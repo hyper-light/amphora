@@ -850,3 +850,46 @@ fn p5_probe_replicated_write_answering_40_mib() {
     eprintln!("P5PROBE40 write+select: {:?} after {:?}", held.as_ref().map(|t| t.iter().map(|t| t.rows.len()).collect::<Vec<_>>()).map_err(|e| format!("{e:#}")), began.elapsed());
     status("after");
 }
+
+/// P5 (CP-T1.13, Ada's any-size bar): a replicated write whose session runs longer than the
+/// followers' election timeout (16 rows of 1 MiB, about 1.1 s on adacachy2's debug build) commits
+/// and keeps its leader. Today the leader's owner thread runs the session and sends no heartbeat
+/// meanwhile, so the followers elect another leader (term 1 to 2) and the write answers
+/// UnknownOutcome. Fails until the leader's heartbeats no longer wait on a session.
+#[test]
+fn cp_t1_13_a_replicated_write_past_an_election_timeout_commits_and_keeps_its_leader() {
+    let dir = tempfile::tempdir().unwrap();
+    let configs = three(dir.path());
+    start(&configs);
+    let c = &configs[0];
+    healthy(c);
+    let keys = c.keys().unwrap();
+    let (_, leader) = Client::connect(&c.members[0].addr, &keys, c.deadline)
+        .unwrap()
+        .leader(Duration::from_secs(60))
+        .unwrap();
+    let mut sql = SqlClient::connect(&leader, &keys, c.deadline).unwrap();
+    let st = |text: &str, params: Vec<Value>| Statement {
+        sql: text.to_owned(),
+        params,
+    };
+    sql.write(vec![st("CREATE TABLE big (id INTEGER PRIMARY KEY, v BLOB)", vec![])])
+        .unwrap();
+    let term = |addr: &str| {
+        let status = Client::connect(addr, &keys, c.deadline).unwrap().ask("status").unwrap();
+        status
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("term="))
+            .unwrap()
+            .to_owned()
+    };
+    let before = term(&leader);
+    let rows = (1..=16i64)
+        .map(|n| st("INSERT INTO big VALUES (?1, ?2)", vec![Value::Integer(n), Value::Blob(vec![9; 1 << 20])]))
+        .collect();
+    let wrote = sql.write(rows);
+    assert!(wrote.is_ok(), "{:#}", wrote.unwrap_err());
+    assert_eq!(term(&leader), before, "the write deposed its leader");
+    let count = sql.read(st("SELECT count(*) FROM big", vec![])).unwrap();
+    assert_eq!(count.rows, vec![vec![Value::Integer(16)]]);
+}
