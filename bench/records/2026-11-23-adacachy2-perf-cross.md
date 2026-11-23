@@ -493,6 +493,10 @@ had tests/serve.rs 8 of 9 with `t_t1_13_1_a_region_lost_is_replaced_by_a_spare` 
 "no voter made the change: NotLeader { leader: Some(3) }", the cut member still the leader heard). Alone from
 the two binaries (r1403 3 runs each, r1415 12 each, load 13-60): 5c28ad0a 14 of 15 passed, main 57b584ee 14 of
 15 (its failure `member promote 4`: UnknownOutcome). The same membership race on both, so not 3b's.
+In the suite (`--test-threads=4`, cp_t1_13 skipped): red 2 of 2 right after a `cargo test` build (r1395,
+r1422), green 5 of 5 from the built binary at 6d10f9e5 (3b + 2a) and 5 of 5 at main d5e901f3 (r1428, load 27-31).
+3b with 2a at 6d10f9e5 (r1422): clippy -p amphora --all-targets clean; lib `serve::` 11/11,
+`database::admission_charge` 3/3, `database::online` 6/6; call_nowait_charge 1/1.
 
 **Unit 2a (f0fff576).** The answers of `call_db` and `call_internal`'s callers count their bytes: `AnswerBytes`
 for `Result<T, E>`, `Refusal` (its strings' and key's capacity), `api::Row`, `ImportProgress`, across.rs's
