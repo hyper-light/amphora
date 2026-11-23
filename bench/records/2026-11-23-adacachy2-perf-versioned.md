@@ -56,9 +56,60 @@ Inconclusive: run-to-run noise (2.7x at 64 clients) is far above any effect, so 
 it stays on branch perf/versioned for an A/B on a quiet machine (or a counted one: cache-line
 transfers under `perf stat -e`).
 
+## perf-C3 unit 1: a read-only end waits for every commit published before it (T-T1.3.1, AUDIT 2.4)
+
+The independent review found that d4418ee0's read-only end flushed redo only through its own
+snapshot (`txn.start`). A writer that published after the reader began, buffered (not yet
+flushed), stayed unflushed when the reader reported a successful commit. The old path took a
+timestamp after every publish and flushed through it. The fix is the reviewer's 67d1bab5
+(t1/main-review), cherry-picked alone: flush through `clock.published()` at the end. Checked
+against the code: `published()` only advances under the publish lock, after `redo.push` stored
+`appended`; `Clock::recovered` and `Redo::new` both start at `replay.newest`. So a read-only
+workload's end still costs one atomic load per lane, and only a new publish makes it flush.
+Evidence: `audit_review_unwritten_commit_flushes_the_prefix_at_finish` (power cut after the
+reader's end, reopen, the writer's row is there, one redo record). It failed before (reviewer's
+r89) and passes on adacachy2 (r187: 153 passed, 2 failed = the known cb4_* below; on the merged
+tip ac58af91, r207: 155 passed, the same 2 failed). On main as a07b635e and ac58af91.
+
+## perf-C3 unit 2: a checkpoint flushes its pages before its header; a clean reopen skips its journal (AUDIT 7.5)
+
+Ada's decision (2026-11-23): one more fsync per checkpoint, between the pages and the header.
+The header carries a word after its stamp saying so. A reopen whose header has the word and
+names the newest journal's checkpoint skips `Journal::apply`. An old-order header (no word) is
+finished from its journal as before, once, and that writes a marked header.
+
+Crash evidence (debug, simulated disk): `audit_7_5_a_crash_at_each_step_of_a_checkpoint_recovers_every_commit`
+crashes after each operation of a checkpoint (journal, pages, flush, header, flush) under five
+power-cut seeds, then reopens twice, checkpoints and reopens. Every commit's rows come back each
+time. Pending: the mutant (the new flush between pages and header deleted) runs in kiln run r207 on
+adacachy2 (its MUTANT_EXIT line). The test should fail there. If it passes, it lacks teeth. `audit_7_5_a_clean_reopen_writes_no_checkpoint_again`:
+a clean reopen writes the data file 0 times and flushes it 0 times. Before, every reopen rewrote
+every page in the journal and flushed once.
+
+Reopen time, release, `crates/engine/examples/versioned_reopen.rs` (20,000 rows of 100 bytes,
+one commit each, flushed and checkpointed; 20 reopens of the same files per rep; 5 reps
+alternating before/after; before = b6cb6aa8, after = 8139baeb):
+
+    OUT=$HOME/.cache/amphora-perf/c3-reopen; for rep in 1 2 3 4 5; do for side in before after; do
+      $OUT/$side $OUT/db-$side-$rep 20000 20; done; done
+
+| rep | before median (min-max), ms | after median (min-max), ms |
+|---|---|---|
+| 1 | 1,556 (717-4,708) | 84.0 (3.5-426) |
+| 2 | 2,266 (960-3,708) | 91.4 (3.5-329) |
+| 3 | 1,616 (649-2,946) | 132 (5.1-368) |
+| 4 | 964 (249-1,350) | 78.1 (4.4-294) |
+| 5 | 864 (588-1,240) | 6.9 (2.7-150) |
+
+Verdict: faster. Every after median sits below every before minimum. The machine was loaded
+(load average 74 on 32 cores, including this lane's own test build), so the ratio itself
+(roughly 12x-125x by median) is not a stable number. The limiter of "before" is inferred, not
+profiled: an fsync of the rewritten pages on a contended NVMe. Every reopen on both sides read
+back all 20,000 rows. To repeat on a quiet machine: the command above.
+
 ## Not done, for the successor (verified against the code)
 
-- Access::Read for read-only statements: `Switch::cursor` (switch.rs) always passes
+- Access::Read for read-only statements (perf-C3 unit 3, not started): `Switch::cursor` (switch.rs) always passes
   `Access::Write(self.txn()?)`; its callers are `versioned_cursor` (vdbe/execute.rs, from OpenRead
   and OpenWrite). A cursor with `txn: None` keeps no reads (`VersionedCursor::note`). Under the
   switch's validation (`Validation::Precision`, the default; SQL never opens SSI) a transaction that
