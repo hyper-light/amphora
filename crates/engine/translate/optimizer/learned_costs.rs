@@ -675,6 +675,8 @@ pub(crate) struct LearnedCosts {
     page_runs: RunCount,
     page: Sampling,
     page_costs: Mutex<Vec<f64>>,
+    /// Lane T15 trace: the batch under way's reads, wall nanoseconds, waited nanoseconds, reads that waited.
+    page_trace: Mutex<[f64; 4]>,
 }
 
 /// Amphora (QT.5, step 3a): which runs of one operation are timed, one in `every`, and the spread
@@ -791,6 +793,7 @@ impl LearnedCosts {
             page_runs: RunCount::default(),
             page: Sampling::new(),
             page_costs: Mutex::new(Vec::new()),
+            page_trace: Mutex::new([0.0; 4]),
         }
     }
 
@@ -821,6 +824,31 @@ impl LearnedCosts {
 
     /// Lane T15: moves the page read's rate by one timed read, as `page_timing` says.
     pub(crate) fn observe_page_read(&self, read: TimedRead) {
+        {
+            let mut t = self.page_trace.lock();
+            t[0] += 1.0;
+            t[1] += read.wall;
+            if let Some((w, _)) = read.waited {
+                t[2] += w;
+                if w > 0.0 {
+                    t[3] += 1.0;
+                }
+            }
+        }
+        let (standing, batches) = {
+            let r = self.rates.lock();
+            (r.page.standing, r.page.batches)
+        };
+        self.observe_page_read_inner(read);
+        let r = self.rates.lock();
+        if r.page.batches != batches {
+            let mut t = self.page_trace.lock();
+            tracing::debug!(target: "amphora::join_search", timing = ?self.page_timing, reads = t[0], wall_mean = t[1] / t[0], waited_mean = t[2] / t[0], waited_reads = t[3], seen = ?r.page.batches.last.map(f64::exp), ?standing, spread = ?batches.spread(), differences = batches.differences, moved = r.page.standing != standing, after = ?r.page.standing, every = self.page.every.load(Ordering::Relaxed), "T15 a page-read batch judged");
+            *t = [0.0; 4];
+        }
+    }
+
+    fn observe_page_read_inner(&self, read: TimedRead) {
         let mut rates = self.rates.lock();
         let rate = &mut rates.page;
         let epoch = rate.epoch;
@@ -950,6 +978,7 @@ impl LearnedCosts {
             return;
         }
         rates.page.anchor(reads, nanos);
+        tracing::debug!(target: "amphora::join_search", timing = ?page_read_timing(), reads, nanos, per_read = nanos / reads, "T15 the open's page-read anchor");
     }
 
     /// PL.8 (lane pl8-16): how much more than the search's best a statement's carried join order
