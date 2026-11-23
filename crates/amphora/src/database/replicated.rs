@@ -2894,11 +2894,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             let input = match receiver.try_recv() {
                 Ok(envelope) => Some(envelope),
                 Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
-                Err(mpsc::TryRecvError::Empty) if self.driving => {
-                    let now = (self.clock)();
-                    self.ran_dry(now)?;
-                    None
-                }
+                Err(mpsc::TryRecvError::Empty) if self.driving => None,
                 Err(mpsc::TryRecvError::Empty) => {
                     let now = (self.clock)();
                     self.ran_dry(now)?;
@@ -2926,7 +2922,9 @@ impl<F: BlockFile + 'static> Actor<F> {
         }
     }
     /// The intake found its channel empty at `now`: unless inputs wait behind a pause, the
-    /// command queue's busy time ends there (`Drain::dry`; QB.1, lane constants-K3).
+    /// command queue's busy time ends there (`Drain::dry`; QB.1, lane constants-K3). The owner
+    /// thread marks it before it waits; a step with no input marks it too, as whoever steps the
+    /// owner found the channel empty (lane replicated-K6).
     fn ran_dry(&mut self, now: Instant) -> Result<(), Refusal> {
         if self.paused_inputs.is_empty() {
             let now = u64::try_from(now.saturating_duration_since(self.started).as_nanos())
@@ -3002,6 +3000,8 @@ impl<F: BlockFile + 'static> Actor<F> {
         if input.is_some() {
             // Work came to the command queue: its busy time begins (`Drain::came`).
             self.intake.came(self.now()?);
+        } else {
+            self.ran_dry(at)?;
         }
         let mut input = input;
         if let Some(envelope) = input.as_mut() {
@@ -3323,6 +3323,13 @@ impl<F: BlockFile + 'static> Actor<F> {
     fn queued(&self) -> u64 {
         u64::try_from(self.control.admitted.load(Ordering::Acquire)).unwrap_or(u64::MAX)
     }
+    /// Whether inputs wait for this owner to take them, in its channel or behind QB.2's pause: the
+    /// command queue's reader has work (QB.1, lane replicated-K6). What it took and still holds (a
+    /// write, a change or a hand-off under way) keeps its bytes charged (`queued`), but waits for
+    /// no reading: counted as work, each tick it is under way weighs as a stall.
+    fn inputs_wait(&self) -> bool {
+        self.control.commands.load(Ordering::Acquire) > 0 || !self.paused_inputs.is_empty()
+    }
     /// The most inputs the command queue holds, as this owner last learned it (QB.1): the waiting
     /// calls are held to it too.
     fn command_bound(&self) -> usize {
@@ -3398,7 +3405,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             self.pace.period(),
         );
         let queued = self.queued();
-        self.intake.sample(now, queued > 0);
+        self.intake.sample(now, self.inputs_wait());
         let mut outgoing = locked(&self.control.outgoing)?;
         let (bytes, messages) = std::mem::take(&mut outgoing.drained);
         self.outgo.drained(bytes, messages);
@@ -5808,7 +5815,8 @@ mod tests {
     /// CP-T1.8: mirror the carrier's bounded admission and observe every processed receipt.
     /// Admission never waits for another owner. All records, including retained proposals,
     /// share the command queue's bounds, its inputs and bytes; each keeps its first absolute
-    /// receive deadline. The receipts grow to the inputs' bound, which the owners learn.
+    /// receive deadline. A record is relayed only while every member's command queue has a place
+    /// for it, by that member's own learned bound.
     struct Pump<'a> {
         clients: &'a [Client],
         receipts: Vec<Option<PumpReceipt>>,
@@ -6018,13 +6026,18 @@ mod tests {
                 for offset in 0..self.clients.len() {
                     // Reserve room for any legal wire record before draining ownership from a peer.
                     // The conservative byte check needs no unbounded overflow/backpressure buffer.
-                    let (bound, commands) = self.clients.first().map_or((0, 0), |client| {
-                        (
-                            client.handle().queue_bound(),
-                            client.handle().command_bound(),
-                        )
+                    // The record may go to any member, so each must have a place left in its
+                    // command queue: its own learned bound, less the inputs its channel holds, the
+                    // test's own calls among them (lane replicated-K6).
+                    let bound = self
+                        .clients
+                        .first()
+                        .map_or(0, |client| client.handle().queue_bound());
+                    let full = self.clients.iter().any(|client| {
+                        let handle = client.handle();
+                        handle.shared.commands.load(Ordering::Acquire) >= handle.command_bound()
                     });
-                    if self.records >= commands || self.bytes + MESSAGE_BYTES > bound {
+                    if full || self.bytes + MESSAGE_BYTES > bound {
                         break;
                     }
                     let index = (first + offset) % self.clients.len();
@@ -10982,6 +10995,48 @@ mod tests {
         }
         settled(&mut driven, &mut pump, 3, &[]);
         write(&mut driven, &mut pump, led, 1);
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// T-QB.1.17 (lane replicated-K6) on driven time: a leader's change waits at its barrier, no
+    /// relay round answering it, while the leader takes a record at one reading of its clock and
+    /// then the clock moves a second, three times. Passes when the leader then admits a burst of
+    /// three records, past the least its command queue carries (a call and a wire record): it read
+    /// each record at the reading it came, so it learned no rate, as a member whose clock stands
+    /// still. Counting the change it holds as inputs waiting, it weighed each second as reading
+    /// time, learned a record a second, and bounded its inputs at that least, 2.
+    #[test]
+    fn t_qb_1_17_a_leader_holding_a_change_admits_what_it_reads_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        let led = clients[leader].handle().clone();
+        let from = if leader == 0 { 2 } else { 1 };
+        let clock = driven.clock(leader);
+        let until = driven.base + offset(&clock) + Duration::from_secs(10);
+        let asked = change(&clients[leader], until, MemberChange::AddLearner(4));
+        driven.step();
+        for _ in 0..3 {
+            let _record = led.admit_receive(from, vec![0xff], until).unwrap();
+            driven.step();
+            let next = driven.base + offset(&clock) + Duration::from_secs(1);
+            set(&clock, driven.base, next);
+            driven.step();
+        }
+        assert!(matches!(asked.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        let burst: Vec<_> = (0..3)
+            .map(|_| led.admit_receive(from, vec![0xff], until).map(|_| ()))
+            .collect();
+        assert!(
+            burst.iter().all(Result::is_ok),
+            "{burst:?}, the leader's command bound {}",
+            led.command_bound()
+        );
         driven.drain(&mut pump);
         pump.finish();
     }
