@@ -1829,8 +1829,9 @@ impl ProgramState {
         cursor_id: usize,
         sizing: Option<crate::vdbe::bloom_filter::FilterSizing>,
     ) -> &mut BloomFilter {
-        self.bloom_filters
-            .get_or_insert_with(cursor_id, || sizing.map_or_else(BloomFilter::new, BloomFilter::sized))
+        self.bloom_filters.get_or_insert_with(cursor_id, || {
+            sizing.map_or_else(BloomFilter::new, BloomFilter::sized)
+        })
     }
 
     /// Gets or creates a bloom filter with a specific capacity for the given cursor ID.
@@ -1840,8 +1841,9 @@ impl ProgramState {
         expected_items: u32,
         false_positive_rate: f32,
     ) -> &mut BloomFilter {
-        self.bloom_filters
-            .get_or_insert_with(cursor_id, || BloomFilter::with_capacity(expected_items, false_positive_rate))
+        self.bloom_filters.get_or_insert_with(cursor_id, || {
+            BloomFilter::with_capacity(expected_items, false_positive_rate)
+        })
     }
 
     /// Gets an existing bloom filter for the given cursor ID.

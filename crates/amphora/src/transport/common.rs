@@ -1735,11 +1735,17 @@ mod tests {
     #[test]
     #[ignore = "passes run alone (5 of 5 on adacachy2); failed once beside transport::common's suite, not yet explained (perf-I2)"]
     fn audit6_at_the_descriptor_limit_the_listener_waits_for_a_give_back() {
-        const TEST: &str =
-            "transport::common::tests::audit6_at_the_descriptor_limit_the_listener_waits_for_a_give_back";
+        const TEST: &str = "transport::common::tests::audit6_at_the_descriptor_limit_the_listener_waits_for_a_give_back";
         if std::env::var_os("AMPHORA_AUDIT6_EMFILE").is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", TEST, "--nocapture", "--include-ignored", "--test-threads", "1"])
+                .args([
+                    "--exact",
+                    TEST,
+                    "--nocapture",
+                    "--include-ignored",
+                    "--test-threads",
+                    "1",
+                ])
                 .env("AMPHORA_AUDIT6_EMFILE", "1")
                 .status()
                 .unwrap();
@@ -1797,7 +1803,10 @@ mod tests {
         // for the budget's give-back.
         let deadline = until();
         while budget.waiting() == 0 {
-            assert!(Instant::now() < deadline, "the listener never waited at the limit");
+            assert!(
+                Instant::now() < deadline,
+                "the listener never waited at the limit"
+            );
             std::thread::yield_now();
         }
         let mut byte = [0];
@@ -1806,7 +1815,10 @@ mod tests {
         second.read_exact(&mut byte).unwrap();
         let gap = ended.elapsed();
         assert_eq!(byte, [1]);
-        println!("audit6 emfile: answered {}us after the first ended", gap.as_micros());
+        println!(
+            "audit6 emfile: answered {}us after the first ended",
+            gap.as_micros()
+        );
         drop(owner);
     }
 
@@ -2263,9 +2275,17 @@ mod tests {
             why: "the database advanced since preparation".into(),
         };
         let malformed = || api::invalid("transaction", "no writes");
-        assert_eq!(spoken(VERSION_SERIALIZATION, Err(stale())).err(), Some(stale()));
-        assert_eq!(spoken(VERSION_SERIALIZATION, Err(malformed())).err(), Some(malformed()));
-        let old = spoken(VERSION_SERIALIZATION - 1, Err(stale())).err().unwrap();
+        assert_eq!(
+            spoken(VERSION_SERIALIZATION, Err(stale())).err(),
+            Some(stale())
+        );
+        assert_eq!(
+            spoken(VERSION_SERIALIZATION, Err(malformed())).err(),
+            Some(malformed())
+        );
+        let old = spoken(VERSION_SERIALIZATION - 1, Err(stale()))
+            .err()
+            .unwrap();
         assert_eq!(
             old,
             Refusal::Invalid {
@@ -2274,10 +2294,16 @@ mod tests {
             }
         );
         assert_eq!(old.to_string(), stale().to_string());
-        assert_eq!(spoken(VERSION_SERIALIZATION - 1, Err(malformed())).err(), Some(malformed()));
+        assert_eq!(
+            spoken(VERSION_SERIALIZATION - 1, Err(malformed())).err(),
+            Some(malformed())
+        );
         // A version-9 peer decodes what it is sent.
         let bytes = postcard::to_allocvec(&spoken(VERSION_MIN, Err(stale()))).unwrap();
-        assert!(matches!(postcard::from_bytes::<Response>(&bytes), Ok(Err(Refusal::Invalid { .. }))));
+        assert!(matches!(
+            postcard::from_bytes::<Response>(&bytes),
+            Ok(Err(Refusal::Invalid { .. }))
+        ));
     }
 
     #[test]

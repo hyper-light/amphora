@@ -1443,7 +1443,8 @@ mod tests {
         }
         fn sync(&self, file: File) -> Result<()> {
             if matches!(file, File::Data) {
-                self.syncs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.syncs
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             self.inner.sync(file)
         }
@@ -1485,7 +1486,11 @@ mod tests {
             assert_eq!(rows(&db), want);
             disk.counted()
         };
-        assert_eq!(reopen(), (0, 0), "a clean reopen's data file writes and flushes");
+        assert_eq!(
+            reopen(),
+            (0, 0),
+            "a clean reopen's data file writes and flushes"
+        );
         write_unordered_header(&*sim);
         let (writes, syncs) = reopen();
         assert!(
@@ -1534,7 +1539,8 @@ mod tests {
                 let finished = db.checkpoint().is_ok();
                 drop(db);
                 disk.power_cut().unwrap();
-                let at = format!("crash after {crash} of {steps}, seed {seed}, finished {finished}");
+                let at =
+                    format!("crash after {crash} of {steps}, seed {seed}, finished {finished}");
                 for reopen in 0..2 {
                     let db = Database::open(disk.clone(), 2_000, 1, cmp)
                         .unwrap_or_else(|e| panic!("{at}, reopen {reopen}: {e}"));
