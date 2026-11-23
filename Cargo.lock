@@ -101,6 +101,7 @@ dependencies = [
  "hyper-timing",
  "hyper-tls",
  "memory-stats",
+ "num-traits",
  "postcard",
  "private-fs",
  "rcgen",

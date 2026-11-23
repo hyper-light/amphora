@@ -12,6 +12,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use super::RowDigest;
+use num_traits::ToPrimitive;
 
 /// Whether and where the database's backup restores and checks its own archive (T-T1.12.C4).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -569,12 +570,12 @@ impl DrillMeter {
             return None;
         }
         // The rank of the quantile among `total` checks, 1-based (nearest rank).
-        #[allow(
-            clippy::cast_precision_loss,
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss
-        )]
-        let rank = ((q.clamp(0.0, 1.0) * total as f64).ceil() as u64).max(1);
+        // The largest u64 rounds up to 2^64 as an f64. That rank selects the final check.
+        let rank = (q.clamp(0.0, 1.0) * total as f64)
+            .ceil()
+            .max(1.0)
+            .to_u64()
+            .unwrap_or(u64::MAX);
         let mut seen = 0u64;
         for (bits, bucket) in self.buckets.iter().enumerate() {
             seen = seen.saturating_add(bucket.load(Ordering::Relaxed));
@@ -805,5 +806,11 @@ mod tests {
         assert_eq!(meter.cost_quantile(0.8), Some(127));
         assert_eq!(meter.cost_quantile(0.999), Some((1 << 20) - 1));
         assert_eq!(meter.cost_ns.load(Ordering::Relaxed), 1_000_107);
+
+        let full = DrillMeter::default();
+        full.buckets[0].store(u64::MAX - 1, Ordering::Relaxed);
+        full.buckets[1].store(1, Ordering::Relaxed);
+        assert_eq!(full.cost_quantile(1.0), Some(1));
+        assert_eq!(full.cost_quantile(f64::NAN), Some(0));
     }
 }

@@ -16,6 +16,7 @@ path = "src/main.rs"
 amphora-api = { path = "../api" }
 amphora-engine-parser.workspace = true
 anyhow = "1"
+num-traits = "0.2"
 thiserror.workspace = true
 tracing = "0.1"
 # The engine a store runs on (crates/engine: what Turso was at 3e09a82, Amphora's own since), pure
