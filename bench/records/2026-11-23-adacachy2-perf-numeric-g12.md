@@ -74,7 +74,8 @@ accepted by the code though the page names only `inf` and `-inf`, the int2/int4/
 |---|---|---|---|
 | r1398, r1406 | be9b0446, 10cc95dd | clippy | compile errors (`program` not in scope, a closure's lifetime), fixed by 10cc95dd and 71db20b4 |
 | r1411 | 71db20b4 | clippy plain and `--features bench`; `--test floating_point_doc --test real_text`; lib `numeric:: printf json:: vdbe::value vdbe::affinity g9_` | clippy clean both; 21 + 2 passed; lib 282 passed, 0 failed |
-| r1420 | 7d11f14a (merged with main d5e901f3; pushed to main) | the same | clippy clean both; 21 + 2 passed; lib 282 passed, 0 failed |
+| r1420 | 7d11f14a (merged with main d5e901f3) | the same | clippy clean both; 21 + 2 passed; lib 282 passed, 0 failed |
+| r1427 | cd6c3b1e (main; merged with main 302eebc8, which brought engine `database.rs`, `lib.rs`, `storage/wal.rs`; pushed before this run, checked right after) | the same | clippy clean both; 21 + 2 passed; lib 282 passed, 0 failed |
 
 ## Successor
 
