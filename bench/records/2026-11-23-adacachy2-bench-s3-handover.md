@@ -36,8 +36,15 @@ fairness problems in the replication measures that any quoted failover or catch-
    - Fix (bench/ only, not started): have each member report its pid on `leader`. `kill(n)` sends SIGKILL to
      that pid, and `start(n)` spawns `amphora-bench --repl-member` again on the same `--dir`, with the same
      args repl_members.sh used. That works for members on this host. For remote ones, return a typed
-     refusal. Don't edit bench/src in `~/.cache/amphora-perf/bench-s` on adacachy2 while the timed runs build
-     from it. Use a separate clone, and build after they finish.
+     refusal. `member_main` also runs `remove_dir_all(&m.dir)` at every start, so a restart would wipe the
+     member's data. It needs a flag that reopens the member on its own data instead. repl_members.sh
+     `wait`s on the original pids and counts any non-zero exit as a failure, so a member that was killed
+     on purpose must not count. Don't edit bench/src in `~/.cache/amphora-perf/bench-s` on adacachy2 while the
+     timed runs build from it. Use a separate clone, and build after they finish.
+   - Related: each member's relay thread loops on `handle.drain` and calls `std::thread::yield_now()` when
+     nothing moved, so every member keeps one core busy for its whole life. That is a polling loop, which
+     CLAUDE.md's event-driven rule forbids. It costs Amphora three cores the competitors don't pay. It
+     matters wherever cores are the limit, and it isn't in `client_use`.
 4. **Picked inputs still in unit 1.** `--behind 100000` (no source), `--poll-us 1000` and `--settle-s 1`. Unit 1
    will still run catch-up with `--behind 100000` into `...-repl-failover/`. Don't quote any `*-catchup.jsonl`
    from that folder. The `--seconds 5` ladder window and the suite's `--seconds 1 --warmup 0.5` limit the
