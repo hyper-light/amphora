@@ -1,0 +1,2 @@
+-- Infinities: one +inf among discounts; +inf and -inf together.
+SELECT sum(CASE WHEN l_orderkey = 1 AND l_linenumber = 1 THEN 1e999 ELSE l_discount END), avg(CASE WHEN l_orderkey = 1 AND l_linenumber = 1 THEN 1e999 ELSE l_discount END), sum(CASE l_linenumber WHEN 1 THEN 1e999 WHEN 2 THEN -1e999 ELSE 1.0 END), total(CASE l_linenumber WHEN 1 THEN 1e999 WHEN 2 THEN -1e999 ELSE 1.0 END) FROM lineitem;

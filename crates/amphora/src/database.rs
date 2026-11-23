@@ -2108,11 +2108,7 @@ impl Database {
             }),
         };
         // Bootstrap DDL used the same WAL; the barrier makes it durable before open succeeds.
-        database.submit_selected(
-            "",
-            Operation::Mutation(Mutation::Sql(Vec::new())),
-            until,
-        )?;
+        database.submit_selected("", Operation::Mutation(Mutation::Sql(Vec::new())), until)?;
         Ok(database)
     }
 
@@ -2350,8 +2346,7 @@ impl Database {
     {
         let call: Call = Box::new(move |db| f(db).map(|v| Box::new(v) as Box<dyn Any + Send>));
         let operation = Operation::Call(Mutex::new(Some(call)), answer);
-        match self.resolve(until)?.submit_selected("", operation, until)?
-        {
+        match self.resolve(until)?.submit_selected("", operation, until)? {
             (Answer::Called(v), token) => v
                 .downcast::<R>()
                 .map(|v| (*v, token))
@@ -2943,16 +2938,10 @@ impl Database {
             }
         }
         let (tx, rx) = mpsc::sync_channel(1);
-        self.submit_local(
-            namespace,
-            operation,
-            until,
-            until,
-            move |result| {
-                // A caller whose deadline elapsed no longer waits, but the committed result stands.
-                let _ = tx.send(result);
-            },
-        )?;
+        self.submit_local(namespace, operation, until, until, move |result| {
+            // A caller whose deadline elapsed no longer waits, but the committed result stands.
+            let _ = tx.send(result);
+        })?;
         rx.recv_timeout(until.saturating_duration_since(Instant::now()))
             .map_err(|e| match e {
                 mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected => {
@@ -4412,7 +4401,10 @@ mod admission_charge {
             cursor: vec![1, 2],
             done: false,
         };
-        assert_eq!(progress.answer_bytes(), std::mem::size_of_val(&progress) + 5);
+        assert_eq!(
+            progress.answer_bytes(),
+            std::mem::size_of_val(&progress) + 5
+        );
         let reads = vec![(vec![1u8; 3], Some(vec![2u8; 4])), (vec![5u8], None)];
         let heap = 2 * std::mem::size_of::<(Vec<u8>, Option<Vec<u8>>)>() + 3 + 4 + 1;
         let locked = crate::xgroup::Reply::Locked {
@@ -4422,7 +4414,10 @@ mod admission_charge {
         let resolved = crate::xgroup::Reply::Resolved;
         assert_eq!(resolved.answer_bytes(), std::mem::size_of_val(&resolved));
         let committed = crate::xgroup::coordinator::Answer::Committed { reads, at: None };
-        assert_eq!(committed.answer_bytes(), std::mem::size_of_val(&committed) + heap);
+        assert_eq!(
+            committed.answer_bytes(),
+            std::mem::size_of_val(&committed) + heap
+        );
         let stepped = online::Stepped::Public {
             held: Duration::from_millis(1),
         };

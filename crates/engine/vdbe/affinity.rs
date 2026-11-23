@@ -1,11 +1,7 @@
 use amphora_engine_parser::ast::{Expr, Literal};
 use either::Either;
 
-use crate::{
-    numeric::Numeric,
-    types::AsValueRef,
-    Value, ValueRef,
-};
+use crate::{numeric::Numeric, types::AsValueRef, Value, ValueRef};
 
 /// # SQLite Column Type Affinities
 ///
