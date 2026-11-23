@@ -17,9 +17,8 @@ use std::collections::BTreeMap;
 use amphora_pg_oracle::digest::{self, Answer};
 use amphora_pg_parser::gram;
 
-/// Statements 19's grammar accepts and one of its actions then refuses (measured on main 93a716b1:
-/// 10 0A000, 4 22023, 21 42601); lower it as actions are ported.
-const REFUSED_IN_ACTIONS: usize = 35;
+mod common;
+use common::REFUSED_IN_ACTIONS;
 
 /// T-PG.5.2: every statement 19's grammar accepts, the tables accept; every one it refuses, they
 /// refuse with its SQLSTATE at its cursor.

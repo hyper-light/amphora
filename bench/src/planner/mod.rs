@@ -523,6 +523,14 @@ pub fn main() -> anyhow::Result<()> {
         Ok(prefix) => Some((prefix, crate::profile_start()?)),
         Err(_) => None,
     };
+    // AMPHORA_PLAN_TRACE (lane T12): the join search's events to stderr, the weights each plan
+    // is made on and every whole plan it weighs, so a plan that changes between runs is traced.
+    if std::env::var_os("AMPHORA_PLAN_TRACE").is_some() {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        let only = tracing_subscriber::filter::Targets::new().with_target("amphora::join_search", tracing_subscriber::filter::LevelFilter::DEBUG);
+        tracing_subscriber::registry().with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_ansi(false)).with(only).try_init()?;
+    }
     for (name, sql) in &b.queries {
         if !o.only.is_empty() && !o.only.contains(name) {
             continue;
