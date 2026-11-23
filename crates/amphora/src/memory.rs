@@ -403,8 +403,8 @@ pub struct Budget {
     held: [AtomicU64; 4],
     /// The streams of each use open now, each of which may hold a charge at once ([`Stream`]).
     streams: [AtomicU64; 4],
-    /// Who waits for room, in the order they asked ([`Budget::when_room`]), and how many: a
-    /// release or a reading with no one waiting takes no lock.
+    /// Who waits for room, in the order they asked ([`Budget::when_room`]), and how many are not
+    /// yet woken: a release or a reading with none takes no lock.
     waiting: Mutex<VecDeque<Waiter>>,
     waiters: AtomicU64,
     /// The next wait's name ([`Waiting`]).
@@ -466,7 +466,7 @@ impl Drop for Waiting {
             let before = waiting.len();
             waiting.retain(|waiter| waiter.id != self.id);
             self.budget.count(&waiting);
-            waiting.len() < before && !waiting.is_empty()
+            waiting.len() < before && self.budget.waiters.load(Ordering::Relaxed) > 0
         };
         if withdrew {
             self.budget.turn();
@@ -735,12 +735,12 @@ impl Budget {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// `waiting`'s length, for a release or a reading to see without the lock.
+    /// The waits in `waiting` not yet woken, for a release or a reading to see without the lock:
+    /// with none, a turn would wake no one.
     fn count(&self, waiting: &VecDeque<Waiter>) {
-        self.waiters.store(
-            u64::try_from(waiting.len()).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
+        let unwoken = waiting.iter().filter(|waiter| !waiter.woken).count();
+        self.waiters
+            .store(u64::try_from(unwoken).unwrap_or(u64::MAX), Ordering::Relaxed);
     }
 
     /// The waiters' turn at a reading now, in the order they asked: each claims, out of the free
@@ -774,6 +774,7 @@ impl Budget {
                     woken.push(waiter.wake.clone());
                 }
             }
+            self.count(&waiting);
             woken
         };
         for wake in woken {
