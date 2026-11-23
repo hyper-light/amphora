@@ -155,6 +155,14 @@ lineitem, `JoinMethods::HashJoinsOnly` or pinned weights (`pin_cost_weights`, si
 the plan is that shape, row counters on; expect c's rows read once (its row count), not its row
 count times the prefix's rows; and the answer equal to `NestedLoopsOnly`'s.
 
+A first try at that test (r441, debug build, not committed; kept at
+`~/.cache/amphora-perf/tpch-exp/t2_q05_shape.rs` on adacachy): customers 300, orders 3,000,
+4 lines an order, `o.d < 2`. It did not take the shape, so it shows nothing yet:
+`HashJoinsOnly` hashed `cu` and kept `li`'s seek by `sqlite_autoindex_li_1` (6,299 rows read
+against nested loops' 5,399, same answer `2400 | 9003000`), and `CROSS JOIN` order planned the
+same. The shape needs the build table to be a prior hash join's probe and no cheaper seek for the
+probe table: pin the weights (`pin_cost_weights`, simulator feature) to q05's state A or B above.
+
 ### 5. Open: the wrong answer
 
 r414's first timed run answered `CHINA 163947441.6399` against SQLite's `CHINA 7822103.0` in 22 s.
