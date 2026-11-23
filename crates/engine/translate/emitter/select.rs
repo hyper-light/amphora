@@ -716,12 +716,15 @@ fn prune_join_order_for_materialized_inputs(
     }
 
     let mut tables_to_remove: TableMask = TableMask::default();
+    // Each input's subplan ran the terms its own prefix holds, and no others.
+    let mut removed_prefixes: Vec<&TableMask> = Vec::new();
     for (build_table_idx, input) in build_inputs.iter() {
         if !build_tables_in_plan.get(*build_table_idx) {
             continue;
         }
         if matches!(input.mode, MaterializedBuildInputMode::KeyPayload { .. }) {
             tables_to_remove.try_extend(input.prefix_tables.iter())?;
+            removed_prefixes.push(&input.prefix_tables);
         }
     }
 
@@ -794,7 +797,14 @@ fn prune_join_order_for_materialized_inputs(
             &plan.table_references,
             &plan.non_from_clause_subqueries,
         )?;
-        if tables_to_remove.contains_all_set_bits_of(&mask) {
+        // A term across two inputs (TPC-H q05's c_nationkey = s_nationkey, customer in one and
+        // supplier in another) ran in neither subplan: the main plan runs it once both inputs'
+        // probes have matched (lane T3: consumed by the union of the prefixes, it was dropped and
+        // q05 answered 21x high).
+        if removed_prefixes
+            .iter()
+            .any(|prefix| prefix.contains_all_set_bits_of(&mask))
+        {
             term.consumed = true;
         }
     }
