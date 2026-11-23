@@ -445,6 +445,10 @@ origin/main 93b6458c merged. `cargo clippy -p amphora-engine --all-targets --loc
 main's own, as in r1233: btree's `wal_reuses_freelist_leaf_after_abandoned_overflowing_insert`, `cb4_a_…` and
 `cb4_ab_…`. `cargo test -p amphora --locked --test store` passed 15. That is r1233's baseline exactly. Run r1279 (on
 0fbf0de8) and r1288 (on 4871ad86) found the compile errors that 4871ad86 and 779b6f0c fixed.
+Run r1309 (same needs, load 22-28) on b7d2cd79, after main a7160678 was merged (it changed btree.rs): clippy exit 0;
+storage passed 695, failed 2 and ignored 14 in 204 s. Main's btree change fixed the freelist test, and the two left are
+`cb4_a_…` and `cb4_ab_…`, main's own. Main then moved to 0d87fcdd in files this change does not touch (replicated.rs,
+hyper-raft), merged without a re-run (RULES 5).
 
 **Step 2, what is left, in order.**
 1. The switch on `SharedLog`, under the write lock: `Segments::switch`, then `second_current`, then the free segment's
