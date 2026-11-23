@@ -2445,7 +2445,8 @@ impl ShmWalCoordination {
     fn seed_or_sync_authority(&self) {
         let snapshot = self.authority.snapshot();
         let local_wal_view_loaded_from_disk = self
-            .shared
+            .log
+            .current()
             .read()
             .metadata
             .loaded_from_disk_scan
@@ -3835,6 +3836,9 @@ pub struct SharedLog {
     first: Arc<RwLock<WalFileShared>>,
     second: Arc<RwLock<WalFileShared>>,
     pub(crate) segments: SpinLock<Segments>,
+    /// Whether `segments` says the second segment is current, published so that every access to
+    /// the current segment's state reads it without that lock. Written only with `segments`.
+    second_current: AtomicBool,
     /// Lock used by in-place VACUUM to keep new read/write transactions out
     /// while VACUUM is in progress.
     /// Normal WAL transactions hold this shared for the lifetime of their
@@ -3860,6 +3864,7 @@ impl SharedLog {
             first,
             second: WalFileShared::new_noop(),
             segments: SpinLock::new(Segments::new(SegmentId::First)),
+            second_current: AtomicBool::new(false),
             vacuum_lock: PaddedLock::new(TursoRwLock::new()),
             write_lock: PaddedLock::new(TursoRwLock::new()),
             checkpoint_lock: PaddedLock::new(TursoRwLock::new()),
@@ -3876,7 +3881,11 @@ impl SharedLog {
 
     /// The segment the writer appends to.
     pub fn current(&self) -> &Arc<RwLock<WalFileShared>> {
-        self.segment(self.segments.lock().current())
+        if self.second_current.load(Ordering::Acquire) {
+            &self.second
+        } else {
+            &self.first
+        }
     }
 
     /// The segment a switch left, until its reset: copied first by the checkpointer.
@@ -8253,14 +8262,14 @@ pub mod test {
     use super::{
         CheckpointLocks, InProcessWalCoordination, ReadGuardKind, RollbackTo, TryBeginReadResult,
         Wal, WalAutoActions, WalCommitState, WalConnectionState, WalCoordination, WalFile,
-        WalSnapshot, NO_LOCK_HELD,
+        SharedLog, WalSnapshot, NO_LOCK_HELD,
     };
     #[cfg(host_shared_wal)]
     use crate::storage::shared_wal_coordination::{
         MappedSharedWalCoordination, SharedWalCoordinationHeader, SharedWalCoordinationOpenMode,
     };
     use crate::sync::{atomic::Ordering, Arc};
-    use crate::sync::{Mutex, RwLock};
+    use crate::sync::Mutex;
     use crate::SqliteDialect;
     use crate::{
         io::FileSyncType,
@@ -11346,6 +11355,7 @@ pub mod test {
             &open_test_db_file_for_wal(&io, &wal_path),
         )
         .unwrap();
+        let shared = SharedLog::new(shared);
 
         let shared = shared.current().read();
         assert_eq!(shared.metadata.max_frame.load(Ordering::Acquire), 1);
@@ -11393,6 +11403,7 @@ pub mod test {
             &open_test_db_file_for_wal(&io, &wal_path),
         )
         .unwrap();
+        let shared = SharedLog::new(shared);
         assert!(shared.current().read().runtime.frame_cache.lock().is_empty());
 
         let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
@@ -11461,6 +11472,7 @@ pub mod test {
             &open_test_db_file_for_wal(&io, &wal_path),
         )
         .unwrap();
+        let shared = SharedLog::new(shared);
 
         let shared = shared.current().read();
         assert_eq!(shared.metadata.max_frame.load(Ordering::Acquire), 1);
@@ -11549,6 +11561,7 @@ pub mod test {
             &open_test_db_file_for_wal(&io, &wal_path),
         )
         .unwrap();
+        let shared = SharedLog::new(shared);
 
         let shared = shared.current().read();
         assert_eq!(shared.metadata.max_frame.load(Ordering::Acquire), 1);
@@ -11618,6 +11631,7 @@ pub mod test {
             &open_test_db_file_for_wal(&io, &wal_path),
         )
         .unwrap();
+        let reopened_shared = SharedLog::new(reopened_shared);
         assert!(!reopened_shared
             .current()
             .read()
@@ -11663,6 +11677,7 @@ pub mod test {
             &open_test_db_file_for_wal(&io, &wal_path),
         )
         .unwrap();
+        let shared = SharedLog::new(shared);
         assert!(shared
             .current()
             .read()
@@ -11725,6 +11740,7 @@ pub mod test {
             &open_test_db_file_for_wal(&io, &wal_path),
         )
         .unwrap();
+        let shared = SharedLog::new(shared);
 
         let shared = shared.current().read();
         assert_eq!(shared.metadata.max_frame.load(Ordering::Acquire), 1);
@@ -12042,6 +12058,7 @@ pub mod test {
             &open_test_db_file_for_wal(&io, &wal_path),
         )
         .unwrap();
+        let shared = SharedLog::new(shared);
 
         let shared = shared.current().read();
         assert_eq!(shared.metadata.max_frame.load(Ordering::Acquire), 0);
