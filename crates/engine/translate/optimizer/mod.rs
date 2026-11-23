@@ -2470,7 +2470,11 @@ fn group_count_from_index_stats<'a>(
             let rows_per_group = *index_stats
                 .avg_rows_per_distinct_prefix
                 .get(columns.len().checked_sub(1)?)?;
-            (rows_per_group > 0).then_some((total_rows / rows_per_group as f64, rows_per_group))
+            if rows_per_group > 0 {
+                Some((total_rows / rows_per_group as f64, rows_per_group))
+            } else {
+                None
+            }
         })
         .fold(
             None,

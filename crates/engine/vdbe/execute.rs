@@ -1124,7 +1124,11 @@ macro_rules! comparison_opcode {
                 *collation,
                 $op,
             )?;
-            state.pc = if jumps { target_pc } else { state.pc + 1 };
+            state.pc = if jumps {
+                target_pc
+            } else {
+                state.pc.checked_add(1).or_overflow()?
+            };
             Ok(InsnFunctionStepResult::Step)
         }
     };
@@ -1918,7 +1922,7 @@ pub fn op_rewind(
             .take(*cursor_id)
             .filter(|walk| walk.phase != crate::skipping::WalkPhase::Idle)
         {
-            let on_row = state.pc + 1;
+            let on_row = state.pc.checked_add(1).or_overflow()?;
             return skip_walk_step(program, state, walk, pc_if_empty.as_offset_int(), on_row);
         }
     }
@@ -1947,7 +1951,7 @@ pub fn op_rewind(
     } else {
         if !program.skip_hints.is_empty() {
             if let Some(walk) = skip_walk_for(program, state, *cursor_id) {
-                let on_row = state.pc + 1;
+                let on_row = state.pc.checked_add(1).or_overflow()?;
                 return skip_walk_step(program, state, walk, pc_if_empty.as_offset_int(), on_row);
             }
         }
@@ -2153,15 +2157,13 @@ fn record_fused_rows(state: &mut ProgramState, rows: usize, fullscan: bool, is_i
         let skipped = skipped as u64;
         state.record_rows_read(skipped);
         state.metrics.btree_next = state.metrics.btree_next.wrapping_add(skipped);
-        state.metrics.search_count = state.metrics.search_count.wrapping_add(skipped as i64);
-        state.metrics.fullscan_steps = state
-            .metrics
-            .fullscan_steps
-            .wrapping_add(fullscan as u64 * skipped);
-        state.metrics.index_steps = state
-            .metrics
-            .index_steps
-            .wrapping_add(is_index as u64 * skipped);
+        state.metrics.search_count = state.metrics.search_count.wrapping_add_unsigned(skipped);
+        if fullscan {
+            state.metrics.fullscan_steps = state.metrics.fullscan_steps.wrapping_add(skipped);
+        }
+        if is_index {
+            state.metrics.index_steps = state.metrics.index_steps.wrapping_add(skipped);
+        }
     }
 }
 
@@ -3918,7 +3920,7 @@ pub fn op_next(
                 }
             }
             let next_pc = state.pc;
-            let on_end = next_pc + 1;
+            let on_end = next_pc.checked_add(1).or_overflow()?;
             let stepped = skip_walk_step(program, state, walk, on_end, pc_if_next.as_offset_int())?;
             if state.pc == pc_if_next.as_offset_int() {
                 let fused = program
@@ -19135,8 +19137,9 @@ fn hash_probe_run(
             op_state.probe_buffered,
         ),
         None => {
+            let keys_end = key_start_reg.checked_add(num_keys).or_overflow()?;
             let keys = hash_table.probe_keys_from(
-                state.registers[key_start_reg..key_start_reg + num_keys]
+                state.registers[key_start_reg..keys_end]
                     .iter()
                     .map(|reg| reg.get_value()),
             )?;
@@ -19344,12 +19347,12 @@ pub fn op_join_switch_step(
         None => Ok(JoinStep::NestedLoop),
     };
     state.pc = match step {
-        Ok(JoinStep::NestedLoop) => state.pc + 1,
+        Ok(JoinStep::NestedLoop) => state.pc.checked_add(1).or_overflow()?,
         Ok(JoinStep::SwitchNow) => data.build_pc.as_offset_int(),
         Ok(JoinStep::Hash) => data.probe_pc.as_offset_int(),
         Err(refused) => {
             tracing::debug!(switch = data.switch_id, %refused, "adaptive join stays a nested loop");
-            state.pc + 1
+            state.pc.checked_add(1).or_overflow()?
         }
     };
     Ok(InsnFunctionStepResult::Step)
@@ -19432,6 +19435,18 @@ pub fn op_join_switch_built(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// `rows` as an `as i64` cast reads it (toward zero, held at i64's ends, NaN as 0), without the
+/// lossy cast: exact for ANALYZE's whole, in-range row counts (PL.13).
+fn analyzed_rows_i64(rows: f64) -> i64 {
+    use num_traits::ToPrimitive;
+    match rows.to_i64() {
+        Some(whole) => whole,
+        None if rows > 0.0 => i64::MAX,
+        None if rows < 0.0 => i64::MIN,
+        None => 0,
+    }
+}
+
 /// Amphora (PL.13, the re-plan): the rows an adaptive join's hash table holds, the whole inner
 /// table, set against the rows the plan counted it at (ANALYZE's with the changes since, PL.9).
 /// Within the estimate's own error the plan stands. Past it the table's row counter is set to the
@@ -19464,7 +19479,7 @@ fn replan_on_built_rows(
         Ok(Replan::Again { rows }) => {
             let changes = i64::try_from(rows)
                 .unwrap_or(i64::MAX)
-                .saturating_sub(analyzed_rows as i64);
+                .saturating_sub(analyzed_rows_i64(analyzed_rows));
             // A count the planner floors to the estimate it already has would plan the same.
             if crate::row_changes::live_rows(analyzed_rows, changes) != estimate {
                 counter.store(changes, crate::sync::atomic::Ordering::Release);
@@ -20708,7 +20723,7 @@ fn op_journal_mode_inner(
                 // Return result
                 let ret: &'static str = new_mode.into();
                 state.registers[*dest].set_text(Text::new(ret))?;
-                state.pc += 1;
+                state.pc = state.pc.checked_add(1).or_overflow()?;
 
                 return Ok(InsnFunctionStepResult::Step);
             }
@@ -20742,7 +20757,7 @@ fn op_journal_mode_inner(
 
                 let ret: &'static str = journal_mode::JournalMode::Mvcc.into();
                 state.registers[*dest].set_text(Text::new(ret))?;
-                state.pc += 1;
+                state.pc = state.pc.checked_add(1).or_overflow()?;
 
                 return Ok(InsnFunctionStepResult::Step);
             }
@@ -20771,7 +20786,7 @@ pub fn op_filter(
     }
     let Some(filter) = state.get_bloom_filter(*cursor_id) else {
         // always safe to fall though, no filter present
-        state.pc += 1;
+        state.pc = state.pc.checked_add(1).or_overflow()?;
         return Ok(InsnFunctionStepResult::Step);
     };
     let contains = filter_contains(filter, &state.registers, *key_reg, *num_keys);
@@ -20779,7 +20794,7 @@ pub fn op_filter(
     if !contains {
         state.pc = target_pc.as_offset_int();
     } else {
-        state.pc += 1;
+        state.pc = state.pc.checked_add(1).or_overflow()?;
     }
     Ok(InsnFunctionStepResult::Step)
 }
@@ -20875,7 +20890,7 @@ pub fn op_star_probes(
         .star_orders
         .get_or_insert_with(pc, || super::star_order::StarOrder::new(data.probes.len(), data.order));
     let Some(order) = state.star_orders.get_mut(&pc) else {
-        state.pc += 1;
+        state.pc = state.pc.checked_add(1).or_overflow()?;
         return Ok(InsnFunctionStepResult::Step);
     };
     let mut rejected = false;
@@ -20907,7 +20922,7 @@ pub fn op_star_probes(
     if rejected {
         state.pc = data.target_pc.as_offset_int();
     } else {
-        state.pc += 1;
+        state.pc = state.pc.checked_add(1).or_overflow()?;
     }
     Ok(InsnFunctionStepResult::Step)
 }
@@ -20943,7 +20958,7 @@ pub fn op_filter_add(
         filter.insert_values(&value_refs);
     }
 
-    state.pc += 1;
+    state.pc = state.pc.checked_add(1).or_overflow()?;
     Ok(InsnFunctionStepResult::Step)
 }
 
@@ -21096,7 +21111,7 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
 
         // Matches sqlite that treats VACUUM temp INTO as a no-op (no file created)
         if source_db_id == TEMP_DB_ID {
-            state.pc += 1;
+            state.pc = state.pc.checked_add(1).or_overflow()?;
             return Ok(InsnFunctionStepResult::Step);
         }
 
@@ -21298,7 +21313,7 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                 program.connection.execute("COMMIT")?;
                 state.auto_txn_cleanup = TxnCleanup::None;
 
-                state.pc += 1;
+                state.pc = state.pc.checked_add(1).or_overflow()?;
                 return Ok(InsnFunctionStepResult::Step);
             }
         }
@@ -21329,7 +21344,7 @@ pub fn op_vacuum(
     match vacuum_state.step(&program.connection) {
         Ok(IOResult::Done(())) => {
             state.op_vacuum_state = VacuumOpState::None;
-            state.pc += 1;
+            state.pc = state.pc.checked_add(1).or_overflow()?;
             Ok(InsnFunctionStepResult::Step)
         }
         Ok(IOResult::IO(io)) => Ok(state.suspend_on_io(io)),
