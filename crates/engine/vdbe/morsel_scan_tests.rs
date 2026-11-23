@@ -3831,3 +3831,56 @@ fn r2_parallel_limit_finds_a_one_row_tables_row() {
     }
     assert!(wrong.is_empty(), "{wrong:?}");
 }
+
+/// Lane R4 (reals), the cause R3 traced (r1585): a result column that is a constant is hoisted
+/// to the program's end, and the body copy's `keep` label followed it there, so every worker
+/// skipped every row. Do: select only constants (and a column before a constant) from a
+/// 20,000-row table in parallel mode at 1 to 32 cores, in memory and on a file reopened by a
+/// fresh database. Expect every row, as the serial loop returns them.
+#[test]
+fn r4_parallel_constant_columns_return_every_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("r4.db").to_str().unwrap().to_string();
+    let file = |path: &str| {
+        let io = Arc::new(crate::io::PlatformIO::new().unwrap());
+        Database::open_file_with_flags(io, path, OpenFlags::default(), DatabaseOpts::new(), None, Arc::new(SqliteDialect))
+            .unwrap()
+            .connect(ConnectOpts::new())
+            .unwrap()
+    };
+    let fill = |conn: &Arc<Connection>| {
+        conn.execute("CREATE TABLE big (a INTEGER, b TEXT)").unwrap();
+        conn.execute("BEGIN").unwrap();
+        for i in 0..20000 {
+            conn.execute(format!("INSERT INTO big VALUES ({i}, 'row {i}')")).unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+    };
+    let memory = open(":memory:r4-constants");
+    fill(&memory);
+    fill(&file(&path));
+    let reopened = file(&path);
+    let sorted = |rows: Vec<Vec<Value>>| {
+        let mut rows: Vec<String> = rows.iter().map(|row| format!("{row:?}")).collect();
+        rows.sort();
+        rows
+    };
+    let mut wrong = Vec::new();
+    for (name, conn) in [("memory", &memory), ("file reopened", &reopened)] {
+        for sql in ["SELECT 1 FROM big", "SELECT 1, 'two', 3.5, NULL FROM big", "SELECT a, 7 FROM big"] {
+            conn.set_parallel_mode(ParallelMode::Off);
+            let serial = sorted(sql_rows(conn, sql));
+            assert_eq!(serial.len(), 20000, "{name}: {sql} serially");
+            for cores in [1usize, 2, 4, 8, 16, 32] {
+                conn.set_parallel_mode(ParallelMode::On);
+                conn.set_parallel_cores(NonZeroUsize::new(cores));
+                match conn.prepare(sql).and_then(|mut s| s.run_collect_rows()) {
+                    Ok(rows) if sorted(rows.clone()) == serial => {}
+                    Ok(rows) => wrong.push(format!("{name}: {sql} at {cores} cores: {} rows", rows.len())),
+                    Err(error) => wrong.push(format!("{name}: {sql} at {cores} cores: {error}")),
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
