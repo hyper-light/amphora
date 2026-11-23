@@ -139,8 +139,30 @@ read in the 1.102 nightly source here; the pinned 1.99.1 has no source installed
 `uring.rs` is Linux only. So the checkpoint's two flushes and the redo log's are full flushes on
 macOS. The same mutant on macOS plus a timing of `sync_data` vs `fsync(2)` vs `F_FULLFSYNC`:
 `JOBS=4 sh bench/versioned/mutant_7_5.sh` (kiln run r336, MacBook Pro 2, needs
-`macos/arm64,cpus=4,mem=16g` because it had 6-7 of 18 cores idle and refused cpus=8). Its output
-was not in when this lane's hour ended: the successor reads it.
+`macos/arm64,cpus=4,mem=16g` because it had 6-7 of 18 cores idle and refused cpus=8).
+
+r336's result (MacBook Pro 2, arm64, rustc 1.99.1, debug tests, tree 62687f5d; load average 30.2 at
+the start, 34.5 at the end):
+
+- The base tree: `storage::versioned::durable` 21 passed, 0 failed.
+- The mutant: `audit_7_5_a_crash_at_each_step_of_a_checkpoint_recovers_every_commit` fails at
+  durable.rs:1540 ("crash after 17 of 20, seed 3, finished false, reopen 0": the reopen lost rows),
+  MUTANT_EXIT=101. The test catches the missing flush on macOS as on Linux.
+- Flush timing, one 4 KiB page appended then flushed, 40 flushes per arm, the three arms in turn and
+  the round repeated (`flush.rs` in the script, `rustc -O`):
+
+| call | round 1 min / median / max, us | round 2 min / median / max, us |
+|---|---|---|
+| `File::sync_data` | 3,396 / 5,266 / 14,965 | 3,826 / 5,503 / 22,859 |
+| `fsync(2)` | 64 / 115 / 4,312 | 59 / 94 / 4,248 |
+| `fcntl(F_FULLFSYNC)` | 3,479 / 5,430 / 17,747 | 4,100 / 5,434 / 17,178 |
+
+Reading: `sync_data` costs what `F_FULLFSYNC` costs (medians within 3% in both rounds, each 50x
+plain `fsync`), which is what the std source says it calls on Apple targets. So the versioned
+storage's flushes on macOS are full flushes. Plain `fsync(2)` is fast because it does not empty
+the drive's write cache, and it is not durable across power loss. The limiter of the full flush is
+the drive's cache flush; the load (30-34 on 18 cores) widens the max, not the medians' order.
+Every flush call returned success (the program asserts each).
 
 ## perf-C4 unit 2: reopen A/B (pending)
 
