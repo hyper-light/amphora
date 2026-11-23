@@ -5389,9 +5389,13 @@ impl<F: BlockFile + 'static> Actor<F> {
             }
         }
         self.tail = None;
-        let Phase::Barrier(operation) = pending.phase else {
-            self.pending = Some(pending);
-            return Ok(());
+        let operation = match std::mem::replace(&mut pending.phase, Phase::Running) {
+            Phase::Barrier(operation) => operation,
+            other => {
+                pending.phase = other;
+                self.pending = Some(pending);
+                return Ok(());
+            }
         };
         if self.replica.machine().bootstrap_pending() {
             let source = self
