@@ -3378,7 +3378,10 @@ impl<F: BlockFile + 'static> Actor<F> {
             self.pace.period(),
         );
         let queued = self.queued();
+        let before = self.intake;
         self.intake.sample(now, queued > 0);
+        #[cfg(test)]
+        let trace = (before, self.intake, self.control.commands.load(Ordering::Acquire), self.paused_inputs.len(), self.changing.is_some(), self.pending.is_some(), self.transferring.is_some(), queued);
         let mut outgoing = locked(&self.control.outgoing)?;
         let (bytes, messages) = std::mem::take(&mut outgoing.drained);
         self.outgo.drained(bytes, messages);
@@ -3392,6 +3395,8 @@ impl<F: BlockFile + 'static> Actor<F> {
             self.peers(),
             self.replica.core().raft.config().limits.members,
         )?;
+        #[cfg(test)]
+        eprintln!("K6TRACE id={} leader={} now={now} timeout={timeout:?} period={:?} commands_bound={} channel={} paused={} changing={} pending={} transferring={} queued={} before={:?} after={:?}", self.replica.id(), self.replica.is_leader(), self.pace.period(), bounds.commands, trace.2, trace.3, trace.4, trace.5, trace.6, trace.7, trace.0, trace.1);
         outgoing.bound = bounds.outgoing;
         outgoing.room = bounds.room;
         let held = u64::try_from(outgoing.bytes).unwrap_or(u64::MAX);
