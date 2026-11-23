@@ -191,6 +191,7 @@ cross-type comparisons, each through `Dialect` with a test quoting PostgreSQL 19
 | r1299 | 89307344 | clippy plain; clippy `--features bench`; tests with `bench`; lib | plain clippy: `FpDigits::new` unused (why unit 2 stays off main); bench clippy clean; 12 + 2 passed, 1 failed (fixed on f96543f2); lib 231 passed |
 | r1299 | 3fedc10f, 89307344 | corpus, A/B | above |
 | r1311 | 6911e962 (merged with main a7160678) | clippy plain and `bench`; `floating_point_doc real_text oracle_findings`; lib `numeric:: printf json:: vdbe::value vdbe::affinity g9_` | clippy clean both; 9 + 83 + 2 passed; lib 282 passed, 0 failed |
+| after the push | 80c1f31c (main; 11 engine files from main merged in after r1311, none of them numeric) | clippy `--features bench`; the same tests and lib filters | clippy clean; 9 + 83 + 2 passed; lib 282 passed, 0 failed |
 
 ## Successor
 
