@@ -180,3 +180,88 @@ mid-batch times out only that write.
    of disks.
 2. **Batching several writes into one entry (above) needs no decision.** Durability is unchanged and every write
    keeps its answer. It's the successor's next unit, with family a's ladder as its A/B.
+
+# Lane V2 (commits) on adacachy2: held commits form, and each write's barrier still waits on two log writes (2026-11-23, 13:51Z to 14:46Z)
+
+Ada's goal is Amphora about 10x faster than every competitor on the same client and machine. V found every
+replicated commit waiting on the leader's log flush and one follower's. The approved design (replication.md, "Fast
+acknowledgement") answers a replicated-class write once the entry is held in memory across fates and the proposer
+has applied it. This hour asked why that doesn't show in the bench.
+
+## Losses first
+
+1. **No product fix landed.** The cause is found with counters and code (below). The fix touches vendored
+   hyper-raft or the owner's barrier rule. Its test, clippy and the replicated suite could not finish by 14:46Z:
+   the bench build alone took 8 min 46 s (r820), and kiln refused two runs for room.
+2. **Batching (unit 3) and the ladder A/B (unit 4) were not started.**
+3. **The bench's replicated class runs on fates that don't exist.** Three members on one host each declare their
+   own fate (`bench/src/repl.rs`, `Fates { of: ids.map(|i| (i, i)) }`, both the in-process group and `--repl-member`).
+   They share one host and one power feed. The design says a configuration that can't span the fates asked
+   refuses the class, and the runbook says "Each member is its own fate, so put each on its own machine". The fair
+   replicated measurement is three machines on a LAN, as AC-T1.8.3 states. The one-host column is a trial of the
+   path, not of the class's guarantee. Held commits form here only because of those declared fates.
+4. **main's bench did not build.** The root patches `hyper-rt` to `vendor/` since f8f65110; `bench/Cargo.toml`
+   didn't, so cargo looked for hyper-rt on crates.io ("no matching package named `awak`"). Fixed in 7f2650a9.
+
+## Do real members commit on held quorums? Yes (unit 1)
+
+r851, binary 7f2650a9 (`bench/` release, V's `counters` op), `python3 -I bench/thread_sample.py BIN 29490 DIR W
+leader 5 2 3 replicated`, members' folders on btrfs (`~/.cache`) or tmpfs (`/dev/shm`), one 3 s span a phase,
+needs cpus=4,mem=4g. Counters are the leader's over the span (followers count no commits, by design).
+
+| folders | writers | commits/s | held | classic | held share | load (1 min) | CPU some / I/O some (avg10) |
+|---|---|---|---|---|---|---|---|
+| btrfs | 1 | 26.0 | 34 | 49 | 41% | 72.6 | 19.6% / 4.1% |
+| tmpfs | 1 | 272.6 | 403 | 396 | 50% | 51.1 | 8.4% / 2.0% |
+| btrfs | 32 | 43.2 | 105 | 24 | 81% | 74.5 | 51.4% / 0.3% |
+| tmpfs | 32 | 286.4 | 395 | 152 | 72% | 82.6 | 48.4% / 0.7% |
+
+The work happened: held plus classic over the span (27.7/s at btrfs, 1 writer) matches the driver's rate. Each
+member's flushing thread made one database flush a commit (83 flushes for 83 commits; 5.3 ms each on btrfs). That
+thread is off the answer's path (design item 4).
+
+So most commits are held, and the rate is still the flush rate. The commit is not what waits.
+
+## What waits: each write's barrier (cause, from the code)
+
+A write at the leader crosses a ReadIndex barrier before it prepares ("One command at a time crosses ReadIndex
+before evaluation", replicated.rs head). At 1 writer, write N+1's barrier starts as soon as write N is answered on
+its held commit, while every member's log write of entry N is still out. The barrier then waits on two of them:
+
+1. **The leader's own log write.** Amphora states `depth: 1` to `Limits::derive` (replicated.rs, the core's
+   settings), so the core's `readies_in_flight` is 1. `RawNode::ready_given` refuses a second `Ready` while one is
+   issued (hyper-raft node.rs, `Capacity("readies in flight")`). Reads are asked in a round when a `Ready` is given
+   (`Raft::ask_reads`), and their confirmations reach the shell only in a `Ready` (hyper-durable replica.rs,
+   `take_read_states` in `take_ready`), never in `light_now`. So the barrier can't start or finish until the
+   leader's write of entry N is durable.
+2. **One follower's log write.** A follower's heartbeat answer is an ordinary message. A follower's messages leave
+   at once only "with no write out and nothing left to write" (node.rs `releases_now`, I2). Its write of entry N is
+   out, so the answer the ReadIndex quorum needs leaves after that flush. Only held answers skip this
+   (`take_held_messages`).
+
+That is V's "Whose flush" table: a commit is fast only when the leader's log and at least one follower's log flush
+for free. The held commit shortens the commit; the next write's barrier puts both flushes back.
+
+## The fix, designed for the successor (unit 2)
+
+The test first (red today): in the driven group, three fates, two to span, every member's log flushes held
+(`pump.hold_durable()`). Two writes at the leader one after the other: both are answered while no log write has
+completed, and the leader's counters show held commits and zero flushes before either answer. Today the second
+hangs at its barrier until the hold is let go.
+
+Two changes, each at its cause:
+- **Reads without a `Ready`.** A read's confirmation depends on no write. Give read states through `light_now` (core)
+  and `take_light` (shell), released as today once applied, and ask the round there too. Vendored hyper-raft, as a
+  recorded change (`scripts/vendor.py record hyper-raft`, then `check hyper-raft`).
+- **A follower's heartbeat answer at once when it states nothing its disk doesn't hold:** its term and vote durable
+  (the leader's I1 rule) and no position past its durable log. That answer confirms the leader's term for the
+  ReadIndex quorum and promises nothing about the log. Vendored hyper-raft as well. Check first whether
+  `HeartbeatAnswers::Position` is on for Amphora: a position must then name the durable end, not the last index.
+
+Either alone leaves the other flush in the path. Neither changes what a commit or an answer promises.
+
+## Commands
+
+    # on adacachy2: kiln run, on 00aad8daff2fa3c9daa65d53c425d450, sync false, cwd ~/.cache/amphora-perf/commits-remote
+    (cd bench && CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=~/.cache/amphora-perf-target/commits cargo build --release)   # r820, 8m46s
+    python3 -I bench/thread_sample.py ~/.cache/amphora-perf-bin/commits/7f2650a9 29490 DIR W leader 5 2 3 replicated   # r851, cpus=4,mem=4g
