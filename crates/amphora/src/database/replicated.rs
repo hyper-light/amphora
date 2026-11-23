@@ -2685,6 +2685,9 @@ fn settings(
     let core = hyper_raft::Config {
         fates,
         apply_unpersisted,
+        // A follower answers a heartbeat with what its disk holds without waiting for its write,
+        // so its flush doesn't hold the read barrier of the leader's next write (AC-T1.8.3).
+        answer_beats_now: true,
         check_quorum: true,
         pre_vote: true,
         max_size_per_msg: message,

@@ -1429,11 +1429,48 @@ fn a_notice_heard_in_a_later_term_makes_nothing_durable() {
     assert!(node.raft.log().unstable().entries().is_empty());
 }
 
-/// A follower whose term and vote are durable answers a heartbeat at once, whatever its writes
-/// out, and names only what its disk holds: the durable end of its log, not its last index.
+/// I2: what a notice makes for a member that does not lead leaves with it
+/// only when nothing is out or unwritten; otherwise it waits for the next
+/// `Ready`, whose write holds what it says.
+#[test]
+fn a_followers_answer_waits_for_the_write_that_holds_what_it_says() {
+    let mut node = follower_with(with_depth(2, 2));
+    let mut taken = Vec::new();
+    for index in [4, 5] {
+        let mut append = answer(MessageType::MsgAppend, 1, 2, 1);
+        append.index = index - 1;
+        append.log_term = 1;
+        append.commit = 2;
+        append.entries = vec![entry(index, 1)];
+        node.step(append).unwrap();
+        let mut ready = node.ready().unwrap();
+        ready.take_persisted_messages();
+        taken.push(ready.entries().to_vec());
+        node.advance_issued(ready).unwrap();
+    }
+    // A heartbeat's answer says how far the log goes: to 5, not durable.
+    let mut beat = answer(MessageType::MsgHeartbeat, 1, 2, 1);
+    beat.commit = 2;
+    node.step(beat).unwrap();
+    node.store_mut().append(&taken[0]);
+    let light = node.on_persist(1).unwrap();
+    assert!(light.messages().is_empty());
+    assert_eq!(node.raft.messages().len(), 1);
+    node.store_mut().append(&taken[1]);
+    let light = node.on_persist(2).unwrap();
+    assert_eq!(light.messages().len(), 1);
+    assert_eq!(light.messages()[0].index, 5);
+}
+
+/// Under `Config::answer_beats_now`, a follower whose term and vote are durable answers a heartbeat
+/// at once, whatever its writes out, and names only what its disk holds: the durable end of its
+/// log, not its last index.
 #[test]
 fn a_followers_heartbeat_answer_names_only_what_its_disk_holds() {
-    let mut node = follower_with(with_depth(2, 2));
+    let mut node = follower_with(Config {
+        answer_beats_now: true,
+        ..with_depth(2, 2)
+    });
     let mut taken = Vec::new();
     for index in [4, 5] {
         let mut append = answer(MessageType::MsgAppend, 1, 2, 1);
@@ -1599,9 +1636,9 @@ fn an_answer_states_no_commit_that_no_durable_write_stated() {
     );
 }
 
-/// R-6: a heartbeat moves a follower's commit while its write is out. Its term
-/// and vote durable, the follower answers at once (`Raft::answer_beat_now`),
-/// and no `Ready` will state that commit (the notice of the write gives it as
+/// R-6: a heartbeat moves a follower's commit while its write is out. The
+/// notice of that write releases the answer at once, nothing being left to
+/// write, and no `Ready` will state that commit (the notice gives it as
 /// `LightReady::commit_index`). The answer states the commit the follower's
 /// storage states, not the one the heartbeat moved; once its owner writes
 /// that and says so (`RawNode::commit_durable`), its answers state it.
@@ -1623,12 +1660,11 @@ fn an_answer_a_notice_releases_states_the_durable_commit() {
     beat.commit = 3;
     node.step(beat).unwrap();
     assert_eq!(node.raft.log().committed(), 3);
-    // Its term and vote are durable: the answer leaves at once, with the write still out.
-    assert_eq!(beat_answers(&node.messages_now()), vec![2]);
     node.store_mut().append(&written);
     let mut light = node.on_persist(1).unwrap();
     assert_eq!(light.commit_index(), Some(3));
-    assert!(beat_answers(&light.take_messages()).is_empty());
+    let sent = light.take_messages();
+    assert_eq!(beat_answers(&sent), vec![2]);
     assert_eq!(node.store().hard_state.commit, 2);
     assert!(!node.has_ready());
     // The owner writes the commit and says so.
@@ -1646,7 +1682,7 @@ fn an_answer_a_notice_releases_states_the_durable_commit() {
     node.step(beat).unwrap();
     let mut ready = node.ready().unwrap();
     assert!(ready.hard_state().is_none());
-    assert_eq!(beat_answers(&ready.take_held_messages()), vec![3]);
+    assert_eq!(beat_answers(&ready.take_persisted_messages()), vec![3]);
 }
 
 /// R-6's apply pause (etcd's `applyingEntsPaused`): while the owner holds
@@ -1669,7 +1705,7 @@ fn an_owner_that_pauses_apply_is_given_nothing_more() {
     node.step(beat).unwrap();
     let mut ready = node.ready().unwrap();
     assert!(ready.committed_entries().is_empty());
-    assert_eq!(ready.take_held_messages().len(), 1);
+    assert_eq!(ready.take_persisted_messages().len(), 1);
     let light = node.advance_append(ready).unwrap();
     assert!(light.committed_entries().is_empty());
     assert!(!node.has_ready());

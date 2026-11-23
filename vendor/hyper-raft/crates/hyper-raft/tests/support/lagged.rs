@@ -199,10 +199,12 @@ fn check_message(disk: &Disk, message: &Message, member: u64) -> bool {
                 disk.last_index()
             );
         }
-        // A heartbeat's answer naming a position (`HeartbeatAnswers::Position`) is taken by its
-        // leader as an append's answer, for the classic quorum and the reads it confirms, and it
-        // may leave while writes are out: the disk holds what it names.
-        MessageType::MsgHeartbeatResponse if current && message.log_term != 0 => {
+        // A heartbeat's answer naming a position of its term (`HeartbeatAnswers::Position`) is
+        // taken by its leader as an append's answer, for the classic quorum and the reads it
+        // confirms, and it may leave while writes are out: the disk holds what it names. A leader
+        // takes no position of an older term (`handle_heartbeat_response`): one named by an answer
+        // that waited for the write of a new term may be a tail that write replaced.
+        MessageType::MsgHeartbeatResponse if current && message.log_term == message.term => {
             assert!(
                 message.index <= disk.last_index(),
                 "member {member}: a heartbeat's answer named {} with {} durable",
@@ -636,8 +638,14 @@ impl Lagged {
 impl Replica for Lagged {
     const LAGGED: bool = true;
     fn open(id: u64, store: Store, settings: &Settings, seed: u64, members: usize) -> Self {
+        // A member driven ahead of its persistence answers heartbeats at once, so that its
+        // answers, which leave while its writes are out, are held to its disk (`check_message`).
+        let settings = Settings {
+            answer_beats_now: true,
+            ..*settings
+        };
         Self {
-            node: New::open(id, store, settings, seed, members),
+            node: New::open(id, store, &settings, seed, members),
             depth: settings.depth,
             writes: Writes::new(settings.depth),
             output: Output::default(),

@@ -288,6 +288,14 @@ pub struct Config {
     /// What a member says when it answers a heartbeat, and what its leader
     /// makes of a full window.
     pub heartbeat_answers: HeartbeatAnswers,
+    /// A member whose term and vote are durable answers a heartbeat at once, whatever its writes
+    /// out, stating only what its disk holds: the durable commit and, under
+    /// [`HeartbeatAnswers::Position`], the durable end of its log (`Raft::answer_beat_now`).
+    /// Its owner's flush then no longer holds the leader's read round, nor the read barrier of
+    /// the leader's next write. Off, as raft-rs's rule: the answer waits for the write that holds
+    /// what it says, and states the commit that write made durable, so the two cores compare
+    /// under one setting.
+    pub answer_beats_now: bool,
     /// What a member does with a leader's entries that arrive ahead of a
     /// hole in its log.
     pub ahead: Ahead,
@@ -375,6 +383,7 @@ impl Config {
             raft_rs_precedence: false,
             read_rounds: ReadRounds::Shared,
             heartbeat_answers: HeartbeatAnswers::Position,
+            answer_beats_now: false,
             ahead: Ahead::Kept,
             fast: false,
             skip_bcast_commit: false,
@@ -4563,7 +4572,7 @@ impl<S: Storage> Raft<S> {
         }
         let mut answer = proto::message(message.from, MessageType::MsgHeartbeatResponse);
         answer.context = std::mem::take(&mut message.context);
-        if self.vote_durable() {
+        if self.config.answer_beats_now && self.vote_durable() {
             return self.answer_beat_now(answer);
         }
         answer.commit = self.log.committed();
