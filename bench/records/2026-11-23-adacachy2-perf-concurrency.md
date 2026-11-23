@@ -91,3 +91,27 @@ in each run, 6 runs; host load average 50-64 on 32 cores from other lanes):
 What it measures: the owner's per-step work on its waiting submits alone (the old loop's shape
 against the new line), not a whole step; the rest of a step doesn't depend on N. Before grows
 linearly (2.2-3.8 ns a waiting submit a step); after is flat at the sizes asked.
+
+## Verified for the successor (perf-I4)
+
+- Item 1, one proposal per group: still holds on main 62687f5d. `pending: Option<Pending>`
+  (replicated.rs:922) and `limits.proposals = 1` in `settings` (replicated.rs:2651). `prepare`
+  (replicated.rs:5117) takes the one pending submit through its barrier, slot, floor and bootstrap
+  rules and proposes it; the next waits until it applies. Batching means one entry carrying several
+  waiting submits, each under its own savepoint and answered apart. Verified by reading the code,
+  not measured. Harness for the A/B: `amphora-bench --repl commit --system amphora-replicated
+  --writers N` (bench/src/repl.rs:398) gives throughput and latency at N closed-loop writers.
+- TLS (coordinator's unit 3, revised 04:20Z): Amphora builds a config per connection, at
+  transport/network.rs:277 (`Listener::accept`), 295 (`Dialer::connect`), 322 (`listen`'s accept)
+  and 393 (`request`), and validates and drops one at 161, 255, 265 and 312. Their inputs never
+  change after `Credentials` is made. Node-to-node is one connection per request
+  (transport/common.rs:405, 454, 476). hyper-tls's identity (identity.rs) is minted once per built
+  config (client/builder.rs:172,176) and checked before resuming (client/hs.rs:1191-1193,
+  msgs/persist.rs:288-289), so a config kept for its life resumes its own sessions with no
+  hyper-tls change.
+- Constraint for "one ServerConfig per listener": `ServerConnection::new(&ServerConfig)` borrows
+  shared, but `process_new_packets(&mut Config)` (conn.rs:384) and `complete_io(.., &mut Config)`
+  (conn.rs:565) take it mutably on both sides, because the session stores live inside the config
+  (`split`, conn.rs:1257). Connections served on their own threads can't share one config by
+  borrow. `read_tls` and `write_tls` (conn.rs:729, 754) don't take the config, so a shared config
+  could be locked around `process_new_packets` alone, never across socket I/O.
