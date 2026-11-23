@@ -2991,3 +2991,122 @@ differs from the one published only in its fence wakes the waiters; one that dif
 - an answer under `Session` that differs from `Latest`'s for a session carrying its tokens;
 - a read with no token that waits for the log;
 - redirects above 1 in 100 under steady lag (the bound learned is too short).
+
+## Decision (lane P6): a caller's session runs on a worker of its own, beside the owner's step (2026-11-23, CP-T1.13; designed, not built)
+
+### What was wrong
+
+Lane P5's record (bench/records/2026-11-23-adacachy2-perf-serve-p5.md): one replicated write of 16 rows of 1 MiB
+answered UnknownOutcome after 1114 ms, and one of 12 after 776 ms, each with an election (term 1 to 2) and another
+leader; 8 MiB answered Ok in 820 ms. The caller's session runs on the owner's thread (`Actor::prepare`, then
+`Machine::prepare_db`, then `Db::prepare_traced`). While it runs the owner neither ticks nor drives, so it sends no
+heartbeat. A session longer than the followers' learned election timeout lets one campaign and win (Ongaro and
+Ousterhout, "In Search of an Understandable Consensus Algorithm", USENIX ATC 2014, section 5.2). The old leader
+proposes once the session ends, steps down on the higher term, and the write's outcome is truly unknown. Ada's bar:
+any size and length commits or is refused typed, and one long write never costs the group its leader.
+
+### The constraint: one writer
+
+The database takes one writer at a time: the engine's log write lock (SQLite's WAL design, which the engine keeps:
+"since there is only one WAL file, there can only be one writer at a time", sqlite.org/wal.html). Three things on a
+replica take it:
+
+- a session's preparation: `Db::prepare_traced` runs inside `BEGIN IMMEDIATE` and ends with `ROLLBACK`;
+- an apply: `Db::apply_pages` begins with `wal_insert_begin`, which takes the write lock (`begin_write_tx`);
+- every owner read through `Machine::read_db` (the refresh after an apply, a claim's check), which prepares too.
+
+A worker on a second connection while the owner goes on applying would have one wait on the other. The owner waiting
+on the worker's write lock is P5's stall moved, not removed. So the worker is lent the write lock for its session's
+length, and the owner takes none until it has the result back.
+
+### The decision
+
+1. **One session worker per owner.** A thread started with the owner and ended with it, waiting on its job channel
+   (it wakes on a job, never on a timer). It runs every caller's session (`Author::Application`), at a leader and at
+   a follower alike: a follower's owner stalled by a session answers its leader late too. The owner's own sessions
+   (the floor keeper's, the seed's chunks, a compaction's step) stay on the owner: each is bounded by what the owner
+   sets (a compaction's page limit and deadline), and none runs a caller's SQL.
+2. **Its connection.** Its own, opened through the machine's opener (`Machine::reader`, as a local read's), kept
+   across jobs. It runs what the owner runs today, unchanged: `prepare_traced` at the same bounds (`COMMAND_BYTES`,
+   the read-set bound, page 1 at the base), the application claim checked inside the traced session, the session's
+   deadline guard (`deadline_on`) on the owner's clock. Lane P2's rule holds inside it: a write's answer is encoded
+   and held, charged, before anything is proposed, and it is answered only on its commit.
+3. **The write lock is lent, and applies are held.** From the hand-off until the owner takes the result, the owner
+   takes no write lock: it holds applies (hyper-raft's `RawNode::pause_apply`, the hold hyper-durable already uses
+   behind its durability fence, core step R-6, under which `Ready`s go on), with a hold of Amphora's own beside the
+   fence's so the fence's `resume_apply` cannot lift it. Applied state stays still, so the owner neither refreshes
+   nor runs a `read_db`. Everything else goes on: ticks, heartbeats, votes (a vote is the raft log's hard state, not
+   the database's), appends and their flushes, ReadIndex, a member's forward appended.
+4. **The result handed back, on an event.** The worker sends its result on a done channel and wakes the owner's bell,
+   as the flushing thread does (`Flushing::Thread`). The owner's next step takes it with `try_recv`: it woke on the
+   bell, so nothing polls. The owner lifts its hold, lets the step's drive apply what committed meanwhile, then
+   decides the pending write, which waited in a phase of its own (running, between `Barrier` and `Proposed`):
+   - still leader, in the pending write's term, with the same leader: proposed as today (`Actor::propose`, which moves
+     a base made stale by entries appended since by its read set, `rebase`), then `Proposed`;
+   - lead lost or term moved: refused `NotLeader` with the leader it knows. Nothing was proposed, so nothing was
+     written: a known outcome. Its session is spent (a call is `FnOnce`), so it is never run again, unlike a pending
+     write requeued before its preparation;
+   - past its deadline: `Timeout`, as today (the deadline guard ends the SQL inside the worker too);
+   - the session's error: that error, as today.
+5. **Ordering.** Unchanged: one pending write per owner; later submits wait in `waiting` in arrival order and are
+   received once it ends. The worker moves where a session runs, not when. An entry committed during the hold (a
+   member's forward, a change of members, the class entry) keeps its place in the log before the session's entry and
+   applies when the hold lifts, before the proposal. The session's base is then behind it: the leader's walk moves
+   the base past it if the session read nothing it wrote, or the base fence refuses the write at apply, typed, as for
+   any stale base today.
+6. **Memory.** The worker's connection is one of its replica's readers, taken at the hand-off through the readers'
+   ledger at the derived bound ("A replica's local readers bounded by derivation"): with no room, the write waits for
+   one, bounded by its deadline, then `Timeout`. One worker per owner runs one session at a time, so its memory is
+   one session's: its answer's frames charged as lane P2 charges them, and its dirty pages bounded by the image's
+   `COMMAND_BYTES`, as on the owner today.
+7. **Reads during a long write.** A local read (`read_local`) runs on a reader connection of its own, a WAL snapshot
+   reader that takes no write lock: answered throughout, at the applied state, which the hold keeps still. A session
+   token's read for a write committed during the hold waits for its apply, at most until the hold lifts, bounded by
+   the read's deadline. A quorum read prepared on the owner's connection (`Machine::read`) takes the write lock, so
+   none may run during a hold; if any caller remains it moves to a read transaction (`Db::query_transaction`), which
+   takes none.
+8. **The owner ending.** A write whose session is out when its owner ends is answered the end's reason, not
+   UnknownOutcome: nothing was proposed. The worker's transaction always rolls back (`prepare_traced`), and a result
+   that comes back to no owner is dropped with its charges.
+
+### Where the hold goes in hyper-durable
+
+The replica already keeps committed entries back behind its durability fence: `Replica::apply_range` extends
+`fence`'s range while one is held, `release_fence` applies the range once the durable commit covers its first entry
+(or at the next drive for a paged one), and `RawNode::pause_apply` keeps the core from giving out more meanwhile
+(vendor/hyper-raft/crates/hyper-durable/src/replica.rs). The owner's hold is one more reason for that same range to
+wait, not a second mechanism: while it is set, `apply_range` with no fence opens one and pauses, and
+`release_fence` returns before applying. Lifting it leaves the range to `release_fence`'s own rule at the next
+drive (the durable commit covering its first entry), so the durability fence promises what it promised before.
+Entries a `Ready` gave out before the hold was taken were applied in that step's drive or wait behind the fence
+already, so the session's base is the applied point the owner hands over.
+
+### The candidates weighed
+
+- **A database thread** doing every write to the database (applies, sessions, refreshes, the floor's reads and
+  images) while the owner does only Raft. One writer either way, so an apply still waits behind a long session, and
+  every owner read of its machine becomes a round trip. More moved for nothing over the decision.
+- **A concurrent writer** (an engine transaction whose pages stay its own until commit; the engine's parser takes
+  `BEGIN CONCURRENT`, and that it builds such a writer was not checked): applies would go on beside the session. The
+  follow-on if held applies are found to cost members' writes too much (see "Falsified by").
+- **Heartbeats sent from another thread** (P5's option b): rejected as a band-aid. The core's state is the owner's;
+  a second sender would speak for a term the owner may have left.
+- **Refusing long sessions** (P5's option c): fails the any-size bar.
+
+### Tests it is built with
+
+- `cp_t1_13_a_replicated_write_past_an_election_timeout_commits_and_keeps_its_leader` (crates/amphora/tests/serve.rs,
+  P5's 318b0a86): 16 rows of 1 MiB commit, the term holds, the leader keeps its lead.
+- On the driven shell: a vote request stepped into the leader while its worker holds a session is answered; a local
+  read is answered meanwhile.
+- On the driven shell: the leader loses its lead while its worker holds a session; the write is refused `NotLeader`,
+  no entry was proposed for it, and no member holds its rows.
+- The replicated suite, `serve::` and tests/serve.rs as they are.
+
+### Falsified by
+
+- a leader deposed while a session runs, with no other fault;
+- a write answered UnknownOutcome whose entry was never proposed;
+- an apply whose write lock overlaps a session's transaction (the hold leaking);
+- commit latency at 1 or 32 writers on the replicated rung worse than before beyond run-to-run noise: the hand-off
+  adds a thread's wake each way, and no saving at small writes pays for it.
