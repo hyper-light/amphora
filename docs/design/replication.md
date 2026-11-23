@@ -2498,6 +2498,11 @@ rule settles back near the rate work comes at. What a reader takes within one ti
 no time, never over the empty time after it. The command queue's owner marks both moments at its intake. The outgoing
 queue's host drain does not yet: its host thread reads no owner clock, so it needs a time-stamp for the moment it ran
 dry before it can (T-QB.1.16).
+The queue holds work while inputs wait in it to be taken, in its channel or behind QB.2's pause, and only then
+(lane replicated-K6): a write, a change or a hand-off the owner took and still holds keeps its bytes charged but
+waits for no reading. Counted as work, a leader's change waiting at its barrier while its clock moved a second at a
+time weighed each second as reading time, and the leader alone learned a bound of 2 inputs, refusing records its
+followers admitted by the hundred million (`a_change_past_its_deadline_answers_what_its_stage_knows`, T-QB.1.17).
 The election timeout is learned too: `election_tick` periods of the owner's measured pace (TP.1). The bounds are read
 again at each tick of the pace (`Actor::rebound`), where the queues' bytes are charged to the budget (`Budget::take`).
 - The outgoing queue holds the lesser of its host's rate times that timeout and the memory budget's room for queues
