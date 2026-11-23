@@ -15824,7 +15824,8 @@ mod tests {
     /// base holds a joint configuration is refused before it proposes. Do, in a group of three
     /// voters bound to kiln.host-store 7 with joins tracked: add learner 4, and once the leader has
     /// applied the joint entry, lose every append so its way out can't commit while heartbeats
-    /// go on; raise the floor to 7 at the leader; then let the appends through and raise again.
+    /// go on; raise the floor to 7 at the leader; then let the appends through, the leader's
+    /// clock moving until the group leaves the joint configuration, and raise again.
     /// Expect: the first refused Unavailable, saying the group is leaving a joint configuration;
     /// the second refused naming member 4, which has not attested.
     #[test]
@@ -15876,6 +15877,18 @@ mod tests {
                 .is_empty()
         );
         pump.appends_lost = false;
+        // What was lost is made good by the leader's next heartbeat, which only its ticks send:
+        // the owner steps on while the raise's session runs on the worker, so the barrier
+        // round's appends were carried while appends were still lost.
+        for _ in 0..ROUNDS {
+            if applied_configuration(&driven, leader)
+                .voters_outgoing
+                .is_empty()
+            {
+                break;
+            }
+            driven.tick(&mut pump, leader);
+        }
         settled(&mut driven, &mut pump, 3, &[4]);
         let again = raise(&mut driven, &mut pump, led, 7);
         assert!(
