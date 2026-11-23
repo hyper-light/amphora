@@ -879,7 +879,26 @@ mod stored {
 
     /// The calibration kept for `key`, None if there is none or what's there is anything else.
     pub(super) fn load(key: &Key) -> Option<Calibration> {
-        let text = std::fs::read_to_string(key.file()).ok()?;
+        load_from(key, std::fs::File::open(key.file()).ok()?)
+    }
+
+    pub(super) fn load_from(key: &Key, reader: impl std::io::Read) -> Option<Calibration> {
+        use std::io::Read;
+        // render uses fixed-width hexadecimal fields. Only the header varies with the key.
+        let size = render(
+            key,
+            &Calibration {
+                timing_nanos: 0.0,
+                kinds: [(0.0, 0.0); CALIBRATED.len()],
+            },
+        )
+        .len();
+        let bound = u64::try_from(size).ok()?.checked_add(1)?;
+        let mut text = String::new();
+        reader.take(bound).read_to_string(&mut text).ok()?;
+        if text.len() != size {
+            return None;
+        }
         parse(key, &text)
     }
 
@@ -888,33 +907,23 @@ mod stored {
         // not read as another number.
         let body = text.strip_prefix(&key.header())?.strip_suffix('\n')?;
         let mut lines = body.split('\n');
-        let bits = |line: Option<&str>, name: &str| -> Option<Vec<f64>> {
-            let mut words = line?.split(' ');
-            (words.next()? == name).then_some(())?;
-            words
-                .map(|w| {
-                    let digits = w.len() == 16 && w.bytes().all(|b| b.is_ascii_hexdigit());
-                    digits.then(|| u64::from_str_radix(w, 16).ok().map(f64::from_bits))?
-                })
-                .collect()
+        let number = |word: &str| -> Option<f64> {
+            (word.len() == 16 && word.bytes().all(|b| b.is_ascii_hexdigit())).then_some(())?;
+            u64::from_str_radix(word, 16).ok().map(f64::from_bits)
         };
-        let timing = bits(lines.next(), "timing")?;
-        let [timing_nanos] = timing.as_slice() else {
-            return None;
-        };
+        let timing_nanos = number(lines.next()?.strip_prefix("timing ")?)?;
         let mut kinds = [(0.0, 0.0); 7];
         for (slot, kind) in kinds.iter_mut().zip(CALIBRATED) {
-            let pair = bits(lines.next(), &format!("{kind:?}"))?;
-            let [units, nanos] = pair.as_slice() else {
-                return None;
-            };
-            *slot = (*units, *nanos);
+            let (name, pair) = lines.next()?.split_once(' ')?;
+            (name == format!("{kind:?}")).then_some(())?;
+            let (units, nanos) = pair.split_once(' ')?;
+            *slot = (number(units)?, number(nanos)?);
         }
         if lines.next().is_some() {
             return None;
         }
         let kept = Calibration {
-            timing_nanos: *timing_nanos,
+            timing_nanos,
             kinds,
         };
         kept.timed().then_some(kept)
@@ -1430,6 +1439,23 @@ mod tests {
                 (512.0, 650.0),
             ],
         }
+    }
+
+    /// T-QT.5.5. A cache entry of the wrong size is discarded after reading at most the size
+    /// of this key's record and one trailing byte.
+    #[test]
+    fn review_calibration_reads_only_one_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = audit_7_1_key(dir.path());
+        let record = stored::render(&key, &audit_7_1_calibration());
+        let mut input = std::io::Cursor::new(record.repeat(2));
+        assert_eq!(stored::load_from(&key, &mut input), None);
+        assert!(
+            input.position() <= record.len() as u64 + 1,
+            "read {} bytes for a {} byte record",
+            input.position(),
+            record.len()
+        );
     }
 
     /// Do: keep a calibration for a key, then read it back (AUDIT §7.1). Expect: the very same
