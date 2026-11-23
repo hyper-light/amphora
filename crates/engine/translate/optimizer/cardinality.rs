@@ -191,8 +191,85 @@ struct Sampled {
     selectivity: f64,
 }
 
+/// The share of a set's rows a WHERE term keeps, read from the statistics once and evaluated in
+/// each set holding the term's tables (T-PL.8.13).
+enum Share {
+    Fixed(f64),
+    /// `IS NULL` of a column of the table at this place, whose own rows hold NULL at `share`.
+    Null {
+        table: usize,
+        share: f64,
+    },
+    Not(Box<Share>),
+    And(Box<Share>, Box<Share>),
+    Or(Box<Share>, Box<Share>),
+}
+
+impl Share {
+    /// Built as the planner estimates any term: `AND` multiplies, `OR` adds by inclusion-exclusion
+    /// (both assuming independence), `IS NULL` reads ANALYZE's counted NULLs, and any other
+    /// comparison takes its operator's estimate without a column.
+    fn of(
+        expr: &ast::Expr,
+        joined_tables: &[JoinedTable],
+        schema: &Schema,
+        params: &CostModelParams,
+    ) -> Self {
+        let of = |e: &ast::Expr| Box::new(Self::of(e, joined_tables, schema, params));
+        let null_of = |operand: &ast::Expr| match unparenthesized(operand) {
+            ast::Expr::Column { table, column, .. } => joined_tables
+                .iter()
+                .enumerate()
+                .find(|(_, joined)| joined.internal_id == *table)
+                .map_or(Self::Fixed(params.sel_is_null), |(at, joined)| Self::Null {
+                    table: at,
+                    share: super::constraints::null_share(
+                        schema,
+                        joined.table.get_name(),
+                        joined.table.columns().get(*column),
+                    )
+                    .unwrap_or(params.sel_is_null),
+                }),
+            _ => Self::Fixed(params.sel_is_null),
+        };
+        let is_null = |e: &ast::Expr| matches!(e, ast::Expr::Literal(ast::Literal::Null));
+        match unparenthesized(expr) {
+            ast::Expr::Binary(l, Operator::And, r) => Self::And(of(l), of(r)),
+            ast::Expr::Binary(l, Operator::Or, r) => Self::Or(of(l), of(r)),
+            ast::Expr::Unary(ast::UnaryOperator::Not, inner) => Self::Not(of(inner)),
+            ast::Expr::Binary(l, Operator::Is, r) if is_null(r) => null_of(l),
+            ast::Expr::Binary(l, Operator::IsNot, r) if is_null(r) => {
+                Self::Not(Box::new(null_of(l)))
+            }
+            ast::Expr::IsNull(operand) => null_of(operand),
+            ast::Expr::NotNull(operand) => Self::Not(Box::new(null_of(operand))),
+            ast::Expr::Binary(_, op, _) => Self::Fixed(super::constraints::estimate_selectivity(
+                schema,
+                "",
+                None,
+                None,
+                (*op).into(),
+                params,
+                false,
+                false,
+            )),
+            _ => Self::Fixed(params.sel_other),
+        }
+    }
+}
+
+/// A WHERE term no table's constraint counts (`WhereTermInfo::home_table` is `None`) that reads
+/// two tables or more, so no table's sample can run it: counted once in every set holding its
+/// tables, whichever order or tree joins them.
+struct Loose {
+    tables: TableMask,
+    share: Share,
+}
+
 pub(super) struct JoinedSetRows<'a> {
     tables: Vec<Table>,
+    /// T-PL.8.13: the WHERE terms counted on the joined set rather than on one table.
+    loose: Vec<Loose>,
     /// The columns the equivalence classes' terms read, at most two a WHERE term.
     columns: Vec<Domain>,
     /// Each `=` term an equivalence class takes, by its two columns' places in `columns`: in a set
@@ -677,6 +754,29 @@ impl<'a> JoinedSetRows<'a> {
         let none_pass = where_clause
             .iter()
             .any(|term| term.origin.join_origin().is_none() && never_true(&term.expr));
+        let loose = where_clause
+            .iter()
+            .enumerate()
+            .filter(|(pos, term)| {
+                !term.consumed
+                    && matches!(
+                        term.origin,
+                        WhereTermOrigin::Where | WhereTermOrigin::Join(_)
+                    )
+                    && !term.origin.is_outer_join()
+                    && homes(*pos).is_none()
+            })
+            .filter_map(|(pos, term)| {
+                let tables = masks(pos)?;
+                let semi_or_anti = tables
+                    .iter()
+                    .any(|t| kinds.get(t).is_none_or(|kind| *kind == Kind::SemiOrAnti));
+                (tables.count() >= 2 && !semi_or_anti).then(|| Loose {
+                    tables,
+                    share: Share::of(&term.expr, joined_tables, schema, params),
+                })
+            })
+            .collect();
         // PL.13 (lane replan-10): each table's own filter terms together, the sampled ones and
         // those its constraints count, whose share a filtered build or sorter checks.
         let own_filters: Vec<Option<OwnFilter>> = tables
@@ -760,6 +860,7 @@ impl<'a> JoinedSetRows<'a> {
         .flatten();
         Self {
             tables,
+            loose,
             columns,
             equalities,
             unique_keys,
@@ -1110,6 +1211,35 @@ impl<'a> JoinedSetRows<'a> {
         }
     }
 
+    /// The share of a set's rows `share` keeps, its tables' terms ready in `ready`. `IS NULL` of a
+    /// LEFT JOIN's right table holds in every row the ON matched nothing for, by the join's own
+    /// Poisson model ([Self::factor]), and in the matched rows at the column's own NULL share.
+    fn share(&self, share: &Share, ready: &TableMask) -> f64 {
+        let kept = match share {
+            Share::Fixed(kept) => *kept,
+            Share::Null { table, share } => match self.tables.get(*table) {
+                Some(t) if t.kind == Kind::Left => {
+                    let matches = t.rows * self.on_selectivity(*table, ready);
+                    let unmatched = (-matches).exp();
+                    let per_row = matches + unmatched;
+                    if per_row > 0.0 {
+                        (unmatched + matches * share) / per_row
+                    } else {
+                        1.0
+                    }
+                }
+                _ => *share,
+            },
+            Share::Not(inner) => 1.0 - self.share(inner, ready),
+            Share::And(l, r) => self.share(l, ready) * self.share(r, ready),
+            Share::Or(l, r) => {
+                let (l, r) = (self.share(l, ready), self.share(r, ready));
+                l + r - l * r
+            }
+        };
+        kept.clamp(0.0, 1.0)
+    }
+
     /// Whether every key constraint of `table` reads only tables of `ready`.
     fn keys_ready(&self, table: usize, ready: &TableMask) -> bool {
         let (Some(t), Some(table_constraints)) =
@@ -1201,6 +1331,11 @@ impl<'a> JoinedSetRows<'a> {
                 }
             }
             barrier = end;
+        }
+        for term in self.loose.iter() {
+            if set.contains_all_set_bits_of(&term.tables) {
+                rows *= self.share(&term.share, set);
+            }
         }
         rows / self.class_divisor(set)
     }

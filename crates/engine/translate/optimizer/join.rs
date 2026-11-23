@@ -551,6 +551,10 @@ struct WhereTermInfo {
     /// name; implied bounds and semi and anti joins' tables aside): every set holding the tables
     /// the term reads counts it there and only there; `None` when the term constrains no table.
     home_table: Option<usize>,
+    /// Whether some table's constraint derives from the term (T-PL.8.13). A term none does (an OR
+    /// across tables, a comparison of two tables' expressions) narrows no table's read: a nested
+    /// loop meets every pair of rows before it and filters them, as a cross product does.
+    narrows: bool,
 }
 
 impl JoinN {
@@ -744,7 +748,9 @@ fn join_lhs_and_rhs<'a>(
 
     let has_join_constraint = lhs.is_some()
         && where_terms.iter().any(|term| {
-            term.table_mask.get(rhs_table_number) && term.table_mask.intersects(&lhs_mask)
+            term.narrows
+                && term.table_mask.get(rhs_table_number)
+                && term.table_mask.intersects(&lhs_mask)
         });
     // Penalize cross products so we don't introduce a table before it can join.
     let cross_product_cost = (lhs.is_some() && !has_join_constraint).then(|| {
@@ -3390,6 +3396,15 @@ fn build_where_term_info(
     // no rows to count a filter on.
     let joined_tables = table_references.joined_tables();
     let mut homes: Vec<Option<(usize, f64)>> = vec![None; where_clause.len()];
+    let mut narrows: Vec<bool> = vec![false; where_clause.len()];
+    for constraint in constraints
+        .iter()
+        .flat_map(|table| table.constraints.iter())
+    {
+        if let Some(narrows) = narrows.get_mut(constraint.where_clause_pos.0) {
+            *narrows = true;
+        }
+    }
     for (table_idx, table) in constraints.iter().enumerate() {
         let joined = joined_tables.get(table_idx);
         if joined
@@ -3427,7 +3442,8 @@ fn build_where_term_info(
     where_clause
         .iter()
         .zip(homes)
-        .map(|(term, home)| {
+        .zip(narrows)
+        .map(|((term, home), narrows)| {
             let table_mask = table_mask_from_expr(&term.expr, table_references, subqueries)?;
             // A term reading a semi or anti join's table is that join's condition, unnested from
             // its EXISTS: it decides which rows of the other tables are kept, which the join's
@@ -3435,6 +3451,7 @@ fn build_where_term_info(
             let home = home.filter(|_| !table_mask.intersects(&semi_or_anti));
             Ok(WhereTermInfo {
                 home_table: home.map(|(table_idx, _)| table_idx),
+                narrows,
                 table_mask,
                 // FIXME: The row cost also includes one simple condition. Give row work
                 // and condition work separate costs so this does not need to subtract one.
@@ -4030,6 +4047,7 @@ mod tests {
                 extra_steps: 0,
                 equal_tables: None,
                 home_table: None,
+                narrows: true,
             })
             .collect()
     }

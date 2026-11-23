@@ -569,7 +569,7 @@ fn column_distinct(schema: &Schema, table: &JoinedTable, pos: usize) -> Option<(
 ///
 /// Falls back to hardcoded estimates when stats are unavailable.
 #[allow(clippy::too_many_arguments)]
-fn estimate_selectivity(
+pub(super) fn estimate_selectivity(
     schema: &Schema,
     table_name: &str,
     column: Option<&Column>,
@@ -675,7 +675,11 @@ fn is_value(null_matching: bool, value: Option<&ast::Expr>, params: &CostModelPa
 /// none at all.
 ///
 /// [sampled_filters]: super::cardinality
-fn null_share(schema: &Schema, table_name: &str, column: Option<&Column>) -> Option<f64> {
+pub(super) fn null_share(
+    schema: &Schema,
+    table_name: &str,
+    column: Option<&Column>,
+) -> Option<f64> {
     let name = crate::util::normalize_ident(column?.name.as_deref()?);
     let counted = schema
         .analyze_stats
