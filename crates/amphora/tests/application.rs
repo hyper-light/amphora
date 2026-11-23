@@ -109,7 +109,7 @@ fn a_read_below_the_standalone_floor_is_refused_as_a_replicated_one_is() {
     let current = database.for_application("kiln.host-store", 7).unwrap();
     current.writer_floor("kiln.host-store", 7, until()).unwrap();
     let read = |database: &Database| {
-        database.query(until(), |c| {
+        database.query(until(), AnswerMax::fixed(), |c| {
             Ok(c.query_row("SELECT count(*) FROM items", [], |r| {
                 r.get::<_, i64>(0usize)
             })?)

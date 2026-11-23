@@ -570,3 +570,76 @@ Tests: `xgroup::sql::answers::a13_lock_reply_at_its_worst_case_holds_what_its_st
 
 Not reached (next lane): unit 3 (`Database::query` takes a declared bound) and unit 4 (resharding charges by
 row; deletes `store::Config::queue`, `ROOM_LOOK`, bench `AMPHORA_QUEUE`).
+
+## Unit 3 built, not merged; the group's own scan path trims (perf-A14)
+
+**Before unit 3.** r1511 at main 5f511d8d (cb9717be plus S6's bench record; adacachy2, needs
+linux/amd64,cpus=8,mem=24g, load 19-37): clippy -p amphora --all-targets clean; lib `a13_` 3/3,
+`database::across` 13/13 (1 ignored), `database::admission_charge` 3/3, `database::online` 6/6, `xgroup::`
+34/34. A13's merged tree holds; nothing to fix.
+
+**2b check: the group's own scan path did not trim.** database.rs's `Operation::Scan` grew its page by
+`push` and answered it as grown, while admission charges it `page_bytes::<Row>(limit)`. At the worst case
+(`limit` rows at the largest key and value) a pushed spine holds the next power of two: 5 rows, 8 slots, 3
+`Row`s past the charge. It is trimmed before it answers (254fc9d1). Test:
+`database::admission_charge::a14_a_group_scan_at_its_worst_case_holds_what_admission_charged`.
+
+**Unit 3 (254fc9d1; doc 82c3e84e).** `Database::query(until, answer: AnswerMax<R>, f)`, `R: AnswerBytes`:
+charged `answer` at admission where it runs as a call (a remote or replicated database, before a flat
+`REQUEST_MAX`), and checked by `within` wherever it runs. `query_session` and `query_waiting` take the bound
+for reads at the leader's latest commit; `query_local`, `query_closed` and `query_local_waiting` read on this
+node's state and take none (`query_reader`). A waiting run declares `met_max`: its answer, or the met row's
+cross-group key, trimmed, at most `KEY_MAX`. Callers: `AnswerMax::fixed()` for counts and heads (tests,
+guards.rs, xgroup's `head`, bench scale.rs and cluster.rs); xgroup's W11 reads an option plus `VALUE_MAX` (one
+Records get's value). Test: `database::admission_charge::a14_a_query_at_its_worst_case_answers_within_its_declared_bound`
+(3 blobs of 100 bytes, `LIMIT 3`: the answer holds exactly its derived bound; a byte less is refused
+`TooLarge`). Codemods: `~/.cache/amphora-perf/cross-a14-scripts/*.py`.
+
+| run | commit | result |
+|---|---|---|
+| r1550 | 254fc9d1 | clippy -p amphora --all-targets clean; lib `a14_` 2/2, `database::admission_charge` 5/5, `database::across` 13/13 (1 ignored), `database::online` 6/6, `database::guards` 13/13; `xgroup::` 33/34: `xgroup::lan::tests::ac_t1_10_5_seeded_histories_over_two_endpoints_show_no_anomaly` panicked at lan.rs:757 (`elle(..).unwrap()`, its `Err` not captured; lan.rs calls no query and no scan); bench not checked (`-p amphora-bench` matches no package: bench is outside the workspace); load 10-17 |
+| r1557 | 254fc9d1 and 5f511d8d lib binaries | the lan test alone: 3/3 pass on each binary (0.42-0.48 s a run), so r1550's failure did not reproduce outside the suite; bench clippy `--locked` refused: bench has no committed Cargo.lock |
+| r1559 | a6dab53e | clippy `--manifest-path bench/Cargo.toml --all-targets` without `--locked`, offline. Pending at hand-off |
+
+Not merged: the bench crate, whose `query_session` callers changed, is unchecked. Next lane: read r1559;
+with bench clippy clean, merge origin/main, re-run clippy and the touched tests, push HEAD:main. Unit 4 is
+not started.
+
+Seen on the way, not changed:
+- A local query with no free reader runs on the writer through `Store::run`, the store's own bounded channel (`Config::queue`, unit 4), charged nothing at admission.
+- `query_local`, `query_closed` and a session read served on a replica run on the caller's thread, charged nothing.
+- `query_local_waiting` now needs `R: AnswerBytes` (it shares `session_waiting`), though its read takes no bound.
+- A11's "~280 lines name `query`": the query family has 10 callers outside database.rs (5 `query`, 1 `query_waiting`, 1 `query_local_waiting`, 3 `query_session`); most `.query(` matches are `Db::query` and the engine's.
+- across.rs's `Held::Locked` keys come from `xgroup::sql::locked`, built by `record_key` with `extend`, so capacity can pass length; A13 declared `KEY_MAX` for them; whether they're trimmed is not checked.
+
+## Unit 3 checked on the merged tree; unit 4 not built (perf-A15)
+
+**Unit 3's merge.** r1559 (A14's bench clippy, no `--locked`) ended rc 101; its list was cut at 40 lines by
+`head -40`, so it couldn't show a compile error further down. The coordinator's bar for bench (11-23): no new
+finding on the lines A14 changed, since bench's clippy fails on main itself (S7, T11, R1: 160-166 findings).
+Script `~/.cache/amphora-perf/cross-a15-scripts/check15.sh` (adacachy2, needs linux/amd64,cpus=8,mem=24g):
+
+| run | commit | result |
+|---|---|---|
+| r1582 | 4a2954bd (a6b275c4 + main 7cfe907e) | clippy -p amphora --all-targets clean; lib `a14_` 2/2, `database::admission_charge` 5/5, `database::across` 13/13 (1 ignored), `database::online` 6/6, `database::guards` 13/13, `xgroup::` 34/34; bench clippy 164 findings (main's own: println, env::args), 0 compile errors, none on A14's lines (cluster.rs 426-432, scale.rs 2014-2022); load 24-31 |
+| r1601 | 9dc7a735 (4a2954bd + main 8feb1cbe: pg-parser, one engine optimizer file, bench planner, scripts) | the same results: clippy clean; `a14_` 2/2, `database::admission_charge` 5/5, `database::across` 13/13 (1 ignored), `database::online` 6/6, `database::guards` 13/13, `xgroup::` 34/34; bench 164 findings, 0 compile errors, none on A14's lines; load 18-32 (adacachy2 refused its first submission at 1 of 32 cores idle) |
+
+NOT on main. Main moved after r1582, so the merged tree was checked again (r1601, green). Main then moved three more times before the push: records and scripts/engine-ratchet.toml; bench/src/store.rs and suite_db.rs (lanes W1, W2); then crates/amphora/src/database/replicated.rs. The last merge, e0fcbc82 on perf/cross-a13, is not checked: adacachy2 refused its check twice at 22:03Z (2 of 32 cores idle). Next lane: run check15.sh at e0fcbc82 (or a fresh merge) with the same filters, then push HEAD:main.
+
+**Unit 4, read and not started.** What the next lane needs:
+- `Config::queue` users: `Config::default()` is `Some(4096)`, so `Groups` (groups.rs:467, :525 take the caller's
+  config), reshard/replicated.rs tests (:424, :522), database.rs tests (:5180, :5298, :5319), tests/crash.rs:628,
+  tests/store.rs (`Some(1)`), bench/src/store.rs:195 (`AMPHORA_QUEUE`) and bench/src/suite_db.rs:317 (`..defaults`).
+  A `Database`'s own store already passes `None` (database.rs:2120).
+- `ROOM_LOOK` (store.rs:516) is reached only on `TrySendError::Full`, in `hand` (:1452) and `run` (:1549): only a
+  counted queue reports `Full`. Why it polls: the writer calls `room.1.notify_all()` (:1727 for rows, :1741 for a
+  run) without taking `room.0`, and a sender's `try_send` and its wait are not under that lock, so a wakeup
+  between them is lost. An event-driven wait keeps the room's state (bytes queued) under `room.0`: the sender
+  charges and checks under the lock and waits on the condvar until its deadline only; the writer releases a
+  batch's bytes under the lock, then notifies.
+- "By row" needs a row's size, which the `Engine` trait doesn't have (A11's note still holds): `E::Row` has no
+  byte size today. A `Database`'s row is a `Command`, whose charge is `Admission::bytes_for(&operation)`.
+- A standalone `query` with no free reader: `Store::read`/`read_committed` fall back to `self.run(until,
+  on_writer)` when `readers.with` gives `None` (store.rs:1484, :1521), queuing a `Msg::Run` on the unbounded
+  queue with no charge; `Database::query_reader`'s writer fallback is the place to charge it at admission (its
+  `AnswerMax` plus the closure).

@@ -425,7 +425,7 @@ fn ryw(partition: &Partition, o: &Opts, relayed: &RelayCounts, sessions: usize, 
                     };
                     let t = Instant::now();
                     let found = reader
-                        .query_session(o.read_mode, token, Instant::now() + WAIT, move |c| {
+                        .query_session(o.read_mode, token, Instant::now() + WAIT, AnswerMax::fixed(), move |c| {
                             let mut q = c.prepare_cached("SELECT id FROM events WHERE id = ?1")?;
                             let rows = q.query_map(vec![amphora_api::Value::Text(id)], |row| row.get::<_, String>(0usize))?;
                             Ok(rows.count())

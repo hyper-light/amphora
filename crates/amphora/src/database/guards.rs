@@ -205,7 +205,7 @@ mod tests {
                 "the group dropped with a handle left"
             );
             let rows = handle
-                .query(until(), |db| {
+                .query(until(), AnswerMax::fixed(), |db| {
                     Ok(db.query_row("SELECT count(*) FROM t", [], |row| row.get::<usize, i64>(0))?)
                 })
                 .unwrap();

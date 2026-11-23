@@ -2016,6 +2016,7 @@ mod inproc {
                         ReadMode::Session,
                         Some(token),
                         until,
+                        AnswerMax::fixed(),
                         counted!(ONE, session, seq),
                     )
                     .map_err(|e| anyhow::anyhow!("group {g} refused a read: {e:?}"))?
