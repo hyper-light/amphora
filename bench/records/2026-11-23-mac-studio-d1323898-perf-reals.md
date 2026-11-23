@@ -112,3 +112,166 @@ python3 -I bench/real_sums_answers.py ~/.cache/amphora-perf/reals-out/sf1   # un
 python3 -I bench/real_sums_stats.py ~/.cache/amphora-perf/reals-out/sf1     # unit 2 table: p50/p99/p99.9, ratios vs Serial and DuckDB
 bench/real_sums_ab.sh 10 $HOME/.cache/amphora-perf/reals-out/sf10 data ref build load answers timed-a   # SF10
 ```
+
+# Lane R2 (reals), 2026-11-23 19:56Z to 20:51Z: SF1 answers and q01/q06 timings from r1468; KBN's loss case built and referenced, its engine answers not yet run
+
+Ada's goal: Amphora about 10x faster than DuckDB and SQLite on TPC-H, its answers following each
+dialect's docs exactly. SUM and AVG over REAL keep q01 and q06 on one thread. Ada picks arm (a)
+`RowOrder` or arm (b) `Exact` from this A/B. The default stays `Serial`.
+
+## Verdict, losses first
+
+- **Not done in this hour.**
+  - The engine's answers on KBN's loss case (real_sums q09). The case, its references and the
+    command are ready. It needs r1468's database, which r1468 holds until it ends.
+  - The twelve other REAL-summing TPC-H queries at 1, 4 and 8 workers. r1468 answers them at 16
+    only. Their timings are r1468's `timed-b`, still running when this was written.
+  - PostgreSQL 19 references for those twelve. Their joins feed SUM in plan order, so PostgreSQL's
+    own answer depends on its plan. None computed.
+- **Exact (arm b) answers NULL where a sum overflows.** On R1's q07 (`sum(1e308)` over 6,001,215
+  rows, and `+1e308 +1e308 -1e308 -1e308` within each order), Exact returns NULL at 1, 4, 8 and 16
+  workers. SQLite 3.53.2, func.c's steps and the exact sum all say `inf`. This is a bug in G8's arm,
+  not a property of exact summation.
+- **Both arms are slower than Serial on one worker.** q01: Exact 3.0x, RowOrder 3.3x slower. q06:
+  8.5x and 8.7x slower. On q06 only 114,160 rows reach the sum, so the cost is likely the morsel
+  path's per-row work, not the sum (a guess: not profiled).
+- **RowOrder gets slower as workers are added on q01.** 6.8 s at 1 worker, 4.4 s at 4, 9.3 s at 8,
+  23.8 s at 16. Serial takes 2.07 s at every worker count.
+- **Neither arm comes near DuckDB.** At 16 workers DuckDB answers q01 in 26 ms and q06 in 6.1 ms.
+  That is 25x faster than Exact on q01 (654 ms) and 64x on q06 (389 ms). The 10x goal needs the
+  per-row cost cut whichever arm wins.
+- **R1's side finding reproduces in isolation, and LIMIT is not its cause** (below).
+- **Mac Studio 2 was shared.** Load was 7 to 20 on 32 cores during the timed rounds (other lanes'
+  work). The arms alternate within each round, so each saw the same spread.
+
+## Answers at SF1
+
+The arms run from one binary (fe02d165, r1468), at 1, 4, 8 and 16 workers. "SQLite 3.53.2" is the
+bench's own sqlite target on the same data and statement. The references are bench/real_sums_ref.py
+over `lineitem.tbl` in row order (R1's ref.json, and r1515's ref-r2.json for q09 and TPC-H q01, q06).
+
+| case | arm | bit-identical to Serial | equal to SQLite's KBN sum | equal to PostgreSQL 19's sum |
+|---|---|---|---|---|
+| R1's hard cases q01-q08, 29 columns | Serial | yes at 4, 8, 16 workers | yes, all 29 | 4 of 21 (8 are `total`, which PostgreSQL lacks) |
+| same | RowOrder | yes at 1, 4, 8, 16 | yes, all 29 | 4 of 21 |
+| same | Exact | 25 of 29: q07's 4 columns are NULL, Serial's `inf` | 25 of 29 | 4 of 21 |
+| KBN's loss, q09, 3 columns | all | not run yet | not run yet | not run yet |
+| TPC-H q01, 4 groups x 7 REAL cells | all three | yes at 1, 4, 8, 16 | yes, all 28 | 8 of 28 (20 differ, up to 20,675 ulps) |
+| TPC-H q06, 1 cell | all three | yes at 1, 4, 8, 16 | yes | no (71 ulps) |
+| TPC-H q03 q05 q07 q08 q09 q10 q11 | all three | yes at 16 | yes at 16 | no reference |
+| TPC-H q14 q15 q17 q19 q22 | all three | yes at 16 | SQLite's answers were not written yet | no reference |
+
+On every case measured, SQLite's KBN sum equals the exact sum rounded once. So these cases cannot
+tell Exact from SQLite except by Exact's overflow bug. q09 is the case that can.
+
+### KBN's loss case (bench/planner/real_sums/queries/q09.sql)
+
+KBN keeps one error term. It loses when that term has to hold two magnitudes at once. The inputs
+are 1e36, 1e18, 1.0, -1e36 and -1e18 on line 1 of orders 1, 1500000, 3000000, 4500000 and 6000000,
+a quarter of the table apart, so they land in different workers' morsels. Every other row is 0.0.
+r1515 counted exactly 5 nonzero inputs in `lineitem.tbl`.
+
+- 1e18 is below half an ulp of 1e36, so it goes to the error term.
+- Then 1.0 is below half an ulp of 1e18 (128), so the error term drops it.
+- The two big values cancel, and -1e18 cancels the error term.
+
+| column | SQLite (func.c steps) | PostgreSQL 19 (float.c) | exact |
+|---|---|---|---|
+| sum | 0.0 | -1e+18 | 1.0 |
+| avg | 0.0 | -166632923499.658 | 1.6663292349965798e-07 |
+| total | 0.0 | n/a | 1.0 |
+
+Expected from the code, not yet measured: Serial and RowOrder answer 0.0 (SQLite's), Exact 1.0.
+
+### Full answer tables (python3 -I bench/real_sums_answers.py on r1468's output, 20:22Z)
+
+Hard cases: every cell of Exact and RowOrder equals Serial at 1 worker, at every worker count,
+except Exact on q07 (`NULL at all`). SQLite 3.53.2 equals SQLite's func.c reference on all 29.
+
+| query | column | Serial | Exact | SQLite 3.53.2 | PostgreSQL 19 ref |
+|---|---|---|---|---|---|
+| q07 | sum(1e308 each row) | inf | NULL | inf | ERROR: value out of range: overflow |
+| q07 | avg(1e308 each row) | inf | NULL | inf | ERROR: value out of range: overflow |
+| q07 | total(1e308 each row) | inf | NULL | inf | n/a |
+| q07 | sum(+1e308 +1e308 -1e308 -1e308) | inf | NULL | inf | ERROR: value out of range: overflow |
+
+TPC-H cells that differ by bits (most ulps). Each arm at each worker count, and SQLite 3.53.2,
+gives the same row:
+
+| query | vs Serial at 1 | vs SQLite 3.53.2 | vs SQLite ref (func.c) | vs PostgreSQL 19 ref | vs exact ref |
+|---|---|---|---|---|---|
+| q01 | 0 (0) | 0 (0) | 0 (0) | 20 of 28 (20,675) | 0 (0) |
+| q06 | 0 (0) | 0 (0) | 0 (0) | 1 of 1 (71) | 0 (0) |
+
+## Timings at SF1 (r1468 `timed-a`, 19:47Z to 20:19Z)
+
+25 runs per cell: 5 rounds alternating Serial, Exact, RowOrder and DuckDB, rotating which goes
+first, 5 runs each. 0 failed. With 25 runs, p99 is the slowest run. ms; ranges are min to max.
+
+| query | workers | Serial p50 / p99 | Exact p50 / p99 | RowOrder p50 / p99 | DuckDB p50 / p99 |
+|---|---|---|---|---|---|
+| q01 | 1 | 2070 / 2432 | 6171 / 6953 | 6773 / 7329 | 220 / 292 |
+| q01 | 4 | 2067 / 2119 | 1880 / 2088 | 4432 / 4909 | 68.5 / 73.8 |
+| q01 | 8 | 2066 / 2120 | 1027 / 1101 | 9277 / 10011 | 40.2 / 42.6 |
+| q01 | 16 | 2068 / 2084 | 654 / 795 | 23831 / 24515 | 26.0 / 27.4 |
+| q06 | 1 | 477 / 493 | 4069 / 4530 | 4144 / 4727 | 47.5 / 48.6 |
+| q06 | 4 | 478 / 487 | 1154 / 1203 | 1174 / 1263 | 15.1 / 16.0 |
+| q06 | 8 | 477 / 484 | 645 / 713 | 636 / 677 | 9.1 / 9.9 |
+| q06 | 16 | 479 / 485 | 389 / 500 | 374 / 394 | 6.1 / 7.1 |
+
+- Against Serial at the same workers, Exact is 1.10x, 2.01x and 3.16x faster on q01 at 4, 8 and 16
+  workers. On q06 it is slower until 16 workers (1.23x faster there).
+- RowOrder is slower than Serial on q01 at every count. On q06 it is 1.28x faster at 16 workers.
+- On q06 at 16 workers, Exact (366 to 500 ms) and RowOrder (356 to 394 ms) overlap: no measurable
+  difference between the arms there.
+- Serial is one thread at every count, by design: a statement that sums a REAL goes back to the
+  serial loop.
+- Build: real_sums_ab.sh's release build (thin LTO, one codegen unit, overflow checks on). DuckDB
+  runs `SET threads = n`. One binary for the three arms, so one calibration (RULES 5e).
+- The answers above come from the same binary and SQL at each worker count, so the timed work is
+  checked work. The limiters are not profiled.
+
+## What each arm gives up
+
+- **Serial (today).** Gives up speed. Any statement that sums a REAL runs on one thread: q01 takes
+  2.07 s and q06 0.48 s at every worker count, about 80x DuckDB's time at 16 threads. Its answers
+  equal SQLite's bit for bit on every case measured.
+- **RowOrder (a).** Keeps Serial's answers bit for bit, at every worker count, on every case
+  measured. It gives up speed and memory. It holds every SUM, AVG and TOTAL input with its row
+  number until the end, then adds them up on one thread. Where many rows reach the sum, it is
+  slower than Serial and gets slower with more workers (q01: 23.8 s at 16 workers). Its memory
+  grows with the rows summed: one (position, value) pair per input, by the code. The peak was not
+  measured.
+- **Exact (b).** The only arm that speeds up with workers (q01: 3.2x Serial at 16). It gives up
+  SQLite's answer wherever KBN rounds differently from the exact sum. q09 is built to show this
+  (exact 1.0, SQLite 0.0), but the engine has not run it yet. Today it also answers NULL on
+  overflow where SQLite says `inf`, a bug to fix before it could ship.
+- **Both arms.** Neither matches PostgreSQL 19, which adds plainly in its own row order. A Postgres
+  dialect needs its own `float8pl`/`float8_accum` aggregate whichever arm wins (R1).
+
+## R1's side finding, in isolation (r1503, r1521 on adacachy2)
+
+Test `r2_parallel_limit_finds_a_one_row_tables_row`, branch `perf/reals-r2-limit-repro` (c6788f95,
+not for main). One-row table `bench_loaded`, in memory and on a file reopened by a fresh database.
+
+- Parallel mode off: `SELECT 1 FROM bench_loaded LIMIT 1` returns its row; `count(*)` is 1.
+- Parallel mode on, parallel LIMIT off, 4 cores: the LIMIT query returns its row (the serial loop
+  answers it). `SELECT 1 FROM bench_loaded` with no LIMIT returns no row and no error.
+- Parallel mode on and parallel LIMIT on, at 1, 2, 4, 8, 16 and 32 cores: no row, no error.
+
+So the parallel scan loses the row, with or without LIMIT. Only `SELECT 1` over a one-row table was
+tried. Not fixed (out of this lane's brief).
+
+## Successor: commands
+
+After r1468 ends, never beside it (both open the same database). On Mac Studio 2 (d1323898),
+needs `macos/arm64,cpus=16,mem=12g`, sync from a clone of `perf/reals` (sync only after r1468
+ends: it runs bench/real_sums_ab.sh from the same folder):
+
+```
+bench/real_sums_r2.sh 1 $HOME/.cache/amphora-perf/reals-out/sf1 fe02d165 answers-kbn answers-b limit
+python3 -I bench/real_sums_answers.py ~/.cache/amphora-perf/reals-out/sf1   # q09 row, answers-b at 1/4/8/16
+python3 -I bench/real_sums_stats.py ~/.cache/amphora-perf/reals-out/sf1     # adds timed-b
+```
+
+`ref-r2.json` (q09, TPC-H q01 and q06 references) is already in that folder, from r1515.
