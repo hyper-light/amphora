@@ -26,8 +26,14 @@ Change: `Descriptors` counts give-backs (`Held::drop`) and unparks the threads i
 `wait_release`; the loop reads the count before each accept and, refused while the budget holds
 descriptors, parks until a give-back after it (or stopping). With the budget holding none, the
 park stays: no give-back will come and a host closing its own file raises no event (a decision).
-Not measured: forcing EMFILE needs a harness lowering RLIMIT_NOFILE in a child process; by
-construction the old wake after a release was 0-10 ms late.
+Found on the way: at EMFILE the branch's recount (`refused_by_system`) opens /dev/fd, refused by
+the same limit, and its error ended the listener before it reached any wait. Fixed: a recount
+refused for want of a descriptor leaves the count for later. A/B with
+`transport::common::tests::audit6_at_the_descriptor_limit_the_listener_waits_for_a_give_back`
+(ignored; child process, RLIMIT_NOFILE lowered to leave 3 descriptors): before, the listener
+stopped and the waiting connection never answered; after, it answered 69-150 us after the held
+connection ended (5 runs: 96, 69, 150, 74, 117 us). Run beside the module's suite it failed once,
+unexplained, hence ignored.
 
 ## Verified, not changed (perf-I2, for the successor)
 
