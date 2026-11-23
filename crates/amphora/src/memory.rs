@@ -407,13 +407,34 @@ pub struct Budget {
     /// one waiting takes no lock.
     waiting: Mutex<VecDeque<Waiter>>,
     waiters: AtomicU64,
+    /// The next wait's name ([`Waiting`]).
+    next_wait: AtomicU64,
 }
 
 /// One wait for room: `bytes` more of `used`'s, woken once by the release that frees them.
 struct Waiter {
+    id: u64,
     used: Use,
     bytes: u64,
     wake: Waker,
+}
+
+/// A wait for room ([`Budget::when_room`]), withdrawn when this drops if it wasn't woken: a waiter
+/// that goes away leaves nothing queued.
+pub struct Waiting {
+    budget: Arc<Budget>,
+    id: u64,
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        let mut waiting = self.budget.waiting_now();
+        waiting.retain(|waiter| waiter.id != self.id);
+        self.budget.waiters.store(
+            u64::try_from(waiting.len()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
 }
 
 /// One stream of a use's that may hold a charge at any moment while it lives (a backup's base copy,
@@ -501,6 +522,7 @@ impl Budget {
             streams: Default::default(),
             waiting: Mutex::default(),
             waiters: AtomicU64::new(0),
+            next_wait: AtomicU64::new(0),
         })
     }
 
@@ -621,11 +643,14 @@ impl Budget {
     /// Wakes `wake` once `used` has room for `bytes` more: at once if it has it now, else at the
     /// release of a charge that frees it ([`Budget::give`]), the oldest waiters that fit first. A
     /// room that can't be read wakes it too, for the waiter to meet the refusal. Woken once; a
-    /// waiter that still finds no room asks again.
-    pub fn when_room(&self, used: Use, bytes: u64, wake: &Waker) {
+    /// waiter that still finds no room asks again. Dropping the answer withdraws the wait.
+    #[must_use]
+    pub fn when_room(self: &Arc<Self>, used: Use, bytes: u64, wake: &Waker) -> Waiting {
+        let id = self.next_wait.fetch_add(1, Ordering::Relaxed);
         {
             let mut waiting = self.waiting_now();
             waiting.push_back(Waiter {
+                id,
                 used,
                 bytes,
                 wake: wake.clone(),
@@ -638,6 +663,10 @@ impl Budget {
         // Pairs with the fence in `give`.
         std::sync::atomic::fence(Ordering::SeqCst);
         self.wake_fitting();
+        Waiting {
+            budget: Arc::clone(self),
+            id,
+        }
     }
 
     /// The waiting queue, whatever a waker that panicked left it as.
@@ -795,8 +824,8 @@ pub(crate) mod tests {
         budget.hold(Use::Images, 1024 * KIB).unwrap();
         let (older, older_wake) = counter();
         let (younger, younger_wake) = counter();
-        budget.when_room(Use::Queues, 256 * KIB, &older_wake);
-        budget.when_room(Use::Queues, 256 * KIB, &younger_wake);
+        let _older = budget.when_room(Use::Queues, 256 * KIB, &older_wake);
+        let _younger = budget.when_room(Use::Queues, 256 * KIB, &younger_wake);
         assert_eq!((woken(&older), woken(&younger)), (0, 0), "no room, no wake");
         budget.give(Use::Images, 128 * KIB);
         assert_eq!((woken(&older), woken(&younger)), (0, 0), "128 KiB fits neither");
@@ -809,7 +838,7 @@ pub(crate) mod tests {
         budget.give(Use::Images, 256 * KIB);
         assert_eq!((woken(&older), woken(&younger)), (1, 1), "the next release the younger");
         let (now, now_wake) = counter();
-        budget.when_room(Use::Queues, 256 * KIB, &now_wake);
+        let _now = budget.when_room(Use::Queues, 256 * KIB, &now_wake);
         assert_eq!(woken(&now), 1, "room there already wakes at once");
         budget.give(Use::Images, 512 * KIB);
         assert_eq!(
@@ -819,8 +848,13 @@ pub(crate) mod tests {
         );
         let unread = Budget::new(Box::new(Fed::new(None, Some(0))));
         let (refused, refused_wake) = counter();
-        unread.when_room(Use::Images, 1, &refused_wake);
+        let _refused = unread.when_room(Use::Images, 1, &refused_wake);
         assert_eq!(woken(&refused), 1, "an unread room wakes the wait to meet its refusal");
+        budget.hold(Use::Images, 1024 * KIB).unwrap();
+        let (gone, gone_wake) = counter();
+        drop(budget.when_room(Use::Queues, KIB, &gone_wake));
+        budget.give(Use::Images, 1024 * KIB);
+        assert_eq!(woken(&gone), 0, "a wait dropped before its room is withdrawn");
     }
 
     /// T-T1.12.M1: a use's streams share its room. Do: open one stream of chunks, then a second,

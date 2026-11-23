@@ -994,7 +994,7 @@ struct Actor<F: BlockFile + 'static = LogDevice> {
     log_full: Option<String>,
     // While a due compaction's image waits for the memory budget's room: rung by the release that
     // frees it (`memory::Budget::when_room`), and not measured again before.
-    room_wait: Option<Arc<RoomWait>>,
+    room_wait: Option<(Arc<RoomWait>, crate::memory::Waiting)>,
     // The input queued as this step began, its own envelope among it: what a restart in the
     // step found, on the basis each later step reads its queue.
     step_queued: u64,
@@ -2776,7 +2776,7 @@ impl<F: BlockFile + 'static> Actor<F> {
         if self
             .room_wait
             .as_ref()
-            .is_some_and(|wait| !wait.rang.load(Ordering::Acquire))
+            .is_some_and(|(wait, _)| !wait.rang.load(Ordering::Acquire))
         {
             return Ok(false);
         }
@@ -2788,12 +2788,12 @@ impl<F: BlockFile + 'static> Actor<F> {
                     rang: std::sync::atomic::AtomicBool::new(false),
                     owner: self.waker.clone(),
                 });
-                self.room_wait = Some(Arc::clone(&wait));
-                crate::memory::process().when_room(
+                let waiting = crate::memory::process().when_room(
                     crate::memory::Use::Images,
                     bytes,
-                    &std::task::Waker::from(wait),
+                    &std::task::Waker::from(Arc::clone(&wait)),
                 );
+                self.room_wait = Some((wait, waiting));
                 Ok(false)
             }
             crate::replication::ImageFit::Other => Ok(false),
