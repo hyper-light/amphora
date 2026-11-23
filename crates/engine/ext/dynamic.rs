@@ -1,7 +1,7 @@
 use crate::{
     ext::{
         register_aggregate_function, register_scalar_function_with_options, register_vtab_module,
-        unregister_function,
+        register_window_function, unregister_function,
     },
     Connection, LimboError,
 };
@@ -117,6 +117,7 @@ pub fn add_builtin_vfs_extensions(
                 builtin_vfs: vfslist.as_mut_ptr(),
                 builtin_vfs_count: 0,
             },
+            register_window_function,
         },
         Some(mut api) => {
             api.vfs_interface.builtin_vfs = vfslist.as_mut_ptr();

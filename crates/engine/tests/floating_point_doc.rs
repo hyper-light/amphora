@@ -475,11 +475,45 @@ mod fp_digits_per_connection {
 /// where it shows one, else sqlite3 3.54.0's (bench/records/2026-11-23-adacachy2-perf-numeric-g13.md).
 mod page_sentences {
     use super::{open, texts};
-    use amphora_engine::{StepResult, IO};
+    use amphora_engine::{StepResult, Value, IO};
 
     fn one(sql: &str) -> String {
         let (io, conn) = open();
         texts(&io, &conn, sql).join("|")
+    }
+
+    /// Every row's first column, NULL as "NULL", joined by "|".
+    fn column(sql: &str) -> String {
+        let (io, conn) = open();
+        let mut stmt = conn.prepare(sql).unwrap();
+        let mut out = Vec::new();
+        loop {
+            match stmt.step().unwrap() {
+                StepResult::Row => {
+                    let v = stmt.row().unwrap().get_values().next().unwrap().clone();
+                    out.push(match v {
+                        Value::Null => "NULL".to_string(),
+                        v => v.to_string(),
+                    });
+                }
+                StepResult::IO => io.step().unwrap(),
+                _ => return out.join("|"),
+            }
+        }
+    }
+
+    /// The error the statement stops with.
+    fn error(sql: &str) -> String {
+        let (io, conn) = open();
+        let mut stmt = conn.prepare(sql).unwrap();
+        loop {
+            match stmt.step() {
+                Err(e) => return e.to_string(),
+                Ok(StepResult::IO) => io.step().unwrap(),
+                Ok(StepResult::Row) => {}
+                Ok(other) => panic!("{sql}: ended {other:?} without an error"),
+            }
+        }
     }
 
     fn fails(sql: &str) -> bool {
@@ -717,6 +751,64 @@ mod page_sentences {
             one("SELECT decimal_sum(x) FROM (SELECT '0.1' AS x UNION ALL SELECT '0.2' UNION ALL SELECT '0.3')"),
             "0.6"
         );
+    }
+
+    /// Lane G16, §2.2.5: "The decimal_sum(X) function is an aggregate, like the built-in total()
+    /// aggregate function". total() of no rows is 0.0, so decimal_sum of no rows is "0", an empty
+    /// window frame included (sqlite3 3.54.0 gives NULL for both; the page wins).
+    #[test]
+    fn g16_decimal_sum_of_no_rows_is_zero_like_total() {
+        assert_eq!(
+            one("SELECT decimal_sum(x), total(x) FROM (SELECT '1.5' AS x WHERE 0)"),
+            "0|0.0"
+        );
+        assert_eq!(
+            column("SELECT decimal_sum(x) OVER (ROWS BETWEEN 1 PRECEDING AND 1 PRECEDING) FROM (SELECT '1.5' AS x UNION ALL SELECT '2')"),
+            "0|1.5"
+        );
+    }
+
+    /// Lane G16: the page is silent on window frames, so sqlite3 3.54.0 decides. decimal.c gives
+    /// decimal_sum an xInverse: a row leaving the frame is subtracted, and the fraction digits it
+    /// brought stay (each answer below is 3.54.0's, `sqlite3 -batch :memory:`).
+    #[test]
+    fn g16_decimal_sum_over_window_frames_gives_3_54_0s_answers() {
+        let rows = "FROM (SELECT '1.5' AS x UNION ALL SELECT '2' UNION ALL SELECT '3')";
+        for (frame, expect) in [
+            ("ROWS BETWEEN 1 PRECEDING AND CURRENT ROW", "1.5|3.5|5.0"),
+            ("ROWS BETWEEN 1 FOLLOWING AND 1 FOLLOWING", "2.0|3.0|0.0"),
+            ("ROWS BETWEEN 2 FOLLOWING AND 3 FOLLOWING", "3.0|0.0|0.0"),
+            ("", "6.5|6.5|6.5"),
+            ("ORDER BY x", "1.5|3.5|6.5"),
+        ] {
+            assert_eq!(
+                column(&format!("SELECT decimal_sum(x) OVER ({frame}) {rows}")),
+                expect,
+                "{frame}"
+            );
+        }
+        assert_eq!(
+            column("SELECT decimal_sum(x) OVER (ROWS BETWEEN CURRENT ROW AND CURRENT ROW) FROM (SELECT '0.25' AS x UNION ALL SELECT '-1' UNION ALL SELECT '1')"),
+            "0.25|-1.00|1.00"
+        );
+        assert_eq!(
+            column("SELECT decimal_sum(x) OVER (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM (SELECT NULL AS x UNION ALL SELECT '2' UNION ALL SELECT NULL)"),
+            "0|2|2"
+        );
+    }
+
+    /// Lane G16: sqlite3 3.54.0's decimalSumStep fails at a row decimal_new cannot read (more than
+    /// 10,000,000 digits), before the next row is evaluated: the third row's abs() overflow is never
+    /// reached. A sum that outgrows the limit is only marked until the end, so there the third
+    /// row's overflow is the error (3.54.0 answers both the same).
+    #[test]
+    fn g16_decimal_sum_fails_at_the_bad_row() {
+        let sum = |second: &str| {
+            format!("SELECT decimal_sum(CASE WHEN n = 3 THEN abs(-9223372036854775808) ELSE x END) FROM (SELECT 1 AS n, '{first}' AS x UNION ALL SELECT 2, '{second}' UNION ALL SELECT 3, '2')",
+                first = if second == "1" { "1e9999999" } else { "1" })
+        };
+        assert!(error(&sum("12e9999999")).contains("out of memory"));
+        assert!(error(&sum("1")).contains("integer overflow"));
     }
 
     /// §2.2.6: "the "decimal" collating sequence that compares decimal text strings in numeric order."
