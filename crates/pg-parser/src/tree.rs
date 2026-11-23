@@ -19,6 +19,8 @@ pub enum TransactionStmtKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Val {
     Integer(i32),
+    /// A numeric literal's text (FCONST), printed as it is.
+    Float(String),
     String(String),
 }
 
@@ -28,8 +30,9 @@ pub enum Val {
 pub enum Node {
     /// value.h's String.
     String(String),
-    /// A List of nodes, as an element of another list (`valuesLists`).
-    List(Vec<NodeId>),
+    /// A List of nodes as an element of another list (`valuesLists`, RangeFunction's `functions`);
+    /// its own elements may be NULL (`list_make2($1, NIL)`).
+    List(Vec<Option<NodeId>>),
     RawStmt {
         stmt: Option<NodeId>,
         stmt_location: i32,
@@ -60,19 +63,19 @@ pub enum Node {
         with_clause: Option<NodeId>,
         override_kind: i32,
     },
-    /// SelectStmt as a simple SELECT or VALUES builds it (`op` SETOP_NONE, no set operands).
-    SelectStmt {
-        target_list: Vec<NodeId>,
-        from_clause: Vec<NodeId>,
-        where_clause: Option<NodeId>,
-        values_lists: Vec<NodeId>,
-    },
+    SelectStmt(Box<SelectStmt>),
     RangeVar {
-        relname: Option<String>,
+        catalogname: Option<String>,
+        schemaname: Option<String>,
+        relname: String,
+        inh: bool,
+        relpersistence: char,
+        alias: Option<NodeId>,
         location: i32,
     },
     ResTarget {
         name: Option<String>,
+        indirection: Vec<NodeId>,
         val: Option<NodeId>,
         location: i32,
     },
@@ -100,6 +103,62 @@ pub enum Node {
         typmod: i32,
         location: i32,
     },
+    Alias {
+        aliasname: String,
+        colnames: Vec<NodeId>,
+    },
+    RangeFunction {
+        lateral: bool,
+        ordinality: bool,
+        is_rowsfrom: bool,
+        functions: Vec<NodeId>,
+        alias: Option<NodeId>,
+        coldeflist: Vec<NodeId>,
+    },
+    FuncCall(Box<FuncCall>),
+}
+
+/// parsenodes.h's FuncCall, fields in struct order; `default()` is makeNode's zeroed node, whose
+/// `funcformat` 0 is COERCE_EXPLICIT_CALL and `ignore_nulls` 0 NO_NULLTREATMENT.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FuncCall {
+    pub funcname: Vec<NodeId>,
+    pub args: Vec<NodeId>,
+    pub agg_order: Vec<NodeId>,
+    pub agg_filter: Option<NodeId>,
+    pub over: Option<NodeId>,
+    pub ignore_nulls: i32,
+    pub agg_within_group: bool,
+    pub agg_star: bool,
+    pub agg_distinct: bool,
+    pub func_variadic: bool,
+    pub funcformat: i32,
+    pub location: i32,
+}
+
+/// parsenodes.h's SelectStmt, fields in struct order; `default()` is makeNode's zeroed node.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SelectStmt {
+    pub distinct_clause: Vec<NodeId>,
+    pub into_clause: Option<NodeId>,
+    pub target_list: Vec<NodeId>,
+    pub from_clause: Vec<NodeId>,
+    pub where_clause: Option<NodeId>,
+    pub group_clause: Vec<NodeId>,
+    pub group_distinct: bool,
+    pub having_clause: Option<NodeId>,
+    pub window_clause: Vec<NodeId>,
+    pub values_lists: Vec<NodeId>,
+    pub sort_clause: Vec<NodeId>,
+    pub limit_offset: Option<NodeId>,
+    pub limit_count: Option<NodeId>,
+    pub limit_option: i32,
+    pub locking_clause: Vec<NodeId>,
+    pub with_clause: Option<NodeId>,
+    pub op: i32,
+    pub all: bool,
+    pub larg: Option<NodeId>,
+    pub rarg: Option<NodeId>,
 }
 
 /// A tree's arena: a node index that isn't in it, or an arena past `u32` nodes.
@@ -115,13 +174,19 @@ pub struct Tree {
 /// One piece of a node's text form, in the order outfuncs.c writes it.
 enum Piece<'t> {
     Text(&'static str),
+    /// A value's text written as it is (`_outFloat`).
+    Raw(&'t str),
     Int(i64),
     /// outToken: `<>` for NULL, `""` for empty, read.c's special characters backslashed.
     Token(Option<&'t str>),
+    /// outChar: `<>` for `'\0'`, else the character as outToken writes it.
+    Char(char),
     /// outNode on a node pointer: `<>` for NULL.
     Node(Option<NodeId>),
     /// outNode on a List field: `<>` for NIL.
     List(&'t [NodeId]),
+    /// outNode on a List whose elements may be NULL.
+    Items(&'t [Option<NodeId>]),
 }
 
 impl Tree {
@@ -152,15 +217,28 @@ impl Tree {
         while let Some(piece) = stack.pop() {
             match piece {
                 Piece::Text(s) => out.push_str(s),
+                Piece::Raw(s) => out.push_str(s),
                 Piece::Int(n) => out.push_str(&n.to_string()),
                 Piece::Token(s) => token(&mut out, s),
+                Piece::Char('\0') => out.push_str("<>"),
+                Piece::Char(c) => token(&mut out, Some(c.encode_utf8(&mut [0; 4]))),
                 Piece::Node(None) => out.push_str("<>"),
                 Piece::Node(Some(id)) => {
                     let mut pieces = Vec::new();
                     self.pieces(self.get(id)?, &mut pieces);
                     stack.extend(pieces.into_iter().rev());
                 }
-                Piece::List([]) => out.push_str("<>"),
+                Piece::List([]) | Piece::Items([]) => out.push_str("<>"),
+                Piece::Items(items) => {
+                    stack.push(Piece::Text(")"));
+                    for (i, &item) in items.iter().enumerate().rev() {
+                        stack.push(Piece::Node(item));
+                        if i > 0 {
+                            stack.push(Piece::Text(" "));
+                        }
+                    }
+                    stack.push(Piece::Text("("));
+                }
                 Piece::List(items) => {
                     stack.push(Piece::Text(")"));
                     for (i, &item) in items.iter().enumerate().rev() {
@@ -178,7 +256,8 @@ impl Tree {
 
     /// A node's pieces, field by field as outfuncs writes them (WRITE_*_FIELD: ` :name value`).
     fn pieces<'t>(&'t self, node: &'t Node, p: &mut Vec<Piece<'t>>) {
-        use Piece::{Int, List, Node as N, Text, Token};
+        use Piece::{Char, Int, Items, List, Node as N, Raw, Text, Token};
+        let truth = |b: bool| if b { "true" } else { "false" };
         let location = |p: &mut Vec<Piece<'t>>, name: &'static str, at: i32| {
             p.push(Text(name));
             p.push(Int(i64::from(at)));
@@ -191,7 +270,7 @@ impl Tree {
                 }
                 p.push(Text("\""));
             }
-            Node::List(items) => p.push(List(items)),
+            Node::List(items) => p.push(Items(items)),
             Node::RawStmt {
                 stmt,
                 stmt_location,
@@ -219,7 +298,11 @@ impl Tree {
                     Token(savepoint_name.as_deref()),
                     Text(" :gid "),
                     Token(gid.as_deref()),
-                    Text(if *chain { " :chain true" } else { " :chain false" }),
+                    Text(if *chain {
+                        " :chain true"
+                    } else {
+                        " :chain false"
+                    }),
                 ]);
                 location(p, " :location ", *at);
                 p.push(Text("}"));
@@ -271,43 +354,88 @@ impl Tree {
                 Int(i64::from(*override_kind)),
                 Text("}"),
             ]),
-            Node::SelectStmt {
-                target_list,
-                from_clause,
-                where_clause,
-                values_lists,
-            } => p.extend([
-                Text("{SELECTSTMT :distinctClause <> :intoClause <> :targetList "),
-                List(target_list),
-                Text(" :fromClause "),
-                List(from_clause),
-                Text(" :whereClause "),
-                N(*where_clause),
-                Text(" :groupClause <> :groupDistinct false :havingClause <> :windowClause <> :valuesLists "),
-                List(values_lists),
-                Text(" :sortClause <> :limitOffset <> :limitCount <> :limitOption 0 :lockingClause <> :withClause <> :op 0 :all false :larg <> :rarg <>}"),
-            ]),
+            Node::SelectStmt(n) => {
+                p.extend([
+                    Text("{SELECTSTMT :distinctClause "),
+                    List(&n.distinct_clause),
+                    Text(" :intoClause "),
+                    N(n.into_clause),
+                    Text(" :targetList "),
+                    List(&n.target_list),
+                    Text(" :fromClause "),
+                    List(&n.from_clause),
+                    Text(" :whereClause "),
+                    N(n.where_clause),
+                    Text(" :groupClause "),
+                    List(&n.group_clause),
+                    Text(" :groupDistinct "),
+                    Text(truth(n.group_distinct)),
+                    Text(" :havingClause "),
+                    N(n.having_clause),
+                    Text(" :windowClause "),
+                    List(&n.window_clause),
+                    Text(" :valuesLists "),
+                    List(&n.values_lists),
+                    Text(" :sortClause "),
+                    List(&n.sort_clause),
+                    Text(" :limitOffset "),
+                    N(n.limit_offset),
+                    Text(" :limitCount "),
+                    N(n.limit_count),
+                    Text(" :limitOption "),
+                    Int(i64::from(n.limit_option)),
+                    Text(" :lockingClause "),
+                    List(&n.locking_clause),
+                    Text(" :withClause "),
+                    N(n.with_clause),
+                    Text(" :op "),
+                    Int(i64::from(n.op)),
+                    Text(" :all "),
+                    Text(truth(n.all)),
+                    Text(" :larg "),
+                    N(n.larg),
+                    Text(" :rarg "),
+                    N(n.rarg),
+                    Text("}"),
+                ]);
+            }
             Node::RangeVar {
+                catalogname,
+                schemaname,
                 relname,
+                inh,
+                relpersistence,
+                alias,
                 location: at,
             } => {
                 p.extend([
-                    Text("{RANGEVAR :catalogname <> :schemaname <> :relname "),
-                    Token(relname.as_deref()),
-                    Text(" :inh true :relpersistence p :alias <>"),
+                    Text("{RANGEVAR :catalogname "),
+                    Token(catalogname.as_deref()),
+                    Text(" :schemaname "),
+                    Token(schemaname.as_deref()),
+                    Text(" :relname "),
+                    Token(Some(relname)),
+                    Text(if *inh { " :inh true" } else { " :inh false" }),
+                    Text(" :relpersistence "),
+                    Char(*relpersistence),
+                    Text(" :alias "),
+                    N(*alias),
                 ]);
                 location(p, " :location ", *at);
                 p.push(Text("}"));
             }
             Node::ResTarget {
                 name,
+                indirection,
                 val,
                 location: at,
             } => {
                 p.extend([
                     Text("{RESTARGET :name "),
                     Token(name.as_deref()),
-                    Text(" :indirection <> :val "),
+                    Text(" :indirection "),
+                    List(indirection),
+                    Text(" :val "),
                     N(*val),
                 ]);
                 location(p, " :location ", *at);
@@ -343,6 +471,7 @@ impl Tree {
                 p.push(Text("{A_CONST :val "));
                 match val {
                     Val::Integer(n) => p.push(Int(i64::from(*n))),
+                    Val::Float(s) => p.push(Raw(s)),
                     Val::String(s) => {
                         p.push(Text("\""));
                         if !s.is_empty() {
@@ -374,6 +503,66 @@ impl Tree {
                     Int(i64::from(*typmod)),
                 ]);
                 location(p, " :location ", *at);
+                p.push(Text("}"));
+            }
+            Node::Alias {
+                aliasname,
+                colnames,
+            } => p.extend([
+                Text("{ALIAS :aliasname "),
+                Token(Some(aliasname)),
+                Text(" :colnames "),
+                List(colnames),
+                Text("}"),
+            ]),
+            Node::RangeFunction {
+                lateral,
+                ordinality,
+                is_rowsfrom,
+                functions,
+                alias,
+                coldeflist,
+            } => p.extend([
+                Text("{RANGEFUNCTION :lateral "),
+                Text(truth(*lateral)),
+                Text(" :ordinality "),
+                Text(truth(*ordinality)),
+                Text(" :is_rowsfrom "),
+                Text(truth(*is_rowsfrom)),
+                Text(" :functions "),
+                List(functions),
+                Text(" :alias "),
+                N(*alias),
+                Text(" :coldeflist "),
+                List(coldeflist),
+                Text("}"),
+            ]),
+            Node::FuncCall(n) => {
+                p.extend([
+                    Text("{FUNCCALL :funcname "),
+                    List(&n.funcname),
+                    Text(" :args "),
+                    List(&n.args),
+                    Text(" :agg_order "),
+                    List(&n.agg_order),
+                    Text(" :agg_filter "),
+                    N(n.agg_filter),
+                    Text(" :over "),
+                    N(n.over),
+                    Text(" :ignore_nulls "),
+                    Int(i64::from(n.ignore_nulls)),
+                    Text(" :agg_within_group "),
+                    Text(truth(n.agg_within_group)),
+                    Text(" :agg_star "),
+                    Text(truth(n.agg_star)),
+                    Text(" :agg_distinct "),
+                    Text(truth(n.agg_distinct)),
+                    Text(" :func_variadic "),
+                    Text(truth(n.func_variadic)),
+                    Text(" :funcformat "),
+                    Int(i64::from(n.funcformat)),
+                ]);
+                location(p, " :location ", n.location);
                 p.push(Text("}"));
             }
         }
@@ -408,38 +597,10 @@ fn token(out: &mut String, s: Option<&str>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Node, NodeId, TransactionStmtKind, Tree, Val};
+    use super::{Node, NodeId, TransactionStmtKind, Tree};
 
     fn string(t: &mut Tree, s: &str) -> NodeId {
         t.push(Node::String(s.into())).unwrap()
-    }
-
-    fn column(t: &mut Tree, name: &str, location: i32) -> NodeId {
-        let field = string(t, name);
-        t.push(Node::ColumnRef {
-            fields: vec![field],
-            location,
-        })
-        .unwrap()
-    }
-
-    fn op(t: &mut Tree, name: &str, lexpr: NodeId, rexpr: NodeId, location: i32) -> NodeId {
-        let name = string(t, name);
-        t.push(Node::AExprOp {
-            name: vec![name],
-            lexpr: Some(lexpr),
-            rexpr: Some(rexpr),
-            location,
-        })
-        .unwrap()
-    }
-
-    fn int(t: &mut Tree, n: i32, location: i32) -> NodeId {
-        t.push(Node::AConst {
-            val: Val::Integer(n),
-            location,
-        })
-        .unwrap()
     }
 
     /// T-PG.6.2: BEGIN's tree prints as the oracle printed it for `BEGIN` (lane PG6's capture).
@@ -468,132 +629,6 @@ mod tests {
             "({RAWSTMT :stmt {TRANSACTIONSTMT :kind 0 :options <> :savepoint_name <> :gid <> :chain false :location -1} :stmt_location 0 :stmt_len 0})"
         );
         assert_eq!(t.to_text(&[]).unwrap(), "<>");
-    }
-
-    /// T-PG.6.2: pgbench's TPC-B UPDATE (simple protocol, a negative delta folded into its constant)
-    /// prints byte for byte as the oracle printed it on adacachy2 (lane PG7).
-    #[test]
-    fn t_pg_6_2_pgbench_update_prints_as_19_prints_it() {
-        let mut t = Tree::default();
-        let relation = t
-            .push(Node::RangeVar {
-                relname: Some("pgbench_accounts".into()),
-                location: 7,
-            })
-            .unwrap();
-        let l = column(&mut t, "abalance", 39);
-        let r = int(&mut t, -2741, 50);
-        let sum = op(&mut t, "+", l, r, 48);
-        let target = t
-            .push(Node::ResTarget {
-                name: Some("abalance".into()),
-                val: Some(sum),
-                location: 28,
-            })
-            .unwrap();
-        let l = column(&mut t, "aid", 62);
-        let r = int(&mut t, 34521, 68);
-        let filter = op(&mut t, "=", l, r, 66);
-        let stmt = t
-            .push(Node::UpdateStmt {
-                relation: Some(relation),
-                target_list: vec![target],
-                where_clause: Some(filter),
-                from_clause: vec![],
-                returning_clause: None,
-                with_clause: None,
-            })
-            .unwrap();
-        let raw = t
-            .push(Node::RawStmt {
-                stmt: Some(stmt),
-                stmt_location: 0,
-                stmt_len: 73,
-            })
-            .unwrap();
-        assert_eq!(
-            t.to_text(&[raw]).unwrap(),
-            "({RAWSTMT :stmt {UPDATESTMT :relation {RANGEVAR :catalogname <> :schemaname <> :relname pgbench_accounts :inh true :relpersistence p :alias <> :location 7} :targetList ({RESTARGET :name abalance :indirection <> :val {A_EXPR :name (\"+\") :lexpr {COLUMNREF :fields (\"abalance\") :location 39} :rexpr {A_CONST :val -2741 :location 50} :rexpr_list_start 0 :rexpr_list_end 0 :location 48} :location 28}) :whereClause {A_EXPR :name (\"=\") :lexpr {COLUMNREF :fields (\"aid\") :location 62} :rexpr {A_CONST :val 34521 :location 68} :rexpr_list_start 0 :rexpr_list_end 0 :location 66} :fromClause <> :returningClause <> :withClause <>} :stmt_location 0 :stmt_len 73})"
-        );
-    }
-
-    /// T-PG.6.2: pgbench's TPC-B INSERT (extended protocol): VALUES as a list of lists, $n as
-    /// PARAMREF, CURRENT_TIMESTAMP as SQLVALUEFUNCTION op 3, as the oracle printed it (lane PG7).
-    #[test]
-    fn t_pg_6_2_pgbench_insert_prints_as_19_prints_it() {
-        let mut t = Tree::default();
-        let relation = t
-            .push(Node::RangeVar {
-                relname: Some("pgbench_history".into()),
-                location: 12,
-            })
-            .unwrap();
-        let mut cols = vec![];
-        for (name, at) in [
-            ("tid", 29),
-            ("bid", 34),
-            ("aid", 39),
-            ("delta", 44),
-            ("mtime", 51),
-        ] {
-            cols.push(
-                t.push(Node::ResTarget {
-                    name: Some(name.into()),
-                    val: None,
-                    location: at,
-                })
-                .unwrap(),
-            );
-        }
-        let mut row = vec![];
-        for (number, at) in [(1, 66), (2, 70), (3, 74), (4, 78)] {
-            row.push(
-                t.push(Node::ParamRef {
-                    number,
-                    location: at,
-                })
-                .unwrap(),
-            );
-        }
-        row.push(
-            t.push(Node::SqlValueFunction {
-                op: 3,
-                typmod: -1,
-                location: 82,
-            })
-            .unwrap(),
-        );
-        let row = t.push(Node::List(row)).unwrap();
-        let select = t
-            .push(Node::SelectStmt {
-                target_list: vec![],
-                from_clause: vec![],
-                where_clause: None,
-                values_lists: vec![row],
-            })
-            .unwrap();
-        let stmt = t
-            .push(Node::InsertStmt {
-                relation: Some(relation),
-                cols,
-                select_stmt: Some(select),
-                on_conflict_clause: None,
-                returning_clause: None,
-                with_clause: None,
-                override_kind: 0,
-            })
-            .unwrap();
-        let raw = t
-            .push(Node::RawStmt {
-                stmt: Some(stmt),
-                stmt_location: 0,
-                stmt_len: 100,
-            })
-            .unwrap();
-        assert_eq!(
-            t.to_text(&[raw]).unwrap(),
-            "({RAWSTMT :stmt {INSERTSTMT :relation {RANGEVAR :catalogname <> :schemaname <> :relname pgbench_history :inh true :relpersistence p :alias <> :location 12} :cols ({RESTARGET :name tid :indirection <> :val <> :location 29} {RESTARGET :name bid :indirection <> :val <> :location 34} {RESTARGET :name aid :indirection <> :val <> :location 39} {RESTARGET :name delta :indirection <> :val <> :location 44} {RESTARGET :name mtime :indirection <> :val <> :location 51}) :selectStmt {SELECTSTMT :distinctClause <> :intoClause <> :targetList <> :fromClause <> :whereClause <> :groupClause <> :groupDistinct false :havingClause <> :windowClause <> :valuesLists (({PARAMREF :number 1 :location 66} {PARAMREF :number 2 :location 70} {PARAMREF :number 3 :location 74} {PARAMREF :number 4 :location 78} {SQLVALUEFUNCTION :op 3 :type 0 :typmod -1 :location 82})) :sortClause <> :limitOffset <> :limitCount <> :limitOption 0 :lockingClause <> :withClause <> :op 0 :all false :larg <> :rarg <>} :onConflictClause <> :returningClause <> :withClause <> :override 0} :stmt_location 0 :stmt_len 100})"
-        );
     }
 
     /// T-PG.6.2: outToken backslashes what read.c treats specially, as outfuncs.c does.

@@ -21,13 +21,16 @@ pub(crate) use vtab::{
     create_virtual_table, ExtensionCursor, ExtensionTable, ModuleImplementation,
 };
 
-use crate::{function::ExternalFunc, Connection, Database};
+use crate::{
+    function::{ExternalFunc, WindowCallbacks},
+    Connection, Database,
+};
 use crate::{vtab::VirtualTable, SymbolTable};
 #[cfg(feature = "fs")]
 use crate::{LimboError, IO};
 use amphora_engine_ext::{
     ContextDestructor, ExtensionApi, InitAggFunction, ResultCode, ScalarFunction, VTabKind,
-    VTabModuleImpl, ValueDestructor,
+    VTabModuleImpl, ValueDestructor, ValueFunction,
 };
 pub use amphora_engine_ext::{
     FinalizeFunction, StepFunction, Value as ExtValue, ValueType as ExtValueType,
@@ -190,6 +193,64 @@ pub(crate) unsafe extern "C" fn register_aggregate_function(
     aggregate_destructor: Option<ContextDestructor>,
     value_destructor: Option<ValueDestructor>,
 ) -> ResultCode {
+    unsafe {
+        register_aggregate(
+            ctx,
+            name,
+            args,
+            context,
+            (init_func, step_func, finalize_func),
+            None,
+            (context_destructor, aggregate_destructor, value_destructor),
+        )
+    }
+}
+
+/// sqlite3_create_window_function: an aggregate with xValue and xInverse, usable over any frame.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe extern "C" fn register_window_function(
+    ctx: *mut c_void,
+    name: *const c_char,
+    args: i32,
+    context: usize,
+    init_func: InitAggFunction,
+    step_func: StepFunction,
+    finalize_func: FinalizeFunction,
+    value_func: ValueFunction,
+    inverse_func: StepFunction,
+    context_destructor: Option<ContextDestructor>,
+    aggregate_destructor: Option<ContextDestructor>,
+    value_destructor: Option<ValueDestructor>,
+) -> ResultCode {
+    unsafe {
+        register_aggregate(
+            ctx,
+            name,
+            args,
+            context,
+            (init_func, step_func, finalize_func),
+            Some(WindowCallbacks {
+                value: value_func,
+                inverse: inverse_func,
+            }),
+            (context_destructor, aggregate_destructor, value_destructor),
+        )
+    }
+}
+
+unsafe fn register_aggregate(
+    ctx: *mut c_void,
+    name: *const c_char,
+    args: i32,
+    context: usize,
+    func: (InitAggFunction, StepFunction, FinalizeFunction),
+    window: Option<WindowCallbacks>,
+    destructors: (
+        Option<ContextDestructor>,
+        Option<ContextDestructor>,
+        Option<ValueDestructor>,
+    ),
+) -> ResultCode {
     if ctx.is_null() || name.is_null() {
         return ResultCode::InvalidArgs;
     }
@@ -198,11 +259,13 @@ pub(crate) unsafe extern "C" fn register_aggregate_function(
         Ok(s) => crate::util::normalize_ident(s),
         Err(_) => return ResultCode::InvalidArgs,
     };
+    let (context_destructor, aggregate_destructor, value_destructor) = destructors;
     let function = match ExternalFunc::new_aggregate(
         name_str.clone(),
         args,
         context,
-        (init_func, step_func, finalize_func),
+        func,
+        window,
         context_destructor,
         aggregate_destructor,
         value_destructor,
@@ -304,6 +367,7 @@ impl Database {
                 builtin_vfs: std::ptr::null_mut(),
                 builtin_vfs_count: 0,
             },
+            register_window_function,
         };
 
         #[cfg(feature = "uuid")]
@@ -381,6 +445,7 @@ impl Connection {
                 builtin_vfs: std::ptr::null_mut(),
                 builtin_vfs_count: 0,
             },
+            register_window_function,
         }
     }
 

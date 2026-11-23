@@ -511,6 +511,7 @@ fn extension_constructors_validate_argument_counts() {
                 None,
                 None,
                 None,
+                None,
             ),
             ExternalFunc::new_native_scalar(
                 "delayed".into(),
@@ -603,6 +604,7 @@ fn rejected_c_functions_leave_context_ownership_with_the_caller() {
                             unused_aggregate_step,
                             unused_aggregate_finalize,
                         ),
+                        None,
                         Some(drop_context),
                         None,
                         None,
