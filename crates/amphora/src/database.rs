@@ -86,11 +86,6 @@ impl Admission {
         Self::charge(bytes, Self::bytes_for(operation))
     }
 
-    /// A call charged its command and the `answer` bytes its caller declared ([`AnswerMax`]).
-    fn reserve_call(bytes: &Arc<AtomicUsize>, answer: usize) -> Result<Self, Refusal> {
-        Self::charge(bytes, Self::fixed().saturating_add(answer))
-    }
-
     fn fixed() -> usize {
         std::mem::size_of::<Command>().saturating_add(std::mem::size_of::<Answer>())
     }
@@ -120,8 +115,8 @@ impl Admission {
     /// perf-A6); an SQL batch carries its statements and parameters and answers a result per
     /// statement, their rows' bytes at most `RESULT_MAX` (Ada, AUDIT §1: their real worst case,
     /// lane perf-A5). The rest keep the full request bound, `REQUEST_MAX`: a migration, an import's
-    /// page and its publication up to `REQUEST_MAX`, and a call's answer is whatever its closure
-    /// returns, which no API bound holds. Counts saturate: a sum past the address space is
+    /// page and its publication up to `REQUEST_MAX`. A call is charged the bytes its caller declared
+    /// its answer holds ([`AnswerMax`], carried in `Operation::Call`). Counts saturate: a sum past the address space is
     /// refused by the budget, never wrapped.
     fn bytes_for(operation: &Operation) -> usize {
         let fixed = Self::fixed();
@@ -188,8 +183,8 @@ impl Admission {
                     .saturating_add(results)
                     .saturating_add(api::RESULT_MAX)
             }
+            Operation::Call(_, answer) => *answer,
             Operation::Mutation(Mutation::Migrate(_))
-            | Operation::Call(_)
             | Operation::Import(_)
             | Operation::ImportProgress => api::REQUEST_MAX,
         };
@@ -425,7 +420,9 @@ enum Operation {
     Scan(String, Scan, LockedReads),
     Changes(String, Rev, usize),
     Head,
-    Call(Mutex<Option<Call>>),
+    /// A call, and the bytes its caller declared its answer holds ([`AnswerMax`]): what admission
+    /// charges it, on a local writer and a replicated owner alike.
+    Call(Mutex<Option<Call>>, usize),
     Import(amphora_api::import::ImportPage),
     ImportProgress,
 }
@@ -2054,7 +2051,6 @@ impl Database {
         database.submit_selected(
             "",
             Operation::Mutation(Mutation::Sql(Vec::new())),
-            None,
             until,
         )?;
         Ok(database)
@@ -2123,18 +2119,17 @@ impl Database {
         R: AnswerBytes + Send + 'static,
         F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + 'static,
     {
-        self.session(until, Some(answer.bytes), move |connection| {
+        self.session(until, answer.bytes, move |connection| {
             Ok(within(f(connection)?, answer)?)
         })
     }
 
     /// One SQL session on the writer, or on an attached client's owner. `answer`: the bytes its
-    /// answer is charged at admission on a local writer, `None` for the operation's own bound
-    /// ([`Database::query`] on a replicated or attached database, which admits nothing here).
+    /// answer is declared to hold, charged at admission ([`AnswerMax`]).
     fn session<R, F>(
         &self,
         until: Instant,
-        answer: Option<usize>,
+        answer: usize,
         f: F,
     ) -> Result<(R, Option<Token>), Refusal>
     where
@@ -2187,8 +2182,7 @@ impl Database {
         let mut answerer = Answerer(Some(Arc::clone(&slot)));
         self.submit_local(
             "",
-            Operation::Call(Mutex::new(Some(call))),
-            Some(answer.bytes),
+            Operation::Call(Mutex::new(Some(call)), answer.bytes),
             until,
             Instant::now(),
             move |result: Result<Answer, Refusal>| {
@@ -2229,15 +2223,16 @@ impl Database {
         R: Send + 'static,
         F: FnOnce(&mut Db) -> anyhow::Result<R> + Send + 'static,
     {
-        self.call_db_session(until, None, f).map(|(value, _)| value)
+        self.call_db_session(until, api::REQUEST_MAX, f)
+            .map(|(value, _)| value)
     }
 
-    /// `answer`: the bytes the call's answer is charged at admission ([`AnswerMax`]), `None`
-    /// for the full `REQUEST_MAX`.
+    /// `answer`: the bytes the call's answer is declared to hold, charged at admission
+    /// ([`AnswerMax`]).
     fn call_db_session<R, F>(
         &self,
         until: Instant,
-        answer: Option<usize>,
+        answer: usize,
         f: F,
     ) -> Result<(R, Option<Token>), Refusal>
     where
@@ -2245,10 +2240,8 @@ impl Database {
         F: FnOnce(&mut Db) -> anyhow::Result<R> + Send + 'static,
     {
         let call: Call = Box::new(move |db| f(db).map(|v| Box::new(v) as Box<dyn Any + Send>));
-        let operation = Operation::Call(Mutex::new(Some(call)));
-        match self
-            .resolve(until)?
-            .submit_selected("", operation, answer, until)?
+        let operation = Operation::Call(Mutex::new(Some(call)), answer);
+        match self.resolve(until)?.submit_selected("", operation, until)?
         {
             (Answer::Called(v), token) => v
                 .downcast::<R>()
@@ -2269,7 +2262,9 @@ impl Database {
     {
         let database = self.resolve(until)?;
         let Writer::Local(store) = &database.shared.writer else {
-            return database.session(until, None, f).map(|(value, _)| value);
+            return database
+                .session(until, api::REQUEST_MAX, f)
+                .map(|(value, _)| value);
         };
         let _in_flight = database
             .shared
@@ -2807,16 +2802,13 @@ impl Database {
         until: Instant,
     ) -> Result<(Answer, Option<Token>), Refusal> {
         self.resolve(until)?
-            .submit_selected(namespace, operation, None, until)
+            .submit_selected(namespace, operation, until)
     }
 
-    /// `call_answer`: the bytes a call's answer is charged at admission, `None` for the
-    /// operation's own bound ([`Admission::bytes_for`]).
     fn submit_selected(
         &self,
         namespace: &str,
         operation: Operation,
-        call_answer: Option<usize>,
         until: Instant,
     ) -> Result<(Answer, Option<Token>), Refusal> {
         if Instant::now() >= until {
@@ -2852,7 +2844,6 @@ impl Database {
         self.submit_local(
             namespace,
             operation,
-            call_answer,
             until,
             until,
             move |result| {
@@ -2876,7 +2867,6 @@ impl Database {
         &self,
         namespace: &str,
         operation: Operation,
-        call_answer: Option<usize>,
         until: Instant,
         room_until: Instant,
         reply: impl FnOnce(Result<Answer, Refusal>) + Send + 'static,
@@ -2887,10 +2877,7 @@ impl Database {
                 "only a local owner queues a call without blocking; call answers here",
             ));
         };
-        let admission = match call_answer {
-            Some(answer) => Admission::reserve_call(&self.shared.admitted, answer)?,
-            None => Admission::reserve(&self.shared.admitted, &operation)?,
-        };
+        let admission = Admission::reserve(&self.shared.admitted, &operation)?;
         // In flight from here to its answer, as a backed-up writer's checks yield to it.
         let in_flight = self
             .shared
@@ -2918,7 +2905,7 @@ impl Database {
                 &operation,
                 Operation::Mutation(Mutation::Compact { .. } | Mutation::CompactStep { .. })
             );
-        let wake = wake || matches!(&operation, Operation::Import(_) | Operation::Call(_));
+        let wake = wake || matches!(&operation, Operation::Import(_) | Operation::Call(..));
         let publish = match &operation {
             Operation::Mutation(Mutation::Records { namespace, tx }) if !tx.writes.is_empty() => {
                 let mut families = BTreeMap::new();
@@ -2935,7 +2922,7 @@ impl Database {
                 Mutation::Compact { namespace, .. } | Mutation::CompactStep { namespace, .. },
             ) => Some(Publish::Compact(namespace.clone())),
             Operation::Import(_) => Some(Publish::Imported(namespace.into())),
-            Operation::Call(_) => Some(Publish::Call),
+            Operation::Call(..) => Some(Publish::Call),
             _ => None,
         };
         let answer: Reply = Arc::new(Mutex::new(None));
@@ -3417,7 +3404,7 @@ impl Engine for Local {
         if rows.iter().any(|r| {
             matches!(
                 r.operation,
-                Operation::Call(_) | Operation::Mutation(Mutation::CompactStep { .. })
+                Operation::Call(..) | Operation::Mutation(Mutation::CompactStep { .. })
             )
         }) {
             for row in rows {
@@ -3451,7 +3438,7 @@ impl Engine for Local {
                             return Err(api::invalid("database", "restore is incomplete").into());
                         }
                         let result = (|| match &row.operation {
-                            Operation::Call(call) => {
+                            Operation::Call(call, _) => {
                                 let f = locked(call)?.take().ok_or_else(|| {
                                     anyhow::anyhow!("SQL session was already executed")
                                 })?;
@@ -3693,7 +3680,7 @@ fn apply(
             return import::progress(db, namespace)
                 .map(|progress| Ok(Answer::ImportProgress(progress)));
         }
-        Operation::Call(_) => {
+        Operation::Call(..) => {
             return Err(anyhow::anyhow!(
                 "SQL session reached replayable command dispatch"
             ));
@@ -3931,7 +3918,7 @@ fn apply(
         }
         Operation::Import(_)
         | Operation::ImportProgress
-        | Operation::Call(_)
+        | Operation::Call(..)
         | Operation::Mutation(Mutation::Sql(_) | Mutation::Migrate(_) | Mutation::Holding(_)) => {
             Err(anyhow::anyhow!(
                 "SQL operation reached the Records dispatch"
@@ -4339,9 +4326,11 @@ mod admission_charge {
         assert_eq!(largest - small, api::VALUE_MAX - 100);
         assert_eq!(Admission::bytes_for(&Operation::Head), fixed);
         let call: Call = Box::new(|_| Ok(Box::new(()) as Box<dyn Any + Send>));
+        let declared = AnswerMax::<[u64; 3]>::fixed().get();
         assert_eq!(
-            Admission::bytes_for(&Operation::Call(Mutex::new(Some(call)))),
-            fixed + api::REQUEST_MAX
+            Admission::bytes_for(&Operation::Call(Mutex::new(Some(call)), declared)),
+            fixed + declared,
+            "a call is charged the bytes its caller declared, not the request bound"
         );
         let row = std::mem::size_of::<Row>();
         let scan = |limit| {

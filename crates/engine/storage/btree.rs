@@ -11219,17 +11219,25 @@ mod tests {
 
     fn query_single_i64(conn: &Arc<Connection>, sql: &str) -> i64 {
         let mut stmt = conn.prepare(sql).unwrap();
-        match stmt.step().unwrap() {
-            StepResult::Row => stmt.row().unwrap().get::<i64>(0).unwrap(),
-            other => panic!("expected a row, got {other:?}"),
-        }
+        step_to_row(&mut stmt);
+        stmt.row().unwrap().get::<i64>(0).unwrap()
     }
 
     fn query_single_text(conn: &Arc<Connection>, sql: &str) -> String {
         let mut stmt = conn.prepare(sql).unwrap();
-        match stmt.step().unwrap() {
-            StepResult::Row => stmt.row().unwrap().get::<String>(0).unwrap(),
-            other => panic!("expected a row, got {other:?}"),
+        step_to_row(&mut stmt);
+        stmt.row().unwrap().get::<String>(0).unwrap()
+    }
+
+    /// Steps `stmt` to its first row. `PRAGMA integrity_check` yields after each read from the
+    /// file and takes the same page on re-entry (29cd28f4, T-T1.12.C8), so a caller steps again.
+    fn step_to_row(stmt: &mut crate::Statement) {
+        loop {
+            match stmt.step().unwrap() {
+                StepResult::Row => return,
+                StepResult::IO | StepResult::Yield => continue,
+                other => panic!("expected a row, got {other:?}"),
+            }
         }
     }
 
@@ -13367,7 +13375,7 @@ mod tests {
 
         let wal_file = io.open_file("test.wal", OpenFlags::Create, false).unwrap();
         let wal_shared = WalFileShared::new_shared(wal_file).unwrap();
-        let last_checksum_and_max_frame = wal_shared.read().last_checksum_and_max_frame();
+        let last_checksum_and_max_frame = wal_shared.current().read().last_checksum_and_max_frame();
         let wal: Arc<dyn Wal> = Arc::new(WalFile::new(
             io.clone(),
             wal_shared,

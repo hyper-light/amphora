@@ -18,7 +18,7 @@
 #            amphora-procs-persisted is the class whose acknowledgement matches rqlite's and dqlite's
 #            (a quorum's disks); libSQL and LiteFS acknowledge on the primary alone (their `about`).
 #   LADDER   default "1 8 32 128 512 2048 4096" (tiny instances may stop at 128).
-#   PROCS_PORT  Amphora's first member's port (default 54290; members take it and the next two).
+#   PROCS_PORT  Amphora's first member's port (default 29290; members take it and the next two).
 # Records: RECORDS/<system>-commit.jsonl (one line a rung), RECORDS/host.json (this host), and the
 # tables printed at the end (p50, p99, p99.9 in ms, commits a second, the client's cores in use),
 # the quorum systems and the primary-only ones apart (each record's `about.column`: the
@@ -31,7 +31,8 @@ shift
 FLAGS=("$@")
 SYSTEMS=${SYSTEMS:-amphora-procs-persisted amphora-procs-replicated rqlite dqlite libsql litefs}
 LADDER=${LADDER:-1 8 32 128 512 2048 4096}
-PROCS_PORT=${PROCS_PORT:-54290}
+# Below the ephemeral ranges, as bench/servers/repl/lib.sh says of the competitors' ports.
+PROCS_PORT=${PROCS_PORT:-29290}
 SCRIPTS="$HERE/servers/repl"
 mkdir -p "$RECORDS"
 # The top rung holds a connection a writer to each node it reaches: take the host's hard limit.

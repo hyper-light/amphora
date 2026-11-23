@@ -2,11 +2,11 @@
 # LiteFS, three candidates for one Consul lease, each `litefs mount` a process on this host
 # (setup.sh's release binaries), SQLite on each node's FUSE mount through the bench's shim
 # (shim/main.go, which LiteFS runs once the node is primary or follows one) on
-# 127.0.0.1:54260-54262; LiteFS's own HTTP on 54270-54272. The lease's holder is the primary; a
+# 127.0.0.1:29260-29262; LiteFS's own HTTP on 29270-29272. The lease's holder is the primary; a
 # commit is acknowledged once the primary's SQLite holds it (synchronous=FULL), and replicas stream it
 # after (LiteFS replicates asynchronously). A write to a replica fails read-only, so the harness sends
-# it on to the next node. Consul runs in dev mode beside the nodes (HTTP on 54280, its other ports
-# 54281-54283, DNS off), and goes with them. FUSE needs /dev/fuse and fusermount3 on the host.
+# it on to the next node. Consul runs in dev mode beside the nodes (HTTP on 29280, its other ports
+# 29281-29283, DNS off), and goes with them. FUSE needs /dev/fuse and fusermount3 on the host.
 #
 # Durability, from LiteFS v0.5.14's source (what setup.sh fetches) and its docs:
 # - The shim opens SQLite with synchronous=FULL (shim/main.go), and LiteFS's CommitWAL, run as
@@ -20,7 +20,7 @@
 # So the strongest LiteFS offers is the primary's own disk, fsynced: it can't match 2 of 3.
 set -euo pipefail
 SYS=litefs
-PORT=${AMPHORA_BENCH_REPL_PORT:-54260}
+PORT=${AMPHORA_BENCH_REPL_PORT:-29260}
 DURABILITY="acknowledged once the primary's SQLite WAL and LTX file hold it, fsynced (synchronous=FULL; LiteFS's CommitWAL syncs both); replicas stream it asynchronously and LiteFS has no mode that waits for one, so no quorum: one member's disk"
 # The comparability rule's column (lib.sh): a commit acknowledged by the primary alone; no mode waits for a replica (above).
 COLUMN="primary only"
