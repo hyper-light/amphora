@@ -611,3 +611,35 @@ Seen on the way, not changed:
 - `query_local_waiting` now needs `R: AnswerBytes` (it shares `session_waiting`), though its read takes no bound.
 - A11's "~280 lines name `query`": the query family has 10 callers outside database.rs (5 `query`, 1 `query_waiting`, 1 `query_local_waiting`, 3 `query_session`); most `.query(` matches are `Db::query` and the engine's.
 - across.rs's `Held::Locked` keys come from `xgroup::sql::locked`, built by `record_key` with `extend`, so capacity can pass length; A13 declared `KEY_MAX` for them; whether they're trimmed is not checked.
+
+## Unit 3 checked on the merged tree; unit 4 not built (perf-A15)
+
+**Unit 3's merge.** r1559 (A14's bench clippy, no `--locked`) ended rc 101; its list was cut at 40 lines by
+`head -40`, so it couldn't show a compile error further down. The coordinator's bar for bench (11-23): no new
+finding on the lines A14 changed, since bench's clippy fails on main itself (S7, T11, R1: 160-166 findings).
+Script `~/.cache/amphora-perf/cross-a15-scripts/check15.sh` (adacachy2, needs linux/amd64,cpus=8,mem=24g):
+
+| run | commit | result |
+|---|---|---|
+| r1582 | 4a2954bd (a6b275c4 + main 7cfe907e) | clippy -p amphora --all-targets clean; lib `a14_` 2/2, `database::admission_charge` 5/5, `database::across` 13/13 (1 ignored), `database::online` 6/6, `database::guards` 13/13, `xgroup::` 34/34; bench clippy 164 findings (main's own: println, env::args), 0 compile errors, none on A14's lines (cluster.rs 426-432, scale.rs 2014-2022); load 24-31 |
+| r1601 | 9dc7a735 (4a2954bd + main 8feb1cbe: pg-parser, one engine optimizer file, bench planner, scripts) | the same check, pending at hand-off; adacachy2 refused it once at 1 of 32 cores idle |
+
+Push 9dc7a735 to main once r1601 passes (main moved after r1582, so 4a2954bd itself no longer fast-forwards).
+
+**Unit 4, read and not started.** What the next lane needs:
+- `Config::queue` users: `Config::default()` is `Some(4096)`, so `Groups` (groups.rs:467, :525 take the caller's
+  config), reshard/replicated.rs tests (:424, :522), database.rs tests (:5180, :5298, :5319), tests/crash.rs:628,
+  tests/store.rs (`Some(1)`), bench/src/store.rs:195 (`AMPHORA_QUEUE`) and bench/src/suite_db.rs:317 (`..defaults`).
+  A `Database`'s own store already passes `None` (database.rs:2120).
+- `ROOM_LOOK` (store.rs:516) is reached only on `TrySendError::Full`, in `hand` (:1452) and `run` (:1549): only a
+  counted queue reports `Full`. Why it polls: the writer calls `room.1.notify_all()` (:1727 for rows, :1741 for a
+  run) without taking `room.0`, and a sender's `try_send` and its wait are not under that lock, so a wakeup
+  between them is lost. An event-driven wait keeps the room's state (bytes queued) under `room.0`: the sender
+  charges and checks under the lock and waits on the condvar until its deadline only; the writer releases a
+  batch's bytes under the lock, then notifies.
+- "By row" needs a row's size, which the `Engine` trait doesn't have (A11's note still holds): `E::Row` has no
+  byte size today. A `Database`'s row is a `Command`, whose charge is `Admission::bytes_for(&operation)`.
+- A standalone `query` with no free reader: `Store::read`/`read_committed` fall back to `self.run(until,
+  on_writer)` when `readers.with` gives `None` (store.rs:1488, :1520), queuing a `Msg::Run` on the unbounded
+  queue with no charge; `Database::query_reader`'s writer fallback is the place to charge it at admission (its
+  `AnswerMax` plus the closure).
