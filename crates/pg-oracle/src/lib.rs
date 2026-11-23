@@ -118,7 +118,7 @@ pub fn read_verdict(r: &mut impl BufRead) -> Result<Verdict, OracleError> {
     }
     let mut end = [0u8; 1];
     r.read_exact(&mut end)?;
-    if end != [b'\n'] {
+    if end != *b"\n" {
         return Err(OracleError::Frame("a body longer than its stated length"));
     }
     let body = String::from_utf8(body).map_err(|_| OracleError::Frame("a body that isn't UTF-8"))?;
@@ -139,7 +139,7 @@ mod tests {
     /// T-PG.3.1: the oracle's frames read back as the verdicts it printed.
     #[test]
     fn t_pg_3_1_frames_read_back_as_verdicts() {
-        assert_eq!(read("T 3\n(a\n)\n").unwrap(), Verdict::Tree("(a\n)".into()));
+        assert_eq!(read("T 4\n(a\n)\n").unwrap(), Verdict::Tree("(a\n)".into()));
         assert_eq!(
             read("E 42601 8 29\ntrailing junk after parameter\n").unwrap(),
             Verdict::Refused { sqlstate: "42601".into(), cursor: 8, message: "trailing junk after parameter".into() }
