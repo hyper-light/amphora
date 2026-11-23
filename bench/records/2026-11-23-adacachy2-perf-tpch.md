@@ -1103,5 +1103,7 @@ One line each, untraced:
 - The tests: `t13_a_page_miss_share_within_its_measured_noise_keeps_the_standing_share` (pager.rs)
   and `t13_two_plannings_against_one_version_choose_one_plan` (optimizer/mod.rs: q05's shape planned
   twice against one pinned version, with the learned seek rate moved a millionfold between; one plan).
-- r1637 (f9385553, the merge with main): clippy clean; the same tests 43 of 43. Main's commits since
-  the branch point touch no engine file.
+- r1637 (f9385553, the first merge with main): clippy clean; the same tests 43 of 43.
+- r1644 (29ce832d, the tree pushed to main: the merge with main's G15 `decimal.rs`, and the planning
+  test moved above t7_q05's doc comment, which it had split from its test): clippy clean; the same
+  tests 43 of 43.
