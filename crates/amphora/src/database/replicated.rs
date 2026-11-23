@@ -18607,8 +18607,11 @@ mod tests {
     /// class, each one write outstanding, and the leader crashed and restarted on its own files
     /// five times while they write (`Driven::restart`, a kill -9). A write refused, unanswered by
     /// a crashed member, or answered unknown is sent again at the next member, the same row
-    /// (`INSERT OR IGNORE` by its id), as the bench sends it. Expect: every writer acknowledged,
-    /// none left unanswered, and every replica holding each row once.
+    /// (`INSERT OR IGNORE` by its id), as the bench sends it. A writer acknowledged while crashes
+    /// remain writes its next row: under the write slot no follower write is refused stale (CP-T1.8,
+    /// lane V8), so the writers' first rows all land in one or two elections' settling and the
+    /// crashes need writes still to come (lane V10's trace, r1591). Expect: every writer
+    /// acknowledged, none left unanswered, and every replica holding each row once.
     #[test]
     fn writers_through_five_leader_crashes_each_land_and_every_acknowledged_row_is_held() {
         const WRITERS: usize = 32;
@@ -18643,6 +18646,8 @@ mod tests {
                 Some((via, submit(&clients[via], driven.until(), write(id))))
             })
             .collect();
+        // Each writer's row in flight: once acknowledged, it writes the next while crashes remain.
+        let mut row: Vec<usize> = (0..WRITERS).collect();
         let mut acknowledged = 0;
         let (mut crashes, mut again) = (0, 0u64);
         let mut rounds = 0;
@@ -18660,6 +18665,10 @@ mod tests {
                     Err(mpsc::TryRecvError::Disconnected) => true,
                     Ok(Ok(_)) => {
                         acknowledged += 1;
+                        if crashes < CRASHES {
+                            row[id] += WRITERS;
+                            *slot = Some((via, submit(&clients[via], driven.until(), write(row[id]))));
+                        }
                         false
                     }
                     Ok(Err(Refusal::Serialization { .. })) => true,
@@ -18674,7 +18683,7 @@ mod tests {
                 if resend {
                     again += 1;
                     let next = (via + 1) % 3;
-                    *slot = Some((next, submit(&clients[next], driven.until(), write(id))));
+                    *slot = Some((next, submit(&clients[next], driven.until(), write(row[id]))));
                 }
             }
             if crashes < CRASHES && acknowledged * (CRASHES + 1) >= WRITERS * (crashes + 1) {
@@ -18714,7 +18723,11 @@ mod tests {
                     Ok(ids)
                 })
                 .unwrap();
-            assert_eq!(ids, (0..WRITERS).collect::<Vec<_>>(), "owner {owner}");
+            let mut rows: Vec<usize> = (0..WRITERS)
+                .flat_map(|id| (id..=row[id]).step_by(WRITERS))
+                .collect();
+            rows.sort_unstable();
+            assert_eq!(ids, rows, "owner {owner}");
         }
         driven.drain(&mut pump);
         pump.finish();

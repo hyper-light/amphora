@@ -47,7 +47,7 @@ const CHARACTER_NOT_IN_REPERTOIRE: &str = "22021";
 const INTERNAL_ERROR: &str = "XX000";
 
 /// scanner_errposition: the 1-based character position of byte `at` (pg_mbstrlen_with_len + 1).
-fn cursor(input: &[u8], at: usize) -> usize {
+pub(crate) fn cursor(input: &[u8], at: usize) -> usize {
     input
         .iter()
         .take(at)

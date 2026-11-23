@@ -13,6 +13,9 @@
     )
 )]
 
+pub mod gram;
+#[rustfmt::skip]
+pub mod gram_tables;
 pub mod lex;
 pub mod scan;
 #[rustfmt::skip]
