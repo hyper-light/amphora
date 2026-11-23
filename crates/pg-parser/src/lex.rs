@@ -492,7 +492,7 @@ impl<'a> Core<'a> {
                 self.lloc = start;
                 return Ok(Some(integer(text, start)));
             }
-            61 | 62 | 63 => {
+            61..=63 => {
                 self.lloc = start;
                 return Err(self.error(match rule {
                     61 => "invalid hexadecimal integer",
