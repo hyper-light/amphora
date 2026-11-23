@@ -28,9 +28,13 @@ Command: `REPS=3 CLIENTS="1 64" READS=4000 STORAGES="versioned default" BASE_SHA
 | default, 1 (control) | 1,165,197, 816,010, 860,102 | 977,236, 1,091,892, 1,122,122 | unchanged (noise) |
 | default, 64 (control) | 1,472,108, 1,474,473, 1,436,985 | 1,837,853, 2,251,200, 1,585,398 | unchanged (noise; other lanes' main changes) |
 
-Before, each versioned SELECT waited on a lane flush (3-10 ms at this load); after, none does. The
-versioned storage's point reads remain 2.3-4x below the default storage's at 64 clients: items 2
-and 3 below.
+The single-reader counter test establishes the redo work removed from this workload. The timed
+harness released its workers before the reporter started its clock. Any reads completed in that
+interval contributed to throughput with their elapsed time omitted. The after arm also included
+the CopyId change. These rates cannot establish an isolated speedup for the unwritten transaction.
+A reader finishing after another writer publishes may still need to flush that writer (T-T1.3.1).
+The revised harness starts the clock before releasing the prepared workers. Each SELECT must
+return its bound key's expected value exactly once, and the reported count sums those answers.
 
 ## Item 2, part: a leaf copy's id per thread (perf-C2, branch perf/versioned e7259743, not merged)
 
