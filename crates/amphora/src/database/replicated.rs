@@ -6116,6 +6116,10 @@ mod tests {
                     }
                     for message in self.clients.get(index).unwrap().handle().drain(1).unwrap() {
                         drained = true;
+                        if std::env::var_os("P11TRACE").is_some() {
+                            let m = Message::decode(&message.bytes).unwrap();
+                            eprintln!("P11TRACE {:?} {}->{} term {} idx {} commit {} n {} reject {} lost_appends {}", m.msg_type, from, message.to, m.term, m.index, m.commit, m.entries.len(), m.reject, self.appends_lost);
+                        }
                         if self.lost.contains(&message.to)
                             || (self.appends_lost
                                 && Message::decode(&message.bytes).unwrap().msg_type
@@ -15562,7 +15566,9 @@ mod tests {
             vec![1, 2, 3]
         );
 
+        eprintln!("P11MARK raise1 begin");
         let refused = raise(&mut driven, &mut pump, led, 7);
+        eprintln!("P11MARK raise1 answered {refused:?}");
         assert!(
             matches!(&refused, Err(Refusal::Unavailable(why)) if why.contains("leaving a joint configuration")),
             "{refused:?}"
@@ -15578,7 +15584,9 @@ mod tests {
                 .is_empty()
         );
         pump.appends_lost = false;
+        eprintln!("P11MARK appends flow");
         settled(&mut driven, &mut pump, 3, &[4]);
+        eprintln!("P11MARK settled");
         let again = raise(&mut driven, &mut pump, led, 7);
         assert!(
             matches!(&again, Err(Refusal::Unavailable(why)) if why.contains("members [4]")),
