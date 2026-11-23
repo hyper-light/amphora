@@ -2906,9 +2906,9 @@ its outgoing queue, as it already rings `drain_wait`'s condition, and when it en
 member that went. The bench gives every member the same bell, and `stop` rings it too. Lane scaleout-harness-9 wrote
 the same hook for `scale.rs`'s relay; lane ryw-5 made the two one (`listen`, which `on_sent` had been). The bell
 keeps a ring given while the relay is moving records, so no record waits for a later ring. A member's records have
-one host to take them, so a waker given again replaces the one before. Each pass drains a member's whole queue:
-`drain` at `ReplicaHandle::outgoing_bound`, the most records the queue holds before its owner fences, where the relay
-drained a picked 4096 before (lane ryw-6, tested by `a_drain_at_the_queues_bound_takes_the_whole_queue`).
+one host to take them, so a waker given again replaces the one before. Each pass takes every record already in a member's queue
+with `ReplicaHandle::drain_all`. The learned bound can shrink below the backlog between passes
+(QB.1, tested by `a_whole_queue_drain_survives_a_shrinking_learned_bound`).
 `amphora_ryw`'s records now carry `relay`: its kind (`Bell` or `Park`), its passes, records moved, waits and the
 wakes that found nothing to move.
 
