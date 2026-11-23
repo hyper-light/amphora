@@ -19,10 +19,11 @@ impl AggFunc for Median {
     const NAME: &'static str = "median";
     const ARGS: i32 = 1;
 
-    fn step(state: &mut Self::State, args: &[Value]) {
+    fn step(state: &mut Self::State, args: &[Value]) -> Result<(), Self::Error> {
         if let Some(val) = args.first().and_then(Value::to_float) {
             state.push(val);
         }
+        Ok(())
     }
 
     fn finalize(state: Self::State) -> Result<Value, Self::Error> {
@@ -53,7 +54,7 @@ impl AggFunc for Percentile {
     const NAME: &'static str = "percentile";
     const ARGS: i32 = 2;
 
-    fn step(state: &mut Self::State, args: &[Value]) {
+    fn step(state: &mut Self::State, args: &[Value]) -> Result<(), Self::Error> {
         let (values, p_value, err_value) = state;
         if let (Some(y), Some(p)) = (
             args.first().and_then(Value::to_float),
@@ -61,19 +62,20 @@ impl AggFunc for Percentile {
         ) {
             if !(0.0..=100.0).contains(&p) {
                 err_value.get_or_insert("Invalid percentile value");
-                return;
+                return Ok(());
             }
 
             if let Some(existing_p) = *p_value {
                 if (existing_p - p).abs() >= 0.001 {
                     err_value.get_or_insert("Inconsistent percentile values across rows");
-                    return;
+                    return Ok(());
                 }
             } else {
                 *p_value = Some(p);
             }
             values.push(y);
         }
+        Ok(())
     }
 
     fn finalize(state: Self::State) -> Result<Value, Self::Error> {
@@ -115,7 +117,7 @@ impl AggFunc for PercentileCont {
     const NAME: &'static str = "percentile_cont";
     const ARGS: i32 = 2;
 
-    fn step(state: &mut Self::State, args: &[Value]) {
+    fn step(state: &mut Self::State, args: &[Value]) -> Result<(), Self::Error> {
         let (values, p_value, err_state) = state;
         if let (Some(y), Some(p)) = (
             args.first().and_then(Value::to_float),
@@ -123,19 +125,20 @@ impl AggFunc for PercentileCont {
         ) {
             if !(0.0..=1.0).contains(&p) {
                 err_state.get_or_insert("Percentile value must be between 0.0 and 1.0 inclusive");
-                return;
+                return Ok(());
             }
 
             if let Some(existing_p) = *p_value {
                 if (existing_p - p).abs() >= 0.001 {
                     err_state.get_or_insert("Inconsistent percentile values across rows");
-                    return;
+                    return Ok(());
                 }
             } else {
                 *p_value = Some(p);
             }
             values.push(y);
         }
+        Ok(())
     }
 
     fn finalize(state: Self::State) -> Result<Value, Self::Error> {
@@ -177,12 +180,12 @@ impl AggFunc for PercentileDisc {
     const NAME: &'static str = "percentile_disc";
     const ARGS: i32 = 2;
 
-    fn step(state: &mut Self::State, args: &[Value]) {
+    fn step(state: &mut Self::State, args: &[Value]) -> Result<(), Self::Error> {
         // Fraction in [0, 1], like percentile_cont and unlike percentile -- as
         // in SQLite's ext/misc/percentile.c and PostgreSQL. Using
         // Percentile::step admitted p up to 100 while finalize indexes by
         // fraction, so percentile_disc(x, 100) ran off the end.
-        PercentileCont::step(state, args);
+        PercentileCont::step(state, args)
     }
 
     fn finalize(state: Self::State) -> Result<Value, Self::Error> {
@@ -222,7 +225,7 @@ impl AggFunc for StandardDeviation {
     const NAME: &'static str = "stddev";
     const ARGS: i32 = 1;
 
-    fn step(state: &mut Self::State, args: &[Value]) {
+    fn step(state: &mut Self::State, args: &[Value]) -> Result<(), Self::Error> {
         let (count, mean, m2) = state;
 
         if let Some(x) = args.first().and_then(Value::to_float) {
@@ -236,6 +239,7 @@ impl AggFunc for StandardDeviation {
             let delta_2 = x - *mean;
             *m2 += delta * delta_2;
         }
+        Ok(())
     }
 
     fn finalize(state: Self::State) -> Result<Value, Self::Error> {
@@ -260,7 +264,7 @@ mod tests {
     fn run_rows<A: AggFunc<State = PctState>>(rows: &[(f64, f64)]) -> Result<Value, A::Error> {
         let mut state = PctState::default();
         for (y, p) in rows {
-            A::step(&mut state, &[Value::from_float(*y), Value::from_float(*p)]);
+            A::step(&mut state, &[Value::from_float(*y), Value::from_float(*p)])?;
         }
         A::finalize(state)
     }

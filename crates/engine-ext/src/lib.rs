@@ -10,9 +10,9 @@ pub use amphora_engine_macros::{
 };
 pub use functions::{
     AggCtx, AggFunc, ContextDestructor, FinalizeFunction, InitAggFunction, ScalarFunc,
-    ScalarFunction, StepFunction, ValueDestructor,
+    ScalarFunction, StepFunction, ValueDestructor, ValueFunction, WindowAggFunc,
 };
-use functions::{RegisterAggFn, RegisterScalarFn, UnregisterFunctionFn};
+use functions::{RegisterAggFn, RegisterScalarFn, RegisterWindowFn, UnregisterFunctionFn};
 use std::os::raw::c_void;
 pub use types::{ResultCode, StepResult, Value, ValueType};
 #[cfg(feature = "vfs")]
@@ -40,6 +40,7 @@ pub struct ExtensionApi {
     pub register_vtab_module: RegisterModuleFn,
     #[cfg(feature = "vfs")]
     pub vfs_interface: VfsInterface,
+    pub register_window_function: RegisterWindowFn,
 }
 
 unsafe impl Send for ExtensionApi {}

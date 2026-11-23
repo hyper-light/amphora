@@ -41,10 +41,30 @@ pub type RegisterAggFn = unsafe extern "C" fn(
     value_destructor: Option<ValueDestructor>,
 ) -> ResultCode;
 
+/// sqlite3_create_window_function's form of RegisterAggFn: an aggregate that also gives its
+/// value without finishing (xValue) and takes a row back out (xInverse), so a window frame can
+/// slide over it.
+pub type RegisterWindowFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    name: *const c_char,
+    args: i32,
+    context: usize,
+    init: InitAggFunction,
+    step: StepFunction,
+    finalize: FinalizeFunction,
+    value: ValueFunction,
+    inverse: StepFunction,
+    context_destructor: Option<ContextDestructor>,
+    aggregate_destructor: Option<ContextDestructor>,
+    value_destructor: Option<ValueDestructor>,
+) -> ResultCode;
+
 pub type InitAggFunction = unsafe extern "C" fn(context: usize) -> *mut AggCtx;
 pub type StepFunction =
     unsafe extern "C" fn(context: usize, ctx: *mut AggCtx, argc: i32, argv: *const Value) -> Value;
 pub type FinalizeFunction = unsafe extern "C" fn(context: usize, ctx: *mut AggCtx) -> Value;
+/// The aggregate's value so far; unlike FinalizeFunction it leaves the state in place.
+pub type ValueFunction = unsafe extern "C" fn(context: usize, ctx: *mut AggCtx) -> Value;
 
 #[repr(C)]
 pub struct AggCtx {
@@ -57,8 +77,17 @@ pub trait AggFunc {
     const NAME: &'static str;
     const ARGS: i32;
 
-    fn step(state: &mut Self::State, args: &[Value]);
+    /// An Err fails the statement at this row, as sqlite3_result_error in an xStep does.
+    fn step(state: &mut Self::State, args: &[Value]) -> Result<(), Self::Error>;
     fn finalize(state: Self::State) -> Result<Value, Self::Error>;
+}
+
+/// An aggregate usable over any window frame (sqlite3_create_window_function): `value` reads the
+/// result so far and `inverse` takes back a row an earlier `step` added. Derive with
+/// `#[derive(AggregateDerive)] #[window]`.
+pub trait WindowAggFunc: AggFunc {
+    fn inverse(state: &mut Self::State, args: &[Value]) -> Result<(), Self::Error>;
+    fn value(state: &Self::State) -> Result<Value, Self::Error>;
 }
 
 /// A scalar function that carries opaque, per-registration state.
