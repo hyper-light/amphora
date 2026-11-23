@@ -521,7 +521,7 @@ fn without_rowid_update_delete_returning_metadata_and_values() {
         INSERT INTO returned VALUES(1,'one'),(2,'two'),(3,'three')",
     );
     let updated = db
-        .call(until(), AnswerMax::fixed(), |c| {
+        .call(until(), AnswerMax::bytes(amphora_api::RESULT_MAX), |c| {
             let mut statement = c.prepare(
                 "UPDATE returned SET v=v || '-new' WHERE id<=2
             RETURNING id AS changed_id,v AS new_value",
@@ -537,7 +537,7 @@ fn without_rowid_update_delete_returning_metadata_and_values() {
         .unwrap();
     assert_eq!(updated, vec![(1, "one-new".into()), (2, "two-new".into())]);
     let deleted = db
-        .call(until(), AnswerMax::fixed(), |c| {
+        .call(until(), AnswerMax::bytes(amphora_api::RESULT_MAX), |c| {
             let mut statement = c.prepare(
                 "DELETE FROM returned WHERE id<=2
             RETURNING id AS deleted_id,v AS old_value",
