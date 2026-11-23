@@ -13,7 +13,7 @@ use tracing::{instrument, Level};
 use crate::plan_cache::{CustomRun, PlanCacheMode, PlanChoice, PlanKind, PlanValues};
 use crate::{alloc::TursoIteratorExt, connection::PrepareOptions};
 use crate::{
-    busy::{BusyHandler, BusyHandlerState, BusyWake, LockRelease},
+    busy::{BusyHandler, BusyHandlerState, BusyWake, LockRelease, OwnReleases},
     parameters,
     schema::Trigger,
     stats::{refresh_analyze_stats_nonblock, RefreshAnalyzeStatsState},
@@ -895,10 +895,13 @@ impl Statement {
             return self.drive_analyze_refresh(waker);
         }
         // Amphora (lane constants-22): the releases so far, read before the step tries its locks,
-        // so a release after a failed try is seen when it waits ([`LockRelease::wait`]).
-        if let Some(release) = self.lock_release.as_ref() {
+        // so a release after a failed try is seen when it waits ([`LockRelease::wait`]); this
+        // step's own releases counted apart (lane perf-A5).
+        let own = self.lock_release.as_ref().map(|release| {
+            let own = release.own_releases();
             self.release_seen = release.generation();
-        }
+            own
+        });
         // Amphora (PL.13): a run handed to a second prepare starts again here, once.
         let res = loop {
             if matches!(self.state.execution_state, ProgramExecutionState::Init)
@@ -932,7 +935,7 @@ impl Statement {
                 }
             }
         };
-        self.finish_step(res, waker)
+        self.finish_step(res, waker, own)
     }
 
     /// Amphora (PL.13, the in-run hand-off; `docs/design/planner.md`, "Decision (lane pl13)"): an
@@ -1083,6 +1086,7 @@ impl Statement {
         &mut self,
         mut res: std::result::Result<StepResult, Box<LimboError>>,
         waker: Option<&Waker>,
+        own: Option<OwnReleases>,
     ) -> Result<StepResult> {
         const MAX_SCHEMA_RETRY: usize = 50;
         for attempt in 0..MAX_SCHEMA_RETRY {
@@ -1178,7 +1182,8 @@ impl Statement {
                 if let Some(left) = busy_state.until_released(max, now) {
                     // Registered: sleep until the release (or the deadline). A release came
                     // since the step read the count: step again now.
-                    let duration = if release.wait(self.release_seen, waker) {
+                    let own = own.unwrap_or_else(|| release.own_releases());
+                    let duration = if release.wait(self.release_seen, &own, waker) {
                         left
                     } else {
                         Duration::ZERO

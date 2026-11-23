@@ -35,6 +35,7 @@ mod reach;
 mod repl;
 mod scale;
 mod schema;
+mod serve;
 mod skipping;
 mod sqlapi;
 mod store;
@@ -583,7 +584,8 @@ fn main() -> anyhow::Result<()> {
         "cedardb" => Arc::new(pool::Pooled::new(pg::Pg::connect(&dsn("postgres://postgres:amphorabenchlocalonly2026@127.0.0.1:55434/postgres"), pg::Engine::Cedardb)?, k, q)?),
         "clickhouse" => Arc::new(pool::Pooled::new(clickhouse::ClickHouse::connect(&dsn("http://127.0.0.1:58123"), false, k + o.readers + 2)?, k, q)?),
         "clickhouse-durable" => Arc::new(pool::Pooled::new(clickhouse::ClickHouse::connect(&dsn("http://127.0.0.1:58123"), true, k + o.readers + 2)?, k, q)?),
-        t => anyhow::bail!("unknown target {t} (amphora, turso, sqlite, vitess, mysql, postgres, orioledb, cedardb, clickhouse, clickhouse-durable, null)"),
+        "amphora-serve" => Arc::new(pool::Pooled::new(serve::AmphoraServe::connect(&dsn(&serve::default_config()))?, k, q)?),
+        t => anyhow::bail!("unknown target {t} (amphora, turso, sqlite, vitess, mysql, postgres, orioledb, cedardb, clickhouse, clickhouse-durable, amphora-serve, null)"),
     };
 
     // Preload: every session's history, a hundred events a write, writers side by side.
