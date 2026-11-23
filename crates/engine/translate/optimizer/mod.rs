@@ -4328,6 +4328,79 @@ pub(crate) mod bushy_test_hook {
             );
         }
 
+        /// Lane T6 (TPC-H q05 at SF1 passed 10 s): q05's shape, where a run `s n` probed by `r`
+        /// matches each outer row to every supplier in ASIA, and `l.sk = s.id` and
+        /// `c.nk = s.nk`, joining the run to the outer loops, run only after that match. The
+        /// planner prices the match's visits, so the plan it chooses takes fewer steps than that
+        /// match alone visits, and answers as the nested loops do.
+        #[test]
+        fn t6_q05_terms_from_a_run_to_the_outer_loops_are_priced_after_its_match() {
+            let io = Arc::new(MemoryIO::new());
+            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            for sql in [
+                "CREATE TABLE r(id INTEGER PRIMARY KEY, name TEXT)",
+                "CREATE TABLE n(id INTEGER PRIMARY KEY, rk INT)",
+                "CREATE TABLE s(id INTEGER PRIMARY KEY, nk INT)",
+                "CREATE TABLE c(id INTEGER PRIMARY KEY, nk INT)",
+                "CREATE TABLE o(id INTEGER PRIMARY KEY, cid INT, d INT)",
+                "CREATE TABLE l(id INTEGER PRIMARY KEY, oid INT, sk INT)",
+                "CREATE INDEX l_oid ON l(oid)",
+                "CREATE INDEX n_rk ON n(rk)",
+                "CREATE INDEX s_nk ON s(nk)",
+                "CREATE INDEX c_nk ON c(nk)",
+                "INSERT INTO r VALUES (1, 'AFRICA'), (2, 'AMERICA'), (3, 'ASIA'), (4, 'EUROPE'), \
+                 (5, 'MIDDLE EAST')",
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 25) \
+                 INSERT INTO n SELECT i, i % 5 + 1 FROM x",
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 2500) \
+                 INSERT INTO s SELECT i, i % 25 + 1 FROM x",
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 1500) \
+                 INSERT INTO c SELECT i, i % 25 + 1 FROM x",
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 15000) \
+                 INSERT INTO o SELECT i, i % 1500 + 1, i % 7 FROM x",
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 60000) \
+                 INSERT INTO l SELECT i, i % 15000 + 1, i * 7 % 2500 + 1 FROM x",
+                "ANALYZE",
+            ] {
+                conn.execute(sql).unwrap();
+            }
+            let sql = "SELECT n.id, count(*) FROM c, o, l, s, n, r \
+                       WHERE c.id = o.cid AND l.oid = o.id AND l.sk = s.id AND c.nk = s.nk \
+                       AND s.nk = n.id AND n.rk = r.id AND r.name = 'ASIA' AND o.d = 3 \
+                       GROUP BY n.id";
+            conn.set_join_methods(JoinMethods::NestedLoopsOnly);
+            let nested_loops = rows(&conn, sql);
+            let count = |sql: &str| -> u64 { rows(&conn, sql)[0].parse().unwrap() };
+            let late_match = count(
+                "SELECT count(*) FROM c, o, l WHERE c.id = o.cid AND l.oid = o.id AND o.d = 3",
+            ) * count(
+                "SELECT count(*) FROM s, n, r WHERE s.nk = n.id AND n.rk = r.id AND r.name = 'ASIA'",
+            );
+            conn.set_join_methods(JoinMethods::ByCost);
+            let mut stmt = conn.prepare(sql).unwrap();
+            let mut chosen: Vec<String> = stmt
+                .run_collect_rows()
+                .unwrap()
+                .into_iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|value| value.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .collect();
+            chosen.sort();
+            let steps = stmt.stmt_status(crate::StatementStatusCounter::VmStep);
+            let plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+            assert!(!nested_loops.is_empty());
+            assert_eq!(chosen, nested_loops, "{plan:?}");
+            assert!(
+                steps < late_match,
+                "{steps} steps, the match before the terms alone visits {late_match}: {plan:?}"
+            );
+        }
+
         /// PL.8 (T-PL.8.13, lane pl8-19): the hand-built bushy tree `(a ((b l c) p))` whose run
         /// holds a LEFT JOIN of `q` (as `l`) on `b`, the run's table its ON reads, matching some
         /// of `b`'s rows and not others; with an ON term no index reads, and WHERE terms on the
