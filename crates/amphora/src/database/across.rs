@@ -399,10 +399,8 @@ fn page_at(
     let upper = super::successor(&scan.prefix);
     // The whole range the scan covers, not only this page's rows: a held put of a row the page
     // doesn't show yet would land in it.
-    if let Some(row) =
-        crate::xgroup::sql::held_at(db, ns, family, &scan.prefix, upper.as_deref(), at)?
-    {
-        return Ok(Ok(Held::Locked(row)));
+    if crate::xgroup::sql::held_at(db, ns, family, &scan.prefix, upper.as_deref(), at)? {
+        return Ok(Ok(Held::Locked));
     }
     // The same four shapes as a group's own scan, the cursor and the upper bound outside the
     // read's OR; a cursor below the prefix is the prefix's own first seek.
@@ -483,8 +481,8 @@ fn row_at(
     }
     let mut next = key.to_vec();
     next.push(0);
-    if let Some(row) = crate::xgroup::sql::held_at(db, ns, family, key, Some(&next), at)? {
-        return Ok(Ok(Held::Locked(row)));
+    if crate::xgroup::sql::held_at(db, ns, family, key, Some(&next), at)? {
+        return Ok(Ok(Held::Locked));
     }
     let mut found = None;
     db.query(
@@ -513,10 +511,9 @@ fn row_at(
 /// (lane split-merge-21, T-T1.9.R28).
 enum Held<T> {
     Read(T),
-    /// A write lock whose stamp is at or before the read's, on this row by its cross-group key:
-    /// the transaction's commit stamp may be too, so its rows may belong in the read. The read
-    /// waits for it to resolve, on that row's waiter list.
-    Locked(Vec<u8>),
+    /// A write lock whose stamp is at or before the read's: the transaction's commit stamp may be
+    /// too, so its rows may belong in the read. The read waits for it to resolve.
+    Locked,
 }
 
 #[cfg(test)]
@@ -525,7 +522,7 @@ impl<T> Held<T> {
     fn read(self) -> T {
         match self {
             Held::Read(answer) => answer,
-            Held::Locked(row) => panic!("a lock on {row:?} held the read"),
+            Held::Locked => panic!("a lock held the read"),
         }
     }
 }
@@ -540,41 +537,57 @@ fn held_whole<T>(
     cut: u64,
     read: impl FnOnce(&Db) -> anyhow::Result<Result<T, Refusal>>,
 ) -> anyhow::Result<Result<Held<T>, Refusal>> {
-    if let Some(row) = crate::xgroup::sql::held_at(db, ns, family, &[], None, cut)? {
-        return Ok(Ok(Held::Locked(row)));
+    if crate::xgroup::sql::held_at(db, ns, family, &[], None, cut)? {
+        return Ok(Ok(Held::Locked));
     }
     Ok(read(db)?.map(Held::Read))
 }
 
 /// Reads `read` in `group` as of a stamp, waiting out each lock in its way (lane split-merge-21,
 /// T-T1.9.R28): no read across groups answers part of a transaction, its rows resolved in one
-/// group and not yet in another. It waits on the event, never a timer: on the waiter list of the
-/// row whose lock held it, rung only by the step that resolves a transaction there and drops that
-/// row's locks (lane split-merge-22, xgroup-sql-11's `LockedReads::WaitOnLock`, as a Records get
-/// waits; a replicated group's reads wait on its change event instead), so neither another row's
-/// resolution nor any other call in the group sends it reading again. `Timeout` at `until`. A
-/// read that waited is counted (`Database::locked_waits`, `locked_wakes`) and on the trace
-/// (`held_read`).
+/// group and not yet in another. It waits on the event, never a timer: a waker registered in the
+/// group's publisher, then the read again, so a resolution between the two isn't missed; it reads
+/// again only once the group's count of resolutions moved, so the wakes of other steps and reads
+/// (each call wakes every watcher) never send it reading. `Timeout` at `until`. A read that waited
+/// is counted on the trace (`held_read`).
 fn waiting<T, F>(group: &Database, until: Instant, read: F) -> Result<T, Refusal>
 where
     T: Send + 'static,
     F: Fn(&Db) -> anyhow::Result<Result<Held<T>, Refusal>> + Send + Sync + 'static,
 {
     let read = Arc::new(read);
-    let mut traced = false;
-    group.wait_locked(super::LockedReads::WaitOnLock, until, || {
+    let signal = Arc::new(Signal::default());
+    let mut registered = None::<Registered>;
+    loop {
+        let seen = group.resolutions(until)?;
         let try_read = Arc::clone(&read);
-        match group.call_internal(until, move |db| try_read(&*db))?? {
-            Held::Read(answer) => Ok(Ok(answer)),
-            Held::Locked(row) => {
-                if !traced {
-                    traced = true;
-                    tracing::trace!(target: "amphora.records", event = "held_read", "a read across groups waits for a lock to resolve");
-                }
-                Ok(Err(row))
-            }
+        if let Held::Read(answer) = group.call_internal(until, move |db| try_read(&*db))?? {
+            return Ok(answer);
         }
-    })
+        if registered.is_none() {
+            let publisher = Arc::clone(&group.resolve(until)?.shared.changed);
+            let waker = std::task::Waker::from(Arc::clone(&signal));
+            let id = super::locked(&publisher.watchers)?.register(waker)?;
+            registered = Some(Registered(vec![(publisher, id)]));
+            tracing::trace!(target: "amphora.records", event = "held_read", "a read across groups waits for a lock to resolve");
+            continue;
+        }
+        while group.resolutions(until)? == seen {
+            let woken = super::locked(&signal.woken)?;
+            let (mut woken, timeout) = signal
+                .event
+                .wait_timeout_while(
+                    woken,
+                    until.saturating_duration_since(Instant::now()),
+                    |w| !*w,
+                )
+                .map_err(unavailable)?;
+            if !*woken && timeout.timed_out() {
+                return Err(Refusal::Timeout);
+            }
+            *woken = false;
+        }
+    }
 }
 
 /// The namespace's head across groups: the cut, a stamp every group has made all its revisions
@@ -2095,7 +2108,7 @@ mod tests {
                 .call_internal(until(), move |db| {
                     Ok(match row_at(db, "n", "f", &k, stamp)? {
                         Ok(Held::Read(row)) => Some(row.map(|r| r.rev)),
-                        Ok(Held::Locked(_)) => None,
+                        Ok(Held::Locked) => None,
                         Err(refusal) => anyhow::bail!("{refusal}"),
                     })
                 })
@@ -2227,73 +2240,5 @@ mod tests {
             );
             assert_eq!(stamps(&["3a", "3b"]), vec![None, None], "{protocol:?}");
         }
-    }
-
-    /// T-T1.9.R31 (CP-T1.9; reshard.md, "Decision (lane split-merge-22): Records::commit and
-    /// recovery on the one stamp", its waits). Do: two backed-up groups, rows ending in b routed to
-    /// the second; two transactions each locking one row there, 1b and 2b, their steps served as
-    /// the transport serves them; a get across groups of 1b as of the later lock's stamp, begun
-    /// while both are held; the transaction on 2b resolved, then the one on 1b. Expect: the get
-    /// waits; 2b's resolution wakes nothing (no wake counted in the second group); 1b's wakes it
-    /// once, and it answers 1b's row at its commit stamp.
-    #[test]
-    fn t_t1_9_r31_a_held_read_across_groups_wakes_only_for_its_own_row() {
-        use crate::xgroup::{Envelope, Outcome, Reply, Step, TxnId};
-        let dir = tempfile::tempdir().unwrap();
-        let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS + 1));
-        let route: crate::xgroup::Route =
-            Arc::new(|key: &[u8]| u32::from(key.last() == Some(&b'b')));
-        let (dbs, _sinks, cluster) = groups_on(
-            dir.path(),
-            2,
-            |_| {
-                let read = Arc::clone(&now);
-                Arc::new(move || read.fetch_add(1, Ordering::SeqCst))
-            },
-            route,
-        );
-        let across = dbs[0].across(Arc::clone(&cluster)).namespace("n").unwrap();
-        let txn = |seq: u64| TxnId {
-            coordinator: 7,
-            epoch: 1,
-            seq,
-        };
-        let serve = |carried: u64, step: Step| {
-            let envelope = Envelope {
-                coordinator: 7,
-                epoch: 1,
-                floor: None,
-                step,
-            };
-            crate::xgroup::sql::serve(&dbs[1], 1, carried, envelope, until()).unwrap()
-        };
-        let mut carried = 0;
-        for (seq, key, value) in [(1, b"1b", 1u8), (2, b"2b", 2)] {
-            let lock = Step::Lock {
-                txn: txn(seq),
-                anchor: 1,
-                reads: vec![],
-                writes: vec![(record_key("n", "f", key).unwrap(), Some(vec![value]))],
-                stage: None,
-            };
-            let (reply, latest, _) = serve(carried, lock);
-            assert!(matches!(reply, Reply::Locked { .. }), "{reply:?}");
-            carried = carried.max(latest.unwrap());
-        }
-        let at = carried;
-        let reading =
-            std::thread::spawn(move || across.get("f", b"1b", Consistency::Snapshot(at), until()));
-        dbs[1].locked_waits_reach(1, until()).unwrap();
-        let resolve = |seq: u64| Step::ResolveAt {
-            txn: txn(seq),
-            outcome: Outcome::Committed,
-            at,
-        };
-        assert_eq!(serve(at, resolve(2)).0, Reply::Resolved);
-        assert_eq!(dbs[1].locked_wakes(), 0, "another row's resolution woke it");
-        assert_eq!(serve(at, resolve(1)).0, Reply::Resolved);
-        let row = reading.join().unwrap().unwrap().unwrap();
-        assert_eq!((row.value, row.rev), (vec![1], at));
-        assert_eq!(dbs[1].locked_wakes(), 1);
     }
 }

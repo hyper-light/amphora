@@ -317,6 +317,9 @@ pub(crate) struct Changed {
     event: Condvar,
     published: Mutex<BTreeMap<String, Published>>,
     watchers: Mutex<watch::Watchers>,
+    /// How many steps have resolved transactions across groups here, each dropping its locks
+    /// (lane split-merge-21, T-T1.9.R28): what a read across groups held by a lock waits to move.
+    resolutions: AtomicU64,
     /// What a Records get of a row under a cross-group lock does ([`LockedReads`] as
     /// [`LockedReads::code`]; [`Database::set_locked_reads`]).
     locked_reads: AtomicU8,
@@ -1559,6 +1562,28 @@ pub(crate) fn ring_unlocked(db: &Db, changed: &Changed) -> Result<(), Refusal> {
         }
     }
     ring(changed, &gone)
+}
+
+impl Database {
+    /// Tells the reads across groups held by a lock here that a step resolved a transaction and
+    /// dropped its locks (lane split-merge-21, T-T1.9.R28): counted, then every watcher woken. The
+    /// step's own call woke them before the count moved; this wake is the one they read again on.
+    pub(crate) fn locks_resolved(&self, until: Instant) -> Result<(), Refusal> {
+        let database = self.resolve(until)?;
+        let changed = &database.shared.changed;
+        changed.resolutions.fetch_add(1, Ordering::AcqRel);
+        wake_changed(changed)
+    }
+
+    /// How many steps have resolved transactions across groups here ([`Database::locks_resolved`]).
+    pub(crate) fn resolutions(&self, until: Instant) -> Result<u64, Refusal> {
+        Ok(self
+            .resolve(until)?
+            .shared
+            .changed
+            .resolutions
+            .load(Ordering::Acquire))
+    }
 }
 
 pub(crate) fn wake_changed(changed: &Changed) -> Result<(), Refusal> {

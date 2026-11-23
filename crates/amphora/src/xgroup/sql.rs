@@ -257,11 +257,10 @@ pub(crate) fn locked_in(
     Ok(held)
 }
 
-/// The first Records row of `namespace`'s `family` from `lower` up to `upper` (none: the family's
-/// end) a transaction across groups holds a write lock on here with its lock stamp at or before
-/// `at`, by its cross-group key (lane split-merge-21, T-T1.9.R28): its commit stamp may then be at
-/// or before `at`, so a read as of `at` can't answer until it resolves, and waits on that row's
-/// waiter list (lane split-merge-22). A read lock writes nothing and holds no read.
+/// Whether a transaction across groups holds a write lock here on a Records row of `namespace`'s
+/// `family` from `lower` up to `upper` (none: the family's end), with its lock stamp at or before
+/// `at` (lane split-merge-21, T-T1.9.R28): its commit stamp may then be at or before `at`, so a
+/// read as of `at` can't answer until it resolves. A read lock writes nothing and holds no read.
 pub(crate) fn held_at(
     db: &Db,
     namespace: &str,
@@ -269,7 +268,7 @@ pub(crate) fn held_at(
     lower: &[u8],
     upper: Option<&[u8]>,
     at: u64,
-) -> anyhow::Result<Option<Vec<u8>>> {
+) -> anyhow::Result<bool> {
     let refused = |e: Refusal| anyhow::anyhow!("{e}");
     let from = record_key(namespace, family, lower).map_err(refused)?;
     // Past every row of the family: its prefix with the next byte past the last (the four-byte
@@ -282,17 +281,17 @@ pub(crate) fn held_at(
             end
         }
     };
-    let mut held = None;
+    let mut held = false;
     db.query(
-        "SELECT l.key FROM __amphora_xg_lock l JOIN __amphora_xg_lock_at t ON t.coordinator = l.coordinator AND t.epoch = l.epoch AND t.seq = l.seq WHERE l.key >= ?1 AND l.key < ?2 AND l.kind != ?3 AND t.stamp <= ?4 ORDER BY l.key LIMIT 1",
+        "SELECT 1 FROM __amphora_xg_lock l JOIN __amphora_xg_lock_at t ON t.coordinator = l.coordinator AND t.epoch = l.epoch AND t.seq = l.seq WHERE l.key >= ?1 AND l.key < ?2 AND l.kind != ?3 AND t.stamp <= ?4 LIMIT 1",
         [
             blob(&from)?,
             blob(&to)?,
             Value::from_i64(READ),
             Value::from_i64(i64::try_from(at)?),
         ],
-        |row| {
-            held = bytes_at(row, 0);
+        |_| {
+            held = true;
             Ok(false)
         },
     )?;
@@ -733,15 +732,28 @@ pub(crate) fn serve(
     until: Instant,
 ) -> Result<(Reply, Option<u64>, Option<u64>), Refusal> {
     let stamp = AtomicU64::new(carried);
+    let resolving = resolves(&envelope);
     let (reply, dropped) = step(group, &stamp, until, move |db| {
         apply_step(db, here, &envelope)
     })?;
     group.ring_locks(&dropped)?;
+    if resolving {
+        group.locks_resolved(until)?;
+    }
     // The group's clock after the step, the one cross-group clock as it keeps it (lane
     // split-merge-22, as `step_on` reads a local group's): a backed-up group's writer clock, which
     // a standalone group's session token never had, so its lock replies carry a stamp too.
     let clock = group.cross_clock(until)?;
     Ok((reply, clock.map(|_| stamp.load(Ordering::Acquire)), clock))
+}
+
+/// Whether a step resolves a transaction here, dropping its locks: the reads across groups they
+/// held wait for it (lane split-merge-21, T-T1.9.R28).
+fn resolves(envelope: &Envelope) -> bool {
+    matches!(
+        envelope.step,
+        super::Step::Resolve { .. } | super::Step::ResolveAt { .. }
+    )
 }
 
 /// Runs one step on `member`, its stamps carried either way. A group on a node answers its closed
@@ -757,10 +769,14 @@ fn step_on(
 ) -> Result<(Reply, Option<u64>), Refusal> {
     match member {
         Member::Local(group) => {
+            let resolving = resolves(&envelope);
             let (reply, dropped) = step(group, carried, until, move |db| {
                 apply_step(db, here, &envelope)
             })?;
             group.ring_locks(&dropped)?;
+            if resolving {
+                group.locks_resolved(until)?;
+            }
             // Read after the step answered, the group's clock is at or past the step's commit:
             // the one cross-group clock as this group keeps it (lane split-merge-21,
             // `Database::cross_clock`), so a standalone backed-up group's lock reply carries its
