@@ -316,13 +316,40 @@ fn decode(r: f64, round: i32, max_round: i32) -> Option<Decode> {
 
 /// floatingpoint.html 1.3.1's steps (a) and (b): r rounded to 15 significant digits, when that text
 /// converts back to r ("Round to 15 digits. Convert the text result back to binary-64."); `None`
-/// sends it to step (c), 17-digit rounding. Rust's `{:.14e}` rounds the exact value, and its parse
-/// takes the nearest double (1.2.1: "The first number is closer to the desired value of 47.49, so that
-/// is the one that gets used"); a tie at 15 digits never converts back, so its tie rule can't show.
+/// sends it to step (c), 17-digit rounding.
+///
+/// For a normal double the two steps are answered by its shortest round-trip digits (Rust's `{:e}`,
+/// exact), without writing 15 digits and parsing them back: half an ulp is at most 2^-53 of r, below
+/// half a unit in the 15th digit (at least 5 x 10^-16 of r), so a 15-digit text converts back exactly
+/// when the shortest text has 15 digits or fewer, and then rounding r to 15 digits gives the shortest
+/// text's digits. A subnormal's ulp is too wide for that (5e-324 converts back; the page's 15 digits
+/// are 4.94065645841247e-324), so it takes the steps as written: Rust's `{:.14e}` rounds the exact
+/// value, and its parse takes the nearest double (1.2.1: "The first number is closer to the desired
+/// value of 47.49, so that is the one that gets used").
 fn fifteen_digits(r: f64) -> Option<Decoded> {
-    if !r.is_finite() || r == 0.0 {
+    if r.is_subnormal() {
+        return fifteen_digits_written(r);
+    }
+    if !r.is_normal() {
         return None;
     }
+    let mut text = Text::default();
+    std::fmt::write(&mut text, format_args!("{:e}", r.abs())).ok()?;
+    let (mantissa, exp) = text.as_str()?.split_once('e')?;
+    let digits: Vec<u8> = mantissa.bytes().filter(u8::is_ascii_digit).collect();
+    if digits.len() > 15 {
+        return None;
+    }
+    Some(Decoded {
+        negative: r.is_sign_negative(),
+        digits,
+        point: exp.parse::<i32>().ok()?.checked_add(1)?,
+    })
+}
+
+/// Steps (a) and (b) as written, for a subnormal: a tie at 15 digits never converts back, so the tie
+/// rule of `{:.14e}` can't show.
+fn fifteen_digits_written(r: f64) -> Option<Decoded> {
     let text = format!("{:.14e}", r.abs());
     if text.parse::<f64>().ok()? != r.abs() {
         return None;
@@ -337,6 +364,31 @@ fn fifteen_digits(r: f64) -> Option<Decoded> {
         digits,
         point: exp.parse::<i32>().ok()?.checked_add(1)?,
     })
+}
+
+/// A double's shortest `{:e}` text, on the stack: at most 17 digits, a point, a sign and `e-324`.
+#[derive(Default)]
+struct Text {
+    bytes: [u8; 32],
+    len: usize,
+}
+
+impl Text {
+    fn as_str(&self) -> Option<&str> {
+        std::str::from_utf8(self.bytes.get(..self.len)?).ok()
+    }
+}
+
+impl std::fmt::Write for Text {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let end = self.len.checked_add(s.len()).ok_or(std::fmt::Error)?;
+        self.bytes
+            .get_mut(self.len..end)
+            .ok_or(std::fmt::Error)?
+            .copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
 }
 
 /// `%!.17g` of r, as SQLite's printf writes it (`zero_pad`: `%!0.17g`, infinity as 9.0e+999 and
