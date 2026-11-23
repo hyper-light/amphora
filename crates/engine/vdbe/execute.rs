@@ -8000,7 +8000,7 @@ fn exact_sum_final(func: &AggFunc, payload: &[Value]) -> Result<Value> {
 ///   Blob(varying inter-string separator lengths)]
 /// - JsonGroupObject/JsonbGroupObject: [Blob([])]
 /// - JsonGroupArray/JsonbGroupArray: [Blob([])]
-fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> Result<()> {
+pub(crate) fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> Result<()> {
     // This initializes `payload` at exactly the right size.
     match func {
         AggFunc::Count | AggFunc::Count0 => {
@@ -8110,7 +8110,7 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
 ///   payload `Vec` (one push per row); the leading slots hold a running count and, for the
 ///   ordered-set aggregates, the collation / percentile fraction to use at finalize time.
 #[amphora_engine_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::AggAccumulate)]
-fn update_agg_payload(
+pub(crate) fn update_agg_payload(
     func: &AggFunc,
     arg: &Value,                // first argument
     maybe_arg2: Option<&Value>, // for GroupConcat/StringAgg, JsonGroupObject/JsonbGroupObject,
@@ -8479,7 +8479,7 @@ const SPARE_AGG_PAYLOADS: usize = 8;
 /// - **Min/Max**: Returns the tracked extreme value directly
 /// - **GroupConcat/StringAgg**: Returns the accumulated string
 /// - **JsonGroup***: Parses accumulated raw JSONB bytes into proper JSON output
-fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
+pub(crate) fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
     match func {
         AggFunc::Avg if payload.len() > EXACT_AVG_SLOTS => return exact_avg_final(payload),
         AggFunc::Sum | AggFunc::Total if payload.len() > EXACT_SUM_SLOTS => {

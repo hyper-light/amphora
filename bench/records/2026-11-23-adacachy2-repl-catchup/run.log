@@ -1,0 +1,2066 @@
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.09s
+== amphora-procs-persisted catchup on 127.0.0.1:29290,127.0.0.1:29291,127.0.0.1:29292
+member 2 ready on 127.0.0.1:29291
+member 1 ready on 127.0.0.1:29290
+member 3 ready on 127.0.0.1:29292
+{"about":{"client":{"driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","transport":"one JSON line a request over TCP, TCP_NODELAY, one request a write; a kept connection to each member for every writer in flight"},"column":"quorum","durability":"the --class named in the record (persisted: once a quorum's disks hold it and the proposer's log is flushed; replicated: once members spanning --spanning fates hold it)","members":["127.0.0.1:29290","127.0.0.1:29291","127.0.0.1:29292"],"platform":"native","system":"amphora","version":"7ac4153dfaf8836d878901fee1bde8c3611917e3"},"batch":1,"behind":0,"bench":"repl_catchup","catchup_ms":18.417,"client_use":{"cpu_s":0.03,"peak_rss_kib":13020,"sockets":3},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"7.29","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":0,"system":"amphora-procs-persisted","text_bytes":600,"unix_s":1795451761}
+ok amphora-procs-persisted catchup
+bench/repl_members.sh: line 75: 2618508 Killed                     "$BIN" "${args[@]}"
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.10s
+== amphora-procs-replicated catchup on 127.0.0.1:29290,127.0.0.1:29291,127.0.0.1:29292
+member 2 ready on 127.0.0.1:29291
+member 3 ready on 127.0.0.1:29292
+member 1 ready on 127.0.0.1:29290
+{"about":{"client":{"driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","transport":"one JSON line a request over TCP, TCP_NODELAY, one request a write; a kept connection to each member for every writer in flight"},"column":"quorum","durability":"the --class named in the record (persisted: once a quorum's disks hold it and the proposer's log is flushed; replicated: once members spanning --spanning fates hold it)","members":["127.0.0.1:29290","127.0.0.1:29291","127.0.0.1:29292"],"platform":"native","system":"amphora","version":"7ac4153dfaf8836d878901fee1bde8c3611917e3"},"batch":1,"behind":0,"bench":"repl_catchup","catchup_ms":16.382,"client_use":{"cpu_s":0.02,"peak_rss_kib":12644,"sockets":3},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"7.29","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":0,"system":"amphora-procs-replicated","text_bytes":600,"unix_s":1795451761}
+ok amphora-procs-replicated catchup
+bench/repl_members.sh: line 75: 2620189 Killed                     "$BIN" "${args[@]}"
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.10s
+== rqlite catchup
+bench/repl.sh: line 36: bench/records/2026-11-23-adacachy2-repl-catchup/restart/rqlite-catchup.jsonl: No such file or directory
+{"about":{"client":{"dialect":"Rqlite","driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","pool_per_node":1,"transport":"HTTP/1.1 keep-alive over TCP (ureq 3), TCP_NODELAY, one request a write"},"column":"quorum","data_fs":"btrfs","durability":"acknowledged once a quorum (2 of 3) of Raft logs hold it, each fdatasynced (BoltDB without NoSync); rqlited's defaults, which no flag weakens or strengthens","durability_check":null,"kernel":"Linux 7.3.3-1-cachyos x86_64","platform":"native","sync_options":[],"system":"rqlite","version":"rqlited v10.7.4 linux amd64 go1.27.4 sqlite3.54.1 (commit 4452a98ae5190e3589acb053fa2ab2eb48717248, compiler gc)"},"batch":1,"behind":0,"bench":"repl_catchup","catchup_ms":141.984,"client_use":{"cpu_s":0.04,"peak_rss_kib":14432,"sockets":2},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"7.02","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":0,"system":"rqlite","text_bytes":600,"unix_s":1795451764}
+ok rqlite catchup
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.08s
+== dqlite catchup
+bench/repl.sh: line 36: bench/records/2026-11-23-adacachy2-repl-catchup/restart/dqlite-catchup.jsonl: No such file or directory
+{"batch":1,"bench":"repl_catchup","commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.78","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"refused":"no-concept","system":"dqlite","text_bytes":600,"unix_s":1795451768,"why":"dqlite serves every read through its leader: a member's own copy can't be read, so its catch-up can't be seen"}
+Error: no-concept: dqlite serves every read through its leader: a member's own copy can't be read, so its catch-up can't be seen
+refused dqlite catchup: dqlite serves every read through its leader: a member's own copy can't be read, so its catch-up can't be seen
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.10s
+== libsql catchup
+bench/repl.sh: line 36: bench/records/2026-11-23-adacachy2-repl-catchup/restart/libsql-catchup.jsonl: No such file or directory
+{"batch":1,"bench":"repl_catchup","commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.78","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"refused":"unavailable","system":"libsql","text_bytes":600,"unix_s":1795451768,"why":"libsql's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh up: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh: line 47: 2645986 Killed                     setsid \"$@\" >> \"$(dir \"$n\")/log\" 2>&1 < /dev/null\nlibsql: the primary runs PRAGMA synchronous=1, not 2 (FULL): durability_mode=strong didn't take"}
+Error: unavailable: libsql's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh up: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh: line 47: 2645986 Killed                     setsid "$@" >> "$(dir "$n")/log" 2>&1 < /dev/null
+libsql: the primary runs PRAGMA synchronous=1, not 2 (FULL): durability_mode=strong didn't take
+refused libsql catchup: libsql's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh up: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh: line 47: 2645986 Killed                     setsid \
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.09s
+== litefs catchup
+bench/repl.sh: line 36: bench/records/2026-11-23-adacachy2-repl-catchup/restart/litefs-catchup.jsonl: No such file or directory
+{"batch":1,"bench":"repl_catchup","commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.78","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"refused":"unavailable","system":"litefs","text_bytes":600,"unix_s":1795451769,"why":"litefs's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh up: consul didn't take leadership; its log ends:\n==> Starting Consul agent...\n               Version: '2.1.0'\n            Build Date: '2026-10-21 07:34:22 +0000 UTC'\n               Node ID: '4f2f8905-5230-4f34-fd18-9f5ebacb59d4'\n             Node name: 'adacachy2'\n            Datacenter: 'dc1' (Segment: '<all>')\n                Server: true (Bootstrap: false)\n           Client Addr: [127.0.0.1] (HTTP: 54280, HTTPS: -1, gRPC: -1, gRPC-TLS: 8503, DNS: -1)\n          Cluster Addr: 127.0.0.1 (LAN: 54281, WAN: 54282)\n     Gossip Encryption: false\n      Auto-Encrypt-TLS: false\n           ACL Enabled: false\n     Reporting Enabled: false\n    ACL Default Policy: allow\n             HTTPS TLS: Verify Incoming: false, Verify Outgoing: false, Min Version: TLSv1_2\n              gRPC TLS: Verify Incoming: false, Min Version: TLSv1_2\n      Internal RPC TLS: Verify Incoming: false, Verify Outgoing: false (Verify Hostname: false), Min Version: TLSv1_2\n\n==> Log data will now stream in as it occurs:\n\n2026-11-23T08:36:08.880-0800 [DEBUG] agent.grpc.balancer: switching server: target=consul://dc1.4f2f8905-5230-4f34-fd18-9f5ebacb59d4/server.dc1 from=<none> to=<none>\n2026-11-23T08:36:08.882-0800 [INFO]  agent.server.raft: initial configuration: index=1 servers=\"[{Suffrage:Voter ID:4f2f8905-5230-4f34-fd18-9f5ebacb59d4 Address:127.0.0.1:54283}]\"\n2026-11-23T08:36:08.882-0800 [INFO]  agent.server: shutting down server\n2026-11-23T08:36:08.882-0800 [ERROR] agent: Error starting agent: error=\"Failed to start Consul server: Failed to start WAN Serf: failed to start TCP listener on \\\"127.0.0.1\\\" port 54282: listen tcp 127.0.0.1:54282: bind: address already in use\"\n2026-11-23T08:36:08.883-0800 [INFO]  agent: Exit code: code=1"}
+Error: unavailable: litefs's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh up: consul didn't take leadership; its log ends:
+==> Starting Consul agent...
+               Version: '2.1.0'
+            Build Date: '2026-10-21 07:34:22 +0000 UTC'
+               Node ID: '4f2f8905-5230-4f34-fd18-9f5ebacb59d4'
+             Node name: 'adacachy2'
+            Datacenter: 'dc1' (Segment: '<all>')
+                Server: true (Bootstrap: false)
+           Client Addr: [127.0.0.1] (HTTP: 54280, HTTPS: -1, gRPC: -1, gRPC-TLS: 8503, DNS: -1)
+          Cluster Addr: 127.0.0.1 (LAN: 54281, WAN: 54282)
+     Gossip Encryption: false
+      Auto-Encrypt-TLS: false
+           ACL Enabled: false
+     Reporting Enabled: false
+    ACL Default Policy: allow
+             HTTPS TLS: Verify Incoming: false, Verify Outgoing: false, Min Version: TLSv1_2
+              gRPC TLS: Verify Incoming: false, Min Version: TLSv1_2
+      Internal RPC TLS: Verify Incoming: false, Verify Outgoing: false (Verify Hostname: false), Min Version: TLSv1_2
+
+==> Log data will now stream in as it occurs:
+
+2026-11-23T08:36:08.880-0800 [DEBUG] agent.grpc.balancer: switching server: target=consul://dc1.4f2f8905-5230-4f34-fd18-9f5ebacb59d4/server.dc1 from=<none> to=<none>
+2026-11-23T08:36:08.882-0800 [INFO]  agent.server.raft: initial configuration: index=1 servers="[{Suffrage:Voter ID:4f2f8905-5230-4f34-fd18-9f5ebacb59d4 Address:127.0.0.1:54283}]"
+2026-11-23T08:36:08.882-0800 [INFO]  agent.server: shutting down server
+2026-11-23T08:36:08.882-0800 [ERROR] agent: Error starting agent: error="Failed to start Consul server: Failed to start WAN Serf: failed to start TCP listener on \"127.0.0.1\" port 54282: listen tcp 127.0.0.1:54282: bind: address already in use"
+2026-11-23T08:36:08.883-0800 [INFO]  agent: Exit code: code=1
+refused litefs catchup: litefs's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh up: consul didn't take leadership; its log ends:\n==> Starting Consul agent...\n               Version: '2.1.0'\n            Build Date: '2026-10-21 07:34:22 +0000 UTC'\n               Node ID: '4f2f8905-5230-4f34-fd18-9f5ebacb59d4'\n             Node name: 'adacachy2'\n            Datacenter: 'dc1' (Segment: '<all>')\n                Server: true (Bootstrap: false)\n           Client Addr: [127.0.0.1] (HTTP: 54280, HTTPS: -1, gRPC: -1, gRPC-TLS: 8503, DNS: -1)\n          Cluster Addr: 127.0.0.1 (LAN: 54281, WAN: 54282)\n     Gossip Encryption: false\n      Auto-Encrypt-TLS: false\n           ACL Enabled: false\n     Reporting Enabled: false\n    ACL Default Policy: allow\n             HTTPS TLS: Verify Incoming: false, Verify Outgoing: false, Min Version: TLSv1_2\n              gRPC TLS: Verify Incoming: false, Min Version: TLSv1_2\n      Internal RPC TLS: Verify Incoming: false, Verify Outgoing: false (Verify Hostname: false), Min Version: TLSv1_2\n\n==> Log data will now stream in as it occurs:\n\n2026-11-23T08:36:08.880-0800 [DEBUG] agent.grpc.balancer: switching server: target=consul://dc1.4f2f8905-5230-4f34-fd18-9f5ebacb59d4/server.dc1 from=<none> to=<none>\n2026-11-23T08:36:08.882-0800 [INFO]  agent.server.raft: initial configuration: index=1 servers=\
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.08s
+== litefs catchup
+{"batch":1,"bench":"repl_catchup","commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.78","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"refused":"unavailable","system":"litefs","text_bytes":600,"unix_s":1795451771,"why":"litefs's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh up: consul didn't take leadership; its log ends:\n==> Starting Consul agent...\n               Version: '2.1.0'\n            Build Date: '2026-10-21 07:34:22 +0000 UTC'\n               Node ID: 'ad7d0b82-1086-3749-408c-882d8f10a6d1'\n             Node name: 'adacachy2'\n            Datacenter: 'dc1' (Segment: '<all>')\n                Server: true (Bootstrap: false)\n           Client Addr: [127.0.0.1] (HTTP: 54280, HTTPS: -1, gRPC: -1, gRPC-TLS: 8503, DNS: -1)\n          Cluster Addr: 127.0.0.1 (LAN: 54281, WAN: 54282)\n     Gossip Encryption: false\n      Auto-Encrypt-TLS: false\n           ACL Enabled: false\n     Reporting Enabled: false\n    ACL Default Policy: allow\n             HTTPS TLS: Verify Incoming: false, Verify Outgoing: false, Min Version: TLSv1_2\n              gRPC TLS: Verify Incoming: false, Min Version: TLSv1_2\n      Internal RPC TLS: Verify Incoming: false, Verify Outgoing: false (Verify Hostname: false), Min Version: TLSv1_2\n\n==> Log data will now stream in as it occurs:\n\n2026-11-23T08:36:10.058-0800 [DEBUG] agent.grpc.balancer: switching server: target=consul://dc1.ad7d0b82-1086-3749-408c-882d8f10a6d1/server.dc1 from=<none> to=<none>\n2026-11-23T08:36:10.060-0800 [INFO]  agent.server.raft: initial configuration: index=1 servers=\"[{Suffrage:Voter ID:ad7d0b82-1086-3749-408c-882d8f10a6d1 Address:127.0.0.1:54283}]\"\n2026-11-23T08:36:10.060-0800 [INFO]  agent.server.raft: entering follower state: follower=\"Node at 127.0.0.1:54283 [Follower]\" leader-address= leader-id=\n2026-11-23T08:36:10.060-0800 [INFO]  agent.server: shutting down server\n2026-11-23T08:36:10.060-0800 [ERROR] agent: Error starting agent: error=\"Failed to start Consul server: Failed to start WAN Serf: failed to start TCP listener on \\\"127.0.0.1\\\" port 54282: listen tcp 127.0.0.1:54282: bind: address already in use\"\n2026-11-23T08:36:10.060-0800 [INFO]  agent: Exit code: code=1"}
+Error: unavailable: litefs's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh up: consul didn't take leadership; its log ends:
+==> Starting Consul agent...
+               Version: '2.1.0'
+            Build Date: '2026-10-21 07:34:22 +0000 UTC'
+               Node ID: 'ad7d0b82-1086-3749-408c-882d8f10a6d1'
+             Node name: 'adacachy2'
+            Datacenter: 'dc1' (Segment: '<all>')
+                Server: true (Bootstrap: false)
+           Client Addr: [127.0.0.1] (HTTP: 54280, HTTPS: -1, gRPC: -1, gRPC-TLS: 8503, DNS: -1)
+          Cluster Addr: 127.0.0.1 (LAN: 54281, WAN: 54282)
+     Gossip Encryption: false
+      Auto-Encrypt-TLS: false
+           ACL Enabled: false
+     Reporting Enabled: false
+    ACL Default Policy: allow
+             HTTPS TLS: Verify Incoming: false, Verify Outgoing: false, Min Version: TLSv1_2
+              gRPC TLS: Verify Incoming: false, Min Version: TLSv1_2
+      Internal RPC TLS: Verify Incoming: false, Verify Outgoing: false (Verify Hostname: false), Min Version: TLSv1_2
+
+==> Log data will now stream in as it occurs:
+
+2026-11-23T08:36:10.058-0800 [DEBUG] agent.grpc.balancer: switching server: target=consul://dc1.ad7d0b82-1086-3749-408c-882d8f10a6d1/server.dc1 from=<none> to=<none>
+2026-11-23T08:36:10.060-0800 [INFO]  agent.server.raft: initial configuration: index=1 servers="[{Suffrage:Voter ID:ad7d0b82-1086-3749-408c-882d8f10a6d1 Address:127.0.0.1:54283}]"
+2026-11-23T08:36:10.060-0800 [INFO]  agent.server.raft: entering follower state: follower="Node at 127.0.0.1:54283 [Follower]" leader-address= leader-id=
+2026-11-23T08:36:10.060-0800 [INFO]  agent.server: shutting down server
+2026-11-23T08:36:10.060-0800 [ERROR] agent: Error starting agent: error="Failed to start Consul server: Failed to start WAN Serf: failed to start TCP listener on \"127.0.0.1\" port 54282: listen tcp 127.0.0.1:54282: bind: address already in use"
+2026-11-23T08:36:10.060-0800 [INFO]  agent: Exit code: code=1
+refused litefs catchup: litefs's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh up: consul didn't take leadership; its log ends:\n==> Starting Consul agent...\n               Version: '2.1.0'\n            Build Date: '2026-10-21 07:34:22 +0000 UTC'\n               Node ID: 'ad7d0b82-1086-3749-408c-882d8f10a6d1'\n             Node name: 'adacachy2'\n            Datacenter: 'dc1' (Segment: '<all>')\n                Server: true (Bootstrap: false)\n           Client Addr: [127.0.0.1] (HTTP: 54280, HTTPS: -1, gRPC: -1, gRPC-TLS: 8503, DNS: -1)\n          Cluster Addr: 127.0.0.1 (LAN: 54281, WAN: 54282)\n     Gossip Encryption: false\n      Auto-Encrypt-TLS: false\n           ACL Enabled: false\n     Reporting Enabled: false\n    ACL Default Policy: allow\n             HTTPS TLS: Verify Incoming: false, Verify Outgoing: false, Min Version: TLSv1_2\n              gRPC TLS: Verify Incoming: false, Min Version: TLSv1_2\n      Internal RPC TLS: Verify Incoming: false, Verify Outgoing: false (Verify Hostname: false), Min Version: TLSv1_2\n\n==> Log data will now stream in as it occurs:\n\n2026-11-23T08:36:10.058-0800 [DEBUG] agent.grpc.balancer: switching server: target=consul://dc1.ad7d0b82-1086-3749-408c-882d8f10a6d1/server.dc1 from=<none> to=<none>\n2026-11-23T08:36:10.060-0800 [INFO]  agent.server.raft: initial configuration: index=1 servers=\
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.08s
+== libsql catchup
+{"batch":1,"bench":"repl_catchup","commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.78","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"refused":"unavailable","system":"libsql","text_bytes":600,"unix_s":1795451771,"why":"libsql's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh up: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh: line 47: 2654908 Killed                     setsid \"$@\" >> \"$(dir \"$n\")/log\" 2>&1 < /dev/null\nlibsql: the primary runs PRAGMA synchronous=1, not 2 (FULL): durability_mode=strong didn't take"}
+Error: unavailable: libsql's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh up: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh: line 47: 2654908 Killed                     setsid "$@" >> "$(dir "$n")/log" 2>&1 < /dev/null
+libsql: the primary runs PRAGMA synchronous=1, not 2 (FULL): durability_mode=strong didn't take
+refused libsql catchup: libsql's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh up: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh: line 47: 2654908 Killed                     setsid \
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.08s
+== dqlite catchup
+{"batch":1,"bench":"repl_catchup","commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.80","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"refused":"no-concept","system":"dqlite","text_bytes":600,"unix_s":1795451774,"why":"dqlite serves every read through its leader: a member's own copy can't be read, so its catch-up can't be seen"}
+Error: no-concept: dqlite serves every read through its leader: a member's own copy can't be read, so its catch-up can't be seen
+refused dqlite catchup: dqlite serves every read through its leader: a member's own copy can't be read, so its catch-up can't be seen
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.08s
+== rqlite catchup
+{"about":{"client":{"dialect":"Rqlite","driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","pool_per_node":1,"transport":"HTTP/1.1 keep-alive over TCP (ureq 3), TCP_NODELAY, one request a write"},"column":"quorum","data_fs":"btrfs","durability":"acknowledged once a quorum (2 of 3) of Raft logs hold it, each fdatasynced (BoltDB without NoSync); rqlited's defaults, which no flag weakens or strengthens","durability_check":null,"kernel":"Linux 7.3.3-1-cachyos x86_64","platform":"native","sync_options":[],"system":"rqlite","version":"rqlited v10.7.4 linux amd64 go1.27.4 sqlite3.54.1 (commit 4452a98ae5190e3589acb053fa2ab2eb48717248, compiler gc)"},"batch":1,"behind":0,"bench":"repl_catchup","catchup_ms":138.688,"client_use":{"cpu_s":0.04,"peak_rss_kib":14548,"sockets":2},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.80","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":0,"system":"rqlite","text_bytes":600,"unix_s":1795451777}
+ok rqlite catchup
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.08s
+== amphora-procs-replicated catchup on 127.0.0.1:29290,127.0.0.1:29291,127.0.0.1:29292
+member 1 ready on 127.0.0.1:29290
+member 2 ready on 127.0.0.1:29291
+member 3 ready on 127.0.0.1:29292
+{"about":{"client":{"driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","transport":"one JSON line a request over TCP, TCP_NODELAY, one request a write; a kept connection to each member for every writer in flight"},"column":"quorum","durability":"the --class named in the record (persisted: once a quorum's disks hold it and the proposer's log is flushed; replicated: once members spanning --spanning fates hold it)","members":["127.0.0.1:29290","127.0.0.1:29291","127.0.0.1:29292"],"platform":"native","system":"amphora","version":"7ac4153dfaf8836d878901fee1bde8c3611917e3"},"batch":1,"behind":0,"bench":"repl_catchup","catchup_ms":16.825,"client_use":{"cpu_s":0.02,"peak_rss_kib":12552,"sockets":2},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.90","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":0,"system":"amphora-procs-replicated","text_bytes":600,"unix_s":1795451778}
+ok amphora-procs-replicated catchup
+bench/repl_members.sh: line 75: 2678940 Killed                     "$BIN" "${args[@]}"
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.08s
+== amphora-procs-persisted catchup on 127.0.0.1:29290,127.0.0.1:29291,127.0.0.1:29292
+member 2 ready on 127.0.0.1:29291
+member 1 ready on 127.0.0.1:29290
+member 3 ready on 127.0.0.1:29292
+{"about":{"client":{"driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","transport":"one JSON line a request over TCP, TCP_NODELAY, one request a write; a kept connection to each member for every writer in flight"},"column":"quorum","durability":"the --class named in the record (persisted: once a quorum's disks hold it and the proposer's log is flushed; replicated: once members spanning --spanning fates hold it)","members":["127.0.0.1:29290","127.0.0.1:29291","127.0.0.1:29292"],"platform":"native","system":"amphora","version":"7ac4153dfaf8836d878901fee1bde8c3611917e3"},"batch":1,"behind":0,"bench":"repl_catchup","catchup_ms":17.275,"client_use":{"cpu_s":0.02,"peak_rss_kib":13048,"sockets":3},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.90","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":0,"system":"amphora-procs-persisted","text_bytes":600,"unix_s":1795451778}
+ok amphora-procs-persisted catchup
+bench/repl_members.sh: line 75: 2680363 Killed                     "$BIN" "${args[@]}"
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.08s
+== amphora-procs-persisted catchup on 127.0.0.1:29290,127.0.0.1:29291,127.0.0.1:29292
+member 3 ready on 127.0.0.1:29292
+member 2 ready on 127.0.0.1:29291
+member 1 ready on 127.0.0.1:29290
+{"about":{"client":{"driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","transport":"one JSON line a request over TCP, TCP_NODELAY, one request a write; a kept connection to each member for every writer in flight"},"column":"quorum","durability":"the --class named in the record (persisted: once a quorum's disks hold it and the proposer's log is flushed; replicated: once members spanning --spanning fates hold it)","members":["127.0.0.1:29290","127.0.0.1:29291","127.0.0.1:29292"],"platform":"native","system":"amphora","version":"7ac4153dfaf8836d878901fee1bde8c3611917e3"},"batch":1,"behind":0,"bench":"repl_catchup","catchup_ms":26.855,"client_use":{"cpu_s":0.02,"peak_rss_kib":12636,"sockets":2},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.90","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":0,"system":"amphora-procs-persisted","text_bytes":600,"unix_s":1795451779}
+ok amphora-procs-persisted catchup
+bench/repl_members.sh: line 75: 2681975 Killed                     "$BIN" "${args[@]}"
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.08s
+== amphora-procs-replicated catchup on 127.0.0.1:29290,127.0.0.1:29291,127.0.0.1:29292
+member 3 ready on 127.0.0.1:29292
+member 1 ready on 127.0.0.1:29290
+member 2 ready on 127.0.0.1:29291
+{"about":{"client":{"driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","transport":"one JSON line a request over TCP, TCP_NODELAY, one request a write; a kept connection to each member for every writer in flight"},"column":"quorum","durability":"the --class named in the record (persisted: once a quorum's disks hold it and the proposer's log is flushed; replicated: once members spanning --spanning fates hold it)","members":["127.0.0.1:29290","127.0.0.1:29291","127.0.0.1:29292"],"platform":"native","system":"amphora","version":"7ac4153dfaf8836d878901fee1bde8c3611917e3"},"batch":1,"behind":0,"bench":"repl_catchup","catchup_ms":41.198,"client_use":{"cpu_s":0.02,"peak_rss_kib":12660,"sockets":2},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.90","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":0,"system":"amphora-procs-replicated","text_bytes":600,"unix_s":1795451779}
+ok amphora-procs-replicated catchup
+bench/repl_members.sh: line 75: 2683461 Killed                     "$BIN" "${args[@]}"
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.09s
+== rqlite catchup
+{"about":{"client":{"dialect":"Rqlite","driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","pool_per_node":1,"transport":"HTTP/1.1 keep-alive over TCP (ureq 3), TCP_NODELAY, one request a write"},"column":"quorum","data_fs":"btrfs","durability":"acknowledged once a quorum (2 of 3) of Raft logs hold it, each fdatasynced (BoltDB without NoSync); rqlited's defaults, which no flag weakens or strengthens","durability_check":null,"kernel":"Linux 7.3.3-1-cachyos x86_64","platform":"native","sync_options":[],"system":"rqlite","version":"rqlited v10.7.4 linux amd64 go1.27.4 sqlite3.54.1 (commit 4452a98ae5190e3589acb053fa2ab2eb48717248, compiler gc)"},"batch":1,"behind":0,"bench":"repl_catchup","catchup_ms":96.746,"client_use":{"cpu_s":0.02,"peak_rss_kib":14424,"sockets":2},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.90","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":0,"system":"rqlite","text_bytes":600,"unix_s":1795451781}
+ok rqlite catchup
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.09s
+== dqlite catchup
+{"batch":1,"bench":"repl_catchup","commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.90","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"refused":"unavailable","system":"dqlite","text_bytes":600,"unix_s":1795451782,"why":"dqlite's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/dqlite.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/dqlite.sh up: dqlite node 2 didn't print its ready line (/shim ready: listening on /) within 120s or ended first; its log ends:\n2026/11/23 08:36:21 create node: failed to set bind address \"127.0.0.1:54252\": 1"}
+Error: unavailable: dqlite's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/dqlite.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/dqlite.sh up: dqlite node 2 didn't print its ready line (/shim ready: listening on /) within 120s or ended first; its log ends:
+2026/11/23 08:36:21 create node: failed to set bind address "127.0.0.1:54252": 1
+refused dqlite catchup: dqlite's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/dqlite.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/dqlite.sh up: dqlite node 2 didn't print its ready line (/shim ready: listening on /) within 120s or ended first; its log ends:\n2026/11/23 08:36:21 create node: failed to set bind address \
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.08s
+== libsql catchup
+{"batch":1,"bench":"repl_catchup","commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.90","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"refused":"unavailable","system":"libsql","text_bytes":600,"unix_s":1795451782,"why":"libsql's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh up: libsql primary didn't come up to set its durability; its log ends:\n           _     _ \n ___  __ _| | __| |\n/ __|/ _` | |/ _` |\n\\__ \\ (_| | | (_| |\n|___/\\__, |_|\\__,_|\n        |_|        \n\nWelcome to sqld!\n\nversion: 0.24.32\ncommit SHA: 40c272de85ee4e62d722c5ccae5da2e76b4253a1\nbuild date: 2025-02-14\n\nThis software is in BETA version.\nIf you encounter any bug, please open an issue at https://github.com/tursodatabase/libsql/issues\n\nconfig:\n\t- mode: primary (127.0.0.1:54230)\n\t- database path: /home/adalundhe/.cache/amphora-repl-data/amphora-bench-repl-libsql/0/data\n\t- extensions path: <disabled>\n\t- listening for HTTP requests on: 127.0.0.1:54220\n\t- grpc_tls: no\n2026-11-23T16:36:22.372603Z  INFO sqld: listening for incoming user HTTP connection on 127.0.0.1:54220\n2026-11-23T16:36:22.372623Z  INFO sqld: listening for incoming adming HTTP connection on 127.0.0.1:54223\nError: Address already in use (os error 98)"}
+Error: unavailable: libsql's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh up: libsql primary didn't come up to set its durability; its log ends:
+           _     _ 
+ ___  __ _| | __| |
+/ __|/ _` | |/ _` |
+\__ \ (_| | | (_| |
+|___/\__, |_|\__,_|
+        |_|        
+
+Welcome to sqld!
+
+version: 0.24.32
+commit SHA: 40c272de85ee4e62d722c5ccae5da2e76b4253a1
+build date: 2025-02-14
+
+This software is in BETA version.
+If you encounter any bug, please open an issue at https://github.com/tursodatabase/libsql/issues
+
+config:
+	- mode: primary (127.0.0.1:54230)
+	- database path: /home/adalundhe/.cache/amphora-repl-data/amphora-bench-repl-libsql/0/data
+	- extensions path: <disabled>
+	- listening for HTTP requests on: 127.0.0.1:54220
+	- grpc_tls: no
+2026-11-23T16:36:22.372603Z  INFO sqld: listening for incoming user HTTP connection on 127.0.0.1:54220
+2026-11-23T16:36:22.372623Z  INFO sqld: listening for incoming adming HTTP connection on 127.0.0.1:54223
+Error: Address already in use (os error 98)
+refused libsql catchup: libsql's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh up: libsql primary didn't come up to set its durability; its log ends:\n           _     _ \n ___  __ _| | __| |\n/ __|/ _` | |/ _` |\n\\__ \\ (_| | | (_| |\n|___/\\__, |_|\\__,_|\n        |_|        \n\nWelcome to sqld!\n\nversion: 0.24.32\ncommit SHA: 40c272de85ee4e62d722c5ccae5da2e76b4253a1\nbuild date: 2025-02-14\n\nThis software is in BETA version.\nIf you encounter any bug, please open an issue at https://github.com/tursodatabase/libsql/issues\n\nconfig:\n\t- mode: primary (127.0.0.1:54230)\n\t- database path: /home/adalundhe/.cache/amphora-repl-data/amphora-bench-repl-libsql/0/data\n\t- extensions path: <disabled>\n\t- listening for HTTP requests on: 127.0.0.1:54220\n\t- grpc_tls: no\n2026-11-23T16:36:22.372603Z  INFO sqld: listening for incoming user HTTP connection on 127.0.0.1:54220\n2026-11-23T16:36:22.372623Z  INFO sqld: listening for incoming adming HTTP connection on 127.0.0.1:54223\nError: Address already in use (os error 98)
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.08s
+== litefs catchup
+{"batch":1,"bench":"repl_catchup","commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.90","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"refused":"unavailable","system":"litefs","text_bytes":600,"unix_s":1795451783,"why":"litefs's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh up: consul didn't take leadership; its log ends:\n==> Starting Consul agent...\n               Version: '2.1.0'\n            Build Date: '2026-10-21 07:34:22 +0000 UTC'\n               Node ID: '18c4d9d2-d16a-efb1-1725-601db04f0d3a'\n             Node name: 'adacachy2'\n            Datacenter: 'dc1' (Segment: '<all>')\n                Server: true (Bootstrap: false)\n           Client Addr: [127.0.0.1] (HTTP: 54280, HTTPS: -1, gRPC: -1, gRPC-TLS: 8503, DNS: -1)\n          Cluster Addr: 127.0.0.1 (LAN: 54281, WAN: 54282)\n     Gossip Encryption: false\n      Auto-Encrypt-TLS: false\n           ACL Enabled: false\n     Reporting Enabled: false\n    ACL Default Policy: allow\n             HTTPS TLS: Verify Incoming: false, Verify Outgoing: false, Min Version: TLSv1_2\n              gRPC TLS: Verify Incoming: false, Min Version: TLSv1_2\n      Internal RPC TLS: Verify Incoming: false, Verify Outgoing: false (Verify Hostname: false), Min Version: TLSv1_2\n\n==> Log data will now stream in as it occurs:\n\n2026-11-23T08:36:22.553-0800 [DEBUG] agent.grpc.balancer: switching server: target=consul://dc1.18c4d9d2-d16a-efb1-1725-601db04f0d3a/server.dc1 from=<none> to=<none>\n2026-11-23T08:36:22.556-0800 [INFO]  agent.server.raft: initial configuration: index=1 servers=\"[{Suffrage:Voter ID:18c4d9d2-d16a-efb1-1725-601db04f0d3a Address:127.0.0.1:54283}]\"\n2026-11-23T08:36:22.556-0800 [INFO]  agent.server.raft: entering follower state: follower=\"Node at 127.0.0.1:54283 [Follower]\" leader-address= leader-id=\n2026-11-23T08:36:22.556-0800 [INFO]  agent.server: shutting down server\n2026-11-23T08:36:22.556-0800 [ERROR] agent: Error starting agent: error=\"Failed to start Consul server: Failed to start WAN Serf: failed to start TCP listener on \\\"127.0.0.1\\\" port 54282: listen tcp 127.0.0.1:54282: bind: address already in use\"\n2026-11-23T08:36:22.556-0800 [INFO]  agent: Exit code: code=1"}
+Error: unavailable: litefs's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh up: consul didn't take leadership; its log ends:
+==> Starting Consul agent...
+               Version: '2.1.0'
+            Build Date: '2026-10-21 07:34:22 +0000 UTC'
+               Node ID: '18c4d9d2-d16a-efb1-1725-601db04f0d3a'
+             Node name: 'adacachy2'
+            Datacenter: 'dc1' (Segment: '<all>')
+                Server: true (Bootstrap: false)
+           Client Addr: [127.0.0.1] (HTTP: 54280, HTTPS: -1, gRPC: -1, gRPC-TLS: 8503, DNS: -1)
+          Cluster Addr: 127.0.0.1 (LAN: 54281, WAN: 54282)
+     Gossip Encryption: false
+      Auto-Encrypt-TLS: false
+           ACL Enabled: false
+     Reporting Enabled: false
+    ACL Default Policy: allow
+             HTTPS TLS: Verify Incoming: false, Verify Outgoing: false, Min Version: TLSv1_2
+              gRPC TLS: Verify Incoming: false, Min Version: TLSv1_2
+      Internal RPC TLS: Verify Incoming: false, Verify Outgoing: false (Verify Hostname: false), Min Version: TLSv1_2
+
+==> Log data will now stream in as it occurs:
+
+2026-11-23T08:36:22.553-0800 [DEBUG] agent.grpc.balancer: switching server: target=consul://dc1.18c4d9d2-d16a-efb1-1725-601db04f0d3a/server.dc1 from=<none> to=<none>
+2026-11-23T08:36:22.556-0800 [INFO]  agent.server.raft: initial configuration: index=1 servers="[{Suffrage:Voter ID:18c4d9d2-d16a-efb1-1725-601db04f0d3a Address:127.0.0.1:54283}]"
+2026-11-23T08:36:22.556-0800 [INFO]  agent.server.raft: entering follower state: follower="Node at 127.0.0.1:54283 [Follower]" leader-address= leader-id=
+2026-11-23T08:36:22.556-0800 [INFO]  agent.server: shutting down server
+2026-11-23T08:36:22.556-0800 [ERROR] agent: Error starting agent: error="Failed to start Consul server: Failed to start WAN Serf: failed to start TCP listener on \"127.0.0.1\" port 54282: listen tcp 127.0.0.1:54282: bind: address already in use"
+2026-11-23T08:36:22.556-0800 [INFO]  agent: Exit code: code=1
+refused litefs catchup: litefs's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh up: consul didn't take leadership; its log ends:\n==> Starting Consul agent...\n               Version: '2.1.0'\n            Build Date: '2026-10-21 07:34:22 +0000 UTC'\n               Node ID: '18c4d9d2-d16a-efb1-1725-601db04f0d3a'\n             Node name: 'adacachy2'\n            Datacenter: 'dc1' (Segment: '<all>')\n                Server: true (Bootstrap: false)\n           Client Addr: [127.0.0.1] (HTTP: 54280, HTTPS: -1, gRPC: -1, gRPC-TLS: 8503, DNS: -1)\n          Cluster Addr: 127.0.0.1 (LAN: 54281, WAN: 54282)\n     Gossip Encryption: false\n      Auto-Encrypt-TLS: false\n           ACL Enabled: false\n     Reporting Enabled: false\n    ACL Default Policy: allow\n             HTTPS TLS: Verify Incoming: false, Verify Outgoing: false, Min Version: TLSv1_2\n              gRPC TLS: Verify Incoming: false, Min Version: TLSv1_2\n      Internal RPC TLS: Verify Incoming: false, Verify Outgoing: false (Verify Hostname: false), Min Version: TLSv1_2\n\n==> Log data will now stream in as it occurs:\n\n2026-11-23T08:36:22.553-0800 [DEBUG] agent.grpc.balancer: switching server: target=consul://dc1.18c4d9d2-d16a-efb1-1725-601db04f0d3a/server.dc1 from=<none> to=<none>\n2026-11-23T08:36:22.556-0800 [INFO]  agent.server.raft: initial configuration: index=1 servers=\
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.08s
+== litefs catchup
+{"batch":1,"bench":"repl_catchup","commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.90","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"refused":"unavailable","system":"litefs","text_bytes":600,"unix_s":1795451784,"why":"litefs's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh up: consul didn't take leadership; its log ends:\n==> Starting Consul agent...\n               Version: '2.1.0'\n            Build Date: '2026-10-21 07:34:22 +0000 UTC'\n               Node ID: '67f2f379-8a7a-8f3f-8c67-6ae45c8f17af'\n             Node name: 'adacachy2'\n            Datacenter: 'dc1' (Segment: '<all>')\n                Server: true (Bootstrap: false)\n           Client Addr: [127.0.0.1] (HTTP: 54280, HTTPS: -1, gRPC: -1, gRPC-TLS: 8503, DNS: -1)\n          Cluster Addr: 127.0.0.1 (LAN: 54281, WAN: 54282)\n     Gossip Encryption: false\n      Auto-Encrypt-TLS: false\n           ACL Enabled: false\n     Reporting Enabled: false\n    ACL Default Policy: allow\n             HTTPS TLS: Verify Incoming: false, Verify Outgoing: false, Min Version: TLSv1_2\n              gRPC TLS: Verify Incoming: false, Min Version: TLSv1_2\n      Internal RPC TLS: Verify Incoming: false, Verify Outgoing: false (Verify Hostname: false), Min Version: TLSv1_2\n\n==> Log data will now stream in as it occurs:\n\n2026-11-23T08:36:23.731-0800 [DEBUG] agent.grpc.balancer: switching server: target=consul://dc1.67f2f379-8a7a-8f3f-8c67-6ae45c8f17af/server.dc1 from=<none> to=<none>\n2026-11-23T08:36:23.734-0800 [INFO]  agent.server.raft: initial configuration: index=1 servers=\"[{Suffrage:Voter ID:67f2f379-8a7a-8f3f-8c67-6ae45c8f17af Address:127.0.0.1:54283}]\"\n2026-11-23T08:36:23.734-0800 [INFO]  agent.server.raft: entering follower state: follower=\"Node at 127.0.0.1:54283 [Follower]\" leader-address= leader-id=\n2026-11-23T08:36:23.734-0800 [INFO]  agent.server: shutting down server\n2026-11-23T08:36:23.734-0800 [ERROR] agent: Error starting agent: error=\"Failed to start Consul server: Failed to start WAN Serf: failed to start TCP listener on \\\"127.0.0.1\\\" port 54282: listen tcp 127.0.0.1:54282: bind: address already in use\"\n2026-11-23T08:36:23.734-0800 [INFO]  agent: Exit code: code=1"}
+Error: unavailable: litefs's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh up: consul didn't take leadership; its log ends:
+==> Starting Consul agent...
+               Version: '2.1.0'
+            Build Date: '2026-10-21 07:34:22 +0000 UTC'
+               Node ID: '67f2f379-8a7a-8f3f-8c67-6ae45c8f17af'
+             Node name: 'adacachy2'
+            Datacenter: 'dc1' (Segment: '<all>')
+                Server: true (Bootstrap: false)
+           Client Addr: [127.0.0.1] (HTTP: 54280, HTTPS: -1, gRPC: -1, gRPC-TLS: 8503, DNS: -1)
+          Cluster Addr: 127.0.0.1 (LAN: 54281, WAN: 54282)
+     Gossip Encryption: false
+      Auto-Encrypt-TLS: false
+           ACL Enabled: false
+     Reporting Enabled: false
+    ACL Default Policy: allow
+             HTTPS TLS: Verify Incoming: false, Verify Outgoing: false, Min Version: TLSv1_2
+              gRPC TLS: Verify Incoming: false, Min Version: TLSv1_2
+      Internal RPC TLS: Verify Incoming: false, Verify Outgoing: false (Verify Hostname: false), Min Version: TLSv1_2
+
+==> Log data will now stream in as it occurs:
+
+2026-11-23T08:36:23.731-0800 [DEBUG] agent.grpc.balancer: switching server: target=consul://dc1.67f2f379-8a7a-8f3f-8c67-6ae45c8f17af/server.dc1 from=<none> to=<none>
+2026-11-23T08:36:23.734-0800 [INFO]  agent.server.raft: initial configuration: index=1 servers="[{Suffrage:Voter ID:67f2f379-8a7a-8f3f-8c67-6ae45c8f17af Address:127.0.0.1:54283}]"
+2026-11-23T08:36:23.734-0800 [INFO]  agent.server.raft: entering follower state: follower="Node at 127.0.0.1:54283 [Follower]" leader-address= leader-id=
+2026-11-23T08:36:23.734-0800 [INFO]  agent.server: shutting down server
+2026-11-23T08:36:23.734-0800 [ERROR] agent: Error starting agent: error="Failed to start Consul server: Failed to start WAN Serf: failed to start TCP listener on \"127.0.0.1\" port 54282: listen tcp 127.0.0.1:54282: bind: address already in use"
+2026-11-23T08:36:23.734-0800 [INFO]  agent: Exit code: code=1
+refused litefs catchup: litefs's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh up: consul didn't take leadership; its log ends:\n==> Starting Consul agent...\n               Version: '2.1.0'\n            Build Date: '2026-10-21 07:34:22 +0000 UTC'\n               Node ID: '67f2f379-8a7a-8f3f-8c67-6ae45c8f17af'\n             Node name: 'adacachy2'\n            Datacenter: 'dc1' (Segment: '<all>')\n                Server: true (Bootstrap: false)\n           Client Addr: [127.0.0.1] (HTTP: 54280, HTTPS: -1, gRPC: -1, gRPC-TLS: 8503, DNS: -1)\n          Cluster Addr: 127.0.0.1 (LAN: 54281, WAN: 54282)\n     Gossip Encryption: false\n      Auto-Encrypt-TLS: false\n           ACL Enabled: false\n     Reporting Enabled: false\n    ACL Default Policy: allow\n             HTTPS TLS: Verify Incoming: false, Verify Outgoing: false, Min Version: TLSv1_2\n              gRPC TLS: Verify Incoming: false, Min Version: TLSv1_2\n      Internal RPC TLS: Verify Incoming: false, Verify Outgoing: false (Verify Hostname: false), Min Version: TLSv1_2\n\n==> Log data will now stream in as it occurs:\n\n2026-11-23T08:36:23.731-0800 [DEBUG] agent.grpc.balancer: switching server: target=consul://dc1.67f2f379-8a7a-8f3f-8c67-6ae45c8f17af/server.dc1 from=<none> to=<none>\n2026-11-23T08:36:23.734-0800 [INFO]  agent.server.raft: initial configuration: index=1 servers=\
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.09s
+== libsql catchup
+{"batch":1,"bench":"repl_catchup","commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.90","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"refused":"unavailable","system":"libsql","text_bytes":600,"unix_s":1795451784,"why":"libsql's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh up: libsql primary didn't come up to set its durability; its log ends:\n           _     _ \n ___  __ _| | __| |\n/ __|/ _` | |/ _` |\n\\__ \\ (_| | | (_| |\n|___/\\__, |_|\\__,_|\n        |_|        \n\nWelcome to sqld!\n\nversion: 0.24.32\ncommit SHA: 40c272de85ee4e62d722c5ccae5da2e76b4253a1\nbuild date: 2025-02-14\n\nThis software is in BETA version.\nIf you encounter any bug, please open an issue at https://github.com/tursodatabase/libsql/issues\n\nconfig:\n\t- mode: primary (127.0.0.1:54230)\n\t- database path: /home/adalundhe/.cache/amphora-repl-data/amphora-bench-repl-libsql/0/data\n\t- extensions path: <disabled>\n\t- listening for HTTP requests on: 127.0.0.1:54220\n\t- grpc_tls: no\n2026-11-23T16:36:24.903785Z  INFO sqld: listening for incoming user HTTP connection on 127.0.0.1:54220\n2026-11-23T16:36:24.903826Z  INFO sqld: listening for incoming adming HTTP connection on 127.0.0.1:54223\nError: Address already in use (os error 98)"}
+Error: unavailable: libsql's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh up: libsql primary didn't come up to set its durability; its log ends:
+           _     _ 
+ ___  __ _| | __| |
+/ __|/ _` | |/ _` |
+\__ \ (_| | | (_| |
+|___/\__, |_|\__,_|
+        |_|        
+
+Welcome to sqld!
+
+version: 0.24.32
+commit SHA: 40c272de85ee4e62d722c5ccae5da2e76b4253a1
+build date: 2025-02-14
+
+This software is in BETA version.
+If you encounter any bug, please open an issue at https://github.com/tursodatabase/libsql/issues
+
+config:
+	- mode: primary (127.0.0.1:54230)
+	- database path: /home/adalundhe/.cache/amphora-repl-data/amphora-bench-repl-libsql/0/data
+	- extensions path: <disabled>
+	- listening for HTTP requests on: 127.0.0.1:54220
+	- grpc_tls: no
+2026-11-23T16:36:24.903785Z  INFO sqld: listening for incoming user HTTP connection on 127.0.0.1:54220
+2026-11-23T16:36:24.903826Z  INFO sqld: listening for incoming adming HTTP connection on 127.0.0.1:54223
+Error: Address already in use (os error 98)
+refused libsql catchup: libsql's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh up: libsql primary didn't come up to set its durability; its log ends:\n           _     _ \n ___  __ _| | __| |\n/ __|/ _` | |/ _` |\n\\__ \\ (_| | | (_| |\n|___/\\__, |_|\\__,_|\n        |_|        \n\nWelcome to sqld!\n\nversion: 0.24.32\ncommit SHA: 40c272de85ee4e62d722c5ccae5da2e76b4253a1\nbuild date: 2025-02-14\n\nThis software is in BETA version.\nIf you encounter any bug, please open an issue at https://github.com/tursodatabase/libsql/issues\n\nconfig:\n\t- mode: primary (127.0.0.1:54230)\n\t- database path: /home/adalundhe/.cache/amphora-repl-data/amphora-bench-repl-libsql/0/data\n\t- extensions path: <disabled>\n\t- listening for HTTP requests on: 127.0.0.1:54220\n\t- grpc_tls: no\n2026-11-23T16:36:24.903785Z  INFO sqld: listening for incoming user HTTP connection on 127.0.0.1:54220\n2026-11-23T16:36:24.903826Z  INFO sqld: listening for incoming adming HTTP connection on 127.0.0.1:54223\nError: Address already in use (os error 98)
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.08s
+== dqlite catchup
+{"batch":1,"bench":"repl_catchup","commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.90","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"refused":"unavailable","system":"dqlite","text_bytes":600,"unix_s":1795451785,"why":"dqlite's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/dqlite.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/dqlite.sh up: dqlite node 2 didn't print its ready line (/shim ready: listening on /) within 120s or ended first; its log ends:\n2026/11/23 08:36:25 create node: failed to set bind address \"127.0.0.1:54252\": 1"}
+Error: unavailable: dqlite's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/dqlite.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/dqlite.sh up: dqlite node 2 didn't print its ready line (/shim ready: listening on /) within 120s or ended first; its log ends:
+2026/11/23 08:36:25 create node: failed to set bind address "127.0.0.1:54252": 1
+refused dqlite catchup: dqlite's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/dqlite.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/dqlite.sh up: dqlite node 2 didn't print its ready line (/shim ready: listening on /) within 120s or ended first; its log ends:\n2026/11/23 08:36:25 create node: failed to set bind address \
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.08s
+== rqlite catchup
+{"about":{"client":{"dialect":"Rqlite","driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","pool_per_node":1,"transport":"HTTP/1.1 keep-alive over TCP (ureq 3), TCP_NODELAY, one request a write"},"column":"quorum","data_fs":"btrfs","durability":"acknowledged once a quorum (2 of 3) of Raft logs hold it, each fdatasynced (BoltDB without NoSync); rqlited's defaults, which no flag weakens or strengthens","durability_check":null,"kernel":"Linux 7.3.3-1-cachyos x86_64","platform":"native","sync_options":[],"system":"rqlite","version":"rqlited v10.7.4 linux amd64 go1.27.4 sqlite3.54.1 (commit 4452a98ae5190e3589acb053fa2ab2eb48717248, compiler gc)"},"batch":1,"behind":0,"bench":"repl_catchup","catchup_ms":113.966,"client_use":{"cpu_s":0.03,"peak_rss_kib":14676,"sockets":2},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.75","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":0,"system":"rqlite","text_bytes":600,"unix_s":1795451789}
+ok rqlite catchup
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.09s
+== amphora-procs-replicated catchup on 127.0.0.1:29290,127.0.0.1:29291,127.0.0.1:29292
+member 2 ready on 127.0.0.1:29291
+member 1 ready on 127.0.0.1:29290
+member 3 ready on 127.0.0.1:29292
+{"about":{"client":{"driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","transport":"one JSON line a request over TCP, TCP_NODELAY, one request a write; a kept connection to each member for every writer in flight"},"column":"quorum","durability":"the --class named in the record (persisted: once a quorum's disks hold it and the proposer's log is flushed; replicated: once members spanning --spanning fates hold it)","members":["127.0.0.1:29290","127.0.0.1:29291","127.0.0.1:29292"],"platform":"native","system":"amphora","version":"7ac4153dfaf8836d878901fee1bde8c3611917e3"},"batch":1,"behind":0,"bench":"repl_catchup","catchup_ms":14.242,"client_use":{"cpu_s":0.02,"peak_rss_kib":12216,"sockets":3},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.75","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":0,"system":"amphora-procs-replicated","text_bytes":600,"unix_s":1795451789}
+ok amphora-procs-replicated catchup
+bench/repl_members.sh: line 75: 2723674 Killed                     "$BIN" "${args[@]}"
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.09s
+== amphora-procs-persisted catchup on 127.0.0.1:29290,127.0.0.1:29291,127.0.0.1:29292
+member 2 ready on 127.0.0.1:29291
+member 3 ready on 127.0.0.1:29292
+member 1 ready on 127.0.0.1:29290
+{"about":{"client":{"driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","transport":"one JSON line a request over TCP, TCP_NODELAY, one request a write; a kept connection to each member for every writer in flight"},"column":"quorum","durability":"the --class named in the record (persisted: once a quorum's disks hold it and the proposer's log is flushed; replicated: once members spanning --spanning fates hold it)","members":["127.0.0.1:29290","127.0.0.1:29291","127.0.0.1:29292"],"platform":"native","system":"amphora","version":"7ac4153dfaf8836d878901fee1bde8c3611917e3"},"batch":1,"behind":0,"bench":"repl_catchup","catchup_ms":17.104,"client_use":{"cpu_s":0.02,"peak_rss_kib":12676,"sockets":3},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.75","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":0,"system":"amphora-procs-persisted","text_bytes":600,"unix_s":1795451789}
+ok amphora-procs-persisted catchup
+bench/repl_members.sh: line 75: 2725102 Killed                     "$BIN" "${args[@]}"
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.08s
+== amphora-procs-persisted catchup on 127.0.0.1:29290,127.0.0.1:29291,127.0.0.1:29292
+member 3 ready on 127.0.0.1:29292
+member 1 ready on 127.0.0.1:29290
+member 2 ready on 127.0.0.1:29291
+{"about":{"client":{"driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","transport":"one JSON line a request over TCP, TCP_NODELAY, one request a write; a kept connection to each member for every writer in flight"},"column":"quorum","durability":"the --class named in the record (persisted: once a quorum's disks hold it and the proposer's log is flushed; replicated: once members spanning --spanning fates hold it)","members":["127.0.0.1:29290","127.0.0.1:29291","127.0.0.1:29292"],"platform":"native","system":"amphora","version":"7ac4153dfaf8836d878901fee1bde8c3611917e3"},"batch":1,"behind":0,"bench":"repl_catchup","catchup_ms":13.593,"client_use":{"cpu_s":0.01,"peak_rss_kib":12844,"sockets":2},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.75","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":0,"system":"amphora-procs-persisted","text_bytes":600,"unix_s":1795451790}
+ok amphora-procs-persisted catchup
+bench/repl_members.sh: line 75: 2729204 Killed                     "$BIN" "${args[@]}"
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.08s
+== amphora-procs-replicated catchup on 127.0.0.1:29290,127.0.0.1:29291,127.0.0.1:29292
+member 2 ready on 127.0.0.1:29291
+member 3 ready on 127.0.0.1:29292
+member 1 ready on 127.0.0.1:29290
+{"about":{"client":{"driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","transport":"one JSON line a request over TCP, TCP_NODELAY, one request a write; a kept connection to each member for every writer in flight"},"column":"quorum","durability":"the --class named in the record (persisted: once a quorum's disks hold it and the proposer's log is flushed; replicated: once members spanning --spanning fates hold it)","members":["127.0.0.1:29290","127.0.0.1:29291","127.0.0.1:29292"],"platform":"native","system":"amphora","version":"7ac4153dfaf8836d878901fee1bde8c3611917e3"},"batch":1,"behind":0,"bench":"repl_catchup","catchup_ms":30.659,"client_use":{"cpu_s":0.01,"peak_rss_kib":12872,"sockets":3},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.75","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":0,"system":"amphora-procs-replicated","text_bytes":600,"unix_s":1795451790}
+ok amphora-procs-replicated catchup
+bench/repl_members.sh: line 75: 2730663 Killed                     "$BIN" "${args[@]}"
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.08s
+== rqlite catchup
+{"about":{"client":{"dialect":"Rqlite","driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","pool_per_node":1,"transport":"HTTP/1.1 keep-alive over TCP (ureq 3), TCP_NODELAY, one request a write"},"column":"quorum","data_fs":"btrfs","durability":"acknowledged once a quorum (2 of 3) of Raft logs hold it, each fdatasynced (BoltDB without NoSync); rqlited's defaults, which no flag weakens or strengthens","durability_check":null,"kernel":"Linux 7.3.3-1-cachyos x86_64","platform":"native","sync_options":[],"system":"rqlite","version":"rqlited v10.7.4 linux amd64 go1.27.4 sqlite3.54.1 (commit 4452a98ae5190e3589acb053fa2ab2eb48717248, compiler gc)"},"batch":1,"behind":0,"bench":"repl_catchup","catchup_ms":102.124,"client_use":{"cpu_s":0.02,"peak_rss_kib":14332,"sockets":2},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.69","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":0,"system":"rqlite","text_bytes":600,"unix_s":1795451793}
+ok rqlite catchup
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.09s
+== dqlite catchup
+{"batch":1,"bench":"repl_catchup","commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.69","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"refused":"unavailable","system":"dqlite","text_bytes":600,"unix_s":1795451793,"why":"dqlite's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/dqlite.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/dqlite.sh up: dqlite node 2 didn't print its ready line (/shim ready: listening on /) within 120s or ended first; its log ends:\n2026/11/23 08:36:33 create node: failed to set bind address \"127.0.0.1:54252\": 1"}
+Error: unavailable: dqlite's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/dqlite.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/dqlite.sh up: dqlite node 2 didn't print its ready line (/shim ready: listening on /) within 120s or ended first; its log ends:
+2026/11/23 08:36:33 create node: failed to set bind address "127.0.0.1:54252": 1
+refused dqlite catchup: dqlite's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/dqlite.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/dqlite.sh up: dqlite node 2 didn't print its ready line (/shim ready: listening on /) within 120s or ended first; its log ends:\n2026/11/23 08:36:33 create node: failed to set bind address \
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.09s
+== libsql catchup
+{"batch":1,"bench":"repl_catchup","commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.69","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"refused":"unavailable","system":"libsql","text_bytes":600,"unix_s":1795451794,"why":"libsql's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh up: libsql primary didn't come up to set its durability; its log ends:\n           _     _ \n ___  __ _| | __| |\n/ __|/ _` | |/ _` |\n\\__ \\ (_| | | (_| |\n|___/\\__, |_|\\__,_|\n        |_|        \n\nWelcome to sqld!\n\nversion: 0.24.32\ncommit SHA: 40c272de85ee4e62d722c5ccae5da2e76b4253a1\nbuild date: 2025-02-14\n\nThis software is in BETA version.\nIf you encounter any bug, please open an issue at https://github.com/tursodatabase/libsql/issues\n\nconfig:\n\t- mode: primary (127.0.0.1:54230)\n\t- database path: /home/adalundhe/.cache/amphora-repl-data/amphora-bench-repl-libsql/0/data\n\t- extensions path: <disabled>\n\t- listening for HTTP requests on: 127.0.0.1:54220\n\t- grpc_tls: no\n2026-11-23T16:36:34.009606Z  INFO sqld: listening for incoming user HTTP connection on 127.0.0.1:54220\n2026-11-23T16:36:34.009628Z  INFO sqld: listening for incoming adming HTTP connection on 127.0.0.1:54223\nError: Address already in use (os error 98)"}
+Error: unavailable: libsql's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh up: libsql primary didn't come up to set its durability; its log ends:
+           _     _ 
+ ___  __ _| | __| |
+/ __|/ _` | |/ _` |
+\__ \ (_| | | (_| |
+|___/\__, |_|\__,_|
+        |_|        
+
+Welcome to sqld!
+
+version: 0.24.32
+commit SHA: 40c272de85ee4e62d722c5ccae5da2e76b4253a1
+build date: 2025-02-14
+
+This software is in BETA version.
+If you encounter any bug, please open an issue at https://github.com/tursodatabase/libsql/issues
+
+config:
+	- mode: primary (127.0.0.1:54230)
+	- database path: /home/adalundhe/.cache/amphora-repl-data/amphora-bench-repl-libsql/0/data
+	- extensions path: <disabled>
+	- listening for HTTP requests on: 127.0.0.1:54220
+	- grpc_tls: no
+2026-11-23T16:36:34.009606Z  INFO sqld: listening for incoming user HTTP connection on 127.0.0.1:54220
+2026-11-23T16:36:34.009628Z  INFO sqld: listening for incoming adming HTTP connection on 127.0.0.1:54223
+Error: Address already in use (os error 98)
+refused libsql catchup: libsql's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh up: libsql primary didn't come up to set its durability; its log ends:\n           _     _ \n ___  __ _| | __| |\n/ __|/ _` | |/ _` |\n\\__ \\ (_| | | (_| |\n|___/\\__, |_|\\__,_|\n        |_|        \n\nWelcome to sqld!\n\nversion: 0.24.32\ncommit SHA: 40c272de85ee4e62d722c5ccae5da2e76b4253a1\nbuild date: 2025-02-14\n\nThis software is in BETA version.\nIf you encounter any bug, please open an issue at https://github.com/tursodatabase/libsql/issues\n\nconfig:\n\t- mode: primary (127.0.0.1:54230)\n\t- database path: /home/adalundhe/.cache/amphora-repl-data/amphora-bench-repl-libsql/0/data\n\t- extensions path: <disabled>\n\t- listening for HTTP requests on: 127.0.0.1:54220\n\t- grpc_tls: no\n2026-11-23T16:36:34.009606Z  INFO sqld: listening for incoming user HTTP connection on 127.0.0.1:54220\n2026-11-23T16:36:34.009628Z  INFO sqld: listening for incoming adming HTTP connection on 127.0.0.1:54223\nError: Address already in use (os error 98)
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.08s
+== litefs catchup
+{"batch":1,"bench":"repl_catchup","commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.69","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"refused":"unavailable","system":"litefs","text_bytes":600,"unix_s":1795451795,"why":"litefs's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh up: consul didn't take leadership; its log ends:\n==> Starting Consul agent...\n               Version: '2.1.0'\n            Build Date: '2026-10-21 07:34:22 +0000 UTC'\n               Node ID: 'dd77a93d-413a-d420-e9c0-79907a02c966'\n             Node name: 'adacachy2'\n            Datacenter: 'dc1' (Segment: '<all>')\n                Server: true (Bootstrap: false)\n           Client Addr: [127.0.0.1] (HTTP: 54280, HTTPS: -1, gRPC: -1, gRPC-TLS: 8503, DNS: -1)\n          Cluster Addr: 127.0.0.1 (LAN: 54281, WAN: 54282)\n     Gossip Encryption: false\n      Auto-Encrypt-TLS: false\n           ACL Enabled: false\n     Reporting Enabled: false\n    ACL Default Policy: allow\n             HTTPS TLS: Verify Incoming: false, Verify Outgoing: false, Min Version: TLSv1_2\n              gRPC TLS: Verify Incoming: false, Min Version: TLSv1_2\n      Internal RPC TLS: Verify Incoming: false, Verify Outgoing: false (Verify Hostname: false), Min Version: TLSv1_2\n\n==> Log data will now stream in as it occurs:\n\n2026-11-23T08:36:34.182-0800 [DEBUG] agent.grpc.balancer: switching server: target=consul://dc1.dd77a93d-413a-d420-e9c0-79907a02c966/server.dc1 from=<none> to=<none>\n2026-11-23T08:36:34.186-0800 [INFO]  agent.server.raft: initial configuration: index=1 servers=\"[{Suffrage:Voter ID:dd77a93d-413a-d420-e9c0-79907a02c966 Address:127.0.0.1:54283}]\"\n2026-11-23T08:36:34.186-0800 [INFO]  agent.server: shutting down server\n2026-11-23T08:36:34.186-0800 [ERROR] agent: Error starting agent: error=\"Failed to start Consul server: Failed to start WAN Serf: failed to start TCP listener on \\\"127.0.0.1\\\" port 54282: listen tcp 127.0.0.1:54282: bind: address already in use\"\n2026-11-23T08:36:34.186-0800 [INFO]  agent: Exit code: code=1"}
+Error: unavailable: litefs's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh up: consul didn't take leadership; its log ends:
+==> Starting Consul agent...
+               Version: '2.1.0'
+            Build Date: '2026-10-21 07:34:22 +0000 UTC'
+               Node ID: 'dd77a93d-413a-d420-e9c0-79907a02c966'
+             Node name: 'adacachy2'
+            Datacenter: 'dc1' (Segment: '<all>')
+                Server: true (Bootstrap: false)
+           Client Addr: [127.0.0.1] (HTTP: 54280, HTTPS: -1, gRPC: -1, gRPC-TLS: 8503, DNS: -1)
+          Cluster Addr: 127.0.0.1 (LAN: 54281, WAN: 54282)
+     Gossip Encryption: false
+      Auto-Encrypt-TLS: false
+           ACL Enabled: false
+     Reporting Enabled: false
+    ACL Default Policy: allow
+             HTTPS TLS: Verify Incoming: false, Verify Outgoing: false, Min Version: TLSv1_2
+              gRPC TLS: Verify Incoming: false, Min Version: TLSv1_2
+      Internal RPC TLS: Verify Incoming: false, Verify Outgoing: false (Verify Hostname: false), Min Version: TLSv1_2
+
+==> Log data will now stream in as it occurs:
+
+2026-11-23T08:36:34.182-0800 [DEBUG] agent.grpc.balancer: switching server: target=consul://dc1.dd77a93d-413a-d420-e9c0-79907a02c966/server.dc1 from=<none> to=<none>
+2026-11-23T08:36:34.186-0800 [INFO]  agent.server.raft: initial configuration: index=1 servers="[{Suffrage:Voter ID:dd77a93d-413a-d420-e9c0-79907a02c966 Address:127.0.0.1:54283}]"
+2026-11-23T08:36:34.186-0800 [INFO]  agent.server: shutting down server
+2026-11-23T08:36:34.186-0800 [ERROR] agent: Error starting agent: error="Failed to start Consul server: Failed to start WAN Serf: failed to start TCP listener on \"127.0.0.1\" port 54282: listen tcp 127.0.0.1:54282: bind: address already in use"
+2026-11-23T08:36:34.186-0800 [INFO]  agent: Exit code: code=1
+refused litefs catchup: litefs's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh up: consul didn't take leadership; its log ends:\n==> Starting Consul agent...\n               Version: '2.1.0'\n            Build Date: '2026-10-21 07:34:22 +0000 UTC'\n               Node ID: 'dd77a93d-413a-d420-e9c0-79907a02c966'\n             Node name: 'adacachy2'\n            Datacenter: 'dc1' (Segment: '<all>')\n                Server: true (Bootstrap: false)\n           Client Addr: [127.0.0.1] (HTTP: 54280, HTTPS: -1, gRPC: -1, gRPC-TLS: 8503, DNS: -1)\n          Cluster Addr: 127.0.0.1 (LAN: 54281, WAN: 54282)\n     Gossip Encryption: false\n      Auto-Encrypt-TLS: false\n           ACL Enabled: false\n     Reporting Enabled: false\n    ACL Default Policy: allow\n             HTTPS TLS: Verify Incoming: false, Verify Outgoing: false, Min Version: TLSv1_2\n              gRPC TLS: Verify Incoming: false, Min Version: TLSv1_2\n      Internal RPC TLS: Verify Incoming: false, Verify Outgoing: false (Verify Hostname: false), Min Version: TLSv1_2\n\n==> Log data will now stream in as it occurs:\n\n2026-11-23T08:36:34.182-0800 [DEBUG] agent.grpc.balancer: switching server: target=consul://dc1.dd77a93d-413a-d420-e9c0-79907a02c966/server.dc1 from=<none> to=<none>\n2026-11-23T08:36:34.186-0800 [INFO]  agent.server.raft: initial configuration: index=1 servers=\
+{
+ "derived": {
+  "amphora-procs-persisted": {
+   "1": {
+    "writes_per_s": 19.8,
+    "writes_runs": 5,
+    "restart_ms": 17.275,
+    "restart_ms_range": [
+     13.593,
+     26.855
+    ],
+    "restart_runs": 5,
+    "behind": 1
+   },
+   "32": {
+    "writes_per_s": 13.8,
+    "writes_runs": 5,
+    "restart_ms": 17.275,
+    "restart_ms_range": [
+     13.593,
+     26.855
+    ],
+    "restart_runs": 5,
+    "behind": 1
+   }
+  },
+  "amphora-procs-replicated": {
+   "1": {
+    "writes_per_s": 14.4,
+    "writes_runs": 5,
+    "restart_ms": 16.825,
+    "restart_ms_range": [
+     14.242,
+     41.198
+    ],
+    "restart_runs": 5,
+    "behind": 1
+   },
+   "32": {
+    "writes_per_s": 19.0,
+    "writes_runs": 5,
+    "restart_ms": 16.825,
+    "restart_ms_range": [
+     14.242,
+     41.198
+    ],
+    "restart_runs": 5,
+    "behind": 1
+   },
+   "128": {
+    "writes_per_s": 17.3,
+    "writes_runs": 2,
+    "restart_ms": 16.825,
+    "restart_ms_range": [
+     14.242,
+     41.198
+    ],
+    "restart_runs": 5,
+    "behind": 1
+   }
+  },
+  "rqlite": {
+   "1": {
+    "writes_per_s": 24.6,
+    "writes_runs": 5,
+    "restart_ms": 113.966,
+    "restart_ms_range": [
+     96.746,
+     141.984
+    ],
+    "restart_runs": 5,
+    "behind": 3
+   },
+   "32": {
+    "writes_per_s": 372.8,
+    "writes_runs": 5,
+    "restart_ms": 113.966,
+    "restart_ms_range": [
+     96.746,
+     141.984
+    ],
+    "restart_runs": 5,
+    "behind": 43
+   },
+   "128": {
+    "writes_per_s": 1389.8,
+    "writes_runs": 5,
+    "restart_ms": 113.966,
+    "restart_ms_range": [
+     96.746,
+     141.984
+    ],
+    "restart_runs": 5,
+    "behind": 159
+   }
+  }
+ },
+ "ladder": [
+  1,
+  10,
+  100,
+  1000
+ ],
+ "refused_or_missing": [
+  "dqlite",
+  "litefs"
+ ]
+}
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.09s
+== amphora-procs-persisted catchup on 127.0.0.1:29290,127.0.0.1:29291,127.0.0.1:29292
+member 3 ready on 127.0.0.1:29292
+member 2 ready on 127.0.0.1:29291
+member 1 ready on 127.0.0.1:29290
+{"about":{"client":{"driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","transport":"one JSON line a request over TCP, TCP_NODELAY, one request a write; a kept connection to each member for every writer in flight"},"column":"quorum","durability":"the --class named in the record (persisted: once a quorum's disks hold it and the proposer's log is flushed; replicated: once members spanning --spanning fates hold it)","members":["127.0.0.1:29290","127.0.0.1:29291","127.0.0.1:29292"],"platform":"native","system":"amphora","version":"7ac4153dfaf8836d878901fee1bde8c3611917e3"},"batch":1,"behind":1,"bench":"repl_catchup","catchup_ms":30.444,"client_use":{"cpu_s":0.01,"peak_rss_kib":12872,"sockets":2},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.47","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":1,"system":"amphora-procs-persisted","text_bytes":600,"unix_s":1795451799}
+ok amphora-procs-persisted catchup
+bench/repl_members.sh: line 75: 2756981 Killed                     "$BIN" "${args[@]}"
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.08s
+== amphora-procs-replicated catchup on 127.0.0.1:29290,127.0.0.1:29291,127.0.0.1:29292
+member 2 ready on 127.0.0.1:29291
+member 1 ready on 127.0.0.1:29290
+member 3 ready on 127.0.0.1:29292
+{"about":{"client":{"driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","transport":"one JSON line a request over TCP, TCP_NODELAY, one request a write; a kept connection to each member for every writer in flight"},"column":"quorum","durability":"the --class named in the record (persisted: once a quorum's disks hold it and the proposer's log is flushed; replicated: once members spanning --spanning fates hold it)","members":["127.0.0.1:29290","127.0.0.1:29291","127.0.0.1:29292"],"platform":"native","system":"amphora","version":"7ac4153dfaf8836d878901fee1bde8c3611917e3"},"batch":1,"behind":1,"bench":"repl_catchup","catchup_ms":42.762,"client_use":{"cpu_s":0.01,"peak_rss_kib":13096,"sockets":3},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.47","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":1,"system":"amphora-procs-replicated","text_bytes":600,"unix_s":1795451799}
+ok amphora-procs-replicated catchup
+bench/repl_members.sh: line 75: 2758694 Killed                     "$BIN" "${args[@]}"
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.08s
+== rqlite catchup
+bench/repl.sh: line 36: bench/records/2026-11-23-adacachy2-repl-catchup/derived/rqlite-catchup.jsonl: No such file or directory
+{"about":{"client":{"dialect":"Rqlite","driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","pool_per_node":1,"transport":"HTTP/1.1 keep-alive over TCP (ureq 3), TCP_NODELAY, one request a write"},"column":"quorum","data_fs":"btrfs","durability":"acknowledged once a quorum (2 of 3) of Raft logs hold it, each fdatasynced (BoltDB without NoSync); rqlited's defaults, which no flag weakens or strengthens","durability_check":null,"kernel":"Linux 7.3.3-1-cachyos x86_64","platform":"native","sync_options":[],"system":"rqlite","version":"rqlited v10.7.4 linux amd64 go1.27.4 sqlite3.54.1 (commit 4452a98ae5190e3589acb053fa2ab2eb48717248, compiler gc)"},"batch":1,"behind":3,"bench":"repl_catchup","catchup_ms":110.632,"client_use":{"cpu_s":0.03,"peak_rss_kib":14556,"sockets":2},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.47","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":3,"system":"rqlite","text_bytes":600,"unix_s":1795451802}
+ok rqlite catchup
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.08s
+== rqlite catchup
+{"about":{"client":{"dialect":"Rqlite","driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","pool_per_node":1,"transport":"HTTP/1.1 keep-alive over TCP (ureq 3), TCP_NODELAY, one request a write"},"column":"quorum","data_fs":"btrfs","durability":"acknowledged once a quorum (2 of 3) of Raft logs hold it, each fdatasynced (BoltDB without NoSync); rqlited's defaults, which no flag weakens or strengthens","durability_check":null,"kernel":"Linux 7.3.3-1-cachyos x86_64","platform":"native","sync_options":[],"system":"rqlite","version":"rqlited v10.7.4 linux amd64 go1.27.4 sqlite3.54.1 (commit 4452a98ae5190e3589acb053fa2ab2eb48717248, compiler gc)"},"batch":1,"behind":43,"bench":"repl_catchup","catchup_ms":155.235,"client_use":{"cpu_s":0.06,"peak_rss_kib":14972,"sockets":3},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.20","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":43,"system":"rqlite","text_bytes":600,"unix_s":1795451805}
+ok rqlite catchup
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.09s
+== rqlite catchup
+{"about":{"client":{"dialect":"Rqlite","driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","pool_per_node":1,"transport":"HTTP/1.1 keep-alive over TCP (ureq 3), TCP_NODELAY, one request a write"},"column":"quorum","data_fs":"btrfs","durability":"acknowledged once a quorum (2 of 3) of Raft logs hold it, each fdatasynced (BoltDB without NoSync); rqlited's defaults, which no flag weakens or strengthens","durability_check":null,"kernel":"Linux 7.3.3-1-cachyos x86_64","platform":"native","sync_options":[],"system":"rqlite","version":"rqlited v10.7.4 linux amd64 go1.27.4 sqlite3.54.1 (commit 4452a98ae5190e3589acb053fa2ab2eb48717248, compiler gc)"},"batch":1,"behind":159,"bench":"repl_catchup","catchup_ms":584.507,"client_use":{"cpu_s":0.31,"peak_rss_kib":14744,"sockets":3},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.02","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":159,"system":"rqlite","text_bytes":600,"unix_s":1795451811}
+ok rqlite catchup
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.09s
+== rqlite catchup
+{"about":{"client":{"dialect":"Rqlite","driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","pool_per_node":1,"transport":"HTTP/1.1 keep-alive over TCP (ureq 3), TCP_NODELAY, one request a write"},"column":"quorum","data_fs":"btrfs","durability":"acknowledged once a quorum (2 of 3) of Raft logs hold it, each fdatasynced (BoltDB without NoSync); rqlited's defaults, which no flag weakens or strengthens","durability_check":null,"kernel":"Linux 7.3.3-1-cachyos x86_64","platform":"native","sync_options":[],"system":"rqlite","version":"rqlited v10.7.4 linux amd64 go1.27.4 sqlite3.54.1 (commit 4452a98ae5190e3589acb053fa2ab2eb48717248, compiler gc)"},"batch":1,"behind":3,"bench":"repl_catchup","catchup_ms":91.152,"client_use":{"cpu_s":0.02,"peak_rss_kib":14540,"sockets":2},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.26","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":3,"system":"rqlite","text_bytes":600,"unix_s":1795451814}
+ok rqlite catchup
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.09s
+== rqlite catchup
+{"about":{"client":{"dialect":"Rqlite","driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","pool_per_node":1,"transport":"HTTP/1.1 keep-alive over TCP (ureq 3), TCP_NODELAY, one request a write"},"column":"quorum","data_fs":"btrfs","durability":"acknowledged once a quorum (2 of 3) of Raft logs hold it, each fdatasynced (BoltDB without NoSync); rqlited's defaults, which no flag weakens or strengthens","durability_check":null,"kernel":"Linux 7.3.3-1-cachyos x86_64","platform":"native","sync_options":[],"system":"rqlite","version":"rqlited v10.7.4 linux amd64 go1.27.4 sqlite3.54.1 (commit 4452a98ae5190e3589acb053fa2ab2eb48717248, compiler gc)"},"batch":1,"behind":43,"bench":"repl_catchup","catchup_ms":70.932,"client_use":{"cpu_s":0.0,"peak_rss_kib":14276,"sockets":2},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.40","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":43,"system":"rqlite","text_bytes":600,"unix_s":1795451818}
+ok rqlite catchup
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.08s
+== rqlite catchup
+{"about":{"client":{"dialect":"Rqlite","driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","pool_per_node":1,"transport":"HTTP/1.1 keep-alive over TCP (ureq 3), TCP_NODELAY, one request a write"},"column":"quorum","data_fs":"btrfs","durability":"acknowledged once a quorum (2 of 3) of Raft logs hold it, each fdatasynced (BoltDB without NoSync); rqlited's defaults, which no flag weakens or strengthens","durability_check":null,"kernel":"Linux 7.3.3-1-cachyos x86_64","platform":"native","sync_options":[],"system":"rqlite","version":"rqlited v10.7.4 linux amd64 go1.27.4 sqlite3.54.1 (commit 4452a98ae5190e3589acb053fa2ab2eb48717248, compiler gc)"},"batch":1,"behind":159,"bench":"repl_catchup","catchup_ms":2596.036,"client_use":{"cpu_s":1.51,"peak_rss_kib":15096,"sockets":3},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.13","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":159,"system":"rqlite","text_bytes":600,"unix_s":1795451826}
+ok rqlite catchup
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.08s
+== amphora-procs-replicated catchup on 127.0.0.1:29290,127.0.0.1:29291,127.0.0.1:29292
+member 1 ready on 127.0.0.1:29290
+member 3 ready on 127.0.0.1:29292
+member 2 ready on 127.0.0.1:29291
+{"about":{"client":{"driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","transport":"one JSON line a request over TCP, TCP_NODELAY, one request a write; a kept connection to each member for every writer in flight"},"column":"quorum","durability":"the --class named in the record (persisted: once a quorum's disks hold it and the proposer's log is flushed; replicated: once members spanning --spanning fates hold it)","members":["127.0.0.1:29290","127.0.0.1:29291","127.0.0.1:29292"],"platform":"native","system":"amphora","version":"7ac4153dfaf8836d878901fee1bde8c3611917e3"},"batch":1,"behind":1,"bench":"repl_catchup","catchup_ms":34.589,"client_use":{"cpu_s":0.01,"peak_rss_kib":13020,"sockets":2},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.13","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":1,"system":"amphora-procs-replicated","text_bytes":600,"unix_s":1795451826}
+ok amphora-procs-replicated catchup
+bench/repl_members.sh: line 75: 2896519 Killed                     "$BIN" "${args[@]}"
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.08s
+== amphora-procs-persisted catchup on 127.0.0.1:29290,127.0.0.1:29291,127.0.0.1:29292
+member 1 ready on 127.0.0.1:29290
+member 3 ready on 127.0.0.1:29292
+member 2 ready on 127.0.0.1:29291
+{"about":{"client":{"driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","transport":"one JSON line a request over TCP, TCP_NODELAY, one request a write; a kept connection to each member for every writer in flight"},"column":"quorum","durability":"the --class named in the record (persisted: once a quorum's disks hold it and the proposer's log is flushed; replicated: once members spanning --spanning fates hold it)","members":["127.0.0.1:29290","127.0.0.1:29291","127.0.0.1:29292"],"platform":"native","system":"amphora","version":"7ac4153dfaf8836d878901fee1bde8c3611917e3"},"batch":1,"behind":1,"bench":"repl_catchup","catchup_ms":46.278,"client_use":{"cpu_s":0.02,"peak_rss_kib":12536,"sockets":2},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.13","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":1,"system":"amphora-procs-persisted","text_bytes":600,"unix_s":1795451827}
+ok amphora-procs-persisted catchup
+bench/repl_members.sh: line 75: 2898262 Killed                     "$BIN" "${args[@]}"
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.08s
+== amphora-procs-persisted catchup on 127.0.0.1:29290,127.0.0.1:29291,127.0.0.1:29292
+member 2 ready on 127.0.0.1:29291
+member 3 ready on 127.0.0.1:29292
+member 1 ready on 127.0.0.1:29290
+{"about":{"client":{"driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","transport":"one JSON line a request over TCP, TCP_NODELAY, one request a write; a kept connection to each member for every writer in flight"},"column":"quorum","durability":"the --class named in the record (persisted: once a quorum's disks hold it and the proposer's log is flushed; replicated: once members spanning --spanning fates hold it)","members":["127.0.0.1:29290","127.0.0.1:29291","127.0.0.1:29292"],"platform":"native","system":"amphora","version":"7ac4153dfaf8836d878901fee1bde8c3611917e3"},"batch":1,"behind":1,"bench":"repl_catchup","catchup_ms":41.202,"client_use":{"cpu_s":0.01,"peak_rss_kib":13200,"sockets":3},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.20","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":1,"system":"amphora-procs-persisted","text_bytes":600,"unix_s":1795451828}
+ok amphora-procs-persisted catchup
+bench/repl_members.sh: line 75: 2900198 Killed                     "$BIN" "${args[@]}"
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.09s
+== amphora-procs-replicated catchup on 127.0.0.1:29290,127.0.0.1:29291,127.0.0.1:29292
+member 1 ready on 127.0.0.1:29290
+member 3 ready on 127.0.0.1:29292
+member 2 ready on 127.0.0.1:29291
+{"about":{"client":{"driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","transport":"one JSON line a request over TCP, TCP_NODELAY, one request a write; a kept connection to each member for every writer in flight"},"column":"quorum","durability":"the --class named in the record (persisted: once a quorum's disks hold it and the proposer's log is flushed; replicated: once members spanning --spanning fates hold it)","members":["127.0.0.1:29290","127.0.0.1:29291","127.0.0.1:29292"],"platform":"native","system":"amphora","version":"7ac4153dfaf8836d878901fee1bde8c3611917e3"},"batch":1,"behind":1,"bench":"repl_catchup","catchup_ms":36.062,"client_use":{"cpu_s":0.03,"peak_rss_kib":12900,"sockets":2},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.20","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":1,"system":"amphora-procs-replicated","text_bytes":600,"unix_s":1795451828}
+ok amphora-procs-replicated catchup
+bench/repl_members.sh: line 75: 2902091 Killed                     "$BIN" "${args[@]}"
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.10s
+== rqlite catchup
+{"about":{"client":{"dialect":"Rqlite","driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","pool_per_node":1,"transport":"HTTP/1.1 keep-alive over TCP (ureq 3), TCP_NODELAY, one request a write"},"column":"quorum","data_fs":"btrfs","durability":"acknowledged once a quorum (2 of 3) of Raft logs hold it, each fdatasynced (BoltDB without NoSync); rqlited's defaults, which no flag weakens or strengthens","durability_check":null,"kernel":"Linux 7.3.3-1-cachyos x86_64","platform":"native","sync_options":[],"system":"rqlite","version":"rqlited v10.7.4 linux amd64 go1.27.4 sqlite3.54.1 (commit 4452a98ae5190e3589acb053fa2ab2eb48717248, compiler gc)"},"batch":1,"behind":3,"bench":"repl_catchup","catchup_ms":105.954,"client_use":{"cpu_s":0.02,"peak_rss_kib":15012,"sockets":3},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.20","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":3,"system":"rqlite","text_bytes":600,"unix_s":1795451831}
+ok rqlite catchup
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.10s
+== rqlite catchup
+{"about":{"client":{"dialect":"Rqlite","driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","pool_per_node":1,"transport":"HTTP/1.1 keep-alive over TCP (ureq 3), TCP_NODELAY, one request a write"},"column":"quorum","data_fs":"btrfs","durability":"acknowledged once a quorum (2 of 3) of Raft logs hold it, each fdatasynced (BoltDB without NoSync); rqlited's defaults, which no flag weakens or strengthens","durability_check":null,"kernel":"Linux 7.3.3-1-cachyos x86_64","platform":"native","sync_options":[],"system":"rqlite","version":"rqlited v10.7.4 linux amd64 go1.27.4 sqlite3.54.1 (commit 4452a98ae5190e3589acb053fa2ab2eb48717248, compiler gc)"},"batch":1,"behind":43,"bench":"repl_catchup","catchup_ms":647.869,"client_use":{"cpu_s":0.33,"peak_rss_kib":14596,"sockets":2},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.26","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":43,"system":"rqlite","text_bytes":600,"unix_s":1795451836}
+ok rqlite catchup
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.08s
+== rqlite catchup
+{"about":{"client":{"dialect":"Rqlite","driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","pool_per_node":1,"transport":"HTTP/1.1 keep-alive over TCP (ureq 3), TCP_NODELAY, one request a write"},"column":"quorum","data_fs":"btrfs","durability":"acknowledged once a quorum (2 of 3) of Raft logs hold it, each fdatasynced (BoltDB without NoSync); rqlited's defaults, which no flag weakens or strengthens","durability_check":null,"kernel":"Linux 7.3.3-1-cachyos x86_64","platform":"native","sync_options":[],"system":"rqlite","version":"rqlited v10.7.4 linux amd64 go1.27.4 sqlite3.54.1 (commit 4452a98ae5190e3589acb053fa2ab2eb48717248, compiler gc)"},"batch":1,"behind":159,"bench":"repl_catchup","catchup_ms":2592.893,"client_use":{"cpu_s":1.38,"peak_rss_kib":14848,"sockets":2},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.07","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":159,"system":"rqlite","text_bytes":600,"unix_s":1795451844}
+ok rqlite catchup
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.08s
+== rqlite catchup
+{"about":{"client":{"dialect":"Rqlite","driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","pool_per_node":1,"transport":"HTTP/1.1 keep-alive over TCP (ureq 3), TCP_NODELAY, one request a write"},"column":"quorum","data_fs":"btrfs","durability":"acknowledged once a quorum (2 of 3) of Raft logs hold it, each fdatasynced (BoltDB without NoSync); rqlited's defaults, which no flag weakens or strengthens","durability_check":null,"kernel":"Linux 7.3.3-1-cachyos x86_64","platform":"native","sync_options":[],"system":"rqlite","version":"rqlited v10.7.4 linux amd64 go1.27.4 sqlite3.54.1 (commit 4452a98ae5190e3589acb053fa2ab2eb48717248, compiler gc)"},"batch":1,"behind":3,"bench":"repl_catchup","catchup_ms":120.828,"client_use":{"cpu_s":0.04,"peak_rss_kib":14680,"sockets":2},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.07","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":3,"system":"rqlite","text_bytes":600,"unix_s":1795451846}
+ok rqlite catchup
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.09s
+== rqlite catchup
+{"about":{"client":{"dialect":"Rqlite","driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","pool_per_node":1,"transport":"HTTP/1.1 keep-alive over TCP (ureq 3), TCP_NODELAY, one request a write"},"column":"quorum","data_fs":"btrfs","durability":"acknowledged once a quorum (2 of 3) of Raft logs hold it, each fdatasynced (BoltDB without NoSync); rqlited's defaults, which no flag weakens or strengthens","durability_check":null,"kernel":"Linux 7.3.3-1-cachyos x86_64","platform":"native","sync_options":[],"system":"rqlite","version":"rqlited v10.7.4 linux amd64 go1.27.4 sqlite3.54.1 (commit 4452a98ae5190e3589acb053fa2ab2eb48717248, compiler gc)"},"batch":1,"behind":43,"bench":"repl_catchup","catchup_ms":142.616,"client_use":{"cpu_s":0.05,"peak_rss_kib":14552,"sockets":2},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.38","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":43,"system":"rqlite","text_bytes":600,"unix_s":1795451850}
+ok rqlite catchup
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.09s
+== rqlite catchup
+{"about":{"client":{"dialect":"Rqlite","driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","pool_per_node":1,"transport":"HTTP/1.1 keep-alive over TCP (ureq 3), TCP_NODELAY, one request a write"},"column":"quorum","data_fs":"btrfs","durability":"acknowledged once a quorum (2 of 3) of Raft logs hold it, each fdatasynced (BoltDB without NoSync); rqlited's defaults, which no flag weakens or strengthens","durability_check":null,"kernel":"Linux 7.3.3-1-cachyos x86_64","platform":"native","sync_options":[],"system":"rqlite","version":"rqlited v10.7.4 linux amd64 go1.27.4 sqlite3.54.1 (commit 4452a98ae5190e3589acb053fa2ab2eb48717248, compiler gc)"},"batch":1,"behind":159,"bench":"repl_catchup","catchup_ms":345.18,"client_use":{"cpu_s":0.16,"peak_rss_kib":14748,"sockets":2},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"6.99","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":159,"system":"rqlite","text_bytes":600,"unix_s":1795451857}
+ok rqlite catchup
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.14s
+== amphora-procs-replicated catchup on 127.0.0.1:29290,127.0.0.1:29291,127.0.0.1:29292
+member 1 ready on 127.0.0.1:29290
+member 3 ready on 127.0.0.1:29292
+member 2 ready on 127.0.0.1:29291
+{"about":{"client":{"driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","transport":"one JSON line a request over TCP, TCP_NODELAY, one request a write; a kept connection to each member for every writer in flight"},"column":"quorum","durability":"the --class named in the record (persisted: once a quorum's disks hold it and the proposer's log is flushed; replicated: once members spanning --spanning fates hold it)","members":["127.0.0.1:29290","127.0.0.1:29291","127.0.0.1:29292"],"platform":"native","system":"amphora","version":"7ac4153dfaf8836d878901fee1bde8c3611917e3"},"batch":1,"behind":1,"bench":"repl_catchup","catchup_ms":43.865,"client_use":{"cpu_s":0.02,"peak_rss_kib":13032,"sockets":2},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"8.35","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":1,"system":"amphora-procs-replicated","text_bytes":600,"unix_s":1795451857}
+ok amphora-procs-replicated catchup
+bench/repl_members.sh: line 75: 3049043 Killed                     "$BIN" "${args[@]}"
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.13s
+== amphora-procs-persisted catchup on 127.0.0.1:29290,127.0.0.1:29291,127.0.0.1:29292
+member 3 ready on 127.0.0.1:29292
+member 1 ready on 127.0.0.1:29290
+member 2 ready on 127.0.0.1:29291
+{"about":{"client":{"driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","transport":"one JSON line a request over TCP, TCP_NODELAY, one request a write; a kept connection to each member for every writer in flight"},"column":"quorum","durability":"the --class named in the record (persisted: once a quorum's disks hold it and the proposer's log is flushed; replicated: once members spanning --spanning fates hold it)","members":["127.0.0.1:29290","127.0.0.1:29291","127.0.0.1:29292"],"platform":"native","system":"amphora","version":"7ac4153dfaf8836d878901fee1bde8c3611917e3"},"batch":1,"behind":1,"bench":"repl_catchup","catchup_ms":52.932,"client_use":{"cpu_s":0.02,"peak_rss_kib":12984,"sockets":2},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"8.35","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":1,"system":"amphora-procs-persisted","text_bytes":600,"unix_s":1795451858}
+ok amphora-procs-persisted catchup
+bench/repl_members.sh: line 75: 3050895 Killed                     "$BIN" "${args[@]}"
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.10s
+== amphora-procs-persisted catchup on 127.0.0.1:29290,127.0.0.1:29291,127.0.0.1:29292
+member 3 ready on 127.0.0.1:29292
+member 1 ready on 127.0.0.1:29290
+member 2 ready on 127.0.0.1:29291
+{"about":{"client":{"driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","transport":"one JSON line a request over TCP, TCP_NODELAY, one request a write; a kept connection to each member for every writer in flight"},"column":"quorum","durability":"the --class named in the record (persisted: once a quorum's disks hold it and the proposer's log is flushed; replicated: once members spanning --spanning fates hold it)","members":["127.0.0.1:29290","127.0.0.1:29291","127.0.0.1:29292"],"platform":"native","system":"amphora","version":"7ac4153dfaf8836d878901fee1bde8c3611917e3"},"batch":1,"behind":1,"bench":"repl_catchup","catchup_ms":52.792,"client_use":{"cpu_s":0.03,"peak_rss_kib":12476,"sockets":2},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"8.35","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":1,"system":"amphora-procs-persisted","text_bytes":600,"unix_s":1795451859}
+ok amphora-procs-persisted catchup
+bench/repl_members.sh: line 75: 3052747 Killed                     "$BIN" "${args[@]}"
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.12s
+== amphora-procs-replicated catchup on 127.0.0.1:29290,127.0.0.1:29291,127.0.0.1:29292
+member 3 ready on 127.0.0.1:29292
+member 2 ready on 127.0.0.1:29291
+member 1 ready on 127.0.0.1:29290
+{"about":{"client":{"driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","transport":"one JSON line a request over TCP, TCP_NODELAY, one request a write; a kept connection to each member for every writer in flight"},"column":"quorum","durability":"the --class named in the record (persisted: once a quorum's disks hold it and the proposer's log is flushed; replicated: once members spanning --spanning fates hold it)","members":["127.0.0.1:29290","127.0.0.1:29291","127.0.0.1:29292"],"platform":"native","system":"amphora","version":"7ac4153dfaf8836d878901fee1bde8c3611917e3"},"batch":1,"behind":1,"bench":"repl_catchup","catchup_ms":58.767,"client_use":{"cpu_s":0.03,"peak_rss_kib":13172,"sockets":2},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"8.35","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":1,"system":"amphora-procs-replicated","text_bytes":600,"unix_s":1795451859}
+ok amphora-procs-replicated catchup
+bench/repl_members.sh: line 75: 3054392 Killed                     "$BIN" "${args[@]}"
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.14s
+== rqlite catchup
+{"about":{"client":{"dialect":"Rqlite","driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","pool_per_node":1,"transport":"HTTP/1.1 keep-alive over TCP (ureq 3), TCP_NODELAY, one request a write"},"column":"quorum","data_fs":"btrfs","durability":"acknowledged once a quorum (2 of 3) of Raft logs hold it, each fdatasynced (BoltDB without NoSync); rqlited's defaults, which no flag weakens or strengthens","durability_check":null,"kernel":"Linux 7.3.3-1-cachyos x86_64","platform":"native","sync_options":[],"system":"rqlite","version":"rqlited v10.7.4 linux amd64 go1.27.4 sqlite3.54.1 (commit 4452a98ae5190e3589acb053fa2ab2eb48717248, compiler gc)"},"batch":1,"behind":3,"bench":"repl_catchup","catchup_ms":103.593,"client_use":{"cpu_s":0.0,"peak_rss_kib":15084,"sockets":2},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"9.37","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":3,"system":"rqlite","text_bytes":600,"unix_s":1795451863}
+ok rqlite catchup
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.17s
+== rqlite catchup
+{"about":{"client":{"dialect":"Rqlite","driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","pool_per_node":1,"transport":"HTTP/1.1 keep-alive over TCP (ureq 3), TCP_NODELAY, one request a write"},"column":"quorum","data_fs":"btrfs","durability":"acknowledged once a quorum (2 of 3) of Raft logs hold it, each fdatasynced (BoltDB without NoSync); rqlited's defaults, which no flag weakens or strengthens","durability_check":null,"kernel":"Linux 7.3.3-1-cachyos x86_64","platform":"native","sync_options":[],"system":"rqlite","version":"rqlited v10.7.4 linux amd64 go1.27.4 sqlite3.54.1 (commit 4452a98ae5190e3589acb053fa2ab2eb48717248, compiler gc)"},"batch":1,"behind":43,"bench":"repl_catchup","catchup_ms":110.234,"client_use":{"cpu_s":0.04,"peak_rss_kib":14784,"sockets":3},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"9.37","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":43,"system":"rqlite","text_bytes":600,"unix_s":1795451866}
+ok rqlite catchup
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.08s
+== rqlite catchup
+{"about":{"client":{"dialect":"Rqlite","driver":"amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each","pool_per_node":1,"transport":"HTTP/1.1 keep-alive over TCP (ureq 3), TCP_NODELAY, one request a write"},"column":"quorum","data_fs":"btrfs","durability":"acknowledged once a quorum (2 of 3) of Raft logs hold it, each fdatasynced (BoltDB without NoSync); rqlited's defaults, which no flag weakens or strengthens","durability_check":null,"kernel":"Linux 7.3.3-1-cachyos x86_64","platform":"native","sync_options":[],"system":"rqlite","version":"rqlited v10.7.4 linux amd64 go1.27.4 sqlite3.54.1 (commit 4452a98ae5190e3589acb053fa2ab2eb48717248, compiler gc)"},"batch":1,"behind":159,"bench":"repl_catchup","catchup_ms":512.397,"client_use":{"cpu_s":0.25,"peak_rss_kib":15224,"sockets":3},"commit":"7ac4153dfaf8836d878901fee1bde8c3611917e3","cpus":32,"host":"","load1":"9.02","nodes":3,"platform":{"arch":"x86_64","kernel":"Linux 7.3.3-1-cachyos x86_64","os":"linux"},"poll_us":0,"rows":159,"system":"rqlite","text_bytes":600,"unix_s":1795451872}
+ok rqlite catchup

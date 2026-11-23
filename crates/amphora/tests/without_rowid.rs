@@ -9,7 +9,7 @@
     clippy::disallowed_macros
 )]
 
-use amphora::database::Database;
+use amphora::database::{AnswerMax, Database};
 use amphora_api::{Refusal, Statement, Value};
 use std::time::{Duration, Instant};
 
@@ -18,7 +18,7 @@ fn until() -> Instant {
 }
 fn exec(db: &Database, sql: &str) {
     let sql = sql.to_owned();
-    db.call(until(), move |c| {
+    db.call(until(), AnswerMax::fixed(), move |c| {
         c.execute_batch(&sql)?;
         Ok(())
     })
@@ -38,7 +38,7 @@ fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
 }
 fn refused(db: &Database, sql: &str) {
     let owned_sql = sql.to_owned();
-    let result: Result<(), Refusal> = db.call(until(), move |c| {
+    let result: Result<(), Refusal> = db.call(until(), AnswerMax::fixed(), move |c| {
         c.execute_batch(&owned_sql)?;
         Ok(())
     });
@@ -225,7 +225,7 @@ fn without_rowid_dml_indexes_and_transaction_rollback() {
         rows(&db, "SELECT a FROM t WHERE u='second'"),
         vec![vec![text("d")]]
     );
-    let result: Result<(), Refusal> = db.call(until(), |c| {
+    let result: Result<(), Refusal> = db.call(until(), AnswerMax::fixed(), |c| {
         c.execute("UPDATE t SET v=99 WHERE a='c'", [])?;
         c.execute("DELETE FROM t WHERE a='d'", [])?;
         anyhow::bail!("application abort")
@@ -521,7 +521,7 @@ fn without_rowid_update_delete_returning_metadata_and_values() {
         INSERT INTO returned VALUES(1,'one'),(2,'two'),(3,'three')",
     );
     let updated = db
-        .call(until(), |c| {
+        .call(until(), AnswerMax::bytes(amphora_api::RESULT_MAX), |c| {
             let mut statement = c.prepare(
                 "UPDATE returned SET v=v || '-new' WHERE id<=2
             RETURNING id AS changed_id,v AS new_value",
@@ -537,7 +537,7 @@ fn without_rowid_update_delete_returning_metadata_and_values() {
         .unwrap();
     assert_eq!(updated, vec![(1, "one-new".into()), (2, "two-new".into())]);
     let deleted = db
-        .call(until(), |c| {
+        .call(until(), AnswerMax::bytes(amphora_api::RESULT_MAX), |c| {
             let mut statement = c.prepare(
                 "DELETE FROM returned WHERE id<=2
             RETURNING id AS deleted_id,v AS old_value",
@@ -614,7 +614,7 @@ fn without_rowid_upsert_update_aborts_statement_despite_outer_fail_policy() {
         "INSERT OR FAIL INTO upsert_abort VALUES('fresh','uf','new'),('conflict','u3','new')
          ON CONFLICT(k) DO UPDATE SET u='u2'",
     ] {
-        let result: Result<(), Refusal> = db.call(until(), move |c| {
+        let result: Result<(), Refusal> = db.call(until(), AnswerMax::fixed(), move |c| {
             c.execute("UPDATE survived SET value=value+1", [])?;
             assert!(c.execute(sql, []).is_err());
             Ok(())

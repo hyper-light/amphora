@@ -1378,7 +1378,7 @@ fn serve(
         let result = if local {
             database.query_local(until, run)
         } else {
-            database.call(until, run)
+            database.call(until, crate::database::AnswerMax::fixed(), run)
         }
         .map(|()| Answer::Done);
         return write(&mut final_stream, &spoken(version, result), until);

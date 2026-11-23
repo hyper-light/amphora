@@ -511,3 +511,149 @@ compared, 0 differ. Amphora's answers match SQLite's and DuckDB's on every query
 - q05 here ran 1,589 ms (1,191 to 1,976) with another plan, while every SF1 timed run in T5's
   q05-only A/B passed 10 s. In one process after 4 other queries, the learned weights stood
   elsewhere and q05 planned differently. That is section 3's instability in the sweep itself.
+
+# Lane T7 (tpch), 2026-11-23 15:55Z to 16:50Z: q05's late terms priced per visit (option i); option ii not built
+
+Machine: adacachy2 (runner 00aad8da), every run named onto it (`on`). Builds and checks asked
+`needs linux/amd64,cpus=4,mem=24g`, the timed A/B `cpus=12,mem=24g`. Kiln refused two runs for
+want of idle cores (0 and 3 of 32 idle). Rule 6's revision sends portable builds and tests to
+macOS. r1176 on Mac Studio 2 failed kiln's sync ("did not answer the sync in 60s"), and kiln then
+offered runner 2768d0d5, which rule 6 forbids. So the checks ran on adacachy2, where the lane's
+target dir was warm.
+
+## 1. q05: option (i), the late terms priced per visit (d041d774)
+
+T6 (70a12ac3) priced the bushy pair's match at the rows it visits: rows(outer + probe) x
+rows(run + probe) / rows(probe) wherever a term joins the run to the outer loops. Each visit was
+still priced at one row's visit (`cpu_cost_per_row`). The two terms each visit runs
+(`l_suppkey = s_suppkey`, `c_nationkey = s_nationkey`) cost nothing: one comparison is folded into
+the row's price, and `ready_where_work` counts only terms with extra steps.
+
+The change (`optimizer/join.rs`, the bushy pair): every visited row runs one late term at least,
+whichever the emitter puts first. The others run on no fewer than the join's rows. Each step is
+priced at the measured WHERE step (`cpu_cost_per_where_step`, `Work::WhereStep`). A pair with no
+late term costs what it did. No constant is picked.
+
+What a visit costs, measured:
+- The calibration the planner bench measured on adacachy2 (T6's xdg, decoded from its f64 bits).
+  A row's visit is 0.454 ns. In rows' visits: a seek 18.55, a hash build 25.81, a probe 4.82, a
+  sort 1.27, a Bloom lookup 4.99, a WHERE step 6.77. So q05's pair now prices a visit at
+  1 + 6.77 = 7.77 rows' visits, not 1.
+- The VM's own count, from the test below with (i) reverted: the late-match plan ran 129,513,060
+  VM steps for 4,286,000 visits, 30 steps a visit.
+
+Test: `t7_q05_late_terms_priced_per_visit_keep_the_late_match_out` (816c78ad, optimizer/mod.rs).
+T6's test passes on main, so this one pins all 8 weights through a lib test hook
+(`learned_costs::test_pin`, a thread-local every prepare on the test's thread reads in place of
+the learned ones). The pinned values are the calibration above, with a row's visit at 0.00027 of a
+page read (T6's SF1 figure) and every page read from the file. Every q05 term is one comparison,
+so the WHERE step reaches q05's plans only through (i). At 0 it reproduces the old pricing. Seeks
+and builds are made dearer by 1, 2, 4, ... until a state takes the late match (VM steps at or past
+its visits). At that state, with the WHERE step at 6.77, the plan must do less work than the late
+match and answer as the nested loops do. T6's test keeps its assertions, and its setup moves to
+helpers both tests share.
+
+Checks:
+- r1185 at 816c78ad: `cargo test -p amphora-engine --lib -- t6_q05 t7_q05 pl_8 hash_join
+  materializ bushy t_qt_5`: 69 passed, 1 failed. The failure is
+  `t_pl_8_13_a_left_join_inside_a_bushy_run_keeps_its_null_rows`, main's (T4 r668 and r754, T6
+  r1042 and r1084). It was not re-run on main this hour. `--test nested_loops`: 7 of 7. Clippy
+  (`-p amphora-engine --all-targets --locked -D warnings`): clean.
+- r1185, the same tree with (i) reversed in join.rs: `t7_q05` fails. At seeks and builds x128 it
+  takes the late match (`MATERIALIZE hash build input for n / SCAN s / SEARCH n ... / HASH JOIN l
+  / HASH JOIN r`) with or without the WHERE step: 129,513,060 steps against 4,286,000 visits.
+  `t6_q05` passes there, as on main.
+
+## 2. Option (ii), the late equalities in the hash key: not built
+
+Not built this hour. Measured against the code, it is a larger change than (i):
+- `find_hash_join_keys` (`optimizer/access_method.rs`) takes an equality only where each side
+  reads one table: the build side the run's last table (nation), the probe side the probe table
+  (region). Both q05 terms fail on both sides. `l_suppkey = s_suppkey` reads lineitem (an outer
+  table) and supplier (a run table that is not the last), and `c_nationkey = s_nationkey` reads
+  customer (outer) and supplier.
+- (ii) needs build keys over any run table, read from the materialized run's rows, and probe keys
+  over the probe table or any outer table, evaluated at the probe's loop. `HashJoinKey`'s users
+  assume one table a side: `get_build_expr` and `get_probe_expr`, the Bloom filters (`lip.rs`),
+  `hash_keys_cover_unique_build_key`, and the emitter's build and probe (`main_loop/hash.rs`).
+  Each is a place a wrong answer could come from.
+- What it would buy at SF1, estimated from T6's counts: keyed on `s_suppkey`, each of the 910,519
+  outer rows matches at most one supplier, so the match visits about 0.9M rows, not 1.82e9.
+
+(i) is in either way. It prices the late terms the emitter runs, and a non-equality late term
+(`<`, `LIKE`) can never be a hash key. Whether (ii) is worth building is the A/B's question below:
+if (i) already keeps q05 off the late match, (ii) would make that plan good rather than avoided.
+
+## 3. q05 before and after (i), against SQLite and DuckDB (r1191)
+
+`~/.cache/amphora-perf/tpch-t7/ab.sh` on adacachy2 (T6's script, its folder T7's, build jobs a
+variable), needs `cpus=12,mem=24g`. Arms: A = 7cdbc32e (main c4b1e62c with the bench's build fix,
+section 6), B = d3eebdbb (A with (i); the test hook is test-only). Both are release
+`amphora-bench --planner` builds in the lane's one target dir (66 s and 62 s). Data: T5's loaded
+SF0.1 and SF1, reflink-copied per arm. Calibration per RULES 5e: each arm opened once, then B's
+body was written under A's key (both sha256 cc0be5f1f5c1a1c0). 5 rounds alternated, each a
+process: the counted warm-up, then 3 timed runs (10 s timeout). SQLite and DuckDB ran 5 times
+each, right after. answers.py: 0 differ at SF0.1 and SF1, every run of both arms included. Load
+average 12 to 15 on 32 cores, CPU pressure (avg10) under 1.5%, I/O pressure 2% to 11%: the
+quietest A/B in this record. r1185 and r1192 (my checks, 4 cores) ran beside it.
+
+| scale | arm | timed runs | median ms | range ms |
+|---|---|---|---|---|
+| SF0.1 | A (main) | 15 done | 237 | 191 to 767 |
+| SF0.1 | B (i) | 15 done | 236 | 202 to 804 |
+| SF0.1 | SQLite | 5 | 111 | 105 to 120 |
+| SF0.1 | DuckDB | 5 | 44 | 42 to 47 |
+| SF1 | A (main) | 15 done | 1,694 | 1,166 to 3,172 |
+| SF1 | B (i) | 15 done | 1,732 | 1,153 to 5,158 |
+| SF1 | SQLite | 5 | 1,816 | 1,791 to 1,822 |
+| SF1 | DuckDB | 5 | 114 | 111 to 116 |
+
+- Verdict: no measurable difference. In every process both arms took the same plans in the same
+  order (SF1: hash-then-seek, then seeks from customer's hash join, then the seek chain from
+  orders; SF0.1: three hash and seek mixes). (i) changes only costs, so the same plan is the
+  same program, and the gaps between arms (B's 5,158 and 4,082 ms, both the second plan, which ran
+  1,405 to 2,379 ms elsewhere) are that plan's run-to-run spread.
+- No process took the late-match pair in either arm (0 of 30 timed runs). T6 saw it in 1 of 5
+  processes at load 52 to 106, where the learned weights stood elsewhere. At this load the A/B
+  cannot show (i)'s effect. The pinned test shows it: at the state that takes the late match,
+  (i) takes a plan doing less work.
+- Against the bar at SF1: Amphora's median is SQLite's (0.93x to 0.95x of its time) and 15x
+  DuckDB's. October's 636 to 661 ms is not reached; at its best run (1,153 ms) q05 is 1.6x
+  SQLite's speed and 10x slower than DuckDB. 10x faster than DuckDB would be about 11 ms.
+- The limiter, inferred from the plans and not profiled: the plan, as in T5 and T6. Each SF1 plan
+  seeks lineitem by `l_orderkey` or hash-joins customer and orders (T6 counted 227,597 order rows
+  there), and the first timed run of each process, on its first plan, is the slowest (2.1 to 3.5 s).
+
+## 4. Unit 2, the versioned cost snapshot: only the test pin
+
+Not done beyond `learned_costs::test_pin` (section 1), which pins all 8 weights for lib tests
+only. The public pin the coordinator asked for (a type behind the `simulator` feature for
+`tests/adaptive_joins.rs:66, 455`) should replace both it and `Connection::pin_cost_weights`'s
+3-weight tuple, with its 4 callers migrated. Then the first batch judged (`Batches::judge`'s
+`_ => true`), `page_miss` versioned, and t_pl_8_13 pinned and run 6 times.
+
+## 5. Unit 3, q19: the plan follows part's estimate, not the weights (r1191)
+
+q19 at SF1 on B, after the q05 runs (one timed run, 797 ms). Its plan, with the planner's
+estimates:
+- `SCAN lineitem`: 427,507 rows out (lineitem's own filters, `l_shipmode` and `l_shipinstruct`,
+  lifted out of the OR's three branches by `lift_common_subexpressions`).
+- `SEARCH part USING INTEGER PRIMARY KEY`: 0.119 rows per line, 50,987 rows out.
+
+`p_partkey = l_partkey` is lifted from the three branches too, so starting from part and seeking
+lineitem by `lineitem_partkey_suppkey`, SQLite's plan, is a plan the search can take. It costs
+more to the planner because part's estimate is all of part's rows. Part's own conditions (brand,
+container, size) stay inside the OR, which also reads `l_quantity`, so they run only after the
+join. No pass derives one table's share of an OR: (brand 12 and container and size) or (...) or
+(...) as an implied filter on part alone, the original OR kept (PostgreSQL's
+`extract_restriction_or_clauses`, `optimizer/util/orclauses.c`). Estimated from TPC-H's uniform
+distributions, not measured: about 480 of SF1's 200,000 parts pass one branch's part conditions
+(80 + 160 + 240). Next: build that derivation, test the work done (VM steps against a full read
+of lineitem), and A/B q19.
+
+## 6. The bench's build
+
+`amphora-bench` at main c4b1e62c did not compile (r1182: E0308 at `bench/src/store.rs:195`).
+80c3a431 (lane perf-A8) made `Config::queue` an `Option<usize>`. Fixed with `.or(defaults.queue)`
+on both arms (7cdbc32e for A, d3eebdbb on perf/tpch). Lane V4 merged the identical line to main
+meanwhile (647f3e03), so the merge took main's.

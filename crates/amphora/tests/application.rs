@@ -12,7 +12,7 @@
 
 use std::time::{Duration, Instant};
 
-use amphora::database::Database;
+use amphora::database::{AnswerMax, Database};
 use amphora_api::Refusal;
 
 fn until() -> Instant {
@@ -20,7 +20,7 @@ fn until() -> Instant {
 }
 
 fn insert(database: &Database, n: i64) -> Result<(), Refusal> {
-    database.call(until(), move |c| {
+    database.call(until(), AnswerMax::fixed(), move |c| {
         c.execute("INSERT INTO items VALUES (?1)", [n])?;
         Ok(())
     })
@@ -28,7 +28,7 @@ fn insert(database: &Database, n: i64) -> Result<(), Refusal> {
 
 fn count(database: &Database) -> i64 {
     database
-        .call(until(), |c| {
+        .call(until(), AnswerMax::fixed(), |c| {
             Ok(c.query_row("SELECT count(*) FROM items", [], |r| r.get(0usize))?)
         })
         .unwrap()
@@ -47,7 +47,7 @@ fn a_write_below_the_standalone_floor_is_refused_and_the_floor_never_falls() {
     let dir = tempfile::tempdir().unwrap();
     let database = Database::open(&dir.path().join("floor.db"), until()).unwrap();
     database
-        .call(until(), |c| {
+        .call(until(), AnswerMax::fixed(), |c| {
             c.execute_batch("CREATE TABLE items(n INTEGER)")?;
             Ok(())
         })
@@ -101,7 +101,7 @@ fn a_read_below_the_standalone_floor_is_refused_as_a_replicated_one_is() {
     let dir = tempfile::tempdir().unwrap();
     let database = Database::open(&dir.path().join("floor.db"), until()).unwrap();
     database
-        .call(until(), |c| {
+        .call(until(), AnswerMax::fixed(), |c| {
             c.execute_batch("CREATE TABLE items(n INTEGER)")?;
             Ok(())
         })
@@ -132,7 +132,7 @@ fn malformed_claims_and_raises_are_refused_before_any_floor_is_installed() {
     let dir = tempfile::tempdir().unwrap();
     let database = Database::open(&dir.path().join("claims.db"), until()).unwrap();
     database
-        .call(until(), |c| {
+        .call(until(), AnswerMax::fixed(), |c| {
             c.execute_batch("CREATE TABLE items(n INTEGER)")?;
             Ok(())
         })

@@ -7,7 +7,7 @@
     clippy::arithmetic_side_effects,
     clippy::disallowed_macros
 )]
-use amphora::database::{Database, Restore};
+use amphora::database::{AnswerMax, Database, Restore};
 use amphora_api::restore::RestorePage;
 use amphora_api::{Records, Statement, Tx, Write};
 use std::time::{Duration, Instant};
@@ -56,7 +56,7 @@ fn pages_resume_without_exposing_partial_state_and_validate_foreign_keys_before_
     let db = restore.finish(vec![2], until()).unwrap();
     assert!(db.restore_progress(until()).unwrap().unwrap().done);
     let count = db
-        .call(until(), |c| {
+        .call(until(), AnswerMax::fixed(), |c| {
             Ok(c.query_row("SELECT count(*) FROM child", [], |r| {
                 r.get::<_, i64>(0usize)
             })?)
@@ -64,7 +64,7 @@ fn pages_resume_without_exposing_partial_state_and_validate_foreign_keys_before_
         .unwrap();
     assert_eq!(count, 1);
     assert!(
-        db.call(until(), |c| {
+        db.call(until(), AnswerMax::fixed(), |c| {
             c.execute("INSERT INTO child VALUES (2,99)", [])?;
             Ok(())
         })
@@ -102,14 +102,14 @@ fn namespaces_keep_the_canonical_owner_alive_and_memory_uses_the_same_pipeline()
     drop(namespace);
     let memory = Database::in_memory(until()).unwrap();
     memory
-        .call(until(), |c| {
+        .call(until(), AnswerMax::fixed(), |c| {
             c.execute_batch("CREATE TABLE test(n); INSERT INTO test VALUES(42)")?;
             Ok(())
         })
         .unwrap();
     assert_eq!(
         memory
-            .call(until(), |c| Ok(c.query_row(
+            .call(until(), AnswerMax::fixed(), |c| Ok(c.query_row(
                 "SELECT n FROM test",
                 [],
                 |r| r.get::<_, i64>(0usize)
@@ -128,7 +128,7 @@ fn unknown_outcome_keeps_the_owner_lease_until_the_writer_actually_drains() {
     let (release, released) = std::sync::mpsc::sync_channel(1);
     let (observed, outcome) = std::sync::mpsc::sync_channel(1);
     let caller = std::thread::spawn(move || {
-        db.call(Instant::now() + Duration::from_millis(25), move |c| {
+        db.call(Instant::now() + Duration::from_millis(25), AnswerMax::fixed(), move |c| {
         started.send(())?;
         released.recv()?;
         let result = c.execute_batch("CREATE TABLE committed_after_timeout(n); INSERT INTO committed_after_timeout VALUES (42)");
@@ -151,7 +151,7 @@ fn unknown_outcome_keeps_the_owner_lease_until_the_writer_actually_drains() {
     let reopened = Database::open(&path, until()).unwrap();
     assert_eq!(
         reopened
-            .call(until(), |c| Ok(c.query_row(
+            .call(until(), AnswerMax::fixed(), |c| Ok(c.query_row(
                 "SELECT n FROM committed_after_timeout",
                 [],
                 |r| r.get::<_, i64>(0usize)
@@ -168,7 +168,7 @@ fn independent_memory_databases_keep_sql_and_records_isolated() {
     let first = Database::in_memory(until()).unwrap();
     let second = Database::in_memory(until()).unwrap();
     first
-        .call(until(), |connection| {
+        .call(until(), AnswerMax::fixed(), |connection| {
             connection
                 .execute_batch("CREATE TABLE private_row(n); INSERT INTO private_row VALUES (7)")?;
             connection.records_commit(
@@ -187,11 +187,12 @@ fn independent_memory_databases_keep_sql_and_records_isolated() {
         .unwrap();
     assert_eq!(
         second
-            .call(until(), |connection| Ok(connection.query_row(
-                "SELECT count(*) FROM sqlite_schema WHERE name = 'private_row'",
-                [],
-                |row| row.get::<_, i64>(0usize)
-            )?))
+            .call(until(), AnswerMax::fixed(), |connection| Ok(connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_schema WHERE name = 'private_row'",
+                    [],
+                    |row| row.get::<_, i64>(0usize)
+                )?))
             .unwrap(),
         0
     );
