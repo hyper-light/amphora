@@ -29,9 +29,6 @@ use std::time::{Duration, Instant};
 use crate::meter::{Counters, Meter};
 use crate::reshard::{Pos, Seq, Span};
 
-mod checkout;
-pub use checkout::ReadCheckout;
-
 /// Flushes what an engine has committed to its disk, from the store's flusher thread.
 pub type Flush = Box<dyn Fn() -> std::io::Result<()> + Send + Sync>;
 
@@ -1002,9 +999,6 @@ struct Readers<R> {
     /// The checkpointer found the log past its bound: the writer starts it again.
     restart: Arc<AtomicBool>,
     meter: Arc<Meter>,
-    /// G3 step 6 (prototype F): a slot a reader, taken without a lock every reader shares; the
-    /// pool, `open` aside, unused then. None: the pool (`ReadCheckout`).
-    slots: Option<checkout::Slots<R>>,
 }
 
 /// The readers not reading, how many are reading, and which database they were opened on (a reader
@@ -1059,10 +1053,6 @@ impl<R> Pool<R> {
 
 impl<R: Send + 'static> Readers<R> {
     fn new(most: usize, meter: Arc<Meter>) -> Self {
-        Self::with_checkout(most, meter, ReadCheckout::process_default())
-    }
-
-    fn with_checkout(most: usize, meter: Arc<Meter>, checkout: ReadCheckout) -> Self {
         Self {
             open: Mutex::new(None),
             pool: Mutex::new(Pool {
@@ -1078,10 +1068,6 @@ impl<R: Send + 'static> Readers<R> {
             gate: Arc::new(RwLock::new(())),
             restart: Arc::new(AtomicBool::new(false)),
             meter,
-            slots: match checkout {
-                ReadCheckout::Pool => None,
-                ReadCheckout::Slots => Some(checkout::Slots::new(most)),
-            },
         }
     }
 
@@ -1187,13 +1173,6 @@ impl<R: Send + 'static> Readers<R> {
                 pool = Pool::wait(pool, &self.returned, None).0;
             }
         }
-        // Each slot once its read is done: `open` is gone, so none is opened in it again.
-        if let Some(slots) = &self.slots {
-            let mut all = slots.take_all();
-            for reader in all.readers() {
-                *reader = None;
-            }
-        }
         if let Some((tx, handle)) = locked(&self.checkpointer).take() {
             drop(tx);
             let _ = handle.join();
@@ -1208,11 +1187,9 @@ impl<R: Send + 'static> Readers<R> {
         }
         let asked = Instant::now();
         let _alone = self.gate.write().unwrap_or_else(PoisonError::into_inner);
-        // Slot readers hold no gate: holding every slot holds them back.
-        let _slots = self.slots.as_ref().map(checkout::Slots::take_all);
-        // Pool readers hold no gate either: none is taken while the pool is held, and the restart
-        // waits for those out to come back.
-        if self.slots.is_none() {
+        // Readers hold no gate: none is taken while the pool is held, and the restart waits for
+        // those out to come back.
+        {
             let mut pool = locked(&self.pool);
             pool.held = true;
             while pool.out > 0 {
@@ -1221,7 +1198,7 @@ impl<R: Send + 'static> Readers<R> {
         }
         let began = Instant::now();
         let restarted = restart();
-        if self.slots.is_none() {
+        {
             let mut pool = locked(&self.pool);
             pool.held = false;
             pool.wake(&self.returned);
@@ -1244,9 +1221,6 @@ impl<R: Send + 'static> Readers<R> {
         until: Instant,
         f: impl FnOnce(&mut R) -> anyhow::Result<T>,
     ) -> Option<anyhow::Result<T>> {
-        if let Some(slots) = &self.slots {
-            return self.with_slot(slots, until, f);
-        }
         let (mut reader, generation) = {
             let mut pool = locked(&self.pool);
             loop {
@@ -1285,28 +1259,6 @@ impl<R: Send + 'static> Readers<R> {
         let answer = f(&mut reader);
         self.give_back(Some(reader), generation);
         Some(answer)
-    }
-
-    /// `with` on a slot's reader (`ReadCheckout::Slots`): the slot this thread takes, its reader
-    /// opened in it the first time; None when there are no readers now.
-    fn with_slot<T>(
-        &self,
-        slots: &checkout::Slots<R>,
-        until: Instant,
-        f: impl FnOnce(&mut R) -> anyhow::Result<T>,
-    ) -> Option<anyhow::Result<T>> {
-        let Some(mut taken) = slots.take(until) else {
-            return Some(Err(Refused::Timeout.into()));
-        };
-        let slot = taken.reader()?;
-        if slot.is_none() {
-            let open = locked(&self.open).clone()?;
-            match open() {
-                Ok(r) => *slot = Some(r),
-                Err(e) => return Some(Err(e)),
-            }
-        }
-        slot.as_mut().map(f)
     }
 
     fn give_back(&self, reader: Option<R>, generation: u64) {
@@ -1794,5 +1746,162 @@ fn writer<E: Engine>(
             }
         }
         meter.held(began.elapsed());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Readers, Refused, locked};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::time::{Duration, Instant};
+
+    /// A reader: its number, and a flag set while a read uses it.
+    struct Reader {
+        busy: Arc<AtomicBool>,
+        dropped: Arc<AtomicUsize>,
+    }
+
+    impl Drop for Reader {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn readers(most: usize) -> (Arc<Readers<Reader>>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let readers = Arc::new(Readers::new(most, Arc::default()));
+        let (opened, dropped) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (o, d) = (opened.clone(), dropped.clone());
+        *locked(&readers.open) = Some(Arc::new(move || {
+            o.fetch_add(1, Ordering::SeqCst);
+            Ok(Reader {
+                busy: Arc::new(AtomicBool::new(false)),
+                dropped: d.clone(),
+            })
+        }));
+        (readers, opened, dropped)
+    }
+
+    fn far() -> Instant {
+        Instant::now() + Duration::from_secs(600)
+    }
+
+    /// G3 step 6 (prototype F, T-G3.6.3). Do: 16 threads read 500 times each through a pool of 4. Expect: every
+    /// read answered, at most 4 readers opened, and no reader used by two reads at once.
+    #[test]
+    fn g3_s6_pool_readers_serve_many_threads_one_read_a_reader_at_a_time() {
+        let (readers, opened, _) = readers(4);
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                let readers = readers.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..500 {
+                        let answer = readers.with(far(), |r| {
+                            let was = r.busy.swap(true, Ordering::SeqCst);
+                            std::hint::spin_loop();
+                            r.busy.store(false, Ordering::SeqCst);
+                            Ok(was)
+                        });
+                        assert!(
+                            !answer.unwrap().unwrap(),
+                            "a reader used by two reads at once"
+                        );
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert!(opened.load(Ordering::SeqCst) <= 4);
+    }
+
+    /// T-G3.6.3. Do: hold the one reader in a read; read from another thread with no time left, then with
+    /// time; end the first read. Expect: the first try refused as a timeout; the second answered
+    /// once the reader is given back (a waiter is woken, never left to its deadline).
+    #[test]
+    fn g3_s6_a_read_waits_for_a_reader_and_is_woken_when_one_is_given_back() {
+        let (readers, _, _) = readers(1);
+        let (hold_tx, hold_rx) = mpsc::channel::<()>();
+        let (held_tx, held_rx) = mpsc::channel::<()>();
+        let holder = {
+            let readers = readers.clone();
+            std::thread::spawn(move || {
+                readers.with(far(), |_| {
+                    held_tx.send(()).unwrap();
+                    hold_rx.recv().unwrap();
+                    Ok(())
+                })
+            })
+        };
+        held_rx.recv().unwrap();
+        let refused = readers.with(Instant::now(), |_| Ok(()));
+        assert!(matches!(
+            refused.unwrap().unwrap_err().downcast_ref::<Refused>(),
+            Some(Refused::Timeout)
+        ));
+        let waiter = {
+            let readers = readers.clone();
+            std::thread::spawn(move || readers.with(far(), |_| Ok(7)))
+        };
+        // The waiter counts itself before it waits; let the holder go once it has.
+        while locked(&readers.pool).waiting == 0 {
+            std::thread::yield_now();
+        }
+        hold_tx.send(()).unwrap();
+        holder.join().unwrap().unwrap().unwrap();
+        assert_eq!(waiter.join().unwrap().unwrap().unwrap(), 7);
+    }
+
+    /// T-G3.6.3. Do: start the log again with a restart that blocks, read from another thread,
+    /// then let the restart end. Expect: the read answered once it ends (the restart's end wakes a
+    /// waiting read; none is left to its deadline).
+    #[test]
+    fn g3_s6_a_read_held_back_by_a_restart_is_woken_when_it_ends() {
+        let (readers, _, _) = readers(2);
+        let (began_tx, began_rx) = mpsc::channel::<()>();
+        let (end_tx, end_rx) = mpsc::channel::<()>();
+        readers.restart.store(true, Ordering::Relaxed);
+        std::thread::scope(|s| {
+            let r = &*readers;
+            let restarter = s.spawn(move || {
+                r.restart_if_asked(move || {
+                    began_tx.send(()).unwrap();
+                    end_rx.recv().unwrap();
+                    Ok(true)
+                });
+            });
+            began_rx.recv().unwrap();
+            let waiter =
+                s.spawn(|| readers.with(Instant::now() + Duration::from_secs(60), |_| Ok(7)));
+            while locked(&readers.pool).waiting == 0 {
+                std::thread::yield_now();
+            }
+            end_tx.send(()).unwrap();
+            restarter.join().unwrap();
+            assert_eq!(waiter.join().unwrap().unwrap().unwrap(), 7);
+        });
+    }
+
+    /// T-G3.6.3. Do: read on 3 readers, then release the readers, then read again. Expect: every reader
+    /// opened is let go by the release, and a read after it finds no reader (the writer reads).
+    #[test]
+    fn g3_s6_release_lets_every_pool_reader_go() {
+        let (readers, opened, dropped) = readers(3);
+        std::thread::scope(|s| {
+            for _ in 0..3 {
+                s.spawn(|| {
+                    for _ in 0..50 {
+                        readers.with(far(), |_| Ok(())).unwrap().unwrap();
+                    }
+                });
+            }
+        });
+        readers.release();
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            opened.load(Ordering::SeqCst)
+        );
+        assert!(readers.with(far(), |_| Ok(())).is_none());
     }
 }
