@@ -624,7 +624,7 @@ Script `~/.cache/amphora-perf/cross-a15-scripts/check15.sh` (adacachy2, needs li
 | r1582 | 4a2954bd (a6b275c4 + main 7cfe907e) | clippy -p amphora --all-targets clean; lib `a14_` 2/2, `database::admission_charge` 5/5, `database::across` 13/13 (1 ignored), `database::online` 6/6, `database::guards` 13/13, `xgroup::` 34/34; bench clippy 164 findings (main's own: println, env::args), 0 compile errors, none on A14's lines (cluster.rs 426-432, scale.rs 2014-2022); load 24-31 |
 | r1601 | 9dc7a735 (4a2954bd + main 8feb1cbe: pg-parser, one engine optimizer file, bench planner, scripts) | the same results: clippy clean; `a14_` 2/2, `database::admission_charge` 5/5, `database::across` 13/13 (1 ignored), `database::online` 6/6, `database::guards` 13/13, `xgroup::` 34/34; bench 164 findings, 0 compile errors, none on A14's lines; load 18-32 (adacachy2 refused its first submission at 1 of 32 cores idle) |
 
-Main moved after r1582, so the merged tree was checked again (r1601) and pushed to main.
+NOT on main. Main moved after r1582, so the merged tree was checked again (r1601, green). Main then moved three more times before the push: records and scripts/engine-ratchet.toml; bench/src/store.rs and suite_db.rs (lanes W1, W2); then crates/amphora/src/database/replicated.rs. The last merge, e0fcbc82 on perf/cross-a13, is not checked: adacachy2 refused its check twice at 22:03Z (2 of 32 cores idle). Next lane: run check15.sh at e0fcbc82 (or a fresh merge) with the same filters, then push HEAD:main.
 
 **Unit 4, read and not started.** What the next lane needs:
 - `Config::queue` users: `Config::default()` is `Some(4096)`, so `Groups` (groups.rs:467, :525 take the caller's
