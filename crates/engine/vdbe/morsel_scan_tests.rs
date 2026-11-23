@@ -3420,8 +3420,12 @@ fn audit_3_p2_real_and_numeric_columns_run_in_parallel_as_the_serial_loop() {
     let rows = 2500u64;
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, r REAL, n NUMERIC, p TEXT)")
         .unwrap();
-    let reals = ["NULL", "0", "-0.0", "1", "2.5", "-3", "3.0", "1e300", "-2.5", "'7'", "'x'"];
-    let numerics = ["NULL", "0", "1", "'2'", "2.5", "'3.0'", "1e30", "-1.5", "'abc'", "4"];
+    let reals = [
+        "NULL", "0", "-0.0", "1", "2.5", "-3", "3.0", "1e300", "-2.5", "'7'", "'x'",
+    ];
+    let numerics = [
+        "NULL", "0", "1", "'2'", "2.5", "'3.0'", "1e30", "-1.5", "'abc'", "4",
+    ];
     conn.execute("BEGIN").unwrap();
     for _ in 0..rows {
         let a = rng.random_range(-50i64..50);
@@ -3471,7 +3475,11 @@ fn audit_3_p2_real_and_numeric_columns_run_in_parallel_as_the_serial_loop() {
             assert_eq!(parallel, serial, "{sql} on {cores} cores");
             if parallel_expected {
                 // The copied body ran over every row once: the parallel path answered.
-                assert_eq!(after - before, rows, "{sql} on {cores} cores: the body's rows");
+                assert_eq!(
+                    after - before,
+                    rows,
+                    "{sql} on {cores} cores: the body's rows"
+                );
                 if conn
                     .morsel_costs
                     .lock()
@@ -3485,7 +3493,10 @@ fn audit_3_p2_real_and_numeric_columns_run_in_parallel_as_the_serial_loop() {
     }
     conn.set_parallel_mode(ParallelMode::Off);
     // Non-vacuity: more than one worker ran the body for most statements.
-    assert!(hooked > parallel_queries.len(), "workers ran {hooked} times");
+    assert!(
+        hooked > parallel_queries.len(),
+        "workers ran {hooked} times"
+    );
 }
 
 /// The answer at each stated core count, after the serial loop's, with the copied body run over

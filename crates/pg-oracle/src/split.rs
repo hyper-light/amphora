@@ -30,8 +30,12 @@ impl Statement {
         if self.idents.len() < IDENTS {
             let lower = word.to_ascii_lowercase();
             let letter = match lower.as_slice() {
-                b"create" | b"function" | b"procedure" | b"or" | b"replace" => lower.first().copied().unwrap_or(0),
-                b"copy" | b"from" | b"stdin" | b"stdout" => lower.first().map_or(0, u8::to_ascii_uppercase),
+                b"create" | b"function" | b"procedure" | b"or" | b"replace" => {
+                    lower.first().copied().unwrap_or(0)
+                }
+                b"copy" | b"from" | b"stdin" | b"stdout" => {
+                    lower.first().map_or(0, u8::to_ascii_uppercase)
+                }
                 _ => 0,
             };
             self.idents.push(letter);
@@ -55,11 +59,16 @@ impl Statement {
 
     fn is_create_routine(&self) -> bool {
         let routine = |c: u8| c == b'f' || c == b'p';
-        self.ident(0) == b'c' && (routine(self.ident(1)) || (self.ident(1) == b'o' && self.ident(2) == b'r' && routine(self.ident(3))))
+        self.ident(0) == b'c'
+            && (routine(self.ident(1))
+                || (self.ident(1) == b'o' && self.ident(2) == b'r' && routine(self.ident(3))))
     }
 
     fn is_copy_from_stdin(&self) -> bool {
-        self.ident(0) == b'C' && (1..IDENTS.saturating_sub(1)).find(|&at| self.ident(at) == b'F').is_some_and(|at| self.ident(at.saturating_add(1)) == b'S')
+        self.ident(0) == b'C'
+            && (1..IDENTS.saturating_sub(1))
+                .find(|&at| self.ident(at) == b'F')
+                .is_some_and(|at| self.ident(at.saturating_add(1)) == b'S')
     }
 
     fn outer(&self) -> bool {
@@ -82,7 +91,12 @@ fn cut(rest: &[u8], n: usize) -> (&[u8], &[u8]) {
 
 /// The line `rest` starts in, through its newline.
 fn line(rest: &[u8]) -> (&[u8], &[u8]) {
-    cut(rest, rest.iter().position(|&c| c == b'\n').map_or(rest.len(), |at| at.saturating_add(1)))
+    cut(
+        rest,
+        rest.iter()
+            .position(|&c| c == b'\n')
+            .map_or(rest.len(), |at| at.saturating_add(1)),
+    )
 }
 
 /// A quoted run from its opening `quote`: `''` stands for one quote, and in an escape string a
@@ -126,7 +140,10 @@ fn block_comment(rest: &[u8]) -> (&[u8], &[u8]) {
 /// A dollar quote's delimiter at the start of `rest` (`$$` or `$tag$`), if it is one.
 fn dollar_delimiter(rest: &[u8]) -> Option<&[u8]> {
     let tail = rest.get(1..)?;
-    let tag = tail.iter().position(|&c| !ident_cont(c) || c == b'$').unwrap_or(tail.len());
+    let tag = tail
+        .iter()
+        .position(|&c| !ident_cont(c) || c == b'$')
+        .unwrap_or(tail.len());
     let first = tail.first().copied()?;
     if tag > 0 && !ident_start(first) {
         return None;
@@ -197,15 +214,28 @@ pub fn statements(script: &[u8]) -> Vec<Vec<u8>> {
             }
             [b'\\', ..] => {
                 let (command, after) = line(rest);
-                let name: Vec<u8> = command.get(1..).unwrap_or(&[]).iter().copied().take_while(|c| c.is_ascii_alphanumeric()).collect();
-                let sends = name.first() == Some(&b'g') || name == b"crosstabview" || name == b"watch";
+                let name: Vec<u8> = command
+                    .get(1..)
+                    .unwrap_or(&[])
+                    .iter()
+                    .copied()
+                    .take_while(|c| c.is_ascii_alphanumeric())
+                    .collect();
+                let sends =
+                    name.first() == Some(&b'g') || name == b"crosstabview" || name == b"watch";
                 if sends {
                     copy_after_line |= statement.is_copy_from_stdin();
                     finish(&mut out, &mut statement);
                 }
                 let lower = command.to_ascii_lowercase();
-                let words: Vec<&[u8]> = lower.split(u8::is_ascii_whitespace).filter(|w| !w.is_empty()).collect();
-                let copy_stdin = name == b"copy" && words.windows(2).any(|pair| pair == [&b"from"[..], &b"stdin"[..]]);
+                let words: Vec<&[u8]> = lower
+                    .split(u8::is_ascii_whitespace)
+                    .filter(|w| !w.is_empty())
+                    .collect();
+                let copy_stdin = name == b"copy"
+                    && words
+                        .windows(2)
+                        .any(|pair| pair == [&b"from"[..], &b"stdin"[..]]);
                 rest = after;
                 if copy_stdin || std::mem::take(&mut copy_after_line) {
                     rest = skip_copy_data(rest);
@@ -240,7 +270,10 @@ pub fn statements(script: &[u8]) -> Vec<Vec<u8>> {
                 continue;
             }
             _ if ident_start(c) => {
-                let len = rest.iter().position(|&c| !ident_cont(c)).unwrap_or(rest.len());
+                let len = rest
+                    .iter()
+                    .position(|&c| !ident_cont(c))
+                    .unwrap_or(rest.len());
                 let (word, after) = cut(rest, len);
                 statement.identifier(word);
                 statement.push(word);
@@ -254,7 +287,8 @@ pub fn statements(script: &[u8]) -> Vec<Vec<u8>> {
             }
             _ => cut(rest, 1),
         };
-        let whitespace_lead = statement.text.is_empty() && (taken.iter().all(u8::is_ascii_whitespace) || taken.starts_with(b"--"));
+        let whitespace_lead = statement.text.is_empty()
+            && (taken.iter().all(u8::is_ascii_whitespace) || taken.starts_with(b"--"));
         if !whitespace_lead {
             statement.push(taken);
         }
@@ -269,30 +303,71 @@ mod tests {
     use super::statements;
 
     fn split(script: &str) -> Vec<String> {
-        statements(script.as_bytes()).into_iter().map(|s| String::from_utf8(s).unwrap()).collect()
+        statements(script.as_bytes())
+            .into_iter()
+            .map(|s| String::from_utf8(s).unwrap())
+            .collect()
     }
 
     /// T-PG.3.2: psql's splitting, rule by rule.
     #[test]
     fn t_pg_3_2_semicolons_end_statements_outside_quotes_parens_and_routine_bodies() {
-        assert_eq!(split("SELECT 1; SELECT ';' ;\nSELECT (1;2);"), ["SELECT 1;", "SELECT ';' ;", "SELECT (1;2);"]);
-        assert_eq!(split("-- lead\nSELECT 1 -- tail ;\n;"), ["SELECT 1 -- tail ;\n;"]);
-        assert_eq!(split("SELECT $$a;b$$, $q$;$q$, $1; SELECT E'\\';', \"a;\"\"\";"), ["SELECT $$a;b$$, $q$;$q$, $1;", "SELECT E'\\';', \"a;\"\"\";"]);
-        assert_eq!(split("SELECT /* a /* ; */ ; */ 1;"), ["SELECT /* a /* ; */ ; */ 1;"]);
         assert_eq!(
-            split("CREATE OR REPLACE FUNCTION f() RETURNS int BEGIN ATOMIC SELECT CASE WHEN true THEN 1 END; END;\nSELECT 2;"),
-            ["CREATE OR REPLACE FUNCTION f() RETURNS int BEGIN ATOMIC SELECT CASE WHEN true THEN 1 END; END;", "SELECT 2;"]
+            split("SELECT 1; SELECT ';' ;\nSELECT (1;2);"),
+            ["SELECT 1;", "SELECT ';' ;", "SELECT (1;2);"]
         );
-        assert_eq!(split("BEGIN; SELECT 1; END;"), ["BEGIN;", "SELECT 1;", "END;"]);
+        assert_eq!(
+            split("-- lead\nSELECT 1 -- tail ;\n;"),
+            ["SELECT 1 -- tail ;\n;"]
+        );
+        assert_eq!(
+            split("SELECT $$a;b$$, $q$;$q$, $1; SELECT E'\\';', \"a;\"\"\";"),
+            [
+                "SELECT $$a;b$$, $q$;$q$, $1;",
+                "SELECT E'\\';', \"a;\"\"\";"
+            ]
+        );
+        assert_eq!(
+            split("SELECT /* a /* ; */ ; */ 1;"),
+            ["SELECT /* a /* ; */ ; */ 1;"]
+        );
+        assert_eq!(
+            split(
+                "CREATE OR REPLACE FUNCTION f() RETURNS int BEGIN ATOMIC SELECT CASE WHEN true THEN 1 END; END;\nSELECT 2;"
+            ),
+            [
+                "CREATE OR REPLACE FUNCTION f() RETURNS int BEGIN ATOMIC SELECT CASE WHEN true THEN 1 END; END;",
+                "SELECT 2;"
+            ]
+        );
+        assert_eq!(
+            split("BEGIN; SELECT 1; END;"),
+            ["BEGIN;", "SELECT 1;", "END;"]
+        );
     }
 
     /// T-PG.3.2: backslash commands and COPY data are no statements.
     #[test]
     fn t_pg_3_2_backslash_commands_and_copy_data_are_not_sent() {
-        assert_eq!(split("\\set x 1\nSELECT :x \\gset\n\\d t\nSELECT 2"), ["SELECT :x", "SELECT 2"]);
-        assert_eq!(split("COPY t FROM stdin;\n1\t;\n\\.\nSELECT 1;"), ["COPY t FROM stdin;", "SELECT 1;"]);
-        assert_eq!(split("COPY t (a) FROM STDIN WITH (format csv);\n1;\n\\.\nCOPY t TO stdout;"), ["COPY t (a) FROM STDIN WITH (format csv);", "COPY t TO stdout;"]);
-        assert_eq!(split("\\copy t from stdin\n1\n\\.\nSELECT 3;"), ["SELECT 3;"]);
+        assert_eq!(
+            split("\\set x 1\nSELECT :x \\gset\n\\d t\nSELECT 2"),
+            ["SELECT :x", "SELECT 2"]
+        );
+        assert_eq!(
+            split("COPY t FROM stdin;\n1\t;\n\\.\nSELECT 1;"),
+            ["COPY t FROM stdin;", "SELECT 1;"]
+        );
+        assert_eq!(
+            split("COPY t (a) FROM STDIN WITH (format csv);\n1;\n\\.\nCOPY t TO stdout;"),
+            [
+                "COPY t (a) FROM STDIN WITH (format csv);",
+                "COPY t TO stdout;"
+            ]
+        );
+        assert_eq!(
+            split("\\copy t from stdin\n1\n\\.\nSELECT 3;"),
+            ["SELECT 3;"]
+        );
         assert_eq!(split("SELECT 1 \\; SELECT 2;"), ["SELECT 1 ; SELECT 2;"]);
     }
 
@@ -302,7 +377,17 @@ mod tests {
         assert_eq!(split("SELECT 'a;"), ["SELECT 'a;"]);
         assert_eq!(split("SELECT $x$;"), ["SELECT $x$;"]);
         assert_eq!(split("/* ; "), ["/* ;"]);
-        for script in ["\\", "$", "e", "E'", "--", "(", ")))", "\\copy x from stdin", "COPY x FROM stdin;"] {
+        for script in [
+            "\\",
+            "$",
+            "e",
+            "E'",
+            "--",
+            "(",
+            ")))",
+            "\\copy x from stdin",
+            "COPY x FROM stdin;",
+        ] {
             let _ = statements(script.as_bytes());
         }
     }

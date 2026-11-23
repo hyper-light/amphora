@@ -1762,7 +1762,9 @@ impl Versioned {
             return Ok(Some(txn));
         }
         txn.reads = Reads::default();
-        self.clock.budget.release(std::mem::take(&mut txn.read_bytes));
+        self.clock
+            .budget
+            .release(std::mem::take(&mut txn.read_bytes));
         self.clock.forget(&txn)?;
         Ok(None)
     }

@@ -69,7 +69,10 @@ const fn varint_bytes(n: usize) -> usize {
 /// The bytes `Machine::image` writes for `db` now, as postcard encodes it, counted without reading
 /// a page (CT.1): the baseline's prefix and declaration where one is declared, the list's length,
 /// and each page's id, length and bytes.
-fn image_len(db: &mut Db, declaration: Option<&api::replication::Bootstrap>) -> Result<u64, Refusal> {
+fn image_len(
+    db: &mut Db,
+    declaration: Option<&api::replication::Bootstrap>,
+) -> Result<u64, Refusal> {
     let size = db.image_bytes().map_err(unavailable)?;
     let mut page = 0i64;
     db.query("PRAGMA page_size", [], |row| {
@@ -84,9 +87,11 @@ fn image_len(db: &mut Db, declaration: Option<&api::replication::Bootstrap>) -> 
         .saturating_add(count.saturating_mul(varint_bytes(page)))
         .saturating_add(size);
     let baseline = match declaration {
-        Some(declaration) => BASELINE_SNAPSHOT
-            .len()
-            .saturating_add(postcard::to_allocvec(declaration).map_err(unavailable)?.len()),
+        Some(declaration) => BASELINE_SNAPSHOT.len().saturating_add(
+            postcard::to_allocvec(declaration)
+                .map_err(unavailable)?
+                .len(),
+        ),
         None => 0,
     };
     Ok(u64::try_from(pages.saturating_add(baseline)).unwrap_or(u64::MAX))
@@ -97,7 +102,11 @@ fn ids_bytes(count: usize) -> usize {
     let (mut bytes, mut low, mut width) = (0usize, 1usize, 1usize);
     while low <= count {
         let high = low.saturating_mul(128).saturating_sub(1).min(count);
-        bytes = bytes.saturating_add(high.saturating_sub(low).saturating_add(1).saturating_mul(width));
+        bytes = bytes.saturating_add(
+            high.saturating_sub(low)
+                .saturating_add(1)
+                .saturating_mul(width),
+        );
         if high == count {
             break;
         }
@@ -1556,7 +1565,11 @@ mod image_room_tests {
             let mut machine = Machine::open(&path, ConfState::default()).unwrap();
             let mut image = Vec::new();
             machine.image(&mut image).unwrap();
-            assert_eq!(machine.image_bytes(), Some(image.len() as u64), "{rows} rows");
+            assert_eq!(
+                machine.image_bytes(),
+                Some(image.len() as u64),
+                "{rows} rows"
+            );
         }
     }
 

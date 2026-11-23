@@ -70,10 +70,14 @@ fn a_warm_point_read_allocates_neither_a_waker_nor_its_text() {
     let db = db();
     let read = || {
         let mut v = 0;
-        db.query("SELECT v FROM t WHERE id = ?1", [Value::from_i64(1)], |row| {
-            v = row.get::<i64>(0).unwrap();
-            Ok(true)
-        })
+        db.query(
+            "SELECT v FROM t WHERE id = ?1",
+            [Value::from_i64(1)],
+            |row| {
+                v = row.get::<i64>(0).unwrap();
+                Ok(true)
+            },
+        )
         .unwrap();
         assert_eq!(v, 10, "the read answers the row");
     };
@@ -81,7 +85,10 @@ fn a_warm_point_read_allocates_neither_a_waker_nor_its_text() {
     let allocations = per_run(1_000, read);
     println!("allocations per warm point read: {allocations}");
     // Measured on adacachy2: 3 on main 2d939193 (the engine's 1, an `Arc<Unpark>`, an `Arc<str>`).
-    assert!(allocations <= 1, "a warm point read allocates no waker and no text: {allocations}");
+    assert!(
+        allocations <= 1,
+        "a warm point read allocates no waker and no text: {allocations}"
+    );
 }
 
 /// Do: run a transaction of one update again and again. Expect: BEGIN, the update and COMMIT
@@ -98,5 +105,8 @@ fn a_warm_transaction_allocates_neither_a_waker_nor_its_text() {
     let allocations = per_run(1_000, &mut write);
     println!("allocations per warm one-update transaction: {allocations}");
     // Measured on adacachy2: 57 on main 2d939193, two of them for each of its three statements.
-    assert!(allocations <= 51, "no statement of the three allocates a waker or its text: {allocations}");
+    assert!(
+        allocations <= 51,
+        "no statement of the three allocates a waker or its text: {allocations}"
+    );
 }

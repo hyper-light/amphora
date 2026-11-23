@@ -19096,9 +19096,10 @@ pub fn op_hash_distinct(
             track_matched: false,
             partition_count: None,
         };
-        state
-            .hash_tables
-            .insert(data.hash_table_id, HashTable::new(config, pager.io.clone())?);
+        state.hash_tables.insert(
+            data.hash_table_id,
+            HashTable::new(config, pager.io.clone())?,
+        );
     }
     let hash_table = state
         .hash_tables
@@ -21162,9 +21163,9 @@ pub fn op_star_probes(
         let most = u64::try_from(most).unwrap_or(u64::MAX);
         state.metrics.star_filter_bytes = state.metrics.star_filter_bytes.max(most);
     }
-    state
-        .star_orders
-        .get_or_insert_with(pc, || super::star_order::StarOrder::new(data.probes.len(), data.order));
+    state.star_orders.get_or_insert_with(pc, || {
+        super::star_order::StarOrder::new(data.probes.len(), data.order)
+    });
     let Some(order) = state.star_orders.get_mut(&pc) else {
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);

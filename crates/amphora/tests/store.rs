@@ -516,7 +516,7 @@ fn a_transaction_holding_a_failed_statement_is_never_committed() {
 #[test]
 fn a_full_queue_refuses_typed_and_counted_and_a_wait_for_room_is_taken() {
     let config = Config {
-        queue: 1,
+        queue: Some(1),
         ..Config::default()
     };
     let lab = lab(config, None);

@@ -1007,7 +1007,8 @@ mod tests {
         let conn = db
             .connect(ConnectOpts::new().with_versioned_storage())
             .unwrap();
-        conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y TEXT)").unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y TEXT)")
+            .unwrap();
         conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
         let switch = conn.versioned.as_ref().unwrap().clone();
         let before = switch.db.log_counters();
@@ -1022,7 +1023,11 @@ mod tests {
         conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
         let wrote = switch.db.log_counters();
         assert_eq!(wrote.records, read.records + 1, "the write's record");
-        assert_eq!(wrote.flushes, read.flushes + 1, "the write flushed before it returned");
+        assert_eq!(
+            wrote.flushes,
+            read.flushes + 1,
+            "the write flushed before it returned"
+        );
         let mut stmt = conn.prepare("SELECT count(*) FROM t").unwrap();
         let rows = stmt.run_collect_rows().unwrap();
         assert_eq!(rows.len(), 1);

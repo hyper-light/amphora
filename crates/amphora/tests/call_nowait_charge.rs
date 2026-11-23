@@ -37,7 +37,10 @@ fn a7_a_dropped_calling_gives_back_its_charge() {
                 Ok(vec![7u64; 1 << 17])
             })
             .unwrap();
-        assert!(process().held(Use::Queues) > before, "{charge:?} charged nothing");
+        assert!(
+            process().held(Use::Queues) > before,
+            "{charge:?} charged nothing"
+        );
         drop(held);
         drop(wait_here.0);
     }

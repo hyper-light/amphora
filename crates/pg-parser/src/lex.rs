@@ -6,8 +6,10 @@
 use crate::scan::longest_match;
 use crate::scan_tables::{INITIAL, XB, XC, XD, XDOLQ, XE, XEU, XH, XQ, XQS, XUI, XUS};
 use crate::scan_tokens::{
-    BCONST, BETWEEN, COLON_EQUALS, DOT_DOT, EQUALS_GREATER, FCONST, FIRST_P, FORMAT, FORMAT_LA, GREATER_EQUALS, ICONST, IDENT, ILIKE, IN_P, JSON, KEYWORDS, LAST_P, LESS_EQUALS, LIKE, NOT, NOT_EQUALS,
-    NOT_LA, NULLS_LA, NULLS_P, OP, ORDINALITY, PARAM, SCONST, SIMILAR, TIME, TYPECAST, UESCAPE, UIDENT, USCONST, WITH, WITH_LA, WITHOUT, WITHOUT_LA, XCONST,
+    BCONST, BETWEEN, COLON_EQUALS, DOT_DOT, EQUALS_GREATER, FCONST, FIRST_P, FORMAT, FORMAT_LA,
+    GREATER_EQUALS, ICONST, IDENT, ILIKE, IN_P, JSON, KEYWORDS, LAST_P, LESS_EQUALS, LIKE, NOT,
+    NOT_EQUALS, NOT_LA, NULLS_LA, NULLS_P, OP, ORDINALITY, PARAM, SCONST, SIMILAR, TIME, TYPECAST,
+    UESCAPE, UIDENT, USCONST, WITH, WITH_LA, WITHOUT, WITHOUT_LA, XCONST,
 };
 
 /// NAMEDATALEN: identifiers keep at most `NAMEDATALEN - 1` bytes.
@@ -46,11 +48,20 @@ const INTERNAL_ERROR: &str = "XX000";
 
 /// scanner_errposition: the 1-based character position of byte `at` (pg_mbstrlen_with_len + 1).
 fn cursor(input: &[u8], at: usize) -> usize {
-    input.iter().take(at).filter(|&&b| b & 0xC0 != 0x80).count().saturating_add(1)
+    input
+        .iter()
+        .take(at)
+        .filter(|&&b| b & 0xC0 != 0x80)
+        .count()
+        .saturating_add(1)
 }
 
 fn fault() -> ScanError {
-    ScanError { sqlstate: INTERNAL_ERROR, cursor: 0, message: "scanner tables fault" }
+    ScanError {
+        sqlstate: INTERNAL_ERROR,
+        cursor: 0,
+        message: "scanner tables fault",
+    }
 }
 
 fn add(a: usize, b: usize) -> Result<usize, ScanError> {
@@ -60,7 +71,11 @@ fn add(a: usize, b: usize) -> Result<usize, ScanError> {
 /// ScanKeywordLookup: the keyword whose name is `text` with ASCII letters lowered.
 fn keyword(text: &[u8]) -> Option<(&'static str, i32)> {
     let lower: Vec<u8> = text.iter().map(u8::to_ascii_lowercase).collect();
-    KEYWORDS.binary_search_by(|(k, _)| k.as_bytes().cmp(lower.as_slice())).ok().and_then(|i| KEYWORDS.get(i)).copied()
+    KEYWORDS
+        .binary_search_by(|(k, _)| k.as_bytes().cmp(lower.as_slice()))
+        .ok()
+        .and_then(|i| KEYWORDS.get(i))
+        .copied()
 }
 
 /// truncate_identifier: at most NAMEDATALEN - 1 bytes, cut at a character boundary (pg_mbcliplen).
@@ -123,8 +138,16 @@ fn strtoint32(text: &[u8]) -> Option<i32> {
 /// process_integer_literal: ICONST when it fits an int4, else FCONST with its text.
 fn integer(text: &[u8], offset: usize) -> Token {
     match strtoint32(text) {
-        Some(v) => Token { token: ICONST, offset, value: Value::Int(v) },
-        None => Token { token: FCONST, offset, value: Value::Str(text.to_vec()) },
+        Some(v) => Token {
+            token: ICONST,
+            offset,
+            value: Value::Int(v),
+        },
+        None => Token {
+            token: FCONST,
+            offset,
+            value: Value::Str(text.to_vec()),
+        },
     }
 }
 
@@ -154,11 +177,16 @@ fn surrogate_second(c: u32) -> bool {
 }
 
 fn surrogate_pair(first: u32, second: u32) -> u32 {
-    (first & 0x3FF).saturating_mul(0x400).saturating_add(0x10000).saturating_add(second & 0x3FF)
+    (first & 0x3FF)
+        .saturating_mul(0x400)
+        .saturating_add(0x10000)
+        .saturating_add(second & 0x3FF)
 }
 
 fn hex_value(digits: &[u8]) -> Option<u32> {
-    digits.iter().try_fold(0u32, |v, &c| v.checked_mul(16)?.checked_add(char::from(c).to_digit(16)?))
+    digits.iter().try_fold(0u32, |v, &c| {
+        v.checked_mul(16)?.checked_add(char::from(c).to_digit(16)?)
+    })
 }
 
 /// scan.l's `core_yylex`: one token per call, `None` at the end of input.
@@ -177,16 +205,35 @@ struct Core<'a> {
 
 impl<'a> Core<'a> {
     fn new(input: &'a [u8]) -> Self {
-        Self { input, pos: 0, condition: INITIAL, lloc: 0, lit: Vec::new(), xcdepth: 0, state_before_str_stop: INITIAL, saw_non_ascii: false, utf16_first_part: 0, dolqstart: Vec::new() }
+        Self {
+            input,
+            pos: 0,
+            condition: INITIAL,
+            lloc: 0,
+            lit: Vec::new(),
+            xcdepth: 0,
+            state_before_str_stop: INITIAL,
+            saw_non_ascii: false,
+            utf16_first_part: 0,
+            dolqstart: Vec::new(),
+        }
     }
 
     /// scanner_yyerror: a syntax error at yylloc.
     fn error(&self, message: &'static str) -> ScanError {
-        ScanError { sqlstate: SYNTAX_ERROR, cursor: cursor(self.input, self.lloc), message }
+        ScanError {
+            sqlstate: SYNTAX_ERROR,
+            cursor: cursor(self.input, self.lloc),
+            message,
+        }
     }
 
     fn token(&self, token: i32, value: Value) -> Token {
-        Token { token, offset: self.lloc, value }
+        Token {
+            token,
+            offset: self.lloc,
+            value,
+        }
     }
 
     /// The literal a quote ended (scan.l's `<xqs>` return), once xqs knows no continuation follows.
@@ -198,7 +245,11 @@ impl<'a> Core<'a> {
             XH => XCONST,
             XQ | XE => {
                 if self.saw_non_ascii && (lit.contains(&0) || std::str::from_utf8(&lit).is_err()) {
-                    return Err(ScanError { sqlstate: CHARACTER_NOT_IN_REPERTOIRE, cursor: 0, message: "invalid byte sequence for encoding \"UTF8\"" });
+                    return Err(ScanError {
+                        sqlstate: CHARACTER_NOT_IN_REPERTOIRE,
+                        cursor: 0,
+                        message: "invalid byte sequence for encoding \"UTF8\"",
+                    });
                 }
                 SCONST
             }
@@ -376,7 +427,11 @@ impl<'a> Core<'a> {
             // <xe,xeu>{xeunicodefail}
             27 => {
                 self.lloc = start;
-                return Err(ScanError { sqlstate: INVALID_ESCAPE_SEQUENCE, cursor: cursor(self.input, start), message: "invalid Unicode escape" });
+                return Err(ScanError {
+                    sqlstate: INVALID_ESCAPE_SEQUENCE,
+                    cursor: cursor(self.input, start),
+                    message: "invalid Unicode escape",
+                });
             }
             // <xe>{xeescape}: unescape_single_char
             28 => {
@@ -399,8 +454,19 @@ impl<'a> Core<'a> {
             }
             // <xe>{xeoctesc}, {xehexesc}: strtoul into an unsigned char
             29 | 30 => {
-                let (digits, radix) = if rule == 29 { (text.get(1..), 8) } else { (text.get(2..), 16) };
-                let v = digits.ok_or_else(fault)?.iter().try_fold(0u32, |v, &c| v.checked_mul(radix)?.checked_add(char::from(c).to_digit(radix)?)).ok_or_else(fault)?;
+                let (digits, radix) = if rule == 29 {
+                    (text.get(1..), 8)
+                } else {
+                    (text.get(2..), 16)
+                };
+                let v = digits
+                    .ok_or_else(fault)?
+                    .iter()
+                    .try_fold(0u32, |v, &c| {
+                        v.checked_mul(radix)?
+                            .checked_add(char::from(c).to_digit(radix)?)
+                    })
+                    .ok_or_else(fault)?;
                 let c = v.to_le_bytes().first().copied().unwrap_or(0);
                 self.lit.push(c);
                 if c == 0 || c >= 0x80 {
@@ -431,7 +497,8 @@ impl<'a> Core<'a> {
                     return Ok(Some(self.token(SCONST, Value::Str(lit))));
                 }
                 let keep = text.len().saturating_sub(1);
-                self.lit.extend_from_slice(text.get(..keep).ok_or_else(fault)?);
+                self.lit
+                    .extend_from_slice(text.get(..keep).ok_or_else(fault)?);
                 self.yyless(start, keep)?;
             }
             // {xdstart}, {xuistart}
@@ -447,7 +514,11 @@ impl<'a> Core<'a> {
                     return Err(self.error("zero-length delimited identifier"));
                 }
                 let lit = std::mem::take(&mut self.lit);
-                return Ok(Some(if rule == 40 { self.token(IDENT, Value::Str(truncate(lit))) } else { self.token(UIDENT, Value::Str(lit)) }));
+                return Ok(Some(if rule == 40 {
+                    self.token(IDENT, Value::Str(truncate(lit)))
+                } else {
+                    self.token(UIDENT, Value::Str(lit))
+                }));
             }
             // <xd,xui>{xddouble}
             42 => self.lit.push(b'"'),
@@ -455,7 +526,10 @@ impl<'a> Core<'a> {
             44 => {
                 self.lloc = start;
                 self.yyless(start, 1)?;
-                return Ok(Some(self.token(IDENT, Value::Str(downcase_truncate(text.get(..1).ok_or_else(fault)?)))));
+                return Ok(Some(self.token(
+                    IDENT,
+                    Value::Str(downcase_truncate(text.get(..1).ok_or_else(fault)?)),
+                )));
             }
             45..=52 => {
                 self.lloc = start;
@@ -538,9 +612,17 @@ impl<'a> Core<'a> {
             (Some(a), None) | (None, Some(a)) => a,
             (None, None) => text.len(),
         };
-        let ends_sign = |n: usize| matches!(n.checked_sub(1).and_then(|i| text.get(i)), Some(b'+' | b'-'));
+        let ends_sign = |n: usize| {
+            matches!(
+                n.checked_sub(1).and_then(|i| text.get(i)),
+                Some(b'+' | b'-')
+            )
+        };
         if nchars > 1 && ends_sign(nchars) {
-            let special = text.iter().take(nchars.saturating_sub(1)).any(|c| b"~!@#^&|`?%".contains(c));
+            let special = text
+                .iter()
+                .take(nchars.saturating_sub(1))
+                .any(|c| b"~!@#^&|`?%".contains(c));
             if !special {
                 loop {
                     nchars = nchars.saturating_sub(1);
@@ -579,20 +661,34 @@ impl<'a> Core<'a> {
 
 /// check_uescapechar.
 fn uescape_char_ok(c: u8) -> bool {
-    !(c.is_ascii_hexdigit() || matches!(c, b'+' | b'\'' | b'"' | b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C))
+    !(c.is_ascii_hexdigit()
+        || matches!(
+            c,
+            b'+' | b'\'' | b'"' | b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C
+        ))
 }
 
 /// parser.c's str_udeescape: `\XXXX` and `\+XXXXXX` (with `escape` for `\`) into UTF-8, surrogate
 /// pairs joined; errors point at `position + 3 + ` the escape's byte in the literal, as 19's do.
 fn udeescape(input: &[u8], s: &[u8], escape: u8, position: usize) -> Result<Vec<u8>, ScanError> {
-    let at = |i: usize| ScanError { sqlstate: SYNTAX_ERROR, cursor: cursor(input, i.saturating_add(position).saturating_add(3)), message: "" };
-    let pair = |i: usize| ScanError { message: "invalid Unicode surrogate pair", ..at(i) };
+    let at = |i: usize| ScanError {
+        sqlstate: SYNTAX_ERROR,
+        cursor: cursor(input, i.saturating_add(position).saturating_add(3)),
+        message: "",
+    };
+    let pair = |i: usize| ScanError {
+        message: "invalid Unicode surrogate pair",
+        ..at(i)
+    };
     let mut out = Vec::with_capacity(s.len());
     let mut pair_first = 0u32;
     let mut i = 0usize;
     let hex = |from: usize, n: usize| -> Option<u32> {
         let d = s.get(from..from.checked_add(n)?)?;
-        d.iter().all(u8::is_ascii_hexdigit).then(|| hex_value(d)).flatten()
+        d.iter()
+            .all(u8::is_ascii_hexdigit)
+            .then(|| hex_value(d))
+            .flatten()
     };
     while let Some(&c) = s.get(i) {
         if c != escape {
@@ -619,10 +715,16 @@ fn udeescape(input: &[u8], s: &[u8], escape: u8, position: usize) -> Result<Vec<
         {
             (u, 8)
         } else {
-            return Err(ScanError { message: "invalid Unicode escape", ..at(i) });
+            return Err(ScanError {
+                message: "invalid Unicode escape",
+                ..at(i)
+            });
         };
         if !valid_codepoint(unicode) {
-            return Err(ScanError { message: "invalid Unicode escape value", ..at(i) });
+            return Err(ScanError {
+                message: "invalid Unicode escape value",
+                ..at(i)
+            });
         }
         let mut unicode = unicode;
         if pair_first != 0 {
@@ -656,7 +758,10 @@ pub struct Lexer<'a> {
 
 impl<'a> Lexer<'a> {
     pub fn new(input: &'a [u8]) -> Self {
-        Self { core: Core::new(input), lookahead: None }
+        Self {
+            core: Core::new(input),
+            lookahead: None,
+        }
     }
 
     /// The grammar's next token, `None` at the end.
@@ -683,18 +788,30 @@ impl<'a> Lexer<'a> {
             cur.token = la;
         }
         if cur.token == UIDENT || cur.token == USCONST {
-            let Value::Str(s) = std::mem::replace(&mut cur.value, Value::None) else { return Err(fault()) };
+            let Value::Str(s) = std::mem::replace(&mut cur.value, Value::None) else {
+                return Err(fault());
+            };
             let decoded = if next_token == UESCAPE {
                 let third = self.core.next()?;
                 let escape = match third {
-                    Some(Token { token: SCONST, value: Value::Str(e), .. }) => e,
-                    _ => return Err(self.core.error("UESCAPE must be followed by a simple string literal")),
+                    Some(Token {
+                        token: SCONST,
+                        value: Value::Str(e),
+                        ..
+                    }) => e,
+                    _ => {
+                        return Err(self
+                            .core
+                            .error("UESCAPE must be followed by a simple string literal"));
+                    }
                 };
                 let ok = match escape.as_slice() {
                     [c] if uescape_char_ok(*c) => Some(*c),
                     _ => None,
                 };
-                let Some(esc) = ok else { return Err(self.core.error("invalid Unicode escape character")) };
+                let Some(esc) = ok else {
+                    return Err(self.core.error("invalid Unicode escape character"));
+                };
                 udeescape(self.core.input, &s, esc, cur.offset)?
             } else {
                 self.lookahead = Some(next);
@@ -778,7 +895,12 @@ mod tests {
     /// T-PG.4.4: the lookahead filter turns NOT before IN into NOT_LA.
     #[test]
     fn t_pg_4_4_not_in_is_not_la() {
-        assert_eq!(lines("not in"), "775 0 3 not\n450 4 2 in\n".replace("450", &crate::scan_tokens::IN_P.to_string()).replace("775", &crate::scan_tokens::NOT_LA.to_string()));
+        assert_eq!(
+            lines("not in"),
+            "775 0 3 not\n450 4 2 in\n"
+                .replace("450", &crate::scan_tokens::IN_P.to_string())
+                .replace("775", &crate::scan_tokens::NOT_LA.to_string())
+        );
     }
 
     /// T-PG.4.4: unterminated literals and junk are 42601 at the lexeme's first character.
