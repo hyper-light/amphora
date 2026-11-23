@@ -135,6 +135,16 @@ lane M's 32. The harness stops a query's runs at the first timeout.
 - **amphora-adaptive** loses on q22 (3.6x slower than amphora) and q18 (1.9x), and wins on q13 (1.26x)
   and q05 (it finishes).
 
+- **Order check (inconclusive).** A rerun of the four biggest losses (q01, q03, q06, q19) with the order
+  reversed (duckdb-mt first, then amphora, 5 runs each) ran on the reflinked copies at about 13:11Z.
+  The load had risen to 26 to 54, from 13.6 to 26.3 in the main pass. duckdb-mt's medians stayed close
+  to the main pass: 41 against 32 ms on q01, 32 against 39 ms on q19. Amphora's rose 1.6 to 2.1x
+  (q01 2954 ms, spread 54%; q03 3136 ms, spread 222%). So this check measured the load, not the order.
+  It does say Amphora's one-thread times are far more sensitive to other work on the machine than
+  DuckDB's. Why is not known. It isn't CPU: DuckDB runs 32 threads and should suffer more there.
+  Memory bandwidth or page-cache residency of the copies are guesses. Raw records: in
+  ~/.cache/amphora-bench-m2/out/29eb13ba…/tpch-reversed.jsonl on adacachy2.
+
 ## Multi-threaded
 
 **Amphora's parallel execution doesn't scale. From 1 to 8 cores it got slower.** These are medians of 5
