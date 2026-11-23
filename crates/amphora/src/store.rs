@@ -891,7 +891,8 @@ fn flusher(sends: &Sends, flush: &Flush, meter: &Meter) {
             loop {
                 let stopping = sends.stopping.load(Ordering::Relaxed);
                 if committed.batches > *locked(&sends.claimed) {
-                    let handed = *gathering.get_or_insert_with(|| sends.handed.load(Ordering::Relaxed));
+                    let handed =
+                        *gathering.get_or_insert_with(|| sends.handed.load(Ordering::Relaxed));
                     if kept_up
                         && !stopping
                         && committed.batches < handed
