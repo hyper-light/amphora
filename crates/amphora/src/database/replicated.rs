@@ -17443,8 +17443,18 @@ mod tests {
                 kept.send((receipts, finishing, processed)).unwrap();
                 Ok(Vec::new())
             });
+            // The capture runs on the owner's session worker (CP-T1.13): the owner is stepped
+            // until it hands the capture over, then held still until the capture has checked
+            // admission, as it was while the capture ran on its own thread.
+            for _ in 0..ROUNDS {
+                if driven.owner(0).sessions.out {
+                    break;
+                }
+                driven.step();
+            }
+            assert!(driven.owner(0).sessions.out, "the capture was handed to the worker");
+            let (mut receipts, finishing, processed) = taken.recv().unwrap();
             assert_eq!(driven.settle(&mut pump, &capture), Ok(Vec::new()));
-            let (mut receipts, finishing, processed) = taken.try_recv().unwrap();
             for receipt in &mut receipts {
                 assert!(matches!(
                     finish(&mut driven, receipt),
