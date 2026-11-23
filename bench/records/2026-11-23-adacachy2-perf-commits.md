@@ -266,3 +266,203 @@ Either alone leaves the other flush in the path. Neither changes what a commit o
     # on adacachy2: kiln run, on 00aad8daff2fa3c9daa65d53c425d450, sync false, cwd ~/.cache/amphora-perf/commits-remote
     (cd bench && CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=~/.cache/amphora-perf-target/commits cargo build --release)   # r820, 8m46s
     python3 -I bench/thread_sample.py ~/.cache/amphora-perf-bin/commits/7f2650a9 29490 DIR W leader 5 2 3 replicated   # r851, cpus=4,mem=4g
+
+# Lane V3 (commits) on adacachy2: the barrier's two flushes removed on a branch, not merged (2026-11-23, 14:38Z to 15:33Z)
+
+Ada's goal is replicated commits about 10x faster than dqlite and rqlite. AC-T1.8.3 asks p99 at most 2 ms for 3
+nodes on a LAN. V2 found each write's ReadIndex barrier waiting on the leader's log write and one follower's.
+This hour built V2's two fixes and the red test, on branch `perf/commits-v3`.
+
+## Losses first
+
+1. **Nothing merged to main.** The fixes change vendored hyper-raft's consensus core. Their own crate's
+   invariant tests (`tests/pipeline.rs`, `tests/strategies.rs`, the lib tests) never ran: kiln refused this lane's
+   runs for room four times (0 to 3 of 32 cores idle). The new heartbeat-position oracle lives in those tests, so the
+   fix for (2) is unproven by its own test. It waits for that run.
+2. **The replicated suite has one failure, and it is main's.** At 6237d769: 136 passed, 1 failed, 4 ignored, 131 s,
+   load 36 to 71 (r926). The failure is `a_write_at_a_follower_is_answered_on_its_groups_commit`, at
+   `assert_eq!(taken.len(), 1)`. It fails the same way without the fix, at 4f2626de (main 9a7b14bb plus the new test
+   alone): 1 run of 1, 123 s (r939, stopped after that run). One run is not a rate. It is not this change's, by that
+   A/B.
+3. **Units 3 (the ladder against dqlite and rqlite) and 4 (batching) were not started.**
+
+## Unit 1, the red test: red on main, green with the fixes
+
+`v3_two_replicated_writes_in_a_row_answer_with_every_log_flush_held` (replicated.rs): three voters behind log gates,
+three fates, two to span. Warm writes run until each follower states a durable promise. Then every member's raft-log
+flushes are held, and two writes go to the leader one after the other.
+
+| commit | first write | second write | run |
+|---|---|---|---|
+| 4f2626de (main plus the test) | answered while held | answered only once the gates let the flushes go | r922 |
+| 6237d769 (the fixes) | answered while held | answered while held | r926, 2.88 s |
+
+## Unit 2, the fixes (6237d769, vendored hyper-raft change 0009)
+
+1. **Reads without a `Ready`.** `RawNode::light_now` asks the round for the reads that wait (`Raft::ask_reads`). It
+   gives the reads confirmed since the last `Ready` (`LightReady::read_states`). `Replica::take_light` queues them as
+   `take_ready` does, and they're released once applied, as before.
+2. **A heartbeat answer at once.** A member whose term and vote are durable answers a heartbeat beside the held
+   answers (`Raft::answer_beat_now`). Its position is `(Log::persisted, its term)`, the durable end of its log, not
+   `last_index`. Its commit is the durable commit. A leader takes a position of its term as an append's answer, for
+   the classic quorum and for the reads it confirms, so it never counts one past that member's durable log. Where
+   the persisted entry's term can't be read (a snapshot not yet durable), the answer names no position. The durable
+   term and vote moved from `RawNode` to `Raft` (`durable_vote`), so the answer is decided where it is made.
+   Answers made otherwise keep today's path and position.
+3. **The test for (2)** is an oracle in the lagged harness (`tests/support/lagged.rs`). Every heartbeat answer that
+   names a position of the current term must name an index the member's disk holds, whenever it leaves. The harness
+   also takes the reads a light ready gives. It runs under `pipeline.rs`'s random interleavings, including
+   `held_commits_across_fates_keep_every_invariant`, which also checks that every answered read saw what was
+   committed when it was asked. **Not run yet.**
+4. **An Amphora-level guard for (2)**, `v3_a_leader_counts_no_follower_position_past_its_durable_log` (81043799):
+   both followers' log flushes held, two writes at the leader, the second's barrier answered by heartbeats while the
+   followers hold the first in memory alone. Each follower must hold entries past its durable log, and the
+   leader's progress for it must stay at or below that durable end. It should be red on main (the second write
+   stalls) and green with the fixes. **Not compiled or run yet.**
+
+Checks at 6237d769: clippy `-p amphora --all-targets` clean, clippy `-p hyper-raft -p hyper-durable` (lib) clean
+(r926). `scripts/vendor.py check hyper-raft`: 8 recorded changes, 0 differences.
+
+A side effect to measure, a guess not seen: with positions at the durable end, a follower in the middle of a long
+flush answers heartbeats without news. A leader whose window to it is full then probes it after a beat
+(`Progress::heard_heartbeat`). That costs a resend, not correctness.
+
+## Commands
+
+    # on adacachy2: kiln run, on 00aad8daff2fa3c9daa65d53c425d450, needs linux/amd64,cpus=8,mem=24g, sync false,
+    # cwd ~/.cache/amphora-perf/commits-remote, CARGO_TARGET_DIR=~/.cache/amphora-perf-target/commits, CARGO_INCREMENTAL=0
+    cargo test -p amphora --lib --locked -- --exact database::replicated::tests::v3_two_replicated_writes_in_a_row_answer_with_every_log_flush_held   # r922, r926
+    cargo test -p amphora --lib --locked -- database::replicated:: --test-threads=8                                                                  # r926
+    cargo test -p amphora --lib --locked -- database::replicated::tests::v3_ --test-threads=2                                                     # not run: refused for room
+    cargo test --manifest-path vendor/hyper-raft/Cargo.toml -p hyper-raft --lib --test pipeline --test strategies -- --test-threads=8              # not run: refused for room
+
+# Lane V4 (commits) on adacachy2: hyper-raft's own tests run on change 0009, and they refuse it (2026-11-23, 15:26Z to 16:21Z)
+
+Ada's goal is replicated commits about 10x faster than dqlite and rqlite; AC-T1.8.3 asks p99 at most 2 ms for 3
+nodes on a LAN. V3 built change 0009 (reads confirmed and heartbeats answered without a write) on
+`perf/commits-v3`. This hour ran its proof: hyper-raft's and hyper-durable's own tests, the two v3 tests, the
+replicated suite and clippy.
+
+## Losses first
+
+1. **0009 is not merged.** hyper-raft's own tests, run on it for the first time, fail in two suites that pass
+   without it: `tests/differential.rs` 2 of 8 pass (base 8 of 8), `tests/pipeline.rs` 7 of 12 run pass (base 12 of 12).
+   One defect was found and fixed (the incarnation, below). The pipeline failure's cause is not found, and the
+   differential failure needs a design choice. Both are open.
+2. **Units 3 (the ladder) and 4 (batching) were not started.** The bench did not build on main (fixed in
+   `bba65c73`, merged with this record).
+3. **The proof runs on upstream's tree, under rustc 1.99.1.** The vendored copy can't build hyper-raft's tests:
+   `vendor/MANIFEST.toml` takes 15 crates, not `hyper-check`, which hyper-raft's dev-dependencies need. The runs
+   clone upstream on adacachy2, check out the pin `d5d5f8f6`, apply `vendor/patches/hyper-raft/*.patch` in order
+   and test there. Base is the same tree without 0009. Upstream pins 1.98.1, and Amphora builds these crates
+   with 1.99.1. Clippy there needs `-A deprecated`: 1.99 deprecates `fetch_update` in `hyper-rt`, which base fails
+   the same way (r1037).
+
+## What the runs found
+
+Load 45 to 100 (1 min) on 32 cores, CPU pressure "some" 12 to 58%, I/O "some" under 8% (avg10), every step.
+
+| suite | base: pin + 0001..0008 (r1037, r1081) | 0009 at V3's `6237d769` (r1037) | 0009 at `3abd6ec7` (r1081, r1083) |
+|---|---|---|---|
+| hyper-raft lib | 161 of 161 | 153 of 161 | 160 of 161 (the last fixed in `6a5d0a13`, see below) |
+| `differential.rs` | 8 of 8 | not run (cargo stopped at lib) | 2 of 8 |
+| `pipeline.rs` | 12 of 12, 1 ignored | not run | 7 of 12, 1 ignored |
+| `strategies.rs` | 12, 37 ignored (campaigns, release) | not run | 12, 37 ignored |
+| `check`, `backlog`, `fast`, `group`, `repair`, `suspicion` | pass | not run | pass |
+| hyper-durable, every target | not run | pass | pass (lib 6, directed 5, hyperlog 14, keep 2, liveness 21 + 5 ignored, shell 47, sim 5, threads 1) |
+| clippy hyper-raft + hyper-durable, all targets | fails in hyper-rt only (deprecated) | fails in hyper-rt only | clean with `-A deprecated` |
+| amphora `v3_` tests | | 2 of 2 | 2 of 2 (V3's guard test `v3_a_leader_counts_no_follower_position_past_its_durable_log` compiled and run for the first time: green) |
+| amphora replicated suite | | | 138 of 139, 4 ignored, 130 s (the one failure is main's, below) |
+| clippy `-p amphora --all-targets -D warnings` | | | clean |
+
+**1. A defect, fixed (`3abd6ec7`).** `Raft::send` states the member's incarnation on every append and heartbeat
+answer (`held_asking`, R-8): a member marked through a promise of its term asks its leader where its log ends.
+`Raft::answer_beat_now` built its answer beside `send` and left it out, so such a member's mark was never narrowed
+(`a_member_opened_with_a_promise_is_marked_and_its_leader_narrows_the_mark`). The early answer states it now.
+
+**2. The core's tests, moved to the new rule (`3abd6ec7`, `6a5d0a13`).** Their `drain` helpers dropped `Ready::held`,
+where 0009's answers leave. They take it now, as an owner does. Three tests held the old rule, that a beat's answer
+waits for the write that holds what it says. They hold the new one: the answer leaves at once, naming the durable
+end of the log and the durable commit. `a_followers_answer_waits_for_the_write_that_holds_what_it_says` is renamed
+`a_followers_heartbeat_answer_names_only_what_its_disk_holds`. A beat in a new term, whose vote isn't durable, still
+waits for the write (`an_answer_states_no_commit_that_no_durable_write_stated` holds that).
+
+**3. `differential.rs`: the cores differ on the commit a heartbeat answer states (open, a design choice).** For
+example, "seed 0, step 180: member 2 messages: raft-rs MsgHeartbeatResponse 2->1 term 1 commit 7, hyper-raft commit 4"
+(r1081). The early answer states the durable commit (4), as upstream's rule says every answer must
+(`an_answer_states_no_commit_that_no_durable_write_stated`). Without 0009 the answer waited for the write, by which
+time 7 was durable. The answer can't wait only when its commit would be clamped: a beat that moves the commit is
+exactly the barrier's case, so that would put the follower's flush back. The choice for the successor:
+- (a) the early answer is an owner's opt-in (a `Config` field, off by default), so the core in its default,
+  raft-rs-like settings agrees with raft-rs, and Amphora's replicated owner turns it on; the lagged pipeline
+  harness then opts in to keep 0009 under its oracles;
+- (b) the differential harness stops comparing the commit of heartbeat answers.
+(a) keeps the differential oracle whole; recommended.
+
+**4. `pipeline.rs`: the new oracle sees answers past the disk (open, cause not found).** Five schedules
+(`faults_at_rest_lose_nothing_acknowledged`, `faults_at_rest_on_two_members_at_once_lose_nothing_acknowledged`,
+`held_commits_across_fates_keep_every_invariant`, `members_of_one_fate_make_no_held_commit_under_any_schedule`,
+`random_interleavings_by_suspicion_keep_every_invariant`) fail V3's oracle in `tests/support/lagged.rs`. r1106
+widened its message:
+
+| schedule | named | disk's last | answer's log_term | answer's term | disk's term there | disk hard (term, vote, commit) |
+|---|---|---|---|---|---|---|
+| faults at rest, one member and two | 26 | 9 | 1 | 4 | none | (4, 0, 2) |
+| held commits across fates | 26 | 10 | 2 | 3 | none | (3, 0, 5) |
+| members of one fate | 24 | 8 | 2 | 3 | none | (3, 0, 3) |
+| interleavings by suspicion | 15 | 4 | 1 | 4 | none | (4, 0, 0) |
+
+In every one, the named position is of an older term than the answer, and the disk holds nothing there. A leader
+takes a heartbeat's position only when it is of the leader's own term (`handle_heartbeat_response`,
+`message.log_term == self.term`), so no leader would count these. But the answer names `Log::persisted()`, which
+should never pass the disk (`Log::maybe_persist` checks the storage's term at the index), and here it is 26 against
+9. The oracle checks every `log_term != 0`, stricter than V3's stated rule ("a position of the current term").
+Narrowing it to that rule would likely pass these five, but it would leave `persisted` ahead of the disk
+unexplained, so it was not narrowed. Candidates, none checked: a write noticed durable whose entries the
+harness's disk then lost (faults at rest, or a fate's loss) without the member restarting; `Log::new` counting
+entries the store keeps in memory (in-place readies, `on_persist_keeping`) as persisted; the disk's tail replaced
+in the same term between the answer and its leaving. The next step is one run: log `raw.raft.log().persisted()` and
+`disk.last_index()` at each step of `faults_at_rest_lose_nothing_acknowledged` and find the first step where the
+first passes the second.
+
+The tip `6a5d0a13` holds 1 and 2. Every hyper-raft target there (r1149, 16:05Z to 16:08Z, load 72 to 83): lib
+161 of 161, `differential.rs` 2 of 8 (3), `pipeline.rs` 7 of 12 with 1 ignored (4), and backlog 1, check 11, fast 15,
+group 12, repair 7, strategies 12 (37 ignored), suspicion 35, timed 2 (1 ignored) and toolchain 1, all passing.
+
+## Main's own failures (for a lane)
+
+1. **`a_write_at_a_follower_is_answered_on_its_groups_commit` fails every run, on main and on this branch**: 6 of 6
+   on main `ea04b5b7` and 6 of 6 at `3abd6ec7`, 122 to 128 s each, one at a time from copied test binaries (r1083).
+   It is not a flake: the results are `[Err(Serialization { what: "prepared transaction", why: "the database
+   advanced since preparation" }), Ok([2])]`. Exactly one write applies, as designed, but the test expects the
+   loser's refusal as `Refusal::Invalid`. `876e68e2` (T-T1.8.W1) and `4add0134` (lane W3) made it
+   `Refusal::Serialization`, retryable. Still stale on origin/main `1df94b59` (replicated.rs line 7896). For lane W3.
+2. **bench/ did not build on main** since `80c3a431` (lane perf-A8 made `store::Config::queue` an `Option<usize>`):
+   `bench/src/store.rs:195`, E0308. bench/ is outside the root workspace, so main's checks never built it. Fixed in
+   `bba65c73`: `AMPHORA_QUEUE` sets `Some(q)` and the default (no count bound) stays otherwise.
+
+## The patch number
+
+Lane P8's `perf/serve-p7` also records hyper-raft `0009` (hyper-durable's `Replica::hold_apply`). origin/main
+`1df94b59` holds 0001 to 0008. Whichever merges second renumbers its change to 0010: merge origin/main, move its
+0009 aside, `python3 -I scripts/vendor.py record hyper-raft "<title>" --why "<why>"` (it takes the next number),
+update the file name in its `vendor/hyper-raft/UPSTREAM.md` row, then `python3 -I scripts/vendor.py check hyper-raft`
+clean.
+
+## Commands
+
+    # on adacachy2: kiln run, on 00aad8daff2fa3c9daa65d53c425d450, needs linux/amd64,cpus=8,mem=24g, sync false
+    # hyper-raft's proof, in an upstream clone (~/.cache/amphora-perf/commits-hyper-raft), RUSTUP_TOOLCHAIN=1.99.1,
+    # CARGO_TARGET_DIR=~/.cache/amphora-perf-target/commits-hyper-raft, CARGO_INCREMENTAL=0
+    git checkout -f --detach d5d5f8f66368bb8a08822518dd45d257e95e2dbf && git clean -fd
+    git -C ~/.cache/amphora-perf/commits-remote archive <sha> vendor/patches/hyper-raft | tar -x -C <P>
+    for p in <P>/vendor/patches/hyper-raft/*.patch; do git apply --whitespace=nowarn $p; done
+    cargo test -p hyper-raft --lib --tests --no-fail-fast -- --test-threads=8                       # r1081, r1149
+    cargo test -p hyper-durable --lib --tests --no-fail-fast -- --test-threads=8                    # r1081
+    cargo clippy -p hyper-raft -p hyper-durable --all-targets -- -D warnings -A deprecated          # r1081
+    git apply -R <P>/vendor/patches/hyper-raft/0009-*.patch   # base, then the same tests            # r1037, r1081
+    # Amphora, cwd ~/.cache/amphora-perf/commits-remote, CARGO_TARGET_DIR=~/.cache/amphora-perf-target/commits
+    cargo test -p amphora --lib --locked -- database::replicated::tests::v3_ --test-threads=2       # r1083
+    cargo test -p amphora --lib --locked -- database::replicated:: --test-threads=8                 # r1083
+    cargo clippy -p amphora --all-targets --locked -- -D warnings                                   # r1083
+    (cd crates/amphora && ~/.cache/amphora-perf-bin/commits/tests-<sha> --exact database::replicated::tests::a_write_at_a_follower_is_answered_on_its_groups_commit)   # r1083, 6 a side
