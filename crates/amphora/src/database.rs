@@ -648,6 +648,64 @@ where
     }
     done
 }
+/// A Records read (get, scan, changes, head) answered on a reader beside the writer (AUDIT 2.5):
+/// no writer transaction, no group log entry, no flush of its own. It keeps the writer path's
+/// guarantees: it reads once every write handed over before it is committed (read-your-writes,
+/// the order a writer batch gave it), and answers once what it read is durable, as an answer
+/// given after its batch's flush was. None for any other operation, and for a read the writer
+/// must answer: while a restore is unfinished (the writer knows whether it is the restore), or
+/// while the store has no reader to lend.
+fn read_records(
+    store: &Store<Local>,
+    namespace: &str,
+    operation: &Operation,
+    claim: &Option<Application>,
+    until: Instant,
+) -> Result<Option<Result<Answer, Refusal>>, Refusal> {
+    if !matches!(
+        operation,
+        Operation::Get(..) | Operation::Scan(..) | Operation::Changes(..) | Operation::Head
+    ) {
+        return Ok(None);
+    }
+    let read = store
+        .read(
+            None,
+            until,
+            |db| {
+                if Instant::now() >= until {
+                    return Err(Refusal::Timeout.into());
+                }
+                if restore::incomplete(db)? {
+                    return Ok(None);
+                }
+                let result = db
+                    .query_transaction(|db| {
+                        let _deadline = db.deadline(until);
+                        application::check(db, claim.as_ref(), operation)?;
+                        apply(db, namespace, operation)
+                    })
+                    .unwrap_or_else(|e| Err(refused(&e)));
+                if result.is_err() && Instant::now() >= until {
+                    return Err(Refusal::Timeout.into());
+                }
+                Ok(Some(result))
+            },
+            |_| Ok(None),
+        )
+        .map_err(|e| match e.downcast_ref::<store::Refused>() {
+            Some(store_refused) => admission_refusal(*store_refused),
+            None => refused(&e),
+        })?;
+    let Some(result) = read else {
+        return Ok(None);
+    };
+    match store.sync(until) {
+        Ok(()) => Ok(Some(result)),
+        Err(store::Refused::Timeout) => Err(Refusal::Timeout),
+        Err(_) => Err(Refusal::UnknownOutcome),
+    }
+}
 /// A read's answer and the time it was answered at (replication.md, "Follower reads at a closed
 /// time"): the state it read is its group's at that time, every write at it or before and none
 /// after.
@@ -2141,6 +2199,10 @@ impl Database {
             .foreground
             .get()
             .map(crate::backup::Foreground::call);
+        if let Some(answer) = read_records(store, namespace, &operation, &self.application, until)?
+        {
+            return answer.map(|answer| (answer, None));
+        }
         let wake = matches!(&operation, Operation::Mutation(Mutation::Records { tx, .. }) if !tx.writes.is_empty())
             || matches!(
                 &operation,
