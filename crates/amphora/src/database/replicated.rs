@@ -358,15 +358,9 @@ struct Control {
     commands: AtomicUsize,
     /// The most inputs the command queue holds, as the owner last learned it (`Bounds::commands`).
     command_bound: AtomicUsize,
-    /// Application calls in the command queue: no more than `call_bound`, so that a wire record
-    /// always finds a slot while calls wait for a leader (QB.1).
-    calls: AtomicUsize,
-    /// The most application calls the command queue holds, as the owner last learned it: what it
-    /// takes in an election timeout at its learned message rate, no more than the queue's inputs
-    /// less one (`queue_bounds`; QB.1).
-    call_bound: AtomicUsize,
-    /// The bytes application calls hold of the command queue, held to `applications` apart from
-    /// the wire records beside them (QB.1).
+    /// The bytes the application calls waiting in the command queue hold, each its own real or
+    /// declared size (`Admission::bytes_for`), held to `applications` apart from the wire records
+    /// beside them (QB.1, lane perf-A11). Calls are not counted: the bytes bound them.
     called: AtomicUsize,
     // The command queue's bound in bytes and a wire record's most, as the owner last learned them
     // (`queue_bounds`; QB.1).
@@ -768,8 +762,6 @@ struct Reservation {
     /// owner takes it or it is dropped untaken (QB.1, lane constants-20).
     slot: bool,
     bytes: usize,
-    /// An application call's slot in the command queue, given back with its bytes (QB.1).
-    call: bool,
     /// An application call's bytes in `called`, given back with it.
     called: usize,
 }
@@ -787,10 +779,9 @@ impl Drop for Reservation {
         self.control
             .admitted
             .fetch_sub(self.bytes, Ordering::AcqRel);
-        if self.call {
-            self.control.calls.fetch_sub(1, Ordering::AcqRel);
-            self.control.called.fetch_sub(self.called, Ordering::AcqRel);
-        }
+        self.control
+            .called
+            .fetch_sub(self.called, Ordering::AcqRel);
     }
 }
 struct Envelope {
@@ -1244,8 +1235,6 @@ struct Bounds {
     applications: usize,
     /// The most inputs the command queue holds.
     commands: usize,
-    /// The most application calls the command queue holds.
-    calls: usize,
     /// A wire record's most bytes: an image's, held inside the command queue's bound.
     wire: usize,
     /// The outgoing queue's bytes and messages.
@@ -1258,15 +1247,14 @@ struct Bounds {
 /// queue bounds by drain rate"; QB.1). The command queue's bytes are the memory budget's room for
 /// queues (MB.1), and application calls hold that less one wire record's room, so that waiting
 /// calls cannot block the record that finds a leader. A wire record's image is the budget's room
-/// for one (SB.1), held inside the command queue's bound. Calls are counted too: no more than the
-/// owner takes in `timeout`, the learned election timeout, at its learned message rate, and never
-/// more than the queue's inputs less one, so that a wire record always finds a place. The inputs
-/// are what the owner takes in `timeout` at that rate, at least a call and a wire record, and never
-/// more than the room holds of an input's least, its own envelope: a wire record may carry no
-/// bytes, so its bytes alone would not bound them (lane constants-20). Before any intake is
-/// measured, what the room holds. A call is charged its worst case (`REQUEST_MAX`) while
-/// the intake's byte rate is learned mostly from small wire records, so calls are bounded in count
-/// by the rate and in bytes by the room, never in bytes by the rate. The outgoing queue holds what
+/// for one (SB.1), held inside the command queue's bound. Calls are not counted apart: each is
+/// charged its real or declared size (`Admission::bytes_for`), so the calls waiting are held by
+/// their own bytes, never by a count derived from the largest call (lane perf-A11), and take any of
+/// the queue's inputs but the last, which a wire record always finds. The inputs are what the owner
+/// takes in `timeout`, the learned election timeout, at its learned message rate, at least a call
+/// and a wire record, and never more than the room holds of an input's least, its own envelope: a
+/// wire record may carry no bytes, so its bytes alone would not bound them (lane constants-20).
+/// Before any intake is measured, what the room holds. The outgoing queue holds what
 /// its host drains in an election timeout, at least a record to each of its `peers` (one broadcast)
 /// and no more than the room: the room before any drain is measured.
 fn queue_bounds(
@@ -1295,7 +1283,7 @@ fn queue_bounds(
     // block the record that finds a leader: its bytes and its envelope (lane constants-21).
     let envelope = u64::try_from(ENVELOPE_BYTES).unwrap_or(u64::MAX);
     let applications = queued.saturating_sub(wire).saturating_sub(envelope);
-    let (commands, calls) = command_counts(intake, timeout, room, request);
+    let commands = command_counts(intake, timeout, room);
     // The least the outgoing queue carries and still works: one broadcast, a record to each peer
     // (a leader's heartbeats, its appends), so that a queue held to it sheds no record of one.
     let one = super::drain::Bound {
@@ -1306,43 +1294,28 @@ fn queue_bounds(
         queued: usize::try_from(queued).unwrap_or(usize::MAX),
         applications: usize::try_from(applications).unwrap_or(usize::MAX),
         commands: usize::try_from(commands).unwrap_or(usize::MAX),
-        calls: usize::try_from(calls).unwrap_or(usize::MAX),
         wire: usize::try_from(wire).unwrap_or(usize::MAX),
         outgoing: outgoing.bound(timeout, one, room),
         room,
     })
 }
 
-/// The command queue's inputs and its application calls, counted (QB.1, lane constants-20): the
-/// inputs the owner takes in `timeout` at its learned message rate, at least a call and a wire
-/// record, and no more than `room` holds of an input's least, its own envelope (a wire record may
-/// carry no bytes); the calls the same, at least one, the queue's last input kept for a wire
-/// record. Before anything is measured, what the room holds. `request` is a call's charge.
-fn command_counts(
-    intake: &super::drain::Drain,
-    timeout: Duration,
-    room: u64,
-    request: u64,
-) -> (u64, u64) {
+/// The command queue's inputs, counted (QB.1, lane constants-20): what the owner takes in `timeout`
+/// at its learned message rate, at least a call and a wire record, and no more than `room` holds of
+/// an input's least, its own envelope (a wire record may carry no bytes). Before anything is
+/// measured, what the room holds. Application calls are not counted apart: their waiting bytes
+/// bound them, and the queue's last input stays a wire record's (`ReplicaHandle::enqueue`).
+fn command_counts(intake: &super::drain::Drain, timeout: Duration, room: u64) -> u64 {
     let envelope = u64::try_from(ENVELOPE_BYTES).unwrap_or(u64::MAX);
     let input = super::drain::Bound {
         bytes: envelope,
         messages: 2,
     };
-    let commands = intake
+    intake
         .bound(timeout, input, room)
         .messages
         .min(room.checked_div(envelope).unwrap_or(0))
-        .max(2);
-    let call = super::drain::Bound {
-        bytes: request,
-        messages: 1,
-    };
-    let calls = intake
-        .bound(timeout, call, room)
-        .messages
-        .min(commands.saturating_sub(1));
-    (commands, calls)
+        .max(2)
 }
 
 /// The frames the database's log may hold now, read on the flushing thread: its file's room and
@@ -1441,7 +1414,6 @@ impl ReplicaHandle {
         // waiting calls leave the rest of the queue to the wire records that discover it.
         let limit = self.shared.queued.load(Ordering::Acquire);
         let application_limit = self.shared.applications.load(Ordering::Acquire);
-        let call_limit = self.shared.call_bound.load(Ordering::Acquire);
         let command_limit = self.shared.command_bound.load(Ordering::Acquire);
         let call = matches!(
             &command,
@@ -1455,25 +1427,19 @@ impl ReplicaHandle {
             control: Arc::clone(&self.shared),
             slot: false,
             bytes: 0,
-            call: false,
             called: 0,
         };
-        // A call takes one of the calls' places, never the queue's last: that one stays a wire
-        // record's. A call refused for its count names the count bound.
-        if call {
-            self.shared
-                .calls
-                .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
-                    held.checked_add(1).filter(|next| *next <= call_limit)
-                })
-                .map_err(|_| Refusal::Full { limit: call_limit })?;
-            reservation.call = true;
-        }
-        // Every input takes a place in the channel, held to the inputs' bound (lane constants-20).
+        // Every input takes a place in the channel, held to the inputs' bound (lane constants-20); a
+        // call never the last, which stays a wire record's.
+        let places = if call {
+            command_limit.saturating_sub(1)
+        } else {
+            command_limit
+        };
         self.shared
             .commands
             .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
-                held.checked_add(1).filter(|next| *next <= command_limit)
+                held.checked_add(1).filter(|next| *next <= places)
             })
             .map_err(|_| Refusal::Full {
                 limit: command_limit,
@@ -1526,6 +1492,9 @@ impl ReplicaHandle {
         if Instant::now() >= until {
             return Err(Refusal::Timeout);
         }
+        // Charged what the operation and its answer can hold, a call the bytes its caller declared
+        // (lane perf-A11), as a local writer's admission charges it.
+        let bytes = Admission::bytes_for(&operation);
         let (response, receiver) = mpsc::sync_channel(1);
         self.enqueue(
             Input::Submit {
@@ -1535,7 +1504,7 @@ impl ReplicaHandle {
                 until,
                 response,
             },
-            api::REQUEST_MAX,
+            bytes,
         )?;
         receiver
             .recv_timeout(until.saturating_duration_since(Instant::now()))
@@ -1669,11 +1638,6 @@ impl ReplicaHandle {
     #[cfg(test)]
     fn command_bound(&self) -> usize {
         self.shared.command_bound.load(Ordering::Acquire)
-    }
-    /// The most application calls the command queue holds in force (QB.1).
-    #[cfg(test)]
-    fn call_bound(&self) -> usize {
-        self.shared.call_bound.load(Ordering::Acquire)
     }
     /// A wire record's most bytes in force (QB.1): a host's transport refuses a longer record
     /// before it reads it (`crate::serve`).
@@ -2407,8 +2371,6 @@ fn open_on<F: BlockFile + 'static>(
         admitted: AtomicUsize::new(0),
         commands: AtomicUsize::new(0),
         command_bound: AtomicUsize::new(first.commands),
-        calls: AtomicUsize::new(0),
-        call_bound: AtomicUsize::new(first.calls),
         called: AtomicUsize::new(0),
         queued: AtomicUsize::new(first.queued),
         applications: AtomicUsize::new(first.applications),
@@ -3433,9 +3395,6 @@ impl<F: BlockFile + 'static> Actor<F> {
         self.control
             .command_bound
             .store(bounds.commands, Ordering::Release);
-        self.control
-            .call_bound
-            .store(bounds.calls, Ordering::Release);
         self.control.wire.store(bounds.wire, Ordering::Release);
         self.queues = None;
         self.queues = crate::memory::process()
@@ -4912,7 +4871,6 @@ impl<F: BlockFile + 'static> Actor<F> {
                 control: Arc::clone(&self.control),
                 slot: false,
                 bytes: 0,
-                call: false,
                 called: 0,
             },
         });
@@ -5081,12 +5039,11 @@ impl<F: BlockFile + 'static> Actor<F> {
             namespace: String::new(),
             author: Author::Owner,
             response: None,
-            phase: Phase::Barrier(Some(Operation::Call(Mutex::new(Some(call))))),
+            phase: Phase::Barrier(Some(Operation::Call(Mutex::new(Some(call)), AnswerMax::<()>::fixed().get()))),
             _reservation: Reservation {
                 control: Arc::clone(&self.control),
                 slot: false,
                 bytes: 0,
-                call: false,
                 called: 0,
             },
         });
@@ -5377,7 +5334,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                     return Err(refused.refusal.into());
                 }
                 match &operation {
-                    Operation::Call(call) => {
+                    Operation::Call(call, _) => {
                         let call = locked(call)?
                             .take()
                             .ok_or_else(|| unavailable("SQL session already executed"))?;
@@ -5554,32 +5511,26 @@ mod tests {
     /// T-QB.1.6 (QB.1, lane constants-20): the command queue's inputs are counted, not picked. Do:
     /// count them with nothing measured, then for an intake draining 10 inputs every 10 ms under a
     /// 100 ms election timeout, then in a room of one envelope. Expect: the room's envelopes before
-    /// anything is measured, about 100 once measured, never fewer than a call and a wire record,
-    /// and the calls always one fewer than the inputs, the last kept for a wire record.
+    /// anything is measured, about 100 once measured, never fewer than a call and a wire record.
     #[test]
     fn t_qb_1_6_command_queue_inputs_counted_by_rate_within_the_room() {
         let envelope = u64::try_from(std::mem::size_of::<Envelope>()).unwrap();
-        let request = u64::try_from(api::REQUEST_MAX).unwrap();
         let room = 1000 * envelope;
         let timeout = Duration::from_millis(100);
         let idle = super::super::drain::Drain::default();
-        assert_eq!(command_counts(&idle, timeout, room, request), (1000, 999));
+        assert_eq!(command_counts(&idle, timeout, room), 1000);
         let mut intake = super::super::drain::Drain::default();
         intake.sample(0, true);
         for step in 1..=40u64 {
             intake.drained(1000, 10);
             intake.sample(step * 10_000_000, true);
         }
-        let (commands, calls) = command_counts(&intake, timeout, room, request);
+        let commands = command_counts(&intake, timeout, room);
         assert!((90..=110).contains(&commands), "{commands}");
-        assert_eq!(calls, commands - 1);
         // A room past the rate's count leaves the rate's; one below it, the room's envelopes.
-        assert_eq!(
-            command_counts(&intake, timeout, 50 * envelope, request),
-            (50, 49)
-        );
-        assert_eq!(command_counts(&intake, timeout, envelope, request), (2, 1));
-        assert_eq!(command_counts(&idle, timeout, 0, request), (2, 1));
+        assert_eq!(command_counts(&intake, timeout, 50 * envelope), 50);
+        assert_eq!(command_counts(&intake, timeout, envelope), 2);
+        assert_eq!(command_counts(&idle, timeout, 0), 2);
     }
 
     /// T-QB.1.10 (QB.1, lane constants-21): every queued input is charged its envelope against
@@ -5647,10 +5598,43 @@ mod tests {
         drop(driven);
     }
 
+    /// A call waiting for a leader, as `ReplicaHandle::submit` queues it: charged its operation's
+    /// real or declared size (`Admission::bytes_for`).
+    fn waiting_call(
+        handle: &ReplicaHandle,
+        declared: usize,
+        until: Instant,
+        evaluated: &Arc<AtomicUsize>,
+    ) -> Result<mpsc::Receiver<Result<Answered, Refusal>>, Refusal> {
+        let counted = Arc::clone(evaluated);
+        let operation = Operation::Call(
+            Mutex::new(Some(Box::new(move |_| {
+                counted.fetch_add(1, Ordering::Relaxed);
+                Ok(Box::new(()) as Box<dyn Any + Send>)
+            }))),
+            declared,
+        );
+        let bytes = Admission::bytes_for(&operation);
+        let (response, receiver) = mpsc::sync_channel(1);
+        handle
+            .enqueue(
+                Input::Submit {
+                    namespace: String::new(),
+                    operation,
+                    application: None,
+                    until,
+                    response,
+                },
+                bytes,
+            )
+            .map(|()| receiver)
+    }
+
     /// CP-T1.8 on driven time: admitted application calls cannot consume replication's reserved
-    /// byte capacity. Do: fill a leaderless member's queue with calls until it refuses one, then
-    /// admit a member's heartbeat and step the member. Expect: the refusal is the application
-    /// bound, the heartbeat processed, and no call run.
+    /// byte capacity. Do: fill a leaderless member's queue with calls each declaring an eighth of
+    /// the calls' room until it refuses one, then admit a member's heartbeat and step the member.
+    /// Expect: seven calls admitted, the refusal the calls' bytes bound, the heartbeat processed,
+    /// and no call run.
     #[test]
     fn unknown_leader_application_pressure_keeps_wire_admission_available() {
         let dir = tempfile::tempdir().unwrap();
@@ -5659,26 +5643,13 @@ mod tests {
         let handle = client.handle();
         let until = driven.until();
         let evaluated = Arc::new(AtomicUsize::new(0));
+        let application = handle.application_bound();
+        let declared = application / 8;
         let mut replies = Vec::new();
         let mut refusal = None;
-        for _ in 0..handle.command_bound() {
-            let counted = Arc::clone(&evaluated);
-            let operation = Operation::Call(Mutex::new(Some(Box::new(move |_| {
-                counted.fetch_add(1, Ordering::Relaxed);
-                Ok(Box::new(Vec::<u8>::new()) as Box<dyn Any + Send>)
-            }))));
-            let (response, receiver) = mpsc::sync_channel(1);
-            match handle.enqueue(
-                Input::Submit {
-                    namespace: String::new(),
-                    operation,
-                    application: None,
-                    until,
-                    response,
-                },
-                api::REQUEST_MAX,
-            ) {
-                Ok(()) => replies.push(receiver),
+        for _ in 0..=8 {
+            match waiting_call(&handle, declared, until, &evaluated) {
+                Ok(reply) => replies.push(reply),
                 Err(error) => {
                     refusal = Some(error);
                     break;
@@ -5686,10 +5657,6 @@ mod tests {
             }
         }
         assert_eq!(evaluated.load(Ordering::Relaxed), 0);
-        // The bounds the calls were admitted under, before the step learns new ones.
-        let application = handle.application_bound();
-        let calls = handle.call_bound();
-        let commands = handle.command_bound();
         let mut bytes = Vec::new();
         Message {
             msg_type: hyper_raft::proto::MessageType::MsgHeartbeat,
@@ -5702,21 +5669,57 @@ mod tests {
         let mut heartbeat = handle.admit_receive(2, bytes, until).unwrap();
         driven.step();
         assert!(matches!(heartbeat.try_result(), Ok(Some(()))));
-        assert!(
-            calls < commands,
-            "the queue's last place stays a wire record's"
-        );
-        // Calls stop at their bytes' bound or at their count's, the fewer, and the refusal names
-        // the bound that refused (QB.1). The count is checked first. Each call is charged its
-        // worst case and its envelope (lane constants-21).
-        let by_bytes = application / (api::REQUEST_MAX + ENVELOPE_BYTES);
-        let refused_by = if by_bytes < calls { application } else { calls };
         assert!(matches!(
             refusal,
-            Some(Refusal::Full { limit }) if limit == refused_by
+            Some(Refusal::Full { limit }) if limit == application
         ));
-        assert_eq!(replies.len(), by_bytes.min(calls));
-        assert!(!replies.is_empty());
+        assert_eq!(replies.len(), 7);
+        assert_eq!(evaluated.load(Ordering::Relaxed), 0);
+    }
+
+    /// AUDIT 2026-11-23 §1, lane perf-A11: a replicated owner's queue admits calls by the bytes
+    /// those waiting declared, not by a count nor the largest call's bound. Do: on a leaderless
+    /// member, queue calls each declaring a third of the calls' room, then submit one more; on
+    /// another, queue one more call declaring a fixed answer than the calls' room held at a
+    /// `REQUEST_MAX` charge each. Expect: two large calls admitted, the third refused `Full` at the
+    /// calls' bytes, typed, through `submit`; every small call admitted.
+    #[test]
+    fn a11_replicated_queue_admits_waiting_calls_by_their_declared_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let client = driven.open(dir.path(), 1, vec![1, 2, 3], None);
+        let handle = client.handle();
+        let until = driven.until();
+        let evaluated = Arc::new(AtomicUsize::new(0));
+        let application = handle.application_bound();
+        let third = application / 3;
+        let large = (0..2)
+            .map(|_| waiting_call(&handle, third, until, &evaluated).unwrap())
+            .collect::<Vec<_>>();
+        let operation = Operation::Call(
+            Mutex::new(Some(Box::new(|_| Ok(Box::new(()) as Box<dyn Any + Send>)))),
+            third,
+        );
+        let refused = handle.submit(String::new(), operation, None, until);
+        assert!(
+            matches!(refused, Err(Refusal::Full { limit }) if limit == application),
+            "{refused:?}"
+        );
+        drop(large);
+        drop(client);
+        drop(driven);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let client = driven.open(dir.path(), 1, vec![1, 2, 3], None);
+        let handle = client.handle();
+        let until = driven.until();
+        let declared = AnswerMax::<u64>::fixed().get();
+        let worst = handle.application_bound() / (api::REQUEST_MAX + ENVELOPE_BYTES);
+        let small = (0..=worst)
+            .map(|_| waiting_call(&handle, declared, until, &evaluated))
+            .collect::<Result<Vec<_>, _>>();
+        assert_eq!(small.map(|calls| calls.len()), Ok(worst + 1));
         assert_eq!(evaluated.load(Ordering::Relaxed), 0);
     }
 
@@ -8585,7 +8588,7 @@ mod tests {
     ) -> mpsc::Receiver<Result<Answered, Refusal>> {
         let operation = Operation::Call(Mutex::new(Some(Box::new(move |db| {
             Ok(Box::new(f(db)?) as Box<dyn Any + Send>)
-        }))));
+        }))), api::REQUEST_MAX);
         enqueue(client, until, "", operation)
     }
     /// Tells owner `owner` the host detector's `verdict` and steps every owner once: what the
@@ -11590,7 +11593,7 @@ mod tests {
                         db.exec("CREATE TABLE IF NOT EXISTS qb2(value)")?;
                         db.exec("INSERT INTO qb2 VALUES(1)")?;
                         Ok(Box::new(Vec::<u8>::new()) as Box<dyn Any + Send>)
-                    }))));
+                    }))), api::REQUEST_MAX);
                     let (response, receiver) = mpsc::sync_channel(1);
                     let asked = clients[target].handle.enqueue(
                         Input::Submit {
@@ -13609,7 +13612,7 @@ mod tests {
     ) -> Result<R, Refusal> {
         let operation = Operation::Call(Mutex::new(Some(Box::new(move |db| {
             Ok(Box::new(f(db)?) as Box<dyn Any + Send>)
-        }))));
+        }))), api::REQUEST_MAX);
         let (response, receiver) = mpsc::sync_channel(1);
         client
             .handle
@@ -13803,7 +13806,7 @@ mod tests {
             // The configuration at the raise's base, which the stale-base rule makes its own at apply.
             let learners = crate::replication::floor::configuration(db)?.learners;
             Ok(Box::new((floor.version, learners)) as Box<dyn Any + Send>)
-        }))));
+        }))), api::REQUEST_MAX);
         let (response, raised) = mpsc::sync_channel(1);
         clients[leader]
             .handle
@@ -14030,7 +14033,7 @@ mod tests {
             db.exec("CREATE TABLE IF NOT EXISTS floor_items(version)")?;
             db.exec("INSERT INTO floor_items VALUES(7)")?;
             Ok(Box::new(()) as Box<dyn Any + Send>)
-        }))));
+        }))), api::REQUEST_MAX);
         let (response, written) = mpsc::sync_channel(1);
         clients[leader]
             .handle
@@ -14148,7 +14151,7 @@ mod tests {
             let floor = crate::database::application::raise(db, kiln(7), true)?
                 .map_err(|refused| anyhow::Error::from(refused.refusal))?;
             Ok(Box::new(floor.version) as Box<dyn Any + Send>)
-        }))));
+        }))), api::REQUEST_MAX);
         let (response, raised) = mpsc::sync_channel(1);
         client
             .handle
@@ -14494,7 +14497,7 @@ mod tests {
         let operation = Operation::Call(Mutex::new(Some(Box::new(|db: &mut Db| {
             db.exec("CREATE TABLE IF NOT EXISTS ahead(x)")?;
             Ok(Box::new(()) as Box<dyn Any + Send>)
-        }))));
+        }))), api::REQUEST_MAX);
         let (response, written) = mpsc::sync_channel(1);
         clients[leader]
             .handle
@@ -14593,7 +14596,7 @@ mod tests {
         let operation = Operation::Call(Mutex::new(Some(Box::new(|db: &mut Db| {
             db.exec("CREATE TABLE IF NOT EXISTS ahead(x)")?;
             Ok(Box::new(()) as Box<dyn Any + Send>)
-        }))));
+        }))), api::REQUEST_MAX);
         let (response, written) = mpsc::sync_channel(1);
         clients[leader]
             .handle
@@ -15280,7 +15283,7 @@ mod tests {
                 let operation = Operation::Call(Mutex::new(Some(Box::new(|db: &mut Db| {
                     db.exec("CREATE TABLE IF NOT EXISTS in_flight(x)")?;
                     Ok(Box::new(()) as Box<dyn Any + Send>)
-                }))));
+                }))), api::REQUEST_MAX);
                 let (response, written) = mpsc::sync_channel(1);
                 clients[leader]
                     .handle
