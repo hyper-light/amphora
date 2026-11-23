@@ -82,7 +82,7 @@ fn child(path: &Path, mode: &str) -> std::process::ExitStatus {
 fn migration_diagnostics(database: &Database) {
     // U05/U16: caller migration context and the engine cause survive either SQL session path.
     let failure = database
-        .call::<(), _>(until(), |db| {
+        .call::<(), _>(until(), AnswerMax::fixed(), |db| {
             db.execute_batch("CREATE INDEX diagnostic_index ON missing_diagnostic_table(value)")
                 .context("migration 20261023-1300_p6_records.sql")
                 .context("apply migrations")?;
@@ -102,7 +102,7 @@ fn migration_diagnostics(database: &Database) {
             "lost error context {expected}: {message}"
         );
     }
-    let refusal = database.call::<(), _>(until(), |_| {
+    let refusal = database.call::<(), _>(until(), AnswerMax::fixed(), |_| {
         Err(
             anyhow::Error::new(api::Refusal::NotLeader { leader: Some(7) })
                 .context("apply migrations"),
@@ -112,7 +112,7 @@ fn migration_diagnostics(database: &Database) {
         refusal,
         Err(api::Refusal::NotLeader { leader: Some(7) })
     ));
-    let refusal = database.call::<(), _>(until(), |_| {
+    let refusal = database.call::<(), _>(until(), AnswerMax::fixed(), |_| {
         Err(
             anyhow::Error::new(api::sql::Error::Refusal(api::Refusal::Fenced(
                 "writer fenced".into(),
