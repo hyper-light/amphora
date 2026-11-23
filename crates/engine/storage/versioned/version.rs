@@ -1750,6 +1750,23 @@ impl Versioned {
         Ok(ts)
     }
 
+    /// Ends `txn` with no commit if it changed nothing and its validation would keep nothing of
+    /// it (AUDIT 2.4, `AC-NS.2.1`): a transaction that only read is serialized at its snapshot
+    /// under every validation but SSI with reads kept ([`Versioned::validate`] and
+    /// [`Versioned::kept`] pass it untouched), so its commit only took a timestamp and published
+    /// nothing. Its snapshot, state and read charge are let go, as a commit's are. `txn` back,
+    /// untouched, when it must commit.
+    pub fn end_unwritten(&self, mut txn: Txn) -> Result<Option<Txn>> {
+        let kept_reads = self.validation == Validation::Ssi && !txn.reads.is_empty();
+        if !txn.ops.is_empty() || !txn.changed.is_empty() || kept_reads {
+            return Ok(Some(txn));
+        }
+        txn.reads = Reads::default();
+        self.clock.budget.release(std::mem::take(&mut txn.read_bytes));
+        self.clock.forget(&txn)?;
+        Ok(None)
+    }
+
     /// Keeps, for `txn`'s commit's validation, that it read tree `tree`'s keys from `from` to `to`,
     /// both included (none: from the least, to the greatest), as its snapshot sees them: the rows
     /// there and the gaps between them, as [`VTree::read_range`] keeps a scan. The SQL cursor's

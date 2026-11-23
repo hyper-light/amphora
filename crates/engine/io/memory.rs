@@ -90,6 +90,10 @@ impl Clock for MemoryIO {
 }
 
 impl IO for MemoryIO {
+    fn page_read_backend(&self) -> Option<&'static str> {
+        Some("memory")
+    }
+
     fn is_memory(&self) -> bool {
         true
     }

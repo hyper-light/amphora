@@ -474,6 +474,15 @@ pub trait IO: Clock + Send + Sync {
         false
     }
 
+    /// Amphora (AUDIT §7.1, perf/coldstart): the name of the way this IO reads a file, when every
+    /// IO of that name reads a page on a given device at the same cost, so a page read timed
+    /// through one (`learned_costs::page_read_anchor`) stands for the next opened on that device.
+    /// `None` (the default) for an IO that may read otherwise (a test's or a simulator's): each of
+    /// its opens times its own.
+    fn page_read_backend(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Amphora (G7 step 2, `AC-NS.2.1`): for an IO whose files live in memory, the versioned
     /// storage of the database at `path`, kept beside its file for as long as the IO keeps the
     /// file, so a database reopened on the same IO finds its trees as it finds its file: made by
