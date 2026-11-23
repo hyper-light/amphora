@@ -941,11 +941,6 @@ struct Actor<F: BlockFile + 'static = LogDevice> {
     // A floor session, a follower's write, or the leader's in its turn after a slot, past its
     // barrier, waiting for this member to apply its own log up to the last index it held then.
     tail: Option<u64>,
-    // The term in which one of this follower's writes was refused as stale, so its leader queued
-    // it for a write slot its next barrier begins: if that barrier's work forwards nothing, a
-    // second barrier tells the leader at once, which ends the slot (`Slots::read`) instead of its
-    // length (replication.md, "the write slot").
-    slotted: Option<u64>,
     floor_requests_applied: u64,
     floor_requests_stale: u64,
     // The floor version this owner last published, none before its first: a raise is it rising.
@@ -2589,7 +2584,6 @@ fn open_on<F: BlockFile + 'static>(
         floor_failures: 0,
         floor_requesting: false,
         tail: None,
-        slotted: None,
         floor_requests_applied: 0,
         floor_requests_stale: 0,
         floor_published: None,
@@ -4358,6 +4352,9 @@ impl<F: BlockFile + 'static> Actor<F> {
                     return stepped;
                 }
                 hyper_raft::proto::MessageType::MsgReadIndex => {
+                    // A follower's write prepares in a slot from its first try, so no base it
+                    // prepares on is passed before its write appends (CP-T1.8, lane V8).
+                    self.slots.ask(from);
                     let read = self.slots.read(from, self.at, (message, reservation));
                     self.slot_ended(read.ended);
                     let stepped = match read.step {
@@ -4745,9 +4742,6 @@ impl<F: BlockFile + 'static> Actor<F> {
                 .as_ref()
                 .is_some_and(|p| p.context == applied.context);
             if matches && let Some(mut pending) = self.pending.take() {
-                if matches!(pending.phase, Phase::Proposed(_)) {
-                    self.queued_by(&applied.result);
-                }
                 let result = match pending.phase {
                     // The write's own token: its entry's index and time (`tokens`).
                     Phase::Proposed(value) => applied.result.map(|()| Answered {
@@ -4986,7 +4980,6 @@ impl<F: BlockFile + 'static> Actor<F> {
             // A malformed entry fences at its apply, which answers.
             Err(_) => return,
         };
-        self.queued_by(&result);
         let Some(mut pending) = self.pending.take() else {
             return;
         };
@@ -5361,17 +5354,11 @@ impl<F: BlockFile + 'static> Actor<F> {
         self.control.moved.notify_all();
         Ok(())
     }
-    /// A follower's write refused as stale queued it at its leader (`Slots::refused`).
-    fn queued_by<T>(&mut self, result: &Result<T, Refusal>) {
-        if matches!(result, Err(Refusal::Serialization { .. })) && !self.replica.is_leader() {
-            self.slotted = Some(self.replica.term());
-        }
-    }
-    /// Prepares the operation past its barrier. A follower whose barrier began its write slot and
-    /// whose work ended forwarding nothing (a read, a refused or failed write) sends a second
-    /// barrier, which ends the slot at its leader at once; a forward ends it there itself. A
-    /// leader of any version ends a holder's slot on its second barrier, so this needs nothing new
-    /// on the wire, and a stray barrier's read state matches nothing here and is dropped. Work
+    /// Prepares the operation past its barrier. Each follower's barrier begins its write slot, so
+    /// a follower whose work ended forwarding nothing (a read, a refused or failed write) sends a
+    /// second barrier, which ends the slot at its leader at once; a forward ends it there itself.
+    /// A leader of any version ends a holder's slot on its second barrier, so this needs nothing
+    /// new on the wire, and a stray barrier's read state matches nothing here and is dropped. Work
     /// handed to the session worker ends when it comes back (`Actor::decide`).
     fn prepare(&mut self) -> Result<(), Refusal> {
         let work = self
@@ -5387,13 +5374,9 @@ impl<F: BlockFile + 'static> Actor<F> {
         }
         Ok(())
     }
-    /// The holder's work in its slot ended: if it forwarded nothing, its second barrier.
+    /// A follower's work in its slot ended: if it forwarded nothing, its second barrier.
     fn end_slot(&mut self) -> Result<(), Refusal> {
-        if let Some(term) = self.slotted.take()
-            && self.pending.is_none()
-            && term == self.replica.term()
-            && !self.replica.is_leader()
-        {
+        if self.pending.is_none() && !self.replica.is_leader() {
             let context = self.context()?;
             self.replica.read(context).map_err(raft_error)?;
         }
@@ -18800,6 +18783,104 @@ mod tests {
         pump.finish();
     }
 
+    /// Lane V6's fifth test, the acceptance test for lane V7's designs A and B
+    /// (bench/records/2026-11-23-adacachy2-perf-commits.md, "Unit 2"): 128 writers at once in
+    /// each class, writer w at member w % 3, each one write outstanding, appending a row to one
+    /// table (every write conflicts with every other), a write refused for a stale base made again
+    /// at the same member, as the bench's driver does. Expect: every write answered Ok before its
+    /// deadline, the run ending within ROUNDS (no livelock), each row on every replica once, and in
+    /// neither class any write refused for a stale base. Red today: a follower prepares on its own
+    /// base and loses to the leader's log (V6's r1238, V7's r1312 and r1346).
+    #[test]
+    fn v7_a_hundred_and_twenty_eight_spread_writers_are_each_answered_with_no_stale_base() {
+        const WRITERS: usize = 128;
+        let mut stale = Vec::new();
+        for durability in [Durability::Persisted, three_fates()] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut driven = Driven::new();
+            let clients: Vec<Client> = (1..=3)
+                .map(|n| driven.open_with(dir.path(), n, vec![1, 2, 3], None, durability.clone()))
+                .collect();
+            let mut pump = Pump::new(&clients);
+            let leader = driven.elect(&mut pump, &clients, 0, 1);
+            driven
+                .call(&mut pump, &clients[leader], |db| {
+                    db.exec("CREATE TABLE events(id INTEGER NOT NULL, body TEXT NOT NULL)")?;
+                    Ok(Vec::new())
+                })
+                .unwrap();
+            driven.tick(&mut pump, leader);
+            let write = |id: usize| {
+                move |db: &mut Db| {
+                    db.exec(&format!(
+                        "INSERT INTO events VALUES ({id}, '{}')",
+                        "x".repeat(600)
+                    ))?;
+                    Ok(Vec::new())
+                }
+            };
+            let mut inflight: Vec<Option<Answering>> = (0..WRITERS)
+                .map(|id| Some(submit(&clients[id % 3], driven.until(), write(id))))
+                .collect();
+            let mut refused = vec![0u64; WRITERS];
+            let mut rounds = 0;
+            while inflight.iter().any(Option::is_some) {
+                assert!(
+                    rounds < ROUNDS,
+                    "{durability:?}: unanswered: {}",
+                    inflight.iter().flatten().count()
+                );
+                for (id, slot) in inflight.iter_mut().enumerate() {
+                    let Some(answer) = slot.take() else {
+                        continue;
+                    };
+                    match answer.try_recv() {
+                        Err(mpsc::TryRecvError::Empty) => *slot = Some(answer),
+                        Err(error) => panic!("owner ended: {error}"),
+                        Ok(Ok(_)) => {}
+                        Ok(Err(Refusal::Serialization { .. })) => {
+                            refused[id] += 1;
+                            *slot = Some(submit(&clients[id % 3], driven.until(), write(id)));
+                        }
+                        Ok(Err(refusal)) => {
+                            panic!("{durability:?}: writer {id} at member {}: {refusal:?}", id % 3 + 1)
+                        }
+                    }
+                }
+                driven.round(&mut pump);
+                rounds += 1;
+            }
+            driven.quiet(&mut pump);
+            driven.tick(&mut pump, leader);
+            driven.tick(&mut pump, leader);
+            for owner in 0..3 {
+                let ids = driven
+                    .owner_mut(owner)
+                    .replica
+                    .machine_mut()
+                    .read_db(|db| {
+                        let mut ids = Vec::new();
+                        db.query_owned("SELECT id FROM events ORDER BY id", [], |row| {
+                            ids.push(usize::try_from(row.get::<i64>(0)?).unwrap());
+                            Ok(true)
+                        })?;
+                        Ok(ids)
+                    })
+                    .unwrap();
+                assert_eq!(ids, (0..WRITERS).collect::<Vec<_>>(), "{durability:?}: owner {owner}");
+            }
+            driven.drain(&mut pump);
+            pump.finish();
+            let writes = refused.iter().filter(|n| **n > 0).count();
+            let most = refused.iter().max().copied().unwrap_or(0);
+            stale.push((
+                refused.iter().sum::<u64>(),
+                format!("{durability:?}: over {writes} writes, at most {most} for one, in {rounds} rounds"),
+            ));
+        }
+        assert!(stale.iter().all(|(n, _)| *n == 0), "stale-base refusals: {stale:?}");
+    }
+
     /// T-T1.8.W1, the stale-base refusal's type (PostgreSQL's 40001): a write refused because
     /// what it read changed is to be asked again, and nothing else is answered as if it were. Do:
     /// on the persisted class, every member at once appends a row to one table (each write
@@ -18920,8 +19001,8 @@ mod tests {
     /// appends a write of its own on the same base, then let through; the follower's write made
     /// again, its forward held the same way while the leader is asked for a second write, then let
     /// through. Expect, with the slot off: the follower refused both times, stale. With the slot
-    /// on: refused once, then applied on its next try, the leader's second write held until it
-    /// lands and then applied too.
+    /// on: applied both times, its barrier beginning its slot from its first try (lane V8), the
+    /// leader's writes held until it lands and then applied too.
     #[test]
     fn todays_rule_refuses_a_follower_twice_in_a_row_where_the_slot_lands_its_retry() {
         for slot_off in [true, false] {
@@ -18999,8 +19080,10 @@ mod tests {
             if slot_off {
                 assert!(outcomes.iter().all(stale), "today's rule: {outcomes:?}");
             } else {
-                assert!(stale(&outcomes[0]), "the slot: {outcomes:?}");
-                assert_eq!(outcomes[1], Ok(Vec::new()), "the slot: {outcomes:?}");
+                assert!(
+                    outcomes.iter().all(|outcome| *outcome == Ok(Vec::new())),
+                    "the slot: {outcomes:?}"
+                );
             }
             driven.quiet(&mut pump);
             driven.drain(&mut pump);
@@ -19336,8 +19419,6 @@ mod tests {
         driven.quiet(&mut pump);
         let holder = 3;
         driven.owner_mut(0).slots.refused(holder);
-        let term = driven.owner(2).replica.term();
-        driven.owner_mut(2).slotted = Some(term);
         let failed = submit(&clients[2], driven.until(), |db| {
             db.exec("INSERT INTO missing VALUES (1)")?;
             Ok(Vec::new())

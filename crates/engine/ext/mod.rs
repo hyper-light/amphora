@@ -270,6 +270,17 @@ impl Database {
             #[cfg(all(feature = "fts", not(target_family = "wasm")))]
             syms.index_methods
                 .insert(FTS_INDEX_METHOD_NAME.to_string(), Arc::new(FtsIndexMethod));
+            // floatingpoint.html §2.2.6: "the \"decimal\" collating sequence that compares decimal
+            // text strings in numeric order".
+            syms.collations.insert(
+                crate::translate::collate::CollationSeq::custom("decimal").id(),
+                Arc::new(crate::function::ExternalCollation::new(
+                    "decimal".to_string(),
+                    0,
+                    decimal_collation,
+                    None,
+                )),
+            );
         }
         let syms = self.builtin_syms.data_ptr();
         // Pass the mutex pointer and the appropriate handler
@@ -304,6 +315,8 @@ impl Database {
         #[cfg(feature = "percentile")]
         crate::percentile::register_extension(&mut ext_api);
         crate::regexp::register_extension(&mut ext_api);
+        crate::ieee754::register_extension(&mut ext_api);
+        crate::decimal::register_extension(&mut ext_api);
         #[cfg(feature = "fs")]
         {
             let vfslist = add_builtin_vfs_extensions(Some(ext_api)).map_err(|e| e.to_string())?;
@@ -379,5 +392,27 @@ impl Connection {
             return;
         }
         let _ = unsafe { Box::from_raw(api.ctx as *mut ExtensionCtx) };
+    }
+}
+
+/// The decimal collating sequence's callback: both sides as text, in numeric order.
+unsafe extern "C" fn decimal_collation(
+    _context: usize,
+    left_ptr: *const u8,
+    left_len: usize,
+    right_ptr: *const u8,
+    right_len: usize,
+) -> i32 {
+    let side = |ptr: *const u8, len: usize| -> String {
+        if ptr.is_null() {
+            return String::new();
+        }
+        // SAFETY: the comparator hands each side as a pointer and length into a live buffer.
+        String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(ptr, len) }).into_owned()
+    };
+    match crate::decimal::decimal_collate(&side(left_ptr, left_len), &side(right_ptr, right_len)) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
     }
 }
