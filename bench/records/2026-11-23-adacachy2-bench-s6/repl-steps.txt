@@ -1,0 +1,42 @@
+== amphora-procs-persisted writers 1
+== amphora-procs-persisted commit on 127.0.0.1:29290,127.0.0.1:29291,127.0.0.1:29292
+ok amphora-procs-persisted commit
+== amphora-procs-replicated writers 1
+== amphora-procs-replicated commit on 127.0.0.1:29290,127.0.0.1:29291,127.0.0.1:29292
+ok amphora-procs-replicated commit
+== rqlite writers 1
+ok rqlite 1
+== dqlite writers 1
+ok dqlite 1
+== libsql writers 1
+refused libsql 1: libsql's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh up: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh: line 47: 3408772 Killed                     setsid \
+== litefs writers 1
+ok litefs 1
+== amphora-procs-persisted writers 32
+== amphora-procs-persisted commit on 127.0.0.1:29290,127.0.0.1:29291,127.0.0.1:29292
+ok amphora-procs-persisted commit
+== amphora-procs-replicated writers 32
+== amphora-procs-replicated commit on 127.0.0.1:29290,127.0.0.1:29291,127.0.0.1:29292
+ok amphora-procs-replicated commit
+== rqlite writers 32
+ok rqlite 32
+== dqlite writers 32
+ok dqlite 32
+== libsql writers 32
+refused libsql 32: libsql's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh up: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh: line 47: 3649603 Killed                     setsid \
+== litefs writers 32
+ok litefs 32
+== amphora-procs-persisted writers 128
+== amphora-procs-persisted commit on 127.0.0.1:29290,127.0.0.1:29291,127.0.0.1:29292
+ok amphora-procs-persisted commit
+== amphora-procs-replicated writers 128
+== amphora-procs-replicated commit on 127.0.0.1:29290,127.0.0.1:29291,127.0.0.1:29292
+ok amphora-procs-replicated commit
+== rqlite writers 128
+ok rqlite 128
+== dqlite writers 128
+ok dqlite 128
+== libsql writers 128
+refused libsql 128: libsql's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh up: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh: line 47: 3968087 Killed                     setsid \
+== litefs writers 128
+ok litefs 128
