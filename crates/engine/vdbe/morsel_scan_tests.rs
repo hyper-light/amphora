@@ -3708,3 +3708,23 @@ fn t_qt_6_3_k7_probe() {
     conn.set_parallel_limit(false);
     conn.set_parallel_mode(ParallelMode::Off);
 }
+
+#[test]
+fn t_qt_6_3_k7_probe_6_35() {
+    let conn = open(":memory:qt-6-35-probe");
+    let mut rng = ChaCha8Rng::seed_from_u64(635);
+    fill_with_ids(&conn, &mut rng, &[("f", 3000), ("d", 600), ("e", 300)]);
+    conn.set_parallel_mode(ParallelMode::On);
+    *conn.morsel_costs.lock() = Some(MachineCosts::stated(NonZeroUsize::new(1).unwrap(), 1.0, 1.0));
+    for sql in [
+        "SELECT count(*), sum(d.b) FROM f JOIN d ON f.a = d.a WHERE f.id > 2000",
+        "SELECT d.c, count(*), min(f.b) FROM f JOIN d ON f.c = d.c WHERE f.id BETWEEN 500 AND 1500 AND d.id < 300 GROUP BY d.c",
+    ] {
+        let plan = sql_rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+        let before = conn.morsel_join_links.load(std::sync::atomic::Ordering::Relaxed);
+        let _ = sql_rows(&conn, sql);
+        let after = conn.morsel_join_links.load(std::sync::atomic::Ordering::Relaxed);
+        eprintln!("K7 6_35 links {} plan {plan:?} for {sql}", after - before);
+    }
+    conn.set_parallel_mode(ParallelMode::Off);
+}
