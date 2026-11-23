@@ -11,6 +11,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::{
     cell::{Cell, RefCell},
     io::{Read, Write},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -543,6 +544,9 @@ impl crate::groups::Peers for Nodes {
 pub struct Owner {
     stop: Arc<AtomicBool>,
     listener: Option<thread::JoinHandle<()>>,
+    /// The listening socket's second handle, and the address it listens at: stopping wakes the
+    /// accept the listener's thread blocks in through it ([`Owner::drop`]).
+    wake: Option<(endpoint::Listener, SocketAddr)>,
 }
 impl Owner {
     /// `acquire` must upgrade a weak database reference, avoiding an owner/database cycle.
@@ -588,6 +592,14 @@ impl Owner {
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = Arc::clone(&stop);
         let descriptors = crate::descriptors::process()?;
+        // AUDIT 6 (event-driven accept): the thread blocks in accept, woken by each connection
+        // and by stopping, rather than polling a nonblocking listener on a sleep, which kept
+        // every new connection (each attached call, each dialed RPC) waiting up to a poll.
+        listener.set_nonblocking(false).map_err(unavailable)?;
+        let wake = (
+            listener.try_clone().map_err(unavailable)?,
+            wake_address(listener.local_addr().map_err(unavailable)?),
+        );
         let waits = Arc::new(AtomicUsize::new(0));
         let handle = thread::Builder::new()
             .name("amphora.owner".into())
@@ -595,6 +607,8 @@ impl Owner {
                 let _guard = guard;
                 while !stopping.load(Ordering::Acquire) {
                     match listener.accept() {
+                        // Stopping's own wake-up connection, or one that raced it.
+                        Ok(_) if stopping.load(Ordering::Acquire) => break,
                         Ok((stream, _)) => {
                             if let Err(error)=stream.set_nonblocking(false) {
                                 tracing::warn!(target:"amphora.transport",event="stream_configuration_failed",%error);
@@ -627,9 +641,10 @@ impl Owner {
                                 tracing::warn!(target: "amphora.transport", event = "worker_start_failed", %error);
                             }
                         }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::park_timeout(Duration::from_millis(10))
-                        }
+                        // A signal, or a connection reset before it was taken.
+                        Err(e) if matches!(e.kind(), std::io::ErrorKind::Interrupted | std::io::ErrorKind::ConnectionAborted) => {}
+                        // Linux's wake on stopping: the listening socket shut down.
+                        Err(_) if stopping.load(Ordering::Acquire) => break,
                         // The system's limit reached by descriptors no budget charges (the
                         // host's own): the connection waits in the backlog until one is let go,
                         // and the listener goes on.
@@ -653,15 +668,40 @@ impl Owner {
         Ok(Self {
             stop,
             listener: Some(handle),
+            wake: Some(wake),
         })
     }
+}
+/// Where stopping connects to wake its own listener: the address it listens at, its loopback
+/// when it listens at every address.
+fn wake_address(listening: SocketAddr) -> SocketAddr {
+    let ip = match listening.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    SocketAddr::new(ip, listening.port())
 }
 impl Drop for Owner {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(handle) = self.listener.take() {
             handle.thread().unpark();
-            let _joined = handle.join();
+            let woken = self.wake.take().is_some_and(|(listener, address)| {
+                // Linux wakes an accept blocked on a listening socket shut down (EINVAL);
+                // macOS and Windows refuse to shut one down, and take a connection instead.
+                socket2::SockRef::from(&listener)
+                    .shutdown(std::net::Shutdown::Read)
+                    .is_ok()
+                    || std::net::TcpStream::connect(address).is_ok()
+            });
+            if woken {
+                let _joined = handle.join();
+            } else {
+                // Neither wake reached it: it stops at its next connection, and is not
+                // waited on here.
+                tracing::warn!(target: "amphora.transport", event = "listener_stop_unwoken");
+            }
         }
     }
 }
@@ -1629,6 +1669,99 @@ mod tests {
     }
     fn until() -> Instant {
         Instant::now() + HANG
+    }
+
+    /// An owner answering each connection with one byte, at the loopback.
+    fn answering_owner() -> (Owner, std::net::SocketAddr) {
+        let listener = endpoint::listener(std::net::SocketAddr::from((
+            std::net::Ipv4Addr::LOCALHOST,
+            0,
+        )))
+        .unwrap();
+        let address = listener.local_addr().unwrap();
+        let owner = Owner::accept(
+            listener,
+            (),
+            Arc::new(|mut stream: Stream, _waits: &Arc<AtomicUsize>| {
+                stream.write_all(&[1]).map_err(unavailable)
+            }),
+        )
+        .unwrap();
+        (owner, address)
+    }
+
+    /// One connection answered by `address`'s owner.
+    fn answered(address: std::net::SocketAddr) {
+        let mut client = std::net::TcpStream::connect_timeout(&address, HANG).unwrap();
+        client.set_read_timeout(Some(HANG)).unwrap();
+        let mut byte = [0];
+        client.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, [1]);
+    }
+
+    #[test]
+    fn audit6_owner_accepts_each_connection_and_stops_when_idle_in_accept() {
+        // AUDIT 6: the owner blocks in accept (no poll), takes every connection, and stopping
+        // wakes that accept: dropping it returns, and the port no longer listens.
+        let (owner, address) = answering_owner();
+        for _ in 0..64 {
+            answered(address);
+        }
+        drop(owner);
+        assert!(std::net::TcpStream::connect_timeout(&address, HANG).is_err());
+    }
+
+    #[test]
+    fn audit6_owner_listening_everywhere_stops() {
+        // Stopping reaches an owner listening at every address through its loopback.
+        let listener = endpoint::listener(std::net::SocketAddr::from((
+            std::net::Ipv4Addr::UNSPECIFIED,
+            0,
+        )))
+        .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let owner = Owner::accept(
+            listener,
+            (),
+            Arc::new(|_stream: Stream, _waits: &Arc<AtomicUsize>| Ok(())),
+        )
+        .unwrap();
+        drop(owner);
+        let loopback = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+        assert!(std::net::TcpStream::connect_timeout(&loopback, HANG).is_err());
+    }
+
+    /// AUDIT 6 measurement (not a check): sequential connections' accept-to-answer latency,
+    /// printed as p50/p99/p99.9 in microseconds. `cargo test --release -p amphora --lib
+    /// audit6_measure_accept -- --ignored --nocapture`; AUDIT6_CONNECTIONS sets the count.
+    #[test]
+    #[ignore = "a measurement"]
+    fn audit6_measure_accept_latency() {
+        let count: usize = std::env::var("AUDIT6_CONNECTIONS")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(2000);
+        let (owner, address) = answering_owner();
+        let mut taken: Vec<u128> = (0..count)
+            .map(|_| {
+                let started = Instant::now();
+                answered(address);
+                started.elapsed().as_micros()
+            })
+            .collect();
+        drop(owner);
+        taken.sort_unstable();
+        // The quantile at `per_mille` thousandths, by rank.
+        let at = |per_mille: usize| taken[(taken.len() - 1) * per_mille / 1000];
+        let total: u128 = taken.iter().sum();
+        println!(
+            "audit6 accept: n={count} p50={}us p99={}us p999={}us max={}us connections/s={}",
+            at(500),
+            at(990),
+            at(999),
+            at(1000),
+            u128::try_from(count).unwrap() * 1_000_000 / total.max(1)
+        );
     }
 
     /// Whether this is the child copy of the test binary that `test` runs alone, to be stopped
