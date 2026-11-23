@@ -124,7 +124,7 @@ impl Database {
                 let Writer::Replicated { client, .. } = &self.shared.writer else {
                     return refusal;
                 };
-                let stale = matches!(&refusal, Refusal::Invalid { what, .. } if what == "prepared transaction");
+                let stale = matches!(&refusal, Refusal::Serialization { .. });
                 let refusal = overtaken(refusal);
                 if stale {
                     client
@@ -242,7 +242,7 @@ pub(crate) fn raise(
 /// displaced entry stays UnknownOutcome.
 pub(super) fn overtaken(refusal: Refusal) -> Refusal {
     match refusal {
-        Refusal::Invalid { what, why }
+        Refusal::Serialization { what, why }
             if what == "prepared transaction"
                 && why == "the database advanced since preparation" =>
         {

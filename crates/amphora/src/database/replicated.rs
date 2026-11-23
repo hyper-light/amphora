@@ -4233,9 +4233,8 @@ impl<F: BlockFile + 'static> Actor<F> {
         let term = self.replica.term();
         let mut refused = false;
         for entry in &message.entries {
-            if let Ok(Err(Refusal::Invalid { what, .. })) =
+            if let Ok(Err(Refusal::Serialization { .. })) =
                 crate::replication::verdict(&entry.data, before)
-                && what == "prepared transaction"
             {
                 refused = true;
             }
@@ -4608,7 +4607,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                 #[cfg(test)]
                 if self.turn_context.as_ref() == Some(&pending.context) {
                     self.turn_context = None;
-                    if matches!(&result, Err(Refusal::Invalid { what, .. }) if what == "prepared transaction")
+                    if matches!(&result, Err(Refusal::Serialization { .. }))
                     {
                         self.turns.1 = self.turns.1.saturating_add(1);
                     }
@@ -4622,7 +4621,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                             self.floor_requests_applied =
                                 self.floor_requests_applied.saturating_add(1);
                         }
-                        Err(Refusal::Invalid { what, .. }) if what == "prepared transaction" => {
+                        Err(Refusal::Serialization { .. }) => {
                             self.floor_requests_stale = self.floor_requests_stale.saturating_add(1);
                         }
                         Err(_) => {}
@@ -9562,7 +9561,7 @@ mod tests {
             1,
             "{outcomes:?}"
         );
-        assert_eq!(outcomes.iter().filter(|r| matches!(r, Err(Refusal::Invalid { what, .. }) if what == "prepared transaction")).count(), 1, "{outcomes:?}");
+        assert_eq!(outcomes.iter().filter(|r| matches!(r, Err(Refusal::Serialization { .. }))).count(), 1, "{outcomes:?}");
         let count = driven
             .call(&mut pump, clients.get(origin).unwrap(), |db| {
                 db.exec("INSERT INTO actor_items(value) VALUES(x'03')")?;
@@ -9701,7 +9700,7 @@ mod tests {
             for outcome in &outcomes {
                 assert!(
                     matches!(outcome, Ok(v) if v == &vec![1])
-                        || matches!(outcome, Err(Refusal::Invalid { what, .. }) if what == "prepared transaction")
+                        || matches!(outcome, Err(Refusal::Serialization { .. }))
                         || matches!(outcome, Err(Refusal::UnknownOutcome)),
                     "position {position}: {outcomes:?}"
                 );
@@ -15082,7 +15081,7 @@ mod tests {
     /// kiln.host-store 7 with joins tracked: the leader appends the addition of learner 5 (never
     /// running), every append lost while heartbeats go on, so the change can't commit; a follower
     /// raises the floor to 7, prepared at a base without the change and forwarded; then the appends
-    /// go again. Expect: the raise Invalid, "prepared transaction", "the database advanced since
+    /// go again. Expect: the raise refused Serialization, "prepared transaction", "the database advanced since
     /// preparation", which writer_floor answers Unavailable, to be asked again; the change
     /// applied; and no floor on any voter.
     #[test]
@@ -15132,7 +15131,7 @@ mod tests {
         let refused = driven.answer(&mut pump, &raised).err().unwrap();
         assert_eq!(
             refused,
-            Refusal::Invalid {
+            Refusal::Serialization {
                 what: "prepared transaction".into(),
                 why: "the database advanced since preparation".into(),
             }
@@ -17626,7 +17625,7 @@ mod tests {
                         run.committed[w] += 1;
                         streaks[w] = 0;
                     }
-                    Ok(Err(Refusal::Invalid { what, .. })) if what == "prepared transaction" => {
+                    Ok(Err(Refusal::Serialization { .. })) => {
                         history[index].outcome = Outcome::Refused;
                         run.refused[w] += 1;
                         streaks[w] += 1;
@@ -17906,7 +17905,7 @@ mod tests {
                     Err(mpsc::TryRecvError::Empty) => *slot = Some((via, answer)),
                     Err(error) => panic!("owner ended: {error}"),
                     Ok(Ok(_)) => {}
-                    Ok(Err(Refusal::Invalid { what, .. })) if what == "prepared transaction" => {
+                    Ok(Err(Refusal::Serialization { .. })) => {
                         refused[id] += 1;
                         let next = (via + 1) % 3;
                         *slot = Some((next, submit(&clients[next], driven.until(), write(id))));
@@ -17940,6 +17939,106 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(ids, (0..WRITERS).collect::<Vec<_>>(), "owner {owner}");
+        }
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// T-T1.8.W1, the stale-base refusal's type (PostgreSQL's 40001): a write refused because
+    /// what it read changed is to be asked again, and nothing else is answered as if it were. Do:
+    /// on the persisted class, every member at once appends a row to one table (each write
+    /// conflicts with every other), beside them a write the caller refuses itself `Invalid` (a
+    /// malformed request); each refused append made again at the next member, up to 20 rounds of
+    /// three. Expect: some append refused `Serialization` with the text it had as `Invalid`, the
+    /// malformed write `Invalid` each time and never `Serialization`, and every append held once.
+    #[test]
+    fn an_overlapping_write_is_refused_serialization_and_a_malformed_one_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        driven
+            .call(&mut pump, &clients[leader], |db| {
+                db.exec("CREATE TABLE events(id INTEGER NOT NULL)")?;
+                Ok(Vec::new())
+            })
+            .unwrap();
+        driven.tick(&mut pump, leader);
+        let append = |id: usize| {
+            move |db: &mut Db| {
+                db.exec(&format!("INSERT INTO events VALUES ({id})"))?;
+                Ok(Vec::new())
+            }
+        };
+        let malformed = |db: &mut Db| -> anyhow::Result<Vec<u8>> {
+            db.exec("INSERT INTO events VALUES (-1)")?;
+            Err(api::invalid("events row", "its id is negative").into())
+        };
+        let mut serialization = Vec::new();
+        let mut landed = 0;
+        for round in 0..20 {
+            let mut inflight: Vec<Option<(usize, Answering)>> = (0..3)
+                .map(|via| Some((via, submit(&clients[via], driven.until(), append(round * 3 + via)))))
+                .collect();
+            let mut bad = Some(submit(&clients[(leader + 1) % 3], driven.until(), malformed));
+            let mut rounds = 0;
+            while inflight.iter().any(Option::is_some) || bad.is_some() {
+                assert!(rounds < ROUNDS, "unanswered");
+                for (at, slot) in inflight.iter_mut().enumerate() {
+                    let Some((via, answer)) = slot.take() else {
+                        continue;
+                    };
+                    match answer.try_recv() {
+                        Err(mpsc::TryRecvError::Empty) => *slot = Some((via, answer)),
+                        Err(error) => panic!("owner ended: {error}"),
+                        Ok(Ok(_)) => landed += 1,
+                        Ok(Err(refused @ Refusal::Serialization { .. })) => {
+                            serialization.push(refused);
+                            let next = (via + 1) % 3;
+                            *slot = Some((next, submit(&clients[next], driven.until(), append(round * 3 + at))));
+                        }
+                        Ok(Err(other)) => panic!("append via {via}: {other:?}"),
+                    }
+                }
+                if let Some(answer) = bad.take() {
+                    match answer.try_recv() {
+                        Err(mpsc::TryRecvError::Empty) => bad = Some(answer),
+                        Ok(refused) => assert_eq!(
+                            refused.err(),
+                            Some(Refusal::Invalid { what: "events row".into(), why: "its id is negative".into() })
+                        ),
+                        Err(error) => panic!("owner ended: {error}"),
+                    }
+                }
+                driven.round(&mut pump);
+                rounds += 1;
+            }
+            if !serialization.is_empty() && round >= 2 {
+                break;
+            }
+        }
+        let refused = serialization.first().expect("no append was refused Serialization");
+        assert_eq!(refused.to_string(), "invalid prepared transaction: the database advanced since preparation");
+        driven.quiet(&mut pump);
+        driven.tick(&mut pump, leader);
+        for owner in 0..3 {
+            let ids = driven
+                .owner_mut(owner)
+                .replica
+                .machine_mut()
+                .read_db(|db| {
+                    let mut ids = Vec::new();
+                    db.query_owned("SELECT id FROM events ORDER BY id", [], |row| {
+                        ids.push(row.get::<i64>(0)?);
+                        Ok(true)
+                    })?;
+                    Ok(ids)
+                })
+                .unwrap();
+            assert_eq!(ids, (0..i64::try_from(landed).unwrap()).collect::<Vec<_>>(), "owner {owner}");
         }
         driven.drain(&mut pump);
         pump.finish();
@@ -18023,7 +18122,7 @@ mod tests {
                     "slot off {slot_off} attempt {attempt}: the leader's write"
                 );
             }
-            let stale = |outcome: &Result<Vec<u8>, Refusal>| matches!(outcome, Err(Refusal::Invalid { what, .. }) if what == "prepared transaction");
+            let stale = |outcome: &Result<Vec<u8>, Refusal>| matches!(outcome, Err(Refusal::Serialization { .. }));
             if slot_off {
                 assert!(outcomes.iter().all(stale), "today's rule: {outcomes:?}");
             } else {
@@ -18113,7 +18212,7 @@ mod tests {
                     "off {off} attempt {attempt}: the leader's write"
                 );
             }
-            let stale = |outcome: &Result<Vec<u8>, Refusal>| matches!(outcome, Err(Refusal::Invalid { what, .. }) if what == "prepared transaction");
+            let stale = |outcome: &Result<Vec<u8>, Refusal>| matches!(outcome, Err(Refusal::Serialization { .. }));
             let moved = driven.owner(leader).read_sets_moved;
             if off {
                 assert!(outcomes.iter().all(stale), "read sets off: {outcomes:?}");

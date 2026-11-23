@@ -199,6 +199,25 @@ pub enum Refusal {
     NotLeader { leader: Option<u64> },
     #[error("the replica is fenced: {0}")]
     Fenced(String),
+    /// What the write read changed before it applied, so none of it was written: the same request
+    /// asked again is prepared on the newer state (PostgreSQL's 40001, serialization_failure).
+    /// Its text is the `Invalid` one it had before it had a type of its own, so a caller matching
+    /// that text still retries; a peer whose wire version predates it is sent that `Invalid`
+    /// ([`Refusal::without_serialization`]).
+    #[error("invalid {what}: {why}")]
+    Serialization { what: String, why: String },
+}
+
+impl Refusal {
+    /// This refusal as a peer that predates [`Refusal::Serialization`] is sent it: that variant as
+    /// the `Invalid` it was, every other as it is.
+    #[must_use]
+    pub fn without_serialization(self) -> Self {
+        match self {
+            Self::Serialization { what, why } => Self::Invalid { what, why },
+            other => other,
+        }
+    }
 }
 
 /// One namespace's records.

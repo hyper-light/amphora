@@ -187,10 +187,10 @@ fn on_base(base_index: u64, base_term: u64, point: Point) -> Result<(), Refusal>
     if base_index == point.index && base_term == point.term {
         Ok(())
     } else {
-        Err(api::invalid(
-            "prepared transaction",
-            "the database advanced since preparation",
-        ))
+        Err(Refusal::Serialization {
+            what: "prepared transaction".into(),
+            why: "the database advanced since preparation".into(),
+        })
     }
 }
 
