@@ -132,6 +132,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | planner | – | Decision (lane qs5-20): a sized filter's hashes grow within its bound, old and new together | [planner.md](design/planner.md#decision-lane-qs5-20-a-sized-filters-hashes-grow-within-its-bound-old-and-new-together) |
 | planner | – | Decision (lane qs5-20): a sort-merge join costed beside the hash join, traced until its operator lands | [planner.md](design/planner.md#decision-lane-qs5-20-a-sort-merge-join-costed-beside-the-hash-join-traced-until-its-operator-lands) |
 | planner | – | Decision (lane qs5-21): a sort-merge join is the hash join with its rows merged by key, behind a switch | [planner.md](design/planner.md#decision-lane-qs5-21-a-sort-merge-join-is-the-hash-join-with-its-rows-merged-by-key-behind-a-switch) |
+| planner | – | Decision (lane perf-planner): a term no table's constraint comes from joins no table | [planner.md](design/planner.md#decision-lane-perf-planner-a-term-no-tables-constraint-comes-from-joins-no-table) |
 | records-compaction | – | Durable progress and retention | [records-compaction.md](design/records-compaction.md#durable-progress-and-retention) |
 | records-compaction | – | Dirty-page and serialized bounds | [records-compaction.md](design/records-compaction.md#dirty-page-and-serialized-bounds) |
 | records-compaction | – | Embedded owner compatibility | [records-compaction.md](design/records-compaction.md#embedded-owner-compatibility) |

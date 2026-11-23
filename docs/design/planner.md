@@ -2972,3 +2972,31 @@ the sort-merge's own spill (sorted runs merged) is not built. To be measured, ag
 over the concurrency ladder: probes in key order and not, builds already ordered and not, and builds
 that fit and that pass the statement's memory: `qt_5_18_merge_versus_hash_harness`, ignored, the
 coordinator's.
+
+## Decision (lane perf-planner): a term no table's constraint comes from joins no table
+
+**Decision.** T-PL.8.13 query 7, AUDIT 5.1. A WHERE term counts as joining the next table to the
+tables before it (`join_lhs_and_rhs`, `optimizer/join.rs`) only when some table's constraint comes
+from it (`WhereTermInfo::narrows`). A term none comes from, such as an OR across two tables or a
+comparison of two tables' expressions, leaves the next table a filtered cross product, and that
+table pays the cross product's penalty (its rows times the rows before it), as a table with no
+joining term does. Such a term's cut is counted once, in every joined set holding its tables
+(`JoinedSetRows`, `optimizer/cardinality.rs`), so the left-deep and the bushy costing read the same
+rows.
+
+**Why.** The penalty is the work a nested loop does when no index seek or hash key narrows the next
+table's read: it meets every pair of rows and filters them. A term no constraint comes from narrows
+nothing, so the loop does that work whether or not the term reads both sides. Counting it as a join
+let query 7 (`... AND (s.id IS NULL OR s.cat + f2.k = 11)`, s a LEFT JOIN's right table) put f2
+after {d1, s} at 6,179 to 11,918 where the same order with no term cost about 43,000, so the search
+kept the left-deep plan [d1, s, f2, d2, f1] over the bushy one. The cut alone (q-error about 2 down
+to about 1.4 on the joined sets) did not change the plan: both costings fell together.
+
+**Evidence.** The three `t_pl_8_13_*` tests (`optimizer::bushy_search_tests`,
+`optimizer::bushy_test_hook`, `join::tests`): kiln runs r169 and r185 traced the cause, and r200
+passed 3 of 3, all 8 queries bushy, each answer equal to nested loops'. The planner, column_stats,
+sample_filters and adaptive_joins suites pass with it (r206).
+
+**Limits.** Measured on T-PL.8.13's queries only. JOB, the tree before the change against it
+(`amphora-bench --planner --bench job`, five passes a side, alternated, answers compared), is the
+gate before it merges, since every query with a term no constraint comes from can plan again.
