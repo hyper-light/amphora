@@ -33,14 +33,15 @@ fairness problems in the replication measures that any quoted failover or catch-
    - Catch-up: from `c.start(member)` on, Amphora pays only for reconnecting. Each competitor also pays its
      process start and recovery. **Amphora's catch-up time is favoured by its missing restart.** Don't
      compare it with the others until members are really killed.
-   - Fix (bench/ only, not started): have each member report its pid on `leader`. `kill(n)` sends SIGKILL to
-     that pid, and `start(n)` spawns `amphora-bench --repl-member` again on the same `--dir`, with the same
-     args repl_members.sh used. That works for members on this host. For remote ones, return a typed
-     refusal. `member_main` also runs `remove_dir_all(&m.dir)` at every start, so a restart would wipe the
-     member's data. It needs a flag that reopens the member on its own data instead. repl_members.sh
-     `wait`s on the original pids and counts any non-zero exit as a failure, so a member that was killed
-     on purpose must not count. Don't edit bench/src in `~/.cache/amphora-perf/bench-s` on adacachy2 while the
-     timed runs build from it. Use a separate clone, and build after they finish.
+   - Fix written, **not compiled**: branch `perf/bench-s3` at 2a668d7e. A member now answers `launch` with
+     its program and arguments plus `--reopen`, and `kill` by sending kill -9 to its own process. The
+     driver learns of the death when its connection ends, so it doesn't poll. `start` runs the member
+     again as the driver's child, on the data it kept, because `--reopen` skips `member_main`'s
+     `remove_dir_all`. A member on another machine is refused. repl_members.sh accepts exit 137 from
+     the original members in failover and catchup. The lane's target dir stayed locked all hour, so
+     nothing compiled. Next: `cargo clippy` on the bench and its repl tests, a failover smoke run
+     (`--kills` small), then merge. Build it in the lane's target dir once the timed runs finish, not
+     while they build from the adacachy2 clone.
    - Related: each member's relay thread loops on `handle.drain` and calls `std::thread::yield_now()` when
      nothing moved, so every member keeps one core busy for its whole life. That is a polling loop, which
      CLAUDE.md's event-driven rule forbids. It costs Amphora three cores the competitors don't pay. It
