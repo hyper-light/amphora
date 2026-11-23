@@ -3639,6 +3639,30 @@ mod versioned {
 
     const FILTER: &str = "SELECT rowid FROM t WHERE a BETWEEN 100 AND 120 ORDER BY rowid";
 
+    /// AC-NS.2.1 / T-SKU.10. Dropping a connection with an uncommitted versioned write
+    /// restores its row and releases the writer observed by a waiting summary builder.
+    #[test]
+    fn review_dropping_a_versioned_connection_releases_its_writer() {
+        let (db, reader, root) = waiting_table();
+        let writer = db
+            .connect(ConnectOpts::new().with_versioned_storage())
+            .unwrap();
+        writer.execute("BEGIN").unwrap();
+        writer
+            .execute("UPDATE t SET a = -7 WHERE rowid = 1")
+            .unwrap();
+        drop(writer);
+        let switch = reader.versioned_for(crate::MAIN_DB_ID).unwrap();
+        assert_eq!(switch.wait_unwritten(root, None).unwrap(), Ok(false));
+        assert_eq!(
+            rowids(&reader, "SELECT rowid FROM t WHERE a = 0").0,
+            vec![1]
+        );
+        reader
+            .execute("UPDATE t SET a = 42 WHERE rowid = 1")
+            .unwrap();
+    }
+
     /// The filter's rows once row 3001 (`a` = 110) is in.
     fn with_the_new_row() -> Vec<i64> {
         let mut expected: Vec<i64> = (101..=121).collect();
