@@ -5090,7 +5090,25 @@ impl<F: BlockFile + 'static> Actor<F> {
         // The receive rule (Kulkarni et al., OPODIS 2014): past every stamp a step carried in.
         let observed = self.control.observed.load(Ordering::Acquire);
         let now = self.wall_now()?.max(observed.saturating_add(1));
-        let stamped = crate::replication::closed::stamp(now, &bytes);
+        let mut stamped = crate::replication::closed::stamp(now, &bytes);
+        // The leader's own write appends right after its last entry, as a member's forward does
+        // (`step_forward`), and prepared on its applied state, behind the forwards its log holds
+        // uncommitted: the same read-set check moves its base past them, or its apply refuses it
+        // round after round while followers write (the persisted class's longest, its commit
+        // waiting on a quorum's flush).
+        if self.replica.is_leader() {
+            let log = self.replica.core().raft.log();
+            let last = log.last_index().map_err(unavailable)?;
+            let before = Point {
+                index: last,
+                term: log.term(last).map_err(unavailable)?,
+            };
+            if let Ok(Err(_)) = crate::replication::verdict(&stamped, before)
+                && let Some(data) = self.rebase(&stamped, before)?
+            {
+                stamped = data;
+            }
+        }
         self.replica
             .propose(context.to_vec(), stamped)
             .map_err(raft_error)
