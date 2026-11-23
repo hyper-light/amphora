@@ -4542,9 +4542,10 @@ pub(crate) mod bushy_test_hook {
         }
 
         /// Lane T9 (T8's open edge): a table's share of a WHERE OR runs on rows the OR itself may
-        /// never reach. Here no line joins a part, so the OR, and its LIKE with an ESCAPE of two
-        /// characters, runs on no row: the query answers as the same OR inside a CASE (which no
-        /// share is taken from) does, rather than raising the ESCAPE's error from a share.
+        /// never reach. Here no line joins a part, so the OR, and its LIKEs with an ESCAPE of two
+        /// characters, one on each table so whichever table a plan reads first holds one, run on
+        /// no row: the query answers as the same OR inside a CASE (which no share is taken from)
+        /// does, rather than raising the ESCAPE's error from a share.
         #[test]
         fn t9_a_share_of_an_or_raises_no_error_the_or_would_not() {
             let io = Arc::new(MemoryIO::new());
@@ -4552,12 +4553,12 @@ pub(crate) mod bushy_test_hook {
             let conn = db.connect(ConnectOpts::new()).unwrap();
             for sql in [
                 "CREATE TABLE p(id INTEGER PRIMARY KEY, name TEXT, size INT)",
-                "CREATE TABLE l(id INTEGER PRIMARY KEY, pk INT, qty INT)",
+                "CREATE TABLE l(id INTEGER PRIMARY KEY, pk INT, qty INT, tag TEXT)",
                 "CREATE INDEX l_pk ON l(pk)",
                 "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 2000) \
                  INSERT INTO p SELECT i, char(97 + i % 26) || i, i % 50 FROM x",
                 "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 60000) \
-                 INSERT INTO l SELECT i, 100000 + i % 2000, i % 50 FROM x",
+                 INSERT INTO l SELECT i, 100000 + i % 2000, i % 50, char(97 + i % 26) || i FROM x",
                 "ANALYZE",
             ] {
                 conn.execute(sql).unwrap();
@@ -4571,8 +4572,9 @@ pub(crate) mod bushy_test_hook {
                     .collect())
             };
             let branches = "(p.id = l.pk AND p.name LIKE 'a%' ESCAPE 'xy' AND p.size < 5 \
-                 AND l.qty = 1) \
-                 OR (p.id = l.pk AND p.name LIKE 'b%' ESCAPE 'xy' AND p.size < 10 AND l.qty = 2)";
+                 AND l.tag LIKE 'c%' ESCAPE 'xy' AND l.qty = 1) \
+                 OR (p.id = l.pk AND p.name LIKE 'b%' ESCAPE 'xy' AND p.size < 10 \
+                 AND l.tag LIKE 'd%' ESCAPE 'xy' AND l.qty = 2)";
             let unshared = outcome(&format!(
                 "SELECT count(*) FROM l, p WHERE p.id = l.pk \
                  AND CASE WHEN {branches} THEN 1 ELSE 0 END = 1"
