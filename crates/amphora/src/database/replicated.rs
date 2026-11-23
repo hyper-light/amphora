@@ -5373,20 +5373,25 @@ impl<F: BlockFile + 'static> Actor<F> {
     /// whose work ended forwarding nothing (a read, a refused or failed write) sends a second
     /// barrier, which ends the slot at its leader at once; a forward ends it there itself. A
     /// leader of any version ends a holder's slot on its second barrier, so this needs nothing new
-    /// on the wire, and a stray barrier's read state matches nothing here and is dropped.
+    /// on the wire, and a stray barrier's read state matches nothing here and is dropped. Work
+    /// handed to the session worker ends when it comes back (`Actor::decide`).
     fn prepare(&mut self) -> Result<(), Refusal> {
         let work = self
             .pending
             .as_ref()
             .is_some_and(|pending| matches!(pending.phase, Phase::Barrier(Some(_))));
         self.prepare_barrier()?;
-        let ended = !self
-            .pending
-            .as_ref()
-            .is_some_and(|pending| matches!(pending.phase, Phase::Barrier(_)));
-        if work
-            && ended
-            && let Some(term) = self.slotted.take()
+        let ended = !self.pending.as_ref().is_some_and(|pending| {
+            matches!(pending.phase, Phase::Barrier(_) | Phase::Running)
+        });
+        if work && ended {
+            self.end_slot()?;
+        }
+        Ok(())
+    }
+    /// The holder's work in its slot ended: if it forwarded nothing, its second barrier.
+    fn end_slot(&mut self) -> Result<(), Refusal> {
+        if let Some(term) = self.slotted.take()
             && self.pending.is_none()
             && term == self.replica.term()
             && !self.replica.is_leader()
@@ -5639,7 +5644,8 @@ impl<F: BlockFile + 'static> Actor<F> {
             self.requeue(pending);
             return Ok(());
         }
-        self.settle(pending, ran, moved)
+        self.settle(pending, ran, moved)?;
+        self.end_slot()
     }
     /// A prepared write proposed, or answered: at once if it wrote nothing, refused if past its
     /// deadline, or `NotLeader` if the lead `moved` while its session ran.
