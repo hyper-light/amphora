@@ -49,9 +49,9 @@
 //! endian, at most the replica's own record bound) and its bytes; `C`: requests, one line each,
 //! each answered by one line, `ok …` or `err …`, a line at most the API's request bound; `Q`:
 //! frames, each its length (u32, little endian) and a postcard value, a request at most the API's
-//! request bound and an answer at most its result bound: statements with bound parameters,
-//! answered with typed rows and their columns' names ([`SqlClient`]; docs/design/client-protocol.md,
-//! decision 2).
+//! request bound and an answer's frames each at most its result bound: statements with bound
+//! parameters, answered with typed rows and their columns' names, an answer past one frame in
+//! several from version 2 ([`SqlClient`]; docs/design/client-protocol.md, decision 2).
 //!
 //! Bounds: one records connection per peer (a new one from the same peer closes the old); each
 //! client connection takes a descriptor from the process's budget ([`crate::descriptors`]) and is
@@ -88,7 +88,7 @@ const SQL: u8 = b'Q';
 /// The newest version of a `Q` connection's frames this side speaks. A variant appended to
 /// [`SqlRequest`] or [`SqlAnswer`] raises it and is sent only at a version agreed that takes it
 /// (docs/design/client-protocol.md, decision 2). A format value.
-pub const SQL_VERSION: u32 = 1;
+pub const SQL_VERSION: u32 = 2;
 /// The oldest version of a `Q` connection's frames this side speaks. A format value.
 const SQL_VERSION_MIN: u32 = 1;
 /// The challenge's length: SHA-256's output length (FIPS 180-4), HMAC-SHA256's block of proof.
@@ -659,27 +659,39 @@ fn connection(shared: &Shared, s: TcpStream) -> anyhow::Result<()> {
             r.get_mut().flush()?;
         },
         [SQL] => {
+            let answering = Arc::new(Answering {
+                link: Mutex::new(r),
+                socket,
+                timed: AtomicBool::new(false),
+            });
             let mut agreed = None;
             loop {
-                let answer = match read_frame(&mut r, amphora_api::REQUEST_MAX)? {
+                let frame = read_frame(&mut *answering.lock()?, amphora_api::REQUEST_MAX)?;
+                let answer = match frame {
                     None => return Ok(()),
-                    Some(Frame::Refused(refusal)) => refused_frame(refusal)?,
+                    Some(Frame::Refused(refusal)) => vec![refused_frame(refusal)?],
                     Some(Frame::Held(bytes, _charge)) => {
                         match postcard::from_bytes::<SqlRequest>(&bytes) {
                             Ok(request) => match Charged::request(&request) {
-                                Ok(_decoded) => shared.sql(request, &mut agreed)?,
-                                Err(refusal) => refused_frame(refusal)?,
+                                Ok(_decoded) => shared.sql(request, &mut agreed, &answering)?,
+                                Err(refusal) => vec![refused_frame(refusal)?],
                             },
-                            Err(e) => refused_frame(amphora_api::invalid(
+                            Err(e) => vec![refused_frame(amphora_api::invalid(
                                 "SQL request",
                                 &format!(
                                     "{e}: this member speaks versions {SQL_VERSION_MIN} to {SQL_VERSION}"
                                 ),
-                            ))?,
+                            ))?],
                         }
                     }
                 };
-                write_frame(r.get_mut(), &answer.bytes)?;
+                let mut link = answering.lock()?;
+                if answering.timed.swap(false, Ordering::Relaxed) {
+                    answering.socket.set_write_timeout(Some(shared.deadline))?;
+                }
+                for frame in &answer {
+                    write_frame(link.get_mut(), &frame.bytes)?;
+                }
             }
         }
         _ => bail!("a connection opened with {kind:?}"),
@@ -699,22 +711,43 @@ enum SqlRequest {
     Read(#[serde(deserialize_with = "crate::transport::bounded::statement")] Statement),
 }
 
+/// The tables of one answer at most: a request's statements, `TX_MAX` at most.
+fn bounded_tables<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Table>, D::Error> {
+    crate::transport::bounded::vector::<D, Table, { amphora_api::TX_MAX }>(d)
+}
+
+/// A table's column names: a row's values at most, as `transport::bounded` counts them.
+fn bounded_columns<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    crate::transport::bounded::vector::<D, String, { crate::transport::bounded::VALUE_COUNT }>(d)
+}
+
 /// A `Q` connection's answer to one request ([`SqlRequest`]); variants only appended.
 #[derive(Debug, Serialize, Deserialize)]
 enum SqlAnswer {
     Agreed(u32),
-    /// Each statement's table, in the order asked.
-    Tables(Vec<Table>),
+    /// Each statement's table, in the order asked: the answer's last frame.
+    Tables(#[serde(deserialize_with = "bounded_tables")] Vec<Table>),
     /// The request refused, and why: a write's statements all rolled back, unless the refusal is
-    /// `Timeout` or `UnknownOutcome`, whose write may have committed. The connection goes on.
+    /// `Timeout` or `UnknownOutcome`, whose write may have committed. The answer's last frame, its
+    /// rows sent before it dropped. The connection goes on.
     Refused(Refusal),
+    /// Version 2: rows of the request's statement `statement` (counted from 0), ahead of those its
+    /// table holds in the last frame. An answer past one frame comes in frames of at most the
+    /// API's result bound, so none is refused for its size alone.
+    Rows {
+        statement: u32,
+        #[serde(deserialize_with = "crate::transport::bounded::rows")]
+        rows: Vec<Vec<Value>>,
+    },
 }
 
 /// One statement's answer: its columns' names, its rows of SQLite's typed values, and what SQLite
 /// counts after it (the rows the last insert, update or delete changed, and the last rowid).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Table {
+    #[serde(deserialize_with = "bounded_columns")]
     pub columns: Vec<String>,
+    #[serde(deserialize_with = "crate::transport::bounded::rows")]
     pub rows: Vec<Vec<Value>>,
     pub affected: u64,
     pub last_insert_rowid: i64,
@@ -786,13 +819,10 @@ fn refused_frame(refusal: Refusal) -> anyhow::Result<Encoded> {
     })
 }
 
-/// `statements`' tables run on `c`, encoded and charged inside `c`'s session: a write commits only
-/// once its answer is encoded and held, so no committed write is answered refused for want of room
-/// to answer it. Past the API's result bound, TooLarge.
-fn answered(c: &crate::sql::Connection<'_>, statements: Vec<Statement>) -> anyhow::Result<Encoded> {
-    let mut rows = Charged::new();
-    let answer = SqlAnswer::Tables(tables(c, statements, &mut rows)?);
-    let bytes = postcard::to_allocvec(&answer)?;
+/// `answer`'s frame, past the API's result bound TooLarge, its bytes charged to the process's
+/// memory budget until written.
+fn frame(answer: &SqlAnswer) -> anyhow::Result<Encoded> {
+    let bytes = postcard::to_allocvec(answer)?;
     amphora_api::bound("a SQL answer", bytes.len(), amphora_api::RESULT_MAX)?;
     let held = memory::process().take(Use::Queues, u64::try_from(bytes.len())?)?;
     Ok(Encoded {
@@ -801,13 +831,108 @@ fn answered(c: &crate::sql::Connection<'_>, statements: Vec<Statement>) -> anyho
     })
 }
 
+/// A `Q` connection's link, shared with the read whose answer streams out through it while the
+/// connection waits on that read's call.
+struct Answering {
+    link: Mutex<BufReader<Link>>,
+    socket: TcpStream,
+    /// A streamed frame set the socket's write timeout to its request's time left: the
+    /// connection sets its own back before it writes again.
+    timed: AtomicBool,
+}
+
+impl Answering {
+    fn lock(&self) -> anyhow::Result<std::sync::MutexGuard<'_, BufReader<Link>>> {
+        self.link.lock().map_err(|_| anyhow!("a SQL link poisoned"))
+    }
+
+    /// `frame` written out ahead of its answer's last, by `until`. The connection holds its link
+    /// from the moment the request's call returns, so a session still stepping past then has been
+    /// answered already and sends nothing.
+    fn send(&self, until: Instant, frame: &Encoded) -> anyhow::Result<()> {
+        let left = until
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or(Refusal::Timeout)?;
+        let mut link = self.link.try_lock().map_err(|_| Refusal::Timeout)?;
+        self.timed.store(true, Ordering::Relaxed);
+        self.socket.set_write_timeout(Some(left))?;
+        if let Err(e) = write_frame(link.get_mut(), &frame.bytes) {
+            // A frame cut partway can't be followed by another: the connection ends.
+            let _ = self.socket.shutdown(std::net::Shutdown::Both);
+            let timed_out = e.downcast_ref::<std::io::Error>().is_some_and(|e| {
+                matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+            });
+            return Err(if timed_out { Refusal::Timeout.into() } else { e });
+        }
+        Ok(())
+    }
+}
+
+/// Where an answer's frames go before its last. At version 1 there are none, and an answer past
+/// one frame is refused TooLarge. From version 2 a read's go out on its link as each fills, and a
+/// write's are held until its transaction commits, so no write waits on a client's network.
+enum Spill {
+    None,
+    Held(Vec<Encoded>),
+    Sent(Arc<Answering>, Instant),
+}
+
+impl Spill {
+    /// The rows `tables` hold, out as one frame for each statement that has some, their memory
+    /// given back once each frame holds them.
+    fn rows(&mut self, tables: &mut [Table], charged: &mut Charged) -> anyhow::Result<()> {
+        for (statement, table) in tables.iter_mut().enumerate() {
+            if table.rows.is_empty() {
+                continue;
+            }
+            let encoded = frame(&SqlAnswer::Rows {
+                statement: u32::try_from(statement)?,
+                rows: std::mem::take(&mut table.rows),
+            })?;
+            match self {
+                Self::None => bail!("a version 1 answer spilled rows"),
+                Self::Held(frames) => frames.push(encoded),
+                Self::Sent(link, until) => link.send(*until, &encoded)?,
+            }
+        }
+        charged.spilled();
+        Ok(())
+    }
+}
+
+/// `statements`' tables run on `c`, encoded and charged inside `c`'s session: a write commits only
+/// once its answer is encoded and held, so no committed write is answered refused for want of room
+/// to answer it. Past the API's result bound, TooLarge, unless `spill` takes the frames before the
+/// last; each frame at most that bound.
+fn answered(
+    c: &crate::sql::Connection<'_>,
+    statements: Vec<Statement>,
+    mut spill: Spill,
+) -> anyhow::Result<Vec<Encoded>> {
+    let mut charged = Charged::new();
+    let tables = tables(c, statements, &mut charged, &mut spill)?;
+    let last = frame(&SqlAnswer::Tables(tables))?;
+    let mut frames = match spill {
+        Spill::Held(frames) => frames,
+        Spill::None | Spill::Sent(..) => Vec::new(),
+    };
+    frames.push(last);
+    Ok(frames)
+}
+
 /// What a request or an answer's rows hold as they're built: their memory, charged to the
-/// process's budget (past its room, its refusal), and their encoded bytes, counted against the
-/// API's result bound (past it, TooLarge); the memory given back when it drops.
+/// process's budget (past its room, its refusal), and the memory the rows not yet in a frame take
+/// once a client decodes them, counted against the API's result bound as the transport's decoders
+/// count it (past it, a frame's end); the memory given back when it drops.
 struct Charged {
     budget: Arc<memory::Budget>,
     held: u64,
-    encoded: usize,
+    /// What of `held` is rows not yet in a frame.
+    rows: u64,
 }
 
 impl Charged {
@@ -815,7 +940,7 @@ impl Charged {
         Self {
             budget: memory::process(),
             held: 0,
-            encoded: 0,
+            rows: 0,
         }
     }
 
@@ -842,7 +967,7 @@ impl Charged {
         Ok(charged)
     }
 
-    fn hold(&mut self, bytes: usize) -> Result<(), Refusal> {
+    fn hold(&mut self, bytes: usize) -> Result<u64, Refusal> {
         let bytes =
             u64::try_from(bytes).map_err(|_| amphora_api::invalid("SQL bytes", "past u64"))?;
         let after = self
@@ -851,23 +976,38 @@ impl Charged {
             .ok_or_else(|| amphora_api::invalid("SQL bytes", "past u64"))?;
         self.budget.hold(Use::Queues, bytes)?;
         self.held = after;
-        Ok(())
+        Ok(bytes)
     }
 
-    /// `value` read into an answer: refused before it's kept when the answer would pass the
-    /// result bound or the budget's room.
-    fn value(&mut self, value: &Value) -> Result<(), Refusal> {
-        let encoded = postcard::experimental::serialized_size(value)
-            .map_err(|e| amphora_api::invalid("SQL value", &e.to_string()))?;
-        self.encoded(encoded)?;
-        self.hold(value_bytes(value))
+    /// Whether a row of `bytes` (as [`crate::sql::row_bytes`] counts it) fits the frame beside the
+    /// rows not yet in one.
+    fn fits(&self, bytes: usize) -> bool {
+        u64::try_from(bytes)
+            .ok()
+            .and_then(|bytes| self.rows.checked_add(bytes))
+            .is_some_and(|after| {
+                u64::try_from(amphora_api::RESULT_MAX).is_ok_and(|bound| after <= bound)
+            })
     }
 
-    fn encoded(&mut self, bytes: usize) -> Result<(), Refusal> {
-        let after = self.encoded.saturating_add(bytes);
+    /// A row of `bytes` read into an answer: refused before it's kept when it passes the result
+    /// bound beside the rows not yet in a frame, or the budget's room.
+    fn row(&mut self, bytes: usize) -> Result<(), Refusal> {
+        let after = usize::try_from(self.rows)
+            .ok()
+            .and_then(|rows| rows.checked_add(bytes))
+            .ok_or_else(|| amphora_api::invalid("SQL bytes", "past usize"))?;
         amphora_api::bound("a SQL answer", after, amphora_api::RESULT_MAX)?;
-        self.encoded = after;
+        let held = self.hold(bytes)?;
+        self.rows = self.rows.saturating_add(held);
         Ok(())
+    }
+
+    /// The rows not yet in a frame are in one: their memory given back, the frame holding it.
+    fn spilled(&mut self) {
+        self.budget.give(Use::Queues, self.rows);
+        self.held = self.held.saturating_sub(self.rows);
+        self.rows = 0;
     }
 }
 
@@ -887,12 +1027,14 @@ fn value_bytes(value: &Value) -> usize {
     std::mem::size_of::<Value>().saturating_add(held)
 }
 
-/// `statements` run in order on `c`, each one's table, each value charged to `charged` as it's
-/// read. A statement the engine refuses is refused as `statement N` (counted from 0), typed.
+/// `statements` run in order on `c`, each one's table, each row charged to `charged` as the engine
+/// steps it, and the rows past a frame out through `spill`. A statement the engine refuses is
+/// refused as `statement N` (counted from 0), typed.
 fn tables(
     c: &crate::sql::Connection<'_>,
     statements: Vec<Statement>,
     charged: &mut Charged,
+    spill: &mut Spill,
 ) -> anyhow::Result<Vec<Table>> {
     let mut out = Vec::new();
     for (i, s) in statements.into_iter().enumerate() {
@@ -903,34 +1045,50 @@ fn tables(
             }
         };
         let columns = c.column_names(&s.sql).map_err(refused)?;
-        charged.encoded(postcard::experimental::serialized_size(&columns)?)?;
         charged.hold(
             columns
                 .iter()
                 .map(|name| name.len().saturating_add(std::mem::size_of::<String>()))
                 .fold(std::mem::size_of::<Table>(), usize::saturating_add),
         )?;
-        let mut rows = Vec::new();
-        {
-            let mut statement = c.prepare(&s.sql).map_err(refused)?;
-            let mut cursor = statement.query(s.params).map_err(refused)?;
-            while let Some(row) = cursor.next().map_err(refused)? {
-                charged.hold(std::mem::size_of::<Vec<Value>>())?;
-                let mut values = Vec::with_capacity(columns.len());
-                for column in 0..columns.len() {
-                    let value = row.get::<_, Value>(column).map_err(refused)?;
-                    charged.value(&value)?;
-                    values.push(value);
-                }
-                rows.push(values);
-            }
-        }
         out.push(Table {
             columns,
-            rows,
-            affected: c.changes(),
-            last_insert_rowid: c.last_insert_rowid(),
+            rows: Vec::new(),
+            affected: 0,
+            last_insert_rowid: 0,
         });
+        // Why the stream stopped, when not the engine: a frame that couldn't go out.
+        let mut stopped = None;
+        let mut statement = c.prepare(&s.sql).map_err(refused)?;
+        let stepped = statement.each(s.params, |values| {
+            let bytes = crate::sql::row_bytes(&values)
+                .ok_or_else(|| amphora_api::invalid("SQL row", "size past usize"))?;
+            if !charged.fits(bytes)
+                && !matches!(spill, Spill::None)
+                && let Err(e) = spill.rows(&mut out, charged)
+            {
+                let refusal = e
+                    .downcast_ref::<Refusal>()
+                    .cloned()
+                    .unwrap_or_else(|| amphora_api::invalid("SQL answer", "its link failed"));
+                stopped = Some(e);
+                return Err(refusal.into());
+            }
+            charged.row(bytes)?;
+            if let Some(table) = out.last_mut() {
+                table.rows.push(values);
+            }
+            Ok(true)
+        });
+        drop(statement);
+        if let Some(e) = stopped {
+            return Err(e);
+        }
+        stepped.map_err(refused)?;
+        if let Some(table) = out.last_mut() {
+            table.affected = c.changes();
+            table.last_insert_rowid = c.last_insert_rowid();
+        }
     }
     Ok(out)
 }
@@ -950,41 +1108,62 @@ fn read_line(r: &mut BufReader<Link>) -> anyhow::Result<Option<String>> {
 }
 
 impl Shared {
-    /// One `Q` request's answer ([`SqlRequest`]), and what its rows hold of the memory budget.
-    fn sql(&self, request: SqlRequest, agreed: &mut Option<u32>) -> anyhow::Result<Encoded> {
+    /// One `Q` request's answer ([`SqlRequest`]): its frames to write, in order, each holding its
+    /// share of the memory budget; a read's frames before its last already out on `answering`.
+    fn sql(
+        &self,
+        request: SqlRequest,
+        agreed: &mut Option<u32>,
+        answering: &Arc<Answering>,
+    ) -> anyhow::Result<Vec<Encoded>> {
         let until = match after(self.deadline) {
             Ok(until) => until,
-            Err(e) => return refused_frame(amphora_api::invalid("deadline", &e.to_string())),
+            Err(e) => return Ok(vec![refused_frame(amphora_api::invalid("deadline", &e.to_string()))?]),
         };
+        let streams = agreed.is_some_and(|version| version >= 2);
         let result = match request {
             SqlRequest::Hello { oldest, newest } => {
                 let both = newest.min(SQL_VERSION);
                 if both < oldest.max(SQL_VERSION_MIN) {
-                    return refused_frame(amphora_api::invalid(
+                    return Ok(vec![refused_frame(amphora_api::invalid(
                         "SQL versions",
                         &format!(
                             "the client speaks {oldest} to {newest}, this member {SQL_VERSION_MIN} to {SQL_VERSION}"
                         ),
-                    ));
+                    ))?]);
                 }
                 *agreed = Some(both);
-                return Ok(Encoded {
+                return Ok(vec![Encoded {
                     bytes: postcard::to_allocvec(&SqlAnswer::Agreed(both))?,
                     _held: None,
-                });
+                }]);
             }
             _ if agreed.is_none() => Err(amphora_api::invalid("SQL request", "asked before Hello")),
             SqlRequest::Write(_) if self.cut.load(Ordering::Relaxed) => Err(Refusal::Unavailable(
                 "this member is cut off (a drill)".into(),
             )),
-            SqlRequest::Write(statements) => self.db.call(until, move |c| answered(c, statements)),
-            SqlRequest::Read(statement) => self
-                .db
-                .query_local(until, move |c| answered(c, vec![statement])),
+            SqlRequest::Write(statements) => {
+                let spill = if streams {
+                    Spill::Held(Vec::new())
+                } else {
+                    Spill::None
+                };
+                self.db
+                    .call(until, move |c| answered(c, statements, spill))
+            }
+            SqlRequest::Read(statement) => {
+                let spill = if streams {
+                    Spill::Sent(Arc::clone(answering), until)
+                } else {
+                    Spill::None
+                };
+                self.db
+                    .query_local(until, move |c| answered(c, vec![statement], spill))
+            }
         };
         match result {
-            Ok(encoded) => Ok(encoded),
-            Err(refusal) => refused_frame(refusal),
+            Ok(frames) => Ok(frames),
+            Err(refusal) => Ok(vec![refused_frame(refusal)?]),
         }
     }
 
@@ -1311,7 +1490,9 @@ impl SqlClient {
         })? {
             SqlAnswer::Agreed(_) => Ok(client),
             SqlAnswer::Refused(refusal) => Err(refusal.into()),
-            SqlAnswer::Tables(_) => bail!("the member answered its greeting with tables"),
+            SqlAnswer::Tables(_) | SqlAnswer::Rows { .. } => {
+                bail!("the member answered its greeting with tables")
+            }
         }
     }
 
@@ -1332,7 +1513,9 @@ impl SqlClient {
         match self.ask(request)? {
             SqlAnswer::Tables(tables) => Ok(tables),
             SqlAnswer::Refused(refusal) => Err(refusal.into()),
-            SqlAnswer::Agreed(_) => bail!("the member answered a request with a greeting"),
+            SqlAnswer::Agreed(_) | SqlAnswer::Rows { .. } => {
+                bail!("the member answered a request with a greeting")
+            }
         }
     }
 
@@ -1343,9 +1526,25 @@ impl SqlClient {
         );
         let bytes = postcard::to_allocvec(request)?;
         amphora_api::bound("a SQL request", bytes.len(), amphora_api::REQUEST_MAX)?;
+        let statements = match request {
+            SqlRequest::Hello { .. } => 0,
+            SqlRequest::Write(statements) => statements.len(),
+            SqlRequest::Read(_) => 1,
+        };
         self.broken = true;
         write_frame(self.r.get_mut(), &bytes)?;
-        let answer = match read_frame(&mut self.r, amphora_api::RESULT_MAX)? {
+        let answer = answer(&mut self.r, statements)?;
+        self.broken = false;
+        Ok(answer)
+    }
+}
+
+/// The answer to a request of `statements` statements, read from `r`: its last frame, the rows of
+/// the frames before it put ahead of each table's own.
+fn answer(r: &mut impl Read, statements: usize) -> anyhow::Result<SqlAnswer> {
+    let mut early: Vec<Vec<Vec<Value>>> = Vec::new();
+    loop {
+        let answer = match read_frame(r, amphora_api::RESULT_MAX)? {
             Some(Frame::Held(bytes, _charge)) => postcard::from_bytes(&bytes)?,
             // Not the member's refusal: a write's outcome is unknown here, so no `Refusal` to read
             // as rolled back.
@@ -1356,8 +1555,35 @@ impl SqlClient {
             }
             None => bail!("the member closed the connection"),
         };
-        self.broken = false;
-        Ok(answer)
+        match answer {
+            SqlAnswer::Rows { statement, mut rows } => {
+                let statement = usize::try_from(statement)?;
+                ensure!(
+                    statement < statements,
+                    "rows of statement {statement} answering {statements}"
+                );
+                if early.len() <= statement {
+                    early.resize_with(statement.saturating_add(1), Vec::new);
+                }
+                if let Some(ahead) = early.get_mut(statement) {
+                    ahead.append(&mut rows);
+                }
+            }
+            SqlAnswer::Tables(mut tables) => {
+                ensure!(
+                    early.len() <= tables.len(),
+                    "rows of {} statements before {} tables",
+                    early.len(),
+                    tables.len()
+                );
+                for (table, mut ahead) in tables.iter_mut().zip(early) {
+                    ahead.append(&mut table.rows);
+                    table.rows = ahead;
+                }
+                return Ok(SqlAnswer::Tables(tables));
+            }
+            other => return Ok(other),
+        }
     }
 }
 
@@ -1956,17 +2182,22 @@ mod tests {
             answered(
                 c,
                 vec![statement("CREATE TABLE t (id INTEGER PRIMARY KEY)", vec![])],
+                Spill::None,
             )
         })
         .unwrap();
         let half = || Value::Blob(vec![0; amphora_api::RESULT_MAX / 2 + 1]);
         let read = db.query_local(sql_until(), move |c| {
-            answered(c, vec![statement("SELECT ?1, ?1", vec![half()])])
+            answered(
+                c,
+                vec![statement("SELECT ?1, ?1", vec![half()])],
+                Spill::None,
+            )
         });
         assert!(
             matches!(read, Err(Refusal::TooLarge { .. })),
             "{:?}",
-            read.map(|e| e.bytes.len())
+            read.map(|e| e.len())
         );
         let write = db.call(sql_until(), move |c| {
             answered(
@@ -1975,18 +2206,26 @@ mod tests {
                     statement("INSERT INTO t VALUES (1)", vec![]),
                     statement("SELECT ?1, ?1", vec![half()]),
                 ],
+                Spill::None,
             )
         });
         assert!(
             matches!(write, Err(Refusal::TooLarge { .. })),
             "{:?}",
-            write.map(|e| e.bytes.len())
+            write.map(|e| e.len())
         );
         let count = db
             .query_local(sql_until(), |c| {
-                answered(c, vec![statement("SELECT count(*) FROM t", vec![])])
+                answered(
+                    c,
+                    vec![statement("SELECT count(*) FROM t", vec![])],
+                    Spill::None,
+                )
             })
             .unwrap();
+        let [count] = count.as_slice() else {
+            panic!("{} frames", count.len());
+        };
         let SqlAnswer::Tables(tables) = postcard::from_bytes::<SqlAnswer>(&count.bytes).unwrap()
         else {
             panic!("not tables");
@@ -2052,5 +2291,261 @@ mod tests {
             member.join().unwrap(),
             "a second request reached the member"
         );
+    }
+    const MIB: usize = 1 << 20;
+
+    /// A database of `rows` rows `(id, v)`, each `v` a blob of a MiB but the last, of `last` bytes.
+    fn blobs(dir: &Path, rows: i64, last: usize) -> Database {
+        let db = Database::open(&dir.join("q.db"), sql_until()).unwrap();
+        db.call(sql_until(), move |c| {
+            c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)")?;
+            for id in 1..=rows {
+                let size = if id == rows { last } else { MIB };
+                c.execute(
+                    "INSERT INTO t VALUES (?1, ?2)",
+                    [Value::Integer(id), Value::Blob(vec![7; size])],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        db
+    }
+
+    /// A served link and its client's socket, as a `Q` connection's past its proof.
+    fn link() -> (Arc<Answering>, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (served, _) = listener.accept().unwrap();
+        let answering = Arc::new(Answering {
+            socket: served.try_clone().unwrap(),
+            link: Mutex::new(BufReader::new(Link::Plain(served))),
+            timed: AtomicBool::new(false),
+        });
+        (answering, client)
+    }
+
+    /// A read at version 2 on `answering`, its last frame written as a connection writes it.
+    fn serve_read(db: &Database, answering: &Arc<Answering>, until: Instant, sql: &str) {
+        let spill = Spill::Sent(Arc::clone(answering), until);
+        let read = statement(sql, vec![]);
+        let frames = db
+            .query_local(until, move |c| answered(c, vec![read], spill))
+            .unwrap_or_else(|refusal| vec![refused_frame(refusal).unwrap()]);
+        let mut link = answering.lock().unwrap();
+        for frame in &frames {
+            let _ = write_frame(link.get_mut(), &frame.bytes);
+        }
+    }
+
+    /// CP-T1.13, AC-T1.2.3 (decision 2's bounds): do hand the client an answer of Nulls a byte
+    /// each whose rows, decoded, pass the result bound, as one table and as rows ahead of one;
+    /// expect both refused while decoding, as the transport's decoders refuse them, and the same
+    /// rows within the bound read.
+    #[test]
+    fn cp_t1_13_a_sql_client_decodes_answers_within_the_result_bound() {
+        let past = vec![vec![Value::Null]; amphora_api::RESULT_MAX / 32 + 2];
+        let table = |rows: Vec<Vec<Value>>| Table {
+            columns: vec!["n".into()],
+            rows,
+            affected: 0,
+            last_insert_rowid: 0,
+        };
+        for frames in [
+            vec![SqlAnswer::Tables(vec![table(past.clone())])],
+            vec![
+                SqlAnswer::Rows {
+                    statement: 0,
+                    rows: past,
+                },
+                SqlAnswer::Tables(vec![table(vec![])]),
+            ],
+        ] {
+            let mut wire = Vec::new();
+            for frame in &frames {
+                write_frame(&mut wire, &postcard::to_allocvec(frame).unwrap()).unwrap();
+            }
+            assert!(answer(&mut wire.as_slice(), 1).is_err(), "{} bytes decoded", wire.len());
+        }
+        let within = vec![vec![Value::Null]; 1000];
+        let mut wire = Vec::new();
+        write_frame(
+            &mut wire,
+            &postcard::to_allocvec(&SqlAnswer::Tables(vec![table(within.clone())])).unwrap(),
+        )
+        .unwrap();
+        let SqlAnswer::Tables(tables) = answer(&mut wire.as_slice(), 1).unwrap() else {
+            panic!("not tables");
+        };
+        assert_eq!(tables[0].rows, within);
+    }
+
+    /// CP-T1.13, AC-T1.2.3 (decision 2, version 2): do write a row and read back 40 rows of a MiB
+    /// each in one write, an answer past one frame; expect it in more than one frame, each within
+    /// the result bound, held until the write commits, read by the client as one table of every
+    /// row in order, and the write committed.
+    #[test]
+    fn cp_t1_13_a_sql_write_answer_past_one_frame_is_held_in_frames_and_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = blobs(dir.path(), 40, MIB);
+        let frames = db
+            .call(sql_until(), |c| {
+                answered(
+                    c,
+                    vec![
+                        statement("INSERT INTO t VALUES (41, NULL)", vec![]),
+                        statement("SELECT id, v FROM t WHERE id <= 40 ORDER BY id", vec![]),
+                    ],
+                    Spill::Held(Vec::new()),
+                )
+            })
+            .unwrap();
+        assert!(frames.len() > 1, "{} frames", frames.len());
+        assert!(frames.iter().all(|f| f.bytes.len() <= amphora_api::RESULT_MAX));
+        let mut wire = Vec::new();
+        for frame in &frames {
+            write_frame(&mut wire, &frame.bytes).unwrap();
+        }
+        let SqlAnswer::Tables(tables) = answer(&mut wire.as_slice(), 2).unwrap() else {
+            panic!("not tables");
+        };
+        assert_eq!(tables[0].affected, 1);
+        let ids: Vec<_> = tables[1].rows.iter().map(|row| row[0].clone()).collect();
+        assert_eq!(ids, (1..=40).map(Value::Integer).collect::<Vec<_>>());
+        assert!(tables[1].rows.iter().all(|row| row[1] == Value::Blob(vec![7; MIB])));
+        let count = db
+            .query_local(sql_until(), |c| {
+                Ok(c.query_row("SELECT count(*) FROM t", [], |r| r.get::<_, i64>(0))?)
+            })
+            .unwrap();
+        assert_eq!(count, 41, "the write committed");
+    }
+
+    /// CP-T1.13, AC-T1.2.3 (decision 2, version 2): do read 40 rows of a MiB each, then rows whose
+    /// last passes one frame by itself, on one link; expect the first answer whole in more than
+    /// one frame, the second refused TooLarge after its first rows went out, and a third read on
+    /// the same link answered: the connection goes on.
+    #[test]
+    fn cp_t1_13_a_sql_read_streams_past_one_frame_and_a_refusal_midway_ends_its_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = blobs(dir.path(), 40, amphora_api::RESULT_MAX / 2 + 1);
+        let (answering, client) = link();
+        let reader = std::thread::spawn(move || {
+            let mut r = BufReader::new(client);
+            let mut answers = Vec::new();
+            for _ in 0..3 {
+                answers.push(answer(&mut r, 1).unwrap());
+            }
+            answers
+        });
+        let until = sql_until();
+        serve_read(&db, &answering, until, "SELECT id, v FROM t WHERE id < 40 ORDER BY id");
+        serve_read(&db, &answering, until, "SELECT id, v, v FROM t ORDER BY id");
+        serve_read(&db, &answering, until, "SELECT count(*) FROM t");
+        let answers = reader.join().unwrap();
+        let SqlAnswer::Tables(first) = &answers[0] else {
+            panic!("{:?}", answers[0]);
+        };
+        let ids: Vec<_> = first[0].rows.iter().map(|row| row[0].clone()).collect();
+        assert_eq!(ids, (1..40).map(Value::Integer).collect::<Vec<_>>());
+        assert!(
+            matches!(answers[1], SqlAnswer::Refused(Refusal::TooLarge { .. })),
+            "{:?}",
+            answers[1]
+        );
+        let SqlAnswer::Tables(third) = &answers[2] else {
+            panic!("{:?}", answers[2]);
+        };
+        assert_eq!(third[0].rows, vec![vec![Value::Integer(40)]]);
+    }
+
+    /// CP-T1.13, AC-T1.2.3 (decision 2: a streamed read never runs on the writer): do hold every
+    /// reader with a session, stream a 40 MiB read to a client that doesn't read yet, write, let
+    /// the readers go, then write again while the read is held on its client; expect both writes
+    /// committed within their own deadlines (the read waits for a reader, and a read held on its
+    /// client on the writer would hold every write back past them) and the read answered whole
+    /// once its client reads.
+    #[test]
+    fn cp_t1_13_a_streamed_read_waits_for_a_reader_and_never_holds_a_write_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = blobs(dir.path(), 40, MIB);
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let mut releases = Vec::new();
+        let mut parked = Vec::new();
+        for _ in 0..crate::store::Config::default().readers {
+            let (release, wait) = std::sync::mpsc::channel::<()>();
+            releases.push(release);
+            let (db, entered_tx) = (db.clone(), entered_tx.clone());
+            parked.push(std::thread::spawn(move || {
+                db.query_local(sql_until(), move |_| {
+                    entered_tx.send(()).unwrap();
+                    wait.recv().unwrap();
+                    Ok(())
+                })
+            }));
+        }
+        for _ in &parked {
+            entered.recv().unwrap();
+        }
+        let (answering, mut client) = link();
+        // Past every write's deadline here: a read held on the writer would refuse the writes
+        // Timeout rather than end before them.
+        let reading = Instant::now() + Duration::from_secs(120);
+        let streamed = {
+            let (db, answering) = (db.clone(), Arc::clone(&answering));
+            std::thread::spawn(move || serve_read(&db, &answering, reading, "SELECT id, v FROM t ORDER BY id"))
+        };
+        let write = |id: i64| {
+            db.call(sql_until(), move |c| {
+                c.execute("INSERT INTO t VALUES (?1, ?2)", [Value::Integer(id), Value::Blob(vec![])])?;
+                Ok(())
+            })
+        };
+        let wrote = write(41);
+        assert!(wrote.is_ok(), "a write while every reader is busy and a read waits: {wrote:?}");
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        for p in parked {
+            p.join().unwrap().unwrap();
+        }
+        client.peek(&mut [0u8; 1]).unwrap();
+        let wrote = write(42);
+        assert!(wrote.is_ok(), "a write while a read is held on its client: {wrote:?}");
+        let got = answer(&mut BufReader::new(&mut client), 1).unwrap();
+        streamed.join().unwrap();
+        let SqlAnswer::Tables(tables) = got else {
+            panic!("{got:?}");
+        };
+        let ids: Vec<_> = tables[0].rows.iter().map(|row| row[0].clone()).collect();
+        assert_eq!(ids, (1..=41).map(Value::Integer).collect::<Vec<_>>(), "whole, read once the first write committed");
+    }
+
+    /// CP-T1.13, AC-T1.2.3 (decision 2, version 2): do read an answer of 40 MiB through a link
+    /// whose client never reads; expect the read refused Timeout at its deadline, never TooLarge
+    /// (its frames go out one at a time, none held past the one waiting on the client), and the
+    /// link ended: the client reads less than the answer, then the end.
+    #[test]
+    fn cp_t1_13_a_sql_read_to_a_client_that_stops_reading_ends_at_its_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = blobs(dir.path(), 40, MIB);
+        let (answering, mut client) = link();
+        let until = Instant::now() + Duration::from_secs(2);
+        let spill = Spill::Sent(Arc::clone(&answering), until);
+        let read = db.query_local(until, move |c| {
+            answered(
+                c,
+                vec![statement("SELECT id, v FROM t ORDER BY id", vec![])],
+                spill,
+            )
+        });
+        assert!(
+            matches!(read, Err(Refusal::Timeout)),
+            "{:?}",
+            read.map(|frames| frames.len())
+        );
+        let mut got = Vec::new();
+        let _ = client.read_to_end(&mut got);
+        assert!(got.len() <= amphora_api::RESULT_MAX + 4, "{} bytes", got.len());
     }
 }

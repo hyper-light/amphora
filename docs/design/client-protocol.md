@@ -66,9 +66,23 @@ memory (each value and what it points to) against the budget's room, and by thei
 against the result bound; its frame is encoded and charged by its length inside the request's
 session, so a write commits only once its answer is held, and each is given back once written. Past
 a bound or the budget's room the answer is a typed `TooLarge`, a write rolled back whole, and the
-connection goes on; a frame refused is read past through a fixed buffer, never held. The result
-bound fits one frame, so an answer never spans frames: nothing below the bound needs streaming,
-and nothing past it is answered.
+connection goes on; a frame refused is read past through a fixed buffer, never held.
+
+**Answers past one frame (version 2, 2026-11-23).** The engine hands a statement's rows over one
+at a time as it steps them (`Statement::each`), each value copied out of the engine once, never
+the whole result first. A frame ends when its next row would carry its rows past the result bound
+as the transport's decoders count it (each value's size in memory and what it points to,
+`transport::bounded::rows`), so every frame decodes within the bound on the client too. At version
+2 the rows before the last frame go as `Rows` frames (the statement's place in the request and its
+rows), ahead of the last frame, `Tables` or `Refused`; the client puts them ahead of each table's
+own rows, and drops them on a refusal. A read's frames go out on its link as each fills: the read
+holds the frame being written or the rows of the next, never the answer, and a client that stops
+reading holds the read only until its deadline, when the read is refused `Timeout` and the
+connection ends (a frame cut partway can't be followed by another). A write's frames are held,
+each charged by its length, until its transaction commits, so no write waits on a client's network
+and none commits unanswerable; past the budget's room it is refused and rolled back whole. A row
+past the bound by itself is refused `TooLarge`, midway or not, and the connection goes on. A client
+at version 1 gets version 1's answer: one frame, past the bound `TooLarge`.
 
 **Why, from the evidence.**
 - The benchmark drives every server from one program through that server's own client (MySQL's
@@ -83,8 +97,9 @@ and nothing past it is answered.
   trips, so no write waits on a client's network.
 
 **What would falsify it.** A client whose transaction needs its own logic between statements
-across round trips; an answer past the result bound a caller must have whole; or a measured class
-where serve's thread for each connection, not the engine, holds clients back.
+across round trips; a write whose answer passes the memory budget's room and must still commit; a
+read too large to send within its deadline (a cursor kept across requests would take that up); or a
+measured class where serve's thread for each connection, not the engine, holds clients back.
 
-**Needs Ada's word.** Proposed, not approved. Left out, each a variant appended later: a
-transaction held open across round trips, and an answer past the result bound streamed in frames.
+**Needs Ada's word.** Proposed, not approved. Left out, a variant appended later: a transaction
+held open across round trips.
