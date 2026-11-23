@@ -218,7 +218,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | store | 11 | Told when durable | [store.md](design/store.md#11-told-when-durable) |
 | store | 12 | Written in place, every page checksummed | [store.md](design/store.md#12-written-in-place-every-page-checksummed) |
 | store | 13 | The log flushed by its data, and kept at its length | [store.md](design/store.md#13-the-log-flushed-by-its-data-and-kept-at-its-length) |
-| store | 14 | Gathering before a flush at low load | [store.md](design/store.md#14-gathering-before-a-flush-at-low-load) |
+| store | 14 | A flush begins as soon as none is running | [store.md](design/store.md#14-a-flush-begins-as-soon-as-none-is-running) |
 | store | 15 | The checkpoint copies what the flusher made durable | [store.md](design/store.md#15-the-checkpoint-copies-what-the-flusher-made-durable) |
 | store | 16 | The log packed: a commit's pages compressed into records | [store.md](design/store.md#16-the-log-packed-a-commits-pages-compressed-into-records) |
 | store | 17 | Only the bytes that changed: deltas in the packed log | [store.md](design/store.md#17-only-the-bytes-that-changed-deltas-in-the-packed-log) |

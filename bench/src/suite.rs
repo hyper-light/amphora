@@ -681,16 +681,59 @@ fn perf_ctl(cmd: &str) {
 
 /// Runs `op` from `clients` clients for the warmup and then `seconds`, each client on a session of
 /// its own, closed loop.
+/// Client `c`'s stream of draws for statement `op`, the same at every client count. Each
+/// statement's clients draw from streams of their own: mix is a bijection, so no two clients' seeds
+/// are equal (adding the client's number and then XORing it in made clients 0, 2, 4, ... draw the
+/// same parameters, and statements whose names were as long drew the same).
+fn client_rng(op: &str, c: usize) -> Rng {
+    let base = op.bytes().fold(0x2545_f491_4f6c_dd1d_u64, |h, b| mix(h ^ u64::from(b)));
+    Rng(mix(base ^ mix(c as u64 + 1)) | 1)
+}
+
+fn param_json(p: &P) -> serde_json::Value {
+    match p {
+        P::I(i) => serde_json::json!(i),
+        P::F(f) => serde_json::json!(f),
+        P::T(t) => serde_json::json!(t),
+        P::B(b) => serde_json::json!(suite_db::Cell::Blob(b).text()),
+        P::Z(z) => serde_json::json!(z),
+        P::N => serde_json::Value::Null,
+    }
+}
+
+/// The answer check's answers: each read's rows, every value, for the first parameters each client
+/// of the largest client count draws in its timed runs (`client_rng`), a parameter list once.
+/// Taken before any write runs, so every database answers over the same rows.
+fn answers(target: &Arc<dyn Target>, only: Option<&str>, shape: &Shape, clients: usize) -> anyhow::Result<Vec<serde_json::Value>> {
+    let d = target.dialect();
+    let mut session = target.session()?;
+    let mut out = Vec::new();
+    for op in OPS.iter().filter(|op| op.kind == Kind::Read && selected(only, op.name)) {
+        let Some(stmts) = statements(op.name, d) else { continue };
+        let stmts: Vec<String> = stmts.iter().map(|s| placeholders(d, s)).collect();
+        let mut seen = std::collections::HashSet::new();
+        for c in 0..clients {
+            let p = params(op.name, &mut client_rng(op.name, c), shape, (c, clients), d);
+            let shown: Vec<Vec<serde_json::Value>> = p.iter().map(|ps| ps.iter().map(param_json).collect()).collect();
+            if !seen.insert(serde_json::json!(shown).to_string()) {
+                continue;
+            }
+            let answer = match session.answer(&stmts, &p) {
+                Ok(rows) => serde_json::json!({ "rows": rows }),
+                Err(e) => serde_json::json!({ "error": format!("{e:#}") }),
+            };
+            out.push(serde_json::json!({ "op": op.name, "client": c, "sql": stmts, "params": shown, "answer": answer }));
+        }
+    }
+    Ok(out)
+}
+
 fn run_op(target: &Arc<dyn Target>, op: &Op, stmts: &Arc<Vec<String>>, shape: &Arc<Shape>, clients: usize, warmup: f64, seconds: f64) -> Outcome {
     let stop = Arc::new(AtomicBool::new(false));
     let began = Instant::now();
     let count_from = began + Duration::from_secs_f64(warmup);
     let until = count_from + Duration::from_secs_f64(seconds);
     let total = Arc::new(Mutex::new(Outcome { hist: Hist::new(), rows: 0, errors: 0, error: None, retries: 0, longest_us: 0, cpu: None }));
-    // Each statement's clients draw from streams of their own: mix is a bijection, so no two
-    // clients' seeds are equal (adding the client's number and then XORing it in made clients 0, 2,
-    // 4, ... draw the same parameters, and statements whose names were as long drew the same).
-    let base = op.name.bytes().fold(0x2545_f491_4f6c_dd1d_u64, |h, b| mix(h ^ u64::from(b)));
     let d = target.dialect();
     let cpu = std::thread::scope(|s| {
         // The measured window's own thread: the process's CPU time in it, and perf on and off
@@ -711,7 +754,7 @@ fn run_op(target: &Arc<dyn Target>, op: &Op, stmts: &Arc<Vec<String>>, shape: &A
         });
         for c in 0..clients {
             let (target, stmts, shape, stop, total) = (target.clone(), stmts.clone(), shape.clone(), stop.clone(), total.clone());
-            let mut rng = Rng(mix(base ^ mix(c as u64 + 1)) | 1);
+            let mut rng = client_rng(op.name, c);
             s.spawn(move || {
                 let mut mine = Outcome { hist: Hist::new(), rows: 0, errors: 0, error: None, retries: 0, longest_us: 0, cpu: None };
                 match target.session() {
@@ -858,6 +901,7 @@ pub fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let answers = answers(&target, o.only.as_deref(), &shape, readers)?;
     let mut results = Vec::new();
     for op in OPS {
         if !selected(o.only.as_deref(), op.name) {
@@ -915,6 +959,7 @@ pub fn main() -> anyhow::Result<()> {
         "settle_s": settle_s,
         "reused": o.reuse,
         "results": results,
+        "answers": answers,
         "rss_after_load_mb": rss_after_load_mb,
         "rss_max_mb": crate::rss_max_mb(),
         "heap_peak_mb": crate::heap_mb(&crate::HEAP_PEAK),

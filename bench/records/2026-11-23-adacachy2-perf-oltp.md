@@ -134,3 +134,84 @@ after its `pwritev`. The flusher returns from its wait, then enters a `FUTEX_WAI
   time is near 6.1 ms. Log `flush_time` and `idle_since` at each wait before changing it.
 - Amphora's `fdatasync` ran 40-75 µs longer than SQLite's at p50 in r1 and r2 (16.5 KB of
   frames a commit). That is the next stage once the wait is settled.
+
+# Lane W3 (oltp), 2026-11-23 22:06Z to 23:06Z: the flusher with no gathering wait
+
+## Verdict, losses first
+
+- **update_plain at 32 clients may have lost throughput.** Median 5,476 to 4,854 writes a second
+  (-11%), p50 4.80 to 5.82 ms. A's two best runs (7,585 and 8,064) beat every B run (best 5,441).
+  A rank-sum over 5 runs a side gives U = 6, not significant (critical value 2), on a machine at
+  load 20 to 44 on 32 cores. Rows a flush fell from 24.2 to 15.8.
+- **At 1 client the p50 gain is not measurable at this noise.** p50 3.360 to 3.264 ms (median of 5,
+  ranges 2.976 to 3.872 and 2.880 to 3.488). The gap to SQLite in the same round went from 0.128 to
+  0.096 ms at median, not the 0.19 ms expected. The shim shows the wait gone: the last log write's
+  end to the fdatasync, p50 268.8 to 21.0 µs. The fdatasync itself differed by 286 µs at p50 between
+  the two traced runs (3,532 and 3,246 µs), more than the stage removed.
+- **One B run stalled inside a flush.** r3-B-insert_one-32: 423 writes a second, p99 942 ms. Its
+  longest flush took 930 ms (the store's `longest_us`), and its flushes took 1,444 ms of the 1.5 s
+  run, so the flusher sat in fdatasync, not waiting for a wake-up. A's runs show the same kind of
+  flush stall at 83 to 109 ms.
+- **Merged.** 81fc0dca is on main in 6a3e8ebb (22:39Z): `Sends::gathering`, its timed wait and its
+  fractions are deleted, and docs/design/store.md decision 14 holds the rule.
+- At 128 clients, no measurable difference: insert_one 14,285 to 16,671 at median, update_plain
+  17,788 to 15,382, ranges overlapping.
+
+## The runs (r1657, adacachy2, A = main 98bd0fa9, B = 81fc0dca, 5 rounds alternated)
+
+`ab-w3.sh` and `ab_w3.py` in this record's folder. W2's untraced suite command (`--suite --items
+200000 --seconds 1 --warmup 0.5`), each run a fresh process on a fresh database, A's calibration
+under both arms' keys. Load 19.7 to 44.2 on 32 cores, CPU pressure (avg10) 4 to 37%, I/O pressure 1
+to 5%, printed beside every run. 0 errors and 0 retries in every run. Rows a flush are the store's
+own counters, which cover the warm-up and the timed window (a load-only run reads 0).
+
+| statement | clients | writes/s A | writes/s B | p50 ms A | p50 ms B | p99 ms A | p99 ms B | rows/flush A | rows/flush B |
+|---|---|---|---|---|---|---|---|---|---|
+| insert_one | 1 | 247 (205-302) | 261 (201-314) | 3.360 (2.976-3.872) | 3.264 (2.880-3.488) | 8.19 (5.50-17.66) | 8.00 (5.57-22.78) | 1 | 1 |
+| insert_one | 32 | 5,135 (3,641-5,189) | 4,905 (423-5,289) | 5.824 (5.568-8.192) | 5.824 (5.440-14.464) | 16.64 (12.03-20.74) | 13.82 (10.88-942.08) | 20.8 (18.9-24.6) | 15.8 (14.3-16.0) |
+| insert_one | 128 | 14,285 (9,595-16,241) | 16,671 (9,308-17,619) | 8.448 (7.360-12.416) | 6.720 (6.464-13.184) | 17.41 (13.95-29.18) | 17.15 (12.42-31.74) | 63.2 (60.2-65.1) | 57.3 (51.6-58.8) |
+| update_plain | 32 | 5,476 (3,283-8,064) | 4,854 (4,310-5,441) | 4.800 (3.456-7.488) | 5.824 (5.504-6.976) | 14.85 (8.19-37.89) | 13.95 (10.37-24.32) | 24.2 (20.8-29.5) | 15.8 (15.6-17.7) |
+| update_plain | 128 | 17,788 (10,078-19,911) | 15,382 (9,893-19,456) | 6.720 (5.824-12.032) | 7.296 (5.952-10.624) | 15.74 (11.14-21.76) | 18.94 (10.88-45.06) | 67.9 (63.1-76.1) | 63.2 (58.8-63.9) |
+
+Median (range) of 5 runs. SQLite's insert_one at 1 client, same rounds: 258 (184-288) writes a
+second, p50 3.072 (2.912-3.680) ms.
+
+## Where the batches got smaller (traced, insert_one at 32 clients, one run a side)
+
+- A: flush to flush p50 5,485 µs, of which fdatasync 3,569 µs. About 1.9 ms passes between one
+  flush's end and the next's start: the gathering wait. 24.3 rows a flush (6,843 rows, 282 flushes).
+- B: flush to flush p50 3,424 µs, fdatasync 3,386 µs. The flushes run back to back. 15.9 rows a
+  flush (6,271 rows, 395 flushes).
+- Writer commits a flush, from the calls counted: 520 log writes over 257 flushes in A (2.02), 688
+  over 361 in B (1.91). stages.py's per-cycle count reads 0 for B, because it counts writes between
+  one flush's end and the next's start, and B leaves no gap.
+- Throughput is rows a flush over the mean cycle: 24.3 / 5.32 ms is 4.6k a second for A and
+  15.9 / 3.79 ms is 4.2k for B. The two runs measured 4,630 and 4,164.
+
+## Insert_one at 1 client, traced (one run a side, p50 µs)
+
+| stage | A | B |
+|---|---|---|
+| writer woke to its log write (apply) | 175.3 | 82.6 |
+| log write end to flusher woke | 257.6 | 14.3 |
+| log write end to fdatasync | 268.8 | 21.0 |
+| fdatasync | 3,532.5 | 3,246.4 |
+| fdatasync end to waking the client | 6.5 | 4.6 |
+| wake to the client running | 187.0 | 128.9 |
+| cycle, flush end to flush end | 4,186.1 | 3,433.9 |
+
+The apply and wake stages vary with CPU pressure (7 to 14% in these two runs). The A/B's p50 spread
+at 1 client (0.9 ms in A) is several times the 0.25 ms stage B removes.
+
+## Checks
+
+- Pre-merge tree 661ce5b5 (r1653) and merged tree 6a3e8ebb (r1657), adacachy2:
+  `cargo clippy -p amphora --all-targets --locked -- -D warnings` rc 0; `--test store` 15 passed;
+  `--test crash` 9 passed, 3 ignored (not run).
+
+## Next, for the successor
+
+- Re-run `ab-w3.sh` on a quiet adacachy2 (load under 2, Amphora's CLAUDE.md §7) to settle 1 client,
+  where 0.19 to 0.25 ms is under this run's spread, and update_plain at 32 clients.
+- The flusher still waits on a 1 s timeout when idle (`flusher`, the `Duration::from_secs(1)` wait),
+  as does the notifier. Neither delays a flush; both are timers under RULES 2.

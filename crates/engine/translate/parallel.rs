@@ -881,6 +881,10 @@ fn emit_body(
         });
         program.preassign_label_to_next_insn(done);
     }
+    // A label lands after the instruction emitted before it, wherever that one moves, and an
+    // output that is a constant moves to the program's end (lane R4): `keep` is placed after a
+    // Noop of the body's own, so it stays on the body's next one.
+    program.emit_insn(Insn::Noop);
     program.preassign_label_to_next_insn(body.keep);
     program.emit_insn(Insn::Noop);
     program.preassign_label_to_next_insn(body.skip);

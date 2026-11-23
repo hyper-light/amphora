@@ -22,3 +22,4 @@ pub mod scan;
 pub mod scan_tables;
 #[rustfmt::skip]
 pub mod scan_tokens;
+pub mod tree;
