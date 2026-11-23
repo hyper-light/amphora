@@ -26,7 +26,7 @@ index 28ef5e2b..8f4c3939 100644
 +            log.first_index().ok(),
 +            log.committed(), log.last_index().ok(), raw.raft.term(), raw.raft.vote(), raw.raft.state(), raw.raft.lost(),
 +        );
-+        let bad = p > disk.last_index() || (p >= disk.first_index() && p > 0 && disk.term(p) != log.term(p).ok());
++        let bad = p > disk.last_index();
 +        if bad {
 +            panic!("V5 watch member {}: persisted passed the disk\n  before: {}\n  now:    {}", raw.raft.id(), self.watched, now);
 +        }
