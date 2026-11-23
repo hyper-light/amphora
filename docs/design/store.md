@@ -2218,8 +2218,12 @@ flushed, before the second segment exists. The version lives in the database hea
 a `-wal` of the new format is refused by code that knows only the old one. New files carry both versions from their
 first write. Old code refuses a two-segment database cleanly: an unknown version is an error at open, never a panic
 or an assert. SQLite's wal2 does the same ("Attempting to use any other version of SQLite results in an SQLITE_NOTADB
-error"). Not yet checked: how the engine's open path treats an unknown value in those bytes today. A database can't
-return to the old code after its upgrade. That is the format's price, and it is Ada's to accept.
+error"). The engine already refuses both cleanly. An unknown value in bytes 18 and 19 is `Corrupt("Invalid
+read_version: …")` at open (`crates/engine/database.rs`, 2185-2190). A log header whose format `LogFormat::of` doesn't
+know is `Corrupt("the log's format … isn't known")` (`crates/engine/storage/sqlite3_ondisk.rs`, 1914-1917), and a
+segment's format is one more value in that scheme (`storage/packed.rs`). A log header whose checksum fails is read as an
+empty log, not refused, so the database header's bytes are what keep old code away from a second segment. A database
+can't return to the old code after its upgrade. That is the format's price, and it is Ada's to accept.
 
 **Crash recovery across a switch.** Recovery reads both segments' headers. A segment whose header checksum fails is
 empty. Of two valid segments, the one with the higher checkpoint sequence is current and the other closing. Each
@@ -2236,6 +2240,24 @@ the checkpointer copies the closing segment and then the current one. A crash at
    They are already in the file, and copying them again writes the same pages before the current segment's newer
    frames are copied.
 5. During the upgrade: a one-segment database whose log is copied, or a two-segment one with one segment.
+
+**Where it lands in the engine.** Today there is one log in every structure that keys on a frame number. These are
+the places a segment is added (`crates/engine/storage/`):
+- `wal.rs` `restart_wal_header` (8142-8183) becomes the switch. `begin_restart` and `end_restart` (1731-1757) take
+  every read mark exclusively and refuse a restart while any is held: that is the rule the switch drops.
+- `WalSharedMetadata` and `WalSharedRuntime` (3703-3787) hold one header, one file, one frame cache, one `nbackfills`
+  and five read marks. Each becomes one per segment.
+- `try_begin_read_tx`'s read marks (1528-1604) and `WalSnapshot` (196-211): a snapshot names its segments.
+- `find_frame` (5343-5422, 1471-1498, 1324-1340), `log_index.rs` `ReadIndex` (387-627, which assumes no reader at a
+  restart, 23-25), and `frame_offset` and `read_frame` (6875-6879, 5426-5498): a frame is a segment's.
+- The checkpoint (6977-7372, its safe frame 1701-1725) and the pager's phases (`pager.rs` 5906-6340): the closing
+  segment is copied first, and is reset only after the file's sync. Today a Restart's restart comes before that
+  sync, with the writer's guard held through it (7306-7317).
+- Recovery (`sqlite3_ondisk.rs` 1576-2188) reads two files and orders them by checkpoint sequence; `database.rs`
+  (1659-1663, 2366-2412) opens the second path beside `-wal`.
+- `crates/amphora/src/db.rs` `restart_log` and `hold_log` (505-566), the store's gate (`store.rs` 1129-1148), and the
+  backup, which reads frames out of `-wal` by offset for each generation (`backup/ship.rs` 754-872): it reads the
+  segment the generation is in.
 
 **Sources.** SQLite's wal2 branch, `doc/wal2.md` (github.com/sqlite/sqlite, branch `wal2`): the files are
 "<database>-wal" and "<database>-wal2"; "Once the first wal file has grown large enough, writers switch to appending
