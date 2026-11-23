@@ -23,11 +23,11 @@
 //! conservatism, never correctness: if the authority cannot prove a slot is
 //! dead, it must leave that slot in place.
 
-use crate::storage::log_segments::{ReadSpan, Segments, SlotReads};
+use crate::storage::log_segments::{ReadSpan, SegmentId, Segments, SlotReads};
 use crate::{
     io::{Completion, File, FileSyncType, OpenFlags, SharedWalLockKind, SharedWalMappedRegion, IO},
     sync::{
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{fence, AtomicU32, AtomicU64, Ordering},
         Arc, LazyLock, Mutex, RwLock,
     },
     turso_assert, CompletionError, HashMap, LimboError, Result,
@@ -1265,13 +1265,64 @@ impl MappedSharedWalCoordination {
     /// The log's segments, with the reads every live process counts on each: the
     /// slots of readers proven dead are reclaimed first, so a crash leaks no read.
     pub(crate) fn segments(&self) -> Segments {
+        self.segments_at(self.header().segments.load(Ordering::Acquire))
+    }
+
+    fn segments_at(&self, word: u64) -> Segments {
         self.reclaim_stale_reader_slots();
         let reads = self
             .reader_reads()
             .iter()
             .map(|word| SlotReads(word.load(Ordering::Acquire)))
             .fold(SlotReads::default(), SlotReads::plus);
-        Segments::unpack(self.header().segments.load(Ordering::Acquire)).with_reads(reads)
+        Segments::unpack(word).with_reads(reads)
+    }
+
+    /// The segments a read begun now counts on, and the shared word they were taken from, which
+    /// [`Self::span_holds`] checks once the read is counted.
+    pub(crate) fn begin_span(&self) -> (ReadSpan, u64) {
+        let word = self.header().segments.load(Ordering::SeqCst);
+        (Segments::unpack(word).begin_read(), word)
+    }
+
+    /// Whether the segments are still as `word` had them, asked once a read is counted on the
+    /// span taken from `word` (decision 45, lane B14's race). A reset writes the word before it
+    /// counts the reads ([`Self::reset_if_unread`]), and a read counts itself before it looks
+    /// here, each across a SeqCst fence: either the reset sees the read and leaves the segment,
+    /// or the read sees the word changed and starts over with a span taken from the new word.
+    pub(crate) fn span_holds(&self, word: u64) -> bool {
+        fence(Ordering::SeqCst);
+        self.header().segments.load(Ordering::SeqCst) == word
+    }
+
+    /// The checkpointer copied the closing segment's last frame and flushed the file: the
+    /// segment this resets, if no read of any process counts on it and no backup waits for it.
+    pub(crate) fn copied(&self) -> Option<SegmentId> {
+        let _ = self
+            .header()
+            .segments
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |word| {
+                let mut log = Segments::unpack(word);
+                log.mark_copied();
+                Some(log.pack())
+            });
+        self.reset_if_unread()
+    }
+
+    /// Reset the closing segment if it is copied and shipped and no read of a live process
+    /// counts on it: asked at its copy and at the end of every read, so the last of them resets.
+    pub(crate) fn reset_if_unread(&self) -> Option<SegmentId> {
+        let shared = &self.header().segments;
+        fence(Ordering::SeqCst);
+        Segments::unpack(shared.load(Ordering::SeqCst)).reset_if_done()?;
+        let word = shared.fetch_or(0, Ordering::SeqCst);
+        fence(Ordering::SeqCst);
+        let mut log = self.segments_at(word);
+        let reset = log.reset_if_done()?;
+        shared
+            .compare_exchange(word, log.pack(), Ordering::SeqCst, Ordering::SeqCst)
+            .ok()?;
+        Some(reset)
     }
 
     /// Count a read begun with `span` on `slot`, the reader slot that guards it,
@@ -4559,6 +4610,103 @@ mod tests {
         assert_eq!(seen.state(SegmentId::Second), Segment::Current { reads: 0 });
         assert_eq!(seen.state(SegmentId::First), closing(0));
         assert_eq!(log.end_read(span), None);
+    }
+
+    /// Do: a read in one process begins before a switch (made by hand: unit 5 has none yet), so
+    /// the segment it counts on is the one that closes; another process's checkpointer then says
+    /// it copied that segment; then the read ends. Expect: the copy leaves the closing segment
+    /// while the read counts on it, and the read's end resets it (decision 45: a reset waits for
+    /// every process's reads).
+    #[test]
+    fn d45_a_read_begun_before_the_switch_keeps_the_closing_segment() {
+        use crate::storage::log_segments::{Closing, Segment};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination.tshm");
+        let reading = create_mapping(&path);
+        let checkpointing = create_mapping(&path);
+        let mut log = Segments::new(SegmentId::First);
+        reading.seed_segments(log);
+        let (span, word) = reading.begin_span();
+        let slot = reading
+            .register_reader(reading.owner_record(), 5)
+            .unwrap();
+        assert!(reading.count_read(slot, &span));
+        assert!(reading.span_holds(word));
+        assert_eq!(log.switch(false), Some(SegmentId::Second));
+        checkpointing.seed_segments(log);
+
+        assert_eq!(checkpointing.copied(), None);
+        assert_eq!(
+            checkpointing.segments().state(SegmentId::First),
+            Segment::Closing(Closing {
+                reads: 1,
+                copied: true,
+                shipped: true,
+            }),
+            "the read begun before the switch still counts on the closing segment"
+        );
+
+        reading.uncount_read(slot, &span);
+        reading.unregister_reader(slot);
+        assert_eq!(reading.reset_if_unread(), Some(SegmentId::First));
+        assert_eq!(checkpointing.segments().state(SegmentId::First), Segment::Free);
+        assert_eq!(checkpointing.reset_if_unread(), None, "a segment is reset once");
+    }
+
+    /// Do: a read takes its span while the closing segment is not yet copied, and another
+    /// process's checkpointer copies and resets that segment before the read is counted. Then
+    /// the other order: a read counted before the copy. Expect: the first read finds its span
+    /// gone once counted and starts over with a span that reaches only the current segment; the
+    /// second keeps the segment from its reset until it ends (lane B14's race).
+    #[test]
+    fn d45_a_read_counted_during_a_reset_never_reads_the_reset_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination.tshm");
+        let reading = create_mapping(&path);
+        let checkpointing = create_mapping(&path);
+        let mut log = Segments::new(SegmentId::First);
+        assert_eq!(log.switch(false), Some(SegmentId::Second));
+        reading.seed_segments(log);
+
+        let (late, late_word) = reading.begin_span();
+        assert_eq!(late.closing(), Some(SegmentId::First));
+        assert_eq!(checkpointing.copied(), Some(SegmentId::First));
+        let slot = reading
+            .register_reader(reading.owner_record(), 5)
+            .unwrap();
+        assert!(reading.count_read(slot, &late));
+        assert!(
+            !reading.span_holds(late_word),
+            "a read counted after its segment's reset is refused"
+        );
+        reading.uncount_read(slot, &late);
+        let (again, again_word) = reading.begin_span();
+        assert_eq!(again.lookup_order().collect::<Vec<_>>(), [SegmentId::Second]);
+        assert!(reading.count_read(slot, &again));
+        assert!(reading.span_holds(again_word));
+        reading.uncount_read(slot, &again);
+        reading.unregister_reader(slot);
+
+        let mut log = Segments::new(SegmentId::Second);
+        assert_eq!(log.switch(false), Some(SegmentId::First));
+        reading.seed_segments(log);
+        let (early, early_word) = reading.begin_span();
+        assert_eq!(early.closing(), Some(SegmentId::Second));
+        let slot = reading
+            .register_reader(reading.owner_record(), 5)
+            .unwrap();
+        assert!(reading.count_read(slot, &early));
+        assert!(reading.span_holds(early_word));
+        assert_eq!(
+            checkpointing.copied(),
+            None,
+            "a read counted before the copy keeps the segment"
+        );
+        assert_eq!(checkpointing.segments().closing(), Some(SegmentId::Second));
+        reading.uncount_read(slot, &early);
+        reading.unregister_reader(slot);
+        assert_eq!(reading.reset_if_unread(), Some(SegmentId::Second));
+        assert_eq!(checkpointing.segments().closing(), None);
     }
 
     /// Do: leave a read counted on the closing segment in a reader slot whose owner has died, as
