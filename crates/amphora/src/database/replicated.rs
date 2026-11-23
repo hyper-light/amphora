@@ -2894,10 +2894,16 @@ impl<F: BlockFile + 'static> Actor<F> {
             let input = match receiver.try_recv() {
                 Ok(envelope) => Some(envelope),
                 Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
-                Err(mpsc::TryRecvError::Empty) if self.driving => None,
+                Err(mpsc::TryRecvError::Empty) if self.driving => {
+                    let now = (self.clock)();
+                    self.ran_dry(now)?;
+                    None
+                }
                 Err(mpsc::TryRecvError::Empty) => {
+                    let now = (self.clock)();
+                    self.ran_dry(now)?;
                     let deadline = self.deadline();
-                    let wait = deadline.saturating_duration_since((self.clock)());
+                    let wait = deadline.saturating_duration_since(now);
                     self.control.bell.wait(wait)?;
                     // A wait begun before its deadline and ended at or past it, whatever ended
                     // it, is one the timer's lateness is measured on (`hyper_timing::Lateness`).
@@ -2918,6 +2924,16 @@ impl<F: BlockFile + 'static> Actor<F> {
             };
             self.run_step(input)?;
         }
+    }
+    /// The intake found its channel empty at `now`: unless inputs wait behind a pause, the
+    /// command queue's busy time ends there (`Drain::dry`; QB.1, lane constants-K3).
+    fn ran_dry(&mut self, now: Instant) -> Result<(), Refusal> {
+        if self.paused_inputs.is_empty() {
+            let now = u64::try_from(now.saturating_duration_since(self.started).as_nanos())
+                .map_err(unavailable)?;
+            self.intake.dry(now);
+        }
+        Ok(())
     }
     /// The tick pace from what this owner measured (`pace`), derived once an election timeout:
     /// the core draws each timeout over that many ticks, so a pace derived oftener changes no
@@ -2983,6 +2999,10 @@ impl<F: BlockFile + 'static> Actor<F> {
         // makes no raft step; what comes waits in order, its bytes still charged to the command
         // queue, so the queue's admission bound holds the callers back.
         let paused = self.paused()?;
+        if input.is_some() {
+            // Work came to the command queue: its busy time begins (`Drain::came`).
+            self.intake.came(self.now()?);
+        }
         let mut input = input;
         if let Some(envelope) = input.as_mut() {
             // Taken from the channel: its place there is free, its bytes still held (lane
