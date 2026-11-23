@@ -60,3 +60,42 @@ Not done: open addressing in an arena, and the zero-allocation probe.
 ran out. The successor runs TPC-H SF1 (`--answers`) and `bench/baselines/run.sh join-kinds`, main
 before 2d939193 vs 2d939193, alternating on adacachy2. A script for it: `.perf-vdbe/ab.sh` in the
 perf/vdbe clone (untracked).
+
+## Third hour (perf-E3): the zero-allocation probe; the A/B started, not finished
+
+**AUDIT 3.1's probe allocations (verified, changed).** On 90a81a80 a probe row of an in-memory hash
+join allocated: the probe keys' `Vec<Value>` and a clone of each text or blob key (execute.rs
+`hash_probe_run`), a `Vec<ValueRef>` to hash them and another to compare them (`HashTable::probe`),
+and one more on every `next_match` and `merge_next_match` call; `probe_partition` and
+`partition_for_keys` did the same on a spilled table. Now:
+
+- `HashTable::probe_keys_from` hands the last probe's key buffer back refilled in place
+  (`Value::try_clone_from`, so text and blob keys reuse their own allocations);
+- the hash (`hash_join_values`) and the comparisons (`keys_equal_values`) read the keys as held,
+  through one per-value hasher (`hash_key_part`) shared with `hash_join_key`, so a build row and a
+  probe row hash alike by construction;
+- `probe_partition` keeps its keys in the same buffer.
+
+Test: `vdbe::hash_table::hashtests::audit_3_1_probe_rows_allocate_nothing` counts the thread's
+allocations (a counting global allocator in the engine's lib tests) over 1,000 probe rows with an
+integer key and a NOCASE text key, half hits (two matches each, walked with `next_match`) and half
+misses, and asserts **0 allocations** (before the change the same flow made at least 3 per row plus
+one per `next_match` call, by the code above; not counted on the old tree). Verified on adacachy2
+(kiln run, `.perf-vdbe/check.sh`, the committed tree): `cargo clippy -p amphora-engine --all-targets
+--locked -- -D warnings` exit 0; `cargo test -p amphora-engine --lib --locked -- vdbe::hash_table`
+46 passed, 0 failed, the new test among them. Not run: the SQL-level join suites (tests/hash_*.rs,
+join_methods.rs) that drive the changed `HashProbe` opcode.
+
+Not done: a row probing a spilled table's loaded partition from `HashProbe` still allocates its kept
+buffer once (the register refill took the buffer; `probe_partition` takes a slice); the
+open-addressed arena layout (entries still `Vec<HashEntry>` per bucket, two `Vec<Value>` per entry).
+
+**A/B: builds proven, timing not run.** main before the vdbe work (b817508b) built in release with
+`--offline` under the pinned rustc 1.99.1: the predecessor's `AtomicX::try_update` failure did not
+recur (both trees pin 1.99.1 in rust-toolchain.toml and use `try_update`; the failure was not the
+toolchain pin as read here). A three-arm script (`.perf-vdbe/ab2.sh` in the vdbe clone: base
+b817508b, head 90a81a80 in its own clean clone, probe = head + this change; TPC-H SF1 with
+`--answers`, arms in turn, then SQLite and DuckDB through head's driver) was started at 02:46Z and
+stopped by me at 03:05Z: adacachy2's load average was 88-111 on 32 cores (2 cores idle), so no
+timing taken then would be a number. The successor runs it when the host is quiet:
+`bash .perf-vdbe/ab2.sh` through kiln `run` on adacachy2 (PASSES, RUNS, TIMEOUT, CRUNS env).
