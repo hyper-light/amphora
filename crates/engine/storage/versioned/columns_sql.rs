@@ -1419,6 +1419,42 @@ mod tests {
         );
     }
 
+    /// Lane R5 (one `ExactSum`): under `RealSums::Exact` the column copy's SUM is the rows' own
+    /// `morsel::ExactSum`. Do: per group, R1's bigpairs, a sum that overflows and comes back, and
+    /// an infinity beside finite values that overflow the other way, summed from a copy and from
+    /// the rows. Expect +inf, 1.5 and +inf from both, with the copy read.
+    #[test]
+    fn r5_the_copys_exact_sum_stays_exact_past_the_range() {
+        let (_a, on) = connect();
+        let (_b, off) = connect();
+        copies(&on).set_on(true);
+        copies(&off).set_on(false);
+        for c in [&on, &off] {
+            c.set_real_sums(crate::RealSums::Exact);
+            c.execute("CREATE TABLE r (id INTEGER PRIMARY KEY, g INTEGER, x REAL)")
+                .unwrap();
+            c.execute(
+                "INSERT INTO r VALUES (1, 1, 1e308), (2, 1, 1e308), (3, 1, -1e308), \
+                 (4, 1, -1e308), (5, 1, 1e308), (6, 1, 1e308), (7, 2, 1e308), (8, 2, 1e308), \
+                 (9, 2, -1e308), (10, 2, -1e308), (11, 2, 1.5), (12, 3, 9e999), \
+                 (13, 3, -1e308), (14, 3, -1e308)",
+            )
+            .unwrap();
+        }
+        let q = "SELECT g, sum(x) FROM r GROUP BY g";
+        let want = vec![
+            vec![Value::from_i64(1), Value::from_f64(f64::INFINITY)],
+            vec![Value::from_i64(2), Value::from_f64(1.5)],
+            vec![Value::from_i64(3), Value::from_f64(f64::INFINITY)],
+        ];
+        for _ in 0..3 {
+            assert_eq!(rows(&on, q), want, "from the copy");
+            assert_eq!(rows(&off, q), want, "from the rows");
+        }
+        let seen = copies(&on).counts();
+        assert!(seen.copy > 0, "no statement read the copy: {seen:?}");
+    }
+
     use crate::storage::versioned::memory::Capped;
 
     /// The bytes granted the generation of a copy of `t` filled with rows 1 to `n`, with room to

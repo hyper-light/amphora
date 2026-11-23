@@ -37,7 +37,7 @@ use crate::storage::versioned::version::Ts;
 use crate::sync::{Arc, Mutex};
 use crate::types::{ImmutableRecordRef, ValueRef};
 use crate::vdbe::morsel::{
-    self, MachineCosts, MemoryBudget, MorselError, ParallelMode, Pipeline, RunStats,
+    self, ExactSum, MachineCosts, MemoryBudget, MorselError, ParallelMode, Pipeline, RunStats,
 };
 use crate::Result;
 use std::cmp::Ordering;
@@ -656,90 +656,6 @@ impl Agg {
     }
 }
 
-/// A real sum kept exactly, as non-overlapping parts (Shewchuk 1997, "Adaptive Precision
-/// Floating-Point Arithmetic"): the same however its values are split and merged. Its parts are
-/// bounded by binary64's exponent range over its precision, a format value.
-#[derive(Clone, Debug, Default, PartialEq)]
-struct ExactSum {
-    parts: Vec<f64>,
-    /// The plain sum of what isn't finite, or of parts that overflowed: what it then is.
-    special: Option<f64>,
-}
-
-impl ExactSum {
-    fn add(&mut self, mut x: f64) {
-        if !x.is_finite() {
-            self.special = Some(self.special.unwrap_or(0.0) + x);
-            return;
-        }
-        let mut kept = Vec::with_capacity(self.parts.len().saturating_add(1));
-        for mut y in self.parts.drain(..) {
-            if x.abs() < y.abs() {
-                std::mem::swap(&mut x, &mut y);
-            }
-            let hi = x + y;
-            if !hi.is_finite() {
-                self.special = Some(self.special.unwrap_or(0.0) + hi);
-                x = 0.0;
-                continue;
-            }
-            let lo = y - (hi - x);
-            if lo != 0.0 {
-                kept.push(lo);
-            }
-            x = hi;
-        }
-        kept.push(x);
-        self.parts = kept;
-    }
-
-    fn merge(&mut self, other: &ExactSum) {
-        for p in &other.parts {
-            self.add(*p);
-        }
-        if let Some(s) = other.special {
-            self.special = Some(self.special.unwrap_or(0.0) + s);
-        }
-    }
-
-    /// The sum, rounded once (Python's `math.fsum`'s last step).
-    fn value(&self) -> f64 {
-        if let Some(s) = self.special {
-            return s;
-        }
-        let p = &self.parts;
-        let mut n = p.len();
-        let mut hi = 0.0f64;
-        let mut lo = 0.0f64;
-        if n > 0 {
-            n = n.saturating_sub(1);
-            hi = p.get(n).copied().unwrap_or(0.0);
-            while n > 0 {
-                let x = hi;
-                n = n.saturating_sub(1);
-                let y = p.get(n).copied().unwrap_or(0.0);
-                hi = x + y;
-                let yr = hi - x;
-                lo = y - yr;
-                if lo != 0.0 {
-                    break;
-                }
-            }
-            if n > 0 {
-                let next = p.get(n.saturating_sub(1)).copied().unwrap_or(0.0);
-                if (lo < 0.0 && next < 0.0) || (lo > 0.0 && next > 0.0) {
-                    let y = lo * 2.0;
-                    let x = hi + y;
-                    if y == x - hi {
-                        hi = x;
-                    }
-                }
-            }
-        }
-        hi
-    }
-}
-
 /// One aggregate's running state.
 #[derive(Clone, Debug, PartialEq)]
 enum Acc {
@@ -758,6 +674,13 @@ enum Acc {
 
 fn overflow() -> LimboError {
     LimboError::IntegerOverflow
+}
+
+fn exact(e: MorselError) -> LimboError {
+    match e {
+        MorselError::Alloc => LimboError::OutOfMemory,
+        e => LimboError::InternalError(format!("column scan's exact sum: {e}")),
+    }
 }
 
 impl Acc {
@@ -793,7 +716,7 @@ impl Acc {
                     *numbers = numbers.checked_add(1).ok_or_else(overflow)?;
                 }
                 Cell::Real(x) => {
-                    reals.add(*x);
+                    reals.add(*x).map_err(exact)?;
                     *any_real = true;
                     *numbers = numbers.checked_add(1).ok_or_else(overflow)?;
                 }
@@ -837,7 +760,7 @@ impl Acc {
                 },
             ) => {
                 *ints = ints.checked_add(*i2).ok_or_else(overflow)?;
-                reals.merge(r2);
+                reals.merge(r2).map_err(exact)?;
                 *any_real |= *a2;
                 *numbers = numbers.checked_add(*n2).ok_or_else(overflow)?;
             }
@@ -880,7 +803,7 @@ impl Acc {
                         let part = magnitude
                             .checked_shr(k.saturating_mul(32))
                             .map_or(0, |v| u32::try_from(v & 0xffff_ffff).unwrap_or(0));
-                        all.add(f64::from(part) * scale);
+                        all.add(f64::from(part) * scale).map_err(exact)?;
                         // 2^32: a format value, exact as a double.
                         scale *= 4_294_967_296.0;
                     }
@@ -1443,7 +1366,7 @@ fn fold_slots(
                     Some(x),
                 ) = (slot(accs, s, j), xs.get(i))
                 {
-                    reals.add(*x);
+                    reals.add(*x).map_err(exact)?;
                     *any_real = true;
                     count(numbers)?;
                 }
@@ -1542,7 +1465,7 @@ fn fold_vector(
             let mut k = 0u64;
             for (i, (x, s)) in xs.iter().zip(sel).enumerate() {
                 if *s && valid(i) {
-                    reals.add(*x);
+                    reals.add(*x).map_err(exact)?;
                     k = k.saturating_add(1);
                 }
             }
@@ -2452,7 +2375,7 @@ mod tests {
         assert_eq!(int_real(0, -0.0), Ordering::Equal);
         let mut s = ExactSum::default();
         for v in [1e100, 1.0, -1e100, 0.25] {
-            s.add(v);
+            s.add(v).unwrap();
         }
         assert_eq!(s.value(), 1.25);
     }
