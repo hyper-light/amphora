@@ -4475,6 +4475,66 @@ pub(crate) mod bushy_test_hook {
             );
         }
 
+        /// Lane T8 (TPC-H q19 at SF1, 17x SQLite's time): q19's shape at small scale, an OR of
+        /// three branches each joining `p` to `l` with terms on each table alone. `p`'s terms
+        /// keep 239 of its 2,000 rows, yet they stayed inside the OR, which also reads `l`, so
+        /// `p` was priced at every row (the branches' brands are all of them, so the IN filter
+        /// on brand keeps every part) and the plan read all 60,000 of `l`. Each table's share of
+        /// the OR now filters it alone, so the plan starts from `p`'s few rows and seeks `l` by
+        /// its index. Expect: fewer VM steps than reading `l` whole with its own filters (work
+        /// any plan reading all of `l` does), and the answer of the same OR inside a CASE, which
+        /// no share is taken from.
+        #[test]
+        fn t8_q19_each_tables_share_of_an_or_filters_it_before_the_join() {
+            let io = Arc::new(MemoryIO::new());
+            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            for sql in [
+                "CREATE TABLE p(id INTEGER PRIMARY KEY, brand INT, container INT, size INT)",
+                "CREATE TABLE l(id INTEGER PRIMARY KEY, pk INT, qty INT, mode INT, instr INT, \
+                 price INT)",
+                "CREATE INDEX l_pk ON l(pk)",
+                // Brand, container and size independent; each part's 30 lines take each
+                // quantity once, and every mode and instruction in turn.
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 2000) \
+                 INSERT INTO p SELECT i, i % 3, i / 3 % 10, i / 30 % 50 + 1 FROM x",
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 60000) \
+                 INSERT INTO l SELECT i, i % 2000 + 1, i / 2000 % 50 + 1, (i * 3 + i / 2000) % 7, \
+                 (i + i / 2000) % 4, i % 1000 FROM x",
+                "ANALYZE",
+            ] {
+                conn.execute(sql).unwrap();
+            }
+            let branches = "(p.id = l.pk AND p.brand = 0 AND p.container IN (0, 1, 2, 3) \
+                 AND l.qty >= 1 AND l.qty <= 11 AND p.size BETWEEN 1 AND 5 \
+                 AND l.mode IN (0, 1) AND l.instr = 0) \
+                 OR (p.id = l.pk AND p.brand = 1 AND p.container IN (4, 5, 6, 7) \
+                 AND l.qty >= 10 AND l.qty <= 20 AND p.size BETWEEN 1 AND 10 \
+                 AND l.mode IN (0, 1) AND l.instr = 0) \
+                 OR (p.id = l.pk AND p.brand = 2 AND p.container IN (6, 7, 8, 9) \
+                 AND l.qty >= 20 AND l.qty <= 30 AND p.size BETWEEN 1 AND 15 \
+                 AND l.mode IN (0, 1) AND l.instr = 0)";
+            let sql = format!("SELECT count(*), sum(l.price) FROM l, p WHERE {branches}");
+            let unshared = rows(
+                &conn,
+                &format!(
+                    "SELECT count(*), sum(l.price) FROM l, p \
+                     WHERE p.id = l.pk AND CASE WHEN {branches} THEN 1 ELSE 0 END = 1"
+                ),
+            );
+            let (_, whole_l, _) = by_cost(
+                &conn,
+                "SELECT count(*), sum(l.price) FROM l WHERE l.mode IN (0, 1) AND l.instr = 0",
+            );
+            let (answer, steps, plan) = by_cost(&conn, &sql);
+            assert_ne!(unshared, vec!["0,".to_string()], "no row passes the OR");
+            assert_eq!(answer, unshared, "{plan:?}");
+            assert!(
+                steps < whole_l,
+                "{steps} steps, reading l whole with its own filters takes {whole_l}: {plan:?}"
+            );
+        }
+
         /// PL.8 (T-PL.8.13, lane pl8-19): the hand-built bushy tree `(a ((b l c) p))` whose run
         /// holds a LEFT JOIN of `q` (as `l`) on `b`, the run's table its ON reads, matching some
         /// of `b`'s rows and not others; with an ON term no index reads, and WHERE terms on the

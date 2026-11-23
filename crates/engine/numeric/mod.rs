@@ -612,7 +612,7 @@ pub fn round_half_away_from_zero_tie(f: f64, precision: usize) -> Option<f64> {
 }
 
 /// A REAL as text, as SQLite converts one: CAST(x AS TEXT), TEXT affinity, printf's %s
-/// (numeric/fp.rs: SQLite 3.54's `%!.17g`, the fewest of up to 17 digits that round-trip).
+/// (numeric/fp.rs: floatingpoint.html 1.3.1, 15 digits when they convert back, else 17).
 pub fn format_float(v: f64) -> String {
     fp::real_to_text(v)
 }
@@ -624,13 +624,14 @@ pub fn format_float_for_quote(v: f64) -> String {
 
 #[test]
 fn test_decode_float() {
-    // SQLite 3.54.0's own text for each (CAST(x AS TEXT))
-    assert_eq!(format_float(9.93e-322), "9.9307194814090555e-322");
+    // floatingpoint.html 1.3.1: 15 digits when they convert back (the subnormals; SQLite 3.54.0
+    // writes 17 there), else 17
+    assert_eq!(format_float(9.93e-322), "9.93071948140906e-322");
     assert_eq!(format_float(9.93), "9.93");
     assert_eq!(format_float(0.093), "0.093");
     assert_eq!(format_float(-0.093), "-0.093");
     assert_eq!(format_float(0.0), "0.0");
-    assert_eq!(format_float(4.94e-322), "4.9406564584124654e-322");
+    assert_eq!(format_float(4.94e-322), "4.94065645841247e-322");
     assert_eq!(format_float(-20228007.0), "-20228007.0");
 }
 

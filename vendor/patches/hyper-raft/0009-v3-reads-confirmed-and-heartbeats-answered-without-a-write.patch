@@ -1,0 +1,532 @@
+Subject: v3 reads confirmed and heartbeats answered without a write
+Why: A write's ReadIndex barrier waited on two log flushes (Amphora lanes V3-V5, AC-T1.8.3)
+
+diff --git a/crates/hyper-durable/src/replica.rs b/crates/hyper-durable/src/replica.rs
+index 5288ddb5557c06d9ced2971d81def3179501fe3c..2fdba1668afd288421472f6e5a8070dee02345c7 100644
+--- a/crates/hyper-durable/src/replica.rs
++++ b/crates/hyper-durable/src/replica.rs
+@@ -1775,12 +1775,16 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
+ 
+     /// What the core may apply and send without a write, whatever the writes out
+     /// (`RawNode::light_now`): a leader's appends when it proposes and what it commits when it
+-    /// commits, a follower's held answers when it takes the entries (core step R-8). Without it
+-    /// they wait for a write of the member's own to free a place for the next `Ready`.
++    /// commits, its read rounds and the reads they confirm, a follower's held answers when it
++    /// takes the entries (core step R-8) and its heartbeats' answers on a durable term and vote.
++    /// Without it they wait for a write of the member's own to free a place for the next `Ready`.
+     fn take_light(&mut self, out: &mut Output<M::Answer>) -> Result<(), ReplicaError> {
+         let light = self.node.light_now(true);
+         let mut light = self.must(light)?;
+         self.emit(light.take_messages(), out);
++        for read in light.take_read_states() {
++            self.reads.push_back((read.index, read.request_ctx));
++        }
+         if let Some((first, last)) = light.committed_range() {
+             self.apply_range(first, last, out)?;
+         }
+diff --git a/crates/hyper-raft/src/node.rs b/crates/hyper-raft/src/node.rs
+index adba8f74c92547cad8ff2fcc9b00cd8f6f9f88f8..1b3c185cc2aff4f7f22d04771966d52e933c3ea8 100644
+--- a/crates/hyper-raft/src/node.rs
++++ b/crates/hyper-raft/src/node.rs
+@@ -139,6 +139,8 @@ pub struct LightReady {
+     /// What to apply, where storage holds it, for a `Ready` given in place.
+     committed_range: Option<(u64, u64)>,
+     messages: Vec<Message>,
++    /// Reads confirmed since the last `Ready` or light ready ([`RawNode::light_now`]).
++    read_states: Vec<ReadState>,
+ }
+ impl LightReady {
+     /// The commit, when it moved. It need not be durable to be acted on, and
+@@ -176,6 +178,15 @@ impl LightReady {
+     pub fn take_messages(&mut self) -> Vec<Message> {
+         std::mem::take(&mut self.messages)
+     }
++    /// Reads that may be served once their index is applied: those confirmed since the last
++    /// `Ready` or light ready, given by [`RawNode::light_now`] alone.
++    pub fn read_states(&self) -> &[ReadState] {
++        &self.read_states
++    }
++    /// Takes the reads, leaving none.
++    pub fn take_read_states(&mut self) -> Vec<ReadState> {
++        std::mem::take(&mut self.read_states)
++    }
+ }
+ 
+ /// What the member asks of its owner at once: what to persist, send and
+@@ -195,8 +206,8 @@ pub struct Ready {
+     snapshot: Option<Snapshot>,
+     after_persisting: bool,
+     light: LightReady,
+-    /// Held answers (core step R-8): sent at once whatever the write, since they promise memory
+-    /// alone.
++    /// Held answers (core step R-8), and heartbeats' answers on a durable term and vote: sent at
++    /// once whatever the write, since they promise memory alone, or only what the disk holds.
+     held: Vec<Message>,
+     must_sync: bool,
+     /// Its messages were taken: a commit can no longer be deferred, since
+@@ -333,7 +344,9 @@ impl Ready {
+     }
+     /// Held answers (core step R-8, `docs/raft.md` §3.7): to send at once, before this `Ready`'s
+     /// write and whatever it holds, since each promises only that the entries it names are in
+-    /// memory. None in a group whose owner states no fates.
++    /// memory; none in a group whose owner states no fates. Beside them, heartbeats' answers made
++    /// on a durable term and vote, which state only what the member's disk holds
++    /// (`Raft::answer_beat_now`).
+     pub fn held_messages(&self) -> &[Message] {
+         &self.held
+     }
+@@ -450,9 +463,6 @@ pub struct RawNode<S> {
+     /// The `Ready`s whose writes are out, oldest first; at most
+     /// [`crate::Limits::readies_in_flight`].
+     issued: VecDeque<Given>,
+-    /// The term and vote storage holds durably: as the member opened, then
+-    /// as the last write known durable stated them.
+-    durable_vote: (u64, u64),
+     /// What was given to apply reaches this index.
+     commit_since: u64,
+     /// The owner holds what it was given to apply and is given no more
+@@ -484,7 +494,8 @@ impl<S> RawNode<S> {
+ impl<S: Storage> RawNode<S> {
+     /// The member `config` names, opened on what `store` holds.
+     pub fn new(config: &Config, store: S) -> Result<Self> {
+-        let raft = Raft::new(config, store)?;
++        let mut raft = Raft::new(config, store)?;
++        raft.durable_vote = (raft.term(), raft.vote());
+         let mut issued = VecDeque::new();
+         // Reserved once: a write issued never grows the queue.
+         issued
+@@ -493,7 +504,6 @@ impl<S: Storage> RawNode<S> {
+         Ok(Self {
+             previous_soft: raft.soft_state(),
+             previous_hard: raft.hard_state(),
+-            durable_vote: (raft.term(), raft.vote()),
+             released: raft.classic,
+             raft,
+             number: 0,
+@@ -868,6 +878,7 @@ impl<S: Storage> RawNode<S> {
+             committed_entries,
+             committed_range: None,
+             messages: self.messages(release),
++            read_states: Vec::new(),
+         })
+     }
+     /// As [`RawNode::light`] while the owner holds what it was given to
+@@ -901,6 +912,7 @@ impl<S: Storage> RawNode<S> {
+             committed_entries: Vec::new(),
+             committed_range,
+             messages: self.messages(release),
++            read_states: Vec::new(),
+         })
+     }
+     fn messages(&mut self, release: bool) -> Vec<Message> {
+@@ -926,7 +938,7 @@ impl<S: Storage> RawNode<S> {
+     /// Whether the term and vote the member holds are durable.
+     #[inline]
+     fn vote_durable(&self) -> bool {
+-        self.durable_vote == (self.raft.term(), self.raft.vote())
++        self.raft.vote_durable()
+     }
+     /// Whether what a notice of durability made may be sent at once (I1,
+     /// I2): a leader's while its term and vote are durable; any member's
+@@ -957,7 +969,7 @@ impl<S: Storage> RawNode<S> {
+     /// follower's held answer when it takes the entries. What is left leaves with the next
+     /// `Ready`, as before.
+     pub fn messages_now(&mut self) -> Vec<Message> {
+-        let mut messages = self.raft.take_held_answers();
++        let mut messages = self.raft.take_answers_now();
+         if self.releases_now() && !self.raft.msgs.is_empty() {
+             let queued = self.raft.msgs.take();
+             if messages.is_empty() {
+@@ -973,18 +985,26 @@ impl<S: Storage> RawNode<S> {
+     /// [`RawNode::messages_now`]. A leader whose writes fill its pipeline then applies what it
+     /// commits when it commits, not when a write of its own frees a place for the next `Ready`.
+     /// `in_place` as [`RawNode::ready_in_place`]. Refused while a `Ready` is taken and not issued.
++    ///
++    /// Reads go on as well, since none waits for a write: the round for the reads asked since the
++    /// last leaves (`Raft::ask_reads`), and the reads confirmed since the last `Ready` are given
++    /// ([`LightReady::read_states`]). A leader whose writes fill its pipeline then confirms a read
++    /// when a quorum answers its round, not when a write of its own frees a place for the next
++    /// `Ready`.
+     pub fn light_now(&mut self, in_place: bool) -> Result<LightReady> {
+         if self.taken.is_some() {
+             return Err(Error::Invariant(
+                 "a light ready asked for while a ready is taken and not issued",
+             ));
+         }
++        self.raft.ask_reads()?;
+         let release = self.releases_now();
+         let mut light = self.light(in_place, release)?;
+-        let held = self.raft.take_held_answers();
+-        if !held.is_empty() {
+-            light.messages.extend(held);
++        let now = self.raft.take_answers_now();
++        if !now.is_empty() {
++            light.messages.extend(now);
+         }
++        light.read_states = std::mem::take(&mut self.raft.read_states);
+         self.hold_released(&mut light);
+         let hard = self.raft.hard_state();
+         if hard.commit > self.previous_hard.commit {
+@@ -998,7 +1018,7 @@ impl<S: Storage> RawNode<S> {
+         let raft = &self.raft;
+         let unstable = raft.log().unstable();
+         !raft.msgs.is_empty()
+-            || raft.has_held_answers()
++            || raft.has_answers_now()
+             || raft.reads_unasked()
+             || raft.soft_state() != self.previous_soft
+             || raft.hard_state() != self.previous_hard
+@@ -1140,7 +1160,7 @@ impl<S: Storage> RawNode<S> {
+         // Taken, and not emptied: what the member holds when it rests is
+         // what it held before.
+         ready.read_states = std::mem::take(&mut self.raft.read_states);
+-        ready.held = self.raft.take_held_answers();
++        ready.held = self.raft.take_answers_now();
+         ready.displaced = self.raft.take_displaced();
+         if !ready.proposals.is_empty() || new_entries {
+             ready.must_sync = true;
+@@ -1316,12 +1336,7 @@ impl<S: Storage> RawNode<S> {
+         let keeps = keep.is_some();
+         let mut kept = Kept::default();
+         let mut in_place = false;
+-        let Self {
+-            raft,
+-            issued,
+-            durable_vote,
+-            ..
+-        } = self;
++        let Self { raft, issued, .. } = self;
+         let term = raft.term();
+         for given in issued
+             .iter_mut()
+@@ -1330,7 +1345,7 @@ impl<S: Storage> RawNode<S> {
+             given.stable = stabilize(
+                 &mut raft.log,
+                 term,
+-                durable_vote,
++                &mut raft.durable_vote,
+                 &given.mark,
+                 &mut kept,
+                 keeps,
+@@ -1355,7 +1370,7 @@ impl<S: Storage> RawNode<S> {
+         self.raft.settle_priority();
+         // A candidate's vote for itself counts once it is durable, after what
+         // the writes held is: the entries a leader it makes appends are not.
+-        let (term, vote) = self.durable_vote;
++        let (term, vote) = self.raft.durable_vote;
+         self.raft.on_vote_durable(term, vote)?;
+         // The promise those writes stated is durable (R-8).
+         self.raft.held_durable(number)?;
+@@ -1442,7 +1457,7 @@ impl<S: Storage> RawNode<S> {
+         }
+         if let Some(hard) = ready.hard_state {
+             self.previous_hard = hard;
+-            self.durable_vote = (hard.term, hard.vote);
++            self.raft.durable_vote = (hard.term, hard.vote);
+             self.raft.commit_durable(hard.commit);
+         }
+         let mut kept = Kept::default();
+@@ -1479,7 +1494,7 @@ impl<S: Storage> RawNode<S> {
+         self.raft.settle_priority();
+         // A candidate's vote for itself counts once it is durable, after what
+         // the write held is: the entries a leader it makes appends are not.
+-        let (term, vote) = self.durable_vote;
++        let (term, vote) = self.raft.durable_vote;
+         self.raft.on_vote_durable(term, vote)?;
+         self.raft.held_durable(taken.number)?;
+         // Nothing is out and nothing is left to write: what follows leaves
+diff --git a/crates/hyper-raft/src/raft.rs b/crates/hyper-raft/src/raft.rs
+index 493c154146d0c2a2ce686eccbd2f366e8673c464..d902938ec7e45fea1b2c0ac488bbb54ea2d7c633 100644
+--- a/crates/hyper-raft/src/raft.rs
++++ b/crates/hyper-raft/src/raft.rs
+@@ -288,6 +288,14 @@ pub struct Config {
+     /// What a member says when it answers a heartbeat, and what its leader
+     /// makes of a full window.
+     pub heartbeat_answers: HeartbeatAnswers,
++    /// A member whose term and vote are durable answers a heartbeat at once, whatever its writes
++    /// out, stating only what its disk holds: the durable commit and, under
++    /// [`HeartbeatAnswers::Position`], the durable end of its log (`Raft::answer_beat_now`).
++    /// Its owner's flush then no longer holds the leader's read round, nor the read barrier of
++    /// the leader's next write. Off, as raft-rs's rule: the answer waits for the write that holds
++    /// what it says, and states the commit that write made durable, so the two cores compare
++    /// under one setting.
++    pub answer_beats_now: bool,
+     /// What a member does with a leader's entries that arrive ahead of a
+     /// hole in its log.
+     pub ahead: Ahead,
+@@ -375,6 +383,7 @@ impl Config {
+             raft_rs_precedence: false,
+             read_rounds: ReadRounds::Shared,
+             heartbeat_answers: HeartbeatAnswers::Position,
++            answer_beats_now: false,
+             ahead: Ahead::Kept,
+             fast: false,
+             skip_bcast_commit: false,
+@@ -773,6 +782,13 @@ pub struct Raft<S> {
+     /// with. Its answers state no more when they leave
+     /// (`RawNode::durable_commit`).
+     pub(crate) durable_commit: u64,
++    /// The term and vote storage holds durably: as the member opened, then as the last write
++    /// known durable stated them (`RawNode`'s notices). A member whose term and vote are durable
++    /// answers a heartbeat at once ([`Raft::answer_beat_now`]).
++    pub(crate) durable_vote: (u64, NodeId),
++    /// Heartbeats' answers that wait for no write ([`Raft::answer_beat_now`]): they leave at once,
++    /// beside the held answers.
++    beat_answers: Vec<Message>,
+     /// What this member's durable log may lack of what it acknowledged ([`Lost`]).
+     lost: Option<Lost>,
+     /// Commits on entries held in memory (core step R-8): what a member keeps for them, behind a
+@@ -1436,6 +1452,8 @@ impl<S: Storage> Raft<S> {
+             priority: config.priority,
+             priority_in_force: 0,
+             durable_commit: 0,
++            durable_vote: (0, 0),
++            beat_answers: Vec::new(),
+             lost: config.lost,
+             held_commit: Box::default(),
+             conf_before: Configuration::default(),
+@@ -4554,6 +4572,9 @@ impl<S: Storage> Raft<S> {
+         }
+         let mut answer = proto::message(message.from, MessageType::MsgHeartbeatResponse);
+         answer.context = std::mem::take(&mut message.context);
++        if self.config.answer_beats_now && self.vote_durable() {
++            return self.answer_beat_now(answer);
++        }
+         answer.commit = self.log.committed();
+         if self.config.heartbeat_answers == HeartbeatAnswers::Position {
+             // How far this log goes. It is sent once what the log holds is
+@@ -4563,6 +4584,39 @@ impl<S: Storage> Raft<S> {
+         }
+         self.send(answer)
+     }
++    /// Whether the term and vote this member holds are durable.
++    #[inline]
++    pub(crate) fn vote_durable(&self) -> bool {
++        self.durable_vote == (self.term, self.vote)
++    }
++    /// A heartbeat's answer that waits for no write of this member's: its term and vote are
++    /// durable (I1), and it states no commit and no position its disk doesn't hold, so it leaves
++    /// at once, whatever writes are out. Its position is the durable end of the log, not its last
++    /// index: the leader takes a position of its term as an append's answer and counts it toward
++    /// the classic quorum and the reads it confirms. Where that entry's term can't be read (a
++    /// snapshot taken and not yet durable) it states no position. Without it, a follower's write
++    /// out held its leader's read round, and with it the read barrier of the leader's next write,
++    /// behind that write's flush (Amphora's lane V2, AC-T1.8.3).
++    fn answer_beat_now(&mut self, mut answer: Message) -> Result<()> {
++        answer.from = self.id;
++        answer.term = self.term;
++        // As `Raft::send` states it on every answer: marked through a promise of its term, the
++        // member asks its leader where its log ends (R-8).
++        answer.incarnation = self.held_asking();
++        answer.commit = self.durable_commit.min(self.log.committed());
++        if self.config.heartbeat_answers == HeartbeatAnswers::Position {
++            let durable = self.log.persisted();
++            if let Ok(term) = self.log.term(durable) {
++                answer.index = durable;
++                answer.log_term = term;
++            }
++        }
++        self.beat_answers
++            .try_reserve(1)
++            .map_err(|_| Error::Memory)?;
++        self.beat_answers.push(answer);
++        Ok(())
++    }
+     fn handle_snapshot(&mut self, mut message: Message) -> Result<()> {
+         let snapshot = message
+             .snapshot
+@@ -5313,13 +5367,20 @@ impl<S: Storage> Raft<S> {
+                 .iter()
+                 .all(|(_, promise, _)| promise.term == 0)
+     }
+-    /// The held answers waiting to be taken, to send at once (R-8).
+-    pub(crate) fn take_held_answers(&mut self) -> Vec<Message> {
+-        std::mem::take(&mut self.held_commit.out)
++    /// The answers waiting to be taken that leave at once, whatever the writes out: the held
++    /// answers (R-8), then the heartbeats' answered on a durable term and vote
++    /// ([`Raft::answer_beat_now`]).
++    pub(crate) fn take_answers_now(&mut self) -> Vec<Message> {
++        let mut answers = std::mem::take(&mut self.held_commit.out);
++        if answers.is_empty() {
++            return std::mem::take(&mut self.beat_answers);
++        }
++        answers.append(&mut self.beat_answers);
++        answers
+     }
+-    /// Whether held answers wait to be taken.
+-    pub(crate) fn has_held_answers(&self) -> bool {
+-        !self.held_commit.out.is_empty()
++    /// Whether answers that leave at once wait to be taken.
++    pub(crate) fn has_answers_now(&self) -> bool {
++        !self.held_commit.out.is_empty() || !self.beat_answers.is_empty()
+     }
+ }
+ 
+diff --git a/crates/hyper-raft/src/tests.rs b/crates/hyper-raft/src/tests.rs
+index ff63b51f43a87ddab6f170c43a07ecb66b6ce5cb..5adb1aadd9f2062e5ad18a236e30ea6f5707128e 100644
+--- a/crates/hyper-raft/src/tests.rs
++++ b/crates/hyper-raft/src/tests.rs
+@@ -47,6 +47,7 @@ fn drain(node: &mut RawNode<Memory>) -> Vec<Message> {
+             let hard = *hard;
+             node.store_mut().hard_state = hard;
+         }
++        messages.extend(ready.take_held_messages());
+         messages.extend(ready.take_messages());
+         messages.extend(ready.take_persisted_messages());
+         let mut applied = ready.committed_entries().last().map(|entry| entry.index);
+@@ -1461,6 +1462,49 @@ fn a_followers_answer_waits_for_the_write_that_holds_what_it_says() {
+     assert_eq!(light.messages()[0].index, 5);
+ }
+ 
++/// Under `Config::answer_beats_now`, a follower whose term and vote are durable answers a heartbeat
++/// at once, whatever its writes out, and names only what its disk holds: the durable end of its
++/// log, not its last index.
++#[test]
++fn a_followers_heartbeat_answer_names_only_what_its_disk_holds() {
++    let mut node = follower_with(Config {
++        answer_beats_now: true,
++        ..with_depth(2, 2)
++    });
++    let mut taken = Vec::new();
++    for index in [4, 5] {
++        let mut append = answer(MessageType::MsgAppend, 1, 2, 1);
++        append.index = index - 1;
++        append.log_term = 1;
++        append.commit = 2;
++        append.entries = vec![entry(index, 1)];
++        node.step(append).unwrap();
++        let mut ready = node.ready().unwrap();
++        ready.take_persisted_messages();
++        taken.push(ready.entries().to_vec());
++        node.advance_issued(ready).unwrap();
++    }
++    // The log goes to 5 and the disk holds 3: the answer names 3, and leaves at once.
++    let mut beat = answer(MessageType::MsgHeartbeat, 1, 2, 1);
++    beat.commit = 2;
++    node.step(beat.clone()).unwrap();
++    let said = node.messages_now();
++    assert_eq!(said.len(), 1);
++    assert_eq!((said[0].index, said[0].log_term), (3, 1));
++    assert!(node.raft.messages().is_empty());
++    node.store_mut().append(&taken[0]);
++    let light = node.on_persist(1).unwrap();
++    assert!(light.messages().is_empty());
++    node.store_mut().append(&taken[1]);
++    let light = node.on_persist(2).unwrap();
++    assert!(light.messages().is_empty());
++    // Both writes durable: the next answer names 5.
++    node.step(beat).unwrap();
++    let said = node.messages_now();
++    assert_eq!(said.len(), 1);
++    assert_eq!((said[0].index, said[0].log_term), (5, 1));
++}
++
+ /// Election Safety across a crash: a candidate counts its vote for itself only once the hard state
+ /// naming it is durable, so a sole voter leads only from then. Counted at once, the sole voter led on
+ /// a vote it could lose: hyper-durable's simulation, seed 206 of its first shape, had member 3 elected
+@@ -2673,6 +2717,7 @@ fn drain_applying(node: &mut RawNode<Memory>) -> Vec<Message> {
+             let hard = *hard;
+             node.store_mut().hard_state = hard;
+         }
++        messages.extend(ready.take_held_messages());
+         messages.extend(ready.take_messages());
+         messages.extend(ready.take_persisted_messages());
+         let mut committed = ready.take_committed_entries();
+diff --git a/crates/hyper-raft/tests/support/lagged.rs b/crates/hyper-raft/tests/support/lagged.rs
+index 2a9eea5568eb4133a92db8d400166baff73dc2be..f165a03b5ce19eee2265d5c5eea287f820d157b3 100644
+--- a/crates/hyper-raft/tests/support/lagged.rs
++++ b/crates/hyper-raft/tests/support/lagged.rs
+@@ -199,6 +199,19 @@ fn check_message(disk: &Disk, message: &Message, member: u64) -> bool {
+                 disk.last_index()
+             );
+         }
++        // A heartbeat's answer naming a position of its term (`HeartbeatAnswers::Position`) is
++        // taken by its leader as an append's answer, for the classic quorum and the reads it
++        // confirms, and it may leave while writes are out: the disk holds what it names. A leader
++        // takes no position of an older term (`handle_heartbeat_response`): one named by an answer
++        // that waited for the write of a new term may be a tail that write replaced.
++        MessageType::MsgHeartbeatResponse if current && message.log_term == message.term => {
++            assert!(
++                message.index <= disk.last_index(),
++                "member {member}: a heartbeat's answer named {} with {} durable",
++                message.index,
++                disk.last_index()
++            );
++        }
+         _ if current && kind == hyper_raft::fast::FAST_VOTE => {
+             for entry in &message.entries {
+                 // Once the log reaches the index, what it holds there was the
+@@ -227,13 +240,14 @@ impl Lagged {
+         let id = raw.raft.id();
+         let leads = raw.raft.state() == hyper_raft::StateRole::Leader;
+         let messages = light.take_messages();
++        let reads = light.take_read_states();
+         let committed = committed_of(
+             raw,
+             in_place,
+             light.take_committed_entries(),
+             light.committed_range(),
+         );
+-        if messages.is_empty() && committed.is_empty() {
++        if messages.is_empty() && committed.is_empty() && reads.is_empty() {
+             return false;
+         }
+         for message in messages.iter().filter(|_| !self.judged) {
+@@ -257,6 +271,11 @@ impl Lagged {
+             }
+         }
+         self.output.messages.extend(messages);
++        self.output.reads.extend(
++            reads
++                .into_iter()
++                .map(|read| (read.index, read.request_ctx)),
++        );
+         self.apply(committed);
+         self.node
+             .raw
+@@ -619,8 +638,14 @@ impl Lagged {
+ impl Replica for Lagged {
+     const LAGGED: bool = true;
+     fn open(id: u64, store: Store, settings: &Settings, seed: u64, members: usize) -> Self {
++        // A member driven ahead of its persistence answers heartbeats at once, so that its
++        // answers, which leave while its writes are out, are held to its disk (`check_message`).
++        let settings = Settings {
++            answer_beats_now: true,
++            ..*settings
++        };
+         Self {
+-            node: New::open(id, store, settings, seed, members),
++            node: New::open(id, store, &settings, seed, members),
+             depth: settings.depth,
+             writes: Writes::new(settings.depth),
+             output: Output::default(),
+diff --git a/crates/hyper-raft/tests/support/mod.rs b/crates/hyper-raft/tests/support/mod.rs
+index 9f8224553527c8e8c7342479ad507e31d442b7b4..8bfcb660c3e37daedbb6e72086700f91c6d51174 100644
+--- a/crates/hyper-raft/tests/support/mod.rs
++++ b/crates/hyper-raft/tests/support/mod.rs
+@@ -656,6 +656,9 @@ pub struct Settings {
+     /// Whether a heartbeat's answer says nothing of the member's log and
+     /// frees a full window's first message, as in `raft-rs`.
+     pub bare_answers: bool,
++    /// Whether a member whose term and vote are durable answers a heartbeat at once
++    /// (`Config::answer_beats_now`); in `raft-rs` the answer waits for the member's write.
++    pub answer_beats_now: bool,
+     /// Whether a member keeps nothing of an append that arrives ahead of a
+     /// hole in its log, as in `raft-rs` (`Ahead::Refused`).
+     pub refuse_ahead: bool,
+@@ -775,6 +778,7 @@ impl Settings {
+             by_length: true,
+             round_each: true,
+             bare_answers: true,
++            answer_beats_now: false,
+             refuse_ahead: true,
+             fast: false,
+             in_place: false,
+@@ -1385,6 +1389,7 @@ impl Replica for New {
+             } else {
+                 hyper_raft::HeartbeatAnswers::Position
+             },
++            answer_beats_now: settings.answer_beats_now,
+             ahead: if settings.refuse_ahead {
+                 hyper_raft::Ahead::Refused
+             } else {

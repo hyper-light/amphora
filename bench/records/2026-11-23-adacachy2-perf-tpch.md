@@ -657,3 +657,89 @@ of lineitem), and A/B q19.
 80c3a431 (lane perf-A8) made `Config::queue` an `Option<usize>`. Fixed with `.or(defaults.queue)`
 on both arms (7cdbc32e for A, d3eebdbb on perf/tpch). Lane V4 merged the identical line to main
 meanwhile (647f3e03), so the merge took main's.
+
+# Lane T8 (tpch), 2026-11-23 16:45Z to 17:40Z: q19's per-table shares of its OR; 17.6x faster, still 1.5x SQLite's time
+
+Machine: adacachy2 (runner 00aad8da), every run named onto it (`on`). Checks asked
+`needs linux/amd64,cpus=4,mem=24g`, the timed A/B `cpus=12,mem=24g`.
+
+## 1. q19: each table's share of a WHERE OR (408fb177, on main as b6c9ddaa)
+
+T7 found the cause (section 5 of its record): part's own terms stay inside the OR, which also
+reads lineitem, so part is priced at all its rows. `rewrite_or_terms`
+(`optimizer/lift_common_subexpressions.rs`) now adds, for each table that every branch has a
+term on alone, the OR of each branch's terms on that table, after the common terms are lifted;
+the original OR still decides each joined row. That is PostgreSQL's
+`extract_restriction_or_clauses` (src/backend/optimizer/util/orclauses.c). For q19 it adds
+`(p_brand = 'Brand#12' AND p_container IN (...) AND p_size BETWEEN 1 AND 5) OR (...) OR (...)`
+on part and `(l_quantity >= 1 AND l_quantity <= 11) OR (...) OR (...)` on lineitem. Limits:
+- WHERE terms only (an ON term's shares are not derived).
+- A term with a function, a subquery, a JSON or array operator, MATCH or REGEXP is not copied:
+  it could give another value, or an error, on a row the original never reads.
+- A share of one `column = value` a branch is left to the existing IN filter rule (q07's
+  nation names keep their IN filters and get nothing more).
+- No selectivity threshold. PostgreSQL drops a share that keeps more than 90% of the rows, a
+  figure its source calls arbitrary; the share is kept here, and the sample prices it.
+- The planner's estimate: the original OR, reading two tables, gives no constraint, so the
+  join's estimate does not count the shares twice. The share is a filter on its own table, so
+  the table's sample prices it with the table's other filters.
+
+Of TPC-H's 22 queries, only q19 and q07 have an OR across tables; q07's is left to the IN
+rule, so only q19's plan changes.
+
+## 2. q19 at SF1, before and after (r1258)
+
+`~/.cache/amphora-perf/tpch-t8/ab.sh` (T7's script, the query a variable, SF1 only). Arms:
+A = main 26e67dc5, B = b6c9ddaa (A with the shares merged). Both release `amphora-bench
+--planner` builds in the lane's one target dir (93 s and 78 s). Data: T5's loaded SF1,
+reflink-copied per arm. Calibration per RULES 5e: each arm opened once, then B's body written
+under A's key (both sha256 49f81859c0811707). 5 rounds alternated, each a process: the counted
+warm-up, then 3 timed runs. SQLite and DuckDB 5 runs each, right after. answers.py: 0 differ
+(every run of both arms, SQLite and DuckDB). Load 22 to 25 on 32 cores, CPU pressure (avg10)
+1.3% to 2.6%, I/O pressure 4.8% to 11.8%. My check run r1259 (4 cores) built beside it.
+
+| arm | timed runs | median ms | range ms | plan, every run |
+|---|---|---|---|---|
+| A (main) | 15 done | 738 | 631 to 949 | `SCAN lineitem / SEARCH part USING INTEGER PRIMARY KEY (rowid=?)` |
+| B (shares) | 15 done | 42 | 36 to 82 | `SCAN part / SEARCH lineitem USING INDEX lineitem_partkey_suppkey (l_partkey=?)` |
+| SQLite | 5 | 28 | 26 to 29 | |
+| DuckDB | 5 | 80 | 80 to 83 | |
+
+- Verdict: faster. 738 ms to 42 ms at the median, 17.6x; the ranges do not overlap (A's
+  fastest 631, B's slowest 82). Each B process's first timed run is the slow one (72 to 82 ms),
+  the next two 36 to 45 ms.
+- Against the bar: B is 1.9x faster than DuckDB and 1.5x slower than SQLite (28 ms), which
+  runs the same plan. 10x faster than SQLite would be 2.8 ms.
+- The limiter, inferred from the plan and not profiled: B reads all 200,000 parts and runs the
+  share on each (about 480 pass, from TPC-H's uniform distributions), then about 14,400 lines
+  by the index. 40 ms over 200,000 parts is 200 ns a part. With no index on part's columns,
+  any row store reads them all; beating SQLite by 10x here is the per-row cost of a scan and a
+  filter, not the plan.
+
+## 3. The test (t8_q19, optimizer/mod.rs)
+
+`t8_q19_each_tables_share_of_an_or_filters_it_before_the_join`: q19's shape at small scale
+(2,000 parts, 60,000 lines, an index on the lines' part key), the branches' brands all of the
+brands, so the IN rule's brand filter keeps every part; part's share keeps 239. It asserts the
+answer of the same OR inside a CASE (which no share is taken from; SQLite on the same data: 187
+rows, sum 80224), and fewer VM steps than reading `l` whole with its own filters, work any
+plan reading all of `l` does.
+
+Checks:
+- r1243 at 408fb177 (the change, the test's first data): clippy
+  (`-p amphora-engine --all-targets --locked -D warnings`) clean; `cargo test -p amphora-engine
+  --lib -- t8_q19 t6_q05 t7_q05 lift_common_subexpressions multi_index`: 18 passed, t8_q19
+  failed on its own data (brand and container both linear in the row number, so no part passed
+  a branch). Fixed in the test (15d52b98, 56f04d7f).
+- r1252 and r1259: clippy clean, 19 of 19. With the derivation off, the test passed too:
+  full-scan steps did not tell the plans apart (part read whole, then l sought for every part).
+  The bound is now VM steps against reading `l` whole (38d99784).
+- r1268 at 38d99784: clippy clean, 19 of 19. With the derivation off (`if false && ...`),
+  t8_q19 fails: 327,251 steps against 278,584 for reading `l` whole, plan
+  `SCAN l / SEARCH p USING INTEGER PRIMARY KEY (rowid=?)`, q19's SF1 plan before the change.
+- Not run this hour: the engine's whole lib suite and the sqllogictest suites.
+
+## 4. Units 2 and 3: not started
+
+Unit 2 (the versioned cost snapshot) stands where T7 left it (its section 4). Unit 3, the next
+worst of T6's table after q19: q03 (15.6x DuckDB's time), q06 (11.4x) and q01 (10.8x).

@@ -2296,6 +2296,15 @@ the places a segment is added (`crates/engine/storage/`):
 - `try_begin_read_tx`'s read marks (1528-1604) and `WalSnapshot` (196-211): a snapshot names its segments.
 - `find_frame` (5343-5422, 1471-1498, 1324-1340), `log_index.rs` `ReadIndex` (387-627, which assumes no reader at a
   restart, 23-25), and `frame_offset` and `read_frame` (6875-6879, 5426-5498): a frame is a segment's.
+- The pager's shared pages key a version by its generation and frame (`pager.rs` 4787-4790, `Version::Frame`), and
+  take the generation from the connection's position (`connection_wal_pos`), which is the current segment's. Frame n
+  of the closing segment and frame n of the current one would then share a key, and a read could be handed the other
+  segment's page. So `find_frame` answers with the segment its frame is in, and the key takes that segment's checkpoint
+  sequence (checked by lane B8, 2026-11-23). The page cache's forget rule needs no change (decision 18, `read_change`,
+  `wal.rs` 5114-5136): a switch changes the current segment's checkpoint sequence, so a connection whose last read was
+  in the other generation forgets every page, as after a restart today. A packed delta chains only from a version of
+  the same generation (`chains_from`, `wal.rs` 4430-4436, on both of the commit's paths), so none chains across a
+  switch.
 - The checkpoint (6977-7372, its safe frame 1701-1725) and the pager's phases (`pager.rs` 5906-6340): the closing
   segment is copied first, and is reset only after the file's sync. Today a Restart's restart comes before that
   sync, with the writer's guard held through it (7306-7317).
