@@ -3031,8 +3031,14 @@ from the staged ranges against a new view.
    An ask is a request, so it passes serving's own admission, and its answer is charged to the source's one memory
    budget, which serving shares. That budget has no event today: it re-reads its limit and resident memory at each
    check, and compaction waits by checking again at each step (lane H4's reading). So this decision adds one: a
-   released charge wakes the oldest parked waiter that fits, and an ask with no room parks there instead of being
-   refused. Pacing by the follower's window alone is not enough. The window bounds the path, not the source's
+   released charge, a withdrawn wait, or a reading that finds the limit changed runs the waiters' turn
+   (`memory::Budget::when_room`), and an ask with no room parks there instead of being refused. The turn is
+   head-of-queue reservation (the coordinator's decision on lane R2's question): in the order asked, each wait claims
+   the free room its use lacks, so the oldest gathers freed room until it fits and a later ask, however small, has
+   only the room past the needs before it. Nothing starves, and nothing waits behind more than those needs. A wait
+   keeps its place until it withdraws; one woken that finds the room gone asks again in its place. Room that frees
+   with no release (resident memory falling) is seen at the next release, which writes make constant whenever a
+   compaction is due; a limit the host changes is seen at the next reading of any use's room. Pacing by the follower's window alone is not enough. The window bounds the path, not the source's
    memory, so a source full from serving could only refuse, and the follower would have no event to ask again on
    but a poll.
 3. A page's version is the index of the entry that last wrote it, kept by apply beside the pages and durable with
@@ -3119,6 +3125,9 @@ so the A/B measures the view's lifetime and the direction alone.
   install. Tests: a follower catches up a database ten times the test's memory budget, with peak memory within one
   window (a counting allocator); killing the source and the follower mid-pull leaves the follower identical to the
   leader, its pages and answers matching.
+  Built so far (lane R3): the source itself, `replication/source.rs`, one `Source` with `Views::Held` (the push) and
+  `Views::PerAnswer` (the pull) on a reader connection of its own; not yet wired to an ask, the descriptor or the
+  staged install.
 - C, resume from the journal. Test: a crash after every synced answer resumes and ends identical.
 - D, any member serves. Test: the leader is cut off mid-pull and the follower finishes from another member.
 - E, page versions and the delta. Test: after random applies and crashes at every write, every page's version is at
