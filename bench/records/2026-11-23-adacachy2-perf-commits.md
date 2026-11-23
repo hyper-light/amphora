@@ -687,3 +687,179 @@ class, wired) would. Three like Macs could compare Amphora with rqlite only.
     # ~/.cache/commits-v6/am.sh SHA FILTER: cwd ~/.cache/amphora-perf/commits-remote, CARGO_TARGET_DIR=~/.cache/amphora-perf-target/commits
     cargo clippy -p amphora --all-targets --locked -- -D warnings
     cargo test -p amphora --lib --locked -- --test-threads=4 database::replicated::tests::v3_
+
+# Lane V7 (commits) on adacachy2: 0009's loss is the followers' writes, and A and B designed, not built (2026-11-23, 17:57Z to 18:52Z)
+
+Ada's goal is replicated commits about 10x faster than dqlite and rqlite, never refusing writes under load, at agentic
+Meta scale. V6 found every Amphora run at 128 writers refused, and change 0009 a probable loss at 32 replicated
+writers. This hour profiled that loss, moved the bench's ports out of the ephemeral range, and designed the two write
+paths Ada asked for. Neither path is built.
+
+## Losses first
+
+1. **Neither design is built, and no ladder ran (units 2 and 3).** The hour went to unit 1's profile and the port fix.
+   Both designs are sketched below with the data shape, the switch, where each change goes and the tests, so the
+   successor can build them. The architect skill's multi-model arena did not run, so this is one design pass.
+2. **0009 is worse than V6 measured.** At 32 writers spread over three members, 6 of 6 runs of `2431406e` (0009)
+   aborted with "the database advanced since preparation" (a write still refused at its 10 s deadline), against 1 of
+   6 for `924fbe5c` (before 0009), over r1312 and r1346. V6's r1238 still got 13.2 commits/s from it. Both arms sit
+   at the deadline's edge: before 0009 the slowest write took 6.7 to 10.4 s.
+3. **0009's mechanism is inferred, not traced.** The profile shows where the loss is (followers' writes, not the
+   leader's own path). The line in the code that makes followers lose more often is a guess, labelled below.
+4. **The profile ran at cpus=8, not 16.** kiln refused cpus=16 (14 of 32 cores idle). Three members and the driver
+   used about 3.2 cores. Load (1 min) 23 to 30, CPU pressure "some" avg10 1.2 to 7.6%, I/O "some" 3.0 to 8.4%.
+5. **The dqlite fix has one smoke run, not a ladder.** dqlite started in 2 of 2 phases on the new ports, after 0 of 5
+   rounds in r1238 on the old ones. One run per system and writer count measures nothing yet.
+
+## Unit 1: where 0009's 32-writer loss goes (r1312, r1346)
+
+`bench/thread_sample.py`, members on btrfs (`~/.cache`), 32 writers, class replicated, family a's flags, 8 s windows
+sampled from 3 s to 8 s, the two arms' release binaries from `~/.cache/amphora-perf-bin/commits/`, 3 rounds, order
+reversed each round. "spread" routes writer w to member w % 3 (the ladder's). "leader" sends every writer to the
+leader, the control: it takes the followers' write path out.
+
+| route | arm | commits/s, per round | median | p99 ms | slowest ms | aborted |
+|---|---|---|---|---|---|---|
+| leader | `924fbe5c` before | 23.25, 20.75, 45.75 | 23.25 | 1,688, 1,917, 1,622 | 1,706 to 1,954 | 0 of 3 |
+| leader | `2431406e` 0009 | 45.25, 23.25, 25.25 | 25.25 | 1,229, 1,589, 1,376 | 1,250 to 1,612 | 0 of 3 |
+| spread | `924fbe5c` before | 19.25, 18.75, 19.88 | 19.25 | 7,799, 9,175, 6,029 | 6,740 to 10,357 | 0 of 3 |
+| spread | `2431406e` 0009 | none | none | none | none | 3 of 3 |
+
+What the numbers say:
+
+- **The leader's own path didn't change.** Leader-routed, the two arms overlap (medians 23.25 and 25.25, both
+  bimodal near 23 and 45). 0009 didn't slow the leader's writes, and it didn't speed them up either.
+- **The loss is the followers' writes.** With two thirds of the writers at followers, 0009 turns a slow run into a
+  failing one. Every abort's last refusal is the stale base.
+- **No thread is busy with the work.** The owner's `amphora.replica` threads use 0.03 to 0.13 of a core on every member
+  in both arms. Each follower's `hyper-log-io` sits in `fdatasync` on its log (fd 16). Every member has one thread
+  named after the binary at 0.90 to 0.99 of a core, `R`, in both arms and both routes. That matches V's note on the
+  bench relay's spinning threads (inferred from the name and the note, not traced), and it doesn't differ by arm. The
+  time goes to waiting: on flushes, and on followers' writes that commit and are then refused at apply.
+- **Wasted entries.** Before 0009, spread, round 1: the leader committed 149 entries in the 5 s span (113 held, 36
+  classic) while the driver acknowledged 19.25 writes/s, about 96 in that span. So about a third of the entries
+  carried a write that was refused at apply and retried (inferred: a refused entry still commits).
+
+r1346 repeats spread routing at 16 writers, where 0009's runs finish, and at 32. "unacked" is the share of the
+leader's committed entries (held plus classic, over the span) that no caller got as an acknowledgement (driver's
+writes/s over the window). The two windows differ (5 s span, 8 s window), so the share is approximate:
+
+| writers | arm | acks/s, per round | median | leader's entries/s | unacked share | p99 ms | aborted |
+|---|---|---|---|---|---|---|---|
+| 16 | `924fbe5c` before | 17.0, 18.6, 16.6 | 17.0 | 24.0, 28.2, 24.8 | 0.29, 0.34, 0.33 | 3,539 to 4,981 | 0 of 3 |
+| 16 | `2431406e` 0009 | 11.6, 12.3, 11.1 | 11.6 | 19.6, 22.2, 18.0 | 0.41, 0.45, 0.38 | 6,423 to 8,913 | 0 of 3 |
+| 32 | `924fbe5c` before | 17.3, aborted, 13.0 | | 25.4, 25.0, 21.8 | 0.32, none, 0.40 | 6,750 to 8,651 | 1 of 3 |
+| 32 | `2431406e` 0009 | aborted 3 times | | 23.6, 22.0, 20.8 | none | none | 3 of 3 |
+
+At 16 writers 0009 is 32% slower (17.0 to 11.6 acks/s), and every round of it is below every round before it (exact
+rank-sum p = 0.1, the smallest 3 rounds a side can give). Both factors move: the leader commits fewer entries (24.8
+to 19.6/s), and more of them carry a write refused at apply (0.33 to 0.41).
+
+**Why 0009 hurts (a guess that fits both factors, not traced).** 0009 lets a ReadIndex barrier finish without the
+leader's log flush and one follower's. A barrier answers with the leader's commit index, not its last index. Before
+0009 the barrier waited a flush, and the leader's entries in flight mostly committed meanwhile. Now a follower's
+barrier returns while they are still in flight. The follower prepares on a base the leader's log has already passed,
+and its write is refused at apply. Each refusal costs a wasted entry and then a write slot, in which the leader appends
+nothing of its own. That would explain both factors: more refused entries, and fewer entries a second. The leader-routed
+control has no follower writes, so it has neither cost, and it doesn't move. Every write in this bench inserts into
+one table, so read sets can't rebase any of them (they share the rightmost leaf and page 1's size). And each member
+forwards one write at a time while about 10 of its writers queue behind it, so a write at the back of a follower's
+queue waits through about 10 rounds, plus a refusal and a slot for each stale base. Past 10 s it is refused for good.
+
+**Recommendation on 0009: revert it from main, with this evidence.** No gain was measured anywhere on this disk: at 1
+writer 14.0 against 14.0 commits/s (r1238), leader-routed at 32 writers 25.25 against 23.25 (r1312, ranges overlap).
+It has a functional loss: 1 of 6 to 6 of 6 runs aborted at 32 spread writers (r1312, r1346), and 17.0 to 11.6
+acknowledged writes/s at 16 (r1346), on top of r1238's -18% at 32. Under
+design B no follower prepares, so the way 0009 hurts goes away. 0009 can come back after B, with its own A/B. The
+revert drops recorded change 0009 (`scripts/vendor.py`, then `check hyper-raft`) and the two `v3_` tests that rest
+on it. The term-0 guard (V6) lives in 0009 and goes with it.
+
+## The bench's ports below the ephemeral range (c8ff608f)
+
+rqlite listened on 54200 to 54212, libsql on 54220 to 54230, dqlite on 54240 to 54252, litefs and its Consul on 54260
+to 54283, and the ladder's Amphora members on 54290 to 54292. All of them sit inside adacachy2's
+`ip_local_port_range` (32768 to 60999), where an outbound connection's local port can take a node's address. Every
+default moves to 29200 to 29292, below Linux's range and macOS's and Windows' (49152 to 65535). Lane S4's
+`families.sh` had already moved Amphora's members to 29290. `bench/servers/repl/lib.sh` states the rule.
+
+Smoke run r1337 (one run each, the 2431406e binary, family a's flags, 5 s windows): dqlite 209.2 commits/s at 1 writer
+(p50 4.6 ms, p99 8.0 ms) and 170.0 at 32 (p50 130 ms, p99 860 ms). rqlite 26.2 at 1 (p50 37.4 ms) and 280.0 at 32
+(p50 90.1 ms). One run each, so these show dqlite starts. They are not rates to compare.
+
+## Unit 2, designed for the successor: A (prepare at the follower) and B (leader-executed), behind one switch
+
+The shared core comes first, because both designs need it: **the leader's batch.** `Actor::pending: Option<Pending>`
+holds one write today. It becomes one entry that carries several writes:
+
+    struct Pending { context, term, leader, namespace, phase, writes: Vec<Write> }   // the entry's own fields
+    struct Write { until: Instant, author: Author, response: Option<Response<Answered>>, value: Option<Answer>, _reservation: Reservation }
+
+In `prepare_barrier` (replicated.rs about 5224), once the head write passes its barrier, take from `waiting` every
+`Input::Submit` of the same namespace with an `Operation::Call` whose deadline hasn't passed and whose claim passes.
+Keep taking while the entry stays within `Actor::entry_room` (about 5107), the bound the entry already obeys. Run
+each one in the one `prepare_db` under `SAVEPOINT w<n>`: `RELEASE` on success, `ROLLBACK TO` and `RELEASE` on its own
+error, so a failing write refuses only itself. The batch is what queued during the last entry's flush. There is no
+timer and no count of its own, and one writer stays one write an entry. On apply (`answer_committed`, about 4794, and
+the apply answer) each write gets its own value and the entry's token. No answer leaves before its entry applies.
+
+**The switch** is one field, `FollowerWrites { Prepare, Forward }`, on the member's replica configuration, defaulting
+to `Prepare` (today). It is per member, not per group. Every leader serves both forms, so a group can run mixed while
+it upgrades, as long as a member asks for `Forward` only of a leader whose version reads it. It goes away, with the
+losing path, once the ladder decides.
+
+**A, `Prepare`: today's path, plus batching on both sides.** A follower still crosses its barrier, prepares at its
+log tail and forwards the pages, and the leader still validates by exact base or read set. Same-page writes like the
+bench's can't join the leader's batch, because their pages were computed on an older base. So under A "a
+follower's write joins the leader's batch" means the follower batches its own queue the same way, into one forwarded
+preparation, prepared in its write slot at its log tail (the slot's rule makes that base current). A follower can't
+retry a refused write itself: preparation consumes the `FnOnce` closure ("SQL session already executed"). So for A
+to pass test 5, a follower with writes queued asks for its slot before its first try, not after a refusal as today.
+A cycle then carries every queued write in about three entries: one for each follower's slot, plus the leader's own
+batch in its turn.
+
+**B, `Forward`: the leader executes.** A follower doesn't prepare and doesn't cross a barrier. It forwards the request.
+The leader runs it in its single writer's order as one more write in its batch, so no request ever has a stale base.
+Two facts shape it:
+
+- **A closure can't cross the wire.** `Operation::Call` holds `Box<dyn FnOnce(&mut Db)>`. B needs a request stated as
+  data: `Request::Statements(Vec<(String, Vec<Value>)>)`, through a new `Database::execute(until, statements)`. A
+  named procedure that every member registers, `Request::Procedure { name, args }`, could follow later. A
+  `call` closure at a follower keeps A's path under either switch. The bench member's `exec` op already holds its
+  statements as data.
+- **Peer bytes are hyper-raft `Message`s** (`Actor::step`, about 4149: `Message::decode`). There is no Amphora envelope
+  to add a variant to. So the request rides a forwarded proposal, whose entry data is a new appended `Request`
+  form. The leader's `step_forward` (about 4254), which already intercepts forwards for the slot, runs it as a local
+  write instead of appending it. The answer rides the log: the leader's batch entry carries, as a postcard trailer
+  after its `Prepared` as the read sets do, each forwarded write's context and outcome (`Ok(value)` or its refusal).
+  A follower answers its caller when it applies that entry. If the lead moves before then, it answers
+  `UnknownOutcome`, as a forward that meets an election does today. At its own deadline it answers `Timeout`. The
+  leader gets the caller's remaining time, not an `Instant`, since clocks differ across machines.
+
+What each costs, before the data (inferred from the code, not measured): A spends a ReadIndex round, the follower's
+preparation and a forward a write, and a slot whenever the leader's log moved. B spends a forward and the leader's
+CPU for every write, since the leader prepares them all. V measured that at 1.27 ms of the leader's busiest thread
+for each entry, at one write an entry.
+
+**Tests, behaviour only, each run under both switches:**
+1. two writes queued behind a barrier commit as one entry, and each gets its own answer;
+2. one of them failing refuses only itself, and the other applies;
+3. a batch spanning a leader change answers each of its writes `UnknownOutcome` or requeues it, as one write does today;
+4. a deadline passing mid-batch times out only that write;
+5. at 128 writers spread over three members, every write is answered before its deadline, none is refused for a
+   stale base, and the run ends (no livelock). Today that run fails (V6's r1238 and this hour's 32-writer spread runs).
+
+## Unit 3: the ladder (not run)
+
+Family a (`families.sh` fam_a on adacachy2): 1, 32 and 128 writers, persisted and replicated, A against B against
+main, with rqlite and dqlite on the new ports. 5 rounds with the order reversed each round, load and pressure beside
+each, needs cpus=16. Report p50, p99, p99.9 and commits/s. Keep the winner and delete the other path with its switch.
+
+## Commands
+
+    # on adacachy2, kiln run on 00aad8daff2fa3c9daa65d53c425d450, needs linux/amd64,cpus=8,mem=8g, sync false
+    B=~/.cache/amphora-perf-bin/commits    # 924fbe5c before 0009, 2431406e with it
+    python3 -I bench/thread_sample.py $B/<arm> 29490 DIR 32 spread|leader 8 3 5 replicated   # r1312, 3 rounds, order reversed
+    python3 -I bench/thread_sample.py $B/<arm> 29490 DIR 16|32 spread 8 3 5 replicated       # r1346
+    . ~/.cache/amphora-perf/bench-s2/env.sh; cd ~/.cache/amphora-perf/commits-remote   # at c8ff608f
+    $B/2431406e --repl commit --system dqlite|rqlite --scripts bench/servers/repl --record R --batch 1 --text-bytes 600 \
+      --deadline-s 10 --relay-records 128 --spanning 2 --warmup-s 1 --seconds 5 --writers 1|32   # r1337
