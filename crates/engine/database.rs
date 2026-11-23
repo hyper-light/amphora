@@ -2462,13 +2462,24 @@ impl Database {
                         }
                     }
 
+                    // Decision 45: the log's second segment, `-wal2`, recovered beside the first.
+                    #[cfg(host_shared_wal)]
+                    let second_segment = WalFileShared::open_second_segment_if_exists(
+                        &self.io,
+                        &storage::wal::second_segment_path(&self.wal_path),
+                        self.open_flags,
+                    )?;
+                    #[cfg(not(host_shared_wal))]
+                    let second_segment = WalFileShared::new_noop();
+                    let shared_log = SharedLog::recover(shared_wal, second_segment)?;
+
                     let open_mv_store = *open_mv_store;
                     let HeaderValidationState::OpenWal { mut pager, .. } = std::mem::take(st)
                     else {
                         unreachable!("state is OpenWal");
                     };
 
-                    self.shared_wal = SharedLog::new(shared_wal);
+                    self.shared_wal = shared_log;
                     let last_checksum_and_max_frame = self
                         .shared_wal
                         .current()
