@@ -15673,9 +15673,10 @@ mod tests {
     /// U15/CP-T1.8 under a nemesis (replication.md, "The owner's time"): the seeded group with
     /// the lead moved while the delta's call is in flight, while a replica reads the seed's image,
     /// and while the reopened group's reads are. The seed's own transfer to its source is its
-    /// first election. Whatever the election: the delta's answer is Ok or UnknownOutcome, every
-    /// replica reads one value for it (the new one if it answered Ok), and every replica keeps
-    /// the seed's original image.
+    /// first election. Whatever the election: the delta's answer is Ok, UnknownOutcome, or
+    /// NotLeader when the lead moved while its call ran on the session worker and nothing was
+    /// proposed (CP-T1.13); every replica reads one value for it (the new one if it answered Ok,
+    /// the old one if NotLeader), and every replica keeps the seed's original image.
     #[test]
     fn seed_and_delta_hold_through_an_election_at_each_step() {
         let dir = tempfile::tempdir().unwrap();
@@ -15719,7 +15720,10 @@ mod tests {
         let answered = driven.settle(&mut pump, &delta);
         assert!(
             matches!(answered, Ok(ref v) if v.is_empty())
-                || matches!(answered, Err(Refusal::UnknownOutcome)),
+                || matches!(
+                    answered,
+                    Err(Refusal::UnknownOutcome | Refusal::NotLeader { .. })
+                ),
             "{answered:?}"
         );
         let values: Vec<_> = clients
@@ -15732,6 +15736,9 @@ mod tests {
         );
         if answered.is_ok() {
             assert_eq!(values.first().unwrap(), &vec![3]);
+        }
+        if matches!(answered, Err(Refusal::NotLeader { .. })) {
+            assert_eq!(values.first().unwrap(), &vec![2], "a NotLeader delta wrote nothing");
         }
         // The lead moves again while a replica reads the seed's original image.
         let image = submit(clients.get(1).unwrap(), driven.until(), unchanged);
