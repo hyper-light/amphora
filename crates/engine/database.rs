@@ -899,16 +899,17 @@ impl Database {
             let costs = learned_costs::LearnedCosts::new();
             // QT.5: the row's cost is weighed in page reads; before the database reads a page
             // of its own, one scratch page read beside it gives the first time. A database opened
-            // read-only writes nothing beside it; its open reads its own file.
-            if !flags.contains(OpenFlags::ReadOnly) {
-                if let Some((reads, nanos)) = learned_costs::time_page_read(
-                    &path,
-                    io,
-                    BufferPool::DEFAULT_PAGE_SIZE,
-                    costs.page_read_epoch(),
-                ) {
-                    costs.anchor_page_read(reads, nanos);
-                }
+            // read-only writes nothing beside it; its open reads its own file. AUDIT §7.1
+            // (perf/coldstart): a page read this process already timed on the same IO backend and
+            // device stands for this one, so only the first open on a device writes the scratch.
+            if let Some((reads, nanos)) = learned_costs::page_read_anchor(
+                &path,
+                io,
+                BufferPool::DEFAULT_PAGE_SIZE,
+                costs.page_read_epoch(),
+                !flags.contains(OpenFlags::ReadOnly),
+            ) {
+                costs.anchor_page_read(reads, nanos);
             }
             Arc::new(costs)
         };
