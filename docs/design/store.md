@@ -2222,8 +2222,11 @@ without `-wal2`'s commits. Where the open rewrites a rollback file's 1 to 2 toda
 and the rewrite changes no log. Any other value stays `Corrupt("Invalid read_version: …")` at open (2184-2190).
 
 **Crash recovery across a switch.** Recovery reads both segments' headers. A segment whose header checksum fails is
-empty. Of two valid segments, the one with the higher checkpoint sequence is current and the other closing. Each
-segment's frames are recovered as one log's are today (salts and checksums, up to the last valid commit frame), the
+empty. Of two valid segments, the one whose checkpoint sequence is one past the other's is current and the other
+closing: a switch writes the other's sequence plus one, and the sequence is a u32 that wraps (`wal.rs`
+`restart_wal_header` handles its wrap), so "the higher" is wrong at the wrap. A pair neither of which follows the
+other is no switch's, and is refused as corrupt (`storage::log_segments`, `Segments::recover`, on branch
+`perf/pagepath-d45`). Each segment's frames are recovered as one log's are today (salts and checksums, up to the last valid commit frame), the
 closing one's first. A recovered database has copied nothing of either segment, as one log's recovery does today, so
 the checkpointer copies the closing segment and then the current one. A crash at each step of a switch leaves:
 

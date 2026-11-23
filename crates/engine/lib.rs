@@ -143,7 +143,7 @@ pub use cdc::{
 pub use connection::SubqueryUnnestingMode;
 pub use connection::{
     resolve_ext_path, BackgroundSearch, BushyLeftJoinProbes, CarriedJoinOrders, Connection,
-    IsValueEstimate, JoinMethods, JoinSearchBudget, OuterJoinProbe, PrepareOptions, Row,
+    IsValueEstimate, JoinMethods, JoinSearchBudget, OuterJoinProbe, PrepareOptions, RealSums, Row,
     SearchedLinks, StarFilterOrder, StarFilters, StepResult, SymbolTable,
 };
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
