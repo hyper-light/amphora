@@ -1690,5 +1690,5 @@ tests = [
   { id = "T-PG.3.1", text = "amphora-pg-oracle t_pg_3_1_frames_read_back_as_verdicts, t_pg_3_1_malformed_frames_are_refused" },
   { id = "T-PG.3.2", text = "amphora-pg-oracle split::tests::t_pg_3_2_* — pass when semicolons in quotes, parentheses and routine bodies, backslash commands and COPY data split as psql splits them, and hostile scripts end" },
   { id = "T-PG.3.3", text = "amphora-pg-oracle tests/oracle.rs t_pg_3_3_refuses_what_a_19_0_server_refuses_where_it_refuses_it (on demand) — SELECT $1abc is 42601 at 8, NOTIFY ch, $1 is 42601 at 12, as 19.0 answers" },
-  { id = "T-PG.3.4", text = "amphora-pg-oracle tests/oracle.rs t_pg_3_4_every_regression_statement_gets_a_verdict (on demand)" },
+  { id = "T-PG.3.4", text = "amphora-pg-oracle tests/oracle.rs t_pg_3_4_every_regression_statement_gets_a_verdict (on demand), over vendor/postgres/src/test/regress/sql" },
 ]

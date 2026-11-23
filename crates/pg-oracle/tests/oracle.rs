@@ -1,7 +1,7 @@
-//! The oracle against PostgreSQL 19.0 itself (section 11's unit 3). These need the built oracle and
-//! a `REL_19_0` checkout, so they run on demand: `AMPHORA_PG_ORACLE=<work dir>/pg-oracle
-//! AMPHORA_PG_SOURCE=<postgres checkout> cargo test -p amphora-pg-oracle -- --ignored --nocapture`,
-//! after scripts/postgres-oracle-extract.sh.
+//! The oracle against PostgreSQL 19.0 itself (section 11's unit 3), on 19's regression SQL as
+//! vendored (vendor/postgres). These need the built oracle, so they run on demand, after
+//! scripts/postgres-oracle-extract.sh: `AMPHORA_PG_ORACLE=<work dir>/pg-oracle cargo test -p
+//! amphora-pg-oracle --test oracle -- --ignored --nocapture`.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::arithmetic_side_effects, clippy::disallowed_macros)]
 
 use std::collections::BTreeMap;
@@ -34,9 +34,9 @@ fn t_pg_3_3_refuses_what_a_19_0_server_refuses_where_it_refuses_it() {
 
 /// T-PG.3.4: every statement psql sends from 19's regression SQL gets the oracle's verdict.
 #[test]
-#[ignore = "needs AMPHORA_PG_ORACLE and AMPHORA_PG_SOURCE (a REL_19_0 checkout)"]
+#[ignore = "needs AMPHORA_PG_ORACLE, built by scripts/postgres-oracle-extract.sh"]
 fn t_pg_3_4_every_regression_statement_gets_a_verdict() {
-    let dir = env("AMPHORA_PG_SOURCE").join("src/test/regress/sql");
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vendor/postgres/src/test/regress/sql");
     let mut files: Vec<PathBuf> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).filter(|p| p.extension().is_some_and(|x| x == "sql")).collect();
     files.sort();
     let mut oracle = Oracle::spawn(&env("AMPHORA_PG_ORACLE")).unwrap();
