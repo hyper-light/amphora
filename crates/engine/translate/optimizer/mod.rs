@@ -3973,6 +3973,23 @@ pub(crate) mod bushy_test_hook {
     }
 
     thread_local! {
+        /// With `PIN`: the FROM positions of the tables that probe a hash join, one bit each; with
+        /// none, the last table alone.
+        pub(crate) static PIN_HASH_JOINS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Whether the pinned plan's table at `position`, of `tables`, probes a hash join.
+    pub(crate) fn hash_join_pinned_at(position: usize, tables: usize) -> bool {
+        match PIN_HASH_JOINS.with(Cell::get) {
+            0 => tables.checked_sub(1) == Some(position),
+            positions => u32::try_from(position)
+                .ok()
+                .and_then(|shift| positions.checked_shr(shift))
+                .is_some_and(|bits| bits & 1 == 1),
+        }
+    }
+
+    thread_local! {
         /// How many plans `split_build_side` made bushy.
         pub(crate) static APPLIED: Cell<usize> = const { Cell::new(0) };
     }
@@ -4046,7 +4063,7 @@ pub(crate) mod bushy_test_hook {
             clippy::indexing_slicing,
             clippy::arithmetic_side_effects
         )]
-        use super::{APPLIED, PIN, SPLIT};
+        use super::{APPLIED, PIN, PIN_HASH_JOINS, SPLIT};
         use crate::io::MemoryIO;
         use crate::sync::Arc;
         use crate::{ConnectOpts, Database, JoinMethods, SqliteDialect};
@@ -4167,6 +4184,69 @@ pub(crate) mod bushy_test_hook {
                 }
             }
             assert_eq!(compared, 16);
+        }
+
+        /// PL.8 (TPC-H q05's shape, lane T4): a hand-built plan with two materialized build
+        /// inputs, a left-deep one (`c` and `o`, probed from `l`) and a bushy run (`s` and `n`,
+        /// probed from `r`), and a WHERE term across the two, `c.nid = s.nid`. Each input's
+        /// subplan runs only the terms its own tables hold, so the main plan runs that one.
+        /// Expect: both inputs materialized, the run built (`APPLIED`), and the answer the plan
+        /// of nested loops gives. Lane T3: consumed by the two inputs together, the term ran
+        /// nowhere and q05 at SF0.1 answered 23x high.
+        #[test]
+        fn t_pl_8_2_a_term_across_two_build_inputs_runs_in_the_main_plan() {
+            let io = Arc::new(MemoryIO::new());
+            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            for sql in [
+                "CREATE TABLE c(id INTEGER PRIMARY KEY, nid INT)",
+                "CREATE TABLE o(id INTEGER PRIMARY KEY, cid INT)",
+                "CREATE TABLE l(id INTEGER PRIMARY KEY, oid INT, sk INT, price INT)",
+                "CREATE TABLE s(id INTEGER PRIMARY KEY, k INT, nid INT)",
+                "CREATE TABLE n(id INTEGER PRIMARY KEY, rid INT, name TEXT)",
+                "CREATE TABLE r(id INTEGER PRIMARY KEY, name TEXT)",
+                "INSERT INTO r VALUES (1, 'ASIA'), (2, 'EUROPE'), (3, 'AMERICA')",
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 9) \
+                 INSERT INTO n SELECT i, i % 3 + 1, 'n' || i FROM x",
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 30) \
+                 INSERT INTO c SELECT i, i % 9 + 1 FROM x",
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 120) \
+                 INSERT INTO o SELECT i, i % 30 + 1 FROM x",
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 600) \
+                 INSERT INTO l SELECT i, i % 120 + 1, i % 20, i FROM x",
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 20) \
+                 INSERT INTO s SELECT i, i % 20, i % 9 + 1 FROM x",
+                "ANALYZE",
+            ] {
+                conn.execute(sql).unwrap();
+            }
+            // `+ 0` keeps `s` from a seek by a table outside its run.
+            let sql = "SELECT n.name, count(*), sum(l.price) FROM c, o, l, s, n, r \
+                       WHERE o.cid = c.id AND l.oid = o.id AND l.sk = s.k + 0 \
+                       AND c.nid = s.nid + 0 AND n.id = s.nid AND r.id = n.rid \
+                       AND r.name = 'ASIA' GROUP BY n.name";
+            conn.set_join_methods(JoinMethods::NestedLoopsOnly);
+            let nested_loops = rows(&conn, sql);
+            conn.set_join_methods(JoinMethods::ByCost);
+            // Loops in the FROM order, hash joins at `l` and `r`, and the run `s n` built for `r`.
+            PIN.with(|pin| pin.set(true));
+            PIN_HASH_JOINS.with(|positions| positions.set((1 << 2) | (1 << 5)));
+            SPLIT.with(|split| split.set(Some(3)));
+            APPLIED.with(|applied| applied.set(0));
+            let bushy = rows(&conn, sql);
+            let made_bushy = APPLIED.with(Cell::get);
+            let plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+            SPLIT.with(|split| split.set(None));
+            PIN_HASH_JOINS.with(|positions| positions.set(0));
+            PIN.with(|pin| pin.set(false));
+            let inputs = plan
+                .iter()
+                .filter(|line| line.contains("MATERIALIZE"))
+                .count();
+            assert!(made_bushy > 0, "no plan was made bushy: {plan:?}");
+            assert_eq!(inputs, 2, "two materialized build inputs: {plan:?}");
+            assert!(!nested_loops.is_empty());
+            assert_eq!(bushy, nested_loops, "{plan:?}");
         }
 
         /// PL.8 (T-PL.8.13, lane pl8-19): the hand-built bushy tree `(a ((b l c) p))` whose run

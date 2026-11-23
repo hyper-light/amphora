@@ -1051,14 +1051,17 @@ fn join_lhs_and_rhs<'a>(
             // build input is materialized from the join prefix.
             // Amphora: one method only when the connection asks (QT.5);
             // the structural conditions below hold whichever it asks for.
-            // PL.8's test hook pins the plan: loops in the FROM order and one hash join, at the last
-            // table (`bushy_test_hook::PIN`).
+            // PL.8's test hook pins the plan: loops in the FROM order and hash joins at the tables
+            // it names, the last one unless it names others (`bushy_test_hook::PIN`).
             #[cfg(test)]
             let pinned = super::bushy_test_hook::PIN.with(std::cell::Cell::get);
             #[cfg(not(test))]
             let pinned = false;
-            let pinned_hash_here =
-                pinned && joined_tables.len().checked_sub(1) == Some(rhs_table_idx);
+            #[cfg(test)]
+            let pinned_hash_here = pinned
+                && super::bushy_test_hook::hash_join_pinned_at(rhs_table_idx, joined_tables.len());
+            #[cfg(not(test))]
+            let pinned_hash_here = false;
             let preferred_over_seek = if pinned {
                 pinned_hash_here
             } else {
