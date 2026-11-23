@@ -52,6 +52,17 @@ pub struct ReadSpan {
 }
 
 impl ReadSpan {
+    /// The segment current when the read began: its read marks guard the read.
+    pub const fn current(&self) -> SegmentId {
+        self.current
+    }
+
+    /// The closing segment the read counts on, if any: its uncopied frames are in no file, so
+    /// such a read never takes read mark 0 (decision 45's rule 2).
+    pub const fn closing(&self) -> Option<SegmentId> {
+        self.closing
+    }
+
     /// Where the read looks a page up, in order, before the file.
     pub fn lookup_order(&self) -> impl Iterator<Item = SegmentId> {
         iter::once(self.current).chain(self.closing)
