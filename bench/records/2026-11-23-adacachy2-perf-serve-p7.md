@@ -58,7 +58,7 @@ mergeable. Each failure and what it shows:
 
 `run.sh eb0d3741 test --lib serve::`: 11 of 11 ok. `run.sh eb0d3741 testargs --test serve -- --skip p5_probe`:
 9 passed, 2 failed: both `cp_t1_13` tests, P5's 16 MiB one included, which passed at r1060 (load average 70).
-At load average 90 the 16 MiB write fails as the 20 MiB one does: after its proposal.
+That the 16 MiB write was lost after its proposal too, as the 20 MiB one was, is inferred, not shown: no probe ran beside it.
 
 `run.sh eb0d3741 clippy` (r1101): exit 0.
 
