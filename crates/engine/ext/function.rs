@@ -103,36 +103,80 @@ impl ExtFunc {
                     .collect::<Result<Vec<_>, _>>()?;
                 crate::native_ext::step_aggregate(&mut registers[acc_reg], function.as_ref(), &args)
             }
-            Self::Aggregate { .. } => {
-                let aggregate = self.c_aggregate(&mut registers[acc_reg]).clone();
-                let args: Vec<_> = registers[start_reg..start_reg + aggregate.argc]
-                    .iter()
-                    .map(|arg| arg.get_value().to_ffi())
-                    .collect();
-                let argv = if args.is_empty() {
-                    std::ptr::null()
-                } else {
-                    args.as_ptr()
-                };
-                let result = unsafe {
-                    (aggregate.step_fn)(
-                        aggregate.context,
-                        aggregate.state,
-                        aggregate.argc as i32,
-                        argv,
-                    )
-                };
-                if let Err(err) = finish_call(result, aggregate.value_destructor, args) {
-                    if let Some(destructor) = aggregate.aggregate_destructor {
-                        unsafe { destructor(aggregate.state as usize) };
-                    }
-                    registers[acc_reg].set_null();
-                    return Err(err.into());
-                }
+            Self::Aggregate { step, .. } => {
+                self.call_with_row(registers, acc_reg, start_reg, *step)?;
                 Ok(IOResult::Done(()))
             }
             _ => unreachable!("scalar function called in aggregate context"),
         }
+    }
+
+    /// xInverse: takes back a row an earlier step added, for a window frame whose start moved.
+    pub(crate) fn inverse_aggregate(
+        &self,
+        registers: &mut [Register],
+        acc_reg: usize,
+        start_reg: usize,
+    ) -> Result<()> {
+        let Self::Aggregate {
+            window: Some(window),
+            ..
+        } = self
+        else {
+            return Err(crate::LimboError::InternalError(
+                "AggInverse on an extension aggregate registered without xInverse".into(),
+            ));
+        };
+        self.call_with_row(registers, acc_reg, start_reg, window.inverse)
+    }
+
+    /// Calls `f` (step or inverse) on the accumulator with the row's arguments. An error fails
+    /// the statement at this row; the accumulator is released.
+    fn call_with_row(
+        &self,
+        registers: &mut [Register],
+        acc_reg: usize,
+        start_reg: usize,
+        f: amphora_engine_ext::StepFunction,
+    ) -> Result<()> {
+        let missing = || {
+            crate::LimboError::InternalError(format!(
+                "extension aggregate accumulator {acc_reg} past the registers"
+            ))
+        };
+        let (context, state, argc, value_destructor) = {
+            let aggregate = self.c_aggregate(registers.get_mut(acc_reg).ok_or_else(missing)?);
+            (
+                aggregate.context,
+                aggregate.state,
+                aggregate.argc,
+                aggregate.value_destructor,
+            )
+        };
+        let args: Vec<_> = registers
+            .get(start_reg..start_reg.saturating_add(argc))
+            .ok_or_else(|| {
+                crate::LimboError::InternalError(format!(
+                    "extension aggregate arguments {start_reg}..+{argc} past the registers"
+                ))
+            })?
+            .iter()
+            .map(|arg| arg.get_value().to_ffi())
+            .collect();
+        let argv = if args.is_empty() {
+            std::ptr::null()
+        } else {
+            args.as_ptr()
+        };
+        let argc = i32::try_from(argc).map_err(|_| {
+            crate::LimboError::InternalError(format!("{argc} extension aggregate arguments"))
+        })?;
+        let result = unsafe { f(context, state, argc, argv) };
+        if let Err(err) = finish_call(result, value_destructor, args) {
+            registers.get_mut(acc_reg).ok_or_else(missing)?.set_null();
+            return Err(err);
+        }
+        Ok(())
     }
 
     pub(crate) fn finalize_aggregate(&self, accumulator: &mut Register) -> IOResultOr<Value> {
@@ -141,17 +185,40 @@ impl ExtFunc {
                 crate::native_ext::finalize_aggregate(accumulator, function.as_ref())
             }
             Self::Aggregate { .. } => {
-                let aggregate = self.c_aggregate(accumulator).clone();
-                accumulator.set_null();
-                let result = unsafe { (aggregate.finalize_fn)(aggregate.context, aggregate.state) };
-                let value = finish_call(result, aggregate.value_destructor, Vec::new());
-                if let Some(destructor) = aggregate.aggregate_destructor {
-                    unsafe { destructor(aggregate.state as usize) };
-                }
-                value.map(IOResult::Done).map_err(Into::into)
+                self.c_aggregate(accumulator);
+                let Register::Aggregate(AggContext::External(mut aggregate)) =
+                    std::mem::replace(accumulator, Register::Value(Value::Null))
+                else {
+                    return Err(crate::LimboError::InternalError(
+                        "extension aggregate finalized without its accumulator".into(),
+                    )
+                    .into());
+                };
+                let Some(result) = aggregate.finish() else {
+                    return Ok(IOResult::Done(Value::Null));
+                };
+                finish_call(result, aggregate.value_destructor, Vec::new())
+                    .map(IOResult::Done)
+                    .map_err(Into::into)
             }
             _ => unreachable!("scalar function called in aggregate context"),
         }
+    }
+
+    /// xValue: the aggregate's result so far, leaving the accumulator to go on.
+    pub(crate) fn value_aggregate(&self, accumulator: &mut Register) -> Result<Value> {
+        let Self::Aggregate {
+            window: Some(window),
+            ..
+        } = self
+        else {
+            return Err(crate::LimboError::InternalError(
+                "AggValue on an extension aggregate registered without xValue".into(),
+            ));
+        };
+        let aggregate = self.c_aggregate(accumulator);
+        let result = unsafe { (window.value)(aggregate.context, aggregate.state) };
+        finish_call(result, aggregate.value_destructor, Vec::new())
     }
 
     fn c_aggregate<'a>(&self, accumulator: &'a mut Register) -> &'a ExternalAggState {
