@@ -47,6 +47,7 @@ fn drain(node: &mut RawNode<Memory>) -> Vec<Message> {
             let hard = *hard;
             node.store_mut().hard_state = hard;
         }
+        messages.extend(ready.take_held_messages());
         messages.extend(ready.take_messages());
         messages.extend(ready.take_persisted_messages());
         let mut applied = ready.committed_entries().last().map(|entry| entry.index);
@@ -655,6 +656,34 @@ fn a_read_with_no_leader_to_ask_is_refused() {
         node.read_index(b"nowhere".to_vec()),
         Err(Error::ReadDropped)
     ));
+}
+
+/// A follower that knows its leader passes on its own reads and drops a peer's: passed on, the
+/// peer's read would reach the leader from this member under the peer's name.
+#[test]
+fn a_follower_passes_on_its_own_read_and_drops_a_peers() {
+    let mut node = follower();
+    node.step(answer(MessageType::MsgHeartbeat, 1, 2, 1)).unwrap();
+    drain(&mut node);
+    let mut relayed = answer(MessageType::MsgReadIndex, 3, 2, 0);
+    relayed.entries = vec![Entry {
+        data: b"peer".to_vec(),
+        ..Entry::default()
+    }];
+    node.step(relayed).unwrap();
+    assert!(drain(&mut node).is_empty());
+    node.read_index(b"own".to_vec()).unwrap();
+    let sent: Vec<(u64, u64, Vec<u8>)> = drain(&mut node)
+        .into_iter()
+        .map(|message| {
+            (
+                message.from,
+                message.to,
+                message.entries.first().map(|entry| entry.data.clone()).unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(sent, vec![(2, 1, b"own".to_vec())]);
 }
 
 /// A read, or a read's answer, without its one context contradicts what a read is, and is
@@ -1459,6 +1488,49 @@ fn a_followers_answer_waits_for_the_write_that_holds_what_it_says() {
     let light = node.on_persist(2).unwrap();
     assert_eq!(light.messages().len(), 1);
     assert_eq!(light.messages()[0].index, 5);
+}
+
+/// Under `Config::answer_beats_now`, a follower whose term and vote are durable answers a heartbeat
+/// at once, whatever its writes out, and names only what its disk holds: the durable end of its
+/// log, not its last index.
+#[test]
+fn a_followers_heartbeat_answer_names_only_what_its_disk_holds() {
+    let mut node = follower_with(Config {
+        answer_beats_now: true,
+        ..with_depth(2, 2)
+    });
+    let mut taken = Vec::new();
+    for index in [4, 5] {
+        let mut append = answer(MessageType::MsgAppend, 1, 2, 1);
+        append.index = index - 1;
+        append.log_term = 1;
+        append.commit = 2;
+        append.entries = vec![entry(index, 1)];
+        node.step(append).unwrap();
+        let mut ready = node.ready().unwrap();
+        ready.take_persisted_messages();
+        taken.push(ready.entries().to_vec());
+        node.advance_issued(ready).unwrap();
+    }
+    // The log goes to 5 and the disk holds 3: the answer names 3, and leaves at once.
+    let mut beat = answer(MessageType::MsgHeartbeat, 1, 2, 1);
+    beat.commit = 2;
+    node.step(beat.clone()).unwrap();
+    let said = node.messages_now();
+    assert_eq!(said.len(), 1);
+    assert_eq!((said[0].index, said[0].log_term), (3, 1));
+    assert!(node.raft.messages().is_empty());
+    node.store_mut().append(&taken[0]);
+    let light = node.on_persist(1).unwrap();
+    assert!(light.messages().is_empty());
+    node.store_mut().append(&taken[1]);
+    let light = node.on_persist(2).unwrap();
+    assert!(light.messages().is_empty());
+    // Both writes durable: the next answer names 5.
+    node.step(beat).unwrap();
+    let said = node.messages_now();
+    assert_eq!(said.len(), 1);
+    assert_eq!((said[0].index, said[0].log_term), (5, 1));
 }
 
 /// Election Safety across a crash: a candidate counts its vote for itself only once the hard state
@@ -2673,6 +2745,7 @@ fn drain_applying(node: &mut RawNode<Memory>) -> Vec<Message> {
             let hard = *hard;
             node.store_mut().hard_state = hard;
         }
+        messages.extend(ready.take_held_messages());
         messages.extend(ready.take_messages());
         messages.extend(ready.take_persisted_messages());
         let mut committed = ready.take_committed_entries();

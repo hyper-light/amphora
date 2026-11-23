@@ -23,7 +23,11 @@ pub fn physical_memory() -> Option<u64> {
             0,
         )
     };
-    (rc == 0 && len == std::mem::size_of::<u64>() && bytes > 0).then_some(bytes)
+    if rc == 0 && len == std::mem::size_of::<u64>() && bytes > 0 {
+        Some(bytes)
+    } else {
+        None
+    }
 }
 
 /// See the macOS reading above.
@@ -36,7 +40,11 @@ pub fn physical_memory() -> Option<u64> {
     status.dwLength = u32::try_from(std::mem::size_of::<MEMORYSTATUSEX>()).ok()?;
     // SAFETY: `status` is a live MEMORYSTATUSEX whose `dwLength` is set, as the call requires.
     let ok = unsafe { GlobalMemoryStatusEx(&raw mut status) };
-    (ok != 0 && status.ullTotalPhys > 0).then_some(status.ullTotalPhys)
+    if ok != 0 && status.ullTotalPhys > 0 {
+        Some(status.ullTotalPhys)
+    } else {
+        None
+    }
 }
 
 /// Neither macOS nor Windows: this reading has nothing to say (Linux reads `/proc/meminfo`).

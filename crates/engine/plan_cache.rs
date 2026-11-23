@@ -153,7 +153,11 @@ impl PlanValues {
             share,
             read,
             planned_share,
-            sample_rows: counted.is_none().then_some(sample_rows),
+            sample_rows: if counted.is_none() {
+                Some(sample_rows)
+            } else {
+                None
+            },
         });
         planned_share
     }

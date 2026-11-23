@@ -4,7 +4,8 @@
 //! `crate::event`), `--batch` events a write, one write outstanding per writer.
 //!
 //! - `commit` (AC-T1.8.2, AC-T1.8.3): `--writers` closed-loop writers for `--seconds` after
-//!   `--warmup-s`; commit latency p50/p99/p99.9 and throughput.
+//!   `--warmup-s`; commit latency p50/p99/p99.9 and throughput, overall and by the node that
+//!   acknowledged, and the writes that missed `--deadline-s` (each sent again unchanged).
 //! - `failover` (AC-T1.8.4; step 3's "kill -9 of the leader 100 times under load"): writers run
 //!   throughout; `--kills` times the leader is killed and a probe writes through the survivors until
 //!   one write is acknowledged: the time from the kill to that acknowledgement. Every writer resends
@@ -407,6 +408,18 @@ fn send(
     s: &[(String, Vec<Arg>)],
     deadline: Duration,
 ) -> anyhow::Result<usize> {
+    send_counting(c, down, via, s, deadline, &Default::default())
+}
+
+/// [`send`], counting each node's `Serialization` refusals in `refused`.
+fn send_counting(
+    c: &dyn Cluster,
+    down: &[AtomicBool; NODES],
+    via: usize,
+    s: &[(String, Vec<Arg>)],
+    deadline: Duration,
+    refused: &[AtomicU64; NODES],
+) -> anyhow::Result<usize> {
     let until = Instant::now() + deadline;
     let mut n = via;
     let mut last = None;
@@ -419,10 +432,14 @@ fn send(
         match c.exec(node, s, until) {
             Ok(()) => return Ok(node),
             Err(e) => {
-                if !matches!(
+                if matches!(
                     e.downcast_ref::<amphora_api::Refusal>(),
                     Some(amphora_api::Refusal::Serialization { .. })
                 ) {
+                    if let Some(r) = refused.get(node) {
+                        r.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else {
                     n += 1;
                 }
                 last = Some(e);
@@ -493,22 +510,46 @@ fn commit(c: &dyn Cluster, o: &Opts) -> anyhow::Result<serde_json::Value> {
     let down: [AtomicBool; NODES] = Default::default();
     let began = Instant::now();
     let (counting, ends) = (began + warmup, began + warmup + seconds);
-    let hists = std::thread::scope(|scope| -> anyhow::Result<Vec<(Hist, u64)>> {
+    // Each write's latency by the node that acknowledged it, and the `Serialization` refusals
+    // each node gave counted writes (lane W4: the leader's writes against the followers').
+    let refused: [AtomicU64; NODES] = Default::default();
+    let hists = std::thread::scope(|scope| -> anyhow::Result<Vec<([Hist; NODES], u64, u64)>> {
         let handles: Vec<_> = (0..writers)
             .map(|w| {
-                let down = &down;
-                scope.spawn(move || -> anyhow::Result<(Hist, u64)> {
+                let (down, refused) = (&down, &refused);
+                scope.spawn(move || -> anyhow::Result<([Hist; NODES], u64, u64)> {
                     let mut wr = Writer::new(w);
-                    let (mut h, mut writes) = (Hist::new(), 0u64);
+                    let (mut h, mut writes, mut missed) = (std::array::from_fn(|_| Hist::new()), 0u64, 0u64);
                     loop {
                         let t = Instant::now();
                         if t >= ends {
-                            return Ok((h, writes));
+                            return Ok((h, writes, missed));
                         }
                         let s = stmts(&wr.next(o.batch, o.text_bytes))?;
-                        send(c, down, w, &s, o.deadline)?;
+                        let mine: [AtomicU64; NODES] = Default::default();
+                        // A write that misses its deadline is counted, not the run's end: it is sent
+                        // again unchanged (same ids), as `failover`'s writers do, and timed from its
+                        // first send once acknowledged; one unacknowledged when the run ends is untimed.
+                        let node = loop {
+                            match send_counting(c, down, w, &s, o.deadline, &mine) {
+                                Ok(node) => break Some(node),
+                                Err(_) if t >= counting => missed += 1,
+                                Err(_) => {}
+                            }
+                            if Instant::now() >= ends {
+                                break None;
+                            }
+                        };
+                        let Some(node) = node else {
+                            return Ok((h, writes, missed));
+                        };
                         if t >= counting {
-                            h.record(us(t));
+                            if let Some(h) = h.get_mut(node) {
+                                h.record(us(t));
+                            }
+                            for (total, n) in refused.iter().zip(&mine) {
+                                total.fetch_add(n.load(Ordering::Relaxed), Ordering::Relaxed);
+                            }
                             writes += 1;
                         }
                     }
@@ -521,15 +562,28 @@ fn commit(c: &dyn Cluster, o: &Opts) -> anyhow::Result<serde_json::Value> {
             .collect()
     })?;
     let mut all = Hist::new();
-    let mut writes = 0u64;
-    for (h, n) in &hists {
-        all.merge(h);
+    let mut nodes: [Hist; NODES] = std::array::from_fn(|_| Hist::new());
+    let (mut writes, mut missed, mut writers_missed) = (0u64, 0u64, 0u64);
+    for (hs, n, m) in &hists {
+        for (node, h) in nodes.iter_mut().zip(hs) {
+            all.merge(h);
+            node.merge(h);
+        }
         writes += n;
+        missed += m;
+        writers_missed += u64::from(*m > 0);
     }
+    let by_node: Vec<_> = nodes
+        .into_iter()
+        .zip(&refused)
+        .map(|(h, r)| serde_json::json!({ "buckets_us": h.buckets(), "max_us": h.max, "latency_ms": summary(h), "refused": r.load(Ordering::Relaxed) }))
+        .collect();
+    let leader = c.leader(Instant::now() + o.deadline).ok().flatten();
     let secs = seconds.as_secs_f64();
     Ok(serde_json::json!({
         "writers": writers, "warmup_s": warmup.as_secs_f64(), "seconds": secs, "latency_ms": summary(all),
         "writes_per_s": writes as f64 / secs, "events_per_s": (writes as f64) * (o.batch as f64) / secs,
+        "by_node": by_node, "leader": leader, "deadline_misses": missed, "writers_missed": writers_missed,
     }))
 }
 
@@ -1961,6 +2015,34 @@ mod procs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W6 (CP-T1.8): runs' bucket lists summed by least value are the merged runs' histogram, so
+    // `bench/pool.py` pools rounds into quantiles over all their samples; each sample reads back as
+    // its bucket's least value, within 1/64 of itself.
+    #[test]
+    fn w6_buckets_of_runs_pool_into_the_merged_histogram() {
+        let (mut a, mut b, mut merged) = (Hist::new(), Hist::new(), Hist::new());
+        let mut rng = Rng(7);
+        for i in 0..20_000u64 {
+            let us = 1 + rng.next() % 5_000_000;
+            if i % 3 == 0 { a.record(us) } else { b.record(us) }
+            merged.record(us);
+            if i % 10 == 0 {
+                let mut one = Hist::new();
+                one.record(us);
+                let least = one.buckets()[0][0].as_u64().unwrap();
+                assert!(least <= us && us - least <= us / 64, "{us} reads back as {least}");
+            }
+        }
+        let mut pooled = std::collections::BTreeMap::<u64, u64>::new();
+        for h in [&a, &b] {
+            for p in h.buckets().as_array().into_iter().flatten() {
+                *pooled.entry(p[0].as_u64().unwrap()).or_default() += p[1].as_u64().unwrap();
+            }
+        }
+        let pooled: Vec<_> = pooled.into_iter().map(|(least, n)| serde_json::json!([least, n])).collect();
+        assert_eq!(serde_json::Value::from(pooled), merged.buckets());
+    }
 
     fn args(s: &str) -> Vec<String> {
         s.split_whitespace().map(str::to_owned).collect()
