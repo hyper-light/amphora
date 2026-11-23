@@ -5257,7 +5257,8 @@ impl<F: BlockFile + 'static> Actor<F> {
         // holds the write slot through others' writes (amphora-seam-owner's review of 392902d).
         if (matches!(pending.author, Author::Owner)
             || !self.replica.is_leader()
-            || self.slots.turn())
+            || self.slots.turn()
+            || leader_tail())
             && matches!(pending.phase, Phase::Barrier(Some(_)))
             && !self.replica.machine().bootstrap_pending()
         {
@@ -5450,6 +5451,13 @@ impl<F: BlockFile + 'static> Actor<F> {
     }
 }
 
+/// Lane W4's A/B switch (replication.md, "The leader's turn": the general tail rule), deleted
+/// with its verdict: with `AMPHORA_LEADER_TAIL=1` the leader waits for its own log before every
+/// write, as a follower does.
+fn leader_tail() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("AMPHORA_LEADER_TAIL").is_some_and(|v| v == "1"))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
