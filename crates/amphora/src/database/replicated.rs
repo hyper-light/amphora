@@ -15864,6 +15864,36 @@ mod tests {
                 .is_empty()
         );
         pump.appends_lost = false;
+        let settled_now = |driven: &Driven| {
+            (0..3).all(|owner| {
+                let applied = applied_configuration(driven, owner);
+                applied.voters_outgoing.is_empty()
+                    && applied.learners_next.is_empty()
+                    && applied.learners == [4]
+                    && !driven.owner(owner).replica.core().raft.has_pending_conf()
+            })
+        };
+        for _ in 0..ROUNDS {
+            if settled_now(&driven) {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        if !settled_now(&driven) {
+            for owner in 0..3 {
+                let actor = driven.owner(owner);
+                eprintln!(
+                    "P10PROBE joint owner {owner}: out {} apply_held {} applied {} last {:?} pending_conf {} has_pending_conf {} conf {:?}",
+                    actor.sessions.out,
+                    actor.replica.apply_held(),
+                    actor.replica.applied().index,
+                    actor.replica.core().raft.log().last_index(),
+                    pending_change(&driven, owner),
+                    actor.replica.core().raft.has_pending_conf(),
+                    applied_configuration(&driven, owner)
+                );
+            }
+        }
         settled(&mut driven, &mut pump, 3, &[4]);
         let again = raise(&mut driven, &mut pump, led, 7);
         assert!(
