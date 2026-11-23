@@ -1675,7 +1675,9 @@ fn time_single_reads(
         read_once()?;
         let read = timer.stop();
         let wall = read.map_or_else(|| timer.wall.elapsed().as_nanos() as f64, |read| read.wall);
-        own = own.zip(read.and_then(|read| read.less_waits())).map(|(sum, nanos)| sum + nanos);
+        own = own
+            .zip(read.and_then(|read| read.less_waits()))
+            .map(|(sum, nanos)| sum + nanos);
         total += wall;
         walls.push(wall);
     }
