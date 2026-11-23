@@ -803,11 +803,14 @@ fn p5_probe_large_replicated_writes() {
         let st = |text: &str, params: Vec<Value>| Statement { sql: text.to_owned(), params };
         sql.write(vec![st("CREATE TABLE big (id INTEGER PRIMARY KEY, v BLOB)", vec![])]).unwrap();
         let mib = 1 << 20;
+        let status = |when: &str| for m in &c.members { eprintln!("P5PROBE {when} {}: {:?}", m.addr, Client::connect(&m.addr, &keys, c.deadline).and_then(|mut k| k.ask("status")).map(|s| s.replace('\n', " | "))); };
+        status("before");
         eprintln!("P5PROBE begin {count} MiB at leader {leader}");
         let rows = (0..count).map(|n| st("INSERT INTO big VALUES (?1, ?2)", vec![Value::Integer(n), Value::Blob(vec![9; mib])])).collect();
         let began = Instant::now();
         let got = sql.write(rows);
         eprintln!("P5PROBE write {count} MiB: {:?} after {:?}", got.as_ref().map(|t| t.len()).map_err(|e| format!("{e:#}")), began.elapsed());
+        status("after");
         let mut sql = SqlClient::connect(&leader, &keys, c.deadline).unwrap();
         let began = Instant::now();
         let held = sql.write(vec![st("INSERT INTO big (id) VALUES (100000)", vec![]), st("SELECT id, v FROM big ORDER BY id", vec![])]);
