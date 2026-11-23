@@ -47,6 +47,9 @@ const JOURNAL_MAGIC: u64 = 0x4c4e_524a_4f52_5041;
 const PAGES_FLUSHED: u64 = 1;
 /// The seal's magic, body length and hash are each an encoded u64.
 const SEAL_LEN: usize = size_of::<[u64; 3]>();
+/// A header page holds the seal, the four fixed words in `Stamp::encode`, and one word per root.
+const HEADER_ROOT_SLOTS: usize =
+    (PAGE_SIZE - SEAL_LEN - size_of::<[u64; 4]>()) / size_of::<u64>();
 
 /// A checkpoint as a header or journal names it.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -392,6 +395,12 @@ impl Journal {
             disk.write_at(File::Data, page_offset(no)?, page)?;
         }
         disk.sync(File::Data)?;
+        // An older writer could publish an oversized journal, then fail to write its header.
+        // Keep that durable journal as the recovery source. Checkpoint refuses this catalog
+        // before switching redo turns or overwriting either journal (T-T1.3.1).
+        if stamp.roots.len() > HEADER_ROOT_SLOTS {
+            return Ok(());
+        }
         Database::write_header(disk, stamp)?;
         disk.sync(File::Data)
     }
@@ -645,6 +654,9 @@ impl Database {
         cmp: impl Fn() -> Comparator,
     ) -> Result<Self> {
         let all = trees.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+        if all > HEADER_ROOT_SLOTS {
+            return Err(LimboError::TooBig);
+        }
         let v = Versioned::new_in(Pool::backed_in(room, disk.clone(), 0)?, all, |i| {
             if i == trees {
                 bytes_order()
@@ -696,6 +708,9 @@ impl Database {
     pub fn make_tree(&self, d: &mut Descender, cmp: Comparator) -> Result<u64> {
         let _alone = self.gate.write();
         self.redo.usable()?;
+        if self.v.root_slots() >= HEADER_ROOT_SLOTS {
+            return Err(LimboError::TooBig);
+        }
         let id = self.v.make_tree(cmp)?;
         let logged = self.log_alone(d, Op::Made { tree: id });
         if logged.is_err() {
@@ -1103,10 +1118,14 @@ impl Database {
 
     /// A checkpoint (decision 7): the pages written since the last, the rows to correct, the
     /// redo log before its timestamp cut. Its timestamp. One that fails leaves the database
-    /// making nothing more durable until reopened.
+    /// making nothing more durable until reopened. An oversized catalog recovered from an older
+    /// journal is refused before the checkpoint changes anything.
     pub fn checkpoint(&self) -> Result<Ts> {
         let mut last = self.last.lock();
         self.redo.usable()?;
+        if self.v.root_slots() > HEADER_ROOT_SLOTS {
+            return Err(LimboError::TooBig);
+        }
         let seq = last.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
         match self.checkpoint_as(seq) {
             Ok(ts) => {
@@ -1475,6 +1494,79 @@ mod tests {
         disk.power_cut().unwrap();
         let db = Database::open(disk, 2_000, 1, cmp).unwrap();
         assert_eq!(rows(&db), want);
+    }
+
+    /// AC-NS.2.5, T-T1.3.1. Fill the root directory, try to add one tree, then checkpoint.
+    /// The extra tree must be refused while the last supported tree's data remains recoverable.
+    #[test]
+    fn review_tree_growth_is_refused_before_it_can_make_recovery_fail() {
+        let disk = Arc::new(Simulated::new(9, 1).unwrap());
+        let trees = HEADER_ROOT_SLOTS - 1; // The overflow tree occupies one slot.
+        assert!(matches!(
+            Database::open(disk.clone(), 2_000, HEADER_ROOT_SLOTS, cmp),
+            Err(LimboError::TooBig)
+        ));
+        assert_eq!(disk.len(File::Journal).unwrap(), 0);
+        let db = Database::open(disk.clone(), 2_000, trees, cmp).unwrap();
+        let tree = u64::try_from(trees - 1).unwrap();
+        let mut d = Descender::new();
+        let mut txn = db.begin().unwrap();
+        db.put(&mut d, &mut txn, tree, b"k", b"last").unwrap();
+        db.commit(txn, &mut d, db.lane(), true).unwrap();
+        let added = db.make_tree(&mut d, cmp());
+        assert!(matches!(added, Err(LimboError::TooBig)), "{added:?}");
+        db.checkpoint().unwrap();
+        drop(db);
+        disk.power_cut().unwrap();
+        let db = Database::open(disk, 2_000, trees, cmp).unwrap();
+        assert_eq!(tree_rows(&db, tree).get(b"k".as_slice()).unwrap(), b"last");
+    }
+
+    /// T-T1.3.1. Older writers could flush a journal whose roots did not fit the data header.
+    /// Recover its row; a refused checkpoint must leave that journal and later redo usable.
+    #[test]
+    fn review_recovers_an_existing_oversized_checkpoint_journal() {
+        let disk = Arc::new(Simulated::new(11, 1).unwrap());
+        let db = Database::open(disk.clone(), 2_000, 1, cmp).unwrap();
+        let mut d = Descender::new();
+        let mut txn = db.begin().unwrap();
+        db.put(&mut d, &mut txn, 0, b"k", b"old").unwrap();
+        db.commit(txn, &mut d, db.lane(), true).unwrap();
+        for _ in db.v.root_slots()..=HEADER_ROOT_SLOTS {
+            db.v.make_tree(cmp()).unwrap();
+        }
+        let stamp = Stamp {
+            seq: 1,
+            ts: db.newest(),
+            allocated: db.v.pool.allocated(),
+            roots: db.v.roots(),
+        };
+        let epoch = db.v.pool.begin_copy().unwrap();
+        Journal::write(
+            &*disk,
+            &stamp,
+            &db.v.corrections(stamp.ts).unwrap(),
+            |each| db.v.pool.copy_owed(epoch, stamp.allocated, each),
+        )
+        .unwrap();
+        drop(db);
+        disk.power_cut().unwrap();
+        let db = Database::open(disk.clone(), 2_000, 1, cmp).expect("recover the durable journal");
+        assert_eq!(rows(&db).get(b"k".as_slice()).unwrap(), b"old");
+        let before = disk.operations();
+        assert!(matches!(db.checkpoint(), Err(LimboError::TooBig)));
+        assert_eq!(
+            before,
+            disk.operations(),
+            "the recovery journal must stay in place"
+        );
+        let mut txn = db.begin().unwrap();
+        db.put(&mut d, &mut txn, 0, b"k", b"later").unwrap();
+        db.commit(txn, &mut d, db.lane(), true).unwrap();
+        drop(db);
+        disk.power_cut().unwrap();
+        let db = Database::open(disk, 2_000, 1, cmp).unwrap();
+        assert_eq!(rows(&db).get(b"k".as_slice()).unwrap(), b"later");
     }
 
     /// A simulated disk that counts the data file's writes and flushes.

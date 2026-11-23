@@ -1566,6 +1566,11 @@ impl Versioned {
         })
     }
 
+    /// Root-directory slots, including dropped trees whose IDs cannot be reused.
+    pub(super) fn root_slots(&self) -> usize {
+        self.trees.read().len()
+    }
+
     /// Each tree's root page, by tree; 0 for a tree dropped (`AC-NS.2.5`).
     pub fn roots(&self) -> Vec<u64> {
         self.trees
