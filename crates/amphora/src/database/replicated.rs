@@ -97,6 +97,7 @@ const ENVELOPE_BYTES: usize = std::mem::size_of::<Envelope>();
 // Session tokens: read-your-writes on any replica (replication.md, "Decision (lane ryw-1):
 // read-your-writes by session tokens").
 mod tokens;
+mod waiting;
 pub use tokens::{ReadMode, Served, SessionCounters, Token};
 
 /// One of the floor's own sessions: the work it does on the database at its base.
@@ -962,7 +963,7 @@ struct Actor<F: BlockFile + 'static = LogDevice> {
     floor_published: Option<u32>,
     // At most the command queue's inputs' bound of admitted operations wait behind the sole
     // prepared transaction (`Control::command_bound`).
-    waiting: VecDeque<Envelope>,
+    waiting: waiting::Waiting<Envelope>,
     // The leader's write slot (replication.md, "A follower's write under steady leader writes"):
     // the members whose writes it refused, queued, and the forwards and barrier it holds, each
     // still charged to the inbound queue by its reservation; and whether this leader's own
@@ -2612,7 +2613,7 @@ fn open_on<F: BlockFile + 'static>(
         floor_requests_applied: 0,
         floor_requests_stale: 0,
         floor_published: None,
-        waiting: VecDeque::new(),
+        waiting: waiting::Waiting::new(),
         slots,
         slot_deferred: false,
         serial: 0,
@@ -2825,6 +2826,9 @@ fn settings(
     let core = hyper_raft::Config {
         fates,
         apply_unpersisted,
+        // A follower answers a heartbeat with what its disk holds without waiting for its write,
+        // so its flush doesn't hold the read barrier of the leader's next write (AC-T1.8.3).
+        answer_beats_now: true,
         check_quorum: true,
         pre_vote: true,
         max_size_per_msg: message,
@@ -3017,10 +3021,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             self.control.moved.notify_all();
             drop(closed);
         }
-        for _ in 0..self.waiting.len() {
-            let Some(envelope) = self.waiting.pop_front() else {
-                break;
-            };
+        while let Some(envelope) = self.waiting.pop_front() {
             if let Input::Submit { response, .. } = envelope.command {
                 answer(response, Err(reason.clone()));
             }
@@ -3121,14 +3122,8 @@ impl<F: BlockFile + 'static> Actor<F> {
             .ticked
             .checked_add(self.pace.period())
             .unwrap_or(self.at);
-        let waiting = self
-            .waiting
-            .iter()
-            .filter_map(|envelope| match &envelope.command {
-                Input::Submit { until, .. } => Some(*until),
-                _ => None,
-            });
         let held = [
+            self.waiting.next_deadline(),
             self.pending.as_ref().map(|pending| pending.until),
             self.changing.as_ref().map(|changing| changing.until),
             self.transferring
@@ -3136,9 +3131,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                 .map(|transferring| transferring.until),
             self.slots.until(),
         ];
-        waiting
-            .chain(held.into_iter().flatten())
-            .fold(tick, Instant::min)
+        held.into_iter().flatten().fold(tick, Instant::min)
     }
     /// One step at its clock's reading: the input first, then a tick if one is due, the core's
     /// work, deadlines, and what waits.
@@ -3660,21 +3653,11 @@ impl<F: BlockFile + 'static> Actor<F> {
         Ok(())
     }
     fn expire(&mut self) {
-        // Expired callers relinquish queued operations even while a seed or proposal is held.
-        // Rotate the bounded queue once; surviving requests retain their FIFO order.
-        let queued = self.waiting.len();
-        for _ in 0..queued {
-            let Some(envelope) = self.waiting.pop_front() else {
-                break;
-            };
-            let expired =
-                matches!(&envelope.command, Input::Submit { until, .. } if self.at >= *until);
-            if expired {
-                if let Input::Submit { response, .. } = envelope.command {
-                    answer(response, Err(Refusal::Timeout));
-                }
-            } else {
-                self.waiting.push_back(envelope);
+        // Expired callers relinquish queued operations even while a seed or proposal is held;
+        // surviving requests retain their FIFO order.
+        for envelope in self.waiting.expire(self.at) {
+            if let Input::Submit { response, .. } = envelope.command {
+                answer(response, Err(Refusal::Timeout));
             }
         }
         let Some(pending) = self.pending.as_ref() else {
@@ -3756,16 +3739,19 @@ impl<F: BlockFile + 'static> Actor<F> {
                 }),
             );
         } else {
-            self.waiting.push_front(Envelope {
-                command: Input::Submit {
-                    namespace: pending.namespace,
-                    operation,
-                    application,
-                    until: pending.until,
-                    response,
+            self.waiting.push_front(
+                pending.until,
+                Envelope {
+                    command: Input::Submit {
+                        namespace: pending.namespace,
+                        operation,
+                        application,
+                        until: pending.until,
+                        response,
+                    },
+                    _reservation: pending._reservation,
                 },
-                _reservation: pending._reservation,
-            });
+            );
         }
     }
     /// The change under way, once its barrier shows this leader current: proposed, or answered
@@ -3979,16 +3965,19 @@ impl<F: BlockFile + 'static> Actor<F> {
                             }),
                         );
                     } else {
-                        self.waiting.push_back(Envelope {
-                            command: Input::Submit {
-                                namespace,
-                                operation,
-                                application,
-                                until,
-                                response,
+                        self.waiting.push_back(
+                            until,
+                            Envelope {
+                                command: Input::Submit {
+                                    namespace,
+                                    operation,
+                                    application,
+                                    until,
+                                    response,
+                                },
+                                _reservation: reservation,
                             },
-                            _reservation: reservation,
-                        });
+                        );
                     }
                 } else {
                     let context = match self.context() {
@@ -8023,7 +8012,7 @@ mod tests {
     /// forward held until the leader's own is appended); the follower's log
     /// flushes held once its write is in the leader's log. Expect: the follower's answer while it
     /// hasn't applied its write; of the two writes one taken and the other refused as its apply
-    /// refuses it; once the flushes go, the follower applies as it answered and reads the write
+    /// refuses it, `Serialization` (local-owner-transport.md, "Version 10"); once the flushes go, the follower applies as it answered and reads the write
     /// that took.
     #[test]
     fn a_write_at_a_follower_is_answered_on_its_groups_commit() {
@@ -8131,7 +8120,7 @@ mod tests {
         assert!(
             results.iter().any(|result| matches!(
                 result,
-                Err(Refusal::Invalid { why, .. }) if why.contains("advanced since preparation")
+                Err(Refusal::Serialization { why, .. }) if why.contains("advanced since preparation")
             )),
             "{results:?}"
         );
@@ -8601,6 +8590,169 @@ mod tests {
             (false, Ok(vec![1])),
             "the persisted class answered a write no majority's log held durable"
         );
+    }
+
+    /// CP-T1.8 (AC-T1.8.3), the replicated class (replication.md, "Fast acknowledgement"): a write's
+    /// ReadIndex barrier waits on no log flush (lane V2's cause: the leader's read round and its
+    /// confirmation left only with a `Ready`, which its write out held back, and a follower's
+    /// heartbeat answer only once its own write was durable). Do: three voters on raft logs behind
+    /// gates, three fates, two to span; writes until each follower states a durable promise; every
+    /// member's log flushes held; two writes at the leader, one after the other. Expect: both
+    /// answered while no member's log has flushed either.
+    #[test]
+    fn v3_two_replicated_writes_in_a_row_answer_with_every_log_flush_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::<Gated>::empty();
+        let powers: Vec<Power> = (1..=3).map(Power::new).collect();
+        let gates: Vec<Arc<Gate>> = (0..3).map(|_| Arc::new(Gate::default())).collect();
+        let clients: Vec<Client> = (0..3)
+            .map(|i| {
+                driven.open_gated(
+                    dir.path(),
+                    u64::try_from(i + 1).unwrap(),
+                    vec![1, 2, 3],
+                    three_fates(),
+                    powers.get(i).unwrap(),
+                    gates.get(i).unwrap(),
+                )
+            })
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        for n in 0..4 {
+            let answer = driven.call(&mut pump, clients.get(leader).unwrap(), move |db| {
+                db.exec(&format!("CREATE TABLE warm{n}(value)"))?;
+                Ok(Vec::new())
+            });
+            assert_eq!(answer, Ok(Vec::new()));
+        }
+        let applied = clients
+            .get(leader)
+            .unwrap()
+            .handle()
+            .status()
+            .unwrap()
+            .applied;
+        driven.follow(&mut pump, &clients, applied);
+        for gate in &gates {
+            gate.hold();
+        }
+        let mut answered = Vec::new();
+        let mut writes = Vec::new();
+        for value in 1..=2u8 {
+            let write = submit(clients.get(leader).unwrap(), driven.until(), move |db| {
+                db.exec(&format!("INSERT INTO warm0 VALUES ({value})"))?;
+                Ok(vec![value])
+            });
+            answered.push(driven.answer_or_stall(&mut pump, &write));
+            writes.push(write);
+        }
+        for gate in &gates {
+            gate.release();
+        }
+        let outcomes: Vec<(bool, Result<Vec<u8>, Refusal>)> = answered
+            .into_iter()
+            .zip(&writes)
+            .map(|(held, write)| match held {
+                Some(result) => (true, result),
+                None => (false, driven.settle(&mut pump, write)),
+            })
+            .collect();
+        driven.drain(&mut pump);
+        pump.finish();
+        assert_eq!(
+            outcomes,
+            vec![(true, Ok(vec![1])), (true, Ok(vec![2]))],
+            "a write waited on a log flush (false: answered only once the gates let the flushes go)"
+        );
+    }
+
+    /// CP-T1.8 (AC-T1.8.3), linearizable reads and the barrier under heartbeats answered at once
+    /// (hyper-raft change 0009): a leader never counts a follower's position past that follower's
+    /// durable log. Do: three voters on raft logs behind gates, three fates, two to span; writes
+    /// until each follower states a durable promise; both followers' log flushes held; two writes
+    /// at the leader, the second's barrier answered by heartbeats while the followers hold the
+    /// first in memory alone. Expect: both answered; each follower holds entries past its durable
+    /// log, and the leader counts it through no more than its durable log.
+    #[test]
+    fn v3_a_leader_counts_no_follower_position_past_its_durable_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::<Gated>::empty();
+        let powers: Vec<Power> = (1..=3).map(Power::new).collect();
+        let gates: Vec<Arc<Gate>> = (0..3).map(|_| Arc::new(Gate::default())).collect();
+        let clients: Vec<Client> = (0..3)
+            .map(|i| {
+                driven.open_gated(
+                    dir.path(),
+                    u64::try_from(i + 1).unwrap(),
+                    vec![1, 2, 3],
+                    three_fates(),
+                    powers.get(i).unwrap(),
+                    gates.get(i).unwrap(),
+                )
+            })
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        for n in 0..4 {
+            let answer = driven.call(&mut pump, clients.get(leader).unwrap(), move |db| {
+                db.exec(&format!("CREATE TABLE warm{n}(value)"))?;
+                Ok(Vec::new())
+            });
+            assert_eq!(answer, Ok(Vec::new()));
+        }
+        let applied = clients
+            .get(leader)
+            .unwrap()
+            .handle()
+            .status()
+            .unwrap()
+            .applied;
+        driven.follow(&mut pump, &clients, applied);
+        let followers: Vec<usize> = (0..3).filter(|at| *at != leader).collect();
+        for at in &followers {
+            gates.get(*at).unwrap().hold();
+        }
+        let mut writes = Vec::new();
+        for value in 1..=2u8 {
+            let write = submit(clients.get(leader).unwrap(), driven.until(), move |db| {
+                db.exec(&format!("INSERT INTO warm0 VALUES ({value})"))?;
+                Ok(vec![value])
+            });
+            assert_eq!(
+                driven.answer_or_stall(&mut pump, &write),
+                Some(Ok(vec![value])),
+                "write {value} waited on its followers' log flushes"
+            );
+            writes.push(write);
+        }
+        for at in &followers {
+            let id = u64::try_from(*at + 1).unwrap();
+            let log = driven.owner(*at).replica.core().raft.log();
+            let (durable, last) = (log.persisted(), log.last_index().unwrap());
+            let counted = driven
+                .owner(leader)
+                .replica
+                .core()
+                .raft
+                .tracker()
+                .get(id)
+                .unwrap()
+                .matched;
+            assert!(
+                durable < last,
+                "follower {id} holds nothing past its durable log ({durable}, last {last})"
+            );
+            assert!(
+                counted <= durable,
+                "the leader counts follower {id} through {counted}, past its durable log at {durable}"
+            );
+        }
+        for gate in &gates {
+            gate.release();
+        }
+        driven.drain(&mut pump);
+        pump.finish();
     }
 
     /// One share of the 10,000-seed nemesis in `class`, as the environment names it, sharded across

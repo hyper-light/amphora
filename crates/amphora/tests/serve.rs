@@ -542,7 +542,7 @@ fn t_t1_13_1_a_leaders_disk_hung_under_load_loses_no_acknowledged_write() {
 /// the fence, not at its deadline, so `serve` returns and the process ends.
 #[test]
 fn t_t1_13_1_a_refused_log_write_ends_the_replica_and_wakes_its_drain() {
-    use amphora::database::{Database, LogDisk};
+    use amphora::database::{AnswerMax, Database, LogDisk};
     use amphora_api::{Refusal, replication::ReplicaConfig};
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("raft.log");
@@ -558,7 +558,7 @@ fn t_t1_13_1_a_refused_log_write_ends_the_replica_and_wakes_its_drain() {
         Database::open_replicated(&dir.path().join("state.db"), &log, config, until()).unwrap();
     let handle = db.replica().unwrap();
     handle.wait_leader(0, until()).unwrap();
-    db.call(until(), |c| {
+    db.call(until(), AnswerMax::fixed(), |c| {
         c.execute_batch("CREATE TABLE t(v INTEGER); INSERT INTO t VALUES(1)")?;
         Ok(())
     })
@@ -578,7 +578,7 @@ fn t_t1_13_1_a_refused_log_write_ends_the_replica_and_wakes_its_drain() {
     waits.recv().unwrap();
 
     Database::set_log_disk(&log, LogDisk::Cut).unwrap();
-    let refused = db.call(until(), |c| {
+    let refused = db.call(until(), AnswerMax::fixed(), |c| {
         c.execute_batch("INSERT INTO t VALUES(2)")?;
         Ok(())
     });

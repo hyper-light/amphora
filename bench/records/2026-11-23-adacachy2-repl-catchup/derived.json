@@ -1,0 +1,108 @@
+{
+ "derived": {
+  "amphora-procs-persisted": {
+   "1": {
+    "writes_per_s": 19.8,
+    "writes_runs": 5,
+    "restart_ms": 17.275,
+    "restart_ms_range": [
+     13.593,
+     26.855
+    ],
+    "restart_runs": 5,
+    "behind": 1
+   },
+   "32": {
+    "writes_per_s": 13.8,
+    "writes_runs": 5,
+    "restart_ms": 17.275,
+    "restart_ms_range": [
+     13.593,
+     26.855
+    ],
+    "restart_runs": 5,
+    "behind": 1
+   }
+  },
+  "amphora-procs-replicated": {
+   "1": {
+    "writes_per_s": 14.4,
+    "writes_runs": 5,
+    "restart_ms": 16.825,
+    "restart_ms_range": [
+     14.242,
+     41.198
+    ],
+    "restart_runs": 5,
+    "behind": 1
+   },
+   "32": {
+    "writes_per_s": 19.0,
+    "writes_runs": 5,
+    "restart_ms": 16.825,
+    "restart_ms_range": [
+     14.242,
+     41.198
+    ],
+    "restart_runs": 5,
+    "behind": 1
+   },
+   "128": {
+    "writes_per_s": 17.3,
+    "writes_runs": 2,
+    "restart_ms": 16.825,
+    "restart_ms_range": [
+     14.242,
+     41.198
+    ],
+    "restart_runs": 5,
+    "behind": 1
+   }
+  },
+  "rqlite": {
+   "1": {
+    "writes_per_s": 24.6,
+    "writes_runs": 5,
+    "restart_ms": 113.966,
+    "restart_ms_range": [
+     96.746,
+     141.984
+    ],
+    "restart_runs": 5,
+    "behind": 3
+   },
+   "32": {
+    "writes_per_s": 372.8,
+    "writes_runs": 5,
+    "restart_ms": 113.966,
+    "restart_ms_range": [
+     96.746,
+     141.984
+    ],
+    "restart_runs": 5,
+    "behind": 43
+   },
+   "128": {
+    "writes_per_s": 1389.8,
+    "writes_runs": 5,
+    "restart_ms": 113.966,
+    "restart_ms_range": [
+     96.746,
+     141.984
+    ],
+    "restart_runs": 5,
+    "behind": 159
+   }
+  }
+ },
+ "ladder": [
+  1,
+  10,
+  100,
+  1000
+ ],
+ "refused_or_missing": [
+  "dqlite",
+  "litefs"
+ ]
+}

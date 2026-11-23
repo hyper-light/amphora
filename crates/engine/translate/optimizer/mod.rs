@@ -4328,13 +4328,12 @@ pub(crate) mod bushy_test_hook {
             );
         }
 
-        /// Lane T6 (TPC-H q05 at SF1 passed 10 s): q05's shape, where a run `s n` probed by `r`
-        /// matches each outer row to every supplier in ASIA, and `l.sk = s.id` and
-        /// `c.nk = s.nk`, joining the run to the outer loops, run only after that match. The
-        /// planner prices the match's visits, so the plan it chooses takes fewer steps than that
-        /// match alone visits, and answers as the nested loops do.
-        #[test]
-        fn t6_q05_terms_from_a_run_to_the_outer_loops_are_priced_after_its_match() {
+        /// T6's q05 shape at small scale (6 tables, 60,000 lines, 500 suppliers in ASIA), where a
+        /// run `s n` probed by `r` matches each outer row to every supplier in ASIA, and
+        /// `l.sk = s.id` and `c.nk = s.nk`, joining the run to the outer loops, run only after
+        /// that match. Returns the connection, the query, the nested loops' answer, and the rows
+        /// that match alone visits (the outer rows times the run's rows in ASIA).
+        fn q05_shape() -> (Arc<crate::Connection>, &'static str, Vec<String>, u64) {
             let io = Arc::new(MemoryIO::new());
             let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
             let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -4378,6 +4377,11 @@ pub(crate) mod bushy_test_hook {
                 "SELECT count(*) FROM s, n, r WHERE s.nk = n.id AND n.rk = r.id AND r.name = 'ASIA'",
             );
             conn.set_join_methods(JoinMethods::ByCost);
+            (conn, sql, nested_loops, late_match)
+        }
+
+        /// `sql` planned by cost: its rows, sorted; the VM steps it took; and its plan.
+        fn by_cost(conn: &Arc<crate::Connection>, sql: &str) -> (Vec<String>, u64, Vec<String>) {
             let mut stmt = conn.prepare(sql).unwrap();
             let mut chosen: Vec<String> = stmt
                 .run_collect_rows()
@@ -4392,12 +4396,143 @@ pub(crate) mod bushy_test_hook {
                 .collect();
             chosen.sort();
             let steps = stmt.stmt_status(crate::StatementStatusCounter::VmStep);
-            let plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+            (chosen, steps, rows(conn, &format!("EXPLAIN QUERY PLAN {sql}")))
+        }
+
+        /// Lane T6 (TPC-H q05 at SF1 passed 10 s): the planner prices the late match's visits,
+        /// so the plan it chooses takes fewer steps than that match alone visits, and answers as
+        /// the nested loops do.
+        #[test]
+        fn t6_q05_terms_from_a_run_to_the_outer_loops_are_priced_after_its_match() {
+            let (conn, sql, nested_loops, late_match) = q05_shape();
+            let (chosen, steps, plan) = by_cost(&conn, sql);
             assert!(!nested_loops.is_empty());
             assert_eq!(chosen, nested_loops, "{plan:?}");
             assert!(
                 steps < late_match,
                 "{steps} steps, the match before the terms alone visits {late_match}: {plan:?}"
+            );
+        }
+
+        /// Lane T7 (TPC-H q05, option i): the late terms each visit runs are priced per visit.
+        /// Every weight is pinned at the planner bench's calibration on adacachy2 (T6's, at
+        /// 952f5766: in rows' visits a seek 18.55, a hash build 25.81, a probe 4.82, a sort 1.27,
+        /// a Bloom lookup 4.99, a WHERE step 6.77; a row's visit 0.00027 of a page read at SF1;
+        /// every page read from the file). With seeks and builds dearer by a growing factor and
+        /// the WHERE step at nothing, the pricing before this lane, the first state that takes
+        /// the late match (some step count at or past what it visits) is the slow plan's; with
+        /// the WHERE step at its measured price, that same state takes a plan doing less work,
+        /// and answers as the nested loops do.
+        #[test]
+        fn t7_q05_late_terms_priced_per_visit_keep_the_late_match_out() {
+            use crate::translate::optimizer::learned_costs::{test_pin, LearnedWeights};
+            let (conn, sql, nested_loops, late_match) = q05_shape();
+            let pin = |factor: f64, where_step: f64| {
+                test_pin::WEIGHTS.with(|weights| {
+                    weights.set(Some(LearnedWeights {
+                        row_in_pages: Some(0.00027),
+                        seek: 18.55 * factor,
+                        hash_build: 25.81 * factor,
+                        hash_probe: 4.82,
+                        sort: 1.27,
+                        bloom_probe: 4.99,
+                        where_step,
+                        page_miss: Some(1.0),
+                    }))
+                });
+            };
+            let mut seen = Vec::new();
+            let mut slow_state = None;
+            for factor in (0..14).map(|power| f64::from(1u32 << power)) {
+                pin(factor, 0.0);
+                let (_, steps, plan) = by_cost(&conn, sql);
+                if steps >= late_match {
+                    slow_state = Some((factor, plan));
+                    break;
+                }
+                seen.push((factor, steps));
+            }
+            let Some((factor, slow_plan)) = slow_state else {
+                test_pin::WEIGHTS.with(|weights| weights.set(None));
+                panic!("no pinned state took the late match ({late_match} visits): {seen:?}");
+            };
+            pin(factor, 6.77);
+            let (chosen, steps, plan) = by_cost(&conn, sql);
+            test_pin::WEIGHTS.with(|weights| weights.set(None));
+            assert_eq!(chosen, nested_loops, "{plan:?}");
+            assert!(
+                steps < late_match,
+                "seeks and builds x{factor}: {steps} steps, the late match visits {late_match}: \
+                 {plan:?}; with no WHERE step: {slow_plan:?}"
+            );
+        }
+
+        /// Lane T8 (TPC-H q19 at SF1, 17x SQLite's time): q19's shape at small scale, an OR of
+        /// three branches each joining `p` to `l` with terms on each table alone. `p`'s terms
+        /// keep 120 of its 2,000 rows, yet they stayed inside the OR, which also reads `l`, so
+        /// `p` was priced at every row and the plan read all 60,000 of `l`. Each table's share of
+        /// the OR now filters it alone, so the plan starts from `p`'s few rows and seeks `l` by
+        /// its index. Expect: full-scan steps fewer than `l`'s rows, and the answer of the same
+        /// OR inside a CASE, which no share is taken from.
+        #[test]
+        fn t8_q19_each_tables_share_of_an_or_filters_it_before_the_join() {
+            let io = Arc::new(MemoryIO::new());
+            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            for sql in [
+                "CREATE TABLE p(id INTEGER PRIMARY KEY, brand INT, container INT, size INT)",
+                "CREATE TABLE l(id INTEGER PRIMARY KEY, pk INT, qty INT, mode INT, instr INT, \
+                 price INT)",
+                "CREATE INDEX l_pk ON l(pk)",
+                // One part for each brand, container and size; each part's 30 lines take each
+                // quantity once, and every mode and instruction in turn.
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 2000) \
+                 INSERT INTO p SELECT i, i % 5, i / 5 % 10, i / 50 % 50 + 1 FROM x",
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 60000) \
+                 INSERT INTO l SELECT i, i % 2000 + 1, i / 2000 % 50 + 1, (i * 3 + i / 2000) % 7, \
+                 (i + i / 2000) % 4, i % 1000 FROM x",
+                "ANALYZE",
+            ] {
+                conn.execute(sql).unwrap();
+            }
+            let branches = "(p.id = l.pk AND p.brand = 1 AND p.container IN (0, 1, 2, 3) \
+                 AND l.qty >= 1 AND l.qty <= 11 AND p.size BETWEEN 1 AND 5 \
+                 AND l.mode IN (0, 1) AND l.instr = 0) \
+                 OR (p.id = l.pk AND p.brand = 2 AND p.container IN (4, 5, 6, 7) \
+                 AND l.qty >= 10 AND l.qty <= 20 AND p.size BETWEEN 1 AND 10 \
+                 AND l.mode IN (0, 1) AND l.instr = 0) \
+                 OR (p.id = l.pk AND p.brand = 3 AND p.container IN (6, 7, 8, 9) \
+                 AND l.qty >= 20 AND l.qty <= 30 AND p.size BETWEEN 1 AND 15 \
+                 AND l.mode IN (0, 1) AND l.instr = 0)";
+            let sql = format!("SELECT count(*), sum(l.price) FROM l, p WHERE {branches}");
+            let unshared = rows(
+                &conn,
+                &format!(
+                    "SELECT count(*), sum(l.price) FROM l, p \
+                     WHERE p.id = l.pk AND CASE WHEN {branches} THEN 1 ELSE 0 END = 1"
+                ),
+            );
+            let count = |sql: &str| -> u64 { rows(&conn, sql)[0].parse().unwrap() };
+            let lines = count("SELECT count(*) FROM l");
+            let mut stmt = conn.prepare(&sql).unwrap();
+            let answer: Vec<String> = stmt
+                .run_collect_rows()
+                .unwrap()
+                .into_iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|value| value.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .collect();
+            let full_scan_steps = stmt.stmt_status(crate::StatementStatusCounter::FullscanStep);
+            let plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+            assert_ne!(unshared, vec!["0,".to_string()], "no row passes the OR");
+            assert_eq!(answer, unshared, "{plan:?}");
+            assert!(
+                full_scan_steps < lines,
+                "{full_scan_steps} full-scan steps, {lines} rows of l: {plan:?}"
             );
         }
 
