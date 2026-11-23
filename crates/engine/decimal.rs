@@ -102,6 +102,23 @@ impl Decimal {
         Some(out)
     }
 
+    /// The significant digits (0..=9, most significant first, no leading or trailing zeros) and
+    /// where the point falls among them: the magnitude is 0.d1d2... x 10^point. None for NULL or
+    /// zero.
+    pub fn significant_digits(&self) -> Option<(&[u8], i32)> {
+        if self.is_null {
+            return None;
+        }
+        let lead = self.digits.iter().take_while(|d| **d == 0).count();
+        let trail = self.digits.iter().rev().take_while(|d| **d == 0).count();
+        let digits = self.digits.get(lead..self.digits.len().checked_sub(trail)?)?;
+        if digits.is_empty() {
+            return None;
+        }
+        let point = i32::try_from(self.int_len()).ok()?.checked_sub(i32::try_from(lead).ok()?)?;
+        Some((digits, point))
+    }
+
     /// The digits widened to `ndigit` with `nfrac` after the point (decimal.c's decimal_expand).
     fn expanded(&self, ndigit: usize, nfrac: usize) -> Option<Vec<u8>> {
         let add_frac = nfrac.checked_sub(self.frac)?;
@@ -594,6 +611,18 @@ mod tests {
         assert_eq!(plain(decimal_from_double(0.1)).as_deref(), Some("0.1000000000000000055511151231257827021181583404541015625"));
         assert_eq!(plain(decimal_from_double(12.0)).as_deref(), Some("12"));
         assert_eq!(plain(decimal_from_double(f64::NAN)), None);
+    }
+
+    #[test]
+    fn significant_digits_drop_leading_and_trailing_zeros_and_place_the_point() {
+        let sig = |r: f64| decimal_from_double(r).and_then(|d| d.significant_digits().map(|(s, p)| (s.to_vec(), p)));
+        assert_eq!(sig(47.49).map(|(s, p)| (s.len(), s.get(..4).map(<[u8]>::to_vec), p)), Some((49, Some(vec![4, 7, 4, 9]), 2)));
+        assert_eq!(sig(0.001).map(|(s, p)| (s.first().copied(), p)), Some((Some(1), -2)));
+        assert_eq!(sig(-0.25), Some((vec![2, 5], 0)));
+        assert_eq!(sig(1200.0), Some((vec![1, 2], 4)));
+        assert_eq!(sig(0.0625), Some((vec![6, 2, 5], -1)));
+        assert_eq!(sig(0.0), None);
+        assert_eq!(sig(f64::INFINITY), None);
     }
 
     #[test]

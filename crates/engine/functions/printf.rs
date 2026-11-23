@@ -3,7 +3,7 @@ use std::iter::{repeat_n, Peekable};
 use std::str;
 use std::str::Chars;
 
-use crate::numeric::fp::{real_to_text_digits, FpDigits};
+use crate::numeric::fp::{exact_digits, real_to_text_digits, FpDigits};
 use crate::numeric::{str_to_i64, Numeric};
 use crate::types::Value;
 use crate::vdbe::Register;
@@ -452,6 +452,21 @@ fn fp_decode(r: f64, i_round: i32, max_round: usize) -> (Vec<u8>, i32) {
 
     let n = buf.len();
     let mut dp = n as i32 + exp;
+
+    // printf.html: "26 significant digits if the "!" alternate-form-2 flag is used". The product
+    // above carries 19, so more than 17 kept digits are the double's exact ones.
+    let kept = if i_round > 0 {
+        Some(i_round)
+    } else {
+        dp.checked_sub(i_round)
+    };
+    let exact = kept
+        .zip(i32::try_from(max_round).ok())
+        .and_then(|(kept, most)| exact_digits(r, kept.min(most)));
+    if let Some((digits, point)) = exact {
+        buf = digits;
+        dp = point;
+    }
 
     // ── Rounding (sqlite3.c:36968-36997) ──────────────────────────
     let mut i_round = i_round;
@@ -2068,12 +2083,12 @@ mod tests {
             exec_printf(&[text("%.20e"), float(1.0 / 3.0)], FpDigits::DEFAULT).unwrap(),
             *text("3.33333333333333300000e-01").get_value()
         );
-        // ! flag: 26 significant digits max, trailing zeros stripped (sqlite3.c:32496).
-        // fp_decode extracts 19 digits from the u64; the ! flag's RTZ then strips
-        // the trailing '0', yielding 19 fractional characters.
+        // printf.html: "26 significant digits if the "!" alternate-form-2 flag is used". 1/3 is
+        // 0.333333333333333314829616256...; its first 20 digits, rounded (SQLite 3.54.0 writes 19:
+        // 0.3333333333333333148).
         assert_eq!(
             exec_printf(&[text("%!.20f"), float(1.0 / 3.0)], FpDigits::DEFAULT).unwrap(),
-            *text("0.3333333333333333148").get_value()
+            *text("0.33333333333333331483").get_value()
         );
     }
 
