@@ -69,10 +69,18 @@ a quarter of the samples are waiting on a lock. Which lock is not traced yet.
 | r1713 | none, fresh load in the same process | 1,011 |
 | r1708 | S8's nine reads, fresh load | 1,561,786 |
 
-The fresh load does not cause it, and a full scan alone (table_group_by) does not either. One of
-point_pk, point_secondary, point_text, filter_no_index, aggregates_range, join_three, json_field and
-blob_read, or their combination with the scans, leaves the readers' page caches in a state where a
-count's 531 pages are evicted before the next count reads them.
+The fresh load does not cause it, and a full scan alone (table_group_by) does not either. Bisect
+r1719 (reopened database, then the statements named, then table_count):
+
+| r1719 sequence before table_count | table_count 1-client read syscalls |
+|---|---|
+| point_pk, point_secondary, point_text, json_field, blob_read | 1,709,899 |
+| filter_no_index | 2,430 |
+| aggregates_range, join_three | 1,520,223 |
+
+Statements that look rows up by key or index range, at 1, 32 and 128 clients, leave the readers'
+page caches in a state where a count's 531 pages are evicted before the next count reads them;
+whole-table scans (filter_no_index, table_group_by) don't.
 
 ## What is named, and what is not
 
@@ -82,8 +90,9 @@ count's 531 pages are evicted before the next count reads them.
 - Not named yet: why the cache evicts them. The cache is SIEVE with reference levels
   (`page_cache.rs`, `evict_one`), 2,000 pages a reader (`READER_PAGES`); the count's 531 pages fit.
   The next step is the cache's own numbers in this state (capacity, length, evictions, and the
-  reference levels of what it keeps), then bisecting the nine statements. Until those are measured,
-  any account of the eviction is a guess.
+  reference levels of what it keeps after the lookups, then through one count), with point_secondary
+  alone before table_count as the smallest repro to try first. Until those are measured, any account
+  of the eviction is a guess.
 - Answers: the `--query` runs answered 200,000 on Amphora and on SQLite; S8's answer check had already
   found Amphora's and Turso's answers equal to SQLite's.
 
@@ -99,6 +108,7 @@ All on adacachy2 (runner 00aad8daff2fa3c9daa65d53c425d450), binary
   --target amphora --dir … --clients 1,32,128 --seconds 1 --warmup 0.5 --only
   'point_pk$,point_secondary$,point_text$,filter_no_index$,aggregates_range$,join_three$,json_field$,blob_read$,table_group_by$,table_count$'`.
 - r1713: the same with `--reuse`, then a fresh load with `--only 'table_count$'`.
+- r1719: `--reuse` with `--only '<sequence>,table_count$'` for each row of the bisect table.
 
 The host was shared throughout (1-minute load 13 to 79 on 32 cores, my own build of main 4536a0d4
 running beside r1701 to r1713), so every throughput above is one run and directional. The syscall
