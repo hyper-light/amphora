@@ -1107,11 +1107,6 @@ struct Pass {
 /// checkpoint period, measured on fedora 2026-10-20 (docs/design/store.md, decision 4).
 const CHECKPOINT_EVERY: Duration = Duration::from_millis(25);
 
-/// Whether the owner holds local reads back for a restart of the database's log (replication.md,
-/// "A replica's database log bounded by what it measures"): past its room, always; with a restart
-/// due, once a pass copied every durable frame (the restart waits only for the reads out), or
-/// once a pass found the log busy: a read that began on a log wholly copied reads the file alone
-/// and holds every pass off, so only holding reads back lets the passes copy again.
 /// A wait for the memory budget's room (`memory::Budget::when_room`): rung once, it wakes the owner.
 struct RoomWait {
     rang: std::sync::atomic::AtomicBool,
@@ -1129,6 +1124,11 @@ impl std::task::Wake for RoomWait {
     }
 }
 
+/// Whether the owner holds local reads back for a restart of the database's log (replication.md,
+/// "A replica's database log bounded by what it measures"): past its room, always; with a restart
+/// due, once a pass copied every durable frame (the restart waits only for the reads out), or
+/// once a pass found the log busy: a read that began on a log wholly copied reads the file alone
+/// and holds every pass off, so only holding reads back lets the passes copy again.
 fn hold_due(pass: &Pass, due: bool, past: bool) -> bool {
     past || (due && (pass.caught_up || pass.busy))
 }

@@ -40,11 +40,7 @@ struct BaselineSnapshot {
 const META: &str = "CREATE TABLE IF NOT EXISTS __amphora_replica (id INTEGER PRIMARY KEY CHECK(id = 1), applied TEXT NOT NULL, term TEXT NOT NULL, configuration BLOB NOT NULL)";
 /// One resolved transaction's page budget. Oversize transactions are refused before proposal.
 pub const COMMAND_BYTES: usize = api::REQUEST_MAX;
-/// The room for one image now: the process memory budget's room for an image (the seam owner's
-/// ruling (c): an image is held whole in memory until snapshots stream, so the memory it may take
-/// bounds it; docs/design/replication.md, "Decision (lane constants): an image is bounded by the
-/// memory budget's room for one"; SB.1). Read again at every image made or installed; refused,
-/// typed, where the process's memory can't be read.
+
 /// Whether an image fits its room ([`Machine::image_fit`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ImageFit {
@@ -56,6 +52,11 @@ pub(crate) enum ImageFit {
     Other,
 }
 
+/// The room for one image now: the process memory budget's room for an image (the seam owner's
+/// ruling (c): an image is held whole in memory until snapshots stream, so the memory it may take
+/// bounds it; docs/design/replication.md, "Decision (lane constants): an image is bounded by the
+/// memory budget's room for one"; SB.1). Read again at every image made or installed; refused,
+/// typed, where the process's memory can't be read.
 pub(crate) fn image_room() -> Result<usize, Refusal> {
     crate::memory::process().image_room()
 }
@@ -618,9 +619,8 @@ impl Machine {
     /// A member that joins catches up by this machine's image once the log no longer reaches
     /// back, and an image is bounded (replication.md, "Membership"): past its ceiling, a joiner
     /// is refused before it is added, never left unable to catch up.
-    /// Whether an image of the database now is within this machine's image budget: past it,
-    /// `image` refuses, and a compaction, which needs one, waits (CT.1).
-    /// Whether an image of this machine fits its room now, and if not, what bounds it.
+    /// Whether an image of the database now is within this machine's image budget, and if not,
+    /// what bounds it: past it, `image` refuses, and a compaction, which needs one, waits (CT.1).
     pub(crate) fn image_fit(&mut self) -> Result<ImageFit, Refusal> {
         let size = self.db.image_bytes().map_err(unavailable)?;
         if size <= self.snapshot_bytes()? {
