@@ -208,9 +208,13 @@ after the other in the lane's target dir. It then runs 5 alternated rounds of `p
 each run, and errors and rows per op. Run r836's first build of 76a62c3d failed in `amphora`: main's `bench/Cargo.toml`
 did not patch `hyper-rt`, which the postgres listener (f8f65110) uses, so cargo took crates.io's. Main has patched it
 since, and 639245cc has that patch. After that, adacachy2 refused the run for room five times between 14:25 and
-14:45Z, with 0-7 of 32 cores idle. It was placed at 14:46:39Z as run r902 (needs `linux/amd64,cpus=16,mem=24g`,
-load 64 at its start). Its numbers land in `~/.cache/amphora-perf-bin/pagepath/ab6-<HHMM>.jsonl` on adacachy2, with
-the summary at the end of r902's output. If it dies, pass the script's body to `run` again and retry until placed.
+14:45Z, with 0-7 of 32 cores idle. Run r902 (placed 14:46:39Z) built both arms: after in 1m44s, base in 1m25s,
+with the revert's diff stat 3 insertions and 72 deletions in `log_index.rs` and `wal.rs`. The binaries are on
+adacachy2 at `~/.cache/amphora-perf-bin/pagepath/b5-after-639245cc` and `b5-base-639245cc`. No number came out: every
+timed run stopped at `--reuse: no database`, because the data folder was new. The timed half alone is
+`.git/perf-ab6-timed.sh`: it loads the suite's database once without `--reuse`, then runs the 10 alternated runs. At
+14:53Z it was refused for room (11 of 32 cores idle). Run it with needs `linux/amd64,cpus=16,mem=24g`, `on` adacachy2,
+sync false, and retry until it is placed.
 
 **B4's fix alone on main.** 3a30e5f1 (branch `perf/pagepath-b4-pick`) is 4da616cf cherry-picked onto origin/main
 9a7b14bb, clean. On that tree (run r901) clippy exited 0 and `storage::wal storage::log_index` passed 104, failed 0,
