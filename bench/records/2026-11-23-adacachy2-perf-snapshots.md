@@ -35,3 +35,19 @@ r405 (adacachy2, needs linux/amd64,cpus=8,mem=24g): `cargo clippy -p amphora --a
 -- -D warnings`; `cargo test -p amphora --lib -- memory:: replication::image_room_tests snapshots_
 a_member_installed_from_a_snapshot compaction`; `cargo test -p amphora --test design_index`. Results:
 PENDING when the lane's hour ended.
+
+### Lane R3 (05:19Z to 06:14Z)
+
+r405 (R2's checks at af4f3131) printed nothing in its first 13 minutes of R3's hour and was stopped at 05:32Z so
+the lane's one target dir could check the newer head.
+
+r417 (adacachy2, needs linux/amd64,cpus=8,mem=24g, `CARGO_INCREMENTAL=0`, the lane's target dir, from the GitHub
+clone `~/.cache/amphora-perf/snapshots-remote` at faebe9ba: decisions 1 and 2, the owner-level test, origin/main
+78fa9fdb merged): `cargo clippy -p amphora --all-targets --locked -- -D warnings`; `cargo test -p amphora --locked
+--lib -- --test-threads=8 memory:: image_room_tests snapshots_ compaction joiner`; `cargo test -p amphora --locked
+--test design_index`; `cargo test -p amphora --locked --test held_view -- --nocapture`. Clippy began 05:34:27Z at
+load 130.45 157.54 190.50 and was still running at 05:57Z. Results: PENDING when the lane's hour ended; the
+held-view counts land here and in replication.md, "The held view, measured", from r417's output.
+
+Not covered by r417 (committed after it checked out): 938e15a0 (the waiters count of waits not yet woken),
+d05e55eb (unit B's source, `replication/source.rs`, and its test), 1b906a09 (design text).
