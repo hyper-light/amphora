@@ -24,10 +24,7 @@
 //! that runs past it, naming the committed entry at the commit, is taken past
 //! the commit here (Raft §5.3: a receiver appends any new entries not already
 //! in its log) and answered with the commit and dropped there: the schedule
-//! loses that message for both too. A peer's read delivered to a follower that
-//! knows its leader is dropped here, where passed on it would reach the leader
-//! under the peer's name from another member, and passed on there: the
-//! schedule loses that message for both too.
+//! loses that message for both too.
 #![allow(
     clippy::panic,
     clippy::unwrap_used,
@@ -75,8 +72,6 @@ struct Reached {
     older_rounds: u64,
     /// Appends behind their member's commit that run past it, lost for both.
     past_commits: u64,
-    /// Peers' reads delivered to a follower that knows its leader, lost for both.
-    relayed_reads: u64,
     terms: u64,
     committed: u64,
     changes: u64,
@@ -236,25 +231,6 @@ fn runs_past_the_commit(group: &Cluster<New>, op: &Op) -> bool {
                 entry.index == committed && log.term(committed).is_ok_and(|held| held == entry.term)
             })
     })
-}
-
-/// Whether `op` delivers a peer's read to a follower that knows its leader: this core drops it,
-/// where passed on it would reach the leader under the peer's name from another member; raft-rs
-/// passes it on, and the comparison loses it for both.
-fn relays_a_peers_read(group: &Cluster<New>, op: &Op) -> bool {
-    let Op::Deliver {
-        at, lose: false, ..
-    } = op
-    else {
-        return false;
-    };
-    let Some(message) = group.net.get(*at) else {
-        return false;
-    };
-    message.msg_type == MessageType::MsgReadIndex
-        && group.peek(message.to).is_some_and(|member| {
-            member.raw.raft.state() == StateRole::Follower && member.raw.raft.leader_id() != 0
-        })
 }
 
 /// Whether `op` asks a read of a leader that has not committed an entry of its term, or delivers
@@ -484,14 +460,6 @@ fn run(seed: u64, steps: u64, settings: Settings, mix: Mix, reached: &mut Reache
             }
             Op::Deliver { at, keep, .. } if runs_past_the_commit(&new, &op) => {
                 reached.past_commits += 1;
-                Op::Deliver {
-                    at,
-                    keep,
-                    lose: true,
-                }
-            }
-            Op::Deliver { at, keep, .. } if relays_a_peers_read(&new, &op) => {
-                reached.relayed_reads += 1;
                 Op::Deliver {
                     at,
                     keep,

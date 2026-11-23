@@ -4386,13 +4386,13 @@ impl Connection {
     }
 
     fn database_has_existing_wal_state(db: &Database) -> bool {
-        let shared_wal = db.shared_wal.read();
+        let shared_wal = db.shared_wal.current().read();
         shared_wal.page_size() != 0 || shared_wal.last_checksum_and_max_frame().1 != 0
     }
 
     fn install_database_wal_on_pager(db: &Arc<Database>, pager: &mut Arc<Pager>) {
         let shared_wal = db.shared_wal.clone();
-        let last_checksum_and_max_frame = shared_wal.read().last_checksum_and_max_frame();
+        let last_checksum_and_max_frame = shared_wal.current().read().last_checksum_and_max_frame();
         let wal = Arc::new(crate::storage::wal::WalFile::new(
             db.io.clone(),
             shared_wal,

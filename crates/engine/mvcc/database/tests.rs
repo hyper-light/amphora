@@ -1184,7 +1184,7 @@ fn mvcc_passive_begin_concurrent_after_backfill_does_not_busy() {
 
     {
         let database = db.get_db();
-        let shared = database.shared_wal.read();
+        let shared = database.shared_wal.current().read();
         let max_frame = shared.metadata.max_frame.load(Ordering::SeqCst);
         let nbackfills = shared.metadata.nbackfills.load(Ordering::SeqCst);
         assert!(

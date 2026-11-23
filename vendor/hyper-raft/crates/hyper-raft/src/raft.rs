@@ -4070,8 +4070,8 @@ impl<S: Storage> Raft<S> {
         }
     }
 
-    /// A read this member does not take: refused when asked here, so its owner answers it now; one a
-    /// peer sent is dropped, and that peer's owner answers its own.
+    /// A read with no leader to ask: refused when asked here, so its owner answers it now; one a
+    /// peer forwarded is dropped, and that peer's owner answers its own.
     fn drop_read(message: &Message) -> Result<()> {
         if message.from == 0 {
             return Err(Error::ReadDropped);
@@ -4196,10 +4196,7 @@ impl<S: Storage> Raft<S> {
                 self.forward(message)
             }
             MessageType::MsgReadIndex => {
-                // A peer's read reaches a follower only when the peer took it for the leader. Passed
-                // on, it would reach the leader from this member under the peer's name, a record an
-                // authenticated transport refuses; dropped, the peer's owner asks again.
-                if self.leader_id == 0 || message.from != 0 {
+                if self.leader_id == 0 {
                     return Self::drop_read(&message);
                 }
                 self.forward(message)
