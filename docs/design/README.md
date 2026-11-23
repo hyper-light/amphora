@@ -60,3 +60,4 @@ Every decision of every record is indexed in [docs/design.md](../design.md), one
 | The executor's work repeated on every run of a statement or row: ephemeral tables kept between runs, an IN subquery's list searched once a row, a subquery run only where it is read (`executor.md`) | CP-T1.2 | made |
 | Where answers depart from SQLite's, each for a stated reason: TEXT is well-formed UTF-8 (`semantics.md`) | G2 step 3 | made |
 | Analytics' columns: a copy derived from the rows, kept from each commit's redo record after the commit, exact at every snapshot, every size learned where it runs (`columnar.md`) | G11 step 1 | made; prototypes next |
+| PostgreSQL clients: PostgreSQL 19's protocol, grammar, types, catalog, errors and isolation over the SQLite engine, at 10x PostgreSQL's speed (`postgres.md`); opens the network listener `client-protocol.md` left open, for PostgreSQL's protocol | Ada, 2026-11-23 | proposed; unit 1 next |
