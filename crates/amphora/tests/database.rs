@@ -799,3 +799,154 @@ fn a_query_answers_beside_a_held_writer_and_writes_nothing() {
     assert!(wrote.is_err(), "a query wrote: {wrote:?}");
     assert_eq!(count(&db).unwrap(), 2);
 }
+
+/// AUDIT 2026-11-23 §1, MB.1: a call charged by its answer answers within its bound, and an
+/// answer past its declared bound is refused and rolled back, never committed.
+#[test]
+fn mb_1_a_charged_call_past_its_declared_answer_rolls_back() {
+    use amphora::database::{AnswerBytes, AnswerCharge};
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dir.path().join("charged.db"), until()).unwrap();
+    db.call(until(), |c| {
+        c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
+        Ok(())
+    })
+    .unwrap();
+    let write = |id: i64, charge: AnswerCharge| {
+        db.call_charged(until(), charge, move |c| {
+            c.execute(
+                "INSERT INTO t (id, v) VALUES (?1, 'x')",
+                vec![Value::Integer(id)],
+            )?;
+            Ok("y".repeat(100))
+        })
+    };
+    let answer = "y".repeat(100).answer_bytes();
+    assert_eq!(write(1, AnswerCharge::Declared(answer)).unwrap().len(), 100);
+    assert_eq!(write(2, AnswerCharge::Measured).unwrap().len(), 100);
+    assert!(matches!(
+        write(3, AnswerCharge::Declared(answer - 1)),
+        Err(Refusal::TooLarge { .. })
+    ));
+    let ids = db
+        .call(until(), |c| {
+            let mut s = c.prepare("SELECT id FROM t ORDER BY id")?;
+            let ids = s
+                .query_map(Vec::<Value>::new(), |row| row.get::<_, i64>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ids)
+        })
+        .unwrap();
+    assert_eq!(ids, vec![1, 2]);
+}
+
+/// Runs `future` on this thread, parked until its waker is woken; counts the wakes.
+fn block_on<T>(future: impl std::future::Future<Output = T>) -> (T, usize) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Wake, Waker};
+    struct Unpark(std::thread::Thread, AtomicUsize);
+    impl Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            self.0.unpark();
+        }
+    }
+    let unpark = Arc::new(Unpark(std::thread::current(), AtomicUsize::new(0)));
+    let waker = Waker::from(Arc::clone(&unpark));
+    let mut future = std::pin::pin!(future);
+    loop {
+        if let Poll::Ready(value) = future.as_mut().poll(&mut Context::from_waker(&waker)) {
+            return (value, unpark.1.load(Ordering::SeqCst));
+        }
+        std::thread::park();
+    }
+}
+
+fn ids(db: &Database) -> Vec<i64> {
+    db.call(until(), |c| {
+        let mut s = c.prepare("SELECT id FROM t ORDER BY id")?;
+        let ids = s
+            .query_map(Vec::<Value>::new(), |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ids)
+    })
+    .unwrap()
+}
+
+/// Lane perf-A7: a call queued without blocking answers through its `Calling` once, whatever its
+/// charge, and a second poll gets no second answer.
+#[test]
+fn a7_a_nowait_call_answers_exactly_once() {
+    use amphora::database::AnswerCharge;
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dir.path().join("nowait.db"), until()).unwrap();
+    db.call(until(), |c| {
+        c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
+        Ok(())
+    })
+    .unwrap();
+    let charges = [
+        AnswerCharge::Flat,
+        AnswerCharge::Declared(1 << 20),
+        AnswerCharge::Measured,
+    ];
+    let calling: Vec<_> = (1..=3i64)
+        .zip(charges)
+        .map(|(id, charge)| {
+            db.call_nowait(until(), charge, move |c| {
+                c.execute(
+                    "INSERT INTO t (id, v) VALUES (?1, 'x')",
+                    vec![Value::Integer(id)],
+                )?;
+                Ok(id * 10)
+            })
+            .unwrap()
+        })
+        .collect();
+    for (id, mut calling) in (1..=3i64).zip(calling) {
+        let (answer, wakes) = block_on(&mut calling);
+        assert_eq!(answer.unwrap(), id * 10);
+        assert!(wakes <= 1, "woken {wakes} times");
+        let (again, _) = block_on(&mut calling);
+        assert!(matches!(again, Err(Refusal::Unavailable(_))), "{again:?}");
+    }
+    assert_eq!(ids(&db), vec![1, 2, 3]);
+}
+
+/// Lane perf-A7: a call admission refuses is answered typed at once, and one past its declared
+/// answer is refused through its `Calling` and rolled back.
+#[test]
+fn a7_a_refused_or_oversize_nowait_call_is_typed_and_rolls_back() {
+    use amphora::database::{AnswerBytes, AnswerCharge};
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dir.path().join("refused.db"), until()).unwrap();
+    db.call(until(), |c| {
+        c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
+        Ok(())
+    })
+    .unwrap();
+    let write = |id: i64, charge: AnswerCharge| {
+        db.call_nowait(until(), charge, move |c| {
+            c.execute(
+                "INSERT INTO t (id, v) VALUES (?1, 'x')",
+                vec![Value::Integer(id)],
+            )?;
+            Ok("y".repeat(100))
+        })
+    };
+    assert!(matches!(
+        write(1, AnswerCharge::Declared(usize::MAX)),
+        Err(Refusal::Full { .. })
+    ));
+    let past = Instant::now() - Duration::from_millis(1);
+    assert!(matches!(
+        db.call_nowait(past, AnswerCharge::Measured, |_| Ok(0i64)),
+        Err(Refusal::Timeout)
+    ));
+    let answer = "y".repeat(100).answer_bytes();
+    let (over, _) = block_on(write(2, AnswerCharge::Declared(answer - 1)).unwrap());
+    assert!(matches!(over, Err(Refusal::TooLarge { .. })), "{over:?}");
+    let (fits, _) = block_on(write(3, AnswerCharge::Declared(answer)).unwrap());
+    assert_eq!(fits.unwrap().len(), 100);
+    assert_eq!(ids(&db), vec![3]);
+}
