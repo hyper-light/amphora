@@ -13078,7 +13078,7 @@ mod tests {
             let now = owner.now().unwrap();
             owner
                 .replica
-                .compact(0, now, std::task::Waker::noop())
+                .compact(0, now, &owner.waker)
                 .unwrap();
             owner.replica.applied().index
         };
@@ -16066,7 +16066,7 @@ mod tests {
             let now = owner.now().unwrap();
             owner
                 .replica
-                .compact(0, now, std::task::Waker::noop())
+                .compact(0, now, &owner.waker)
                 .unwrap();
             owner.replica.applied().index
         };
@@ -16443,7 +16443,7 @@ mod tests {
             let now = owner.now().unwrap();
             let out = owner
                 .replica
-                .compact(0, now, std::task::Waker::noop())
+                .compact(0, now, &owner.waker)
                 .unwrap();
             assert!(out, "no compaction went out");
             driven.quiet(pump);
