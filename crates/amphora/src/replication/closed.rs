@@ -27,21 +27,6 @@ pub(crate) fn stamp(micros: u64, data: &[u8]) -> Vec<u8> {
     bytes
 }
 
-/// Writes `micros` into the stamp `stamp` made: an entry copied where it was prepared, off the
-/// owner's step, takes its proposer's clock as it is proposed, in place (CP-T1.13, replication.md
-/// "Decision (lane P9)", part 3).
-pub(crate) fn restamp(micros: u64, stamped: &mut [u8]) -> Result<(), Refusal> {
-    if !stamped.starts_with(PREFIX) {
-        return Err(api::invalid("stamped entry", "the entry carries no stamp"));
-    }
-    let (time, _) = stamped
-        .get_mut(PREFIX.len()..)
-        .and_then(<[u8]>::split_first_chunk_mut::<8>)
-        .ok_or_else(|| api::invalid("stamped entry", "the stamp is cut short"))?;
-    *time = micros.to_le_bytes();
-    Ok(())
-}
-
 /// An entry's stamp, if it carries one, and the entry inside it. An entry from before stamps, or
 /// one hyper-raft made itself (an election's empty entry), carries none.
 pub(crate) fn open(data: &[u8]) -> Result<(Option<u64>, &[u8]), Refusal> {
