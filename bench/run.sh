@@ -2,7 +2,7 @@
 # Runs the bench once per target and prints a record line for each (JSON): the bench's report
 # with when, where and on what it ran (CLAUDE.md §7). Records go to bench/records/ as JSON lines.
 #
-# A server's target (postgres, orioledb, cedardb, mysql, clickhouse, clickhouse-durable) runs against
+# A server's target (postgres, orioledb, cedardb, mysql, clickhouse, clickhouse-durable, amphora-serve) runs against
 # its container (servers/<engine>.sh), restarted first so that the high-water mark its cgroup keeps
 # (cgroup v2's memory.peak, which only grows while the cgroup lives) is this run's alone; with
 # AMPHORA_BENCH_RESTART=0 it is only started if it isn't running, and the peak is since it started.
@@ -42,6 +42,7 @@ engine() {
   case "$1" in
     postgres | orioledb | cedardb | mysql) echo "$1" ;;
     clickhouse | clickhouse-durable) echo clickhouse ;;
+    amphora-serve) echo amphora ;;
   esac
 }
 # The most of anon + shmem a cgroup's memory.stat shows, read every 0.2 s until the cgroup goes or
