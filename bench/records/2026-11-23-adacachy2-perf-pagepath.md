@@ -165,3 +165,28 @@ it; 5 rounds, arm order alternated, load recorded; output `ab5-<HHMM>.jsonl`, wr
 build finishes. Under load 90-136 the after build took 20m22s (run r211). r211's base build then
 failed: `git archive` leaves out the untracked `bench/Cargo.lock`. Relaunched as run r266 with the
 lock files copied in.
+
+## perf-B4: the lock-free ways' "collapse past 4 threads" is the bitmap sending half the reads to the lock (AUDIT 2.1)
+
+`PageBits::holds` said "ask under the lock" for a page past its words. The bench reads pages
+1..2*pages; at 32,612 pages the bitmap's 512 words reach page 32,767, so 32,457 of the 32,612
+absent pages (half of all reads) took the shared `RwLock` and the frame index's lock. At 32,768
+pages the words double (1,024: to 65,535) and every read is answered lock-free. One binary (perf-B2's
+release test binary, copied to `lookup-old-2b58`), only the page count changed, alternated, threads
+pinned with `taskset -c 0..n-1`, kiln run r318 (needs cpus=16), records `b4-bits-0436.txt`, load
+78-100 on 32 cores. Lookups a second, all threads, reps:
+
+| threads | Published 32,612 | Published 32,768 | Optimistic 32,612 | Optimistic 32,768 | Locked (either) |
+|---|---|---|---|---|---|
+| 1 | 29.1 M, 28.9 M, 29.4 M | 36.6 M, 36.2 M | 29.9 M, 30.9 M, 31.2 M | 39.0 M, 39.1 M | 46-51 M |
+| 2 | 38.0 M, 36.7 M, 38.2 M | 73.9 M, 72.3 M | 39.8 M, 39.7 M, 37.6 M | 76.2 M, 75.3 M | 15.7-17.0 M |
+| 4 | 29.2 M, 29.7 M, 28.9 M | 136.6 M, 130.1 M | 32.9 M, 34.9 M, 32.3 M | 92.3 M, 144.6 M | 10.2-11.1 M |
+| 8 | 18.3 M, 18.2 M, 18.1 M | 196.1 M, 220.0 M | 17.9 M, 17.6 M, 17.6 M | 203.2 M, 273.7 M | 7.0-7.1 M |
+| 16 | 8.47 M, 8.37 M | 407.8 M, 382.1 M | 8.27 M, 8.24 M | 370.1 M, 495.5 M | 3.0-3.4 M |
+
+Reading: with every read answered lock-free, both ways scale with the threads (27-42 ns a lookup a
+thread from 1 to 16), 120-150x the lock at 16. So nothing a lookup writes is shared, and
+`ArcSwap::load` is not the collapse. What remains against the lock is one reader: 27-29 ns against
+20 ns, the three `ArcSwap` loads. The fix (4da616cf) answers a page past the words as absent; its
+own A/B (this bench, its binary against `lookup-old-2b58`, 32,612 pages) is still to run, as are its
+clippy (run r314) and the release storage suite (run r312).
