@@ -7885,6 +7885,62 @@ fn exact_avg_step(arg: &Value, payload: &mut [Value]) -> Result<()> {
     Ok(())
 }
 
+/// A window frame's row leaving an exact SUM, TOTAL or AVG (its count in slot `count_at`): the
+/// value subtracted exactly; sumInverse's exact INTEGER subtract while the sum is one.
+fn exact_inverse(arg: NumericArg, payload: &mut [Value], count_at: usize) -> Result<()> {
+    use crate::vdbe::morsel::ExactSum;
+    let Some(Value::Numeric(Numeric::Integer(count))) = payload.get_mut(count_at) else {
+        return Err(LimboError::InternalError(
+            "an exact sum's count slot is not an integer".to_string(),
+        ));
+    };
+    *count = count.checked_sub(1).or_overflow()?;
+    let integer_sum = count_at == 4
+        && matches!(payload.get(2), Some(Value::Numeric(Numeric::Integer(0))));
+    let Some(acc) = payload.first_mut() else {
+        return Err(LimboError::InternalError("an exact sum's payload is empty".to_string()));
+    };
+    if let (true, Value::Numeric(Numeric::Integer(total)), NumericArg::Integer(sub)) =
+        (integer_sum, &mut *acc, &arg)
+    {
+        if let Some(rest) = total.checked_sub(*sub) {
+            *total = rest;
+            return Ok(());
+        }
+    }
+    let was_integer = matches!(acc, Value::Numeric(Numeric::Integer(_)));
+    let mut sum = match &*acc {
+        // Both infinities met: NULL, which stays.
+        Value::Null => return Ok(()),
+        Value::Numeric(Numeric::Integer(total)) => {
+            let mut sum = ExactSum::default();
+            exact_add_int(&mut sum, *total)?;
+            sum
+        }
+        acc => exact_sum_of(acc)?,
+    };
+    match arg {
+        NumericArg::Null => return Ok(()),
+        NumericArg::Integer(i) => match i.checked_neg() {
+            Some(negated) => exact_add_int(&mut sum, negated)?,
+            // -i64::MIN is 2^63, a double exactly.
+            None => sum.add(9_223_372_036_854_775_808.0).map_err(exact_error)?,
+        },
+        NumericArg::Float(f) => sum.add(-f).map_err(exact_error)?,
+    }
+    *acc = exact_sum_value(&sum)?;
+    if integer_sum && was_integer {
+        // The INTEGER subtract overflowed: sum() reports it at the end, as the step does.
+        if let Some(slot) = payload.get_mut(2) {
+            *slot = Value::from_i64(1);
+        }
+        if let Some(slot) = payload.get_mut(3) {
+            *slot = Value::from_i64(1);
+        }
+    }
+    Ok(())
+}
+
 fn exact_avg_final(payload: &[Value]) -> Result<Value> {
     let count = payload.get(2).and_then(Value::as_int).unwrap_or(0);
     match payload.first() {
@@ -9354,6 +9410,9 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
             if matches!(parsed, NumericArg::Null) {
                 return Ok(());
             }
+            if payload.len() > EXACT_SUM_SLOTS {
+                return exact_inverse(parsed, payload, 4);
+            }
             let [acc, r_err_val, approx_val, ovrfl_val, count_val, ..] = payload else {
                 unreachable!(
                     "Sum/Total payload has acc/r_err/approx/ovrfl/count per init_agg_payload"
@@ -9417,6 +9476,9 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
             let parsed = classify_numeric_arg(&arg);
             if matches!(parsed, NumericArg::Null) {
                 return Ok(());
+            }
+            if payload.len() > EXACT_AVG_SLOTS {
+                return exact_inverse(parsed, payload, 2);
             }
             let [sum_val, r_err_val, count_val, ..] = payload else {
                 unreachable!("Avg payload has sum/r_err/count per init_agg_payload");
