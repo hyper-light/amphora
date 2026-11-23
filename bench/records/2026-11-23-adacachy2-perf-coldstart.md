@@ -12,20 +12,19 @@ Command (kiln run r94, one machine, before and after interleaved, 5 reps x 200 o
 `open_time` opens 200 new database files one after another, each with a new PlatformIO as
 crates/amphora/src/db.rs does, then reopens each; it times `Database::open` and the first statement.
 
-| phase | before min / median of 5 medians (us) | after min / median of 5 medians (us) |
+| phase | before best / median of 5 run medians (µs) | after best / median of 5 run medians (µs) |
 |---|---|---|
-| new file open | 233.7 / 347.6 | 189.9 / 278.8 |
-| reopen | 173.4 / 259.1 | 144.7 / 160.4 |
-| first statement on a new file (CREATE TABLE, fsync-bound) | 7359 / 18657 | 7791 / 19288 (no change; noise) |
-| reopen's first statement | 8.6 / 11.7 | 7.4 / 8.3 |
+| new file open | 316.1 / 347.6 | 258.7 / 278.8 |
+| reopen | 183.2 / 259.1 | 156.2 / 160.4 |
+| first statement on a new file (CREATE TABLE, fsync-bound) | — / 18657 | — / 19288 |
+| reopen's first statement | — / 11.7 | — / 8.3 |
 
 Per-rep medians, new open: before 345.1 316.1 351.5 382.0 347.6; after 347.1 284.1 258.7 273.8 278.8.
 Per-rep medians, reopen: before 305.5 291.8 183.2 259.1 191.1; after 248.4 156.2 156.2 160.4 160.5.
 
-Reading: the scratch page (create, write 4 KiB, timed reads, unlink) cost about 30-40 us of every
-writable open after the first on a device; the min falls 18% (new) and 17% (reopen). The rest of an
-open (~145-210 us) is elsewhere: perf-D's bootstrap/fdatasync and perf-C's versioned open are the
-next pieces of it.
+Across these runs the best median fell 18.2% for new opens and 14.7% for reopens.
+The record preserves only the aggregate medians for first statements. Other builds shared
+the host, so these observations do not establish an isolated cost for the scratch read (T-QT.5.5).
 
 The process's first open (CPU calibration, `process_calibration`, still on the first open) ranged
 2.2 ms to 1.0 s across runs on this loaded host (calibration samples until each median settles,
