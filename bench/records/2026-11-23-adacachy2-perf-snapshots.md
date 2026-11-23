@@ -26,8 +26,10 @@ holds back every new read of the replica until a restart (`database/replicated.r
 `hold_reads`), the engine refuses the restart as busy while any view is open (`Db::restart_log`), and
 the owner refuses submits as unavailable (`log_full`).
 
-## Checks (one run at a time, the lane's target dir, `CARGO_INCREMENTAL=0` for fewer files on the
-stalled disk)
+## Checks
+
+One run at a time, in the lane's one target dir, with `CARGO_INCREMENTAL=0` for fewer files on the
+stalled disk.
 
 r405 (adacachy2, needs linux/amd64,cpus=8,mem=24g): `cargo clippy -p amphora --all-targets --locked
 -- -D warnings`; `cargo test -p amphora --lib -- memory:: replication::image_room_tests snapshots_
