@@ -336,20 +336,27 @@ impl Writer {
 }
 
 /// Sends `events` through the live nodes, starting at `via`, until one acknowledges them or the
-/// deadline passes: the same ids every time, so a resend is the same write.
+/// deadline passes: the same ids every time, so a resend is the same write. A write refused
+/// [`amphora_api::Refusal::Serialization`] (what it read changed: Amphora's 40001) is asked again
+/// at the node that refused it, which is up and serving; any other failure moves to the next node.
 fn send(c: &dyn Cluster, down: &[AtomicBool; NODES], via: usize, s: &[(String, Vec<Arg>)], deadline: Duration) -> anyhow::Result<usize> {
     let until = Instant::now() + deadline;
     let mut n = via;
     let mut last = None;
     while Instant::now() < until {
         let node = n % NODES;
-        n += 1;
         if down.get(node).is_some_and(|d| d.load(Ordering::Relaxed)) {
+            n += 1;
             continue;
         }
         match c.exec(node, s, until) {
             Ok(()) => return Ok(node),
-            Err(e) => last = Some(e),
+            Err(e) => {
+                if !matches!(e.downcast_ref::<amphora_api::Refusal>(), Some(amphora_api::Refusal::Serialization { .. })) {
+                    n += 1;
+                }
+                last = Some(e);
+            }
         }
     }
     Err(anyhow::anyhow!("no live node acknowledged a write within --deadline-s: {last:?}"))
@@ -732,7 +739,7 @@ mod inproc {
                     }
                     Ok(())
                 })
-                .map_err(|e| anyhow::anyhow!("node {via} refused a write: {e:?}"))
+                .map_err(|e| anyhow::Error::new(e).context(format!("node {via} refused a write")))
         }
 
         fn count(&self, on: usize, sql: &str, args: Vec<Arg>, until: Instant) -> anyhow::Result<u64> {
@@ -1103,7 +1110,8 @@ mod procs {
         fn answer(&self, line: &str) -> serde_json::Value {
             match self.request(line) {
                 Ok(v) => v,
-                Err(e) => serde_json::json!({ "error": format!("{e:#}") }),
+                // The refusal's type beside its text, so the driver retries on the type.
+                Err(e) => serde_json::json!({ "error": format!("{e:#}"), "refusal": e.downcast_ref::<amphora_api::Refusal>() }),
             }
         }
 
@@ -1125,7 +1133,7 @@ mod procs {
                             }
                             Ok(())
                         })
-                        .map_err(|e| anyhow::anyhow!("refused a write: {e:?}"))?;
+                        .map_err(|e| anyhow::Error::new(e).context("refused a write"))?;
                     Ok(serde_json::json!({ "ok": true }))
                 }
                 Some("count") => {
@@ -1145,6 +1153,14 @@ mod procs {
                 Some("leader") => {
                     let status = self.db.replica().ok_or_else(|| anyhow::anyhow!("no replica"))?.status().map_err(|e| anyhow::anyhow!("{e:?}"))?;
                     Ok(serde_json::json!({ "leader": status.leader }))
+                }
+                Some("counters") => {
+                    let c = self.db.replica().ok_or_else(|| anyhow::anyhow!("no replica"))?.counters();
+                    Ok(serde_json::json!({
+                        "commits_held": c.commits_held, "commits_classic": c.commits_classic,
+                        "flushes": c.flushes.iter().sum::<u64>(), "flush_ms": c.flush_time.as_secs_f64() * 1e3,
+                        "flush_backlog": c.flush_backlog, "write_slot_holds": c.write_slot_holds,
+                    }))
                 }
                 Some("cut") => {
                     self.cut.store(r.get("to").and_then(|t| t.as_bool()).ok_or_else(|| anyhow::anyhow!("cut takes to"))?, Ordering::Relaxed);
@@ -1356,7 +1372,10 @@ mod procs {
             pool.lock().map_err(|_| anyhow::anyhow!("pool poisoned"))?.push(conn);
             let v: serde_json::Value = serde_json::from_str(&back)?;
             if let Some(e) = v.get("error").and_then(|e| e.as_str()) {
-                anyhow::bail!("node {n}: {e}");
+                return Err(match v.get("refusal").and_then(|r| serde_json::from_value::<amphora_api::Refusal>(r.clone()).ok()) {
+                    Some(refusal) => anyhow::Error::new(refusal).context(format!("node {n}")),
+                    None => anyhow::anyhow!("node {n}: {e}"),
+                });
             }
             Ok(v)
         }
