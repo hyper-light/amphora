@@ -1058,9 +1058,8 @@ codex-notices/OWNER.md, section 7).
   joint configuration") before it proposes. A change appended but not applied at its base is not visible there; a
   raise beside it applies only if no change applied between its base and its index, since the stale-base rule
   refuses it otherwise, so it is never applied while a member it did not prove belongs to the configuration
-  (T-T1.8.A2). `writer_floor` answers that refusal `Unavailable`, the retry class, "the database advanced since
-  preparation: the group changed while the raise was proven; raise again"; a raise whose entry another lead replaces
-  stays `UnknownOutcome`. A learner that has not attested blocks a
+  (T-T1.8.A2). `writer_floor` answers that refusal as it is, `Serialization`, like any write whose base moved, to be asked
+  again; a raise whose entry another lead replaces stays `UnknownOutcome`. A learner that has not attested blocks a
   raise, and the refusal names it. Falsified by: a floor applied while a learner of the configuration at its index had
   no attestation at its version under its current join.
 - c) **One `u32`, the highest version the binary runs.** It is the claim U05's standalone floor already carries

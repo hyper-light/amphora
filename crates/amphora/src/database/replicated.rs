@@ -14008,10 +14008,6 @@ mod tests {
             .unwrap();
         let refusal = answered.err().unwrap();
         assert_eq!(refusal, Refusal::UnknownOutcome);
-        assert_eq!(
-            crate::database::application::overtaken(refusal),
-            Refusal::UnknownOutcome
-        );
         settled(&mut driven, &mut pump, 3, &[]);
         for owner in 0..3 {
             assert_eq!(floor_version(&mut driven, owner), None, "owner {owner}");
@@ -15157,7 +15153,7 @@ mod tests {
     /// running), every append lost while heartbeats go on, so the change can't commit; a follower
     /// raises the floor to 7, prepared at a base without the change and forwarded; then the appends
     /// go again. Expect: the raise refused Serialization, "prepared transaction", "the database advanced since
-    /// preparation", which writer_floor answers Unavailable, to be asked again; the change
+    /// preparation", which writer_floor answers as it is, like any write's, to be asked again; the change
     /// applied; and no floor on any voter.
     #[test]
     fn a_raise_a_change_overtakes_is_refused_by_the_stale_base_rule() {
@@ -15210,13 +15206,6 @@ mod tests {
                 what: "prepared transaction".into(),
                 why: "the database advanced since preparation".into(),
             }
-        );
-        // What writer_floor answers its caller for it: ask again.
-        assert_eq!(
-            crate::database::application::overtaken(refused),
-            Refusal::Unavailable(
-                "the database advanced since preparation: the group changed while the raise was proven; raise again".into()
-            )
         );
 
         driven.answer(&mut pump, &added).unwrap();

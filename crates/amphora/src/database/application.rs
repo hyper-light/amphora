@@ -121,12 +121,9 @@ impl Database {
         let outcome = database
             .call_db(until, move |db| raise(db, wanted, replicated))
             .map_err(|refusal| {
-                let Writer::Replicated { client, .. } = &self.shared.writer else {
-                    return refusal;
-                };
-                let stale = matches!(&refusal, Refusal::Serialization { .. });
-                let refusal = overtaken(refusal);
-                if stale {
+                if let Writer::Replicated { client, .. } = &self.shared.writer
+                    && matches!(&refusal, Refusal::Serialization { .. })
+                {
                     client
                         .handle()
                         .floor_refused(FloorRefusal::StaleBase, &refusal);
@@ -234,22 +231,6 @@ pub(crate) fn raise(
         name: wanted.name,
         version,
     }))
-}
-
-/// What a replicated raise answers when the stale-base rule refuses it: the group changed
-/// between its proof and its index, so it is to be asked again, `Unavailable`, the class for
-/// "retry later" (amphora-seam-owner's ruling on step 4, a). Every other answer is its own: a
-/// displaced entry stays UnknownOutcome.
-pub(super) fn overtaken(refusal: Refusal) -> Refusal {
-    match refusal {
-        Refusal::Serialization { what, why }
-            if what == "prepared transaction"
-                && why == "the database advanced since preparation" =>
-        {
-            Refusal::Unavailable("the database advanced since preparation: the group changed while the raise was proven; raise again".into())
-        }
-        other => other,
-    }
 }
 
 /// The members' proof of a raise to `version` on a replica, read at this session's base; the
