@@ -351,7 +351,11 @@ impl Chooser {
     /// [`Chooser::install_cracker`]). Until then the leader answers.
     pub fn rebuild_due(&self) -> Option<SkipMethod> {
         let (method, trial) = self.next_method();
-        (trial && !self.keeps(method)).then_some(method)
+        if trial && !self.keeps(method) {
+            Some(method)
+        } else {
+            None
+        }
     }
 
     /// Builds the dropped zone map again from the cracker's copy of the column, in the dropped
@@ -366,14 +370,15 @@ impl Chooser {
         let mut builder = super::ZoneMapBuilder::new();
         let mut next_start = 0usize;
         for (rowid, value) in rows {
-            while self
-                .zone_starts
-                .get(next_start)
-                .is_some_and(|start| *start <= rowid)
-            {
+            let passed = self.zone_starts.get(next_start..).map_or(0, |rest| {
+                rest.iter().take_while(|start| **start <= rowid).count()
+            });
+            for _ in 0..passed {
                 builder.end_run();
-                next_start += 1;
             }
+            next_start = next_start
+                .checked_add(passed)
+                .unwrap_or(self.zone_starts.len());
             builder.row(rowid, value)?;
         }
         self.zones = Some(builder.finish());

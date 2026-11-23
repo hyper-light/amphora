@@ -163,7 +163,8 @@ mod tests {
         let steps: u32 = 20_000;
         for n in [1_u64, 100, 1_000, 10_000] {
             // Deadlines spread over a minute, none due at `start`.
-            let until = |i: u64| start + Duration::from_micros(1 + i.wrapping_mul(7919) % 60_000_000);
+            let until =
+                |i: u64| start + Duration::from_micros(1 + i.wrapping_mul(7919) % 60_000_000);
             let mut queue: VecDeque<(Instant, u64)> = (0..n).map(|i| (until(i), i)).collect();
             let mut line = Waiting::new();
             for i in 0..n {
@@ -172,9 +173,14 @@ mod tests {
             let began = Instant::now();
             let mut soonest = start;
             for _ in 0..steps {
-                soonest = queue.iter().map(|(until, _)| *until).fold(start + Duration::from_secs(120), Instant::min);
+                soonest = queue
+                    .iter()
+                    .map(|(until, _)| *until)
+                    .fold(start + Duration::from_secs(120), Instant::min);
                 for _ in 0..queue.len() {
-                    let Some(entry) = queue.pop_front() else { break };
+                    let Some(entry) = queue.pop_front() else {
+                        break;
+                    };
                     if start >= entry.0 {
                         continue;
                     }

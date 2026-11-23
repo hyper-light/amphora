@@ -346,3 +346,57 @@ row lists declared `fixed()`, fixed in 54a8bdf7.
 What is left (not this unit): the cross-group steps' `call_internal` and a replicated owner's command queue
 still charge a call `REQUEST_MAX` (replication.md, "A call is charged its worst case"); the bound would travel
 in `Operation::Call`.
+
+## A9's bench edits build; the three sessions tests are not A9's (perf-A10)
+
+**Unit 1, bench builds on main.** r1235 (adacachy2, needs cpus=8,mem=24g, load 23): at main 5e6c619f,
+`cp Cargo.lock bench/Cargo.lock` (bench/.gitignore keeps that copy out of git) then `cargo check
+--all-targets` in `bench/`: rc 0, no errors. A9's `AnswerMax` edits in bench/src/{repl,sqlapi,scale,cluster}.rs
+compile as they are; nothing to fix. Script: `~/.cache/amphora-perf/cross-a10-scripts/u12.sh`.
+
+**Unit 2, xgroup::sql::sessions::t_t1_10_w7, w8 and w11 alone, 6 runs each.** Main is 5e6c619f (r1235, through
+`cargo test --lib <name> -- --test-threads=1`); before A9 is 7c303299, the parent of A9's first commit
+(r1245, the lib test binary run directly, one process a test). Both runs shared the lane's one target dir, and
+the two commits' lib test binaries have one path there, so r1235's `cargo test` rebuilt main's over r1245's
+binary after r1245's first runs: only runs whose log says `449 filtered out` (7c303299's test count; main's is
+452) are counted for 7c303299. r1265 re-runs w7 and w11 five more times each from a copy of 7c303299's binary
+(`~/.cache/amphora-perf-bin/cross/amphora-lib-7c303299`, logs `a10-pre2-*` on adacachy2); its numbers were not
+in when this lane ended. 7c303299..54a8bdf7 holds only A9's five commits.
+
+| test | main 5e6c619f | before A9 7c303299 |
+|---|---|---|
+| w7 | 0 of 6 passed | 0 of 1 passed |
+| w8 | 6 of 6 passed | 6 of 6 passed |
+| w11 | 0 of 6 passed | 0 of 1 passed |
+
+r1245's other runs (main's binary, `452 filtered out`): w7 0 of 5 passed, w11 1 of 5. So on main w7 is red in 11
+of 11 runs and w11 in 10 of 11.
+
+A failing run ends at its read's 120 s deadline (`get(..).unwrap()` on `Err(Timeout)`, sql.rs:2952). In w7 the
+modes TwoPhase/Decided/Committed, TwoPhase/Resolved/Committed and TwoPhase/Decided/Wait pass; the next,
+TwoPhase/Decided/WaitOnLock, never answers after the gate opens, on both commits; w11 fails on its WaitOnLock
+mode too (sql.rs:3281, `left: Err(Timeout)`, `right: Ok(Some([8]))`). So w7 and w11 failed before A9
+landed, in the same mode with the same timeout: they are not A9's (A9 touched no xgroup, replica or read path), and are left for the lane that owns CP-T1.10's locked reads. A guess at where to look,
+not checked: 968b9c1a (11-22, "a read across groups held by a lock wakes only for its own row's resolution")
+narrowed the wake that 1495f4fb's WaitOnLock replica reads depend on.
+
+What is left for lane A11 (decisions 3a, 3b and unit 4; not started here, so no code on perf/cross-a10):
+
+- 3a. `Operation::Call(Mutex<Option<Call>>)` gains its declared bound (`Operation::Call(call, answer_bytes)`);
+  `Admission::bytes_for` charges it, so `Admission::reserve_call` and the `answer: Option<usize>` threaded
+  through `session`, `call_db_session`, `submit_selected` and `submit_local` go. `call_internal` and `call_db`
+  take an `AnswerMax<R>` from each caller (xgroup/sql.rs 6 sites, database/across.rs 5, restore.rs 4,
+  online.rs 2, transport/common.rs 2, postgres/listener.rs 1, application.rs 1). In
+  database/replicated.rs, `Handle::submit` enqueues every Submit at `api::REQUEST_MAX` (line ~1538): charge
+  `bytes_for(&operation)` instead; the test sites (~10, each `enqueue(Input::Submit{..}, REQUEST_MAX)`) follow.
+  `queue_bounds` passes `REQUEST_MAX` as a call's charge to `command_counts` (the most calls the room holds),
+  and it and `owner_image_room` hold one call's `REQUEST_MAX` of room back beside the wire record; the test at
+  replicated.rs ~5709 asserts that count (`application / (REQUEST_MAX + ENVELOPE_BYTES)`). Those are bounds
+  derived from the largest call, not per-call charges, and need their own decision once no call is charged it.
+- 3b. serve.rs's write path calls `db.call(until, AnswerMax::bytes(RESULT_MAX), ..)`. Each frame is held by its
+  own `Charged` as it's built and `Encoded::answer_bytes` counts only unheld bytes, but the answer's
+  `Vec<Encoded>` spine is not charged, and its frame count has no bound before the call runs. Charging the
+  spine as frames are pushed would let the call declare `size_of::<Vec<Encoded>>()` alone.
+- 4. `store::Config::queue` (`Some(4096)` by default, `Groups` and tests/store.rs's `Some(1)`) and
+  `ROOM_LOOK` (store.rs:516, the 5 ms re-look at :1452 and :1549) remain; bench/src/store.rs:195
+  (`AMPHORA_QUEUE`, V4's bba65c73) sets the count and must go with it. The `Engine` trait has no row size yet.

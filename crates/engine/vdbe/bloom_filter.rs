@@ -77,6 +77,14 @@ fn hash_of(value: &impl Hash) -> u64 {
     hasher.finish()
 }
 
+/// `bytes` in whole 64-bit words, fastbloom's unit (and the hashes' while a build collects them).
+const fn whole_words(bytes: usize) -> usize {
+    match bytes.checked_div(size_of::<u64>()) {
+        Some(words) => words,
+        None => 0,
+    }
+}
+
 /// Amphora (PL.5): the filter for a build's distinct key hashes. Its rate is `fp_per_key` times
 /// the keys, but never below the rate its memory bound allows: with `m` bits, `n` keys and the
 /// best number of hashes a Bloom filter's rate is `exp(-(m/n)·ln²2)` (Broder and Mitzenmacher,
@@ -93,7 +101,7 @@ fn sized_store(hashes: &[u64], sizing: FilterSizing, held: usize) -> Store {
     }
     let keys = hashes.len() as f64;
     let ln2_squared = std::f64::consts::LN_2 * std::f64::consts::LN_2;
-    let room_words = sizing.max_bytes.saturating_sub(held) / size_of::<u64>();
+    let room_words = whole_words(sizing.max_bytes.saturating_sub(held));
     let floor = (-(room_words as f64 * 64.0 / keys) * ln2_squared).exp();
     let rate = (sizing.fp_per_key * keys).max(floor);
     if rate.is_nan() || rate <= 0.0 || rate >= 1.0 {
@@ -102,13 +110,11 @@ fn sized_store(hashes: &[u64], sizing: FilterSizing, held: usize) -> Store {
     // The bits `rate` takes over the keys (the same survey's `m = -n·ln(rate)/ln²2`), in words,
     // at most the room's: the floor's rate fills the room.
     let wanted_words = (keys * -rate.ln() / ln2_squared / 64.0).ceil();
-    let words = if wanted_words.is_finite() && wanted_words < room_words as f64 {
-        // Within the room, so within usize.
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let wanted = wanted_words as usize;
-        wanted.max(1)
-    } else {
-        room_words
+    // `wanted_words` is a whole number (its `ceil`), so the conversion is exact when it is in
+    // range; NaN, infinite or past `usize` it is `None`, and the room's words are the bits.
+    let words = match num_traits::ToPrimitive::to_usize(&wanted_words) {
+        Some(wanted) if wanted < room_words => wanted.max(1),
+        _ => room_words,
     };
     if words == 0 {
         return Store::PassAll;
@@ -167,7 +173,7 @@ impl BloomFilter {
                 // the bound leaves beside the old one (QT.5, lane qs5-20): it doubles while three
                 // lists' room fits, then takes the rest, and past half the bound it can't grow.
                 if hashes.len() == hashes.capacity() {
-                    let most = sizing.max_bytes / size_of::<u64>();
+                    let most = whole_words(sizing.max_bytes);
                     let old = hashes.capacity();
                     let more = old.max(1).min(most.saturating_sub(old.saturating_mul(2)));
                     if more == 0 || hashes.try_reserve_exact(more).is_err() {
@@ -256,7 +262,8 @@ impl BloomFilter {
     pub fn bytes(&self) -> usize {
         match &self.store {
             Store::Fixed(inner) | Store::Sized(inner) => inner.num_bits() / 8,
-            Store::Collecting(hashes) => hashes.capacity() * size_of::<u64>(),
+            // A Vec's bytes fit isize, so this never saturates.
+            Store::Collecting(hashes) => hashes.capacity().saturating_mul(size_of::<u64>()),
             Store::NoKeys | Store::PassAll => 0,
         }
     }

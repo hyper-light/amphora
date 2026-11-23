@@ -1006,7 +1006,8 @@ pub fn main() -> anyhow::Result<()> {
         "timing": "Instant around prepare, run and every row read",
     });
     let platform = serde_json::json!({ "host": host(), "os": std::env::consts::OS, "arch": std::env::consts::ARCH });
-    let all = scenarios(scale);
+    let all = scenarios(scale)
+        .ok_or_else(|| anyhow::anyhow!("colcopy: a scenario's size at scale {scale} passes i64"))?;
     let probe = all.iter().map(|s| s.rows).min().unwrap_or(1);
     let reach = reach(probe)?;
     eprintln!("queries no copy can answer: {}", skipped_queries(&reach));
