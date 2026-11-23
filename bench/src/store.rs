@@ -138,8 +138,7 @@ impl Engine for Convo {
     }
 
     // As Amphora's own engine reports it (database.rs): the checkpointer then leaves a log within
-    // its bound uncopied (docs/design/store.md, decision 35). Without it the store can't tell and
-    // copies the log into the file every period, with a flush of the file each time.
+    // its bound uncopied (docs/design/store.md, decision 35).
     fn uncopied(reader: &mut Db) -> anyhow::Result<Option<Checkpointed>> {
         Ok(Some(reader.uncopied()))
     }
