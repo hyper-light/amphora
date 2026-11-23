@@ -80,9 +80,11 @@ Test: `vdbe::hash_table::hashtests::audit_3_1_probe_rows_allocate_nothing` count
 allocations (a counting global allocator in the engine's lib tests) over 1,000 probe rows with an
 integer key and a NOCASE text key, half hits (two matches each, walked with `next_match`) and half
 misses, and asserts **0 allocations** (before the change the same flow made at least 3 per row plus
-one per `next_match` call, by the code above; not counted on the old tree). **Not yet run green:**
-clippy and this test (kiln run on adacachy2, target `vdbe-check`) were still compiling at the
-hour's end with the host at load 87-111, so this is on branch perf/vdbe, not main.
+one per `next_match` call, by the code above; not counted on the old tree). Verified on adacachy2
+(kiln run, `.perf-vdbe/check.sh`, the committed tree): `cargo clippy -p amphora-engine --all-targets
+--locked -- -D warnings` exit 0; `cargo test -p amphora-engine --lib --locked -- vdbe::hash_table`
+46 passed, 0 failed, the new test among them. Not run: the SQL-level join suites (tests/hash_*.rs,
+join_methods.rs) that drive the changed `HashProbe` opcode.
 
 Not done: a row probing a spilled table's loaded partition from `HashProbe` still allocates its kept
 buffer once (the register refill took the buffer; `probe_partition` takes a slice); the
