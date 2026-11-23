@@ -453,36 +453,26 @@ impl Rates {
     }
 }
 
-/// Lane T7 (TPC-H q05): a lib test's whole set of weights, planned with by every prepare on its
-/// thread in place of the learned ones, so no cost input moves with the machine or the test's runs.
-#[cfg(test)]
-pub(crate) mod test_pin {
-    thread_local! {
-        pub(crate) static WEIGHTS: std::cell::Cell<Option<super::LearnedWeights>> =
-            const { std::cell::Cell::new(None) };
-    }
-}
-
 /// The four weights, each in rows' visits: what one unit of the work takes against one row read
 /// and tested; and the row's visit itself in page reads, the planner's unit, once the database has
 /// read a page from its file.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct LearnedWeights {
+pub struct LearnedWeights {
     /// A row's visit against a page read; None until the database has timed one (a database
     /// whose pages all came from memory so far has no page read to weigh it against).
-    pub(crate) row_in_pages: Option<f64>,
-    pub(crate) seek: f64,
-    pub(crate) hash_build: f64,
-    pub(crate) hash_probe: f64,
-    pub(crate) sort: f64,
+    pub row_in_pages: Option<f64>,
+    pub seek: f64,
+    pub hash_build: f64,
+    pub hash_probe: f64,
+    pub sort: f64,
     /// A Bloom filter's lookup of a key it doesn't hold (`Work::BloomProbe`).
-    pub(crate) bloom_probe: f64,
+    pub bloom_probe: f64,
     /// A `WHERE` condition's step (`Work::WhereStep`).
-    pub(crate) where_step: f64,
+    pub where_step: f64,
     /// The share of the connection's recent page fetches that read a file, None before its first
     /// fetch (`Pager::page_miss_ratio`): how many of the pages a plan would first read from a cold
     /// cache it reads from the file (`cost::file_reads`).
-    pub(crate) page_miss: Option<f64>,
+    pub page_miss: Option<f64>,
 }
 
 /// Amphora (AUDIT 3.3): one connection's count of its runs of each sampled operation

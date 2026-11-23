@@ -468,12 +468,14 @@ impl amphora_engine::storage::versioned::memory::Source for StorageMemory {
         self.0
             .hold(Use::Caches, bytes)
             .map_err(|refusal| match refusal {
-                Refusal::TooLarge { limit, .. } => amphora_engine::LimboError::MemoryBudget {
-                    what,
-                    asked: bytes,
-                    held: self.0.held(Use::Caches),
-                    limit: u64::try_from(limit).unwrap_or(u64::MAX),
-                },
+                Refusal::TooLarge { limit, .. } => {
+                    amphora_engine::LimboError::MemoryBudget(Box::new(amphora_engine::BudgetFull {
+                        what,
+                        asked: bytes,
+                        held: self.0.held(Use::Caches),
+                        limit: u64::try_from(limit).unwrap_or(u64::MAX),
+                    }))
+                }
                 other => amphora_engine::LimboError::InternalError(format!(
                     "versioned storage: {what}: {other}"
                 )),
