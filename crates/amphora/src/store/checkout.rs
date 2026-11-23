@@ -1,14 +1,13 @@
 //! Amphora (G3 step 6, prototype F): a read takes its reader without a lock or a mutex every reader
 //! shares (docs/design/store.md decision 43; docs/research/read-path.md, the 32-client profile).
 //!
-//! The pool (`Readers::with`'s other way) takes the pool's mutex to take a reader and again to give
-//! it back, wakes the waiters, and holds the read side of one `RwLock` for the read: three writes
-//! per read to lines every reader writes, which move between their cores at 32 clients (decision
-//! 22's effect, LeanStore's rule: "programs that frequently write to memory locations accessed by
-//! multiple threads do not scale"). Here each reader lives in a slot of its own, on a line of its
+//! A pool behind one mutex writes the pool's lock to take a reader and again to give it back: lines
+//! every reader writes, which move between their cores at 32 clients (decision 22's effect,
+//! LeanStore's rule: "programs that frequently write to memory locations accessed by multiple
+//! threads do not scale"). Here each reader lives in a slot of its own, on a line of its
 //! own; a thread takes the slot its number names, so at most as many threads as slots each write
 //! only their own slot's lock. A thread whose slot is busy tries the others; when all are, it waits
-//! on the pool's condition variable, and a read that ends wakes it only when someone waits (a read
+//! on the slots' condition variable, and a read that ends wakes it only when someone waits (a read
 //! of a counter only waiters write).
 //!
 //! Holding a slot is what holding the gate's read side was: the writer's restart of the log and
@@ -18,44 +17,6 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering, fence};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::Instant;
-
-/// How a read takes its reader (the prototype's switch; `AMPHORA_READ_CHECKOUT` sets it for a
-/// process: `pool` or `slots`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum ReadCheckout {
-    /// Today's: one pool behind a mutex, and a shared gate held through each read.
-    Pool = 0,
-    /// A slot a reader, on a line of its own, taken by the thread whose number names it.
-    Slots = 1,
-}
-
-/// `set_process_default`'s choice; `UNSET` until it is called.
-static PROCESS_DEFAULT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(UNSET);
-const UNSET: u8 = u8::MAX;
-
-impl ReadCheckout {
-    /// The way stores started from now on take: `set_process_default`'s if called, else
-    /// `AMPHORA_READ_CHECKOUT` (read once), else `Pool`.
-    pub fn process_default() -> Self {
-        static FROM_ENV: std::sync::OnceLock<ReadCheckout> = std::sync::OnceLock::new();
-        match PROCESS_DEFAULT.load(Ordering::Relaxed) {
-            UNSET => {
-                *FROM_ENV.get_or_init(|| match std::env::var("AMPHORA_READ_CHECKOUT").as_deref() {
-                    Ok("slots") => Self::Slots,
-                    _ => Self::Pool,
-                })
-            }
-            1 => Self::Slots,
-            _ => Self::Pool,
-        }
-    }
-
-    /// Sets the way stores started from now on in this process take (a bench's or a test's switch).
-    pub fn set_process_default(mode: Self) {
-        PROCESS_DEFAULT.store(mode as u8, Ordering::Relaxed);
-    }
-}
 
 /// A slot, alone on its cache line pair (the adjacent-line prefetcher pulls lines in pairs, so
 /// 128 bytes, as crossbeam's `CachePadded` aligns on x86_64 and aarch64).
@@ -220,7 +181,6 @@ impl<R> Drop for All<'_, R> {
 #[cfg(test)]
 mod tests {
     use super::super::{Readers, Refused, locked};
-    use super::ReadCheckout;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::{Duration, Instant};
@@ -238,11 +198,7 @@ mod tests {
     }
 
     fn readers(most: usize) -> (Arc<Readers<Reader>>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
-        let readers = Arc::new(Readers::with_checkout(
-            most,
-            Arc::default(),
-            ReadCheckout::Slots,
-        ));
+        let readers = Arc::new(Readers::new(most, Arc::default()));
         let (opened, dropped) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let (o, d) = (opened.clone(), dropped.clone());
         *locked(&readers.open) = Some(Arc::new(move || {
@@ -318,14 +274,7 @@ mod tests {
             std::thread::spawn(move || readers.with(far(), |_| Ok(7)))
         };
         // The waiter counts itself before it waits; let the holder go once it has.
-        while readers
-            .slots
-            .as_ref()
-            .unwrap()
-            .waiting
-            .load(Ordering::SeqCst)
-            == 0
-        {
+        while readers.slots.waiting.load(Ordering::SeqCst) == 0 {
             std::thread::yield_now();
         }
         hold_tx.send(()).unwrap();
@@ -339,7 +288,7 @@ mod tests {
     #[test]
     fn g3_s6_a_read_held_back_by_a_restart_is_woken_when_it_ends() {
         let (readers, _, _) = readers(2);
-        let slots = readers.slots.as_ref().unwrap();
+        let slots = &readers.slots;
         std::thread::scope(|s| {
             let all = slots.take_all();
             let waiter =

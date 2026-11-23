@@ -10,7 +10,7 @@
 //! - **One batch's failure is its own.** A commit that fails is tried again batch by batch: the
 //!   batches that commit alone are kept, and one that can't is refused to its sender
 //!   ([`Refused::Failed`]), nothing of it written.
-//! - **Readers beside the writer.** A read takes a connection of its own from a pool and runs on
+//! - **Readers beside the writer.** A read takes a connection of its own from its slot and runs on
 //!   its caller's thread, once the writes of its key handed over before it are committed.
 //! - **No checkpoint in a commit's way.** A checkpointer with a connection of its own copies the log
 //!   into the file without waiting for anyone. Once the log has grown past its bound it copies
@@ -30,7 +30,6 @@ use crate::meter::{Counters, Meter};
 use crate::reshard::{Pos, Seq, Span};
 
 mod checkout;
-pub use checkout::ReadCheckout;
 
 /// Flushes what an engine has committed to its disk, from the store's flusher thread.
 pub type Flush = Box<dyn Fn() -> std::io::Result<()> + Send + Sync>;
@@ -984,104 +983,35 @@ impl<R> Checkpointing<R> {
     }
 }
 
-/// The readers: connections of their own for reading, which a read takes from the pool and uses on
-/// its own thread (no thread between a read and its answer), opened as reads want them, up to the
-/// store's bound. None while the engine replaces its file: reads go to the writer then.
+/// The readers: connections of their own for reading, each in a slot of its own, which a read takes
+/// and uses on its own thread (no thread between a read and its answer), opened as reads want them,
+/// up to the store's bound. None while the engine replaces its file: reads go to the writer then.
 struct Readers<R> {
     /// Opens a reader on the database in use; none while its file is being replaced.
     open: Mutex<Option<Opener<R>>>,
-    pool: Mutex<Pool<R>>,
-    returned: Condvar,
-    most: usize,
     /// The checkpointer: a connection of its own copying the log into the file, never in a
     /// commit's way. It goes and comes back with the readers.
     checkpointer: Mutex<Option<(mpsc::Sender<()>, std::thread::JoinHandle<()>)>>,
     /// Held by each checkpoint as it runs, and by the writer alone while it starts the log again.
-    /// Reads are held back by the pool's `held` instead, so a read touches one lock.
+    /// Reads are held back by the slots instead (`checkout`), so a read writes no line another
+    /// reader writes.
     gate: Arc<RwLock<()>>,
     /// The checkpointer found the log past its bound: the writer starts it again.
     restart: Arc<AtomicBool>,
     meter: Arc<Meter>,
-    /// G3 step 6 (prototype F): a slot a reader, taken without a lock every reader shares; the
-    /// pool, `open` aside, unused then. None: the pool (`ReadCheckout`).
-    slots: Option<checkout::Slots<R>>,
-}
-
-/// The readers not reading, how many are reading, and which database they were opened on (a reader
-/// of an earlier one, given back, is let go).
-struct Pool<R> {
-    idle: Vec<R>,
-    out: usize,
-    generation: u64,
-    /// Threads waiting on `returned`: a reader given back wakes them only when there are some
-    /// (std's futex `Condvar` makes a `FUTEX_WAKE` syscall on every notify, waiters or none).
-    waiting: usize,
-    /// The writer is starting the log again: no reader is taken until it is done.
-    held: bool,
-}
-
-impl<R> Pool<R> {
-    /// Waits on `returned` until `until`, counted as a waiter meanwhile; false once it has passed.
-    fn wait<'a>(
-        mut pool: MutexGuard<'a, Self>,
-        returned: &Condvar,
-        until: Option<Instant>,
-    ) -> (MutexGuard<'a, Self>, bool) {
-        pool.waiting = pool.waiting.saturating_add(1);
-        let (mut pool, in_time) = match until {
-            None => (
-                returned.wait(pool).unwrap_or_else(PoisonError::into_inner),
-                true,
-            ),
-            Some(until) => {
-                let left = until.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    (pool, false)
-                } else {
-                    let (pool, _) = returned
-                        .wait_timeout(pool, left)
-                        .unwrap_or_else(PoisonError::into_inner);
-                    (pool, true)
-                }
-            }
-        };
-        pool.waiting = pool.waiting.saturating_sub(1);
-        (pool, in_time)
-    }
-
-    /// Wakes the waiters, if any.
-    fn wake(&self, returned: &Condvar) {
-        if self.waiting > 0 {
-            returned.notify_all();
-        }
-    }
+    /// A slot a reader, taken without a lock every reader shares (decision 43).
+    slots: checkout::Slots<R>,
 }
 
 impl<R: Send + 'static> Readers<R> {
     fn new(most: usize, meter: Arc<Meter>) -> Self {
-        Self::with_checkout(most, meter, ReadCheckout::process_default())
-    }
-
-    fn with_checkout(most: usize, meter: Arc<Meter>, checkout: ReadCheckout) -> Self {
         Self {
             open: Mutex::new(None),
-            pool: Mutex::new(Pool {
-                idle: Vec::new(),
-                out: 0,
-                generation: 0,
-                waiting: 0,
-                held: false,
-            }),
-            returned: Condvar::new(),
-            most: most.max(1),
             checkpointer: Mutex::new(None),
             gate: Arc::new(RwLock::new(())),
             restart: Arc::new(AtomicBool::new(false)),
             meter,
-            slots: match checkout {
-                ReadCheckout::Pool => None,
-                ReadCheckout::Slots => Some(checkout::Slots::new(most)),
-            },
+            slots: checkout::Slots::new(most),
         }
     }
 
@@ -1179,20 +1109,9 @@ impl<R: Send + 'static> Readers<R> {
     /// Lets every reader go, once each read under way is done: none holds the database after.
     fn release(&self) {
         *locked(&self.open) = None;
-        {
-            let mut pool = locked(&self.pool);
-            pool.generation = pool.generation.wrapping_add(1);
-            pool.idle.clear();
-            while pool.out > 0 {
-                pool = Pool::wait(pool, &self.returned, None).0;
-            }
-        }
         // Each slot once its read is done: `open` is gone, so none is opened in it again.
-        if let Some(slots) = &self.slots {
-            let mut all = slots.take_all();
-            for reader in all.readers() {
-                *reader = None;
-            }
+        for reader in self.slots.take_all().readers() {
+            *reader = None;
         }
         if let Some((tx, handle)) = locked(&self.checkpointer).take() {
             drop(tx);
@@ -1208,24 +1127,10 @@ impl<R: Send + 'static> Readers<R> {
         }
         let asked = Instant::now();
         let _alone = self.gate.write().unwrap_or_else(PoisonError::into_inner);
-        // Slot readers hold no gate: holding every slot holds them back.
-        let _slots = self.slots.as_ref().map(checkout::Slots::take_all);
-        // Pool readers hold no gate either: none is taken while the pool is held, and the restart
-        // waits for those out to come back.
-        if self.slots.is_none() {
-            let mut pool = locked(&self.pool);
-            pool.held = true;
-            while pool.out > 0 {
-                pool = Pool::wait(pool, &self.returned, None).0;
-            }
-        }
+        // Readers hold no gate: holding every slot holds them back.
+        let _all = self.slots.take_all();
         let began = Instant::now();
         let restarted = restart();
-        if self.slots.is_none() {
-            let mut pool = locked(&self.pool);
-            pool.held = false;
-            pool.wake(&self.returned);
-        }
         self.meter
             .restarted(began.saturating_duration_since(asked), began.elapsed());
         match restarted {
@@ -1237,65 +1142,15 @@ impl<R: Send + 'static> Readers<R> {
         }
     }
 
-    /// Runs `f` on a reader, on this thread: one idle, or one opened now, or the first given back
-    /// before `until`. None when there are no readers now (the writer reads instead).
+    /// Runs `f` on a reader, on this thread: in the slot this thread takes (a free one, or the first
+    /// given back before `until`), its reader opened in it the first time. None when there are no
+    /// readers now (the writer reads instead).
     fn with<T>(
         &self,
         until: Instant,
         f: impl FnOnce(&mut R) -> anyhow::Result<T>,
     ) -> Option<anyhow::Result<T>> {
-        if let Some(slots) = &self.slots {
-            return self.with_slot(slots, until, f);
-        }
-        let (mut reader, generation) = {
-            let mut pool = locked(&self.pool);
-            loop {
-                if pool.held {
-                    let (p, in_time) = Pool::wait(pool, &self.returned, Some(until));
-                    if !in_time {
-                        return Some(Err(Refused::Timeout.into()));
-                    }
-                    pool = p;
-                    continue;
-                }
-                if let Some(r) = pool.idle.pop() {
-                    pool.out = pool.out.saturating_add(1);
-                    break (r, pool.generation);
-                }
-                let open = locked(&self.open).clone()?;
-                if pool.out < self.most {
-                    pool.out = pool.out.saturating_add(1);
-                    let generation = pool.generation;
-                    drop(pool);
-                    match open() {
-                        Ok(r) => break (r, generation),
-                        Err(e) => {
-                            self.give_back(None, generation);
-                            return Some(Err(e));
-                        }
-                    }
-                }
-                let (p, in_time) = Pool::wait(pool, &self.returned, Some(until));
-                if !in_time {
-                    return Some(Err(Refused::Timeout.into()));
-                }
-                pool = p;
-            }
-        };
-        let answer = f(&mut reader);
-        self.give_back(Some(reader), generation);
-        Some(answer)
-    }
-
-    /// `with` on a slot's reader (`ReadCheckout::Slots`): the slot this thread takes, its reader
-    /// opened in it the first time; None when there are no readers now.
-    fn with_slot<T>(
-        &self,
-        slots: &checkout::Slots<R>,
-        until: Instant,
-        f: impl FnOnce(&mut R) -> anyhow::Result<T>,
-    ) -> Option<anyhow::Result<T>> {
-        let Some(mut taken) = slots.take(until) else {
+        let Some(mut taken) = self.slots.take(until) else {
             return Some(Err(Refused::Timeout.into()));
         };
         let slot = taken.reader()?;
@@ -1307,15 +1162,6 @@ impl<R: Send + 'static> Readers<R> {
             }
         }
         slot.as_mut().map(f)
-    }
-
-    fn give_back(&self, reader: Option<R>, generation: u64) {
-        let mut pool = locked(&self.pool);
-        pool.out = pool.out.saturating_sub(1);
-        if let Some(r) = reader.filter(|_| pool.generation == generation) {
-            pool.idle.push(r);
-        }
-        pool.wake(&self.returned);
     }
 }
 
