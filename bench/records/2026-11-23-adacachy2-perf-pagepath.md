@@ -653,3 +653,44 @@ the new test; `cargo test -p amphora --locked
 --test store` passed 15. Run r1549 (same needs, load 13-17) on 55a805d0,
 the merge with origin/main cf820fc5 (main touched no file under `storage/` or `vdbe/`): the workspace clippy exit 0
 in 28 s; the `d45_`, coordination-guard and reader tests passed 16; the store test passed 15.
+
+## perf-B14 (2026-11-23, 21:58-22:58Z)
+
+**Losses first.** `scripts/check-production.sh` fails, and on main itself: `clippy::disallowed_methods` 41 against the 40 the
+ratchet holds. Run r1663 counted 41 disallowed-method sites on this branch (853c72a6) and on origin/main (6a3e8ebb), the
+per-file lists identical. The 41st is `.then_some(spread)` in `crates/engine/translate/optimizer/learned_costs.rs`, from
+lane T13's 9ac9687b. This unit adds none. Not done by the brief's scope: the non-host build (no `host_shared_wal`: 32-bit,
+wasm) still opens `-wal` alone, through its async driver, and recovers with a free second segment; a second driver
+belongs with the switch. No A/B ran (the brief: none).
+
+**Unit 3, built.** Reads are counted across processes in the reader slots (the coordinator's decision), not B13's packed
+word:
+- `SlotReads` (log_segments.rs): one word per reader slot, bits 0-31 the reads through it on the first segment, 32-63 on
+  the second. One slot serves every read of a snapshot in its process, so it counts rather than flags them. A read past
+  a count's 32 bits is refused and retried. The words sit in the `.tshm`'s fifth per-slot array, the one reserved for a
+  future per-reader array, so the file's size is unchanged.
+- Every path that frees a dead or unused slot zeroes its word before the slot's free bit is set (the two reclaims of a
+  dead owner, the stale-slot probe, the inline reclaim in `live_reader_frames`, the exclusive-open repair), so a process
+  that dies mid-read leaks no count. `MappedSharedWalCoordination::segments` reclaims dead slots, then sums the live words.
+- The shared word keeps B13's four flags (which segment is current; the other closing, copied, shipped) without counts,
+  and B13's other-segment header (format version 2).
+- The shared-memory backend counts a read on its slot right after registering it and before the snapshot's re-check
+  (`publish_shared_reader`), and takes it back at `end_read_tx` before the slot is released.
+- At open, `-wal2` (`second_segment_path`) is recovered from its file if it exists, else free and empty: the writer's
+  first switch makes the file, never an open (`open_second_segment_if_exists`, without `Create`). `SharedLog::recover`
+  takes each valid header's checkpoint sequence to `Segments::recover`, and is Corrupt for a pair neither of which
+  follows the other. `seed_or_sync_authority` publishes the recovered segments and the other segment's header when the
+  authority is empty or repaired from this process's disk scan.
+
+**Tests.** `d45_open_recovers_both_segments_of_the_log` (B13's: the `-wal` kept before a TRUNCATE checkpoint and the next
+`-wal` as `-wal2`, its sequence one higher: the second current, the first closing and uncopied, each segment's last
+commit frame its file's), `d45_two_mappings_of_one_file_see_each_others_reads`,
+`d45_a_dead_readers_slot_is_reclaimed_and_its_read_stops_counting`, and in log_segments.rs
+`d45_the_shared_word_holds_every_state` and `d45_a_slot_counts_each_segments_reads_and_refuses_one_past_its_bits`.
+
+**Checks** (adacachy2, needs `linux/amd64,cpus=8,mem=24g`, script `~/.cache/amphora-perf/pagepath-b14/check.sh`). Run r1656
+on 8d4f34c9 (origin/main b234421d merged): `cargo test -p amphora-engine --lib --locked -- d45_` passed 13;
+`storage:: vdbe::vacuum` passed 722, failed 2, ignored 14 in 201 s, the two main's own (`cb4_a_read_only_transaction_reads_the_copy_at_its_snapshot`,
+`cb4_ab_both_rebuy_policies_at_the_extremes`, as in B9-B12); `cargo test -p amphora --locked --test store` passed 15;
+the workspace clippy failed on one lazy `then` closure and the ratchet counted one index more, both fixed in 853c72a6.
+Run r1663 on 853c72a6: `cargo clippy --workspace --all-targets --locked -- -D warnings` exit 0; check-production as above.
