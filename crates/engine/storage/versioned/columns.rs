@@ -1399,7 +1399,7 @@ mod tests {
         let before = copy.granted();
         let refused = copy.rebuild(3, &rows, 0);
         assert!(
-            matches!(refused, Err(LimboError::MemoryBudget { what, .. }) if what == BLOCKS),
+            matches!(refused, Err(LimboError::MemoryBudget(full)) if full.what == BLOCKS),
             "{refused:?}"
         );
         check("refused");

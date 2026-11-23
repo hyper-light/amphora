@@ -612,12 +612,12 @@ impl Pool {
         let all = u64::try_from(self.frames_made())
             .unwrap_or(u64::MAX)
             .saturating_mul(each);
-        LimboError::MemoryBudget {
+        LimboError::MemoryBudget(Box::new(crate::BudgetFull {
             what,
             asked: each,
             held: all,
             limit: all,
-        }
+        }))
     }
 
     /// `page`, latched shared; read in first if it isn't resident.
@@ -1214,11 +1214,11 @@ mod tests {
         let b = pool.read(pages[1]).unwrap();
         assert!(matches!(
             pool.read(pages[2]),
-            Err(LimboError::MemoryBudget { .. })
+            Err(LimboError::MemoryBudget(_))
         ));
         assert!(matches!(
             pool.allocate(),
-            Err(LimboError::MemoryBudget { .. })
+            Err(LimboError::MemoryBudget(_))
         ));
         drop((a, b));
         assert!(pool.read(pages[2]).is_ok());
@@ -1253,7 +1253,7 @@ mod tests {
         let pool = Pool::backed_in(Room::Shared(none), disk, 0).unwrap();
         assert!(matches!(
             pool.allocate(),
-            Err(LimboError::MemoryBudget { .. })
+            Err(LimboError::MemoryBudget(_))
         ));
     }
 

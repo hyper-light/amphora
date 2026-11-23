@@ -225,12 +225,12 @@ impl Budget {
     fn reserve(&self, what: &'static str, n: usize) -> Result<u64> {
         let asked = u64::try_from(n).map_err(|_| LimboError::IntegerOverflow)?;
         let mut held = self.held.lock();
-        let refused = |held: u64| LimboError::MemoryBudget {
+        let refused = |held: u64| LimboError::MemoryBudget(Box::new(crate::BudgetFull {
             what,
             asked,
             held,
             limit: self.limit,
-        };
+        }));
         let after = held
             .held
             .checked_add(asked)
@@ -393,7 +393,7 @@ impl Reads {
                 *bytes = bytes.saturating_add(n);
                 Ok(())
             }
-            Err(LimboError::MemoryBudget { .. }) => {
+            Err(LimboError::MemoryBudget(_)) => {
                 let mut freed = 0u64;
                 self.points.retain(|(t, k)| {
                     if *t == tree {
@@ -2807,7 +2807,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             t.read(&v.pool, &mut d, &v.clock, &mut txn, &[2]),
-            Err(LimboError::MemoryBudget { .. })
+            Err(LimboError::MemoryBudget(_))
         ));
         v.clock.budget.release(filler);
         assert!(txn.reads.lost);
@@ -2930,7 +2930,7 @@ mod tests {
                                 Ok(()) => {
                                     commits.fetch_add(1, Ordering::Relaxed);
                                 }
-                                Err(LimboError::MemoryBudget { .. }) => {
+                                Err(LimboError::MemoryBudget(_)) => {
                                     refused_budget.fetch_add(1, Ordering::Relaxed);
                                 }
                                 Err(
@@ -3012,7 +3012,7 @@ mod tests {
                 }
             }
             assert!(
-                matches!(refusal, Some(LimboError::MemoryBudget { .. })),
+                matches!(refusal, Some(LimboError::MemoryBudget(_))),
                 "{validation:?}: {refusal:?}"
             );
             v.abort(all, &mut d).unwrap();
