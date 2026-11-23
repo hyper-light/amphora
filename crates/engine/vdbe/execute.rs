@@ -6935,7 +6935,7 @@ fn timed_run(
     run: impl FnOnce() -> InsnResult,
 ) -> InsnResult {
     let costs = &program.connection.db.learned_costs;
-    if !costs.sampled(work) {
+    if !costs.sampled(work, &program.connection.cost_runs) {
         return run();
     }
     let started = std::time::Instant::now();
@@ -18695,19 +18695,10 @@ fn hash_build_run(
     };
 
     // Create hash table if it doesn't exist yet
-    let temp_store = program.connection.get_temp_store();
-    // When temp_store=memory, disable the memory limit entirely to avoid spilling.
-    // Spilling to an in-memory file has serialization overhead - simpler to never spill.
-    let mem_budget = if matches!(temp_store, crate::TempStore::Memory) {
-        usize::MAX
-    } else {
-        // Amphora: the statement's budget, shared by its tables (decision 8): read as the
-        // distinct and group tables read it, from the connection's cache as it is now.
-        table_share(pager.statement_memory_budget(), program.memory_tables)
-    };
-    if let std::collections::hash_map::Entry::Vacant(e) =
-        state.hash_tables.entry(data.hash_table_id)
-    {
+    if !state.hash_tables.contains_key(&data.hash_table_id) {
+        // Amphora (AUDIT 3.2): the budget is read once, when the table is made, not per row:
+        // `statement_memory_budget` takes the page cache's lock and a SeqCst load.
+        let (temp_store, mem_budget) = table_memory(program, pager);
         let config = HashTableConfig {
             initial_buckets: 1024,
             mem_budget,
@@ -18720,7 +18711,7 @@ fn hash_build_run(
         let mut table = HashTable::new(config, pager.io.clone())?;
         // Amphora (QT.5 step 4, lane qs5-21): a sort-merge join's table.
         table.set_merge(data.merge);
-        e.insert(table);
+        state.hash_tables.insert(data.hash_table_id, table);
     }
 
     // Read pre-computed key values directly from registers
@@ -18804,6 +18795,20 @@ fn hash_build_run(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Amphora (decision 8; AUDIT 3.2): a new hash or group table's temp store and memory budget,
+/// read when the table is made. With temp_store=memory there is no limit (spilling to an
+/// in-memory file only adds serialization); otherwise the table's share of the statement's
+/// budget, from the connection's cache as it is now.
+fn table_memory(program: &Program, pager: &Pager) -> (crate::TempStore, usize) {
+    let temp_store = program.connection.get_temp_store();
+    let budget = if matches!(temp_store, crate::TempStore::Memory) {
+        usize::MAX
+    } else {
+        table_share(pager.statement_memory_budget(), program.memory_tables)
+    };
+    (temp_store, budget)
+}
+
 pub fn op_hash_distinct(
     program: &Program,
     state: &mut ProgramState,
@@ -18812,17 +18817,9 @@ pub fn op_hash_distinct(
 ) -> InsnResult {
     load_insn!(HashDistinct { data }, insn);
 
-    let temp_store = program.connection.get_temp_store();
-    // When temp_store=memory, disable the memory limit entirely to avoid spilling.
-    let mem_budget = if matches!(temp_store, crate::TempStore::Memory) {
-        usize::MAX
-    } else {
-        // Amphora: the statement's budget, shared by its tables (decision 8).
-        table_share(pager.statement_memory_budget(), program.memory_tables)
-    };
-    if let std::collections::hash_map::Entry::Vacant(e) =
-        state.hash_tables.entry(data.hash_table_id)
-    {
+    if !state.hash_tables.contains_key(&data.hash_table_id) {
+        // Amphora (AUDIT 3.2): read once, when the table is made.
+        let (temp_store, mem_budget) = table_memory(program, pager);
         let config = HashTableConfig {
             initial_buckets: 1024,
             mem_budget,
@@ -18832,7 +18829,9 @@ pub fn op_hash_distinct(
             track_matched: false,
             partition_count: None,
         };
-        e.insert(HashTable::new(config, pager.io.clone())?);
+        state
+            .hash_tables
+            .insert(data.hash_table_id, HashTable::new(config, pager.io.clone())?);
     }
     let hash_table = state
         .hash_tables
@@ -18906,17 +18905,10 @@ pub fn op_group_find(
 ) -> InsnResult {
     load_insn!(GroupFind { data }, insn);
     // A table past its budget sends its new groups' rows to the sorter; with temp_store=memory
-    // there is no budget, as for the hash join's tables.
-    let budget = if matches!(
-        program.connection.get_temp_store(),
-        crate::TempStore::Memory
-    ) {
-        usize::MAX
-    } else {
-        // Amphora: the statement's budget, shared by its tables (decision 8).
-        table_share(pager.statement_memory_budget(), program.memory_tables)
-    };
-    let table = state.group_tables.entry(data.table_id).or_insert_with(|| {
+    // there is no budget, as for the hash join's tables. Amphora (AUDIT 3.2): the budget is read
+    // once, when the table is made, not per row.
+    let table = state.group_tables.get_or_insert_with(data.table_id, || {
+        let (_, budget) = table_memory(program, pager);
         group_table::GroupTable::new(data.num_keys, data.collations.clone(), budget)
     });
     let end = data
@@ -20912,8 +20904,7 @@ pub fn op_star_probes(
     }
     state
         .star_orders
-        .entry(pc)
-        .or_insert_with(|| super::star_order::StarOrder::new(data.probes.len(), data.order));
+        .get_or_insert_with(pc, || super::star_order::StarOrder::new(data.probes.len(), data.order));
     let Some(order) = state.star_orders.get_mut(&pc) else {
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
@@ -22324,7 +22315,7 @@ mod tests {
         let (ht, probe_key, _) = make_spilled_hash_table();
 
         let mut state = ProgramState::new(2, 0);
-        state.hash_tables.insert(7, ht);
+        state.hash_tables.insert(7usize, ht);
         state.set_register(0, Register::Value(probe_key[0].clone()));
 
         let insn = Insn::HashProbe {
@@ -22379,7 +22370,7 @@ mod tests {
         };
 
         let mut state = ProgramState::new(2, 0);
-        state.hash_tables.insert(7, ht);
+        state.hash_tables.insert(7usize, ht);
         state.set_register(0, Register::Value(probe_key[0].clone()));
 
         let insn = Insn::HashProbe {

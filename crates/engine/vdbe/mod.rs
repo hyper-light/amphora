@@ -33,6 +33,7 @@ pub mod explain;
 pub mod group_table;
 #[allow(dead_code)]
 pub mod hash_table;
+pub(crate) mod id_map;
 pub mod insn;
 pub mod leaf_batch;
 pub mod metrics;
@@ -977,13 +978,13 @@ pub struct ProgramState {
     pub explain_state: RwLock<ExplainState>,
     /// Scratch buffer for [Insn::HashDistinct] to avoid per-row allocations.
     distinct_key_values: Vec<Value>,
-    hash_tables: HashMap<usize, HashTable>,
+    hash_tables: id_map::IdMap<HashTable>,
     /// Amphora (PL.13): each adaptive join's switch, by switch id; None for one that cannot
     /// switch (`optimizer::adaptive::JoinSwitch`).
     join_switches: HashMap<usize, Option<crate::translate::optimizer::adaptive::JoinSwitch>>,
     /// Amphora (QT.5, T-QT.5.11): each star probe's filters in their measured order, by the
     /// instruction's address (`Insn::StarProbes`); made at its first row, dropped with the run.
-    star_orders: HashMap<InsnReference, star_order::StarOrder>,
+    star_orders: id_map::IdMap<star_order::StarOrder>,
     /// Amphora (PL.13, the in-run hand-off): this run may still be handed to a second prepare.
     /// `Statement` opens it as a read-only root statement's run starts and shuts it at the run's
     /// first row, so a run that has returned a row is never started again.
@@ -992,7 +993,7 @@ pub struct ProgramState {
     /// hand-off was open, and stopped the run so `Statement` starts it again on a new plan.
     pub(crate) handoff_asked: bool,
     /// Amphora: each hash-aggregated GROUP BY's groups (`group_table.rs`), by table id.
-    group_tables: HashMap<usize, group_table::GroupTable>,
+    group_tables: id_map::IdMap<group_table::GroupTable>,
     /// Amphora (QT.6): the rows [Insn::MorselAggregate] answered, read out by [Insn::MorselNext].
     morsel_rows: Option<std::vec::IntoIter<Vec<Value>>>,
     /// TempFile handles for ephemeral cursors, keyed by cursor_id.
@@ -1037,7 +1038,7 @@ pub struct ProgramState {
     pub(crate) spare_agg_payloads: Vec<crate::alloc::Vec<Value>>,
     /// Bloom filters stored by cursor ID for probabilistic set membership testing
     /// Used to avoid unnecessary seeks on ephemeral indexes and hash tables
-    pub(crate) bloom_filters: HashMap<usize, BloomFilter>,
+    pub(crate) bloom_filters: id_map::IdMap<BloomFilter>,
     /// Number of deferred foreign key violations when the statement started.
     /// When a statement subtransaction rolls back, the connection's deferred foreign key violations counter
     /// is reset to this value.
@@ -1142,14 +1143,14 @@ impl ProgramState {
             fk_immediate_violations_during_stmt: AtomicIsize::new(0),
             rowsets: HashMap::default(),
             spare_agg_payloads: Vec::new(),
-            bloom_filters: HashMap::default(),
-            hash_tables: HashMap::default(),
+            bloom_filters: id_map::IdMap::default(),
+            hash_tables: id_map::IdMap::default(),
             join_switches: HashMap::default(),
-            star_orders: HashMap::default(),
+            star_orders: id_map::IdMap::default(),
             handoff_open: false,
             handoff_asked: false,
             busy_writer: None,
-            group_tables: HashMap::default(),
+            group_tables: id_map::IdMap::default(),
             morsel_rows: None,
             ephemeral_temp_files: HashMap::default(),
             ephemeral_kept: HashMap::default(),
@@ -1821,7 +1822,7 @@ impl ProgramState {
 
     /// Gets or creates a bloom filter for the given cursor ID.
     pub fn get_or_create_bloom_filter(&mut self, cursor_id: usize) -> &mut BloomFilter {
-        self.bloom_filters.entry(cursor_id).or_default()
+        self.bloom_filters.get_or_default(cursor_id)
     }
 
     /// Amphora (PL.5): gets or creates the cursor's bloom filter, sized when its build ends
@@ -1832,8 +1833,7 @@ impl ProgramState {
         sizing: Option<crate::vdbe::bloom_filter::FilterSizing>,
     ) -> &mut BloomFilter {
         self.bloom_filters
-            .entry(cursor_id)
-            .or_insert_with(|| sizing.map_or_else(BloomFilter::new, BloomFilter::sized))
+            .get_or_insert_with(cursor_id, || sizing.map_or_else(BloomFilter::new, BloomFilter::sized))
     }
 
     /// Gets or creates a bloom filter with a specific capacity for the given cursor ID.
@@ -1844,8 +1844,7 @@ impl ProgramState {
         false_positive_rate: f32,
     ) -> &mut BloomFilter {
         self.bloom_filters
-            .entry(cursor_id)
-            .or_insert_with(|| BloomFilter::with_capacity(expected_items, false_positive_rate))
+            .get_or_insert_with(cursor_id, || BloomFilter::with_capacity(expected_items, false_positive_rate))
     }
 
     /// Gets an existing bloom filter for the given cursor ID.

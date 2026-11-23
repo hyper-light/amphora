@@ -41,3 +41,72 @@ Reading: no regression outside the noise; point_pk at 64 and 128 clients is abov
 (+14%, +6%). The 10x isn't here: the header was already read lock-free under the non-default read
 indexes (decision 40), and the default's per-read cost is elsewhere (AUDIT 2.1's frame_cache lock,
 2.2). To re-measure on a quiet host.
+
+## AUDIT 2.3 (a02e4b20): the plain page path looks in the shared pages once; shards by file and page, padded
+
+`AMPHORA_PAGE_PATH=plain`, base (origin/main b817508b) against a02e4b20's code, alternating, three reps
+(script `.git/perf-ab2.sh`, records `ab2-0110.jsonl`; load 42-71). Median [min-max], queries a second:
+
+| op | clients | base | after | after/base |
+|---|---|---|---|---|
+| point_pk | 1 | 365,827 [294,068-374,791] | 340,442 [330,981-376,127] | 0.93 (noise) |
+| point_pk | 8 | 1,424,041 [1,312,275-1,660,093] | 1,794,027 [1,774,896-1,860,297] | 1.26 |
+| point_pk | 32 | 934,830 [898,827-1,024,831] | 951,298 [925,215-960,041] | 1.02 |
+| point_pk | 64 | 896,028 [792,993-994,306] | 935,551 [914,302-943,583] | 1.04 |
+| point_pk | 128 | 880,984 [838,169-884,149] | 906,576 [898,926-945,065] | 1.03 |
+| point_secondary | 8 | 1,010,083 [1,004,339-1,040,666] | 998,582 [970,545-1,007,210] | 0.99 |
+| point_secondary | 32 | 921,690 [912,099-961,359] | 929,467 [893,977-953,320] | 1.01 |
+
+## AUDIT 2.1, the log's read index (decision 40): the four ways on the default page path (perf-B2)
+
+One binary (a02e4b20's), `AMPHORA_LOG_READ_INDEX` = locked / optimistic / published / filtered
+alternating within each of three reps (script `.git/perf-ab3.sh`, records `ab3-0141.jsonl`; load
+25-68), clients 1, 32, 128. Median [min-max]:
+
+| op | clients | locked | optimistic | published | filtered |
+|---|---|---|---|---|---|
+| point_pk | 1 | 301,236 [279,146-330,995] | 328,648 [308,566-330,651] | 321,882 [313,962-323,446] | 307,418 [285,029-321,327] |
+| point_pk | 32 | 949,151 [888,678-1,013,616] | 1,000,693 [998,833-1,035,090] | 928,678 [924,817-993,940] | 943,381 [878,449-953,500] |
+| point_pk | 128 | 846,119 [768,536-851,280] | 862,263 [835,523-889,842] | 891,461 [763,330-909,631] | 851,883 [769,625-890,271] |
+| point_secondary | 1 | 256,019 [239,485-257,272] | 271,788 [183,452-272,614] | 266,118 [238,855-278,832] | 261,473 [256,778-267,815] |
+| point_secondary | 32 | 723,235 [658,390-723,502] | 732,026 [681,783-778,036] | 752,286 [687,720-781,980] | 676,965 [652,817-824,767] |
+| point_secondary | 128 | 556,668 [468,883-596,688] | 396,963 [306,489-468,065] | 492,604 [323,461-562,226] | 410,350 [397,573-604,968] |
+
+Reading: the ways are within each other's noise; optimistic's point_pk is +9% at 1 client and +5% at
+32, nothing holds for point_secondary. AUDIT 2.1's "27-79% of cycles in the frame lookup" is NOT
+verified by the suite, and can't be: the suite's settle runs `PRAGMA wal_checkpoint(TRUNCATE)`
+(bench/src/suite_db.rs), the log is 12 KB through every read run, so `find_frame` is reached with
+next to no frames. What the suite does show: every path and every way flattens at ~0.9-1.0 M/s from 32
+clients on (the plain path too, which reaches 1.79 M/s at 8), with the kernel taking 55-60% of the
+CPU at 32 and 128 clients (`cpu_sys_s` / total; 16-19% at one client). That ceiling is shared by every
+page path and log way, so it lies outside them (the bench's reader hand-off, futexes or preads; adacachy2
+has no perf or strace and its /proc syscall files aren't readable, so not yet named).
+
+### The lookup itself with the log full: `storage::wal::tests::g3_2_log_lookup_bench` (perf-B2)
+
+An ignored release micro-bench (no SQL, no pager): the log holds 32,612 pages (the suite's database)
+written twice, 65,224 frames; each thread looks up random pages, half not in the log, every answer
+checked against the locked index's. Lookups a second, all threads together (`cargo test -p
+amphora-engine --release --lib g3_2_log_lookup_bench -- --ignored --nocapture`; threads = CPUs
+allowed via `taskset`; 32 = the whole machine; records `lookup-0201.txt`, `scale-0207.txt`; load 32-73).
+Reps in brackets:
+
+| threads | locked | filtered | published | optimistic |
+|---|---|---|---|---|
+| 1 | 44.2 M, 34.5 M, 40.6 M (22.6-29.0 ns) | 23.4 M, 21.3 M, 20.4 M | 28.1 M, 20.6 M, 22.4 M | 28.9 M, 25.1 M, 24.6 M (34.6-40.6 ns) |
+| 2 | 15.1 M, 16.1 M | 14.9 M, 15.2 M | 33.5 M, 35.4 M | 27.5 M, 38.2 M |
+| 4 | 9.7 M, 8.9 M | 10.2 M, 10.0 M | 33.4 M, 35.4 M | 35.4 M, 37.2 M |
+| 8 | 6.7 M, 6.8 M | 6.7 M, 7.0 M | 17.5 M, 17.1 M | 16.0 M, 16.7 M |
+| 16 | 2.8 M, 2.8 M | 2.6 M, 2.6 M | 7.7 M, 7.5 M | 7.0 M, 7.9 M |
+| 32 | 1.89 M, 1.65 M, 1.81 M | 1.90 M, 1.82 M, 1.77 M | 4.88 M, 5.09 M, 5.19 M | 4.63 M, 4.28 M, 4.75 M |
+
+Reading: with the log full the lock is the collapse AUDIT 2.1 describes (one reader 22-29 ns, 32
+readers 17-19 µs a lookup each, total down 23x); published and optimistic hold 2.2-3.9x more from 2
+threads on. But they are 1.4-1.7x slower than the lock at one reader, and they collapse too past 4
+threads (35 M/s at 4, 4.8 M/s at 32): a read-only lookup with no writer should scale with the cores,
+so something shared is still written on each one. Not yet named (no perf on adacachy2); the
+candidates are `ArcSwap::load` on `bits` and `latest` each lookup (its debt slots' SeqCst stores and
+the node list) and the lines the ReadIndex's fields share. The fix to try next: a connection keeps its
+`Arc<PageBits>`/`Arc<Latest>` and checks them against `generation` (one plain load) instead of an
+`ArcSwap::load` per lookup, then this bench again at 1-32 threads. Default left at `locked`: the
+graduation is Ada's decision (below), and the suite shows no end-to-end gain while its log is empty.
