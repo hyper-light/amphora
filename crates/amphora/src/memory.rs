@@ -403,37 +403,74 @@ pub struct Budget {
     held: [AtomicU64; 4],
     /// The streams of each use open now, each of which may hold a charge at once ([`Stream`]).
     streams: [AtomicU64; 4],
-    /// Who waits for room, oldest first ([`Budget::when_room`]), and how many: a release with no
-    /// one waiting takes no lock.
+    /// Who waits for room, in the order they asked ([`Budget::when_room`]), and how many: a
+    /// release or a reading with no one waiting takes no lock.
     waiting: Mutex<VecDeque<Waiter>>,
     waiters: AtomicU64,
     /// The next wait's name ([`Waiting`]).
     next_wait: AtomicU64,
+    /// The limit the last reading found, one past its bytes (0: none read): a reading that finds
+    /// it changed is room freed or taken that no release says, so it runs the waiters' turn.
+    limit_seen: AtomicU64,
 }
 
-/// One wait for room: `bytes` more of `used`'s, woken once by the release that frees them.
+/// One wait for `used`'s room to reach `bytes` ([`Budget::when_room`]). It keeps its place and its
+/// claim on the room from its ask until it withdraws, woken or not.
 struct Waiter {
     id: u64,
     used: Use,
     bytes: u64,
     wake: Waker,
+    woken: bool,
 }
 
-/// A wait for room ([`Budget::when_room`]), withdrawn when this drops if it wasn't woken: a waiter
-/// that goes away leaves nothing queued.
+/// A wait for room ([`Budget::when_room`]), withdrawn when this drops: a waiter that goes away
+/// leaves nothing queued, and the room it claimed passes to those after it.
 pub struct Waiting {
     budget: Arc<Budget>,
     id: u64,
+    used: Use,
+}
+
+impl Waiting {
+    /// The wait asked again in its own place, for `bytes` now: a waiter woken that found the room
+    /// gone, or its need grown, keeps its turn ahead of those who asked after it.
+    pub fn again(&self, bytes: u64, wake: &Waker) {
+        {
+            let mut waiting = self.budget.waiting_now();
+            match waiting.iter_mut().find(|waiter| waiter.id == self.id) {
+                Some(waiter) => {
+                    waiter.bytes = bytes;
+                    waiter.wake.clone_from(wake);
+                    waiter.woken = false;
+                }
+                None => waiting.push_back(Waiter {
+                    id: self.id,
+                    used: self.used,
+                    bytes,
+                    wake: wake.clone(),
+                    woken: false,
+                }),
+            }
+            self.budget.count(&waiting);
+        }
+        std::sync::atomic::fence(Ordering::SeqCst);
+        self.budget.turn();
+    }
 }
 
 impl Drop for Waiting {
     fn drop(&mut self) {
-        let mut waiting = self.budget.waiting_now();
-        waiting.retain(|waiter| waiter.id != self.id);
-        self.budget.waiters.store(
-            u64::try_from(waiting.len()).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
+        let withdrew = {
+            let mut waiting = self.budget.waiting_now();
+            let before = waiting.len();
+            waiting.retain(|waiter| waiter.id != self.id);
+            self.budget.count(&waiting);
+            waiting.len() < before && !waiting.is_empty()
+        };
+        if withdrew {
+            self.budget.turn();
+        }
     }
 }
 
@@ -523,6 +560,7 @@ impl Budget {
             waiting: Mutex::default(),
             waiters: AtomicU64::new(0),
             next_wait: AtomicU64::new(0),
+            limit_seen: AtomicU64::new(0),
         })
     }
 
@@ -582,15 +620,31 @@ impl Budget {
     /// (the larger of its resident bytes and every charge counted, `used`'s own given back).
     /// Refused, typed and naming the platform, when the limit can't be read.
     pub fn room(&self, used: Use) -> Result<u64, Refusal> {
-        self.room_in(self.readings.read(), used)
+        let reading = self.readings.read();
+        let limit = seen_limit(reading);
+        // A limit changed is the host's, never a release's (lane snapshots, coordinator decision
+        // 1): the reading that finds it, at the next ask of any use's room, runs the waiters'
+        // turn. One load when it stands, as it does but for a host's change.
+        if self.limit_seen.load(Ordering::Relaxed) != limit
+            && self.limit_seen.swap(limit, Ordering::Relaxed) != limit
+            && self.waiters.load(Ordering::SeqCst) > 0
+        {
+            self.turn();
+        }
+        self.room_in(reading, used)
+    }
+
+    /// Every use's charges counted.
+    fn charged(&self) -> u64 {
+        Use::ALL
+            .iter()
+            .fold(0u64, |sum, each| sum.saturating_add(self.held(*each)))
     }
 
     /// [`Budget::room`] as of `reading`.
     fn room_in(&self, reading: Reading, used: Use) -> Result<u64, Refusal> {
         let limit = reading.limit.ok_or_else(|| unread("memory limit"))?;
-        let charged = Use::ALL
-            .iter()
-            .fold(0u64, |sum, each| sum.saturating_add(self.held(*each)));
+        let charged = self.charged();
         let resident = reading.resident.unwrap_or(charged);
         let others = resident.max(charged).saturating_sub(self.held(used));
         Ok(limit.saturating_sub(others))
@@ -637,14 +691,19 @@ impl Budget {
                 Some(held.saturating_sub(bytes))
             });
         if self.waiters.load(Ordering::SeqCst) > 0 {
-            self.wake_fitting();
+            self.turn();
         }
     }
 
-    /// Wakes `wake` once `used` has room for `bytes` more: at once if it has it now, else at the
-    /// release of a charge that frees it ([`Budget::give`]), the oldest waiters that fit first. A
-    /// room that can't be read wakes it too, for the waiter to meet the refusal. Woken once; a
-    /// waiter that still finds no room asks again. Dropping the answer withdraws the wait.
+    /// Wakes `wake` once `used`'s room ([`Budget::room`]) reaches `bytes` in its turn: at once if
+    /// it does now, else at the release of a charge ([`Budget::give`]), the withdrawal of a wait
+    /// before it, or the reading of a changed limit ([`Budget::room`]) that brings it there. The
+    /// turn is head-of-queue reservation (lane snapshots, coordinator decision 2): in the order
+    /// asked, each wait claims the free room its use lacks of its bytes, so a later ask, however
+    /// small, has only the room past the needs of those before it, and none starves. A room that
+    /// can't be read wakes it too, for the waiter to meet the refusal. Woken once; a waiter that
+    /// finds no room asks again in its place ([`Waiting::again`]). Dropping the answer withdraws
+    /// the wait.
     #[must_use]
     pub fn when_room(self: &Arc<Self>, used: Use, bytes: u64, wake: &Waker) -> Waiting {
         let id = self.next_wait.fetch_add(1, Ordering::Relaxed);
@@ -655,18 +714,17 @@ impl Budget {
                 used,
                 bytes,
                 wake: wake.clone(),
+                woken: false,
             });
-            self.waiters.store(
-                u64::try_from(waiting.len()).unwrap_or(u64::MAX),
-                Ordering::Relaxed,
-            );
+            self.count(&waiting);
         }
         // Pairs with `give`'s sequentially consistent release and count.
         std::sync::atomic::fence(Ordering::SeqCst);
-        self.wake_fitting();
+        self.turn();
         Waiting {
             budget: Arc::clone(self),
             id,
+            used,
         }
     }
 
@@ -677,35 +735,45 @@ impl Budget {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Wakes, oldest first, every waiter whose bytes fit its use's room beside those woken before
-    /// it in this pass, and keeps the rest in order.
-    fn wake_fitting(&self) {
+    /// `waiting`'s length, for a release or a reading to see without the lock.
+    fn count(&self, waiting: &VecDeque<Waiter>) {
+        self.waiters.store(
+            u64::try_from(waiting.len()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// The waiters' turn at a reading now, in the order they asked: each claims, out of the free
+    /// room no one before it claimed, what its use's room lacks of its bytes, and is woken (once)
+    /// when its use's room past the claims before it reaches them. One that doesn't fit claims
+    /// every free byte left, so those after it have only their own use's held bytes.
+    fn turn(&self) {
+        let reading = self.readings.read();
+        self.limit_seen
+            .store(seen_limit(reading), Ordering::Relaxed);
         let woken: Vec<Waker> = {
             let mut waiting = self.waiting_now();
-            let reading = self.readings.read();
-            let mut granted = 0u64;
+            let charged = self.charged();
+            let free = reading.limit.map(|limit| {
+                limit.saturating_sub(reading.resident.unwrap_or(charged).max(charged))
+            });
+            let mut claimed = 0u64;
             let mut woken = Vec::new();
-            let mut kept = VecDeque::with_capacity(waiting.len());
-            for waiter in waiting.drain(..) {
-                let fits = match self.room_in(reading, waiter.used) {
-                    Ok(room) => {
-                        self.held(waiter.used)
-                            .saturating_add(granted)
-                            .saturating_add(waiter.bytes)
-                            <= room
+            for waiter in waiting.iter_mut() {
+                let fits = match (free, self.room_in(reading, waiter.used)) {
+                    (Some(free), Ok(room)) => {
+                        let need = waiter.bytes.saturating_sub(self.held(waiter.used));
+                        let fits = room.saturating_sub(claimed) >= waiter.bytes;
+                        claimed = claimed.saturating_add(need).min(free);
+                        fits
                     }
-                    Err(_) => true,
+                    _ => true,
                 };
-                if fits {
-                    granted = granted.saturating_add(waiter.bytes);
-                    woken.push(waiter.wake);
-                } else {
-                    kept.push_back(waiter);
+                if fits && !waiter.woken {
+                    waiter.woken = true;
+                    woken.push(waiter.wake.clone());
                 }
             }
-            self.waiters
-                .store(u64::try_from(kept.len()).unwrap_or(u64::MAX), Ordering::Relaxed);
-            *waiting = kept;
             woken
         };
         for wake in woken {
@@ -720,6 +788,11 @@ impl Budget {
         self.room(Use::Images)
             .map(|room| usize::try_from(room).unwrap_or(usize::MAX))
     }
+}
+
+/// `reading`'s limit as [`Budget`]'s `limit_seen` keeps it: one past its bytes, 0 for none read.
+fn seen_limit(reading: Reading) -> u64 {
+    reading.limit.map_or(0, |limit| limit.saturating_add(1))
 }
 
 /// The refusal where `what` can't be read on this platform.
@@ -811,51 +884,133 @@ pub(crate) mod tests {
         count.0.load(Ordering::SeqCst)
     }
 
-    /// Room freed (lane snapshots, coordinator decision 2): a release wakes the oldest waiters
-    /// that fit, an event and never a poll. Do: a budget fed 1 MiB and nothing resident, all of it
-    /// held for images; two waits for 256 KiB of queues; give back 128 KiB, 128 KiB more, then
-    /// 256 KiB; then a third wait with room to spare; then a wait on a budget whose limit can't be
-    /// read. Expect: no wake until a release frees room; the release that frees 256 KiB wakes the
-    /// older wait alone, as the younger doesn't fit beside it; the next wakes the younger; each
-    /// woken once; a wait with room now, or no room reading, woken at once.
+    const KIB: u64 = 1 << 10;
+
+    /// A budget fed a 1 MiB limit and nothing resident, every byte of it held by the caches.
+    fn full() -> (Arc<Budget>, Fed) {
+        let fed = Fed::new(Some(1024 * KIB), Some(0));
+        let budget = Budget::new(Box::new(fed.clone()));
+        budget.hold(Use::Caches, 1024 * KIB).unwrap();
+        (budget, fed)
+    }
+
+    /// Room freed (lane snapshots, R2's room-freed event): a release wakes the waits its room
+    /// reaches, an event and never a poll. Do: on a full budget, two waits for 256 KiB of the
+    /// queues' room; give back 128 KiB, 128 KiB more, then 256 KiB, then 512 KiB; both withdrawn;
+    /// a wait with room to spare; one on a budget whose limit can't be read; one dropped before its
+    /// room comes. Expect: no wake until a release brings the room; 256 KiB wakes the older alone,
+    /// the next 256 KiB the younger; each woken once; a wait with room now, or no room reading,
+    /// woken at once; a dropped wait never.
     #[test]
-    fn snapshots_room_freed_wakes_the_oldest_waits_that_fit() {
-        const KIB: u64 = 1 << 10;
-        let budget = Budget::new(Box::new(Fed::new(Some(1024 * KIB), Some(0))));
-        budget.hold(Use::Images, 1024 * KIB).unwrap();
+    fn snapshots_room_freed_wakes_the_waits_it_reaches() {
+        let (budget, _fed) = full();
         let (older, older_wake) = counter();
         let (younger, younger_wake) = counter();
-        let _older = budget.when_room(Use::Queues, 256 * KIB, &older_wake);
-        let _younger = budget.when_room(Use::Queues, 256 * KIB, &younger_wake);
+        let older_wait = budget.when_room(Use::Queues, 256 * KIB, &older_wake);
+        let younger_wait = budget.when_room(Use::Queues, 256 * KIB, &younger_wake);
         assert_eq!((woken(&older), woken(&younger)), (0, 0), "no room, no wake");
-        budget.give(Use::Images, 128 * KIB);
+        budget.give(Use::Caches, 128 * KIB);
         assert_eq!((woken(&older), woken(&younger)), (0, 0), "128 KiB fits neither");
-        budget.give(Use::Images, 128 * KIB);
-        assert_eq!(
-            (woken(&older), woken(&younger)),
-            (1, 0),
-            "256 KiB freed wakes the older alone"
-        );
-        budget.give(Use::Images, 256 * KIB);
-        assert_eq!((woken(&older), woken(&younger)), (1, 1), "the next release the younger");
+        budget.give(Use::Caches, 128 * KIB);
+        assert_eq!((woken(&older), woken(&younger)), (1, 0), "256 KiB wakes the older alone");
+        budget.give(Use::Caches, 256 * KIB);
+        assert_eq!((woken(&older), woken(&younger)), (1, 1), "the next 256 KiB the younger");
+        budget.give(Use::Caches, 512 * KIB);
+        assert_eq!((woken(&older), woken(&younger)), (1, 1), "each woken once");
+        drop((older_wait, younger_wait));
         let (now, now_wake) = counter();
-        let _now = budget.when_room(Use::Queues, 256 * KIB, &now_wake);
+        let now_wait = budget.when_room(Use::Queues, 256 * KIB, &now_wake);
         assert_eq!(woken(&now), 1, "room there already wakes at once");
-        budget.give(Use::Images, 512 * KIB);
-        assert_eq!(
-            (woken(&older), woken(&younger), woken(&now)),
-            (1, 1, 1),
-            "each woken once"
-        );
         let unread = Budget::new(Box::new(Fed::new(None, Some(0))));
         let (refused, refused_wake) = counter();
         let _refused = unread.when_room(Use::Images, 1, &refused_wake);
         assert_eq!(woken(&refused), 1, "an unread room wakes the wait to meet its refusal");
-        budget.hold(Use::Images, 1024 * KIB).unwrap();
+        drop(now_wait);
+        budget.hold(Use::Caches, 1024 * KIB).unwrap();
         let (gone, gone_wake) = counter();
         drop(budget.when_room(Use::Queues, KIB, &gone_wake));
-        budget.give(Use::Images, 1024 * KIB);
+        budget.give(Use::Caches, 1024 * KIB);
         assert_eq!(woken(&gone), 0, "a wait dropped before its room is withdrawn");
+    }
+
+    /// Head-of-queue reservation, no starvation (lane snapshots, coordinator decision 2): the
+    /// oldest wait gathers the room freed until it fits, and no later ask takes it, however small.
+    /// Do: on a full budget, a wait for 256 KiB of an image's room, then one for 64 KiB of the
+    /// queues'; give back 64 KiB three times, asking a second 64 KiB wait after the third; then
+    /// 64 KiB more; the image's 256 KiB held and its wait withdrawn; then 128 KiB. Expect: no wake
+    /// while the freed room is short of the head's 256 KiB, the later waits' 64 KiB though it
+    /// would fit them; the head woken at 256 KiB, the later ones not; both later ones woken once
+    /// 128 KiB more comes past the head's.
+    #[test]
+    fn snapshots_the_oldest_wait_is_never_passed_by_later_smaller_ones() {
+        let (budget, _fed) = full();
+        let (head, head_wake) = counter();
+        let (later, later_wake) = counter();
+        let head_wait = budget.when_room(Use::Images, 256 * KIB, &head_wake);
+        let _later = budget.when_room(Use::Queues, 64 * KIB, &later_wake);
+        for _ in 0..3 {
+            budget.give(Use::Caches, 64 * KIB);
+            assert_eq!((woken(&head), woken(&later)), (0, 0), "the freed room is the head's");
+        }
+        let (asked, asked_wake) = counter();
+        let _asked = budget.when_room(Use::Queues, 64 * KIB, &asked_wake);
+        assert_eq!(woken(&asked), 0, "a later ask doesn't take the head's room either");
+        budget.give(Use::Caches, 64 * KIB);
+        assert_eq!(
+            (woken(&head), woken(&later), woken(&asked)),
+            (1, 0, 0),
+            "256 KiB freed wakes the head alone"
+        );
+        budget.hold(Use::Images, 256 * KIB).unwrap();
+        drop(head_wait);
+        assert_eq!((woken(&later), woken(&asked)), (0, 0), "the head took its room");
+        budget.give(Use::Caches, 128 * KIB);
+        assert_eq!((woken(&later), woken(&asked)), (1, 1), "the room past the head's goes on");
+    }
+
+    /// Head-of-queue reservation, no blocking past the head's need (lane snapshots, coordinator
+    /// decision 2). Do: on a full budget, a wait for 256 KiB of an image's room and a later one
+    /// for 64 KiB of the queues'; one release of 320 KiB. Then, on a second full budget, the same
+    /// two waits, 128 KiB given back, and the head's wait withdrawn. Expect: one release that frees
+    /// the head's need and the later's wakes both; a head withdrawn passes its room on at once,
+    /// no release needed.
+    #[test]
+    fn snapshots_room_past_the_heads_need_goes_on_at_once() {
+        let (budget, _fed) = full();
+        let (head, head_wake) = counter();
+        let (later, later_wake) = counter();
+        let _head = budget.when_room(Use::Images, 256 * KIB, &head_wake);
+        let _later = budget.when_room(Use::Queues, 64 * KIB, &later_wake);
+        budget.give(Use::Caches, 320 * KIB);
+        assert_eq!((woken(&head), woken(&later)), (1, 1), "one release wakes both");
+
+        let (budget, _fed) = full();
+        let (head, head_wake) = counter();
+        let (later, later_wake) = counter();
+        let head_wait = budget.when_room(Use::Images, 256 * KIB, &head_wake);
+        let _later = budget.when_room(Use::Queues, 64 * KIB, &later_wake);
+        budget.give(Use::Caches, 128 * KIB);
+        assert_eq!((woken(&head), woken(&later)), (0, 0), "128 KiB is the head's");
+        drop(head_wait);
+        assert_eq!(woken(&later), 1, "a head withdrawn passes its room on");
+    }
+
+    /// A changed limit wakes (lane snapshots, coordinator decision 1): the host raising the limit
+    /// frees room no release says, and the reading that finds it runs the waiters' turn. Do: on a
+    /// full budget, a wait for 256 KiB of an image's room; the limit raised by 128 KiB and a use's
+    /// room asked; then raised by 256 KiB and a charge taken. Expect: the first reading finds too
+    /// little, no wake; the charge's reading of the higher limit wakes it, no release given.
+    #[test]
+    fn snapshots_a_changed_limit_wakes_the_waits_it_makes_room_for() {
+        let (budget, fed) = full();
+        let (waits, wake) = counter();
+        let _wait = budget.when_room(Use::Images, 256 * KIB, &wake);
+        fed.set(Some(1152 * KIB), Some(0));
+        let _ = budget.room(Use::Caches).unwrap();
+        assert_eq!(woken(&waits), 0, "128 KiB more falls short");
+        fed.set(Some(1280 * KIB), Some(0));
+        budget.hold(Use::Queues, 0).unwrap();
+        assert_eq!(woken(&waits), 1, "the reading of 256 KiB more wakes it");
     }
 
     /// T-T1.12.M1: a use's streams share its room. Do: open one stream of chunks, then a second,

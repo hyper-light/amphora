@@ -2769,9 +2769,11 @@ impl<F: BlockFile + 'static> Drop for Actor<F> {
 }
 impl<F: BlockFile + 'static> Actor<F> {
     /// Whether a due compaction's image fits its room now. One past the memory budget's room alone
-    /// waits for the budget's room-freed event and isn't measured again until it rings (lane
-    /// snapshots, coordinator decision 2); one past its carrier's or its disk share is measured at
-    /// each step, as the flushing thread's passes move the disk's.
+    /// waits in its turn for room (`memory::Budget::when_room`) and isn't measured again until the
+    /// budget wakes it; woken and still past it, it asks again in its own place, so the waits that
+    /// asked after it never take its turn (lane snapshots, coordinator decision 2). Its wait holds
+    /// until the image is made or the compaction isn't due. One past its carrier's or its disk
+    /// share is measured at each step, as the flushing thread's passes move the disk's.
     fn image_fits_now(&mut self) -> Result<bool, Refusal> {
         if self
             .room_wait
@@ -2780,23 +2782,33 @@ impl<F: BlockFile + 'static> Actor<F> {
         {
             return Ok(false);
         }
-        self.room_wait = None;
         match self.replica.machine_mut().image_fit()? {
             crate::replication::ImageFit::Fits => Ok(true),
             crate::replication::ImageFit::Memory(bytes) => {
-                let wait = Arc::new(RoomWait {
-                    rang: std::sync::atomic::AtomicBool::new(false),
-                    owner: self.waker.clone(),
-                });
-                let waiting = crate::memory::process().when_room(
-                    crate::memory::Use::Images,
-                    bytes,
-                    &std::task::Waker::from(Arc::clone(&wait)),
-                );
-                self.room_wait = Some((wait, waiting));
+                match &self.room_wait {
+                    Some((wait, waiting)) => {
+                        wait.rang.store(false, Ordering::Release);
+                        waiting.again(bytes, &std::task::Waker::from(Arc::clone(wait)));
+                    }
+                    None => {
+                        let wait = Arc::new(RoomWait {
+                            rang: std::sync::atomic::AtomicBool::new(false),
+                            owner: self.waker.clone(),
+                        });
+                        let waiting = crate::memory::process().when_room(
+                            crate::memory::Use::Images,
+                            bytes,
+                            &std::task::Waker::from(Arc::clone(&wait)),
+                        );
+                        self.room_wait = Some((wait, waiting));
+                    }
+                }
                 Ok(false)
             }
-            crate::replication::ImageFit::Other => Ok(false),
+            crate::replication::ImageFit::Other => {
+                self.room_wait = None;
+                Ok(false)
+            }
         }
     }
 
@@ -3186,9 +3198,12 @@ impl<F: BlockFile + 'static> Actor<F> {
         // compaction is what frees its room. An image past its room is refused (`owner_image_room`),
         // so a due compaction waits for one within it; a stall still compacts, and fences on it.
         let ready = !self.replica.machine().bootstrap_pending();
-        let due = ready
-            && self.replica.compaction_due(self.compacting.rule())
-            && self.image_fits_now()?;
+        let due = ready && self.replica.compaction_due(self.compacting.rule());
+        if !due {
+            // A wait for room to make an image no compaction needs gives its turn up.
+            self.room_wait = None;
+        }
+        let due = due && self.image_fits_now()?;
         if due || (ready && self.replica.is_stalled()) {
             let nanos = self.now()?;
             let began = (self.clock)();
@@ -13240,6 +13255,105 @@ mod tests {
         let (differ, compared) = pages_differ(&driven, &[0, 1, 2, 3]);
         assert!(compared > 0, "no page compared");
         assert!(differ.is_empty(), "pages differ (owner, index, page, byte): {differ:?} of {compared}");
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// Lane snapshots (replication.md, "Decision (lane snapshots)"; coordinator decision 2 on
+    /// R2's room-freed event), at the owner: a due compaction whose image is past the memory
+    /// budget's room waits in its turn for room, and runs once a release frees it. Do: one voter
+    /// on a budget fed a 1 GiB limit and nothing resident; a row written, flushed, and the log
+    /// compacted; the image's carrier bound lowered so no compaction runs, and rows written and
+    /// flushed until one is due; every free byte of the budget held by a charge of the queues', the
+    /// bound raised, the image measured, and half its bytes given back; rounds; then the rest of
+    /// the charge given back; rounds. Expect: while the charge is held, a compaction due, the image
+    /// past the memory budget's room alone, the owner waiting for room and its log's start where it
+    /// stood; after the release, the log's start past it and the wait gone.
+    #[test]
+    fn snapshots_a_due_compaction_runs_once_a_release_frees_its_room() {
+        use crate::memory::Use;
+        fn insert(driven: &mut Driven, pump: &mut Pump<'_>, client: &Client) {
+            driven
+                .call(pump, client, |db| {
+                    db.exec("CREATE TABLE IF NOT EXISTS roomy(b)")?;
+                    db.exec("INSERT INTO roomy VALUES(randomblob(4000))")?;
+                    Ok(Vec::new())
+                })
+                .unwrap();
+        }
+        let fed = crate::memory::tests::Fed::new(Some(1 << 30), Some(0));
+        let (budget, _unset) = crate::memory::tests::budget(&fed);
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = vec![driven.open(dir.path(), 1, vec![1], None)];
+        let mut pump = Pump::new(&clients);
+        driven.elect(&mut pump, &clients, 0, 1);
+        insert(&mut driven, &mut pump, &clients[0]);
+        quiet(&mut driven, &mut pump);
+        driven.flushed(&mut pump, 0);
+        {
+            let owner = driven.owner_mut(0);
+            let now = owner.now().unwrap();
+            let imaged = owner
+                .replica
+                .compact(0, now, std::task::Waker::noop())
+                .unwrap();
+            assert!(imaged, "no first image");
+        }
+        quiet(&mut driven, &mut pump);
+        driven
+            .owner_mut(0)
+            .replica
+            .machine_mut()
+            .set_snapshot_bytes(1);
+        for _ in 0..16 {
+            insert(&mut driven, &mut pump, &clients[0]);
+        }
+        quiet(&mut driven, &mut pump);
+        driven.flushed(&mut pump, 0);
+        let due = |driven: &Driven| {
+            let owner = driven.owner(0);
+            owner.replica.compaction_due(owner.compacting.rule())
+        };
+        let start = |driven: &Driven| {
+            driven
+                .owner(0)
+                .replica
+                .core()
+                .raft
+                .log()
+                .first_index()
+                .unwrap()
+        };
+        assert!(due(&driven), "no compaction due after the writes");
+        let before = start(&driven);
+        let free = budget.room(Use::Queues).unwrap() - budget.held(Use::Queues);
+        budget.hold(Use::Queues, free).unwrap();
+        driven
+            .owner_mut(0)
+            .replica
+            .machine_mut()
+            .set_snapshot_bytes(usize::MAX);
+        let fit = driven.owner_mut(0).replica.machine_mut().image_fit().unwrap();
+        let crate::replication::ImageFit::Memory(size) = fit else {
+            panic!("the image isn't past the memory budget's room alone: {fit:?}");
+        };
+        budget.give(Use::Queues, size / 2);
+        let held = free - size / 2;
+        for _ in 0..8 {
+            driven.round(&mut pump);
+        }
+        quiet(&mut driven, &mut pump);
+        assert!(due(&driven), "the compaction stopped being due");
+        assert_eq!(start(&driven), before, "a compaction ran past its room");
+        assert!(driven.owner(0).room_wait.is_some(), "the owner isn't waiting for room");
+        budget.give(Use::Queues, held);
+        for _ in 0..8 {
+            driven.round(&mut pump);
+        }
+        quiet(&mut driven, &mut pump);
+        assert!(start(&driven) > before, "no compaction once the room was freed");
+        assert!(driven.owner(0).room_wait.is_none(), "the wait outlived its image");
         driven.drain(&mut pump);
         pump.finish();
     }
