@@ -453,14 +453,19 @@ Still at `REQUEST_MAX`, so not done (the rest of 3a):
 
 What is left for the next cross lane (3a's rest above; 3b and 4 not started here):
 
-- 3b. serve.rs `Shared::sql`'s write calls `db.call(until, AnswerMax::bytes(RESULT_MAX), ..)`. Each frame's bytes
-  are held by its own `memory::Charge` (`frame`), and `Encoded::answer_bytes` counts only unheld bytes, so what
-  the declared bound covers is the `Vec<Encoded>` spine: `size_of::<Encoded>()` a frame plus spare capacity,
-  with no frame count known before the call. A sketch: a `Frames { list: Vec<Encoded>, spine: Charged }` whose
-  `push` charges `(new_cap - cap) * size_of::<Encoded>()` before `try_reserve_exact`, used by `Spill::Held` and
-  `answered`, its `AnswerBytes` its own size (all else held), declared `AnswerMax::bytes(size_of::<Frames>())`.
-  The spine's charge must last until the frames are written, so `Shared::sql` and its writer take `Frames`, not
-  `Vec<Encoded>` (refusal and Hello frames an uncharged one-frame list).
+- 3b, on branch perf/cross-a11 (3c22e6ae, 46f03fef), NOT merged: serve.rs's frame list is `Frames`,
+  its slots charged to the budget before the list grows (`Frames::push`, a typed refusal past the room), each
+  frame holding its own bytes as before; its `AnswerBytes` is its own size plus any unheld frame's bytes, so the
+  write declares `Frames::DECLARED` (`size_of::<Frames>()`) in place of `RESULT_MAX`. Refusal and agreement
+  answers are one uncharged frame (`Frames::one`). Test: `cp_t1_13_a_sql_write_answer_past_one_frame_*` declares
+  `Frames::DECLARED` and commits a write answered in many frames. Not tested: a refusal of the list's own growth
+  for memory (needs a budget held short mid-answer). r1350 at 46f03fef (adacachy2, needs cpus=4,mem=16g, load
+  26-33): clippy -p amphora --all-targets clean; lib `serve::` 11/11, `database::admission_charge` 2/2,
+  call_nowait_charge 1/1; tests/serve.rs 9/10, `cp_t1_13_sql_takes_bound_parameters_and_answers_typed_rows_with_their_names`
+  failed at tests/serve.rs:759, the `unwrap` of a 20-statement write carrying 20 MiB of blobs, whose answer is
+  one small frame. Its error text was not captured (the check greps it out) and the re-run alone was refused
+  (adacachy2 at 1 of 32 cores idle), so whether 3b or the host's memory refused it is not known. Next: run that
+  test alone at 46f03fef and at main 66484d49 and read its `Err`.
 - 4. `store::Config::queue`, `ROOM_LOOK` and its re-looks, and bench/src/store.rs's `AMPHORA_QUEUE` (bba65c73)
   are as A10 found them.
 
