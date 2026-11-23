@@ -326,3 +326,7 @@ is only in `bench/`.
 - The clean close starts at `Connection::close` (connection.rs 3424) and `Pager::checkpoint_shutdown` (pager.rs
   6421): a TRUNCATE checkpoint today, given up silently after three `Busy` answers. A backed-up writer turns it off
   (`Db::hold_log`, db.rs 564).
+- Unit 4's slow reader exists as a test, not as a bench: `cp_t1_13_a_sql_read_to_a_client_that_stops_reading_ends_at_its_deadline`
+  (`crates/amphora/src/serve.rs` on main) streams a read with `Spill::Sent` to the client end of `link()`, which never
+  reads, until its deadline. The A/B's harness can hold one such read open, start it again each time it ends, and
+  time the writers' commits beside it.
