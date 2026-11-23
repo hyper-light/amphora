@@ -1419,13 +1419,13 @@ mod tests {
         );
     }
 
-    /// Lane R5 (one `ExactSum`): under `RealSums::Exact` the column copy's SUM is the rows' own
-    /// `morsel::ExactSum`. Do: per group, R1's bigpairs, a sum that overflows and comes back, and
-    /// an infinity beside finite values that overflow the other way, summed from a copy and from
-    /// the rows (3,000 zeros in a group of their own, so the planner reads the copy). Expect
-    /// +inf, 1.5 and +inf from both, with the copy read.
+    /// Lane R5 (one `ExactSum`): SQL under `RealSums::Exact` on a versioned storage, its column
+    /// copies switched on and off. Do: per group, R1's bigpairs, a sum that overflows and comes
+    /// back, and an infinity beside finite values that overflow the other way. Expect +inf, 1.5
+    /// and +inf from both. (The copy declines these statements, r1735: the scan's own sum is
+    /// held by `r5_the_copys_sum_stays_exact_past_the_range`.)
     #[test]
-    fn r5_the_copys_exact_sum_stays_exact_past_the_range() {
+    fn r5_versioned_exact_sums_stay_exact_past_the_range() {
         let (_a, on) = connect();
         let (_b, off) = connect();
         copies(&on).set_on(true);
@@ -1452,11 +1452,9 @@ mod tests {
             vec![Value::from_i64(3), Value::from_f64(f64::INFINITY)],
         ];
         for _ in 0..3 {
-            assert_eq!(rows(&on, q), want, "from the copy");
-            assert_eq!(rows(&off, q), want, "from the rows");
+            assert_eq!(rows(&on, q), want, "copies on");
+            assert_eq!(rows(&off, q), want, "copies off");
         }
-        let seen = copies(&on).counts();
-        assert!(seen.copy > 0, "no statement read the copy: {seen:?}");
     }
 
     use crate::storage::versioned::memory::Capped;

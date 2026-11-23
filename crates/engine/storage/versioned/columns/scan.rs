@@ -2380,6 +2380,36 @@ mod tests {
         assert_eq!(s.value(), 1.25);
     }
 
+    /// Lane R5 (one `ExactSum`): the copy's SUM is `morsel::ExactSum`. Do: fold R1's bigpairs, a
+    /// sum that overflows and comes back, and an infinity beside finite values that overflow the
+    /// other way, cut in two at every place and merged. Expect +inf, 1.5 and +inf, never NaN.
+    #[test]
+    fn r5_the_copys_sum_stays_exact_past_the_range() {
+        let cases: [(&[f64], f64); 3] = [
+            (&[1e308, 1e308, -1e308, -1e308, 1e308, 1e308], f64::INFINITY),
+            (&[1e308, 1e308, -1e308, -1e308, 1.5], 1.5),
+            (&[f64::INFINITY, -1e308, -1e308], f64::INFINITY),
+        ];
+        for (terms, want) in cases {
+            for cut in 0..=terms.len() {
+                let mut parts = [Acc::new(Agg::Sum(0)), Acc::new(Agg::Sum(0))];
+                for (pos, x) in terms.iter().enumerate() {
+                    let part = usize::from(pos >= cut);
+                    parts[part]
+                        .fold(&Cell::Real(*x), u64::try_from(pos).unwrap())
+                        .unwrap();
+                }
+                let [mut a, b] = parts;
+                a.merge(&b).unwrap();
+                assert_eq!(
+                    a.finish().unwrap(),
+                    Cell::Real(want),
+                    "{terms:?} cut at {cut}"
+                );
+            }
+        }
+    }
+
     /// Do: group rows whose keys mix integers with equal reals, nulls and text, under every
     /// aggregate, over granules of each size from one row to all of them, run whole and merged one
     /// granule at a time from the last. Expect: each answer equals the statement row by row,
