@@ -4,6 +4,9 @@ pub mod decimal;
 pub mod fp;
 pub mod nonnan;
 
+#[cfg(test)]
+mod decimal_tests;
+
 use nonnan::NonNan;
 
 // TODO: Remove when https://github.com/rust-lang/libs-team/issues/230 is available
