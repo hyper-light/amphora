@@ -77,17 +77,30 @@ it (`waiting [3]`), and with member 3's work in hand the harness never moves a c
 would end by its length, so each such stray barrier would hold the leader's writes and every other follower's for a
 slot length (inferred, not measured).
 
-The first place the branch decides wrong, measured: the leader begins a slot for a member's ending barrier that
-arrived after its slot ended. Not traced: why main never reaches it in these tests (on main the follower's call runs
-inline, so its ending barrier is queued in the same step that steps the barrier; whether main's barrier also waits a
-round unsent is not shown). Lane V9's part 2 design (a barrier whose work writes nothing is marked, and a marked
-barrier never asks for a slot) would cover the ending barrier; not tested.
+Main b85ca877, the same probes (probe_main.py; main's ending barrier is sent from `prepare()`), the same test, 21:59Z,
+passed:
+
+    P13 L1 readindex from 2 step false slots[holder None queue [] waiting [2] ...]
+    P13 L1 slot began member 2 length 200ms slots[holder Some((2, 3)) ... ready 1]
+    P13 M2 prepare sends its ending barrier
+    P13 L1 readindex from 2 step true slots[holder None queue [] waiting [] read None turn true ready 0]
+    P13 L1 slot ended member 2 how Released
+    P13 L1 readindex from 3 step false slots[holder None queue [] waiting [3] ...]
+    P13 L1 slot began member 3 length 200ms ...
+    P13 M3 prepare sends its ending barrier
+
+The first divergence, measured on both arms: member 2's ending barrier reaches the leader while member 2 holds its
+slot on main (ended Released), and after that slot ended Expired on the branch, where it begins a second slot. Why the
+branch's clock moved first is inferred, not shown: its session's result is decided a step after the barrier's answer,
+and `lapse_slots` counts the group quiet while the ending barrier is still unsent in member 2's core. Lane V9's part 2
+design (a barrier whose work writes nothing is marked, and a marked barrier never asks for a slot) would keep a late
+ending barrier from beginning a slot; not tested.
 
 ## Next
 
-Run the same probes on main b85ca877 (probe.py's slot-core and leader probes apply as written; main's ending barrier
-is sent from `prepare()`) for the same test, and compare the order of `slot ended` and the ending barrier's arrival.
-Then fix where the two first differ, and rerun r1576's script on the fixed head.
+Decide which side is wrong where the two differ: the product (a late ending barrier begins a slot no work will end:
+legitimate in real time, where a long session outlasts its slot) or the harness (it moves a clock while an owner holds
+an unsent record). Fix there, then rerun r1576's script on the fixed head.
 
 ## Commands
 
