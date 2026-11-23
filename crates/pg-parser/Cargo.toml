@@ -1,0 +1,12 @@
+[package]
+name = "amphora-pg-parser"
+description = "PostgreSQL 19's parser in Rust (docs/design/postgres.md section 3): its own flex and bison tables, driven by flat loops"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
