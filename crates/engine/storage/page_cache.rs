@@ -1331,6 +1331,75 @@ mod tests {
         cache.verify_cache_integrity();
     }
 
+    /// Lane Q2 (decision 19): do 20,000 point lookups through one index of a table larger than a
+    /// 200-page cache, then count the table's rows four times, through an index the cache holds.
+    /// Expect: every count answers the row count, and the counts after the first read no page from
+    /// the file (S8's `table_count` after `point_secondary` read its index's 607 pages every time).
+    #[test]
+    fn q2_counts_after_point_lookups_read_no_page_from_the_file() {
+        use crate::{ConnectOpts, Database, DatabaseOpts, OpenFlags, SqliteDialect, Value};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q2.db");
+        let io = Arc::new(crate::io::PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            path.to_str().unwrap(),
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let rows: i64 = 20_000;
+        let writer = db.connect(ConnectOpts::new()).unwrap();
+        writer
+            .execute("CREATE TABLE items (id INTEGER PRIMARY KEY, k INTEGER NOT NULL, owner INTEGER NOT NULL, body TEXT NOT NULL)")
+            .unwrap();
+        writer.execute("BEGIN").unwrap();
+        let body = "x".repeat(200);
+        for id in 0..rows {
+            let (k, owner) = ((id * 7919) % rows, id % 97);
+            writer
+                .execute(format!("INSERT INTO items VALUES ({id}, {k}, {owner}, '{body}')"))
+                .unwrap();
+        }
+        writer.execute("COMMIT").unwrap();
+        writer.execute("CREATE INDEX items_k ON items (k)").unwrap();
+        writer.execute("CREATE INDEX items_owner ON items (owner)").unwrap();
+        writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+        let reader = db.connect(ConnectOpts::new()).unwrap();
+        reader.execute("PRAGMA cache_size = 200").unwrap();
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        for _ in 0..20_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let k = i64::try_from(x % u64::try_from(rows).unwrap()).unwrap();
+            let found = reader
+                .prepare(format!("SELECT body FROM items WHERE k = {k}"))
+                .unwrap()
+                .run_collect_rows()
+                .unwrap();
+            assert_eq!(found.len(), 1, "k = {k}");
+        }
+        let pager = reader.get_pager();
+        let mut reads = Vec::new();
+        for _ in 0..4 {
+            let before = pager.page_file_reads();
+            let counted = reader
+                .prepare("SELECT COUNT(*) FROM items")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap();
+            assert_eq!(counted, vec![vec![Value::from_i64(rows)]]);
+            reads.push(pager.page_file_reads().saturating_sub(before));
+        }
+        let (first, later) = reads.split_first().unwrap();
+        assert!(*first > 0, "the first count read its pages: {reads:?}");
+        assert_eq!(later, [0, 0, 0], "file reads per count: {reads:?}");
+    }
+
     #[test]
     fn test_delete_locked_page() {
         let mut cache = PageCache::default();
