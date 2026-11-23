@@ -22,8 +22,8 @@ probe.py, the probe's edits). Logs on adacachy2: ~/.cache/amphora-perf/serve-p13
   `autonomous_quorum_seed_preserves_unchanged_pages_then_delta_and_restart`,
   `seed_and_delta_hold_through_an_election_at_each_step`) and `every_falsifier_of_the_floor_holds_under_a_nemesis`.
   V9's merge (five tests with the slot off) changed none of the six.
-- No fix. The first divergence is traced on the branch (below); main's side of it is not traced, so no fix was
-  written: the hour went to it (a 19-minute worktree checkout on adacachy and an API outage at about 21:30Z).
+- No fix. The first divergence is traced on both arms (below), at 21:59Z; no time was left to fix and verify it (a
+  19-minute worktree checkout on adacachy and an API outage at about 21:30Z took the hour's middle).
 - Main still fails `cp_t1_13_sql_takes_bound_parameters_and_answers_typed_rows_with_their_names` (3 of 3); the branch
   passes it (3 of 3). Main fails `writers_through_five_leader_crashes_each_land_and_every_acknowledged_row_is_held`
   (3 of 3 here); the branch passes it (3 of 3).
