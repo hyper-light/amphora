@@ -426,7 +426,10 @@ impl Sqlite {
     pub fn open(dir: &Path, cache_kib: i64) -> anyhow::Result<Self> {
         std::fs::create_dir_all(dir)?;
         let conn = rusqlite::Connection::open(dir.join("bench.db"))?;
-        conn.execute_batch(&format!("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA cache_size = -{cache_kib}"))?;
+        // A read-heavy SQLite in production maps its file and keeps temporaries in memory. The
+        // mmap request is the largest an i64 holds, so SQLite clamps it to its own compiled
+        // ceiling (SQLITE_MAX_MMAP_SIZE); `about` records the size it took (lane M2, 2026-11-23).
+        conn.execute_batch(&format!("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA cache_size = -{cache_kib}; PRAGMA mmap_size = {}; PRAGMA temp_store = MEMORY", i64::MAX))?;
         Ok(Self { conn, cache_kib })
     }
 }
@@ -442,7 +445,9 @@ impl Target for Sqlite {
 
     fn about(&mut self) -> anyhow::Result<serde_json::Value> {
         let version: String = self.conn.query_row("SELECT sqlite_version()", [], |r| r.get(0))?;
-        Ok(serde_json::json!({ "engine": "sqlite", "version": version, "cache_kib": self.cache_kib, "threads": 1 }))
+        let mmap_size: i64 = self.conn.query_row("PRAGMA mmap_size", [], |r| r.get(0))?;
+        let temp_store: i64 = self.conn.query_row("PRAGMA temp_store", [], |r| r.get(0))?;
+        Ok(serde_json::json!({ "engine": "sqlite", "version": version, "cache_kib": self.cache_kib, "threads": 1, "mmap_size": mmap_size, "temp_store": temp_store }))
     }
 
     fn exec(&mut self, sql: &str) -> anyhow::Result<()> {
