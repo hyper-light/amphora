@@ -58,6 +58,10 @@ successor starts from the state below.
 
 ## Planned commands (the successor runs these)
 
+Admission (coordinator, 03:40Z): every timed run goes through kiln `run` with `on` 00aad8daff2fa3c9daa65d53c425d450 and
+needs "linux/amd64,cpus=16,mem=48g", left queued until that much is idle. Builds take needs "cpus=8,mem=24g" with
+CARGO_BUILD_JOBS=8. Record the load average beside every run. Hour 1 took no timed numbers, so nothing needs relabelling.
+
 Workload inputs and where each comes from:
 
 - `--batch 1`: one event a write, the commit path at its most demanding.
