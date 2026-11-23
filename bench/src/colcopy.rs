@@ -151,6 +151,21 @@ impl Amphora {
         Ok(out)
     }
 
+    /// Leave this round's room for the copies, accounting for bytes already granted.
+    fn press(&self, room: &Capped, other: &mut u64, free: u64) -> anyhow::Result<()> {
+        let want = free.saturating_sub(self.storage.copy_meter().held);
+        let now = room.room().map_err(e)?;
+        if now > want {
+            room.take("the driver's other use", now - want).map_err(e)?;
+            *other = other.saturating_add(now - want);
+        } else {
+            let back = (want - now).min(*other);
+            room.give(back);
+            *other = other.saturating_sub(back);
+        }
+        Ok(())
+    }
+
     /// The copies' resident and granted bytes.
     fn copies(&self) -> (u64, u64) {
         self.storage.copy_held()
@@ -374,17 +389,23 @@ fn run(
         if s.grow > 0 {
             let from = next.get(i).copied().unwrap_or(s.rows + 1);
             let to = from + s.grow - 1;
-            // The engine's write first. The scenario's room is the analytic work's (lane
-            // colcopy-8): each engine's cap is lifted while its rows grow (Amphora's other use
-            // gives its bytes back, DuckDB's limit is reset to its default) and set again after,
-            // so a copy that must grow with its table meets the cap, not the table's rows. A write
-            // still refused is counted and left out of the reference too, so the answers still
-            // compare.
+            // The row growth has room on both engines. Amphora publishes its changes to the
+            // copies at COMMIT, where the copies must already face this round's limit.
             let wrote = match (&amphora, &duck) {
                 (Some(a), _) => {
                     room.give(other);
                     other = 0;
-                    a.exec(&fill(false, i, from, to))
+                    a.exec("BEGIN")?;
+                    let written = a.exec(&fill(false, i, from, to)).and_then(|()| {
+                        if let Some(free) = s.free_at(k, need) {
+                            a.press(&room, &mut other, free)?;
+                        }
+                        a.exec("COMMIT")
+                    });
+                    if written.is_err() && !a.conn.get_auto_commit() {
+                        a.exec("ROLLBACK")?;
+                    }
+                    written
                 }
                 (_, Some(d)) => d
                     .conn
@@ -408,16 +429,7 @@ fn run(
         let free = s.free_at(k, need);
         // The cap: the engine's bytes for its rows now, and the free bytes on top.
         if let (Some(a), Some(f)) = (&amphora, free) {
-            let want = f.saturating_sub(a.storage.copy_meter().held);
-            let now = room.room().map_err(e)?;
-            if now > want {
-                room.take("the driver's other use", now - want).map_err(e)?;
-                other = other.saturating_add(now - want);
-            } else {
-                let back = (want - now).min(other);
-                room.give(back);
-                other = other.saturating_sub(back);
-            }
+            a.press(&room, &mut other, f)?;
             let rows_bytes = room
                 .held()
                 .saturating_sub(other)

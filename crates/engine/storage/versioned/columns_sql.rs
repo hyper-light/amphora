@@ -1716,15 +1716,21 @@ mod tests {
                 if s.grow > 0 {
                     let from = next.get(i).copied().unwrap_or(s.rows + 1);
                     let w = fill_sql(i, from, from + s.grow - 1);
-                    // The scenario's room is the copies' (lane colcopy-8): the other use gives its
-                    // bytes back while the rows grow, so the table's growth is never what the cap
-                    // refuses, and the press after it puts the copies back at their room. A copy
-                    // that must grow with its table then meets the cap first, as the scenario
-                    // says. A write still refused is counted, and left out of the row loop's
-                    // table too, so the answers still compare.
+                    // Grow the row tree first. The commit offers its changes to the copies'
+                    // feeds, so restore this round's pressure before publishing the transaction.
                     room.give(other);
                     other = 0;
-                    match on.execute(&w) {
+                    on.execute("BEGIN").unwrap();
+                    let written = on.execute(&w).and_then(|()| {
+                        if let Some(free) = s.free_at(k, need) {
+                            press(&room, &mut other, free, &on);
+                        }
+                        on.execute("COMMIT")
+                    });
+                    if written.is_err() && !on.get_auto_commit() {
+                        on.execute("ROLLBACK").unwrap();
+                    }
+                    match written {
                         Ok(()) => {
                             off.execute(&w).unwrap();
                             if let Some(n) = next.get_mut(i) {
