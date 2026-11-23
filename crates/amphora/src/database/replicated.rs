@@ -4187,12 +4187,9 @@ impl<F: BlockFile + 'static> Actor<F> {
                         .entries
                         .first()
                         .is_some_and(|entry| reads(&entry.data));
-                    let read = if marked {
-                        self.slots.pass(from, self.at, (message, reservation))
-                    } else {
-                        self.slots.ask(from);
-                        self.slots.read(from, self.at, (message, reservation))
-                    };
+                    let _ = marked;
+                    self.slots.ask(from);
+                    let read = self.slots.read(from, self.at, (message, reservation));
                     self.slot_ended(read.ended);
                     let stepped = match read.step {
                         Some((message, _reservation)) => {
