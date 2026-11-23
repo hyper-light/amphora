@@ -12,8 +12,7 @@ into `bench/`.
 
 **Decision.** One writer thread owns the engine and commits as soon as nothing more waits in its
 queue (or a commit reaches its row bound); what came while it committed shares the next commit.
-Nothing waits for a timer. (The flusher may wait, bounded by a flush's own time, before it begins a
-flush: decision 14.)
+Nothing waits for a timer, the flusher included (decision 14).
 
 **Sources.** Group commit in DeWitt et al., "Implementation Techniques for Main Memory Database
 Systems" (SIGMOD 1984); Helland et al., "Group Commit Timers and High Volume Transaction Systems"
@@ -357,39 +356,39 @@ test reaches frames left from before a restart.
 **Falsified by.** An acknowledged batch lost to a power cut (`tests/crash.rs`); on ext4 or XFS, the
 log's `fdatasync` no faster than its `fsync`.
 
-## 14. Gathering before a flush at low load
+## 14. A flush begins as soon as none is running
 
-**Decision.** When the writer ran out of work during a flush, the flusher doesn't begin the next
-flush at the first commit after it. It waits until the writer has been idle for a 32nd of a flush,
-or half a flush has gone by, whichever comes first (a flush's time smoothed: the first, then an
-eighth of each new one), and then flushes everything committed. When the writer never ran out of
-work, flushes follow one another as before.
+**Decision.** The flusher begins a flush as soon as something is committed that no flush has begun
+for, and waits for nothing else. What is committed during a flush joins the next one. With one
+flusher a commit waits for the flush under way, if any, and the next.
 
-**Why.** Writers that each wait for their write to be durable send their next write when told. A
-flush begun at the first commit after the last flush covers the first few of those writes and
-leaves the rest to the flush after; the writers settle into two halves, each committing during the
-other's flush, and each write waits two flushes. At 32 writers on a 2.8 ms flush: 5.6 ms a write
-and 5,700 writes a second, predicted; 5.1–5.8 ms and 5,134–5,608 a second, measured.
+**Why.** Nothing in the store waits for a timer (decision 1). Until 2026-11-23 the flusher gathered
+instead: when the writer had run out of work during a flush, the flusher waited until the writer
+had been idle for a 32nd of a flush, or half a flush had gone by, before it began the next. That
+wait was a timer, and its two fractions were chosen, never measured. With one client nothing can
+join the flush its only sender waits for, so the wait timed out every time and added its whole
+length to every write.
 
-**Sources.** Helland et al. (HPTS 1987; decision 1) on group commit timers: a fixed delay adds
-latency once commits arrive faster than they complete, which is why this one is taken only when the
-writer ran out of work, and is bounded by the flush's own time. PostgreSQL's `commit_delay` and
-`commit_siblings`: a delay before the flush when other transactions are active.
+**Sources.** Helland et al. (HPTS 1987; decision 1): a timer adds latency without adding throughput
+once commits arrive faster than they complete.
 
-**Evidence.** fedora, 2026-10-20, 32 writers, one group, three runs each alternating with
-PostgreSQL 17 in the same windows, at load 4–12 with other work on the machine
-(`bench/records/2026-10-20-fedora-32-writers-flush-at-first-commit.jsonl`,
-`...-gathering.jsonl`). Flushing at the first commit: 5,134–5,608 writes a second, p50 5.12–5.76 ms,
-p99 9.3–9.7 ms, p99.9 14.6–20.7 ms, max 26–54 ms. Gathering: 7,390–7,605 writes a second, p50
-4.06–4.16 ms, p99 7.2–8.1 ms, p99.9 11.3–17.2 ms, max 21–38 ms, with about 5,000 flushes a run
-against 7,000. PostgreSQL: 5,803–6,164 writes a second, p50 5.06–5.44 ms, p99 7.4–8.1 ms, p99.9
-9.5–20.2 ms, max 10–29 ms. Crash injection: 10,000 power cuts, none lost. The two fractions are
-chosen, not yet tuned: a 16th and a 64th of a flush are to be measured against the 32nd on a quiet
-machine, and gathering at 1,000 writers and more against flushing at once.
+**Evidence.** adacachy2, 2026-11-23, insert_one at 1 client, traced with an `LD_PRELOAD` shim on the
+log's write, open, flush and close and on the threads' futex hand-offs (lane W2,
+`bench/records/2026-11-23-adacachy2-perf-oltp.md`). Between the log's write and its flush, the
+flusher sat in a `FUTEX_WAIT_BITSET` of 191.8 to 192.8 µs that returned timed out, in an insert of
+2.9 to 3.3 ms at p50. Outside the flush Amphora spent 292 µs an insert, SQLite 95 µs. The A/B
+against the gathering flusher at 1, 32 and 128 clients is in the same record (lane W3).
 
-**Falsified by.** A workload where gathering lengthens a write's p50 or tails against flushing at
-the first commit (an open-loop trickle pays up to a 32nd of a flush a write), or more writers where
-flushes stop following one another.
+What gathering bought, and what this decision answers for: fedora, 2026-10-20, 32 writers, one
+group (`bench/records/2026-10-20-fedora-32-writers-flush-at-first-commit.jsonl`,
+`...-gathering.jsonl`). Flushing at the first commit: 5,134–5,608 writes a second, p50
+5.12–5.76 ms, p99 9.3–9.7 ms. Gathering: 7,390–7,605 writes a second, p50 4.06–4.16 ms, p99
+7.2–8.1 ms. Writers that each wait for their own write send their next when told. A flush begun at
+the first of those covers few of them, and the writers can settle into two halves that each commit
+during the other's flush.
+
+**Falsified by.** A flush begun on an event other than the last flush's end (never a timer) that
+gives more writes a second at 32 writers and more, with no longer a write's p50 at one.
 
 ## 15. The checkpoint copies what the flusher made durable
 
