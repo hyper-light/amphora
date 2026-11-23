@@ -390,6 +390,13 @@ impl Hist {
         self.max = self.max.max(o.max);
     }
 
+    /// The buckets that hold samples, as `[least value, count]` pairs in ascending order: summing
+    /// counts by least value across runs gives the runs' merged histogram, so their quantiles pool
+    /// (`bench/pool.py`).
+    fn buckets(&self) -> serde_json::Value {
+        self.counts.iter().enumerate().filter(|(_, c)| **c > 0).map(|(i, c)| serde_json::json!([Self::value(i), c])).collect()
+    }
+
     fn quantile(&self, q: f64) -> u64 {
         let want = ((self.n as f64) * q).ceil().max(1.0) as u64;
         let mut seen = 0;
