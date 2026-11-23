@@ -8323,6 +8323,81 @@ mod tests {
         );
     }
 
+    /// CP-T1.8 (AC-T1.8.3), the replicated class (replication.md, "Fast acknowledgement"): a write's
+    /// ReadIndex barrier waits on no log flush (lane V2's cause: the leader's read round and its
+    /// confirmation left only with a `Ready`, which its write out held back, and a follower's
+    /// heartbeat answer only once its own write was durable). Do: three voters on raft logs behind
+    /// gates, three fates, two to span; writes until each follower states a durable promise; every
+    /// member's log flushes held; two writes at the leader, one after the other. Expect: both
+    /// answered while no member's log has flushed either.
+    #[test]
+    fn v3_two_replicated_writes_in_a_row_answer_with_every_log_flush_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::<Gated>::empty();
+        let powers: Vec<Power> = (1..=3).map(Power::new).collect();
+        let gates: Vec<Arc<Gate>> = (0..3).map(|_| Arc::new(Gate::default())).collect();
+        let clients: Vec<Client> = (0..3)
+            .map(|i| {
+                driven.open_gated(
+                    dir.path(),
+                    u64::try_from(i + 1).unwrap(),
+                    vec![1, 2, 3],
+                    three_fates(),
+                    powers.get(i).unwrap(),
+                    gates.get(i).unwrap(),
+                )
+            })
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        for n in 0..4 {
+            let answer = driven.call(&mut pump, clients.get(leader).unwrap(), move |db| {
+                db.exec(&format!("CREATE TABLE warm{n}(value)"))?;
+                Ok(Vec::new())
+            });
+            assert_eq!(answer, Ok(Vec::new()));
+        }
+        let applied = clients
+            .get(leader)
+            .unwrap()
+            .handle()
+            .status()
+            .unwrap()
+            .applied;
+        driven.follow(&mut pump, &clients, applied);
+        for gate in &gates {
+            gate.hold();
+        }
+        let mut answered = Vec::new();
+        let mut writes = Vec::new();
+        for value in 1..=2u8 {
+            let write = submit(clients.get(leader).unwrap(), driven.until(), move |db| {
+                db.exec(&format!("INSERT INTO warm0 VALUES ({value})"))?;
+                Ok(vec![value])
+            });
+            answered.push(driven.answer_or_stall(&mut pump, &write));
+            writes.push(write);
+        }
+        for gate in &gates {
+            gate.release();
+        }
+        let outcomes: Vec<(bool, Result<Vec<u8>, Refusal>)> = answered
+            .into_iter()
+            .zip(&writes)
+            .map(|(held, write)| match held {
+                Some(result) => (true, result),
+                None => (false, driven.settle(&mut pump, write)),
+            })
+            .collect();
+        driven.drain(&mut pump);
+        pump.finish();
+        assert_eq!(
+            outcomes,
+            vec![(true, Ok(vec![1])), (true, Ok(vec![2]))],
+            "a write waited on a log flush (false: answered only once the gates let the flushes go)"
+        );
+    }
+
     /// One share of the 10,000-seed nemesis in `class`, as the environment names it, sharded across
     /// machines by bench/power_nemesis.sh: `AMPHORA_POWER_SEEDS=from:count` (default 0:10000),
     /// `AMPHORA_POWER_WORKERS` threads (default the machine's cores) and `AMPHORA_POWER_RECORD`, the
