@@ -1,0 +1,166 @@
+diff --git a/crates/hyper-raft/tests/support/lagged.rs b/crates/hyper-raft/tests/support/lagged.rs
+index 28ef5e2b..8f4c3939 100644
+--- a/crates/hyper-raft/tests/support/lagged.rs
++++ b/crates/hyper-raft/tests/support/lagged.rs
+@@ -126,6 +126,7 @@ pub struct Lagged {
+     /// The group states fates (R-8): its leader applies its own entries a held quorum committed
+     /// before its write of them is durable, as `Config::apply_unpersisted` has it do.
+     fated: bool,
++    watched: String,
+ }
+ 
+ /// Whether a held answer of `raw`'s needs a durable promise: everywhere but one half of at most two
+@@ -227,6 +228,24 @@ fn check_message(disk: &Disk, message: &Message, member: u64) -> bool {
+ }
+ 
+ impl Lagged {
++    fn watch(&mut self, what: &str) {
++        let raw = &self.node.raw;
++        let log = raw.raft.log();
++        let p = log.persisted();
++        let disk = &raw.store().0;
++        let now = format!(
++            "after {what}: persisted {p} (log term {:?}) disk first {} last {} term there {:?} snap {} hard {:?} | log first {:?} | committed {} last {:?} | term {} vote {} role {:?} lost {:?}",
++            log.term(p).ok(), disk.first_index(), disk.last_index(), disk.term(p), disk.snapshot_index(),
++            (disk.hard_state.term, disk.hard_state.vote, disk.hard_state.commit),
++            log.first_index().ok(),
++            log.committed(), log.last_index().ok(), raw.raft.term(), raw.raft.vote(), raw.raft.state(), raw.raft.lost(),
++        );
++        let bad = p > disk.last_index() || (p >= disk.first_index() && p > 0 && disk.term(p) != log.term(p).ok());
++        if bad {
++            panic!("V5 watch member {}: persisted passed the disk\n  before: {}\n  now:    {}", raw.raft.id(), self.watched, now);
++        }
++        self.watched = now;
++    }
+     /// What the member may apply and send without a write, whatever its writes out
+     /// (`RawNode::light_now`): held to I2 as a notice's messages are, held answers to the disk's
+     /// promise, and what it applies to I4.
+@@ -647,6 +666,7 @@ impl Replica for Lagged {
+             judged: settings.judged,
+             answered: (0, 0),
+             fated: settings.fates.is_some(),
++            watched: String::from("open"),
+         }
+     }
+     fn id(&self) -> u64 {
+@@ -659,40 +679,57 @@ impl Replica for Lagged {
+         self.node.store_mut()
+     }
+     fn tick(&mut self) -> bool {
+-        self.node.tick()
++        let r = self.node.tick();
++        self.watch("tick");
++        r
+     }
+     fn step(&mut self, message: Message) -> bool {
++        let what = format!("step {:?} {}->{} term {} index {} log_term {} commit {} entries {:?} reject {} snap {:?}", message.msg_type, message.from, message.to, message.term, message.index, message.log_term, message.commit, message.entries.iter().map(|e| (e.index, e.term)).collect::<Vec<_>>(), message.reject, message.snapshot.as_ref().and_then(|s| s.metadata.as_ref().map(|m| (m.index, m.term))));
+         let before = self.node.raw.raft.taken_ahead();
+         let stepped = self.node.step(message);
+         self.coverage.ahead += self.node.raw.raft.taken_ahead() - before;
++        self.watch(&what);
+         stepped
+     }
+     fn propose(&mut self, data: Vec<u8>) -> bool {
+-        self.node.propose(data)
++        let r = self.node.propose(data);
++        self.watch("propose");
++        r
+     }
+     fn propose_fast(&mut self, data: Vec<u8>) -> Option<u64> {
+-        self.node.propose_fast(data)
++        let r = self.node.propose_fast(data);
++        self.watch("propose_fast");
++        r
+     }
+     fn propose_change(&mut self, change: &hyper_raft::proto::ConfChangeV2) -> bool {
+-        self.node.propose_change(change)
++        let r = self.node.propose_change(change);
++        self.watch("propose_change");
++        r
+     }
+     fn campaign(&mut self) -> bool {
+-        self.node.campaign()
++        let r = self.node.campaign();
++        self.watch("campaign");
++        r
+     }
+     fn ping(&mut self) {
+         self.node.ping();
++        self.watch("ping");
+     }
+     fn transfer(&mut self, to: u64) {
+         self.node.transfer(to);
++        self.watch("transfer");
+     }
+     fn read(&mut self, context: Vec<u8>) {
+         self.node.read(context);
++        self.watch("read");
+     }
+     fn unreachable(&mut self, member: u64) {
+         self.node.unreachable(member);
++        self.watch("unreachable");
+     }
+     fn snapshot_status(&mut self, member: u64, arrived: bool) {
+         self.node.snapshot_status(member, arrived);
++        self.watch("snapshot_status");
+     }
+     fn set_priority(&mut self, priority: i64) {
+         self.node.set_priority(priority);
+@@ -702,15 +739,20 @@ impl Replica for Lagged {
+     }
+     fn suspect(&mut self, member: u64) {
+         self.node.suspect(member);
++        self.watch("suspect");
+     }
+     fn trust(&mut self, member: u64) {
+         self.node.trust(member);
++        self.watch("trust");
+     }
+     fn restarted(&mut self, member: u64) {
+         self.node.restarted(member);
++        self.watch("restarted");
+     }
+     fn wake(&mut self, now: u64) -> bool {
+-        self.node.wake(now)
++        let r = self.node.wake(now);
++        self.watch("wake");
++        r
+     }
+     fn deadline(&self) -> Option<u64> {
+         self.node.deadline()
+@@ -728,9 +770,9 @@ impl Replica for Lagged {
+     }
+     fn persist(&mut self, step: Step) -> bool {
+         match step {
+-            Step::Take => self.take(),
+-            Step::Durable => self.make_durable(),
+-            Step::Notify => self.notify(),
++            Step::Take => { let r = self.take(); self.watch("take"); r }
++            Step::Durable => { let r = self.make_durable(); self.watch("durable"); r }
++            Step::Notify => { let r = self.notify(); self.watch("notify"); r }
+             Step::Flush => {
+                 let mut any = false;
+                 // Each round takes, writes or hears of something, and what
+@@ -739,11 +781,14 @@ impl Replica for Lagged {
+                     let mut moved = false;
+                     while self.take() {
+                         moved = true;
++                        self.watch("flush take");
+                     }
+                     while self.make_durable() {
+                         moved = true;
++                        self.watch("flush durable");
+                     }
+                     moved |= self.notify();
++                    self.watch("flush notify");
+                     if !moved {
+                         return any;
+                     }
+@@ -803,6 +848,7 @@ impl Replica for Lagged {
+         }
+         let data = self.node.app().encode();
+         self.node.store_mut().0.compact(index, data);
++        self.watch("compact");
+         true
+     }
+     fn counts_by(&self) -> Option<hyper_raft::proto::ConfState> {
