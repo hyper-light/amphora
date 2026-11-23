@@ -168,9 +168,14 @@ rule whose action changed, fails the build (an exhaustive match over the rule en
 mismatch), so nothing from a new release slips through unported. Until a statement kind's actions
 are ported, the parser accepts exactly what 19 accepts and refuses the unported statement with
 `0A000` naming it. The `ereport(ERROR` calls inside `gram.y`'s actions (89 of them) are ported with
-their SQLSTATEs. The oracle, used only in tests, is libpg_query's extraction run on `REL_19_0`
-(its Makefile takes `PG_VERSION`); every statement of 19's regression SQL, and a grammar-driven
-fuzzer's output, must give the oracle's verdict, error position and parse tree.
+their SQLSTATEs. The oracle, used only in tests, is PostgreSQL 19's own `raw_parser`, unpatched,
+taken out of `REL_19_0` with libpg_query's extraction machinery (its libclang walk and its output
+functions) but not its patches: those don't apply to 19 (patch 04 fails at `scan.l`), and several
+change what is accepted (patches 01, 09 and 16 allow `$n` parameters in more places and remove 19's
+"trailing junk after parameter" rule, so a patched oracle accepts `NOTIFY ch, $1` and `SELECT $1abc`,
+which 19 refuses; patch 04 makes comments tokens; patch 15 moves node locations). Building that
+oracle is a unit of its own (section 11). Every statement of 19's regression SQL, and a
+grammar-driven fuzzer's output, must then give the oracle's verdict, error position and parse tree.
 
 **Vendoring.** One entry in `vendor/MANIFEST.toml`: `postgres` at `REL_19_0` (`5c839a2a0`), the
 files `src/backend/parser/{gram.y,scan.l,parser.c,scansup.c}`, `src/include/parser/kwlist.h`,
@@ -249,13 +254,13 @@ columns carry no SQLite affinity, so SQLite never converts a value.
 | float4 (700), float8 (701) | REAL; NaN as one fixed BLOB | REAL compares -0 = 0 as PostgreSQL does; every NaN is one BLOB, and SQLite orders numbers before BLOBs, so NaN = NaN and NaN sorts above everything, as `float8_cmp_internal` does. The engine stores NaN as NULL (`types.rs:678`), so NaN never takes the REAL path |
 | numeric (1700) | BLOB | An ascending decimal key with trailing zeros folded into the exponent (CockroachDB's layout), so 1.0 and 1.00 are one key; -Infinity, finite, +Infinity, NaN in PostgreSQL's order. Display scale from `numeric(p,s)`'s typmod, else a hidden INTEGER |
 | text (25), varchar (1043), name (19) | TEXT | BINARY, which is PostgreSQL's order under the `C` and builtin `C.UTF-8` collations; lengths checked on write (`22001`) |
-| bpchar (1042) | TEXT | Trailing spaces stripped, as bpchar compares; padded back from the typmod on output |
+| bpchar (1042) | TEXT | Trailing spaces stripped, as bpchar compares; `char(n)` padded back to n on output, and a `bpchar` without a length keeps the text as written in a hidden column, since PostgreSQL shows its spaces |
 | bytea (17), uuid (2950) | BLOB | memcmp, PostgreSQL's order for both |
 | date (1082), time (1083), timestamp (1114), timestamptz (1184) | INTEGER | Days or microseconds from 2000-01-01, PostgreSQL's own epoch; plus and minus infinity as the integer extremes, as PostgreSQL stores them. timestamptz is UTC; the session's `TimeZone` applies on input and output, from the vendored tz database |
-| timetz (1266) | BLOB | The UTC instant, then the zone, as `timetz_cmp_internal` orders them |
+| timetz (1266) | BLOB | `time + zone` in microseconds (the zone in seconds west of UTC, not wrapped to a day), then the zone, exactly as `timetz_cmp_internal` computes them (`src/backend/utils/adt/date.c:2570`, `:2582-2585`) |
 | interval (1186) | BLOB | The 128-bit span PostgreSQL compares (`interval_cmp_value`: a month is 30 days, a day 24 hours), so '1 mon' = '30 days'; the three fields in a hidden BLOB |
 | json (114) | TEXT | The text as written; PostgreSQL gives json no btree order either |
-| jsonb (3802) | BLOB | PostgreSQL's jsonb order (object > array > boolean > number > string > null, counts before members), strings escaped and terminated, numbers as numeric keys; the text in a hidden column |
+| jsonb (3802) | BLOB | PostgreSQL's jsonb order (object > array > boolean > number > string > null, counts before members), with its one exception kept: a top-level empty array sorts below every top-level scalar (`src/backend/utils/adt/jsonb_util.c:248-262`, `doc/src/sgml/json.sgml:593`); strings escaped and terminated, numbers as numeric keys; the text in a hidden column |
 | arrays (`_int4` 1007, `_text` 1009, ...) | BLOB | Element keys in order, NULL after every value as `array_cmp` orders it, then dimensions and lower bounds |
 | enum | BLOB | A fractional key between its neighbours, so `ALTER TYPE ... ADD VALUE BEFORE` never renumbers; `pg_enum.enumsortorder` derived from it |
 
@@ -299,11 +304,13 @@ than PostgreSQL 19's would.
 
 **The decision.** Namespaces are PostgreSQL's: `pg_catalog` (OID 11), `public` (2200),
 `information_schema`, `pg_toast`, `pg_temp` and user schemas. Resolution happens only in analysis, in
-PostgreSQL's order: `pg_temp` first for relations and never for functions or operators;
-`pg_catalog` first unless `search_path` names it; then `search_path`'s entries, `"$user"` as the
-role's schema. Statements lower fully qualified, so the engine never guesses. The engine already
-resolves unqualified names through a search path (`crates/engine/connection.rs:178`,
-`translate/emitter/mod.rs:1020-1072`), with `public` mapped to `main` (`:1066`); PostgreSQL schemas
+PostgreSQL's order (`src/backend/catalog/namespace.c:4308-4320`): `pg_catalog` first unless
+`search_path` names it; `pg_temp` first for relations unless `search_path` names it, then at its
+listed place, and never for functions or operators; then `search_path`'s entries, `"$user"` as the
+role's schema. Statements lower fully qualified, so the engine never guesses: its own resolution
+checks temp first unconditionally (`crates/engine/translate/emitter/mod.rs:1020-1076`), which is
+not PostgreSQL's rule. The engine resolves unqualified names through a search path
+(`crates/engine/connection.rs:178`), with `public` mapped to `main` (`emitter/mod.rs:1072-1074`); PostgreSQL schemas
 are engine schemas, and `pg_temp` is the connection's temp schema, so temporary tables end with the
 session as in PostgreSQL. User object OIDs start at `FirstNormalObjectId` (16384, PostgreSQL's
 `src/include/access/transam.h`) from a durable counter outside the caller's transaction. A prepared
@@ -317,15 +324,24 @@ the same `search_path`.
 **The decision.** Each PostgreSQL level is given exactly; where the engine can't yet, the gap is
 named and counted, never hidden.
 
-- **SERIALIZABLE** runs on the versioned storage's `Validation::Ssi`
-  (`crates/engine/storage/versioned/version.rs:321`), PostgreSQL's own algorithm (Ports and
-  Grittner), and refuses with `40001`. Which transactions abort is PostgreSQL's to vary too; the
-  isolation suite's serializable specs say whether ours match (Choices for Ada).
-- **REPEATABLE READ** is snapshot isolation, Amphora's floor. One difference to close: Amphora's
-  first writer wins at once (`WriteWriteConflict`, `crates/engine/error.rs:109`), where PostgreSQL
-  makes the second writer wait for the first and then fails it with `40001` only if the first
-  committed. Engine work: a row-lock wait queue woken by the holder's commit or abort (an event, no
-  timer), a wait-for graph refusing deadlocks with `40P01`, and `lock_timeout` refusing with `55P03`.
+SQL's storage runs one validation for every transaction today: `Precision`, HyPer's precision
+locking, the `#[default]` of `Validation` (`crates/engine/storage/versioned/version.rs:330-336`,
+taken at `:1504`); the other variants (`Snapshot`, `Ssi`, `Occ`) serve only the Elle checks.
+Choosing the validation per transaction, from the session's isolation level, is the first engine
+work every level below needs.
+
+- **SERIALIZABLE** refuses with `40001`. Precision refuses different transactions than
+  PostgreSQL's SSI does, and the versioned storage's `Ssi` validation is not yet PostgreSQL's
+  algorithm as PostgreSQL builds it; which transactions abort is Ada's choice below (Choices for
+  Ada), measured by the isolation suite's serializable specs.
+- **REPEATABLE READ** is snapshot isolation, which needs the `Snapshot` validation chosen per
+  transaction: under Precision a writing transaction is refused when something it read changed,
+  which PostgreSQL's REPEATABLE READ never does. A second difference to close: Amphora's first writer
+  wins at once (`WriteWriteConflict`, `crates/engine/error.rs:109`), where PostgreSQL makes the
+  second writer wait for the first and then fails it with `40001` only if the first committed.
+  Engine work: a row-lock wait queue woken by the holder's commit or abort (an event, no timer), a
+  wait-for graph refusing deadlocks with `40P01`, and `lock_timeout` refusing with `55P03`. Until
+  then, every `40001` PostgreSQL wouldn't raise is counted as a failure, as READ COMMITTED's are.
 - **READ COMMITTED** (PostgreSQL's default, and pgbench's) does not exist in the engine: a
   transaction's snapshot is fixed at its start (`version.rs:631-650`), and the engine's own
   Hermitage tests mark the difference (`crates/engine/mvcc/database/hermitage_tests.rs:101`). Engine
@@ -360,12 +376,17 @@ the engine's schema and the tables' stored PostgreSQL definitions, never copied:
   `pg_namespace`, `pg_attribute`, `pg_type`, `pg_attrdef`, `pg_index`, `pg_constraint`,
   `pg_inherits` and `pg_partitioned_table` (empty until partitioning), `pg_am`, `pg_collation`,
   `pg_description`, `pg_depend`, `pg_trigger`, `pg_policy`, `pg_statistic_ext`, `pg_rewrite`,
-  `pg_publication` and `pg_publication_rel` (present, empty, with every column), `pg_roles`,
-  `pg_database`, `pg_settings`; and the functions those queries call: `format_type`,
-  `pg_get_expr`, `pg_get_indexdef`, `pg_get_constraintdef`, `pg_get_userbyid`,
-  `pg_table_is_visible`, `current_schemas`, `array_position`, `obj_description`, and the `~`
-  operator, which is PostgreSQL's regular expressions (Spencer's ARE engine, ported as a flat,
-  bounded loop: Rust's `regex` crate is a different language).
+  `pg_publication`, `pg_publication_rel` and `pg_publication_namespace` (present, empty, with every
+  column), `pg_roles`, `pg_database`, `pg_settings`; the casts `regclass`, `regnamespace` and
+  `regtype`; and the functions those queries call: `format_type`, `pg_get_expr`,
+  `pg_get_indexdef`, `pg_get_constraintdef`, `pg_get_statisticsobjdef_columns`, `pg_get_viewdef`,
+  `pg_get_userbyid`, `pg_table_is_visible`, `pg_relation_is_publishable`, `col_description`,
+  `obj_description`, `current_schemas`, `array_position`, `= any(array)`, and the `~` operator,
+  which is PostgreSQL's regular expressions (Spencer's ARE engine, ported as a flat, bounded loop:
+  Rust's `regex` crate is a different language). psql sends every describe query for a plain table
+  to a 19 server (foreign keys, extended statistics and publications among them,
+  `src/bin/psql/describe.c:2640`, `:2826`, `:3091`) and stops printing at the first that fails, so
+  `\d` needs all of them.
 - **Static rows** for `pg_proc`, `pg_operator`, `pg_cast`, `pg_opclass`, `pg_amop` from the vendored
   `.dat` files, plus user rows.
 - **`information_schema`** is PostgreSQL's own `information_schema.sql`, vendored and run through the
@@ -392,11 +413,14 @@ what it answers.
   (`pg_regress.c:2043-2047`). Reported per file, pass or fail, with the diff's size. Done when 243
   of 243 pass, and the isolation suite's 139 specs (`src/test/isolation/isolation_schedule`) pass.
   The suite assumes what a PostgreSQL server has: C functions from `regress.so` (`test_setup.sql`
-  `:250-253`; 18 files load it), COPY from files on the server's disk (`:137-138`; 15 files), an
-  in-place tablespace (`:27-28`) and a superuser (Choices for Ada asks how to count these).
-- **The drivers' own suites,** at pinned versions: libpq (PostgreSQL's `libpq_pipeline`, which takes
-  any server and `max_protocol_version=latest`, `src/test/modules/libpq_pipeline/libpq_pipeline.c:2156`),
-  pgjdbc, psycopg 3, pgx v5, node-postgres, and after them lib/pq, asyncpg and Npgsql. Done when each
+  `:250-253`; 18 files load it), COPY from files on the server's disk (`:137-138`; 13 files name
+  `abs_srcdir`, 15 with `abs_builddir`), an in-place tablespace (`:27-28`) and a superuser (Choices
+  for Ada asks how to count these).
+- **The drivers' own suites,** at pinned versions: libpq (PostgreSQL's `libpq_pipeline` binary,
+  called directly with a conninfo and `max_protocol_version=latest`, its usage at
+  `src/test/modules/libpq_pipeline/libpq_pipeline.c:2156`, its traces compared by our harness, since
+  its TAP script starts a PostgreSQL of its own, `t/001_libpq_pipeline.pl:24-26`), pgjdbc,
+  psycopg 3, pgx v5, node-postgres, and after them lib/pq, asyncpg and Npgsql. Done when each
   suite's pass and fail sets against Amphora equal its sets against PostgreSQL 19 on the same machine
   (CockroachDB runs the same suites with lists of expected failures, its `orm_helpers.go`; ours is
   empty: the reference is PostgreSQL itself).
@@ -472,20 +496,21 @@ correctly. A unit that outgrows its hour splits at its check.
 |---|---|---|
 | 1 | The wire core, sans-IO: startup at 3.0 and 3.2, NegotiateProtocolVersion (grease included), SSLRequest and GSSENCRequest answered `N`, SCRAM-SHA-256, the 15 ParameterStatus values, BackendKeyData, simple Query framing with each statement refused `0A000`, Terminate | A protocol-level test client written in the test: RFC 7677's SCRAM vectors, a 3.9999 start-up negotiated down, a wrong password refused `28P01`, a Query answered ErrorResponse then ReadyForQuery `I`; hostile input to every message parser |
 | 2 | The listener shell on hyper-rt, sessions charged to the memory budget, admission shared with lane P | psql and pgbench connect, authenticate, and get `0A000` for a statement; a refused session is `53300` |
-| 3 | The scanner: flex tables from 19's `scan.l`, the Rust scan loop, its actions, `parser.c`'s filter | Every statement of 19's regression SQL scans to the oracle's tokens; fuzzed input never panics |
-| 4 | The grammar tables from 19's `gram.y`, the Rust LR loop, every rule refusing `0A000` | Every statement of 19's regression SQL accepted or rejected as the oracle does, at the same position |
-| 5 | Actions for the statements pgbench and psql send (SELECT, INSERT, UPDATE, DELETE, BEGIN, END, COPY, CREATE and DROP TABLE, TRUNCATE, VACUUM, ALTER TABLE ADD PRIMARY KEY, SET, SHOW) | Their parse trees equal the oracle's |
-| 6 | The catalog core: the vendored `.dat` tables, `pg_namespace`, `pg_class`, `pg_attribute`, `pg_type`, OIDs, `search_path` | Built-in `pg_type` rows equal 19's; name resolution tests |
-| 7 | Analysis for int4, int8, text, char(n), timestamptz and their operators and casts, with SQLSTATEs | `SELECT 1` is int4; `2147483647 + 1` is `22003`; results typed as 19 types them |
-| 8 | Lowering into the planner and the keys of section 5 for those types; RowDescription and DataRow in text | TPC-B's statements on a small table give 19's rows |
-| 9 | The extended protocol and binary formats for those types | pgbench `-M extended` and `-M prepared` statement flows, through the test client |
-| 10 | COPY FROM STDIN, TRUNCATE, VACUUM, `ALTER TABLE ADD PRIMARY KEY`, `CREATE TABLE ... WITH (fillfactor)` | `pgbench -i` (steps `dtgvp`, and `G`) leaves the tables 19 leaves |
-| 11 | The start-up query's catalog: `pg_partitioned_table`, `pg_inherits`, LATERAL, `current_schemas`, `array_position`, text[] | pgbench's partition query returns 19's row; TPC-B at one client runs with no failure and the balances agree (milestone one at one client) |
-| 12 | psql's describe catalog and functions, and PostgreSQL's regular expressions | `\dt` and `\d pgbench_accounts` print what 19 prints |
-| 13 | Statement snapshots and the row-lock wait queue (section 8) | Two sessions updating one row: the second waits and then sees the first's value |
-| 14 | EvalPlanQual recheck, deadlock refusal, `lock_timeout` | TPC-B at 32 clients: no failed transaction, balances agree (milestone one) |
-| 15 | The bench harness: PostgreSQL 19 and Amphora on one machine, the stub server, the flush floor, percentiles | The first 10x table for TPC-B and select-only at 1 to 10,000 clients, floors beside each ratio |
-| 16 | The regression harness: upstream `pg_regress --use-existing`, per-file results kept in `bench/records/` | The first per-file pass table for 19's 243 files |
+| 3 | The oracle: 19's own `raw_parser` taken out of `REL_19_0` by libpg_query's extraction, without its patches, with tree output, in a test-only crate | It refuses `SELECT $1abc` and `NOTIFY ch, $1` as 19 does, and gives a verdict for every statement of 19's regression SQL |
+| 4 | The scanner: flex tables from 19's `scan.l` (11 exclusive start conditions, `yyless`), the Rust scan loop, its actions, `parser.c`'s filter | Every statement of 19's regression SQL scans to the oracle's tokens; fuzzed input never panics |
+| 5 | The grammar tables from 19's `gram.y`, the Rust LR loop, every rule refusing `0A000` | Every statement of 19's regression SQL accepted or rejected as the oracle does, at the same position |
+| 6 | Actions for the statements pgbench and psql send (SELECT, INSERT, UPDATE, DELETE, BEGIN, END, COPY, CREATE and DROP TABLE, TRUNCATE, VACUUM, ALTER TABLE ADD PRIMARY KEY, SET, SHOW) | Their parse trees equal the oracle's |
+| 7 | The catalog core: the vendored `.dat` tables, `pg_namespace`, `pg_class`, `pg_attribute`, `pg_type`, OIDs, `search_path` | Built-in `pg_type` rows equal 19's; name resolution tests |
+| 8 | Analysis for int4, int8, text, char(n), `"char"`, timestamp, timestamptz (and the assignment cast between them under the session's `TimeZone`), `regclass`, and their operators and casts, with SQLSTATEs | `SELECT 1` is int4; `2147483647 + 1` is `22003`; `$1::pg_catalog.regclass` resolves a table; results typed as 19 types them |
+| 9 | Lowering into the planner and the keys of section 5 for those types; RowDescription and DataRow in text | TPC-B's statements on a small table give 19's rows |
+| 10 | The extended protocol and binary formats for those types | pgbench `-M extended` and `-M prepared` statement flows, and step `g`'s `PQexecParams` relkind query (`pgbench.c:868`), through the test client |
+| 11 | COPY FROM STDIN with `FREEZE` (sent to servers reporting 14 or later, `pgbench.c:5050-5052`), TRUNCATE, VACUUM, `ALTER TABLE ADD PRIMARY KEY`, `CREATE TABLE ... WITH (fillfactor)`, `generate_series` in FROM | `pgbench -i` (steps `dtgvp`, and `G`) leaves the tables 19 leaves |
+| 12 | The start-up query's catalog: `pg_partitioned_table`, `pg_inherits`, LATERAL, `current_schemas`, `array_position`, text[] | pgbench's partition query returns 19's row; TPC-B at one client runs with no failure and the balances agree (milestone one at one client) |
+| 13 | psql's describe catalog, casts and functions (section 9's list), and PostgreSQL's regular expressions | `\dt` and `\d pgbench_accounts` print what 19 prints |
+| 14 | The validation chosen per transaction, statement snapshots and the row-lock wait queue (section 8) | Two sessions updating one row: the second waits and then sees the first's value |
+| 15 | EvalPlanQual recheck, deadlock refusal, `lock_timeout` | TPC-B at 32 clients: no failed transaction, balances agree (milestone one) |
+| 16 | The bench harness: PostgreSQL 19 and Amphora on one machine, the stub server, the flush floor, percentiles | The first 10x table for TPC-B and select-only at 1 to 10,000 clients, floors beside each ratio |
+| 17 | The regression harness: upstream `pg_regress --use-existing`, per-file results kept in `bench/records/` | The first per-file pass table for 19's 243 files |
 
 After milestone one, units follow the regression suite's failing files and the benchmark's largest
 server-attributable gaps, alternating, with TLS (SCRAM-PLUS, direct TLS), CancelRequest and
