@@ -489,7 +489,9 @@ its owner asks again on the leader change.
   passed, the fix ce479ab9 (0011 removed, the owner's drop in) 16 of 16 passed, no "replica sender" line in any run.
   As in W5's r1214, the base did not fail here, so these runs show the fix breaks nothing in the nemesis; the relay is
   shown gone by the two tests and their red arm.
-- Re-checked after merging main again (its 0009 update, lane V6) at f0fb2e8f: r1306.
+- Re-checked after merging main again (its 0009 update, lane V6) at f0fb2e8f (r1306): clippy clean as above, the three
+  tests pass, the `database::replicated` suite 143 passed, 0 failed, 5 ignored; `vendor.py check hyper-raft` 8 recorded
+  changes, 0 differences.
 
 ## 4. The read-or-write tag on member requests (not started)
 
