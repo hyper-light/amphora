@@ -4434,6 +4434,29 @@ pub(crate) mod bushy_test_hook {
             );
         }
 
+        /// Lane T13 (PL.13, the versioned cost snapshot; `docs/design/planner.md`): do plan q05's
+        /// shape against one version of the cost inputs, then move the database's learned seek
+        /// weight a millionfold and plan again against that same version; expect one plan, and
+        /// the learned weights moved (so the version, not the learning, made the plan).
+        #[test]
+        fn t13_two_plannings_against_one_version_choose_one_plan() {
+            use crate::translate::optimizer::learned_costs::Work;
+            let (conn, sql, _, _) = q05_shape();
+            let version = conn.db.learned_costs.weights_at(Some(1.0)).unwrap();
+            conn.pin_cost_weights(Some(version));
+            let (first_rows, _, first) = by_cost(&conn, sql);
+            let seek = conn.db.learned_costs.nanos_per(Work::Seek).unwrap();
+            for _ in 0..128 {
+                conn.db.learned_costs.observe(Work::Seek, 1e9, seek * 1e6 * 1e9);
+            }
+            let moved = conn.db.learned_costs.weights_at(Some(1.0)).unwrap();
+            let (second_rows, _, second) = by_cost(&conn, sql);
+            conn.pin_cost_weights(None);
+            assert!(moved.seek > version.seek * 1e3, "the learning did not move: {version:?} {moved:?}");
+            assert_eq!(first, second, "two plannings against one version chose two plans");
+            assert_eq!(first_rows, second_rows);
+        }
+
         /// Lane T7 (TPC-H q05, option i): the late terms each visit runs are priced per visit.
         /// Every weight is pinned at the planner bench's calibration on adacachy2 (T6's, at
         /// 952f5766: in rows' visits a seek 18.55, a hash build 25.81, a probe 4.82, a sort 1.27,
