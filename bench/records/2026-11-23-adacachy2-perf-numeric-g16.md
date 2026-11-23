@@ -75,7 +75,8 @@ CARGO_TARGET_DIR=~/.cache/amphora-perf-target/numeric CARGO_INCREMENTAL=0`, cpus
 | run | head | result |
 |---|---|---|
 | r1682 | b81423ae | clippy failed: `new_aggregate` 8 arguments, one test caller not updated (fixed in 9322622b); lib tests did not build for the same reason; `floating_point_doc` 51 passed (the 3 G16 tests included) |
-| r1694 | d04b54da (9322622b merged with main f91a9a92) | see the merge commit |
+| r1694 | d04b54da (9322622b merged with main f91a9a92) | clippy: percentile.rs's test driver dropped a step's Result (fixed in 9ceb70f9); lib `decimal:: native_extension percentile external_aggregate window` 72 passed; `floating_point_doc` 51 passed |
+| r1704, r1710 | 9ceb70f9 | cpus=8 and cpus=4 refused (2 of 32 cores idle); at cpus=2,mem=8g (jobs 2) clippy clean, load 75 |
 
     cargo clippy -p amphora-engine -p amphora-engine-ext -p amphora-engine-macros --all-targets --features amphora-engine/bench --locked -- -D warnings
     cargo test -p amphora-engine --features bench --locked --lib -- decimal:: native_extension percentile external_aggregate window
