@@ -939,11 +939,6 @@ struct Actor<F: BlockFile + 'static = LogDevice> {
     // A floor session, a follower's write, or the leader's in its turn after a slot, past its
     // barrier, waiting for this member to apply its own log up to the last index it held then.
     tail: Option<u64>,
-    // The term in which one of this follower's writes was refused as stale, so its leader queued
-    // it for a write slot its next barrier begins: if that barrier's work forwards nothing, a
-    // second barrier tells the leader at once, which ends the slot (`Slots::read`) instead of its
-    // length (replication.md, "the write slot").
-    slotted: Option<u64>,
     floor_requests_applied: u64,
     floor_requests_stale: u64,
     // The floor version this owner last published, none before its first: a raise is it rising.
@@ -2435,7 +2430,6 @@ fn open_on<F: BlockFile + 'static>(
         floor_failures: 0,
         floor_requesting: false,
         tail: None,
-        slotted: None,
         floor_requests_applied: 0,
         floor_requests_stale: 0,
         floor_published: None,
@@ -4174,6 +4168,9 @@ impl<F: BlockFile + 'static> Actor<F> {
                     return stepped;
                 }
                 hyper_raft::proto::MessageType::MsgReadIndex => {
+                    // A follower's write prepares in a slot from its first try, so no base it
+                    // prepares on is passed before its write appends (CP-T1.8, lane V8).
+                    self.slots.ask(from);
                     let read = self.slots.read(from, self.at, (message, reservation));
                     self.slot_ended(read.ended);
                     let stepped = match read.step {
@@ -4561,9 +4558,6 @@ impl<F: BlockFile + 'static> Actor<F> {
                 .as_ref()
                 .is_some_and(|p| p.context == applied.context);
             if matches && let Some(mut pending) = self.pending.take() {
-                if matches!(pending.phase, Phase::Proposed(_)) {
-                    self.queued_by(&applied.result);
-                }
                 let result = match pending.phase {
                     // The write's own token: its entry's index and time (`tokens`).
                     Phase::Proposed(value) => applied.result.map(|()| Answered {
@@ -4801,7 +4795,6 @@ impl<F: BlockFile + 'static> Actor<F> {
             // A malformed entry fences at its apply, which answers.
             Err(_) => return,
         };
-        self.queued_by(&result);
         let Some(mut pending) = self.pending.take() else {
             return;
         };
@@ -5157,17 +5150,11 @@ impl<F: BlockFile + 'static> Actor<F> {
         self.control.moved.notify_all();
         Ok(())
     }
-    /// A follower's write refused as stale queued it at its leader (`Slots::refused`).
-    fn queued_by<T>(&mut self, result: &Result<T, Refusal>) {
-        if matches!(result, Err(Refusal::Serialization { .. })) && !self.replica.is_leader() {
-            self.slotted = Some(self.replica.term());
-        }
-    }
-    /// Prepares the operation past its barrier. A follower whose barrier began its write slot and
-    /// whose work ended forwarding nothing (a read, a refused or failed write) sends a second
-    /// barrier, which ends the slot at its leader at once; a forward ends it there itself. A
-    /// leader of any version ends a holder's slot on its second barrier, so this needs nothing new
-    /// on the wire, and a stray barrier's read state matches nothing here and is dropped.
+    /// Prepares the operation past its barrier. Each follower's barrier begins its write slot, so
+    /// a follower whose work ended forwarding nothing (a read, a refused or failed write) sends a
+    /// second barrier, which ends the slot at its leader at once; a forward ends it there itself.
+    /// A leader of any version ends a holder's slot on its second barrier, so this needs nothing
+    /// new on the wire, and a stray barrier's read state matches nothing here and is dropped.
     fn prepare(&mut self) -> Result<(), Refusal> {
         let work = self
             .pending
@@ -5178,13 +5165,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             .pending
             .as_ref()
             .is_some_and(|pending| matches!(pending.phase, Phase::Barrier(_)));
-        if work
-            && ended
-            && let Some(term) = self.slotted.take()
-            && self.pending.is_none()
-            && term == self.replica.term()
-            && !self.replica.is_leader()
-        {
+        if work && ended && self.pending.is_none() && !self.replica.is_leader() {
             let context = self.context()?;
             self.replica.read(context).map_err(raft_error)?;
         }
@@ -19075,8 +19056,6 @@ mod tests {
         driven.quiet(&mut pump);
         let holder = 3;
         driven.owner_mut(0).slots.refused(holder);
-        let term = driven.owner(2).replica.term();
-        driven.owner_mut(2).slotted = Some(term);
         let failed = submit(&clients[2], driven.until(), |db| {
             db.exec("INSERT INTO missing VALUES (1)")?;
             Ok(Vec::new())
