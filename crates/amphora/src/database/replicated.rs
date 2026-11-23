@@ -2656,7 +2656,8 @@ fn settings(
         apply_unpersisted,
         // A follower answers a heartbeat with what its disk holds without waiting for its write,
         // so its flush doesn't hold the read barrier of the leader's next write (AC-T1.8.3).
-        answer_beats_now: true,
+        answer_beats_now: std::env::var_os("AB_BEATS_OFF").is_none(),
+        confirm_reads_now: std::env::var_os("AB_READS_OFF").is_none(),
         check_quorum: true,
         pre_vote: true,
         max_size_per_msg: message,

@@ -296,6 +296,11 @@ pub struct Config {
     /// what it says, and states the commit that write made durable, so the two cores compare
     /// under one setting.
     pub answer_beats_now: bool,
+    /// A light ready ([`crate::RawNode::light_now`]) also asks the read round for the reads asked
+    /// since the last, and gives the reads confirmed since the last `Ready`: a leader whose writes
+    /// fill its pipeline confirms a read when a quorum answers its round, not when a write of its
+    /// own frees a place for the next `Ready`. Off, as raft-rs's rule: reads go with the `Ready`.
+    pub confirm_reads_now: bool,
     /// What a member does with a leader's entries that arrive ahead of a
     /// hole in its log.
     pub ahead: Ahead,
@@ -384,6 +389,7 @@ impl Config {
             read_rounds: ReadRounds::Shared,
             heartbeat_answers: HeartbeatAnswers::Position,
             answer_beats_now: false,
+            confirm_reads_now: false,
             ahead: Ahead::Kept,
             fast: false,
             skip_bcast_commit: false,

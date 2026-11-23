@@ -986,25 +986,28 @@ impl<S: Storage> RawNode<S> {
     /// commits when it commits, not when a write of its own frees a place for the next `Ready`.
     /// `in_place` as [`RawNode::ready_in_place`]. Refused while a `Ready` is taken and not issued.
     ///
-    /// Reads go on as well, since none waits for a write: the round for the reads asked since the
-    /// last leaves (`Raft::ask_reads`), and the reads confirmed since the last `Ready` are given
-    /// ([`LightReady::read_states`]). A leader whose writes fill its pipeline then confirms a read
-    /// when a quorum answers its round, not when a write of its own frees a place for the next
-    /// `Ready`.
+    /// Under [`crate::Config::confirm_reads_now`] reads go on as well, since none waits for a
+    /// write: the round for the reads asked since the last leaves (`Raft::ask_reads`), and the
+    /// reads confirmed since the last `Ready` are given ([`LightReady::read_states`]).
     pub fn light_now(&mut self, in_place: bool) -> Result<LightReady> {
         if self.taken.is_some() {
             return Err(Error::Invariant(
                 "a light ready asked for while a ready is taken and not issued",
             ));
         }
-        self.raft.ask_reads()?;
+        let reads = self.raft.config.confirm_reads_now;
+        if reads {
+            self.raft.ask_reads()?;
+        }
         let release = self.releases_now();
         let mut light = self.light(in_place, release)?;
         let now = self.raft.take_answers_now();
         if !now.is_empty() {
             light.messages.extend(now);
         }
-        light.read_states = std::mem::take(&mut self.raft.read_states);
+        if reads {
+            light.read_states = std::mem::take(&mut self.raft.read_states);
+        }
         self.hold_released(&mut light);
         let hard = self.raft.hard_state();
         if hard.commit > self.previous_hard.commit {

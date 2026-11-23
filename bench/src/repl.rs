@@ -1547,6 +1547,20 @@ mod procs {
                         .map_err(|e| anyhow::anyhow!("refused a read: {e:?}"))?;
                     Ok(serde_json::json!({ "count": n }))
                 }
+                Some("get") => {
+                    let mut stmts = stmts_of(r.get("stmts"))?;
+                    anyhow::ensure!(stmts.len() == 1, "get takes one statement");
+                    let (sql, args) = stmts.pop().ok_or_else(|| anyhow::anyhow!("no statement"))?;
+                    let n = self
+                        .db
+                        .query(until, move |c| {
+                            let mut s = c.prepare_cached(&sql)?;
+                            let mut rows = s.query_map(args, |r| r.get::<_, i64>(0usize))?;
+                            Ok(rows.next().transpose()?.unwrap_or(0))
+                        })
+                        .map_err(|e| anyhow::anyhow!("refused a read: {e:?}"))?;
+                    Ok(serde_json::json!({ "count": n }))
+                }
                 Some("leader") => {
                     let status = self
                         .db
