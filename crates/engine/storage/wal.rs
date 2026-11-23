@@ -11955,7 +11955,7 @@ pub mod test {
         let exclusive_coordination =
             ShmWalCoordination::new(SharedLog::new(exclusive), authority.clone());
         assert_eq!(authority.iter_latest_frames(0, u64::MAX), vec![(7, 1)]);
-        assert_eq!(exclusive_coordination.find_frame(7, 0, 1, None), Some(1));
+        assert_eq!(exclusive_coordination.find_frame(SegmentId::First, 7, 0, 1, None), Some(1));
 
         drop(exclusive_coordination);
         drop(authority);
@@ -11983,7 +11983,7 @@ pub mod test {
             .loaded_from_disk_scan
             .load(Ordering::Acquire));
         let reopened_coordination = ShmWalCoordination::new(reopened_shared, reopened_authority);
-        assert_eq!(reopened_coordination.find_frame(7, 0, 1, None), Some(1));
+        assert_eq!(reopened_coordination.find_frame(SegmentId::First, 7, 0, 1, None), Some(1));
     }
 
     #[cfg(host_shared_wal)]
