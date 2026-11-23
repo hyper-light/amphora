@@ -1058,12 +1058,7 @@ fn format_general_inner(output: &mut String, f: f64, spec: &FormatSpec, uppercas
     apply_width(output, prefix, &content, spec.width, &spec.flags, false);
 }
 
-fn format_string(
-    output: &mut String,
-    value: &Value,
-    spec: &FormatSpec,
-    digits: FpDigits,
-) {
+fn format_string(output: &mut String, value: &Value, spec: &FormatSpec, digits: FpDigits) {
     // For blobs, truncate at first NUL byte (SQLite behavior)
     let s = match value {
         Value::Blob(b) => {
@@ -1080,12 +1075,7 @@ fn format_string(
     apply_width(output, "", truncated, spec.width, &flags, false);
 }
 
-fn format_char(
-    output: &mut String,
-    value: &Value,
-    spec: &FormatSpec,
-    digits: FpDigits,
-) {
+fn format_char(output: &mut String, value: &Value, spec: &FormatSpec, digits: FpDigits) {
     // In SQLite SQL context, %c takes the first character of the string representation
     let c = match value {
         Value::Text(t) => t.value.chars().next().unwrap_or('\0'),
@@ -1125,12 +1115,7 @@ fn escape_control_chars(s: &str) -> String {
     result
 }
 
-fn format_sql_quote(
-    output: &mut String,
-    value: &Value,
-    spec: &FormatSpec,
-    digits: FpDigits,
-) {
+fn format_sql_quote(output: &mut String, value: &Value, spec: &FormatSpec, digits: FpDigits) {
     // %q: double single quotes; NULL → (NULL). Supports width/precision.
     // %#q: also escape control characters as \uXXXX.
     let mut flags = spec.flags.clone();
@@ -1152,12 +1137,7 @@ fn format_sql_quote(
     }
 }
 
-fn format_sql_quote_wrap(
-    output: &mut String,
-    value: &Value,
-    spec: &FormatSpec,
-    digits: FpDigits,
-) {
+fn format_sql_quote_wrap(output: &mut String, value: &Value, spec: &FormatSpec, digits: FpDigits) {
     // %Q: like %q but wrapped in quotes; NULL → unquoted NULL. Supports width/precision.
     // %#Q: also escape control characters as \uXXXX.
     let mut flags = spec.flags.clone();
@@ -1254,12 +1234,7 @@ fn format_json_string(
     apply_width(output, "", &literal, spec.width, &flags, false);
 }
 
-fn format_sql_identifier(
-    output: &mut String,
-    value: &Value,
-    spec: &FormatSpec,
-    digits: FpDigits,
-) {
+fn format_sql_identifier(output: &mut String, value: &Value, spec: &FormatSpec, digits: FpDigits) {
     // %w: double double-quotes (no wrapping quotes in SQL context); NULL → (NULL).
     let mut flags = spec.flags.clone();
     flags.zero_pad = false;
@@ -1438,7 +1413,11 @@ pub fn exec_printf_values(format: &Value, args: &[&Value]) -> crate::Result<Valu
 
 /// `exec_printf_values` with a REAL written as text at `digits` (lane G12). With no connection, as
 /// for sqlite3_mprintf, SQLite writes 17: `p->db ? p->db->nFpDigit : 17` (`vdbeMemRenderNum`).
-fn exec_printf_values_at(format: &Value, args: &[&Value], digits: FpDigits) -> crate::Result<Value> {
+fn exec_printf_values_at(
+    format: &Value,
+    args: &[&Value],
+    digits: FpDigits,
+) -> crate::Result<Value> {
     // SQLite converts the format argument to text if not already text.
     let fmt_owned: String;
     // The format ends at its first NUL, as SQLite reads it.
@@ -1579,7 +1558,10 @@ mod tests {
             (vec![text("100%% complete")], text("100% complete")),
         ];
         for (input, output) in test_cases {
-            assert_eq!(exec_printf(&input, FpDigits::DEFAULT).unwrap(), *output.get_value());
+            assert_eq!(
+                exec_printf(&input, FpDigits::DEFAULT).unwrap(),
+                *output.get_value()
+            );
         }
     }
 
@@ -1603,7 +1585,10 @@ mod tests {
             (vec![text("Number: %i"), integer(42)], text("Number: 42")),
         ];
         for (input, output) in test_cases {
-            assert_eq!(exec_printf(&input, FpDigits::DEFAULT).unwrap(), *output.get_value());
+            assert_eq!(
+                exec_printf(&input, FpDigits::DEFAULT).unwrap(),
+                *output.get_value()
+            );
         }
     }
 
@@ -1618,7 +1603,10 @@ mod tests {
             (vec![text("NaN: %u"), text("not a number")], text("NaN: 0")),
         ];
         for (input, output) in test_cases {
-            assert_eq!(exec_printf(&input, FpDigits::DEFAULT).unwrap(), *output.get_value());
+            assert_eq!(
+                exec_printf(&input, FpDigits::DEFAULT).unwrap(),
+                *output.get_value()
+            );
         }
     }
 
@@ -1653,7 +1641,10 @@ mod tests {
         assert!(huge_str.ends_with(".000000"));
         assert!(!huge_str.contains("inf"));
         for (input, expected) in test_cases {
-            assert_eq!(exec_printf(&input, FpDigits::DEFAULT).unwrap(), *expected.get_value());
+            assert_eq!(
+                exec_printf(&input, FpDigits::DEFAULT).unwrap(),
+                *expected.get_value()
+            );
         }
     }
 
@@ -1669,14 +1660,21 @@ mod tests {
             (vec![text("%#x"), integer(255)], text("0xff")),
         ];
         for (input, expected) in test_cases {
-            assert_eq!(exec_printf(&input, FpDigits::DEFAULT).unwrap(), *expected.get_value());
+            assert_eq!(
+                exec_printf(&input, FpDigits::DEFAULT).unwrap(),
+                *expected.get_value()
+            );
         }
     }
 
     #[test]
     fn test_printf_dynamic_width() {
         assert_eq!(
-            exec_printf(&[text("%.*f"), integer(2), float(3.14258)], FpDigits::DEFAULT).unwrap(),
+            exec_printf(
+                &[text("%.*f"), integer(2), float(3.14258)],
+                FpDigits::DEFAULT
+            )
+            .unwrap(),
             *text("3.14").get_value()
         );
     }
@@ -1706,7 +1704,10 @@ mod tests {
             ),
         ];
         for (input, expected) in test_cases {
-            assert_eq!(exec_printf(&input, FpDigits::DEFAULT).unwrap(), *expected.get_value());
+            assert_eq!(
+                exec_printf(&input, FpDigits::DEFAULT).unwrap(),
+                *expected.get_value()
+            );
         }
     }
 
@@ -1724,7 +1725,10 @@ mod tests {
             (vec![text("Exp: %e"), float(0.0)], text("Exp: 0.000000e+00")),
         ];
         for (input, expected) in test_cases {
-            assert_eq!(exec_printf(&input, FpDigits::DEFAULT).unwrap(), *expected.get_value());
+            assert_eq!(
+                exec_printf(&input, FpDigits::DEFAULT).unwrap(),
+                *expected.get_value()
+            );
         }
     }
 
@@ -1745,7 +1749,10 @@ mod tests {
             ),
         ];
         for (input, expected) in test_cases {
-            assert_eq!(exec_printf(&input, FpDigits::DEFAULT).unwrap(), *expected.get_value());
+            assert_eq!(
+                exec_printf(&input, FpDigits::DEFAULT).unwrap(),
+                *expected.get_value()
+            );
         }
     }
 
@@ -1760,11 +1767,19 @@ mod tests {
             *text("'it''s'").get_value()
         );
         assert_eq!(
-            exec_printf(&[text("%Q"), Register::Value(Value::Null)], FpDigits::DEFAULT).unwrap(),
+            exec_printf(
+                &[text("%Q"), Register::Value(Value::Null)],
+                FpDigits::DEFAULT
+            )
+            .unwrap(),
             *text("NULL").get_value()
         );
         assert_eq!(
-            exec_printf(&[text("%q"), Register::Value(Value::Null)], FpDigits::DEFAULT).unwrap(),
+            exec_printf(
+                &[text("%q"), Register::Value(Value::Null)],
+                FpDigits::DEFAULT
+            )
+            .unwrap(),
             *text("(NULL)").get_value()
         );
     }
@@ -1800,9 +1815,15 @@ mod tests {
             (vec![text("%f"), float(-0.0)], text("0.000000")),
         ];
         for (input, expected) in test_cases {
-            assert_eq!(exec_printf(&input, FpDigits::DEFAULT).unwrap(), *expected.get_value());
+            assert_eq!(
+                exec_printf(&input, FpDigits::DEFAULT).unwrap(),
+                *expected.get_value()
+            );
         }
-        assert_eq!(exec_printf(&[text("")], FpDigits::DEFAULT).unwrap(), *text("").get_value());
+        assert_eq!(
+            exec_printf(&[text("")], FpDigits::DEFAULT).unwrap(),
+            *text("").get_value()
+        );
         assert_eq!(
             exec_printf(&[text("%s"), text("")], FpDigits::DEFAULT).unwrap(),
             *text("").get_value()
@@ -1826,7 +1847,10 @@ mod tests {
             (vec![text("hex: %x"), text("")], text("hex: 0")),
         ];
         for (input, expected) in test_cases {
-            assert_eq!(exec_printf(&input, FpDigits::DEFAULT).unwrap(), *expected.get_value());
+            assert_eq!(
+                exec_printf(&input, FpDigits::DEFAULT).unwrap(),
+                *expected.get_value()
+            );
         }
     }
 
@@ -1847,7 +1871,10 @@ mod tests {
             ),
         ];
         for (input, expected) in test_cases {
-            assert_eq!(exec_printf(&input, FpDigits::DEFAULT).unwrap(), *expected.get_value());
+            assert_eq!(
+                exec_printf(&input, FpDigits::DEFAULT).unwrap(),
+                *expected.get_value()
+            );
         }
     }
 
@@ -1999,7 +2026,11 @@ mod tests {
             *text("-Inf").get_value()
         );
         assert_eq!(
-            exec_printf(&[text("%020e"), float(f64::NEG_INFINITY)], FpDigits::DEFAULT).unwrap(),
+            exec_printf(
+                &[text("%020e"), float(f64::NEG_INFINITY)],
+                FpDigits::DEFAULT
+            )
+            .unwrap(),
             *text("-0000009.000000e+999").get_value()
         );
         // # flag with %g infinity: RTZ disabled, so trailing zeros remain
@@ -2013,7 +2044,8 @@ mod tests {
             *text("9.0e+999").get_value()
         );
         // ! flag with %f infinity: strips trailing fractional zeros
-        let inf_bang_f = exec_printf(&[text("%!0f"), float(f64::INFINITY)], FpDigits::DEFAULT).unwrap();
+        let inf_bang_f =
+            exec_printf(&[text("%!0f"), float(f64::INFINITY)], FpDigits::DEFAULT).unwrap();
         let inf_bang_str = match &inf_bang_f {
             Value::Text(t) => t.as_str().to_string(),
             _ => panic!("expected text"),
@@ -2096,12 +2128,20 @@ mod tests {
     fn test_i32_star_precision_wrapping() {
         // i32::MIN as * precision wraps back to itself after negation → treated as 0
         assert_eq!(
-            exec_printf(&[text("%.*d"), integer(-2147483648), integer(42)], FpDigits::DEFAULT).unwrap(),
+            exec_printf(
+                &[text("%.*d"), integer(-2147483648), integer(42)],
+                FpDigits::DEFAULT
+            )
+            .unwrap(),
             *text("42").get_value()
         );
         // 4294967295 as i64 → -1 as i32 → wrapping_neg → 1
         assert_eq!(
-            exec_printf(&[text("%.*d"), integer(4294967295), integer(42)], FpDigits::DEFAULT).unwrap(),
+            exec_printf(
+                &[text("%.*d"), integer(4294967295), integer(42)],
+                FpDigits::DEFAULT
+            )
+            .unwrap(),
             *text("42").get_value()
         );
     }
@@ -2166,15 +2206,27 @@ mod tests {
     fn test_q_null_precision_truncation() {
         // Precision truncates the NULL literal representation
         assert_eq!(
-            exec_printf(&[text("%.0q"), Register::Value(Value::Null)], FpDigits::DEFAULT).unwrap(),
+            exec_printf(
+                &[text("%.0q"), Register::Value(Value::Null)],
+                FpDigits::DEFAULT
+            )
+            .unwrap(),
             *text("").get_value()
         );
         assert_eq!(
-            exec_printf(&[text("%.3q"), Register::Value(Value::Null)], FpDigits::DEFAULT).unwrap(),
+            exec_printf(
+                &[text("%.3q"), Register::Value(Value::Null)],
+                FpDigits::DEFAULT
+            )
+            .unwrap(),
             *text("(NU").get_value()
         );
         assert_eq!(
-            exec_printf(&[text("%.0Q"), Register::Value(Value::Null)], FpDigits::DEFAULT).unwrap(),
+            exec_printf(
+                &[text("%.0Q"), Register::Value(Value::Null)],
+                FpDigits::DEFAULT
+            )
+            .unwrap(),
             *text("").get_value()
         );
     }
@@ -2183,7 +2235,11 @@ mod tests {
     fn test_q_null_width_padding() {
         // Width applies to the NULL representation
         assert_eq!(
-            exec_printf(&[text("%-10q"), Register::Value(Value::Null)], FpDigits::DEFAULT).unwrap(),
+            exec_printf(
+                &[text("%-10q"), Register::Value(Value::Null)],
+                FpDigits::DEFAULT
+            )
+            .unwrap(),
             *text("(NULL)    ").get_value()
         );
     }
@@ -2248,7 +2304,11 @@ mod tests {
     fn test_very_small_float_no_nan() {
         // 1e-300 with %G should not produce NaN — round_half_away_e must handle
         // subnormal scale values from 10^(-309+) without dividing by ~0.
-        let result = exec_printf(&[text("%.*G"), integer(10), float(1e-300)], FpDigits::DEFAULT).unwrap();
+        let result = exec_printf(
+            &[text("%.*G"), integer(10), float(1e-300)],
+            FpDigits::DEFAULT,
+        )
+        .unwrap();
         assert_eq!(result, *text("1E-300").get_value());
 
         // Also test with %e

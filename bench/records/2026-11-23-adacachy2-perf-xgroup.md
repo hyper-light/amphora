@@ -75,3 +75,6 @@ another checkout had just built there, so cargo took the stale `amphora-api` and
 | perf/xgroup-k11 8023452b (fix merged with main d5e901f3), r1416 | 6 of 6 (1.6 s) | 6 of 6 (1.0 s) | 6 of 6 (0.8 s) | 35 passed, 0 failed (13.5 s) | rc 0 |
 
 Load during r1416: 53-57 on 32 cores (other lanes' runs); CPU pressure some avg60 10.9, I/O some avg60 22.4.
+
+After the merge (5b): the `database::` suite at 8023452b, 245 passed, 0 failed, 6 ignored (r1421, 45.7 s, load 23-26).
+b8bdb465 (rustfmt of the two step calls, doc reflow; layout only): w7, w8, w11 2 of 2 each, clippy rc 0 (r1432).

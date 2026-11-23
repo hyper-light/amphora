@@ -877,7 +877,9 @@ impl Value {
     /// offset falls outside `0..length-1`, matching PostgreSQL exactly. A `NULL`
     /// input or offset yields `NULL`.
     pub fn exec_get_byte(&self, offset: &Value) -> Result<Value> {
-        let Value::Numeric(Numeric::Integer(offset)) = offset.exec_cast("INT", crate::numeric::fp::FpDigits::DEFAULT)? else {
+        let Value::Numeric(Numeric::Integer(offset)) =
+            offset.exec_cast("INT", crate::numeric::fp::FpDigits::DEFAULT)?
+        else {
             return Ok(Value::Null);
         };
         let Some(bytes) = self.byte_view() else {
@@ -898,10 +900,14 @@ impl Value {
     /// Raises an error when the offset falls outside `0..length-1`, matching
     /// PostgreSQL exactly. A `NULL` input, offset, or value yields `NULL`.
     pub fn exec_set_byte(&self, offset: &Value, new_value: &Value) -> Result<Value> {
-        let Value::Numeric(Numeric::Integer(offset)) = offset.exec_cast("INT", crate::numeric::fp::FpDigits::DEFAULT)? else {
+        let Value::Numeric(Numeric::Integer(offset)) =
+            offset.exec_cast("INT", crate::numeric::fp::FpDigits::DEFAULT)?
+        else {
             return Ok(Value::Null);
         };
-        let Value::Numeric(Numeric::Integer(new_value)) = new_value.exec_cast("INT", crate::numeric::fp::FpDigits::DEFAULT)? else {
+        let Value::Numeric(Numeric::Integer(new_value)) =
+            new_value.exec_cast("INT", crate::numeric::fp::FpDigits::DEFAULT)?
+        else {
             return Ok(Value::Null);
         };
         let Some(bytes) = self.byte_view() else {
@@ -1474,9 +1480,14 @@ impl Value {
     ) -> std::result::Result<Value, crate::alloc::TryReserveError> {
         // TEXT whatever the operands, two BLOBs too, as SQLite's OP_Concat gives; a REAL at the
         // connection's FP_DIGITS.
-        fn text(v: &Value, digits: crate::numeric::fp::FpDigits) -> Option<std::borrow::Cow<'_, str>> {
+        fn text(
+            v: &Value,
+            digits: crate::numeric::fp::FpDigits,
+        ) -> Option<std::borrow::Cow<'_, str>> {
             match v {
-                Value::Numeric(Numeric::Float(_)) => Some(std::borrow::Cow::Owned(v.to_text_at(digits))),
+                Value::Numeric(Numeric::Float(_)) => {
+                    Some(std::borrow::Cow::Owned(v.to_text_at(digits)))
+                }
                 other => other.cast_text_ref(),
             }
         }
@@ -2091,7 +2102,8 @@ mod tests {
         let rhs = blob(&[3, 4]);
 
         assert_eq!(
-            lhs.exec_concat(&rhs, crate::numeric::fp::FpDigits::DEFAULT).unwrap(),
+            lhs.exec_concat(&rhs, crate::numeric::fp::FpDigits::DEFAULT)
+                .unwrap(),
             Value::build_text("\u{1}\u{2}\u{3}\u{4}")
         );
     }
@@ -2946,7 +2958,10 @@ mod tests {
         let input_blob = blob(&[0xd2, 0x64, 0xc0, 0x07, 0xf6, 0x44, 0xe4, 0x59]);
         let expected = input_blob.clone();
 
-        assert_eq!(allocated(input_blob.exec_cast("BLOB", crate::numeric::fp::FpDigits::DEFAULT)), expected);
+        assert_eq!(
+            allocated(input_blob.exec_cast("BLOB", crate::numeric::fp::FpDigits::DEFAULT)),
+            expected
+        );
     }
 
     #[test]

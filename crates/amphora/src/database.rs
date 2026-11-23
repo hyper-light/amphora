@@ -323,8 +323,8 @@ pub(crate) struct Changed {
     locked_wakes: AtomicU64,
     /// [`LockedReads::WaitOnLock`]'s waiter lists: each row a get waits on, by its cross-group key
     /// (`xgroup::sql::record_key`), with its own bell, rung when a resolution here drops that
-    /// row's locks ([`Database::call_internal_ringing`]). A row's entry lives while a get waits on it, so it
-    /// holds at most one entry per waiting get.
+    /// row's locks ([`Database::call_internal_ringing`]). A row's entry lives while a get waits
+    /// on it, so it holds at most one entry per waiting get.
     lock_waiters: Mutex<BTreeMap<Vec<u8>, LockBell>>,
 }
 
@@ -366,9 +366,9 @@ pub enum LockedReads {
     /// As [`LockedReads::Wait`], but a waiting get waits on its own row's waiter list, rung when
     /// a resolution here drops that row's locks, not on every change in the group (T-T1.10.W9,
     /// lane xgroup-sql-11: Wait's thundering herd at scale). The step that resolves rings it in
-    /// the process that commits it (`Database::call_internal_ringing`), and every replica of a replicated group
-    /// rings its own lists as it applies the resolution, whichever process ran the step
-    /// (`ring_unlocked`; T-T1.10.W13, lane xgroup-sql-12).
+    /// the process that commits it (`Database::call_internal_ringing`), and every replica of a
+    /// replicated group rings its own lists as it applies the resolution, whichever process ran
+    /// the step (`ring_unlocked`; T-T1.10.W13, lane xgroup-sql-12).
     WaitOnLock,
 }
 
@@ -2108,11 +2108,7 @@ impl Database {
             }),
         };
         // Bootstrap DDL used the same WAL; the barrier makes it durable before open succeeds.
-        database.submit_selected(
-            "",
-            Operation::Mutation(Mutation::Sql(Vec::new())),
-            until,
-        )?;
+        database.submit_selected("", Operation::Mutation(Mutation::Sql(Vec::new())), until)?;
         Ok(database)
     }
 
@@ -2350,8 +2346,7 @@ impl Database {
     {
         let call: Call = Box::new(move |db| f(db).map(|v| Box::new(v) as Box<dyn Any + Send>));
         let operation = Operation::Call(Mutex::new(Some(call)), answer);
-        match self.resolve(until)?.submit_selected("", operation, until)?
-        {
+        match self.resolve(until)?.submit_selected("", operation, until)? {
             (Answer::Called(v), token) => v
                 .downcast::<R>()
                 .map(|v| (*v, token))
@@ -2727,11 +2722,11 @@ impl Database {
 
     /// [`LockedReads::WaitOnLock`] (T-T1.10.W9, lane xgroup-sql-11): a locked read waits on the
     /// waiter list of the row it met, rung only by a resolution that drops that row's locks
-    /// ([`Database::call_internal_ringing`]). It joins the list and tries once more before it first waits
-    /// there, so a resolution between its try and joining isn't missed; from then on the list's
-    /// ring count, read before each try, says whether one landed since. Meeting another row, it
-    /// moves to that row's list the same way. It leaves its list however it ends. It is counted
-    /// waiting ([`Database::locked_waits`]) as it first blocks.
+    /// ([`Database::call_internal_ringing`]). It joins the list and tries once more before it
+    /// first waits there, so a resolution between its try and joining isn't missed; from then on
+    /// the list's ring count, read before each try, says whether one landed since. Meeting another
+    /// row, it moves to that row's list the same way. It leaves its list however it ends. It is
+    /// counted waiting ([`Database::locked_waits`]) as it first blocks.
     fn wait_on_lock<T>(
         &self,
         until: Instant,
@@ -2943,16 +2938,10 @@ impl Database {
             }
         }
         let (tx, rx) = mpsc::sync_channel(1);
-        self.submit_local(
-            namespace,
-            operation,
-            until,
-            until,
-            move |result| {
-                // A caller whose deadline elapsed no longer waits, but the committed result stands.
-                let _ = tx.send(result);
-            },
-        )?;
+        self.submit_local(namespace, operation, until, until, move |result| {
+            // A caller whose deadline elapsed no longer waits, but the committed result stands.
+            let _ = tx.send(result);
+        })?;
         rx.recv_timeout(until.saturating_duration_since(Instant::now()))
             .map_err(|e| match e {
                 mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected => {
@@ -4412,7 +4401,10 @@ mod admission_charge {
             cursor: vec![1, 2],
             done: false,
         };
-        assert_eq!(progress.answer_bytes(), std::mem::size_of_val(&progress) + 5);
+        assert_eq!(
+            progress.answer_bytes(),
+            std::mem::size_of_val(&progress) + 5
+        );
         let reads = vec![(vec![1u8; 3], Some(vec![2u8; 4])), (vec![5u8], None)];
         let heap = 2 * std::mem::size_of::<(Vec<u8>, Option<Vec<u8>>)>() + 3 + 4 + 1;
         let locked = crate::xgroup::Reply::Locked {
@@ -4422,7 +4414,10 @@ mod admission_charge {
         let resolved = crate::xgroup::Reply::Resolved;
         assert_eq!(resolved.answer_bytes(), std::mem::size_of_val(&resolved));
         let committed = crate::xgroup::coordinator::Answer::Committed { reads, at: None };
-        assert_eq!(committed.answer_bytes(), std::mem::size_of_val(&committed) + heap);
+        assert_eq!(
+            committed.answer_bytes(),
+            std::mem::size_of_val(&committed) + heap
+        );
         let stepped = online::Stepped::Public {
             held: Duration::from_millis(1),
         };
