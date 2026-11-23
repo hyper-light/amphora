@@ -2602,7 +2602,7 @@ are to be removed, with that work driven from events, not given better intervals
 timeouts stay learned, since they are truly about time. Lane repl-measure-8 owns the commit path's timer waits
 (`run_loop`, `deadline`, `Bell`).
 
-**Tests.** `drain::tests::drain_nothing_measured_bounds_one_record` (T-QB.1.1),
+**Tests.** `drain::tests::drain_nothing_measured_bounds_the_room` (T-QB.1.1),
 `drain_bound_is_rate_times_election_timeout_within_room` (T-QB.1.2), `drain_bound_follows_the_reader_and_ignores_no_time`
 (T-QB.1.3), `replicated::tests::queue_bound_a_burst_at_start_grows_before_it_fences` (T-QB.1.4),
 `replicated::tests::t_qb_1_6_command_queue_inputs_counted_by_rate_within_the_room` (T-QB.1.6) and
