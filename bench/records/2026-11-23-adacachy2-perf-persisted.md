@@ -285,7 +285,12 @@ rule makes wait for that entry's apply. Six other slot and floor tests pass with
 the three W tests, the retry race).
 
 Bench timings (in-process persisted commit, 3, 32 and 128 writers, 5 alternated rounds, latency by acknowledging node
-and Serialization refusals by node: bench/src/repl.rs `by_node`, `leader`): BENCH_PENDING.
+and Serialization refusals by node: bench/src/repl.rs `by_node`, `leader`): not measured. The bench does not compile on
+main (r1104): perf-A8's 80c3a431 made `store::Config::queue` an `Option`, and bench/src/store.rs still unwraps it
+(`AMPHORA_QUEUE`); the one-line fix (`.or(defaults.queue)`) is bc856f59 on perf/persisted-w4, not yet built. The bench
+also has no Cargo.lock of its own (its workspace sits outside the root's), so `--locked` refuses; r1104 built it
+`--offline` against lane bench-s's CARGO_HOME and its stale lock. Its run of the rungs (`persisted-scripts/ab3.sh
+bc856f59`) waited for room on adacachy2 (0 of 32 cores idle) at the hour's end.
 
 ## 3. The read-or-write tag on member requests (not started)
 
