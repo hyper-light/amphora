@@ -627,15 +627,16 @@ impl Budget {
     /// `bytes` held by `used` ([`Budget::hold`]) given back: room freed, which wakes those waiting
     /// for it that now fit ([`Budget::when_room`]).
     pub fn give(&self, used: Use, bytes: u64) {
+        // Sequentially consistent, against the fence in `when_room`: a waiter counted after this
+        // release reads the room it freed, and one counted before is seen here. On x86 these cost
+        // what acquire-release does (a locked update, a plain load), so a release with no one
+        // waiting adds no fence.
         let _ = self
             .slot(used)
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
                 Some(held.saturating_sub(bytes))
             });
-        // Pairs with the fence in `when_room`: a waiter added after this release reads the room it
-        // freed, and one added before is counted here.
-        std::sync::atomic::fence(Ordering::SeqCst);
-        if self.waiters.load(Ordering::Relaxed) > 0 {
+        if self.waiters.load(Ordering::SeqCst) > 0 {
             self.wake_fitting();
         }
     }
@@ -660,7 +661,7 @@ impl Budget {
                 Ordering::Relaxed,
             );
         }
-        // Pairs with the fence in `give`.
+        // Pairs with `give`'s sequentially consistent release and count.
         std::sync::atomic::fence(Ordering::SeqCst);
         self.wake_fitting();
         Waiting {
