@@ -4439,21 +4439,19 @@ pub(crate) mod bushy_test_hook {
         /// and answers as the nested loops do.
         #[test]
         fn t7_q05_late_terms_priced_per_visit_keep_the_late_match_out() {
-            use crate::translate::optimizer::learned_costs::{test_pin, LearnedWeights};
+            use crate::translate::optimizer::learned_costs::LearnedWeights;
             let (conn, sql, nested_loops, late_match) = q05_shape();
             let pin = |factor: f64, where_step: f64| {
-                test_pin::WEIGHTS.with(|weights| {
-                    weights.set(Some(LearnedWeights {
-                        row_in_pages: Some(0.00027),
-                        seek: 18.55 * factor,
-                        hash_build: 25.81 * factor,
-                        hash_probe: 4.82,
-                        sort: 1.27,
-                        bloom_probe: 4.99,
-                        where_step,
-                        page_miss: Some(1.0),
-                    }))
-                });
+                conn.pin_cost_weights(Some(LearnedWeights {
+                    row_in_pages: Some(0.00027),
+                    seek: 18.55 * factor,
+                    hash_build: 25.81 * factor,
+                    hash_probe: 4.82,
+                    sort: 1.27,
+                    bloom_probe: 4.99,
+                    where_step,
+                    page_miss: Some(1.0),
+                }));
             };
             let mut seen = Vec::new();
             let mut slow_state = None;
@@ -4467,12 +4465,12 @@ pub(crate) mod bushy_test_hook {
                 seen.push((factor, steps));
             }
             let Some((factor, slow_plan)) = slow_state else {
-                test_pin::WEIGHTS.with(|weights| weights.set(None));
+                conn.pin_cost_weights(None);
                 panic!("no pinned state took the late match ({late_match} visits): {seen:?}");
             };
             pin(factor, 6.77);
             let (chosen, steps, plan) = by_cost(&conn, sql);
-            test_pin::WEIGHTS.with(|weights| weights.set(None));
+            conn.pin_cost_weights(None);
             assert_eq!(chosen, nested_loops, "{plan:?}");
             assert!(
                 steps < late_match,
@@ -5173,7 +5171,14 @@ pub(crate) mod bushy_search_tests {
             for probe in [10.0, 400.0] {
                 for seek in [learned.seek / 4.0, learned.seek * 4.0] {
                     for build in [learned.hash_build / 4.0, learned.hash_build * 4.0] {
-                        conn.pin_cost_weights(Some((seek, build, probe)));
+                        conn.pin_cost_weights(Some(
+                            crate::translate::optimizer::learned_costs::LearnedWeights {
+                            seek,
+                            hash_build: build,
+                            hash_probe: probe,
+                            ..learned
+                        },
+                        ));
                         for sql in FACT_QUERIES {
                             BUSHY_PLANS.with(|plans| plans.set(0));
                             drop(conn.prepare(sql).unwrap());
