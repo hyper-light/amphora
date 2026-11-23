@@ -8002,7 +8002,10 @@ fn exact_sum_final(func: &AggFunc, payload: &[Value]) -> Result<Value> {
 ///   Blob(varying inter-string separator lengths)]
 /// - JsonGroupObject/JsonbGroupObject: [Blob([])]
 /// - JsonGroupArray/JsonbGroupArray: [Blob([])]
-pub(crate) fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> Result<()> {
+pub(crate) fn init_agg_payload(
+    func: &AggFunc,
+    payload: &mut crate::alloc::Vec<Value>,
+) -> Result<()> {
     // This initializes `payload` at exactly the right size.
     match func {
         AggFunc::Count | AggFunc::Count0 => {

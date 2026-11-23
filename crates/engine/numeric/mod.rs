@@ -532,9 +532,9 @@ pub fn str_to_f64(input: impl AsRef<str>) -> Option<StrToF64> {
         .trim_matches(|ch: char| ch.is_ascii_whitespace() || ch == VERTICAL_TAB);
     let bytes = input.as_bytes();
     let digits_end = |from: usize| {
-        from + bytes
-            .get(from..)
-            .map_or(0, |rest| rest.iter().take_while(|b| b.is_ascii_digit()).count())
+        from + bytes.get(from..).map_or(0, |rest| {
+            rest.iter().take_while(|b| b.is_ascii_digit()).count()
+        })
     };
 
     let mantissa = usize::from(matches!(bytes.first(), Some(b'-' | b'+')));

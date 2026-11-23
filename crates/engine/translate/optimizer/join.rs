@@ -2364,10 +2364,10 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                                 && info.table_mask.intersects(&outer_mask)
                         })
                         .map(|(_, info)| info.extra_steps.saturating_add(1) as f64);
-                    let (late_least, late_all) = late_steps.fold(
-                        (f64::INFINITY, 0.0),
-                        |(least, all): (f64, f64), steps| (least.min(steps), all + steps),
-                    );
+                    let (late_least, late_all) = late_steps
+                        .fold((f64::INFINITY, 0.0), |(least, all): (f64, f64), steps| {
+                            (least.min(steps), all + steps)
+                        });
                     let late_work = if late_all > 0.0 {
                         visited * late_least + rows * (late_all - late_least)
                     } else {

@@ -4400,7 +4400,11 @@ pub(crate) mod bushy_test_hook {
                 .collect();
             chosen.sort();
             let steps = stmt.stmt_status(crate::StatementStatusCounter::VmStep);
-            (chosen, steps, rows(conn, &format!("EXPLAIN QUERY PLAN {sql}")))
+            (
+                chosen,
+                steps,
+                rows(conn, &format!("EXPLAIN QUERY PLAN {sql}")),
+            )
         }
 
         /// Lane T6 (TPC-H q05 at SF1 passed 10 s): the planner prices the late match's visits,

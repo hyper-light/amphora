@@ -558,7 +558,9 @@ impl<'a> JoinedSetRows<'a> {
                     (!not_a_filter(pos)
                         && matches!(
                             term.origin,
-                            WhereTermOrigin::Where | WhereTermOrigin::Implied | WhereTermOrigin::Join(_)
+                            WhereTermOrigin::Where
+                                | WhereTermOrigin::Implied
+                                | WhereTermOrigin::Join(_)
                         )
                         && !term.origin.is_outer_join()
                         && home.is_none_or(|home| home == table_idx))
