@@ -951,17 +951,15 @@ impl Database {
         Ok(ts)
     }
 
-    /// Ends `txn` if it wrote nothing ([`Versioned::end_unwritten`], AUDIT 2.4, `AC-NS.2.1`):
-    /// no timestamp, no redo record, no publish lock. Durable as a commit of it was: every commit
-    /// its snapshot saw is durable before this returns (a commit's record is appended before its
-    /// timestamp is published, so each is in a lane by then), and a log refused since is refused
-    /// here too. `txn` back when it must commit ([`Database::commit_with`]).
+    /// Ends `txn` if it wrote nothing ([`Versioned::end_unwritten`], AUDIT 2.4, `AC-NS.2.1`).
+    /// Its durable finish covers every writer published by that point, including a writer that
+    /// committed after its snapshot began. Each writer appends its redo before publishing its
+    /// timestamp. The reader needs no record or timestamp of its own.
     pub fn end_unwritten(&self, txn: Txn) -> Result<Option<Txn>> {
-        let start = txn.start;
         if let Some(txn) = self.v.end_unwritten(txn)? {
             return Ok(Some(txn));
         }
-        self.redo.sync_all(&*self.disk, start)?;
+        self.redo.sync_all(&*self.disk, self.v.clock.published())?;
         Ok(None)
     }
 
@@ -1172,6 +1170,30 @@ mod tests {
         let mut with_late = want.clone();
         with_late.insert(b"late".to_vec(), b"x".to_vec());
         assert!(got == want || got == with_late, "{} rows", got.len());
+    }
+
+    /// T-T1.3.1, AUDIT 2.4. Publish a buffered write after a reader takes its snapshot and
+    /// before it finishes durably. Its snapshot still misses the write. Recovery must keep it.
+    #[test]
+    fn audit_review_unwritten_commit_flushes_the_prefix_at_finish() {
+        let disk = Arc::new(Simulated::new(5, 1).unwrap());
+        let db = Database::open(disk.clone(), 2_000, 1, cmp).unwrap();
+        let mut d = Descender::new();
+        let reader = db.begin().unwrap();
+        let mut writer = db.begin().unwrap();
+        db.put(&mut d, &mut writer, 0, b"key", b"value").unwrap();
+        db.commit(writer, &mut d, db.lane(), false).unwrap();
+        assert_eq!(db.get(&mut d, &reader.snapshot(), 0, b"key").unwrap(), None);
+        assert!(db.end_unwritten(reader).unwrap().is_none());
+        let flushed = db.log_counters().records;
+        drop(db);
+        disk.power_cut().unwrap();
+        let reopened = Database::open(disk, 2_000, 1, cmp).unwrap();
+        assert_eq!(
+            rows(&reopened).get(b"key".as_slice()).map(Vec::as_slice),
+            Some(b"value".as_slice())
+        );
+        assert_eq!(flushed, 1, "only the writer logged a record");
     }
 
     /// The rows of tree `tree`, as a snapshot begun now sees them.
