@@ -854,6 +854,11 @@ trait WalCoordination: Debug + Send + Sync {
         None
     }
 
+    /// The in-process writer lock, whose release permits another write transaction.
+    fn writer_release(&self) -> Option<Arc<LockRelease>> {
+        None
+    }
+
     /// Amphora: whether `ensure_local_frame_cache_covers` has anything to do: only under another
     /// process's authority is there a fallback cache to fill, so a reader in one process builds no
     /// snapshot for it on every page it looks up.
@@ -1033,6 +1038,11 @@ pub trait Wal: Debug + Send + Sync {
     /// Amphora (lane constants-22): the event a statement busy on this log's locks waits on
     /// ([`LockRelease`]); None when a release may come from another process unseen.
     fn lock_release(&self) -> Option<Arc<LockRelease>> {
+        None
+    }
+
+    /// The in-process writer lock, whose release permits another write transaction.
+    fn writer_release(&self) -> Option<Arc<LockRelease>> {
         None
     }
 
@@ -1406,6 +1416,7 @@ impl InProcessWalCoordination {
     fn unlock_write_lock(&self) {
         let shared = self.shared.read();
         shared.runtime.write_lock.unlock();
+        shared.runtime.writer_released.notify();
         shared.runtime.released.notify();
     }
 
@@ -1441,6 +1452,10 @@ impl WalCoordination for InProcessWalCoordination {
 
     fn lock_release(&self) -> Option<Arc<LockRelease>> {
         Some(Arc::clone(&self.shared.read().runtime.released))
+    }
+
+    fn writer_release(&self) -> Option<Arc<LockRelease>> {
+        Some(Arc::clone(&self.shared.read().runtime.writer_released))
     }
 
     fn publish_backfill(&self, max_frame: u64) {
@@ -3738,6 +3753,7 @@ pub struct WalSharedRuntime {
     /// Amphora (lane constants-22): each release of the locks above in this process, and each
     /// commit published, for the statements busy on them to wake on ([`LockRelease`]).
     pub released: Arc<LockRelease>,
+    pub writer_released: Arc<LockRelease>,
     /// Increments on each checkpoint, used to prevent stale cached pages being used for
     /// backfilling.
     pub epoch: AtomicU32,
@@ -5122,6 +5138,10 @@ impl WalFile {
 impl Wal for WalFile {
     fn lock_release(&self) -> Option<Arc<LockRelease>> {
         self.coordination.lock_release()
+    }
+
+    fn writer_release(&self) -> Option<Arc<LockRelease>> {
+        self.coordination.writer_release()
     }
 
     fn begin_read_tx(&self, most: usize) -> Result<ReadChange> {
@@ -7950,6 +7970,7 @@ impl WalFileShared {
                 write_lock: TursoRwLock::new(),
                 checkpoint_lock: TursoRwLock::new(),
                 released: Arc::default(),
+                writer_released: Arc::default(),
                 epoch: AtomicU32::new(snapshot.checkpoint_epoch),
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
@@ -8035,6 +8056,7 @@ impl WalFileShared {
                 write_lock: TursoRwLock::new(),
                 checkpoint_lock: TursoRwLock::new(),
                 released: Arc::default(),
+                writer_released: Arc::default(),
                 epoch: AtomicU32::new(0),
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
@@ -8086,6 +8108,7 @@ impl WalFileShared {
                 write_lock: TursoRwLock::new(),
                 checkpoint_lock: TursoRwLock::new(),
                 released: Arc::default(),
+                writer_released: Arc::default(),
                 epoch: AtomicU32::new(0),
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),

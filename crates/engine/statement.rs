@@ -891,6 +891,7 @@ impl Statement {
 
     fn step_inner(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
         self.release_wait = None;
+        self.state.busy_writer = None;
         // ANALYZE already ran to Done; only its stats refresh is outstanding.
         // Checked first: the root-statement count was released at Done, so
         // `prepare_step` must not re-register this statement as a root.
@@ -1167,21 +1168,27 @@ impl Statement {
                 (BusyHandler::Timeout(max), Some(waker))
                     if self.program.connection.busy_wake() == BusyWake::Release =>
                 {
-                    if self.lock_release.is_none() {
-                        self.lock_release =
-                            self.pager.wal.as_ref().and_then(|wal| wal.lock_release());
-                    }
-                    self.lock_release
-                        .as_ref()
-                        .map(|release| (*max, release, waker))
+                    let event = match self.state.busy_writer.take() {
+                        Some(wait) => wait.0,
+                        None => {
+                            if self.lock_release.is_none() {
+                                self.lock_release =
+                                    self.pager.wal.as_ref().and_then(|wal| wal.lock_release());
+                            }
+                            self.lock_release
+                                .as_ref()
+                                .map(|event| (Arc::clone(event), self.release_seen))
+                        }
+                    };
+                    event.map(|(release, seen)| (*max, release, seen, waker))
                 }
                 _ => None,
             };
-            if let Some((max, release, waker)) = release {
+            if let Some((max, release, seen, waker)) = release {
                 if let Some(left) = busy_state.until_released(max, now) {
                     // Registered: sleep until the release (or the deadline). A release came
                     // since the step read the count: step again now.
-                    self.release_wait = release.subscribe(self.release_seen, waker);
+                    self.release_wait = release.subscribe(seen, waker);
                     let duration = if self.release_wait.is_some() {
                         left
                     } else {

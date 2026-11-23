@@ -89,6 +89,10 @@ impl LockRelease {
     }
 }
 
+/// A blocked write upgrade. A cross-process WAL has no local notification for it.
+#[derive(Debug)]
+pub(crate) struct WriteLockWait(pub Option<(Arc<LockRelease>, u64)>);
+
 struct StatementWake(Waker);
 
 impl Wake for StatementWake {

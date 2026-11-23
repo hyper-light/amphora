@@ -973,6 +973,7 @@ pub struct ProgramState {
     /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
     /// This is used when statement in auto-commit mode reseted after previous uncomplete execution - in which case we may need to rollback transaction started on previous attempt
     pub(crate) auto_txn_cleanup: TxnCleanup,
+    pub(crate) busy_writer: Option<crate::busy::WriteLockWait>,
     pub explain_state: RwLock<ExplainState>,
     /// Scratch buffer for [Insn::HashDistinct] to avoid per-row allocations.
     distinct_key_values: Vec<Value>,
@@ -1147,6 +1148,7 @@ impl ProgramState {
             star_orders: HashMap::default(),
             handoff_open: false,
             handoff_asked: false,
+            busy_writer: None,
             group_tables: HashMap::default(),
             morsel_rows: None,
             ephemeral_temp_files: HashMap::default(),
@@ -1225,6 +1227,7 @@ impl ProgramState {
 
     pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
         self.io_completions = None;
+        self.busy_writer = None;
         self.extension_state = crate::native_ext::ExtensionState::None;
         self.pc = 0;
 

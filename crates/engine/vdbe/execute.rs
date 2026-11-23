@@ -4667,6 +4667,28 @@ impl crate::mvcc::yield_hooks::YieldPointMarker for TransactionYieldPoint {
     }
 }
 
+/// Save the writer-lock generation before attempting the upgrade. Releasing the
+/// contender's own read mark afterwards cannot wake a wait on the writer lock.
+fn begin_statement_write(
+    state: &mut ProgramState,
+    pager: &Pager,
+    actions: WalAutoActions,
+) -> IOResultOr<()> {
+    let release = pager
+        .wal
+        .as_ref()
+        .and_then(|wal| wal.writer_release())
+        .map(|event| {
+            let seen = event.generation();
+            (event, seen)
+        });
+    let result = pager.begin_write_tx(actions);
+    if matches!(&result, Err(err) if matches!(**err, LimboError::Busy)) {
+        state.busy_writer = Some(crate::busy::WriteLockWait(release));
+    }
+    result
+}
+
 pub fn op_transaction(
     program: &Program,
     state: &mut ProgramState,
@@ -5368,7 +5390,8 @@ pub fn op_transaction_inner(
                             !conn.is_nested_stmt(),
                             "nested stmt should not begin a new write transaction"
                         );
-                        let begin_w_tx_res = pager.begin_write_tx(conn.wal_auto_actions());
+                        let begin_w_tx_res =
+                            begin_statement_write(state, &pager, conn.wal_auto_actions());
                         if matches!(
                             &begin_w_tx_res,
                             Err(err) if matches!(**err, LimboError::Busy | LimboError::BusySnapshot)
@@ -5430,7 +5453,7 @@ pub fn op_transaction_inner(
             // begin_read_tx has already completed in the Start state.
             OpTransactionState::AttachedBeginWriteTx => {
                 let conn = program.connection.clone();
-                let res = pager.begin_write_tx(conn.wal_auto_actions())?;
+                let res = begin_statement_write(state, &pager, conn.wal_auto_actions())?;
                 if let IOResult::IO(io) = res {
                     return Ok(state.suspend_on_io(io));
                 }
