@@ -314,6 +314,11 @@ flushes are held, and two writes go to the leader one after the other.
    also takes the reads a light ready gives. It runs under `pipeline.rs`'s random interleavings, including
    `held_commits_across_fates_keep_every_invariant`, which also checks that every answered read saw what was
    committed when it was asked. **Not run yet.**
+4. **An Amphora-level guard for (2)**, `v3_a_leader_counts_no_follower_position_past_its_durable_log` (81043799):
+   both followers' log flushes held, two writes at the leader, the second's barrier answered by heartbeats while the
+   followers hold the first in memory alone. Each follower must hold entries past its durable log, and the
+   leader's progress for it must stay at or below that durable end. It should be red on main (the second write
+   stalls) and green with the fixes. **Not compiled or run yet.**
 
 Checks at 6237d769: clippy `-p amphora --all-targets` clean, clippy `-p hyper-raft -p hyper-durable` (lib) clean
 (r926). `scripts/vendor.py check hyper-raft`: 8 recorded changes, 0 differences.
@@ -328,4 +333,5 @@ flush answers heartbeats without news. A leader whose window to it is full then 
     # cwd ~/.cache/amphora-perf/commits-remote, CARGO_TARGET_DIR=~/.cache/amphora-perf-target/commits, CARGO_INCREMENTAL=0
     cargo test -p amphora --lib --locked -- --exact database::replicated::tests::v3_two_replicated_writes_in_a_row_answer_with_every_log_flush_held   # r922, r926
     cargo test -p amphora --lib --locked -- database::replicated:: --test-threads=8                                                                  # r926
+    cargo test -p amphora --lib --locked -- database::replicated::tests::v3_ --test-threads=2                                                     # not run: refused for room
     cargo test --manifest-path vendor/hyper-raft/Cargo.toml -p hyper-raft --lib --test pipeline --test strategies -- --test-threads=8              # not run: refused for room
