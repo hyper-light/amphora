@@ -5039,7 +5039,10 @@ impl<F: BlockFile + 'static> Actor<F> {
             namespace: String::new(),
             author: Author::Owner,
             response: None,
-            phase: Phase::Barrier(Some(Operation::Call(Mutex::new(Some(call)), AnswerMax::<()>::fixed().get()))),
+            phase: Phase::Barrier(Some(Operation::Call(
+                Mutex::new(Some(call)),
+                AnswerMax::<()>::fixed().get(),
+            ))),
             _reservation: Reservation {
                 control: Arc::clone(&self.control),
                 slot: false,
@@ -5700,9 +5703,9 @@ mod tests {
             Mutex::new(Some(Box::new(|_| Ok(Box::new(()) as Box<dyn Any + Send>)))),
             third,
         );
-        let refused = handle.submit(String::new(), operation, None, until);
+        let refused = handle.submit(String::new(), operation, None, until).err();
         assert!(
-            matches!(refused, Err(Refusal::Full { limit }) if limit == application),
+            matches!(refused, Some(Refusal::Full { limit }) if limit == application),
             "{refused:?}"
         );
         drop(large);
