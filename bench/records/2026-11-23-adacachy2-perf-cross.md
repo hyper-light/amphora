@@ -656,3 +656,28 @@ NOT on main. Main moved after r1582, so the merged tree was checked again (r1601
 - `query_reader`'s writer fallback is charged at admission before it is queued (`Store::on_reader` splits the reader attempt from `read_committed`): its job, its session and `query`'s declared answer. `query_local` and `query_closed` declare no answer, so their fallback charges only the job and session.
 - Test `store::tests::mb1_a_wait_for_room_is_woken_by_the_commit_that_gives_room_back` (room for one row; deadline an hour off; `Counters::room_waits`, new, as its non-vacuity count) replaces tests/store.rs's counted-queue test.
 - Main 4b2a9793 conflicts with 5e5ae655 in crates/amphora/src/store.rs (W3's flusher change): the next lane merges it.
+
+## Units 3 and 4 landed (perf-A17)
+
+**Unit 3 on main (626b0a90).** While unit 3 waited, main's V11 (ad4c0922, CP-T1.8) changed `Database::query`: a replicated query runs past its group's barrier as `Operation::Query`, charged a flat `REQUEST_MAX`. The merge 96b83947 keeps both. The replicated arm submits `Operation::Query` charged `answer.get()`, and `within` checks the answer inside the call, as `call_nowait` does. The attached client's session takes `answer.get()` and `within`. Script `~/.cache/amphora-perf/cross-a17-scripts/check17.sh` (check16.sh with `JOBS`, `STORE` and `BENCH`; adacachy2):
+
+| run | commit | result |
+|---|---|---|
+| r1712 | 96b83947 (b5738b12 + main dd9c3ce7) | needs cpus=4: clippy -p amphora --all-targets clean; lib `a14_` 2/2, `database::admission_charge` 5/5, `database::across` 13/13 (1 ignored), `database::online` 6/6, `database::guards` 13/13, `xgroup::` 34/34, and V11's `a_follower_read_completes_while_another_member_holds_the_write_slot`, `a_replicated_query_that_writes_is_refused_and_writes_nothing`, `a_read_barrier_asks_for_no_slot_and_ends_its_members_own` 1/1 each; load 34-48 |
+| r1732, first half | 848a16c2 (96b83947 + main c75bb13f: engine types, vdbe, functions) | needs cpus=8: the same set, all green; load 28-33 |
+
+Pushed as 626b0a90: 848a16c2 + main 8c426f7b, which moved only crates/pg-parser and docs/requirements.toml. No crate in the workspace or bench depends on amphora-pg-parser, so no new run. A16's r1684 (macOS, b5738b12, never started) was stopped: r1712 had checked the newer merge.
+
+**Unit 4 on main.** 5e5ae655 merged with unit 3's landing (b7910c4a, cf13e776). store.rs conflicted with W3's flusher change (81fc0dca, via 6a3e8ebb) at the writer's take-off of `Msg::Rows` and `Msg::Run`: W3 deleted `Sends::went_busy`, unit 4 the lock-free `room.1.notify_all`. Both deletions are kept. Unit 4 compiled as A16 wrote it.
+
+| run | commit | result |
+|---|---|---|
+| r1732, second half | cf13e776 | needs cpus=8: clippy -p amphora --all-targets clean; lib `store::` 5/5 (`mb1_` among them), `database::` 253/254 (6 ignored), `xgroup::` 34/34; tests/store.rs 14/14; bench clippy 164 findings (main's own count), 0 compile errors, none on unit 4's `row_bytes` lines; load 33-48 |
+| foreground, no id | 848a16c2 and cf13e776 lib binaries | `database::`'s failure alone, `t_t1_10_r1_a_session_reads_its_write_on_a_lagging_follower`: 10/10 pass on each binary; load 31-36 |
+| r1756 | the same binaries, `database::` at 8 threads | round 1: 848a16c2 (no unit 4) fails the same test (253/254), cf13e776 passes 254/254; load 23-51 |
+
+The failure is main's own: session_reads.rs:122 asserts `counters.waited == 1` once `behind` was read before the reading thread starts, so under the suite's load the follower can catch up before the read waits. It fails on the arm without unit 4. Pushed as the merge of cf13e776 with main 626b0a90, which moved only crates/pg-parser, docs/requirements.toml and records past cf13e776's own.
+
+Seen on the way, not changed:
+- `Budget::hold` refuses `Unavailable` where the memory limit can't be read. `Store::charge` treats every refusal as no room, so on such a platform a batch with a nonzero `row_bytes` is refused `Full` at once, as `Admission::charge` already refuses a database's requests there.
+- r1740 (the first try of the 10/10 runs) ended and was collected before its output was read: the kiln server did not answer in time.
