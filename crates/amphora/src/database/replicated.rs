@@ -862,9 +862,10 @@ struct Changing {
 enum Stage {
     /// Waiting for the ReadIndex that shows this leader current and its configuration applied.
     Barrier,
-    /// Past its barrier, its configuration past the group's member bound, waiting for the write
-    /// under way to end before the entry that raises the bound moves the point under it (lane
-    /// constants-21).
+    /// Past its barrier, waiting for the write under way to end: its configuration past the
+    /// group's member bound, before the entry that raises the bound moves the point under it (lane
+    /// constants-21), or a promotion, before its floor check reads the database a caller's session
+    /// holds (CP-T1.13).
     Raising,
     /// Proposed at `index`, in this leader's term.
     Proposed { index: u64 },
@@ -994,7 +995,7 @@ struct Actor<F: BlockFile + 'static = LogDevice> {
     sessions: Sessions,
     // The session worker's result, taken as the step began: decided once its drive applied what
     // committed while the session ran (`Actor::decide`).
-    ran: Option<Ran>,
+    ran: Option<Back>,
     // What this owner's restarts of its database's log held, against what it applied
     // (replication.md, "A replica's database log bounded by what it measures").
     spacing: log_bound::Spacing,
@@ -1087,14 +1088,17 @@ enum Flushing {
 /// and the owner's bell rings: the owner takes it on the step the ring wakes, never by polling.
 struct Sessions {
     ask: mpsc::SyncSender<Session>,
-    done: mpsc::Receiver<Ran>,
+    done: mpsc::Receiver<Back>,
     /// Whether a session is out: the write lock is lent and applies are held until it comes back.
     out: bool,
 }
 /// A caller's session as the worker runs it: prepared at the base the owner handed over.
-type Session = Box<dyn FnOnce(&mut Db) -> Ran + Send>;
+type Session = Box<dyn FnOnce(&mut Db) -> Back + Send>;
 /// What a session prepared, and its answer, or why it failed.
 type Ran = Result<(crate::replication::Prepared, Answer), Refusal>;
+/// A session's result with its operation handed back: data, which a lead moved while it ran
+/// sends back to wait for the next lead, or a call, spent (`Actor::decide`).
+type Back = (Ran, Operation);
 
 impl Sessions {
     /// The worker, its connection opened as the owner starts: it waits on its job channel and
@@ -1143,7 +1147,7 @@ impl Sessions {
         Ok(())
     }
     /// The session's result if it came back.
-    fn take(&mut self) -> Result<Option<Ran>, Refusal> {
+    fn take(&mut self) -> Result<Option<Back>, Refusal> {
         if !self.out {
             return Ok(None);
         }
@@ -3768,6 +3772,12 @@ impl<F: BlockFile + 'static> Actor<F> {
             Err(Refusal::Timeout)
         } else if changing.term != self.replica.term() || !self.replica.is_leader() {
             Err(not_leader(self.replica.leader()))
+        } else if self.sessions.out && matches!(changing.change, MemberChange::Promote(_)) {
+            // A promotion's floor check reads the database, whose write lock a caller's session
+            // holds: it waits for that write to end (`raise_waiting`), as a raise does (CP-T1.13).
+            changing.stage = Stage::Raising;
+            self.changing = Some(changing);
+            return;
         } else {
             match self.member_change(changing.change) {
                 Ok(None) => Ok(status(&self.replica)),
@@ -4244,17 +4254,9 @@ impl<F: BlockFile + 'static> Actor<F> {
     /// A learner becomes a voter only on its attestation of the floor in force, under its current
     /// join, at or above it (replication.md, "How it composes with membership changes"). It is read
     /// on a quiescent tail, so the state read is the state at the change's index; a tail still to
-    /// apply is answered at once, never waited on. A group with no floor promotes as before.
+    /// apply is answered at once, never waited on. A group with no floor promotes as before. A
+    /// caller's session out on the worker was waited for (`propose_change`).
     fn admits_voter(&mut self, member: u64) -> Result<(), Refusal> {
-        // A caller's session holds the database's write lock: refused at once, as a tail still to
-        // apply is, never waited on.
-        if self.sessions.out {
-            let refusal = unavailable(format!(
-                "a caller's session holds the database; promote {member} once it ends"
-            ));
-            floor_refused(&self.control, FloorRefusal::Busy, &refusal);
-            return Err(refusal);
-        }
         let (floor, attested) = self.replica.machine_mut().read_db(|db| {
             let Some(floor) = super::application::policy(db)? else {
                 return Ok((None, None));
@@ -5580,9 +5582,10 @@ impl<F: BlockFile + 'static> Actor<F> {
             Arc::clone(&self.clock),
         );
         self.sessions.hand(Box::new(move |db: &mut Db| {
-            crate::replication::prepare_at(db, &base, |db| {
+            let ran = crate::replication::prepare_at(db, &base, |db| {
                 run_session(db, &operation, &namespace, claim.as_ref(), until, clock)
-            })
+            });
+            (ran, operation)
         }))?;
         self.replica.hold_apply(true);
         pending.phase = Phase::Running;
@@ -5591,13 +5594,14 @@ impl<F: BlockFile + 'static> Actor<F> {
     }
     /// Decides the write whose session came back from the worker, once this step's drive applied
     /// what committed while it ran: proposed if this member keeps the lead it had in the write's
-    /// term, else refused `NotLeader`, a known outcome since nothing was proposed for it. Its
-    /// session is spent and never runs again.
+    /// term. If the lead moved, nothing was proposed for it: data waits for the next lead, as a
+    /// write whose lead moved before its preparation does (`requeue`), and a call, its closure
+    /// spent, is refused `NotLeader`, a known outcome, never run again (CP-T1.13).
     fn decide(&mut self) -> Result<(), Refusal> {
-        let Some(ran) = self.ran.take() else {
+        let Some((ran, operation)) = self.ran.take() else {
             return Ok(());
         };
-        let Some(pending) = self.pending.take() else {
+        let Some(mut pending) = self.pending.take() else {
             return Ok(());
         };
         if !matches!(pending.phase, Phase::Running) {
@@ -5608,6 +5612,14 @@ impl<F: BlockFile + 'static> Actor<F> {
         let moved = pending.term != self.replica.term()
             || pending.leader != self.replica.leader()
             || self.replica.leader() == 0;
+        if moved
+            && !matches!(operation, Operation::Call(_))
+            && ran.as_ref().is_ok_and(|(prepared, _)| !prepared.is_empty())
+        {
+            pending.phase = Phase::Barrier(Some(operation));
+            self.requeue(pending);
+            return Ok(());
+        }
         self.settle(pending, ran, moved)
     }
     /// A prepared write proposed, or answered: at once if it wrote nothing, refused if past its
