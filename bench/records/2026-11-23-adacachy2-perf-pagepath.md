@@ -293,7 +293,7 @@ section has no numbers. The hour went to the coordinator's rules in decision 45,
 files as the one-segment state. An open or crashed Amphora database carries 3 in bytes 18 and 19 from its first
 commit on, in the file and in every later frame of page 1, so plain SQLite refuses it (it reads page 1 through `-wal`
 whenever that file exists, so the mark has to be in both). A clean close folds both segments in, syncs the file,
-truncates both segments, and only then writes 2 in place and syncs again. A close that cannot fold leaves 3. The crash
+truncates both segments and syncs them, and only then writes 2 in place and syncs again. A close that cannot fold leaves 3. The crash
 test now covers each step of the close in place of the deleted upgrade, and a new test has SQLite itself read a
 cleanly closed file and refuse an open one. The engine's workspace has no SQLite for that test: `rusqlite` (bundled)
 is only in `bench/`.

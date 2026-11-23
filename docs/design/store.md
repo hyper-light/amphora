@@ -2229,12 +2229,14 @@ segment `Current`, the other `Free`), read by the same recovery.
   that first commit on it is in both. Any other value stays `Corrupt("Invalid read_version: …")` at open (2184-2190).
 - *A cleanly closed Amphora database is a plain SQLite file.* The last connection's close (`Connection::close`,
   `Pager::checkpoint_shutdown`) folds both segments into the file. It copies the closing segment, then the current
-  one, syncs the file, and truncates both segments to nothing. Only then does it write 2 into bytes 18 and 19 of the
-  file's first page, in place and not through the log, and sync the file again. sqlite3 and other tools then read a
-  WAL-mode file with an empty log. The order is the rule. A 2 written while either segment still holds frames lets
-  SQLite read `-wal` alone: it misses `-wal2`'s commits, or reads the closing segment's older frames over the newer
-  pages in the file. A 2 written through the log is such a frame. A crash at any step of the close before the 2's
-  sync leaves 3: SQLite refuses the file, and Amphora recovers it as it recovers any crash. A close that cannot fold
+  one, syncs the file, truncates both segments to nothing and syncs them. Only then does it write 2 into bytes 18 and
+  19 of the file's first page, in place and not through the log, and sync the file again. sqlite3 and other tools
+  then read a WAL-mode file with an empty log. The order is the rule. A 2 that is durable while either segment still
+  holds frames, or while a truncation is not, lets SQLite read `-wal` alone: it misses `-wal2`'s commits, or reads the
+  closing segment's older frames over the newer pages in the file. A 2 written through the log is such a frame. A
+  crash before the 2 is written leaves 3: SQLite refuses the file, and Amphora recovers it as it recovers any crash.
+  A crash while it is written leaves 3 or 2, and with 2 every commit is already in the file and both segments are
+  empty. A close that cannot fold
   (the shutdown checkpoint gives up after three `Busy` answers, as it does today) also leaves 3: that database was not
   closed cleanly, and SQLite refuses it.
 
