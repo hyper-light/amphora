@@ -45,6 +45,21 @@ index cfc432f32226fc7740b98ff93ad7a87954b46610..2b5de67055450aa96e4a556ebc467f19
          }
      }
  }
+diff --git a/crates/hyper-durable/src/machine.rs b/crates/hyper-durable/src/machine.rs
+index 18ea679fa1853c4268153600c195c5facb24998c..4880eea720c963dbd6023fe5f5214af8810756c6 100644
+--- a/crates/hyper-durable/src/machine.rs
++++ b/crates/hyper-durable/src/machine.rs
+@@ -59,8 +59,8 @@ pub trait StateMachine {
+     fn image(&mut self, into: &mut Vec<u8>) -> Result<(Point, ConfState), Fatal>;
+ 
+     /// The bytes [`StateMachine::image`] would write now, or none for a machine that keeps no
+-    /// image. Asked when a member opens on a log never compacted: the compaction rule weighs the
+-    /// log against the image it was last compacted to ([`crate::Compaction`]), and before the
++    /// image, counted without making it. Asked when a member opens: the compaction rule weighs
++    /// the log against the image it was last compacted to ([`crate::Compaction`]), and before the
+     /// first, against the state the member opened with, which a group formed with state (a range
+     /// split from another) holds already. A machine that keeps none is never due.
+     fn image_bytes(&self) -> Option<u64>;
 diff --git a/crates/hyper-durable/src/replica.rs b/crates/hyper-durable/src/replica.rs
 index 4d1720b9db9ecb12ed7369d73e1cdb8b6c745bc1..5288ddb5557c06d9ced2971d81def3179501fe3c 100644
 --- a/crates/hyper-durable/src/replica.rs
@@ -104,3 +119,16 @@ index 4d1720b9db9ecb12ed7369d73e1cdb8b6c745bc1..5288ddb5557c06d9ced2971d81def317
      /// Makes the state machine's applied state durable and lets the log free what is before it,
      /// keeping `keep` entries for members that lag; true when a compaction's start went out.
      /// The start never passes the state machine's durable index (I8) nor what the log holds
+diff --git a/crates/hyper-durable/tests/shell.rs b/crates/hyper-durable/tests/shell.rs
+index ab0abd82e2a7b5a56fa167ad88fdf2303582a953..008c26aafd502ccb2fe6f86e0d31bbedb6d99c13 100644
+--- a/crates/hyper-durable/tests/shell.rs
++++ b/crates/hyper-durable/tests/shell.rs
+@@ -2192,7 +2192,7 @@ fn a_member_that_reopens_counts_what_its_log_holds() {
+         Unbounded,
+     )
+     .unwrap();
+-    // Its log compacted, the member made an image at open, of everything applied.
++    // Its log compacted, it is weighed against the image of everything applied.
+     let image = image_of(&mut r);
+     r.campaign().unwrap();
+     pump(&mut r);
