@@ -58,7 +58,7 @@ use super::changes::ChangeLog;
 use super::packed::{self, LogFormat, Record, Records};
 use super::pager::PageRef;
 pub use super::pager::{PageContent, PageInner};
-use super::wal::{OverflowFallbackCoverage, TursoRwLock, WalSharedMetadata, WalSharedRuntime};
+use super::wal::{OverflowFallbackCoverage, PaddedLock, TursoRwLock, WalSharedMetadata, WalSharedRuntime};
 use crate::error::LimboError;
 use crate::fast_lock::SpinLock;
 use crate::io::{Buffer, Completion, CompletionGroup, FileSyncType, ReadComplete};
@@ -1577,7 +1577,7 @@ impl BuildSharedWal {
         let size = file.size()?;
 
         let header = Arc::new(crate::storage::wal::HeaderCell::new(WalHeader::default()));
-        let read_locks = std::array::from_fn(|_| TursoRwLock::new());
+        let read_locks = std::array::from_fn(|_| PaddedLock::new(TursoRwLock::new()));
         for (i, l) in read_locks.iter().enumerate() {
             l.write();
             l.set_value_exclusive(if i < 2 { 0 } else { READMARK_NOT_USED });
@@ -1602,9 +1602,9 @@ impl BuildSharedWal {
                 frame_cache_high_water: AtomicU64::new(0),
                 file: Some(file.clone()),
                 read_locks,
-                vacuum_lock: TursoRwLock::new(),
-                write_lock: TursoRwLock::new(),
-                checkpoint_lock: TursoRwLock::new(),
+                vacuum_lock: PaddedLock::new(TursoRwLock::new()),
+                write_lock: PaddedLock::new(TursoRwLock::new()),
+                checkpoint_lock: PaddedLock::new(TursoRwLock::new()),
                 released: Arc::default(),
                 epoch: AtomicU32::new(0),
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
