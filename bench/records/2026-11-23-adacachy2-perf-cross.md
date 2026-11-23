@@ -676,7 +676,16 @@ Pushed as 626b0a90: 848a16c2 + main 8c426f7b, which moved only crates/pg-parser 
 | foreground, no id | 848a16c2 and cf13e776 lib binaries | `database::`'s failure alone, `t_t1_10_r1_a_session_reads_its_write_on_a_lagging_follower`: 10/10 pass on each binary; load 31-36 |
 | r1756 | the same binaries, `database::` at 8 threads | round 1: 848a16c2 (no unit 4) fails the same test (253/254), cf13e776 passes 254/254; load 23-51 |
 
-The failure is main's own: session_reads.rs:122 asserts `counters.waited == 1` once `behind` was read before the reading thread starts, so under the suite's load the follower can catch up before the read waits. It fails on the arm without unit 4. Pushed as the merge of cf13e776 with main 626b0a90, which moved only crates/pg-parser, docs/requirements.toml and records past cf13e776's own.
+The failure is main's own: session_reads.rs:122 asserts `counters.waited == 1` once `behind` was read before the reading thread starts, so under the suite's load the follower can catch up before the read waits. It fails on the arm without unit 4.
+
+Main moved inside `crates/` twice more before the push, so each merge was checked again with the same set:
+
+| run | commit | result |
+|---|---|---|
+| r1762 | a36e1cce (22ccfa30 + main 41422da9: R5's engine sums and column scans) | needs cpus=8: clippy clean; lib `store::` 5/5, `database::` 254/254 (6 ignored), `xgroup::` 34/34; tests/store.rs 14/14; bench clippy 164 findings, 0 compile errors, none on unit 4's lines; load 21-34 |
+| r1776 | 3c9425d3 (a36e1cce + main ef34f511: W4's store.rs, decision 9, and its crash test) | needs cpus=8: clippy clean; lib `store::` 5/5, `database::` 254/254 (6 ignored), `xgroup::` 34/34; tests/store.rs 14/14; tests/crash.rs 10/10 (3 ignored); bench clippy 164 findings, 0 compile errors, none on unit 4's lines; load 19-37 |
+
+3c9425d3 conflicted in store.rs's `Sends`: W4 replaced `claimed: Mutex<u64>` with `claims: Mutex<Claims>`, unit 4 made `room` a `(Mutex<u64>, Condvar)`. Both kept.
 
 Seen on the way, not changed:
 - `Budget::hold` refuses `Unavailable` where the memory limit can't be read. `Store::charge` treats every refusal as no room, so on such a platform a batch with a nonzero `row_bytes` is refused `Full` at once, as `Admission::charge` already refuses a database's requests there.
