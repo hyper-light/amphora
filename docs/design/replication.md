@@ -3066,6 +3066,18 @@ length, and the owner takes none until it has the result back.
    UnknownOutcome: nothing was proposed. The worker's transaction always rolls back (`prepare_traced`), and a result
    that comes back to no owner is dropped with its charges.
 
+### Where the hold goes in hyper-durable
+
+The replica already keeps committed entries back behind its durability fence: `Replica::apply_range` extends
+`fence`'s range while one is held, `release_fence` applies the range once the durable commit covers its first entry
+(or at the next drive for a paged one), and `RawNode::pause_apply` keeps the core from giving out more meanwhile
+(vendor/hyper-raft/crates/hyper-durable/src/replica.rs). The owner's hold is one more reason for that same range to
+wait, not a second mechanism: while it is set, `apply_range` with no fence opens one and pauses, and
+`release_fence` returns before applying. Lifting it leaves the range to `release_fence`'s own rule at the next
+drive (the durable commit covering its first entry), so the durability fence promises what it promised before.
+Entries a `Ready` gave out before the hold was taken were applied in that step's drive or wait behind the fence
+already, so the session's base is the applied point the owner hands over.
+
 ### The candidates weighed
 
 - **A database thread** doing every write to the database (applies, sessions, refreshes, the floor's reads and
