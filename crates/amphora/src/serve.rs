@@ -2443,7 +2443,7 @@ mod tests {
         let read = statement(sql, vec![]);
         let frames = db
             .query_local(until, move |c| answered(c, vec![read], spill))
-            .unwrap_or_else(|refusal| vec![refused_frame(refusal).unwrap()]);
+            .unwrap_or_else(|refusal| Frames::one(refused_frame(refusal).unwrap()));
         let mut link = answering.lock().unwrap();
         for frame in &frames {
             let _ = write_frame(link.get_mut(), &frame.bytes);
