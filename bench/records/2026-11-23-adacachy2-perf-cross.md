@@ -451,3 +451,16 @@ Still at `REQUEST_MAX`, so not done (the rest of 3a):
   not on main at 4c529b66, and removing them first would let waiting calls refuse the heartbeat that finds a
   leader (the pressure test above). Log appends (`Input::Receive`) are already charged their bytes.
 
+What is left for the next cross lane (3a's rest above; 3b and 4 not started here):
+
+- 3b. serve.rs `Shared::sql`'s write calls `db.call(until, AnswerMax::bytes(RESULT_MAX), ..)`. Each frame's bytes
+  are held by its own `memory::Charge` (`frame`), and `Encoded::answer_bytes` counts only unheld bytes, so what
+  the declared bound covers is the `Vec<Encoded>` spine: `size_of::<Encoded>()` a frame plus spare capacity,
+  with no frame count known before the call. A sketch: a `Frames { list: Vec<Encoded>, spine: Charged }` whose
+  `push` charges `(new_cap - cap) * size_of::<Encoded>()` before `try_reserve_exact`, used by `Spill::Held` and
+  `answered`, its `AnswerBytes` its own size (all else held), declared `AnswerMax::bytes(size_of::<Frames>())`.
+  The spine's charge must last until the frames are written, so `Shared::sql` and its writer take `Frames`, not
+  `Vec<Encoded>` (refusal and Hello frames an uncharged one-frame list).
+- 4. `store::Config::queue`, `ROOM_LOOK` and its re-looks, and bench/src/store.rs's `AMPHORA_QUEUE` (bba65c73)
+  are as A10 found them.
+
