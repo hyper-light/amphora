@@ -1095,8 +1095,23 @@ struct Sessions {
 }
 /// A caller's session as the worker runs it: prepared at the base the owner handed over.
 type Session = Box<dyn FnOnce(&mut Db) -> Back + Send>;
-/// What a session prepared, and its answer, or why it failed.
-type Ran = Result<(crate::replication::Prepared, Answer), Refusal>;
+/// What a session prepared, as its entry, and its answer, or why it failed.
+type Ran = Result<(Encoded, Answer), Refusal>;
+/// A prepared write's entry, encoded and stamped where the write was prepared, its proposer's
+/// clock written in as it is proposed (`Actor::propose_stamped`): none if the write changed
+/// nothing, and the encoding's refusal if it is past the entry's bound.
+type Encoded = Option<Result<Vec<u8>, Refusal>>;
+
+/// `prepared`'s entry, made on the thread that prepared it: a caller's on the session worker, so
+/// the copies of a large write never hold the owner's ticks, heartbeats and votes (CP-T1.13,
+/// replication.md "Decision (lane P9)", part 3).
+fn encoded(prepared: &crate::replication::Prepared) -> Encoded {
+    (!prepared.is_empty()).then(|| {
+        prepared
+            .encode()
+            .map(|bytes| crate::replication::closed::stamp(0, &bytes))
+    })
+}
 /// A session's result with its operation handed back: data, which a lead moved while it ran
 /// sends back to wait for the next lead, or a call, spent (`Actor::decide`).
 type Back = (Ran, Operation);
@@ -5282,15 +5297,25 @@ impl<F: BlockFile + 'static> Actor<F> {
     /// closed time"): every entry an owner proposes carries one, its room taken out of
     /// [`Actor::entry_room`].
     fn propose(&mut self, context: &[u8], bytes: Vec<u8>) -> Result<(), Refusal> {
+        self.propose_stamped(context, crate::replication::closed::stamp(0, &bytes))
+    }
+    /// Proposes `stamped`, an entry `closed::stamp` made, its stamp written now: the copy was
+    /// made before, where the write was prepared, so this step's work does not grow with the
+    /// entry (CP-T1.13).
+    fn propose_stamped(&mut self, context: &[u8], mut stamped: Vec<u8>) -> Result<(), Refusal> {
+        let entry = stamped
+            .len()
+            .checked_sub(crate::replication::closed::STAMP_BYTES)
+            .ok_or_else(|| fenced("a stamped entry shorter than its stamp"))?;
         api::bound(
             "replication log entry",
-            bytes.len(),
+            entry,
             self.entry_room(context.len())?,
         )?;
         // The receive rule (Kulkarni et al., OPODIS 2014): past every stamp a step carried in.
         let observed = self.control.observed.load(Ordering::Acquire);
         let now = self.wall_now()?.max(observed.saturating_add(1));
-        let mut stamped = crate::replication::closed::stamp(now, &bytes);
+        crate::replication::closed::restamp(now, &mut stamped)?;
         // The leader's own write appends right after its last entry, as a member's forward does
         // (`step_forward`), and prepared on its applied state, behind the forwards its log holds
         // uncommitted: the same read-set check moves its base past them, or its apply refuses it
@@ -5556,7 +5581,8 @@ impl<F: BlockFile + 'static> Actor<F> {
         if bounded && let Err(Refusal::Fenced(reason)) = &prepared {
             return Err(fenced(reason));
         }
-        self.settle(pending, prepared, false)
+        let ran = prepared.map(|(prepared, answer)| (encoded(&prepared), answer));
+        self.settle(pending, ran, false)
     }
     /// Hands a caller's session to the session worker, lent the database's write lock: this
     /// owner applies nothing until it comes back (replication.md, "Decision (lane P6)"). Its base
@@ -5584,7 +5610,8 @@ impl<F: BlockFile + 'static> Actor<F> {
         self.sessions.hand(Box::new(move |db: &mut Db| {
             let ran = crate::replication::prepare_at(db, &base, |db| {
                 run_session(db, &operation, &namespace, claim.as_ref(), until, clock)
-            });
+            })
+            .map(|(prepared, answer)| (encoded(&prepared), answer));
             (ran, operation)
         }))?;
         self.replica.hold_apply(true);
@@ -5614,7 +5641,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             || self.replica.leader() == 0;
         if moved
             && !matches!(operation, Operation::Call(_))
-            && ran.as_ref().is_ok_and(|(prepared, _)| !prepared.is_empty())
+            && ran.as_ref().is_ok_and(|(entry, _)| entry.is_some())
         {
             pending.phase = Phase::Barrier(Some(operation));
             self.requeue(pending);
@@ -5626,36 +5653,37 @@ impl<F: BlockFile + 'static> Actor<F> {
     /// deadline, or `NotLeader` if the lead `moved` while its session ran.
     fn settle(&mut self, mut pending: Pending, prepared: Ran, moved: bool) -> Result<(), Refusal> {
         let result = match prepared {
-            Ok((prepared, value)) => {
+            Ok((entry, value)) => {
                 if self.at >= pending.until {
                     Err(Refusal::Timeout)
-                } else if prepared.is_empty() {
+                } else if let Some(entry) = entry {
+                    if moved {
+                        Err(not_leader(self.replica.leader()))
+                    } else {
+                        match entry
+                            .and_then(|stamped| self.propose_stamped(&pending.context, stamped))
+                        {
+                            Ok(()) => {
+                                if self.replica.is_leader() {
+                                    #[cfg(test)]
+                                    if self.slots.turn() {
+                                        self.turn_context = Some(pending.context.clone());
+                                        self.turns.0 = self.turns.0.saturating_add(1);
+                                    }
+                                    self.slots.took_turn();
+                                }
+                                pending.phase = Phase::Proposed(value);
+                                self.pending = Some(pending);
+                                return Ok(());
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                } else {
                     Ok(Answered {
                         answer: value,
                         token: None,
                     })
-                } else if moved {
-                    Err(not_leader(self.replica.leader()))
-                } else {
-                    match prepared
-                        .encode()
-                        .and_then(|bytes| self.propose(&pending.context, bytes))
-                    {
-                        Ok(()) => {
-                            if self.replica.is_leader() {
-                                #[cfg(test)]
-                                if self.slots.turn() {
-                                    self.turn_context = Some(pending.context.clone());
-                                    self.turns.0 = self.turns.0.saturating_add(1);
-                                }
-                                self.slots.took_turn();
-                            }
-                            pending.phase = Phase::Proposed(value);
-                            self.pending = Some(pending);
-                            return Ok(());
-                        }
-                        Err(error) => Err(error),
-                    }
                 }
             }
             Err(error) => Err(if self.at >= pending.until {
