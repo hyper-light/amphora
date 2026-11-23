@@ -3328,11 +3328,7 @@ impl ShmWalCoordination {
         };
         // Decision 45: the read counts on its segments in its slot, where every process's
         // checkpointer sees it, before the snapshot's check below.
-        if !self.authority.count_read(reader, span) {
-            self.authority.unregister_reader_for_snapshot(reader);
-            read_locks[read_lock_idx].unlock();
-            return false;
-        }
+        let counted = self.authority.count_read(reader, span);
         aristo::intent_stmt!(
             "After the slot is registered, the shared snapshot is compared again, and any \
              difference releases both the slot and the local read lock. A checkpoint that \
@@ -3343,8 +3339,10 @@ impl ShmWalCoordination {
             id = "reader_rechecks_snapshot_after_registration",
             parent = "checkpoint_safe_frame_below_every_reader"
         );
-        if self.load_snapshot() != snapshot {
-            self.authority.uncount_read(reader, span);
+        if !counted || self.load_snapshot() != snapshot {
+            if counted {
+                self.authority.uncount_read(reader, span);
+            }
             self.authority.unregister_reader_for_snapshot(reader);
             read_locks[read_lock_idx].unlock();
             return false;

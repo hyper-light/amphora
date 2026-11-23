@@ -245,14 +245,19 @@ impl Segments {
         } else {
             SegmentId::Second
         };
-        Self {
-            current,
-            reads: 0,
-            other: (word & CLOSING != 0).then(|| Closing {
+        let other = if word & CLOSING == 0 {
+            None
+        } else {
+            Some(Closing {
                 reads: 0,
                 copied: word & COPIED != 0,
                 shipped: word & SHIPPED != 0,
-            }),
+            })
+        };
+        Self {
+            current,
+            reads: 0,
+            other,
         }
     }
 
