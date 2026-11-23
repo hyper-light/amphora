@@ -267,7 +267,7 @@ pub struct Wait {
 
 fn asked(e: &LimboError) -> u64 {
     match e {
-        LimboError::MemoryBudget { asked, .. } => *asked,
+        LimboError::MemoryBudget(full) => full.asked,
         _ => 0,
     }
 }
@@ -487,12 +487,12 @@ impl Copies {
     /// statement pays the rent again and the one after buys again; B, it waits for room for
     /// `expected` bytes and what its table grows by.
     fn let_go(&self, db: &VDatabase, tree: u64, refused: LimboError, expected: u64) -> Result<()> {
-        let LimboError::MemoryBudget {
-            asked, held, limit, ..
-        } = refused
-        else {
+        let LimboError::MemoryBudget(full) = refused else {
             return Err(refused);
         };
+        let crate::BudgetFull {
+            asked, held, limit, ..
+        } = *full;
         let now = tick(self.base);
         let rebuy = self.rebuy();
         self.tables.lock().remove(&tree);
@@ -1039,12 +1039,12 @@ mod tests {
     impl Source for Refuses {
         fn take(&self, what: &'static str, bytes: u64) -> Result<()> {
             if what == self.what {
-                return Err(LimboError::MemoryBudget {
+                return Err(LimboError::MemoryBudget(Box::new(crate::BudgetFull {
                     what,
                     asked: bytes,
                     held: 0,
                     limit: 0,
-                });
+                })));
             }
             Ok(())
         }
