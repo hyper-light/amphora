@@ -899,3 +899,138 @@ process per engine, not alternated: read a ratio under 2x as noise. answers.py: 
   merged. No TPC-H column has a custom type in the SQLite dialect, so no benchmark query hits it.
 - q19 under the Postgres dialect: not checked.
 - clippy --all-features: not touched; it does not block the bench build.
+
+# Lane T11 (tpch), 2026-11-23 19:46Z to 20:41Z: q03's limiter located, not fixed; profile.sh not built
+
+Losses first: q03 is no faster. bench/profile.sh (the coordinator's order at about 20:20Z) is not
+built, and per-operator time is not built. Machine: adacachy2, every run named onto it, load 25 to 79
+on 32 cores. No timed claim below beyond a single run's numbers.
+
+## 0. T10's IN-filter test (f9082cc7) and fix (3a5aa8e1): neither merged
+
+r1489, debug, one worktree (`~/.cache/tpch-ab/97a9f956`), `cargo test -p amphora-engine --lib
+t10_an_in_filter`: the test fails at its first assert both without the fix and with it,
+`left: Ok(["300"]) right: Ok(["200"])` (optimizer/mod.rs:4630). The CASE form, which takes no
+filter, answers 300 where the test expects 200, so the test shows nothing about the IN filter. Both
+commits stay on perf/tpch, off main.
+
+## 1. Profiling on adacachy2
+
+- samply refuses there: `perf_event_paranoid` is 2 and samply needs 1 or lower (root to change).
+  `perf` is not installed. The MacBook Pro 2 (e30189ea) has no samply either.
+- e7067f8c: `AMPHORA_PROFILE=<prefix>` now samples `--planner`'s query runs with main.rs's profiler
+  (pprof, a timer signal at 997 Hz, no perf events), writing `<prefix>.txt`, `.folded` and `.svg`.
+  It covers the bench's own process only, so it is not the general profile.sh. Clippy: no finding
+  on the new lines (the bench binary has 162 findings on main, all println, env::args and sleep).
+- r1506: q03 at SF1, target `amphora` (serial, adaptive joins off), the counted run then 5 timed
+  runs, calibration copied from d5e901f3's (body sha256 faba8ac5eb119381). Profile:
+  `~/.cache/tpch-t11/q03-e7067f8c.{txt,folded,svg}` on adacachy2.
+
+## 2. What the profile and the plans show
+
+DuckDB at 1 thread (the `duckdb` target sets `threads = 1`): best 87.6 ms of 5, range 87.6 to 133.6
+(T10's r1431). Amphora serial best 999 ms there. The per-core gap is 11.4x on best times.
+
+The timed runs re-plan q03. Five timed runs on main eb365f3d plus e7067f8c used five plans:
+
+| run | ms | plan (EXPLAIN QUERY PLAN as the bench recorded it for that run) |
+|---|---|---|
+| 0 | 1,270 | SCAN lineitem / SEARCH orders by rowid / SEARCH customer by rowid |
+| 1 | 822 | SCAN orders / SEARCH customer by rowid / SEARCH lineitem USING INDEX sqlite_autoindex_lineitem_1 (l_orderkey=?) |
+| 2 | 808 | HASH JOIN orders (build customer) / SEARCH lineitem USING INDEX sqlite_autoindex_lineitem_1 |
+| 3 | 1,740 | HASH JOIN customer / SEARCH lineitem USING INDEX sqlite_autoindex_lineitem_1 / SCAN orders |
+| 4 | 1,107 | MATERIALIZE hash build input for orders / HASH JOIN orders / SCAN customer / HASH JOIN lineitem |
+
+T10's r1431 at d5e901f3 shows the same: run 0 5,764 ms on SCAN customer / SEARCH orders USING INDEX
+orders_custkey / SEARCH lineitem USING INDEX sqlite_autoindex_lineitem_1, then the hash-hash plan
+in runs 1 to 4 (999 to 1,245 ms). The counted run's estimates are close to its actual rows:
+customer's hash build 29,963 estimated against 30,142 rows, the orders prefix 141,331 against
+147,126. So bad estimates do not explain the plan changes. What does is not found: the `amphora`
+target has adaptive joins off; T4's section 3 says every timed run moves the learned costs
+(`observe`), which every prepare reads.
+
+The profile, split by stack (6,080 samples): the timed runs 4,654 (76.5%), the counted run 1,420
+(23.4%). Within the timed runs, by opcode: Column 37.7% (its deferred-seek path is 11% of all
+samples), Next 15.4%, Seek on an index 9.0%, SeekRowid 6.6%, HashBuild 5.2%, Filter 4.2%,
+StarProbes 2.6%. By leaf: read_varint 13.4%, swap_bytes 8.0%, can_advance_within_leaf 7.5%,
+locate_past_kept 4.8%, cell_read_payload_at 4.2%. The seeks are the index plans' per-row lookups;
+the hash-hash plan's own program (its bytecode EXPLAIN) has no index cursor.
+
+Two limiters, from these numbers:
+1. Plan choice across runs. One query at one scale on one connection ran 808 to 1,740 ms (2.2x)
+   as its plan changed, and 5,764 ms in T10's first run.
+2. Row decoding and B-tree cursor work within any one plan: read_varint, swap_bytes,
+   can_advance_within_leaf and cell_read_payload_at are 33.1% of the timed samples as leaves.
+   The best run (808 ms) is still 9.2x DuckDB's 87.6 ms.
+
+Not recorded: the planning time per run (`search_ms`, `prepare_ms` are in
+`~/.cache/tpch-t11/prof-q03-e7067f8c.jsonl` but adacachy2 had no idle core to read them at 20:24Z),
+per-operator time, and the costs of the plans the planner weighed.
+
+## 3. Next, in order
+
+- bench/profile.sh: samply on macOS and on Linux where `perf_event_paranoid` is 1 or lower. On
+  adacachy2 (2, no perf, no root) it needs a sampler that uses no perf events for any command
+  (an LD_PRELOAD timer-signal sampler, or perf from a package). Install samply on the Macs first.
+- Per-operator actual rows and time for one statement: the counted run already gives estimated
+  against actual rows per plan position (`counts`); time per operator is missing.
+- Then find what changes q03's plan between timed runs, and print the costs of the plans it weighs.
+
+# Lane T12 (tpch), 2026-11-23 20:33Z to 21:28Z: q03's re-planning traced to two moving inputs; not fixed
+
+Losses first: the plan still changes from run to run. The versioned cost snapshot is not built, no
+test pins it, nothing is merged to main but this record. The trace (5694e705 on perf/tpch-t12) has
+not passed clippy yet (r1572 queued at 21:17Z). Load 83 to 88 on 32 cores, CPU pressure avg10 36 to
+46%: one run, a trace, not a timing.
+
+## 1. The trace
+
+5694e705 adds debug events on `amphora::join_search`: the weights each prepare plans on (learned or
+pinned, the page-miss share, the fitted weights), the tables, and the cost of every whole plan the
+search weighs (left-deep at the full mask, and bushy). The bench prints them under
+`AMPHORA_PLAN_TRACE=1`. r1568, adacachy2: `SHA=5694e705 bash ~/.cache/tpch-t12/trace.sh` (T11's
+`db-sf1` and its calibration, body sha256 faba8ac5eb119381; q03, target `amphora`, the counted run
+then 5 timed runs on one connection). Output: `~/.cache/tpch-t12/trace-q03-5694e705.{jsonl,log}`.
+
+Each run prepares twice (the bench's EXPLAIN, then the run). Both prepares of a run saw the same
+inputs and weighed the same plans at the same costs, every time. Between runs the inputs moved:
+
+| prepare | seek | hash build | hash probe | row in pages | page miss | plans weighed (cost) | ran | ms |
+|---|---|---|---|---|---|---|---|---|
+| record, counted | 16.9 | 24.8 | 4.59 | 0.000230 | 0.984, 0.988 | no whole plan logged | | 2,538 (counted) |
+| run 0 | 16.9 | 419.4 | 99.4 | 0.000191 | 0.984 | lineitem, orders, customer 270,105; orders, customer, lineitem by index 281,296 | SCAN lineitem / orders by rowid / customer by rowid | 1,444 |
+| run 1 | 16.9 | 419.4 | 99.4 | 0.000353 | 0.592 | orders, customer, lineitem by index 176,171 | SCAN orders / customer by rowid / lineitem by index | 881 |
+| run 2 | 876.5 | 419.4 | 99.4 | 0.000112 | 0.197 | no whole plan logged (bound 143,243) | MATERIALIZE orders / HASH JOIN orders / SCAN customer / HASH JOIN lineitem | 1,533 |
+| run 3 | 876.5 | 417.4 | 200.8 | 0.000112 | 0.167 | hash join customer, lineitem by index, orders 161,812 | HASH JOIN customer / lineitem by index / SCAN orders | 2,082 |
+| run 4 | 3,603.6 | 556.5 | 1,075.3 | 0.000112 | 0.0 | the same shape 397,961 | the same | 2,100 |
+
+Weights are in rows' visits, as `LearnedWeights` holds them; the search's budget rule was `Fixed`
+(10,000 subsets) every time, and the fitted weights were None.
+
+## 2. What flips the plan
+
+Two inputs move under every run, and each flip lines up with one of them:
+- The learned weights. Between the counted run and run 0 the hash build went 24.8 to 419.4 rows'
+  visits and the probe 4.59 to 99.4; between runs 1 and 2 the seek went 16.9 to 876.5; between runs
+  3 and 4, 876.5 to 3,603.6 and the probe 200.8 to 1,075.3. Runs 0 and 1 have the same weights.
+- The connection's page-miss share (`Pager::page_miss_ratio`, read at every prepare): 0.984, 0.592,
+  0.197, 0.167, 0.0 as the cache warms, with the row's visit in pages moving beside it. Run 0 to run
+  1 is this input alone: the seek and hash weights are equal, the page miss went 0.984 to 0.592,
+  and the plan went from SCAN lineitem (270,105) to SCAN orders (176,171).
+
+So T11's lead holds in part: the weights move under each run, and so does the page-miss share. A
+snapshot of the weights alone would leave run 0 to run 1's flip. The snapshot Ada decided needs both
+in it (lane T9's test-only `Connection::pin_cost_weights` already pins both).
+
+Not explained yet, one line each, both untraced: why a seek reaches 3,603.6 rows' visits (a guess
+to test: preempted samples at this load passing the batch-means test); which path made the plans
+where no whole plan was logged (the counted run's and run 2's prepares).
+
+## 3. Next, in order
+
+1. The versioned cost snapshot: plans read one version (the weights and the page-miss share
+   together); learning writes a new version; a version replaces the current one only when the costs
+   it gives differ from the current version's by more than their measured noise. The decision is not
+   yet in docs/design/planner.md: write it there with the trace above as its evidence.
+2. A test: two plannings against one version choose one plan, with the alternatives' costs logged.
+3. r1568 again on the snapshot: five runs of q03, one plan.

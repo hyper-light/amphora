@@ -517,6 +517,20 @@ pub fn main() -> anyhow::Result<()> {
     // --answers: a directory for the benchmark (TPC-H's named with its scale factor, tpch-sf1, as
     // record.sh names its benchmarks), and in it one for each query.
     let answers_root = o.answers.as_ref().map(|dir| dir.join(if o.bench == "tpch" { format!("tpch-sf{}", o.sf) } else { o.bench.clone() }));
+    // AMPHORA_PROFILE=<prefix>: the queries' runs sampled (main.rs's profiler, a timer signal: no
+    // perf events, so it works where perf_event_paranoid forbids samply), written as main.rs writes it.
+    let profiler = match std::env::var("AMPHORA_PROFILE") {
+        Ok(prefix) => Some((prefix, crate::profile_start()?)),
+        Err(_) => None,
+    };
+    // AMPHORA_PLAN_TRACE (lane T12): the join search's events to stderr, the weights each plan
+    // is made on and every whole plan it weighs, so a plan that changes between runs is traced.
+    if std::env::var_os("AMPHORA_PLAN_TRACE").is_some() {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        let only = tracing_subscriber::filter::Targets::new().with_target("amphora::join_search", tracing_subscriber::filter::LevelFilter::DEBUG);
+        tracing_subscriber::registry().with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_ansi(false)).with(only).try_init()?;
+    }
     for (name, sql) in &b.queries {
         if !o.only.is_empty() && !o.only.contains(name) {
             continue;
@@ -586,6 +600,9 @@ pub fn main() -> anyhow::Result<()> {
             eprintln!("{name} {}: {}", target.name(), record["runs"].as_array().and_then(|r| r.iter().filter_map(|r| r["ms"].as_f64()).reduce(f64::min)).map_or_else(|| "no time".to_owned(), |ms| format!("{ms:.1} ms")));
             write(record)?;
         }
+    }
+    if let Some((prefix, guard)) = &profiler {
+        crate::write_profile(prefix, guard)?;
     }
     Ok(())
 }
