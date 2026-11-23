@@ -127,8 +127,8 @@ impl Descriptors {
         self.released.load(Ordering::SeqCst)
     }
 
-    /// The threads waiting for a give-back now.
-    #[cfg(test)]
+    /// The threads waiting for a give-back now (read only by the Linux accept-loop test).
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn waiting(&self) -> usize {
         self.waiters.lock().unwrap_or_else(PoisonError::into_inner).len()
     }

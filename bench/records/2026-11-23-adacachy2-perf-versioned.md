@@ -77,8 +77,7 @@ finished from its journal as before, once, and that writes a marked header.
 Crash evidence (debug, simulated disk): `audit_7_5_a_crash_at_each_step_of_a_checkpoint_recovers_every_commit`
 crashes after each operation of a checkpoint (journal, pages, flush, header, flush) under five
 power-cut seeds, then reopens twice, checkpoints and reopens. Every commit's rows come back each
-time. Pending: the mutant (the new flush between pages and header deleted) runs in kiln run r207 on
-adacachy2 (its MUTANT_EXIT line). The test should fail there. If it passes, it lacks teeth. `audit_7_5_a_clean_reopen_writes_no_checkpoint_again`:
+time. The mutant (the new flush between pages and header deleted) fails it: kiln run r207 on adacachy2, MUTANT_EXIT=101 (see perf-C4 unit 1). `audit_7_5_a_clean_reopen_writes_no_checkpoint_again`:
 a clean reopen writes the data file 0 times and flushes it 0 times. Before, every reopen rewrote
 every page in the journal and flushed once.
 
@@ -123,3 +122,69 @@ back all 20,000 rows. To repeat on a quiet machine: the command above.
 `storage::versioned::columns_sql::tests::ab::cb4_ab_both_rebuy_policies_at_the_extremes` fail on
 b817508b (before this change) at the same lines (columns_sql.rs:1263, 1875): "no generation answers
 the statement's snapshot".
+
+## perf-C4 unit 1: the crash test catches a missing mid-checkpoint flush; macOS flushes are full (AUDIT 7.5)
+
+Mutant (kiln run r207, adacachy2, debug): `Journal::apply` with the `disk.sync(File::Data)` between
+the pages and the header deleted. `audit_7_5_a_crash_at_each_step_of_a_checkpoint_recovers_every_commit`
+fails at durable.rs:1540, the reopen after a power cut that kept the header and lost unflushed
+pages refuses to open. `audit_7_5_a_clean_reopen_writes_no_checkpoint_again` fails at its flush
+count (line 1490). MUTANT_EXIT=101. The test has teeth, so it is unchanged.
+
+macOS flush, from the code: every versioned flush is `Disk::sync` or the trait's default
+`write_sync` (write, then `sync`), and `Files::sync` (disk.rs) is `std::fs::File::sync_data`.
+Rust's std maps `sync_data` and `sync_all` to `fcntl(fd, F_FULLFSYNC)` on Apple targets
+(library/std/src/sys/fs/unix.rs, `os_datasync` / `os_fsync` under `target_vendor = "apple"`,
+read in the 1.102 nightly source here; the pinned 1.99.1 has no source installed here).
+`uring.rs` is Linux only. So the checkpoint's two flushes and the redo log's are full flushes on
+macOS. The same mutant on macOS plus a timing of `sync_data` vs `fsync(2)` vs `F_FULLFSYNC`:
+`JOBS=4 sh bench/versioned/mutant_7_5.sh` (kiln run r336, MacBook Pro 2, needs
+`macos/arm64,cpus=4,mem=16g` because it had 6-7 of 18 cores idle and refused cpus=8).
+
+r336's result (MacBook Pro 2, arm64, rustc 1.99.1, debug tests, tree 62687f5d; load average 30.2 at
+the start, 34.5 at the end):
+
+- The base tree: `storage::versioned::durable` 21 passed, 0 failed.
+- The mutant: `audit_7_5_a_crash_at_each_step_of_a_checkpoint_recovers_every_commit` fails at
+  durable.rs:1540 ("crash after 17 of 20, seed 3, finished false, reopen 0": the reopen lost rows),
+  MUTANT_EXIT=101. The test catches the missing flush on macOS as on Linux.
+- Flush timing, one 4 KiB page appended then flushed, 40 flushes per arm, the three arms in turn and
+  the round repeated (`flush.rs` in the script, `rustc -O`):
+
+| call | round 1 min / median / max, us | round 2 min / median / max, us |
+|---|---|---|
+| `File::sync_data` | 3,396 / 5,266 / 14,965 | 3,826 / 5,503 / 22,859 |
+| `fsync(2)` | 64 / 115 / 4,312 | 59 / 94 / 4,248 |
+| `fcntl(F_FULLFSYNC)` | 3,479 / 5,430 / 17,747 | 4,100 / 5,434 / 17,178 |
+
+Reading: `sync_data` costs what `F_FULLFSYNC` costs (medians within 3% in both rounds, each 50x
+plain `fsync`), which is what the std source says it calls on Apple targets. So the versioned
+storage's flushes on macOS are full flushes. Plain `fsync(2)` is fast because it does not empty
+the drive's write cache, and it is not durable across power loss. The limiter of the full flush is
+the drive's cache flush; the load (30-34 on 18 cores) widens the max, not the medians' order.
+Every flush call returned success (the program asserts each).
+
+## perf-C4 unit 2: reopen A/B (pending)
+
+`sh bench/versioned/reopen_ab.sh` (before = a07b635e = ac58af91^1, after = ac58af91, each from its
+own clone and target under `~/.cache/versioned-ab`, the example copied in, 5 reps alternating, the
+load beside each) runs as kiln run r288 on adacachy2 with needs `linux/amd64,cpus=16,mem=24g`. The
+before build alone took 22 min there. Numbers were not in when this lane's hour ended. r288 was stopped by the coordinator during adacachy2's disk stall (2026-11-23, RULES 5d: load 379, metadata 96.8%), so it has no numbers: A/B stopped by the disk stall, to rerun once the stall is lifted.
+
+## perf-C4 unit 3: read-only snapshots for autocommit statements (verified, not implemented)
+
+Verified against the code (main 62687f5d), not measured:
+- `Switch::cursor` and `Switch::clear` (switch.rs) always pass `Access::Write(self.txn()?)`.
+- Each seek, next and prev of a cursor with a transaction calls `VersionedCursor::note`
+  (cursor.rs): it locks the `SharedTxn` mutex and calls `Versioned::keep_read` (version.rs), which
+  copies the span's keys and reserves their bytes in `clock.budget`, whose `held` is one
+  `Mutex<Held>` per database. The end releases them under the same mutex. A cursor built with
+  `Access::Read` has `txn: None` and skips all of it.
+
+A hazard the C3 notes did not list: a read-only autocommit statement's end is today
+`Switch::end` -> `Database::end_unwritten`, which flushes redo through `clock.published()`
+(a07b635e, the reviewer's durability fix: a reader never reports success before the commits it
+could have seen are durable). A statement that reads through `Access::Read(snapshot)` with no
+transaction has no `Txn` for `end` to see, so `end` would take the `None` arm and flush nothing.
+The change must keep that flush at the statement's end, or it regresses
+`audit_review_unwritten_commit_flushes_the_prefix_at_finish`'s guarantee.

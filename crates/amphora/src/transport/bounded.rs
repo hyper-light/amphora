@@ -58,7 +58,7 @@ struct Statement {
     #[serde(deserialize_with = "params")]
     params: Vec<Value>,
 }
-pub(super) fn statements<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<api::Statement>, D::Error> {
+pub(crate) fn statements<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<api::Statement>, D::Error> {
     Ok(vector::<D, Statement, { api::TX_MAX }>(d)?
         .into_iter()
         .map(|s| api::Statement {
@@ -66,6 +66,14 @@ pub(super) fn statements<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<api::Sta
             params: s.params,
         })
         .collect())
+}
+/// One statement, its parameters bounded as [`statements`]' are (a `Q` connection's read).
+pub(crate) fn statement<'de, D: Deserializer<'de>>(d: D) -> Result<api::Statement, D::Error> {
+    let s = Statement::deserialize(d)?;
+    Ok(api::Statement {
+        sql: s.sql,
+        params: s.params,
+    })
 }
 #[derive(Deserialize)]
 struct Tx {
