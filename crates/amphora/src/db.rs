@@ -20,6 +20,8 @@ use amphora_engine::{
 
 use crate::store::{Checkpointed, Config, Flush, Opener};
 
+#[cfg(test)]
+mod allocs;
 mod cache;
 
 /// The pages a process's databases share (docs/design/store.md, decision 20).
@@ -117,6 +119,12 @@ fn fail(e: impl std::error::Error + Send + Sync + 'static) -> anyhow::Error {
 /// Wakes the thread that made it: what a statement stepped on this thread waits on while it is busy
 /// (the release of the lock it found held, [`step`]).
 struct Unpark(std::thread::Thread);
+
+thread_local! {
+    /// This thread's [`Unpark`], made once: every statement stepped here shares it, since only the
+    /// thread is woken and one thread waits on one statement at a time (AUDIT 1, perf-A3).
+    static UNPARK: std::task::Waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+}
 
 impl std::task::Wake for Unpark {
     fn wake(self: Arc<Self>) {
@@ -761,7 +769,7 @@ impl Db {
         let result = self.conn.prepare_execute_batch(sql).map_err(fail);
         // A failed script may have executed DDL before refusing. Invalidate on its actual schema,
         // including rollback and raw-image reparses, without flushing every BEGIN/COMMIT.
-        self.statements.schema(self.conn.current_schema())?;
+        self.statements.schema(&self.conn.current_schema())?;
         self.marked()?;
         result
     }
@@ -786,19 +794,16 @@ impl Db {
     ) -> anyhow::Result<()> {
         self.ensure_unfenced()?;
         let schema = self.conn.current_schema();
-        self.statements.schema(Arc::clone(&schema))?;
-        let (mut stmt, marked) = match self.statements.take(sql)? {
-            Some(taken) => taken,
-            None => (self.conn.prepare(sql).map_err(fail)?, false),
+        let (text, mut stmt, marked) = match self.statements.take(sql, &schema)? {
+            Some(taken) => (Some(taken.text), taken.statement, taken.validated),
+            None => (None, self.conn.prepare(sql).map_err(fail)?, false),
         };
         step(self.io.as_ref(), &mut stmt, params, each)?;
+        // A callback can change schema and run another query. The cache never keeps this
+        // checked-out statement under that later schema's cache identity.
         let current = self.conn.current_schema();
-        self.statements.schema(Arc::clone(&current))?;
-        // A callback can change schema and run another query. Never return this checked-out
-        // statement under that later schema's cache identity.
-        if same_schema(&schema, &current) {
-            self.statements.put(sql, stmt, marked)?;
-        }
+        self.statements
+            .put(sql, text, stmt, marked, &schema, &current)?;
         self.marked()
     }
 
@@ -809,13 +814,14 @@ impl Db {
     /// Keeps its cache entry's validation mark and never sets one, as [`Db::query_owned`].
     pub fn column_count(&self, sql: &str) -> anyhow::Result<usize> {
         self.ensure_unfenced()?;
-        self.statements.schema(self.conn.current_schema())?;
-        let (stmt, marked) = match self.statements.take(sql)? {
-            Some(taken) => taken,
-            None => (self.conn.prepare(sql).map_err(fail)?, false),
+        let schema = self.conn.current_schema();
+        let (text, stmt, marked) = match self.statements.take(sql, &schema)? {
+            Some(taken) => (Some(taken.text), taken.statement, taken.validated),
+            None => (None, self.conn.prepare(sql).map_err(fail)?, false),
         };
         let columns = stmt.num_columns();
-        self.statements.put(sql, stmt, marked)?;
+        self.statements
+            .put(sql, text, stmt, marked, &schema, &schema)?;
         Ok(columns)
     }
 
@@ -826,23 +832,19 @@ impl Db {
     pub(crate) fn cached(&self, sql: &str) -> anyhow::Result<Option<Held>> {
         self.ensure_unfenced()?;
         let schema = self.conn.current_schema();
-        self.statements.schema(Arc::clone(&schema))?;
-        Ok(self
-            .statements
-            .take(sql)?
-            .map(|(statement, validated)| Held {
-                sql: sql.to_owned(),
-                statement,
-                schema,
-                validated,
-            }))
+        Ok(self.statements.take(sql, &schema)?.map(|taken| Held {
+            sql: sql.to_owned(),
+            statement: taken.statement,
+            schema,
+            validated: taken.validated,
+        }))
     }
 
     /// Prepares `sql` for a caller that holds it as [`Db::cached`] says, unmarked.
     pub(crate) fn prepare_held(&self, sql: &str) -> anyhow::Result<Held> {
         self.ensure_unfenced()?;
         let schema = self.conn.current_schema();
-        self.statements.schema(Arc::clone(&schema))?;
+        self.statements.schema(&schema)?;
         Ok(Held {
             sql: sql.to_owned(),
             statement: self.conn.prepare(sql).map_err(fail)?,
@@ -861,7 +863,7 @@ impl Db {
     ) -> anyhow::Result<()> {
         self.ensure_unfenced()?;
         let schema = self.conn.current_schema();
-        self.statements.schema(Arc::clone(&schema))?;
+        self.statements.schema(&schema)?;
         if !same_schema(&held.schema, &schema) {
             held.statement = self.conn.prepare(&held.sql).map_err(fail)?;
             held.schema = schema;
@@ -873,11 +875,14 @@ impl Db {
     /// schema is the one it was prepared under.
     pub(crate) fn give_back(&self, held: Held) -> anyhow::Result<()> {
         let current = self.conn.current_schema();
-        self.statements.schema(Arc::clone(&current))?;
-        if same_schema(&held.schema, &current) {
-            self.statements
-                .put(&held.sql, held.statement, held.validated)?;
-        }
+        self.statements.put(
+            &held.sql,
+            None,
+            held.statement,
+            held.validated,
+            &held.schema,
+            &current,
+        )?;
         Ok(())
     }
 
@@ -1229,7 +1234,7 @@ impl Db {
         // writes the header's cookie, marks the transaction's schema changed (published to every
         // connection when it commits) and reads this writer's schema again.
         self.conn.write_schema_version(next).map_err(fail)?;
-        self.statements.schema(self.conn.current_schema())?;
+        self.statements.schema(&self.conn.current_schema())?;
         Ok(())
     }
 
@@ -1391,7 +1396,11 @@ fn step_between(
     }
     // The engine wakes this thread when a lock the statement found held is released, and the
     // statement tries again then: no delay of its own between tries (lane constants-22).
-    let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+    // `try_with`, not `with`: a statement stepped while the thread's locals are torn down gets a
+    // waker of its own rather than a panic.
+    let waker = UNPARK
+        .try_with(std::task::Waker::clone)
+        .unwrap_or_else(|_| std::task::Waker::from(Arc::new(Unpark(std::thread::current()))));
     loop {
         match stmt.step_with_waker(&waker).map_err(fail)? {
             StepResult::Row => {
