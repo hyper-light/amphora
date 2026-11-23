@@ -86,8 +86,18 @@ encoding), the followers' steps on the entry at 13-31 ms, and the apply, unchang
 
 - Part 2 (entries in parts sized by a path's carriage in a heartbeat interval) and part 3's apply half: not built.
 - Small-write commit latency at 1 and 32 writers: not run.
-- P8's open items: the write slot's turn covering the holder's whole session, `a_raise_whose_base_is_joint_is_refused`
-  (the state P9 names not printed yet), the worker's reader taken on the worker thread: not started.
+- P8's open items: the write slot's turn covering the holder's whole session, and the worker's reader taken on the
+  worker thread: not started.
+- `a_raise_whose_base_is_joint_is_refused`, the state P9 named, printed where the group never settles (r1365, probe
+  branch p10-probe-joint 73a2ebd3, not for main): owner 0, the leader, `applied 8 last 9 pending_conf 9
+  has_pending_conf true`; owners 1 and 2 `applied 8 last 8`; all three `out false apply_held false`, configuration
+  joint (`voters_outgoing [1, 2, 3]`). So P9's candidate (a), applies held after the session, is ruled out (measured):
+  the followers never received the way-out entry, index 9. The test drops appends (`pump.appends_lost = true`) while
+  the raise is refused, then lets them through and settles with time standing still, so nothing ticks and no heartbeat
+  shows the followers behind. Guess, unchecked: on main something in the raise's path (its barrier's heartbeat round,
+  whose answers show a follower behind and make the leader send again) re-sends index 9 after appends flow again, and
+  on the branch that round happens while appends are still lost, or not at all. Check: the same print on main's tree
+  at the same point, and the records the leader sends between `appends_lost = false` and the settle on each.
 - Seen, not changed: `Prepared.pages` is `Vec<(u32, Vec<u8>)>`, which serde hands postcard as a sequence, one call a
   byte, on encode and decode. postcard writes a byte sequence and a byte string identically (a varint length, then the
   bytes), so encoding the pages as bytes would keep every entry's encoding and cut the per-byte work on the worker and
