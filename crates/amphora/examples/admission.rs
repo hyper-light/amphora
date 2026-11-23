@@ -193,7 +193,10 @@ fn machine() -> String {
     let group = std::fs::read_to_string("/proc/self/cgroup")
         .unwrap_or_default()
         .lines()
-        .find_map(|line| line.strip_prefix("0::").map(|at| format!("/sys/fs/cgroup{at}")))
+        .find_map(|line| {
+            line.strip_prefix("0::")
+                .map(|at| format!("/sys/fs/cgroup{at}"))
+        })
         .unwrap_or_default();
     let in_group = |file: &str| {
         std::fs::read_to_string(format!("{group}/{file}"))
