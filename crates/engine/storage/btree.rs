@@ -7818,7 +7818,9 @@ impl CursorTrait for BTreeCursor {
                     }
                     // Each pass of this arm stands on a page just entered: the root, then each
                     // child the descents below push (PL.7).
-                    self.pages += 1;
+                    self.pages = self.pages.checked_add(1).ok_or_else(|| {
+                        LimboError::InternalError("count: page tally overflowed".into())
+                    })?;
 
                     let cell_idx = self.stack.current_cell_index() as usize;
 

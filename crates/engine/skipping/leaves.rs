@@ -253,7 +253,15 @@ pub fn set_skipping(
     let deadline = match conn.get_query_timeout_ms() {
         0 => None,
         millis => Some(
-            conn.get_pager().io.current_time_monotonic() + std::time::Duration::from_millis(millis),
+            conn.get_pager()
+                .io
+                .current_time_monotonic()
+                .checked_add(std::time::Duration::from_millis(millis))
+                .ok_or_else(|| {
+                    crate::LimboError::InternalError(
+                        "skipping summary: the query timeout's deadline is past the clock's range".into(),
+                    )
+                })?,
         ),
     };
     set_skipping_with_until(
@@ -278,7 +286,15 @@ pub fn set_skipping_with(
     let deadline = match conn.get_query_timeout_ms() {
         0 => None,
         millis => Some(
-            conn.get_pager().io.current_time_monotonic() + std::time::Duration::from_millis(millis),
+            conn.get_pager()
+                .io
+                .current_time_monotonic()
+                .checked_add(std::time::Duration::from_millis(millis))
+                .ok_or_else(|| {
+                    crate::LimboError::InternalError(
+                        "skipping summary: the query timeout's deadline is past the clock's range".into(),
+                    )
+                })?,
         ),
     };
     set_skipping_with_until(conn, table, column, kind, build, deadline)

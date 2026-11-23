@@ -68,7 +68,7 @@ pub(crate) fn choose(
             continue;
         };
         let mut candidates = Vec::new();
-        for dim_member in join_order.iter().skip(fact_pos + 1) {
+        for dim_member in join_order.iter().skip(fact_pos).skip(1) {
             let dim_idx = dim_member.original_idx;
             let Some(dim) = joined.get(dim_idx) else {
                 continue;
@@ -135,7 +135,11 @@ pub(crate) fn choose(
             reaching *= pass;
         }
     }
-    let share = params.statement_memory / chosen.len().max(1);
+    // No filter chosen leaves the whole budget, as dividing by max(1) did.
+    let share = params
+        .statement_memory
+        .checked_div(chosen.len())
+        .unwrap_or(params.statement_memory);
     for filter in &mut chosen {
         filter.max_bytes = share;
     }

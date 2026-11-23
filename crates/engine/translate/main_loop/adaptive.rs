@@ -596,7 +596,7 @@ impl<'a> AdaptiveSeek<'a> {
         // index entry by the whole of it: key, other columns, rowid.
         let other_columns = &self.index.columns[num_keys..];
         let num_payload = other_columns.len();
-        let entry_len = num_keys + num_payload + 1;
+        let entry_len = sum(sum(num_keys, num_payload)?, 1)?;
         // Its own id: a hash join the plan chose keys its table by its build table's id.
         let hash_table_id = program.alloc_hash_table_id();
         let switch_id = hash_table_id;
@@ -614,8 +614,17 @@ impl<'a> AdaptiveSeek<'a> {
         // The bytes the hash table would hold, by the statistics: each row's key values and rowid.
         // Value's in-memory size is a format value (`size_of`); the table's own spill check
         // (`JoinSwitchBuilt` below) bounds what this estimate misses.
-        let entry_bytes = entry_len as u64 * std::mem::size_of::<crate::Value>() as u64;
-        let build_bytes = (self.build_rows.max(0.0) as u64).saturating_mul(entry_bytes);
+        let entry_bytes = u64::try_from(std::mem::size_of::<crate::Value>())
+            .ok()
+            .zip(u64::try_from(entry_len).ok())
+            .and_then(|(size, len)| len.checked_mul(size))
+            .ok_or_else(|| {
+                crate::LimboError::InternalError("adaptive join: an entry's bytes past u64".into())
+            })?;
+        // A row count past u64 saturates, as `as` did.
+        let build_bytes = num_traits::ToPrimitive::to_u64(&self.build_rows.max(0.0))
+            .unwrap_or(u64::MAX)
+            .saturating_mul(entry_bytes);
         program.emit_insn(Insn::JoinSwitchStep {
             data: Box::new(JoinSwitchData {
                 switch_id,
@@ -651,9 +660,9 @@ impl<'a> AdaptiveSeek<'a> {
             pc_if_empty: built,
         });
         program.preassign_label_to_next_insn(build_row);
-        let build_keys = program.alloc_registers(num_keys + num_payload);
+        let build_keys = program.alloc_registers(sum(num_keys, num_payload)?);
         for (i, column) in key_columns.iter().chain(other_columns).enumerate() {
-            program.emit_column_or_rowid(build_cursor_id, column.pos_in_table, build_keys + i);
+            program.emit_column_or_rowid(build_cursor_id, column.pos_in_table, sum(build_keys, i)?);
         }
         emit_affinity(program, build_keys, num_keys, &affinities);
         program.emit_insn(Insn::HashBuild {
@@ -665,7 +674,7 @@ impl<'a> AdaptiveSeek<'a> {
                 mem_budget: t_ctx.resolver.statement_memory(),
                 collations,
                 payload_start_reg: if num_payload > 0 {
-                    Some(build_keys + num_keys)
+                    Some(sum(build_keys, num_keys)?)
                 } else {
                     None
                 },
@@ -705,7 +714,7 @@ impl<'a> AdaptiveSeek<'a> {
                 program,
                 Some(table_references),
                 expr,
-                probe_keys + i,
+                sum(probe_keys, i)?,
                 &t_ctx.resolver,
             )?;
         }
@@ -713,16 +722,16 @@ impl<'a> AdaptiveSeek<'a> {
         for i in 0..num_keys {
             // `=` never matches NULL, as the seek's own NULL check says.
             program.emit_insn(Insn::IsNull {
-                reg: probe_keys + i,
+                reg: sum(probe_keys, i)?,
                 target_pc: loop_end,
             });
         }
         let payload_reg = if num_payload > 0 {
-            Some(probe_keys + num_keys)
+            Some(sum(probe_keys, num_keys)?)
         } else {
             None
         };
-        let match_reg = probe_keys + num_keys + num_payload;
+        let match_reg = sum(sum(probe_keys, num_keys)?, num_payload)?;
         program.emit_insn(Insn::HashProbe {
             hash_table_id: to_u32(hash_table_id),
             key_start_reg: to_u32(probe_keys),
@@ -797,4 +806,10 @@ pub(super) fn emit_close_switch(program: &mut ProgramBuilder, ctx: &AdaptiveJoin
         switch_id: ctx.switch_id,
         target_pc: ctx.hash_next,
     });
+}
+
+/// `a + b` for the join's register numbers and entry widths; past usize is refused.
+fn sum(a: usize, b: usize) -> Result<usize> {
+    a.checked_add(b)
+        .ok_or_else(|| crate::LimboError::InternalError("adaptive join: a register past usize".into()))
 }

@@ -2614,7 +2614,7 @@ pub(crate) fn group_count_error(plan: &SelectPlan, schema: &Schema) -> Option<f6
     }
     let stored_average = match rows_per_group {
         0 | 1 => 0.0,
-        a => ((a - 1) as f64).recip(),
+        a => a.checked_sub(1).map_or(0.0, |below| (below as f64).recip()),
     };
     let total_rows = table_stats
         .row_count

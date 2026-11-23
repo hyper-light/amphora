@@ -614,7 +614,7 @@ impl JoinN {
                     }
                 };
                 *joined = Some(node);
-                if *end != position + 1 || open.len() == 1 {
+                if position.checked_add(1) != Some(*end) || open.len() == 1 {
                     break;
                 }
                 open.pop();
@@ -1303,10 +1303,10 @@ fn join_lhs_and_rhs<'a>(
                                     );
                                 // The materialized input's visits are the merge's as well.
                                 let merge_join_cost = if *materialize_build_input {
-                                    merge_join_cost
-                                        + Cost(
-                                            effective_build_cardinality * params.cpu_cost_per_row,
-                                        )
+                                    Cost(
+                                        merge_join_cost.0
+                                            + effective_build_cardinality * params.cpu_cost_per_row,
+                                    )
                                 } else {
                                     merge_join_cost
                                 };
@@ -2323,22 +2323,25 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                         .get(probe)
                         .copied()
                         .unwrap_or_else(|| RowCountEstimate::hardcoded_fallback(params));
-                    let probe_cost = estimate_hash_join_cost(
-                        build.output_cardinality,
-                        *probe_rows,
-                        rows,
-                        HashJoinType::Inner,
-                        mem_budget,
-                        outer_rows,
-                        // The probe's scan costs its own pages, as a left-deep plan's does (PL.7).
-                        &params.for_table(probe_table, analyze_stats),
-                    ) + Cost(build.output_cardinality * params.cpu_cost_per_row)
-                        + Cost(if left_join_probe {
-                            build.output_cardinality * outer_rows * params.cpu_cost_per_row
-                        } else {
-                            0.0
-                        });
-                    let cost = outer.cost + build.cost + probe_cost;
+                    let probe_cost = Cost(
+                        estimate_hash_join_cost(
+                            build.output_cardinality,
+                            *probe_rows,
+                            rows,
+                            HashJoinType::Inner,
+                            mem_budget,
+                            outer_rows,
+                            // The probe's scan costs its own pages, as a left-deep plan's does (PL.7).
+                            &params.for_table(probe_table, analyze_stats),
+                        )
+                        .0 + build.output_cardinality * params.cpu_cost_per_row
+                            + if left_join_probe {
+                                build.output_cardinality * outer_rows * params.cpu_cost_per_row
+                            } else {
+                                0.0
+                            },
+                    );
+                    let cost = Cost(outer.cost.0 + build.cost.0 + probe_cost.0);
                     let Some(method) = access_methods_arena.get_mut(probe_method) else {
                         access_methods_arena.truncate(arena_len);
                         continue;
