@@ -159,6 +159,9 @@ spread over per-thread addresses, plus the host's load. Sample it next. Not yet 
 
 ## AUDIT 2.1 header, the fair A/B (perf-B3): running, not finished in the hour
 
-`.git/perf-ab5.sh` (rewritten): after = HEAD, base = HEAD's tree with only ae729b06's `crates/` diff
-reversed; 5 rounds, arm order alternated, load recorded; output `ab5-<HHMM>.jsonl`, written once both
-builds finish. Under load 90-136 the after build took 20m22s. Its kiln run is r211 on adacachy2.
+`.git/perf-ab5.sh` (rewritten): after = 4314cb0c's bench binary (`bench-hdr-after-4314`), base =
+4314cb0c's tree with only ae729b06's `crates/` diff reversed, so main's later merges can't confound
+it; 5 rounds, arm order alternated, load recorded; output `ab5-<HHMM>.jsonl`, written once the base
+build finishes. Under load 90-136 the after build took 20m22s (run r211). r211's base build then
+failed: `git archive` leaves out the untracked `bench/Cargo.lock`. Relaunched as run r266 with the
+lock files copied in.
