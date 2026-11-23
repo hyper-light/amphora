@@ -6058,6 +6058,14 @@ mod tests {
             }
             self.reap();
         }
+        /// Ends a pump whose records are never settled (fenced or stalled members'), without its
+        /// settling checks: what it holds is let go here, said so, rather than the pump forgotten.
+        fn abandon(mut self) {
+            self.records = 0;
+            self.bytes = 0;
+            self.receipts.clear();
+            self.phase = PumpPhase::Relay;
+        }
         fn finish(mut self) {
             assert!(
                 matches!(self.phase, PumpPhase::Relay),
