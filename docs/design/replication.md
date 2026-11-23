@@ -3085,7 +3085,24 @@ Members that don't speak `VERSION` 10 keep today's whole-image path within SB.1'
 
 ### The held view, measured (the A/B's first piece)
 
-PENDING
+The storage half, counted in frames and bytes of log rather than time:
+`crates/amphora/tests/held_view.rs`. One commit, then 2000 commits that each rewrite four rows of a page,
+every commit followed by the store's two log steps (a passive checkpoint, then a restart), the most often the
+store could run them. Three arms: no reader; a short view before each commit (the pull's answers); one view
+begun after the first commit and held across the rest (the push). The test asserts the premise: without a held
+view the log starts again after every commit and holds one commit's frames; with one, the checkpoint copies
+nothing past the view's mark, no restart happens, and the log grows by every commit's frames until the view
+ends. Its numbers are not in yet: the lane's runs on adacachy2 waited on that machine's disk (btrfs metadata
+full, every file write waiting for a reservation), and the record (`bench/records/2026-11-23-adacachy2-perf-snapshots.md`)
+takes them when the run ends.
+
+The serving half, read in the code and not yet measured: past the log's room, the owner holds back every new
+local read of the replica until a restart (`database/replicated.rs`, `hold_due` and `hold_reads`); the restart
+waits until no read of the replica is out (`restart_unread`), and the engine refuses it as busy while any view
+is open (`Db::restart_log`); and the owner refuses every submit as unavailable while the log is past its room
+(`log_full`). So a push's view, held past the point where the log
+fills its room, would stall the source's reads and refuse its writes: a healthy member stalled for a follower,
+which the goal forbids. The A/B measures both halves under the order's write loads.
 
 ### Units, in order, each merged with its tests
 
