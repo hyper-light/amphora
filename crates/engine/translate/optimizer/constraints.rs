@@ -669,6 +669,26 @@ fn is_value(null_matching: bool, value: Option<&ast::Expr>, params: &CostModelPa
     }
 }
 
+/// AUDIT 5.1: the share of `table_name`'s rows whose `column` is NULL, as ANALYZE's sketch counted
+/// every row's, `None` where it counted none. A column it saw no NULL in counts half a row, the
+/// continuity correction the sample's shares take ([sampled_filters]), so a plan never rests on
+/// none at all.
+///
+/// [sampled_filters]: super::cardinality
+fn null_share(schema: &Schema, table_name: &str, column: Option<&Column>) -> Option<f64> {
+    let name = crate::util::normalize_ident(column?.name.as_deref()?);
+    let counted = schema
+        .analyze_stats
+        .table_stats(table_name)?
+        .columns
+        .get(&name)?;
+    let rows = counted.non_null.saturating_add(counted.nulls);
+    if rows == 0 {
+        return None;
+    }
+    Some(((counted.nulls as f64).max(0.5) / rows as f64).min(1.0))
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Estimate selectivity for a single WHERE/ON constraint applied to `table_reference`. `value` is
 /// the expression the constrained column is compared with, where there is one.
@@ -698,6 +718,16 @@ fn estimate_constraint_selectivity(
                 .is_some_and(|table| table.primary_key_columns.len() == 1),
         )
     };
+    // AUDIT 5.1: `IS NULL` and `IS NOT NULL` take the column's NULLs as ANALYZE counted them
+    // ([null_share]), the fixed shares only where it counted none.
+    let null_value = || is_value(true, value, params) == IsValue::Null;
+    let nulls = || null_share(schema, table_reference.table.get_name(), column);
+    if operator.as_ast_operator() == Some(ast::Operator::IsNot) {
+        return match nulls().filter(|_| null_value()) {
+            Some(share) => 1.0 - share,
+            None => estimate(operator),
+        };
+    }
     if operator.as_ast_operator() != Some(ast::Operator::Is) {
         return estimate(operator);
     }
@@ -709,7 +739,7 @@ fn estimate_constraint_selectivity(
     let known = is_value(null_matching, value, params);
     let selectivity = match (known, params.is_value_estimate) {
         (IsValue::NotNull, _) | (IsValue::Unknown, crate::IsValueEstimate::Equality) => equality(),
-        (IsValue::Null, _) => estimate(operator),
+        (IsValue::Null, _) => nulls().unwrap_or_else(|| estimate(operator)),
         (IsValue::Unknown, crate::IsValueEstimate::WorstCase) => equality().max(estimate(operator)),
     };
     tracing::trace!(
@@ -2295,6 +2325,13 @@ fn estimate_bound_expr_selectivity(
         )
     };
 
+    // AUDIT 5.1: an operand that is one of this table's columns, its NULLs' share.
+    let column_null_share = |operand: &ast::Expr| -> Option<f64> {
+        let operand = crate::translate::expr::unwrap_parens(operand).unwrap_or(operand);
+        let (column, _, _) = resolve_side(operand)?;
+        null_share(schema, table_reference.table.get_name(), column)
+    };
+
     match expr {
         Expr::Binary(lhs, ast::Operator::And, rhs) => {
             let l = estimate_bound_expr_selectivity(
@@ -2330,19 +2367,21 @@ fn estimate_bound_expr_selectivity(
             );
             (l + r - l * r).min(1.0)
         }
-        Expr::Binary(_, ast::Operator::Is, rhs)
+        Expr::Binary(lhs, ast::Operator::Is, rhs)
             if matches!(rhs.as_ref(), Expr::Literal(ast::Literal::Null)) =>
         {
-            params.sel_is_null
+            column_null_share(lhs).unwrap_or(params.sel_is_null)
         }
-        Expr::Binary(_, ast::Operator::IsNot, rhs)
+        Expr::Binary(lhs, ast::Operator::IsNot, rhs)
             if matches!(rhs.as_ref(), Expr::Literal(ast::Literal::Null)) =>
         {
-            params.sel_is_not_null
+            column_null_share(lhs).map_or(params.sel_is_not_null, |share| 1.0 - share)
         }
         Expr::Binary(lhs, op, rhs) => leaf_selectivity(lhs, rhs, (*op).into()),
-        Expr::IsNull(_) => params.sel_is_null,
-        Expr::NotNull(_) => params.sel_is_not_null,
+        Expr::IsNull(operand) => column_null_share(operand).unwrap_or(params.sel_is_null),
+        Expr::NotNull(operand) => {
+            column_null_share(operand).map_or(params.sel_is_not_null, |share| 1.0 - share)
+        }
         Expr::Between { not, .. } => {
             if *not {
                 1.0 - params.sel_closed_range

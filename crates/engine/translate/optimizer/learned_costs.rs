@@ -696,13 +696,267 @@ impl LearnedCosts {
     }
 }
 
-/// The rates measured once a process, on the hardware it runs on.
+/// The rates measured on the hardware the process runs on: once a machine, not once a process
+/// (AUDIT §7.1, perf/coldstart). A calibration this machine's CPU already measured for this very
+/// executable (`stored::Key`) is read back, exactly as it was measured; otherwise calibration runs
+/// before the first plan, as it always did, and is kept for the next process. A machine whose CPU
+/// or executable changed has another key, so it is measured again then (detected, never on a
+/// timer); one whose CPU can't be told (`stored::Key::here` None) calibrates each process.
 fn process_calibration() -> &'static Rates {
     static CALIBRATION: OnceLock<Rates> = OnceLock::new();
     CALIBRATION.get_or_init(|| {
+        let key = stored::Key::here();
+        if let Some(kept) = key.as_ref().and_then(stored::load) {
+            return kept.rates();
+        }
         let start = Instant::now();
-        calibrate(&mut || start.elapsed().as_nanos() as f64)
+        let measured = measure_calibration(&mut || start.elapsed().as_nanos() as f64);
+        if let Some(key) = &key {
+            stored::save(key, &measured);
+        }
+        measured.rates()
     })
+}
+
+/// What calibration measured (AUDIT §7.1): the timer's cost, a pair of clock reads, and each kind
+/// of [CALIBRATED] work's (units, nanoseconds), the median sample's. The rates are made from it
+/// (`Calibration::rates`), so one read back from a machine's store plans exactly as the
+/// calibration that measured it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Calibration {
+    timing_nanos: f64,
+    kinds: [(f64, f64); 7],
+}
+
+/// The kinds of work calibration times, in [Calibration::kinds]' order.
+const CALIBRATED: [Work; 7] = [
+    Work::Row,
+    Work::Seek,
+    Work::HashBuild,
+    Work::HashProbe,
+    Work::Sort,
+    Work::BloomProbe,
+    Work::WhereStep,
+];
+
+/// The keys of one page calibration times each kind of work over (`calibrate`).
+fn calibration_keys() -> usize {
+    crate::storage::buffer_pool::BufferPool::DEFAULT_PAGE_SIZE / std::mem::size_of::<u64>()
+}
+
+impl Calibration {
+    /// Whether every time is a finite, positive number: one whose clock never moved isn't kept.
+    fn timed(&self) -> bool {
+        let good = |x: f64| x.is_finite() && x > 0.0;
+        good(self.timing_nanos) && self.kinds.iter().all(|(u, n)| good(*u) && good(*n))
+    }
+
+    fn rates(&self) -> Rates {
+        let mut rates = Rates {
+            timing_nanos: self.timing_nanos,
+            ..Rates::default()
+        };
+        for (kind, (units, nanos)) in CALIBRATED.iter().zip(self.kinds) {
+            *rates.rate_mut(*kind) = Rate::measured(units, nanos);
+        }
+        // A page read can't be timed here: there's no file yet. Each database anchors it at open
+        // (`time_page_read`, `LearnedCosts::anchor_page_read`), then its own reads move it
+        // (`LearnedCosts::observe`), its epoch the pages whose rows calibration visited.
+        rates.page = Rate {
+            epoch: (rates.row.epoch / calibration_keys() as f64).max(1.0),
+            ..Rate::default()
+        };
+        rates
+    }
+}
+
+/// AUDIT §7.1 (perf/coldstart): a machine's calibration, kept across processes in the user's
+/// cache (`$XDG_CACHE_HOME/amphora/calibration`, else `~/.cache/amphora/calibration`), one file a
+/// CPU and executable, each holding the key it was measured under in full and the times as their
+/// f64 bits, so a read back is the measurement itself. Anything else found there (another key, a
+/// torn or foreign file) is measured again and replaced; a store that can't be read or written
+/// leaves calibration once a process, as before.
+mod stored {
+    use super::{Calibration, CALIBRATED};
+    use std::path::PathBuf;
+
+    /// What a calibration was measured under: the CPU (its identity as the OS reports it) and the
+    /// executable timed on it (its path, length and modification time: a rebuild is other code).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) struct Key {
+        pub(super) dir: PathBuf,
+        pub(super) cpu: String,
+        pub(super) exe: String,
+    }
+
+    impl Key {
+        /// This process's key, None where the CPU, the executable or the cache can't be told.
+        pub(super) fn here() -> Option<Self> {
+            let cpu = cpu_identity()?;
+            let exe = std::env::current_exe().ok()?;
+            let meta = std::fs::metadata(&exe).ok()?;
+            let modified = meta
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_nanos();
+            let exe = format!("{} {} {modified}", exe.display(), meta.len());
+            Some(Self {
+                dir: cache_dir()?.join("amphora").join("calibration"),
+                cpu,
+                exe,
+            })
+        }
+
+        /// The file this key's calibration is kept in: named by a hash of the CPU and the
+        /// executable's path, so a rebuild replaces its own file instead of adding one.
+        pub(super) fn file(&self) -> PathBuf {
+            let path = self.exe.rsplitn(3, ' ').last().unwrap_or(&self.exe);
+            self.dir
+                .join(format!("{:016x}", fnv1a(&[self.cpu.as_bytes(), b"\0", path.as_bytes()])))
+        }
+
+        fn header(&self) -> String {
+            format!("amphora-calibration 1\ncpu {}\nexe {}\n", escape(&self.cpu), escape(&self.exe))
+        }
+    }
+
+    /// FNV-1a over `parts` (Fowler, Noll and Vo; its published 64-bit offset basis and prime).
+    fn fnv1a(parts: &[&[u8]]) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in parts.iter().flat_map(|part| part.iter()) {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    /// One line's worth: line breaks and backslashes escaped.
+    fn escape(text: &str) -> String {
+        text.replace('\\', "\\\\").replace('\n', "\\n")
+    }
+
+    /// The calibration kept for `key`, None if there is none or what's there is anything else.
+    pub(super) fn load(key: &Key) -> Option<Calibration> {
+        let text = std::fs::read_to_string(key.file()).ok()?;
+        parse(key, &text)
+    }
+
+    pub(super) fn parse(key: &Key, text: &str) -> Option<Calibration> {
+        // Whole lines only, each time its f64's sixteen hex digits: a file cut short is refused,
+        // not read as another number.
+        let body = text.strip_prefix(&key.header())?.strip_suffix('\n')?;
+        let mut lines = body.split('\n');
+        let bits = |line: Option<&str>, name: &str| -> Option<Vec<f64>> {
+            let mut words = line?.split(' ');
+            (words.next()? == name).then_some(())?;
+            words
+                .map(|w| {
+                    let digits = w.len() == 16 && w.bytes().all(|b| b.is_ascii_hexdigit());
+                    digits.then(|| u64::from_str_radix(w, 16).ok().map(f64::from_bits))?
+                })
+                .collect()
+        };
+        let timing = bits(lines.next(), "timing")?;
+        let [timing_nanos] = timing.as_slice() else {
+            return None;
+        };
+        let mut kinds = [(0.0, 0.0); 7];
+        for (slot, kind) in kinds.iter_mut().zip(CALIBRATED) {
+            let pair = bits(lines.next(), &format!("{kind:?}"))?;
+            let [units, nanos] = pair.as_slice() else {
+                return None;
+            };
+            *slot = (*units, *nanos);
+        }
+        if lines.next().is_some() {
+            return None;
+        }
+        let kept = Calibration {
+            timing_nanos: *timing_nanos,
+            kinds,
+        };
+        kept.timed().then_some(kept)
+    }
+
+    pub(super) fn render(key: &Key, calibration: &Calibration) -> String {
+        let mut text = key.header();
+        text.push_str(&format!("timing {:016x}\n", calibration.timing_nanos.to_bits()));
+        for (kind, (units, nanos)) in CALIBRATED.iter().zip(calibration.kinds) {
+            text.push_str(&format!("{kind:?} {:016x} {:016x}\n", units.to_bits(), nanos.to_bits()));
+        }
+        text
+    }
+
+    /// Keeps `calibration` for `key`: written to a file of its own, then renamed over the key's, so
+    /// a process reading it sees the old file or the new one whole, never part of either. A
+    /// calibration whose clock never moved isn't kept. Failure is logged and leaves no file behind.
+    pub(super) fn save(key: &Key, calibration: &Calibration) {
+        if !calibration.timed() {
+            return;
+        }
+        let file = key.file();
+        let partial = key.dir.join(format!(".{}", uuid::Uuid::new_v4().simple()));
+        let written = std::fs::create_dir_all(&key.dir)
+            .and_then(|()| std::fs::write(&partial, render(key, calibration)))
+            .and_then(|()| std::fs::rename(&partial, &file));
+        if let Err(err) = written {
+            let _ = std::fs::remove_file(&partial);
+            tracing::debug!("AUDIT 7.1: calibration not kept at {}: {err}", file.display());
+        }
+    }
+
+    fn cache_dir() -> Option<PathBuf> {
+        let absolute = |var: &str| {
+            std::env::var_os(var)
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+        };
+        absolute("XDG_CACHE_HOME").or_else(|| absolute("HOME").map(|home| home.join(".cache")))
+    }
+
+    /// The CPU as Linux reports it: the first processor's record of `/proc/cpuinfo` (its model,
+    /// stepping, microcode, flags and bugs), less what moves while it runs (its clock, `cpu MHz`,
+    /// and `bogomips`, measured at each boot). Only the first record is read: the kernel
+    /// generates the file a record at a time as it is read.
+    #[cfg(target_os = "linux")]
+    fn cpu_identity() -> Option<String> {
+        use std::io::Read;
+        let mut file = std::fs::File::open("/proc/cpuinfo").ok()?;
+        let mut head = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let read = file.read(&mut chunk).ok()?;
+            let got = chunk.get(..read)?;
+            head.extend_from_slice(got);
+            if read == 0 || head.windows(2).any(|w| w == b"\n\n") {
+                break;
+            }
+        }
+        cpu_record(std::str::from_utf8(&head).ok()?)
+    }
+
+    /// Other platforms name their CPU through calls this crate doesn't make (no unsafe code): each
+    /// process calibrates, as before.
+    #[cfg(not(target_os = "linux"))]
+    fn cpu_identity() -> Option<String> {
+        None
+    }
+
+    /// The first record of a `/proc/cpuinfo`, its fields that don't move, one a line; None without
+    /// a whole record.
+    pub(super) fn cpu_record(text: &str) -> Option<String> {
+        let (record, _) = text.split_once("\n\n")?;
+        let kept: Vec<&str> = record
+            .lines()
+            .filter(|line| {
+                let name = line.split(':').next().unwrap_or("").trim();
+                !matches!(name, "cpu MHz" | "bogomips" | "BogoMIPS")
+            })
+            .collect();
+        (!kept.is_empty()).then(|| kept.join("\n"))
+    }
 }
 
 /// SplitMix64's output function (Steele, Lea and Flood, "Fast splittable pseudorandom number
@@ -751,8 +1005,14 @@ fn measure(
 /// more samples can't sharpen it (`median_settled`). Its spread sets how many samples that takes:
 /// few on a quiet host, more under load. The rounds stop at a page's keys, as each sample's
 /// repetitions do, so calibration's time stays bounded however loaded the host is.
+#[cfg(test)]
 fn calibrate(clock: &mut dyn FnMut() -> f64) -> Rates {
-    let n = crate::storage::buffer_pool::BufferPool::DEFAULT_PAGE_SIZE / std::mem::size_of::<u64>();
+    measure_calibration(clock).rates()
+}
+
+/// [calibrate]'s measurement, the times it makes its rates from (`Calibration`).
+fn measure_calibration(clock: &mut dyn FnMut() -> f64) -> Calibration {
+    let n = calibration_keys();
     let keys: Vec<u64> = (0..n as u64).map(mix).collect();
     let mut ordered = keys.clone();
     ordered.sort_unstable();
@@ -830,7 +1090,10 @@ fn calibrate(clock: &mut dyn FnMut() -> f64) -> Rates {
     for (_, _, work) in kinds.iter_mut() {
         target = target.max(measure(clock, 0.0, 1, &mut **work).1);
     }
-    let mut rates = Rates::default();
+    let mut calibration = Calibration {
+        timing_nanos: 0.0,
+        kinds: [(0.0, 0.0); 7],
+    };
     // A pair of clock reads, timed as the kinds are, a page's keys' worth of times at most: what
     // timing one run costs (step 3a), and the finest a sample's reading resolves.
     let mut timing = || {
@@ -838,7 +1101,7 @@ fn calibrate(clock: &mut dyn FnMut() -> f64) -> Rates {
         black_box(start.elapsed());
     };
     let (reps, nanos) = measure(clock, target, n, &mut timing);
-    rates.timing_nanos = nanos / reps;
+    calibration.timing_nanos = nanos / reps;
     // Each kind's repetitions a sample, found as `measure` finds them; then its samples, a round
     // at a time.
     let mut sampled: [(usize, Vec<f64>, bool); 7] = Default::default();
@@ -859,25 +1122,21 @@ fn calibrate(clock: &mut dyn FnMut() -> f64) -> Rates {
         // The spread is read each time the samples double, as `measure` doubles repetitions.
         if round.is_power_of_two() {
             for (_, samples, settled) in sampled.iter_mut() {
-                *settled = *settled || median_settled(samples, rates.timing_nanos);
+                *settled = *settled || median_settled(samples, calibration.timing_nanos);
             }
             if sampled.iter().all(|(_, _, settled)| *settled) {
                 break;
             }
         }
     }
-    for ((kind, units, _), (reps, samples, _)) in kinds.iter().zip(sampled.iter_mut()) {
+    for ((_, units, _), ((reps, samples, _), slot)) in kinds
+        .iter()
+        .zip(sampled.iter_mut().zip(calibration.kinds.iter_mut()))
+    {
         let nanos = median(samples).unwrap_or(0.0);
-        *rates.rate_mut(*kind) = Rate::measured(*reps as f64 * *units, nanos);
+        *slot = (*reps as f64 * *units, nanos);
     }
-    // A page read can't be timed here: there's no file yet. Each database anchors it at open
-    // (`time_page_read`, `LearnedCosts::anchor_page_read`), then its own reads move it
-    // (`LearnedCosts::observe`), its epoch the pages whose rows calibration visited.
-    rates.page = Rate {
-        epoch: (rates.row.epoch / rows).max(1.0),
-        ..Rate::default()
-    };
-    rates
+    calibration
 }
 
 /// The middle of `samples`, sorting them; None for none.
@@ -1109,6 +1368,120 @@ fn read_through_io(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn audit_7_1_key(dir: &std::path::Path) -> stored::Key {
+        stored::Key {
+            dir: dir.to_path_buf(),
+            cpu: "vendor_id\t: GenuineTest\nmodel name\t: Test CPU".into(),
+            exe: "/bin/amphora-test 1234 5678".into(),
+        }
+    }
+
+    fn audit_7_1_calibration() -> Calibration {
+        Calibration {
+            timing_nanos: 21.5,
+            kinds: [
+                (512.0, 300.25),
+                (512.0, 9_000.0),
+                (256.0, 7_700.5),
+                (512.0, 4_100.0),
+                (4_608.0, 20_000.125),
+                (512.0, 1_000.0),
+                (512.0, 650.0),
+            ],
+        }
+    }
+
+    /// Do: keep a calibration for a key, then read it back (AUDIT §7.1). Expect: the very same
+    /// times, so the rates, the weights and the page read's epoch are the measured ones exactly.
+    #[test]
+    fn audit_7_1_kept_calibration_reads_back_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = audit_7_1_key(dir.path());
+        let measured = audit_7_1_calibration();
+        stored::save(&key, &measured);
+        let kept = stored::load(&key).unwrap();
+        assert_eq!(kept, measured);
+        assert_eq!(kept.rates(), measured.rates());
+        assert_eq!(
+            LearnedCosts::from_rates(&kept.rates()).weights(),
+            LearnedCosts::from_rates(&measured.rates()).weights()
+        );
+        // The write left only the key's own file.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    /// Do: read a kept calibration under another CPU, a rebuilt executable, and from torn or
+    /// foreign files. Expect: none of them is taken (each is measured again); a rebuild of the
+    /// same executable keeps its file's name, so it replaces it rather than adding one.
+    #[test]
+    fn audit_7_1_another_cpu_or_build_measures_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = audit_7_1_key(dir.path());
+        let measured = audit_7_1_calibration();
+        let text = stored::render(&key, &measured);
+        assert_eq!(stored::parse(&key, &text), Some(measured));
+
+        let other_cpu = stored::Key {
+            cpu: "vendor_id\t: GenuineTest\nmodel name\t: Test CPU v2".into(),
+            ..key.clone()
+        };
+        assert_eq!(stored::parse(&other_cpu, &text), None);
+        assert_ne!(other_cpu.file(), key.file());
+
+        let rebuilt = stored::Key {
+            exe: "/bin/amphora-test 1234 9999".into(),
+            ..key.clone()
+        };
+        assert_eq!(stored::parse(&rebuilt, &text), None);
+        assert_eq!(rebuilt.file(), key.file());
+
+        let torn = text.get(..text.len() - 5).unwrap();
+        assert_eq!(stored::parse(&key, torn), None);
+        assert_eq!(stored::parse(&key, &format!("{text}Extra 0 0\n")), None);
+        assert_eq!(stored::parse(&key, "not a calibration"), None);
+        assert_eq!(stored::load(&key), None);
+
+        // A calibration whose clock never moved isn't kept.
+        let unmoved = Calibration {
+            timing_nanos: 0.0,
+            ..measured
+        };
+        stored::save(&key, &unmoved);
+        assert_eq!(stored::load(&key), None);
+    }
+
+    /// Do: read the CPU's identity from a `/proc/cpuinfo` whose clock moved between two reads,
+    /// and from one cut off before its first record ends. Expect: the same identity for the first
+    /// two; none for the last; another stepping is another identity (AUDIT §7.1).
+    #[test]
+    fn audit_7_1_cpu_identity_ignores_the_clock() {
+        let at = |mhz: &str, stepping: &str| {
+            format!(
+                "processor\t: 0\nvendor_id\t: AuthenticAMD\nmodel name\t: Test 9950X\nstepping\t: {stepping}\ncpu MHz\t\t: {mhz}\nbogomips\t: 8583.{mhz}\nflags\t\t: fpu sse2\n\nprocessor\t: 1\ncpu MHz\t\t: 1\n"
+            )
+        };
+        let first = stored::cpu_record(&at("4291.0", "0")).unwrap();
+        assert_eq!(stored::cpu_record(&at("599.9", "0")).unwrap(), first);
+        assert!(!first.contains("MHz") && !first.contains("bogomips"));
+        assert!(first.contains("flags"));
+        assert_ne!(stored::cpu_record(&at("4291.0", "1")).unwrap(), first);
+        assert_eq!(stored::cpu_record("processor\t: 0\nvendor_id\t: A"), None);
+    }
+
+    /// Do: calibrate on this machine twice through the process's store (AUDIT §7.1). Expect: the
+    /// process's calibration is sane, and where the machine can be told it is kept for the next
+    /// process under this CPU and executable.
+    #[test]
+    fn audit_7_1_process_calibration_is_kept_for_the_machine() {
+        let rates = process_calibration();
+        assert!(LearnedCosts::from_rates(rates).weights().is_some());
+        if let Some(key) = stored::Key::here() {
+            if let Some(kept) = stored::load(&key) {
+                assert!(kept.timed());
+            }
+        }
+    }
 
     fn fixed_rates(row: f64, seek: f64, build: f64, probe: f64, sort: f64) -> Rates {
         Rates {

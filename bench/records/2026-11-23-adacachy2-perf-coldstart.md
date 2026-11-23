@@ -34,3 +34,28 @@ bounded by a page of keys): that is the remaining §7.1 work (cache per machine 
 Planner test A/B (kiln run r89, same host, under load): `tests/planner.rs`
 `a_whole_table_group_by_scans_and_sorts_where_lookups_would_read_pages` failed 2 of 3 runs on
 before and 3 of 3 on after: a load-dependent flake on main itself, not settled by this change.
+
+## AUDIT §7.1, second part (perf-H2): CPU calibration kept per machine across processes
+
+Host: adacachy2 (as above), shared with other builds (18 of 32 cores idle at the start). Release
+profile. Before: origin/main dcd6ce4c. After: the synced tree (perf/coldstart, this commit).
+
+Command (kiln run r133, one machine, before and after interleaved, 25 fresh processes each, one
+shared empty `XDG_CACHE_HOME` for the run):
+
+    sh .perf/first_open.sh dcd6ce4c 25
+    # each process: open_time <dir> 1, its "process's first open" line (Database::open, the
+    # process's CPU calibration included)
+
+| process's first open (us) | min | median | max |
+|---|---|---|---|
+| before (calibrates every process) | 7567 | 82604 | 161025 |
+| after, the machine's first process (calibrates, keeps it) | 91186 | | |
+| after, the 24 processes after it (read the kept calibration) | 670 | ~870 | 1257 |
+
+The kept file is 2.4 KB (`$XDG_CACHE_HOME/amphora/calibration/<fnv of cpu + exe path>`). A process
+reads it back bit for bit (the times as f64 bits), so it plans on exactly the rates the
+calibration measured; another CPU record (model, stepping, microcode, flags, bugs) or another
+executable (path, length, mtime) is another key and is measured again. Linux only: macOS and
+Windows name their CPU through calls this crate doesn't make (no unsafe), so they calibrate each
+process, as before.

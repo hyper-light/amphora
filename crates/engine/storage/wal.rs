@@ -284,6 +284,13 @@ impl WalConnectionState {
 /// - The embedded value can be atomically read without holding any lock
 pub struct TursoRwLock(AtomicU64);
 
+/// Amphora (AUDIT 2.1): one of the log's locks, alone on its cache-line pair. The five read locks,
+/// the vacuum, write and checkpoint locks shared one 64-byte line, so a reader taking read lock 1
+/// invalidated the line every writer and checkpointer spun on, and the reverse. `CachePadded`
+/// aligns to 128 bytes on x86_64 and aarch64 (the adjacent-line prefetcher pulls lines in pairs),
+/// as `optimistic_pages`' frames do.
+pub type PaddedLock = crossbeam_utils::CachePadded<TursoRwLock>;
+
 pub const READMARK_NOT_USED: u32 = 0xffffffff;
 const NO_LOCK_HELD: usize = usize::MAX;
 
@@ -3156,7 +3163,7 @@ impl ShmWalCoordination {
     /// is released and the caller retries.
     fn publish_shared_reader(
         &self,
-        read_locks: &[TursoRwLock; 5],
+        read_locks: &[PaddedLock; 5],
         snapshot: WalSnapshot,
         read_lock_idx: usize,
     ) -> bool {
@@ -3646,6 +3653,7 @@ impl HeaderCell {
             locked: self.header.lock(),
             copy: &self.checkpoint_seq,
             whole: &self.copy,
+            written: false,
         }
     }
 
@@ -3667,13 +3675,18 @@ impl std::fmt::Debug for HeaderCell {
     }
 }
 
-/// The header, locked; dropped, it leaves its `checkpoint_seq` readable without the lock. Its fields
-/// are named unlike any of the header's: a field of the guard would hide the header's of the same
-/// name from code reaching it through `Deref`.
+/// The header, locked; dropped after a write, it leaves its `checkpoint_seq` and the whole header
+/// readable without the lock. Its fields are named unlike any of the header's: a field of the guard
+/// would hide the header's of the same name from code reaching it through `Deref`.
 pub struct HeaderGuard<'a> {
     locked: crate::fast_lock::SpinLockGuard<'a, WalHeader>,
     copy: &'a AtomicU32,
     whole: &'a super::log_index::HeaderCopy,
+    /// Amphora (AUDIT 2.1): set by `DerefMut`, the only way to change the header through the
+    /// guard. A guard only read leaves the copies as the last writing guard left them, which is the
+    /// header still, so its drop publishes nothing: a reader's drop wrote the seqlock's line every
+    /// read, and every other reader of the copy then missed in its cache.
+    written: bool,
 }
 
 impl std::ops::Deref for HeaderGuard<'_> {
@@ -3686,12 +3699,16 @@ impl std::ops::Deref for HeaderGuard<'_> {
 
 impl std::ops::DerefMut for HeaderGuard<'_> {
     fn deref_mut(&mut self) -> &mut WalHeader {
+        self.written = true;
         &mut self.locked
     }
 }
 
 impl Drop for HeaderGuard<'_> {
     fn drop(&mut self) {
+        if !self.written {
+            return;
+        }
         self.copy
             .store(self.locked.checkpoint_seq, Ordering::Release);
         self.whole.store(&self.locked);
@@ -3737,19 +3754,19 @@ pub struct WalSharedRuntime {
     /// from a partially checkpointed db file.
     /// Slots 1‑4 carry a frame‑number in value and may be shared by many readers. Slot 1 is the
     /// default read lock and is to contain the max_frame in WAL.
-    pub read_locks: [TursoRwLock; 5],
+    pub read_locks: [PaddedLock; 5],
     /// Lock used by in-place VACUUM to keep new read/write transactions out
     /// while VACUUM is in progress.
     /// Normal WAL transactions hold this shared for the lifetime of their
     /// transaction. VACUUM holds it exclusively until its final truncate
     /// checkpoint has completed.
-    pub vacuum_lock: TursoRwLock,
+    pub vacuum_lock: PaddedLock,
     /// There is only one write allowed in WAL mode. This lock takes care of ensuring there is only
     /// one used.
-    pub write_lock: TursoRwLock,
+    pub write_lock: PaddedLock,
 
     /// Serialises checkpointer threads, only one checkpoint can be in flight at any time. Blocking and exclusive only
-    pub checkpoint_lock: TursoRwLock,
+    pub checkpoint_lock: PaddedLock,
     /// Amphora (lane constants-22): each release of the locks above in this process, and each
     /// commit published, for the statements busy on them to wake on ([`LockRelease`]).
     pub released: Arc<LockRelease>,
@@ -7941,7 +7958,7 @@ impl WalFileShared {
             checksum_2: snapshot.checksum_2,
             ..WalHeader::new()
         };
-        let read_locks = array::from_fn(|_| TursoRwLock::new());
+        let read_locks = array::from_fn(|_| PaddedLock::new(TursoRwLock::new()));
         for (i, lock) in read_locks.iter().enumerate() {
             lock.write();
             lock.set_value_exclusive(if i < 2 { 0 } else { READMARK_NOT_USED });
@@ -7966,9 +7983,9 @@ impl WalFileShared {
                 frame_cache_high_water: AtomicU64::new(0),
                 file: Some(file),
                 read_locks,
-                vacuum_lock: TursoRwLock::new(),
-                write_lock: TursoRwLock::new(),
-                checkpoint_lock: TursoRwLock::new(),
+                vacuum_lock: PaddedLock::new(TursoRwLock::new()),
+                write_lock: PaddedLock::new(TursoRwLock::new()),
+                checkpoint_lock: PaddedLock::new(TursoRwLock::new()),
                 released: Arc::default(),
                 writer_released: Arc::default(),
                 epoch: AtomicU32::new(snapshot.checkpoint_epoch),
@@ -8028,7 +8045,7 @@ impl WalFileShared {
 
     pub fn new_noop() -> Arc<RwLock<WalFileShared>> {
         let wal_header = WalHeader::new();
-        let read_locks = array::from_fn(|_| TursoRwLock::new());
+        let read_locks = array::from_fn(|_| PaddedLock::new(TursoRwLock::new()));
         for (i, lock) in read_locks.iter().enumerate() {
             lock.write();
             lock.set_value_exclusive(if i < 2 { 0 } else { READMARK_NOT_USED });
@@ -8052,9 +8069,9 @@ impl WalFileShared {
                 frame_cache_high_water: AtomicU64::new(0),
                 file: None,
                 read_locks,
-                vacuum_lock: TursoRwLock::new(),
-                write_lock: TursoRwLock::new(),
-                checkpoint_lock: TursoRwLock::new(),
+                vacuum_lock: PaddedLock::new(TursoRwLock::new()),
+                write_lock: PaddedLock::new(TursoRwLock::new()),
+                checkpoint_lock: PaddedLock::new(TursoRwLock::new()),
                 released: Arc::default(),
                 writer_released: Arc::default(),
                 epoch: AtomicU32::new(0),
@@ -8077,7 +8094,7 @@ impl WalFileShared {
     #[cfg(test)]
     pub(super) fn new_shared(file: Arc<dyn File>) -> Result<Arc<RwLock<WalFileShared>>> {
         let wal_header = WalHeader::new();
-        let read_locks = array::from_fn(|_| TursoRwLock::new());
+        let read_locks = array::from_fn(|_| PaddedLock::new(TursoRwLock::new()));
         // slot zero is always zero as it signifies that reads can be done from the db file
         // directly, and slot 1 is the default read mark containing the max frame. in this case
         // our max frame is zero so both slots 0 and 1 begin at 0
@@ -8104,9 +8121,9 @@ impl WalFileShared {
                 frame_cache_high_water: AtomicU64::new(0),
                 file: Some(file),
                 read_locks,
-                vacuum_lock: TursoRwLock::new(),
-                write_lock: TursoRwLock::new(),
-                checkpoint_lock: TursoRwLock::new(),
+                vacuum_lock: PaddedLock::new(TursoRwLock::new()),
+                write_lock: PaddedLock::new(TursoRwLock::new()),
+                checkpoint_lock: PaddedLock::new(TursoRwLock::new()),
                 released: Arc::default(),
                 writer_released: Arc::default(),
                 epoch: AtomicU32::new(0),
