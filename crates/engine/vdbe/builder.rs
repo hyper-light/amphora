@@ -19,7 +19,7 @@ use crate::{
 };
 
 // Keep distinct hash-table ids far from table internal ids to avoid collisions.
-const HASH_TABLE_ID_BASE: usize = 1 << 30;
+pub(crate) const HASH_TABLE_ID_BASE: usize = 1 << 30;
 
 #[derive(Default)]
 pub struct TableRefIdCounter {
