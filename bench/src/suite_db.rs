@@ -1071,14 +1071,14 @@ struct PgCell(Option<String>);
 
 impl<'a> postgres::types::FromSql<'a> for PgCell {
     fn from_sql(ty: &postgres::types::Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
-        use postgres::types::{FromSql, Type};
+        use postgres::types::Type;
         let cell = match *ty {
-            Type::BOOL => Cell::Int(i64::from(bool::from_sql(ty, raw)?)),
-            Type::INT2 => Cell::Int(i64::from(i16::from_sql(ty, raw)?)),
-            Type::INT4 => Cell::Int(i64::from(i32::from_sql(ty, raw)?)),
-            Type::INT8 => Cell::Int(i64::from_sql(ty, raw)?),
-            Type::FLOAT4 => Cell::Real(f64::from(f32::from_sql(ty, raw)?)),
-            Type::FLOAT8 => Cell::Real(f64::from_sql(ty, raw)?),
+            Type::BOOL => Cell::Int(i64::from(<bool as postgres::types::FromSql>::from_sql(ty, raw)?)),
+            Type::INT2 => Cell::Int(i64::from(<i16 as postgres::types::FromSql>::from_sql(ty, raw)?)),
+            Type::INT4 => Cell::Int(i64::from(<i32 as postgres::types::FromSql>::from_sql(ty, raw)?)),
+            Type::INT8 => Cell::Int(<i64 as postgres::types::FromSql>::from_sql(ty, raw)?),
+            Type::FLOAT4 => Cell::Real(f64::from(<f32 as postgres::types::FromSql>::from_sql(ty, raw)?)),
+            Type::FLOAT8 => Cell::Real(<f64 as postgres::types::FromSql>::from_sql(ty, raw)?),
             Type::NUMERIC => return Ok(PgCell(Some(numeric_text(raw).ok_or("a NUMERIC cut short")?))),
             Type::BYTEA => Cell::Blob(raw),
             // JSONB's binary form is a version byte, then the document's text.
