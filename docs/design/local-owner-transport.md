@@ -176,7 +176,9 @@ across a drain. Each side says the versions it speaks and both use the newest on
   (`Request::since`, which names every request and every `xgroup::Step`) is refused before it goes
   out, `Invalid`, on a connection that agreed on an older version. Version 9's
   `Answer::SteppedClosed` is `Stepped` plus the group's closed time; an owner answers a step at 8
-  with `Stepped`, as version 8 did.
+  with `Stepped`, as version 8 did. At 8 both `Step.carried` and `Stepped.latest` carry the backup
+  clock's nanoseconds. At 9 the stamps are microseconds. Each side speaking 9 converts at the
+  version-8 boundary, rounding an incoming nanosecond stamp up so its clock covers it (T-T1.12.X2).
 - What a version-8 peer can't say is missing, not guessed: a step a version-8 node answers adds no
   closed time to a transaction's token (xgroup.md, "Reading its own writes across groups"), so
   reading one's own writes in that node's groups holds once it speaks 9.
