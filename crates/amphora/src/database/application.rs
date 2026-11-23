@@ -119,7 +119,9 @@ impl Database {
             version: required,
         };
         let outcome = database
-            .call_db(until, move |db| raise(db, wanted, replicated))
+            .call_db(until, AnswerMax::bytes(RAISE_MAX), move |db| {
+                raise(db, wanted, replicated)
+            })
             .inspect_err(|refusal| {
                 if let Writer::Replicated { client, .. } = &self.shared.writer
                     && matches!(refusal, Refusal::Serialization { .. })
@@ -189,6 +191,10 @@ impl FloorRefused {
         Self { reason, refusal }
     }
 }
+
+/// A floor raise's answer at its bound: an application's name is family-shaped, so at most
+/// `api::FAMILY_MAX` bytes (`Application::validate`); a refusal's text is one of `raise`'s own.
+const RAISE_MAX: usize = std::mem::size_of::<Result<Application, FloorRefused>>() + api::FAMILY_MAX;
 
 impl AnswerBytes for FloorRefused {
     fn answer_bytes(&self) -> usize {
