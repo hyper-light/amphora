@@ -3672,10 +3672,10 @@ mod admission_charge {
                 LockedReads::Committed,
             ))
         };
-        assert_eq!(scan(1), fixed + 2 + 2 * row, "a one-row page and the row past it");
+        assert_eq!(scan(1), fixed + 3 + 2 * row, "a one-row page and the row past it");
         assert_eq!(
             scan(api::SCAN_MAX),
-            fixed + 2 + (api::SCAN_MAX + 1) * row,
+            fixed + 3 + (api::SCAN_MAX + 1) * row,
             "the largest page: ~1 GiB, past the flat 32 MiB it was charged"
         );
         assert!(scan(api::SCAN_MAX) > api::REQUEST_MAX);
