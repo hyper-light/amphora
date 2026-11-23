@@ -152,5 +152,9 @@ the message whole. The kinds known at the barrier: `Operation::Mutation` and `Im
 
 ## 4. The crash test after lane K6's fix
 
-K6's fix is on main (46abb6c0). perf/persisted-crash (6d0f897a) merged with main is perf/persisted-w2-crash
-(82fce4cd); its run is below.
+K6's fix is on main (46abb6c0). bd6abd42 had taken the test off main; W2 brought it back on main 7777fa99 (with
+`Serialization`), perf/persisted-w2-crash 5159e10e. r882: it passes, "32 writers through 5 leader crashes: 25 sent
+again, 153 rounds", one run (load 14-34); clippy `-p amphora --all-targets -D warnings` clean (r888). No stale state
+after a restart showed in this run; it stopped on `Full { limit: 2 }` before K6's fix and not after. The other W2
+checks after the merge (09f19c51, r861): clippy clean, the touched tests 36 of 36, `--test transport` 6 of 6. Not
+run: the module suites on main after the push (rule 5b), for the successor.
