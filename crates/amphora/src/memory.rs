@@ -52,7 +52,10 @@ fn read_group_limit(text: &str) -> Result<Option<u64>, std::num::ParseIntError> 
         return Ok(None);
     }
     let bytes = text.parse::<u64>()?;
-    Ok((bytes < V1_UNLIMITED).then_some(bytes))
+    if bytes >= V1_UNLIMITED {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
 }
 
 /// The machine's memory in bytes, from `/proc/meminfo`'s `MemTotal:` line (in KiB).
