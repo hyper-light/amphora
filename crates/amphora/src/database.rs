@@ -2871,8 +2871,6 @@ impl Database {
                 }],
                 room_until,
                 move |done| {
-                    let _admission = admission;
-                    let _in_flight = in_flight;
                     let mut result = match done {
                         Ok(()) => locked(&answer)
                             .and_then(|mut r| {
@@ -2966,6 +2964,10 @@ impl Database {
                             Err(error) => result = Err(error),
                         }
                     }
+                    // Its charge and its count in flight end before its answer is handed over,
+                    // so a caller holding the answer holds no charge but its answer's.
+                    drop(admission);
+                    drop(in_flight);
                     reply(result);
                 },
             )
