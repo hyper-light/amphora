@@ -8443,7 +8443,7 @@ pub mod test {
     #[test]
     fn replace_after_external_restore_preserves_lock_identity() {
         let shared = SharedLog::new(WalFileShared::new_noop());
-        let restored = SharedLog::new(WalFileShared::new_noop());
+        let restored = WalFileShared::new_noop();
 
         let read_lock_ptrs = {
             let shared = shared.current().read();

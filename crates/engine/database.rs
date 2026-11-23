@@ -50,8 +50,8 @@ use crate::{
     AtomicSyncMode, AtomicTempStore, AtomicTransactionState, Buffer, BufferPool, CipherMode,
     Completion, CompletionError, Connection, DatabaseStorage, Dialect, EncryptionKey, IOResult,
     InternalVirtualTable, LimboError, MemoryIO, MvStore, OpenFlags, PageCodec, PageCodecId,
-    PageRef, Pager, PlatformIO, Result, SymbolTable, SyncMode, SyscallIO, TempStore,
-    TransactionState, VirtualTable, SharedLog, Wal, WalAutoActions, WalFile, WalFileShared, IO,
+    PageRef, Pager, PlatformIO, Result, SharedLog, SymbolTable, SyncMode, SyscallIO, TempStore,
+    TransactionState, VirtualTable, Wal, WalAutoActions, WalFile, WalFileShared, IO,
 };
 use arc_swap::{ArcSwap, ArcSwapOption};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -1707,8 +1707,13 @@ impl Database {
 
                     #[cfg(debug_assertions)]
                     {
-                        let wal_enabled =
-                            db.shared_wal.current().read().metadata.enabled.load(Ordering::SeqCst);
+                        let wal_enabled = db
+                            .shared_wal
+                            .current()
+                            .read()
+                            .metadata
+                            .enabled
+                            .load(Ordering::SeqCst);
                         let mv_store_enabled = db.get_mv_store().is_some();
                         assert!(
                             db.is_readonly() || wal_enabled || mv_store_enabled,
@@ -2464,8 +2469,11 @@ impl Database {
                     };
 
                     self.shared_wal = SharedLog::new(shared_wal);
-                    let last_checksum_and_max_frame =
-                        self.shared_wal.current().read().last_checksum_and_max_frame();
+                    let last_checksum_and_max_frame = self
+                        .shared_wal
+                        .current()
+                        .read()
+                        .last_checksum_and_max_frame();
                     let wal =
                         self.build_wal(last_checksum_and_max_frame, pager.buffer_pool.clone())?;
                     pager.set_wal(wal);
