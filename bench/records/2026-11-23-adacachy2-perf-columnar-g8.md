@@ -9,8 +9,8 @@ the switch with today's behaviour as the default.
 
 ## Verdict, losses first
 
-- **Nothing merged to main.** The code is on branch `perf/columnar-g8` (f53fe695), but it has
-  never been compiled. Clippy and the unit tests never ran: kiln refused every check run for room
+- **Nothing merged to main.** The code is on branch `perf/columnar-g8`, merged with main
+  ea04b5b7 (clean), but it has never been compiled. Clippy and the unit tests never ran: kiln refused every check run for room
   on adacachy2 (0 or 1 of 32 cores idle, 15:22Z to 15:27Z). The first run (r952) started but
   stopped at `git checkout`: `~/.cache/amphora-perf/columnar-remote` on adacachy2 holds untracked
   files a sync left. The command below uses a new folder, `columnar-g8-remote`.
@@ -102,5 +102,5 @@ The A/B (unit 2), after the gate:
 ## Files
 
 - Branch `perf/columnar-g8`: bec8f463 (switch and arm b), 840e7443 (window frames), f53fe695
-  (a borrow fix).
+  (a borrow fix), this record, and the merge of main ea04b5b7.
 - On adacachy2: `~/.cache/amphora-g8/` (empty until a check runs).
