@@ -2187,8 +2187,14 @@ struct ShmWalCoordination {
 impl ShmWalCoordination {
     /// The read mark that guards a read of `snapshot` begun with `span`, taken on the segment
     /// current when the read began (decision 45). The read is counted on `span`'s segments in
-    /// its shared reader slot, where every process sees it.
-    fn try_read_mark(&self, snapshot: WalSnapshot, span: &ReadSpan) -> Option<ReadGuardKind> {
+    /// its shared reader slot, where every process sees it; `word` is the shared word the span
+    /// was taken from.
+    fn try_read_mark(
+        &self,
+        snapshot: WalSnapshot,
+        span: &ReadSpan,
+        word: u64,
+    ) -> Option<ReadGuardKind> {
         turso_assert!(
             snapshot.max_frame <= u32::MAX as u64,
             "max_frame exceeds u32 read mark range"
@@ -2208,7 +2214,7 @@ impl ShmWalCoordination {
                 read_locks[0].unlock();
                 return None;
             }
-            if !self.publish_shared_reader(read_locks, snapshot, 0, span) {
+            if !self.publish_shared_reader(read_locks, snapshot, 0, span, word) {
                 return None;
             }
             return Some(ReadGuardKind::DbFile(segment));
@@ -2253,7 +2259,7 @@ impl ShmWalCoordination {
         }
 
         let read_mark_index = NonZeroUsize::new(best_idx as usize)?;
-        if !self.publish_shared_reader(read_locks, snapshot, best_idx as usize, span) {
+        if !self.publish_shared_reader(read_locks, snapshot, best_idx as usize, span, word) {
             return None;
         }
         Some(ReadGuardKind::ReadMark(segment, read_mark_index))
@@ -2895,23 +2901,23 @@ impl WalCoordination for ShmWalCoordination {
         prev
     }
 
+    /// The span comes from the shared memory's word, where every process's switch, copy and
+    /// reset is, and the read is counted only there (decision 45).
     fn try_begin_read_tx(&self, snapshot: WalSnapshot) -> Option<(ReadGuardKind, ReadSpan)> {
-        let span = self.log.begin_read();
-        match self.try_read_mark(snapshot, &span) {
-            Some(guard) => Some((guard, span)),
-            None => {
-                self.log.end_read(span);
-                None
-            }
-        }
+        let (span, word) = self.authority.begin_span();
+        let guard = self.try_read_mark(snapshot, &span, word)?;
+        Some((guard, span))
     }
 
     fn end_read_tx(&self, guard: ReadGuardKind, span: ReadSpan) {
         if let Some(reader) = self.active_reader.lock().take() {
             self.authority.uncount_read(reader, &span);
             self.authority.unregister_reader_for_snapshot(reader);
+            self.authority.reset_if_unread();
         }
-        self.fallback.end_read_tx(guard, span);
+        if let Some((segment, slot)) = guard.read_mark() {
+            self.fallback.unlock_segment_read_mark(segment, slot);
+        }
     }
 
     fn try_begin_write_tx(&self) -> bool {
@@ -3301,6 +3307,7 @@ impl ShmWalCoordination {
         snapshot: WalSnapshot,
         read_lock_idx: usize,
         span: &ReadSpan,
+        word: u64,
     ) -> bool {
         aristo::intent_stmt!(
             "A reader that reads only the database file registers in the shared reader \
@@ -3327,7 +3334,8 @@ impl ShmWalCoordination {
             return false;
         };
         // Decision 45: the read counts on its segments in its slot, where every process's
-        // checkpointer sees it, before the snapshot's check below.
+        // checkpointer sees it, then checks that no reset took a segment of its span meanwhile
+        // (`span_holds`), before the snapshot's check below.
         let counted = self.authority.count_read(reader, span);
         aristo::intent_stmt!(
             "After the slot is registered, the shared snapshot is compared again, and any \
@@ -3339,9 +3347,10 @@ impl ShmWalCoordination {
             id = "reader_rechecks_snapshot_after_registration",
             parent = "checkpoint_safe_frame_below_every_reader"
         );
-        if !counted || self.load_snapshot() != snapshot {
+        if !counted || !self.authority.span_holds(word) || self.load_snapshot() != snapshot {
             if counted {
                 self.authority.uncount_read(reader, span);
+                self.authority.reset_if_unread();
             }
             self.authority.unregister_reader_for_snapshot(reader);
             read_locks[read_lock_idx].unlock();
