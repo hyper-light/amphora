@@ -2410,6 +2410,7 @@ fn register_keepalive_aggregate(conn: &Arc<Connection>) {
                 1,
                 0,
                 (keepalive_init, keepalive_step, keepalive_finalize),
+                None,
                 Some(keepalive_destroy_context),
                 None,
                 None,
