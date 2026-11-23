@@ -209,6 +209,63 @@ moving rows out of blocks over positional deltas, which complicate reads [c80].
    costs it measures differ, or that loses to some fixed value from the sources' range on any of
    them [c91][c93]: then it is a constant in disguise, or its estimator measures the wrong thing.
 
+## 2. Column copies granted their memory before they are built, a refused copy bought again by a switch
+
+**Decision.**
+
+1. **Asked before built.** Each block of a table's copy asks the storage's memory source for its
+   bytes before it is made, sized from the block's format alone (`Block::bytes`, equal to the made
+   block's resident bytes), and each change asks for its bytes before it is applied. A build refused
+   part way gives back what it took with the blocks it made. So a copy never holds a byte its source
+   did not grant, and a capped source is never passed (T-CB.1.1, T-CB.1.2, T-CB.1.3).
+2. **Bought again by one of two ways, behind `AMPHORA_COLUMN_REBUY`.** A, the control and today's
+   behaviour: a refused copy is let go, its table's next analytic statement pays the rent again and
+   the one after buys again, reading the whole table. B (`room`): a refused copy waits until the
+   source reports room (`Source::room`) for its expected size, what it needed when refused and what
+   its table's commits put since; no whole-table read is spent before (T-CB.2.1, T-CB.2.2).
+3. **Instruments.** Counters (`CopyCounts`: rebuys, the rows and bytes builds and rebuys read, the
+   statements and rows the row loop answered against the rows the copy served, the time copies were
+   absent), a metered source (`Meter`: takes asked, granted and refused, bytes held and at most),
+   the copies waiting and for how long, the bytes resident against the bytes granted, and trace
+   events with their reasons under the target `amphora::columns`.
+4. **Which way is the default is open.** The A/B harness (`columns_sql::tests::ab`, T-CB.4.1) forces
+   each way's failure mode: a laptop's cap with one big table, many tables under a small cap, steady
+   pressure, bursty pressure that frees memory in small pieces, a table that grows while its copy
+   waits, and a huge cap with many tables; and at fleet scale, 64 tables in half a copy's room, and
+   64 growing tables given room for every copy at once and then none, so copies are bought and let
+   go together. The scenarios are defined once (`storage::versioned::columns_ab`, AC-CB.4.3) for the
+   test and the DuckDB driver; each record says what its scenario forces, counts the copies' trace
+   events by reason, and gives the last copy let go with its refusal, the copies still waiting, and
+   the writes the cap refused. It writes one JSONL record per way and scenario. The
+   choice waits for the coordinator's run of record; until then A stays the default. Against DuckDB,
+   one driver (`amphora-bench --colcopy`, AC-CB.4.2) runs the same scenarios on Amphora under both
+   ways and on DuckDB, both in process and in memory, each statement timed the same way. DuckDB's
+   cap is `SET memory_limit` to the bytes it holds before the statement plus the scenario's free
+   bytes: its table is its columns, so it gets the same room for the analytic work as Amphora's copies.
+   The scenario's room is the analytic work's alone (lane colcopy-8, AC-CB.4.4): while a table's rows
+   grow, each engine's cap is lifted (Amphora's other use gives its bytes back, DuckDB's limit is
+   reset) and set again after, so a copy that must grow with its table meets the cap, not the rows;
+   the A/B test checks that no growing table's write is refused and that, under waves, copies a wave
+   bought are let go in a round after it (T-CB.4.3). The same driver
+   runs the concurrency ladder (`--ladder`, AC-CB.4.5): 1, 8, 32, 128, 512, 2048 and 4096 clients at
+   once on each engine, each its own connection and thread, one record a step with p50, p99 and
+   p99.9, and the client's threads, connections, peak resident bytes and own share of the time, to
+   show whether the client bounds the top step. Only statements a copy could answer are weighed
+   (lane colcopy-9, AC-CB.4.6): a statement the scan hook hands over that no copy can answer (its
+   rows, a filter only its loop states, a join, a transaction) reads the rows under either way, so
+   it is counted with its reason and traced, and left out. The A/B test tells statement by
+   statement from the copies' counts; the driver runs each query once on a probe table first, and
+   leaves the same ones out on DuckDB and in the ladder. Each record's percentiles count only the
+   statements that reached the copies, every statement's beside them, and it names the queries
+   left out and why. A transaction that only reads reads the copy at its own snapshot (lane
+   colcopy-10, AC-CB.4.7): a generation made at or before the snapshot and not behind there answers
+   it, the current one or the one it replaced, which is kept while an older snapshot is open; a
+   rebuild is made at a snapshot of every commit now, never at an older transaction's, which would
+   lack the commits between them. A snapshot no generation answers is refused, counted `unserved`
+   and traced, and the rows answer it. What the copy answered is kept as read, the whole table, for
+   the transaction's validation, as the rows' cursor walking every row would keep it. Only a
+   transaction that changed rows still skips the copy.
+
 ## What the next steps prototype and measure
 
 **Step 2, in-memory columns against persistent column blocks.** Both prototypes implement the whole

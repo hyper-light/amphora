@@ -2993,6 +2993,7 @@ impl TryClone for FromClauseSubquery {
             result_columns_start_reg: self.result_columns_start_reg,
             materialized_cursor_id: self.materialized_cursor_id,
             cte: self.cte,
+            identity: self.identity,
         })
     }
 }
@@ -4364,6 +4365,10 @@ pub struct FromClauseSubquery {
     /// CTE-specific materialization metadata, when this FROM-subquery is a CTE
     /// reference rather than an inline derived table.
     pub cte: Option<FromClauseSubqueryCteMetadata>,
+    /// Amphora (PL.13, lane replan-6): the subquery's identity, its syntax's fingerprint taken
+    /// when it was planned (`subquery_rows::identity`); `None` for one the planner made (an
+    /// unnested or windowed rewrite), a lateral one, or one that reads a parameter.
+    pub(crate) identity: Option<u64>,
 }
 
 /// Name data that an outer query can use through a parenthesized join.

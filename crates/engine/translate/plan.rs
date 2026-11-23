@@ -859,6 +859,10 @@ pub struct SelectPlan {
     /// Estimated output rows from the optimizer's join order computation.
     /// Used to propagate cardinality estimates for CTE/subquery tables.
     pub estimated_output_rows: Option<f64>,
+    /// Amphora (PL.13, lane replan-10): an uncorrelated IN subquery's identity, the key of the
+    /// distinct values its ephemeral index counted (`subquery_rows::in_identity`); `None` for every
+    /// other query.
+    pub(crate) in_identity: Option<u64>,
     /// Estimated work for this query after its table reads are chosen.
     /// Parent queries use this when they compare a subquery with a join.
     pub(crate) estimated_cost: Option<f64>,
@@ -1886,6 +1890,8 @@ pub struct TableReferences {
     joined_tables: Vec<JoinedTable>,
     /// Tables from outer scopes that are referenced in this query scope.
     outer_query_refs: Vec<OuterQueryReference>,
+    /// Amphora (QT.5, T-QT.5.3): the star joins' Bloom filters the planner chose.
+    lip_filters: Vec<LipFilter>,
 }
 
 impl Default for TableReferences {
@@ -1895,11 +1901,6 @@ impl Default for TableReferences {
 }
 
 impl TableReferences {
-    /// The maximum number of tables that can be joined together in a query.
-    /// This limit is arbitrary, although we currently use a u128 to represent the [crate::translate::planner::TableMask],
-    /// which can represent up to 128 tables.
-    /// Even at 63 tables we currently cannot handle the optimization performantly, hence the arbitrary cap.
-    pub const MAX_JOINED_TABLES: usize = 63;
     pub const fn new(
         joined_tables: Vec<JoinedTable>,
         outer_query_refs: Vec<OuterQueryReference>,
@@ -1907,6 +1908,7 @@ impl TableReferences {
         Self {
             joined_tables,
             outer_query_refs,
+            lip_filters: Vec::new(),
         }
     }
 
@@ -1914,7 +1916,18 @@ impl TableReferences {
         Self {
             joined_tables: Vec::new(),
             outer_query_refs: Vec::new(),
+            lip_filters: Vec::new(),
         }
+    }
+
+    /// Amphora (QT.5, T-QT.5.3): the star joins' Bloom filters, each checked at its fact table's
+    /// scan, in the order the scan checks them.
+    pub fn lip_filters(&self) -> &[LipFilter] {
+        &self.lip_filters
+    }
+
+    pub fn set_lip_filters(&mut self, filters: Vec<LipFilter>) {
+        self.lip_filters = filters;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -2259,6 +2272,7 @@ impl TableReferences {
         let TableReferences {
             joined_tables,
             outer_query_refs,
+            ..
         } = other;
 
         // Avoid `Vec::extend` here: `JoinedTable` is large, and many prepare
@@ -2778,6 +2792,26 @@ pub struct ExpressionIndexUsage {
 /// Represents one key pair in a hash join equality condition.
 /// For `expr1 = expr2`, this tracks which WHERE term contains the equality
 /// and which side of the equality belongs to the build table.
+/// Amphora (QT.5, T-QT.5.3): a star join's dimension, read once into a Bloom filter of its join
+/// keys that the fact table's scan checks before any later loop (`optimizer/lip.rs`).
+#[derive(Debug, Clone)]
+pub struct LipFilter {
+    /// The fact table, whose scan checks the filter.
+    pub fact_idx: usize,
+    /// The dimension, read into the filter.
+    pub dim_idx: usize,
+    /// The equalities between them; each key's build side is the dimension's.
+    pub keys: Vec<HashJoinKey>,
+    /// The dimension's own `WHERE` terms the build applies.
+    pub dim_terms: Vec<usize>,
+    /// The filter's false-positive rate per distinct key (`bloom_filter_rate_saving`).
+    pub fp_per_key: f64,
+    /// The filter's share of the statement's memory.
+    pub max_bytes: usize,
+    /// The planner's estimate of the share of fact rows it passes.
+    pub pass: f64,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct HashJoinKey {
     /// Index into the where_clause vector
@@ -2843,6 +2877,21 @@ impl HashJoinType {
     }
 }
 
+/// Amphora (QT.5 step 4, lane qs5-21, T-QT.5.18): how a hash-shaped join finds a probe row's build
+/// rows. Both keep the build rows in the hash table (`vdbe/hash_table.rs`), with its matched bits,
+/// unmatched-row scan and spills, so every join type runs the same way under either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HashJoinMethod {
+    /// By the key's hash: the control.
+    #[default]
+    Hash,
+    /// By a sort-merge: the build rows sorted by key once built, and each probe row's matches
+    /// found by merging forward from the previous probe row's, so a probe read in key order passes
+    /// each build row once and a repeated key replays its run. A probe row out of key order
+    /// finds its run by binary search instead.
+    Merge,
+}
+
 /// Hash join operation metadata
 #[derive(Debug, Clone)]
 pub struct HashJoinOp {
@@ -2864,6 +2913,8 @@ pub struct HashJoinOp {
     pub bloom_fp_per_key: f64,
     /// Join semantics.
     pub join_type: HashJoinType,
+    /// QT.5 step 4: by hash or by sort-merge (`HashJoinMethod`).
+    pub method: HashJoinMethod,
     /// PL.8: the tables of a bushy plan's inner join whose result is the build side, joined among
     /// themselves in the materialized build input and read from its payload; the build table is
     /// one of them. Empty for a left-deep plan, whose build input is the tables before the probe.
@@ -3185,6 +3236,7 @@ impl JoinedTable {
             result_columns_start_reg: None,
             materialized_cursor_id: None,
             cte: None,
+            identity: None,
         }));
         Ok(Self {
             op: Operation::default_scan_for(&table),
@@ -3207,6 +3259,9 @@ impl JoinedTable {
     /// If `cte_id` is provided, this subquery is a CTE reference that can share materialized data.
     /// If `materialize_hint` is true, the CTE was declared with AS MATERIALIZED and should always
     /// be materialized regardless of reference count.
+    /// `identity` is the subquery's syntax's fingerprint (PL.13, lane replan-6), where its stored
+    /// result may be counted against its estimate.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_subquery_from_plan(
         identifier: String,
         plan: Plan,
@@ -3215,6 +3270,7 @@ impl JoinedTable {
         explicit_columns: Option<&[String]>,
         cte_id: Option<usize>,
         materialize_hint: bool,
+        identity: Option<u64>,
     ) -> Result<Self> {
         let columns = subquery_output_columns(&plan, explicit_columns)?;
         // Get result columns and table references from the plan
@@ -3234,6 +3290,7 @@ impl JoinedTable {
             result_columns_start_reg: None,
             materialized_cursor_id: None,
             cte,
+            identity,
         }));
         Ok(Self {
             op: Operation::default_scan_for(&table),

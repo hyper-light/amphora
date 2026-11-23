@@ -738,6 +738,14 @@ pub struct Database<
     pub(crate) learned_costs: Arc<crate::translate::optimizer::learned_costs::LearnedCosts>,
     /// Amphora (PL.9): each table's rows inserted less rows deleted since ANALYZE counted it.
     pub(crate) row_changes: Arc<crate::row_changes::RowChanges>,
+    /// Amphora (PL.13, lane replan-5): filter shares filtered hash-join builds counted.
+    pub(crate) filter_shares: Arc<crate::filter_shares::FilterShares>,
+    /// Amphora (PL.13, lane replan-6): subquery results stored results counted.
+    pub(crate) subquery_rows: Arc<crate::subquery_rows::SubqueryRows>,
+    /// Amphora (PL.8, T-PL.8.10, lane pl8-17): where the exact join searches of statements
+    /// prepared with the fast plan run under `BackgroundSearch::Worker`, and both placements'
+    /// counters (`background_search.rs`).
+    pub(crate) planner: crate::background_search::Planner,
     /// Amphora (PL.7): the cost weights fitted to its statements' measured times, and the switch
     /// the planner reads them behind.
     pub(crate) cost_fit: Arc<crate::translate::optimizer::cost_fit::DatabaseFit>,
@@ -919,6 +927,9 @@ impl Database {
             _shared_page_cache: shared_page_cache,
             learned_costs,
             row_changes: Arc::new(crate::row_changes::RowChanges::new()),
+            filter_shares: Arc::new(crate::filter_shares::FilterShares::new()),
+            subquery_rows: Arc::new(crate::subquery_rows::SubqueryRows::new()),
+            planner: crate::background_search::Planner::default(),
             cost_fit: Arc::new(crate::translate::optimizer::cost_fit::DatabaseFit::new()),
             shared_wal,
             #[cfg(host_shared_wal)]
@@ -2771,9 +2782,10 @@ impl Database {
                 crate::storage::versioned::switch::asked() && self.versioned_found(),
                 None,
             )?
-            .map(crate::storage::versioned::switch::Switch::new);
+            .map(|s| Arc::new(crate::storage::versioned::switch::Switch::new(s)));
         let conn = Arc::new(Connection {
             versioned,
+            versioned_attached: RwLock::new(HashMap::default()),
             db: self.clone(),
             context,
             pager: ArcSwap::new(pager),
@@ -2843,16 +2855,58 @@ impl Database {
             join_methods: crate::connection::AtomicJoinMethods::new(
                 crate::connection::JoinMethods::ByCost,
             ),
+            join_search_budget: crate::connection::AtomicJoinSearchBudget::new(
+                crate::connection::JoinSearchBudget::Fixed,
+            ),
+            carried_join_orders: crate::connection::AtomicCarriedJoinOrders::new(
+                crate::connection::CarriedJoinOrders::Off,
+            ),
+            bushy_left_join_probes: crate::connection::AtomicBushyLeftJoinProbes::new(
+                crate::connection::BushyLeftJoinProbes::Off,
+            ),
+            background_search: crate::connection::AtomicBackgroundSearch::new(
+                crate::connection::BackgroundSearch::Off,
+            ),
+            idle_searches: crate::background_search::IdleSearches::default(),
+            star_filters: crate::connection::AtomicStarFilters::new(
+                crate::connection::StarFilters::ByCost,
+            ),
+            is_value_estimate: crate::connection::AtomicIsValueEstimate::new(
+                crate::connection::IsValueEstimate::Equality,
+            ),
+            star_filter_order: crate::connection::AtomicStarFilterOrder::new(
+                crate::connection::StarFilterOrder::Planned,
+            ),
             sorted_fetches: AtomicBool::new(false),
             adaptive_joins: AtomicBool::new(false),
             adaptive_join_switches: AtomicU64::new(0),
             adaptive_replans: AtomicU64::new(0),
+            adaptive_build_checks: AtomicU64::new(0),
+            adaptive_filter_checks: AtomicU64::new(0),
+            adaptive_filter_corrections: AtomicU64::new(0),
+            adaptive_sort_checks: AtomicU64::new(0),
+            adaptive_subquery_checks: AtomicU64::new(0),
             adaptive_handoff: AtomicBool::new(true),
             adaptive_handoffs: AtomicU64::new(0),
             pinned_cost_weights: crate::sync::RwLock::new(None),
             automatic_indexes: AtomicBool::new(true),
             parallel_mode: AtomicBool::new(false),
+            parallel_limit: AtomicBool::new(false),
+            parallel_cores: std::sync::atomic::AtomicUsize::new(0),
+            parallel_join_direct: AtomicBool::new(false),
+            parallel_outer_probe: crate::connection::AtomicOuterJoinProbe::new(
+                crate::connection::OuterJoinProbe::Padded,
+            ),
             morsel_costs: crate::sync::Mutex::new(None),
+            morsel_body_rows: AtomicU64::new(0),
+            morsel_join_links: AtomicU64::new(0),
+            morsel_join_direct_rows: AtomicU64::new(0),
+            morsel_outer: crate::vdbe::morsel_scan::OuterCounters::default(),
+            parallel_searched_links: crate::connection::AtomicSearchedLinks::new(
+                crate::connection::SearchedLinks::Off,
+            ),
+            morsel_searched_links: AtomicU64::new(0),
+            morsel_seek_links: AtomicU64::new(0),
             vectorized_scans: AtomicBool::new(false),
             enable_load_extension: AtomicBool::new(self.can_load_extensions()),
             fk_pragma: AtomicBool::new(false),
@@ -5138,6 +5192,11 @@ mod database_tests {
     #[cfg(feature = "fs")]
     #[test]
     fn pragma_checkpoint_codec_error_releases_checkpoint_lock() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's own pages: its page codec, its log and checkpoint; the versioned storage keeps neither",
+        ) {
+            return;
+        }
         let temp_dir = tempfile::TempDir::new().unwrap();
         let path = temp_dir.path().join("codec-pragma-checkpoint-retry.db");
         let path = path.to_str().unwrap();
@@ -5204,6 +5263,11 @@ mod database_tests {
     #[cfg(feature = "fs")]
     #[test]
     fn page_codec_transaction_recovers_after_wal_encode_failure() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's own pages: its page codec, its log and checkpoint; the versioned storage keeps neither",
+        ) {
+            return;
+        }
         let temp_dir = tempfile::TempDir::new().unwrap();
         let path = temp_dir.path().join("codec-commit-retry.db");
         let path = path.to_str().unwrap();
@@ -5247,6 +5311,11 @@ mod database_tests {
     #[cfg(feature = "fs")]
     #[test]
     fn page_codec_pager_read_recovers_after_decode_failure() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's own pages: its page codec, its log and checkpoint; the versioned storage keeps neither",
+        ) {
+            return;
+        }
         let temp_dir = tempfile::TempDir::new().unwrap();
         let path = temp_dir.path().join("codec-read-retry.db");
         let path = path.to_str().unwrap();
@@ -5294,6 +5363,11 @@ mod database_tests {
     #[cfg(feature = "fs")]
     #[test]
     fn page_codec_checkpoint_recovers_after_backfill_transform_failures() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's own pages: its page codec, its log and checkpoint; the versioned storage keeps neither",
+        ) {
+            return;
+        }
         let temp_dir = tempfile::TempDir::new().unwrap();
         let path = temp_dir.path().join("codec-backfill-retry.db");
         let path = path.to_str().unwrap();
@@ -5346,6 +5420,11 @@ mod database_tests {
     #[cfg(feature = "fs")]
     #[test]
     fn page_codec_round_trips_wal_and_checkpointed_database_with_bootstrap_header() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's own pages: its page codec, its log and checkpoint; the versioned storage keeps neither",
+        ) {
+            return;
+        }
         let temp_dir = tempfile::TempDir::new().unwrap();
         let path = temp_dir.path().join("codec-roundtrip.db");
         let path = path.to_str().unwrap();
@@ -5580,6 +5659,11 @@ mod database_tests {
     #[cfg(feature = "fs")]
     #[test]
     fn page_codec_reopen_rejects_invalid_header_layout() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's own pages: its page codec, its log and checkpoint; the versioned storage keeps neither",
+        ) {
+            return;
+        }
         let temp_dir = tempfile::TempDir::new().unwrap();
         let path = temp_dir.path().join("codec-invalid-header-layout.db");
         let path = path.to_str().unwrap();
@@ -5805,6 +5889,11 @@ mod database_tests {
     #[cfg(feature = "fs")]
     #[test]
     fn page_codec_connections_preserve_old_reader_snapshot_during_checkpoint() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's own pages: its page codec, its log and checkpoint; the versioned storage keeps neither",
+        ) {
+            return;
+        }
         let temp_dir = tempfile::TempDir::new().unwrap();
         let path = temp_dir.path().join("codec-connections.db");
         let path = path.to_str().unwrap();
@@ -5901,6 +5990,11 @@ mod database_tests {
     #[cfg(feature = "fs")]
     #[test]
     fn page_codec_reserved_tail_detects_persistent_page_corruption() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's own pages: its page codec, its log and checkpoint; the versioned storage keeps neither",
+        ) {
+            return;
+        }
         use std::fs::OpenOptions as StdOpenOptions;
         use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -6010,6 +6104,11 @@ mod database_tests {
     #[cfg(feature = "fs")]
     #[test]
     fn page_codec_rejects_database_already_in_mvcc_mode() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's own pages: its page codec, its log and checkpoint; the versioned storage keeps neither",
+        ) {
+            return;
+        }
         let temp_dir = tempfile::TempDir::new().unwrap();
         let path = temp_dir.path().join("codec-existing-mvcc.db");
         let path_str = path.to_str().unwrap();

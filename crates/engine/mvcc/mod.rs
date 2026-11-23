@@ -305,6 +305,11 @@ mod tests {
 
     #[test]
     fn test_mvcc_dual_cursor_transaction_isolation() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's MVCC store and its log; the versioned storage keeps its own row versions",
+        ) {
+            return;
+        }
         let res = tracing_subscriber::fmt::try_init();
         drop(res);
         let mut db = MvccTestDbNoConn::new_with_random_db();

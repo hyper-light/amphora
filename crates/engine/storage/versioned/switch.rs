@@ -9,7 +9,9 @@
 //! root page in `sqlite_schema` (tree 1 is `sqlite_schema` itself), and each SQL transaction is one
 //! transaction of the storage, begun by its first cursor and committed or rolled back where the
 //! pager's ends. The pager still runs beside it for what the trees don't hold yet: the database
-//! header (the schema cookie, the user version). An index tree's order is recorded in the storage
+//! header (the schema cookie, the user version). Only a program that writes that header takes the
+//! pager's write lock, so writers of rows run beside each other and conflict only on the rows
+//! they touch (`PreparedProgram::writes_pager_header`). An index tree's order is recorded in the storage
 //! when its first cursor brings it ([`encode_order`]), so a reopened database orders the tree as
 //! before it replays a row of it.
 
@@ -19,7 +21,7 @@ use super::disk::{Disk, Files, Simulated};
 use super::durable::Database as VDatabase;
 use super::memory::Source;
 use super::pool::Room;
-use super::version::Savepoint;
+use super::version::{Savepoint, Ts, UnwrittenRefusal};
 use crate::error::LimboError;
 use crate::sync::{Arc, Mutex, OnceLock};
 use crate::translate::collate::CollationSeq;
@@ -63,7 +65,29 @@ pub struct Storage {
     orders: Mutex<HashMap<u64, Arc<OnceLock<KeyOrder>>>>,
     /// The SQL tables' column copies (G11 step 5, CS.5; [`super::columns_sql`]).
     pub(crate) copies: super::columns_sql::Copies,
+    /// A test's pause of a skipping build ([`Switch::pause_next_build`]): the table's root page,
+    /// told when the build paused, and what lets it go on.
+    #[cfg(test)]
+    build_pause: Mutex<Option<BuildPause>>,
+    /// A test's pause of the next commit with the pager's part ([`Switch::pause_next_commit_with`]):
+    /// told when it paused, and what lets it go on.
+    #[cfg(test)]
+    commit_pause: Mutex<Option<CommitPause>>,
+    /// A test's word of the next schema read's wait for the commits it may have seen
+    /// ([`Switch::tell_next_publish_wait`]).
+    #[cfg(test)]
+    publish_wait: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
+
+#[cfg(test)]
+type CommitPause = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+
+#[cfg(test)]
+type BuildPause = (
+    i64,
+    std::sync::mpsc::Sender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
 
 /// The versioned storage of the database at `path`: in memory for a memory database or one whose
 /// files the engine keeps in memory (`memory`), else in the directory `<path>-versioned`. It holds
@@ -99,6 +123,9 @@ pub fn open(path: &str, memory: bool, source: Option<Arc<dyn Source>>) -> Result
             Ok(order.comparator())
         },
     )?);
+    // Tree 1 is `sqlite_schema`: a writer begun before its newest change is refused at commit
+    // (lane g7s2-17, `AC-NS.2.1`).
+    db.v.keep_catalog(1);
     Ok(Arc::new(Storage {
         db,
         orders: Mutex::new(recovered.into_inner()),
@@ -108,6 +135,12 @@ pub fn open(path: &str, memory: bool, source: Option<Arc<dyn Source>>) -> Result
             crate::translate::optimizer::column_path::asked(),
             source,
         ),
+        #[cfg(test)]
+        build_pause: Mutex::new(None),
+        #[cfg(test)]
+        commit_pause: Mutex::new(None),
+        #[cfg(test)]
+        publish_wait: Mutex::new(None),
     }))
 }
 
@@ -121,6 +154,35 @@ impl Storage {
     /// The last SQL table's column copy let go for its memory, and why (G11 step 5).
     pub fn copy_dropped(&self) -> Option<super::columns_sql::Dropped> {
         self.copies.last_dropped()
+    }
+
+    /// Turns the SQL tables' column copies on or off, as `AMPHORA_COLUMN_PATH=on` does at open,
+    /// for a driver outside the crate: the bench's comparison against DuckDB (lane colcopy-5,
+    /// AC-CB.4.2).
+    pub fn set_copies_on(&self, on: bool) {
+        self.copies.set_on(on);
+    }
+
+    /// Sets how a copy the memory source refused is bought again, as `AMPHORA_COLUMN_REBUY` does
+    /// at open (lane colcopy-5, AC-CB.4.2).
+    pub fn set_copy_rebuy(&self, rebuy: super::columns_sql::Rebuy) {
+        self.copies.set_rebuy(rebuy);
+    }
+
+    /// What the copies asked their memory source for (lane colcopy-5, AC-CB.4.2).
+    pub fn copy_meter(&self) -> super::columns_sql::Meter {
+        self.copies.meter()
+    }
+
+    /// The copies' resident bytes and the bytes granted them (lane colcopy-5, AC-CB.4.2).
+    pub fn copy_held(&self) -> (u64, u64) {
+        self.copies.held()
+    }
+
+    /// The copies let go and waiting for room, what each waits for and how long it has waited
+    /// (lane colcopy-7, AC-CB.3.2), for the bench's records.
+    pub fn copy_waiting(&self) -> Vec<super::columns_sql::Wait> {
+        self.copies.waiting()
     }
 
     /// The versioned database under it.
@@ -311,6 +373,10 @@ pub struct Switch {
     /// `rollback_tx`, ending an aborted statement): the next transaction begun on this
     /// connection is refused with it, once (G7 step 2, `AC-NS.2.1`: not only logged).
     failed: Mutex<Option<LimboError>>,
+    /// The storage's newest commit as the connection's pager last began a read
+    /// ([`Switch::pager_read_begins`], lane g7s2-19, `AC-NS.2.1`): the schema checks of the
+    /// transaction begun in that read are as old as it.
+    header_at: Mutex<Option<Ts>>,
 }
 
 /// How many trees the transaction had made and dropped when a savepoint was taken: rolling back
@@ -353,6 +419,88 @@ impl Switch {
             named: Mutex::new(Vec::new()),
             d: Mutex::new(Descender::new()),
             failed: Mutex::new(None),
+            header_at: Mutex::new(None),
+        }
+    }
+
+    /// The connection's pager is about to begin a read (lane g7s2-19, `AC-NS.2.1`): the
+    /// statements run in it check the schema cookie in the header that read sees, and a schema
+    /// change commits the pager's part (the cookie) before it publishes its rows. So the storage's
+    /// newest commit is read here, before the read begins, and kept as the limit of the
+    /// transaction begun in it ([`super::version::Txn::schema_seen_by`]): a commit that changed
+    /// the catalog after it may be missing from the header its statements were checked against,
+    /// though the transaction's snapshot, begun later, holds it, so its writes are refused. Read
+    /// after the pager's read began, a schema change could be published between, its pager part
+    /// unseen and its timestamp inside the limit. Kept until the next read begins: an older limit
+    /// only refuses more.
+    pub fn pager_read_begins(&self) {
+        *self.header_at.lock() = Some(self.db.v.clock.published());
+    }
+
+    /// Returns once every commit whose pager part a read of the header may have seen is
+    /// published (lane g7s2-19, `AC-NS.2.1`): the pager's part of a schema change commits under
+    /// the storage's publish lock, before its rows are published, so passing that lock closes the
+    /// gap. A schema read after this reads the rows of the cookie it read; before, it could read
+    /// the older rows, keep them under the newer cookie, and give them to every connection. What
+    /// holds the publish lock never waits on a pager reader (a commit's checkpoint is passive), so
+    /// a reader that waits here holds nothing it waits for.
+    pub fn await_published(&self) {
+        #[cfg(test)]
+        self.told_publish_wait();
+        self.db.v.clock.at_publish(|_| ());
+    }
+
+    /// A test's pause of the next commit with the pager's part ([`Switch::commit_with`]), once
+    /// that part committed and before the storage publishes its rows, under the publish lock (lane
+    /// g7s2-19, `AC-NS.2.1`): a receiver told when it has paused, and a sender that lets it go on
+    /// (or is dropped).
+    #[cfg(test)]
+    pub(crate) fn pause_next_commit_with(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release) = std::sync::mpsc::channel();
+        *self.storage.commit_pause.lock() = Some((entered, release));
+        (entered_rx, release_tx)
+    }
+
+    /// Drops a pause no commit took: its test hears the commit ended without pausing.
+    #[cfg(test)]
+    pub(crate) fn clear_commit_pause(&self) {
+        *self.storage.commit_pause.lock() = None;
+    }
+
+    /// The commit's pager part has committed: paused here if a test asked
+    /// ([`Switch::pause_next_commit_with`]).
+    #[cfg(test)]
+    fn committed_with(&self) {
+        let pause = self.storage.commit_pause.lock().take();
+        if let Some((entered, release)) = pause {
+            entered.send(()).ok();
+            release.recv().ok();
+        }
+    }
+
+    /// A receiver told when the next schema read on this storage is about to wait for the commits
+    /// it may have seen ([`Switch::await_published`], lane g7s2-19, `AC-NS.2.1`).
+    #[cfg(test)]
+    pub(crate) fn tell_next_publish_wait(&self) -> std::sync::mpsc::Receiver<()> {
+        let (tell, told) = std::sync::mpsc::channel();
+        *self.storage.publish_wait.lock() = Some(tell);
+        told
+    }
+
+    /// Drops a word no schema read took: its test hears no read waited.
+    #[cfg(test)]
+    pub(crate) fn clear_publish_wait(&self) {
+        *self.storage.publish_wait.lock() = None;
+    }
+
+    #[cfg(test)]
+    fn told_publish_wait(&self) {
+        let tell = self.storage.publish_wait.lock().take();
+        if let Some(tell) = tell {
+            tell.send(()).ok();
         }
     }
 
@@ -375,6 +523,146 @@ impl Switch {
             .is_some_and(|t| t.lock().as_ref().is_some_and(|t| t.wrote()))
     }
 
+    /// The transaction an analytic statement answered by a column copy reads in (lane
+    /// colcopy-10, AC-CB.4.7): the connection's open one; with none open, in an explicit
+    /// transaction one begun now, as the statement's first cursor would begin it, so its later
+    /// statements read the same snapshot; in autocommit none (the statement reads at a snapshot
+    /// of its own).
+    pub(crate) fn reading(&self, autocommit: bool) -> Result<Option<SharedTxn>> {
+        let open = self.txn.lock().clone();
+        match open {
+            Some(txn) => Ok(Some(txn)),
+            None if autocommit => Ok(None),
+            None => self.txn().map(Some),
+        }
+    }
+
+    /// The connection's snapshot and the newest commit published, as commit timestamps, for the
+    /// skipping summaries (G7 step 2, `AC-NS.2.1`): the open transaction's start, or with none
+    /// open the newest commit, where the connection's next read begins.
+    pub(crate) fn skipping_positions(&self) -> (super::version::Ts, super::version::Ts) {
+        let newest = self.db.newest();
+        let start = self
+            .txn
+            .lock()
+            .as_ref()
+            .and_then(|shared| shared.lock().as_ref().map(|txn| txn.start));
+        (start.unwrap_or(newest), newest)
+    }
+
+    /// Why a skipping summary of the table at `root_page`, built in the connection's open
+    /// transaction, misses rows the newest commit or a later one will hold (G7 step 2,
+    /// `AC-NS.2.1`); `None` when it holds exactly the newest commit. Writers here take no single
+    /// write lock, so one may have changed the table before the build, beside it, and commit after.
+    /// The tree's writers are read before the newest commit: a writer is uncounted only after its
+    /// commit is published, so one that ended between is seen by its commit.
+    pub(crate) fn skipping_build_missed(&self, root_page: i64) -> Result<Option<&'static str>> {
+        let tree = tree_of(root_page)?;
+        let (start, own) = match self.txn.lock().as_ref() {
+            Some(shared) => match shared.lock().as_ref() {
+                Some(txn) => (Some(txn.start), txn.wrote_tree(tree)),
+                None => (None, false),
+            },
+            None => (None, false),
+        };
+        let writers = self.db.v.clock.writers_of(tree);
+        let newest = self.db.newest();
+        if writers > u64::from(own) {
+            return Ok(Some("another open transaction has changed the table"));
+        }
+        if start.is_some_and(|start| start != newest) {
+            return Ok(Some("a commit passed the build's snapshot"));
+        }
+        Ok(None)
+    }
+
+    /// Blocks until no open transaction has changed a row of the table at `root_page`, woken by
+    /// its last writer's end, not by a timer (G7 step 2, `AC-NS.2.1`; a skipping build under
+    /// `AMPHORA_SKIP_BUILD=wait`). Whether it waited. The caller holds no transaction: one of its
+    /// own would never end. Refused, typed (lane g7s2-17): at once, when an open writer of the
+    /// table changed it on the caller's thread (on another connection: it would wait on itself
+    /// for good); and when `give_up` (what is left of the caller's statement's deadline) passes
+    /// first, the waiter then taken out.
+    pub(crate) fn wait_unwritten(
+        &self,
+        root_page: i64,
+        give_up: Option<std::time::Duration>,
+    ) -> Result<std::result::Result<bool, UnwrittenRefusal>> {
+        let tree = tree_of(root_page)?;
+        let clock = &self.db.v.clock;
+        let wait = match clock.when_unwritten(tree, std::thread::current().id()) {
+            Ok(Some(wait)) => wait,
+            Ok(None) => return Ok(Ok(false)),
+            Err(refused) => return Ok(Err(refused)),
+        };
+        let untold = || {
+            LimboError::InternalError(
+                "versioned storage: a table's writers ended untold".to_string(),
+            )
+        };
+        match give_up {
+            None => wait.told.recv().map_err(|_| untold())?,
+            Some(left) => match wait.told.recv_timeout(left) {
+                Ok(()) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    clock.give_up(tree, wait.waiter);
+                    // Told between the timeout and the give-up: the writers ended.
+                    if wait.told.try_recv().is_ok() {
+                        return Ok(Ok(true));
+                    }
+                    return Ok(Err(UnwrittenRefusal::Deadline));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Err(untold()),
+            },
+        }
+        Ok(Ok(true))
+    }
+
+    /// A test's pause of the next skipping build of the table at `root_page`, once it has read
+    /// its rows and before it checks for open writers (lane g7s2-17, `AC-NS.2.1`): a receiver
+    /// told when it has paused, and a sender that lets it go on (or is dropped).
+    #[cfg(test)]
+    pub(crate) fn pause_next_build(
+        &self,
+        root_page: i64,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release) = std::sync::mpsc::channel();
+        *self.storage.build_pause.lock() = Some((root_page, entered, release));
+        (entered_rx, release_tx)
+    }
+
+    /// Drops a pause no build took: its test hears the build ended without pausing.
+    #[cfg(test)]
+    pub(crate) fn clear_build_pause(&self) {
+        *self.storage.build_pause.lock() = None;
+    }
+
+    /// A skipping build of the table at `root_page` has read its rows: paused here if a test
+    /// asked ([`Switch::pause_next_build`]).
+    #[cfg(test)]
+    pub(crate) fn built(&self, root_page: i64) {
+        let pause = {
+            let mut slot = self.storage.build_pause.lock();
+            if slot.as_ref().is_some_and(|(root, _, _)| *root == root_page) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, entered, release)) = pause {
+            entered.send(()).ok();
+            release.recv().ok();
+        }
+    }
+
+    /// How many wait for the table at `root_page`'s open writers to end (tests of
+    /// [`Switch::wait_unwritten`]).
+    #[cfg(test)]
+    pub(crate) fn waiting_on(&self, root_page: i64) -> Result<usize> {
+        Ok(self.db.v.clock.waiting_on(tree_of(root_page)?))
+    }
+
     /// The connection's transaction, begun if none is open.
     fn txn(&self) -> Result<SharedTxn> {
         let mut slot = self.txn.lock();
@@ -384,7 +672,13 @@ impl Switch {
         if let Some(error) = self.failed.lock().take() {
             return Err(error);
         }
-        let txn = Arc::new(Mutex::new(Some(self.db.begin()?)));
+        let mut began = self.db.begin()?;
+        // Its statements' schema checks are as old as the pager's read they ran in (lane
+        // g7s2-19, `AC-NS.2.1`).
+        if let Some(at) = *self.header_at.lock() {
+            began.schema_seen_by(at);
+        }
+        let txn = Arc::new(Mutex::new(Some(began)));
         *slot = Some(txn.clone());
         Ok(txn)
     }
@@ -624,6 +918,26 @@ impl Switch {
     /// or rolls it back. A cursor still holding it is refused its next write.
     /// Trees the transaction made are dropped if it rolls back; trees it dropped, once it commits.
     pub fn finish(&self, rollback: bool) -> Result<()> {
+        self.end(rollback, || Ok(()))
+    }
+
+    /// Commits the connection's transaction with `with` (the pager's commit of its header, the
+    /// schema cookie among it), atomically (lane g7s2-18, `AC-NS.2.1`): `with` runs once the
+    /// storage's verdict is in and before its commit is published, so a refusal (a conflict, a
+    /// `SchemaConflict`) refuses before `with` runs and leaves the pager's transaction to roll
+    /// back, and a failure of `with` rolls the storage's back. With no transaction open here,
+    /// `with` alone runs.
+    pub fn commit_with(&self, with: impl FnOnce() -> Result<()>) -> Result<()> {
+        self.end(false, || {
+            with()?;
+            #[cfg(test)]
+            self.committed_with();
+            Ok(())
+        })
+    }
+
+    /// [`Switch::finish`] and [`Switch::commit_with`]: `with` runs only on a commit.
+    fn end(&self, rollback: bool, with: impl FnOnce() -> Result<()>) -> Result<()> {
         self.statements.lock().clear();
         self.named.lock().clear();
         let made = std::mem::take(&mut *self.made.lock());
@@ -638,11 +952,12 @@ impl Switch {
                     self.db.abort(txn, &mut d)
                 } else {
                     self.db
-                        .commit(txn, &mut d, self.db.lane(), true)
+                        .commit_with(txn, &mut d, self.db.lane(), true, with)
                         .map(|_| ())
                 }
             }
-            None => Ok(()),
+            None if rollback => Ok(()),
+            None => with(),
         };
         // A transaction that didn't commit leaves the trees it made named by no schema row: they
         // are dropped, a failed commit's too. A commit whose flush failed may be durable, but its
@@ -690,5 +1005,102 @@ mod tests {
             rows,
             vec![vec![crate::Value::from_i64(2), crate::Value::from_i64(4)]]
         );
+    }
+
+    /// A versioned database whose table `t` spans many leaves: `rows` rows of 100 bytes each.
+    fn many_leaves(rows: i64) -> (Arc<crate::Connection>, i64) {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new().with_versioned_storage())
+            .unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER, pad BLOB)")
+            .unwrap();
+        conn.execute("BEGIN").unwrap();
+        for i in 0..rows {
+            conn.execute(format!("INSERT INTO t VALUES ({i}, zeroblob(100))"))
+                .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+        let mut stmt = conn
+            .prepare("SELECT rootpage FROM sqlite_schema WHERE name = 't'")
+            .unwrap();
+        let found = stmt.run_collect_rows().unwrap();
+        let root = found
+            .first()
+            .and_then(|row| row.first())
+            .map(|v| v.to_string().parse::<i64>().unwrap())
+            .unwrap();
+        (conn, root)
+    }
+
+    /// AC-NS.2.7 (G7 step 2): a count over many leaves on the versioned storage, interrupted,
+    /// stops at the next leaf refused `Interrupt`; not interrupted, the same cursor counts every
+    /// row.
+    #[test]
+    fn ns_2_7_an_interrupted_count_stops_at_the_next_leaf() {
+        use crate::storage::btree::CursorTrait;
+        use crate::sync::atomic::Ordering;
+        use crate::types::IOResult;
+        let (conn, root) = many_leaves(2000);
+        let switch = conn.versioned_for(crate::MAIN_DB_ID).unwrap();
+        let pager = conn.pager.load().clone();
+        let mut cursor = switch
+            .cursor(root, None, pager.clone())
+            .unwrap()
+            .watched_by(&conn);
+        assert!(matches!(cursor.count(), Ok(IOResult::Done(2000))));
+        conn.interrupt_requested.store(true, Ordering::SeqCst);
+        let mut cursor = switch.cursor(root, None, pager).unwrap().watched_by(&conn);
+        let stopped = cursor.count();
+        conn.interrupt_requested.store(false, Ordering::SeqCst);
+        assert!(
+            matches!(
+                stopped.as_ref().map_err(|e| &**e),
+                Err(LimboError::Interrupt)
+            ),
+            "{stopped:?}"
+        );
+        switch.finish(true).unwrap();
+    }
+
+    /// Pauses the first time it's asked at `NextStart`, never again.
+    #[derive(Debug, Default)]
+    struct PauseOnce(crate::sync::atomic::AtomicBool);
+
+    impl crate::mvcc::yield_points::YieldInjector for PauseOnce {
+        fn should_yield(
+            &self,
+            _instance_id: u64,
+            _selection_key: u64,
+            point: crate::mvcc::yield_points::YieldPoint,
+        ) -> bool {
+            use crate::mvcc::yield_hooks::YieldPointMarker;
+            point == crate::mvcc::cursor::CursorYieldPoint::NextStart.point()
+                && !self.0.swap(true, crate::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// AC-NS.2.7 (G7 step 2): the connection's yield injector pauses a scan on the versioned
+    /// storage where it pauses the pager's cursor (a step's start), and the statement resumed
+    /// returns every row once.
+    #[test]
+    fn ns_2_7_a_scan_paused_at_a_steps_start_resumes_whole() {
+        let (conn, _) = many_leaves(300);
+        let injector = Arc::new(PauseOnce::default());
+        conn.set_yield_injector(Some(injector));
+        let mut stmt = conn.prepare("SELECT x FROM t").unwrap();
+        let (mut rows, mut paused) = (0i64, 0);
+        loop {
+            match stmt.step().unwrap() {
+                crate::StepResult::Row => rows += 1,
+                crate::StepResult::Yield => paused += 1,
+                crate::StepResult::IO => stmt.get_pager().io.step().unwrap(),
+                crate::StepResult::Done => break,
+                other => panic!("{other:?}"),
+            }
+        }
+        conn.set_yield_injector(None);
+        assert_eq!((rows, paused), (300, 1));
     }
 }

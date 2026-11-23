@@ -102,6 +102,10 @@ impl Limits {
 pub struct Ran<'a> {
     pub record: &'a Record,
     pub outcome: Outcome,
+    /// The engine's error for a statement SQLite refuses too (an agreement by "any error
+    /// matches"), which crate::refusal compares with SQLite's by kind; None for one after a
+    /// statement with no translation or that the engine refused, which may be why.
+    pub refused: Option<String>,
     /// Time spent running and comparing it, in nanoseconds.
     pub nanos: u64,
 }
@@ -208,6 +212,7 @@ pub fn run_file(
             each(Ran {
                 record: &record,
                 outcome: Outcome::Unreached,
+                refused: None,
                 nanos: 0,
             });
             continue;
@@ -223,6 +228,7 @@ pub fn run_file(
                 each(Ran {
                     record: &record,
                     outcome: Outcome::Untranslatable(why.to_owned()),
+                    refused: None,
                     nanos: 0,
                 });
                 continue;
@@ -230,6 +236,7 @@ pub fn run_file(
         };
         let began = Instant::now();
         let until = limits.until(began);
+        let mut refused = None;
         let outcome = match &record.kind {
             Kind::Statement { ok } => {
                 dirty = true;
@@ -238,7 +245,11 @@ pub fn run_file(
                     .try_for_each(|part| engine.run(part, 0, until).map(drop));
                 match (ran, ok) {
                     (Err(Stop::PastBudget), _) => Outcome::PastBudget,
-                    (Ok(()), true) | (Err(Stop::Refused(_)), false) => Outcome::Agree,
+                    (Ok(()), true) => Outcome::Agree,
+                    (Err(Stop::Refused(e)), false) => {
+                        refused = Some(e);
+                        Outcome::Agree
+                    }
                     (Ok(()), false) => Outcome::Accepted,
                     (Err(Stop::Refused(e)), true) => Outcome::Refused(e),
                 }
@@ -323,6 +334,9 @@ pub fn run_file(
         each(Ran {
             record: &record,
             outcome,
+            // A refusal after a statement with no translation, or one the engine refused, may be
+            // that statement's: not compared by kind.
+            refused: refused.filter(|_| untranslated.is_none()),
             nanos,
         });
     }

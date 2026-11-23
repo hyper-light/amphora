@@ -1784,6 +1784,11 @@ fn test_mvcc_explicit_tx_unfinished_writer_poisons_transaction() {
 
 #[test]
 fn test_wal_explicit_tx_unfinished_writer_poisons_transaction() {
+    if crate::storage::versioned::switch::pager_only(
+        "it pauses the pager's page spill on a table read (Pager::arm_spill_yield_on_read), which the versioned storage has no pages for; its pause at a step's start is ns_2_7_a_scan_paused_at_a_steps_start_resumes_whole",
+    ) {
+        return;
+    }
     let env = SameConnectionWal::new(":memory:wal-explicit-unfinished-writer-poison");
     env.setup_rows_table();
     env.conn
@@ -2015,6 +2020,11 @@ fn test_insert_is_busy_while_delete_returning_writer_is_active() {
 /// writer can then resume and the savepoint stack stays usable.
 #[test]
 fn test_wal_savepoint_ops_are_busy_while_writer_suspended() {
+    if crate::storage::versioned::switch::pager_only(
+        "it pauses the pager's page spill on a table read (Pager::arm_spill_yield_on_read), which the versioned storage has no pages for; its pause at a step's start is ns_2_7_a_scan_paused_at_a_steps_start_resumes_whole",
+    ) {
+        return;
+    }
     let env = SameConnectionWal::new(":memory:wal-savepoint-busy-mid-writer");
     env.setup_rows_table();
     env.conn
@@ -2054,6 +2064,11 @@ fn test_wal_savepoint_ops_are_busy_while_writer_suspended() {
 
 #[test]
 fn test_wal_savepoint_is_busy_while_autocommit_writer_suspended() {
+    if crate::storage::versioned::switch::pager_only(
+        "it pauses the pager's page spill on a table read (Pager::arm_spill_yield_on_read), which the versioned storage has no pages for; its pause at a step's start is ns_2_7_a_scan_paused_at_a_steps_start_resumes_whole",
+    ) {
+        return;
+    }
     let env = SameConnectionWal::new(":memory:wal-savepoint-busy-autocommit-writer");
     env.setup_rows_table();
     env.conn

@@ -133,6 +133,8 @@ pub enum AccessMethodParams {
         bloom_fp_per_key: f64,
         /// Join semantics: Inner, LeftOuter, or FullOuter.
         join_type: HashJoinType,
+        /// QT.5 step 4 (lane qs5-21): by hash or by sort-merge.
+        method: crate::translate::plan::HashJoinMethod,
     },
     /// Custom index method access (e.g., FTS).
     /// This variant is used when the optimizer determines that a custom index method
@@ -1564,15 +1566,40 @@ pub fn bloom_filter_rate_per_key(
     matched_probe_rows: f64,
     params: &CostModelParams,
 ) -> Option<f64> {
-    let misses = (probe_rows - matched_probe_rows.max(0.0)).max(0.0);
     let probe_cost = params.hash_cpu_cost + params.hash_lookup_cost;
+    match bloom_filter_rate_saving(
+        build_keys,
+        probe_rows,
+        matched_probe_rows,
+        probe_cost,
+        0.0,
+        params,
+    ) {
+        Some((rate_per_key, true)) => Some(rate_per_key),
+        _ => None,
+    }
+}
+
+/// The filter's rate per key as [bloom_filter_rate_per_key] finds it, for a filter whose misses
+/// each save `probe_cost` and whose build adds `build_cost` beyond its bits (a star join's
+/// dimension read once more, T-QT.5.3), and whether it pays: `None` when a cost isn't measured or
+/// no rate under one is worth its bits.
+pub fn bloom_filter_rate_saving(
+    build_keys: f64,
+    probe_rows: f64,
+    matched_probe_rows: f64,
+    probe_cost: f64,
+    build_cost: f64,
+    params: &CostModelParams,
+) -> Option<(f64, bool)> {
+    let misses = (probe_rows - matched_probe_rows.max(0.0)).max(0.0);
     let lookup_cost = params.bloom_lookup_cost;
     let bit_cost =
         (params.hash_cpu_cost + params.hash_insert_cost) / (8.0 * params.hash_bytes_per_row);
     let measured = [build_keys, misses, probe_cost, bit_cost]
         .iter()
         .all(|v| v.is_finite() && *v > 0.0);
-    if !measured || !lookup_cost.is_finite() {
+    if !measured || !lookup_cost.is_finite() || !build_cost.is_finite() || build_cost < 0.0 {
         return None;
     }
     let ln2_squared = std::f64::consts::LN_2 * std::f64::consts::LN_2;
@@ -1582,9 +1609,10 @@ pub fn bloom_filter_rate_per_key(
         return None;
     }
     let bits = build_keys * -rate.ln() / ln2_squared;
-    let with_filter = probe_rows * lookup_cost + misses * rate * probe_cost + bits * bit_cost;
+    let with_filter =
+        probe_rows * lookup_cost + misses * rate * probe_cost + bits * bit_cost + build_cost;
     let without = misses * probe_cost;
-    (with_filter < without).then_some(rate_per_key)
+    Some((rate_per_key, with_filter < without))
 }
 
 /// Estimate the cost of a hash join between two tables.
@@ -1644,6 +1672,162 @@ pub fn estimate_hash_join_cost(
     )
 }
 
+/// Amphora (QT.5, step 4, lane qs5-20): one input of a sort-merge join, for
+/// [estimate_merge_join_cost].
+#[derive(Debug, Clone, Copy)]
+pub struct MergeInput {
+    /// The rows it gives the merge in one pass.
+    pub rows: f64,
+    /// Rows a page of its table ([CostModelParams::for_table]), for the pages a spilled sort
+    /// writes and reads back.
+    pub rows_per_page: f64,
+    /// Whether its read already gives its rows in the join keys' order (an index on them, or the
+    /// rowid), so the merge reads them as they come and sorts nothing.
+    pub ordered: bool,
+}
+
+impl MergeInput {
+    /// What putting this input in key order costs: nothing when its read is ordered; otherwise a
+    /// sort's comparisons (`estimate_sort_cpu_cost`), and, where its rows outgrow `mem_budget`,
+    /// their pages written once and read back once. That is the sorter's own shape: it holds
+    /// rows up to its buffer, writes each full buffer out as a sorted chunk, and merges every
+    /// chunk in one pass through a heap (`vdbe/sorter.rs`, `Sorter::init_chunk_heap`), so a
+    /// spilled row is written and read once whatever the number of chunks.
+    fn sort_cost(&self, mem_budget: usize, params: &CostModelParams) -> Cost {
+        if self.ordered {
+            return Cost(0.0);
+        }
+        let rows = self.rows.max(0.0);
+        let rows_per_page = self.rows_per_page.max(1.0);
+        let row_bytes = params.page_bytes / rows_per_page;
+        let spills = rows * row_bytes > mem_budget as f64;
+        let spill_pages = if spills {
+            2.0 * (rows / rows_per_page).ceil()
+        } else {
+            0.0
+        };
+        Cost(super::cost::estimate_sort_cpu_cost(rows, params).0 + spill_pages)
+    }
+}
+
+/// Amphora (QT.5, step 4, lane qs5-20): the cost of a sort-merge join of `build` and `probe`, in
+/// the same plan shape and units as [estimate_hash_join_cost], so the planner can weigh the two
+/// at one choice point (`join.rs`, the hash join's candidate).
+///
+/// The cost model accounts for:
+/// - Sort phase: each input not already in key order is sorted ([MergeInput]); the build side
+///   once, as a hash join builds once, and the probe side on each of its `probe_multiplier`
+///   passes.
+/// - Probe scan: the probe table's pages and rows on each pass (`estimate_scan_cost`), as for a
+///   hash join.
+/// - Merge phase: one key comparison for each row either side gives, on each pass, at a sort's
+///   cost a comparison (`sort_cpu_per_row`).
+/// - Match phase: visiting matching rows (`rows_visited`), which includes the rows a run of equal
+///   keys on one side gives for each equal row on the other; and, for joins that keep unmatched
+///   build rows, each of those, which the merge meets in order and needs no pass of its own.
+///
+/// Unlike a hash join, nothing here is held whole in memory: a merge holds one run of equal keys
+/// at a time, and a sort that outgrows `mem_budget` spills its pages rather than the join's.
+pub fn estimate_merge_join_cost(
+    build: MergeInput,
+    probe: MergeInput,
+    rows_visited: f64,
+    join_type: HashJoinType,
+    mem_budget: usize,
+    probe_multiplier: f64,
+    params: &CostModelParams,
+) -> Cost {
+    let passes = probe_multiplier.max(0.0);
+    let build_sort = build.sort_cost(mem_budget, params).0;
+    let probe_sort = probe.sort_cost(mem_budget, params).0 * passes;
+    let probe_scan_cost = estimate_scan_cost(probe.rows, probe_multiplier, params);
+    let merge_cost = (build.rows.max(0.0) + probe.rows.max(0.0)) * passes * params.sort_cpu_per_row;
+    let visit_cost = rows_visited * params.cpu_cost_per_row;
+    let unmatched_build_cost = if join_type.keeps_unmatched_build_rows() {
+        build.rows.max(0.0) * params.cpu_cost_per_row
+    } else {
+        0.0
+    };
+    Cost(
+        build_sort
+            + probe_sort
+            + probe_scan_cost.0
+            + merge_cost
+            + visit_cost
+            + unmatched_build_cost,
+    )
+}
+
+/// Amphora (QT.5, step 4, lane qs5-20): whether a sort-merge join's inputs come in its key order
+/// already, the build side read by `build_read` and the probe side by the hash join's own read of
+/// it, a forward scan of its table. The merge may lead with any of its keys, so it leads with the
+/// one that leaves the most inputs ordered ([read_in_key_order]).
+pub(super) fn merge_inputs_in_key_order(
+    build_table: &JoinedTable,
+    build_read: Option<&AccessMethod>,
+    probe_table: &JoinedTable,
+    join_keys: &[HashJoinKey],
+    where_clause: &[WhereTerm],
+) -> (bool, bool) {
+    join_keys
+        .iter()
+        .map(|key| {
+            (
+                read_in_key_order(build_table, build_read, key.get_build_expr(where_clause)),
+                read_in_key_order(probe_table, None, key.get_probe_expr(where_clause)),
+            )
+        })
+        .max_by_key(|&(build, probe)| u8::from(build) + u8::from(probe))
+        .unwrap_or((false, false))
+}
+
+/// Whether `read` gives `table`'s rows in the order of `key`, its side of a join key: a forward
+/// read of the table where the key is its rowid (`read` none is a forward scan of the table), or
+/// of an index whose first column is the key's column, ascending in its default collation. A read
+/// that seeks, builds an index or isn't a B-tree's gives no order a merge can rely on.
+fn read_in_key_order(table: &JoinedTable, read: Option<&AccessMethod>, key: &ast::Expr) -> bool {
+    let column = match key {
+        ast::Expr::Column {
+            table: id,
+            column,
+            is_rowid_alias,
+            ..
+        } if *id == table.internal_id => {
+            if *is_rowid_alias {
+                None
+            } else {
+                Some(*column)
+            }
+        }
+        ast::Expr::RowId { table: id, .. } if *id == table.internal_id => None,
+        _ => return false,
+    };
+    let rowid_order = column.is_none() && table.btree().is_some_and(|btree| btree.has_rowid);
+    match read.map(|method| &method.params) {
+        None => rowid_order,
+        Some(AccessMethodParams::BTreeTable {
+            iter_dir: IterationDirection::Forwards,
+            index: None,
+            build_index: false,
+            constraint_refs,
+        }) if constraint_refs.is_empty() => rowid_order,
+        Some(AccessMethodParams::BTreeTable {
+            iter_dir: IterationDirection::Forwards,
+            index: Some(index),
+            build_index: false,
+            constraint_refs,
+        }) if constraint_refs.is_empty() => column.is_some_and(|column| {
+            index.columns.first().is_some_and(|first| {
+                first.expr.is_none()
+                    && first.pos_in_table == column
+                    && matches!(first.order, SortOrder::Asc)
+                    && first.collation.is_none()
+            })
+        }),
+        Some(_) => false,
+    }
+}
+
 /// Try to create a hash join access method for joining two tables.
 #[allow(clippy::too_many_arguments)]
 pub fn try_hash_join_access_method(
@@ -1653,18 +1837,15 @@ pub fn try_hash_join_access_method(
     probe_table_idx: usize,
     build_constraints: &TableConstraints,
     probe_constraints: &TableConstraints,
-    joined_before_probe_mask: &TableMask,
     where_clause: &mut [WhereTerm],
     equal_terms: impl Iterator<Item = (usize, TableInternalId, TableInternalId)>,
     max_distinct_build_keys: f64,
     build_cardinality: f64,
     probe_cardinality: f64,
     probe_multiplier: f64,
-    hash_can_replace_build_index: bool,
     subqueries: &[NonFromClauseSubquery],
     joined_tables: &[JoinedTable],
     params: &CostModelParams,
-    prefer_seeks: bool,
 ) -> Result<Option<AccessMethod>> {
     if probe_table
         .join_info
@@ -1709,53 +1890,6 @@ pub fn try_hash_join_access_method(
             || expr_uses_custom_collation(join_key.get_probe_expr(where_clause))
     }) {
         return Ok(None);
-    }
-
-    // Prefer nested loops when an index can read the join columns, unless the connection asks for
-    // hash joins only (`prefer_seeks` false; Amphora's QT.5).
-    for join_key in join_keys.iter().filter(|_| prefer_seeks) {
-        let probe_expr = join_key.get_probe_expr(where_clause);
-        if expr_is_simple_column_from_table(probe_expr, probe_table.internal_id)
-            && probe_index_can_seek_join_key(
-                probe_constraints,
-                join_key,
-                joined_before_probe_mask,
-                probe_table_idx,
-            )
-        {
-            return Ok(None);
-        }
-
-        let build_expr = join_key.get_build_expr(where_clause);
-        let build_is_simple_column =
-            expr_is_simple_column_from_table(build_expr, build_table.internal_id);
-
-        if build_is_simple_column && !hash_can_replace_build_index {
-            if let Some(constraint) = build_constraints
-                .constraints
-                .iter()
-                .find(|constraint| constraint.where_clause_pos.0 == join_key.where_clause_idx)
-            {
-                if let Some(column_position) = constraint.table_col_pos {
-                    if build_table
-                        .columns()
-                        .get(column_position)
-                        .is_some_and(|column| column.is_rowid_alias())
-                    {
-                        return Ok(None);
-                    }
-                    if build_constraints.candidates.iter().any(|candidate| {
-                        candidate.index.as_ref().is_some_and(|index| {
-                            index
-                                .column_table_pos_to_index_pos(column_position)
-                                .is_some()
-                        })
-                    }) {
-                        return Ok(None);
-                    }
-                }
-            }
-        }
     }
 
     let probe_join_key_selectivity = join_keys
@@ -1819,6 +1953,7 @@ pub fn try_hash_join_access_method(
             use_bloom_filter: false,
             bloom_fp_per_key: 0.0,
             join_type: hash_join_type,
+            method: crate::translate::plan::HashJoinMethod::Hash,
         },
     }))
 }
@@ -1938,37 +2073,6 @@ fn hash_join_type(probe_table: &JoinedTable) -> HashJoinType {
     }
 }
 
-fn probe_index_can_seek_join_key(
-    probe_constraints: &TableConstraints,
-    join_key: &HashJoinKey,
-    joined_before_probe_mask: &TableMask,
-    probe_table_idx: usize,
-) -> bool {
-    let Some(join_constraint_idx) = probe_constraints
-        .constraints
-        .iter()
-        .position(|constraint| constraint.where_clause_pos.0 == join_key.where_clause_idx)
-    else {
-        return false;
-    };
-
-    probe_constraints.candidates.iter().any(|candidate| {
-        usable_constraints_for_lhs_mask(
-            &probe_constraints.constraints,
-            &candidate.refs,
-            joined_before_probe_mask,
-            probe_table_idx,
-        )
-        .iter()
-        .any(|constraint_ref| {
-            constraint_ref
-                .eq
-                .as_ref()
-                .is_some_and(|equality| equality.constraint_pos == join_constraint_idx)
-        })
-    })
-}
-
 /// Return true when the hash keys contain one complete unique key from the build table.
 fn hash_keys_cover_unique_build_key(
     build_table: &JoinedTable,
@@ -2017,15 +2121,6 @@ fn hash_keys_cover_unique_build_key(
                     })
         })
     })
-}
-
-/// Returns true when the expression is a simple column/rowid reference to the table.
-/// Used to decide if an index seek could replace a hash join.
-fn expr_is_simple_column_from_table(expr: &ast::Expr, table_id: TableInternalId) -> bool {
-    matches!(
-        expr,
-        ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } if *table == table_id
-    )
 }
 
 /// Check whether a subquery's intrinsic row order (from its ORDER BY or
@@ -2533,4 +2628,197 @@ fn materialized_subquery_order_properties(
         true,
         order_bonus,
     )
+}
+
+#[cfg(test)]
+mod merge_join_cost_tests {
+    //! Amphora (QT.5, step 4, lane qs5-20, T-QT.5.15): a sort-merge join's cost beside a hash
+    //! join's.
+    use super::{estimate_hash_join_cost, estimate_merge_join_cost, MergeInput};
+    use crate::translate::optimizer::cost_params::DEFAULT_PARAMS;
+    use crate::translate::plan::HashJoinType;
+
+    fn input(rows: f64, ordered: bool) -> MergeInput {
+        MergeInput {
+            rows,
+            rows_per_page: DEFAULT_PARAMS.rows_per_table_page,
+            ordered,
+        }
+    }
+
+    #[test]
+    fn qt_5_15_merge_of_ordered_inputs_sorts_nothing() {
+        let params = &DEFAULT_PARAMS;
+        let cost = estimate_merge_join_cost(
+            input(100.0, true),
+            input(1_000.0, true),
+            250.0,
+            HashJoinType::Inner,
+            usize::MAX,
+            1.0,
+            params,
+        );
+        let expected = 1_000.0 / params.rows_per_table_page
+            + 1_000.0 * params.cpu_cost_per_row
+            + 1_100.0 * params.sort_cpu_per_row
+            + 250.0 * params.cpu_cost_per_row;
+        assert!(
+            (cost.0 - expected).abs() < 1e-9 * expected,
+            "{} {expected}",
+            cost.0
+        );
+    }
+
+    #[test]
+    fn qt_5_15_unordered_inputs_pay_their_sorts() {
+        let params = &DEFAULT_PARAMS;
+        let ordered = estimate_merge_join_cost(
+            input(100.0, true),
+            input(1_000.0, true),
+            250.0,
+            HashJoinType::Inner,
+            usize::MAX,
+            1.0,
+            params,
+        );
+        let unordered = estimate_merge_join_cost(
+            input(100.0, false),
+            input(1_000.0, false),
+            250.0,
+            HashJoinType::Inner,
+            usize::MAX,
+            1.0,
+            params,
+        );
+        let sorts = 100.0 * 100f64.log2() * params.sort_cpu_per_row
+            + 1_000.0 * 1_000f64.log2() * params.sort_cpu_per_row;
+        assert!(
+            (unordered.0 - ordered.0 - sorts).abs() < 1e-9 * sorts,
+            "{} {} {sorts}",
+            unordered.0,
+            ordered.0
+        );
+    }
+
+    #[test]
+    fn qt_5_15_a_sort_past_its_memory_writes_and_reads_its_pages_once() {
+        let params = &DEFAULT_PARAMS;
+        let rows = 100_000.0;
+        let row_bytes = params.page_bytes / params.rows_per_table_page;
+        let fits = (rows * row_bytes) as usize + 1;
+        let cost_at = |mem_budget| {
+            estimate_merge_join_cost(
+                input(rows, false),
+                input(0.0, true),
+                0.0,
+                HashJoinType::Inner,
+                mem_budget,
+                1.0,
+                params,
+            )
+            .0
+        };
+        let pages = (rows / params.rows_per_table_page).ceil();
+        let spilled = cost_at(fits - 2) - cost_at(fits);
+        assert!(
+            (spilled - 2.0 * pages).abs() < 1e-9 * pages,
+            "{spilled} {pages}"
+        );
+    }
+
+    #[test]
+    fn qt_5_15_ordered_inputs_past_memory_cost_less_merged_than_hashed() {
+        // The case a merge join exists for: both inputs come in key order and the build side
+        // outgrows the hash table's memory, so a hash join spills both sides and a merge sorts
+        // and spills nothing.
+        let params = &DEFAULT_PARAMS;
+        let (build, probe) = (1_000_000.0, 1_000_000.0);
+        let mem_budget = (build * params.hash_bytes_per_row / 4.0) as usize;
+        let hashed = estimate_hash_join_cost(
+            build,
+            probe,
+            probe,
+            HashJoinType::Inner,
+            mem_budget,
+            1.0,
+            params,
+        );
+        let merged = estimate_merge_join_cost(
+            input(build, true),
+            input(probe, true),
+            probe,
+            HashJoinType::Inner,
+            mem_budget,
+            1.0,
+            params,
+        );
+        assert!(merged.0 < hashed.0, "{} {}", merged.0, hashed.0);
+    }
+
+    #[test]
+    fn qt_5_15_unordered_inputs_that_fit_cost_less_hashed_than_merged() {
+        // The other side: neither input is ordered and the build fits, so the merge pays two
+        // sorts a hash join doesn't.
+        let params = &DEFAULT_PARAMS;
+        let (build, probe) = (10_000.0, 1_000_000.0);
+        let hashed = estimate_hash_join_cost(
+            build,
+            probe,
+            probe,
+            HashJoinType::Inner,
+            usize::MAX,
+            1.0,
+            params,
+        );
+        let merged = estimate_merge_join_cost(
+            input(build, false),
+            input(probe, false),
+            probe,
+            HashJoinType::Inner,
+            usize::MAX,
+            1.0,
+            params,
+        );
+        assert!(hashed.0 < merged.0, "{} {}", hashed.0, merged.0);
+    }
+
+    #[test]
+    fn qt_5_15_unmatched_build_rows_are_met_in_the_merge() {
+        let params = &DEFAULT_PARAMS;
+        let cost_of = |join_type| {
+            estimate_merge_join_cost(
+                input(100.0, true),
+                input(1_000.0, true),
+                250.0,
+                join_type,
+                usize::MAX,
+                1.0,
+                params,
+            )
+            .0
+        };
+        let unmatched = cost_of(HashJoinType::LeftOuter) - cost_of(HashJoinType::Inner);
+        let expected = 100.0 * params.cpu_cost_per_row;
+        assert!(
+            (unmatched - expected).abs() < 1e-9,
+            "{unmatched} {expected}"
+        );
+    }
+
+    #[test]
+    fn qt_5_15_empty_inputs_cost_no_sort() {
+        let params = &DEFAULT_PARAMS;
+        let cost = estimate_merge_join_cost(
+            input(0.0, false),
+            input(0.0, false),
+            0.0,
+            HashJoinType::Inner,
+            0,
+            1.0,
+            params,
+        );
+        assert!(cost.0.is_finite() && cost.0 >= 0.0, "{}", cost.0);
+        let scan_only = super::estimate_scan_cost(0.0, 1.0, params).0;
+        assert!((cost.0 - scan_only).abs() < 1e-9, "{} {scan_only}", cost.0);
+    }
 }

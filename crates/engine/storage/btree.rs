@@ -8678,6 +8678,13 @@ pub fn integrity_check(
                 let (page, c) = return_if_io!(pager.read_page(page_idx));
                 state.page = Some(page);
                 if let Some(c) = c {
+                    // Amphora (T-T1.12.C8): a read from the file is a wait on the device even when
+                    // it ended at once (a synchronous read, which the program steps past): the check
+                    // yields there, so its caller can pause inside the statement. A read still in
+                    // flight is waited on as before; this page is taken again on re-entry.
+                    if c.succeeded() {
+                        io_yield_one!(crate::Completion::new_yield());
+                    }
                     io_yield_one!(c);
                 }
                 state.page.take().expect("page should be present")

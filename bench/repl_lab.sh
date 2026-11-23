@@ -3,7 +3,8 @@
 # seeds in both commit classes). Run from a checkout of the commit to measure; the three machines
 # are its arguments, reached by ssh, each with a clone of this repository at LAB_REPO (default the
 # same path relative to its home as this checkout's to this home), bash, cargo and, for the
-# comparison set, docker and go. Nothing here picks a machine: the person running it names them.
+# comparison set, Linux with bench/servers/repl/setup.sh run once (its competitors run as processes,
+# as Amphora's members do). Nothing here picks a machine: the person running it names them.
 #
 # usage: bench/repl_lab.sh RUN HOST1 HOST2 HOST3 [-- REPL_FLAG VALUE ...]
 #   RUN       the run's name: its records go to bench/records/power-nemesis/RUN/ and
@@ -16,8 +17,8 @@
 #             one a machine, each run with bench/power_nemesis.sh; then merged per class.
 #   CLASSES   (default "replicated persisted"). STEPS (default "nemesis repl").
 #   SYSTEMS, MEASURES: passed to bench/repl.sh on every machine.
-# What it doesn't do: Amphora's three members on three machines (the LAN p99). amphora-bench --repl
-# runs Amphora's members in one process; members across machines need a harness that doesn't exist yet.
+# Amphora's three members on three machines (the LAN p99) are bench/repl_members.sh's, each member
+# its own process at an address given as an argument.
 # Exit: 0 when every step on every machine gave its records and both merges passed; 1 otherwise.
 set -uo pipefail
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

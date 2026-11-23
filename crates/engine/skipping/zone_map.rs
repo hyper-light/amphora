@@ -158,6 +158,11 @@ impl ZoneMap {
         self.stats
     }
 
+    /// Each zone's first rowid, ascending (lane skip-5: a zone map built again keeps its zones).
+    pub fn starts(&self) -> Vec<i64> {
+        self.zones.iter().map(|zone| zone.start).collect()
+    }
+
     pub fn zone_count(&self) -> usize {
         self.zones.len()
     }
@@ -242,13 +247,31 @@ impl ZoneMap {
     /// The rowid ranges a filter `lo <= value <= hi` may find rows in: each zone that may match,
     /// adjacent ones joined into one range.
     pub fn candidate_ranges(&mut self, lo: i64, hi: i64) -> Vec<RowidRange> {
+        self.ranges_where(|zone| zone.may_match(lo, hi))
+    }
+
+    /// Lane skip-11 (T-SKU.14): the rowid ranges a filter whose rows lie in any of `spans`
+    /// (each `(lo, hi)`, inclusive) may find rows in: each zone that may match one of them, in
+    /// one pass over the zones (each zone checked against every span); no span: the zones
+    /// holding a value that isn't an integer.
+    pub fn candidate_ranges_each(&mut self, spans: &[(i64, i64)]) -> Vec<RowidRange> {
+        if let [(lo, hi)] = spans {
+            return self.candidate_ranges(*lo, *hi);
+        }
+        self.ranges_where(|zone| {
+            zone.others > 0 || spans.iter().any(|(lo, hi)| zone.may_match(*lo, *hi))
+        })
+    }
+
+    /// The zones `keep` keeps, adjacent ones joined into one range.
+    fn ranges_where(&mut self, keep: impl Fn(&Zone) -> bool) -> Vec<RowidRange> {
         let mut ranges: Vec<RowidRange> = Vec::new();
         let mut read: u64 = 0;
         let mut skipped: u64 = 0;
         let mut previous_matched = false;
         let mut zones = self.zones.iter().peekable();
         while let Some(zone) = zones.next() {
-            let matched = zone.may_match(lo, hi);
+            let matched = keep(zone);
             if matched {
                 read = read.saturating_add(1);
                 // A zone ends where the next begins; the last reaches every larger rowid.

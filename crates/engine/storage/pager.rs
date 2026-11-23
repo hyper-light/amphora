@@ -3830,6 +3830,29 @@ impl Pager {
             self.commit_wal_end();
         };
 
+        // Amphora (G7 step 2, `AC-NS.2.1`): a writer on the versioned storage that never wrote
+        // the pager's header never took its write lock (`PreparedProgram::writes_pager_header`):
+        // the pager has nothing of it to commit, only its read to end. The storage commits the
+        // rows where the pager's transaction ends.
+        if connection.versioned.is_some()
+            && !wal.holds_write_lock()
+            && self.commit_info.read().state != CommitState::AutoCheckpoint
+        {
+            if !self.dirty_pages.read().is_empty() {
+                return Err(LimboError::InternalError(
+                    "versioned storage: a writer without the pager's write lock changed a page"
+                        .into(),
+                )
+                .into());
+            }
+            if wal.holds_read_lock() {
+                wal.end_read_tx();
+            }
+            complete_commit();
+            self.clear_savepoints()?;
+            return Ok(IOResult::Done(()));
+        }
+
         loop {
             let commit_state = self.commit_info.read().state;
             tracing::debug!("commit_state: {:?}", commit_state);
@@ -3874,7 +3897,10 @@ impl Pager {
                     wal.end_read_tx();
 
                     tracing::debug!("commit_tx: schema_did_change={schema_did_change}");
-                    if schema_did_change {
+                    // On the versioned storage the schema's rows are the storage's: the schema is
+                    // published once they are (`Program::commit_versioned_with_header`, lane
+                    // g7s2-18, `AC-NS.2.1`), not here, inside the storage's commit.
+                    if schema_did_change && connection.versioned.is_none() {
                         let schema = connection.schema.read().clone();
                         connection.db.update_schema_if_newer(schema);
                     }
@@ -3910,18 +3936,23 @@ impl Pager {
         // Amphora (G7 step 2, `AC-NS.2.1`): the versioned storage's transaction rolls back with
         // the pager's, on every path that ends one. This returns no error, so a failed rollback
         // is logged and kept: the connection's next transaction is refused with it.
-        if let Some(switch) = connection.versioned.as_ref() {
+        let _ = connection.each_versioned(|switch| {
             if let Err(e) = switch.finish(true) {
                 tracing::error!(target: "amphora.versioned", event = "rollback_failed", error = %e);
                 switch.rollback_failed(e);
             }
-        }
+            Ok(())
+        });
         let Some(wal) = self.wal.as_ref() else {
             // TODO: Unsure what the semantics of "end_tx" is for in-memory databases, ephemeral tables and ephemeral indexes.
             return;
         };
+        // A writer on the versioned storage holds the pager's write lock only once it wrote the
+        // header (G7 step 2, `AC-NS.2.1`); without it the pager has only a read to undo.
         let (is_write, schema_did_change) = match connection.get_tx_state() {
-            TransactionState::Write { schema_did_change } => (true, schema_did_change),
+            TransactionState::Write { schema_did_change } if wal.holds_write_lock() => {
+                (true, schema_did_change)
+            }
             _ => (false, false),
         };
         tracing::trace!("rollback_tx(schema_did_change={})", schema_did_change);
@@ -4232,11 +4263,21 @@ impl Pager {
         };
 
         match self.cache_insert(page_idx as usize, page.clone())? {
-            IOResult::Done(()) => {
+            IOResult::Done(resident) => {
                 if resumed {
                     self.remove_pending_read(page_idx);
                 }
-                Ok(IOResult::Done((page, c_disk)))
+                let Some(resident) = resident else {
+                    return Ok(IOResult::Done((page, c_disk)));
+                };
+                // Amphora (QT.6): another reader's copy reached the cache first; this read's copy
+                // is dropped and every reader shares the cached frame. While that copy's read is
+                // in flight there is no completion to wait on here, so yield, and the next call
+                // finds it as a cache hit does.
+                if !resident.is_loaded() {
+                    io_yield_one!(crate::Completion::new_yield());
+                }
+                Ok(IOResult::Done((resident, None)))
             }
             IOResult::IO(IOCompletions(spill_c)) => {
                 // Amphora: only a read that must wait on a spill is recorded, so the next call to
@@ -4363,7 +4404,10 @@ impl Pager {
     /// evicted, the page is admitted over capacity rather than failing the
     /// read (mirroring SQLite, where `cache_size` may be exceeded while all
     /// pages are in use); later inserts drain the excess.
-    fn cache_insert(&self, page_idx: usize, page: PageRef) -> IOResultOr<()> {
+    /// Puts `page` in the cache, or, when another reader that missed too inserted its own copy
+    /// first (QT.6: morsel workers loading one page at once), returns that copy, which the caller
+    /// takes in place of its own.
+    fn cache_insert(&self, page_idx: usize, page: PageRef) -> IOResultOr<Option<PageRef>> {
         #[cfg(test)]
         if i64::try_from(page_idx).is_ok_and(|idx| self.insert_yield.should_yield_for(idx)) {
             io_yield_one!(crate::Completion::new_yield());
@@ -4371,11 +4415,8 @@ impl Pager {
         {
             let mut page_cache = self.page_cache.write();
             let page_key = PageCacheKey::new(page_idx);
-            match page_cache.insert(page_key, page.clone()) {
-                Ok(_) => return Ok(IOResult::Done(())),
-                Err(CacheError::KeyExists) => {
-                    unreachable!("Page should not exist in cache after get() miss");
-                }
+            match page_cache.insert_or_get(page_key, page.clone(), false) {
+                Ok(resident) => return Ok(IOResult::Done(resident)),
                 Err(CacheError::Full) => {
                     // Fall through to spilling
                 }
@@ -4387,9 +4428,8 @@ impl Pager {
             IOResult::Done(()) => {
                 let mut page_cache = self.page_cache.write();
                 let page_key = PageCacheKey::new(page_idx);
-                match page_cache.force_insert_page(page_key, page) {
-                    Ok(_) => Ok(IOResult::Done(())),
-                    Err(CacheError::KeyExists) => Ok(IOResult::Done(())),
+                match page_cache.insert_or_get(page_key, page, true) {
+                    Ok(resident) => Ok(IOResult::Done(resident)),
                     Err(e) => Err(e.into()),
                 }
             }
@@ -7175,6 +7215,13 @@ pub fn allocate_new_page(page_id: i64, buffer_pool: &Arc<BufferPool>) -> PageRef
     let page = Arc::new(Page::new(page_id));
     {
         let buffer = buffer_pool.get_page();
+        // A new page is all zeros, as SQLite's are (pager.c zero-fills a page past the file's
+        // end). The pool hands out recycled buffers (arena slots, the thread's temporary cache)
+        // still holding an earlier page's bytes, which would otherwise stay in the new page's free
+        // space: written to disk, shipped to replicas and backups, and different from member to
+        // member as allocation differs (CP-T1.8, T-T1.8.A6: members' image digests are equal at
+        // every applied index).
+        buffer.as_mut_slice().fill(0);
         let inner = page.get();
         inner.set_buffer(Arc::new(buffer));
         page.set_loaded();
@@ -7438,6 +7485,34 @@ mod tests {
     };
     use crate::{Buffer, Completion, CompletionError, LimboError};
 
+    /// CP-T1.8, T-T1.8.A6: a new page is all zeros even when the pool hands it a buffer an
+    /// earlier page wrote. Do: take more pages than the test arena holds (so both the arena's
+    /// slots and the temporary buffers are used), fill each with a pattern, drop them, and take
+    /// as many again. Expect: every byte of every new page zero.
+    #[test]
+    fn t_t1_8_a6_a_new_page_is_zeroed_from_a_recycled_buffer() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let page_size = 4096;
+        let pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        pool.finalize_with_page_size(page_size).unwrap();
+        let count = BufferPool::TEST_ARENA_SIZE / page_size + 2;
+        let written: Vec<_> = (0..count)
+            .map(|i| {
+                let page = super::allocate_new_page(i as i64 + 2, &pool);
+                page.get_contents().as_ptr().fill(0xa5);
+                page
+            })
+            .collect();
+        drop(written);
+        for i in 0..count {
+            let page = super::allocate_new_page(i as i64 + 2, &pool);
+            assert!(
+                page.get_contents().as_ptr().iter().all(|byte| *byte == 0),
+                "page {i} kept an earlier page's bytes"
+            );
+        }
+    }
+
     #[test]
     fn page_id_changes_keep_header_access_at_the_correct_offset() {
         let mut page = super::PageInner::from_buffer(Buffer::new_temporary(4096));
@@ -7465,6 +7540,11 @@ mod tests {
     /// each time it reads the rows as committed.
     #[test]
     fn a_reader_forgets_only_the_pages_written_since_its_last_read() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's page cache and its log; the versioned storage keeps neither",
+        ) {
+            return;
+        }
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db =
             crate::Database::open_file(io, "forget.db", Arc::new(crate::SqliteDialect)).unwrap();
@@ -8231,6 +8311,11 @@ mod checkpoint_phase_tests {
 
     #[test]
     fn checkpoint_db_sync_completion_still_leaves_backfill_unpublished_until_proof_install() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's page cache and its log; the versioned storage keeps neither",
+        ) {
+            return;
+        }
         let (db, dir) = open_checkpoint_test_database();
         let db_path = dir.path().join("test.db");
         let conn = db.connect(ConnectOpts::new()).unwrap();

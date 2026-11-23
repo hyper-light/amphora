@@ -100,8 +100,48 @@ pub struct Clock {
     next_tx: AtomicU64,
     states: Vec<Mutex<FxHashMap<u64, State>>>,
     open: Mutex<Open>,
+    /// Each tree's count of open transactions that have changed a row of it (G7 step 2,
+    /// `AC-NS.2.1`): a summary built beside one would miss its rows once it commits. Bounded by
+    /// the trees, each counted once a transaction.
+    writing: Mutex<Writing>,
     /// What versions, transactions' records and kept commits may hold.
     budget: Budget,
+}
+
+/// Each tree's open writers, and who waits for a tree to have none (G7 step 2, `AC-NS.2.1`): one
+/// lock, so a waiter that found writers is told by the last one's end.
+#[derive(Default)]
+struct Writing {
+    counts: BTreeMap<u64, u64>,
+    /// The thread each open writer of a tree changed it on, one entry a writer (lane g7s2-17): a
+    /// waiter on the same thread would wait on itself, so it is refused. Bounded as `counts` is.
+    threads: BTreeMap<u64, Vec<std::thread::ThreadId>>,
+    /// Woken, each once, when the tree's last open writer ends, by waiter: one a skipping build
+    /// that waits for its table's writers (`AMPHORA_SKIP_BUILD=wait`), so bounded by the builds
+    /// under way; a waiter that gives up first takes itself out ([`Clock::give_up`]).
+    idle: BTreeMap<u64, Vec<(u64, std::sync::mpsc::SyncSender<()>)>>,
+    /// The next waiter's number.
+    next_waiter: u64,
+}
+
+/// A wait for a tree's open writers to end ([`Clock::when_unwritten`]): told once the last one
+/// ends; `waiter` takes it out if it gives up first ([`Clock::give_up`]).
+pub struct Unwritten {
+    pub told: std::sync::mpsc::Receiver<()>,
+    pub waiter: u64,
+}
+
+/// Why a wait for a tree's open writers to end is refused (G7 step 2, `AC-NS.2.1`; lane
+/// g7s2-17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum UnwrittenRefusal {
+    /// An open writer of the tree changed it on the waiting thread: only that thread can end it,
+    /// so the wait would never end.
+    #[error("an open writer of the table is the waiting thread's own")]
+    OwnThread,
+    /// The waiter's deadline (its statement's) passed before the writers ended.
+    #[error("the deadline passed before the table's writers ended")]
+    Deadline,
 }
 
 /// Open snapshots' timestamps, each with how many are open at it: all of them, and those of
@@ -251,7 +291,19 @@ pub struct Snapshot {
 pub struct Txn {
     pub id: u64,
     pub start: Ts,
+    /// The newest commit the schema its statements were checked against can hold (lane
+    /// g7s2-19, `AC-NS.2.1`): its start, or earlier, the newest commit published before its
+    /// connection's pager began the read whose header its schema checks read
+    /// ([`Txn::schema_seen_by`]). A commit that changed the catalog after it refuses its writes.
+    schema_seen: Ts,
     changed: Vec<(u64, Vec<u8>)>,
+    /// The trees it has changed a row of, each once, counted in [`Clock`]'s `writing` until it
+    /// ends (G7 step 2, `AC-NS.2.1`). A rollback to a savepoint keeps them: counted a little
+    /// longer, a summary is only built again.
+    trees: Vec<u64>,
+    /// The thread it first changed a row on, counted with it among each tree's writers (lane
+    /// g7s2-17): a wait on that thread for the tree's writers is refused.
+    writer: Option<std::thread::ThreadId>,
     /// Its changes in the order made: its redo record (decision 6).
     ops: Vec<Op>,
     /// What it read through [`VTree::read`], [`VTree::read_range`] and [`Versioned::keep_read`]: its
@@ -267,7 +319,13 @@ pub struct Txn {
 /// serializable against each other on the same commit path, and keeps one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Validation {
-    /// Nothing: snapshot isolation, which allows write skew. The Elle checks' control.
+    /// Nothing: snapshot isolation, which allows write skew. The Elle checks' control, set only
+    /// by [`Versioned::with_validation`], which the Elle checks, this file's tests and the
+    /// validations' bench (`amphora-bench --cc`) call on a storage of their own: SQL's storage
+    /// (`durable::Database`, through the switch) is never opened with it. So its gap stays a
+    /// control's (lane g7s2-18, `AC-NS.2.1`): a `CREATE INDEX` that read its table while a writer
+    /// of the table committed beside it is not refused here, and its index lacks that writer's
+    /// rows; every other validation refuses it.
     Snapshot,
     /// Precision locking as HyPer adapts it (Neumann, Mühlbauer, Kemper, SIGMOD 2015): a
     /// transaction that wrote checks the rows and spans it read against the rows written by the
@@ -434,6 +492,19 @@ impl Txn {
         !self.changed.is_empty()
     }
 
+    /// Whether it has changed a row of tree `tree` (G7 step 2, `AC-NS.2.1`).
+    pub fn wrote_tree(&self, tree: u64) -> bool {
+        self.trees.contains(&tree)
+    }
+
+    /// Its statements checked the schema against a header read in a pager snapshot begun when
+    /// `ts` was the newest commit published ([`Clock::published`], read before that snapshot
+    /// began), so a catalog change after `ts` may be missing from what they were compiled
+    /// against, though its snapshot, begun later, holds it (lane g7s2-19, `AC-NS.2.1`).
+    pub fn schema_seen_by(&mut self, ts: Ts) {
+        self.schema_seen = self.schema_seen.min(ts);
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             start: self.start,
@@ -502,6 +573,7 @@ impl Clock {
                 .map(|_| Mutex::new(FxHashMap::default()))
                 .collect(),
             open: Mutex::new(Open::default()),
+            writing: Mutex::new(Writing::default()),
             budget,
         }
     }
@@ -536,6 +608,14 @@ impl Clock {
         Ok(start)
     }
 
+    /// The newest commit published now (lane g7s2-19, `AC-NS.2.1`). A commit's work under the
+    /// publish lock (the pager's header among it, `durable::Database::commit_with`) happens
+    /// before its timestamp is published, so whatever begins after this read sees the work of
+    /// every commit up to it.
+    pub fn published(&self) -> Ts {
+        self.visible.load(Ordering::Acquire)
+    }
+
     /// Ends a read-only snapshot that began at `start` ([`Clock::snapshot`]).
     pub fn close(&self, start: Ts) {
         count_out(&mut self.open.lock().all, start);
@@ -559,7 +639,10 @@ impl Clock {
         Ok(Txn {
             id,
             start,
+            schema_seen: start,
             changed: Vec::new(),
+            trees: Vec::new(),
+            writer: None,
             ops: Vec::new(),
             reads: Reads::default(),
             charged: 0,
@@ -628,9 +711,112 @@ impl Clock {
             count_out(&mut open.all, txn.start);
             count_out(&mut open.txns, txn.start);
         }
+        // After its commit is published: one who finds it no longer writing finds its commit.
+        let mut woken = Vec::new();
+        {
+            let mut writing = self.writing.lock();
+            for tree in &txn.trees {
+                count_out(&mut writing.counts, *tree);
+                if let Some(thread) = txn.writer {
+                    let emptied = writing.threads.get_mut(tree).is_some_and(|threads| {
+                        if let Some(at) = threads.iter().position(|t| *t == thread) {
+                            threads.swap_remove(at);
+                        }
+                        threads.is_empty()
+                    });
+                    if emptied {
+                        writing.threads.remove(tree);
+                    }
+                }
+                if !writing.counts.contains_key(tree) {
+                    woken.extend(
+                        writing
+                            .idle
+                            .remove(tree)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|(_, tell)| tell),
+                    );
+                }
+            }
+        }
+        // A waiter that went away dropped its end: nothing to tell it.
+        for waiter in woken {
+            let _ = waiter.try_send(());
+        }
         self.budget
             .release(txn.charged.saturating_add(txn.read_bytes));
         Ok(())
+    }
+
+    /// `txn` changes a row of tree `tree`: counted among the tree's writers once, before the
+    /// change is made, until it ends (G7 step 2, `AC-NS.2.1`).
+    fn writes_to(&self, txn: &mut Txn, tree: u64) -> Result<()> {
+        if txn.trees.contains(&tree) {
+            return Ok(());
+        }
+        let thread = *txn
+            .writer
+            .get_or_insert_with(|| std::thread::current().id());
+        let mut writing = self.writing.lock();
+        count_in(&mut writing.counts, tree)?;
+        writing.threads.entry(tree).or_default().push(thread);
+        txn.trees.push(tree);
+        Ok(())
+    }
+
+    /// How many open transactions have changed a row of tree `tree` (G7 step 2, `AC-NS.2.1`): a
+    /// skipping summary built while one is open misses its rows when it commits. One that ended
+    /// is no longer counted only after its commit was published ([`Clock::forget`]), so a caller
+    /// that reads this first, then the newest commit, sees either the writer or its commit.
+    pub fn writers_of(&self, tree: u64) -> u64 {
+        self.writing.lock().counts.get(&tree).copied().unwrap_or(0)
+    }
+
+    /// Tree `tree`'s end of writing (G7 step 2, `AC-NS.2.1`), waited for on thread `thread`:
+    /// `None` when no open transaction has changed a row of it, else a receiver told once its last
+    /// open writer ends (after that writer's commit is published, [`Clock::forget`]). Read and
+    /// registered under one lock, so no end is missed between. Refused at once, registering
+    /// nothing, when an open writer of the tree is `thread`'s own (lane g7s2-17): `thread` would
+    /// wait on itself for good.
+    pub fn when_unwritten(
+        &self,
+        tree: u64,
+        thread: std::thread::ThreadId,
+    ) -> std::result::Result<Option<Unwritten>, UnwrittenRefusal> {
+        let mut writing = self.writing.lock();
+        if !writing.counts.contains_key(&tree) {
+            return Ok(None);
+        }
+        if writing
+            .threads
+            .get(&tree)
+            .is_some_and(|threads| threads.contains(&thread))
+        {
+            return Err(UnwrittenRefusal::OwnThread);
+        }
+        let waiter = writing.next_waiter;
+        writing.next_waiter = waiter.wrapping_add(1);
+        let (tell, told) = std::sync::mpsc::sync_channel(1);
+        writing.idle.entry(tree).or_default().push((waiter, tell));
+        Ok(Some(Unwritten { told, waiter }))
+    }
+
+    /// Takes waiter `waiter` of tree `tree` out, one that gave up before the tree's writers ended
+    /// (lane g7s2-17), so waiters that give up hold nothing while writers keep the tree open.
+    pub fn give_up(&self, tree: u64, waiter: u64) {
+        let mut writing = self.writing.lock();
+        if let Some(waiters) = writing.idle.get_mut(&tree) {
+            waiters.retain(|(w, _)| *w != waiter);
+            if waiters.is_empty() {
+                writing.idle.remove(&tree);
+            }
+        }
+    }
+
+    /// How many wait for tree `tree`'s last open writer to end ([`Clock::when_unwritten`]).
+    pub fn waiting_on(&self, tree: u64) -> usize {
+        self.writing.lock().idle.get(&tree).map_or(0, Vec::len)
     }
 
     /// The oldest open snapshot's timestamp, or the last commit's with none open: versions older
@@ -909,6 +1095,7 @@ impl VTree {
         heads: &mut FxHashMap<Vec<u8>, Head>,
     ) -> Result<Option<Vec<u8>>> {
         let before = row_of(cell);
+        clock.writes_to(txn, self.id)?;
         // What the version kept for the snapshots that see it, and `txn`'s note of the row, take
         // from the budget: reserved before anything changes, so a refusal leaves the row as it is.
         let older = Older {
@@ -1249,6 +1436,25 @@ pub struct Versioned {
     /// until its newest version is at or below the watermark). Locked only under the publish
     /// lock.
     recent: Mutex<VecDeque<Committed>>,
+    /// The catalog's tree and its newest change ([`Versioned::keep_catalog`]).
+    catalog: Catalog,
+}
+
+/// The tree whose rows are the database's catalog (`sqlite_schema` on the switch), named once,
+/// and the timestamp of the newest commit that changed a row of it, moved under the publish lock
+/// (lane g7s2-17, `AC-NS.2.1`).
+struct Catalog {
+    tree: crate::sync::OnceLock<u64>,
+    changed_at: AtomicU64,
+}
+
+impl Catalog {
+    fn new() -> Self {
+        Self {
+            tree: crate::sync::OnceLock::new(),
+            changed_at: AtomicU64::new(0),
+        }
+    }
 }
 
 /// The budget of a pool's versions and records (decision 10). A pool of a fixed count of frames
@@ -1297,6 +1503,7 @@ impl Versioned {
             trees: RwLock::new(made),
             validation: Validation::default(),
             recent: Mutex::new(VecDeque::new()),
+            catalog: Catalog::new(),
         })
     }
 
@@ -1315,6 +1522,25 @@ impl Versioned {
 
     pub fn validation(&self) -> Validation {
         self.validation
+    }
+
+    /// Names tree `tree` the catalog, once (lane g7s2-17, `AC-NS.2.1`): writers no longer take
+    /// one lock, so a transaction that changed rows commits only if no commit changed the catalog
+    /// after its snapshot. Its statements were compiled against the catalog its snapshot saw (an
+    /// index, a trigger, a column it didn't know of would be left out of its rows); refused,
+    /// typed (`SchemaConflict`), it rolls back and runs again against the new one. Every schema
+    /// change against every writer begun before it, as PostgreSQL's DDL locks and this engine's
+    /// MVCC store refuse them: a table-grain rule is a later A/B.
+    pub fn keep_catalog(&self, tree: u64) {
+        let _ = self.catalog.tree.set(tree);
+    }
+
+    /// Whether `txn` changed a row of the catalog.
+    fn changes_catalog(&self, txn: &Txn) -> bool {
+        self.catalog
+            .tree
+            .get()
+            .is_some_and(|tree| txn.trees.contains(tree))
     }
 
     /// The trees whose roots are `roots`, in `pool` (recovery), tree `i` ordered by `cmp(i)`.
@@ -1336,6 +1562,7 @@ impl Versioned {
             trees: RwLock::new(trees),
             validation: Validation::default(),
             recent: Mutex::new(VecDeque::new()),
+            catalog: Catalog::new(),
         })
     }
 
@@ -1466,6 +1693,15 @@ impl Versioned {
         let mut reached = false;
         let published = self.clock.commit(&txn, |ts, ops| {
             reached = true;
+            // A writer whose schema checks came before the catalog's newest change wrote against
+            // an older one (lane g7s2-17; its limit, lane g7s2-19, `Txn::schema_seen_by`):
+            // checked and moved under this lock, so none slips between.
+            if !txn.changed.is_empty()
+                && self.catalog.changed_at.load(Ordering::Acquire) > txn.schema_seen
+            {
+                self.clock.budget.release(read_bytes);
+                return Err(LimboError::SchemaConflict);
+            }
             let mut recent = self.recent.lock();
             let out_first = match self.validate(&txn, &reads, &recent, d) {
                 Ok(out_first) => out_first,
@@ -1484,6 +1720,10 @@ impl Versioned {
             }
             if let Some(c) = kept {
                 recent.push_back(c);
+            }
+            // Moved only here, under the publish lock, where timestamps rise.
+            if self.changes_catalog(&txn) {
+                self.catalog.changed_at.store(ts, Ordering::Release);
             }
             Ok(())
         });
@@ -2808,5 +3048,121 @@ mod tests {
         assert_eq!(machine.held(), 38);
         drop(budget);
         assert_eq!(machine.held(), 0);
+    }
+
+    /// Do: two transactions change rows of one tree, one of them twice, beside a third that only
+    /// reads it; one commits, one rolls back. Expect (G7 step 2, `AC-NS.2.1`): the tree counts each
+    /// writer once while it is open, the reader not at all, and none once they end; a write refused
+    /// by the first writer's win still counts its transaction until it rolls back.
+    #[test]
+    fn t_ns_2_1_a_tree_counts_its_open_writers() {
+        let v = db();
+        let t = v.tree(0).unwrap();
+        let mut d = Descender::new();
+        let mut a = v.clock.begin().unwrap();
+        let mut b = v.clock.begin().unwrap();
+        let reader = v.clock.begin().unwrap();
+        assert_eq!(v.clock.writers_of(0), 0);
+        t.put(&v.pool, &mut d, &v.clock, &mut a, b"x", b"1")
+            .unwrap();
+        t.put(&v.pool, &mut d, &v.clock, &mut a, b"y", b"1")
+            .unwrap();
+        assert!(a.wrote_tree(0) && !b.wrote_tree(0));
+        assert_eq!(v.clock.writers_of(0), 1);
+        t.put(&v.pool, &mut d, &v.clock, &mut b, b"z", b"2")
+            .unwrap();
+        assert_eq!(
+            t.get(&v.pool, &mut d, &v.clock, &reader.snapshot(), b"x")
+                .unwrap(),
+            None
+        );
+        assert_eq!(v.clock.writers_of(0), 2);
+        assert!(matches!(
+            t.put(&v.pool, &mut d, &v.clock, &mut b, b"x", b"2"),
+            Err(LimboError::WriteWriteConflict)
+        ));
+        assert_eq!(v.clock.writers_of(0), 2);
+        v.commit(a, &mut d).unwrap();
+        assert_eq!(v.clock.writers_of(0), 1);
+        v.abort(b, &mut d).unwrap();
+        v.commit(reader, &mut d).unwrap();
+        assert_eq!(v.clock.writers_of(0), 0);
+    }
+
+    /// Do: wait for a tree's writers to end while two are open; end one, then the other. Expect
+    /// (G7 step 2, `AC-NS.2.1`, `AMPHORA_SKIP_BUILD=wait`): no wait with none open, the waiter
+    /// untold while either is open and told once, by the last one's end.
+    #[test]
+    fn t_ns_2_1_a_tree_tells_its_waiters_when_its_last_writer_ends() {
+        let v = db();
+        let t = v.tree(0).unwrap();
+        let mut d = Descender::new();
+        // The waiter is another thread's: the writers below are this thread's own.
+        let other = std::thread::spawn(|| std::thread::current().id())
+            .join()
+            .unwrap();
+        assert!(v.clock.when_unwritten(0, other).unwrap().is_none());
+        let mut a = v.clock.begin().unwrap();
+        let mut b = v.clock.begin().unwrap();
+        t.put(&v.pool, &mut d, &v.clock, &mut a, b"x", b"1")
+            .unwrap();
+        t.put(&v.pool, &mut d, &v.clock, &mut b, b"y", b"2")
+            .unwrap();
+        let wait = v.clock.when_unwritten(0, other).unwrap().unwrap();
+        assert_eq!(v.clock.waiting_on(0), 1);
+        v.commit(a, &mut d).unwrap();
+        assert!(wait.told.try_recv().is_err(), "told while a writer is open");
+        v.commit(b, &mut d).unwrap();
+        assert!(
+            wait.told.try_recv().is_ok(),
+            "untold after the last writer ended"
+        );
+        assert_eq!(v.clock.waiting_on(0), 0);
+        assert!(v.clock.when_unwritten(0, other).unwrap().is_none());
+    }
+
+    /// Do (lane g7s2-17, `AC-NS.2.1`): this thread opens a writer of a tree, then waits for the
+    /// tree's writers to end on this thread and on another; the other's waiter gives up. Expect:
+    /// this thread's wait is refused at once as its own (nothing registered: it would wait on
+    /// itself for good); the other's is registered, and taken out when it gives up, so nothing is
+    /// held for it while the writer stays open; once the writer ends, none is refused.
+    #[test]
+    fn t_ns_2_1_a_wait_on_its_own_threads_writer_is_refused() {
+        let v = db();
+        let t = v.tree(0).unwrap();
+        let mut d = Descender::new();
+        let here = std::thread::current().id();
+        let other = std::thread::spawn(|| std::thread::current().id())
+            .join()
+            .unwrap();
+        let mut a = v.clock.begin().unwrap();
+        t.put(&v.pool, &mut d, &v.clock, &mut a, b"x", b"1")
+            .unwrap();
+        assert_eq!(
+            v.clock.when_unwritten(0, here).err(),
+            Some(UnwrittenRefusal::OwnThread)
+        );
+        assert_eq!(v.clock.waiting_on(0), 0);
+        let wait = v.clock.when_unwritten(0, other).unwrap().unwrap();
+        assert_eq!(v.clock.waiting_on(0), 1);
+        v.clock.give_up(0, wait.waiter);
+        assert_eq!(v.clock.waiting_on(0), 0);
+        v.commit(a, &mut d).unwrap();
+        assert!(v.clock.when_unwritten(0, here).unwrap().is_none());
+        // A writer on another thread: this thread may wait for it.
+        let (begun, mut b) = (std::sync::mpsc::channel(), None);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut txn = v.clock.begin().unwrap();
+                let mut d = Descender::new();
+                t.put(&v.pool, &mut d, &v.clock, &mut txn, b"y", b"2")
+                    .unwrap();
+                begun.0.send(txn).unwrap();
+            });
+            b = begun.1.recv().ok();
+        });
+        assert!(v.clock.when_unwritten(0, here).unwrap().is_some());
+        v.commit(b.unwrap(), &mut d).unwrap();
+        assert_eq!(v.clock.waiting_on(0), 0);
     }
 }

@@ -145,6 +145,13 @@ pub trait Engine: Send + 'static {
         Ok(None)
     }
 
+    /// Where its rows fall about half each side by position, for the planner's size cut (CP-T1.9,
+    /// T-T1.9.R19; docs/design/reshard.md, decision "The size cut from the B-tree's middle key"),
+    /// found without reading every row: none if it can't say.
+    fn size_cut(&mut self) -> anyhow::Result<Option<crate::reshard::plan::Cut>> {
+        Ok(None)
+    }
+
     /// The number of the last entry in its log (0: none yet).
     fn head(&mut self) -> anyhow::Result<Seq> {
         Err(no_copy_path())

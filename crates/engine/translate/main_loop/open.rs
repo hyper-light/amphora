@@ -163,7 +163,8 @@ impl OpenLoop {
                     .iter()
                     .any(|t| t.join_info.as_ref().is_some_and(|ji| ji.is_outer()));
                 if btree.has_rowid && !outer {
-                    let terms = crate::skipping::bound_terms(
+                    let hint = crate::skipping::SkipHint::of(
+                        cursor_id,
                         predicates
                             .iter()
                             .filter(|t| {
@@ -176,14 +177,22 @@ impl OpenLoop {
                             .map(|t| &t.expr),
                         table.internal_id,
                     );
-                    if !terms.is_empty() {
-                        program
-                            .skip_hints
-                            .push(crate::skipping::SkipHint { cursor_id, terms });
-                    }
+                    program.skip_hints.extend(hint);
                 }
             }
 
+            // Amphora (QT.5, T-QT.5.3): the dimensions this scan's star filters read, once.
+            let star_probes = if matches!(mode, OperationMode::SELECT) {
+                super::star::emit_builds(
+                    program,
+                    t_ctx,
+                    table_references,
+                    predicates,
+                    joined_table_index,
+                )?
+            } else {
+                Vec::new()
+            };
             match &table.op {
                 Operation::HashJoin(hash_join_op) => {
                     HashProbeSetupEmitter::new(
@@ -322,6 +331,14 @@ impl OpenLoop {
                 subqueries,
             )
             .emit()?;
+            super::star::emit_probes(
+                program,
+                t_ctx,
+                table_references,
+                predicates,
+                &star_probes,
+                condition_fail_target,
+            )?;
 
             // HASH SEMI-JOIN (G6 step 5): all conditions passed means the build row matched; it
             // goes on only at its first match in this probe pass, and later matches move on to the

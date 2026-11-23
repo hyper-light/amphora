@@ -2,7 +2,10 @@
 # AC-G3.5.2 (decision 41): point_pk at one client with each descent-skip setting, the same database
 # reused, records appended to $SUITE_OUT (default records/<date>-<host>-descent-skip.jsonl). The winner
 # passes at 20% more queries a second than `off`. A measurement: the coordinator's, on a quiet host
-# (CLAUDE.md §7), after `cargo build --release --locked -p amphora-bench`.
+# (CLAUDE.md §7), after `cargo build --release --manifest-path bench/Cargo.toml` from the root: the bench
+# is a workspace of its own, which `-p amphora-bench` from the root doesn't reach, and its lock file is
+# ignored (bench/.gitignore), so `--locked` refuses a fresh clone. run.sh runs bench/target's binary
+# (or $CARGO_TARGET_DIR's).
 #
 # usage: bench/descent_skip.sh [suite arguments...]
 #   e.g. bench/descent_skip.sh --items 1000000 --seconds 20 --warmup 5

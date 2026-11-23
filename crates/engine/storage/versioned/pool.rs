@@ -1217,32 +1217,7 @@ mod tests {
         assert!(pool.read(pages[2]).is_ok());
     }
 
-    /// A source of `limit` bytes for a test, counting what it holds.
-    struct Capped {
-        limit: u64,
-        held: AtomicU64,
-    }
-
-    impl Source for Capped {
-        fn take(&self, what: &'static str, bytes: u64) -> Result<()> {
-            let limit = self.limit;
-            self.held
-                .try_update(Ordering::AcqRel, Ordering::Acquire, |h| {
-                    h.checked_add(bytes).filter(|a| *a <= limit)
-                })
-                .map(|_| ())
-                .map_err(|held| LimboError::MemoryBudget {
-                    what,
-                    asked: bytes,
-                    held,
-                    limit,
-                })
-        }
-
-        fn give(&self, bytes: u64) {
-            self.held.fetch_sub(bytes, Ordering::AcqRel);
-        }
-    }
+    use crate::storage::versioned::memory::Capped;
 
     /// T-NS.2.10: a pool over a disk whose frames come from a source with room for three (runs of
     /// one and two; the next run, four, refused), handing out ten pages. Expect: three frames made,
@@ -1251,10 +1226,7 @@ mod tests {
     /// (`AC-NS.2.1`: no share picked, the source decides).
     #[test]
     fn ns2_a_shared_pools_frames_are_what_its_source_grants() {
-        let source = Arc::new(Capped {
-            limit: frame_bytes() * 3 + frame_bytes() / 2,
-            held: AtomicU64::new(0),
-        });
+        let source = Arc::new(Capped::new(frame_bytes() * 3 + frame_bytes() / 2));
         let disk: Arc<dyn Disk> = Arc::new(Simulated::new(5, 1).unwrap());
         let pool = Pool::backed_in(Room::Shared(source.clone()), disk, 0).unwrap();
         let pages: Vec<u64> = (0..10).map(|_| pool.allocate().unwrap()).collect();
@@ -1265,14 +1237,11 @@ mod tests {
             assert!(holds(&pool.read(p).unwrap(), p, 1), "page {p}");
         }
         assert_eq!(pool.frames_made(), 3);
-        assert_eq!(source.held.load(Ordering::Acquire), frame_bytes() * 3);
+        assert_eq!(source.held(), frame_bytes() * 3);
         assert!(pool.counts().evictions > 0);
         drop(pool);
-        assert_eq!(source.held.load(Ordering::Acquire), 0);
-        let none = Arc::new(Capped {
-            limit: frame_bytes() - 1,
-            held: AtomicU64::new(0),
-        });
+        assert_eq!(source.held(), 0);
+        let none = Arc::new(Capped::new(frame_bytes() - 1));
         let disk: Arc<dyn Disk> = Arc::new(Simulated::new(6, 1).unwrap());
         let pool = Pool::backed_in(Room::Shared(none), disk, 0).unwrap();
         assert!(matches!(
@@ -1458,10 +1427,7 @@ mod tests {
     /// made past the three the source grants (a refused run of frames ends a run, never a read).
     #[test]
     fn qs2_read_ahead_takes_only_the_frames_a_shared_source_grants() {
-        let source = Arc::new(Capped {
-            limit: frame_bytes() * 3 + frame_bytes() / 2,
-            held: AtomicU64::new(0),
-        });
+        let source = Arc::new(Capped::new(frame_bytes() * 3 + frame_bytes() / 2));
         let pool = Pool::backed_in(Room::Shared(source.clone()), data_disk(40), 40).unwrap();
         pool.set_read_ahead(true);
         pool.run_pages.store(8, Ordering::Relaxed);
@@ -1469,7 +1435,7 @@ mod tests {
             assert!(holds(&pool.read(p).unwrap(), p, 0), "page {p}");
         }
         assert_eq!(pool.frames_made(), 3);
-        assert_eq!(source.held.load(Ordering::Acquire), frame_bytes() * 3);
+        assert_eq!(source.held(), frame_bytes() * 3);
         let c = pool.counts();
         assert!(
             c.longest > 1 && c.longest <= 3 && c.reads < c.misses,

@@ -130,6 +130,12 @@ pub struct CostModelParams {
     /// (`plan_cache.rs`). Not a tuning parameter: set as the statement is planned.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) plan_values: Option<crate::sync::Arc<crate::plan_cache::PlanValues>>,
+
+    /// Amphora (QT.5, lane qs5-18): how an `IS` of a value planning doesn't know is estimated
+    /// (`Connection::set_is_value_estimate`). Not a tuning parameter: set as the statement is
+    /// planned.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) is_value_estimate: crate::IsValueEstimate,
 }
 
 impl CostModelParams {
@@ -181,6 +187,7 @@ impl CostModelParams {
             ),
 
             plan_values: None,
+            is_value_estimate: crate::IsValueEstimate::Equality,
         }
     }
 }
@@ -280,6 +287,15 @@ impl CostModelParams {
         }
     }
 
+    /// Amphora (QT.5): these parameters with the connection's rule for an `IS` of a value planning
+    /// doesn't know (lane qs5-18).
+    pub(crate) fn with_is_value_estimate(self, rule: crate::IsValueEstimate) -> Self {
+        Self {
+            is_value_estimate: rule,
+            ..self
+        }
+    }
+
     /// Amphora (PL.12): the value an estimate takes for `expr`: a literal's own, a parameter's
     /// bound value (noting that an estimate asked for it), else `None`.
     pub(crate) fn constant_value(
@@ -308,6 +324,41 @@ impl CostModelParams {
                 let values = self.plan_values.as_deref()?;
                 values.note_asked();
                 values.value(variable).cloned()
+            }
+            _ => None,
+        }
+    }
+
+    /// Amphora (QT.5, lane qs5-18): whether an estimate takes `expr` as NULL: the NULL literal and
+    /// a parameter a custom plan binds to NULL are (noting that an estimate asked), a non-NULL
+    /// literal and a parameter bound to a value aren't; `None` where planning doesn't know (a
+    /// generic plan's parameter, another table's column, any other expression).
+    pub(crate) fn value_is_null(&self, expr: &amphora_engine_parser::ast::Expr) -> Option<bool> {
+        use amphora_engine_parser::ast;
+        let mut expr = expr;
+        // As in `constant_value`: a loop, not recursion (CLAUDE.md §11).
+        while let ast::Expr::Parenthesized(exprs) = expr {
+            let [only] = exprs.as_slice() else {
+                return None;
+            };
+            expr = only;
+        }
+        match expr {
+            ast::Expr::Literal(ast::Literal::Null) => Some(true),
+            ast::Expr::Literal(
+                ast::Literal::Numeric(_)
+                | ast::Literal::String(_)
+                | ast::Literal::Blob(_)
+                | ast::Literal::True
+                | ast::Literal::False
+                | ast::Literal::CurrentDate
+                | ast::Literal::CurrentTime
+                | ast::Literal::CurrentTimestamp,
+            ) => Some(false),
+            ast::Expr::Variable(variable) => {
+                let values = self.plan_values.as_deref()?;
+                values.note_asked();
+                values.is_null(variable)
             }
             _ => None,
         }
@@ -489,6 +540,46 @@ impl CostModelParams {
 
 #[cfg(all(test, feature = "optimizer_params"))]
 mod tests {
+    /// T-QT.5.9 (lane qs5-18): do: ask whether an `IS`'s value is NULL for the NULL literal, a
+    /// parenthesized NULL, a number, and a parameter with no values, in the generic plan, and in a
+    /// custom plan bound to 7, NULL and nothing. Expect: NULL for both literals and the parameter
+    /// bound to NULL; not NULL for the number and the one bound to 7; unknown for the rest; and
+    /// the custom plan noting that an estimate asked.
+    #[test]
+    fn t_qt_5_9_an_is_value_is_null_only_where_planning_knows_it() {
+        use amphora_engine_parser::ast;
+        let null = ast::Expr::Literal(ast::Literal::Null);
+        let param = |i: u32| {
+            ast::Expr::Variable(ast::Variable::indexed(
+                std::num::NonZeroU32::new(i).unwrap(),
+            ))
+        };
+        let with = |values: crate::plan_cache::PlanValues| {
+            super::CostModelParams::new().with_plan_values(Some(&crate::sync::Arc::new(values)))
+        };
+        let none = super::CostModelParams::new();
+        assert_eq!(none.value_is_null(&null), Some(true));
+        assert_eq!(
+            none.value_is_null(&ast::Expr::Parenthesized(vec![Box::new(null.clone())])),
+            Some(true)
+        );
+        assert_eq!(
+            none.value_is_null(&ast::Expr::Literal(ast::Literal::Numeric("5".into()))),
+            Some(false)
+        );
+        assert_eq!(none.value_is_null(&param(1)), None);
+        let generic = with(crate::plan_cache::PlanValues::generic());
+        assert_eq!(generic.value_is_null(&param(1)), None);
+        let custom = with(crate::plan_cache::PlanValues::bound(vec![
+            crate::Value::from_i64(7),
+            crate::Value::Null,
+        ]));
+        assert_eq!(custom.value_is_null(&param(1)), Some(false));
+        assert_eq!(custom.value_is_null(&param(2)), Some(true));
+        assert_eq!(custom.value_is_null(&param(3)), None);
+        assert!(custom.plan_values.as_deref().is_some_and(|v| v.asked()));
+    }
+
     /// T-QT.5.7: a hash entry's bytes are the build table's row, its page over its rows a page,
     /// plus the entry's fixed bytes; the build's, not the probe's.
     #[test]

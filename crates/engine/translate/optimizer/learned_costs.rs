@@ -41,55 +41,316 @@ pub(crate) enum Work {
     PageRead,
 }
 
-/// Units of work and the nanoseconds they took.
+/// One batch's observations (an epoch's): their work and time summed, and how many.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct Span {
     units: f64,
     nanos: f64,
+    count: f64,
 }
 
-/// One kind's running rate: the work of the epoch under way and of the one before it. An epoch is
-/// as much work as calibration timed, so the rate follows the latest one to two calibrations' worth
-/// of work and leaves older times behind as conditions move.
+impl Span {
+    fn add(&mut self, units: f64, nanos: f64) {
+        self.units += units;
+        self.nanos += nanos;
+        self.count += 1.0;
+    }
+
+    /// Nanoseconds a unit over the span, None without work and time.
+    fn per_unit(&self) -> Option<f64> {
+        (self.units > 0.0 && self.nanos > 0.0).then(|| self.nanos / self.units)
+    }
+}
+
+/// PL.8 (T-PL.8.6): how far a batch's rate must sit from the standing one before it replaces it:
+/// a two-sided 95% test, Bonferroni-corrected for the eight kinds of work `Rates` tests as their
+/// batches close (Dunn, "Multiple Comparisons Among Means", JASA 56(293), 1961), as `cost_fit`'s
+/// `AGREE_Z` is for its weights. `MOVE_LEVEL` is the test's central probability, 1 - 0.05/8;
+/// `MOVE_Z` its standard normal quantile, the least Student's t quantile can be (`student_t`).
+const MOVE_LEVEL: f64 = 1.0 - 0.05 / 8.0;
+const MOVE_Z: f64 = 2.734_368_786_533_176;
+
+/// PL.8 (T-PL.8.6, lane pl8-14): the spread between a rate's batch means, the error its weight is
+/// judged by. A burst of load slows a whole batch at once, so the times inside one batch agree
+/// with each other however far the batch sits from the last: their own spread (the ratio
+/// estimator's, before this) took each burst for evidence, and on a loaded host the hash probe's
+/// weight climbed in significant steps through one run (10, 170, 220, 280 rows' visits) and
+/// flipped `t_pl_8_2`'s plans. The spread between batches holds those bursts, as the method of
+/// batch means reads a correlated series' error (Schmeiser, "Batch Size Effects in the Analysis of
+/// Simulation Output", Operations Research 30(3), 1982).
+///
+/// It is read from successive differences of the batch means' logarithms (von Neumann, Kent,
+/// Bellinson and Hart, "The Mean Square Successive Difference", Annals of Mathematical Statistics
+/// 12(2), 1941): a load that slows the work multiplies its times, so a logarithm's spread is the
+/// same at any level, and a successive difference stays small across a slow drift. The difference
+/// into a batch that moved the rate is a change in the work, not its noise, and is left out.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct Batches {
+    /// The last batch mean's logarithm; None before the first batch closed.
+    last: Option<f64>,
+    /// How many successive differences `squares` sums the squares of.
+    differences: f64,
+    squares: f64,
+}
+
+impl Batches {
+    /// Whether a batch whose mean's logarithm is `seen` replaces `standing`, the rate standing
+    /// (nanoseconds a unit); and the batch counted. The first batch observed replaces the rate
+    /// calibration measured or the open anchored: those are timed on other work than the
+    /// database's operators, so there is no spread to weigh the two against. A later one replaces
+    /// it only past the spread between batches (`refutes`).
+    fn judge(&mut self, standing: Option<f64>, seen: f64) -> bool {
+        let moves = match (standing, self.last) {
+            (Some(standing), Some(_)) => self.refutes(standing.ln(), seen),
+            _ => true,
+        };
+        if let (Some(last), false) = (self.last, moves) {
+            self.differences += 1.0;
+            self.squares += (seen - last) * (seen - last);
+        }
+        self.last = Some(seen);
+        moves
+    }
+
+    /// Whether `seen` sits from `standing` (logarithms) past the spread between batches. The
+    /// difference of two batch means has twice a batch's variance, and the mean square successive
+    /// difference estimates twice it as well, so the gap is weighed against the root of the mean
+    /// square successive difference itself: their ratio is Student's t with as many degrees of
+    /// freedom as there are differences, tested at [MOVE_LEVEL]. None yet: no batch moves the rate.
+    ///
+    /// The test costs a bounded number of steps however long the process runs (lane pl8-15): the
+    /// ratio's own probability (`t_central`, one term each two degrees of freedom) while there are
+    /// few differences, and past that the quantile's expansion in `1 / nu` (`move_t_expanded`),
+    /// once that expansion is exact to an f64. A ratio under the normal quantile never needs
+    /// either: Student's t is never under it.
+    fn refutes(&self, standing: f64, seen: f64) -> bool {
+        let nu = self.differences;
+        if nu < 1.0 {
+            return false;
+        }
+        let ratio = (seen - standing).abs() / (self.squares / nu).sqrt();
+        if ratio.is_nan() || ratio <= MOVE_Z {
+            return false;
+        }
+        match move_t_expanded(nu) {
+            Some(t) => ratio > t,
+            None => t_central(ratio.atan2(nu.sqrt()), nu) > MOVE_LEVEL,
+        }
+    }
+}
+
+/// Student's t quantile at [MOVE_LEVEL] for `nu` degrees of freedom by its Cornish-Fisher
+/// expansion about the normal quantile [MOVE_Z] (Abramowitz and Stegun, "Handbook of Mathematical
+/// Functions", 1964, 26.7.5, its four terms); None while the last term is past an f64's resolution
+/// of the sum, where the expansion is not yet the quantile and the closed form decides
+/// (`Batches::refutes`). With [MOVE_Z] that is past about 13,000 degrees of freedom.
+fn move_t_expanded(nu: f64) -> Option<f64> {
+    let x = MOVE_Z;
+    let x2 = x * x;
+    let terms = [
+        x * (x2 + 1.0) / 4.0,
+        x * ((5.0 * x2 + 16.0) * x2 + 3.0) / 96.0,
+        x * (((3.0 * x2 + 19.0) * x2 + 17.0) * x2 - 15.0) / 384.0,
+        x * ((((79.0 * x2 + 776.0) * x2 + 1482.0) * x2 - 1920.0) * x2 - 945.0) / 92160.0,
+    ];
+    let (mut t, mut power, mut last) = (x, 1.0, 0.0);
+    for term in terms {
+        power *= nu;
+        last = term / power;
+        t += last;
+    }
+    (last.abs() <= f64::EPSILON * t).then_some(t)
+}
+
+/// Student's t quantile for `nu` degrees of freedom (a whole number, at least one) at central
+/// probability `level`: the `t` with `P(|T| <= t) = level`. Found by bisection on
+/// `theta = atan(t / sqrt(nu))` over `P(|T| <= t)`'s closed form for whole degrees of freedom
+/// (`t_central`), until the halves meet at an f64's resolution. None outside its domain. The
+/// tests' reference for `t_central` and `move_t_expanded`.
+#[cfg(test)]
+fn student_t(level: f64, nu: f64) -> Option<f64> {
+    if !(level > 0.0 && level < 1.0 && nu.is_finite() && nu >= 1.0) {
+        return None;
+    }
+    let nu = nu.floor();
+    let (mut low, mut high) = (0.0_f64, std::f64::consts::FRAC_PI_2);
+    loop {
+        let mid = 0.5 * (low + high);
+        if mid <= low || mid >= high {
+            break;
+        }
+        if t_central(mid, nu) < level {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    let t = nu.sqrt() * high.tan();
+    t.is_finite().then_some(t)
+}
+
+/// `P(|T| <= sqrt(nu) tan(theta))` for Student's t with `nu` degrees of freedom, a whole number
+/// (Abramowitz and Stegun, "Handbook of Mathematical Functions", 1964, 26.7.3 for odd `nu` and
+/// 26.7.4 for even): a sum of powers of `cos(theta)` to `cos(theta)^(nu - 2)`, each term the last
+/// times `cos(theta)^2 (p + 1) / (p + 2)` from power `p`.
+fn t_central(theta: f64, nu: f64) -> f64 {
+    let (sin, cos) = theta.sin_cos();
+    let odd = nu % 2.0 == 1.0;
+    let (mut term, mut power) = if odd { (cos, 1.0) } else { (1.0, 0.0) };
+    let mut sum = 0.0;
+    while power <= nu - 2.0 {
+        sum += term;
+        term *= cos * cos * (power + 1.0) / (power + 2.0);
+        power += 2.0;
+    }
+    if odd {
+        std::f64::consts::FRAC_2_PI * (theta + sin * sum)
+    } else {
+        sin * sum
+    }
+}
+
+/// Amphora (PL.8, T-PL.8.6, lane pl8-16): the rule that moves a learned weight, behind this switch
+/// so the two can be measured against each other (the coordinator's A/B; `Connection::set_weight_rule`).
+/// Each forces its own failure: `Blend` follows every read, so noise and bursts of load flip
+/// close plans; `BatchMeans` holds through them, but it can't judge a batch until it has seen the
+/// spread between batches, so a change in the work's cost soon after start is learned slowly. The
+/// harness `ab_tests` measures both (plan flips a batch, batches to follow a change).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WeightRule {
+    /// The control, the rule before lane pl8-13: every read blends into the rate at once, the
+    /// running mean of the batch under way and the one before it.
+    Blend,
+    /// The candidate (lanes pl8-14 and pl8-15): a closed batch replaces the standing rate only
+    /// past the spread between batch means (`Batches::judge`).
+    #[default]
+    BatchMeans,
+}
+
+/// One kind's rate: the one standing, the batch under way, and the spread between batches. A
+/// batch (an epoch) is as much work as calibration timed. Under [WeightRule::BatchMeans], when one
+/// closes, its rate replaces the standing one only if the two differ significantly by the spread
+/// between batches (`Batches::judge`); otherwise the standing rate stays exactly where it was. So
+/// the weights the planner reads move on evidence alone, never by a batch's noise or a burst of
+/// load, and a plan chosen on them is chosen again until the work really costs something else
+/// (PL.8, T-PL.8.6). Under [WeightRule::Blend], the rate is the running mean over `previous`, the
+/// last closed batch, and the batch under way.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct Rate {
+    rule: WeightRule,
     epoch: f64,
-    previous: Span,
+    standing: Option<f64>,
     current: Span,
+    batches: Batches,
+    /// [WeightRule::Blend]'s last closed batch (calibration's work, or the open's anchor, first).
+    previous: Span,
 }
 
 impl Rate {
-    /// The rate calibration measured: `units` of work in `nanos`, also the epoch's length.
-    fn calibrated(units: f64, nanos: f64) -> Self {
-        Self {
+    /// A rate measured as `units` of work in `nanos`, also the batch's length (calibration's; a
+    /// test's fixed rate).
+    fn measured(units: f64, nanos: f64) -> Self {
+        let mut rate = Self {
             epoch: units,
-            previous: Span { units, nanos },
-            current: Span::default(),
+            ..Self::default()
+        };
+        rate.anchor(units, nanos);
+        rate
+    }
+
+    /// Stands the rate at `units` of work in `nanos`, as calibration or the open's anchor timed it.
+    fn anchor(&mut self, units: f64, nanos: f64) {
+        if units > 0.0 && nanos > 0.0 {
+            self.standing = Some(nanos / units);
+            self.previous = Span {
+                units,
+                nanos,
+                count: 1.0,
+            };
+        }
+    }
+
+    /// Moves to `rule` from the rate as it stands, a batch's worth of work at it: the batch under
+    /// way and the spread between batches start again, so neither rule reads what the other kept.
+    fn switch(&mut self, rule: WeightRule) {
+        let now = self.nanos_per_unit();
+        *self = Self {
+            rule,
+            epoch: self.epoch,
+            ..Self::default()
+        };
+        if let Some(now) = now {
+            self.anchor(self.epoch.max(1.0), now * self.epoch.max(1.0));
         }
     }
 
     /// Adds an observation. One with no work or a time that is not a finite, non-negative number
-    /// says nothing about the rate, and is left out.
+    /// says nothing about the rate, and is left out. A batch with one observation alone runs on
+    /// until a second: one time alone is one moment's load.
     fn observe(&mut self, units: f64, nanos: f64) {
         if !(units.is_finite() && units > 0.0 && nanos.is_finite() && nanos >= 0.0) {
             return;
         }
-        self.current.units += units;
-        self.current.nanos += nanos;
-        if self.current.units >= self.epoch {
-            self.previous = self.current;
-            self.current = Span::default();
+        self.current.add(units, nanos);
+        if self.rule == WeightRule::Blend {
+            if self.current.units >= self.epoch {
+                self.previous = std::mem::take(&mut self.current);
+            }
+            return;
+        }
+        if self.current.units < self.epoch || self.current.count < 2.0 {
+            return;
+        }
+        let Some(mean) = self.current.per_unit() else {
+            return;
+        };
+        self.current = Span::default();
+        if self.batches.judge(self.standing, mean.ln()) {
+            self.standing = Some(mean);
         }
     }
 
-    /// Nanoseconds a unit, None before any time was seen.
-    fn nanos_per_unit(&self) -> Option<f64> {
-        let units = self.previous.units + self.current.units;
-        let nanos = self.previous.nanos + self.current.nanos;
-        if units > 0.0 && nanos > 0.0 {
-            Some(nanos / units)
+    /// PL.8 (T-PL.8.2, lane pl8-22): closes a batch of single timed runs (`Sampling`) at `median`,
+    /// their median run's nanoseconds, judged as a batch mean is (`Batches::judge`). A timed run
+    /// the scheduler preempted measures the preemption, milliseconds against the run's tens of
+    /// nanoseconds, and one of those in a batch moved its mean a hundredfold: the first batch
+    /// replaces calibration's rate unjudged, so under load a hash probe's weight jumped and the
+    /// plans flipped (20 copies at once of `t_pl_8_2`, kiln run r124). The median holds while
+    /// fewer than half the runs are preempted, as calibration's samples are read
+    /// (`calibrate`, `t_qt_5_5_calibration_weights_hold_through_preempted_samples`).
+    fn close_runs(&mut self, median: f64) {
+        if !(median.is_finite() && median > 0.0) {
+            return;
+        }
+        self.current = Span::default();
+        if self.batches.judge(self.standing, median.ln()) {
+            self.standing = Some(median);
+        }
+    }
+
+    /// The spread between this rate's batch means, as a logarithm's (`Batches`): None under
+    /// [WeightRule::Blend], which keeps none, or before a difference was counted.
+    fn spread(&self) -> Option<f64> {
+        let batches = &self.batches;
+        let spread = (batches.squares / batches.differences).sqrt();
+        if self.rule == WeightRule::BatchMeans && batches.differences >= 1.0 && spread.is_finite() {
+            Some(spread)
         } else {
             None
+        }
+    }
+
+    /// Nanoseconds a unit, None before any time was seen: the standing rate, or before there is
+    /// one, the batch's so far (there is no standing rate for it to move).
+    fn nanos_per_unit(&self) -> Option<f64> {
+        match self.rule {
+            WeightRule::Blend => Span {
+                units: self.previous.units + self.current.units,
+                nanos: self.previous.nanos + self.current.nanos,
+                count: self.previous.count + self.current.count,
+            }
+            .per_unit(),
+            WeightRule::BatchMeans => self.standing.or_else(|| self.current.per_unit()),
         }
     }
 }
@@ -109,6 +370,51 @@ struct Rates {
 }
 
 impl Rates {
+    /// PL.8 (lane pl8-16): the share of a plan's cost its weights' error could explain
+    /// (`LearnedCosts::cost_margin`). A plan's cost is a sum of work counts times weights in page
+    /// reads, each weight a kind's rate over the page read's, so a term's error (as a logarithm's)
+    /// is `sqrt(s_kind^2 + s_page^2)` from the spreads between batch means, and a sum of positive
+    /// terms is off by no more than its worst term. Two plans priced on the same weights share
+    /// their errors, so this bounds the gap between them from above. Tested at [MOVE_Z], the
+    /// level the weights themselves move at; 0 where no spread was measured.
+    fn cost_margin(&self) -> f64 {
+        let page = self.page.spread().unwrap_or(0.0);
+        let kind = [
+            &self.row,
+            &self.seek,
+            &self.hash_build,
+            &self.hash_probe,
+            &self.sort,
+            &self.bloom_probe,
+            &self.where_step,
+        ]
+        .into_iter()
+        .filter_map(Rate::spread)
+        .fold(0.0_f64, f64::max);
+        let margin = (MOVE_Z * (kind * kind + page * page).sqrt()).exp_m1();
+        if margin.is_finite() && margin > 0.0 {
+            margin
+        } else {
+            0.0
+        }
+    }
+
+    /// Every kind's rate under `rule` (`Rate::switch`).
+    fn switch(&mut self, rule: WeightRule) {
+        for rate in [
+            &mut self.row,
+            &mut self.seek,
+            &mut self.hash_build,
+            &mut self.hash_probe,
+            &mut self.sort,
+            &mut self.bloom_probe,
+            &mut self.where_step,
+            &mut self.page,
+        ] {
+            rate.switch(rule);
+        }
+    }
+
     fn rate_mut(&mut self, work: Work) -> &mut Rate {
         match work {
             Work::Row => &mut self.row,
@@ -171,6 +477,8 @@ pub(crate) struct LearnedCosts {
     hash_probe: Sampling,
     /// What timing one run costs: two clock reads, as calibration timed them.
     timing_nanos: f64,
+    /// PL.8: the join search's measured time a candidate, and what it chose.
+    search: super::search_budget::SearchRate,
 }
 
 /// Amphora (QT.5, step 3a): which runs of one operation are timed, one in `every`, and the spread
@@ -189,6 +497,10 @@ struct Sampling {
     runs: AtomicU64,
     every: AtomicU64,
     spread: Mutex<Spread>,
+    /// PL.8 (T-PL.8.2, lane pl8-22): the timed runs of the batch under way, under
+    /// [WeightRule::BatchMeans]: at most an epoch's, the work calibration timed a sample of
+    /// (`Rate::close_runs`).
+    batch: Mutex<Vec<f64>>,
 }
 
 /// Welford's running mean and sum of squared deviations (Welford, "Note on a method for
@@ -219,6 +531,7 @@ impl Sampling {
             runs: AtomicU64::new(0),
             every: AtomicU64::new(1),
             spread: Mutex::new(Spread::default()),
+            batch: Mutex::new(Vec::new()),
         }
     }
 
@@ -268,7 +581,13 @@ impl LearnedCosts {
             hash_build: Sampling::new(),
             hash_probe: Sampling::new(),
             timing_nanos: rates.timing_nanos,
+            search: super::search_budget::SearchRate::default(),
         }
+    }
+
+    /// PL.8: the join search's measured rate and counts.
+    pub(crate) fn search(&self) -> &super::search_budget::SearchRate {
+        &self.search
     }
 
     fn sampling(&self, work: Work) -> Option<&Sampling> {
@@ -287,18 +606,32 @@ impl LearnedCosts {
     }
 
     /// Records a timed run of `work`, one unit in `nanos`: it moves the rate, and its spread sets
-    /// how often the runs are timed.
+    /// how often the runs are timed. Under [WeightRule::BatchMeans] a batch of runs closes at its
+    /// median run (`Rate::close_runs`); under [WeightRule::Blend], the control, each run blends in.
     pub(crate) fn observe_sampled(&self, work: Work, nanos: f64) {
         if !(nanos.is_finite() && nanos >= 0.0) {
             return;
         }
+        let sampling = self.sampling(work);
         let epoch = {
             let mut rates = self.rates.lock();
             let rate = rates.rate_mut(work);
-            rate.observe(1.0, nanos);
+            match (rate.rule, sampling) {
+                (WeightRule::BatchMeans, Some(sampling)) => {
+                    let mut batch = sampling.batch.lock();
+                    batch.push(nanos);
+                    if batch.len() as f64 >= rate.epoch.max(2.0) {
+                        if let Some(median) = median(&mut batch) {
+                            rate.close_runs(median);
+                        }
+                        batch.clear();
+                    }
+                }
+                _ => rate.observe(1.0, nanos),
+            }
             rate.epoch
         };
-        if let Some(sampling) = self.sampling(work) {
+        if let Some(sampling) = sampling {
             sampling.add(nanos, epoch, self.timing_nanos);
         }
     }
@@ -336,10 +669,24 @@ impl LearnedCosts {
         if !(reads.is_finite() && reads > 0.0 && nanos.is_finite() && nanos > 0.0) {
             return;
         }
-        rates.page.previous = Span {
-            units: reads,
-            nanos,
-        };
+        rates.page.anchor(reads, nanos);
+    }
+
+    /// PL.8 (lane pl8-16): how much more than the search's best a statement's carried join order
+    /// may cost and keep its place (`join::keep_carried`), as a share of the best's cost: what the
+    /// weights' measured error could explain (`Rates::cost_margin`). 0 under [WeightRule::Blend].
+    pub(crate) fn cost_margin(&self) -> f64 {
+        self.rates.lock().cost_margin()
+    }
+
+    /// PL.8 (T-PL.8.6, lane pl8-16): moves every weight to `rule` (`WeightRule`), from the rates as
+    /// they stand.
+    pub(crate) fn set_rule(&self, rule: WeightRule) {
+        let mut rates = self.rates.lock();
+        rates.switch(rule);
+        for sampling in [&self.seek, &self.hash_build, &self.hash_probe] {
+            sampling.batch.lock().clear();
+        }
     }
 
     /// The page reads an epoch of the page read's rate holds: the most the open's anchor times
@@ -440,12 +787,14 @@ fn calibrate(clock: &mut dyn FnMut() -> f64) -> Rates {
     // A hash join's filter over the page's keys, sized as the planner sizes one (PL.5,
     // `FilterSizing`) for one false positive expected across a page of keys it doesn't hold,
     // and looked up for such a page: the probe rows a filter is for. Its memory is bounded by the
-    // page's keys' hashes, all it is given.
+    // page's keys' hashes and as many bytes again for the filter built beside them (QT.5, lane
+    // qs5-19: a sized filter's bound holds both at once): its rate, one in a page's keys, takes
+    // `ln(rows)/ln²2` bits a key, fewer than a hash's 64 for any page.
     let fp_per_key = 1.0 / (rows * rows);
     let mut filter =
         crate::vdbe::bloom_filter::BloomFilter::sized(crate::vdbe::bloom_filter::FilterSizing {
             fp_per_key,
-            max_bytes: n.saturating_mul(std::mem::size_of::<u64>()),
+            max_bytes: n.saturating_mul(2 * std::mem::size_of::<u64>()),
         });
     for k in &keys {
         filter.insert_i64(*k as i64);
@@ -519,7 +868,7 @@ fn calibrate(clock: &mut dyn FnMut() -> f64) -> Rates {
     }
     for ((kind, units, _), (reps, samples, _)) in kinds.iter().zip(sampled.iter_mut()) {
         let nanos = median(samples).unwrap_or(0.0);
-        *rates.rate_mut(*kind) = Rate::calibrated(*reps as f64 * *units, nanos);
+        *rates.rate_mut(*kind) = Rate::measured(*reps as f64 * *units, nanos);
     }
     // A page read can't be timed here: there's no file yet. Each database anchors it at open
     // (`time_page_read`, `LearnedCosts::anchor_page_read`), then its own reads move it
@@ -553,9 +902,16 @@ fn median(samples: &mut [f64]) -> Option<f64> {
 /// populations of unknown distribution form", Annals of Mathematical Statistics 7(3), 1936).
 /// Under two samples there's no spread to read.
 fn median_settled(samples: &mut [f64], resolution: f64) -> bool {
+    median_se(samples).is_some_and(|se| se <= resolution)
+}
+
+/// The standard error of the median of `samples` (sorted here): half the distance between the
+/// order statistics a standard error either side of the middle rank (`median_settled`). None
+/// under two samples.
+fn median_se(samples: &mut [f64]) -> Option<f64> {
     let count = samples.len();
     if count < 2 {
-        return false;
+        return None;
     }
     samples.sort_unstable_by(f64::total_cmp);
     let half = count as f64 / 2.0;
@@ -564,8 +920,8 @@ fn median_settled(samples: &mut [f64], resolution: f64) -> bool {
     let low = (half - reach).floor().clamp(0.0, last) as usize;
     let high = (half + reach).ceil().clamp(0.0, last) as usize;
     match (samples.get(low), samples.get(high)) {
-        (Some(low), Some(high)) => (high - low) / 2.0 <= resolution,
-        _ => false,
+        (Some(low), Some(high)) => Some((high - low) / 2.0),
+        _ => None,
     }
 }
 
@@ -676,13 +1032,13 @@ mod tests {
 
     fn fixed_rates(row: f64, seek: f64, build: f64, probe: f64, sort: f64) -> Rates {
         Rates {
-            row: Rate::calibrated(100.0, 100.0 * row),
-            seek: Rate::calibrated(100.0, 100.0 * seek),
-            hash_build: Rate::calibrated(100.0, 100.0 * build),
-            hash_probe: Rate::calibrated(100.0, 100.0 * probe),
-            sort: Rate::calibrated(100.0, 100.0 * sort),
-            bloom_probe: Rate::calibrated(100.0, 100.0 * probe / 4.0),
-            where_step: Rate::calibrated(100.0, 100.0 * row),
+            row: Rate::measured(100.0, 100.0 * row),
+            seek: Rate::measured(100.0, 100.0 * seek),
+            hash_build: Rate::measured(100.0, 100.0 * build),
+            hash_probe: Rate::measured(100.0, 100.0 * probe),
+            sort: Rate::measured(100.0, 100.0 * sort),
+            bloom_probe: Rate::measured(100.0, 100.0 * probe / 4.0),
+            where_step: Rate::measured(100.0, 100.0 * row),
             page: Rate {
                 epoch: 4.0,
                 ..Rate::default()
@@ -749,7 +1105,8 @@ mod tests {
         assert_eq!(start.sort, 2.0);
         costs.observe(Work::Sort, 50.0, 50.0 * 8.0);
         let partway = costs.weights().unwrap();
-        assert!(partway.sort > 2.0 && partway.sort < 8.0, "{partway:?}");
+        // PL.8 (T-PL.8.6): half an epoch is no evidence yet; the weight holds.
+        assert_eq!(partway.sort, 2.0, "{partway:?}");
         for _ in 0..4 {
             costs.observe(Work::Sort, 50.0, 50.0 * 8.0);
         }
@@ -758,6 +1115,150 @@ mod tests {
         assert_eq!(moved.seek, start.seek);
         assert_eq!(moved.hash_build, start.hash_build);
         assert_eq!(moved.hash_probe, start.hash_probe);
+    }
+
+    /// Do: settle the seek's rate on a first batch at 125 ns, then close twelve batches whose
+    /// means wander 10% either way of it, every time inside a batch alike, then one batch 20% slow
+    /// (a burst of load within the wander), then one four times slower. Expect: the weight where
+    /// the first batch put it through the wander and the burst, though each batch's own times
+    /// have no spread at all; then at the slow batch's mean (T-PL.8.6, lane pl8-14: a weight's
+    /// error is the spread between batch means, so a burst that slows one whole batch is no
+    /// evidence, and a change past that spread is).
+    #[test]
+    fn t_pl_8_6_a_burst_of_load_inside_the_batches_spread_moves_nothing() {
+        let costs = LearnedCosts::from_rates(&fixed_rates(1.0, 10.0, 20.0, 15.0, 2.0));
+        let batch = |nanos: f64| {
+            for _ in 0..100 {
+                costs.observe_sampled(Work::Seek, nanos);
+            }
+        };
+        batch(125.0);
+        assert_eq!(costs.weights().unwrap().seek, 125.0);
+        for i in 0..12 {
+            batch(if i % 2 == 0 { 112.5 } else { 137.5 });
+            assert_eq!(costs.weights().unwrap().seek, 125.0, "{i}");
+        }
+        batch(150.0);
+        assert_eq!(costs.weights().unwrap().seek, 125.0);
+        batch(500.0);
+        assert_eq!(costs.weights().unwrap().seek, 500.0);
+    }
+
+    /// Do: a first batch of seeks timed at 125 ns, two of them preempted for 4 ms, then a later
+    /// batch with a preempted run of its own. Expect: the weight at 125 throughout: a preempted run
+    /// times the scheduler, not the seek (T-PL.8.2, lane pl8-22; the mean of the first batch was
+    /// 80,122.5 ns, and a weight like it flipped the bushy plans under load in kiln run r124).
+    #[test]
+    fn t_pl_8_2_preempted_runs_move_no_weight() {
+        let costs = LearnedCosts::from_rates(&fixed_rates(1.0, 10.0, 20.0, 15.0, 2.0));
+        for i in 0..100 {
+            let nanos = if i == 17 || i == 61 {
+                4_000_000.0
+            } else {
+                125.0
+            };
+            costs.observe_sampled(Work::Seek, nanos);
+        }
+        assert_eq!(costs.weights().unwrap().seek, 125.0);
+        for i in 0..300 {
+            costs.observe_sampled(Work::Seek, if i == 150 { 4_000_000.0 } else { 125.0 });
+        }
+        assert_eq!(costs.weights().unwrap().seek, 125.0);
+    }
+
+    /// Do: a first batch, then a second far from it. Expect: the second holds: one batch mean
+    /// beside another has no spread between batches to be judged by (T-PL.8.6, lane pl8-14).
+    #[test]
+    fn t_pl_8_6_two_batches_alone_move_nothing() {
+        let mut rate = Rate::measured(2.0, 2.0);
+        rate.observe(1.0, 4.0);
+        rate.observe(1.0, 4.0);
+        assert_eq!(rate.nanos_per_unit(), Some(4.0));
+        rate.observe(1.0, 40.0);
+        rate.observe(1.0, 40.0);
+        assert_eq!(rate.nanos_per_unit(), Some(4.0));
+    }
+
+    /// Do: an epoch of one observation, however large its work. Expect: it closes only once a
+    /// second joins it (T-PL.8.6: one time alone is one moment's load).
+    #[test]
+    fn t_pl_8_6_one_observation_alone_moves_nothing() {
+        let costs = LearnedCosts::from_rates(&fixed_rates(1.0, 10.0, 20.0, 15.0, 2.0));
+        costs.observe(Work::Sort, 1_000.0, 1_000.0 * 8.0);
+        assert_eq!(costs.weights().unwrap().sort, 2.0);
+        costs.observe(Work::Sort, 1_000.0, 1_000.0 * 8.0);
+        assert_eq!(costs.weights().unwrap().sort, 8.0);
+    }
+
+    /// Do: find where the quantile's expansion first holds, and compare it there and far past it
+    /// with the closed form's bisection. Expect: the expansion takes over only once exact to well
+    /// inside the tables' precision, and it takes over at all, so a long-running process's test
+    /// stays bounded (T-PL.8.6, lane pl8-15).
+    #[test]
+    fn t_pl_8_6_the_expanded_quantile_agrees_where_it_takes_over() {
+        assert_eq!(move_t_expanded(100.0), None);
+        let mut nu = 1.0_f64;
+        while move_t_expanded(nu).is_none() {
+            nu *= 2.0;
+            assert!(nu < 1e9, "the expansion never takes over");
+        }
+        for nu in [nu, nu * 4.0] {
+            let (expanded, exact) = (
+                move_t_expanded(nu).unwrap(),
+                student_t(MOVE_LEVEL, nu).unwrap(),
+            );
+            assert!(
+                (expanded - exact).abs() < 1e-9,
+                "{nu}: {expanded} vs {exact}"
+            );
+        }
+    }
+
+    /// Do: judge batches against a spread, with a ratio just past and just inside Student's t for
+    /// three degrees of freedom. Expect: only the one past it moves the rate (T-PL.8.6).
+    #[test]
+    fn t_pl_8_6_a_batch_moves_the_rate_only_past_students_t() {
+        let batches = Batches {
+            last: Some(0.0),
+            differences: 3.0,
+            squares: 3.0,
+        };
+        let t = student_t(MOVE_LEVEL, 3.0).unwrap();
+        assert!(batches.refutes(0.0, t * 1.001));
+        assert!(!batches.refutes(0.0, t * 0.999));
+        assert!(!batches.refutes(0.0, MOVE_Z));
+    }
+
+    /// Do: Student's t quantiles from the closed forms. Expect: the tables' values (Abramowitz and
+    /// Stegun, table 26.10: 12.706 for one degree of freedom at 95%, 2.228 for ten, 4.032 for five
+    /// at 99%), and the normal quantile [MOVE_Z] approached as the degrees of freedom grow
+    /// (T-PL.8.6, lane pl8-14).
+    #[test]
+    fn t_pl_8_6_student_t_matches_its_tables() {
+        let near = |got: Option<f64>, want: f64| got.is_some_and(|t| (t - want).abs() < 1e-3);
+        assert!(
+            near(student_t(0.95, 1.0), 12.706),
+            "{:?}",
+            student_t(0.95, 1.0)
+        );
+        assert!(
+            near(student_t(0.95, 10.0), 2.228),
+            "{:?}",
+            student_t(0.95, 10.0)
+        );
+        assert!(
+            near(student_t(0.99, 5.0), 4.032),
+            "{:?}",
+            student_t(0.99, 5.0)
+        );
+        assert!(
+            near(student_t(0.95, 2.0), 4.303),
+            "{:?}",
+            student_t(0.95, 2.0)
+        );
+        let large = student_t(MOVE_LEVEL, 10_000.0).unwrap();
+        assert!(large > MOVE_Z && large - MOVE_Z < 1e-3, "{large}");
+        assert_eq!(student_t(0.95, 0.0), None);
     }
 
     /// Do: observe nothing-sized and non-finite times. Expect: the weights unchanged (T-QT.5.5).
@@ -792,7 +1293,18 @@ mod tests {
         assert_eq!(costs.weights().unwrap().row_in_pages, None);
         costs.observe(Work::PageRead, 1.0, 100.0);
         assert_eq!(costs.weights().unwrap().row_in_pages, Some(2.0 / 100.0));
-        for _ in 0..8 {
+        for _ in 0..3 {
+            costs.observe(Work::PageRead, 1.0, 100.0);
+        }
+        assert_eq!(costs.weights().unwrap().row_in_pages, Some(2.0 / 100.0));
+        // T-PL.8.6 (lane pl8-14): batches 10% either way show the reads' noise between batches.
+        for i in 0..8 {
+            for _ in 0..4 {
+                costs.observe(Work::PageRead, 1.0, if i % 2 == 0 { 90.0 } else { 110.0 });
+            }
+        }
+        assert_eq!(costs.weights().unwrap().row_in_pages, Some(2.0 / 100.0));
+        for _ in 0..4 {
             costs.observe(Work::PageRead, 1.0, 400.0);
         }
         assert_eq!(costs.weights().unwrap().row_in_pages, Some(2.0 / 400.0));
@@ -947,5 +1459,174 @@ mod tests {
     fn t_qt_5_5_a_stopped_clock_gives_no_weights() {
         let rates = calibrate(&mut || 0.0);
         assert_eq!(rates.weights(None), None);
+    }
+}
+
+/// PL.8 (T-PL.8.6, lane pl8-16): the A/B of the weight rules (`WeightRule`), each forced into its
+/// own failure on one seeded series of times, the same for both. A rate's work costs 100 ns a unit,
+/// read by reads that scatter 30% (the logarithm's spread) and batches of which a quarter are
+/// slowed together by up to 30% (a burst of load over a whole batch). It reports:
+/// - plan flips: how often the weight crosses a boundary 5% above the true cost (two plans whose
+///   costs cross there), read after every observation, as a statement prepared then would;
+/// - batches to follow: after the cost quadruples at batch `k`, how many batches at the new cost
+///   until the weight stays within half again of it; early `k` is batch means' failure.
+///
+/// The run of record: `cargo test -p amphora-engine --lib learned_costs::ab_tests -- --nocapture`
+/// (more seeds and batches are the constants below; the coordinator's).
+#[cfg(test)]
+mod ab_tests {
+    use super::*;
+
+    /// The tests' calibrated batch: 100 units (`tests::fixed_rates`).
+    const EPOCH: f64 = 100.0;
+    const TRUE_NANOS: f64 = 100.0;
+
+    fn unit(seed: u64, i: u64) -> f64 {
+        (mix(seed.wrapping_mul(1 << 32).wrapping_add(i)) >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// A read's own scatter: `exp(0.3 z)`, `z` near normal (twelve uniforms less six).
+    fn scatter(seed: u64, i: u64) -> f64 {
+        let z: f64 = (0..12).map(|k| unit(seed, 12 * i + k)).sum::<f64>() - 6.0;
+        (0.3 * z).exp()
+    }
+
+    /// Batch `b`'s burst: a quarter of the batches slowed together, by up to 30%.
+    fn burst(seed: u64, b: u64) -> f64 {
+        let s = seed ^ 0xB0B;
+        if unit(s, 2 * b) < 0.25 {
+            1.0 + 0.3 * unit(s, 2 * b + 1)
+        } else {
+            1.0
+        }
+    }
+
+    fn rate(rule: WeightRule, nanos: f64) -> Rate {
+        let mut rate = Rate::measured(EPOCH, EPOCH * nanos);
+        rate.switch(rule);
+        rate
+    }
+
+    /// Times the weight crossed the boundary over `batches` batches.
+    fn flips(rule: WeightRule, seed: u64, batches: u64) -> u64 {
+        let boundary = TRUE_NANOS * 1.05;
+        let mut rate = rate(rule, TRUE_NANOS);
+        let above = |rate: &Rate| rate.nanos_per_unit().is_some_and(|n| n > boundary);
+        let (mut side, mut flips) = (above(&rate), 0);
+        for i in 0..batches * EPOCH as u64 {
+            rate.observe(
+                1.0,
+                TRUE_NANOS * scatter(seed, i) * burst(seed, i / EPOCH as u64),
+            );
+            if above(&rate) != side {
+                side = !side;
+                flips += 1;
+            }
+        }
+        flips
+    }
+
+    /// Batches at the new cost until the weight stays within half again of it, after the cost
+    /// quadruples at batch `step`; None if it hadn't by `batches`.
+    fn batches_to_follow(rule: WeightRule, seed: u64, step: u64, batches: u64) -> Option<u64> {
+        let after = TRUE_NANOS * 4.0;
+        let mut rate = rate(rule, TRUE_NANOS);
+        let mut last_off = None;
+        for b in 0..batches {
+            let cost = if b < step { TRUE_NANOS } else { after };
+            for k in 0..EPOCH as u64 {
+                let i = b * EPOCH as u64 + k;
+                rate.observe(1.0, cost * scatter(seed, i) * burst(seed, b));
+            }
+            let off = rate
+                .nanos_per_unit()
+                .is_none_or(|n| (n / after).ln().abs() > 1.5_f64.ln());
+            if b >= step && off {
+                last_off = Some(b);
+            }
+        }
+        match last_off {
+            None => Some(1),
+            Some(b) if b + 1 == batches => None,
+            Some(b) => Some(b - step + 2),
+        }
+    }
+
+    /// Do: both rules over the same eight seeded runs of 200 batches, then a quadrupled cost at
+    /// batch 1, 2, 4, 16 and 64 over four. Expect: the control flips the plan at every few reads
+    /// (over ten times the candidate's flips); the candidate follows a change late in the run in
+    /// one batch as the control does, but one right after start only after several (T-PL.8.8:
+    /// each rule's failure, measured; the numbers are the report).
+    #[test]
+    fn t_pl_8_6_ab_plan_flips_and_batches_to_follow_a_change() {
+        let rules = [WeightRule::Blend, WeightRule::BatchMeans];
+        let [blend, batch] = rules.map(|rule| (1..=8).map(|s| flips(rule, s, 200)).sum::<u64>());
+        println!("plan flips, 8 runs of 200 batches: blend {blend}, batch means {batch}");
+        assert!(batch * 10 < blend, "blend {blend}, batch means {batch}");
+        for step in [1, 2, 4, 16, 64] {
+            let [blend, batch] = rules.map(|rule| {
+                (1..=4)
+                    .map(|s| batches_to_follow(rule, s, step, 200))
+                    .collect::<Vec<_>>()
+            });
+            println!(
+                "batches to follow a change at batch {step}: blend {blend:?}, batch means {batch:?}"
+            );
+            assert!(blend.iter().all(|b| *b == Some(1)), "{step}: {blend:?}");
+            assert!(batch.iter().all(Option::is_some), "{step}: {batch:?}");
+            if step == 1 {
+                assert!(batch.iter().all(|b| b.is_some_and(|b| b > 1)), "{batch:?}");
+            }
+            if step == 64 {
+                assert!(batch.iter().all(|b| *b == Some(1)), "{batch:?}");
+            }
+        }
+    }
+
+    /// Do: a rate's batches 10% either way of their mean, then the same under the blend. Expect: no
+    /// margin before a spread is measured, then `exp(MOVE_Z * s) - 1` for the batches' spread `s`,
+    /// and none under the blend, which measures no spread (T-PL.8.9, lane pl8-16).
+    #[test]
+    fn t_pl_8_cost_margin_is_the_weights_error() {
+        let costs = LearnedCosts::from_rates(&Rates {
+            row: Rate::measured(EPOCH, EPOCH),
+            seek: Rate::measured(EPOCH, EPOCH * TRUE_NANOS),
+            ..Rates::default()
+        });
+        assert_eq!(costs.cost_margin(), 0.0);
+        for i in 0..4 {
+            for _ in 0..100 {
+                costs.observe_sampled(Work::Seek, if i % 2 == 0 { 90.0 } else { 110.0 });
+            }
+        }
+        // The first batch replaced calibration's rate; then three differences of ln(110/90).
+        let s = (110.0_f64 / 90.0).ln();
+        let want = (MOVE_Z * s).exp_m1();
+        let got = costs.cost_margin();
+        assert!((got - want).abs() < 1e-12, "{got} vs {want}");
+        costs.set_rule(WeightRule::Blend);
+        assert_eq!(costs.cost_margin(), 0.0);
+    }
+
+    /// Do: a rate under each rule, switched to the other after a batch. Expect: the weight as it
+    /// stood carries over, and each rule then moves as its own (T-PL.8.6, lane pl8-16).
+    #[test]
+    fn t_pl_8_6_a_switched_rule_starts_from_the_rate_as_it_stands() {
+        let mut blend = rate(WeightRule::Blend, TRUE_NANOS);
+        blend.observe(EPOCH, EPOCH * 200.0);
+        assert_eq!(blend.nanos_per_unit(), Some(200.0));
+        blend.observe(1.0, 1_000.0);
+        assert!(blend.nanos_per_unit().is_some_and(|n| n > 200.0));
+        let mut batch = rate(WeightRule::BatchMeans, TRUE_NANOS);
+        batch.observe(1.0, 1_000.0);
+        assert_eq!(batch.nanos_per_unit(), Some(TRUE_NANOS));
+        batch.switch(WeightRule::Blend);
+        assert_eq!(batch.nanos_per_unit(), Some(TRUE_NANOS));
+        batch.observe(1.0, 1_000.0);
+        assert!(batch.nanos_per_unit().is_some_and(|n| n > TRUE_NANOS));
+        blend.switch(WeightRule::BatchMeans);
+        let stood = blend.nanos_per_unit();
+        blend.observe(1.0, 1.0);
+        assert_eq!(blend.nanos_per_unit(), stood);
     }
 }

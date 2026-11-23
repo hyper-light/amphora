@@ -7,7 +7,7 @@ point ("Continuous Archiving and Point-in-Time Recovery", postgresql.org/docs/cu
 
 - **The seam.** Amphora reaches Mantle only through `amphora_api::blobs::Blobs` (CLAUDE.md §9):
   create-once, get, list by prefix, delete; `SimBlobs` is its simulator and `blobs::conformance` its
-  suite (AMPHORA-BLOBS-1 to 7). kiln implements it over `kiln_seams::blobs::Blobs`, with Mantle
+  suite (AMPHORA-BLOBS-1 to 7 and 9). kiln implements it over `kiln_seams::blobs::Blobs`, with Mantle
   behind that.
 - **What is shipped.** The log's own bytes: a segment is a run of frames of one log generation with
   its header (sqlite.org/fileformat2.html, "WAL File Format"), so the restore needs no decoder of its
@@ -44,6 +44,57 @@ point ("Continuous Archiving and Point-in-Time Recovery", postgresql.org/docs/cu
   last outweighs it, after a break, or once restore rates measured by drills say a restore would pass
   AC-T1.12.3's 30 minutes (`plan::base_due`). Marks are kept one a second (the restore target's
   granularity, AC-T1.12.1) and at most as many as the log holds frames between restarts.
+- **A chunk's memory** (T-T1.12.M1, M2). The memory given is the process's budget
+  (`memory::Use::Chunks`), not a size taken once: a base copy and a restore each open a stream of
+  chunks, and a chunk takes at most its stream's share of the room for chunks now (the room over
+  the streams open), read and sealed at once (twice its bytes and the sum), under the store's
+  objects and the caller's cap (`Archive::memory`). Each chunk is charged while it's held and given
+  back once it's put, so a file far larger than memory goes in chunks that fit beside every other
+  use, and a chunk taken while another use holds the room is refused, typed, and tried again at the
+  next commit. A new base keeps the latest base's chunk size while it still fits, so an incremental
+  base can keep its chunks. A restore needs no room the backup had: it fetches each chunk in ranged
+  gets (`Blobs::get_range`, AMPHORA-BLOBS-9; S3's ranged GET, as kiln's seam's `get` takes a
+  `Range`) of its own stream's share, no larger than the manifest's largest sealed chunk, one part
+  held and charged at a time, the chunk's sum checked over its parts. With no room for a part it's
+  refused, typed (`Unrestorable::PastRoom`), before it makes the file.
+- **A segment's memory** (T-T1.12.M3, M4). Shipping opens a stream of chunks for each send and
+  bounds a segment's part by half its share (its frames read, then encoded, then sealed: two copies
+  at most), charged before any part is put, so a send with no room is refused, typed, before it
+  writes, and its commits stay pending for the next round. A send carries only as many of the
+  marks ready as leave its head (the marks among it) room for a frame in that half, one at least,
+  and the round sends again at once for the rest, so a backlog of marks after the store refused
+  rounds for long ships over sends instead of never. A restore, and a shipper opening, read each
+  segment in ranged parts of half their stream's share: the segment's head (its fields before the
+  frames, as postcard lays them out) kept and charged until it decodes, then the frames written as
+  their parts come, the sum checked over the parts (no room: `Unrestorable::SegmentPastRoom`). A
+  create that finds its object there already (an earlier answer lost) compares it in ranged parts
+  that its caller's charge covers, never reading it back whole.
+- **A retried send** (T-T1.12.M6). Each segment is named by its generation and its first and last
+  frame. A send the store refused partway (an error, or an answer lost after it stored the object)
+  is sent again as it was: the same marks, the same through and the same parts, whatever was
+  committed or freed since, so each object it stored before is made again under the same key and
+  found the same, and no segment of the retry lies over another's frames; the commits since go in
+  the next send. A shipper that opens carries on from the end of the log the archive covers. An
+  archive whose sends were made again otherwise (an older shipper's, with more commits or other
+  parts) can hold segments over the same frames: a restore reads the log once over
+  (`plan::cover`): of the segments a generation has from one frame, the one reaching furthest,
+  one ending at marks before a part of the same span, and none ending within what it kept. A kept
+  segment may begin inside the one before it: those frames are compared, a frame at a time, with
+  the log the restore wrote, and a segment that differs there is refused even when its sum holds.
+  The plan walks back across such an overlap within a generation; across generations a segment
+  still ends where the link says. Retention plans on the cover and lets go of every segment of a
+  generation it lets go.
+- **A base's end and the cut.** A restore takes the latest base that ended at or before the cut,
+  never one ending after it, however close: a checkpoint may have folded frames past the cut into
+  the file while the base was copied, and no replay takes those out. A base copied after the
+  cut's own commit with nothing committed since ends at the cut's frame, so it is the one taken
+  (T-T1.12.P7, M1, M2, M5).
+- **Growing chunks** (T-T1.12.M5, an A/B; `ChunkGrowth`, Keep the control). Keeping the latest
+  base's chunk size keeps every unchanged chunk, but a backup begun with little room keeps small
+  chunks, and a restore's many requests, for good. Growing doubles the size as often as the room
+  holds, never shrinking while it fits (so a wavering room makes the chunks grow at most
+  log2(largest / first) times), and copies the whole file again each time it grows. The test forces
+  both costs; the A/B of record decides.
 - **The database's shipping thread.** `Database::open_backed_up` stamps the writer's commits as it
   opens and starts a thread woken by each commit the store makes (and once at its start), never by
   a timer: a round ships, then moves a due base on by a chunk, chunks following one another without
@@ -94,7 +145,7 @@ research/backup-single-node.md §1.3).
 - **Deletes** remove the file and then each directory left empty; a create that loses its directory
   to such a delete makes it again, until its deadline.
 
-**Evidence.** `backup::folder` tests: the seam's conformance suite (AMPHORA-BLOBS-1 to 7) on a folder,
+**Evidence.** `backup::folder` tests: the seam's conformance suite (AMPHORA-BLOBS-1 to 7 and 9) on a folder,
 at two depths, leaving the folder empty; names that differ only in case, `.`, `..`, device names and
 a key under a key each kept apart (AMPHORA-BLOBS-8); and 4 seeds of 400 random creates, deletes,
 gets and listings (random prefixes, cursors and limits) answered exactly as `SimBlobs` answers them.
@@ -102,6 +153,33 @@ T-T1.12.C1 backs a database up to a folder through its own shipping thread and r
 
 **Falsified by.** A listing on a folder that differs from the simulator's; two creates of one key
 both succeeding over a mount; an object read torn after a crash.
+
+## The peer store
+
+**Decision (lane backups-6).** A backup archive may live in another process's folder, reached over
+Amphora's own owner transport rather than a mount: `transport::PeerStore` serves an object store
+(a `backup::FolderBlobs` it owns) at an endpoint, and `transport::PeerBlobs` is the seam's `Blobs`
+on the database's side. The archive then lives apart from the database it backs up with no cloud
+and no shared mount, under the transport's authentication (the endpoint's private record), as the
+folder store's decision asks of "a peer machine's folder".
+
+- **One call, one request.** Each `Blobs` call is one authenticated connection and one request
+  (`Request::Blob`, answered `Answer::Blob`), as a node's pull is; the store's refusals cross typed
+  as the seam says them. An answer lost after a create went out is `Timeout`, the seam's "a create
+  may still land", so the writer reads the object back.
+- **Bounded by the protocol.** An object holds at most the protocol's bound on a result
+  (`amphora_api::RESULT_MAX`, a format value), so its frame carries it with its key; the client's
+  `object_max()` is the smaller of that and the store's own. A listing's answer holds as many
+  entries as a result carries (a key of 1,024 bytes at most and two varints each), and says more
+  follow past them, as the seam lets any store's. The protocol's version moved to 9.
+
+**Evidence.** The seam's conformance suite through a peer store over the simulator, in one
+process; and T-T1.12.N1: a child process serves a folder store, and from the parent the suite
+passes through the client, a database backed up to it restores every row through the client and
+straight from the child's folder, and the child ends cleanly.
+
+**Falsified by.** A create acknowledged that the peer's folder doesn't hold; a refusal that crosses
+as another; an object or listing larger than a frame carries.
 
 ## Restore-and-check
 
@@ -287,3 +365,100 @@ reuses it.
 **After an open.** The shipper reads the archived segments since the latest base began back
 and marks their pages, so the next base is incremental after a restart of the process too (the log
 since a base is bounded by `base_due`); a gap since leaves it whole.
+
+## Continuous restore drills
+
+**Decision (lane backups-3).** The shipping thread checks its own archive by default, not only
+when given a scratch path. `Archive::check` is a `backup::CheckPolicy`, a switch with three
+settings: `Off`; `Scratch(path)`, lane pitr-8's behaviour kept as the control (a check whenever
+one is due, at the newest quiet second, no budget); and `Continuous`, the default. Continuous
+checks restore into `<database>.check` beside the database (the same disk), and:
+
+- **Within a budget derived from the machine** (`backup::admit`, T-T1.12.C5). A due check runs only
+  once the thread has waited for commits, since the last check ended, at least as long as that
+  check took, so checks spend only time the foreground leaves idle and none while it keeps the
+  thread busy; the first runs at once, nothing being measured yet. It runs only if the disk's free
+  bytes hold the restore (the source's file and log as they stand) and still leave the source's
+  log room to grow to the most it keeps. No number is picked: each side is measured where the
+  database runs.
+- **At random seconds** (`backup::Drills`, T-T1.12.C6). Each quiet snapshot's second and rows join
+  a uniform sample of every snapshot taken (Vitter's Algorithm R, "Random sampling with a
+  reservoir", ACM TOMS 11(1), 1985), as many as `Archive::memory` holds; each check restores one
+  drawn uniformly and compares every row (`backup::restore_and_check_at`). Draws come from
+  SplitMix64 (Steele, Lea and Flood, OOPSLA 2014) seeded once from the system's entropy. A drilled
+  second the archive's owner has since expired is `Check::Expired`, dropped from the sample, never
+  a failure.
+- **Instruments.** `amphora_backup_checks_deferred_total{reason="busy"|"disk"}`,
+  `amphora_backup_check_seconds` (each check's cost, digest included, in power-of-two buckets for
+  p50/p99/p99.9), drills of a second older than the newest, the thread's idle time
+  (`Shipping::drills`), each deferral a trace event with its reason and inputs
+  (`amphora.backup.check`, `event="deferred"`).
+
+**Evidence.** T-T1.12.C4: on by default with no path given, three checks pass beside the database
+and leave no file behind. T-T1.12.C5: one writer per core committing back to back, under the
+control and under the default; no check fails under either, checks pass once the load ends, and
+under the budget the checks took no more time than the thread was idle (the last check aside).
+One tiny run (adacachy, 32 writers, 50 commits each; one run, not a measurement): control commit
+p50 17.7 ms, p99 184 ms; continuous p50 11.8 ms, p99 351 ms, 181 checks deferred busy; 848 writes
+refused `Full` by the database's own bound under both, the same count, so the refusals are the
+load's, not the checks'. The live test of record is the coordinator's
+(`AMPHORA_DRILL_LOAD_COMMITS=<n> cargo test -p amphora --release --test backup t_t1_12_c5 -- --nocapture`).
+
+**Falsified by.** A continuous check that runs while the thread has been idle less than the last
+check took; a restore admitted that leaves the source's log no room; a second held by the sample
+more or less often than uniform; a drill that passes on rows that differ.
+
+Paced checks (lane backups-4, T-T1.12.C7). A tiny C5 run showed continuous checks raising commit p99
+from 184 ms to 351 ms, as they ran on the shipping thread with one fsync at the end of a whole
+restore. Checks now run on a thread of their own (`amphora-backup-check`), told of each round,
+so shipping never waits on them. Continuous, every step (a base chunk, a log segment, a replay,
+an object's worth of rows digested) is paced (`backup::Pacer`): it begins only once the store
+has made no commit for as long as the last step took, so a commit pauses the steps after it; a
+writing step is made durable as it ends, so its cost is the device's; and after each step it
+rests `took x (1 - room) / room`, the room being the fastest a step of its kind went per byte
+over how fast this one went (the way LEDBAT, RFC 6817, and TCP Vegas read a queue from their own
+delay). The default is back to unpaced checks into a scratch file (`CheckPolicy::Scratch(None)`,
+beside the database), Ada's earlier word, because the data doesn't yet show paced checks within
+the control's spread: in three interleaved tiny runs on adacachy (32 writers, run beside other
+tests and production), commit p99 was 24 to 32 ms with no checks, 4.8 to 100 ms unpaced and 4.7
+to 94 ms paced, a spread wider than any difference; and under one writer committing back to back
+(T-T1.12.C4) paced checks found no quiet stretch and only the first passed. The coordinator's
+run of record: `AMPHORA_DRILL_LOAD_RUNS=20 AMPHORA_DRILL_LOAD_COMMITS=500 cargo test -p amphora
+--release --test backup t_t1_12_c5 -- --nocapture --test-threads=1` on an otherwise idle machine.
+
+Starvation, event-driven (lane backups-6, T-T1.12.C7, C8). Under one writer per core the
+foreground always has a call in flight, so a check that yields to it fully never runs: the
+failure mode at scale. `CheckPolicy` gains a fourth setting for the A/B, the control
+(`Scratch`, unpaced) unchanged beside it:
+
+- `Continuous` yields fully (`backup::Yield::Fully`): a step begins only while the database runs
+  no call. The database counts each call from its submission to its answer
+  (`backup::Foreground::call`, reads on the local writer too), not only finished commits, and
+  the call that ends last wakes the check. No timer: the quiet wait and the rest after each step
+  are gone, as every wait now ends on an event (a call's end, a commit, the database's end).
+- `Shared(retention)` gives each check a minimum share (`backup::Yield::Share`): its work over the
+  retention period its owner expires the archive by, so a check finishes within the time its
+  second is kept. A check behind its share (`backup::behind`: its work so far under the last whole
+  check's work times the share of the period gone; before any whole check, once the whole period
+  is gone) takes its step with calls in flight, counted as `forced`; it looks again at each commit
+  (the store's one thread tells it) and at the last call's end, so callers never meet on the
+  check's lock while the foreground stays busy.
+- A check's work is counted in the device's time (`backup::device_ns`): a step's bytes at the
+  fastest a step of its kind went per byte, never more than it took, so a step the foreground
+  slowed counts what it would take alone. That reference decays: it is the fastest of the check
+  under way and the last whole check (LEDBAT's base delay, kept as minima over recent intervals,
+  RFC 6817's BASE_HISTORY; the interval here a check), so a device that slowed for good is read as it is after one
+  check.
+- The replay and the integrity check are steps that can pause. The replay folds the log in parts
+  of an object's worth of frames (the engine's passive checkpoint, bounded), each made durable as
+  it ends, the last fold emptying the log; unpaced, it folds in one step as before. The integrity
+  check ends a step at each of its waits on the device, inside its one statement.
+
+Evidence: unit tests of the share, the device cost, the decay and both yields, and a restore whose
+paced replay and integrity check end steps inside them (T-T1.12.C8). The A/B of record is the
+coordinator's: `AMPHORA_DRILL_LOAD_RUNS=20 AMPHORA_DRILL_LOAD_COMMITS=500
+AMPHORA_DRILL_LOAD_WRITERS=<1, 8, 32, 128, 512, 2048, 4096>
+AMPHORA_DRILL_RETENTION_MS=<the retention under test> cargo test -p amphora --release --test backup
+t_t1_12_c5 -- --nocapture --test-threads=1`, reading `under_load`, `forced` and commit p99 per
+policy. A single call running long with no other event holds a waiting check until it ends: one
+call's length, not a starvation.

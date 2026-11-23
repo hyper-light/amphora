@@ -159,23 +159,26 @@ pub fn resident() -> Option<u64> {
 }
 
 /// What the process's memory is shared out to, each by its own measured use (MB.1): the owners'
-/// queues (commands waiting, messages going out), the images a replica makes and installs, and
-/// the caches (the page pool and what else keeps data to read again).
+/// queues (commands waiting, messages going out), the images a replica makes and installs, the
+/// caches (the page pool and what else keeps data to read again), and the chunks of a database's
+/// file a backup copies and a restore fetches (T-T1.12.M1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Use {
     Queues,
     Images,
     Caches,
+    Chunks,
 }
 
 impl Use {
-    const ALL: [Self; 3] = [Self::Queues, Self::Images, Self::Caches];
+    const ALL: [Self; 4] = [Self::Queues, Self::Images, Self::Caches, Self::Chunks];
 
     fn name(self) -> &'static str {
         match self {
             Self::Queues => "the owners' queues",
             Self::Images => "an image",
             Self::Caches => "the caches",
+            Self::Chunks => "a backup's chunk",
         }
     }
 }
@@ -211,7 +214,27 @@ impl Readings for System {
 /// No share is picked: a use has what the others leave, as measured now.
 pub struct Budget {
     readings: Box<dyn Readings>,
-    held: [AtomicU64; 3],
+    held: [AtomicU64; 4],
+    /// The streams of each use open now, each of which may hold a charge at once ([`Stream`]).
+    streams: [AtomicU64; 4],
+}
+
+/// One stream of a use's that may hold a charge at any moment while it lives (a backup's base copy,
+/// a restore): counted while it lives, so each stream's room is its use's room shared by the
+/// streams open now ([`Budget::stream_room`]) and every stream's charge fits together.
+pub struct Stream {
+    budget: Arc<Budget>,
+    used: Use,
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        let _ = self.budget.streams_of(self.used).try_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |open| Some(open.saturating_sub(1)),
+        );
+    }
 }
 
 /// Bytes held against a budget by one use, given back when this drops.
@@ -261,6 +284,14 @@ impl amphora_engine::storage::versioned::memory::Source for StorageMemory {
     fn give(&self, bytes: u64) {
         self.0.give(Use::Caches, bytes);
     }
+
+    fn room(&self) -> amphora_engine::Result<u64> {
+        self.0.room(Use::Caches).map_err(|refusal| {
+            amphora_engine::LimboError::InternalError(format!(
+                "versioned storage: the memory budget's room: {refusal}"
+            ))
+        })
+    }
 }
 
 impl Budget {
@@ -270,17 +301,54 @@ impl Budget {
         Arc::new(Self {
             readings,
             held: Default::default(),
+            streams: Default::default(),
         })
     }
 
     /// The counter of what `used` holds.
     fn slot(&self, used: Use) -> &AtomicU64 {
-        let [queues, images, caches] = &self.held;
+        Self::of(&self.held, used)
+    }
+
+    /// The counter of `used`'s streams open now.
+    fn streams_of(&self, used: Use) -> &AtomicU64 {
+        Self::of(&self.streams, used)
+    }
+
+    fn of(counters: &[AtomicU64; 4], used: Use) -> &AtomicU64 {
+        let [queues, images, caches, chunks] = counters;
         match used {
             Use::Queues => queues,
             Use::Images => images,
             Use::Caches => caches,
+            Use::Chunks => chunks,
         }
+    }
+
+    /// A stream of `used`'s opened: counted until it drops.
+    #[must_use]
+    pub fn stream(self: &Arc<Self>, used: Use) -> Stream {
+        self.streams_of(used).fetch_add(1, Ordering::AcqRel);
+        Stream {
+            budget: Arc::clone(self),
+            used,
+        }
+    }
+
+    /// The streams of `used` open now.
+    #[must_use]
+    pub fn streams(&self, used: Use) -> u64 {
+        self.streams_of(used).load(Ordering::Acquire)
+    }
+
+    /// One stream's room ([`Stream`]): `used`'s room ([`Budget::room`]) shared by its streams
+    /// open now (the asker's own among them; one at least), so each may hold a charge that size at
+    /// once.
+    pub fn stream_room(&self, used: Use) -> Result<u64, Refusal> {
+        Ok(self
+            .room(used)?
+            .checked_div(self.streams(used).max(1))
+            .unwrap_or(0))
     }
 
     /// The bytes `used` holds now, as charged.
@@ -418,6 +486,26 @@ pub(crate) mod tests {
         let budget = Budget::new(Box::new(fed.clone()));
         BUDGET.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&budget)));
         (budget, Unset)
+    }
+
+    /// T-T1.12.M1: a use's streams share its room. Do: open one stream of chunks, then a second,
+    /// then close the first. Expect: one stream has the whole room, two half each, and a closed
+    /// stream gives its share back.
+    #[test]
+    fn t_t1_12_m1_streams_share_a_uses_room() {
+        let fed = Fed::new(Some(1 << 20), Some(0));
+        let budget = Budget::new(Box::new(fed));
+        assert_eq!(budget.stream_room(Use::Chunks).unwrap(), 1 << 20);
+        let first = budget.stream(Use::Chunks);
+        assert_eq!(budget.stream_room(Use::Chunks).unwrap(), 1 << 20);
+        let second = budget.stream(Use::Chunks);
+        assert_eq!(budget.streams(Use::Chunks), 2);
+        assert_eq!(budget.stream_room(Use::Chunks).unwrap(), 1 << 19);
+        assert_eq!(budget.stream_room(Use::Images).unwrap(), 1 << 20);
+        drop(first);
+        assert_eq!(budget.stream_room(Use::Chunks).unwrap(), 1 << 20);
+        drop(second);
+        assert_eq!(budget.streams(Use::Chunks), 0);
     }
 
     /// Do: a budget fed a 1 GiB limit and 100 MiB resident; take queue bytes, then image bytes;

@@ -71,6 +71,19 @@ for t in ${targets//,/ }; do
   load=$(cut -d' ' -f1 /proc/loadavg)
   out=$("$bin" --target "$t" --dir "$data/$t" "$@" | tail -1)
   load_after=$(cut -d' ' -f1 /proc/loadavg)
+  # Where this target's engine ran (Ada's fair comparisons, 2026-11-21: one client and one platform
+  # for every system compared, said in each record): in the driver's process or as a local server
+  # (in a container or not), and the disk, filesystem and file attributes under its data.
+  if [[ -n "$e" ]]; then
+    tdir="${AMPHORA_BENCH_DATA:-$HOME/.cache/amphora-bench-data-nocow}/$e" runs_as="a local server over 127.0.0.1"
+    image=$(docker inspect -f '{{.Config.Image}}' "$c" 2>/dev/null || true)
+  else
+    tdir="$data/$t" runs_as="in the driver's process" image=
+  fi
+  tfs=$(findmnt -no FSTYPE -T "$tdir" 2>/dev/null || echo unknown)
+  tdev=$(findmnt -no SOURCE -T "$tdir" 2>/dev/null | sed 's/\[.*//; s#/dev/##; s/p[0-9]*$//')
+  tdisk=$(cat "/sys/block/$tdev/device/model" 2>/dev/null | xargs || echo unknown)
+  tattrs=$(lsattr -d "$tdir" 2>/dev/null | cut -d' ' -f1 || true)
   server=()
   if [[ -n "$e" ]]; then
     kill "$sampler" 2>/dev/null || true
@@ -92,6 +105,9 @@ record = {
     "date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)", "host": "$host", "cpu": "$cpu", "cores": $cores,
     "disk": "$disk", "fs": "$fs", "kernel": "$kernel", "commit": "$commit", "dirty_files": $dirty,
     "load_before": $load, "load_after": $load_after, "args": "$*", "report": report,
+    "client": {"program": "amphora-bench", "mode": "$1", "commit": "$commit", "timing": "amphora-bench's own, one code path for every target"},
+    "platform": {"host": "$host", "os": "$(uname -s | tr '[:upper:]' '[:lower:]')", "arch": "$(uname -m)", "kernel": "$kernel", "cpu": "$cpu", "cores": $cores,
+                 "engine_runs": "$runs_as", "container": "$image" or None, "data_dir": "$tdir", "fs": "$tfs", "disk": "$tdisk", "file_attrs": "$tattrs"},
     "limits": {"memory": "${AMPHORA_BENCH_MEMORY:-8g}", "write_bps": "${AMPHORA_BENCH_WRITE_BPS:-}", "write_devices": "${AMPHORA_BENCH_WRITE_DEVICES:-}"},
 }
 env = os.environ

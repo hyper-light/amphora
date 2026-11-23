@@ -1313,6 +1313,7 @@ fn plan_cte(
                 explicit_columns,
                 Some(cte_definition.cte_id),
                 cte_definition.materialize_hint,
+                crate::subquery_rows::identity(&cte_definition.select),
             )
         }
         Plan::Delete(_) | Plan::Update(_) => {
@@ -1649,6 +1650,10 @@ fn parse_from_clause_table(
                 });
             }
 
+            // Amphora (PL.13, lane replan-6): a lateral subquery reads the row before it: no identity.
+            let identity = (!lateral)
+                .then(|| crate::subquery_rows::identity(&subselect))
+                .flatten();
             let subplan = if lateral {
                 prepare_lateral_subquery_plan(
                     subselect,
@@ -1687,6 +1692,7 @@ fn parse_from_clause_table(
                 None,  // No explicit columns for regular subqueries
                 None,  // Regular inline subqueries don't have a CTE identity
                 false, // No materialize hint for inline subqueries
+                identity,
             )?);
             Ok(())
         }
@@ -2053,6 +2059,8 @@ fn parse_table(
             };
 
             if let Some(cte_select) = cte_select_syntax {
+                // Amphora (PL.13, lane replan-6): every use of the CTE has its syntax's identity.
+                let identity = crate::subquery_rows::identity(&cte_select);
                 // Plan each use separately so two uses do not receive the same
                 // table or cursor IDs.
                 let cte_query_plan = prepare_select_plan(
@@ -2088,6 +2096,7 @@ fn parse_table(
                     explicit_columns,
                     cte_id,
                     materialize_hint,
+                    identity,
                 )?;
                 if let Some(alias) = alias {
                     joined_table.identifier = alias;

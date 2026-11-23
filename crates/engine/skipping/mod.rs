@@ -27,20 +27,29 @@
 //!
 //! The switch is per table and per column: a connection that turns neither on pays nothing.
 
+mod build;
+mod choose;
 mod cracking;
 mod leaves;
 mod registry;
 mod scan;
 mod zone_map;
 
+pub(crate) use build::{build_inline, start_build};
+pub use choose::{Chooser, ChooserStats, Lead, MethodStats, SkipMethod, Upkeep};
 pub use cracking::{CrackerColumn, CrackerStats};
+pub(crate) use leaves::{cracker_of_table, nanos_since};
 pub use leaves::{
-    set_skipping, skipping_candidates, skipping_counts, zone_map_of_table, LeafBuildError, SkipKind,
+    set_list_probe, set_skipping, set_skipping_until, set_skipping_with, set_skipping_with_until,
+    skipping_candidates, skipping_counts, zone_map_of_table, LeafBuildError, SkipKind,
 };
-pub use registry::{SkipCounts, SkipRefusal, SkipRegistry, WalPos};
+pub use registry::{
+    BuildClaim, BuildEnd, BuildMode, BuildPolicy, ListProbe, SkipCounts, SkipRefusal, SkipRegistry,
+    WalPos,
+};
 pub use scan::{
-    bound_terms, BoundOp, BoundTerm, BoundValue, ColumnBounds, SkipHint, SkipWalk, SkipWalks,
-    WalkPhase, WalkTarget,
+    BoundOp, BoundTerm, BoundValue, ColumnBounds, ListTerm, SkipHint, SkipWalk, SkipWalks,
+    WalkMeasure, WalkPhase, WalkTarget,
 };
 pub use zone_map::{RowidRange, ZoneMap, ZoneMapBuilder, ZoneStats};
 
@@ -92,6 +101,9 @@ pub enum Skipping {
     Off,
     ZoneMaps(ZoneMap),
     Cracking(CrackerColumn),
+    /// Both, each filter answered by whichever measures cheaper (lane skip-3, T-SKU.2;
+    /// `choose.rs`).
+    Measured(Box<Chooser>),
 }
 
 /// The rows a filter `lo <= value <= hi` may need, as a summary names them.
@@ -113,15 +125,57 @@ impl Skipping {
             Skipping::Off => Ok(()),
             Skipping::ZoneMaps(zones) => zones.on_write(write),
             Skipping::Cracking(cracker) => cracker.on_write(write),
+            Skipping::Measured(chooser) => chooser.on_write(write),
         }
     }
 
     /// The rows a filter `lo <= value <= hi` on the summarized column may need.
     pub fn candidates(&mut self, lo: i64, hi: i64) -> Result<Candidates, SkipError> {
+        self.candidates_by(lo, hi).map(|(candidates, _)| candidates)
+    }
+
+    /// [`Skipping::on_write`], a measured summary's upkeep timed by `now` (lane skip-5, T-SKU.5).
+    pub fn on_write_timed(
+        &mut self,
+        write: RowWrite,
+        now: &mut dyn FnMut() -> u64,
+    ) -> Result<(), SkipError> {
+        match self {
+            Skipping::Measured(chooser) => chooser.on_write_timed(write, now),
+            other => other.on_write(write),
+        }
+    }
+
+    /// [`Skipping::candidates`], with the method a [`Skipping::Measured`] answered by (its scan's
+    /// cost goes back to [`Chooser::record`]).
+    pub fn candidates_by(
+        &mut self,
+        lo: i64,
+        hi: i64,
+    ) -> Result<(Candidates, Option<SkipMethod>), SkipError> {
+        self.candidates_spans(&[(lo, hi)])
+    }
+
+    /// Lane skip-11 (T-SKU.14): [`Skipping::candidates_by`] for a filter whose rows lie in any of
+    /// `spans` (each `(lo, hi)`, inclusive), each probed and the candidates unioned; a measured
+    /// summary counts it as one filter. No span: the rows whose value isn't an integer.
+    pub fn candidates_spans(
+        &mut self,
+        spans: &[(i64, i64)],
+    ) -> Result<(Candidates, Option<SkipMethod>), SkipError> {
         Ok(match self {
-            Skipping::Off => Candidates::All,
-            Skipping::ZoneMaps(zones) => Candidates::Ranges(zones.candidate_ranges(lo, hi)),
-            Skipping::Cracking(cracker) => Candidates::Rowids(cracker.candidate_rowids(lo, hi)?),
+            Skipping::Off => (Candidates::All, None),
+            Skipping::ZoneMaps(zones) => {
+                (Candidates::Ranges(zones.candidate_ranges_each(spans)), None)
+            }
+            Skipping::Cracking(cracker) => (
+                Candidates::Rowids(cracker.candidate_rowids_each(spans)?),
+                None,
+            ),
+            Skipping::Measured(chooser) => {
+                let (candidates, method) = chooser.candidates_spans(spans)?;
+                (candidates, Some(method))
+            }
         })
     }
 }

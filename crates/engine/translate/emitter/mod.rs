@@ -209,6 +209,32 @@ pub struct Resolver<'a> {
     fitted_weights: Option<crate::translate::optimizer::cost_fit::FittedWeights>,
     /// Amphora: the join methods the planner may choose (`Connection::set_join_methods`).
     join_methods: crate::JoinMethods,
+    /// Amphora (PL.8, lane pl8-20): whether a bushy plan may probe with a LEFT JOIN's table
+    /// (`Connection::set_bushy_left_join_probes`).
+    bushy_left_join_probes: bool,
+    /// Amphora (T-QT.5.3): when a star join's fact scan checks its dimensions' filters.
+    star_filters: crate::StarFilters,
+    /// Amphora (QT.5): how an `IS` of a value planning doesn't know is estimated
+    /// (`Connection::set_is_value_estimate`).
+    is_value_estimate: crate::IsValueEstimate,
+    /// Amphora (T-QT.5.11): the order a star join's fact row checks its filters in
+    /// (`Connection::set_star_filter_order`).
+    star_filter_order: crate::StarFilterOrder,
+    /// Amphora (PL.8): what sizes the join search (`Connection::set_join_search_budget`).
+    join_search: crate::translate::optimizer::search_budget::SearchBudget,
+    /// Amphora (PL.8, lane pl8-16): where this plan notes each query block's join order, and the
+    /// orders the statement's last plan noted (`join::JoinOrders`); set at prepare.
+    join_orders: Option<crate::sync::Arc<crate::translate::optimizer::join::JoinOrders>>,
+    carried_join_orders: Option<crate::sync::Arc<crate::translate::optimizer::join::JoinOrders>>,
+    /// Amphora (PL.8, lane pl8-16): the share of a plan's cost a carried join order may cost past
+    /// the search's best (`LearnedCosts::cost_margin`); set at prepare.
+    join_margin: f64,
+    /// Amphora (QT.6, lane qs6-15): which table a two-table outer join on morsels probes
+    /// (`Connection::set_parallel_outer_probe`).
+    outer_probe: crate::OuterJoinProbe,
+    /// Amphora (QT.6, lane qs6-16): whether a table read by a seek may be a morsel join's hash
+    /// link (`Connection::set_parallel_searched_links`).
+    searched_links: crate::SearchedLinks,
     /// Amphora: whether the planner may choose a sorted fetch (`Connection::set_sorted_fetches`).
     sorted_fetches: bool,
     /// Amphora (PL.13): whether index nested loops carry a hash join to switch to
@@ -350,6 +376,16 @@ impl<'a> Resolver<'a> {
             learned_weights: None,
             fitted_weights: None,
             join_methods: crate::JoinMethods::ByCost,
+            bushy_left_join_probes: false,
+            star_filters: crate::StarFilters::ByCost,
+            is_value_estimate: crate::IsValueEstimate::Equality,
+            star_filter_order: crate::StarFilterOrder::Planned,
+            join_search: crate::translate::optimizer::search_budget::SearchBudget::FIXED,
+            join_orders: None,
+            carried_join_orders: None,
+            join_margin: 0.0,
+            outer_probe: crate::OuterJoinProbe::Padded,
+            searched_links: crate::SearchedLinks::Off,
             sorted_fetches: false,
             adaptive_joins: false,
             automatic_indexes: true,
@@ -453,6 +489,93 @@ impl<'a> Resolver<'a> {
         self.join_methods = methods;
     }
 
+    pub(crate) fn bushy_left_join_probes(&self) -> bool {
+        self.bushy_left_join_probes
+    }
+
+    pub(crate) fn set_bushy_left_join_probes(&mut self, allowed: bool) {
+        self.bushy_left_join_probes = allowed;
+    }
+
+    pub(crate) fn star_filters(&self) -> crate::StarFilters {
+        self.star_filters
+    }
+
+    pub(crate) fn set_star_filters(&mut self, rule: crate::StarFilters) {
+        self.star_filters = rule;
+    }
+
+    pub(crate) fn is_value_estimate(&self) -> crate::IsValueEstimate {
+        self.is_value_estimate
+    }
+
+    pub(crate) fn set_is_value_estimate(&mut self, rule: crate::IsValueEstimate) {
+        self.is_value_estimate = rule;
+    }
+
+    pub(crate) fn star_filter_order(&self) -> crate::StarFilterOrder {
+        self.star_filter_order
+    }
+
+    pub(crate) fn set_star_filter_order(&mut self, order: crate::StarFilterOrder) {
+        self.star_filter_order = order;
+    }
+
+    pub(crate) fn join_search(&self) -> crate::translate::optimizer::search_budget::SearchBudget {
+        self.join_search
+    }
+
+    pub(crate) fn set_join_search(
+        &mut self,
+        budget: crate::translate::optimizer::search_budget::SearchBudget,
+    ) {
+        self.join_search = budget;
+    }
+
+    /// PL.8 (lane pl8-16): where this plan notes its join orders, and the last plan's.
+    pub(crate) fn set_join_orders(
+        &mut self,
+        record: crate::sync::Arc<crate::translate::optimizer::join::JoinOrders>,
+        carried: Option<crate::sync::Arc<crate::translate::optimizer::join::JoinOrders>>,
+        margin: f64,
+    ) {
+        self.join_orders = Some(record);
+        self.carried_join_orders = carried;
+        self.join_margin = margin;
+    }
+
+    /// The order the statement's last plan read the block of `tables` in (`join::JoinOrders`).
+    pub(crate) fn carried_join_order(&self, tables: &[String]) -> Option<Vec<usize>> {
+        self.carried_join_orders.as_ref()?.get(tables)
+    }
+
+    pub(crate) fn join_margin(&self) -> f64 {
+        self.join_margin
+    }
+
+    /// Notes the order the block of `tables` chose, for the statement's next plan.
+    pub(crate) fn record_join_order(&self, tables: Vec<String>, order: Vec<usize>) {
+        if let Some(orders) = &self.join_orders {
+            orders.record(tables, order);
+        }
+    }
+
+    pub(crate) fn outer_probe(&self) -> crate::OuterJoinProbe {
+        self.outer_probe
+    }
+
+    pub(crate) fn set_outer_probe(&mut self, probe: crate::OuterJoinProbe) {
+        self.outer_probe = probe;
+    }
+
+    pub(crate) fn searched_links(&self) -> crate::SearchedLinks {
+        self.searched_links
+    }
+
+    pub(crate) fn set_searched_links(&mut self, links: crate::SearchedLinks) {
+        self.searched_links = links;
+    }
+
     pub(crate) fn sorted_fetches(&self) -> bool {
         self.sorted_fetches
     }
@@ -513,6 +636,16 @@ impl<'a> Resolver<'a> {
             learned_weights: self.learned_weights,
             fitted_weights: self.fitted_weights,
             join_methods: self.join_methods,
+            bushy_left_join_probes: self.bushy_left_join_probes,
+            star_filters: self.star_filters,
+            is_value_estimate: self.is_value_estimate,
+            star_filter_order: self.star_filter_order,
+            join_search: self.join_search,
+            join_orders: self.join_orders.clone(),
+            carried_join_orders: self.carried_join_orders.clone(),
+            join_margin: self.join_margin,
+            outer_probe: self.outer_probe,
+            searched_links: self.searched_links,
             sorted_fetches: self.sorted_fetches,
             adaptive_joins: self.adaptive_joins,
             automatic_indexes: self.automatic_indexes,
@@ -551,6 +684,16 @@ impl<'a> Resolver<'a> {
             learned_weights: self.learned_weights,
             fitted_weights: self.fitted_weights,
             join_methods: self.join_methods,
+            bushy_left_join_probes: self.bushy_left_join_probes,
+            star_filters: self.star_filters,
+            is_value_estimate: self.is_value_estimate,
+            star_filter_order: self.star_filter_order,
+            join_search: self.join_search,
+            join_orders: self.join_orders.clone(),
+            carried_join_orders: self.carried_join_orders.clone(),
+            join_margin: self.join_margin,
+            outer_probe: self.outer_probe,
+            searched_links: self.searched_links,
             sorted_fetches: self.sorted_fetches,
             adaptive_joins: self.adaptive_joins,
             automatic_indexes: self.automatic_indexes,

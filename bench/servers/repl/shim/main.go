@@ -1,11 +1,17 @@
 // The bench's shim for the replicated SQLites without an HTTP API of their own (bench/src/repl.rs):
 // dqlite through go-dqlite's app package, and SQLite on a LiteFS mount. It takes
-//   POST /exec  {"stmts": [[sql, arg...], ...]}  the statements in one transaction: {} or {"error": ...}
-//   POST /count {"stmts": [[sql, arg...]]}       the first column of the first row: {"count": n}
-//   GET  /ready                                  200 once the database takes statements
-//   GET  /leader                                 dqlite's leader address; on LiteFS the lease holder's
-//                                                hostname: this node's when it takes a write
-//                                                transaction, else its .primary file's
+//
+//	POST /exec  {"stmts": [[sql, arg...], ...]}  the statements in one transaction: {} or {"error": ...}
+//	POST /count {"stmts": [[sql, arg...]]}       the first column of the first row: {"count": n}
+//	GET  /ready                                  200 once the database takes statements
+//	GET  /leader                                 dqlite's leader address; on LiteFS the lease holder's
+//	                                             hostname: this node's when it takes a write
+//	                                             transaction, else its .primary file's
+//	GET  /voters                                 dqlite: {"voters": n, "members": m}, as the leader's
+//	                                             configuration has them
+//
+// Once it listens and its database takes statements, it prints "shim ready: listening on ADDR" on
+// stderr: the ready signal ../lib.sh waits for.
 package main
 
 import (
@@ -63,28 +69,28 @@ func reply(w http.ResponseWriter, v any) {
 
 func main() {
 	backend := flag.String("backend", "dqlite", "dqlite or sqlite")
-	dir := flag.String("dir", "/data", "dqlite's data directory")
-	address := flag.String("address", "", "dqlite's address, host:port")
+	dir := flag.String("dir", "", "dqlite's data directory")
+	address := flag.String("address", "", "dqlite's address, ip:port (it binds what it advertises)")
 	join := flag.String("join", "", "dqlite: comma-separated addresses to join")
-	path := flag.String("path", "/litefs/bench.db", "sqlite: the database file")
-	listen := flag.String("listen", ":8080", "HTTP address")
+	path := flag.String("path", "", "sqlite: the database file")
+	listen := flag.String("listen", "", "HTTP address, ip:port")
+	// The name /leader gives for this node on LiteFS (its lease hostname): nodes sharing one host
+	// each name themselves (../litefs.sh).
+	name := flag.String("name", "", "sqlite: this node's lease hostname")
 	flag.Parse()
 	ctx := context.Background()
+	required := map[string][]*string{"dqlite": {dir, address, listen}, "sqlite": {path, name, listen}}
+	for _, v := range required[*backend] {
+		if *v == "" {
+			log.Fatalf("the %s backend takes -dir, -address and -listen (dqlite) or -path, -name and -listen (sqlite)", *backend)
+		}
+	}
 
 	var db *sql.DB
 	var dq *app.App
 	var err error
 	switch *backend {
 	case "dqlite":
-		// dqlite binds the address it advertises, which must be an IP: a container's name becomes
-		// its address on the cluster's network.
-		if host, port, err := net.SplitHostPort(*address); err == nil && net.ParseIP(host) == nil {
-			ips, err := net.LookupIP(host)
-			if err != nil || len(ips) == 0 {
-				log.Fatalf("resolve %s: %v", host, err)
-			}
-			*address = net.JoinHostPort(ips[0].String(), port)
-		}
 		if err = os.MkdirAll(*dir, 0o755); err != nil {
 			log.Fatal(err)
 		}
@@ -130,12 +136,7 @@ func main() {
 		if dq == nil {
 			if tx, err := db.BeginTx(r.Context(), nil); err == nil {
 				_ = tx.Rollback()
-				host, err := os.Hostname()
-				if err != nil {
-					http.Error(w, err.Error(), http.StatusServiceUnavailable)
-					return
-				}
-				_, _ = w.Write([]byte(host))
+				_, _ = w.Write([]byte(*name))
 				return
 			}
 			primary, err := os.ReadFile(filepath.Join(filepath.Dir(*path), ".primary"))
@@ -157,19 +158,55 @@ func main() {
 			http.Error(w, "no leader", http.StatusServiceUnavailable)
 			return
 		}
-		// The leader by its container's name (the network's reverse lookup), as the script reads it.
-		addr := info.Address
-		if host, port, err := net.SplitHostPort(addr); err == nil {
-			if names, err := net.LookupAddr(host); err == nil && len(names) > 0 {
-				addr = net.JoinHostPort(strings.SplitN(names[0], ".", 2)[0], port)
+		_, _ = w.Write([]byte(info.Address))
+	})
+	// go-dqlite's app joins a node as a spare and promotes voters only once three nodes are in
+	// the cluster (app/roles.go, RolesChanges.Assume): a node can be Ready before it votes. The
+	// cluster script reads this once every node is ready, so a commit's quorum is known, not assumed.
+	http.HandleFunc("/voters", func(w http.ResponseWriter, r *http.Request) {
+		if dq == nil {
+			http.Error(w, "dqlite only", http.StatusNotFound)
+			return
+		}
+		cli, err := dq.Leader(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		defer cli.Close()
+		nodes, err := cli.Cluster(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		voters := 0
+		for _, n := range nodes {
+			if n.Role.String() == "voter" {
+				voters++
 			}
 		}
-		_, _ = w.Write([]byte(addr))
+		reply(w, map[string]any{"voters": voters, "members": len(nodes)})
 	})
 	http.HandleFunc("/exec", func(w http.ResponseWriter, r *http.Request) {
 		req, err := decode(r)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		// One statement is its own transaction, as rqlite's and sqld's one-statement requests are:
+		// one exchange with the database, not BEGIN, the statement and COMMIT (three of dqlite's
+		// round trips to its leader).
+		if len(req.Stmts) == 1 {
+			q, a, ok := args(req.Stmts[0])
+			if !ok {
+				http.Error(w, "a statement is [sql, arg...]", http.StatusBadRequest)
+				return
+			}
+			if _, err := db.ExecContext(r.Context(), q, a...); err != nil {
+				reply(w, map[string]any{"error": err.Error()})
+				return
+			}
+			reply(w, map[string]any{})
 			return
 		}
 		tx, err := db.BeginTx(r.Context(), nil)
@@ -214,5 +251,14 @@ func main() {
 		}
 		reply(w, map[string]any{"count": n})
 	})
-	log.Fatal(http.ListenAndServe(*listen, nil))
+	// Bound before the ready line, so a client that read the line connects at once. The line is
+	// the shim's own ready signal (../lib.sh waits for it on the node's log): dqlite's node is
+	// Ready and its database open, or LiteFS has made this node primary or connected it to one
+	// (LiteFS runs the shim only then). It goes to stderr, which LiteFS passes on as its own.
+	ln, err := net.Listen("tcp", *listen)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("shim ready: listening on %s", ln.Addr())
+	log.Fatal(http.Serve(ln, nil))
 }

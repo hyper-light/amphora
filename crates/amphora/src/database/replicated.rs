@@ -28,7 +28,7 @@ use hyper_raft::wire::Record;
 const COMMANDS: usize = 64;
 const QUEUED_BYTES: usize = 512 << 20;
 const OUTGOING_BYTES: usize = 512 << 20;
-const OUTGOING_MESSAGES: usize = 4096;
+pub(crate) const OUTGOING_MESSAGES: usize = 4096;
 pub(crate) const MEMBERS: usize = 64;
 /// The most image bytes one wire record carries into this owner's command queue: the queue's room
 /// held back from application calls for one record (`enqueue`). Picked with `QUEUED_BYTES`, whose
@@ -36,7 +36,7 @@ pub(crate) const MEMBERS: usize = 64;
 /// budget and the measured drain rate). An image's own bound is the memory budget's room for one
 /// (SB.1), no more than this while it travels through this queue (`owner_image_room`).
 const WIRE_IMAGE_BYTES: usize = 256 << 20;
-const WIRE_BYTES: usize = WIRE_IMAGE_BYTES.saturating_add(2 << 20);
+pub(crate) const WIRE_BYTES: usize = WIRE_IMAGE_BYTES.saturating_add(2 << 20);
 const MESSAGE_BYTES: usize = crate::replication::COMMAND_BYTES.saturating_add(2 << 20);
 // Ticks are the pinned core's documented tick election mode (raft.rs, Elections::Ticks). Its
 // randomized election and heartbeat, in the core's fixed tick counts, use this owner clock, never
@@ -51,9 +51,14 @@ const TICK: Duration = Duration::from_millis(10);
 // no input, as before.
 const CHANGE_BYTES: usize = std::mem::size_of::<Input>();
 
+// Session tokens: read-your-writes on any replica (replication.md, "Decision (lane ryw-1):
+// read-your-writes by session tokens").
+mod tokens;
+pub use tokens::{ReadMode, Served, SessionCounters, Token};
+
 /// One of the floor's own sessions: the work it does on the database at its base.
 type FloorSession = Box<dyn FnOnce(&mut Db) -> anyhow::Result<()> + Send>;
-type Durable<F = DeviceFile> = Replica<GroupStore<F>, crate::replication::Machine, Bytes>;
+type Durable<F = LogDevice> = Replica<GroupStore<F>, crate::replication::Machine, Bytes>;
 type Response<T> = mpsc::SyncSender<Result<T, Refusal>>;
 
 /// A bounded ingress and egress handle. Clones share one product-owned Raft actor.
@@ -72,12 +77,18 @@ pub struct ReplicaHandle {
 struct Bell {
     rung: Mutex<bool>,
     ringing: std::sync::Condvar,
+    // A driven test's shell, which steps the owner itself and so waits where the owner would: on
+    // this bell's rings (`tests::Driven::tapped`).
+    #[cfg(test)]
+    told: std::sync::OnceLock<std::task::Waker>,
 }
 impl Bell {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             rung: Mutex::new(false),
             ringing: std::sync::Condvar::new(),
+            #[cfg(test)]
+            told: std::sync::OnceLock::new(),
         })
     }
     /// Wakes the owner, or its next wait if it isn't waiting. A poisoned bell only rings for an
@@ -86,6 +97,10 @@ impl Bell {
         if let Ok(mut rung) = self.rung.lock() {
             *rung = true;
             self.ringing.notify_one();
+        }
+        #[cfg(test)]
+        if let Some(told) = self.told.get() {
+            told.wake_by_ref();
         }
     }
     /// Waits until the bell rings or `wait` passes, whichever is first, and takes the ring:
@@ -165,11 +180,20 @@ impl Client {
         operation: Operation,
         application: Option<crate::database::Application>,
         until: Instant,
-    ) -> Result<Answer, Refusal> {
+    ) -> Result<Answered, Refusal> {
         self.handle.submit(namespace, operation, application, until)
     }
     pub(super) fn handle(&self) -> ReplicaHandle {
         self.handle.clone()
+    }
+    /// Takes in a cross-group stamp a step carried (lane split-merge-21, T-T1.9.R28): every entry
+    /// this owner proposes from now on is stamped past it, so the group's closed time after the
+    /// step is too (`closed::next` keeps it rising past the time before).
+    pub(super) fn observe(&self, micros: u64) {
+        self.handle
+            .shared
+            .observed
+            .fetch_max(micros, Ordering::AcqRel);
     }
     /// `f` on this owner's own applied state, on the caller's thread, asking the group's leader
     /// nothing (replication.md, "A local read on a replica"): it answers with the leader gone or
@@ -293,7 +317,16 @@ struct Control {
     floor_status: Mutex<amphora_api::replication::FloorStatus>,
     floor_meter: FloorMeter,
     outgoing: Mutex<Outgoing>,
+    /// Rung when a record joins `outgoing` ([`ReplicaHandle::drain_wait`]).
+    sent: std::sync::Condvar,
+    /// The host's one listener ([`ReplicaHandle::listen`]): woken when records join `outgoing`,
+    /// as `sent` is rung, and when the owner ends or is dropped.
+    listener: Mutex<Option<std::task::Waker>>,
     status: Mutex<Result<ReplicaStatus, Refusal>>,
+    /// The one wake of [`ReplicaHandle::wait_leader`]: told, under `status`, when a step publishes
+    /// another leader, term or fence ([`leads_otherwise`]), when the owner ends, and when it is
+    /// dropped mid-run.
+    led: std::sync::Condvar,
     meter: Arc<ReplicaMeter>,
     local: Local,
     bell: Arc<Bell>,
@@ -302,12 +335,46 @@ struct Control {
     // reads at a closed time").
     closed: Mutex<Closed>,
     moved: std::sync::Condvar,
+    // This replica's token reads, counted (`tokens`).
+    sessions: tokens::SessionMeter,
+    // The latest cross-group stamp a step carried in (lane split-merge-21, T-T1.9.R28), in the
+    // closed time's microseconds: this owner proposes past it, the hybrid logical clock's receive
+    // rule, so the group's entries after the step are stamped after every stamp it carried.
+    observed: AtomicU64,
 }
-/// What a replica's owner published of its closed time.
-#[derive(Debug, Clone, Copy, Default)]
+impl Control {
+    /// Wakes the host's listener, if one is set ([`ReplicaHandle::listen`]). Taken out first, so
+    /// the host's waker runs with no lock of this member's held. A slot poisoned (only a panic
+    /// while it was held does that) wakes no one, and the host's next `listen` is refused.
+    fn listened(&self) {
+        let waker = self
+            .listener
+            .lock()
+            .ok()
+            .and_then(|listener| listener.clone());
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+    /// Wakes the senders waiting in [`ReplicaHandle::drain_wait`] for a status just published that
+    /// fenced or ended (CP-T1.13): under the outgoing lock, which a drain holds as it reads the
+    /// status, so none misses it. Called with the status lock released (a drain takes the two in
+    /// that order). A poisoned lock leaves no waiter: its drain fails on that poison.
+    fn fenced_to_senders(&self) {
+        if let Ok(outgoing) = self.outgoing.lock() {
+            self.sent.notify_all();
+            drop(outgoing);
+        }
+    }
+}
+/// What a replica's owner published of its closed time, and of its applied and answered points
+/// (the session tokens', `tokens`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Closed {
     time: Option<u64>,
     lag: Option<u64>,
+    /// The index this replica applied.
+    applied: u64,
 }
 /// The readers of a replica's local reads (replication.md, "A local read on a replica"):
 /// connections of their own on the machine's database, each on what the machine committed when
@@ -630,7 +697,7 @@ enum Input {
         // The handle's application claim, checked against the floor at the session's base.
         application: Option<crate::database::Application>,
         until: Instant,
-        response: Response<Answer>,
+        response: Response<Answered>,
     },
     Receive {
         from: u64,
@@ -709,10 +776,17 @@ struct Pending {
     until: Instant,
     namespace: String,
     author: Author,
-    response: Option<Response<Answer>>,
+    response: Option<Response<Answered>>,
     phase: Phase,
     // Keep admission charged while its command is in flight, not just while queued.
     _reservation: Reservation,
+}
+/// A submitted operation's answer, with its write's own session token (`tokens`): the index and
+/// time of the entry its group's log took for it, so a session that reads with the token waits
+/// for this write and for no later one. None for an answer that wrote nothing.
+pub(super) struct Answered {
+    pub(super) answer: Answer,
+    pub(super) token: Option<Token>,
 }
 enum Phase {
     Barrier(Option<Operation>),
@@ -725,7 +799,7 @@ enum Phase {
         index: u64,
     },
 }
-struct Actor<F: BlockFile + 'static = DeviceFile> {
+struct Actor<F: BlockFile + 'static = LogDevice> {
     replica: Durable<F>,
     // Keep the log owner and its exclusive lease until the replica has drained/dropped.
     _log: hyper_log::Log<F>,
@@ -1046,6 +1120,13 @@ fn nanos_between(from: Instant, to: Instant) -> u64 {
 fn fenced(reason: impl std::fmt::Display) -> Refusal {
     Refusal::Fenced(reason.to_string())
 }
+/// Whether `now` tells a leader waiter something `was` didn't (lane ryw-6, CP-T1.13): another
+/// leader or term ([`ReplicaHandle::wait_leader`]'s answer), or a fence come or gone (its
+/// refusal). Any other change, the applied point's above all, wakes none of them.
+fn leads_otherwise(was: &Result<ReplicaStatus, Refusal>, now: &ReplicaStatus) -> bool {
+    !matches!(was, Ok(was)
+        if was.leader == now.leader && was.term == now.term && was.fenced == now.fenced)
+}
 fn unknown() -> Refusal {
     Refusal::UnknownOutcome
 }
@@ -1144,7 +1225,7 @@ impl ReplicaHandle {
         operation: Operation,
         application: Option<crate::database::Application>,
         until: Instant,
-    ) -> Result<Answer, Refusal> {
+    ) -> Result<Answered, Refusal> {
         if Instant::now() >= until {
             return Err(Refusal::Timeout);
         }
@@ -1221,10 +1302,18 @@ impl ReplicaHandle {
         })
     }
 
-    /// Takes at most `limit` messages. An undrained host eventually fences explicitly at the
-    /// egress bound; the actor never acknowledges a send the host has not taken.
+    /// The most records this member's outgoing queue holds (the owner fences rather than queue
+    /// one more), and so the most one [`Self::drain`] takes: a host that drains at it empties the
+    /// queue each call, with no count of its own to pick (lane ryw-6, kiln goal 8119f25d).
+    pub fn outgoing_bound(&self) -> usize {
+        OUTGOING_MESSAGES
+    }
+
+    /// Takes at most `limit` messages, `limit` no more than [`Self::outgoing_bound`]. An undrained
+    /// host eventually fences explicitly at the egress bound; the actor never acknowledges a send
+    /// the host has not taken.
     pub fn drain(&self, limit: usize) -> Result<Vec<Outbound>, Refusal> {
-        api::bound("replica drain count", limit, OUTGOING_MESSAGES)?;
+        api::bound("replica drain count", limit, self.outgoing_bound())?;
         let mut outgoing = locked(&self.shared.outgoing)?;
         if outgoing.messages.is_empty()
             && let Err(error) = &*locked(&self.shared.status)?
@@ -1243,6 +1332,94 @@ impl ReplicaHandle {
             messages.push(message);
         }
         Ok(messages)
+    }
+
+    /// As [`Self::drain`], waiting until `until` for a record when none waits: a host's sender
+    /// waits here rather than spinning (`crate::serve`, CP-T1.13). With none waiting, refused
+    /// Fenced at once while the replica is fenced, and with the owner's reason once it ended: the
+    /// owner rings `sent` when it publishes either (`Control::fenced_to_senders`), so a fenced
+    /// member's sender hears it then, not at `until`.
+    pub fn drain_wait(&self, limit: usize, until: Instant) -> Result<Vec<Outbound>, Refusal> {
+        {
+            let mut outgoing = locked(&self.shared.outgoing)?;
+            while outgoing.messages.is_empty() {
+                match &*locked(&self.shared.status)? {
+                    Err(ended) => return Err(ended.clone()),
+                    Ok(s) => {
+                        if let Some(reason) = &s.fenced {
+                            return Err(fenced(reason));
+                        }
+                    }
+                }
+                let left = until.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                outgoing = self
+                    .shared
+                    .sent
+                    .wait_timeout(outgoing, left)
+                    .map_err(|_| fenced("outgoing lock poisoned"))?
+                    .0;
+            }
+        }
+        self.drain(limit)
+    }
+
+    /// Sets the one listener this member wakes each time records join its outgoing queue, as
+    /// [`Self::drain_wait`]'s wait is woken, and when its owner ends or is dropped (lanes ryw-4,
+    /// ryw-5 and scaleout-harness-9; kiln goal 8119f25d, G13; replication.md, "The bench's relay
+    /// wakes on records"). A host that relays many members' records from one thread waits on one
+    /// wake of its own across all of them, then drains each: no timer between a record and its
+    /// delivery, and a member whose owner went is heard at once (its drain then answers why). A
+    /// member's records have one host to take them, so a listener set again replaces the one
+    /// before.
+    pub fn listen(&self, waker: std::task::Waker) -> Result<(), Refusal> {
+        *locked(&self.shared.listener)? = Some(waker);
+        Ok(())
+    }
+
+    /// Waits until this member's published status names a leader in a term past `past` (0: any
+    /// leader), and answers that status (lanes ryw-5 and ryw-6, kiln goal 8119f25d; CP-T1.13;
+    /// replication.md, "A host waits for a leader on the owner's word"). One wake, `led`: the
+    /// owner tells this wait each time its step publishes another leader, term or fence, as it
+    /// ends, and as it is dropped mid-run, so a host waits for its group's first leader (`past`
+    /// 0: the bench's schema, `crate::serve`'s `leader` request), or for the next one after a
+    /// call the lead's move refused, with no retry timer. Refused Timeout at `until`; Fenced
+    /// while the replica is fenced; with the owner's reason once it ended; Fenced once it was
+    /// dropped mid-run.
+    pub fn wait_leader(&self, past: u64, until: Instant) -> Result<ReplicaStatus, Refusal> {
+        let mut status = locked(&self.shared.status)?;
+        loop {
+            match &*status {
+                // The owner ended: its reason.
+                Err(ended) => return Err(ended.clone()),
+                // Dropped mid-run, it left its status standing: it releases its local reads
+                // before it tells this wait (under `status`), so the end is seen here or heard
+                // below.
+                Ok(_) if locked(&self.shared.local.open)?.is_none() => {
+                    return Err(fenced("replica owner ended"));
+                }
+                Ok(now) => {
+                    if let Some(reason) = &now.fenced {
+                        return Err(fenced(reason));
+                    }
+                    if now.leader != 0 && now.term > past {
+                        return Ok(now.clone());
+                    }
+                }
+            }
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(Refusal::Timeout);
+            }
+            status = self
+                .shared
+                .led
+                .wait_timeout(status, left)
+                .map_err(|_| fenced("the status lock was poisoned"))?
+                .0;
+        }
     }
 
     pub fn status(&self) -> Result<ReplicaStatus, Refusal> {
@@ -1481,9 +1658,209 @@ fn open(
         hyper_block::buf::Alignment::new(4096).map_err(unavailable)?,
     )
     .map_err(unavailable)?;
+    let file = LogDevice {
+        file,
+        disk: disk_switch(log_path)?,
+    };
     open_on(
         machine, log_owner, file, config, durability, changed, lease, until, clock,
     )
+}
+
+/// Each open replicated log's disk switch, by its path as the open resolved it (CP-T1.13,
+/// T-T1.13.1: the fire drills' cut and hung disks). An open puts a fresh switch, the disk there, in
+/// place of its path's last: a member started again finds its disk back. Bounded by the logs open
+/// now: a switch no log holds any more is dropped when the next is put in.
+static DISKS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<DiskSwitch>>>> = OnceLock::new();
+
+/// What a fire drill does to a member's log disk ([`Database::set_log_disk`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogDisk {
+    /// The disk there: every operation the file's own.
+    Back,
+    /// The disk hung: every operation waits, its thread with it, until the disk is back or cut,
+    /// as a disk that stops answering holds them; the member's network and clock go on.
+    Hung,
+    /// The disk gone: every operation fails with an I/O error, and the replica fences on the
+    /// first, as it does when a real disk goes away.
+    Cut,
+}
+
+/// One log's disk as a drill set it: read with one relaxed load per operation, waited on only
+/// while hung, woken when it is set again.
+struct DiskSwitch {
+    now: std::sync::atomic::AtomicU8,
+    set: Mutex<()>,
+    moved: Condvar,
+}
+
+impl DiskSwitch {
+    const BACK: u8 = 0;
+    const HUNG: u8 = 1;
+    const CUT: u8 = 2;
+
+    fn set(&self, disk: LogDisk) -> Result<(), Refusal> {
+        let held = locked(&self.set)?;
+        self.now.store(
+            match disk {
+                LogDisk::Back => Self::BACK,
+                LogDisk::Hung => Self::HUNG,
+                LogDisk::Cut => Self::CUT,
+            },
+            Ordering::Release,
+        );
+        // Under the lock, so no operation that saw the disk hung misses its change.
+        self.moved.notify_all();
+        drop(held);
+        Ok(())
+    }
+
+    /// Whether `op` may go to the disk now: at once while it is there, an error once it is cut,
+    /// and while it hangs, a wait for the next setting.
+    fn pass(&self, op: &'static str) -> Result<(), hyper_block::DiskError> {
+        let cut = || hyper_block::DiskError::Io {
+            op,
+            path: PathBuf::new(),
+            source: std::io::Error::other("the disk is cut (a fire drill)"),
+        };
+        let poisoned = || hyper_block::DiskError::Io {
+            op,
+            path: PathBuf::new(),
+            source: std::io::Error::other("a disk switch's lock was poisoned"),
+        };
+        match self.now.load(Ordering::Acquire) {
+            Self::BACK => return Ok(()),
+            Self::CUT => return Err(cut()),
+            _ => {}
+        }
+        let mut held = self.set.lock().map_err(|_| poisoned())?;
+        while self.now.load(Ordering::Acquire) == Self::HUNG {
+            held = self.moved.wait(held).map_err(|_| poisoned())?;
+        }
+        drop(held);
+        match self.now.load(Ordering::Acquire) {
+            Self::CUT => Err(cut()),
+            _ => Ok(()),
+        }
+    }
+}
+
+fn disk_switch(log_path: &Path) -> Result<Arc<DiskSwitch>, Refusal> {
+    let mut disks = locked(DISKS.get_or_init(Mutex::default))?;
+    disks.retain(|_, disk| Arc::strong_count(&*disk) > 1);
+    let disk = Arc::new(DiskSwitch {
+        now: std::sync::atomic::AtomicU8::new(DiskSwitch::BACK),
+        set: Mutex::new(()),
+        moved: Condvar::new(),
+    });
+    disks.insert(log_path.to_path_buf(), Arc::clone(&disk));
+    Ok(disk)
+}
+
+/// Sets the disk under the replicated log open at `log_path` (resolved as its open resolved it).
+/// Refused when no log is open there.
+pub(super) fn set_disk(log_path: &Path, disk: LogDisk) -> Result<(), Refusal> {
+    let switch = {
+        let disks = locked(DISKS.get_or_init(Mutex::default))?;
+        disks
+            .get(log_path)
+            .filter(|switch| Arc::strong_count(*switch) > 1)
+            .cloned()
+            .ok_or_else(|| api::invalid("log path", "no replicated log is open there"))?
+    };
+    switch.set(disk)
+}
+
+/// The system's device file under a member's log, and its disk switch ([`set_disk`]): every
+/// operation the file's own while the disk is there, one relaxed load past it.
+pub(super) struct LogDevice {
+    file: DeviceFile,
+    disk: Arc<DiskSwitch>,
+}
+
+impl LogDevice {
+    fn up(&self, op: &'static str) -> Result<(), hyper_block::DiskError> {
+        self.disk.pass(op)
+    }
+}
+
+impl BlockFile for LogDevice {
+    fn alignment(&self) -> hyper_block::buf::Alignment {
+        self.file.alignment()
+    }
+    fn layout_block(&self) -> hyper_block::buf::Alignment {
+        BlockFile::layout_block(&self.file)
+    }
+    fn len(&self) -> Result<u64, hyper_block::DiskError> {
+        self.up("a length")?;
+        BlockFile::len(&self.file)
+    }
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), hyper_block::DiskError> {
+        self.up("a read")?;
+        BlockFile::read_exact_at(&self.file, buf, offset)
+    }
+    fn read_resident_at(
+        &mut self,
+        buf: &mut [u8],
+        offset: u64,
+    ) -> Result<bool, hyper_block::DiskError> {
+        self.up("a read")?;
+        BlockFile::read_resident_at(&mut self.file, buf, offset)
+    }
+    fn reads_resident(&self) -> bool {
+        BlockFile::reads_resident(&self.file)
+    }
+    fn residency(&self) -> hyper_block::Residency {
+        BlockFile::residency(&self.file)
+    }
+    fn set_residency_shadow(&mut self, on: bool) {
+        BlockFile::set_residency_shadow(&mut self.file, on);
+    }
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), hyper_block::DiskError> {
+        self.up("a write")?;
+        BlockFile::write_all_at(&self.file, buf, offset)
+    }
+    fn sync_data(&self) -> Result<(), hyper_block::DiskError> {
+        self.up("a flush")?;
+        BlockFile::sync_data(&self.file)
+    }
+    fn fills_new_space(&self) -> bool {
+        BlockFile::fills_new_space(&self.file)
+    }
+    fn grows_by_segments(&self) -> bool {
+        BlockFile::grows_by_segments(&self.file)
+    }
+    fn grow(&self, len: u64) -> Result<Option<u64>, hyper_block::DiskError> {
+        self.up("a growth")?;
+        BlockFile::grow(&self.file, len)
+    }
+    fn write_whole(
+        &self,
+        offset: u64,
+        copies: u64,
+        fill: &[u8],
+    ) -> Result<(), hyper_block::DiskError> {
+        self.up("a write")?;
+        BlockFile::write_whole(&self.file, offset, copies, fill)
+    }
+    fn segment_end(&self, offset: u64) -> Result<Option<u64>, hyper_block::DiskError> {
+        self.up("a segment's end")?;
+        BlockFile::segment_end(&self.file, offset)
+    }
+    fn write_durable_at(
+        &self,
+        buf: &[u8],
+        offset: u64,
+    ) -> Result<hyper_block::block::Durable, hyper_block::DiskError> {
+        self.up("a durable write")?;
+        BlockFile::write_durable_at(&self.file, buf, offset)
+    }
+    fn try_clone(&self) -> Result<Self, hyper_block::DiskError> {
+        Ok(Self {
+            file: BlockFile::try_clone(&self.file)?,
+            disk: Arc::clone(&self.disk),
+        })
+    }
 }
 
 /// The write slot's bounds, stated from the core's, so the slot adds no number of its own: a
@@ -1564,15 +1941,21 @@ fn open_on<F: BlockFile + 'static>(
         floor_status: Mutex::default(),
         floor_meter: FloorMeter::default(),
         outgoing: Mutex::default(),
+        sent: std::sync::Condvar::new(),
+        listener: Mutex::new(None),
         status: Mutex::new(Ok(status(&replica))),
+        led: std::sync::Condvar::new(),
         meter,
         local,
         bell: Arc::clone(&bell),
         closed: Mutex::new(Closed {
             time: replica.machine().closed(),
             lag: None,
+            applied: replica.applied().index,
         }),
         moved: std::sync::Condvar::new(),
+        sessions: tokens::SessionMeter::default(),
+        observed: AtomicU64::new(0),
     });
     let election = replica.core().raft.config().election_tick;
     let slots = super::slot::Slots::new(slot_bounds(election, TICK)?);
@@ -1830,6 +2213,14 @@ impl<F: BlockFile + 'static> Drop for Actor<F> {
             self.control.moved.notify_all();
             drop(closed);
         }
+        // And hosts waiting for a leader (under its lock, so none misses it): they find the
+        // local reads released, as the owner's end.
+        if let Ok(status) = self.control.status.lock() {
+            self.control.led.notify_all();
+            drop(status);
+        }
+        // And the host's listener, so a relay hears this member went.
+        self.control.listened();
     }
 }
 impl<F: BlockFile + 'static> Actor<F> {
@@ -1846,6 +2237,9 @@ impl<F: BlockFile + 'static> Actor<F> {
         let configuration = self.replica.configuration().clone();
         let (floor, members) = self.replica.machine_mut().read_db(|db| {
             reload_changed(db, &self.changed)?;
+            // This replica rings its own readers' waiter lists for the resolutions it just
+            // applied (LockedReads::WaitOnLock; T-T1.10.W13, lane xgroup-sql-12).
+            ring_unlocked(db, &self.changed)?;
             let floor = super::application::policy(db)?;
             let mut members = Vec::new();
             for member in crate::replication::floor::members(&configuration) {
@@ -1929,7 +2323,13 @@ impl<F: BlockFile + 'static> Actor<F> {
         }
         if let Ok(mut status) = self.control.status.lock() {
             *status = Err(reason.clone());
+            // Hosts waiting for a leader hear it ended.
+            self.control.led.notify_all();
         }
+        // A host waiting on its listener hears the owner ended: its drain now answers the reason.
+        self.control.listened();
+        // So do the member's senders, waiting for its next record (CP-T1.13).
+        self.control.fenced_to_senders();
         // Local reads end with the owner: none opens again, and the idle readers let its lease go.
         self.control.local.release();
         // Reads waiting for a closed time hear it ended (under the lock, so none misses it).
@@ -2196,7 +2596,26 @@ impl<F: BlockFile + 'static> Actor<F> {
         let entries = self.replica.applied().index.saturating_sub(applied);
         let took = (self.clock)().saturating_duration_since(at);
         self.spacing.stepped(entries, took, queued)?;
-        *locked(&self.control.status)? = Ok(status(&self.replica));
+        let now = status(&self.replica);
+        let fencing = {
+            let mut published = locked(&self.control.status)?;
+            let led = leads_otherwise(&published, &now);
+            let fencing =
+                now.fenced.is_some() && !matches!(&*published, Ok(was) if was.fenced.is_some());
+            *published = Ok(now);
+            // Leader waiters wake on the step that names another leader, term or fence, never on
+            // a timer.
+            if led {
+                self.control.led.notify_all();
+            }
+            fencing
+        };
+        // The member's senders and its host's listener wake on the step that fences, as on the
+        // owner's end (CP-T1.13).
+        if fencing {
+            self.control.listened();
+            self.control.fenced_to_senders();
+        }
         self.publish_closed()?;
         let commits = self.replica.core().raft.commit_stats();
         self.control.meter.stepped(
@@ -3339,6 +3758,11 @@ impl<F: BlockFile + 'static> Actor<F> {
         if self.replica.applied().index != self.published {
             self.refresh()?;
         }
+        // And its applied point, so that a read carrying an answer's token is served here at
+        // once (`tokens`).
+        if !output.answers.is_empty() {
+            self.publish_closed()?;
+        }
         for applied in output.answers {
             let matches = self
                 .pending
@@ -3346,7 +3770,14 @@ impl<F: BlockFile + 'static> Actor<F> {
                 .is_some_and(|p| p.context == applied.context);
             if matches && let Some(mut pending) = self.pending.take() {
                 let result = match pending.phase {
-                    Phase::Proposed(value) => applied.result.map(|()| value),
+                    // The write's own token: its entry's index and time (`tokens`).
+                    Phase::Proposed(value) => applied.result.map(|()| Answered {
+                        answer: value,
+                        token: Some(Token {
+                            micros: applied.time.unwrap_or(0),
+                            index: applied.index,
+                        }),
+                    }),
                     // Answered on the commit: the apply must decide as the log did.
                     Phase::Answered { result: given, .. } => {
                         if given.is_ok() != applied.result.is_ok() {
@@ -3428,6 +3859,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             .unwrap_or(u32::MAX);
         let now = self.now()?;
         let mut outgoing = locked(&self.control.outgoing)?;
+        let any = !output.messages.is_empty();
         for message in output.messages {
             self.pace.sent(&message, now, lost);
             let mut bytes = Vec::new();
@@ -3447,6 +3879,11 @@ impl<F: BlockFile + 'static> Actor<F> {
                 to: message.to,
                 bytes,
             });
+        }
+        self.control.sent.notify_all();
+        drop(outgoing);
+        if any {
+            self.control.listened();
         }
         Ok(())
     }
@@ -3488,6 +3925,11 @@ impl<F: BlockFile + 'static> Actor<F> {
             return;
         };
         let index = entry.index;
+        // The entry's stamp: a lower bound of the time its apply gives it, which is the larger of
+        // the stamp and one past its predecessor's (`closed::next`).
+        let stamp = crate::replication::closed::open(&entry.data)
+            .ok()
+            .and_then(|(stamp, _)| stamp);
         let result = match crate::replication::verdict(&entry.data, before) {
             Ok(result) => result,
             // A malformed entry fences at its apply, which answers.
@@ -3504,7 +3946,18 @@ impl<F: BlockFile + 'static> Actor<F> {
             },
         ) && let Some(response) = pending.response.take()
         {
-            answer(response, result.map(|()| value));
+            // The write's own token (`tokens`): its index, and its stamp for its time. A read with
+            // it here waits for this member to apply the entry.
+            answer(
+                response,
+                result.map(|()| Answered {
+                    answer: value,
+                    token: Some(Token {
+                        micros: stamp.unwrap_or(0),
+                        index,
+                    }),
+                }),
+            );
         }
         self.pending = Some(pending);
     }
@@ -3764,7 +4217,10 @@ impl<F: BlockFile + 'static> Actor<F> {
             bytes.len(),
             self.entry_room(context.len())?,
         )?;
-        let stamped = crate::replication::closed::stamp(self.wall_now()?, &bytes);
+        // The receive rule (Kulkarni et al., OPODIS 2014): past every stamp a step carried in.
+        let observed = self.control.observed.load(Ordering::Acquire);
+        let now = self.wall_now()?.max(observed.saturating_add(1));
+        let stamped = crate::replication::closed::stamp(now, &bytes);
         self.replica
             .propose(context.to_vec(), stamped)
             .map_err(raft_error)
@@ -3779,19 +4235,25 @@ impl<F: BlockFile + 'static> Actor<F> {
     }
     /// Publishes this replica's closed time if it moved since the last step, with the lag it
     /// measured, and tells the reads waiting for it.
+    /// Its applied index too, so it publishes both whenever either moved, and tells the reads
+    /// waiting for them (`tokens`): an event of the owner's step, never a timer's.
     fn publish_closed(&mut self) -> Result<(), Refusal> {
         let time = self.replica.machine().closed();
+        let applied = self.replica.applied().index;
         let mut closed = locked(&self.control.closed)?;
-        if closed.time == time {
-            return Ok(());
-        }
-        if let Some(time) = time {
+        let moved = closed.time != time;
+        if moved && let Some(time) = time {
             self.lag.moved(self.wall_now()?, time);
         }
-        *closed = Closed {
+        let next = Closed {
             time,
-            lag: self.lag.p99(),
+            lag: if moved { self.lag.p99() } else { closed.lag },
+            applied,
         };
+        if *closed == next {
+            return Ok(());
+        }
+        *closed = next;
         drop(closed);
         self.control.moved.notify_all();
         Ok(())
@@ -3983,7 +4445,10 @@ impl<F: BlockFile + 'static> Actor<F> {
                 if self.at >= pending.until {
                     Err(Refusal::Timeout)
                 } else if prepared.is_empty() {
-                    Ok(value)
+                    Ok(Answered {
+                        answer: value,
+                        token: None,
+                    })
                 } else {
                     match prepared
                         .encode()
@@ -4031,6 +4496,8 @@ mod tests {
     // Follower reads at a closed time, under leader changes (replication.md, "Follower reads at a
     // closed time"): in a file of its own, on this module's driven shell.
     mod closed_reads;
+    // Session tokens: read-your-writes on any replica (`tokens`), on the same driven shell.
+    mod session_reads;
 
     thread_local! {
         /// The account the owners a test opens on its thread charge their readers to, in place of
@@ -4110,6 +4577,48 @@ mod tests {
             client.handle().drain(OUTGOING_MESSAGES + 1),
             Err(Refusal::TooLarge { .. })
         ));
+    }
+
+    /// Lane ryw-6 (kiln goal 8119f25d): a host that drains at the handle's bound, as the bench's
+    /// relay does, takes the whole outgoing queue in one call, however full the member can make
+    /// it, and needs no count of its own. Do: a member's queue filled to the most it holds (the
+    /// owner fences rather than queue one more); one drain at `outgoing_bound`; one drain past
+    /// it. Expect: every record taken in order, none left and no bytes charged; past the bound
+    /// refused TooLarge.
+    #[test]
+    fn a_drain_at_the_queues_bound_takes_the_whole_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let client = driven.open(dir.path(), 1, vec![1, 2, 3], None);
+        let handle = client.handle();
+        {
+            let mut outgoing = locked(&handle.shared.outgoing).unwrap();
+            while outgoing.messages.len() < OUTGOING_MESSAGES {
+                let n = u8::try_from(outgoing.messages.len() % 251).unwrap();
+                outgoing.bytes += 1;
+                outgoing.messages.push_back(Outbound {
+                    to: 2,
+                    bytes: vec![n],
+                });
+            }
+        }
+        let drained = handle.drain(handle.outgoing_bound()).unwrap();
+        assert_eq!(drained.len(), OUTGOING_MESSAGES);
+        assert!(
+            drained
+                .iter()
+                .enumerate()
+                .all(|(i, record)| record.bytes == [u8::try_from(i % 251).unwrap()])
+        );
+        let outgoing = locked(&handle.shared.outgoing).unwrap();
+        assert!(outgoing.messages.is_empty());
+        assert_eq!(outgoing.bytes, 0);
+        drop(outgoing);
+        assert!(matches!(
+            handle.drain(handle.outgoing_bound() + 1),
+            Err(Refusal::TooLarge { .. })
+        ));
+        drop(driven);
     }
 
     /// CP-T1.8 on driven time: admitted application calls cannot consume replication's reserved
@@ -4224,7 +4733,7 @@ mod tests {
             before: 2,
         });
         let answer = enqueue(client, driven.until(), "gc", step);
-        let Answer::Compacted(progress) = driven.answer(&mut pump, &answer).unwrap() else {
+        let Answer::Compacted(progress) = driven.answer(&mut pump, &answer).unwrap().answer else {
             panic!("wrong compaction answer")
         };
         assert_eq!(progress.completed, 2);
@@ -4253,7 +4762,7 @@ mod tests {
             "gc",
             Operation::Changes("items".into(), 1, 10),
         );
-        let Answer::Changes(changes) = driven.answer(&mut pump, &changes).unwrap() else {
+        let Answer::Changes(changes) = driven.answer(&mut pump, &changes).unwrap().answer else {
             panic!("wrong changes answer")
         };
         assert_eq!(changes.changes.len(), 1);
@@ -4263,7 +4772,7 @@ mod tests {
             before: 2,
         });
         let answer = enqueue(client, driven.until(), "gc", step);
-        let Answer::Compacted(progress) = driven.answer(&mut pump, &answer).unwrap() else {
+        let Answer::Compacted(progress) = driven.answer(&mut pump, &answer).unwrap().answer else {
             panic!("wrong recovered compaction answer")
         };
         assert_eq!(progress.completed, 2);
@@ -4401,41 +4910,46 @@ mod tests {
                 }
             }
         }
+        /// Takes every receipt answered or expired.
         fn reap(&mut self) {
-            for slot in &mut self.receipts {
-                let Some(pending) = slot.as_mut() else {
+            for at in 0..self.receipts.len() {
+                let Some(pending) = self.receipts.get_mut(at).unwrap().as_mut() else {
                     continue;
                 };
                 let result = pending.receipt.try_result();
                 if matches!(result, Ok(None)) {
                     continue;
                 }
-                let pending = slot.take().unwrap();
-                self.records -= 1;
-                self.bytes -= pending.bytes;
-                if let (Some(refusals), true, Err(Refusal::Unavailable(why))) =
-                    (self.refusals.as_mut(), pending.proposal, &result)
-                    && [
-                        hyper_raft::Dropped::Transferring,
-                        hyper_raft::Dropped::NoLeader,
-                    ]
-                    .iter()
-                    .any(|cause| why.ends_with(&cause.to_string()))
-                {
-                    *refusals += 1;
-                    continue;
-                }
-                if let Err(Refusal::Invalid { why, .. }) = &result
-                    && why == "sender is not a current member"
-                    && self.departed.contains(&pending.from)
-                {
-                    continue;
-                }
-                // Admission was not an ACK: expiry, validation and fencing must fail the test.
-                match result {
-                    Ok(answered) => assert_eq!(answered, Some(())),
-                    Err(refusal) => panic!("{} refused: {refusal:?}", pending.record),
-                }
+                let pending = self.receipts.get_mut(at).unwrap().take().unwrap();
+                self.settle(pending, result);
+            }
+        }
+        /// A receipt's end, `result`: counted off the bounds, and checked.
+        fn settle(&mut self, pending: PumpReceipt, result: Result<Option<()>, Refusal>) {
+            self.records -= 1;
+            self.bytes -= pending.bytes;
+            if let (Some(refusals), true, Err(Refusal::Unavailable(why))) =
+                (self.refusals.as_mut(), pending.proposal, &result)
+                && [
+                    hyper_raft::Dropped::Transferring,
+                    hyper_raft::Dropped::NoLeader,
+                ]
+                .iter()
+                .any(|cause| why.ends_with(&cause.to_string()))
+            {
+                *refusals += 1;
+                return;
+            }
+            if let Err(Refusal::Invalid { why, .. }) = &result
+                && why == "sender is not a current member"
+                && self.departed.contains(&pending.from)
+            {
+                return;
+            }
+            // Admission was not an ACK: expiry, validation and fencing must fail the test.
+            match result {
+                Ok(answered) => assert_eq!(answered, Some(())),
+                Err(refusal) => panic!("{} refused: {refusal:?}", pending.record),
             }
         }
         fn admit(&mut self, packet: PumpPacket) {
@@ -4633,15 +5147,44 @@ mod tests {
                 "retained proposals were not released"
             );
             assert!(self.durable.is_none(), "durable answers were kept back");
-            // No new records or grace deadline: try_result enforces each admitted until.
-            while self.records != 0 {
-                self.reap();
-                if self.records != 0 {
-                    std::thread::park_timeout(POLL);
+            // No new records or grace deadline: each receipt is waited on until its answer comes
+            // or its own until passes.
+            for at in 0..self.receipts.len() {
+                if let Some(mut pending) = self.receipts.get_mut(at).unwrap().take() {
+                    let result = answered(&mut pending.receipt);
+                    self.settle(pending, result);
                 }
             }
+            assert_eq!(self.records, 0);
             assert_eq!(self.bytes, 0);
             assert!(self.receipts.iter().all(Option::is_none));
+        }
+    }
+    /// `receipt`'s end, waited on: its answer, which its owner sends as it takes the record, or
+    /// its until passed, up to the transport tests' hang guard (a hang, never a verdict). What
+    /// the wait doesn't settle (its until passed, its owner ended) [`ReceiveReceipt::try_result`]
+    /// says.
+    fn answered(receipt: &mut ReceiveReceipt) -> Result<Option<()>, Refusal> {
+        let left = receipt.until.saturating_duration_since(Instant::now());
+        let waited = receipt
+            .receiver
+            .get_mut()
+            .map(|receiver| receiver.recv_timeout(left.min(crate::transport::HANG)))
+            .map_err(|_| ());
+        match waited {
+            Ok(Ok(result)) => {
+                receipt.completed = true;
+                result.map(Some)
+            }
+            Ok(Err(mpsc::RecvTimeoutError::Timeout)) => {
+                assert!(
+                    left <= crate::transport::HANG,
+                    "a receipt was unanswered for {:?}: a hang",
+                    crate::transport::HANG
+                );
+                receipt.try_result()
+            }
+            Ok(Err(mpsc::RecvTimeoutError::Disconnected)) | Err(_) => receipt.try_result(),
         }
     }
     impl Drop for Pump<'_> {
@@ -4660,8 +5203,9 @@ mod tests {
     }
 
     /// Rounds a driven group may take for one call, election or settling before the test calls
-    /// it hung. A round with nothing to relay yields `POLL` to the disk, so this is a counted hang
-    /// guard of about a minute of disk waits (CLAUDE.md section 2), never a verdict on time.
+    /// it hung: a counted hang guard (CLAUDE.md section 2), never a verdict on time. A round with
+    /// nothing to relay waits for the work out off the driver's thread (`Driven::wait_if_moving`),
+    /// so rounds count steps that could move the group, not waits on a timer.
     const ROUNDS: usize = 60_000;
 
     /// A test's own clocks and the owners it steps (replication.md, "The owner's time"). Each
@@ -4669,7 +5213,7 @@ mod tests {
     /// steps, or from a call's work while the owner runs it. Its instants start an hour past the
     /// real clock, so a real-clock check of a test deadline (a receipt's poll) holds for an hour:
     /// a hang guard, never a verdict.
-    struct Driven<F: BlockFile + 'static = DeviceFile> {
+    struct Driven<F: BlockFile + 'static = LogDevice> {
         // Each member's owner, by member order; none while a test has cut its power.
         owners: Vec<Option<(Actor<F>, mpsc::Receiver<Envelope>)>>,
         base: Instant,
@@ -4677,6 +5221,59 @@ mod tests {
         clocks: Vec<Arc<AtomicU64>>,
         // Clock moves made for a write slot's end (`Driven::lapse_slots`), each asserted to end it.
         lapses: u64,
+        // What happens off the driver's thread that may let the group move: each owner's bell
+        // rings it (`Driven::tapped`), and each gate as a flush comes to it held.
+        moved: Arc<OffThread>,
+        // The count `moved` stood at as the last step began (`Driven::step`).
+        looked: u64,
+        // Each gated member's gate, by member order (`Driven::gated_log`).
+        gates: BTreeMap<usize, Arc<Gate>>,
+    }
+    /// A count of what happened off a driven shell's thread that may let its group move: anything
+    /// that rings an owner's bell (its log's write or compaction done, its database's flush done,
+    /// an input queued, a handle dropped), or a flush come to a held gate. The driver reads the
+    /// count before it steps and waits only for a count past it, so nothing that happens between
+    /// its look and its wait is lost; it waits on these events, never on a timer.
+    #[derive(Default)]
+    struct OffThread {
+        count: Mutex<u64>,
+        rang: std::sync::Condvar,
+    }
+    impl OffThread {
+        fn ring(&self) {
+            // A poisoned count follows only a test thread's panic, which ends the test.
+            if let Ok(mut count) = self.count.lock() {
+                *count += 1;
+                self.rang.notify_all();
+            }
+        }
+        /// The count now: read before a step, for [`OffThread::wait_past`] after it.
+        fn seen(&self) -> u64 {
+            *self.count.lock().unwrap()
+        }
+        /// Waits until something happens past `seen`, up to the transport tests' hang guard: a
+        /// hang, never a verdict.
+        fn wait_past(&self, seen: u64) {
+            let count = self.count.lock().unwrap();
+            let (_count, waited) = self
+                .rang
+                .wait_timeout_while(count, crate::transport::HANG, |count| *count == seen)
+                .unwrap();
+            assert!(
+                !waited.timed_out(),
+                "work was out off the driver's thread and none ended or came to a held gate in {:?}: a hang",
+                crate::transport::HANG
+            );
+        }
+    }
+    /// Each driven owner's bell rings its shell's count too (`Bell::told`).
+    impl std::task::Wake for OffThread {
+        fn wake(self: Arc<Self>) {
+            self.ring();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.ring();
+        }
     }
     /// The time a driven clock reads past its shell's base.
     fn offset(clock: &AtomicU64) -> Duration {
@@ -4687,16 +5284,25 @@ mod tests {
         let nanos = u64::try_from(to.duration_since(base).as_nanos()).unwrap();
         clock.store(nanos, Ordering::Release);
     }
-    /// The lease on a member's state file: the previous owner of the path lets go of it as its
-    /// owner drops, which a test waits for, its rounds counted.
+    /// The lease on a member's file. The previous owner of the path lets go of it once its last
+    /// holder ends: its owner as the test drops it, then the threads it ran (its log's, its
+    /// flushing thread), which end on their own after. So this waits on the lock itself, which the
+    /// operating system hands over as its last holder closes it, up to the transport tests' hang
+    /// guard: a hang, never a verdict.
     fn lease(path: &Path) -> Arc<File> {
-        for _ in 0..ROUNDS {
-            match exclusive_file(path) {
-                Ok(file) => return Arc::new(file),
-                Err(_) => std::thread::park_timeout(POLL),
-            }
+        let path = crate::database::canonical_path(path).unwrap();
+        let (leased, lease) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            // The test gave up waiting only if the receiver is gone.
+            let _ = leased.send(crate::transport::wait_lease(&path));
+        });
+        match lease.recv_timeout(crate::transport::HANG) {
+            Ok(file) => Arc::new(file.unwrap()),
+            Err(_) => panic!(
+                "the previous owner kept its lease for {:?}: a hang",
+                crate::transport::HANG
+            ),
         }
-        panic!("the previous owner kept its lease");
     }
     impl Driven {
         /// A shell whose members run on the system's files.
@@ -4770,6 +5376,7 @@ mod tests {
                 clock,
             )
             .unwrap();
+            let actor = self.tapped(actor);
             self.owners.push(Some((actor, receiver)));
             self.clocks.push(reading);
             client
@@ -4806,6 +5413,7 @@ mod tests {
                 Arc::new(move || base + offset(&read)),
             )
             .unwrap();
+            let actor = self.tapped(actor);
             *self.owners.get_mut(owner).unwrap() = Some((actor, receiver));
             client
         }
@@ -4817,6 +5425,45 @@ mod tests {
                 base: Instant::now() + Duration::from_secs(3600),
                 clocks: Vec::new(),
                 lapses: 0,
+                moved: Arc::new(OffThread::default()),
+                looked: 0,
+                gates: BTreeMap::new(),
+            }
+        }
+        /// `actor`, its bell ringing this shell's [`OffThread`] too: whatever would wake the owner
+        /// on a thread of its own wakes the driver that steps it. The bell is told before the
+        /// owner's first step, so no ring after it is missed.
+        fn tapped(&self, actor: Actor<F>) -> Actor<F> {
+            let told = actor
+                .control
+                .bell
+                .told
+                .set(std::task::Waker::from(Arc::clone(&self.moved)));
+            assert!(told.is_ok(), "an owner's bell told twice");
+            actor
+        }
+        /// Whether work is out off the driver's thread that ends, or comes to a held gate, on its
+        /// own, and so rings [`OffThread`]: a log write or compaction on a member whose gate is
+        /// open, or held with no flush at it yet; or a flush of a member's database on its
+        /// flushing thread. Only such work can move a group whose round relayed nothing.
+        fn moving(&self) -> bool {
+            self.owners.iter().enumerate().any(|(at, owner)| {
+                owner.as_ref().is_some_and(|(owner, _)| {
+                    let parked = self
+                        .gates
+                        .get(&at)
+                        .is_some_and(|gate| gate.is_held() && gate.waiting());
+                    (owner.replica.in_flight() != 0 && !parked)
+                        || matches!(owner.flushing, Flushing::Thread { out: true, .. })
+                })
+            })
+        }
+        /// After a round that relayed nothing and left nothing in transit, the driver waits for
+        /// work out off its thread to end or come to a held gate ([`Driven::moving`]); with none
+        /// out it waits for nothing, as only its own steps can move the group.
+        fn wait_if_moving(&self, relayed: usize, pump: &Pump<'_>) {
+            if relayed == 0 && pump.records == 0 && self.moving() {
+                self.moved.wait_past(self.looked);
             }
         }
         /// A call's or a record's budget on these clocks: it runs out only if the test moves a
@@ -4895,8 +5542,10 @@ mod tests {
             (reading, Arc::new(move || base + offset(&read)))
         }
         /// One round: every owner takes each input waiting for it, then steps once more, each at
-        /// its own clock's reading.
+        /// its own clock's reading. What happens off the driver's thread from here on is past
+        /// `looked`.
         fn step(&mut self) {
+            self.looked = self.moved.seen();
             for (owner, inputs) in self.owners.iter_mut().flatten() {
                 while let Ok(input) = inputs.try_recv() {
                     owner.run_step(Some(input)).unwrap();
@@ -4904,11 +5553,11 @@ mod tests {
                 owner.run_step(None).unwrap();
             }
         }
-        /// One relay round and one step; a round with nothing to relay yields `POLL` to the disk.
+        /// One relay round and one step; a round with nothing to relay waits for work out off the
+        /// driver's thread, if there is any ([`Driven::wait_if_moving`]).
         fn round(&mut self, pump: &mut Pump<'_>) {
-            if pump.drive_until(self.until()) == 0 {
-                std::thread::park_timeout(POLL);
-            }
+            let relayed = pump.drive_until(self.until());
+            self.wait_if_moving(relayed, pump);
             self.step();
         }
         /// Owner `first` campaigns now, every clock standing still, and rounds go on until every
@@ -4958,6 +5607,35 @@ mod tests {
             }
             panic!("no leader followed in {ROUNDS} driven rounds: {last:?}");
         }
+        /// After the leader's power cut: every member's clock moves a tick in turn, each tick's work
+        /// settling (`Driven::tick`), until every owner follows one leader, then as
+        /// [`Driven::follow`] with at least `applied` applied. Returns the leader's index. With
+        /// time standing still no single campaign settles a cut leader's group: the survivor that
+        /// heard the cut leader last refuses another's votes until its own election timer runs
+        /// out (check-quorum's lease), and the restarted member may have lost what it
+        /// acknowledged and so can't be voted in. Time moving for every member, as it does where
+        /// they run, is what ends both (CP-T1.8, AC-T1.8.5).
+        fn elect_after_cut(
+            &mut self,
+            pump: &mut Pump<'_>,
+            clients: &[Client],
+            applied: u64,
+        ) -> usize {
+            for _ in 0..ROUNDS {
+                let states: Vec<_> = clients
+                    .iter()
+                    .map(|c| c.handle().status().unwrap())
+                    .collect();
+                let leader = states.first().unwrap().leader;
+                if leader != 0 && states.iter().all(|s| s.leader == leader) {
+                    return self.follow(pump, clients, applied);
+                }
+                for owner in 0..self.owners.len() {
+                    self.tick(pump, owner);
+                }
+            }
+            panic!("no leader after the leader's cut in {ROUNDS} ticks of every member");
+        }
         /// The lead moves from owner `from` to owner `to` now (`Replica::transfer`, which no lease
         /// refuses), every clock standing still; rounds go on until every owner follows `to`.
         fn transfer(&mut self, pump: &mut Pump<'_>, clients: &[Client], from: usize, to: usize) {
@@ -4993,9 +5671,7 @@ mod tests {
             let (mut still, mut voter) = (0, 0);
             for _ in 0..ROUNDS {
                 let relayed = pump.drive_until(self.until());
-                if relayed == 0 {
-                    std::thread::park_timeout(POLL);
-                }
+                self.wait_if_moving(relayed, pump);
                 self.step();
                 let states: Vec<_> = clients
                     .iter()
@@ -5031,7 +5707,56 @@ mod tests {
                     Err(error) => panic!("owner ended: {error}"),
                 }
             }
-            panic!("a driven operation was unanswered after {ROUNDS} rounds");
+            // Where each member stands, to tell what the call waits on.
+            let members: Vec<String> = self
+                .owners
+                .iter()
+                .flatten()
+                .map(|(owner, _)| {
+                    let log = owner.replica.core().raft.log();
+                    let phase = owner.pending.as_ref().map(|pending| {
+                        let phase = match &pending.phase {
+                            Phase::Barrier(Some(_)) => "barrier".to_string(),
+                            Phase::Barrier(None) => "barrier(none)".to_string(),
+                            Phase::Proposed(_) => "proposed".to_string(),
+                            Phase::Bootstrap(_) => "bootstrap".to_string(),
+                            Phase::Answered { index, .. } => format!("answered@{index}"),
+                        };
+                        (phase, pending.term, pending.leader, pending.until > owner.at)
+                    });
+                    format!(
+                        "id {} term {} leader {} leads {} applied {} committed {} last {:?} in_flight {} driving {} pending {phase:?} tail {:?} slot_deferred {} slot_left {:?} slot_holds {} flush_out {} waiting {} floor_inflight {} changing {} transferring {}",
+                        owner.replica.id(),
+                        owner.replica.term(),
+                        owner.replica.leader(),
+                        owner.replica.is_leader(),
+                        owner.replica.applied().index,
+                        log.committed(),
+                        log.last_index(),
+                        owner.replica.in_flight(),
+                        owner.driving,
+                        owner.tail,
+                        owner.slot_deferred,
+                        owner.slots.until().map(|until| until.saturating_duration_since(owner.at)),
+                        owner.slots.holds(),
+                        matches!(owner.flushing, Flushing::Thread { out: true, .. }),
+                        owner.waiting.len(),
+                        owner.floor_inflight,
+                        owner.changing.is_some(),
+                        owner.transferring.is_some(),
+                    )
+                })
+                .collect();
+            panic!(
+                "a driven operation was unanswered after {ROUNDS} rounds: moving {} moved {} looked {}; pump records {} delivered {:?} lost {:?} held {:?}; members {members:#?}",
+                self.moving(),
+                self.moved.seen(),
+                self.looked,
+                pump.records,
+                pump.delivered,
+                pump.lost,
+                pump.held,
+            );
         }
         /// Time moves for a write slot alone. Once the group is quiet (nothing relayed or held in
         /// transit, no write out on any disk, and no member but a slot's leader with work in
@@ -5083,7 +5808,7 @@ mod tests {
         fn settle(
             &mut self,
             pump: &mut Pump<'_>,
-            answer: &mpsc::Receiver<Result<Answer, Refusal>>,
+            answer: &mpsc::Receiver<Result<Answered, Refusal>>,
         ) -> Result<Vec<u8>, Refusal> {
             self.answer(pump, answer).map(called)
         }
@@ -5112,9 +5837,7 @@ mod tests {
                 {
                     return;
                 }
-                if admitted == 0 {
-                    std::thread::park_timeout(POLL);
-                }
+                self.wait_if_moving(admitted, pump);
                 self.step();
             }
             panic!("the group was not quiet after {ROUNDS} driven rounds");
@@ -5127,7 +5850,10 @@ mod tests {
             self.step();
             self.quiet(pump);
         }
-        /// Rounds until every record the relay admitted has been taken, so the pump can finish.
+        /// Rounds until every record the relay admitted has been taken, so the pump can finish. An
+        /// owner takes every record queued for it in its next step and answers its receipt there,
+        /// so each round is a step on the driver's thread: nothing here waits, on a timer or on
+        /// anything off the thread, and a held gate can't keep a receipt from its answer.
         fn drain(&mut self, pump: &mut Pump<'_>) {
             for _ in 0..ROUNDS {
                 pump.reap();
@@ -5444,7 +6170,7 @@ mod tests {
                 Arc::new(move || base + offset(&read)),
             )
             .unwrap();
-            (client, (actor, receiver))
+            (client, (self.tapped(actor), receiver))
         }
     }
 
@@ -5474,36 +6200,66 @@ mod tests {
 
     /// Holds the flushes of a member's log device while the test says so: its writes go on, and
     /// none becomes durable until the test lets them go. The log's own threads wait here, never
-    /// the test's.
+    /// the test's; each flush that comes to the gate held tells its shell at once, so the driver
+    /// sees a stall as it happens rather than by looking again.
     #[derive(Default)]
     struct Gate {
-        held: Mutex<bool>,
+        holding: Mutex<Holding>,
         moved: std::sync::Condvar,
     }
+    #[derive(Default)]
+    struct Holding {
+        held: bool,
+        // Flushes waiting at the gate now.
+        waiting: usize,
+        // The shell told as a flush comes to the gate held.
+        told: Option<Arc<OffThread>>,
+    }
     impl Gate {
+        /// The shell `moved` is told each time a flush comes to the gate while it holds.
+        fn tell(&self, moved: &Arc<OffThread>) {
+            self.holding.lock().unwrap().told = Some(Arc::clone(moved));
+        }
         fn hold(&self) {
-            *self.held.lock().unwrap() = true;
+            self.holding.lock().unwrap().held = true;
         }
         fn release(&self) {
-            *self.held.lock().unwrap() = false;
+            self.holding.lock().unwrap().held = false;
             self.moved.notify_all();
         }
+        fn is_held(&self) -> bool {
+            self.holding.lock().unwrap().held
+        }
+        /// Whether a flush waits at the gate now: its member's writes out finish only once the
+        /// test lets the gate go.
+        fn waiting(&self) -> bool {
+            self.holding.lock().unwrap().waiting > 0
+        }
         /// Waits while the flushes are held, up to the transport tests' hang guard: a hang,
-        /// never a verdict.
+        /// never a verdict. A flush that has to wait tells the shell first.
         fn pass(&self) -> Result<(), hyper_block::DiskError> {
             let until = Instant::now() + crate::transport::HANG;
-            let mut held = self.held.lock().unwrap();
-            while *held {
+            let mut holding = self.holding.lock().unwrap();
+            if !holding.held {
+                return Ok(());
+            }
+            holding.waiting += 1;
+            if let Some(told) = &holding.told {
+                told.ring();
+            }
+            while holding.held {
                 let left = until.saturating_duration_since(Instant::now());
                 if left.is_zero() {
+                    holding.waiting -= 1;
                     return Err(hyper_block::DiskError::Io {
                         op: "a held flush",
                         path: std::path::PathBuf::new(),
                         source: std::io::Error::from(std::io::ErrorKind::TimedOut),
                     });
                 }
-                held = self.moved.wait_timeout(held, left).unwrap().0;
+                holding = self.moved.wait_timeout(holding, left).unwrap().0;
             }
+            holding.waiting -= 1;
             Ok(())
         }
     }
@@ -5585,6 +6341,16 @@ mod tests {
         }
     }
     impl Driven<Gated> {
+        /// Member `owner`'s log on `power`'s device behind `gate`, which tells this shell of each
+        /// flush it holds.
+        fn gated_log(&mut self, owner: usize, power: &Power, gate: &Arc<Gate>) -> Gated {
+            gate.tell(&self.moved);
+            self.gates.insert(owner, Arc::clone(gate));
+            Gated {
+                log: power.log.handle().unwrap(),
+                gate: Arc::clone(gate),
+            }
+        }
         /// Member `node_id`: its database on `power`'s disk, its log on `power`'s device behind
         /// `gate`.
         fn open_gated(
@@ -5597,10 +6363,7 @@ mod tests {
             gate: &Arc<Gate>,
         ) -> Client {
             let reading = Arc::new(AtomicU64::new(0));
-            let log = Gated {
-                log: power.log.handle().unwrap(),
-                gate: Arc::clone(gate),
-            };
+            let log = self.gated_log(self.owners.len(), power, gate);
             let (client, owner) = self.owner_on(
                 dir,
                 node_id,
@@ -5618,12 +6381,13 @@ mod tests {
 
     impl Driven<Gated> {
         /// Member `owner`'s power cut while its log's flushes are held, and the member restarted on
-        /// what survived with its gate open: the held flushes meet the cut device and make nothing
-        /// durable. Returns the restarted member's client.
+        /// what survived, of class `durability`, with its gate open: the held flushes meet the cut
+        /// device and make nothing durable. Returns the restarted member's client.
         fn gated_cut(
             &mut self,
             dir: &Path,
             owner: usize,
+            durability: Durability,
             power: &mut Power,
             gate: &Arc<Gate>,
         ) -> Client {
@@ -5633,14 +6397,71 @@ mod tests {
             power.restore(survived);
             let node_id = u64::try_from(owner + 1).unwrap();
             let reading = Arc::clone(self.clocks.get(owner).unwrap());
-            let log = Gated {
-                log: power.log.handle().unwrap(),
-                gate: Arc::clone(gate),
-            };
+            let log = self.gated_log(owner, power, gate);
             let (client, restarted) =
-                self.owner_on(dir, node_id, vec![1, 2, 3], fated(), power, log, reading);
+                self.owner_on(dir, node_id, vec![1, 2, 3], durability, power, log, reading);
             *self.owners.get_mut(owner).unwrap() = Some(restarted);
             client
+        }
+        /// Rounds, time standing still, until `answer` comes (`Some`), or until the group can move
+        /// no further while the members whose gates are held wait to flush (`None`). A round is
+        /// still when it relays nothing and nothing is in transit.
+        /// After a still round with work out that ends or comes to its gate on its own
+        /// ([`Driven::moving`]: a write on an open gate's member, or a held one's not yet at its
+        /// gate), the driver waits for that to happen: an owner's bell rung or a flush come to a
+        /// held gate (`Gate::pass`), never a timer. With no such work out, two still rounds running
+        /// are the stall: the first round's relay takes what the step before it sent, and only the
+        /// second's shows that step sent nothing.
+        fn answer_or_stall(
+            &mut self,
+            pump: &mut Pump<'_>,
+            answer: &mpsc::Receiver<Result<Answered, Refusal>>,
+        ) -> Option<Result<Vec<u8>, Refusal>> {
+            let mut still = 0;
+            for _ in 0..ROUNDS {
+                match answer.try_recv() {
+                    Ok(result) => return Some(result.map(called)),
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(error) => panic!("owner ended: {error}"),
+                }
+                let admitted = pump.drive_until(self.until());
+                let quiet = admitted == 0 && pump.records == 0;
+                still = if quiet && !self.moving() {
+                    still + 1
+                } else {
+                    0
+                };
+                if still > 1 {
+                    return None;
+                }
+                self.wait_if_moving(admitted, pump);
+                self.step();
+            }
+            // What tells records going round unanswered from a group that stands still: the
+            // records admitted to each member, and where each stands.
+            let members: Vec<_> = self
+                .owners
+                .iter()
+                .flatten()
+                .map(|(owner, _)| {
+                    let id = owner.replica.id();
+                    let gate = self
+                        .gates
+                        .get(&usize::try_from(id - 1).unwrap())
+                        .map(|gate| (gate.is_held(), gate.waiting()));
+                    (
+                        id,
+                        owner.replica.term(),
+                        owner.replica.is_leader(),
+                        owner.replica.in_flight(),
+                        gate,
+                    )
+                })
+                .collect();
+            panic!(
+                "a driven operation neither answered nor stalled in {ROUNDS} rounds: records admitted by member {:?}; (member, term, leads, writes out, gate held and waited at) {members:?}",
+                pump.delivered
+            );
         }
     }
 
@@ -5790,6 +6611,7 @@ mod tests {
         let restarted = driven.gated_cut(
             dir.path(),
             follower,
+            fated(),
             powers.get_mut(follower).unwrap(),
             gates.get(follower).unwrap(),
         );
@@ -5832,6 +6654,7 @@ mod tests {
         let refused = owner.release(Output {
             answers: vec![crate::replication::Applied {
                 index,
+                time: None,
                 context,
                 result: Err(api::invalid("test", "the apply refuses")),
             }],
@@ -6000,12 +6823,22 @@ mod tests {
         cuts: usize,
         /// Cuts of a leader whose database held an acknowledged write unflushed.
         unflushed_leader: usize,
+        /// Writes acknowledged while a majority's raft logs held their flushes back, so no
+        /// majority held the write durable: the replicated class's way, never the persisted
+        /// class's (replication.md, "Fast acknowledgement").
+        acknowledged_held: usize,
+        /// Cuts of a leader whose raft log held a write it acknowledged unflushed.
+        unflushed_log_leader: usize,
     }
 
-    /// One seed: three voters of `durability`, their flushes held and let go at random; rounds of
-    /// writes at the leader, each round ending in one member's power cut and restart, and a leader
-    /// elected among the members that ran on when the cut one led. Every acknowledged write must
-    /// be read back at the end.
+    /// One seed: three voters of `durability`, each its raft log behind a gate and its database's
+    /// flushes held and let go at random; rounds of writes at the leader, before each write every
+    /// member's raft-log flushes held or let go on a draw of its own, each round ending in one
+    /// member's power cut and restart, and a leader elected among the members that ran on when the
+    /// cut one led. The classes part at the raft log (replication.md, "Fast acknowledgement"): the
+    /// replicated class may answer a write no majority's log holds durable, the persisted class
+    /// never does, so a write the persisted group can't commit while held is answered once the
+    /// flushes go. Every acknowledged write must be read back at the end.
     fn power_seed(seed: u64, durability: &Durability) -> Cuts {
         const ROUNDS_PER_SEED: u64 = 3;
         let dir = tempfile::tempdir().unwrap();
@@ -6013,18 +6846,21 @@ mod tests {
         // schedule of writes, flushes and cuts, so 10,000 seeds ran 5,000. SplitMix64 spreads them.
         let mut rng = Rng(mix(&mut { seed }) | 1);
         let durability = durability.clone();
+        let persisted = matches!(durability, Durability::Persisted);
         let voters = vec![1, 2, 3];
         let mut power: Vec<Power> = (0..3u64).map(|n| Power::new(seed * 4 + n)).collect();
-        let mut driven = Driven::powered();
+        let gates: Vec<Arc<Gate>> = (0..3).map(|_| Arc::new(Gate::default())).collect();
+        let mut driven = Driven::<Gated>::empty();
         let mut clients: Vec<Client> = (1..=3u64)
             .map(|n| {
                 let at = usize::try_from(n - 1).unwrap();
-                driven.open_power(
+                driven.open_gated(
                     dir.path(),
                     n,
                     voters.clone(),
                     durability.clone(),
                     power.get(at).unwrap(),
+                    gates.get(at).unwrap(),
                 )
             })
             .collect();
@@ -6034,6 +6870,14 @@ mod tests {
         let mut done = Cuts::default();
         let mut acknowledged = Vec::new();
         let mut value = 0u64;
+        // Members whose raft log holds, unflushed, a write acknowledged while its gate was held.
+        let mut unflushed_log = [false; 3];
+        let release = |gates: &[Arc<Gate>], unflushed_log: &mut [bool; 3]| {
+            for gate in gates {
+                gate.release();
+            }
+            *unflushed_log = [false; 3];
+        };
         let mut pump = Pump::new(&clients);
         let mut leader = driven.elect(&mut pump, &clients, 0, 1);
         driven
@@ -6046,10 +6890,43 @@ mod tests {
             for _ in 0..=rng.below(4) {
                 value += 1;
                 let v = value;
-                match driven.call(&mut pump, clients.get(leader).unwrap(), move |db| {
+                for (gate, unflushed) in gates.iter().zip(unflushed_log.iter_mut()) {
+                    if rng.below(2) == 0 {
+                        gate.hold();
+                    } else {
+                        gate.release();
+                        *unflushed = false;
+                    }
+                }
+                let held: Vec<usize> = (0..3)
+                    .filter(|at| gates.get(*at).unwrap().is_held())
+                    .collect();
+                let write = submit(clients.get(leader).unwrap(), driven.until(), move |db| {
                     db.exec(&format!("INSERT INTO kept VALUES ({v})"))?;
                     Ok(Vec::new())
-                }) {
+                });
+                let result = match driven.answer_or_stall(&mut pump, &write) {
+                    Some(result) => {
+                        if result.is_ok() {
+                            for at in &held {
+                                *unflushed_log.get_mut(*at).unwrap() = true;
+                            }
+                            if held.len() * 2 > voters.len() {
+                                assert!(
+                                    !persisted,
+                                    "seed {seed}: the persisted class acknowledged write {v} while the raft logs of members {held:?} held their flushes back"
+                                );
+                                done.acknowledged_held += 1;
+                            }
+                        }
+                        result
+                    }
+                    None => {
+                        release(&gates, &mut unflushed_log);
+                        driven.settle(&mut pump, &write)
+                    }
+                };
+                match result {
                     Ok(_) => acknowledged.push(v),
                     Err(Refusal::UnknownOutcome | Refusal::Timeout) => {}
                     Err(error) => panic!("seed {seed}: write {v}: {error:?}"),
@@ -6062,21 +6939,26 @@ mod tests {
             if victim == leader && driven.owner(leader).replica.machine().unflushed().is_some() {
                 done.unflushed_leader += 1;
             }
+            if victim == leader && *unflushed_log.get(leader).unwrap() {
+                done.unflushed_log_leader += 1;
+            }
             driven.drain(&mut pump);
             pump.finish();
-            let restarted = driven.power_cut(
+            let restarted = driven.gated_cut(
                 dir.path(),
                 victim,
-                voters.clone(),
                 durability.clone(),
                 power.get_mut(victim).unwrap(),
+                gates.get(victim).unwrap(),
             );
+            // The members that ran on flush what they held: an election stores its votes.
+            release(&gates, &mut unflushed_log);
             *clients.get_mut(victim).unwrap() = restarted;
             driven.hold_flushes(victim);
             done.cuts += 1;
             pump = Pump::new(&clients);
             if victim == leader {
-                leader = driven.elect(&mut pump, &clients, (victim + 1) % 3, 1);
+                leader = driven.elect_after_cut(&mut pump, &clients, 1);
             } else {
                 // The leader ran on. A member restarted with all it had applied durable (the
                 // persisted class's) is sent no entry, so only a heartbeat tells it who leads:
@@ -6163,6 +7045,8 @@ mod tests {
                                 total.acknowledged += done.acknowledged;
                                 total.cuts += done.cuts;
                                 total.unflushed_leader += done.unflushed_leader;
+                                total.acknowledged_held += done.acknowledged_held;
+                                total.unflushed_log_leader += done.unflushed_log_leader;
                             }
                             Err(panic) => {
                                 let account = panic
@@ -6188,11 +7072,13 @@ mod tests {
                 })
                 .collect();
             let line = format!(
-                "{{\"class\":{},\"from\":{from},\"count\":{n},\"acknowledged\":{},\"cuts\":{},\"unflushed_leader\":{},\"failed\":[{}]}}\n",
+                "{{\"class\":{},\"from\":{from},\"count\":{n},\"acknowledged\":{},\"cuts\":{},\"unflushed_leader\":{},\"acknowledged_held\":{},\"unflushed_log_leader\":{},\"failed\":[{}]}}\n",
                 json_string(class),
                 total.acknowledged,
                 total.cuts,
                 total.unflushed_leader,
+                total.acknowledged_held,
+                total.unflushed_log_leader,
                 failures.join(",")
             );
             std::fs::write(path, line).unwrap();
@@ -6203,11 +7089,13 @@ mod tests {
             failed.len()
         );
         println!(
-            "power-cut nemesis: seeds {from}..{}, {} writes acknowledged, {} cuts, {} of them of a leader holding a write unflushed, none lost",
+            "power-cut nemesis: seeds {from}..{}, {} writes acknowledged, {} of them while a majority's raft logs held them unflushed, {} cuts, {} of them of a leader holding a write unflushed in its database and {} in its raft log, none lost",
             from + n,
             total.acknowledged,
+            total.acknowledged_held,
             total.cuts,
-            total.unflushed_leader
+            total.unflushed_leader,
+            total.unflushed_log_leader
         );
         // Non-vacuity: writes were acknowledged, members were cut, and some cut hit a leader that
         // held an acknowledged write unflushed.
@@ -6219,6 +7107,15 @@ mod tests {
             total.unflushed_leader > 0,
             "no cut hit a leader holding a write unflushed"
         );
+        // The classes part (replication.md, "Fast acknowledgement"): the replicated class answered
+        // some write no majority's log held durable; the persisted class none (each seed asserts
+        // that at the write).
+        if matches!(durability, Durability::Replicated(_)) {
+            assert!(
+                total.acknowledged_held > 0,
+                "the replicated class acknowledged no write while a majority's raft logs held it unflushed"
+            );
+        }
     }
 
     /// The nemesis's power cut is a machine's (AC-T1.8.5): nothing a powered-off machine does
@@ -6279,6 +7176,86 @@ mod tests {
         power_seeds(12, 0, 4, &Durability::Persisted, None);
     }
 
+    /// A write at the leader of three voters of `durability`, each its raft log behind a gate, once
+    /// each follower states a durable promise, with both followers' log flushes held: whether it
+    /// was answered while they were held, and its answer (once the flushes went, if not before).
+    fn held_write(durability: Durability) -> (bool, Result<Vec<u8>, Refusal>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::<Gated>::empty();
+        let powers: Vec<Power> = (1..=3).map(Power::new).collect();
+        let gates: Vec<Arc<Gate>> = (0..3).map(|_| Arc::new(Gate::default())).collect();
+        let clients: Vec<Client> = (0..3)
+            .map(|i| {
+                driven.open_gated(
+                    dir.path(),
+                    u64::try_from(i + 1).unwrap(),
+                    vec![1, 2, 3],
+                    durability.clone(),
+                    powers.get(i).unwrap(),
+                    gates.get(i).unwrap(),
+                )
+            })
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        // Writes before the test's, so that each follower states a durable promise and answers
+        // held at once (hyper-raft R-8).
+        for n in 0..4 {
+            let answer = driven.call(&mut pump, clients.get(leader).unwrap(), move |db| {
+                db.exec(&format!("CREATE TABLE warm{n}(value)"))?;
+                Ok(Vec::new())
+            });
+            assert_eq!(answer, Ok(Vec::new()));
+        }
+        let applied = clients
+            .get(leader)
+            .unwrap()
+            .handle()
+            .status()
+            .unwrap()
+            .applied;
+        driven.follow(&mut pump, &clients, applied);
+        for (at, gate) in gates.iter().enumerate() {
+            if at != leader {
+                gate.hold();
+            }
+        }
+        let write = submit(clients.get(leader).unwrap(), driven.until(), |db| {
+            db.exec("INSERT INTO warm0 VALUES (1)")?;
+            Ok(vec![1])
+        });
+        let held = driven.answer_or_stall(&mut pump, &write);
+        for gate in &gates {
+            gate.release();
+        }
+        let outcome = match held {
+            Some(result) => (true, result),
+            None => (false, driven.settle(&mut pump, &write)),
+        };
+        driven.drain(&mut pump);
+        pump.finish();
+        outcome
+    }
+
+    /// CP-T1.8 (AC-T1.8.5, AC-T1.8.D2): the two classes acknowledge apart under a held flush
+    /// (replication.md, "Fast acknowledgement"). Do: for each class, three voters on raft logs
+    /// behind gates; both followers' log flushes held; a write at the leader. Expect: the
+    /// replicated class answers it while no majority's log holds it durable; the persisted class
+    /// doesn't, its group stalled until the flushes go, and then answers it.
+    #[test]
+    fn the_classes_acknowledge_apart_under_a_held_flush() {
+        assert_eq!(
+            held_write(three_fates()),
+            (true, Ok(vec![1])),
+            "the replicated class waited on its followers' flushes"
+        );
+        assert_eq!(
+            held_write(Durability::Persisted),
+            (false, Ok(vec![1])),
+            "the persisted class answered a write no majority's log held durable"
+        );
+    }
+
     /// One share of the 10,000-seed nemesis in `class`, as the environment names it, sharded across
     /// machines by bench/power_nemesis.sh: `AMPHORA_POWER_SEEDS=from:count` (default 0:10000),
     /// `AMPHORA_POWER_WORKERS` threads (default the machine's cores) and `AMPHORA_POWER_RECORD`, the
@@ -6322,7 +7299,7 @@ mod tests {
         until: Instant,
         namespace: &str,
         operation: Operation,
-    ) -> mpsc::Receiver<Result<Answer, Refusal>> {
+    ) -> mpsc::Receiver<Result<Answered, Refusal>> {
         let (response, receiver) = mpsc::sync_channel(1);
         client
             .handle
@@ -6344,7 +7321,7 @@ mod tests {
         client: &Client,
         until: Instant,
         f: impl FnOnce(&mut Db) -> anyhow::Result<Vec<u8>> + Send + 'static,
-    ) -> mpsc::Receiver<Result<Answer, Refusal>> {
+    ) -> mpsc::Receiver<Result<Answered, Refusal>> {
         let operation = Operation::Call(Mutex::new(Some(Box::new(move |db| {
             Ok(Box::new(f(db)?) as Box<dyn Any + Send>)
         }))));
@@ -6375,8 +7352,8 @@ mod tests {
         driven.step();
         receiver.try_recv().unwrap()
     }
-    fn called(answer: Answer) -> Vec<u8> {
-        match answer {
+    fn called(answered: Answered) -> Vec<u8> {
+        match answered.answer {
             Answer::Called(value) => *value.downcast::<Vec<u8>>().unwrap(),
             _ => panic!("wrong actor reply"),
         }
@@ -7093,6 +8070,7 @@ mod tests {
             Ok(_) => panic!("the member opened stating another class than its group's"),
         }
         let (client, actor, receiver) = reopen(&driven, group).unwrap();
+        let actor = driven.tapped(actor);
         *driven.owners.get_mut(2).unwrap() = Some((actor, receiver));
         let clients = vec![
             clients.first().unwrap().clone(),
@@ -7266,6 +8244,7 @@ mod tests {
             clock,
         )
         .unwrap();
+        let actor = driven.tapped(actor);
         *driven.owners.get_mut(follower).unwrap() = Some((actor, receiver));
         let mut clients = clients;
         *clients.get_mut(follower).unwrap() = client;
@@ -9991,6 +10970,162 @@ mod tests {
         ringer.join().unwrap();
     }
 
+    /// Lanes ryw-4, ryw-5 and scaleout-harness-9 (kiln goal 8119f25d, G13; replication.md, "The
+    /// bench's relay wakes on records"): a member wakes the listener its host set when records
+    /// join its outgoing queue and when its owner goes, so a host relaying many members from one
+    /// thread needs no timer. Do: three voters, a counting listener set on each member's handle;
+    /// elect a leader; set a second listener on the leader; write through it; then drop every
+    /// owner. Expect: every member's listener woken by the election's records (votes and their
+    /// answers, appends and theirs); the write's records wake the second listener and not the
+    /// first, which it replaced; and each listener in place woken again as its owner goes.
+    #[test]
+    fn a_members_listener_wakes_for_its_records_and_its_owners_end() {
+        struct Count(AtomicUsize);
+        impl std::task::Wake for Count {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let counted = |count: &Arc<Count>| count.0.load(Ordering::Relaxed);
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut counts: Vec<Arc<Count>> = clients
+            .iter()
+            .map(|client| {
+                let count = Arc::new(Count(AtomicUsize::new(0)));
+                client
+                    .handle()
+                    .listen(std::task::Waker::from(Arc::clone(&count)))
+                    .unwrap();
+                count
+            })
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        for (member, count) in counts.iter().enumerate() {
+            assert!(counted(count) > 0, "member {member}'s records woke no one");
+        }
+        let again = Arc::new(Count(AtomicUsize::new(0)));
+        clients[leader]
+            .handle()
+            .listen(std::task::Waker::from(Arc::clone(&again)))
+            .unwrap();
+        let replaced = std::mem::replace(&mut counts[leader], again);
+        let before = counted(&replaced);
+        write(&mut driven, &mut pump, &clients[leader], 1);
+        assert!(
+            counted(&counts[leader]) > 0,
+            "the write's records woke no one"
+        );
+        assert_eq!(counted(&replaced), before, "a replaced listener was woken");
+        driven.drain(&mut pump);
+        pump.finish();
+        let woken: Vec<usize> = counts.iter().map(counted).collect();
+        drop(driven);
+        for (member, (count, before)) in counts.iter().zip(woken).enumerate() {
+            assert!(
+                counted(count) > before,
+                "member {member}'s owner went and woke no one"
+            );
+        }
+    }
+
+    /// Lanes ryw-5 and ryw-6 (kiln goal 8119f25d; CP-T1.13; replication.md, "A host waits for a
+    /// leader on the owner's word"): a host waits for a leader on the one wake its member's owner
+    /// tells, not on a retry timer, and each reason the owner tells it wakes it. Do: three voters;
+    /// with no leader, wait for one with no time left; a waiter on member 2 for any leader; elect
+    /// one (a new leader); wait past its term with no time left; a waiter past that term; hand the
+    /// lead to another member (a new term); a waiter past that one, then member 2's owner dropped
+    /// mid-run (its drop). Then a lone voter elected, a waiter past its term, its disk made full
+    /// and a write submitted, its owner run on a thread of its own (its fence, which ends it).
+    /// And the step's rule on its own: a status that differs only in its fence, or only in what it
+    /// applied, against the one published. Expect: Timeout with no leader; the first waiter
+    /// answered with the elected leader and its term; Timeout with none past it; the second
+    /// answered with the new leader in a later term; the third refused Fenced as the owner is
+    /// dropped; the lone voter's waiter refused Fenced with the flush that fenced its owner, which
+    /// ends; a fence come or gone wakes waiters, an applied point alone doesn't, and an ended
+    /// status before it does. Each waiter's guard is `HANG_READ`: a hang, never a verdict.
+    #[test]
+    fn a_host_waits_for_a_leader_on_the_owners_word() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let waiter = |client: &Client, past: u64| {
+            let handle = client.handle();
+            std::thread::spawn(move || handle.wait_leader(past, Instant::now() + HANG_READ))
+        };
+        assert_eq!(
+            clients[1].handle().wait_leader(0, Instant::now()),
+            Err(Refusal::Timeout)
+        );
+        // A new leader.
+        let first = waiter(&clients[1], 0);
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        let led = first.join().unwrap().unwrap();
+        assert_eq!(led.leader, u64::try_from(leader + 1).unwrap());
+        assert!(led.term > 0);
+        assert_eq!(
+            clients[1].handle().wait_leader(led.term, Instant::now()),
+            Err(Refusal::Timeout)
+        );
+        // A new term.
+        let second = waiter(&clients[1], led.term);
+        let to = (leader + 1) % clients.len();
+        driven.transfer(&mut pump, &clients, leader, to);
+        let moved = second.join().unwrap().unwrap();
+        assert_eq!(moved.leader, u64::try_from(to + 1).unwrap());
+        assert!(moved.term > led.term);
+        driven.drain(&mut pump);
+        pump.finish();
+        // The owner dropped mid-run.
+        let third = waiter(&clients[1], moved.term);
+        drop(driven.owners.get_mut(1).unwrap().take());
+        let dropped = third.join().unwrap();
+        assert!(matches!(dropped, Err(Refusal::Fenced(_))), "{dropped:?}");
+
+        // A fence, which ends the owner: its loop's end tells the waiter its reason.
+        let lone_dir = tempfile::tempdir().unwrap();
+        let mut lone = Driven::new();
+        let voter = vec![lone.open(lone_dir.path(), 1, vec![1], None)];
+        let mut lone_pump = Pump::new(&voter);
+        lone.elect(&mut lone_pump, &voter, 0, 1);
+        lone.drain(&mut lone_pump);
+        lone_pump.finish();
+        let term = voter[0].handle().status().unwrap().term;
+        let fourth = waiter(&voter[0], term);
+        let gate = lone.owner(0).replica.machine().flush_gate();
+        gate.fill();
+        let written = submit(&voter[0], Instant::now() + HANG_READ, |db| {
+            db.exec("CREATE TABLE IF NOT EXISTS member_items(value)")?;
+            Ok(Vec::new())
+        });
+        let (mut owner, inputs) = lone.owners.get_mut(0).unwrap().take().unwrap();
+        let running = std::thread::spawn(move || owner.run(inputs));
+        let fenced_end = fourth.join().unwrap();
+        assert!(
+            matches!(&fenced_end, Err(Refusal::Fenced(why)) if why.contains("failed a flush")),
+            "{fenced_end:?}"
+        );
+        running.join().unwrap();
+        drop(written);
+
+        // The step's rule: a fence come or gone tells the waiters; an applied point alone doesn't.
+        let mut fenced_now = moved.clone();
+        fenced_now.fenced = Some("a test's fence".into());
+        assert!(leads_otherwise(&Ok(moved.clone()), &fenced_now));
+        assert!(leads_otherwise(&Ok(fenced_now), &moved));
+        let mut applied = moved.clone();
+        applied.applied += 1;
+        assert!(!leads_otherwise(&Ok(moved.clone()), &applied));
+        assert!(leads_otherwise(&Err(fenced("ended")), &moved));
+    }
+
     /// CP-T1.8, AC-WK.1.2: an owner with nothing to do waits until its next deadline: its next
     /// tick, or sooner the deadline of a submit it holds. Do: a lone member of three (no leader),
     /// stepped with its clock standing still; then a submit due a nanosecond past its clock, which
@@ -10645,10 +11780,12 @@ mod tests {
                 api::REQUEST_MAX,
             )
             .unwrap();
-        driven.answer(pump, &receiver).map(|answer| match answer {
-            Answer::Called(value) => *value.downcast::<R>().unwrap(),
-            _ => panic!("wrong actor reply"),
-        })
+        driven
+            .answer(pump, &receiver)
+            .map(|answered| match answered.answer {
+                Answer::Called(value) => *value.downcast::<R>().unwrap(),
+                _ => panic!("wrong actor reply"),
+            })
     }
     /// A raise of kiln.host-store's floor to `version` at `client`, by a handle bound to it.
     fn raise(
@@ -10883,7 +12020,10 @@ mod tests {
         let _ = driven.answer(&mut pump, &added);
         settled(&mut driven, &mut pump, 3, &[5]);
         match &first {
-            Ok(Answer::Called(value)) => {
+            Ok(Answered {
+                answer: Answer::Called(value),
+                ..
+            }) => {
                 let (version, learners) = value.downcast_ref::<(u32, Vec<u64>)>().unwrap();
                 assert_eq!(*version, 7);
                 assert!(!learners.contains(&5), "raised while 5 was a member");
@@ -11159,7 +12299,7 @@ mod tests {
 
     /// Enqueues a raise of kiln.host-store's floor to 7 at `client`, by a handle bound to it,
     /// without waiting.
-    fn raise_at(client: &Client, until: Instant) -> mpsc::Receiver<Result<Answer, Refusal>> {
+    fn raise_at(client: &Client, until: Instant) -> mpsc::Receiver<Result<Answered, Refusal>> {
         let operation = Operation::Call(Mutex::new(Some(Box::new(|db: &mut Db| {
             let floor = crate::database::application::raise(db, kiln(7), true)?
                 .map_err(|refused| anyhow::Error::from(refused.refusal))?;
@@ -11761,6 +12901,37 @@ mod tests {
             })
         });
     }
+    /// Rounds until each of the first `owners` owners has applied all that the leader has
+    /// committed: what a comparison of their rows waits on, since a calm configuration and a round
+    /// with nothing to relay say nothing of a follower whose records were lost or whose disk still
+    /// writes. Time stands still while anything is relayed or written; once nothing is and an owner
+    /// still lags, only the leader's heartbeat finds the lag and sends again, so every clock moves
+    /// a tick, as real time would. Returns the leader the group then follows.
+    fn caught_up(
+        driven: &mut Driven,
+        pump: &mut Pump<'_>,
+        clients: &[Client],
+        owners: usize,
+    ) -> usize {
+        for _ in 0..ROUNDS {
+            let leader = settle_lead(driven, pump, clients);
+            let committed = driven.owner(leader).replica.core().raft.log().committed();
+            if (0..owners).all(|owner| driven.owner(owner).replica.applied().index >= committed) {
+                return leader;
+            }
+            if pump.drive_until(driven.until()) == 0 {
+                if (0..4).any(|owner| driven.owner(owner).replica.in_flight() > 0) {
+                    std::thread::park_timeout(POLL);
+                } else {
+                    for owner in 0..4 {
+                        driven.advance_tick(owner);
+                    }
+                }
+            }
+            driven.step();
+        }
+        panic!("the first {owners} owners did not apply the leader's commit in {ROUNDS} rounds");
+    }
     /// The member the group follows, as owner `asked` sees it, by its index; None while it knows
     /// none.
     fn leading(clients: &[Client], asked: usize) -> Option<usize> {
@@ -12142,7 +13313,8 @@ mod tests {
                     6 => {
                         let to = (leader + 1 + usize::try_from(rng.below(2)).unwrap()) % 3;
                         if leader < 3 && to != leader {
-                            leader = driven.hand_off(&mut pump, &clients[..3], leader, to);
+                            // The next step settles the lead again (`settle_lead`).
+                            driven.hand_off(&mut pump, &clients[..3], leader, to);
                             reached.lead_handed_off += 1;
                         }
                     }
@@ -12170,7 +13342,7 @@ mod tests {
                             }
                             // Time passes, as it does after a crash: the others' leases on the old
                             // lead run out, and the group elects among its voters, four or three.
-                            leader = settle_lead(&mut driven, &mut pump, &clients);
+                            settle_lead(&mut driven, &mut pump, &clients);
                             crashed = true;
                             reached.leader_crashed += 1;
                         } else {
@@ -12181,9 +13353,23 @@ mod tests {
                             }
                             pump.lost.clear();
                             // Time passes, as it does after an outage: a session whose records
-                            // were lost ends at its deadline, and its owner tries again.
+                            // were lost ends at its deadline, and its owner tries again; and the
+                            // follower gets what was lost on its way to it, which only the
+                            // leader's next heartbeat (time) sends again. Until both, the outage
+                            // is work still out: a later call at that follower would wait on a
+                            // heartbeat its driver, time standing still, never brings.
+                            let mut ended = false;
                             for _ in 0..ROUNDS {
-                                if (0..4).all(|owner| driven.owner(owner).pending.is_none()) {
+                                let committed = (0..3)
+                                    .map(|owner| {
+                                        driven.owner(owner).replica.core().raft.log().committed()
+                                    })
+                                    .max()
+                                    .unwrap_or(0);
+                                if (0..4).all(|owner| driven.owner(owner).pending.is_none())
+                                    && driven.owner(follower).replica.applied().index >= committed
+                                {
+                                    ended = true;
                                     break;
                                 }
                                 for owner in 0..4 {
@@ -12191,6 +13377,10 @@ mod tests {
                                 }
                                 driven.round(&mut pump);
                             }
+                            assert!(
+                                ended,
+                                "seed {seed} step {step}: the outage of owner {follower} didn't end in {ROUNDS} driven rounds"
+                            );
                             reached.records_lost += 1;
                         }
                     }
@@ -12207,9 +13397,11 @@ mod tests {
             }
 
             // Calm: join rows equal, every write recorded at or above the floor at its base, and
-            // members' digests equal at every applied index they share.
+            // members' digests equal at every applied index they share, once each voter has
+            // applied all the leader committed.
             quiet(&mut driven, &mut pump);
             calm(&mut driven, &mut pump, 3);
+            leader = caught_up(&mut driven, &mut pump, &clients, 3);
             let rows = floor_rows(&mut driven, 0);
             for owner in 1..3 {
                 assert_eq!(
@@ -14717,7 +15909,7 @@ mod tests {
         // Stale bases the leader moved by their read sets.
         moved: u64,
     }
-    type Answering = mpsc::Receiver<Result<Answer, Refusal>>;
+    type Answering = mpsc::Receiver<Result<Answered, Refusal>>;
     fn list(db: &mut Db, key: u64) -> anyhow::Result<Vec<String>> {
         let mut out = Vec::new();
         db.query_owned(&format!("SELECT v FROM lists WHERE k = {key}"), [], |row| {

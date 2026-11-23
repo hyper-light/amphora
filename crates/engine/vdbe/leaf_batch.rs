@@ -20,12 +20,17 @@
 //! a platform whose cache size can't be read (`BatchRefusal::CacheSizeUnknown`) scans
 //! row-at-a-time.
 //!
+//! On the versioned storage (G7 step 2) the same batches are decoded from the copy of the leaf
+//! the cursor stands on (`VersionedCursor::table_leaf_under_cursor`), under the same switch: off,
+//! its scans read row-at-a-time, the control the batched scans are checked against.
+//!
 //! COUNT(*) over a whole table is answered from the leaves' cell counts without decoding a row,
 //! by the `Count` instruction (`translate/select.rs`, `BTreeCursor::count`), switch on or off.
 
 use crate::alloc::TryClone;
 use crate::error::LimboError;
 use crate::storage::btree::{BTreeCursor, TableLeafUnderCursor};
+use crate::storage::versioned::cursor::{LeafUnderCursor, VersionedCursor};
 use crate::vdbe::builder::{CursorKey, CursorType};
 use crate::vdbe::insn::Insn;
 use crate::vdbe::row_header::RowHeader;
@@ -168,11 +173,99 @@ enum Slot {
     Unbatched,
 }
 
+/// A scanned table's cursor: the pager's, or the versioned storage's.
+#[derive(Clone, Copy)]
+pub(crate) enum ScanCursor<'a> {
+    Pager(&'a BTreeCursor),
+    Versioned(&'a VersionedCursor),
+}
+
+impl<'a> ScanCursor<'a> {
+    fn leaf(self) -> Option<Leaf<'a>> {
+        match self {
+            Self::Pager(cursor) => cursor.table_leaf_under_cursor().map(Leaf::Pager),
+            Self::Versioned(cursor) => cursor.table_leaf_under_cursor().map(Leaf::Versioned),
+        }
+    }
+
+    fn statement_memory_budget(self) -> usize {
+        match self {
+            Self::Pager(cursor) => cursor.pager.statement_memory_budget(),
+            Self::Versioned(cursor) => cursor.pager().statement_memory_budget(),
+        }
+    }
+}
+
+/// Which leaf a batch was decoded from: a page as its cursor's peers last changed it, or one
+/// copy of a versioned leaf.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum LeafId {
+    #[default]
+    None,
+    Page {
+        id: usize,
+        peers_epoch: u64,
+    },
+    Copy(u64),
+}
+
+/// The leaf under a scanned table's cursor.
+pub(crate) enum Leaf<'a> {
+    Pager(TableLeafUnderCursor<'a>),
+    Versioned(LeafUnderCursor<'a>),
+}
+
+impl Leaf<'_> {
+    fn id(&self) -> LeafId {
+        match self {
+            Self::Pager(leaf) => LeafId::Page {
+                id: leaf.contents.id(),
+                peers_epoch: leaf.peers_epoch,
+            },
+            Self::Versioned(leaf) => LeafId::Copy(leaf.copy),
+        }
+    }
+
+    fn cell(&self) -> usize {
+        match self {
+            Self::Pager(leaf) => leaf.cell,
+            Self::Versioned(leaf) => leaf.cell,
+        }
+    }
+
+    fn cell_count(&self) -> usize {
+        match self {
+            Self::Pager(leaf) => leaf.contents.cell_count(),
+            Self::Versioned(leaf) => leaf.cell_count(),
+        }
+    }
+
+    /// Cell `cell`'s rowid, where the leaf holds it apart from the record (the pager's table
+    /// leaves); None on a versioned leaf copy, whose window isn't bounded by a skipping run (lane
+    /// skip-7, T-SKU.9: skipping scans read the pager's tables).
+    fn rowid(&self, cell: usize) -> Result<Option<i64>> {
+        match self {
+            Self::Pager(leaf) => leaf.contents.cell_table_leaf_read_rowid(cell).map(Some),
+            Self::Versioned(_) => Ok(None),
+        }
+    }
+
+    /// Cell `cell`'s record, or None when it spills to overflow pages (read row-at-a-time).
+    fn payload(&self, cell: usize) -> Option<&[u8]> {
+        match self {
+            Self::Pager(leaf) => leaf
+                .contents
+                .decode_leaf_cell_without_overflow(cell, leaf.limits)
+                .map(|(payload, _)| payload),
+            Self::Versioned(leaf) => leaf.payload(cell),
+        }
+    }
+}
+
 /// The decoded window of one leaf under one cursor.
 #[derive(Debug, Default)]
 struct LeafBatch {
-    page_id: usize,
-    peers_epoch: u64,
+    leaf: LeafId,
     /// The cells `first..first + rows` of the leaf.
     first: usize,
     rows: usize,
@@ -183,13 +276,12 @@ struct LeafBatch {
 }
 
 impl LeafBatch {
-    fn covers(&self, leaf: &TableLeafUnderCursor<'_>) -> bool {
+    fn covers(&self, leaf: &Leaf<'_>) -> bool {
         self.live
-            && self.page_id == leaf.contents.id()
-            && self.peers_epoch == leaf.peers_epoch
-            && leaf.cell >= self.first
+            && self.leaf == leaf.id()
+            && leaf.cell() >= self.first
             && leaf
-                .cell
+                .cell()
                 .checked_sub(self.first)
                 .is_some_and(|row| row < self.rows)
     }
@@ -228,14 +320,16 @@ pub enum Served {
 }
 
 /// Serves column `column` of the row under `cursor` (cursor id `cursor_id`) from its leaf's
-/// batch, decoding a new window when the cursor has moved past the last one.
+/// batch, decoding a new window when the cursor has moved past the last one. `until`: a skipping
+/// scan's candidate run ends at that rowid, and a new window stops there (lane skip-7, T-SKU.9).
 pub(crate) fn serve_column(
     batches: &mut LeafBatches,
     plan: &BatchPlan,
     cursor_id: usize,
-    cursor: &BTreeCursor,
+    cursor: ScanCursor<'_>,
     column: usize,
     dest: &mut Register,
+    until: Option<i64>,
 ) -> Result<Served> {
     let Some(columns) = plan.columns(cursor_id) else {
         return Ok(Served::RowAtATime);
@@ -243,7 +337,7 @@ pub(crate) fn serve_column(
     let Ok(column_slot) = columns.binary_search(&column) else {
         return Ok(Served::RowAtATime);
     };
-    let Some(cell) = window(batches, plan, cursor_id, cursor)? else {
+    let Some(cell) = window(batches, plan, cursor_id, cursor, until)? else {
         return Ok(Served::RowAtATime);
     };
     let batch = batches
@@ -261,17 +355,20 @@ pub(crate) fn serve_column(
 }
 
 /// The cell under `cursor`, its leaf's batch decoded around it (a new window when the cursor
-/// has moved past the last one), or None when the row is read row-at-a-time.
+/// has moved past the last one), or None when the row is read row-at-a-time. A new window going
+/// forward stops after the last row whose rowid is at most `until` (a skipping scan's candidate
+/// run: lane skip-7, T-SKU.9), so rows the scan seeks past are never decoded.
 fn window(
     batches: &mut LeafBatches,
     plan: &BatchPlan,
     cursor_id: usize,
-    cursor: &BTreeCursor,
+    cursor: ScanCursor<'_>,
+    until: Option<i64>,
 ) -> Result<Option<usize>> {
     let Some(columns) = plan.columns(cursor_id) else {
         return Ok(None);
     };
-    let Some(leaf) = cursor.table_leaf_under_cursor() else {
+    let Some(leaf) = cursor.leaf() else {
         return Ok(None);
     };
     if batches.by_cursor.len() <= cursor_id {
@@ -292,30 +389,33 @@ fn window(
         let Ok(budget) = budget_bytes(cursor, plan.batched_cursors) else {
             return Ok(None);
         };
-        let backward = batch.live && batch.page_id == leaf.contents.id() && leaf.cell < batch.first;
-        let rows = decode_window(batch, &leaf, columns, budget, backward)?;
+        let backward = batch.live && batch.leaf == leaf.id() && leaf.cell() < batch.first;
+        let until = until.filter(|_| !backward);
+        let rows = decode_window(batch, &leaf, columns, budget, backward, until)?;
         #[cfg(test)]
         tests::note_decoded(rows);
         if rows == 0 {
             return Ok(None);
         }
     }
-    Ok(Some(leaf.cell))
+    Ok(Some(leaf.cell()))
 }
 
 /// Decodes the window of the leaf that starts at the cursor's cell (ends at it, `backward`),
-/// as many rows as `budget` bytes hold. Returns how many rows it decoded: none when the cursor's
-/// own row alone is over the budget (the stated fallback: row-at-a-time).
+/// as many rows as `budget` bytes hold, and going forward none whose rowid is past `until`.
+/// Returns how many rows it decoded: none when the cursor's own row alone is over the budget
+/// (the stated fallback: row-at-a-time).
 fn decode_window(
     batch: &mut LeafBatch,
-    leaf: &TableLeafUnderCursor<'_>,
+    leaf: &Leaf<'_>,
     columns: &[usize],
     budget: usize,
     backward: bool,
+    until: Option<i64>,
 ) -> Result<usize> {
     batch.live = false;
     batch.values.clear();
-    let cells = leaf.contents.cell_count();
+    let cells = leaf.cell_count();
     let slot_bytes = columns
         .len()
         .checked_mul(std::mem::size_of::<Slot>())
@@ -326,17 +426,20 @@ fn decode_window(
     let mut taken = 0usize;
     loop {
         let next = if backward {
-            leaf.cell.checked_sub(taken)
+            leaf.cell().checked_sub(taken)
         } else {
-            leaf.cell.checked_add(taken)
+            leaf.cell().checked_add(taken)
         };
         let Some(cell) = next.filter(|cell| *cell < cells) else {
             break;
         };
-        let record = leaf
-            .contents
-            .decode_leaf_cell_without_overflow(cell, leaf.limits)
-            .map_or(0, |(payload, _)| payload.len());
+        // Lane skip-7 (T-SKU.9): the candidate run ends here; the scan seeks past what follows.
+        if let Some(until) = until {
+            if leaf.rowid(cell)?.is_some_and(|rowid| rowid > until) {
+                break;
+            }
+        }
+        let record = leaf.payload(cell).map_or(0, <[u8]>::len);
         let charge = record.saturating_add(slot_bytes);
         match charged.checked_add(charge).filter(|total| *total <= budget) {
             Some(total) => charged = total,
@@ -345,10 +448,10 @@ fn decode_window(
         taken = taken.saturating_add(1);
     }
     let (lo, hi) = if backward {
-        let hi = leaf.cell.saturating_add(1);
+        let hi = leaf.cell().saturating_add(1);
         (hi.saturating_sub(taken), hi)
     } else {
-        (leaf.cell, leaf.cell.saturating_add(taken))
+        (leaf.cell(), leaf.cell().saturating_add(taken))
     };
     let rows = hi.saturating_sub(lo);
     if rows == 0 {
@@ -365,10 +468,7 @@ fn decode_window(
     let mut scratch = Register::Value(Value::Null);
     for row in 0..rows {
         let cell = lo.saturating_add(row);
-        let Some((payload, _)) = leaf
-            .contents
-            .decode_leaf_cell_without_overflow(cell, leaf.limits)
-        else {
+        let Some(payload) = leaf.payload(cell) else {
             continue;
         };
         header.forget();
@@ -394,8 +494,7 @@ fn decode_window(
             }
         }
     }
-    batch.page_id = leaf.contents.id();
-    batch.peers_epoch = leaf.peers_epoch;
+    batch.leaf = leaf.id();
     batch.first = lo;
     batch.rows = rows;
     batch.live = true;
@@ -409,7 +508,7 @@ fn alloc_error<E: std::fmt::Display>(error: E) -> LimboError {
 /// The bytes one cursor's batch may hold: the measured second-level cache, or the statement's
 /// memory budget shared among its batched cursors when that is smaller.
 fn budget_bytes(
-    cursor: &BTreeCursor,
+    cursor: ScanCursor<'_>,
     batched_cursors: usize,
 ) -> std::result::Result<usize, BatchRefusal> {
     #[cfg(test)]
@@ -418,7 +517,6 @@ fn budget_bytes(
     }
     let cache = cache::second_level_bytes()?;
     let share = cursor
-        .pager
         .statement_memory_budget()
         .checked_div(batched_cursors)
         .unwrap_or(0);
@@ -513,4 +611,4 @@ mod cache {
 pub(crate) mod fused;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

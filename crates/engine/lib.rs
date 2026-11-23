@@ -63,12 +63,15 @@ mod functions;
 mod incremental;
 mod incremental_blob;
 pub use incremental_blob::Blob;
+mod filter_shares;
 mod info;
 #[cfg(all(feature = "json", not(any(feature = "fuzz", feature = "bench"))))]
 mod json;
 #[cfg(not(any(feature = "fuzz", feature = "bench")))]
 mod numeric;
 mod parameters;
+// Amphora (PL.8, lane pl8-17): the exact join search after the fast plan.
+mod background_search;
 #[cfg(feature = "percentile")]
 mod percentile;
 mod plan_cache;
@@ -82,6 +85,7 @@ mod series;
 mod stack;
 mod statement;
 mod stats;
+mod subquery_rows;
 #[allow(dead_code)]
 #[cfg(feature = "time")]
 mod time;
@@ -130,6 +134,7 @@ pub use amphora_engine_macros::{
     turso_assert_unreachable, turso_debug_assert, turso_soft_unreachable,
 };
 pub use amphora_engine_parser::ast::EqpFormat;
+pub use background_search::BackgroundSearchStats;
 pub use cdc::{
     CaptureDataChangesExt, CaptureDataChangesInfo, CaptureDataChangesMode, CdcVersion,
     CDC_VERSION_CURRENT,
@@ -137,9 +142,13 @@ pub use cdc::{
 #[cfg(feature = "simulator")]
 pub use connection::SubqueryUnnestingMode;
 pub use connection::{
-    resolve_ext_path, Connection, JoinMethods, PrepareOptions, Row, StepResult, SymbolTable,
+    resolve_ext_path, BackgroundSearch, BushyLeftJoinProbes, CarriedJoinOrders, Connection,
+    IsValueEstimate, JoinMethods, JoinSearchBudget, OuterJoinProbe, PrepareOptions, Row,
+    SearchedLinks, StarFilterOrder, StarFilters, StepResult, SymbolTable,
 };
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
+pub use translate::optimizer::learned_costs::WeightRule;
+pub use translate::optimizer::search_budget::JoinSearchStats;
 // Amphora (G6 step 3): learned plan hints, a prototype behind `HintSet::apply`.
 #[cfg(feature = "simulator")]
 pub use database::{clear_database_registry, SharedWalTestingSnapshot};
@@ -191,6 +200,7 @@ pub use storage::{
     wal::{CheckpointMode, CheckpointResult, Wal, WalAutoActions, WalFile, WalFileShared},
 };
 pub use translate::expr::{walk_expr_mut, WalkControl};
+pub use translate::optimizer::join::join_search_ns;
 pub use translate::optimizer::plan_hints::{
     candidate_plans, plan_features, HintChooser, HintGuard, HintModel, HintSet, PlanFeatures,
     Verdict,

@@ -178,6 +178,17 @@ pub struct PrepareOptions {
     pub unqualified_database_search_path: Option<Vec<String>>,
     /// Amphora (PL.12): a run's bound values, for a custom plan; `None` plans the generic one.
     pub(crate) plan_values: Option<Arc<crate::plan_cache::PlanValues>>,
+    /// Amphora (PL.8): the runs the plan is expected to serve, which size its join search under
+    /// `JoinSearchBudget::RunShareByExecutions` (`search_budget`); `None` is one run.
+    pub(crate) expected_runs: Option<u64>,
+    /// Amphora (PL.8, lane pl8-16): the join orders the statement's last plan chose, which the new
+    /// one weighs against its search's best (`join::keep_carried`); `None` for a first plan.
+    pub(crate) carried_join_orders:
+        Option<crate::sync::Arc<crate::translate::optimizer::join::JoinOrders>>,
+    /// Amphora (PL.8, T-PL.8.10, lane pl8-17): plan with the fast search, the exact search only
+    /// where its subsets fit the joins the greedy search tries (`SearchBudget::fast`), the exact
+    /// search to follow (`background_search.rs`).
+    pub(crate) fast_search: bool,
 }
 
 /// Re-entrant state for [`Connection::reparse_schema_nonblock`] and the
@@ -205,6 +216,43 @@ pub struct ReparseSchemaInner {
     phase: ReparsePhase,
 }
 
+/// Amphora (QT.6, lane qs6-15): which table an outer join of two tables probes when it runs on
+/// morsels (`Connection::set_parallel_outer_probe`): the two orientations of one join, both kept
+/// so measurements can decide between them (qs6-14's plan for unifying the outer-join paths, steps
+/// 1 and 2). A LEFT join's kept table is its left one; a FULL join keeps both, and its two
+/// orientations probe its right table or its left one. A LEFT join among more tables and the
+/// chain's joins have one orientation only (the kept tables probe and the padded link pads
+/// during the walk), whichever this says.
+#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
+pub enum OuterJoinProbe {
+    /// Probe the table the join pads with NULLs (a FULL join's right one): the kept table is the
+    /// hash table, each worker marks the rows of it that matched in a bitmap of its own, and the
+    /// rows no worker marked are padded once the bitmaps merge (lane qs6-12). Today's path, the
+    /// default.
+    Padded = 0,
+    /// Probe the kept table (a FULL join's left one): the padded table is the hash table, and a
+    /// kept row no match passed is padded during the walk, as the chain's LEFT link does (lane
+    /// qs6-14). A FULL join's right rows still take the chain's bitmap.
+    Kept = 1,
+}
+
+/// Amphora (QT.6, lane qs6-16): how a join's table that the planner reads by a seek per row of
+/// the tables before it (a rowid lookup, or a seek in one of its indexes) runs on morsels
+/// (`Connection::set_parallel_searched_links`): the candidates, kept so measurements decide.
+#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
+pub enum SearchedLinks {
+    /// Today's, the default: the hook declines such a join unless the planner chose a hash join
+    /// somewhere in it, and the serial loop answers.
+    Off = 0,
+    /// The table is a hash link, read whole once and keyed by its equalities with the tables
+    /// before it: pays against a large probe, loses against a small one.
+    Hash = 1,
+    /// Each worker seeks the table's row by its rowid per joined row, with a cursor of its own,
+    /// as the serial loop does, no table built: an inner join keyed by the table's INTEGER
+    /// PRIMARY KEY only; any other such link is a hash link, as with `Hash`.
+    Seek = 2,
+}
+
 /// Amphora: the join methods newly prepared statements may plan (`Connection::set_join_methods`):
 /// by cost, or one method only, for the tests that run every join both ways and the measurement
 /// of each method's time (`bench/join_methods`; query-speed step 5, QT.5).
@@ -216,6 +264,121 @@ pub enum JoinMethods {
     NestedLoopsOnly = 1,
     /// A hash join wherever the join can take one.
     HashJoinsOnly = 2,
+    /// Amphora (QT.5 step 4, lane qs5-21, T-QT.5.18): a sort-merge join wherever the join can take
+    /// a hash join (`HashJoinMethod::Merge`), for the tests that run every join every way.
+    MergeJoinsOnly = 3,
+    /// As `ByCost`, with a sort-merge join chosen where its cost (`estimate_merge_join_cost`) is
+    /// below the hash join's. Off (`ByCost`) by default until the merge-versus-hash measurement
+    /// says otherwise, so no plan changes.
+    ByCostWithMerge = 4,
+}
+
+impl JoinMethods {
+    /// Whether every join that can take a hash join takes one (as a hash or as a merge).
+    pub fn hash_shaped_only(self) -> bool {
+        matches!(self, Self::HashJoinsOnly | Self::MergeJoinsOnly)
+    }
+}
+
+/// Amphora (PL.8, decision 19): the rule that sizes the join search's budget, the number of
+/// connected subsets the exact search may build before the greedy search orders the join instead.
+/// Behind this switch so the rules can be measured against each other (the coordinator's A/B);
+/// the budget only picks the algorithm, so every rule plans the whole query.
+#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
+pub enum JoinSearchBudget {
+    /// Neumann and Radke's 10,000 subsets (`JOIN_SEARCH_BUDGET`): the control.
+    Fixed = 0,
+    /// Planning may take as long as the query's estimated running time, its bound
+    /// (`search_budget::SearchBudget`), divided by the measured time a candidate takes.
+    RunShare = 1,
+    /// `RunShare` times the runs the plan is expected to serve.
+    RunShareByExecutions = 2,
+}
+
+/// Amphora (PL.8, T-PL.8.9, lane pl8-16): whether a statement planned again weighs the join
+/// orders its last plan chose (`join::keep_carried`). Behind this switch for the A/B: today's
+/// plans made afresh are the control and the default, until the measurements decide.
+#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
+pub enum CarriedJoinOrders {
+    /// Each plan made again searches afresh: the control.
+    Off = 0,
+    /// The last plan's order stands unless the new best is cheaper past the weights' error.
+    WithinMargin = 1,
+}
+
+/// Amphora (PL.8, T-PL.8.14, lane pl8-20): whether a bushy plan's probe may be a LEFT JOIN's right
+/// table, read by an outer hash join that keeps each build row the probe pass didn't match, once for
+/// each outer row (`join::bushy_pair_keeps_left_joins`). Behind this switch for the A/B: today's
+/// bushy plans, with an inner probe only, are the control and the default, until the measurements
+/// decide.
+#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
+pub enum BushyLeftJoinProbes {
+    /// A bushy plan's probe is an inner join's table: the control.
+    Off = 0,
+    /// A LEFT JOIN's table may be the probe too, where the planner's costs choose it.
+    ByCost = 1,
+}
+
+/// Amphora (PL.8, T-PL.8.10, lane pl8-17): where a root statement's exact join search runs when
+/// it is prepared with the fast plan (`background_search.rs`). Behind this switch for the A/B:
+/// today's whole search at prepare is the control and the default, until the measurements decide.
+#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundSearch {
+    /// Each statement's join search runs in full as it is prepared: the control.
+    Off = 0,
+    /// The fast plan first; the exact search on the database's planner worker, woken by each
+    /// request.
+    Worker = 1,
+    /// The fast plan first; the exact search on the connection, when its last statement in
+    /// progress ends.
+    Idle = 2,
+}
+
+/// Amphora (QT.5, T-QT.5.3): whether a star join's dimensions filter the fact table's scan with
+/// their Bloom filters (`translate/optimizer/lip.rs`, `Connection::set_star_filters`): by the
+/// planner's costs, never (the control), or wherever a filter is safe, for the tests that hold its
+/// answers to the control's.
+#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
+pub enum StarFilters {
+    /// Each filter kept when it costs less than the work it saves.
+    ByCost = 0,
+    /// No filter: today's plans.
+    Off = 1,
+    /// Every filter that is safe, whatever it costs.
+    Always = 2,
+}
+
+/// Amphora (QT.5, T-QT.5.11): the order a star join's fact row checks its filters in
+/// (`Connection::set_star_filter_order`, `vdbe/star_order.rs`). Behind this switch so the two can
+/// be measured against each other (the coordinator's A/B, `tests/star_filters.rs`).
+#[derive(Debug, Default, AtomicEnum, Clone, Copy, PartialEq, Eq)]
+pub enum StarFilterOrder {
+    /// The planner's: the filter it estimates passes the fewest rows first. The control.
+    #[default]
+    Planned = 0,
+    /// As the run measures them: the filter that has passed the smallest share of its rows first,
+    /// moved as each row's checks are counted, every row the run has seen weighing alike.
+    Measured = 1,
+    /// As `Measured`, with each filter's counts fading to the rows that tell its share from its
+    /// nearest neighbour's (lane qs5-19, `vdbe/star_order.rs`), so the order follows rows that
+    /// change as the run goes.
+    MeasuredFading = 2,
+}
+
+/// Amphora (QT.5, lane qs5-18): the row estimate of `col IS v` where planning doesn't know whether
+/// `v` is NULL: a parameter of a generic plan, or another table's column. Behind this switch so the
+/// two can be measured against each other (the coordinator's A/B, `tests/is_value_estimate.rs`).
+/// A NULL value (the literal, or a parameter a custom plan binds to NULL) always takes the
+/// `IS NULL` estimate, and a known non-NULL one the `=` estimate.
+#[derive(Debug, Default, AtomicEnum, Clone, Copy, PartialEq, Eq)]
+pub enum IsValueEstimate {
+    /// The `=` estimate, as SQLite's `whereLoopAddBtreeIndex` gives every `IS` but `IS NULL`.
+    #[default]
+    Equality = 0,
+    /// The worst case over the value's possible values: the larger of the `=` and the `IS NULL`
+    /// estimates. The control: before it, every NULL-matching `IS` took the `IS NULL` estimate,
+    /// which this equals wherever that one is the larger.
+    WorstCase = 1,
 }
 
 /// Test-only control over correlated-subquery rewrites.
@@ -427,7 +590,12 @@ impl Drop for ExplicitCheckpointGuard {
 pub struct Connection {
     /// Amphora (G7 step 2, `AC-NS.2.1`): the versioned storage its B-trees are on, when switched
     /// on (`storage::versioned::switch`); else the pager's.
-    pub(crate) versioned: Option<crate::storage::versioned::switch::Switch>,
+    pub(crate) versioned: Option<Arc<crate::storage::versioned::switch::Switch>>,
+    /// Amphora (G7 step 2, `AC-NS.2.1`): each attached database's own versioned storage, by its
+    /// database index, when the main database's B-trees are on one: an attached database's trees
+    /// are its own, never the main storage's, so the file reopened alone finds them.
+    pub(crate) versioned_attached:
+        RwLock<HashMap<usize, Arc<crate::storage::versioned::switch::Switch>>>,
     pub(crate) db: Arc<Database>,
     pub(super) context: Option<Arc<dyn Any + Send + Sync>>,
     pub(crate) pager: ArcSwap<Pager>,
@@ -515,6 +683,22 @@ pub struct Connection {
     pub(super) subquery_unnesting_mode: AtomicSubqueryUnnestingMode,
     /// Amphora: see [`Connection::set_join_methods`].
     pub(super) join_methods: AtomicJoinMethods,
+    pub(super) join_search_budget: AtomicJoinSearchBudget,
+    /// Amphora (PL.8, lane pl8-16): `Connection::set_carried_join_orders`.
+    pub(super) carried_join_orders: AtomicCarriedJoinOrders,
+    /// Amphora (PL.8, lane pl8-20): `Connection::set_bushy_left_join_probes`.
+    pub(super) bushy_left_join_probes: AtomicBushyLeftJoinProbes,
+    /// Amphora (PL.8, lane pl8-17): `Connection::set_background_search`.
+    pub(super) background_search: AtomicBackgroundSearch,
+    /// Amphora (PL.8, lane pl8-17): the exact searches waiting for this connection to go idle
+    /// (`BackgroundSearch::Idle`).
+    pub(crate) idle_searches: crate::background_search::IdleSearches,
+    /// Amphora: see [`Connection::set_star_filters`].
+    pub(super) star_filters: AtomicStarFilters,
+    /// Amphora: see [`Connection::set_is_value_estimate`].
+    pub(super) is_value_estimate: AtomicIsValueEstimate,
+    /// Amphora: see [`Connection::set_star_filter_order`].
+    pub(super) star_filter_order: AtomicStarFilterOrder,
     /// Amphora: see [`Connection::set_sorted_fetches`].
     pub(super) sorted_fetches: AtomicBool,
     /// Amphora: see [`Connection::set_adaptive_joins`].
@@ -525,6 +709,17 @@ pub struct Connection {
     /// Amphora (PL.13): how many adaptive joins' hash tables held rows past their estimate's
     /// error, so their statements are prepared again; see [`Connection::adaptive_replans`].
     pub(super) adaptive_replans: AtomicU64,
+    /// Amphora (PL.13): planner-chosen hash joins' builds counted against their estimates; see
+    /// [`Connection::adaptive_build_checks`].
+    pub(super) adaptive_build_checks: AtomicU64,
+    /// Amphora (PL.13, lane replan-5): see [`Connection::adaptive_filter_checks`].
+    pub(super) adaptive_filter_checks: AtomicU64,
+    /// Amphora (PL.13, lane replan-5): see [`Connection::adaptive_filter_corrections`].
+    pub(super) adaptive_filter_corrections: AtomicU64,
+    /// Amphora (PL.13, lane replan-5): see [`Connection::adaptive_sort_checks`].
+    pub(super) adaptive_sort_checks: AtomicU64,
+    /// Amphora (PL.13, lane replan-6): see [`Connection::adaptive_subquery_checks`].
+    pub(super) adaptive_subquery_checks: AtomicU64,
     /// Amphora: see [`Connection::set_adaptive_handoff`].
     pub(super) adaptive_handoff: AtomicBool,
     /// Amphora (PL.13): how many runs an adaptive join's build handed to a second prepare; see
@@ -537,9 +732,31 @@ pub struct Connection {
     pub(super) automatic_indexes: AtomicBool,
     /// Amphora: see [`Connection::set_parallel_mode`].
     pub(super) parallel_mode: AtomicBool,
+    /// Amphora: see [`Connection::set_parallel_limit`].
+    pub(super) parallel_limit: AtomicBool,
+    /// Amphora: see [`Connection::set_parallel_cores`]; 0 is the machine's every core.
+    pub(super) parallel_cores: std::sync::atomic::AtomicUsize,
+    /// Amphora: see [`Connection::set_parallel_join_direct`].
+    pub(super) parallel_join_direct: AtomicBool,
+    /// Amphora: see [`Connection::set_parallel_outer_probe`].
+    pub(super) parallel_outer_probe: AtomicOuterJoinProbe,
+    /// Amphora: see [`Connection::set_parallel_searched_links`].
+    pub(super) parallel_searched_links: AtomicSearchedLinks,
     /// Amphora: the machine's measured costs of a worker and a morsel (QT.6), measured by the
     /// first parallel statement and learned by every one after.
     pub(crate) morsel_costs: crate::sync::Mutex<Option<crate::vdbe::morsel::MachineCosts>>,
+    /// Amphora (QT.6, lane qs6-7): the rows workers ran through a copy of a statement's loop body.
+    pub(crate) morsel_body_rows: AtomicU64,
+    /// Amphora (QT.6, lane qs6-10): the hash tables the hook built for joins, a chain's links each.
+    pub(crate) morsel_join_links: AtomicU64,
+    /// Amphora: the joined rows whose outputs were copied, no body run (lane qs6-13).
+    pub(crate) morsel_join_direct_rows: AtomicU64,
+    /// Amphora (QT.6, lane qs6-15): what the outer joins on morsels did in each orientation.
+    pub(crate) morsel_outer: crate::vdbe::morsel_scan::OuterCounters,
+    /// Amphora (QT.6, lane qs6-16): the links built from a table the planner reads by a seek,
+    /// and of those, the ones read by a seek per joined row.
+    pub(crate) morsel_searched_links: AtomicU64,
+    pub(crate) morsel_seek_links: AtomicU64,
     /// Amphora: see [`Connection::set_vectorized_scans`].
     pub(super) vectorized_scans: AtomicBool,
     /// Per-connection runtime extension loading flag.
@@ -993,6 +1210,108 @@ impl Connection {
         self.join_methods.get()
     }
 
+    /// Amphora (QT.5, T-QT.5.3): chooses when newly prepared statements filter a star join's fact
+    /// table with its dimensions' Bloom filters.
+    pub fn set_star_filters(&self, rule: StarFilters) {
+        self.star_filters.set(rule);
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn star_filters(&self) -> StarFilters {
+        self.star_filters.get()
+    }
+
+    /// Amphora (QT.5, lane qs5-18): chooses how newly prepared statements estimate the rows of an
+    /// `IS` whose value planning doesn't know (`IsValueEstimate`).
+    pub fn set_is_value_estimate(&self, rule: IsValueEstimate) {
+        self.is_value_estimate.set(rule);
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn is_value_estimate(&self) -> IsValueEstimate {
+        self.is_value_estimate.get()
+    }
+
+    /// Amphora (QT.5, T-QT.5.11): chooses the order newly prepared statements' star joins check
+    /// their filters in (`StarFilterOrder`).
+    pub fn set_star_filter_order(&self, order: StarFilterOrder) {
+        self.star_filter_order.set(order);
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn star_filter_order(&self) -> StarFilterOrder {
+        self.star_filter_order.get()
+    }
+
+    /// Amphora (PL.8): chooses the rule that sizes the join search for newly prepared statements.
+    pub fn set_join_search_budget(&self, rule: JoinSearchBudget) {
+        self.join_search_budget.set(rule);
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn join_search_budget(&self) -> JoinSearchBudget {
+        self.join_search_budget.get()
+    }
+
+    /// Amphora (PL.8, T-PL.8.9, lane pl8-16): chooses whether statements planned again weigh the
+    /// join orders their last plans chose.
+    pub fn set_carried_join_orders(&self, rule: CarriedJoinOrders) {
+        self.carried_join_orders.set(rule);
+    }
+
+    pub(crate) fn carried_join_orders(&self) -> CarriedJoinOrders {
+        self.carried_join_orders.get()
+    }
+
+    /// Amphora (PL.8, T-PL.8.14, lane pl8-20): chooses whether newly prepared statements' bushy
+    /// plans may probe with a LEFT JOIN's table.
+    pub fn set_bushy_left_join_probes(&self, rule: BushyLeftJoinProbes) {
+        self.bushy_left_join_probes.set(rule);
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn bushy_left_join_probes(&self) -> BushyLeftJoinProbes {
+        self.bushy_left_join_probes.get()
+    }
+
+    /// Amphora (PL.8, T-PL.8.10, lane pl8-17): chooses where the exact join search of root
+    /// statements prepared from now on runs: in full at prepare (`Off`, the control), or after a
+    /// fast plan, on the database's planner worker or on this connection when it goes idle.
+    pub fn set_background_search(&self, placement: BackgroundSearch) {
+        self.background_search.set(placement);
+    }
+
+    pub(crate) fn background_search(&self) -> BackgroundSearch {
+        self.background_search.get()
+    }
+
+    /// Amphora (PL.8, T-PL.8.10, lane pl8-17): what the database's exact searches after fast plans
+    /// came to, both placements summed.
+    pub fn background_search_stats(&self) -> crate::BackgroundSearchStats {
+        self.db.planner.counters().stats()
+    }
+
+    /// Amphora (PL.8, T-PL.8.10, lane pl8-17): the exact searches waiting for this connection to go
+    /// idle.
+    pub fn idle_searches_pending(&self) -> usize {
+        self.idle_searches.pending()
+    }
+
+    /// Amphora (PL.8, lane pl8-17): this connection's last statement in progress ended: it runs
+    /// the exact searches waiting for it (`BackgroundSearch::Idle`).
+    pub(crate) fn went_idle(&self) {
+        self.idle_searches.run(self.db.planner.counters());
+    }
+
+    /// Amphora (PL.8, T-PL.8.6, lane pl8-16): chooses the rule that moves the learned cost weights,
+    /// for the coordinator's A/B (`learned_costs::WeightRule`). The weights are the database's,
+    /// shared by its connections, so this moves them for every connection to it, from the rates as
+    /// they stand; newly prepared statements plan on them.
+    pub fn set_weight_rule(&self, rule: crate::WeightRule) {
+        self.db.learned_costs.set_rule(rule);
+        self.bump_prepare_context_generation();
+    }
+
     /// Amphora (G6 step 5, a prototype behind this switch, off by default): lets newly prepared
     /// statements read a non-covering index's rowids into a sorted set and fetch the table's rows
     /// in rowid order (a bitmap-style sorted fetch), chosen by cost against the plain index read.
@@ -1013,6 +1332,71 @@ impl Connection {
         self.bump_prepare_context_generation();
     }
 
+    /// Amphora (QT.6, lane qs6-8): whether a scan's rows under a LIMIT with no ORDER BY run on
+    /// morsels, the workers stopping once they hold the LIMIT's rows. Off (the default, the
+    /// control), the serial loop answers them. It counts only with the parallel mode on.
+    pub fn set_parallel_limit(&self, on: bool) {
+        self.parallel_limit.store(on, Ordering::Release);
+    }
+
+    /// Amphora (QT.6, lane qs6-12): the most cores the morsel workers may use, the machine's
+    /// measured count or fewer (`None`: every core). For the scaling harness's ladder of cores
+    /// (`amphora-bench --planner --cores`); the cost model still picks the workers up to it.
+    pub fn set_parallel_cores(&self, cores: Option<std::num::NonZeroUsize>) {
+        self.parallel_cores.store(
+            cores.map_or(0, std::num::NonZeroUsize::get),
+            Ordering::Release,
+        );
+    }
+
+    /// Amphora (QT.6, lane qs6-13, T-QT.6.21): whether a join's workers copy the outputs of a
+    /// loop body that is nothing but reads (no ON or WHERE term past the keys, every output a
+    /// column or rowid) straight from the joined row instead of running the body's code. Off
+    /// (the body runs on every joined row, lane qs6-12) until the A/B of T-QT.6.20 decides.
+    pub fn set_parallel_join_direct(&self, on: bool) {
+        self.parallel_join_direct.store(on, Ordering::Release);
+    }
+
+    /// Amphora (QT.6, lane qs6-15): which table an outer join of two tables probes on morsels,
+    /// for statements prepared after ([`OuterJoinProbe`]; `Padded`, today's, by default). Both
+    /// orientations answer alike; the switch is for the measurements that decide between them.
+    pub fn set_parallel_outer_probe(&self, probe: OuterJoinProbe) {
+        self.parallel_outer_probe.set(probe);
+        // The orientation is chosen at prepare: cached statements prepare again.
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn parallel_outer_probe(&self) -> OuterJoinProbe {
+        self.parallel_outer_probe.get()
+    }
+
+    /// Amphora (QT.6, lane qs6-16): how a join's table that the planner reads by a seek per row
+    /// of the tables before it runs on morsels, for statements prepared after ([`SearchedLinks`];
+    /// `Off`, today's, by default: such a join, the commonest of foreign key to primary key, runs
+    /// on the serial loop unless the planner chose a hash join somewhere in it). Every setting
+    /// answers alike; the switch is for the measurements that decide between them.
+    pub fn set_parallel_searched_links(&self, links: SearchedLinks) {
+        self.parallel_searched_links.set(links);
+        // The shape is chosen at prepare: cached statements prepare again.
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn parallel_searched_links(&self) -> SearchedLinks {
+        self.parallel_searched_links.get()
+    }
+
+    pub(crate) fn parallel_join_direct(&self) -> bool {
+        self.parallel_join_direct.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn parallel_cores(&self) -> Option<std::num::NonZeroUsize> {
+        std::num::NonZeroUsize::new(self.parallel_cores.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn parallel_limit(&self) -> bool {
+        self.parallel_limit.load(Ordering::Acquire)
+    }
+
     pub(crate) fn parallel_mode(&self) -> crate::vdbe::morsel::ParallelMode {
         if self.parallel_mode.load(Ordering::Acquire) {
             crate::vdbe::morsel::ParallelMode::On
@@ -1029,6 +1413,12 @@ impl Connection {
     pub fn set_fitted_costs(&self, on: bool) {
         self.db.cost_fit.set_on(on);
         self.bump_prepare_context_generation();
+    }
+
+    /// Amphora (lane colcopy-5, AC-CB.4.2): the versioned storage the connection's B-trees are on
+    /// (None: the pager's), for its column copies' switch, rebuy policy and instruments.
+    pub fn versioned_storage(&self) -> Option<Arc<crate::storage::versioned::switch::Storage>> {
+        self.versioned.as_ref().map(|s| s.storage().clone())
     }
 
     pub(crate) fn sorted_fetches(&self) -> bool {
@@ -1065,6 +1455,61 @@ impl Connection {
 
     pub(crate) fn count_adaptive_replan(&self) {
         self.adaptive_replans.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Amphora (PL.13, a materialization point): how many hash joins the planner chose on this
+    /// connection had their build's rows counted against the estimate (each re-plan past its error
+    /// is in [`Connection::adaptive_replans`] too).
+    pub fn adaptive_build_checks(&self) -> u64 {
+        self.adaptive_build_checks.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn count_adaptive_build_check(&self) {
+        self.adaptive_build_checks.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Amphora (PL.13, lane replan-5): how many filtered builds of hash joins the planner chose on
+    /// this connection had their rows counted against the share of the table the plan's filter
+    /// estimate kept.
+    pub fn adaptive_filter_checks(&self) -> u64 {
+        self.adaptive_filter_checks.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn count_adaptive_filter_check(&self) {
+        self.adaptive_filter_checks.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Amphora (PL.13, lane replan-5): how many of those counted past the estimate's error and
+    /// stored the counted share for the planner (each is in [`Connection::adaptive_replans`] too).
+    pub fn adaptive_filter_corrections(&self) -> u64 {
+        self.adaptive_filter_corrections.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn count_adaptive_filter_correction(&self) {
+        self.adaptive_filter_corrections
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Amphora (PL.13, lane replan-5): how many ORDER BY sorters fed by one table's scan on this
+    /// connection had their input rows counted against the plan's estimate of that scan (each
+    /// re-plan past its error is in [`Connection::adaptive_replans`] too).
+    pub fn adaptive_sort_checks(&self) -> u64 {
+        self.adaptive_sort_checks.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn count_adaptive_sort_check(&self) {
+        self.adaptive_sort_checks.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Amphora (PL.13, lane replan-6): how many stored results of uncorrelated FROM-clause
+    /// subqueries on this connection had their rows counted against the plan's estimate once
+    /// filled (each re-plan past its error is in [`Connection::adaptive_replans`] too).
+    pub fn adaptive_subquery_checks(&self) -> u64 {
+        self.adaptive_subquery_checks.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn count_adaptive_subquery_check(&self) {
+        self.adaptive_subquery_checks.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Amphora (PL.13, the in-run hand-off; `docs/design/planner.md`, "Decision (lane pl13)"): when
@@ -1352,17 +1797,25 @@ impl Connection {
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let prepare_options = PrepareOptions::default();
+            // Amphora (PL.8, lane pl8-17): a root statement takes the fast plan where a placement
+            // for the exact search is chosen, and hands that search off.
+            let prepare_options = PrepareOptions {
+                fast_search: origin == StatementOrigin::Root
+                    && self.background_search() != BackgroundSearch::Off,
+                ..PrepareOptions::default()
+            };
             let (program, pager, mode) = self.compile_cmd(cmd, input, origin, &prepare_options)?;
 
-            Ok(Statement::new_with_origin(
+            let mut statement = Statement::new_with_origin(
                 program,
                 pager,
                 mode,
                 byte_offset_end,
                 origin,
                 needs_nested_guard,
-            ))
+            );
+            statement.hand_off_exact_search();
+            Ok(statement)
         })();
         if result.is_err() && needs_nested_guard {
             self.end_nested();
@@ -1576,6 +2029,40 @@ impl Connection {
         self.force_reparse_schema_inner(false)
     }
 
+    /// Amphora (G7 step 2, `AC-NS.2.1`): the versioned storage the database at `db` keeps its
+    /// trees on: the main database's, or an attached database's own; none for TEMP, whose trees
+    /// stay on its pager, or with the switch off.
+    pub(crate) fn versioned_for(
+        &self,
+        db: usize,
+    ) -> Option<Arc<crate::storage::versioned::switch::Switch>> {
+        let main = self.versioned.as_ref()?;
+        match db {
+            MAIN_DB_ID => Some(main.clone()),
+            TEMP_DB_ID => None,
+            _ => self.versioned_attached.read().get(&db).cloned(),
+        }
+    }
+
+    /// Amphora (G7 step 2, `AC-NS.2.1`): runs `f` on every versioned storage the connection's
+    /// transaction may span, the main database's first, then each attached database's; every one
+    /// is run even after one fails, and the first failure is returned.
+    pub(crate) fn each_versioned(
+        &self,
+        mut f: impl FnMut(&crate::storage::versioned::switch::Switch) -> Result<()>,
+    ) -> Result<()> {
+        let Some(main) = self.versioned.as_ref() else {
+            return Ok(());
+        };
+        let mut first = f(main).err();
+        for switch in self.versioned_attached.read().values() {
+            if let Err(e) = f(switch) {
+                first.get_or_insert(e);
+            }
+        }
+        first.map_or(Ok(()), Err)
+    }
+
     /// Amphora (G7 step 2, `AC-NS.2.1`): reads the schema from the versioned storage's
     /// `sqlite_schema` (its tree 1) and makes it the database's, so every connection made after
     /// sees the tables a reopened database holds. Its read ends the storage's transaction it began.
@@ -1746,6 +2233,13 @@ impl Connection {
             // read cookie before consuming statement program - otherwise we can
             // end up reading cookie with closed transaction state
             let cookie = crate::return_if_io!(self.read_current_schema_cookie_nonblock());
+            // Amphora (lane g7s2-19, `AC-NS.2.1`): on the versioned storage a schema change's
+            // cookie can be read a moment before its rows are published; the rows are read only
+            // once every commit the cookie's read may have seen is (`Switch::await_published`),
+            // else the older rows would be kept under the newer cookie, and shared.
+            if let Some(switch) = self.versioned.as_ref() {
+                switch.await_published();
+            }
             *state =
                 ReparseSchemaState::Building(Box::new(self.init_reparse_building(cookie, None)?));
         }
@@ -2175,14 +2669,17 @@ impl Connection {
     pub(crate) fn read_current_schema_cookie(&self) -> Result<u32> {
         if let Some(mv_store) = self.mv_store().as_ref() {
             let tx_id = self.get_mv_tx_id();
-            mv_store.with_header(|header| header.schema_cookie.get(), tx_id.as_ref())
-        } else {
-            let pager = self.pager.load();
-            pager
-                .io
-                .block(|| pager.with_header(|header| header.schema_cookie))
-                .map(|cookie| cookie.get())
+            // Amphora (G7 step 2, `AC-NS.2.1`): before the store's bootstrap publishes the
+            // header, page 1 holds it (`MvStore::header_published`).
+            if tx_id.is_some() || mv_store.header_published() {
+                return mv_store.with_header(|header| header.schema_cookie.get(), tx_id.as_ref());
+            }
         }
+        let pager = self.pager.load();
+        pager
+            .io
+            .block(|| pager.with_header(|header| header.schema_cookie))
+            .map(|cookie| cookie.get())
     }
 
     /// Non-blocking variant of [`Self::read_current_schema_cookie`]. The MVCC
@@ -2192,14 +2689,18 @@ impl Connection {
         use crate::types::IOResult;
         if let Some(mv_store) = self.mv_store().as_ref() {
             let tx_id = self.get_mv_tx_id();
-            let cookie =
-                mv_store.with_header(|header| header.schema_cookie.get(), tx_id.as_ref())?;
-            Ok(crate::types::IOResult::Done(cookie))
-        } else {
-            let pager = self.pager.load();
-            let cookie = crate::return_if_io!(pager.with_header(|header| header.schema_cookie));
-            Ok(crate::types::IOResult::Done(cookie.get()))
+            // Amphora (G7 step 2, `AC-NS.2.1`): before the store's bootstrap publishes the
+            // header, page 1 holds it (`MvStore::header_published`): an open on the versioned
+            // storage reads its schema first.
+            if tx_id.is_some() || mv_store.header_published() {
+                let cookie =
+                    mv_store.with_header(|header| header.schema_cookie.get(), tx_id.as_ref())?;
+                return Ok(IOResult::Done(cookie));
+            }
         }
+        let pager = self.pager.load();
+        let cookie = crate::return_if_io!(pager.with_header(|header| header.schema_cookie));
+        Ok(IOResult::Done(cookie.get()))
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -3552,16 +4053,38 @@ impl Connection {
     }
 
     /// Amphora (G5 step 4): this connection's snapshot and the newest commit, as WAL positions;
-    /// `None` without a WAL.
+    /// `None` without a WAL. On the versioned storage (G7 step 2, `AC-NS.2.1`) they are commit
+    /// timestamps, `(0, ts)`: the open transaction's start (with none open, the newest commit,
+    /// where its next read begins) and the newest commit published.
     pub(crate) fn skipping_positions(
         &self,
     ) -> Option<(crate::skipping::WalPos, crate::skipping::WalPos)> {
+        if let Some(switch) = self.versioned_for(MAIN_DB_ID) {
+            let (start, newest) = switch.skipping_positions();
+            return Some(((0, start), (0, newest)));
+        }
         let pager = self.get_pager();
         let wal = pager.wal.as_ref()?;
         Some((
             wal.connection_wal_pos(),
             (wal.get_checkpoint_seq(), wal.get_max_frame_in_wal()),
         ))
+    }
+
+    /// Amphora (G7 step 2, `AC-NS.2.1`): the newest commit a write to a summarized table is taken
+    /// at, and whether its end must be told (the versioned storage, [`SkipRegistry::on_write_told`]);
+    /// `None` when the summary can't take it and is made stale: without a WAL, or on the versioned
+    /// storage when the writer's snapshot isn't the newest commit (the summary would then hold
+    /// rows it doesn't see).
+    ///
+    /// [`SkipRegistry::on_write_told`]: crate::skipping::SkipRegistry::on_write_told
+    pub(crate) fn skipping_write_base(&self) -> Option<(crate::skipping::WalPos, bool)> {
+        let (snapshot, committed) = self.skipping_positions()?;
+        let told = self.versioned_for(MAIN_DB_ID).is_some();
+        if told && snapshot != committed {
+            return None;
+        }
+        Some((committed, told))
     }
 
     pub fn mv_store(&self) -> impl Deref<Target = Option<Arc<MvStore>>> {
@@ -4173,12 +4696,32 @@ impl Connection {
                     };
                 }
                 AttachDatabaseState::Publish { alias, db, pager } => {
+                    // Amphora (G7 step 2, `AC-NS.2.1`): with the main database's trees on the
+                    // versioned storage, the attached database's go on its own (made, or
+                    // recovered from beside its file), before any statement reads them.
+                    let switch = match self.versioned {
+                        Some(_) => db
+                            .versioned_storage(true, None)?
+                            .map(|s| Arc::new(crate::storage::versioned::switch::Switch::new(s))),
+                        None => None,
+                    };
                     self.has_non_main_pagers.store(true, Ordering::Release);
                     self.attached_databases.write().insert(
                         alias.as_str(),
                         db.clone(),
                         pager.clone(),
                     );
+                    if let Some(switch) = switch {
+                        let index = self
+                            .attached_databases
+                            .read()
+                            .name_to_index
+                            .get(alias.as_str())
+                            .copied();
+                        if let Some(index) = index {
+                            self.versioned_attached.write().insert(index, switch);
+                        }
+                    }
                     self.bump_prepare_context_generation();
                     *state = AttachDatabaseState::Done;
                     return Ok(IOResult::Done(()));
@@ -4232,6 +4775,18 @@ impl Connection {
             return Err(LimboError::InvalidArgument(format!(
                 "database {alias} is locked"
             )));
+        }
+        // Amphora (G7 step 2, `AC-NS.2.1`): its versioned storage goes with it; a transaction
+        // that wrote there holds it, as the pager's write lock does.
+        if let Some(switch) = self.versioned_attached.read().get(&database_id) {
+            if switch.wrote() {
+                return Err(LimboError::InvalidArgument(format!(
+                    "database {alias} is locked"
+                )));
+            }
+        }
+        if let Some(switch) = self.versioned_attached.write().remove(&database_id) {
+            switch.finish(true)?;
         }
 
         if let Some((tx_id, _mode)) = self.get_mv_tx_for_db(database_id) {
@@ -5851,10 +6406,8 @@ impl Connection {
         // the pager's, so a statement abandoned or failed mid-write leaves nothing for the next
         // statement's commit to make durable. The pager's rollback reports no error either; one
         // here is logged, and the storage refuses the ended transaction's cursors their writes.
-        if let Some(switch) = self.versioned.as_ref() {
-            if let Err(e) = switch.finish(true) {
-                tracing::error!("versioned storage: rolling back the transaction: {e}");
-            }
+        if let Err(e) = self.each_versioned(|switch| switch.finish(true)) {
+            tracing::error!("versioned storage: rolling back the transaction: {e}");
         }
         self.rollback_attached_wal_txns();
         self.index_methods_on_transaction_rolled_back();

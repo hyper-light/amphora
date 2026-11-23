@@ -1495,8 +1495,9 @@ each row of the run materialized, the terms a left-deep plan's materialized buil
 bushy plan replaces the left-deep one only when it costs less. The pairs are walked on loops over
 the subsets found, not recursion (CLAUDE.md section 11), and each pair counts against what the
 subsets left of `JOIN_SEARCH_BUDGET` (decision 19): past it the left-deep plan stands. No bushy plan
-is tried for a join with an outer, semi or anti join, a RIGHT or FULL JOIN, or a table that must
-follow another (`bushy_plans_allowed`), and a bushy plan keeps no order, so it removes no sort.
+is tried for a join with an outer join, a RIGHT or FULL JOIN, or a table that must follow another
+(`bushy_core`; semi and anti joins after the inner ones follow a bushy plan, decision pl8-15), and a
+bushy plan keeps no order, so it removes no sort.
 
 **Why.** A left-deep order joins one table at a time, so two selective joins whose small results
 meet only through each other force it to join one side's small result to the other side's whole
@@ -1516,12 +1517,399 @@ a WHERE term between the run and the loop before it, a probe term reading the lo
 
 **Not yet built.** `JOIN_SEARCH_BUDGET` is still decision 19's 10,000 subsets from Neumann and Radke;
 deriving it from a plan-time target (the measured time a candidate takes against the planning time a
-query may take) needs that target defined first. Semi and anti joins placed before other loops. The
-probe is read whole; a probe that keeps its own access method would let the run's result join a loop
+query may take) needs that target defined first. The probe is read whole; a probe that keeps its own access method would let the run's result join a loop
 read by a key.
 
 **Falsified by.** A bushy plan's answer that differs from the nested loops'; a JOB query whose plan
 turns bushy and runs slower than on its parent (AC-PL.8.1).
+
+## Decision (lane pl8-15): weights judged between batches; semi and anti joins after a bushy plan
+
+**Decision.** PL.8, two pieces (lanes pl8-14 and pl8-15).
+
+- *Learned weights* (`optimizer/learned_costs.rs`, T-PL.8.6). A rate's batch (an epoch: as much
+  work as calibration timed) replaces the standing rate only when the two differ by more than the
+  spread between batch means allows. That spread is the root mean square of successive differences
+  of the batch means' logarithms (von Neumann, Kent, Bellinson and Hart, Annals of Mathematical
+  Statistics 12(2), 1941); the jump into a batch that moved the rate is left out. The gap over the
+  spread is tested against Student's t with as many degrees of freedom as differences, at the
+  two-sided 95% level split over the eight kinds of work (Dunn, JASA 56(293), 1961). The test's
+  cost stays bounded however long a process runs: the ratio's probability by Abramowitz and Stegun
+  26.7.3/26.7.4 while there are few differences, then the quantile's Cornish-Fisher expansion
+  (26.7.5) once its last term is under an f64's resolution (about 13,000 differences). The first
+  batch the database times replaces calibration's rate or the open's page-read anchor; calibration's
+  own error estimate is gone.
+- *Semi and anti joins* (`optimizer/join.rs`, `bushy_core`, T-PL.8.2). When a join's tables are
+  inner joins free to move followed only by semi and anti joins (EXISTS, NOT EXISTS) that need
+  only tables before them, the search pairs the inner joins as decision pl8-9 does, then adds the
+  semi and anti joins to each bushy plan as loops in their order, as the left-deep search adds a
+  table. The whole plan replaces the left-deep one only if it costs less. A hash join is not
+  tried for them: it would build from the run's probe.
+
+**Why.** A burst of load slows a whole batch at once, so the times inside one batch agree however
+far the batch sits from the last. Judged by that inner spread (lane pl8-13's ratio estimator), each
+burst was evidence: on a loaded adacachy the hash probe's weight climbed in significant steps
+through one run (10, 170, 220, 280 rows' visits) and flipped `t_pl_8_2`'s plan from run to run. The
+spread between batches holds those bursts, as the method of batch means reads a correlated series'
+error (Schmeiser, Operations Research 30(3), 1982). CD-C keeps every table before a semi or anti
+join ahead of it and the emitter runs those tables as the last loops (`required_lhs_by_table`), so
+a bushy plan of the tables before them is followed by them unchanged.
+
+**Evidence.** `learned_costs::tests::t_pl_8_6_*`: a burst within the spread moves nothing, nor do
+two batches alone or one observation alone; a batch past Student's t moves the weight and one just
+inside does not; Student's t matches Abramowitz and Stegun's table 26.10; the expansion takes over
+only where it agrees with the exact quantile. `bushy_search_tests`: the fact tables hold 12,000 rows,
+so the bushy plan is cheapest at every hash-probe weight seen (with 3,000 the nested loops won at a
+probe of 400, kiln run r1178; with 12,000 the bushy plan won at every corner, r1271);
+`t_pl_8_2_the_bushy_plan_is_cheapest_at_every_corner_of_the_weights` pins those corners (probe 10
+and 400 rows' visits, seek and build a quarter of and four times the learned ones; each plan's cost
+is linear in the weights, so the corners bound the range);
+`t_pl_8_2_semi_and_anti_joins_follow_a_bushy_plan` plans EXISTS and NOT EXISTS, correlated with the
+probe's table and with a run's table, bushy and answers as nested loops do. The run of record is
+the coordinator's: `t_pl_8_2_the_search_picks_the_bushy_plan_where_it_is_cheapest` passing 20 of
+20 copies run at once.
+
+**Not yet built.** Outer joins in a bushy plan: a LEFT JOIN's right table inside the run or after
+the probe. Semi and anti joins read by a hash join after a bushy plan. Right after a process
+starts, with few batches, Student's t is large, so the weights move slowly until batches gather.
+
+**Falsified by.** A plan of `t_pl_8_2` that differs between two of the 20 copies run at once; a
+weight that moves on a batch within the spread between batch means; a semi or anti join's answer
+after a bushy plan that differs from the nested loops'.
+
+## Decision (lane pl8-16): the weight rules A/B; a statement planned again keeps its join order within the weights' error
+
+**Decision.** PL.8, two pieces (lane pl8-16).
+
+- *The weight rule behind a switch* (`optimizer/learned_costs.rs`, `WeightRule`,
+  `Connection::set_weight_rule`, T-PL.8.6). Lane pl8-14 replaced the rule that moves a learned
+  weight outright. The old one is back as the control: `Blend`, every read blended into the rate at
+  once (the running mean of the batch under way and the one before it, the rule before lane
+  pl8-13). `BatchMeans` (decision pl8-15) is the candidate and the default. The switch moves the
+  database's weights from the rates as they stand.
+- *The carried join order* (`optimizer/join.rs`, `JoinOrders`, `keep_carried`). The search notes
+  each query block's chosen left-deep order, keyed by the block's tables in FROM order; the
+  `Program` keeps them; `Statement::reprepare` hands them to its next plan through `PrepareOptions`
+  and the resolver. The new search prices the carried order as the block now stands, where the
+  conflict rules still allow it, and keeps it unless its own best costs less than the carried
+  order's cost over `1 + margin`. The margin is the weights' error, `exp(MOVE_Z * s) - 1`, with `s`
+  the worst kind's spread between batch means in page reads (`sqrt(s_kind^2 + s_page^2)`); it is 0
+  under `Blend` and before any spread is measured, so only a tie keeps the order then. A custom
+  plan (decision pl12) carries nothing. Behind `Connection::set_carried_join_orders`
+  (`CarriedJoinOrders`): `Off`, each plan made again searched afresh, is the control and the
+  default until the A/B decides; `WithinMargin` is the candidate.
+- *LEFT JOINs after a bushy plan* (`optimizer/join.rs`, `bushy_core`, T-PL.8.2). The tail after
+  the core of inner joins may hold LEFT JOINs as well as semi and anti joins: each is a loop over
+  its right table for each row of the plan so far, read as the outer join it is and null-extended
+  where none matches, in FROM order. `bushy_build_groups` checks only a run and its probe, so the
+  tail's outer joins need nothing new from the emitter.
+
+**Why.** Ada's method is A/B for every design decision: today's rule stays as the control, and each
+candidate is forced into its own failure. A plan made again on the same facts should be the same
+plan: two orders whose costs differ by less than the weights' own error are not told apart by the
+evidence, so the order that ran stands.
+
+**Evidence.** `learned_costs::ab_tests::t_pl_8_6_ab_plan_flips_and_batches_to_follow_a_change`
+runs both rules on one seeded series (reads scattered 30%, a quarter of the batches slowed together
+by up to 30%; a plan boundary 5% above the true cost) and reports plan flips and the batches each
+takes to follow a cost that quadruples at batch 1, 2, 4, 16 or 64. A Python mirror of both rules on
+the same series (lane pl8-16, `~/.cache/amphora-t1/pl8-16/ab_sim.py`) gives: `Blend` 353 to 452
+flips in 200 batches, `BatchMeans` 1 to 26; `Blend` follows every change within one batch,
+`BatchMeans` takes 10 to 13 after a change at batch 1, up to 14 after one at batch 2 (one seed of
+four followed it in one), and one batch from batch 4 on.
+`join::tests::t_pl_8_a_carried_join_order_stands_within_its_margin`: the five-table chain keeps its
+order at no margin and at a margin just under the reversed order's extra cost, takes the reversed
+order just past it, and ignores a carried order that isn't each table once.
+`bushy_search_tests::t_pl_8_2_left_joins_follow_a_bushy_plan`: the fact query's core followed by
+LEFT JOINs whose ON terms read the probe's table, a run's table, and another LEFT JOIN's table,
+planned bushy and answering (null-extended rows counted) as nested loops do.
+`learned_costs::ab_tests::t_pl_8_cost_margin_is_the_weights_error` pins the margin's formula.
+`statement::tests::t_pl_8_9_ab_carried_orders_flip_no_more_than_fresh_plans` plans a two-table hash
+join again 40 times with the build's weight pinned 10% either side of the probe's and reports the
+order's flips under `Off` and `WithinMargin`. The
+runs of record are the coordinator's: `cargo test -p amphora-engine --lib learned_costs::ab_tests
+-- --nocapture`, with more seeds and batches.
+
+**Not yet built.** The fast plan first with the exact search in the background: a statement would
+run the greedy plan at once and take the search's plan when the search completes (an event, not a
+timer); the engine has no worker to run a search beside a connection, so where it runs needs a
+decision. A bushy plan's carried shape (only left-deep orders are carried). Two query blocks with
+the same tables in the same FROM order share one key. LEFT JOINs inside a bushy run or as its
+probe (the emitter's build groups refuse them).
+
+**Falsified by.** A statement planned again on unchanged statistics and weights that picks another
+join order; `BatchMeans` flipping a plan as often as `Blend` on the same series; a carried order
+kept where the new best is cheaper past the margin.
+
+## Decision (lane pl8-17): the fast plan first, the exact search on a planner worker or the idle connection
+
+**Decision.** PL.8, T-PL.8.10 (`crates/engine/background_search.rs`). Where the exact join search
+runs once a statement has a fast plan is a design decision, so both placements are built behind one
+switch, `Connection::set_background_search` (`BackgroundSearch`), for the A/B. `Off`, the whole
+search at prepare as before, is the control and the default until the measurements decide.
+
+- *The fast plan.* Under `Worker` or `Idle` a root statement is prepared with the fast budget: the
+  exact search only where its connected subsets fit the tables' count squared, the joins the greedy
+  search tries (`SearchBudget::fast`), so the fast plan costs no more than the greedy search; past
+  it, the greedy search. Its first run starts at once. A plan the greedy search ordered
+  (`Program::fast_planned`) hands its exact search off; one the exact search planned within the
+  fast budget is already exact.
+- *The exact plan, through the carried-order path.* The request plans the statement again with the
+  rule's whole budget, carrying the fast plan's join orders (decision pl8-16's `keep_carried`), and
+  hands its plan back in the statement's slot only where its estimate is below the fast plan's over
+  `1 + margin`, the weights' error (`cost_margin`); otherwise the fast plan stands. The statement
+  takes it as its next run starts, before it checks whether its plan is stale, so a plan made on an
+  older schema is planned again as any other.
+- *Placement (a), `Worker`.* One planner thread per database, started by its first request and
+  sleeping on a condition variable each request signals; the database's drop closes it. Its queue
+  is bounded by the connections open to the database, one pending search each on average: requests
+  whose statements have gone leave first, then the oldest live one, its statement keeping its fast
+  plan (`BackgroundSearchStats::dropped`). It plans on the statement's own connection from its
+  thread, as the connection's settings (join methods, budgets, the carried-order switch) shape the
+  plan.
+- *Placement (b), `Idle`.* The connection itself, when its last statement in progress ends
+  (`Statement::release_active_root_if_counted`): it runs its queued searches, oldest first, before
+  the step or reset that ended the statement returns. Bounded by the statements prepared on it. A
+  connection that never goes idle never runs its searches; they stay pending
+  (`Connection::idle_searches_pending`).
+- Every request ends in exactly one counted outcome (`Connection::background_search_stats`):
+  dropped, abandoned, kept, replaced or failed.
+
+**Why.** Ada's method: build both and let the data decide; latency first. The fast plan takes the
+search off the first row's path; the question is what the exact search then costs and where. The
+worker adds a thread per database and plans beside the connection's own work, and under many
+connections its queue is the risk. The idle connection adds nothing beside it but pays the search
+inside the step that ended a statement, and never runs it on a connection that stays busy. Both
+wake on an event (a request, a connection going idle), never on a timer.
+
+**Evidence.** Tests, none run yet (written while kiln's server was down; lane pl8-17):
+`background_search::tests::t_pl_8_10_the_worker_queue_drops_its_oldest_past_the_connections` (512
+connections, 4 requests each: the queue never past 512, the 1,536 oldest dropped);
+`t_pl_8_10_requests_whose_statements_went_leave_before_live_ones`;
+`t_pl_8_10_the_exact_plan_must_be_cheaper_past_the_margin`;
+`search_budget::tests::t_pl_8_10_the_fast_budget_is_the_greedy_search_s_joins`;
+`statement::tests::t_pl_8_10_a_connection_that_never_goes_idle_never_runs_its_search` (a star of
+ten dimensions, its search pending through three runs while another statement is held, then run on
+the reset that leaves the connection idle; answers unchanged);
+`t_pl_8_10_the_worker_hands_back_the_exact_plan`;
+`t_pl_8_10_every_worker_request_ends_once_under_many_connections` (64 connections). The harness of
+record, `statement::tests::t_pl_8_10_harness_time_to_first_row_and_to_the_exact_plan` (ignored),
+reports the time to the first row and to the exact plan at p50, p99 and the largest, and the
+outcomes, for `Off`, `Worker` and `Idle` at 1, 32 and 512 connections on one database, a thread
+each: `AMPHORA_BG_CONNECTIONS=1,32,512 cargo test -p amphora-engine --lib -- --ignored
+--nocapture t_pl_8_10_harness`. Its numbers decide the default; the run of record is the
+coordinator's.
+
+**Falsified by.** A fast plan slower to its first row than the control's; an exact plan installed
+that is not cheaper past the margin; a worker queue longer than the connections open; a request
+that ends in no outcome or two; a search run while its connection is busy under `Idle`.
+
+**Not yet built.** The exact search's plan replaces a custom plan's generic one but no custom plan
+asks for one. A bushy fast plan's shape isn't carried (only left-deep orders are), so the exact
+search weighs it by cost alone. The planner worker's thread count is one per database.
+
+## Decision (lane pl8-18): the exact search plans on what the fast plan was made on, one search an idle
+
+**Decision.** PL.8, T-PL.8.11 and T-PL.8.12 (`crates/engine/background_search.rs`,
+`Statement::hand_off_exact_search`, `Statement::take_exact_plan`). Decision pl8-17's worker planned
+on the statement's own connection from its own thread while that connection ran. What a plan reads
+of the connection, read for this decision:
+
+- *The schema and its statistics.* `plan_sql` read `Connection::schema` as the search started; the
+  statistics live in it (`Schema::analyze_stats`). While the connection runs, a schema change, a
+  rollback that restores a snapshot or ANALYZE swaps it, so the search could plan on a schema the
+  fast plan never saw. Now the request takes the schema (an `Arc`, never changed after) at hand-off,
+  on the statement's thread, as the fast plan was made, and plans on it (`plan_sql_on`).
+- *The settings.* Join methods, budgets, star filters, column names and the rest are read live as
+  the search runs, so a setting changed mid-search (`PlanHints::apply` sets three at once) gave a
+  plan of some old and some new values. Each setting that shapes a plan moves the
+  connection's generation as it changes (`bump_prepare_context_generation`, the contract
+  `PrepareContext` already states), and the program records the generation as it is built, at the
+  end of the search, so the existing staleness check could pass such a plan. Now the request takes
+  the generation at hand-off, and the statement takes a plan only while the generation is still
+  that one; otherwise it counts it stale (`BackgroundSearchStats::stale`), keeps the fast plan, and
+  the existing check plans it again on the settings as they are.
+- *A write's connection state.* A write's plan reads whether the connection is inside a nested
+  statement (`is_nested_stmt`: count_changes rows, foreign-key and schema paths) and pushes and pops
+  the connection's stack of triggers compiling (`trigger_exec.rs`), which also guards against a
+  trigger firing itself. Read and changed from another thread while the connection runs, a trigger
+  could be skipped. Now only a SELECT takes the fast plan with a search to follow
+  (`translate::translate`); a write is planned in full at prepare, as under `Off`.
+- *The pager and the plan cache.* A SELECT's plan reads no page (only PRAGMA's translation blocks on
+  the pager's header), and the plan cache is the statement's own (PL.12), not the connection's.
+- *Shared estimators.* The learned weights and row counters are the database's, shared by its
+  connections and synchronised for that; the search reads them as any connection's prepare does.
+
+Placement `Idle` now runs one search each time the connection goes idle, the oldest live one
+(requests whose statements have gone leave on the way, as abandoned, costing no search), so the step
+or reset that ended the connection's last statement returns late by one search at most; the rest
+wait for the next time it goes idle. One is the least work that still moves the queue on, not a tuned
+count.
+
+**Why.** A snapshot taken where the fast plan was made means the exact plan answers the same
+question on the same facts, and whatever would make the fast plan stale makes the exact one stale by
+the same checks. Settings copied into a planner connection of the worker's own were the other way:
+it lacks the connection's temporary tables, attached databases and loaded functions, so a name could
+resolve to another table. The generation is the connection's own signal for settings and already
+covers attach, detach and temporary-schema restores. Shuttle's `Weak` is std's (shuttle 0.8.1
+re-exports `std::sync::{Arc, Weak}`), so `Weak::strong_count` builds there.
+
+**Evidence.** Written while kiln's server was down, not run yet (lane pl8-18):
+`statement::tests::t_pl_8_11_a_plan_read_past_a_moved_setting_is_never_taken`,
+`t_pl_8_11_only_a_select_hands_its_search_off`,
+`t_pl_8_11_statements_run_on_the_connection_while_the_worker_plans_for_it` (32 rounds of a
+transaction firing a trigger, a schema change, a setting and the star run on the connection while
+the worker plans for it: answers, trigger firings and outcomes checked; the crate's shuttle build
+doesn't drive std threads, so it is a threaded stress test), and
+`t_pl_8_12_each_idle_runs_one_search`. The harness of record now also reports the time of the
+calls that end the statement, whose difference from `Off` is what `Idle` adds.
+
+**Falsified by.** A plan taken whose generation differs from the one at hand-off; a write handed
+off; a lost trigger firing or a changed answer while the worker plans; an idle that runs two
+searches.
+
+**Not yet built.** The last strong reference to a connection the worker upgraded can drop on the
+worker's thread (its statement and connection closed mid-search), so the connection's close then
+runs there; `Connection` is `Send`, so that is allowed, but the close's work lands on the planner's
+thread. A write whose SELECT the greedy search orders is planned in full at prepare, so it never
+has a fast plan.
+
+## Decision (lane pl8-19): LEFT JOINs inside a bushy run
+
+**Decision.** PL.8, T-PL.8.13 (`join::bushy_core`, `join::bushy_pair_keeps_left_joins`,
+`optimizer::bushy_build_groups`, `emitter::select::prune_join_order_for_materialized_inputs`). A
+LEFT JOIN with an inner join after it used to keep a query out of the bushy search. Now such a LEFT
+JOIN, one the search may move (no CROSS or LATERAL join keeps it in place), is in the bushy core, and
+a bushy pair (outer loops, a run built into a hash join's input, the probe) takes it under three
+rules:
+
+- *In the run, only with its ON's tables.* The run's rows are joined and NULL-extended in the
+  probe's build input before any table outside the run is read. So the right table may stand in the
+  run only if every table its ON terms read is in the run too. Then `(outer, probe, left side) LEFT
+  JOIN t ON p` is `outer JOIN (probe JOIN (left side LEFT JOIN t ON p))`, by the left-asscom and
+  associativity rules (Moerkotte, Fender and Eich, SIGMOD 2013).
+- *Never the probe.* An inner hash join's probe makes no NULL row.
+- *Read by a loop in the run.* Its NULL row is the loop's, as in a left-deep plan.
+
+An ON term holding a subquery keeps the table out of the run. A LEFT JOIN outside the pair is one of
+the outer loops, where the subsets the search builds already hold its ON's tables before it.
+
+A term above the outer join that reads its right table (a WHERE term, or an inner join's ON term) is
+not one of the ON's terms, so it stays above the join:
+
+- If it reads only the run's tables, the build input runs it after the NULL row is made, as a
+  left-deep plan does.
+- Otherwise the main plan runs it at the probe, on the payload's rows, NULL rows included.
+
+The ON's own terms run inside the build input. The main plan now counts them as spent, where before
+it kept every outer-join term for a loop the main plan no longer has. A term the ON's test ran above
+the join would have turned NULL rows into no rows.
+
+LEFT JOINs at the end of the FROM list still follow the bushy plan as its last loops (lane pl8-16):
+the core is everything before the longest run of semi, anti and LEFT JOINs that ends the list.
+
+This is behind the switch every bushy plan is behind: `JoinMethods::NestedLoopsOnly` plans none, and
+those plans are the control the tests compare against.
+
+**Why.** It is the one placement of an outer join in the emitter's bushy shape whose rows are
+provably the query's: the NULL rows are made where the left-deep plan makes them, inside a
+materialization that is a left-deep plan of the run's tables. The other placement, a LEFT JOIN as
+the probe, needs a hash join that keeps the build side's unmatched rows once for each outer row.
+That is new emitter work, not taken here.
+
+**Evidence.** Written while kiln's server was down, not run yet (lane pl8-19):
+
+- `join::tests::t_pl_8_13_a_left_join_stands_in_a_bushy_run_only_with_its_on_tables`: the conflict
+  rules on a hand-built join.
+- `bushy_test_hook::tests::t_pl_8_13_a_left_join_in_a_hand_built_run_answers_as_the_left_deep_plan`:
+  the tree `(a ((b l c) p))` built by hand around a LEFT JOIN, whatever the search would pick. It
+  is checked against nested loops, with the same ON and WHERE cases as the next test.
+- `bushy_search_tests::t_pl_8_13_a_left_join_inside_a_bushy_run_keeps_its_null_rows`: differential
+  against nested loops, on the fact tables, with a LEFT JOIN hung on either dimension. It covers
+  matched and NULL-extended rows, an ON term no index reads, a WHERE `IS NULL` on the padded side,
+  and a WHERE term on the padded side and the probe. Non-vacuity: `BUSHY_PLANS`, and
+  `LEFT_JOINS_IN_RUNS` for at least one side.
+
+**Falsified by.** An answer that differs from nested loops; a LEFT JOIN planned as a probe, or in a
+run without a table its ON reads; a NULL row dropped by an ON term run at the probe.
+
+## Decision (lane pl8-20): a LEFT JOIN as a bushy plan's probe, behind a switch
+
+**Decision.** PL.8, T-PL.8.14 (`join::bushy_pair_keeps_left_joins`, the bushy pairs in
+`compute_best_join_order`, `optimizer::bushy_build_groups`,
+`Connection::set_bushy_left_join_probes`). Decision pl8-19 kept a LEFT JOIN's table from being a
+bushy pair's probe. With the switch `BushyLeftJoinProbes::ByCost` it may be one:
+
+- *The join.* The probe reads the run through the outer hash join a LEFT JOIN's table gets
+  (`HashJoinType::LeftOuter`), whose build side is the run's materialized rows. For each row of the
+  outer loops, the probe pass resets the hash table's matched bits, runs the LEFT JOIN's ON terms on
+  each match and marks the run's rows they pass; after the pass, the run's rows it didn't mark come
+  out once, with the probe's table NULL. That is `(outer JOIN run) LEFT JOIN t ON p`.
+- *The conflict rule.* The order `outer, run, t` must be one a left-deep plan may take: the outer
+  loops and the run hold every table `t` follows (its ON's tables, `required_lhs_by_table`) and none
+  that follows it (`can_add_table_to_prefix`). An ON term with a subquery keeps `t` from the probe.
+- *Terms.* The ON terms run at the probe, before the match is marked, as a left-deep outer hash
+  join runs them. A term between the outer loops and the run (an inner join's) runs after the mark,
+  and again on each unmatched row (`emit_unmatched_row_conditions_and_loop` runs every remaining
+  term), so a run's row comes out NULL-extended only for the outer rows it joins. WHERE terms on
+  `t` run after the mark and on the NULL rows.
+- *Cost.* The probe's cost is the inner probe's plus one visit of every row of the run for each
+  outer row, the unmatched pass; the join has at least the rows of the join before `t`.
+- *The emitter* already had every piece: the matched bits reset at each probe pass, the unmatched
+  pass at the probe's loop end, the payload refilled for each unmatched row. `bushy_build_groups`
+  now accepts the outer hash join as a run's probe (typed refusal otherwise) and counts it for the
+  tests (`LEFT_JOIN_PROBES`).
+
+The switch is off by default: today's bushy plans, with an inner probe only, are the control until
+the A/B says otherwise.
+
+**Why.** A LEFT JOIN whose left side is a join of two cuts (an outer dimension and a run of a fact
+and its dimension) is the bushy shape's case where the outer join's table is the large one, and
+decision pl8-19's rule leaves it no bushy plan: the run must hold the ON's tables, and the probe
+couldn't be the LEFT JOIN. The unmatched pass costs a visit of the run's rows for each outer row,
+which the search weighs.
+
+**Evidence.** Written while kiln's server was down, not run yet (lane pl8-20):
+
+- `join::tests::t_pl_8_13_a_left_join_stands_in_a_bushy_run_only_with_its_on_tables`: with the
+  switch, `l` kept as the probe, and the order before it legal only with the table its ON reads.
+- `bushy_test_hook::tests::t_pl_8_14_a_left_join_probing_a_hand_built_run_answers_as_nested_loops`:
+  the tree `(a ((b c) LEFT JOIN p))` built by hand, a term joining the outer loop to the run, rows
+  matched and not; with an ON term no index reads (on `p`, and on `p` and the outer loop),
+  `WHERE p.id IS NULL`, and a WHERE term on `p` and the run. Checked against nested loops and the
+  left-deep plans; non-vacuity `APPLIED`, `LEFT_JOIN_PROBES` and a NULL row in each answer.
+- `bushy_search_tests::t_pl_8_14_ab_left_join_probes_change_bushy_plans_only_where_cheaper`: every
+  bushy test query planned with the switch off and on; with it on, each answers as nested loops do;
+  it prints how many change plan, how many of those probe with a LEFT JOIN, and their estimated
+  costs off and on. A plan it changes costs no more by the estimate than the control's.
+- `bushy_search_tests::t_pl_8_13_a_left_join_inside_a_bushy_run_keeps_its_null_rows` now forces
+  the LEFT JOIN into the run in every query: the LEFT JOIN's dimension keeps six rows and the other
+  one, so the mirror plan, with the LEFT JOIN's side as the outer loops, scans the probe six times
+  where the plan with it in the run scans it once.
+
+**Falsified by.** An answer under the switch that differs from nested loops; a LEFT JOIN probe whose
+ON reads a table after it; a run's row NULL-extended for an outer row it doesn't join; a plan the
+switch changes to a costlier one by the planner's own estimate.
+
+## Decision (lane pl8-22): a batch of timed runs read at its median run
+
+**Decision.** PL.8, T-PL.8.2 (`learned_costs::LearnedCosts::observe_sampled`, `Rate::close_runs`).
+Under `WeightRule::BatchMeans` (the default), a batch of the seek's, the hash build's or the hash
+probe's single timed runs closes at its median run's time, not its mean. `WeightRule::Blend`, the
+control, still blends each run in.
+
+**Why.** Twenty copies at once of `t_pl_8_2` passed 19 times (kiln run r124). The copy that failed
+ran a query with a bushy plan and planned the same query without a hash join right after: the run
+had moved the hash weights. A timed run is tens of nanoseconds; one the scheduler preempted reads
+milliseconds, and one of those in a batch of a hundred multiplies the batch's mean by hundreds
+(`t_pl_8_2_preempted_runs_move_no_weight`). The first batch replaces calibration's rate
+without a test (there is no spread between batches yet), so one preemption in it set the weight.
+The median holds while fewer than half a batch's runs are preempted, which is how calibration
+already reads its samples (`t_qt_5_5_calibration_weights_hold_through_preempted_samples`).
+
+**Given up.** A run's time with a long tail of real work (a cache miss on a large table) counts at
+its median, below its mean. Bulk timings (the sort, page reads) are unchanged. Memory: a batch
+holds at most an epoch's run times, the work calibration timed a sample of.
 
 ## Decision (lane pl12): custom plans, then a generic one, for prepared statements
 
@@ -1690,7 +2078,16 @@ rows. In autocommit the implicit transaction it ends must be its own: with anoth
 connection under way in it, the run goes on as planned. A run is handed off once at most: the new plan is made on the counted rows, so its own build
 falls within the band, and were it not, it goes on as planned. A run that has returned rows, or
 writes, goes on as planned and the new plan waits for its next run: its answer is right and no row
-comes twice. The other materialization points (a sorter, a materialized subquery) are not built.
+comes twice.
+
+**A hash join the planner chose** (lane pl13r, `BuildCounted`, `Connection::adaptive_build_checks`).
+Where adaptive joins are on, a hash join the plan chose counts its build once it is finished, when the
+build holds its table whole: no filter applied while building and no materialized input, the table
+with statistics and not spilled. The rows are set against the rows the plan counted the table at, the
+same band and the same correction of the table's row counter as the switch's build, and the same
+hand-off. A filtered build counts the filter's rows, not the table's: correcting the table from it
+would be wrong, so it is not checked until a store for filter estimates' corrections is built. The
+sorter's and the materialized subquery's checks are not built.
 
 **Why.** Audit row 13 (`bench/planner/audit/10-no-adaptive.sql`): a nested loop chosen for an
 estimate ran on however many rows came, and an estimate wrong by orders of magnitude was never
@@ -1720,8 +2117,227 @@ switch-off one; the plain join, its rows returned before the build, hands nothin
 each row once (T-PL.13.4). JOB's 20 slowest queries against the parent (AC-PL.13.1) are the
 coordinator's.
 
+**Filtered builds (lane replan-5).** A hash join's build filtered by terms of its own counts the
+share of its table those terms keep, which the table's row counter (PL.9) cannot tell: an UPDATE
+moves it without moving the count. Where the plan's estimate ran exactly those terms on the sample
+(decision 21), the planner notes the share it used (`PlanValues::filter_selectivity`) and the build
+is checked against the table's rows now times that share (`BuildCounted` with a `FilteredBuild`).
+The band is the share's binomial relative error, `sqrt((1 - p) / (p n))` for a share `p` of `n`
+sample rows, and the table count's, added in quadrature as independent errors are. Past it the
+counted share (at least half a row's, the sample's own floor) is stored in the database's
+`FilterShares`, keyed by the table and a fingerprint of the terms (order-free, never for terms
+reading a parameter), and every plan that read the old share is planned again before its next run,
+or at once by the hand-off, as one planned on a moved count is. The planner reads a stored share in
+place of the sample's for the same terms. A build filtered by one `=` or IN list of constants on a
+column the column statistics estimate (decision 20, which the sample does not run) is checked the
+same way against their share (lane replan-9, `constraints::apply_column_stats`): the planner notes
+the share it read for that term alone and reads a stored one in its place; the error is the
+sample's binomial one at the share planned on, as a common value's share is the sample's count and
+a rare value's what the sample's counts leave. Only with adaptive joins on; counted by
+`Connection::adaptive_filter_checks` and `Connection::adaptive_filter_corrections` (each also an
+`adaptive_replans`). The store holds its entries weakly, so it is bound by the plans that read them:
+a share outlives the last statement planned on it only until its entry is swept. A build whose
+terms the sample did not run together and that are not one column statistics term (an `=` beside
+a range, say) is checked the same way (lane replan-10, `cardinality::OwnFilter`): the estimate of
+a table's own filters together, however it combined them (the sample's share, the column
+statistics', independent terms multiplied), is noted under the fingerprint of every term the sample
+ran and every constraint counted as a filter that reads no other table, and a share a build or
+sorter stored for them is read in its place; the error is the sample's binomial one at that share.
+`t_pl_13_16_a_build_filtered_by_a_mix_of_terms_plans_again` (T-PL.13.16): `b.v = 7 AND b.w < 50`,
+the `=` priced by the column statistics and the range by the sample, half the rows set to 7 after:
+one answer with adaptive joins off and on, one share stored, one re-plan, none after. A build fed
+by a materialized input (lane replan-11) holds the rows of a join prefix, the tables before its
+probe with its build table among them, that every term reading only them keeps (PL.6's
+materialization, stored key and payload, one row a row of the prefix). No table's counter or share
+can correct them; their correction is the prefix's rows, keyed as a whole join's are
+(`subquery_rows::prefix_identity`: the tables' names and the fingerprint of every term reading
+only them), so one query's prefix and another's whole join of the same tables by the same terms
+share a count. Once the join order is chosen the plan notes the search's own estimate of each
+materialized prefix under that key (`optimizer::note_materialized_prefixes`, from
+`JoinN::prefix_cardinalities`); the join search reads a count stored under a set's key in place of
+its estimate, asking the store only whether one is there, so the sets it merely tries leave no
+entry (`cardinality::PrefixKeys`, `SubqueryRows::counted`). Once filled, the input's rows (its last
+rowid: the fill numbers them) are checked against the noted rows (`main_loop::join_prefix_check`,
+`SubqueryCounted`), the band each prefix table's statistics' error in quadrature, as for a sorter
+fed by a join; past it the count is stored, the plan made again and the run handed off as a stored
+subquery result's is. Only where the whole join's rows are read: inner joins only, a plan for one
+run, a left-deep plan (a bushy run is joined among itself), a prefix of two tables or more holding
+every table the input reads. A single table's filtered materialized input is not checked.
+`t_pl_13_18_a_build_fed_by_a_materialized_prefix_plans_again` (T-PL.13.18): `r JOIN s JOIN t` by
+hash joins only, `s` the first join's probe and the second's build, so the second's input is
+materialized from a two-table prefix: the prefix the first plan holds is read from its EXPLAIN
+(lane replan-12) before the data changes, and only then is that prefix thrown off its estimate
+(`{r, s}`: every `s.k` set to `r`'s common value, 20 rows estimated, 2,000 counted; `{s, t}`: 2,000
+estimated, 200 counted) and the other left on its own, so the test forces its premise whichever
+prefix the planner picks: one answer with adaptive joins off and on, the prefix counted, one
+re-plan, none after. A set of tables that holds a corrected prefix (lane replan-12) is
+joined from it, so the model's error on the prefix is in its estimate too: the join search scales
+the set's own estimate by the prefix's correction, its counted rows over its own estimate
+(`cardinality::Corrections`), the largest corrected set it holds winning (its count holds any
+smaller one's), not cut to the PL.11 bound again (the count is the rows, where the statistics the
+bound read are stale). A prefix is recorded where the search estimates it, before the sets built
+on it (the exact search goes by size, the greedy one prefix by prefix); two disjoint corrected
+sets are not multiplied together. A whole join's count, stored by a sorter, corrects a prefix of
+the same tables and terms in another query, and is carried the same way.
+`t_pl_13_22_a_corrected_prefix_is_carried_into_the_whole_chain` (T-PL.13.22): a chain of four
+tables whose first pair alone is off its estimate (20 estimated, 2,000 counted, stored by a sorter
+over the pair alone): the chain's whole-join estimate after it is the one before times the pair's
+correction, and the chain runs with one answer off and on, its sorter within the band of the
+carried estimate, nothing planned again; `pl_13_a_corrected_prefix_is_carried_into_the_sets_holding_it`
+holds the rule (largest set, none from a set estimated at no rows). Evidence: `pl_13_a_filtered_builds_share_past_its_estimate_plans_again`
+(`crates/engine/tests/adaptive_joins.rs`; T-PL.13.5), a range one row in a hundred passed at
+ANALYZE and every row after an UPDATE: one answer with adaptive joins off and on, one share stored,
+one re-plan, none on the second run or in a statement prepared on the stored share.
+
+**Sorters (lane replan-5).** An ORDER BY sorter fed by a full scan of one table, with nothing
+grouped, aggregated, windowed or made distinct in between, holds the rows of that table its WHERE
+terms keep. Once the scan has put them all in, ahead of the sort, `SorterCounted` checks their count
+as a build's is: against the table's rows by its counter with no WHERE term, against the share the
+plan read for exactly its WHERE terms with them, re-planning, storing and handing off by the same
+rules. The sorter counts every row put in, kept by a LIMIT or not, in memory or spilled
+(`Sorter::inserted`). Counted by `Connection::adaptive_sort_checks`. Evidence:
+`pl_13_a_sorters_input_past_the_estimate_plans_again` (T-PL.13.6): a table counted far past its rows
+and a range whose share an UPDATE moved, each one answer in order with adaptive joins off and on,
+one re-plan, none on the second run. A sorter fed by an index seek on one table (lane replan-9) is
+checked the same way against the share the plan read for every WHERE term, the seek's own among
+them: `t_pl_13_11_a_sorter_fed_by_an_index_seek_plans_again` (T-PL.13.11), a seek by `v = 7`, and
+by `v IN (7, 8)`, on an index whose values were all distinct at ANALYZE, half the rows set to 7
+after. A GROUP BY's sorter (lane replan-10) holds the same rows, one a row read, before they are
+grouped, and is checked the same way once the loop has put them all in, ahead of its sort
+(`group_by_agg_phase`); its correction is the table's row counter or the filter's stored share, so
+the GROUP BY's estimate is made again from the rows counted. Only a sorter that takes every row:
+one beside a hash table of groups takes only the rows of groups past its budget (executor decision
+4) and is not checked. `t_pl_13_14_a_group_by_sorters_input_past_the_estimate_plans_again`
+(T-PL.13.14): a `count(DISTINCT v)` GROUP BY (no hash table) over a table counted far past its rows,
+and over a range whose share an UPDATE moved: one answer with adaptive joins off and on, one
+re-plan, none on the second run.
+
+A sorter fed by an inner join of two tables or more (lane replan-10, ORDER BY's or GROUP BY's)
+holds the join's rows its WHERE and ON terms keep, one a row, which no table's counter or share
+can correct. Its correction is the rows of the whole join, stored in the database's `SubqueryRows`
+under the join's identity (`subquery_rows::join_identity`: the tables' names in any order and the
+fingerprint of every term, never for terms reading a parameter). The estimate of the set of all a
+join's tables (`cardinality::JoinedSetRows::rows`, for one run: `initial` at most one row, inner
+joins only) reads a count stored there in its place and notes the rows it read, and the sorter,
+once all in, is checked against them (`SorterCounted` with a `CountedCheck`); the band is each
+joined table's statistics' error, independent, in quadrature, and past it the count is stored,
+the plan made again and the run handed off as a stored subquery result's is. A LEFT JOIN (lane
+replan-11) is checked the same way: the estimate of its whole set counts the right table's
+unmatched rows, kept null-extended, and its identity adds a part for each LEFT JOIN's table and
+each of its ON terms, which keep rows an inner join or a WHERE term of the same text would drop;
+`t_pl_13_19_a_sorter_fed_by_a_left_join_past_the_estimate_plans_again` (T-PL.13.19): T-PL.13.15's
+join as a LEFT JOIN, 1,000 rows estimated and 5,491 counted, one answer in order with adaptive
+joins off and on, one re-plan, none after. So is a semi or anti join (an EXISTS or NOT EXISTS
+unnested), whose whole set's estimate is the rows it keeps, its table adding a part of its own to
+the identity, one for a semi and another for an anti join:
+`t_pl_13_20_a_sorter_fed_by_a_semi_or_anti_join_past_the_estimate_plans_again` (T-PL.13.20), by
+hash joins only, `b`'s keys ten values none of `a`'s at ANALYZE; the rows each plan checks its
+sorter against are read from its EXPLAIN first (lane replan-12), and `b`'s keys then set to cover
+all of `a`'s or none, whichever keeps the farther of none and all 1,000 rows from that estimate:
+one answer in order each way, one re-plan each, none after. A RIGHT or FULL JOIN (its unmatched
+right rows read apart), or a table without statistics, is not checked.
+
+A sorter after a SELECT DISTINCT (lane replan-12) takes a row only once the DISTINCT has dropped
+its duplicates, so it holds the distinct rows, which neither a table's counter nor a join's count
+corrects. Its correction is a store of its own in `SubqueryRows`, under the DISTINCT's identity
+(`subquery_rows::distinct_identity`): the rows it reads keyed as a whole join's are, and the
+result columns made distinct as a set, as a GROUP BY's groups are its rows and its keys. The
+planner's estimate of the DISTINCT's output rows (the rows read) reads a count stored there in
+its place and notes the rows it read (`optimizer::distinct_rows`, for one run, with no GROUP BY,
+aggregate or window), and the sorter, once all in, is checked against them
+(`main_loop::distinct_sorter_check`, `SorterCounted` marked `distinct`), the band each table's
+statistics' error in quadrature, as the estimate is the rows read; past it the count is stored and
+the plan made again. `t_pl_13_21_a_distinct_sorters_rows_past_the_estimate_plan_again`
+(T-PL.13.21): `SELECT DISTINCT k ... ORDER BY k DESC` over 5,000 rows holding 20 values, unfiltered
+and filtered: one answer in order with adaptive joins off and on, one re-plan, none after, and a
+new plan reads the 20 rows stored.
+`t_pl_13_15_a_sorter_fed_by_a_join_past_the_estimate_plans_again` (T-PL.13.15): a join estimated
+at 1,000 rows from distinct keys, holding 4,500 after an UPDATE: one answer, in order, with adaptive
+joins off and on, one re-plan, none on the second run or in a new statement.
+
+**Stored subquery results (lane replan-6).** An uncorrelated FROM-clause subquery stored whole in
+an ephemeral table (a CTE read more than once, or one declared `MATERIALIZED`, or a source a
+RIGHT or FULL JOIN reads again) holds the rows the planner estimated for it. Once its fill
+finishes, inside the block that runs it once, `SubqueryCounted` checks their count against the rows
+the plan read for the subquery: its own estimate, `estimated_output_rows`, or a count a fill stored.
+The band is the statistics' relative error of each table the subquery reads, in quadrature. A
+subquery over another FROM-clause subquery (lane replan-10, `main_loop::adaptive::tables_error`)
+takes that subquery's own error in its place: its group count's where ANALYZE's group count set its
+rows, else the errors of the tables it reads, from a worklist bounded by the plan's size. A subquery
+over a table without statistics, or a table-valued function, is not checked.
+`t_pl_13_17_a_stored_subquery_over_a_subquery_plans_again` (T-PL.13.17): a materialized CTE filtered
+by a range on another's column, which no statistics estimate, 4,750 rows: one answer with adaptive
+joins off and on, one re-plan, none on the second run or in a new statement. The
+count is the last row's rowid (the fill numbers its rows 1, 2, ...), read without a scan. Past the
+band the count goes to the database's `SubqueryRows`, keyed by the subquery's identity: a
+fingerprint of its syntax taken when it is planned, since optimizing and emitting the plan rewrite
+its printed form; every reference to one CTE, and every statement writing the same subquery, share
+the key; a lateral subquery or one reading a parameter has none. The planner reads the count in
+place of the estimate (`base_row_estimate`), and every plan that read the old rows plans again, at
+once by the hand-off where the run may start over. Counted by `Connection::adaptive_subquery_checks`.
+A subquery stored in its seek index (`DirectMaterializedIndex`, lane replan-8) is counted there,
+once filled, inside the block that fills it once: the index has no rowid to read, so `Count` walks
+its pages once, each page's cells summed, no row decoded; the index keeps an entry a row (a
+sequence column keeps equal rows apart), so its entries are the rows.
+
+A GROUP BY's estimate is the fewer of the rows it reads and its groups. Where ANALYZE's group count
+set it (an index starting with the GROUP BY's columns, `group_count_from_analyze`), the band is that
+count's error, not the rows' (lane replan-8, `optimizer::group_count_error`): `sqlite_stat1` keeps
+the rows a group as `ceil(total / groups)`, so an average `a` of two or more stands for up to
+`1 / (a - 1)` more groups than read (one is exact), in quadrature with the statistics' own error.
+Where the rows read, or a LIMIT, set the estimate, the rows' error stands. Evidence:
+`t_pl_13_7_a_stored_subquery_result_past_the_estimate_plans_again` (T-PL.13.7): a CTE referenced
+twice and a GROUP BY in a materialized CTE, each over a range whose share an UPDATE moved: one
+answer with adaptive joins off and on, one re-plan, none on the second run or in a new statement.
+`t_pl_13_8_a_subquery_stored_in_its_seek_index_past_the_estimate_plans_again` (T-PL.13.8): a
+GROUP BY subquery read through its seek index, the same way. `t_pl_13_9_a_grouped_result_is_checked_against_its_group_counts_error`
+(T-PL.13.9): 2,000 groups read as 1,667 (3 rows a group), within the group count's error though past
+the rows' (1 / sqrt(1,024)), not planned again; 5,000 after an UPDATE, past it, planned again once.
+`t_pl_13_10_a_build_filtered_by_a_column_statistics_term_plans_again` (T-PL.13.10): a build
+filtered by `b.v = 7`, and by `b.v IN (7, 8)`, on a column every value of which was distinct as
+ANALYZE counted it, half its rows set to 7 after: one answer with adaptive joins off and on, one
+share stored, one re-plan, none on the second run or in a new statement.
+
+**IN subqueries (lane replan-10, `constraints::in_subquery_values`).** An uncorrelated
+`x IN (SELECT y ...)` looks up the subquery's distinct values. Their estimate is at most the
+subquery's rows (its own estimate) and at most `y`'s distinct values where ANALYZE's column
+statistics counted them (decision 20). The values looked up are at most `x`'s distinct values, by
+the containment assumption that the fewer distinct values are among the more (PostgreSQL's
+`eqjoinsel_semi`), and the share of `x`'s table kept is `values / distinct(x)` of its non-NULL
+rows; `x`'s distinct values are its column statistics' count, or the table's rows for a key or a
+column without them, one row a value as an IN list's estimate takes it. A plan with no estimate
+takes SQLite's 25 rows (`in_subquery_rows`, SQLite's own tuning value for `x IN (SELECT ...)`) as
+before. This replaces a cap at the square root of `x`'s table's rows, a picked number. NOT IN keeps
+its estimate, on the new values. Where every table the subquery reads has statistics, the plan
+notes the values it read under the subquery's identity (`subquery_rows::in_identity`, apart from
+the same text's as a FROM-clause subquery) in the database's `SubqueryRows`, and reads a count
+stored there in their place. The ephemeral index, filled inside its run-once block, is counted
+there (`Count`, as a seek index's are): it has no rowid and its inserts skip a key it holds
+(`IdxInsertFlags::no_op_duplicate`), so its entries are the distinct values (a NULL among them one
+more). The count is checked against the values the plan read with the band and the store of a
+stored subquery result, and re-planned, handed off and counted the same way
+(`Connection::adaptive_subquery_checks`). Evidence:
+`t_pl_13_12_an_in_subquerys_stored_result_past_the_estimate_plans_again` (T-PL.13.12): 1,000
+values estimated and five counted after an UPDATE: one answer with adaptive joins off and on, one
+re-plan, none on the second run or in a new statement.
+`t_pl_13_13_an_in_subquerys_values_come_from_its_statistics` (T-PL.13.13): 4,000 rows of distinct
+values read by a scan of the outer table, 4,000 rows of five values by its index, where the square
+root's cap took both for 70 values.
+
+**Not checked yet (lane replan-9's audit of the points this decision names, as lane replan-10
+left it).** A hash join's build fed by a materialized input (it needs a store of a join prefix's
+rows, keyed as the whole join's is and read for that prefix's set of tables); a filter term that
+neither the sample runs nor a constraint counts; a sorter fed by an outer, semi or anti join; a
+GROUP BY's hash table of groups (a store of group counts); a DISTINCT; a stored subquery result
+over a table without statistics (its band has no statistics' error to take).
+Each needs a store for its own correction, or the new plan would be the old one (the last
+falsifier below). A sorter fed by a seek beside other terms is checked against the share of all
+its terms together (T-PL.13.16's `OwnFilter`).
+
 **Falsified by.**
 - JOB's 20 slowest queries not faster than the parent with the shell in (AC-PL.13.1).
+- A filtered build's stored share planned on by a statement whose build then counts past it again,
+  run after run: the share's error band too tight for the filter.
 - A join that switched and ran slower than the nested loop it left, on the same rows: the learned
   weights wrong for the inner side's access (its pages not cached as the seek weight assumes).
 - A statement planned again whose new plan is the old one, many times over: the band too tight to
@@ -1988,9 +2604,10 @@ under load). It now samples:
 - **A WHERE step** (`Work::WhereStep`, `cpu_cost_per_where_step`). Two of the engine's values
   compared, timed per key; the planner's step cost is that weight times the row's, in place of
   0.003. The defaults of both stand only where the clock never moved.
-- **Open.** `hash_bytes_per_row` (100) and the `rhs_has_selective_seek` gate are still to remove;
-  LIP and predicate transfer across star joins (T-QT.5.3), sort-merge and prefetched index joins
-  are not built.
+- **Open.** `hash_bytes_per_row` is now the build table's row (lane qs5-13, T-QT.5.7), and the
+  `rhs_has_selective_seek` gate is gone (lane qs5-15, T-QT.5.8): a seek kept from the start and a
+  hash join are weighed by cost alone. LIP and predicate transfer across star joins (T-QT.5.3),
+  sort-merge and prefetched index joins are not built.
 
 ## Decision (lane g6s3): learned plan hints, kept for a query class only where its held-out runs beat the cost model
 
@@ -2093,3 +2710,265 @@ cost the same before); `cost::tests::t_pl_7_1_*`. `tests/planner.rs`'
 `a_whole_table_group_by_scans_and_sorts_where_lookups_would_read_pages` rested on the 50: its
 20,000 items are 198 real pages, under the smallest cache a connection takes (200), so it now
 builds 80,000.
+
+## Decision (lane qs5-18): an IS takes the equality's row estimate unless its value is NULL
+
+**Decision.** QT.5, T-QT.5.9 (carried over from lane qs5-17). Every `col IS v` whose `v` might be
+NULL (a parameter, another table's column) took the `IS NULL` estimate, a tenth of the rows a
+column, so `a IS ? AND b IS ?` on a million-row table without statistics was expected to return
+10,000 rows. Now:
+
+- **NULL.** The NULL literal, and a parameter a custom plan binds to NULL (or leaves unbound, which
+  runs as NULL), keep the `IS NULL` estimate.
+- **Not NULL.** A non-NULL literal, and a parameter a custom plan binds to a value, take the `=`
+  estimate, as `a IS 5` already did.
+- **Not known.** A parameter of the generic plan, and another table's column, take the `=`
+  estimate too (`CostModelParams::value_is_null`, `constraints::is_value`).
+- A NULL-matching `IS` still never counts as one row (`Constraint::null_matching`): an index, even a
+  unique one, can hold many NULL keys, so the plan keeps its sort.
+
+**Why.** At a tenth of the rows a column, the `(a, b)` search was expected to make 10,000 table
+lookups, which priced it near a full scan (1,794 against 1,025 in one run, 2,558 against 9,552 in
+another). The learned weight of a row visit against a page read then chose between them, and it
+moved about 27 times over between runs on a loaded host (0.00033 against 0.0089 pages a row), so
+`tests/records_plans.rs`' `a_one_row_lookup_needs_no_sort_for_its_columns` planned a scan in 1 to
+3 of every 20 runs. The equality's estimate is what SQLite gives the same term.
+
+**Sources.** SQLite's `whereLoopAddBtreeIndex` (`src/where.c`, 3.54.0): an `IS` term takes the
+row estimate of `=` (`WO_EQ|WO_IS`), and only `IS NULL` (`WO_ISNULL`) is estimated on its own.
+
+**Evidence.** `cost_params::tests::t_qt_5_9_an_is_value_is_null_only_where_planning_knows_it`.
+Lane qs5-17, on the fix this redoes: `a_one_row_lookup_needs_no_sort_for_its_columns` passed 40 of
+40 (two rounds of 20 copies at once on adacachy, where it failed 1 to 3 times in each 20 before),
+with every `records_plans` test and the 134 `translate::optimizer` library tests.
+
+**The value planning doesn't know, behind a switch.** Whether the generic plan's `a IS ?` (and `a
+IS other.col`) takes the `=` estimate is open, so it sits behind `Connection::set_is_value_estimate`
+for the coordinator's A/B (T-QT.5.10):
+
+- `Equality`, the default: SQLite's.
+- `WorstCase`, the control: the larger of the `=` and the `IS NULL` estimates, the worst over the
+  value's possible values. It is what every NULL-matching `IS` took before wherever the `IS NULL`
+  estimate is the larger, which is every case without statistics.
+
+`tests/is_value_estimate.rs` forces each one's failure mode and counts cursor steps, not time (asserted
+without statistics, where a million rows are assumed; with them the two may plan alike):
+
+- **Mostly NULL, NULL bound** (`Equality`'s). A run whose parameters are all NULL always takes the
+  generic plan (the plan choice sees nothing bound), so a column NULL in 19 rows of 20 is searched
+  for NULL and nearly every row looked up, where `WorstCase` scans once.
+- **Distinct values bound** (`WorstCase`'s). The generic plan scans for a one-row answer; with
+  custom plans allowed, each custom plan (its value known, so the `=` estimate) costs far less than
+  the generic one, so every run is planned again.
+
+The harness (`qt_5_10_is_estimate_harness`, ignored) reports each scenario, rule, plan mode and
+statistics at 1,000 and 1,000,000 rows over the concurrency ladder: plan, cursor steps a run, custom
+plans, and latency p50, p99 and p99.9. The default stays `Equality` until that data says otherwise.
+
+**What would falsify it.** The harness's mostly-NULL scenario at a million rows, if `Equality`'s
+latency there costs more than `WorstCase`'s costs in the distinct scenario across the ladder.
+
+## Decision (lane qs5-18): a star join's filters checked in their measured order
+
+**Decision.** QT.5, T-QT.5.11. A star join's fact row checked its dimensions' Bloom filters in
+the planner's order, the one it estimates passes the fewest rows first (`optimizer/lip.rs`), one
+`Filter` instruction each. Now the fact row's keys for every filter are read first and one
+`StarProbes` instruction checks them, to the first that rejects the row. Behind
+`Connection::set_star_filter_order`:
+
+- `Planned`, the control and the default: the planner's order, as before.
+- `Measured`: each filter's checks and passes are counted in the program's state as the rows run
+  (`vdbe/star_order.rs`), and the filters are kept sorted by their share of rows passed, by
+  Laplace's rule of succession, the lowest first. The order moves as each row's checks are
+  counted: no batch, no interval.
+
+**Why.** For filters of equal cost, checking the one that passes the smallest share first checks
+the fewest filters a row (Babu et al.); the planner's shares are estimates, and an estimate wrong
+by orders of magnitude makes every row pay for the filters before the one that rejects it. Lookahead
+information passing orders its filters by observed selectivity for the same reason (Zhu et al.,
+§4.3).
+
+**Sources.** Babu, Motwani, Munagala, Nishizawa and Widom, "Adaptive Ordering of Pipelined Stream
+Filters", SIGMOD 2004, §2 (the order by rank, and A-Greedy for correlated filters); Zhu, Potti,
+Saurabh and Patel, "Looking Ahead Makes Query Plans Robust", VLDB 2017, §4.3.
+
+**Evidence.** `star_order::tests::t_qt_5_11_*` (the filter passing 1 row in 10 moves first and the
+rows take fewer checks; equal shares keep the planner's order; the order follows a change in the
+rows); `tests/star_filters.rs`' `t_qt_5_11_star_filters_checked_in_their_measured_order_check_less`
+(one answer; fewer checks measured than planned where the planner's estimates tie) and
+`t_qt_5_3_star_filters_stay_within_the_statements_memory` (the filters' bytes within the smallest
+cache's statement memory, `StatementMetrics::star_filter_bytes`).
+
+`qt_5_11_star_order_harness` (ignored; the coordinator's) runs both orders at 2,000 and 1,000,000
+fact rows over a star whose estimates tie (the planned order's failure mode) and one whose rows
+drift halfway, so the order learned first is wrong after (the measured order's): checks and rejects
+a row, filter bytes, latency p50, p99 and p99.9.
+
+**Limits.** A filter checked after another is measured only on the rows that one passed, so
+correlated filters can be misordered (A-Greedy's case). The counts never decay, so after a drift
+the order turns only once the new rows outnumber the old. Every filter's keys are read before the
+first check, even for a row the first filter rejects. The `Filter` instruction's star flag is gone:
+`StarProbes` counts `star_filter_probes` and `star_filter_rejects`.
+
+**What would falsify it.** The coordinator's A/B (`StarFilterOrder::Planned` against `Measured`
+over JOB and TPC-H's star joins): `Measured` slower where the planner's order was already right,
+by more than the reading of the keys and the counting cost.
+
+## Decision (lane qs5-19): a star order's counts whole or fading, measured against each other
+
+**Decision.** QT.5, T-QT.5.11. The measured star order (lane qs5-18) counts every row the run has
+seen alike, so rows that change as the run goes (data loaded in order, a key range that shifts
+halfway) turn the order only once the new rows outnumber the old. A third setting of
+`Connection::set_star_filter_order`, `MeasuredFading`, fades each filter's counts to the rows that
+tell its share from its nearest neighbour's in the order: the rows `n` at which the share's
+standard error `sqrt(p(1 - p)/n)` equals the distance `d` to that neighbour, `n = p(1 - p)/d²`.
+Past them both counts are scaled to `n`, keeping the share, so each new row weighs `1/(n + 1)`.
+Far-apart shares fade fast, close ones slowly, equal ones never. Nothing is picked: the window
+is the shares' own standard error, measured as the rows run. `Measured` (whole counts) and
+`Planned` stay; the default stays `Planned` until the coordinator's A/B decides it.
+
+**Why.** Each candidate has its own failure mode, and the data decides between them. Whole
+counts stay wrong after a shift; fading counts turn the order on the noise between close shares,
+each turn a row checked in the worse order. A-Greedy keeps a window of recent rows for the same
+reason (Babu et al., §4), its size a parameter; here the window comes from the shares.
+
+**Sources.** Babu, Motwani, Munagala, Nishizawa and Widom, "Adaptive Ordering of Pipelined Stream
+Filters", SIGMOD 2004, §4 (A-Greedy's profile window); the standard error of a binomial share.
+
+**Evidence.** `star_order::tests` (lane qs5-19):
+`t_qt_5_11_fading_counts_follow_rows_that_shift_halfway` (whole counts' failure mode: a filter
+passing every row and then none after 5,000 rows; whole counts still check it second at 10,000,
+and fading ones turn and check less after the shift); and
+`t_qt_5_11_fading_counts_turn_on_noise_between_close_shares` (fading's: filters passing a half and
+three in five at random; fading turns the order more than ten times as often and checks more). A
+model of the same rules (Python, not a record) gave 7,500 checks whole and 5,002 fading over the
+5,000 rows after the shift, and on the noise 6 turns and 15,090 checks whole, 628 turns and 15,344
+fading (1.7% more). `StatementMetrics::star_filter_reorders` counts the turns a run makes, and
+`qt_5_11_star_order_harness` prints them beside checks, bytes and latency for all three settings.
+
+**Limits.** Scaling the counts each row is a pass over the filters, a few a star; the counts are
+`f64` (whole counts exact to 2⁵³ rows a run). A filter checked after another is still measured
+only on the rows that one passed (A-Greedy's correlated case).
+
+**What would falsify it.** The coordinator's A/B over the harness's stars with and without drift
+and over JOB and TPC-H's star joins: `MeasuredFading` taking more checks or time than `Measured`
+where the rows don't shift by more than it saves where they do.
+
+## Decision (lane qs5-19): a sized filter's hashes and finished filter held within its bound
+
+**Decision.** PL.5, T-QT.5.12. A sized Bloom filter (lane qs5-9) collects its build's key hashes
+within its memory bound, then, at its first probe, sizes and fills the filter from them, holding
+the hashes and the finished filter at once: up to twice the bound. Now the filter gets only the
+room the bound leaves beside the hashes, its bits counted in whole words before they are
+allocated, so the two together never pass the bound. Where the hashes' duplicates leave room, the
+list is shrunk first if the copy a shrink may make fits beside it. `BloomFilter::seal` returns the
+most bytes held while sealing, and `StarProbes` counts, in `star_filter_bytes`, the most the star's
+filters hold together as they are sealed one after another: the ones before holding their
+filters, the one sealing both, the ones after their hashes.
+
+**Why.** The bound is the statement's memory share (`optimizer/lip.rs`) or the hash join's budget,
+and its own description already counts the hashes. A filter whose hashes fill the bound now passes
+every key, as one over the bound did before.
+
+**Evidence.** `bloom_filter::tests::qt_5_sealing_holds_the_hashes_and_the_filter_within_the_bound`
+(hashes taking two thirds of the bound, duplicates that leave room, and hashes filling it: each
+within the bound, the last passing every key); `t_qt_5_3_star_filters_stay_within_the_statements_memory`
+for all three orders. The learned-costs calibration's filter (`learned_costs.rs`) is given the
+page's hashes and as many bytes again, so its filter is still built.
+
+**Limits.** While the hash list grew, a reallocation could briefly hold the old and the new list,
+uncounted; lane qs5-20 bounds and counts it (next decision).
+
+## Decision (lane qs5-20): a sized filter's hashes grow within its bound, old and new together
+
+**Decision.** PL.5, T-QT.5.16. A growth of a sized filter's key hashes may move them, holding the
+old list and the new at once. The new list is now what the bound leaves beside the old one: it
+doubles while three lists' room fits, then takes the rest, and a filter whose next growth would
+pass the bound passes every key instead. `BloomFilter::peak` is the most bytes the filter held at
+once, its growths' two lists and its sealing (the copy a shrink makes included) both, and
+`StarProbes` counts each filter's growth beside every other filter's whole list in
+`star_filter_bytes`: at least what they held then, as the filters built after it held nothing.
+
+**Why.** The two ways to keep the copy within the bound are to reserve the bound up front or to
+grow within it. Reserving holds a filter's whole share from its first key, whatever its build
+gives, and counts it all: a star with several filters, and many statements at once, would hold
+their shares for builds of a few keys. Growing within the bound holds what the keys need and
+costs only the last growth's reach: the hashes stop between half and two thirds of the bound, and
+the filter built beside them still gets the rest.
+
+**Evidence.** `bloom_filter::tests::qt_5_16_the_hashes_grow_within_the_bound_old_and_new_together`
+(bounds of 98,304, 65,536 and 1,000 bytes, keys given one at a time: the most held at once within
+the bound after every key; a growth that would pass it passes every key; a small build's peak is
+its last growth's two lists); the qs5-19 sealing test, whose filled filter now stops growing at
+half its bound and passes every key as before. The learned-costs calibration's filter, given
+twice its page's hashes, still fits its hashes and a filter at its rate (at least a third of its
+bound remains, over 40 bits a key against the `ln(rows)/ln²2` its rate takes).
+
+## Decision (lane qs5-20): a sort-merge join costed beside the hash join, traced until its operator lands
+
+**Decision.** QT.5 step 4, T-QT.5.15. `estimate_merge_join_cost` prices a sort-merge join in the
+hash join's plan shape and units, so one choice point (`join.rs`, the hash join's candidate) can
+weigh the two: each input not already in key order is sorted (the build once, the probe on each
+pass), a sort that outgrows the statement's memory writes and reads its pages once, the merge
+compares each row once, and the matches and any unmatched build rows are visited.
+`merge_inputs_in_key_order` says which inputs are ordered: a forward read of a table whose key is
+its rowid, or of an index whose first column is the key, ascending in its default collation; the
+merge leads with the key that leaves the most inputs ordered. Until the plan node and its operator
+land, the choice point only traces the merge's cost beside the hash join's ("merge-join
+candidate"), so no plan changes.
+
+**Why.** A merge join wins where its inputs already come in key order or the hash table would
+spill: it holds one run of equal keys, not the build side. Every weight is the cost model's
+(`sort_cpu_per_row`, `cpu_cost_per_row`, the page reads), and the spill's shape is the sorter's
+own: it writes each full buffer as a sorted chunk and merges every chunk in one heap pass
+(`vdbe/sorter.rs`), so a spilled row is written and read once.
+
+**Evidence.** `access_method::merge_join_cost_tests` (ordered inputs sort nothing, unordered ones
+pay their sorts, a spilled sort its pages once, ordered inputs past memory cost less merged than
+hashed, unordered ones that fit cost less hashed, unmatched build rows a visit each, empty inputs
+only the probe's scan); `join::tests::qt_5_15_merge_inputs_in_key_order_by_rowid_and_index`;
+`tests/join_methods.rs`'s `qt_5_15_equi_joins_over_empty_null_repeated_and_mixed_keys_give_one_answer`
+(T-QT.5.17), the differential test the operator must pass.
+
+**Limits.** An index's order is a merge's only where its comparison is the equality's: an index of
+another collation, or keys whose affinities differ, aren't counted as ordered here, and the
+operator must sort them in the equality's terms. To be measured once the operator lands: merge
+against hash over the concurrency ladder, ordered and unordered inputs, builds that fit and that
+spill.
+
+## Decision (lane qs5-21): a sort-merge join is the hash join with its rows merged by key, behind a switch
+
+**Decision.** QT.5 step 4, T-QT.5.18. A sort-merge join is a method of the hash join
+(`HashJoinMethod::Merge` on `HashJoinOp` and `AccessMethodParams::HashJoin`), not a new
+`Operation`: it runs through the hash join's instructions, its table (`HashTable::set_merge`) taking
+the build rows as any hash table does. Once the build is done, the rows' positions are sorted by key
+in place (SQLite's order: NULL, numbers by value, text by the key's collation, blobs by their
+bytes). A probe key at or past the previous one merges forward from that key's run, so a probe read
+in key order passes each build row once and a repeated key replays its run with no buffer; a key
+before it finds its run by binary search. The planner takes a merge only under the switch:
+`JoinMethods::MergeJoinsOnly` (always, for the differential tests) or `JoinMethods::ByCostWithMerge`
+(where `estimate_merge_join_cost` is below the hash join's). `ByCost`, the default, never does, so no
+plan changes until the measurement below says so. The parallel path takes only hash joins.
+
+**Why.** Every hash-join site that only cares about the build and probe structure (the open, close
+and init paths, the outer join's unmatched rows, the semi join's first match, the Bloom filter, the
+spill) stays one code path for both methods, so a merge gives every join type's answer the hash
+join gives. The sort is in place with no buffer, and its positions are counted in the table's
+memory: a table whose order would pass its budget, or that spilled, is probed by hash, counted.
+
+**Evidence.** `hash_table::tests::qt_5_18_merge_table_finds_what_the_hash_table_finds` (the same
+rows, with repeats, NULL, 1 and 1.0, text and a blob, probed in key order and out of it, give the
+hash table's matches and unmatched rows; ordered probes merge, the others search);
+`tests/join_methods.rs`'s `qt_5_18_a_merge_join_over_ordered_inputs_merges` (a planned MERGE JOIN
+over inputs read in key order merges forward with no search and gives the hash join's answer);
+`tests/join_methods.rs` under `MergeJoinsOnly` and `ByCostWithMerge` (T-QT.5.1's random joins, the
+star joins' filters, T-QT.5.17's edge cases). Counters: `HashJoinMetrics::merge_steps`,
+`merge_searches`, `merge_tables_hashed`.
+
+**Limits.** The build rows still go in by hash, and a build already in key order is still sorted
+(an in-place sort of ordered input costs about a comparison a row); a probe out of key order pays a
+binary search a row, where the cost function charges it a sort. A merge that spills is a hash join:
+the sort-merge's own spill (sorted runs merged) is not built. To be measured, against the hash join,
+over the concurrency ladder: probes in key order and not, builds already ordered and not, and builds
+that fit and that pass the statement's memory: `qt_5_18_merge_versus_hash_harness`, ignored, the
+coordinator's.

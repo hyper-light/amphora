@@ -85,11 +85,25 @@ fn database_path(path: &Path) -> Result<PathBuf, Refusal> {
 }
 
 fn directory(path: &Path) -> Result<PathBuf, Refusal> {
-    let canonical = database_path(path)?;
-    let mut sidecar = canonical.into_os_string();
-    sidecar.push(".client");
-    Ok(PathBuf::from(sidecar))
+    Ok(sidecar(&database_path(path)?))
 }
+
+/// The private directory beside the database at `canonical`, a path already made canonical.
+fn sidecar(canonical: &Path) -> PathBuf {
+    let mut sidecar = canonical.as_os_str().to_os_string();
+    sidecar.push(".client");
+    PathBuf::from(sidecar)
+}
+
+/// The file [`try_lease`] locks for the database at `canonical`, a path already made canonical,
+/// which may not exist yet. Every path that reaches the database's directory reaches this file, so
+/// its identity names the lease whatever path an open took (CP-T1.13).
+pub(crate) fn lease_file(canonical: &Path) -> PathBuf {
+    sidecar(canonical).join(LEASE)
+}
+
+/// The name of the lease's file in a database's private directory.
+const LEASE: &str = "database-owner";
 
 fn remaining(until: Instant) -> Result<Duration, Refusal> {
     let left = until.saturating_duration_since(Instant::now());
@@ -153,12 +167,32 @@ fn single_database_link(path: &Path) -> Result<(), Refusal> {
 /// Acquire the protected database owner lock before opening an engine or creating SQL state.
 /// A busy lease selects a client; malformed filesystem state is refused before bootstrap.
 pub(crate) fn try_lease(path: &Path) -> Result<Option<File>, Refusal> {
+    let lock = owner_lock(path)?;
+    match lock.try_lock() {
+        Ok(()) => Ok(Some(lock)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => Err(unavailable(error)),
+    }
+}
+
+/// [`try_lease`], waiting for the owner before it to let the lock go: the operating system wakes
+/// it as that owner's last handle on the lock closes. A test's, whose owners end on threads of their
+/// own after the test drops them.
+#[cfg(test)]
+pub(crate) fn wait_lease(path: &Path) -> Result<File, Refusal> {
+    let lock = owner_lock(path)?;
+    lock.lock().map_err(unavailable)?;
+    Ok(lock)
+}
+
+/// The owner lock's file for `path`, not yet locked; malformed filesystem state is refused.
+fn owner_lock(path: &Path) -> Result<File, Refusal> {
     let canonical = database_path(path)?;
     let directory = PrivateDir::ensure(directory(&canonical)?).map_err(unavailable)?;
     single_database_link(&canonical)?;
     let private_lock = directory
         .open_file_with(
-            "database-owner",
+            LEASE,
             OpenOptions {
                 access: FileAccess::ReadWrite,
                 creation: FileCreation::OpenOrCreate,
@@ -166,12 +200,31 @@ pub(crate) fn try_lease(path: &Path) -> Result<Option<File>, Refusal> {
             },
         )
         .map_err(unavailable)?;
-    let lock = clone_lock(&private_lock)?;
-    match lock.try_lock() {
-        Ok(()) => Ok(Some(lock)),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-        Err(std::fs::TryLockError::Error(error)) => Err(unavailable(error)),
-    }
+    clone_lock(&private_lock)
+}
+
+/// A listening socket at `address`, nonblocking: the loopback endpoint's (port 0, the system's
+/// choice) and a network endpoint's ([`super::network`]).
+pub(super) fn listener(address: SocketAddr) -> Result<Listener, Refusal> {
+    let socket = Socket::new(
+        Domain::for_address(address),
+        Type::STREAM,
+        Some(Protocol::TCP),
+    )
+    .map_err(unavailable)?;
+    // SO_REUSEADDR can otherwise redirect Windows connections to another local process.
+    // Microsoft: learn.microsoft.com/windows/win32/winsock/using-so-reuseaddr-and-so-exclusiveaddruse.
+    #[cfg(windows)]
+    socket.set_exclusive_address(true).map_err(unavailable)?;
+    // Fresh Unix sockets retain the OS defaults: SO_REUSEADDR and SO_REUSEPORT are disabled.
+    socket.bind(&address.into()).map_err(unavailable)?;
+    // The backlog is the system's own most: past it each system takes its limit (Linux's
+    // net.core.somaxconn, listen(2); XNU's kern.ipc.somaxconn, solisten), and Windows reads
+    // SOMAXCONN, 0x7fffffff, as "a maximum reasonable value" (Microsoft, listen function).
+    // Accepted connections are bounded by the process's descriptor budget, not here.
+    socket.listen(i32::MAX).map_err(unavailable)?;
+    socket.set_nonblocking(true).map_err(unavailable)?;
+    Ok(Listener::from(socket))
 }
 
 pub(super) fn bind(path: &Path) -> Result<Bound, Refusal> {
@@ -189,23 +242,7 @@ pub(super) fn bind(path: &Path) -> Result<Bound, Refusal> {
     let lock = clone_lock(&private_lock)?;
     lock.try_lock().map_err(unavailable)?;
 
-    let socket =
-        Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).map_err(unavailable)?;
-    // SO_REUSEADDR can otherwise redirect Windows connections to another local process.
-    // Microsoft: learn.microsoft.com/windows/win32/winsock/using-so-reuseaddr-and-so-exclusiveaddruse.
-    #[cfg(windows)]
-    socket.set_exclusive_address(true).map_err(unavailable)?;
-    // Fresh Unix sockets retain the OS defaults: SO_REUSEADDR and SO_REUSEPORT are disabled.
-    socket
-        .bind(&SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
-        .map_err(unavailable)?;
-    // The backlog is the system's own most: past it each system takes its limit (Linux's
-    // net.core.somaxconn, listen(2); XNU's kern.ipc.somaxconn, solisten), and Windows reads
-    // SOMAXCONN, 0x7fffffff, as "a maximum reasonable value" (Microsoft, listen function).
-    // Accepted connections are bounded by the process's descriptor budget, not here.
-    socket.listen(i32::MAX).map_err(unavailable)?;
-    socket.set_nonblocking(true).map_err(unavailable)?;
-    let listener = Listener::from(socket);
+    let listener = listener(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))?;
     let mut token = [0; 32];
     getrandom::fill(&mut token).map_err(unavailable)?;
     let mut record = Vec::with_capacity(RECORD_BYTES);

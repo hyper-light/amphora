@@ -1,5 +1,5 @@
 use crate::{
-    alloc::{TursoFromIterator, TursoIteratorExt},
+    alloc::{TryClone, TursoFromIterator, TursoIteratorExt},
     emit_explain,
     schema::{BTreeCharacteristics, BTreeTable},
     sync::Arc,
@@ -66,7 +66,7 @@ fn emit_program_for_select_with_inputs(
     // Amphora (QT.6): a qualifying scan's aggregates run in leaf-page morsels first; the serial
     // loop below answers only when that run declines.
     let morsel_hook = if resolver.parallel() {
-        crate::translate::parallel::emit_morsel_hook(program, &plan)
+        crate::translate::parallel::emit_morsel_hook(program, &plan, resolver)?
     } else {
         None
     };
@@ -348,6 +348,11 @@ struct MaterializationSpec {
     prefix_tables: TableMask,
     key_exprs: Vec<Expr>,
     payload_columns: Vec<MaterializedColumnRef>,
+    /// PL.13 (lane replan-11): the join prefix whose rows the input holds, one a row, where they
+    /// are checked against the plan's estimate (`main_loop::join_prefix_check`): a left-deep
+    /// prefix of two tables or more (its loops and the build tables their hash joins read, lane
+    /// replan-14), stored key and payload.
+    checked_prefix: Option<TableMask>,
 }
 
 /// Store filtered hash-build inputs before the hash table is built.
@@ -485,6 +490,18 @@ pub(crate) fn emit_materialized_build_inputs(
                 probe_table_idx,
                 &hash_join_op.build_group,
             )?;
+            // T-PL.13.18 (lane replan-14): the prefix the input holds is every table it joins,
+            // the loops before the probe and the build tables their hash joins read. A hash
+            // join's build table runs no loop of its own (the plan's join order leaves it out),
+            // so a two-table prefix whose second table probes the first has a join order of one
+            // table: the check goes by the tables joined, as the planner noted them
+            // (`optimizer::note_materialized_prefixes`, every table before the probe).
+            let checked_prefix =
+                if hash_join_op.build_group.is_empty() && included_tables.count() >= 2 {
+                    Some(included_tables.try_clone()?)
+                } else {
+                    None
+                };
             let prefix_has_other_tables = included_tables
                 .iter()
                 .any(|table_idx| table_idx != hash_join_op.build_table_idx);
@@ -513,6 +530,7 @@ pub(crate) fn emit_materialized_build_inputs(
                     prefix_tables: included_tables,
                     key_exprs,
                     payload_columns,
+                    checked_prefix,
                 });
             } else {
                 // Single-table prefix: a rowid list preserves the build-side filters
@@ -524,6 +542,7 @@ pub(crate) fn emit_materialized_build_inputs(
                     prefix_tables: TableMask::default(),
                     key_exprs: Vec::new(),
                     payload_columns: Vec::new(),
+                    checked_prefix: None,
                 });
             }
         }
@@ -602,6 +621,22 @@ pub(crate) fn emit_materialized_build_inputs(
             program.clear_hash_tables_to_keep_open();
             Ok(())
         })?;
+        // PL.13 (lane replan-11: a build fed by a materialized input): the prefix's rows, all in,
+        // counted against the rows the plan noted for it.
+        let check = match spec.checked_prefix.as_ref() {
+            Some(prefix) => {
+                crate::translate::main_loop::join_prefix_check(resolver, &*plan, prefix)
+            }
+            None => None,
+        };
+        if let Some(check) = check {
+            crate::translate::main_loop::emit_subquery_counted(
+                program,
+                check,
+                cursor_id,
+                crate::translate::subquery::MaterializedFromClauseSubqueryStorage::TableBacked,
+            );
+        }
         program.pop_current_parent_explain();
 
         build_inputs.insert(
@@ -694,6 +729,34 @@ fn prune_join_order_for_materialized_inputs(
         return Ok(());
     }
 
+    // PL.8 (lane pl8-19): the LEFT JOINs inside a bushy plan's build group, by their tables' ids.
+    // The group's materialization joins each and makes its NULL rows, its ON terms reading the
+    // group's tables only (`optimizer::bushy_build_groups`), so the main plan, which reads the
+    // group's rows from the payload, has spent those terms.
+    let mut group_left_joins: Vec<(amphora_engine_parser::ast::TableInternalId, TableMask)> =
+        Vec::new();
+    for member in plan.join_order.iter() {
+        let Some(Operation::HashJoin(hash_join_op)) = plan
+            .table_references
+            .joined_tables()
+            .get(member.original_idx)
+            .map(|table| &table.op)
+        else {
+            continue;
+        };
+        if hash_join_op.build_group.is_empty() {
+            continue;
+        }
+        for table_idx in hash_join_op.build_group.iter() {
+            let Some(table) = plan.table_references.joined_tables().get(table_idx) else {
+                continue;
+            };
+            if table.join_info.as_ref().is_some_and(|info| info.is_outer()) {
+                group_left_joins.push((table.internal_id, hash_join_op.build_group.clone()));
+            }
+        }
+    }
+
     for term in plan.where_clause.iter_mut() {
         if term.consumed {
             continue;
@@ -704,6 +767,26 @@ fn prune_join_order_for_materialized_inputs(
             // does not make those terms safe to consume here, because the
             // materialization subplan does not include the probe table that
             // determines the null-extension boundary.
+            // A bushy plan's build group holds that loop and every table the term reads
+            // (lane pl8-19): the term ran there.
+            let Some(right_table) = term.origin.join_origin().map(|origin| origin.right_table())
+            else {
+                continue;
+            };
+            let Some((_, group)) = group_left_joins
+                .iter()
+                .find(|(table_id, _)| *table_id == right_table)
+            else {
+                continue;
+            };
+            let mask = table_mask_from_expr(
+                &term.expr,
+                &plan.table_references,
+                &plan.non_from_clause_subqueries,
+            )?;
+            if group.contains_all_set_bits_of(&mask) {
+                term.consumed = true;
+            }
             continue;
         }
         let mask = table_mask_from_expr(
@@ -1150,6 +1233,7 @@ fn build_materialized_build_input_plan(
         non_from_clause_subqueries,
         input_cardinality_hint: None,
         estimated_output_rows: None,
+        in_identity: None,
         estimated_cost: None,
         simple_aggregate: None,
         phantom_params: vec![],

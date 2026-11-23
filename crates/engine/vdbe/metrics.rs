@@ -25,6 +25,13 @@ pub struct HashJoinMetrics {
     pub grace_probe_rows_streamed: u64,
     pub grace_probe_rows_buffered: u64,
     pub grace_matches: u64,
+
+    /// Amphora (QT.5 step 4, lane qs5-21): a sort-merge join's build rows passed by merging
+    /// forward, probe rows out of key order found by binary search instead, and merge tables that
+    /// spilled and so probed by hash (`HashTable::set_merge`).
+    pub merge_steps: u64,
+    pub merge_searches: u64,
+    pub merge_tables_hashed: u64,
 }
 
 impl HashJoinMetrics {
@@ -58,6 +65,11 @@ impl HashJoinMetrics {
             .grace_probe_rows_buffered
             .wrapping_add(other.grace_probe_rows_buffered);
         self.grace_matches = self.grace_matches.wrapping_add(other.grace_matches);
+        self.merge_steps = self.merge_steps.wrapping_add(other.merge_steps);
+        self.merge_searches = self.merge_searches.wrapping_add(other.merge_searches);
+        self.merge_tables_hashed = self
+            .merge_tables_hashed
+            .wrapping_add(other.merge_tables_hashed);
     }
 
     pub fn reset(&mut self) {
@@ -90,6 +102,16 @@ pub struct StatementMetrics {
     // Sort and filter operations
     pub sort_operations: u64,
     pub filter_operations: u64,
+    /// Amphora (T-QT.5.3): fact rows a star join's filters checked, and those they rejected.
+    pub star_filter_probes: u64,
+    pub star_filter_rejects: u64,
+    /// Amphora (T-QT.5.3, lanes qs5-18 and qs5-19): the most bytes a star probe's filters held
+    /// together as their builds ended, each sealed one holding its key hashes and its finished
+    /// filter at once (`BloomFilter::seal`).
+    pub star_filter_bytes: u64,
+    /// Amphora (T-QT.5.11, lane qs5-19): the fact rows after which a star probe's measured order
+    /// moved (`vdbe/star_order.rs`): how often its counts turned it.
+    pub star_filter_reorders: u64,
 
     // B-tree operations
     pub btree_seeks: u64,
@@ -133,6 +155,16 @@ impl StatementMetrics {
         self.index_steps = self.index_steps.wrapping_add(other.index_steps);
         self.sort_operations = self.sort_operations.wrapping_add(other.sort_operations);
         self.filter_operations = self.filter_operations.wrapping_add(other.filter_operations);
+        self.star_filter_probes = self
+            .star_filter_probes
+            .wrapping_add(other.star_filter_probes);
+        self.star_filter_rejects = self
+            .star_filter_rejects
+            .wrapping_add(other.star_filter_rejects);
+        self.star_filter_bytes = self.star_filter_bytes.max(other.star_filter_bytes);
+        self.star_filter_reorders = self
+            .star_filter_reorders
+            .wrapping_add(other.star_filter_reorders);
         self.btree_seeks = self.btree_seeks.wrapping_add(other.btree_seeks);
         self.btree_table_seeks = self.btree_table_seeks.wrapping_add(other.btree_table_seeks);
         self.btree_index_seeks = self.btree_index_seeks.wrapping_add(other.btree_index_seeks);

@@ -524,6 +524,11 @@ impl Db {
         self.backup = Some(hooks);
     }
 
+    /// The backup's hooks this writer stamps its commits by; none unbacked and for a reader.
+    pub(crate) fn stamps(&self) -> Option<&Arc<crate::backup::Hooks>> {
+        self.backup.as_ref()
+    }
+
     /// Turns off the engine's own restart of the log at this connection's next write and its
     /// emptying of the log when this connection closes last ([`Db::back_up`]).
     pub(crate) fn hold_log(&self) {
@@ -621,6 +626,32 @@ impl Db {
             })
             .map(|_| ())
             .map_err(fail)
+    }
+
+    /// Folds the log into the file through `frame` (inclusive), leaving the rest in the log and the
+    /// log as it is: a replay in parts, each a step a paced check can pause after (T-T1.12.C8). The
+    /// engine's passive checkpoint, bounded (`CheckpointMode::Passive`'s `upper_bound_inclusive`).
+    pub(crate) fn fold_log_through(&mut self, frame: u64) -> anyhow::Result<()> {
+        self.ensure_unfenced()?;
+        self.conn
+            .checkpoint(CheckpointMode::Passive {
+                upper_bound_inclusive: Some(frame),
+            })
+            .map(|_| ())
+            .map_err(fail)
+    }
+
+    /// [`Db::query`] uncached, `between` called each time the statement waits on the device: a long
+    /// statement (`PRAGMA integrity_check`) a paced check can pause inside (T-T1.12.C8).
+    pub(crate) fn query_between(
+        &self,
+        sql: &str,
+        each: impl FnMut(&Row) -> anyhow::Result<bool>,
+        between: &mut dyn FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        self.ensure_unfenced()?;
+        let mut stmt = self.conn.prepare(sql).map_err(fail)?;
+        step_between(self.io.as_ref(), &mut stmt, [], each, between)
     }
 
     /// The frames the log holds now, as this connection last saw it: for a writer, all of them.
@@ -1127,6 +1158,24 @@ impl Db {
 
     /// Runs `sql` with `params`, its statement prepared the first time and kept, handing each row
     /// to `each` until it says stop (false).
+    /// The bytes of page `pgno` of the database as its pager holds them (CP-T1.9, T-T1.9.R19: a
+    /// group's size cut reads its position index's root page alone). Asked inside a transaction
+    /// that has read, so the page is that transaction's.
+    pub(crate) fn page(&self, pgno: i64) -> anyhow::Result<Vec<u8>> {
+        let pager = self.conn.get_pager();
+        let (page, completion) = pager
+            .io
+            .block(|| pager.read_page(pgno))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if let Some(completion) = completion {
+            pager
+                .io
+                .wait_for_completion(completion)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        Ok(page.get_contents().as_ptr().to_vec())
+    }
+
     pub fn query(
         &self,
         sql: &'static str,
@@ -1299,7 +1348,19 @@ pub fn step(
     io: &dyn IO,
     stmt: &mut Statement,
     params: impl IntoIterator<Item = Value>,
+    each: impl FnMut(&Row) -> anyhow::Result<bool>,
+) -> anyhow::Result<()> {
+    step_between(io, stmt, params, each, &mut || Ok(()))
+}
+
+/// [`step`], `between` called each time the statement waits on the device, before it does: a long
+/// statement's points to pause at (T-T1.12.C8).
+fn step_between(
+    io: &dyn IO,
+    stmt: &mut Statement,
+    params: impl IntoIterator<Item = Value>,
     mut each: impl FnMut(&Row) -> anyhow::Result<bool>,
+    between: &mut dyn FnMut() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     stmt.reset().map_err(fail)?;
     for (i, p) in params.into_iter().enumerate() {
@@ -1317,7 +1378,10 @@ pub fn step(
                 }
             }
             StepResult::Done => return Ok(()),
-            StepResult::IO | StepResult::Yield => io.step().map_err(fail)?,
+            StepResult::IO | StepResult::Yield => {
+                between()?;
+                io.step().map_err(fail)?;
+            }
             StepResult::Sleep { duration } => {
                 pause(duration);
                 io.step().map_err(fail)?;

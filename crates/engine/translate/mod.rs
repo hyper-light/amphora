@@ -95,6 +95,14 @@ pub fn translate(
             | ast::Stmt::Update { .. }
     );
 
+    // Amphora (PL.8, T-PL.8.11, lane pl8-18): only a SELECT takes the fast plan with an exact
+    // search to follow, because only a SELECT's plan reads nothing of what the connection is
+    // doing: a write's reads whether the connection is inside a nested statement and pushes onto
+    // its stack of triggers compiling (`trigger_exec.rs`), state a search made off the connection's
+    // thread would read and change while the connection runs (docs/design/planner.md, decision
+    // pl8-18).
+    let fast_search = prepare_options.fast_search && matches!(stmt, ast::Stmt::Select { .. });
+
     let capture_data_changes_info = if connection.is_mvcc_bootstrap_connection() {
         None
     } else {
@@ -150,6 +158,13 @@ pub fn translate(
     resolver.set_plan_values(plan_values.clone());
     // Amphora (PL.9): the row counts read each table's changes since ANALYZE.
     plan_values.attach_row_changes(connection.db.row_changes.clone());
+    // Amphora (PL.13, lane replan-5): with adaptive joins on, the filter estimates read the shares
+    // filtered builds counted.
+    if connection.adaptive_joins() {
+        plan_values.attach_filter_shares(connection.db.filter_shares.clone());
+        // Amphora (PL.13, lane replan-6): and the subquery estimates the rows fills counted.
+        plan_values.attach_subquery_rows(connection.db.subquery_rows.clone());
+    }
     // Amphora (PL.9): an INSERT or DELETE of a main-database table folds its change count into
     // that table's counter when it finishes.
     let write_target = match &stmt {
@@ -170,6 +185,33 @@ pub fn translate(
     // Amphora: what its hash and group tables hold before they spill (executor decision 8).
     resolver.set_statement_memory(connection.get_pager().statement_memory_budget());
     resolver.set_join_methods(connection.join_methods());
+    // PL.8 (lane pl8-20): whether a bushy plan may probe with a LEFT JOIN's table.
+    resolver.set_bushy_left_join_probes(
+        connection.bushy_left_join_probes() == crate::BushyLeftJoinProbes::ByCost,
+    );
+    resolver.set_star_filters(connection.star_filters());
+    resolver.set_is_value_estimate(connection.is_value_estimate());
+    resolver.set_star_filter_order(connection.star_filter_order());
+    // Amphora (PL.8): the join search's budget, from the rule and this database's measured rates.
+    resolver.set_join_search(
+        crate::translate::optimizer::search_budget::SearchBudget::new(
+            connection.join_search_budget(),
+            &connection.db.learned_costs,
+            prepare_options.expected_runs,
+        )
+        .fast(fast_search),
+    );
+    // Amphora (PL.8, lane pl8-16): where this plan notes its join orders, the last plan's, and the
+    // share of a plan's cost the weights' error could explain, which a carried order keeps its
+    // place by.
+    let join_orders = Arc::new(crate::translate::optimizer::join::JoinOrders::default());
+    resolver.set_join_orders(
+        join_orders.clone(),
+        prepare_options.carried_join_orders.clone(),
+        connection.db.learned_costs.cost_margin(),
+    );
+    resolver.set_outer_probe(connection.parallel_outer_probe());
+    resolver.set_searched_links(connection.parallel_searched_links());
     resolver.set_sorted_fetches(connection.sorted_fetches());
     resolver.set_adaptive_joins(connection.adaptive_joins());
     resolver.set_automatic_indexes(connection.automatic_indexes());
@@ -230,8 +272,16 @@ pub fn translate(
     };
 
     program.epilogue(schema);
+    let searches = crate::translate::optimizer::search_budget::end_statement();
+    connection.db.learned_costs.search().add(searches);
+    // Amphora (PL.8, lane pl8-17): a fast plan the greedy search ordered has an exact search to
+    // follow; one the exact search planned within the fast budget is already exact.
+    program.fast_planned = fast_search && searches.greedy_searches > 0;
     program.reads_parameter_values = plan_values.asked();
     program.planned_tables = plan_values.take_planned();
+    program.join_orders = Some(join_orders);
+    program.planned_filters = plan_values.take_planned_filters();
+    program.planned_subqueries = plan_values.take_planned_subqueries();
     program.write_target = write_target;
 
     program.build(connection, change_cnt_on, input)

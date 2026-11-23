@@ -35,6 +35,8 @@ The capability never crosses the socket. Thus a stale record whose port was reus
 process cannot authenticate that process or expose the capability. Windows exclusive binding
 prevents another local socket from intercepting or relaying traffic after the handshake. OS-local
 stream isolation protects subsequent SQL/Records frames; this is not a network transport.
+Between machines a node's endpoint listens at a network address under mutual TLS instead
+(transport/network.rs; reshard.md, "The transport between machines").
 
 The wire is a four-byte big-endian length followed by a postcard envelope. Variant order is
 append-only. Frames are limited to RESULT_MAX plus 1 MiB of serialization overhead. Serialization
@@ -117,13 +119,13 @@ choice, falsified by a reflected or replayed proof authenticating a new connecti
 
 ## Versions (2026-11-06)
 
-The greeting carries the protocol version (`wire::VERSION`), and the owner refuses a peer of any
-other version at once, `Invalid`, naming both versions, before a challenge and before any frame
+The greeting carries the protocol version (`wire::VERSION`), and the owner refuses a peer with no
+version in common at once ("Negotiated versions"), `Invalid`, naming both versions, before a challenge and before any frame
 whose shape differs. Postcard is not self-describing: a field added to a message is not filled by
 `#[serde(default)]` on decode, so a client reading an older owner's longer or shorter record gets a
 decode error mid-session, `Unavailable`, not the default. So every change to any message's fields
-bumps the version, and an owner and its clients change version together across a drain: stop the
-clients, replace the owner and the clients, start again. Nothing decodes another version's records.
+bumps the version. Before version 9 an owner and its clients changed version together across a drain;
+since 9 they negotiate ("Negotiated versions"). Nothing decodes another version's records.
 The owner's refusal is its own result, never a frame: it writes nothing and closes the connection,
 so a client of another version sees the connection closed before any challenge, whatever shape its
 frames have.
@@ -152,6 +154,39 @@ order of definition", and "their length and field names are not encoded on the w
 ([postcard's wire format, section 28](https://postcard.jamesmunns.com/wire-format.html)), so a
 decoder can't tell a missing trailing field from a short frame. Falsified by: a session that decodes a
 record of another version, or a refusal of another version that comes after the greeting.
+
+## Negotiated versions (2026-11-22)
+
+Version 9 lets nodes of two versions talk, so a cluster upgrades one node at a time instead of
+across a drain. Each side says the versions it speaks and both use the newest one in common:
+
+- The client's greeting frame holds its `Hello`, whose `version` is now the oldest version it
+  speaks, followed by `Speaks`, the newest. The owner's `Challenge` frame is followed by `Agreed`,
+  the version it chose. Postcard decodes a frame's leading value and ignores what comes after it,
+  so a version-8 peer reads these frames as its own and leaves the added value unread.
+- A version-8 owner takes only a `Hello` of exactly 8. A client of this version says 8 as its
+  oldest, so that owner takes it; the client then finds no `Agreed` and uses 8.
+- No version in common is refused at the greeting, `Invalid`, naming both ranges.
+- Once a side says what it speaks (the client sent `Speaks`, the owner sent `Agreed`), both proofs
+  bind the client's newest and the chosen version (`auth::Agreement`). A greeting with one of the
+  two cut off on the way then fails authentication instead of quietly agreeing on 8. Cutting both
+  looks exactly like a version-8 peer, which no scheme a version-8 peer accepts can tell apart.
+- Messages keep their shape at every version. A version adds variants after every existing one,
+  and a variant is sent only on a connection that agreed on a version that has it: a request
+  (`Request::since`, which names every request and every `xgroup::Step`) is refused before it goes
+  out, `Invalid`, on a connection that agreed on an older version. Version 9's
+  `Answer::SteppedClosed` is `Stepped` plus the group's closed time; an owner answers a step at 8
+  with `Stepped`, as version 8 did.
+- What a version-8 peer can't say is missing, not guessed: a step a version-8 node answers adds no
+  closed time to a transaction's token (xgroup.md, "Reading its own writes across groups"), so
+  reading one's own writes in that node's groups holds once it speaks 9.
+
+`VERSION_MIN`, 8, is a format value: every version-8 message keeps its shape, and nothing newer is
+sent at 8. The tests: `a_version_8_client_and_a_version_9_owner_exchange_what_both_know`,
+`a_version_9_client_and_a_version_8_owner_exchange_what_both_know`,
+`a_version_9_greeting_agrees_on_9_and_binds_it`, `negotiated_versions_take_the_newest_both_speak`.
+Falsified by: a version-8 peer refused by a version-9 one, a variant sent on a connection that
+agreed on a version without it, or a greeting with its `Speaks` cut off that authenticates.
 
 ## The tests' budgets (2026-10-31)
 

@@ -7,7 +7,8 @@ use sha2::{Digest, Sha256};
 /// The archive's format: a format value, raised when a body's layout changes.
 pub(super) const FORMAT: u8 = 1;
 
-const SUM_BYTES: usize = 32;
+/// The bytes of a SHA-256 sum (FIPS 180-4): a format value.
+pub(super) const SUM_BYTES: usize = 32;
 
 /// The log generation a segment's frames are of, as its header names it: SQLite's WAL header's
 /// checkpoint sequence and salts (sqlite.org/fileformat2.html, "WAL File Format"), which change
@@ -36,6 +37,21 @@ pub(super) struct Segment {
     pub header: Vec<u8>,
     pub marks: Vec<StoredMark>,
     pub frames: Vec<u8>,
+}
+
+/// A segment's fields before its frames, as postcard lays them out: [`Segment`]'s fields in order,
+/// its frames last, as their length (a varint, postcard's wire format, "varint(usize)") then their
+/// bytes. So a segment read in parts gives its head first and its frames after (T-T1.12.M3).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub(super) struct SegmentHead {
+    pub format: u8,
+    pub generation: u64,
+    pub identity: Identity,
+    pub first: u64,
+    pub header: Vec<u8>,
+    pub marks: Vec<StoredMark>,
+    /// The bytes of its frames, as their length says.
+    pub frames: u64,
 }
 
 /// The manifest's own format: a format value. 1 had no `from` (every chunk its base's own); 2
@@ -156,14 +172,38 @@ pub(super) fn opened<'a>(key: &str, object: &'a [u8]) -> anyhow::Result<&'a [u8]
     Ok(body)
 }
 
-pub(super) fn encode<T: Serialize>(value: &T) -> anyhow::Result<Vec<u8>> {
-    sealed(&postcard::to_allocvec(value)?)
+/// A sealed object read in parts (T-T1.12.M2): its sum from its first bytes, its body hashed as
+/// the parts come, and the sum checked once the last is in ([`Opening::finish`]).
+#[derive(Default)]
+pub(super) struct Opening {
+    sum: Vec<u8>,
+    hasher: Sha256,
 }
 
-pub(super) fn decode<T: for<'de> Deserialize<'de>>(key: &str, object: &[u8]) -> anyhow::Result<T> {
-    let value: T = postcard::from_bytes(opened(key, object)?)
-        .map_err(|e| anyhow::anyhow!("archive object {key} doesn't decode: {e}"))?;
-    Ok(value)
+impl Opening {
+    /// The body's bytes in the next part, in order: what of it follows the sum.
+    pub(super) fn feed<'a>(&mut self, part: &'a [u8]) -> &'a [u8] {
+        let want = SUM_BYTES.saturating_sub(self.sum.len()).min(part.len());
+        let (head, body) = part.split_at_checked(want).unwrap_or((&[], part));
+        self.sum.extend_from_slice(head);
+        self.hasher.update(body);
+        body
+    }
+
+    /// Refused where the parts fed held no whole sum, or the body doesn't match it.
+    pub(super) fn finish(self, key: &str) -> anyhow::Result<()> {
+        if self.sum.len() < SUM_BYTES {
+            anyhow::bail!("archive object {key} is shorter than its sum");
+        }
+        if self.hasher.finalize().as_slice() != self.sum.as_slice() {
+            anyhow::bail!("archive object {key} doesn't match its sum");
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn encode<T: Serialize>(value: &T) -> anyhow::Result<Vec<u8>> {
+    sealed(&postcard::to_allocvec(value)?)
 }
 
 /// The bytes a sealed segment takes beyond its frames: what is left of an object for frames.
@@ -201,8 +241,70 @@ mod tests {
         assert_eq!(manifest("k", &bytes).unwrap(), m);
         let last = bytes.len() - 1;
         bytes[last] ^= 1;
-        assert!(decode::<Manifest>("k", &bytes).is_err());
+        assert!(manifest("k", &bytes).is_err());
         assert!(opened("k", &[0; 3]).is_err());
+    }
+
+    /// T-T1.12.M2: a sealed object read in parts of any size gives its body in order and checks
+    /// its sum; an altered body, or parts that end within the sum, are refused.
+    #[test]
+    fn t_t1_12_m2_opening_in_parts() {
+        let body: Vec<u8> = (0..100u8).collect();
+        let sealed = sealed(&body).unwrap();
+        for size in [1, 7, SUM_BYTES, SUM_BYTES + 1, sealed.len()] {
+            let mut opening = Opening::default();
+            let mut out = Vec::new();
+            for part in sealed.chunks(size) {
+                out.extend_from_slice(opening.feed(part));
+            }
+            opening.finish("k").unwrap();
+            assert_eq!(out, body, "parts of {size}");
+        }
+        let mut altered = sealed.clone();
+        let last = altered.len() - 1;
+        altered[last] ^= 1;
+        let mut opening = Opening::default();
+        for part in altered.chunks(9) {
+            opening.feed(part);
+        }
+        assert!(opening.finish("k").is_err());
+        let mut short = Opening::default();
+        short.feed(&sealed[..SUM_BYTES - 1]);
+        assert!(short.finish("k").is_err());
+    }
+
+    /// T-T1.12.M3: a segment's head decodes from its body's first bytes and leaves its frames' bytes
+    /// after; a prefix that ends within the head asks for more.
+    #[test]
+    fn t_t1_12_m3_segment_head() {
+        let segment = Segment {
+            format: FORMAT,
+            generation: 3,
+            identity: Identity {
+                seq: 1,
+                salt1: 2,
+                salt2: 3,
+            },
+            first: 9,
+            header: vec![7; 32],
+            marks: vec![StoredMark {
+                frame: 10,
+                ns: 11,
+                unknown_from: Some(4),
+            }],
+            frames: (0..200u8).collect(),
+        };
+        let body = postcard::to_allocvec(&segment).unwrap();
+        let (head, rest) = postcard::take_from_bytes::<SegmentHead>(&body).unwrap();
+        assert_eq!(head.first, 9);
+        assert_eq!(head.marks, segment.marks);
+        assert_eq!(head.header, segment.header);
+        assert_eq!(head.frames, 200);
+        assert_eq!(rest, segment.frames.as_slice());
+        assert!(matches!(
+            postcard::take_from_bytes::<SegmentHead>(&body[..40]),
+            Err(postcard::Error::DeserializeUnexpectedEnd)
+        ));
     }
 
     /// T-T1.12.I2: a manifest of format 1 still reads, every chunk its own base's; a format 2

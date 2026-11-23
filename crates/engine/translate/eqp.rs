@@ -275,6 +275,9 @@ pub enum EqpDetail {
         join: Option<EqpJoin>,
         subquery: Option<EqpSubquery>,
         estimate: Option<TablePlanEstimate>,
+        /// Amphora (QT.5 step 4, lane qs5-21): found by sort-merge, not by hash
+        /// (`HashJoinMethod::Merge`): `MERGE JOIN`, JSON's `merge_join`.
+        merge: bool,
     },
     /// Scan the right operand again to emit rows that did not match.
     RightJoin {
@@ -384,7 +387,12 @@ impl Display for EqpDetail {
                 )
             }
             Self::IndexMethod { method, .. } => write!(f, "QUERY INDEX METHOD {method}"),
-            Self::HashJoin { table, .. } => write!(f, "HASH JOIN {}", table.name_with_alias()),
+            Self::HashJoin { table, merge, .. } => write!(
+                f,
+                "{} JOIN {}",
+                if *merge { "MERGE" } else { "HASH" },
+                table.name_with_alias()
+            ),
             Self::RightJoin { table } => write!(f, "RIGHT-JOIN {}", table.identifier()),
             Self::HashBuild { table, .. } => write!(
                 f,
@@ -634,12 +642,13 @@ pub(crate) fn eqp_detail_for_table_op(
                 .to_string(),
             estimate: table.plan_estimate,
         },
-        Operation::HashJoin(_) => EqpDetail::HashJoin {
+        Operation::HashJoin(op) => EqpDetail::HashJoin {
             table: eqp_table,
             build: build_table.map(EqpTable::from_joined),
             join,
             subquery,
             estimate: table.plan_estimate,
+            merge: op.method == crate::translate::plan::HashJoinMethod::Merge,
         },
     }
 }
@@ -880,8 +889,9 @@ impl EqpDetail {
                 join,
                 subquery,
                 estimate,
+                merge,
             } => {
-                obj.str("type", "hash_join");
+                obj.str("type", if *merge { "merge_join" } else { "hash_join" });
                 Self::write_table_fields(&mut obj, table, *join, subquery.as_ref());
                 obj.opt_str("build", build.as_ref().map(EqpTable::identifier));
                 Self::write_estimate(&mut obj, estimate.as_ref());

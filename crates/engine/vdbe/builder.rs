@@ -337,6 +337,14 @@ pub struct ProgramBuilder {
     pub(crate) reads_parameter_values: bool,
     /// Amphora (PL.9): the tables whose row counts the plan read (`row_changes.rs`).
     pub(crate) planned_tables: Vec<crate::row_changes::PlannedTable>,
+    /// Amphora (PL.8, lane pl8-16): the join orders the plan chose (`join::JoinOrders`).
+    pub(crate) join_orders: Option<crate::sync::Arc<crate::translate::optimizer::join::JoinOrders>>,
+    /// Amphora (PL.8, lane pl8-17): the fast plan ordered a join greedily (`background_search.rs`).
+    pub(crate) fast_planned: bool,
+    /// Amphora (PL.13, lane replan-5): the filter shares the plan read (`filter_shares.rs`).
+    pub(crate) planned_filters: Vec<crate::filter_shares::PlannedFilter>,
+    /// Amphora (PL.13, lane replan-6): the subquery rows the plan read (`subquery_rows.rs`).
+    pub(crate) planned_subqueries: Vec<crate::subquery_rows::PlannedSubquery>,
     /// Amphora (PL.9): the table an INSERT or DELETE folds its change count into.
     pub(crate) write_target: Option<crate::row_changes::WriteTarget>,
     pub resolve_type: ResolveType,
@@ -781,6 +789,10 @@ impl ProgramBuilder {
             plan_cost: None,
             reads_parameter_values: false,
             planned_tables: Vec::new(),
+            join_orders: None,
+            fast_planned: false,
+            planned_filters: Vec::new(),
+            planned_subqueries: Vec::new(),
             write_target: None,
             flags: ProgramBuilderFlags::new(is_subprogram),
             emitted_function_call: false,
@@ -2000,11 +2012,25 @@ impl ProgramBuilder {
                 }
                 Insn::JoinSwitchHash { target_pc, .. } => resolve(target_pc, "JoinSwitchHash")?,
                 Insn::JoinSwitchBuilt { data } => resolve(&mut data.target_pc, "JoinSwitchBuilt")?,
+                Insn::StarProbes { data } => resolve(&mut data.target_pc, "StarProbes")?,
                 Insn::HashDistinct { data } => resolve(&mut data.target_pc, "HashDistinct")?,
                 Insn::GroupFind { data } => resolve(&mut data.target_pc_full, "GroupFind")?,
                 Insn::GroupDrain { data } => resolve(&mut data.target_pc_done, "GroupDrain")?,
                 Insn::MorselAggregate { data } => {
-                    resolve(&mut data.target_pc_serial, "MorselAggregate")?
+                    resolve(&mut data.target_pc_serial, "MorselAggregate")?;
+                    if let Some(body) = data.body.as_mut() {
+                        // An outer join's ON code (lane qs6-12) and a chain's links' (lane qs6-14).
+                        if let Some(on) = body.on.as_mut() {
+                            resolve(on, "MorselAggregate")?;
+                        }
+                        for (from, pass) in body.links_on.iter_mut().flatten() {
+                            resolve(from, "MorselAggregate")?;
+                            resolve(pass, "MorselAggregate")?;
+                        }
+                        resolve(&mut body.start, "MorselAggregate")?;
+                        resolve(&mut body.keep, "MorselAggregate")?;
+                        resolve(&mut body.skip, "MorselAggregate")?;
+                    }
                 }
                 Insn::MorselNext { target_pc_done, .. } => resolve(target_pc_done, "MorselNext")?,
                 Insn::HashMarkFirstMatch { target_pc, .. } => {
@@ -2478,39 +2504,12 @@ impl ProgramBuilder {
             let Some(ref default_expr) = default else {
                 break 'value None;
             };
-
-            // Try to constant-fold the default expression into a Value for the
-            // Column instruction. Non-constant defaults (e.g. DEFAULT (ABS(-5)))
-            // can't be folded and yield None here — that's correct: they are
-            // evaluated at INSERT time via translate_expr. The Column default
-            // only matters for pre-existing rows after ALTER TABLE ADD COLUMN,
-            // and ALTER TABLE already validates that the default is constant.
-            let mut value = match crate::translate::alter::eval_constant_default_value(default_expr)
-            {
-                Ok(v) => v,
-                Err(_) => break 'value None,
-            };
-
-            // Apply column affinity to the default value, matching SQLite's
-            // sqlite3ColumnDefault which calls sqlite3ValueFromExpr with
-            // pCol->affinity. This ensures e.g. ALTER TABLE ADD COLUMN c TEXT
-            // DEFAULT 0 returns text "0" rather than integer 0 for pre-existing rows.
             let affinity = match cursor_type {
                 CursorType::BTreeTable(btree) => btree.columns()[column].affinity(),
                 CursorType::MaterializedView(btree, _) => btree.columns()[column].affinity(),
                 _ => Affinity::Blob,
             };
-            if let Some(converted) = affinity.convert(&value) {
-                value = match converted {
-                    either::Either::Left(ValueRef::Numeric(numeric)) => Value::from(numeric),
-                    either::Either::Left(_) => {
-                        unreachable!("affinity conversion returned an unexpected borrowed value")
-                    }
-                    either::Either::Right(val) => val,
-                };
-            }
-
-            Some(value)
+            folded_default(default_expr, affinity)
         };
 
         let default = if self.flags.suppress_column_default() {
@@ -2573,6 +2572,7 @@ impl ProgramBuilder {
             .map(|counters| counters.sites)
             .unwrap_or_default();
         let memory_tables = memory_tables(&self.insns);
+        let writes_pager_header = super::writes_pager_header(&self.insns);
         let prepared = PreparedProgram {
             row_count_sites,
             max_registers: self.next_free_register,
@@ -2589,6 +2589,10 @@ impl ProgramBuilder {
             plan_cost: self.plan_cost,
             reads_parameter_values: self.reads_parameter_values,
             planned_tables: self.planned_tables,
+            join_orders: self.join_orders,
+            fast_planned: self.fast_planned,
+            planned_filters: self.planned_filters,
+            planned_subqueries: self.planned_subqueries,
             write_target: self.write_target,
             sql: sql.to_string(),
             refreshes_analyze_stats: sql
@@ -2607,6 +2611,7 @@ impl ProgramBuilder {
             skip_hints: self.skip_hints,
             read_databases: self.read_databases,
             leaf_batch_plan: None,
+            writes_pager_header,
         };
         Ok(prepared)
     }
@@ -2666,6 +2671,35 @@ impl CursorTypeExt for CursorType {
                 | CursorType::Sorter
         )
     }
+}
+
+/// The value a short row (one written before ALTER TABLE ADD COLUMN) reads for a column whose
+/// DEFAULT is `default_expr`: the default constant-folded, with the column's affinity applied, as
+/// SQLite's sqlite3ColumnDefault reads it; `None` (NULL) for a default that doesn't fold. The
+/// serial loop's Column and the morsel scans' padding (QT.6, lane qs6-17) both take it from here.
+pub(crate) fn folded_default(default_expr: &ast::Expr, affinity: Affinity) -> Option<Value> {
+    // Try to constant-fold the default expression into a Value for the
+    // Column instruction. Non-constant defaults (e.g. DEFAULT (ABS(-5)))
+    // can't be folded and yield None here — that's correct: they are
+    // evaluated at INSERT time via translate_expr. The Column default
+    // only matters for pre-existing rows after ALTER TABLE ADD COLUMN,
+    // and ALTER TABLE already validates that the default is constant.
+    let mut value = crate::translate::alter::eval_constant_default_value(default_expr).ok()?;
+
+    // Apply column affinity to the default value, matching SQLite's
+    // sqlite3ColumnDefault which calls sqlite3ValueFromExpr with
+    // pCol->affinity. This ensures e.g. ALTER TABLE ADD COLUMN c TEXT
+    // DEFAULT 0 returns text "0" rather than integer 0 for pre-existing rows.
+    if let Some(converted) = affinity.convert(&value) {
+        value = match converted {
+            either::Either::Left(ValueRef::Numeric(numeric)) => Value::from(numeric),
+            either::Either::Left(_) => {
+                unreachable!("affinity conversion returned an unexpected borrowed value")
+            }
+            either::Either::Right(val) => val,
+        };
+    }
+    Some(value)
 }
 
 #[cfg(test)]

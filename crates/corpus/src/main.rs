@@ -1,4 +1,4 @@
-//! `amphora-corpus run <pool dir> [--engine <name>] [--budget-s <seconds>] [--times <file>]`: a pool
+//! `amphora-corpus run <pool dir> [--engine <name>] [--budget-s <seconds>] [--times <file>] [--refusals any|kind] [--disk <dir>]`: a pool
 //! of corpus files run on one engine (Amphora by default; every engine of G2 step 4 through
 //! amphora_corpus::engines), each on a fresh database, in the pool's order (`order.tsv`: a line a
 //! file, `required` or `fill`, then its path; every `.test` file in path order when there is none).
@@ -11,6 +11,16 @@
 //! that run it (bench/corpus/subset.py). A file `<source>/base.test` is the fixture of every file under `<source>/`
 //! (bench/corpus/build_corpus.py's rule). Exits 1 on any disagreement, 2 when the run itself fails,
 //! and 3 when the engine can't run on this machine (its program missing, its server not reached).
+//! A `statement error` record the engine refuses too is compared with SQLite's error by kind
+//! (crate::refusal, from `<pool>/refusals/`): both counts are written, "any error matches" (the
+//! control, sqllogictest's own rule) and "the same kind"; `--refusals kind` (the default) makes a
+//! refusal of another kind a disagreement, since "any error matches" hides an engine refusing good
+//! SQL for the wrong reason; `any` (the control) keeps it an agreement. Every record the run writes
+//! (its summary and each `--times` line) names its client and platform (engines::client, engines::platform).
+//! `--disk <dir>` puts Amphora's database for each file on a file in `<dir>`, the disk under test,
+//! with the commit bench's durability (WAL, `synchronous = FULL`; amphora::Amphora::on_disk), so
+//! its times are a disk's (T-T1.4.1); without it the database is in memory (the gate's). Only
+//! Amphora takes it: another engine's database is its own.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -19,13 +29,19 @@ use std::time::{Duration, Instant};
 
 use amphora_corpus::amphora::AmphoraRender;
 use amphora_corpus::dialect::{Translated, Translation};
+use amphora_corpus::refusal::{self, Compared, Refusals};
 use amphora_corpus::run::{Counts, Limits, Outcome, run_file};
+use amphora_corpus::slt::Kind;
 
 struct Args {
     pool: PathBuf,
     engine: String,
     budget: Option<Duration>,
     times: Option<PathBuf>,
+    /// Whether a refusal of another kind than SQLite's disagrees (`--refusals kind`).
+    by_kind: bool,
+    /// Amphora's databases on files in this directory, not in memory (`--disk`).
+    disk: Option<PathBuf>,
 }
 
 fn args() -> Result<Args, String> {
@@ -37,12 +53,13 @@ fn args() -> Result<Args, String> {
         Some("run") => {}
         other => {
             return Err(format!(
-                "usage: amphora-corpus run <pool dir> [--engine <name>] [--budget-s <seconds>] [--times <file>] (got {other:?})"
+                "usage: amphora-corpus run <pool dir> [--engine <name>] [--budget-s <seconds>] [--times <file>] [--refusals any|kind] [--disk <dir>] (got {other:?})"
             ));
         }
     }
     let pool = PathBuf::from(it.next().transpose()?.ok_or("run takes a pool directory")?);
-    let (mut budget, mut times, mut engine) = (None, None, "amphora".to_owned());
+    let (mut budget, mut times, mut engine, mut by_kind, mut disk) =
+        (None, None, "amphora".to_owned(), true, None);
     while let Some(a) = it.next().transpose()? {
         let v = it
             .next()
@@ -60,14 +77,34 @@ fn args() -> Result<Args, String> {
             }
             "--times" => times = Some(PathBuf::from(v)),
             "--engine" => engine = v,
+            "--disk" => disk = Some(PathBuf::from(v)),
+            "--refusals" => {
+                by_kind = match v.as_str() {
+                    "any" => false,
+                    "kind" => true,
+                    _ => return Err(format!("--refusals {v}: any or kind")),
+                }
+            }
             other => return Err(format!("unknown argument {other}")),
         }
+    }
+    if disk.is_some() && engine != "amphora" {
+        return Err(format!(
+            "--disk is Amphora's: {engine}'s database is its own"
+        ));
+    }
+    if let Some(d) = &disk
+        && !d.is_dir()
+    {
+        return Err(format!("--disk {}: not a directory", d.display()));
     }
     Ok(Args {
         pool,
         engine,
         budget,
         times,
+        by_kind,
+        disk,
     })
 }
 
@@ -143,6 +180,10 @@ fn go(out: &mut dyn Write) -> Result<bool, String> {
     let a = args()?;
     let began = Instant::now();
     let deadline = a.budget.and_then(|b| began.checked_add(b));
+    let (client, platform) = (
+        amphora_corpus::engines::client(&a.engine, a.disk.as_deref()),
+        amphora_corpus::engines::platform(),
+    );
     let mut times = match &a.times {
         Some(p) => Some(std::io::BufWriter::new(
             std::fs::File::create(p).map_err(|e| format!("{}: {e}", p.display()))?,
@@ -152,6 +193,9 @@ fn go(out: &mut dyn Write) -> Result<bool, String> {
     let mut render = AmphoraRender::new()?;
     let mut total = Counts::default();
     let (mut files, mut write_error, mut required_past) = (0u64, None, 0u64);
+    // Refusals of what SQLite refuses: of SQLite's kind, of another, not compared; and those of
+    // another counted as disagreements (--refusals kind).
+    let (mut same, mut differs, mut unknown, mut kind_disagree) = (0u64, 0u64, 0u64, 0u64);
     for (required, file) in order(&a.pool)? {
         let text =
             std::fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?;
@@ -189,10 +233,12 @@ fn go(out: &mut dyn Write) -> Result<bool, String> {
             file: t,
             fixture: fix_translation.as_ref(),
         });
+        // SQLite's error for each record it refuses, kept when the corpus was built.
+        let refusals = Refusals::read(&refusal::path(&a.pool, Path::new(&rel)))?;
         let file_began = Instant::now();
         // Its opening, settling and closing statements are bounded as a record is: a server that
         // doesn't answer within the budget is unreachable, never a hung run.
-        let mut engine = amphora_corpus::engines::open(&a.engine, a.budget)
+        let mut engine = amphora_corpus::engines::open(&a.engine, a.budget, a.disk.as_deref())
             .map_err(|e| format!("{UNAVAILABLE}{e}"))?;
         // Fill files stop at the deadline; every record, required ones too, is stopped once it has
         // run as long as the whole budget.
@@ -203,7 +249,36 @@ fn go(out: &mut dyn Write) -> Result<bool, String> {
         let name = a.engine.as_str();
         let counts = run_file(engine.as_mut(), &mut render, &text, fix.as_deref(), translated, limits, &mut |ran| {
             let outcome = match &ran.outcome {
-                Outcome::Agree => "agree".to_owned(),
+                Outcome::Agree => match ran.refused.as_deref() {
+                    // A statement SQLite refuses, refused after one the engine couldn't run.
+                    None if ran.record.kind == Kind::Statement { ok: false } => {
+                        unknown = unknown.saturating_add(1);
+                        "agree".to_owned()
+                    }
+                    None => "agree".to_owned(),
+                    Some(e) => match refusal::compare(refusals.get(ran.record.line), refusal::of(name, e)) {
+                        Compared::Same => {
+                            same = same.saturating_add(1);
+                            "agree".to_owned()
+                        }
+                        Compared::Unknown => {
+                            unknown = unknown.saturating_add(1);
+                            "agree".to_owned()
+                        }
+                        Compared::Differs { sqlite, engine } => {
+                            differs = differs.saturating_add(1);
+                            if a.by_kind {
+                                kind_disagree = kind_disagree.saturating_add(1);
+                                if let Err(err) = writeln!(out, "{rel}:{}: {}\n    SQLite refuses it as a {} error, {name} as a {} error: {e}", ran.record.line, ran.record.sql.replace('\n', " "), sqlite.name(), engine.name()) {
+                                    write_error = Some(err.to_string());
+                                }
+                                "disagree".to_owned()
+                            } else {
+                                "agree".to_owned()
+                            }
+                        }
+                    },
+                },
                 Outcome::Unreached => "unreached".to_owned(),
                 Outcome::Untranslatable(_) => "untranslatable".to_owned(),
                 Outcome::Unreadable(_) => "unreadable".to_owned(),
@@ -221,7 +296,7 @@ fn go(out: &mut dyn Write) -> Result<bool, String> {
                 }
             };
             if let Some(t) = times.as_mut() {
-                let line = serde_json::json!({ "file": rel, "line": ran.record.line, "outcome": outcome, "ns": ran.nanos });
+                let line = serde_json::json!({ "file": rel, "line": ran.record.line, "outcome": outcome, "ns": ran.nanos, "client": client, "platform": platform });
                 if let Err(e) = writeln!(t, "{line}") {
                     write_error = Some(e.to_string());
                 }
@@ -232,7 +307,7 @@ fn go(out: &mut dyn Write) -> Result<bool, String> {
             // The file whole, its fresh database and fixture included: what it costs a run's budget;
             // and its failed settles, which fail a run as a disagreement does.
             let ns = u64::try_from(file_began.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            let line = serde_json::json!({ "file": rel, "file_ns": ns, "required": required, "unsettled": counts.unsettled, "past_budget": counts.past_budget });
+            let line = serde_json::json!({ "file": rel, "file_ns": ns, "required": required, "unsettled": counts.unsettled, "past_budget": counts.past_budget, "client": client, "platform": platform });
             writeln!(t, "{line}").map_err(|e| e.to_string())?;
         }
         files = files.saturating_add(1);
@@ -254,6 +329,8 @@ fn go(out: &mut dyn Write) -> Result<bool, String> {
     if let Some(e) = write_error {
         return Err(e);
     }
+    total.agree = total.agree.saturating_sub(kind_disagree);
+    total.disagree = total.disagree.saturating_add(kind_disagree);
     writeln!(
         out,
         "{}: {files} files in {:.1} s: {} records agree, {} disagree, {} untranslatable into its dialect, {} unreadable in its output, {} skipped (not SQLite's), {} not reached in the budget, {} stopped at the budget ({required_past} of them required), {} settles failed",
@@ -269,5 +346,15 @@ fn go(out: &mut dyn Write) -> Result<bool, String> {
         total.unsettled
     )
     .map_err(|e| e.to_string())?;
+    writeln!(
+        out,
+        "{}: {} refusals of what SQLite refuses (any error matches: the control), {same} of SQLite's kind of error, {differs} of another kind{}, {unknown} not compared (SQLite's kind not kept or none named, or after a statement the engine couldn't run)",
+        a.engine,
+        same.saturating_add(differs).saturating_add(unknown),
+        if a.by_kind { " (disagreements: --refusals kind)" } else { "" }
+    )
+    .map_err(|e| e.to_string())?;
+    writeln!(out, "{}: client {client}, platform {platform}", a.engine)
+        .map_err(|e| e.to_string())?;
     Ok(total.disagree == 0 && total.unsettled == 0 && required_past == 0)
 }

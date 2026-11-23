@@ -314,13 +314,25 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
             });
         }
 
-        for cond_idx in build_prefilter_where_terms(
+        let prefilter = build_prefilter_where_terms(
             planner.predicates,
             planner.table_references,
             planner.non_from_clause_subqueries,
             planner.hash_join_op,
             config.uses_materialized_keys_and_payload,
-        )? {
+        )?;
+        // PL.13 (lane replan-5): a build filtered by its own terms only is counted against the
+        // share of the table the plan's estimate of those terms kept; one fed by a materialized
+        // input is the input's count, not checked.
+        let filter_terms = (materialized_input.is_none()).then(|| {
+            (
+                !prefilter.is_empty(),
+                crate::filter_shares::fingerprint(prefilter.iter().filter_map(|cond_idx| {
+                    planner.predicates.get(*cond_idx).map(|term| &term.expr)
+                })),
+            )
+        });
+        for cond_idx in prefilter {
             let cond = &planner.predicates[cond_idx];
             super::conditions::emit_where_term(
                 planner.program,
@@ -467,6 +479,7 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                 payload_start_reg,
                 num_payload,
                 track_matched: planner.hash_join_op.join_type.tracks_matched(),
+                merge: planner.hash_join_op.method == crate::translate::plan::HashJoinMethod::Merge,
             }),
         });
         if config.use_bloom_filter {
@@ -494,6 +507,14 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
         planner.program.emit_insn(Insn::HashBuildFinalize {
             hash_table_id: planner.hash_table_id,
         });
+        // PL.13: the build, its table whole, counted against the plan's estimate.
+        super::adaptive::emit_build_count(
+            planner.program,
+            planner.t_ctx,
+            &btree,
+            planner.hash_table_id,
+            filter_terms,
+        );
         planner
             .program
             .record_hash_build_signature(planner.hash_table_id, config.signature);

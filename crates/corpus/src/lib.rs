@@ -21,5 +21,6 @@ pub mod complete;
 pub mod dialect;
 pub mod engines;
 pub mod md5;
+pub mod refusal;
 pub mod run;
 pub mod slt;

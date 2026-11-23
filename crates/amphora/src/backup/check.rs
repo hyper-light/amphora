@@ -10,48 +10,103 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use amphora_api::blobs::Blobs;
+use amphora_engine_parser::ast::{Cmd, CreateTableBody, Stmt};
+use amphora_engine_parser::parser::Parser;
 use sha2::{Digest as _, Sha256};
 
+use super::drill::{Pace, Unpaced};
 use super::plan::{self, SegmentKey, ThroughKey};
-use super::restore::{Restored, restore, through_marks};
+use super::restore::{Restored, restore_paced, through_marks};
 use super::ship::list_all;
 use super::{SECOND_NS, second_of};
+
 use crate::db::Db;
 
 /// A database's rows, table by table: each table's name, its row count and a SHA-256 over its rows
-/// in rowid order. Two databases with the same rows have the same digest.
+/// in rowid order, or a WITHOUT ROWID table's in its columns' order ([`row_order`]). Two databases
+/// with the same rows have the same digest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RowDigest(pub Vec<(String, u64, [u8; 32])>);
 
 /// The digest of every table of `db` but the engine's own (`sqlite_*`).
 pub fn digest(db: &Db) -> anyhow::Result<RowDigest> {
+    digest_paced(db, &mut Unpaced, u64::MAX)
+}
+
+/// [`digest`], a step of `pace`'s for each `step` bytes of rows read (T-T1.12.C7).
+pub fn digest_paced(db: &Db, pace: &mut dyn Pace, step: u64) -> anyhow::Result<RowDigest> {
     let mut tables = Vec::new();
     db.query(
-        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        "SELECT name, sql FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
         [],
         |r| {
-            tables.push(r.get::<String>(0).map_err(|e| anyhow::anyhow!("{e}"))?);
+            let name = r.get::<String>(0).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let sql = r.get::<String>(1).map_err(|e| anyhow::anyhow!("{e}"))?;
+            tables.push((name, sql));
             Ok(true)
         },
     )?;
     let mut out = Vec::with_capacity(tables.len());
-    for table in tables {
+    let mut read = 0u64;
+    pace.ready()?;
+    for (table, sql) in tables {
         let quoted = table.replace('"', "\"\"");
+        let order = row_order(&table, &sql)?;
         let mut hash = Sha256::new();
         let mut rows = 0u64;
         db.query_owned(
-            &format!("SELECT * FROM \"{quoted}\" ORDER BY rowid"),
+            &format!("SELECT * FROM \"{quoted}\" ORDER BY {order}"),
             [],
             |r| {
                 let values: Vec<_> = r.get_values().collect();
-                hash.update(format!("{values:?}\n").as_bytes());
+                let line = format!("{values:?}\n");
+                hash.update(line.as_bytes());
                 rows = rows.saturating_add(1);
+                read = read.saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX));
+                if read >= step {
+                    pace.done(None, read)?;
+                    read = 0;
+                    pace.ready()?;
+                }
                 Ok(true)
             },
         )?;
         out.push((table, rows, hash.finalize().into()));
     }
+    pace.done(None, read)?;
     Ok(RowDigest(out))
+}
+
+/// The order a digest reads `table`'s rows in, from its `CREATE TABLE` text `sql`: its rowid's; a
+/// WITHOUT ROWID table has none (the tables of transactions across groups are such, made in every
+/// database), so its every column in turn, a whole order since its primary key makes each row
+/// distinct (T-T1.12.C1).
+fn row_order(table: &str, sql: &str) -> anyhow::Result<String> {
+    let mut parser = Parser::new(sql.as_bytes());
+    let Some(Cmd::Stmt(Stmt::CreateTable {
+        body: CreateTableBody::ColumnsAndConstraints {
+            columns, options, ..
+        },
+        ..
+    })) = parser
+        .next_cmd()
+        .map_err(|e| anyhow::anyhow!("table {table}: {e}"))?
+    else {
+        return Err(anyhow::anyhow!("table {table} is not a table of columns"));
+    };
+    if !options.contains_without_rowid() {
+        return Ok("rowid".to_owned());
+    }
+    Ok((1..=columns.len())
+        .map(|column| column.to_string())
+        .collect::<Vec<_>>()
+        .join(", "))
+}
+
+/// The bytes of rows a paced digest reads a step: as many as one object of the store holds, the
+/// size a restore's steps move (a base's chunk, a log segment's part).
+pub(crate) fn step_bytes(blobs: &dyn Blobs) -> u64 {
+    u64::try_from(blobs.object_max()).unwrap_or(u64::MAX)
 }
 
 /// Why a check failed.
@@ -86,6 +141,12 @@ pub enum Check {
     },
     /// The archive holds no second whole yet.
     Empty,
+    /// The second is before the archive's first commit now: its owner expired it ([`super::expire`]).
+    /// Only a second older than the archive's oldest segment is this; one the archive should
+    /// still restore and doesn't is `Failed`.
+    Expired {
+        second: u64,
+    },
 }
 
 /// Checks run, by result: what `amphora_backup_checks_total{result}` reports.
@@ -94,13 +155,14 @@ pub struct CheckCounters {
     pub passed: AtomicU64,
     pub failed: AtomicU64,
     pub source_moved: AtomicU64,
+    pub expired: AtomicU64,
 }
 
 /// `amphora_backup_checks_total`: its type and help line, as `CheckCounters` counts it.
 pub const CHECK_METRIC: (&str, &str, &str) = (
     "amphora_backup_checks_total",
     "counter",
-    "Restore-and-checks of the backup archive, by result (passed, failed, source_moved).",
+    "Restore-and-checks of the backup archive, by result (passed, failed, source_moved, expired).",
 );
 
 impl CheckCounters {
@@ -109,6 +171,7 @@ impl CheckCounters {
             Check::Passed { .. } => &self.passed,
             Check::Failed { .. } => &self.failed,
             Check::SourceMoved { .. } => &self.source_moved,
+            Check::Expired { .. } => &self.expired,
             Check::Empty => return,
         };
         counter.fetch_add(1, Ordering::Relaxed);
@@ -131,6 +194,8 @@ pub fn newest_second(
         .map(|(m, _)| m)
         .collect();
     plan::raise_through(&mut segments, &marks);
+    // The log once over, as a restore reads it (T-T1.12.M6).
+    let segments = plan::covering(&segments);
     let Some(first) = segments
         .iter()
         .find_map(|s| s.marks)
@@ -174,11 +239,22 @@ pub fn restore_and_check(
     let Some(second) = newest_second(blobs, prefix, until)? else {
         return Ok(Check::Empty);
     };
-    restore_and_check_at(blobs, prefix, second, scratch, source, counters, until)
+    restore_and_check_at(
+        blobs,
+        prefix,
+        second,
+        scratch,
+        source,
+        counters,
+        &mut Unpaced,
+        until,
+    )
 }
 
-/// [`restore_and_check`] at `second`, one the archive holds whole: the shipping thread checks the
-/// second its source's quiet snapshot holds ([`super::Marks::quiet_second`]).
+/// [`restore_and_check`] at `second`, one the archive holds whole, step by step as `pace` lets it
+/// (T-T1.12.C7): the backup's check thread checks the second its source's quiet snapshot holds
+/// ([`super::Marks::quiet_second`]). A pace's [`super::Stopped`] stops it, refused and not counted.
+#[allow(clippy::too_many_arguments)]
 pub fn restore_and_check_at(
     blobs: &dyn Blobs,
     prefix: &str,
@@ -186,9 +262,10 @@ pub fn restore_and_check_at(
     scratch: &Path,
     source: &dyn Fn(u64) -> anyhow::Result<Option<RowDigest>>,
     counters: &CheckCounters,
+    pace: &mut dyn Pace,
     until: Instant,
 ) -> anyhow::Result<Check> {
-    let check = check_second(blobs, prefix, second, scratch, source, until)?;
+    let check = check_second(blobs, prefix, second, scratch, source, pace, until)?;
     counters.count(&check);
     match &check {
         Check::Failed { second, why } => tracing::error!(
@@ -208,10 +285,15 @@ fn check_second(
     second: u64,
     scratch: &Path,
     source: &dyn Fn(u64) -> anyhow::Result<Option<RowDigest>>,
+    pace: &mut dyn Pace,
     until: Instant,
 ) -> anyhow::Result<Check> {
-    let restored = match restore(blobs, prefix, second, scratch, until) {
+    let restored = match restore_paced(blobs, prefix, second, scratch, pace, until) {
         Ok(restored) => restored,
+        Err(e) if e.downcast_ref::<super::Stopped>().is_some() => return Err(e),
+        Err(e) if matches!(e.downcast_ref(), Some(plan::Unrestorable::BeforeArchive(_))) => {
+            return Ok(Check::Expired { second });
+        }
         Err(e) => {
             return Ok(Check::Failed {
                 second,
@@ -221,17 +303,28 @@ fn check_second(
     };
     let db = Db::open(scratch)?;
     let mut integrity = Vec::new();
-    db.query("PRAGMA integrity_check", [], |r| {
-        integrity.push(r.get::<String>(0).map_err(|e| anyhow::anyhow!("{e}"))?);
-        Ok(integrity.len() < 8)
-    })?;
+    // The engine's check runs as one statement; each of its waits on the device is a step's end,
+    // so it pauses inside the statement as the pace says (T-T1.12.C8).
+    pace.ready()?;
+    db.query_between(
+        "PRAGMA integrity_check",
+        |r| {
+            integrity.push(r.get::<String>(0).map_err(|e| anyhow::anyhow!("{e}"))?);
+            Ok(integrity.len() < 8)
+        },
+        &mut || {
+            pace.done(None, 0)?;
+            pace.ready()
+        },
+    )?;
+    pace.done(None, 0)?;
     if integrity.as_slice() != ["ok"] {
         return Ok(Check::Failed {
             second,
             why: CheckFailure::Integrity(integrity.join("; ")),
         });
     }
-    let got = digest(&db)?;
+    let got = digest_paced(&db, pace, step_bytes(blobs))?;
     let Some(want) = source(second)? else {
         return Ok(Check::SourceMoved { second });
     };

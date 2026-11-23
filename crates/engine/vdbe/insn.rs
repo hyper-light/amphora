@@ -268,6 +268,9 @@ pub struct HashBuildData {
     pub num_payload: usize,
     /// Whether to track which entries are matched (for FULL OUTER JOIN).
     pub track_matched: bool,
+    /// Amphora (QT.5 step 4, lane qs5-21): the join is a sort-merge (`HashJoinMethod::Merge`):
+    /// the table sorts its rows by key once built and is probed by merging (`HashTable::set_merge`).
+    pub merge: bool,
 }
 
 /// Amphora (PL.13): one adaptive join's switch (boxed to keep Insn small). The three weights are
@@ -288,6 +291,29 @@ pub struct JoinSwitchData {
     pub probe_pc: BranchOffset,
 }
 
+/// Amphora (QT.5, T-QT.5.11): one of a star probe's filters: the dimension's Bloom filter, by its
+/// cursor, and the fact row's keys for it.
+#[derive(Debug, Clone)]
+pub struct StarProbeKeys {
+    pub cursor_id: CursorID,
+    /// Start register of the keys, already given the comparison's affinities.
+    pub key_reg: usize,
+    pub num_keys: usize,
+}
+
+/// Amphora (QT.5, T-QT.5.11): a fact row's checks against its star join's filters (boxed to keep
+/// Insn small).
+#[derive(Debug, Clone)]
+pub struct StarProbesData {
+    /// The filters, in the planner's order.
+    pub probes: Box<[StarProbeKeys]>,
+    /// Where a row a filter rejects goes.
+    pub target_pc: BranchOffset,
+    /// The order the filters are checked in: the planner's, or measured as the rows run, with
+    /// counts kept whole or fading (`Connection::set_star_filter_order`).
+    pub order: crate::StarFilterOrder,
+}
+
 /// Amphora (PL.13): an adaptive join's hash table, built (boxed to keep Insn small).
 #[derive(Debug, Clone)]
 pub struct JoinSwitchBuiltData {
@@ -301,6 +327,80 @@ pub struct JoinSwitchBuiltData {
     pub analyzed_rows: f64,
     /// The relative standard error of the statistics that count came from
     /// (`row_changes::statistics_error`).
+    pub estimate_error: f64,
+}
+
+/// Amphora (PL.13, the materialization points): a hash join the planner chose, its build over a
+/// table read whole (no filter of its own), counted against the rows the plan counted the table at.
+#[derive(Debug, Clone)]
+pub struct BuildCountedData {
+    /// Amphora (PL.13, lane replan-5): the build's own filter, whose share of the table is counted
+    /// in place of the table's rows; `None` for a build over the whole table.
+    pub filter: Option<FilteredBuild>,
+    pub hash_table_id: usize,
+    /// The build table, as its row counter (PL.9, `row_changes`) names it.
+    pub table: String,
+    /// ANALYZE's count of the build table's rows.
+    pub analyzed_rows: f64,
+    /// The relative standard error of the statistics that count came from
+    /// (`row_changes::statistics_error`).
+    pub estimate_error: f64,
+}
+
+/// Amphora (PL.13, lane replan-5): a filtered build's check: the share of its table the plan's
+/// estimate of its filter terms kept, its relative error, and where a counted share is stored.
+#[derive(Debug, Clone)]
+pub struct FilteredBuild {
+    pub share: crate::sync::Arc<crate::filter_shares::FilterShare>,
+    pub planned_share: f64,
+    /// The relative standard error of the build's estimated rows: the share's and the table
+    /// count's together.
+    pub error: f64,
+}
+
+/// Amphora (PL.13, lane replan-5: the sorter's materialization point): an ORDER BY sorter fed by
+/// one table's full scan, its rows counted against the table's (or its filter's share of them).
+#[derive(Debug, Clone)]
+pub struct SorterCountedData {
+    pub cursor_id: CursorID,
+    /// The scanned table, as its row counter (PL.9, `row_changes`) names it.
+    pub table: String,
+    /// ANALYZE's count of the table's rows.
+    pub analyzed_rows: f64,
+    /// The relative standard error of the statistics that count came from.
+    pub estimate_error: f64,
+    /// The WHERE terms' share check; `None` for a scan with no WHERE term.
+    pub filter: Option<FilteredBuild>,
+    /// Amphora (PL.13, lane replan-10): for a sorter fed by an inner join, the check of its rows
+    /// against the rows the plan read for the whole join, in place of `table`'s and `filter`'s.
+    pub joined: Option<CountedCheck>,
+    /// Amphora (PL.13, lane replan-12): whether `joined` is a SELECT DISTINCT's rows, the sorter
+    /// after it holding them, rather than a join's.
+    pub distinct: bool,
+}
+
+/// A stored result's rows checked against the rows the plan read for it (PL.13, lane replan-10):
+/// where a count past the estimate is stored (`subquery_rows`), the rows planned on, and the
+/// relative standard error of the statistics the estimate came from.
+#[derive(Debug, Clone)]
+pub struct CountedCheck {
+    pub rows: crate::sync::Arc<crate::subquery_rows::CountedRows>,
+    pub planned_rows: f64,
+    pub estimate_error: f64,
+}
+
+/// Amphora (PL.13, lane replan-6: a stored subquery result's materialization point): an
+/// uncorrelated FROM-clause subquery's stored result, filled, its rows counted against the rows
+/// the plan read for it.
+#[derive(Debug, Clone)]
+pub struct SubqueryCountedData {
+    /// The register holding the rows the fill stored.
+    pub rows_reg: usize,
+    /// Where a count past the estimate is stored for the planner (`subquery_rows`).
+    pub rows: crate::sync::Arc<crate::subquery_rows::CountedRows>,
+    /// The rows the plan read for the subquery: its estimate, or a count a fill stored.
+    pub planned_rows: f64,
+    /// The relative standard error of the statistics the estimate came from.
     pub estimate_error: f64,
 }
 
@@ -438,19 +538,126 @@ pub struct MorselAggregateData {
     /// The table's stored columns, and the one its rowid stands in for (an INTEGER PRIMARY KEY).
     pub columns: usize,
     pub rowid_alias: Option<usize>,
+    /// Each column's value in a row written before the column was added (ALTER TABLE ADD COLUMN),
+    /// as the serial loop's Column reads it; empty when every one is NULL (lane qs6-17).
+    pub defaults: Vec<crate::types::Value>,
+    /// The least and greatest rowid the scan reads, each inclusive; `(None, None)`: the whole
+    /// table. The morsels are cut from the leaves that hold them (lane qs6-17).
+    pub rowid_range: (Option<i64>, Option<i64>),
     pub filter: Vec<crate::vdbe::morsel::Predicate>,
     pub group_by: Vec<usize>,
     pub aggregates: Vec<crate::vdbe::morsel::Aggregate>,
     /// For each result column, its place in the pipeline's row (the GROUP BY values, then the
     /// aggregates).
     pub result_map: Vec<usize>,
-    /// A hash join's build side when the scan is the join's probe: the pipeline's row is the probe
-    /// table's columns, then the build's; `filter` is then over the probe table's alone.
-    pub join: Option<MorselJoinData>,
-    /// A join's rows rather than groups: `result_map` then names the joined row's columns each
-    /// output row takes (the result columns, then the ORDER BY keys), and there are no aggregates.
+    /// A join's build sides when the scan is its probe, a chain of hash tables (lane qs6-10): the
+    /// pipeline's row is the probe table's columns, then each link's build row's in turn; each
+    /// link's `probe_key` names places in the row joined before it. `filter` is then over the
+    /// probe table's columns alone. Empty for a scan.
+    pub joins: Vec<MorselJoinData>,
+    /// A join's rows rather than groups: the body's outputs are each output row (the result
+    /// columns, then the ORDER BY keys), and there are no aggregates.
     pub joined_rows: Option<MorselRows>,
+    /// A copy of the serial loop's body that each worker runs per row (lane qs6-7), or per joined
+    /// row (lane qs6-12; always present for a join): when present, the workers' filter, GROUP BY
+    /// values and aggregate inputs are the statement's own bytecode, and `group_by`, `aggregates`
+    /// and `result_map` name places in its output row. A join's `filter` and each link's are then
+    /// the terms a table's own `Predicate` holds, tested before the body runs.
+    pub body: Option<Box<MorselBody>>,
+    /// An outer join of two tables (lane qs6-12): the probe is the table the join may pad with
+    /// NULLs, its one link the table whose every row appears.
+    pub outer: Option<MorselOuter>,
     pub target_pc_serial: BranchOffset,
+}
+
+/// Amphora (QT.6, lane qs6-12): which rows an outer join keeps that match nothing. Each worker
+/// marks the build rows a probe row matched (the ON terms held) in a bitmap of its own; the
+/// bitmaps are merged, and the build rows no worker marked come out padded with NULLs for the
+/// probe's side. A FULL join's probe rows that matched nothing come out padded with NULLs for the
+/// build's side, by the worker that read them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MorselOuter {
+    /// LEFT JOIN: every build row (the left table's) appears.
+    Left,
+    /// FULL JOIN: every row of both tables appears.
+    Full,
+    /// A LEFT JOIN among more than two tables (lane qs6-13): the padded table is the chain's last
+    /// link, probed per joined row of the others; a joined row of the others whose matches there
+    /// all fail the ON terms, or that has none, runs once padded with NULLs for that link's
+    /// columns. No bitmaps: the rows it keeps are the probe's walk itself.
+    LeftLink,
+    /// Joins of three or more tables with a FULL or RIGHT JOIN among them, or more than one outer
+    /// join of any kind (lane qs6-14, T-QT.6.24 and T-QT.6.25): the chain's links are the tables in
+    /// the FROM clause's order, the probe its first, and each link says what it keeps
+    /// ([`MorselJoinData::keeps`]). A probe row walks the chain depth first; at each link a match
+    /// that passes the link's own ON terms ([`MorselBody::links_on`]) goes on to the next, and a
+    /// row of the tables before it that no match passed goes on padded with NULLs for the link
+    /// when it keeps the left rows. A link that keeps the right rows marks the build rows matched
+    /// in each worker's own bitmap; once every row that can reach the link has walked (the
+    /// probe's, then each earlier such link's padded rows), the bitmaps merge and the build rows
+    /// no worker marked walk the rest of the chain, padded with NULLs for the tables before it.
+    Chain,
+}
+
+/// Amphora (QT.6, lane qs6-14): what a link of a [`MorselOuter::Chain`] keeps that matches
+/// nothing. Neither for an inner join; `left` for a LEFT JOIN; `right` for a RIGHT JOIN; both for
+/// a FULL JOIN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MorselKeeps {
+    /// A row of the tables before the link that no match passed goes on padded with NULLs.
+    pub left: bool,
+    /// A build row no joined row matched goes on padded with NULLs for the tables before it.
+    pub right: bool,
+}
+
+/// Amphora (QT.6, lane qs6-7): a one-table scan's loop body, emitted as its own range of the
+/// program, which the serial loop never runs. A worker runs it per row with its own registers
+/// (`ProgramState`): the row's stored columns go into `columns_start..`, its rowid into `rowid`,
+/// then the code runs from `start` until it reaches `keep` (the row passed every filter, its
+/// values in `out_start..out_start + out_count`) or `skip` (it did not). For a join (lane
+/// qs6-12) the row is the joined row: the probe table's columns, then each link's, and `rowid`
+/// is the probe row's.
+#[derive(Debug, Clone)]
+pub struct MorselBody {
+    /// An outer join's ON terms the hash keys don't hold (lane qs6-12): their code runs from here
+    /// and falls through to `start` when they hold (the row matched), else jumps to `skip`.
+    pub on: Option<BranchOffset>,
+    /// A [`MorselOuter::Chain`]'s links' own ON terms the keys and the build filters don't hold
+    /// (lane qs6-14), a place per link: none, or where its code starts and the place it reaches
+    /// when they hold (it jumps to `skip` when they don't). Each reads only the tables up to its
+    /// link. Empty for any other shape.
+    pub links_on: Vec<Option<(BranchOffset, BranchOffset)>>,
+    pub start: BranchOffset,
+    pub keep: BranchOffset,
+    pub skip: BranchOffset,
+    pub columns_start: usize,
+    pub rowid: usize,
+    pub out_start: usize,
+    pub out_count: usize,
+    /// The output row's GROUP BY values (its first places) and the aggregates over its places.
+    pub group_by: Vec<usize>,
+    pub aggregates: Vec<crate::vdbe::morsel::Aggregate>,
+    /// The places where a REAL sends the statement to the serial loop: a SUM's, whose rounding
+    /// the parallel sum's single exact rounding would not repeat; and in a join (lane qs6-12) a
+    /// GROUP BY value's, a MIN's and a MAX's, where a REAL equal to an INTEGER would tie with it
+    /// and the serial loop's order of a probe row's matches, its hash tables', could pick the other.
+    pub no_real: Vec<usize>,
+    /// Whether `MorselAggregateData`'s own filter and aggregates state the same query over the
+    /// table's columns (the versioned storage's column copy reads those, not the body).
+    pub simple: bool,
+    /// Amphora (QT.6, lane qs6-8): the outputs are the statement's result columns, kept as rows
+    /// in leaf order rather than folded into aggregates.
+    pub rows: bool,
+    /// With `rows`, under a LIMIT: the rows the LIMIT and OFFSET take. No morsel is claimed once
+    /// that many are kept, and a morsel stops once it alone holds that many; the morsels run are
+    /// then a prefix of the table, so the first rows are the serial loop's.
+    pub want: Option<u64>,
+    /// A join's body that is nothing but reads (lane qs6-13, T-QT.6.21): no ON or WHERE term left
+    /// past the hash keys and the tables' own `Predicate`s, every output a column or a rowid of
+    /// the joined row. Each output's place in the joined row (`None`: the probe row's rowid), so
+    /// a worker copies them and runs no code, when the connection's switch says so
+    /// ([`crate::Connection::set_parallel_join_direct`]).
+    pub direct: Option<Vec<Option<usize>>>,
 }
 
 /// Amphora: how [MorselAggregateData]'s joined rows come out (QT.6).
@@ -468,11 +675,22 @@ pub struct MorselJoinData {
     pub root_page: i64,
     pub columns: usize,
     pub rowid_alias: Option<usize>,
+    /// As [`MorselAggregateData::defaults`], for the build table (lane qs6-17).
+    pub defaults: Vec<crate::types::Value>,
+    /// As [`MorselAggregateData::rowid_range`], for the build table (lane qs6-17).
+    pub rowid_range: (Option<i64>, Option<i64>),
     /// Terms over the build table's columns, tested before a row goes into the hash table.
     pub filter: Vec<crate::vdbe::morsel::Predicate>,
-    /// The key's columns, pair by pair, in the probe table and in the build table.
+    /// The key's columns, pair by pair, in the row joined so far (the probe table's columns, then
+    /// each earlier link's) and in the build table.
     pub probe_key: Vec<usize>,
     pub build_key: Vec<usize>,
+    /// What the link keeps that matches nothing, in a [`MorselOuter::Chain`] (lane qs6-14);
+    /// neither for any other shape.
+    pub keeps: MorselKeeps,
+    /// Whether the planner reads this table by a seek, the hook reading it whole instead
+    /// (`Connection::set_parallel_searched_links`, lane qs6-16): counted when it is built.
+    pub searched: bool,
 }
 
 /// Amphora: data for [Insn::GroupSort].
@@ -2359,6 +2577,52 @@ pub enum Insn {
         cursor_id: CursorID,
         target_reg: usize,
     },
+
+    /// Amphora (PL.13, a materialization point; `docs/design/planner.md`, "Decision (lane pl13)"):
+    /// a planner-chosen hash join's build over a whole table, its rows set against the plan's
+    /// estimate. Past the estimate's error the table's count is corrected and the statement planned
+    /// again, a run that may start again handed off to the new plan (`JoinSwitchBuilt`'s rule).
+    BuildCounted {
+        data: Box<BuildCountedData>,
+    },
+
+    /// Amphora (PL.13, lane replan-5: the sorter's materialization point): an ORDER BY sorter's
+    /// input, all in, counted against the plan's estimate of the scan that fed it, as
+    /// `BuildCounted` counts a build.
+    SorterCounted {
+        data: Box<SorterCountedData>,
+    },
+
+    /// Amphora (PL.13, lane replan-6: a stored subquery result's materialization point): an
+    /// uncorrelated FROM-clause subquery's stored result, once filled, counted against the plan's
+    /// estimate, as `BuildCounted` counts a build: past its error the count is stored for the
+    /// planner and the statement planned again.
+    SubqueryCounted {
+        data: Box<SubqueryCountedData>,
+    },
+
+    /// Amphora (QT.5, T-QT.5.11; `docs/design/planner.md`, "Decision (lane qs5-18): a star join's
+    /// filters checked in their measured order"): checks the fact row's keys against each of its
+    /// star join's Bloom filters, jumping to `target_pc` at the first that rejects them. In
+    /// `order`: the order the run has measured (each filter's checks and passes, kept in the
+    /// program's state, `vdbe/star_order.rs`), the filter passing the smallest share first, or the
+    /// planner's. Its first row ends every filter's build.
+    StarProbes {
+        data: Box<StarProbesData>,
+    },
+
+    /// Amphora (lane skip-5, T-SKU.6): `PRAGMA skipping`'s setting, acted on when the statement
+    /// runs: keeps a skipping summary of `column` of `table` built from the rows there now
+    /// (`kind` `None`: drops it), as `skipping::set_skipping` does; lane skip-9 (T-SKU.11): a
+    /// measured summary's dropped method built again by `build`; lane skip-11 (T-SKU.14): an IN
+    /// list asked for as `lists` says.
+    SetSkipping {
+        table: String,
+        column: String,
+        kind: Option<crate::skipping::SkipKind>,
+        build: crate::skipping::BuildMode,
+        lists: crate::skipping::ListProbe,
+    },
 }
 
 const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
@@ -2612,6 +2876,11 @@ impl InsnVariants {
             InsnVariants::JoinSwitchHash => execute::op_join_switch_hash,
             InsnVariants::JoinSwitchBuilt => execute::op_join_switch_built,
             InsnVariants::TreePages => execute::op_tree_pages,
+            InsnVariants::BuildCounted => execute::op_build_counted,
+            InsnVariants::SorterCounted => execute::op_sorter_counted,
+            InsnVariants::SubqueryCounted => execute::op_subquery_counted,
+            InsnVariants::StarProbes => execute::op_star_probes,
+            InsnVariants::SetSkipping => execute::op_set_skipping,
         }
     }
 }
@@ -2677,6 +2946,7 @@ impl Insn {
             | Self::AddColumn { .. }
             | Self::AlterColumn { .. }
             | Self::JournalMode { .. }
+            | Self::SetSkipping { .. }
             | Self::Vacuum { .. } => false,
             Self::MaxPgcnt { new_max, .. } => *new_max == 0,
             // A recursive foreign-key action is treated as writable while it's still being

@@ -280,7 +280,7 @@ fn check(
         });
     }
     send(&mut stream, &encoded, batch.until).map_err(|_| Refusal::UnknownOutcome)?;
-    match read_limit::<Response>(&mut stream, batch.until, WATCH_REPLY_MAX)
+    match read_limit::<Response, _>(&mut stream, batch.until, WATCH_REPLY_MAX)
         .map_err(|_| Refusal::UnknownOutcome)??
     {
         Answer::WatchBatch(answers) if answers.len() == batch.ids.len() => Ok(answers),

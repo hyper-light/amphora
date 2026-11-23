@@ -78,10 +78,178 @@ them as their groups reply): `xgroup::sql::sessions`, seeded, both protocols. Va
 
 What is left: the grouped database (Database over Groups, lane split-merge-13) refuses a batch with
 rows in more than one group (`Refused::Groups`); that refusal is where its SQL session hands the
-batch to `Cluster::commit`, once its row keys are the coordinator's keys. A group failing mid-commit
+batch to `Cluster::commit`, once its row keys are the coordinator's keys. Found by lane
+xgroup-sql-5 (2026-11-22): no `Database` runs over `Groups` yet (its writer is one `Store<Local>`,
+which never refuses `Groups`; only the tests' `Groups<Local>` does), and handing the rows over today
+would be wrong in two ways. The coordinator writes `__amphora_xg_data`, not the records tables a
+group's `get`, `scan` and change feed read, so a committed row would not be read back; and a
+single-group Records batch commits without looking at `__amphora_xg_lock`, so it could write under a
+cross-group transaction's lock. A Records batch's conditions (`Absent`, `At`) also have no place in
+the coordinator's transaction, which reads and writes but decides nothing on what it read. The
+hookup needs the Tablet over the records tables (revisions and feed rows written as a Records commit
+writes them) and the records commit checking the locks. A group failing mid-commit
 is tested on the coordinator (T-T1.10.X3), not yet through a SQL session over real groups. The fast
 path refuses a row another transaction only reads; the coordinator's lock rules decide that case the
 same way today (any lock conflicts).
+
+### Reading its own writes across groups (lane xgroup-sql-8, AC-T1.10.1)
+
+A transaction across groups is decided before its groups apply it: each group writes its rows (or
+drops its locks, for an abort) when it resolves it, one round of steps after the decision. So when
+the caller hears decides what it can rely on, and `Options::answer_at` switches it:
+- `AnswerAt::Decided`, the control and today's: the answer comes at the decision (`Event::Answer`). A
+  read straight after it can miss the rows in a group that hasn't resolved it yet, and a retry
+  straight after an abort can run into the transaction's own locks.
+- `AnswerAt::Resolved`: each answer, aborts included, is held until every group it touched has
+  resolved it (`Event::Finished`). The caller waits that one more round. Held answers are counted
+  (`Counted::answers_held`, `answers_held_most`). If the coordinator stops while it holds one, the
+  caller hears `UnknownOutcome`, never "stopped", since its rows may not be readable yet.
+
+`commit_records` answers a token: the newest closed time any touched group published once the commit
+answered (`Database::session_token`; Ada's decision: the commit's revision across groups is the
+cross-group hybrid-logical-clock timestamp, the same one the read-your-writes tokens use, `Token::at`).
+Under `Resolved` every group's resolution is in its closed time by then, so a read that carries the
+token reads the rows on any replica. A group on a node adds its closed time too (lane xgroup-sql-9,
+wire version 9): its owner answers each step with the group's closed time after it, a session
+token's microseconds (`Answer::Stepped`'s `closed`, none for a group that keeps none), and the
+cluster keeps the newest heard from each group on a node. Its last step resolved the commit there
+before a `Resolved` answer comes, so that time is at or past the commit's rows in that group
+(`t_t1_10_w4_*`). A session reading at a follower behind the commit waits, on its owner's
+publication, until the follower has applied the token's time, or is redirected to the leader past
+the follower's measured apply lag; it never answers without the commit (`t_t1_10_w5_*`, a follower
+cut off before the commit and reached again while the read waits).
+
+Every committed answer carries that stamp (lane xgroup-sql-10, for lane split-merge-20's conditional
+commits across groups): `Answer::Committed`'s `at`, an `Option<u64>` of the same microseconds, the
+last field. Lane xgroup-sql-11 makes it the one commit stamp (Ada's decision, 2026-11-22: the commit's
+revision across groups is the cross-group HLC timestamp, the read-your-writes tokens' clock), fixed
+before the answer: each lock reply carries its group's clock, read by the shell once the group took
+the step (a local group's session token, a node's `Answer::Stepped` `closed`), and the sans-IO
+coordinator, which reads no clock, keeps the latest of them (`Coordinator::reply`'s `clock`). So the
+stamp is at or past every group's lock and comes before the decision is sent. None when no group it
+touched keeps a clock, and for a transaction an incarnation only recovered. The one-group fast path
+stamps the group's clock after its commit (`Cluster::stamped`). `commit_records` answers `Token::at`
+of the later of the stamp and the touched groups' newest closed time read once it answered: until
+rows are written at the commit stamp itself and reads past a held lock's stamp wait for it (lane
+split-merge-21), that closed time is what covers the rows each group wrote as it resolved.
+
+The clock is the groups' time, microseconds since the Unix epoch, as session tokens carry it
+(replication.md, "Follower reads at a closed time"): written into each replicated group's log, the
+same on every member, rising strictly along it. Not the backup's commit stamps (`backup::Marks`,
+nanoseconds, kept in the owner's process for backed-up groups only, `docs/design/backup.md`, "Cuts
+across machines"), which are an HLC with Kulkarni's receive rule but no replica holds. To be the one
+HLC the groups' time needs that receive rule: a group takes in the stamp a step carries, so its next
+entry's time is past it. That belongs with writing rows at the stamp (split-merge-21). A stamp that can't be read by the caller's deadline leaves the caller no token past
+the commit's rows, so the caller hears `UnknownOutcome`, as for a commit whose answer was lost
+(counted, `Counted::stamps_unread`; `t_t1_10_w6_*`).
+
+Each mode's failure mode is forced in `xgroup::sql::sessions`: one group's resolution held back (a
+group behind the decision), a read of it straight after the answer
+(`ac_t1_10_1_a_read_straight_after_the_answer_in_a_group_behind`), and an abort with every lock held,
+retried at once by a second caller (`ac_t1_10_1_a_retry_straight_after_an_abort_meets_no_lock_of_its_own`).
+At scale, `xgroup_lan ryw` runs both modes under both protocols, callers writing only their own rows
+so every conflict met is their own earlier transaction's lock. It reports read-your-writes misses,
+conflicts met, the commit's p50, p99 and p99.9 (its tries again included), the answers held at most,
+and throughput. Which mode stays is decided from those numbers, not yet measured.
+
+The alternative, reads that wait on a held lock (lane xgroup-sql-10, option 2 of xgroup-sql-7's), is
+built as a sibling switch on each group's database, `Database::set_locked_reads`:
+- `LockedReads::Committed`, the control and today's: a Records get of a row a cross-group transaction
+  holds a lock on answers the row as last committed there.
+- `LockedReads::Wait`: the get looks the lock up first (one indexed lookup in `__amphora_xg_lock` on
+  every read of a latest row, single-group reads included; a read at an older revision never waits).
+  Under a lock it answers nothing and waits on the group's change event, which each step and each
+  commit there moves, never a timer, then reads again; the transaction's write once it committed, the
+  row before it once it aborted. The change counter is read before each try, so a resolution landing
+  between a try and the wait can't be missed. It is refused `Timeout` at the read's deadline. Reads
+  that waited are counted (`Database::locked_waits`).
+
+With `AnswerAt::Decided` this moves the wait from the commit to the read that needs it: the caller
+hears at the decision, and only a read of a row still under the lock waits. It does nothing for a
+retry straight after an abort, which still meets the transaction's own locks in its commit; nor, yet,
+for scans, SQL reads or a session's reads inside the writer. Its failure mode at scale is the change
+event: every waiting read tries again on every change in its group, its own resolution or not.
+`t_t1_10_w7_*` forces the three settings against one held resolution (the control misses the row,
+`Resolved` holds the answer, `Wait` holds the read) and prints what each adds; `t_t1_10_w8_*` holds
+a read on an aborted transaction's lock and finds the row as it was before; `xgroup_lan ryw` runs
+`locked-wait` beside `decided` and `resolved`, with the reads' p50, p99 and p99.9 and the reads that
+waited.
+
+That failure mode is the thundering herd: with many callers, each commit and each step in a group
+wakes every read waiting there, to read and find its own row still locked. Lane xgroup-sql-11 builds
+the candidate that removes it as a third setting, `LockedReads::WaitOnLock`, `Wait` its control:
+- A waiting get joins its row's waiter list on the group's database (by the row's cross-group key),
+  then reads once more, so a resolution between its first try and joining isn't missed; it waits on
+  that list's own bell, and the list's ring count, read before each try, says whether a resolution
+  landed since.
+- A resolution step that drops a transaction's locks notes their Records rows; once the step has
+  answered, the process that ran it rings those rows' lists (`Database::ring_locks`), so a woken get
+  reads the resolution. A row nobody waits on rings no one, and a list lives only while a get waits.
+- Each wake is counted (`Database::locked_wakes`), under both settings.
+- What it costs: one more read for each get that meets a lock (the read after joining), and a list
+  entry per row waited on.
+- On every replica (lane xgroup-sql-12): the process that ran the resolving step need not be the
+  replica a read waits on, so each replica's owner, once it applied entries, rings the list of every
+  row a get there waits on whose write lock is gone in its applied state (`ring_unlocked`, from the
+  owner's publication). Each waited row is looked up once per publication, whatever the number of
+  gets on it, and none when no get waits. A follower's reads wait this way through
+  `Database::query_local_waiting`, a local read on its own applied state, so the state it reads and
+  the state that rings it are one. `t_t1_10_w13_*`: a local read on a follower of a three-member
+  group 1 waits on the held resolution, eight other commits land there, and it wakes once.
+
+`t_t1_10_w9_*` holds a read waiting on group 1's held resolution while eight commits of another row
+land there: under `WaitOnLock` it wakes once, at its own resolution. `xgroup_lan ryw` runs it as
+`lock-wake` beside `locked-wait`, reporting each one's wakes, wakes per waiting read and per read;
+the A/B of record is the ladder at 1, 128 and 4096 callers.
+
+Scans wait the same way (lane xgroup-sql-11, `t_t1_10_w10_*`): a scan of the latest rows under
+either wait setting looks for a lock in the range its page covers (from its cursor to its last row
+when it stopped short, else the whole range, so a put of a row it doesn't show yet counts) with one
+range lookup in `__amphora_xg_lock`, and waits on the first locked row it meets, then scans again.
+SQL reads wait by running again (`t_t1_10_w11_*`): a SQL session reads one snapshot from when it
+began, so it can't wait inside itself for a resolution to land. `Database::query_waiting` runs a
+session that may run more than once (`Fn`, not `FnOnce`): under either wait setting its Records gets
+look for a lock on their row, and one that meets it is refused and noted; once the session ends, the
+read waits on that row as a get does and runs the session again, on a snapshot past the resolution,
+answering from its last run. `Database::query`, and any session inside the writer, reads as today.
+SQL that reads Records' tables directly, not through a get, doesn't look for locks.
+
+## A refusal before the step (lane xgroup-sql-4, AC-T1.10.6)
+
+A group that refuses a step before taking it (`NotLeader`: its leader moved; `Full`: its writer
+admitted nothing) ran nothing of it. What the driver does then is a switch, `Options::on_refused`,
+until the coordinator's live runs decide:
+- `Stop`, today's and the control: the step counts as lost, as one whose answer never came. A lost
+  lock step aborts its transaction; any other is sent again at once, and a step past its deadline
+  stops the coordinator.
+- `Retry`: the same step is held and sent again after the steps' learned timeout (RFC 6298 §2, the
+  same estimator the resolution uses; the refusal itself, answered at a first send, is a sample),
+  doubled for each refusal of that step (§5.5), while that comes before the step's deadline; past
+  it, as `Stop`. The transaction keeps its locks while its step is held.
+
+`Cluster::counted` gives the instruments: refusals by kind, retries, steps and transactions held
+now and at most, coordinator stops, and each answered transaction's time (p50, p99, p99.9 from the
+LAN harness's log-linear buckets). `Options::fault` is the seam the scenarios use: a group refusing
+a transaction's steps as a sick or restarting group would. `xgroup::sql::sessions` runs one group
+that keeps refusing and all groups refusing at once, both protocols, under both settings: retried,
+the transaction commits with no stop; under the control, it aborts. Values introduced: none.
+
+A group failing mid-commit is also tested through a session over three real groups:
+`ac_t1_10_1_a_group_failure_mid_commit_through_a_session_is_all_or_nothing` fails each group at
+each of its steps in turn, reopens the coordinator, and checks the rows are all written or none and
+read as on one group that ran the transaction or didn't, under both protocols.
+
+### At scale (lane xgroup-sql-5)
+
+`xgroup_lan refusals` (the LAN harness's example) runs the switch under many callers and correlated
+refusals: `--clients` callers each run `--txns` transactions (one read, two writes, mostly across
+groups) while every group refuses together, as a fleet restarting at once: of each `--every` steps
+sent, the first `--burst` are refused (`--refusal not-leader` or `full`) before they are taken. The
+groups are `--node`s over the transport or `--groups` local databases under `--dir`. Each run is one
+JSON line per protocol and setting: outcomes (committed, aborted by why, unknown, failed), the
+coordinator's instruments summed over its incarnations (a coordinator that stops is opened again, as
+its process would be, and counted), and the committed transactions' p50, p99 and p99.9. The scenario's
+sizes are its inputs, not tuned values. Which setting stays is the coordinator's live runs' to decide.
 
 ## A group's failure
 
@@ -98,7 +266,8 @@ in flight landing first or not, under both protocols (T-T1.10.X3).
 
 A group on another node is reached as `Member::Node` (`xgroup::sql`): each step is one request over
 the owner transport, `Request::Step { here, carried, envelope }`, answered `Answer::Stepped { reply,
-latest }` (wire version 8; both variants appended after every existing one). `transport::Nodes`
+latest, closed }` (wire version 8; both variants appended after every existing one; version 9 added
+`closed`, below in "Reading its own writes across groups"). `transport::Nodes`
 (CP-T1.9, lane split-merge-10's) carries it as it carries a pull: one authenticated connection and
 one request, to the endpoint of the group's database, whose owner applies the step as a local one
 is applied, one `call_internal` and one atomic commit. The coordinator's newest commit stamp goes
@@ -106,9 +275,10 @@ with the step and the group's newest comes back with the reply, so the hybrid lo
 step carries (T-T1.12.X2) crosses nodes as it crosses threads. A reply lost after the request went
 out is `UnknownOutcome`, which the protocol already treats as a step that may have landed. The node
 makes its group's tables before it serves (`sql::prepare`). Values introduced: none; a step's size
-is held by the frame's bound, as every request's is. The listener is still loopback: reaching
-another machine waits on split-merge-11's network listener, which `Nodes` addresses through
-unchanged.
+is held by the frame's bound, as every request's is. Between machines, a group's owner
+also listens at a network address under mutual TLS (`Database::listen`, `Nodes::network`;
+reshard.md, "The transport between machines"); the harness's `--listen`, `--cert`, `--key` and
+`--roots` use it.
 
 The harness that chooses the protocol is `xgroup::lan` with its command line,
 `crates/amphora/examples/xgroup_lan.rs`: `node` serves one group at an endpoint; `bench` runs

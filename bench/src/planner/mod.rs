@@ -8,6 +8,22 @@
 //! table loaded and one a query and engine. bench/planner/summary.py reads them. With
 //! `--answers <dir>`, each query's first timed run on each engine writes its whole answer there
 //! (`answers.rs`), which bench/planner/answers.py compares.
+//!
+//! PL.13 (lane replan-9): every query's runs are warm, each engine having run it once before they
+//! are timed (Amphora's counted run, the other engines' warm-up run), and an adaptive engine's
+//! counted run has learned its corrections by then. `--phase cold` times the one query `--only`
+//! names once on each engine as this process opened it: no learned correction, no statement run
+//! before it, and, with the server restarted and the page cache dropped before the process starts
+//! (bench/planner/cold.sh), nothing cached. Its record is a `cold` one, which the readers of
+//! `query` records pass over.
+//!
+//! The scaling ladder (`--cores 1,2,4,8,16,32`, QT.6 lane qs6-12, goal 6d2ae944): every query run
+//! on each engine that takes a core count (`Target::set_cores`: Amphora's morsel workers capped,
+//! DuckDB's `threads`) at each count in turn, through this one driver on this one machine, each
+//! engine in this process through its own library, timed the same way. With `--limit N` each
+//! query runs again as `SELECT * FROM (query) LIMIT N`, the LIMIT shapes the workers stop early
+//! under. Each line is a `scaling` record: the query, its variant, the engine, the cores and its
+//! runs, beside the `run` record naming the client and the platform.
 
 mod answers;
 mod data;
@@ -20,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use answers::{Answer, Refusal};
 use data::Format;
-use engines::{for_dialect, Amphora, Count, Duck, Outcome, Postgres, Sqlite, Target};
+use engines::{for_dialect, Amphora, ClickHouse, Count, Duck, Outcome, Postgres, Sqlite, Target};
 
 struct Opts {
     bench: String,
@@ -45,6 +61,17 @@ struct Opts {
     prepared: Option<PathBuf>,
     params: Option<PathBuf>,
     plan_cache_modes: Vec<String>,
+    /// PL.13 (lane replan-9): `cold` times the one query `--only` names once on each engine, as
+    /// this process opened it; `warm`, every query after a run that warms it.
+    cold: bool,
+    /// `--os-cache-dropped`: the script that started this process dropped the operating system's
+    /// page cache first (cold.sh's claim, recorded as such; `page_cache_kib` is the fact beside it).
+    os_cache_dropped: bool,
+    /// The scaling ladder's core counts (`--cores`), and its LIMIT variant's rows (`--limit`).
+    cores: Vec<usize>,
+    limit: Option<u64>,
+    /// ClickHouse's HTTP interface (`--clickhouse`).
+    clickhouse: String,
 }
 
 fn opts() -> anyhow::Result<Opts> {
@@ -69,6 +96,11 @@ fn opts() -> anyhow::Result<Opts> {
         prepared: None,
         params: None,
         plan_cache_modes: vec!["generic".into(), "auto".into()],
+        cold: false,
+        os_cache_dropped: false,
+        cores: Vec::new(),
+        limit: None,
+        clickhouse: "http://127.0.0.1:58123".into(),
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -95,12 +127,28 @@ fn opts() -> anyhow::Result<Opts> {
             "--prepared" => o.prepared = Some(v()?.into()),
             "--params" => o.params = Some(v()?.into()),
             "--plan-cache-modes" => o.plan_cache_modes = v()?.split(',').map(str::to_owned).collect(),
-            other => anyhow::bail!("unknown argument {other} (--planner takes --bench job|tpch, --data, --queries, --sf, --dir, --targets, --runs, --timeout-s, --count-timeout-s, --dsn, --cache-mib, --only, --max-load, --load-wait-s, --out, --resume, --answers, --prepared, --params, --plan-cache-modes)"),
+            "--phase" => {
+                o.cold = match v()?.as_str() {
+                    "cold" => true,
+                    "warm" => false,
+                    p => anyhow::bail!("--phase is cold or warm, not {p}"),
+                }
+            }
+            "--os-cache-dropped" => o.os_cache_dropped = true,
+            "--cores" => o.cores = v()?.split(',').map(str::parse).collect::<Result<_, _>>()?,
+            "--limit" => o.limit = Some(v()?.parse()?),
+            "--clickhouse" => o.clickhouse = v()?,
+            other => anyhow::bail!("unknown argument {other} (--planner takes --bench job|tpch, --data, --queries, --sf, --dir, --targets, --runs, --timeout-s, --count-timeout-s, --dsn, --cache-mib, --only, --max-load, --load-wait-s, --out, --resume, --answers, --prepared, --params, --plan-cache-modes, --phase cold|warm, --os-cache-dropped, --cores, --limit, --clickhouse)"),
         }
     }
     anyhow::ensure!(matches!(o.bench.as_str(), "job" | "tpch"), "--bench is job or tpch");
     anyhow::ensure!(!o.data.as_os_str().is_empty() && !o.queries.as_os_str().is_empty() && !o.dir.as_os_str().is_empty() && !o.out.as_os_str().is_empty(), "--planner needs --data, --queries, --dir and --out");
     anyhow::ensure!(o.runs > 0, "--runs is at least 1");
+    // A cold run is the first statement its process runs on each engine: one query a process, so
+    // no correction learned on another query's run reaches it.
+    anyhow::ensure!(!o.cold || (o.only.len() == 1 && o.only[0] != "-" && o.prepared.is_none() && o.answers.is_none() && !o.resume), "--phase cold times the one query --only names, without --prepared, --answers or --resume");
+    anyhow::ensure!(o.cores.iter().all(|c| *c > 0), "--cores are at least 1");
+    anyhow::ensure!(o.limit.is_none() || !o.cores.is_empty(), "--limit is the scaling ladder's: give --cores");
     if o.prepared.is_some() {
         anyhow::ensure!(o.bench == "tpch" && o.params.is_some() && o.targets == ["amphora"], "--prepared runs TPC-H on amphora alone, with --params");
         anyhow::ensure!(!o.plan_cache_modes.is_empty(), "--plan-cache-modes names at least one");
@@ -205,6 +253,24 @@ fn quiet(max: f64, wait: Duration) -> Option<f64> {
     }
 }
 
+/// The operating system's page cache now, in KiB (Linux's `Cached` in /proc/meminfo): beside a cold
+/// run, what was cached when it began.
+#[cfg(not(windows))]
+fn page_cache_kib() -> Option<u64> {
+    cached_kib(&std::fs::read_to_string("/proc/meminfo").ok()?)
+}
+
+/// `Cached`'s KiB in /proc/meminfo's text (not `SwapCached`'s).
+#[cfg_attr(windows, allow(dead_code))]
+fn cached_kib(meminfo: &str) -> Option<u64> {
+    meminfo.lines().find_map(|l| l.strip_prefix("Cached:"))?.split_whitespace().next()?.parse().ok()
+}
+
+#[cfg(windows)]
+fn page_cache_kib() -> Option<u64> {
+    None
+}
+
 /// The machine: its processor, memory, disk and system.
 #[cfg(not(windows))]
 fn host(dir: &Path) -> serde_json::Value {
@@ -266,9 +332,12 @@ fn sh(cmd: &str) -> String {
 fn open(o: &Opts, target: &str) -> anyhow::Result<Box<dyn Target>> {
     let dir = o.dir.join(target);
     Ok(match target {
-        "amphora" => Box::new(Amphora::open(&dir, o.cache_kib, false)?),
+        "amphora" => Box::new(Amphora::open(&dir, o.cache_kib, false, false)?),
+        // PL.13 (lane replan-6): the same engine with adaptive joins and re-planning on
+        // (`Connection::set_adaptive_joins`), on a copy of its own; `amphora` is its control.
+        "amphora-adaptive" => Box::new(Amphora::open(&dir, o.cache_kib, false, true)?),
         // QT.7: the same engine, its scans by column batches, on a copy of its own.
-        "amphora-vectorized" => Box::new(Amphora::open(&dir, o.cache_kib, true)?),
+        "amphora-vectorized" => Box::new(Amphora::open(&dir, o.cache_kib, true, false)?),
         "sqlite" => Box::new(Sqlite::open(&dir, o.cache_kib)?),
         "duckdb" => Box::new(Duck::open(&dir, Some(1))?),
         // A database of its own: DuckDB locks its file to one database a process.
@@ -282,13 +351,15 @@ fn open(o: &Opts, target: &str) -> anyhow::Result<Box<dyn Target>> {
             }
             Box::new(Postgres::open(&format!("{} dbname={name}", o.dsn))?)
         }
-        t => anyhow::bail!("--planner runs amphora, amphora-vectorized, sqlite, duckdb, duckdb-mt or postgres, not {t}"),
+        // The scaling ladder's server engine (QT.6 lane qs6-12), a database of the benchmark's own.
+        "clickhouse-mt" => Box::new(ClickHouse::open(&o.clickhouse, &format!("{}_{}", o.bench, o.sf.to_string().replace('.', "_")))?),
+        t => anyhow::bail!("--planner runs amphora, amphora-adaptive, amphora-vectorized, sqlite, duckdb, duckdb-mt, postgres or clickhouse-mt, not {t}"),
     })
 }
 
 fn outcome_json(outcome: &Outcome, load: Option<f64>) -> serde_json::Value {
     match outcome {
-        Outcome::Done(r) => serde_json::json!({ "status": "done", "rows": r.rows, "first": r.first, "prepare_ms": r.prepare_ms, "exec_ms": r.exec_ms, "ms": r.prepare_ms + r.exec_ms, "load": load }),
+        Outcome::Done(r) => serde_json::json!({ "status": "done", "rows": r.rows, "first": r.first, "prepare_ms": r.prepare_ms, "exec_ms": r.exec_ms, "search_ms": r.search_ms, "ms": r.prepare_ms + r.exec_ms, "load": load }),
         Outcome::TimedOut => serde_json::json!({ "status": "timed_out", "load": load }),
         Outcome::Failed(e) => serde_json::json!({ "status": "failed", "error": e, "load": load }),
     }
@@ -359,10 +430,18 @@ pub fn main() -> anyhow::Result<()> {
     for t in &mut targets {
         engines.push(t.about()?);
     }
+    let h = host(&o.dir);
     write(serde_json::json!({
         "record": "run",
         "date": utc_now(),
-        "host": host(&o.dir),
+        // Who drove the engines and where they ran (Ada's fair comparisons, 2026-11-21; goal
+        // 63c98840): this one program for every engine, each in its process, no container.
+        "client": { "program": "amphora-bench --planner", "commit": commit, "timing": "amphora-bench's own, one code path for every engine" },
+        "platform": {
+            "host": h["host"], "os": std::env::consts::OS, "arch": std::env::consts::ARCH, "kernel": h["kernel"], "cpu": h["cpu"],
+            "engine_runs": "in the driver's process", "container": null, "data_dir": o.dir.display().to_string(), "fs": h["fs"], "disk": h["disk"],
+        },
+        "host": h,
         "cores": std::thread::available_parallelism().map(usize::from).unwrap_or(0),
         "commit": commit,
         "dirty_files": git(&["status", "--porcelain"]).lines().count(),
@@ -372,8 +451,15 @@ pub fn main() -> anyhow::Result<()> {
         "queries": b.queries.len(),
         "runs": o.runs, "timeout_s": o.timeout.as_secs(), "count_timeout_s": o.count_timeout.as_secs(),
         "max_load": o.max_load,
+        "phase": if o.cold { "cold" } else { "warm" },
         "engines": engines,
+        "cores_ladder": o.cores, "limit": o.limit,
+        // Fair comparisons: one client, one platform, for every engine.
+        "client": "amphora-bench --planner, one process, each engine through its own library, one connection each, timed by one Instant around prepare and every row read",
     }))?;
+    if !o.cores.is_empty() {
+        return scaling(&o, &b, &mut targets, &mut write);
+    }
     // --prepared: each query prepared once and run with qgen's parameters under each plan cache
     // mode (PL.12, AC-PL.12.1; prepared.rs).
     if let (Some(dir), Some(params)) = (&o.prepared, &o.params) {
@@ -397,6 +483,22 @@ pub fn main() -> anyhow::Result<()> {
         }
         return Ok(());
     }
+    if o.cold {
+        for (name, sql) in b.queries.iter().filter(|(n, _)| o.only.contains(n)) {
+            for target in &mut targets {
+                let sql = for_dialect(sql.trim().trim_end_matches(';'), target.dialect());
+                let server_started_s = target.server_started_s();
+                let load = quiet(o.max_load, o.load_wait);
+                let page_cache_kib = page_cache_kib();
+                let outcome = target.run(&sql, o.timeout, None);
+                let state = serde_json::json!({ "first_query_since_open": true, "server_started_s": server_started_s, "os_cache_dropped": o.os_cache_dropped, "page_cache_kib": page_cache_kib });
+                let record = serde_json::json!({ "record": "cold", "bench": o.bench, "query": name, "target": target.name(), "run": outcome_json(&outcome, load), "state": state });
+                eprintln!("{name} {} cold: {}", target.name(), record["run"]["ms"].as_f64().map_or_else(|| "no time".to_owned(), |ms| format!("{ms:.1} ms")));
+                write(record)?;
+            }
+        }
+        return Ok(());
+    }
     // --answers: a directory for the benchmark (TPC-H's named with its scale factor, tpch-sf1, as
     // record.sh names its benchmarks), and in it one for each query.
     let answers_root = o.answers.as_ref().map(|dir| dir.join(if o.bench == "tpch" { format!("tpch-sf{}", o.sf) } else { o.bench.clone() }));
@@ -410,7 +512,7 @@ pub fn main() -> anyhow::Result<()> {
                 continue;
             }
             let sql = for_dialect(sql.trim().trim_end_matches(';'), target.dialect());
-            let mut record = serde_json::json!({ "record": "query", "bench": o.bench, "query": name, "target": target.name() });
+            let mut record = serde_json::json!({ "record": "query", "bench": o.bench, "query": name, "target": target.name(), "phase": "warm" });
             if let Some(amphora) = target.amphora() {
                 record["plan"] = match amphora.plan_json(&sql) {
                     Ok(plan) => serde_json::from_str(&plan).unwrap_or(serde_json::Value::String(plan)),
@@ -420,6 +522,13 @@ pub fn main() -> anyhow::Result<()> {
                 let (outcome, counts) = amphora.counted(&sql, o.count_timeout);
                 record["counted"] = outcome_json(&outcome, load);
                 record["counts"] = counts_json(&counts);
+                record["warmed_by"] = "counted".into();
+            } else {
+                // PL.13 (lane replan-9): the other engines run the query once before it is timed,
+                // as Amphora's counted run does, so every engine's timed runs are warm alike.
+                let load = quiet(o.max_load, o.load_wait);
+                record["warmup"] = outcome_json(&target.run(&sql, o.timeout, None), load);
+                record["warmed_by"] = "warmup".into();
             }
             // Under --answers the first timed run writes its rows; the runs after it are timed as
             // without.
@@ -457,6 +566,53 @@ pub fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The scaling ladder (QT.6 lane qs6-12): for each core count, each query (and its LIMIT variant
+/// under `--limit`) on each engine that takes the count, best of `--runs`, each run begun once the
+/// load average is under `--max-load`. The core counts go round the engines and queries in turn,
+/// so a drift in the machine falls on every engine alike. An engine that takes no core count is
+/// named once and left out.
+fn scaling(o: &Opts, b: &Bench, targets: &mut [Box<dyn Target>], write: &mut impl FnMut(serde_json::Value) -> anyhow::Result<()>) -> anyhow::Result<()> {
+    let mut variants: Vec<(String, &str, String)> = Vec::new();
+    for (name, sql) in &b.queries {
+        if !o.only.is_empty() && !o.only.contains(name) {
+            continue;
+        }
+        let sql = sql.trim().trim_end_matches(';').to_owned();
+        if let Some(n) = o.limit {
+            variants.push((name.clone(), "limit", format!("SELECT * FROM ({sql}) AS limited LIMIT {n}")));
+        }
+        variants.push((name.clone(), "whole", sql));
+    }
+    let mut skipped = std::collections::HashSet::new();
+    for &cores in &o.cores {
+        for (name, variant, sql) in &variants {
+            for target in targets.iter_mut() {
+                if !target.set_cores(cores)? {
+                    if skipped.insert(target.name()) {
+                        write(serde_json::json!({ "record": "scaling_skipped", "target": target.name(), "why": "it takes no core count" }))?;
+                    }
+                    continue;
+                }
+                let sql = for_dialect(sql, target.dialect());
+                let mut runs = Vec::new();
+                for _ in 0..o.runs {
+                    let load = quiet(o.max_load, o.load_wait);
+                    let outcome = target.run(&sql, o.timeout, None);
+                    let stop = !matches!(outcome, Outcome::Done(_));
+                    runs.push(outcome_json(&outcome, load));
+                    if stop {
+                        break;
+                    }
+                }
+                let best = runs.iter().filter_map(|r| r["ms"].as_f64()).reduce(f64::min);
+                eprintln!("{name} {variant} {} at {cores} cores: {}", target.name(), best.map_or_else(|| "no time".to_owned(), |ms| format!("{ms:.1} ms")));
+                write(serde_json::json!({ "record": "scaling", "bench": o.bench, "query": name, "variant": variant, "target": target.name(), "cores": cores, "best_ms": best, "runs": runs }))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,5 +629,15 @@ mod tests {
         assert_eq!(civil(-1), Some((1969, 12, 31)));
         assert_eq!(civil(11_016), Some((2000, 2, 29)));
         assert_eq!(civil(i64::MAX), None);
+    }
+
+    /// Do: read the page cache from /proc/meminfo's text, a `SwapCached` line before `Cached`'s
+    /// (PL.13, lane replan-9: a cold run's record). Expect: `Cached`'s KiB, and None where the text
+    /// has only `SwapCached`.
+    #[test]
+    fn the_page_cache_is_cacheds_kib() {
+        let meminfo = "MemTotal:       65536000 kB\nSwapCached:          12 kB\nCached:          4096 kB\nActive:  1 kB\n";
+        assert_eq!(cached_kib(meminfo), Some(4096));
+        assert_eq!(cached_kib("MemTotal: 1 kB\nSwapCached: 12 kB\n"), None);
     }
 }

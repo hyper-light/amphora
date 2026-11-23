@@ -452,6 +452,112 @@ fn estimate_in_selectivity(in_list_len: f64, row_count: f64, not: bool) -> f64 {
     }
 }
 
+/// Amphora (PL.13, lane replan-10; docs/design/planner.md, decision PL.13, "IN subqueries"): the
+/// distinct values an uncorrelated `x IN (SELECT y ...)` looks up, with the distinct values of `x`
+/// they are drawn against and the share of `x`'s rows that are not NULL.
+///
+/// The subquery's values are at most its rows (its own estimate, `estimated_output_rows`) and at
+/// most the distinct values of `y` where `y` is a column ANALYZE's column statistics counted
+/// (decision 20). Where every table the subquery reads has statistics, the values are noted as
+/// read under the subquery's identity (`SelectPlan::in_identity`), and a count its ephemeral index
+/// stored past them is read in their place (`PlanValues::subquery_rows`): its fill checks them
+/// (`main_loop::subquery_count_check`). The values looked up are at most `x`'s distinct values:
+/// the containment assumption, that the fewer distinct values are among the more (PostgreSQL's
+/// `eqjoinsel_semi`), so the share kept is `values / distinct(x)` of `x`'s non-NULL rows. `x`'s
+/// distinct values are its column statistics' count, or the table's rows for a key or a column
+/// without them (one row a value, the assumption the IN list's estimate makes). A plan with no
+/// estimate takes SQLite's 25 rows (`in_subquery_rows`) as before.
+fn in_subquery_values(
+    schema: &Schema,
+    table_reference: &JoinedTable,
+    lhs_column: Option<usize>,
+    inner_plan: Option<&crate::translate::plan::SelectPlan>,
+    row_count: f64,
+    params: &CostModelParams,
+) -> (f64, f64, f64) {
+    let (lhs_distinct, lhs_non_null) = lhs_column
+        .filter(|pos| {
+            let single_key = table_reference
+                .table
+                .btree()
+                .is_some_and(|t| t.primary_key_columns.len() == 1);
+            table_reference
+                .table
+                .get_column_at(*pos)
+                .is_some_and(|column| {
+                    !(column.is_rowid_alias()
+                        || (column.primary_key() && single_key)
+                        || column.unique())
+                })
+        })
+        .and_then(|pos| column_distinct(schema, table_reference, pos))
+        .map_or_else(
+            || (row_count.max(1.0), 1.0),
+            |(distinct, non_null)| (distinct.min(row_count).max(1.0), non_null),
+        );
+    let Some(inner) = inner_plan else {
+        return (
+            params.in_subquery_rows.min(lhs_distinct),
+            lhs_distinct,
+            lhs_non_null,
+        );
+    };
+    let Some(rows) = inner.estimated_output_rows else {
+        return (
+            params.in_subquery_rows.min(lhs_distinct),
+            lhs_distinct,
+            lhs_non_null,
+        );
+    };
+    let result_distinct = match inner.result_columns.as_slice() {
+        [column] => match &column.expr {
+            ast::Expr::Column { table, column, .. } => inner
+                .joined_tables()
+                .iter()
+                .find(|joined| joined.internal_id == *table)
+                .and_then(|joined| column_distinct(schema, joined, *column))
+                .map(|(distinct, _)| distinct),
+            _ => None,
+        },
+        _ => None,
+    };
+    let mut values = result_distinct
+        .map_or(rows, |distinct| rows.min(distinct))
+        .max(0.0);
+    let tables = inner.joined_tables();
+    let analyzed = !tables.is_empty()
+        && tables.iter().all(|joined| {
+            joined
+                .btree()
+                .is_some_and(|btree| schema.analyze_stats.table_stats(&btree.name).is_some())
+        });
+    if let (true, Some(identity), Some(plan_values)) =
+        (analyzed, inner.in_identity, params.plan_values.as_deref())
+    {
+        values = plan_values.subquery_rows(identity, values);
+    }
+    (values.min(lhs_distinct), lhs_distinct, lhs_non_null)
+}
+
+/// A column's distinct non-NULL values and its share of non-NULL rows, as ANALYZE's column
+/// statistics counted them (decision 20); `None` without them.
+fn column_distinct(schema: &Schema, table: &JoinedTable, pos: usize) -> Option<(f64, f64)> {
+    let column = table.table.get_column_at(pos)?;
+    let name = crate::util::normalize_ident(column.name.as_deref()?);
+    let counted = schema
+        .analyze_stats
+        .table_stats(table.table.get_name())?
+        .columns
+        .get(&name)?;
+    let rows = counted.non_null.saturating_add(counted.nulls);
+    (rows > 0).then(|| {
+        (
+            counted.distinct.max(1.0),
+            counted.non_null as f64 / rows as f64,
+        )
+    })
+}
+
 /// Estimate the selectivity of a constraint based on the operator, column type, and ANALYZE stats.
 ///
 /// When ANALYZE stats are available, we use:
@@ -538,39 +644,82 @@ fn estimate_selectivity(
     }
 }
 
+/// Amphora (QT.5, lane qs5-18): what an `IS` estimate knows of its value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IsValue {
+    /// Never NULL (a non-NULL literal, or a parameter a custom plan binds to one): the `IS` filters
+    /// exactly like `=`.
+    NotNull,
+    /// NULL: the literal, or a parameter a custom plan binds to NULL.
+    Null,
+    /// Planning doesn't know: a parameter of a generic plan, or another table's column.
+    Unknown,
+}
+
+/// Amphora (QT.5, lane qs5-18): what is known of the value `value` an `IS` compares its column
+/// with; `null_matching` false means it is a non-NULL literal ([Constraint::null_matching]).
+fn is_value(null_matching: bool, value: Option<&ast::Expr>, params: &CostModelParams) -> IsValue {
+    if !null_matching {
+        return IsValue::NotNull;
+    }
+    match value.and_then(|value| params.value_is_null(value)) {
+        Some(true) => IsValue::Null,
+        Some(false) => IsValue::NotNull,
+        None => IsValue::Unknown,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-/// Estimate selectivity for a single WHERE/ON constraint applied to `table_reference`.
+/// Estimate selectivity for a single WHERE/ON constraint applied to `table_reference`. `value` is
+/// the expression the constrained column is compared with, where there is one.
 fn estimate_constraint_selectivity(
     schema: &Schema,
     table_reference: &JoinedTable,
     column: Option<&Column>,
     operator: ConstraintOperator,
     null_matching: bool,
+    value: Option<&ast::Expr>,
     index: Option<&Index>,
     params: &CostModelParams,
     is_rowid: bool,
 ) -> f64 {
-    // `a IS 5` filters exactly like `a = 5` — the key is never NULL — so give
-    // it the `=` estimate. Only a NULL-matching `IS` keeps its own, much less
-    // selective, estimate (see [Constraint::null_matching]).
-    let operator = if operator.as_ast_operator() == Some(ast::Operator::Is) && !null_matching {
-        ConstraintOperator::from(ast::Operator::Equals)
-    } else {
-        operator
+    let estimate = |operator| {
+        estimate_selectivity(
+            schema,
+            table_reference.table.get_name(),
+            column,
+            index,
+            operator,
+            params,
+            is_rowid,
+            table_reference
+                .table
+                .btree()
+                .is_some_and(|table| table.primary_key_columns.len() == 1),
+        )
     };
-    estimate_selectivity(
-        schema,
-        table_reference.table.get_name(),
-        column,
-        index,
-        operator,
-        params,
-        is_rowid,
-        table_reference
-            .table
-            .btree()
-            .is_some_and(|table| table.primary_key_columns.len() == 1),
-    )
+    if operator.as_ast_operator() != Some(ast::Operator::Is) {
+        return estimate(operator);
+    }
+    // QT.5 (lane qs5-18): an `IS` takes the `=` estimate unless its value is NULL, as SQLite's
+    // `whereLoopAddBtreeIndex` gives it, `IS NULL` alone keeping its own. A value planning doesn't
+    // know takes the connection's rule (`IsValueEstimate`). However estimated, a NULL-matching
+    // `IS` still never counts as one row ([Constraint::null_matching]).
+    let equality = || estimate(ConstraintOperator::from(ast::Operator::Equals));
+    let known = is_value(null_matching, value, params);
+    let selectivity = match (known, params.is_value_estimate) {
+        (IsValue::NotNull, _) | (IsValue::Unknown, crate::IsValueEstimate::Equality) => equality(),
+        (IsValue::Null, _) => estimate(operator),
+        (IsValue::Unknown, crate::IsValueEstimate::WorstCase) => equality().max(estimate(operator)),
+    };
+    tracing::trace!(
+        table = table_reference.table.get_name(),
+        value = ?known,
+        rule = ?params.is_value_estimate,
+        selectivity,
+        "IS estimate"
+    );
+    selectivity
 }
 
 fn selectivity_index_for_column<'a>(
@@ -941,6 +1090,7 @@ pub fn constraints_from_where_clause(
                                     Some(table_column),
                                     operator,
                                     null_matching(rhs),
+                                    Some(rhs),
                                     index_for_column(*column),
                                     params,
                                     false,
@@ -974,6 +1124,7 @@ pub fn constraints_from_where_clause(
                                     col,
                                     operator,
                                     null_matching(rhs),
+                                    Some(rhs),
                                     None,
                                     params,
                                     true,
@@ -1000,6 +1151,7 @@ pub fn constraints_from_where_clause(
                             None,
                             operator,
                             null_matching(rhs),
+                            Some(rhs),
                             None,
                             params,
                             false,
@@ -1047,6 +1199,7 @@ pub fn constraints_from_where_clause(
                                     Some(table_column),
                                     operator,
                                     null_matching(lhs),
+                                    Some(lhs),
                                     index_for_column(*column),
                                     params,
                                     false,
@@ -1080,6 +1233,7 @@ pub fn constraints_from_where_clause(
                                     col,
                                     operator,
                                     null_matching(lhs),
+                                    Some(lhs),
                                     None,
                                     params,
                                     true,
@@ -1106,6 +1260,7 @@ pub fn constraints_from_where_clause(
                             None,
                             operator,
                             null_matching(lhs),
+                            Some(lhs),
                             None,
                             params,
                             false,
@@ -1250,23 +1405,36 @@ pub fn constraints_from_where_clause(
                         .and_then(|s| s.row_count)
                         .unwrap_or(params.rows_per_table_fallback as u64)
                         as f64;
-                    // Use the inner plan's row count instead of always using 25.
-                    // FIXME: The plan does not estimate distinct result values.
-                    // Until it does, cap this estimate at the square root of the
-                    // table row count.
-                    let planned_rows = match &subquery.state {
+                    let inner_plan = match &subquery.state {
                         SubqueryState::Unevaluated {
                             plan: Some(inner_plan),
                         } => match inner_plan.as_ref() {
-                            Plan::Select(plan) => plan.estimated_output_rows,
+                            Plan::Select(plan) => Some(&**plan),
                             _ => None,
                         },
                         _ => None,
                     };
-                    let estimated_values = planned_rows
-                        .map(|rows| rows.clamp(0.0, row_count.sqrt().max(1.0)))
-                        .unwrap_or_else(|| params.in_subquery_rows.min(row_count));
-                    let selectivity = estimate_in_selectivity(estimated_values, row_count, *not_in);
+                    let lhs_column = match lhs_expr.as_ref() {
+                        ast::Expr::Column { table, column, .. }
+                            if *table == table_reference.internal_id =>
+                        {
+                            Some(*column)
+                        }
+                        _ => None,
+                    };
+                    let (estimated_values, lhs_distinct, lhs_non_null) = in_subquery_values(
+                        schema,
+                        table_reference,
+                        lhs_column,
+                        inner_plan,
+                        row_count,
+                        params,
+                    );
+                    let selectivity = if *not_in {
+                        estimate_in_selectivity(estimated_values, row_count, true)
+                    } else {
+                        (estimated_values / lhs_distinct).min(1.0) * lhs_non_null
+                    };
                     // SQLite's `comparisonAffinity` for IN-subquery combines the
                     // LHS column affinity with each result column via
                     // `sqlite3CompareAffinity` — that result is already cached on
@@ -2101,7 +2269,11 @@ fn estimate_bound_expr_selectivity(
         }
     };
     let leaf_selectivity = |lhs: &ast::Expr, rhs: &ast::Expr, op: ConstraintOperator| -> f64 {
-        let resolved = resolve_side(lhs).or_else(|| resolve_side(rhs));
+        // The value is the side opposite the constrained column.
+        let (resolved, value) = match resolve_side(lhs) {
+            Some(side) => (Some(side), rhs),
+            None => (resolve_side(rhs), lhs),
+        };
         let (col, col_pos, is_rowid) = resolved.unwrap_or((None, None, false));
         let index = col_pos.and_then(|pos| {
             selectivity_index_for_column(schema, table_reference, available_indexes, pos)
@@ -2116,6 +2288,7 @@ fn estimate_bound_expr_selectivity(
             col,
             op,
             null_matching,
+            Some(value),
             index,
             params,
             is_rowid,
@@ -2192,6 +2365,7 @@ fn estimate_bound_expr_selectivity(
                     estimated_values: rhs.len() as f64,
                 },
                 false,
+                None,
                 index,
                 params,
                 is_rowid,
@@ -2534,6 +2708,7 @@ pub(crate) fn analyze_binary_term_for_index(
         table_column,
         operator,
         null_matching,
+        Some(constraining_expr),
         best_index.as_deref(),
         params,
         is_rowid,
@@ -2833,6 +3008,24 @@ fn apply_column_stats(
                 rhs.iter().map(|value| share(value)).sum::<f64>().min(1.0)
             }
             _ => continue,
+        };
+        // PL.13 (lane replan-9): a share a filtered build counted for this one term stands in for
+        // the column statistics', and the plan notes the share it read, so a build or sorter
+        // filtered by this term alone is checked against it. Its error is the sample's binomial
+        // one at the share planned on: the common values are the sample's counts, and the share
+        // left to a rare value is what the sample's counts leave (decision 20).
+        let selectivity = match (
+            params.plan_values.as_deref(),
+            sample,
+            crate::filter_shares::fingerprint(std::iter::once(&term.expr)),
+        ) {
+            (Some(values), Some((n, _)), Some(fingerprint)) => values.filter_selectivity(
+                table.table.get_name(),
+                fingerprint,
+                selectivity,
+                n as usize,
+            ),
+            _ => selectivity,
         };
         constraint.selectivity = selectivity;
     }

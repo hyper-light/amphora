@@ -19,19 +19,23 @@ mod blink;
 mod cc;
 mod clickhouse;
 mod cluster;
+mod colcopy;
 mod columns;
 mod eqp;
 mod mysql;
 mod oracle;
 mod pg;
+mod pgtext;
 mod planner;
 mod pool;
+mod powercut;
 mod probe;
 mod query;
 mod reach;
 mod repl;
 mod scale;
 mod schema;
+mod skipping;
 mod sqlapi;
 mod store;
 mod suite;
@@ -530,6 +534,11 @@ fn main() -> anyhow::Result<()> {
     if std::env::args().any(|a| a == "--vlog") {
         return vlog::main();
     }
+    // T-T1.4.1's writer and check: the power-cut harnesses' database side (`powercut.rs`,
+    // bench/powercut/; CP-T1.4, G8 step 4).
+    if std::env::args().any(|a| a == "--powercut") {
+        return powercut::main();
+    }
     // G7 step 3's three ways to reach a cached page (`reach.rs`).
     if std::env::args().any(|a| a == "--reach") {
         return reach::main();
@@ -540,12 +549,23 @@ fn main() -> anyhow::Result<()> {
     if std::env::args().any(|a| a == "--scale") {
         return scale::main();
     }
+    if std::env::args().any(|a| a == "--repl-member") {
+        return repl::member_main();
+    }
     if std::env::args().any(|a| a == "--repl") {
         return repl::main();
     }
     // G11 step 2's column copies, A and B, against none (`columns.rs`).
     if std::env::args().any(|a| a == "--columns") {
         return columns::main();
+    }
+    // Row skipping against DuckDB, one driver for both (`skipping.rs`, lane skip-7).
+    if std::env::args().any(|a| a == "--skipping") {
+        return skipping::main();
+    }
+    // Column copies within a fixed memory limit against DuckDB, one driver for both (`colcopy.rs`).
+    if std::env::args().any(|a| a == "--colcopy") {
+        return colcopy::main();
     }
     let o = opts()?;
     let (k, q) = (o.connections, o.queue);

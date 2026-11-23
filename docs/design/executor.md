@@ -402,9 +402,10 @@ VDBE's join in its order (T-QT.6.8); an INTEGER PRIMARY KEY reads its rowid (T-Q
 whose whole work is one rowid table read whole with its filter and aggregates is emitted as
 `Insn::MorselAggregate` and a row loop over `Insn::MorselNext`, ahead of the statement's serial
 loop (`translate/parallel.rs`). Only shapes whose answers equal the serial loop's qualify: columns
-stored as written (INTEGER, TEXT or BLOB affinity, BINARY collation, no defaults, no generated
-columns), terms comparing a column with a literal of its own kind or testing it for NULL,
-plain-column GROUP BY keys, COUNT, SUM over INTEGER columns, MIN and MAX, and no HAVING, ORDER BY,
+stored as written (INTEGER, TEXT or BLOB affinity, BINARY collation, no generated columns, a
+short row padded with its columns' defaults), terms comparing a column with a literal of its own kind or testing it for NULL,
+plain-column GROUP BY keys, COUNT, SUM over INTEGER columns, MIN and MAX (in the copied body, AVG
+and TOTAL over integers too), and no HAVING, ORDER BY,
 LIMIT, DISTINCT, window or subquery; MVCC and the versioned storage, whose rows are not in the
 pager's b-trees, never qualify. When the run meets a value its aggregates don't take (a SUM over
 text) it jumps to the serial loop, so the answer never depends on the switch. Groups come out in
@@ -475,10 +476,308 @@ ends at the LIMIT); the workers still produce every joined row, so the LIMIT sav
 probing. A LIMIT over an order with ties stays serial. T-QT.6.14 checks it row for row against the
 serial loop at 2, 3, 4 and 8 stated cores.
 
-**Not yet.** Workers still run the pipeline's own loop body, not a copy of the VDBE program's,
-so only the filters `Predicate` holds (a column against a literal of its kind, a NULL test) run in
-parallel; joins of more than two tables and outer joins stay serial, and a LIMIT doesn't yet stop
-the workers early.
+**Workers run a copy of the loop body** (lane qs6-7). A one-table scan with its aggregates no
+longer needs its filter and inputs to be ones `Predicate` and `Aggregate` hold: the hook emits a
+copy of the serial loop's body (`MorselBody`) as its own range of the program, after its row loop
+where the serial loop never reaches, translated by the same `translate_condition_expr` and
+`translate_expr` the serial loop uses, with each of the table's columns read from a register (the
+resolver's expression cache) rather than a cursor. Each worker (`TableBodyAggregate`) makes its own
+`ProgramState` (registers, cursors, program counter) at its first morsel, its registers starting
+as the statement's were when the hook ran (the constants the program's start computed, the bound
+parameters), and per row writes the row's columns and rowid into their registers and runs the
+statement's own opcodes from the body's start until it reaches `keep` (its GROUP BY values and
+aggregate inputs are then in the output registers, folded into the worker's partial aggregates)
+or `skip`. So any filter or expression the serial loop runs, functions, CASE, LIKE, arithmetic,
+runs in parallel, with no second evaluator. An error the body raises, or a step that is not a
+plain step, sends the statement to the serial loop, which raises the error its own way; so does a
+REAL a SUM would take, since the parallel sum's one exact rounding is not the serial loop's. The
+GROUP BY values and MIN and MAX are compared bytewise, so a column of another collation, a
+COLLATE, a subquery or a column stored converted (REAL or NUMERIC affinity) stays serial. The
+versioned storage's column copy still reads the simple shape's own filter and aggregates, and
+declines a body only the bytecode states. T-QT.6.15 checks random filters and inputs against the
+serial loop at 1, 2, 3, 4 and 8 stated cores, and that the body ran over every row.
+
+**A scan's rows run through the copy too** (lane qs6-8). A one-table SELECT with no aggregates,
+no GROUP BY and no ORDER BY emits the same copy of the loop body with the result columns as its
+outputs (`MorselBody::rows`); each worker (`TableBodyRows`) keeps the output rows of the rows that
+pass, tagged with its morsel's first leaf, and the runs are joined in leaf order, so the rows come
+out as the serial loop gives them. An ORDER BY stayed serial here; lane qs6-17 sorts it on morsels (below).
+
+**Workers stop early under a LIMIT** (lane qs6-8). With a LIMIT, the body carries the rows the
+LIMIT and OFFSET take (`want`). A shared count of the rows kept is checked before each morsel is
+claimed (`Pipeline::done`), so no morsel is claimed once that many are kept, and a morsel stops
+scanning once it alone holds that many. A morsel claimed always runs, and morsels are claimed in
+leaf order, so the morsels run are a prefix of the table and the first `want` rows in leaf order
+are exactly the serial loop's; the hook's row loop then counts the OFFSET and LIMIT down as it
+does for joins. This runs behind its own switch, `Connection::set_parallel_limit`, off by default:
+off is the control, and the serial loop answers. T-QT.6.16 checks random filters and result
+expressions against the serial loop at 1, 2, 3, 4 and 8 stated cores, with and without a LIMIT;
+under a LIMIT, that the row count is the serial one, that every row is in the serial result, that
+the control never runs the body, and that the body ran over fewer rows than the table holds (the
+workers stopped early) for most statements.
+
+**Joins of any number of tables** (lane qs6-10). An inner join of two or more rowid tables, each
+read whole (a scan, the planner's hash join, or a seek in an ephemeral index the statement builds
+from the whole table), at least one of them a hash join, runs as a chain of hash tables. The probe
+is the first table in the join order that no hash join builds from. Every other table is a link
+(`MorselJoinData`), taken in the join order among the tables an equality links to those already in
+the chain; each equality of two tables' columns is a key of the link that joins the later of its
+two tables, so no join term is left to test, and every other term is a filter on one table. Each
+link's table is read and built once by the workers together, as a two-table join's build side is.
+Each worker walks a probe row through the chain depth first (`each_joined`, an explicit stack as
+deep as the chain, no recursion): the first link's matches in build order, each one's matches in
+the next link, and so on; the joined row is the probe row's columns, then each link's. A join with
+no equality linking a table to the rest (a cross product) stays serial, and a LIMIT or OFFSET is
+taken only when the ORDER BY holds every table's INTEGER PRIMARY KEY. The counter
+`morsel_join_links` counts the hash tables built. T-QT.6.17 checks random joins of three and four
+tables against the serial loop at 1, 2, 3, 4 and 8 stated cores.
+
+**A join's workers run the copy of the loop body** (lane qs6-12). A join's filters and outputs
+are no longer only what `Predicate` and `Aggregate` hold: the hook emits the copy of the serial
+loop's body (`MorselBody`) over the joined row, each table's columns read from registers at its
+place in the chain (the probe's first, then each link's), the probe's rowid its own and a link's
+its INTEGER PRIMARY KEY. The equalities that key the chain stay the hash tables' keys, and a term a
+table's own `Predicate` holds is still tested on that table's rows, before the probe or the
+build; every other term (functions, CASE, LIKE, a comparison of two tables' columns, an equality of
+two kinds) and every output (GROUP BY values, aggregate inputs, result columns, then the ORDER BY
+keys) run in the body, per joined row, through the VDBE's own opcodes (`TableJoinAggregate` and
+`TableJoinRows` hold the body; a join has no other path). The tie argument that held a join's
+columns to INTEGER and TEXT now holds of any value but one: an INTEGER and a REAL can compare equal
+and differ, so a REAL in a GROUP BY value, a MIN's or a MAX's input (`MorselBody::no_real`), as in
+a SUM's, sends the statement to the serial loop, and the serial loop's order of a probe row's
+matches can't change the answer. ORDER BY keys stay plain columns of INTEGER or TEXT affinity, so
+the workers' sort is the serial sorter's. T-QT.6.18 checks random joins of two, three and four
+tables whose filters and outputs only the body states against the serial loop at 1, 2, 3, 4 and
+8 stated cores.
+
+**Outer joins** (lane qs6-12). A LEFT, RIGHT (which the planner turns into a LEFT with the tables
+swapped) or FULL join of two rowid tables runs on morsels too, whatever loop the planner chose for
+it (it makes no FULL hash join): the probe is the table the join may pad with NULLs, the build the
+other, keyed by the ON equalities of columns of one affinity (`MorselOuter`, `TableOuterJoin`).
+ON terms decide which rows match and WHERE terms test the joined row, matched or padded, so they
+are kept apart: only an ON equality is a key; the body's ON terms (`MorselBody::on`) run first, and
+a row that passes them matched; the WHERE terms and the outputs follow. A table's own term is
+tested on its rows only where that drops no row the join keeps: in a LEFT join an ON term on the
+probe and a WHERE term on the build; in a FULL join, none. The build keeps its rows with a NULL key
+(they match nothing, and still appear). Each worker marks the build rows its probe rows matched in
+a bitmap of its own, a bit per row charged to the statement's budget; the bitmaps merge by OR as
+the partials do, and the build rows no worker marked then run the body in morsels of build rows
+(`TableOuterRest`), padded with NULLs for the probe's side, its rowid NULL. A FULL join's probe row
+that matched nothing runs padded with NULLs for the build's side, by the worker that read it. Rows
+come out as the probe's morsels in leaf order, then the padded build rows in build order, sorted
+by a stable merge under an ORDER BY. A LIMIT or OFFSET, a join of more tables with an outer one, a
+RIGHT join the planner keeps as one, and semi and anti joins stay serial. T-QT.6.19 checks random
+LEFT, RIGHT and FULL joins, ON terms on either table or both beside the keys and WHERE terms that
+read the padded side's NULLs, against the serial loop at 1, 2, 3, 4 and 8 stated cores.
+
+**A body of nothing but reads** (lane qs6-13). Running the copied body on every joined row costs
+a simple join what the direct fold of lanes qs6-9 and qs6-10 did not: every column of every table
+written into registers and the body's code stepped, where the fold read only the columns its
+aggregates named. A join's body with no ON or WHERE term left past the hash keys and the tables'
+own `Predicate`s, and every output a column or a rowid of the joined row, gets `MorselBody::direct`,
+each output's place in the joined row (the very register the body's copy reads); with
+`Connection::set_parallel_join_direct` on, a worker copies those values and runs no code, `no_real`
+still checked. Off by default (the body runs, as lane qs6-12 left it) until the A/B decides:
+T-QT.6.20 times simple joins on 054ace65 (the fold) and here (body, and direct) at 1 to 32 cores,
+p50, p99 and p99.9; T-QT.6.21 checks direct against the serial loop. An outer join never copies.
+
+**Outer joins under a LIMIT, and LEFT joins among more tables** (lane qs6-13). An outer join's
+rows are cut by a LIMIT or OFFSET as an inner join's are: only when the ORDER BY holds every
+table's INTEGER PRIMARY KEY. A padded row's NULL key still tells it apart, since a row is padded at
+most once, so the sorted rows are the serial loop's to the row (T-QT.6.22). A LEFT join among
+three or more tables (`MorselOuter::LeftLink`) puts its padded table last in the chain of hash
+tables and probes with a table it keeps: each joined row of the others is probed in that last
+link, the ON terms run on each match (`MorselBody::on`), and a row none of whose matches passed
+them, or with none, runs once more padded with NULLs for that link's columns, tested by the WHERE
+terms alone. No bitmaps: the rows a LEFT join keeps are the probe's own walk. Only an ON equality
+with the padded table keys its link; an equality with it in the WHERE clause, or an ON term
+between the tables it keeps, is the body's; an ON term on the padded table alone filters its
+build, a WHERE term on it does not (T-QT.6.23).
+
+**Outer joins of any kind among any number of tables** (lane qs6-14). A RIGHT or FULL JOIN among
+three or more tables, or more than one outer join in a statement, runs as `MorselOuter::Chain`
+(`TableChain`): the tables joined in the FROM clause's order, as SQL states the joins, the first
+the probe and each other a link of the chain, keyed by its own ON equalities with the tables before
+it and marked with what it keeps (`MorselKeeps`: LEFT the left rows, RIGHT the right rows, FULL
+both). A probe row walks the chain depth first, an explicit stack as deep as the chain. At each
+link a match runs the link's own ON code (`MorselBody::links_on`, a block per link, over the row
+up to it); one that passes goes on to the next link, and a row of the tables before it that no
+match passed goes on once padded with NULLs when the link keeps the left rows. A link that keeps
+the right rows marks the build rows matched in each worker's own bitmap. The walk runs in phases:
+the probe's leaves, then for each link that keeps the right rows, in the chain's order, its build
+rows no worker marked, padded with NULLs for the tables before it, walk the rest of the chain. A
+link's bitmaps are merged only once every phase that can reach it has run: the probe's, and each
+earlier such link's padded rows. Every row at the chain's end runs the WHERE terms and the
+outputs. Where terms run: a link's own ON term over its table alone filters its build unless the
+link keeps its right rows; its other ON terms run in its ON code (an ON term reading a table after
+its link declines). A WHERE term acts early only at the probe or an inner link with no link after
+it that keeps its right rows (such a link's padded rows skip the earlier tests, and every row that
+reaches it marks its build rows whatever the WHERE terms later say): there a term over one table
+filters that table and an equality with an earlier table keys the link. Every other WHERE term runs
+over the whole row. The two-table shapes and one LEFT join among more keep their own paths
+(T-QT.6.24 for FULL joins among three and four tables, T-QT.6.25 for two or more outer joins).
+
+**Two orientations of a two-table outer join, behind a switch** (lane qs6-15; steps 1 and 2 of
+lane qs6-14's plan). `Connection::set_parallel_outer_probe` picks which table a two-table LEFT or
+FULL JOIN probes, for statements prepared after: `OuterJoinProbe::Padded` (the default, today's)
+probes the table the join pads and marks the kept table's matched rows in a bitmap per worker,
+padding the unmarked ones once the bitmaps merge (`TableOuterJoin`); `OuterJoinProbe::Kept` probes
+the kept table (a FULL join's left one) through the chain, padding a kept row no match passed
+during the walk (`TableChain`; a FULL join's right rows still take the link's bitmap). A LEFT join
+among more tables and the chain's joins have the one orientation the chain can state (the kept
+tables probe, the padded link pads in the walk), whatever the switch says. What each did is
+counted on the connection (`OuterCounters`: rows padded during the walk, rows padded after the
+bitmaps merged, the bitmap words the workers held, statements per path) and traced per statement
+(target `amphora.morsel`, "outer join on morsels"). Every outer-join test (T-QT.6.19, T-QT.6.22 to
+T-QT.6.25) runs at both settings; T-QT.6.19 also checks each setting ran its own path.
+
+**The extremes that tell them apart** (lane qs6-16; step 3 of qs6-14's plan). T-QT.6.26, a harness
+in `vdbe/morsel_join_ab.rs`, runs LEFT and FULL joins (counts, a GROUP BY, rows) at both settings
+and a ladder of stated cores on four pairs of tables with unique keys, each forcing one
+orientation's failure mode: a tiny padded table against a huge kept one (`Padded` hashes and marks
+the huge one), a huge padded table against a tiny kept one (`Kept` hashes the huge one), every key
+but one matched on each side (the bitmaps' rest pass finds nothing) and one key matched (all of it
+padded). Per scenario, query, setting and cores it reports p50, p99 and p99.9, the statements each
+path ran and those that fell back to the serial loop, the rows padded each way and the bitmap
+words per statement, and the bytes charged to the statement's memory budget, the mean and the most
+(`OuterCounters::charged_bytes`, `charged_peak`; a budget is not credited back within its
+statement, so a statement's charge bounds what it held at once).
+
+**A table the planner reads by a seek, as a link, behind a switch** (lane qs6-16).
+Planned by cost, a join onto a primary key or an indexed column is an index nested loop: the
+joined table is read by a seek per row of the tables before it (`Search::RowidEq`, `Search::Seek`),
+and the hook declined it, so the commonest join of all ran on the serial loop unless the planner
+chose a hash join somewhere in it. `Connection::set_parallel_searched_links` (`SearchedLinks::Off`,
+today's, the control) lets `shape_join` and `shape_chain` take such a table past the first as a
+link keyed by its equalities with the tables before it, as they already take a seek in an index
+the statement builds. It is correct because the hook tests every term, consumed or not, on the
+joined row: the rows a seek skips fail the terms it was made from. Two candidates, for the
+measurements to decide between: `Hash` reads the table whole into a hash link, which pays
+against a large probe and loses against a small one (a probe of a few rows, or a seek on a
+constant); `Seek` reads an inner join's link keyed by the table's INTEGER PRIMARY KEY by a seek per
+joined row, each worker with a cursor of its own (`SeekLink`, `TableSource::seek_row`; its other
+key pairs compared as the hash table compares keys, its own terms tested on the row found), no
+table built and nothing charged, as the serial loop reads it; any other searched link is a hash
+link there too. `MorselJoinData::searched` marks such a link; `morsel_searched_links` and
+`morsel_seek_links` count them (T-QT.6.27). T-QT.6.28, a harness beside T-QT.6.26, forces each
+candidate's failure mode on a join onto a primary key: a tiny probe against a huge table (`Hash`
+reads it all), a huge probe against a tiny one (`Seek` seeks per row where a small hash table
+would do), and equal sizes, with p50, p99 and p99.9 and the links per statement at each setting
+and stated cores.
+
+**A table with a DEFAULT on morsels** (lane qs6-17). A row written before ALTER TABLE ADD COLUMN
+is shorter than its table, and the serial loop's Column reads the missing column as its default,
+folded with the column's affinity (`vdbe/builder.rs`'s `folded_default`, SQLite's
+sqlite3ColumnDefault; NULL where there is none or it doesn't fold). `stored` refused every table
+with a default, so a table that had ever gained a column ran serially. Now `parallel.rs`'s
+`defaults` takes each column's value from the same `folded_default`, into
+`MorselAggregateData::defaults` and `MorselJoinData::defaults` (empty when all are NULL, so the
+common table pads nothing), and `TableSource` pads a short row with them, on scans and seeks
+alike. Left serial: a STRICT table's custom-typed column with a default (the serial loop ENCODEs
+it at run time), generated columns, and the versioned storage's column copy of such a table.
+T-QT.6.29 checks scans' aggregates, groups and rows and joins with such columns on either side
+against the serial loop at 1, 2, 3, 4 and 8 stated cores.
+
+**AVG and TOTAL on morsels** (lane qs6-17). The serial loop sums AVG's and TOTAL's values as
+doubles with a compensated (Kahan-Babuska-Neumaier) sum, in row order. Over integers whose
+magnitudes sum below 2^53, the integers a double holds exactly (its 53-bit significand, IEEE 754
+binary64), every partial sum in any order is exact and the compensation is zero, so the serial
+answer is the exact sum, as a double, divided by the count for AVG. The copied body's aggregates
+(`body_outputs`, scans and joins alike) now take `Aggregate::Avg` and `Aggregate::Total`: each
+worker keeps the exact sum, the sum of magnitudes and the count, merged once. A REAL among the
+values goes to the serial loop as a SUM's does (`no_real`), and so does a statement whose
+magnitudes reach 2^53 (`MorselError::Unsupported` at the finish). T-QT.6.30 checks them bit for
+bit against the serial loop at 1, 2, 3, 4 and 8 stated cores.
+
+**Aggregates with a FILTER on morsels** (lane qs6-17). An aggregate's FILTER (WHERE c) skips the
+rows where c doesn't hold; every aggregate the pipeline folds skips a NULL input, so the copied
+body reads the input as NULL on such a row (`BodyPlan::agg_filters`: the FILTER tested as the
+serial loop tests a condition, by `translate_condition_expr`, before the input's expression), and
+COUNT(*) FILTER (WHERE c) is COUNT over c itself, which is never NULL where it holds. With no row
+passing, each aggregate gives what it gives over no rows (COUNT 0, SUM, MIN, MAX and AVG NULL,
+TOTAL 0.0), as the serial loop does. A body that is nothing but reads has no FILTER to test, so a
+FILTER keeps the statement off the direct path. T-QT.6.31 checks them in scans and joins against
+the serial loop at 1, 2, 3, 4 and 8 stated cores.
+
+**A HAVING over the aggregates on morsels** (lane qs6-17). The planner moves a HAVING's terms over
+the group keys alone into the WHERE; what is left is the row loop's to test once the groups are
+made. With a HAVING, the hook loads every aggregate's value after the result columns
+(`MorselAggregateData::result_map` grows by one place per aggregate, `MorselNext` fills them, and
+`ResultRow` returns only the result columns), rewrites each aggregate in the HAVING's terms to the
+register its value is loaded into (`having_terms`), and tests them with `translate_condition_expr`
+as the serial loop does, a group that fails going on to the next. Only terms over the aggregates
+and constants qualify: a group key or a bare column read through a register would lose its
+column's affinity in a comparison, which the serial loop applies, so those stay serial. A HAVING
+with no GROUP BY is a GROUP BY of no keys, its one group tested the same way. T-QT.6.32 checks
+them in scans and joins against the serial loop at 1, 2, 3, 4 and 8 stated cores.
+
+**A rowid range on morsels** (lane qs6-17). A one-table statement the planner reads by a forward
+search of the table b-tree between integer literals (`Search::Seek` with no index, no prefix, no
+skip: `WHERE id > 4000`, `rowid BETWEEN 300 AND 5500`) ran serially. `scanned_rowids` takes the
+search's least and greatest rowid, each inclusive, into `MorselAggregateData::rowid_range`, and
+`TableSource::restrict` keeps the leaves that may hold them: the first whose greatest rowid
+reaches the lower bound, through the first whose greatest rowid reaches the upper (two binary
+searches over the leaves' bounds the open already found), its first morsel seeking past the
+leaf before. The morsels are cut from those leaves as from a whole table. The rows of the end
+leaves past the bounds are still read, so the terms the search was made from are tested on every
+row, consumed or not. A backward search (its rows come out in the other order), a bound that is
+no integer literal (a parameter, an expression) and a seek through an index stay serial.
+T-QT.6.33 checks ranges against the serial loop at 1, 2, 3, 4 and 8
+stated cores, and that the body ran over fewer rows than the table holds. A join's tables take
+the same ranges (`shape_join` and `shape_chain`; `MorselJoinData::rowid_range` for a link, whose
+build reads only its leaves too), since the hook tests every term, consumed or not, on the joined
+row. Leaves drop the rows outside the range before the join, which is right only where each such
+row fails a term of an inner join, so in a statement with an outer join every range is read
+whole and the terms decide (a kept table's row outside an ON term's range is still kept).
+T-QT.6.35 checks inner and outer joins over ranges against the serial loop.
+
+**A scan's rows under ORDER BY on morsels** (lane qs6-17). A one-table scan's rows under an ORDER
+BY ran serially. They now sort as a join's rows do: `scan_order` takes keys that are the table's
+columns (or its rowid) of INTEGER or TEXT affinity and BINARY collation, no NULLS FIRST or LAST
+named, so the workers' comparison is the serial sorter's, and appends them to the body's outputs
+after the result columns (`MorselRows`, in `MorselAggregateData::joined_rows`). Each worker sorts
+its morsel's rows (`TableBodyRows::order`), and the runs, put in leaf order, are merged by a
+stable merge sort, so rows equal under the keys keep their rowid order. A sorted scan never stops
+early: the hook's row loop counts the LIMIT and OFFSET down over the merged rows, and it takes
+one only when the keys hold the rowid, which tells every row apart, so the rows cut are the
+serial loop's to the row. Only forward scans qualify now: a backward scan may stand for an ORDER
+BY ... DESC the planner removed, and the morsels' rows come out in rowid order. T-QT.6.34 checks
+them against the serial loop at 1, 2, 3, 4 and 8 stated cores.
+
+**What still runs on the serial loop** (lane qs6-16's audit, updated by lane qs6-17; each an open
+part of QT.6):
+- *A join's rows under a LIMIT whose ORDER BY doesn't hold every table's INTEGER PRIMARY KEY.* The
+  answer is the serial loop's rows exactly, and a probe row's matches come in its hash tables'
+  order, not the hook's. Parallel needs an order the hook can reproduce (or a check of any rows of
+  the right count, as SQL allows) and the scans' early stop.
+- *The merge join* (lane qs5-21): not on this branch; once it is an `Operation`, it is taken as a
+  hash link (as above), or run by key ranges cut at the driving table's leaves.
+- *Correlated subqueries* (`non_from_clause_subqueries`, `outer_query_refs`, `Exists`, `InSelect`):
+  the subquery's code needs cursors of its own in each worker; the unnesting the planner already
+  does turns some into joins, which do run on morsels.
+- *Window functions* (`plan.window`): need a parallel sort, partitioned by PARTITION BY across the
+  workers, and a frame pass per partition.
+- *Recursive CTEs*: each round needs the last; a round's scan or join could run on morsels once an
+  ephemeral table (the queue) is a morsel source (`stored` takes only b-tree tables with a root
+  page).
+- *Scans on the versioned storage*: its pager holds no table's rows, so every statement its column
+  copy doesn't take (joins, expressions only the body states, rows, a statement in a transaction
+  that wrote, a table with no copy yet, or the planner's choice of the rows) runs on the serial
+  loop. Needs a morsel source over the row versions at the statement's snapshot, cut by key ranges.
+- Also found: a table with a generated column (`stored`); a STRICT table's custom-typed column
+  with a DEFAULT, which the serial loop ENCODEs at run time; a table whose short rows read a
+  default, on the versioned storage's column copy, which decodes records as written; a scan
+  through an index or a rowid range whose bounds aren't integer literals (`Operation::Search`;
+  a rowid range is a run of leaves, `TableSource::restrict`); a one-table
+  scan's rows under an ORDER BY on an expression, with NULLS FIRST or LAST, or with a LIMIT whose
+  keys don't hold the rowid, and a backward scan; AVG and TOTAL over REALs or past 2^53, group_concat and DISTINCT
+  aggregates, a HAVING over a group key or a bare column, and
+  an ORDER BY the GROUP BY can't take (on an aggregate's value) or a LIMIT over groups; DISTINCT, compound SELECTs, INSERT ... SELECT and
+  other statements that don't return rows; joins with no equality of one affinity (a cross
+  product, a range join).
+
+**Not yet.** One path for LEFT joins: which orientation wins, or a choice per query from measured
+costs, is T-QT.6.26's run of record to say (qs6-14's plan, step 4: the leftover paths removed).
 
 ## 9. A table scan decodes each leaf once into column batches, behind a switch
 
@@ -649,6 +948,55 @@ table seek. No size is picked: a zone is a table leaf (the page size and the rec
 how many rows it holds), the tail zone grows to the leaves' measured fill, and the cracker's pieces
 are cut where filters asked.
 
+**On the versioned storage (lane g7s2-14, G7 step 2, `AC-NS.2.1`).** A summary is built, built
+again for a trial, and asked through the versioned storage's own cursor (its root page is the
+tree's id). The positions are commit timestamps: a connection's snapshot is its transaction's
+start (the newest commit when none is open), against the newest commit published. Writers there
+take no single write lock, so another may commit while one is open and a newer commit no longer
+means the open writer committed: its writes are taken with `SkipRegistry::on_write_told`, and its
+end is told as its transaction ends (`committed`, or `rolled_back`, which makes the summary
+`Stale`). A write while another writer's is open, or by a writer whose snapshot isn't the newest
+commit, makes the summary `Stale`.
+
+A build there holds no lock against writers either, so a writer may change the table before the
+build or beside it and commit after, and the build, which can't see its open rows, would miss them
+(lane g7s2-15). The versioned storage counts, for each tree, the open transactions that have
+changed a row of it (`Clock::writers_of`; a transaction is counted once a tree, from before its
+first change to after its commit is published). A build is installed with
+`SkipRegistry::set_checked`: under the registry's lock, once the summary is in place, it asks
+whether another open transaction has changed the tree or a commit passed the build's snapshot, and
+if so the summary is kept `Stale` until built again (counted in `SkipCounts::built_stale`, with the
+reason in an `amphora.skipping` trace event). A write whose row changed before that ask is seen by
+it; one after finds the summary and feeds it. An insert that found no summary before its row
+changed reads the registry's install count before and after, and makes a summary installed
+between stale (a delete's hook already runs whether it found one or not).
+
+Stale or wait is decided by data, not argument (lane g7s2-16): both are built behind
+`AMPHORA_SKIP_BUILD` (`SkipRegistry::set_policy`, `BuildPolicy`), stale the control. Under
+`stale` a build beside an open writer goes in stale at once: refused, every scan reads every row
+and stays correct until the next build (lane skip-8's rebuild, or the caller's) makes it current.
+Under `wait` a build first waits for the table's open writers to end, woken by the last one's end
+(`Clock::when_unwritten`, told under the lock that counts the writers, after its commit is
+published: no timer, no poll), then builds; if a writer slipped in beside it, it is installed
+stale and built again after another wait (`SkipRegistry::wait_counts`). Its failure mode: the
+caller is held behind any transaction for as long as it runs, up to its statement's deadline,
+and starved while writers keep the table open. Two waits are refused, typed
+(`UnwrittenRefusal`, counted in `SkipRegistry::wait_refusals`), and that build goes in as `stale`
+builds it (lane g7s2-17): one whose table has an open writer that changed it on the waiting
+thread (on another connection: only that thread can end it, so the wait would never end; the
+clock keeps each open writer's thread beside the tree's count), and one whose deadline passed
+first (the statement's, `state.query_deadline`, or the connection's query timeout for a direct
+call; the waiter is taken out, so waits that give up hold nothing). Each test forces its arm's
+failure (`t_ns_2_1_a_build_beside_an_open_writer_is_kept_stale`: every row read until rebuilt;
+`t_ns_2_1_a_waiting_build_waits_for_the_open_writer`: blocked until the writer commits), the
+refusals theirs (`t_ns_2_1_a_waiting_build_beside_its_own_threads_writer_goes_in_stale`,
+`t_ns_2_1_a_waiting_build_gives_up_at_its_deadline`), and the rebuild path is pinned by a pause
+in the storage between the build's read and its check
+(`t_ns_2_1_a_writer_slipped_in_beside_a_waiting_build_is_built_again`). The run
+of record, the coordinator's: a builder beside the concurrency ladder's writers (1 to 4096) of
+one table, each arm's build latency p50/p99/p99.9, scans' rows read until a current summary, and
+rebuilds.
+
 ### Bounds from parameters (lane skip-usable, T-SKU.1)
 
 Real callers prepare a statement once and bind it on each run (`a BETWEEN ? AND ?`, `a >= :lo`), so
@@ -660,8 +1008,248 @@ anything but an integer (NULL, a real, a text, a blob) gives its term no bound: 
 the same rule as the summaries' (a bound parameter has no affinity, as a numeric literal has none,
 so the comparison it makes is the constant's).
 
-**Not yet.** Neither kind is chosen by measured cost (the harness's numbers aren't recorded), and a
-summary is turned on by `skipping::set_skipping` (no SQL).
+Lane skip-10 (T-SKU.13): an `IN` list bounds its column too (`a IN (?, ?)`, `a IN (1, :v)`). Each of
+its values is a constant or a parameter (`ListTerm`), read as the scan starts like a term's, and
+the list bounds its column by its smallest and largest value: a row it matches equals one of them,
+so lies between the two. One value that isn't an integer on this run leaves the whole list
+unbounded, as a row could match that value; `NOT IN` and a list holding any other expression give
+no bound. The hull is loose for values far apart (it reads the rows between them): asking the
+summary once per value and joining the candidates is tighter, at one summary call per value and
+one measured cost per filter split across them; the hull keeps one call and one cost.
+
+Lane skip-11 (T-SKU.14): both, behind a per-summary switch (`ListProbe`, `PRAGMA skipping = 't.a
+<kind> [span|values]'`); the span is the control and the default until the bench decides. Under
+`values` the scan asks the summary once for each value of the column's shortest list whose values
+are all integers on this run, keeping only the values within the column's bounds (its terms and
+every list's span), and unions the candidates: a zone map checks each zone against every value
+in one pass, a cracker cracks at each value and returns each piece, the rows whose value isn't an
+integer once. No list, or no value within the bounds, asks for the bounds' one span. The chooser
+counts a filter alike under both: it is one filter however many values it asks for (one method
+answers every probe, one trial or choice is counted), and its one measured cost runs from before
+the first probe to the scan's end, so it covers every probe and every row read. `SkipCounts`
+counts the probes. Each failure mode has a test and a bench form: `gap` (two values half the
+table apart: the span reads the whole gap) and `cluster` (64 neighbouring values: 64 probes for the
+rows one span names).
+
+### Choosing a kind by measured cost (lanes skip-3 and skip-4, T-SKU.2)
+
+`SkipKind::Measured` keeps both a zone map and a cracked copy of the column, each fed every write
+(`skipping::Chooser`, `choose.rs`), and answers each filter with one of them. The executor times
+the scan from asking for its candidates to its end and hands the time back
+(`SkipRegistry::record_cost`); a scan stopped early (a LIMIT) hands back nothing. The core reads no
+clock. Each kind is tried once; the kind whose latest measured scan was cheaper leads; the other is
+measured again once the leader has spent as much as the other's last scan cost, times 2 to the
+number of measures in a row that confirmed the leader (the doubling trick, Auer, Cesa-Bianchi,
+Freund and Schapire 2002; ski rental's break-even rule, Karlin et al. 1988, for the first trial).
+The 2 is the doubling trick's base, not a tuned number. A burst of scans issues one trial, not one
+each. Instruments: `ChooserStats` (per kind: filters it answered as leader, trials, costs measured,
+latest and total cost; how often the leader changed) and a debug event on `amphora.skipping` with
+both costs whenever the leader changes.
+
+The scenarios that force each kind's failure mode (`skipping::tests::chooser`): a scattered column
+with narrow filters fails zone maps, and the chooser settles on cracking; a column that follows the
+rowid, with heavy write churn and wide filters, fails cracking, and it settles on zone maps. In
+both, the other kind is measured a logarithmic number of times, and the chooser's total stays
+within twice the better kind alone, plus the kept kind's write upkeep.
+
+**Cost of keeping both.** Both summaries take every write, so the losing kind's write upkeep is paid
+for as long as the column is measured; the doubling bound covers scans, not that upkeep. The cap
+below bounds it.
+
+### The losing kind's upkeep capped (lane skip-5, T-SKU.5)
+
+**Decision.** Behind a switch, `Upkeep` (`choose.rs`): `KeepBoth`, the control (`PRAGMA skipping =
+'t.a measured'`), and `Capped` (`'t.a capped'`). Capped drops the kind not leading once the write
+upkeep it has cost since it last answered a filter passes its latest measured cost to build: ski
+rental's break-even rule (Karlin, Manasse, Rudolph and Sleator, Algorithmica 1988: rent until the
+rent paid equals the price, then buy, within twice the best choice in hindsight). The kind leading
+is never dropped. A dropped kind is still measured on the doubling schedule; its trial's budget
+adds its build cost, and when the trial is due it is built again: zone maps from the cracker's
+own copy of the column, in the dropped map's zones; the cracker from the table, refused if a write
+came in during the build. Lane skip-8 moved the build off the scan's path (T-SKU.10, below).
+The upkeep is timed per write by the executor's clock and handed in (`SkipRegistry::on_write`'s
+`now`); a build's cost is its own time. No number is picked: the threshold is the kind's own
+measured build cost.
+
+**Why.** Keeping both makes every write pay both kinds' upkeep for as long as the column is
+summarized, so on a write-heavy table the kind that answers nothing still costs the most (a
+cracker's moves under churn). Dropping it outright would lose the chance to notice the workload
+shift back; the doubling trial keeps that, at a cost bounded by its build.
+
+**Instruments.** `MethodStats::{upkeep, last_upkeep, dropped, rebuilt}` per kind, and debug events
+on `amphora.skipping` with the upkeep and build cost when a kind is dropped or built again.
+
+**Evidence.** `skipping::tests::chooser::t_sku_5_*`: a write-heavy table whose filters zone maps
+answer best drops the cracker and pays less upkeep than keeping both, which drops nothing; a
+workload that shifts from cracking's ground to zone maps' drops zone maps and builds them again
+when their trial is due. Every candidate set holds every row the plain scan finds.
+
+### What the leader is chosen by (lane skip-7, T-SKU.7)
+
+**Decision.** Behind a second switch, `Lead`: `Scan` compares the kinds' latest measured scans
+(T-SKU.2's rule, the control); `Total` compares each kind's latest scan plus the write upkeep it
+cost over the latest stretch of writes between two filters (lane skip-5's call: the leader counts
+total cost). Each upkeep rule goes with its own lead rule (`Lead::for_upkeep`): `KeepBoth` with
+`Scan`, `Capped` with `Total`. A kind's upkeep is measured only over a stretch it was kept for
+whole; a kind dropped or built again during a stretch keeps the measure it had. Under `Total` the
+leader's upkeep also counts toward what it has spent before the other is measured again, and the
+other's trial budget is its own total. When the kept kind's cost passes a dropped kind's last
+measure, the dropped kind is due a build and a trial at once (before, the dropped kind could be
+named leader and the filter read every row), and the last kind kept is never dropped.
+
+**Why.** Kept both, every write is applied to both kinds whichever leads, so their upkeep is paid
+either way and only the scan differs: counting upkeep there could pick the slower scan for no
+saving. Capped, the kind not leading is the one whose upkeep is shed, so the choice decides which
+upkeep goes on being paid: a cracker under write churn whose scans are cheap can cost far more in
+moves than zone maps cost in rows read.
+
+**Evidence.** `t_sku_7_total_cost_leader_counts_the_write_upkeep` (costs handed in: the leader
+changes on total cost, not on the scan alone); `t_sku_7_capped_total_cost_lead_pays_less_under_write_churn`
+(zone maps' scan failure mode under 256 writes a filter: on scan cost cracking leads and its moves
+go on being paid; on total cost zone maps lead, the cracker is dropped, and the run's whole cost of
+scans, builds and upkeep is lower); `t_sku_7_shifting_workload_ends_led_by_zone_maps_on_total_cost`.
+The live comparison at the extremes (a laptop's table and many connections writing at once) is the
+coordinator's, with `skipping_bench`.
+
+**Falsified by.** A workload where `Capped` with `Total` costs more in scans, builds and upkeep
+together than `Capped` with `Scan`.
+
+### A cracker built again keeps its cut points (lane skip-7, T-SKU.8)
+
+When the cap drops a cracker it keeps the bounds it was cut at (`CrackerColumn::bounds`), and the
+cracker built again is cut at them before it answers (`CrackerColumn::crack_at`), so the filters
+that cut it find their pieces as before instead of paying to cut the whole copy again. The bounds
+are cut middle first (each stretch of the sorted bounds cuts at its middle, then each half), so
+each cut partitions only the piece between two cuts already made: about n log k entries moved for a
+copy of n entries and k bounds, not the n k of cutting in ascending order. The cut is timed and
+added to the build's cost. Evidence: `t_sku_8_*` (the same cut points, the same rowids for each
+filter with nothing partitioned again, at most n entries moved per halving of the bounds).
+
+### Builds off the scan's path, one per summary at a time (lane skip-8, T-SKU.10)
+
+**Decision.** The scan that finds a dropped kind's trial due no longer builds it: it claims the
+build (`SkipRegistry::claim_build`) and goes on with the leader, and the build runs on a thread of
+its own (`skipping/build.rs`). A summary has at most one claim at a time, so connections that find
+the same build due at once start one build between them. Zone maps are built from the cracker's
+copy in memory under the registry's lock. The cracker is read from the table on the build's own
+connection, in a read transaction whose snapshot must be the state the summary holds (the reader's
+rule: no other writer open, the newest commit; `pin_build`), or nothing is read. Each write the
+hook takes while the build is claimed marks it invalidated, and an invalidated build is not
+installed (`BuildEnd::Invalidated`); the next scan that finds the trial due claims a new one. A
+claim that ends without being handed back (an error, a thread that could not start) is handed back
+by its holder's drop. Nothing waits on a clock or a poll: the build starts on the scan that finds
+it due, a write voids it, and its own end hands the claim back.
+
+**Why.** Inside the scan, the cracker's build read every row of the table on the path of one
+filter, which paid for it in latency, and every connection that found the trial due at once built
+its own copy. Comparing a count of writes before and after (skip-5) caught a write during the build
+but not the duplicate builds.
+
+**Bound.** One build, so one thread and one connection, per summary at a time; builds come only at
+a dropped kind's trials, which the doubling schedule spaces geometrically.
+
+**Evidence.** `skipping::tests::builds::t_sku_10_*`: sixteen threads asking for the same due build
+at once get one claim; a write between a build's pin and its install voids it, and a build pinned
+after the writer committed installs; a build beside another connection's open write reads nothing,
+a summary set again ignores the old claim, and a stale summary hands out none; on a real table,
+eight threads that find the cracker due at once start one build, which installs a cracker holding
+every row.
+
+**Falsified by.** A due build that, under writes, is voided at every trial: the dropped kind is
+never measured again. Under steady write churn that would show as `rebuilt` staying at 0 while
+trials come due.
+
+### Three ways to build behind one switch: inline, void-on-write, replay (lane skip-9, T-SKU.11)
+
+**Decision.** How a dropped kind is built again is a per-summary switch (`BuildMode`, set by
+`PRAGMA skipping = 'table.column capped [inline|void|replay]'`):
+
+- `inline`: skip-7's build, the control. The scan that finds the trial due builds on its own path,
+  on its own connection and read, its time left out of the scan's measured cost.
+- `void`: skip-8's build above. Off the scan's path, voided by any write during it.
+- `replay`, the default: off the scan's path. From the pin on, the build records each write the
+  hook takes, and applies them to its copy in order before installing it, so it installs however
+  many writes arrive. A write that the copy refuses (it disagrees with the summary) drops the copy
+  and keeps the summary (`BuildEnd::ReplayRefused`). A rollback still makes the summary stale, and
+  the build is superseded.
+
+**Bound.** A replaying build's record holds at most as many writes as the summary held rows at the
+pin. Past that, replaying costs more than reading the table again, and the record would outweigh
+the copy it feeds, so the build drops its record and falls back to void (`replay_overflows`). That
+bound is the summary's own row count, not a picked number. So a build holds at most twice the
+copy's rows, and the claim keeps one build per summary.
+
+**Why.** Each mode has its own failure mode, and the tests force each one. Inline makes the scan
+that finds the trial due read every row of the table (`inline_rows_read`). Void is starved under
+steady writes: with a write during every build, no build installs and the dropped kind never comes
+back. Replay's cost is memory under a burst of writes, which the bound caps. Which mode leads at
+which write rate is the bench's to say (`amphora-bench --skipping`, its write-rate ladder, under
+`capped:inline`, `capped:void` and `capped:replay`). Replay is the default until that data is in.
+
+**Evidence.** `skipping::tests::builds::t_sku_11_*`:
+
+- With a write during each of eight trials, void installs none and replay installs the first. Its
+  copy holds the table and the write.
+- A burst as large as the bound replays in order: an update, a delete and inserts. One write more
+  never holds more than the bound, and falls back to void.
+- On a real table, an inline build reads all 500 rows on the scan's path, and the other two modes
+  read none there. Answers are equal across the modes.
+- The PRAGMA sets each mode and refuses one after a kind that never builds again.
+
+**Falsified by.** At some write rate on the ladder, replay costs more in filter latency or memory
+than void or inline, or a replaying build installs a copy that answers differently from a plain
+scan.
+
+### The build's own connection opens with the database's key (lane skip-9, T-SKU.12)
+
+**Decision.** The build's own connection opens the database with what the scan's connection holds
+when the build is claimed: its encryption key, or its external page codec. The key stays an
+`EncryptionKey`, held the way the scan's connection holds it. It is zeroed when dropped, its
+`Debug` is redacted, and it is moved into the build's connection. The holder (`BuildKeys`) has no
+`Debug`, and nothing logs it. The key is taken only once a build is claimed, so a scan pays nothing
+for it otherwise.
+
+**Why.** Without the key, the build's connection on an encrypted database could not read page 1.
+The build failed every time, and the dropped kind never came back.
+
+**Evidence.** `skipping::tests::builds::t_sku_12_*`: on an aes256gcm database, the build started
+from the keyed connection installs a cracker holding every row, under void and under replay.
+
+### Fused batches (lane skip-5, T-SKU.4) that decode only the candidate run (lane skip-7, T-SKU.9)
+
+A skipping scan's Next, on a candidate row, runs the fused loop (decision 10) over the leaf's batch
+up to the last rowid of the candidate run it stands in, instead of row by row. A batch's window
+going forward now also stops decoding at that rowid (`leaf_batch::window`'s `until`, from
+`SkipWalks::run_end`), for the fused loop and for a `Column` or `ColumnRange` served from a batch,
+so rows the scan seeks past are never decoded; before, each window ran on to its leaf's end.
+Evidence: `t_sku_4_*` (four databases, batches on and off by skipping on and off, answer alike
+under random writes; skipping rows ran fused) and `t_sku_9_*` (a scattered column, cracking and the
+measured choice: answers as without skipping, and the rows decoded are at most the rows read).
+
+### The setting acts when its statement runs (lane skip-5, T-SKU.6)
+
+**Decision.** `PRAGMA skipping` compiles to its own instruction, `SetSkipping`, which builds the
+summary when the statement runs, not while it is prepared. **Why.** A setting prepared before the
+table holds its rows (a migration script, a prepared statement kept by a pool) built its summary
+from the empty table and so skipped nothing: chosen by a test, `t_sku_6_*`, where the setting
+prepared on an empty table and run once 64,000 rows were in read all 64,000 before and now skips,
+and running it again after `'off'` turns skipping back on.
+
+### A SQL setting (lane skip-4, T-SKU.3)
+
+`PRAGMA skipping = 'table.column'` keeps a measured summary of the column; `'table.column
+zone_maps'`, `'table.column cracking'` and `'table.column off'` pick one kind or drop the summary.
+The summary is built when the statement runs (lane skip-5, below), as `skipping::set_skipping`
+builds it: holding the write lock, refused inside an open
+transaction, under MVCC, or for a column the record doesn't hold, with the reason. `PRAGMA skipping`
+with no value is refused: the setting is set, not read.
+
+**Not yet.** Rows read and latency against DuckDB and ClickHouse are not measured. The driver for
+DuckDB is `amphora-bench --skipping` (lane skip-7: both engines in this process, the same prepared
+statements and bound values, one timing method); ClickHouse needs both engines behind one server
+client, which it doesn't have yet. A dropped kind
+is built again inside the scan whose trial is due, so that scan waits for the build (its measured
+cost leaves the build out, lane skip-7: the leader isn't charged for it).
 
 **Overlap.** G11's column copy (`storage/versioned/columns.rs`, lane g11s4's summaries) keeps its
 own per-block summaries over the copy, fed by commits; these zone maps summarize the row store's
