@@ -1261,6 +1261,15 @@ mod tests {
     #[test]
     fn cb4_a_read_only_transaction_reads_the_copy_at_its_snapshot() {
         let (_db, reader, writer) = reader_and_writer(None);
+        // This test exercises three reads on the copy. Give the planner a stated slow
+        // row path, so machine calibration cannot route the snapshot checks around it.
+        use crate::translate::optimizer::learned_costs::{WeightRule, Work};
+        reader.db.learned_costs.set_rule(WeightRule::Blend);
+        let samples = f64::from(u32::MAX);
+        reader
+            .db
+            .learned_costs
+            .observe(Work::Row, samples, samples * 1_000_000.0);
         reader.execute("BEGIN").unwrap();
         let first = copies(&reader).counts();
         let then = rows(&reader, SNAPSHOT_Q);
