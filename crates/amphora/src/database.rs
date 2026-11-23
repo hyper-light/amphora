@@ -323,8 +323,8 @@ pub(crate) struct Changed {
     locked_wakes: AtomicU64,
     /// [`LockedReads::WaitOnLock`]'s waiter lists: each row a get waits on, by its cross-group key
     /// (`xgroup::sql::record_key`), with its own bell, rung when a resolution here drops that
-    /// row's locks ([`Database::call_internal_ringing`]). A row's entry lives while a get waits on it, so it
-    /// holds at most one entry per waiting get.
+    /// row's locks ([`Database::call_internal_ringing`]). A row's entry lives while a get waits
+    /// on it, so it holds at most one entry per waiting get.
     lock_waiters: Mutex<BTreeMap<Vec<u8>, LockBell>>,
 }
 
@@ -366,9 +366,9 @@ pub enum LockedReads {
     /// As [`LockedReads::Wait`], but a waiting get waits on its own row's waiter list, rung when
     /// a resolution here drops that row's locks, not on every change in the group (T-T1.10.W9,
     /// lane xgroup-sql-11: Wait's thundering herd at scale). The step that resolves rings it in
-    /// the process that commits it (`Database::call_internal_ringing`), and every replica of a replicated group
-    /// rings its own lists as it applies the resolution, whichever process ran the step
-    /// (`ring_unlocked`; T-T1.10.W13, lane xgroup-sql-12).
+    /// the process that commits it (`Database::call_internal_ringing`), and every replica of a
+    /// replicated group rings its own lists as it applies the resolution, whichever process ran
+    /// the step (`ring_unlocked`; T-T1.10.W13, lane xgroup-sql-12).
     WaitOnLock,
 }
 
@@ -2667,11 +2667,11 @@ impl Database {
 
     /// [`LockedReads::WaitOnLock`] (T-T1.10.W9, lane xgroup-sql-11): a locked read waits on the
     /// waiter list of the row it met, rung only by a resolution that drops that row's locks
-    /// ([`Database::call_internal_ringing`]). It joins the list and tries once more before it first waits
-    /// there, so a resolution between its try and joining isn't missed; from then on the list's
-    /// ring count, read before each try, says whether one landed since. Meeting another row, it
-    /// moves to that row's list the same way. It leaves its list however it ends. It is counted
-    /// waiting ([`Database::locked_waits`]) as it first blocks.
+    /// ([`Database::call_internal_ringing`]). It joins the list and tries once more before it
+    /// first waits there, so a resolution between its try and joining isn't missed; from then on
+    /// the list's ring count, read before each try, says whether one landed since. Meeting another
+    /// row, it moves to that row's list the same way. It leaves its list however it ends. It is
+    /// counted waiting ([`Database::locked_waits`]) as it first blocks.
     fn wait_on_lock<T>(
         &self,
         until: Instant,

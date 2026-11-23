@@ -733,7 +733,9 @@ pub(crate) fn serve(
     until: Instant,
 ) -> Result<(Reply, Option<u64>, Option<u64>), Refusal> {
     let stamp = AtomicU64::new(carried);
-    let reply = step(group, &stamp, until, move |db| apply_step(db, here, &envelope))?;
+    let reply = step(group, &stamp, until, move |db| {
+        apply_step(db, here, &envelope)
+    })?;
     // The group's clock after the step, the one cross-group clock as it keeps it (lane
     // split-merge-22, as `step_on` reads a local group's): a backed-up group's writer clock, which
     // a standalone group's session token never had, so its lock replies carry a stamp too.
@@ -754,7 +756,9 @@ fn step_on(
 ) -> Result<(Reply, Option<u64>), Refusal> {
     match member {
         Member::Local(group) => {
-            let reply = step(group, carried, until, move |db| apply_step(db, here, &envelope))?;
+            let reply = step(group, carried, until, move |db| {
+                apply_step(db, here, &envelope)
+            })?;
             // Read after the step answered, the group's clock is at or past the step's commit:
             // the one cross-group clock as this group keeps it (lane split-merge-21,
             // `Database::cross_clock`), so a standalone backed-up group's lock reply carries its
