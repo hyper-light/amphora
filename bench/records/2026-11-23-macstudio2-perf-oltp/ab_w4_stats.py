@@ -1,9 +1,11 @@
 """Lane W4 (oltp): the A/B's table from ab-w4.sh's runs, with a rank-sum test per cell.
 
 python3 -I ab_w4_stats.py <folder of r<round>-<arm>-<op>-<clients>.json and load-<arm>.json>
-Per statement and clients, per arm: median (range) of writes a second, p50 and p99 ms, and rows and
-commits a flush (the arm's load-only run subtracted, as ab_w3.py does); then the Mann-Whitney U of
-writes a second and of p50, A against B, with its exact two-sided p over every split of the runs.
+Per statement and clients, per arm: median (range) of writes a second, p50 and p99 ms, rows and
+commits a flush (the arm's load-only run subtracted, as ab_w3.py does), a flush's mean ms and the
+share of the counters' 1.5 s (warm-up and timed window) the flusher spent flushing; then the
+Mann-Whitney U of writes a second and of p50, A against B, with its exact two-sided p over every
+split of the runs.
 """
 import glob
 import itertools
@@ -65,8 +67,8 @@ def main(folder):
         m = re.match(r"r(\d+)-(A|B|sqlite)-(\w+?)-(\d+)\.json$", os.path.basename(p))
         if m:
             runs.setdefault((m[3], int(m[4]), m[2]), []).append(read(p))
-    print("| statement | clients | arm | runs | writes/s | p50 ms | p99 ms | rows/flush | commits/flush | errors |")
-    print("|---|---|---|---|---|---|---|---|---|---|")
+    print("| statement | clients | arm | runs | writes/s | p50 ms | p99 ms | rows/flush | commits/flush | ms/flush | flushing share | errors |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|")
     cells = sorted({(op, c) for op, c, _ in runs})
     for op, c in cells:
         for arm in ("A", "B", "sqlite"):
@@ -74,15 +76,18 @@ def main(folder):
             if not rs:
                 continue
             base = load.get(arm, {})
-            per_flush, commits_per_flush = [], []
+            per_flush, commits_per_flush, ms_per_flush, share = [], [], [], []
             for _, st in rs:
                 f = (st.get("flushes") or 0) - base.get("flushes", 0)
                 if f > 0:
                     per_flush.append((st.get("rows", 0) - base.get("rows", 0)) / f)
                     commits_per_flush.append((st.get("commits", 0) - base.get("commits", 0)) / f)
+                    ms = (st.get("flush_ms") or 0) - base.get("flush_ms", 0)
+                    ms_per_flush.append(ms / f)
+                    share.append(ms / 1500)
             print(f"| {op} | {c} | {arm} | {len(rs)} | {spread([x.get('ops_per_s') for x, _ in rs], '{:.0f}')} | "
                   f"{spread([(x.get('ms') or {}).get('p50') for x, _ in rs])} | {spread([(x.get('ms') or {}).get('p99') for x, _ in rs], '{:.2f}')} | "
-                  f"{spread(per_flush, '{:.1f}')} | {spread(commits_per_flush, '{:.2f}')} | {sum((x.get('errors') or 0) + (x.get('retries') or 0) for x, _ in rs)} |")
+                  f"{spread(per_flush, '{:.1f}')} | {spread(commits_per_flush, '{:.2f}')} | {spread(ms_per_flush, '{:.2f}')} | {spread(share, '{:.2f}')} | {sum((x.get('errors') or 0) + (x.get('retries') or 0) for x, _ in rs)} |")
     print()
     for op, c in cells:
         a, b = runs.get((op, c, "A"), []), runs.get((op, c, "B"), [])
