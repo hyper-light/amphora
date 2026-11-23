@@ -1,0 +1,12 @@
+total 1066460
+drwxr-xr-x 1 adalundhe adalundhe       188 Nov 11 19:52 .
+drwxr-xr-x 1 adalundhe adalundhe       178 Nov 23 04:34 ..
+-rw-r--r-- 1 adalundhe adalundhe  24196144 Nov 11 19:52 customer.tbl
+-rw-r--r-- 1 adalundhe adalundhe 753862072 Nov 11 19:52 lineitem.tbl
+-rw-r--r-- 1 adalundhe adalundhe      2199 Nov 11 19:52 nation.tbl
+-rw-r--r-- 1 adalundhe adalundhe 170452161 Nov 11 19:52 orders.tbl
+-rw-r--r-- 1 adalundhe adalundhe 118184616 Nov 11 19:52 partsupp.tbl
+-rw-r--r-- 1 adalundhe adalundhe  23935125 Nov 11 19:52 part.tbl
+-rw-r--r-- 1 adalundhe adalundhe       384 Nov 11 19:52 region.tbl
+-rw-r--r-- 1 adalundhe adalundhe        41 Nov 11 19:52 REVISION
+-rw-r--r-- 1 adalundhe adalundhe   1399184 Nov 11 19:52 supplier.tbl

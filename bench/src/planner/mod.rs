@@ -217,10 +217,18 @@ fn bench(o: &Opts) -> anyhow::Result<Bench> {
     })
 }
 
-/// Linux's one-minute load average.
+/// The one-minute load average, from getloadavg(3), which Linux's and macOS's C libraries both
+/// have. /proc/loadavg, read before, is Linux's alone: on macOS every run's load was null and
+/// `--max-load` never held a run back (bench lane M, Mac Studio 2, 2026-11-23).
 #[cfg(not(windows))]
 pub(crate) fn load_average() -> Option<f64> {
-    std::fs::read_to_string("/proc/loadavg").ok()?.split_whitespace().next()?.parse().ok()
+    unsafe extern "C" {
+        fn getloadavg(loadavg: *mut f64, nelem: std::ffi::c_int) -> std::ffi::c_int;
+    }
+    let mut one = [0f64; 1];
+    // SAFETY: getloadavg writes at most `nelem` (1) samples into `one`, which holds 1.
+    let got = unsafe { getloadavg(one.as_mut_ptr(), 1) };
+    if got == 1 { one.first().copied() } else { None }
 }
 
 /// Windows keeps no load average. Its nearest: the cores busy (`% Processor Time` of every

@@ -8,22 +8,22 @@ Command: `~/.cache/amphora-perf/k4-scripts/par2.sh <fix>` on adacachy2 (lib test
 364266aa, b64bdc2a and the fix head, built in `~/.cache/amphora-perf-target/constants`,
 CARGO_INCREMENTAL=0; logs in `~/.cache/amphora-perf-bin/constants/par-logs`).
 
-Runs r508 and r547, 12:3xZ to 12:5xZ, load 19 to 37 on 32 cores, at most 3 test processes at once.
+Runs r508 and r547, 12:38Z to 12:57Z, load 19 to 37 on 32 cores, at most 3 test processes at once.
 Passes of runs:
 
 | test | main 364266aa | b64bdc2a (K3 busy-time Drain) | failure, both arms |
 |---|---|---|---|
-| t_qb_1_9_a_one_voter_group_grows_to_five_then_nine_members | 0/2 | 0/3 | `Option::unwrap()` on `None`, Pump::admit (no owner for learners 3 to 9) |
-| a_follower_retry_racing_the_slots_start_lands_on_its_next_try | 0/2 | 0/3 | "a driven operation was unanswered after 60000 rounds": holder applied 3, leader committed 4 |
-| a_follower_past_its_room_applies_on_and_fences_when_its_disk_fills | 1/2 | 1/2 | one 120 s "work was out off the driver's thread ... a hang" each |
-| a_host_waits_for_a_leader_on_the_owners_word | 0/2 | 0/2 | `Err(Timeout)` at 60 s (replicated.rs:12635 on main) |
-| a_member_installed_from_a_snapshot_holds_the_floors_rows | 0/1 | 0/1 | 120 s hang (driver's thread) |
-| compaction_waits_for_the_engines_flush | 0/1 | 0/1 | 120 s hang (driver's thread) |
+| t_qb_1_9_a_one_voter_group_grows_to_five_then_nine_members | 0/3 | 0/3 | `Option::unwrap()` on `None`, Pump::admit (no owner for learners 3 to 9) |
+| a_follower_retry_racing_the_slots_start_lands_on_its_next_try | 0/3 | 0/3 | "a driven operation was unanswered after 60000 rounds": holder applied 3, leader committed 4 |
+| a_follower_past_its_room_applies_on_and_fences_when_its_disk_fills | 2/3 | 2/3 | one 120 s "work was out off the driver's thread ... a hang" in three, each arm |
+| a_host_waits_for_a_leader_on_the_owners_word | 0/3 | 0/3 | `Err(Timeout)` at 60 s (replicated.rs:12635 on main) |
+| a_member_installed_from_a_snapshot_holds_the_floors_rows | 0/3 | 0/3 | 120 s hang (driver's thread) |
+| compaction_waits_for_the_engines_flush | 0/3 | 0/3 | 120 s hang (driver's thread) |
 
 None is a load flake at this load: the four that fail every time fail the same way alone, and
-a_follower_past_its_room hangs one run in two on both arms. b64bdc2a fails nothing main passes.
+a_follower_past_its_room hangs one run in three on both arms. b64bdc2a fails nothing main passes.
 The fix head (8350cc3a, main plus this lane's three commits) passes t_qb_1_9 3/3 and the
-retry-racing test 3/3 (r547, r564); the other four are untouched here.
+retry-racing test 3/3 (r564, r568, r570 on the merge to main 9462f146); the other four are untouched here. With b64bdc2a merged on (perf/constants-k3m db677a78): the same two 3/3, drain 8/8, patience 11/11, clippy (r575).
 
 ## Fixes
 
