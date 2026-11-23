@@ -431,3 +431,45 @@ fn t_pl_7_1_plans_read_the_pages_analyze_counted() {
     let narrow = access_cost(&conn, "SELECT * FROM narrow");
     assert!(wide > narrow * 10.0, "wide {wide}, narrow {narrow}");
 }
+
+/// A notes table of 3,000 rows a third of whose notes are NULL, each row 2 KiB wide, so 1,024 of
+/// them pass the sample's 1 MiB and the table keeps none: its NULL tests have only the column's
+/// counts to go on.
+fn wide_notes(conn: &Arc<Connection>) {
+    conn.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, note TEXT, body TEXT)")
+        .unwrap();
+    let body = "x".repeat(2048);
+    let rows: Vec<String> = (0..3_000)
+        .map(|i| {
+            if i % 3 == 0 {
+                format!("({i}, NULL, '{body}')")
+            } else {
+                format!("({i}, 'n{i}', '{body}')")
+            }
+        })
+        .collect();
+    insert(conn, "notes", &rows);
+}
+
+/// Do: ANALYZE the notes table, then estimate `note IS NULL` and `note IS NOT NULL`. Expect: each
+/// within 1.1 of its count (1,000 and 2,000), the NULLs ANALYZE counted, where a fixed tenth
+/// (300 rows) and nine tenths (2,700) were estimated (AUDIT 5.1).
+///
+/// Not the postfix forms: `note ISNULL` / `note NOTNULL` make no constraint at all
+/// (`as_binary_components` takes no `Expr::IsNull`), so with no sample they are estimated as
+/// cutting nothing (3,000 rows, kiln run on adacachy2); that gap is the wide-table sample's
+/// (AUDIT 5.1 item 1) and the constraint builder's, not the NULL share's.
+#[test]
+fn audit_5_1_is_null_takes_the_nulls_analyze_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = open(dir.path());
+    wide_notes(&conn);
+    conn.execute("ANALYZE").unwrap();
+    for sql in [
+        "SELECT id FROM notes WHERE note IS NULL",
+        "SELECT id FROM notes WHERE note IS NOT NULL",
+    ] {
+        let (e, c) = (estimate(&conn, sql), count(&conn, sql));
+        assert!(q_error(e, c) <= 1.1, "{sql}: estimated {e}, counted {c}");
+    }
+}
