@@ -223,6 +223,13 @@ change what is accepted (patches 01, 09 and 16 allow `$n` parameters in more pla
 which 19 refuses; patch 04 makes comments tokens; patch 15 moves node locations). Building that
 oracle is a unit of its own (section 11). Every statement of 19's regression SQL, and a
 grammar-driven fuzzer's output, must then give the oracle's verdict, error position and parse tree.
+The oracle's answers are checked in, so `cargo test` holds the Rust parser to 19 with no C:
+`crates/pg-oracle/corpus.digest` keeps, for each regression statement by file and statement index,
+an FNV-1a 64 hash of 19's tree and of the tokens its grammar reads, or each refusal's SQLSTATE and
+cursor (54,978 statements: 54,448 parsed, 485 refused by the grammar, 45 by the scanner; 4 that
+aren't UTF-8 are never sent). `scripts/postgres-digest.sh` builds the oracle from the vendored
+commit and regenerates it; kiln CI's `postgres-oracle` workflow fails whenever vendor/postgres
+changes and the digest is no longer the oracle's answer.
 
 **Vendoring.** One entry in `vendor/MANIFEST.toml`: `postgres` at `REL_19_0` (`5c839a2a0`), the
 files `src/backend/parser/{gram.y,scan.l,parser.c,scansup.c}`, `src/include/parser/kwlist.h`,
