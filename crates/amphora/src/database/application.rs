@@ -190,6 +190,18 @@ impl FloorRefused {
     }
 }
 
+impl AnswerBytes for FloorRefused {
+    fn answer_bytes(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(heap_bytes(&self.refusal))
+    }
+}
+
+impl AnswerBytes for Application {
+    fn answer_bytes(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(self.name.capacity())
+    }
+}
+
 /// The raise's session: the floor becomes `wanted`'s version, or stays above it, for `wanted`'s
 /// application; on a replica only on the members' proof (replication.md, "Raising the floor"). A
 /// refusal is its value, typed, so its caller counts it; it writes nothing.

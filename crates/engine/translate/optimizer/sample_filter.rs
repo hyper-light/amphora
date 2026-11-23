@@ -315,7 +315,7 @@ fn truth_of(value: &Value) -> Option<bool> {
 
 /// `value` with `affinity` applied as a comparison applies it.
 fn converted(value: Value, affinity: Affinity) -> Value {
-    match affinity.convert_for_compare(&value) {
+    match affinity.convert_for_compare(&value, crate::numeric::fp::FpDigits::DEFAULT) {
         Some(either::Either::Left(converted)) => converted.to_owned().unwrap_or(value),
         Some(either::Either::Right(converted)) => converted,
         None => value,
@@ -336,7 +336,10 @@ fn order(l: &Value, r: &Value, compare: Compare) -> Option<Ordering> {
 fn as_text(value: &Value) -> Option<String> {
     match value {
         Value::Text(t) => Some(t.as_str().to_owned()),
-        other => match other.exec_cast("TEXT").ok()? {
+        other => match other
+            .exec_cast("TEXT", crate::numeric::fp::FpDigits::DEFAULT)
+            .ok()?
+        {
             Value::Text(t) => Some(t.as_str().to_owned()),
             _ => None,
         },

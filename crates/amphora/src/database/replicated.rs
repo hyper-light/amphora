@@ -779,9 +779,7 @@ impl Drop for Reservation {
         self.control
             .admitted
             .fetch_sub(self.bytes, Ordering::AcqRel);
-        self.control
-            .called
-            .fetch_sub(self.called, Ordering::AcqRel);
+        self.control.called.fetch_sub(self.called, Ordering::AcqRel);
     }
 }
 struct Envelope {
@@ -8893,9 +8891,12 @@ mod tests {
         until: Instant,
         f: impl FnOnce(&mut Db) -> anyhow::Result<Vec<u8>> + Send + 'static,
     ) -> mpsc::Receiver<Result<Answered, Refusal>> {
-        let operation = Operation::Call(Mutex::new(Some(Box::new(move |db| {
-            Ok(Box::new(f(db)?) as Box<dyn Any + Send>)
-        }))), api::REQUEST_MAX);
+        let operation = Operation::Call(
+            Mutex::new(Some(Box::new(move |db| {
+                Ok(Box::new(f(db)?) as Box<dyn Any + Send>)
+            }))),
+            api::REQUEST_MAX,
+        );
         enqueue(client, until, "", operation)
     }
     /// Tells owner `owner` the host detector's `verdict` and steps every owner once: what the
@@ -11897,11 +11898,14 @@ mod tests {
                     .and_then(|named| named.checked_sub(1))
                     .filter(|named| !fenced.contains(named));
                 if let Some(target) = named {
-                    let operation = Operation::Call(Mutex::new(Some(Box::new(|db: &mut Db| {
-                        db.exec("CREATE TABLE IF NOT EXISTS qb2(value)")?;
-                        db.exec("INSERT INTO qb2 VALUES(1)")?;
-                        Ok(Box::new(Vec::<u8>::new()) as Box<dyn Any + Send>)
-                    }))), api::REQUEST_MAX);
+                    let operation = Operation::Call(
+                        Mutex::new(Some(Box::new(|db: &mut Db| {
+                            db.exec("CREATE TABLE IF NOT EXISTS qb2(value)")?;
+                            db.exec("INSERT INTO qb2 VALUES(1)")?;
+                            Ok(Box::new(Vec::<u8>::new()) as Box<dyn Any + Send>)
+                        }))),
+                        api::REQUEST_MAX,
+                    );
                     let (response, receiver) = mpsc::sync_channel(1);
                     let asked = clients[target].handle.enqueue(
                         Input::Submit {
@@ -12895,7 +12899,10 @@ mod tests {
         let seen = std::rc::Rc::clone(&in_another_name);
         pump.losing = Some(Box::new(move |from, record: &Message| {
             if record.from != from {
-                seen.borrow_mut().push(format!("{:?} from {from} in {}'s name to {}", record.msg_type, record.from, record.to));
+                seen.borrow_mut().push(format!(
+                    "{:?} from {from} in {}'s name to {}",
+                    record.msg_type, record.from, record.to
+                ));
             }
             false
         }));
@@ -12907,7 +12914,10 @@ mod tests {
         driven.drain(&mut pump);
         quiet(&mut driven, &mut pump);
         assert_eq!(*in_another_name.borrow(), Vec::<String>::new());
-        assert_eq!(clients[deposed].handle().status().unwrap().leader, id(leader));
+        assert_eq!(
+            clients[deposed].handle().status().unwrap().leader,
+            id(leader)
+        );
     }
 
     #[test]
@@ -13992,9 +14002,12 @@ mod tests {
         application: crate::database::Application,
         f: impl FnOnce(&mut Db) -> anyhow::Result<R> + Send + 'static,
     ) -> Result<R, Refusal> {
-        let operation = Operation::Call(Mutex::new(Some(Box::new(move |db| {
-            Ok(Box::new(f(db)?) as Box<dyn Any + Send>)
-        }))), api::REQUEST_MAX);
+        let operation = Operation::Call(
+            Mutex::new(Some(Box::new(move |db| {
+                Ok(Box::new(f(db)?) as Box<dyn Any + Send>)
+            }))),
+            api::REQUEST_MAX,
+        );
         let (response, receiver) = mpsc::sync_channel(1);
         client
             .handle
@@ -14182,13 +14195,16 @@ mod tests {
         let leader = tracked_group(&mut driven, &mut pump, &clients);
         let until = driven.until();
         let added = change(&clients[leader], until, MemberChange::AddLearner(5));
-        let operation = Operation::Call(Mutex::new(Some(Box::new(move |db: &mut Db| {
-            let floor = crate::database::application::raise(db, kiln(7), true)?
-                .map_err(|refused| anyhow::Error::from(refused.refusal))?;
-            // The configuration at the raise's base, which the stale-base rule makes its own at apply.
-            let learners = crate::replication::floor::configuration(db)?.learners;
-            Ok(Box::new((floor.version, learners)) as Box<dyn Any + Send>)
-        }))), api::REQUEST_MAX);
+        let operation = Operation::Call(
+            Mutex::new(Some(Box::new(move |db: &mut Db| {
+                let floor = crate::database::application::raise(db, kiln(7), true)?
+                    .map_err(|refused| anyhow::Error::from(refused.refusal))?;
+                // The configuration at the raise's base, which the stale-base rule makes its own at apply.
+                let learners = crate::replication::floor::configuration(db)?.learners;
+                Ok(Box::new((floor.version, learners)) as Box<dyn Any + Send>)
+            }))),
+            api::REQUEST_MAX,
+        );
         let (response, raised) = mpsc::sync_channel(1);
         clients[leader]
             .handle
@@ -14411,11 +14427,14 @@ mod tests {
             driven.round(&mut pump);
         }
         pump.appends_lost = true;
-        let operation = Operation::Call(Mutex::new(Some(Box::new(|db: &mut Db| {
-            db.exec("CREATE TABLE IF NOT EXISTS floor_items(version)")?;
-            db.exec("INSERT INTO floor_items VALUES(7)")?;
-            Ok(Box::new(()) as Box<dyn Any + Send>)
-        }))), api::REQUEST_MAX);
+        let operation = Operation::Call(
+            Mutex::new(Some(Box::new(|db: &mut Db| {
+                db.exec("CREATE TABLE IF NOT EXISTS floor_items(version)")?;
+                db.exec("INSERT INTO floor_items VALUES(7)")?;
+                Ok(Box::new(()) as Box<dyn Any + Send>)
+            }))),
+            api::REQUEST_MAX,
+        );
         let (response, written) = mpsc::sync_channel(1);
         clients[leader]
             .handle
@@ -14529,11 +14548,14 @@ mod tests {
     /// Enqueues a raise of kiln.host-store's floor to 7 at `client`, by a handle bound to it,
     /// without waiting.
     fn raise_at(client: &Client, until: Instant) -> mpsc::Receiver<Result<Answered, Refusal>> {
-        let operation = Operation::Call(Mutex::new(Some(Box::new(|db: &mut Db| {
-            let floor = crate::database::application::raise(db, kiln(7), true)?
-                .map_err(|refused| anyhow::Error::from(refused.refusal))?;
-            Ok(Box::new(floor.version) as Box<dyn Any + Send>)
-        }))), api::REQUEST_MAX);
+        let operation = Operation::Call(
+            Mutex::new(Some(Box::new(|db: &mut Db| {
+                let floor = crate::database::application::raise(db, kiln(7), true)?
+                    .map_err(|refused| anyhow::Error::from(refused.refusal))?;
+                Ok(Box::new(floor.version) as Box<dyn Any + Send>)
+            }))),
+            api::REQUEST_MAX,
+        );
         let (response, raised) = mpsc::sync_channel(1);
         client
             .handle
@@ -14896,10 +14918,13 @@ mod tests {
         let member = u64::try_from(follower + 1).unwrap();
         let proposed = driven.owner(follower).floor_attestations;
         pump.hold_durable();
-        let operation = Operation::Call(Mutex::new(Some(Box::new(|db: &mut Db| {
-            db.exec("CREATE TABLE IF NOT EXISTS ahead(x)")?;
-            Ok(Box::new(()) as Box<dyn Any + Send>)
-        }))), api::REQUEST_MAX);
+        let operation = Operation::Call(
+            Mutex::new(Some(Box::new(|db: &mut Db| {
+                db.exec("CREATE TABLE IF NOT EXISTS ahead(x)")?;
+                Ok(Box::new(()) as Box<dyn Any + Send>)
+            }))),
+            api::REQUEST_MAX,
+        );
         let (response, written) = mpsc::sync_channel(1);
         clients[leader]
             .handle
@@ -14995,10 +15020,13 @@ mod tests {
             }
             _ => false,
         }));
-        let operation = Operation::Call(Mutex::new(Some(Box::new(|db: &mut Db| {
-            db.exec("CREATE TABLE IF NOT EXISTS ahead(x)")?;
-            Ok(Box::new(()) as Box<dyn Any + Send>)
-        }))), api::REQUEST_MAX);
+        let operation = Operation::Call(
+            Mutex::new(Some(Box::new(|db: &mut Db| {
+                db.exec("CREATE TABLE IF NOT EXISTS ahead(x)")?;
+                Ok(Box::new(()) as Box<dyn Any + Send>)
+            }))),
+            api::REQUEST_MAX,
+        );
         let (response, written) = mpsc::sync_channel(1);
         clients[leader]
             .handle
@@ -15682,10 +15710,13 @@ mod tests {
                 quiet(&mut driven, &mut pump);
                 pump.appends_lost = true;
                 // Claimed at 9, the highest floor a run raises, so only the tail holds it back.
-                let operation = Operation::Call(Mutex::new(Some(Box::new(|db: &mut Db| {
-                    db.exec("CREATE TABLE IF NOT EXISTS in_flight(x)")?;
-                    Ok(Box::new(()) as Box<dyn Any + Send>)
-                }))), api::REQUEST_MAX);
+                let operation = Operation::Call(
+                    Mutex::new(Some(Box::new(|db: &mut Db| {
+                        db.exec("CREATE TABLE IF NOT EXISTS in_flight(x)")?;
+                        Ok(Box::new(()) as Box<dyn Any + Send>)
+                    }))),
+                    api::REQUEST_MAX,
+                );
                 let (response, written) = mpsc::sync_channel(1);
                 clients[leader]
                     .handle

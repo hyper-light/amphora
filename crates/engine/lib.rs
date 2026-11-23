@@ -147,9 +147,9 @@ pub use connection::{
     SearchedLinks, StarFilterOrder, StarFilters, StepResult, SymbolTable,
 };
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
-pub use translate::optimizer::learned_costs::WeightRule;
 #[cfg(feature = "simulator")]
 pub use translate::optimizer::learned_costs::LearnedWeights;
+pub use translate::optimizer::learned_costs::WeightRule;
 pub use translate::optimizer::search_budget::JoinSearchStats;
 // Amphora (G6 step 3): learned plan hints, a prototype behind `HintSet::apply`.
 #[cfg(feature = "simulator")]
@@ -168,7 +168,7 @@ pub use database::{
 ))]
 pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
 pub use dialect::{Dialect, SqliteDialect};
-pub use error::{io_error, CompletionError, LimboError};
+pub use error::{io_error, BudgetFull, CompletionError, LimboError};
 pub use function::ContextCollationFunction;
 #[cfg(feature = "io_memory_yield")]
 pub use io::MemoryYieldIO;
@@ -199,7 +199,9 @@ pub use storage::{
     packed::LogFormat,
     page_transform::{PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, PageLocation},
     pager::{Access, Page, PagePath, PageRef, Pager},
-    wal::{CheckpointMode, CheckpointResult, SharedLog, Wal, WalAutoActions, WalFile, WalFileShared},
+    wal::{
+        CheckpointMode, CheckpointResult, SharedLog, Wal, WalAutoActions, WalFile, WalFileShared,
+    },
 };
 pub use translate::expr::{walk_expr_mut, WalkControl};
 pub use translate::optimizer::join::join_search_ns;

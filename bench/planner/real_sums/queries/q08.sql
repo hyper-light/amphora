@@ -1,0 +1,2 @@
+-- Integers past 2^53 among REALs.
+SELECT sum(CASE l_linenumber WHEN 1 THEN 9007199254740993 ELSE 0.5 END), avg(CASE l_linenumber WHEN 1 THEN 9007199254740993 ELSE 0.5 END), total(CASE l_linenumber WHEN 1 THEN 9007199254740993 ELSE 0.5 END) FROM lineitem;

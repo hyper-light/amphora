@@ -323,8 +323,8 @@ pub(crate) struct Changed {
     locked_wakes: AtomicU64,
     /// [`LockedReads::WaitOnLock`]'s waiter lists: each row a get waits on, by its cross-group key
     /// (`xgroup::sql::record_key`), with its own bell, rung when a resolution here drops that
-    /// row's locks ([`Database::ring_locks`]). A row's entry lives while a get waits on it, so it
-    /// holds at most one entry per waiting get.
+    /// row's locks ([`Database::call_internal_ringing`]). A row's entry lives while a get waits
+    /// on it, so it holds at most one entry per waiting get.
     lock_waiters: Mutex<BTreeMap<Vec<u8>, LockBell>>,
 }
 
@@ -366,9 +366,9 @@ pub enum LockedReads {
     /// As [`LockedReads::Wait`], but a waiting get waits on its own row's waiter list, rung when
     /// a resolution here drops that row's locks, not on every change in the group (T-T1.10.W9,
     /// lane xgroup-sql-11: Wait's thundering herd at scale). The step that resolves rings it in
-    /// the process that runs it (`Database::ring_locks`), and every replica of a replicated group
-    /// rings its own lists as it applies the resolution, whichever process ran the step
-    /// (`ring_unlocked`; T-T1.10.W13, lane xgroup-sql-12).
+    /// the process that commits it (`Database::call_internal_ringing`), and every replica of a
+    /// replicated group rings its own lists as it applies the resolution, whichever process ran
+    /// the step (`ring_unlocked`; T-T1.10.W13, lane xgroup-sql-12).
     WaitOnLock,
 }
 
@@ -582,6 +582,66 @@ impl AnswerBytes for Value {
         };
         std::mem::size_of::<Self>().saturating_add(heap)
     }
+}
+
+impl<T: AnswerBytes, E: AnswerBytes> AnswerBytes for Result<T, E> {
+    fn answer_bytes(&self) -> usize {
+        let (inline, held) = match self {
+            Ok(value) => (std::mem::size_of::<T>(), value.answer_bytes()),
+            Err(error) => (std::mem::size_of::<E>(), error.answer_bytes()),
+        };
+        std::mem::size_of::<Self>()
+            .saturating_sub(inline)
+            .saturating_add(held)
+    }
+}
+
+impl<T: FixedAnswer, E: FixedAnswer> FixedAnswer for Result<T, E> {}
+
+impl AnswerBytes for Refusal {
+    fn answer_bytes(&self) -> usize {
+        let heap = match self {
+            Refusal::Conflict { family, key, .. } => {
+                family.capacity().saturating_add(key.capacity())
+            }
+            Refusal::TooLarge { what, .. } => what.capacity(),
+            Refusal::Invalid { what, why } | Refusal::Serialization { what, why } => {
+                what.capacity().saturating_add(why.capacity())
+            }
+            Refusal::Unavailable(text) | Refusal::Fenced(text) => text.capacity(),
+            Refusal::Full { .. }
+            | Refusal::Compacted { .. }
+            | Refusal::Ahead { .. }
+            | Refusal::Timeout
+            | Refusal::UnknownOutcome
+            | Refusal::NotLeader { .. } => 0,
+        };
+        std::mem::size_of::<Self>().saturating_add(heap)
+    }
+}
+
+impl AnswerBytes for Row {
+    fn answer_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.key.capacity())
+            .saturating_add(self.value.capacity())
+    }
+}
+
+impl AnswerBytes for api::import::ImportProgress {
+    fn answer_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.source.capacity())
+            .saturating_add(self.cursor.capacity())
+    }
+}
+
+/// The bytes `value` holds on the heap: its [`AnswerBytes`] past its own inline size, for an
+/// answer type that holds it as a field.
+pub(crate) fn heap_bytes<T: AnswerBytes>(value: &T) -> usize {
+    value
+        .answer_bytes()
+        .saturating_sub(std::mem::size_of::<T>())
 }
 
 /// `value`, the answer of a call that declared `answer`; past it, refused, so the session that
@@ -2048,11 +2108,7 @@ impl Database {
             }),
         };
         // Bootstrap DDL used the same WAL; the barrier makes it durable before open succeeds.
-        database.submit_selected(
-            "",
-            Operation::Mutation(Mutation::Sql(Vec::new())),
-            until,
-        )?;
+        database.submit_selected("", Operation::Mutation(Mutation::Sql(Vec::new())), until)?;
         Ok(database)
     }
 
@@ -2218,6 +2274,55 @@ impl Database {
         database.call_db(until, f)
     }
 
+    /// [`Database::call_internal`] for a cross-group step, `f` answering its value and the
+    /// cross-group keys of the rows whose locks it dropped: once the step commits here, those
+    /// rows' waiter lists are rung ([`LockedReads::WaitOnLock`]) before its answer is handed
+    /// over, whether or not its caller still waits for it. A step answered too late for its
+    /// caller (`UnknownOutcome`) has dropped its locks all the same, and the step sent again finds
+    /// none left to drop, so a ring left to the caller never came (T-T1.10.W7, T-T1.10.W11). A
+    /// replicated group rings once answered, as its replicas ring their own lists on applying it
+    /// (`ring_unlocked`). A row no get waits on rings no one.
+    pub(crate) fn call_internal_ringing<R, F>(&self, until: Instant, f: F) -> Result<R, Refusal>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut Db) -> anyhow::Result<(R, Vec<Vec<u8>>)> + Send + 'static,
+    {
+        let database = self.resolve(until)?;
+        if !matches!(database.shared.writer, Writer::Local(_)) {
+            let (value, dropped) = database.call_internal(until, f)?;
+            ring(&database.shared.changed, &dropped)?;
+            return Ok(value);
+        }
+        if Instant::now() >= until {
+            return Err(Refusal::Timeout);
+        }
+        let call: Call = Box::new(move |db| f(db).map(|v| Box::new(v) as Box<dyn Any + Send>));
+        let changed = Arc::clone(&database.shared.changed);
+        let (tx, rx) = mpsc::sync_channel(1);
+        database.submit_local(
+            "",
+            Operation::Call(Mutex::new(Some(call)), api::REQUEST_MAX),
+            until,
+            until,
+            move |result| {
+                let answer = result.and_then(|answer| match answer {
+                    Answer::Called(v) => v
+                        .downcast::<(R, Vec<Vec<u8>>)>()
+                        .map_err(|_| unavailable("wrong SQL session answer"))
+                        .and_then(|v| {
+                            let (value, dropped) = *v;
+                            ring(&changed, &dropped).map(|()| value)
+                        }),
+                    _ => Err(unavailable("wrong SQL session answer")),
+                });
+                // A caller whose deadline elapsed no longer waits; its rows were rung all the same.
+                let _ = tx.send(answer);
+            },
+        )?;
+        rx.recv_timeout(until.saturating_duration_since(Instant::now()))
+            .map_err(|_| Refusal::UnknownOutcome)?
+    }
+
     fn call_db<R, F>(&self, until: Instant, f: F) -> Result<R, Refusal>
     where
         R: Send + 'static,
@@ -2241,8 +2346,7 @@ impl Database {
     {
         let call: Call = Box::new(move |db| f(db).map(|v| Box::new(v) as Box<dyn Any + Send>));
         let operation = Operation::Call(Mutex::new(Some(call)), answer);
-        match self.resolve(until)?.submit_selected("", operation, until)?
-        {
+        match self.resolve(until)?.submit_selected("", operation, until)? {
             (Answer::Called(v), token) => v
                 .downcast::<R>()
                 .map(|v| (*v, token))
@@ -2524,13 +2628,6 @@ impl Database {
         self.shared.changed.locked_wakes.load(Ordering::Acquire)
     }
 
-    /// Rings the waiter list of each row a resolution here just dropped the locks of, by its
-    /// cross-group key ([`LockedReads::WaitOnLock`]): called once the resolving step answered, so
-    /// a get it wakes reads the resolution. A row no get waits on rings no one.
-    pub(crate) fn ring_locks(&self, keys: &[Vec<u8>]) -> Result<(), Refusal> {
-        ring(&self.shared.changed, keys)
-    }
-
     /// Records gets here that met a cross-group lock and waited for it ([`LockedReads::Wait`]),
     /// each counted once.
     pub fn locked_waits(&self) -> u64 {
@@ -2625,11 +2722,11 @@ impl Database {
 
     /// [`LockedReads::WaitOnLock`] (T-T1.10.W9, lane xgroup-sql-11): a locked read waits on the
     /// waiter list of the row it met, rung only by a resolution that drops that row's locks
-    /// ([`Database::ring_locks`]). It joins the list and tries once more before it first waits
-    /// there, so a resolution between its try and joining isn't missed; from then on the list's
-    /// ring count, read before each try, says whether one landed since. Meeting another row, it
-    /// moves to that row's list the same way. It leaves its list however it ends. It is counted
-    /// waiting ([`Database::locked_waits`]) as it first blocks.
+    /// ([`Database::call_internal_ringing`]). It joins the list and tries once more before it
+    /// first waits there, so a resolution between its try and joining isn't missed; from then on
+    /// the list's ring count, read before each try, says whether one landed since. Meeting another
+    /// row, it moves to that row's list the same way. It leaves its list however it ends. It is
+    /// counted waiting ([`Database::locked_waits`]) as it first blocks.
     fn wait_on_lock<T>(
         &self,
         until: Instant,
@@ -2841,16 +2938,10 @@ impl Database {
             }
         }
         let (tx, rx) = mpsc::sync_channel(1);
-        self.submit_local(
-            namespace,
-            operation,
-            until,
-            until,
-            move |result| {
-                // A caller whose deadline elapsed no longer waits, but the committed result stands.
-                let _ = tx.send(result);
-            },
-        )?;
+        self.submit_local(namespace, operation, until, until, move |result| {
+            // A caller whose deadline elapsed no longer waits, but the committed result stands.
+            let _ = tx.send(result);
+        })?;
         rx.recv_timeout(until.saturating_duration_since(Instant::now()))
             .map_err(|e| match e {
                 mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected => {
@@ -4284,6 +4375,54 @@ mod owner_table {
 #[cfg(test)]
 mod admission_charge {
     use super::*;
+
+    /// AUDIT 2026-11-23 §1 (lane perf-A12): the answers of `call_db` and `call_internal`'s
+    /// callers (cross-group steps, restores, online changes, floor raises) count their heap, so
+    /// a call answering one can declare a bound its answer is held to.
+    #[test]
+    fn a12_call_db_answers_count_their_heap() {
+        let refusal = Refusal::Invalid {
+            what: "ab".to_owned(),
+            why: "cde".to_owned(),
+        };
+        assert_eq!(refusal.answer_bytes(), std::mem::size_of::<Refusal>() + 5);
+        let failed: Result<u64, Refusal> = Err(refusal);
+        assert_eq!(
+            failed.answer_bytes(),
+            std::mem::size_of::<Result<u64, Refusal>>() + 5
+        );
+        let held: Result<String, Refusal> = Ok(String::with_capacity(7));
+        assert_eq!(
+            held.answer_bytes(),
+            std::mem::size_of::<Result<String, Refusal>>() + 7
+        );
+        let progress = api::import::ImportProgress {
+            source: "src".to_owned(),
+            cursor: vec![1, 2],
+            done: false,
+        };
+        assert_eq!(
+            progress.answer_bytes(),
+            std::mem::size_of_val(&progress) + 5
+        );
+        let reads = vec![(vec![1u8; 3], Some(vec![2u8; 4])), (vec![5u8], None)];
+        let heap = 2 * std::mem::size_of::<(Vec<u8>, Option<Vec<u8>>)>() + 3 + 4 + 1;
+        let locked = crate::xgroup::Reply::Locked {
+            reads: reads.clone(),
+        };
+        assert_eq!(locked.answer_bytes(), std::mem::size_of_val(&locked) + heap);
+        let resolved = crate::xgroup::Reply::Resolved;
+        assert_eq!(resolved.answer_bytes(), std::mem::size_of_val(&resolved));
+        let committed = crate::xgroup::coordinator::Answer::Committed { reads, at: None };
+        assert_eq!(
+            committed.answer_bytes(),
+            std::mem::size_of_val(&committed) + heap
+        );
+        let stepped = online::Stepped::Public {
+            held: Duration::from_millis(1),
+        };
+        assert_eq!(stepped.answer_bytes(), std::mem::size_of_val(&stepped));
+    }
 
     fn put(value: usize) -> Operation {
         Operation::Mutation(Mutation::Records {

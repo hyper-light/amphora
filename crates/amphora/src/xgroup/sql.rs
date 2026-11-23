@@ -304,8 +304,8 @@ pub(crate) struct SqlTablet<'a> {
     db: &'a Db,
     /// Each namespace's revision this step writes its Records rows at, and the next row's place.
     revs: BTreeMap<String, (amphora_api::Rev, u64)>,
-    /// The Records rows whose locks this step dropped, by key: once it answered, their waiter
-    /// lists are rung (`Database::ring_locks`, `LockedReads::WaitOnLock`; T-T1.10.W9).
+    /// The Records rows whose locks this step dropped, by key: once it commits, their waiter
+    /// lists are rung (`Database::call_internal_ringing`, `LockedReads::WaitOnLock`; T-T1.10.W9).
     dropped: Vec<Vec<u8>>,
 }
 
@@ -733,10 +733,9 @@ pub(crate) fn serve(
     until: Instant,
 ) -> Result<(Reply, Option<u64>, Option<u64>), Refusal> {
     let stamp = AtomicU64::new(carried);
-    let (reply, dropped) = step(group, &stamp, until, move |db| {
+    let reply = step(group, &stamp, until, move |db| {
         apply_step(db, here, &envelope)
     })?;
-    group.ring_locks(&dropped)?;
     // The group's clock after the step, the one cross-group clock as it keeps it (lane
     // split-merge-22, as `step_on` reads a local group's): a backed-up group's writer clock, which
     // a standalone group's session token never had, so its lock replies carry a stamp too.
@@ -757,10 +756,9 @@ fn step_on(
 ) -> Result<(Reply, Option<u64>), Refusal> {
     match member {
         Member::Local(group) => {
-            let (reply, dropped) = step(group, carried, until, move |db| {
+            let reply = step(group, carried, until, move |db| {
                 apply_step(db, here, &envelope)
             })?;
-            group.ring_locks(&dropped)?;
             // Read after the step answered, the group's clock is at or past the step's commit:
             // the one cross-group clock as this group keeps it (lane split-merge-21,
             // `Database::cross_clock`), so a standalone backed-up group's lock reply carries its
@@ -1237,7 +1235,7 @@ impl Cluster {
         match one.and_then(|i| self.groups.get(i)) {
             Some(Member::Local(group)) => {
                 let answer = step(group, &self.carried, until, move |db| {
-                    one_group(&mut SqlTablet::new(db), &txn)
+                    one_group(&mut SqlTablet::new(db), &txn).map(|answer| (answer, Vec::new()))
                 });
                 self.stamped(answer, &touched, until)
             }
@@ -1457,14 +1455,16 @@ impl Drop for Cluster {
 /// backed up or replicated here make no stamps and carry none. The stamps are the cross-group
 /// clock's, in microseconds (lane split-merge-21, T-T1.9.R28), the unit of the commit stamps and
 /// the tokens: a backed-up group's writer clock, a replicated group's closed time
-/// (`Database::observe_clock`, `Database::cross_clock`).
+/// (`Database::observe_clock`, `Database::cross_clock`). `f` answers the step's reply and the
+/// rows whose locks it dropped, whose waiter lists the group rings once the step commits
+/// (`Database::call_internal_ringing`).
 fn step<R, F>(group: &Database, carried: &AtomicU64, until: Instant, f: F) -> Result<R, Refusal>
 where
     R: Send + 'static,
-    F: FnOnce(&mut Db) -> anyhow::Result<R> + Send + 'static,
+    F: FnOnce(&mut Db) -> anyhow::Result<(R, Vec<Vec<u8>>)> + Send + 'static,
 {
     group.observe_clock(until, carried.load(Ordering::Acquire))?;
-    let reply = group.call_internal(until, f)?;
+    let reply = group.call_internal_ringing(until, f)?;
     if let Some(latest) = group.cross_clock(until)? {
         carried.fetch_max(latest, Ordering::AcqRel);
     }

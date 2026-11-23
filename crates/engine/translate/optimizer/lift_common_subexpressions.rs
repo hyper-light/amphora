@@ -482,7 +482,6 @@ fn literal_expr_can_be_copied(expr: &Expr) -> bool {
 ///
 /// `NULL` cannot satisfy `=`. The rewrite leaves all other literal types in the original expression.
 fn literal_can_be_copied(literal: &Literal) -> bool {
-
     matches!(
         literal,
         Literal::Numeric(_)
@@ -629,7 +628,9 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| false)?;
+        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
+            false
+        })?;
 
         // Should now have 3 terms:
         // 1. (x = 1) OR (y = 1)
@@ -731,7 +732,9 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| false)?;
+        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
+            false
+        })?;
 
         // Should now have 2 terms:
         // 1. (x = 1) OR (y = 1) OR (z = 1)
@@ -798,7 +801,9 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| false)?;
+        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
+            false
+        })?;
 
         // Should remain unchanged since no common terms
         let nonconsumed_terms = where_clause
@@ -864,7 +869,9 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| false)?;
+        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
+            false
+        })?;
 
         let nonconsumed_terms = where_clause
             .iter()
@@ -915,7 +922,9 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| false)?;
+        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
+            false
+        })?;
 
         // Should remain unchanged
         let nonconsumed_terms = where_clause
@@ -964,7 +973,9 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| false)?;
+        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
+            false
+        })?;
 
         let nonconsumed_terms = where_clause
             .iter()
@@ -993,7 +1004,9 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| false)?;
+        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
+            false
+        })?;
 
         assert_eq!(where_clause.len(), 1);
         assert_eq!(where_clause[0].expr, or_expr);
@@ -1019,7 +1032,9 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| false)?;
+        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
+            false
+        })?;
 
         assert_eq!(where_clause.len(), 3);
         assert_eq!(where_clause[0].expr, or_expr);
@@ -1054,7 +1069,9 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| false)?;
+        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
+            false
+        })?;
 
         assert_eq!(where_clause.len(), 2);
         assert!(!where_clause
@@ -1079,7 +1096,9 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| false)?;
+        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
+            false
+        })?;
 
         assert_eq!(where_clause.len(), 2);
         assert_eq!(where_clause[1].origin, where_clause[0].origin);
@@ -1099,7 +1118,9 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| false)?;
+        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
+            false
+        })?;
 
         assert_eq!(where_clause.len(), 2);
         assert_eq!(where_clause[1].origin, where_clause[0].origin);
@@ -1129,7 +1150,9 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| false)?;
+        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
+            false
+        })?;
 
         assert_eq!(where_clause.len(), 1);
         Ok(())

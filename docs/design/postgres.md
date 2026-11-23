@@ -321,35 +321,78 @@ columns carry no SQLite affinity, so SQLite never converts a value.
 Every encoder and decoder is a flat loop with an explicit stack bounded by the input's length
 (CLAUDE.md §11). Hostile input to every decoder is a test (CLAUDE.md §6).
 
-### Numbers as text: due when the frontend returns values (lane G11 note, not built)
+### Numbers as text: due when the frontend returns values (lane G11 note, checked by G12; not built)
 
 The SQLite dialect writes a REAL by floatingpoint.html (15 digits when they convert back, else 17;
 `crates/engine/numeric/fp.rs`). None of that may reach a PostgreSQL session (RULES 5f): each item
 below goes through the `Dialect` hook (`crates/engine/dialect/mod.rs`) once the frontend renders
-values, each with a test quoting PostgreSQL 19's sentence (datatype-numeric.html §8.1.2 and §8.1.3,
-runtime-config-client.html `extra_float_digits`) and a corpus run against PostgreSQL 19.
+values, each with a test quoting PostgreSQL 19's sentence and a corpus run against PostgreSQL 19.
+Lane G12 checked each item against postgresql.org/docs/19/datatype-numeric.html and
+runtime-config-client.html (fetched 2026-11-23 18:40Z) and the source at tag `REL_19_0` (5c839a2a08);
+the quotes below are verbatim.
 
-- **float8 and float4 output follow `extra_float_digits`.** Its default (1) and any value above 0
-  write the shortest text that converts back to the same value exactly (float8 at most 17
-  significant digits, float4 at most 9); 0 and below round to 15 + n (float8) or 6 + n (float4)
-  significant digits. The setting is per session (`SET`, startup options, `ParameterStatus` only
-  where PostgreSQL reports it). The shortest digits are what fp.rs's normal-double path already asks
-  Rust's `{:e}` for (G11); the layout (where exponent form starts, `1e+16` where SQLite writes
-  `1.0e+16`, no `.0` on whole values) is PostgreSQL's own and is checked against it, not assumed.
-- **float4 is its own type.** Text in and out at single precision (shortest float4 digits, not the
-  float8 digits of the widened value); storage as REAL is lossless for it, its output is not.
-- **Special values in PostgreSQL's spelling.** `Infinity`, `-Infinity`, `NaN` on output (not
-  SQLite's `Inf`, `-Inf`, `9.0e+999`, `null`); input accepts them case-insensitively, with `inf`
-  and `+inf`; `-0` prints `-0`.
-- **float input errors.** Out-of-range text is `22003` ("is out of range for type double
-  precision"), malformed text `22P02`; never SQLite's longest-prefix CAST or its 0.0.
-- **numeric is exact decimal.** Arithmetic, rounding (half away from zero), division scale and
-  `numeric(p,s)` typmod coercion as PostgreSQL 19 computes them, output at the value's display scale
-  (the key's hidden scale above), with `NaN`, `Infinity`, `-Infinity`; overflow of the typmod is
-  `22003`. Never routed through binary64.
-- **Casts and comparisons between them.** float8 to int rounds half to even and errors out of range
-  (`22003`), unlike SQLite's truncating, saturating CAST; numeric compared with float8 compares as
-  PostgreSQL's cross-type operators do, not SQLite's int/real comparison.
+- **float8 and float4 output follow `extra_float_digits`.** runtime-config-client.html: "If the value
+  is 1 (the default) or above, float values are output in shortest-precise format; see Section
+  8.1.3. The actual number of digits generated depends only on the value being output, not on the
+  value of this parameter. At most 17 digits are required for float8 values, and 9 for float4
+  values." and "If the value is zero or negative, then the output is rounded to a given decimal
+  precision. The precision used is the standard number of digits for the type (FLT_DIG or DBL_DIG as
+  appropriate) reduced according to the value of this parameter." The setting runs from -15 to 3
+  ("For historical compatibility, values up to 3 are permitted"; `guc_parameters.dat:1085-1092`,
+  `boot_val => '1'`). Code: `float8out_internal` (`float.c:578-590`) calls
+  `double_to_shortest_decimal_buf` when `extra_float_digits > 0`, else `pg_strfromd(ascii, 32,
+  DBL_DIG + extra_float_digits, num)`. The setting is per session (`SET`, startup options,
+  `ParameterStatus` only where PostgreSQL reports it).
+- **Shortest is not Rust's shortest at a midpoint (G11's note corrected).** datatype-numeric.html
+  §8.1.3: "the decimal value produced is closer to the true stored binary value than to any other
+  value representable in the same binary precision. (However, the output value is currently never
+  exactly midway between two representable values, in order to avoid a widespread bug where input
+  routines do not properly respect the round-to-nearest-even rule.)" PostgreSQL's Ryu is built with
+  `STRICTLY_SHORTEST 0` (`src/common/ryu_common.h:46`), so `acceptBounds = false`
+  (`src/common/d2s.c:363-368`) for every mantissa. Rust's `{:e}`, which fp.rs's normal-double path
+  uses, accepts the bounds for even mantissas, so it may print the midpoint where PostgreSQL prints
+  one more digit. G11 said the shortest digits are "what fp.rs's normal-double path already asks
+  Rust's `{:e}` for"; that holds except at the bounds. The Postgres dialect needs a shortest search
+  with open bounds, checked against PostgreSQL 19 on doubles whose shortest text is a midpoint.
+- **Layout.** Fixed notation while the display exponent is from -4 to 14, else `d.ddde+XX` with at
+  least two exponent digits: "The thresholds for fixed-point output are chosen to match printf
+  defaults." (`d2s.c:801-806`, `if (exp >= -4 && exp < 15)`; the exponent at `d2s.c:934-956`). So
+  `1e15` prints `1e+15` (SQLite: `1.0e+15`), and a whole value prints no `.0`.
+- **float4 is its own type.** Text in and out at single precision (`float4out` and `f2s.c`, at most 9
+  digits; 0 and below round to `FLT_DIG + extra_float_digits`, 6 by default, `float.c:364-366`);
+  storage as REAL is lossless for it, its output from a widened double is not.
+- **Special values in PostgreSQL's spelling.** Output `NaN`, `Infinity`, `-Infinity`, and `-0` for
+  negative zero (`copy_special_str`, `ryu_common.h:95-113`), not SQLite's `Inf`, `-Inf`,
+  `9.0e+999`, `null`. Input: "On input, these strings are recognized in a case-insensitive manner.
+  The infinity values can alternatively be spelled inf and -inf." The code also takes `+Infinity`
+  and `+inf` (`float.c:475-509`, `pg_strncasecmp`), which the page does not name; the page does not
+  forbid them, so the dialect takes them too and a test names the page's silence. Leading and
+  trailing whitespace is skipped (`float.c:443`, `:541-552`).
+- **float input errors.** Out of range: `22003`, `"%s" is out of range for type double precision`
+  (`float.c:527-530`; `real` for float4, `:326-328`), raised when `strtod` reports `ERANGE` and the
+  result is zero or infinite. That includes underflow to zero (§8.1.3: "Numbers too close to zero that
+  are not representable as distinct from zero will cause an underflow error."), which G11's note left
+  out; a subnormal result is accepted (`float.c:512-520`). Malformed text: `22P02`, `invalid input
+  syntax for type %s: "%s"` (`float.c:536-537`, `:550-551`). Never SQLite's longest-prefix CAST or
+  its 0.0.
+- **numeric is exact decimal.** datatype-numeric.html §8.1.2: "When rounding values, the numeric type
+  rounds ties away from zero, while (on most machines) the real and double precision types round
+  ties to the nearest even number." and "If the scale of a value to be stored is greater than the
+  declared scale of the column, the system will round the value to the specified number of
+  fractional digits. Then, if the number of digits to the left of the decimal point exceeds the
+  declared precision minus the declared scale, an error is raised." Output at the value's display
+  scale (the key's hidden scale above), with `NaN`, `Infinity`, `-Infinity`; "an infinity can only
+  be stored in an unconstrained numeric column". Never routed through binary64.
+- **Casts.** float8 to int2, int4 and int8 round with `rint()` (half to even under the default
+  rounding mode) and error `22003` outside the type: `smallint out of range` (`dtoi2`,
+  `float.c:1280-1295`), `integer out of range` (`dtoi4`, `float.c:1255-1270`), `bigint out of range`
+  (`dtoi8`, `int8.c:1338-1353`), unlike SQLite's truncating, saturating CAST.
+- **numeric compared with float8 (G11's note corrected).** PostgreSQL 19 has no operator between
+  numeric and float8 (`pg_operator.dat` has none). numeric to float8 is an implicit cast
+  (`castcontext => 'i'`, `pg_cast.dat:79-80`) and float8 to numeric only an assignment cast
+  (`'a'`, `:69-70`), so `numeric = float8` resolves to `float8 = float8` with the numeric converted
+  to float8. G11 said "compares as PostgreSQL's cross-type operators do"; there are none, and the
+  dialect must convert as the parser does.
 
 **Why not a new comparator (the other candidate).** The other design kept exact bytes and taught
 the record comparator PostgreSQL's operator classes, a `Pg(PgOpClass)` beside `CollationSeq`
