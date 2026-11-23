@@ -239,14 +239,18 @@ pub fn translate(
     } else {
         connection.get_pager().page_miss_ratio()
     };
-    resolver.set_learned_weights(connection.db.learned_costs.weights_at(page_miss));
     // Amphora (PL.13, lane T9): a test's whole set of pinned weights in their place
     // (`Connection::pin_cost_weights`).
-    if let Some(pinned) = connection.pinned_cost_weights() {
-        resolver.set_learned_weights(Some(pinned));
-    }
+    let weights = connection
+        .pinned_cost_weights()
+        .or_else(|| connection.db.learned_costs.weights_at(page_miss));
+    resolver.set_learned_weights(weights);
     // Amphora (PL.7): and, with its switch on, as its statements' measured times fit them.
-    resolver.set_fitted_weights(connection.db.cost_fit.weights());
+    let fitted = connection.db.cost_fit.weights();
+    // Lane T12 (PL.13): what each plan is made on, so a plan that changes between two prepares
+    // of one statement can be traced to the input that moved.
+    tracing::debug!(target: "amphora::join_search", ?weights, ?page_miss, ?fitted, "the weights this plan is made on");
+    resolver.set_fitted_weights(fitted);
 
     match stmt {
         // There can be no nesting with pragma, so lift it up here

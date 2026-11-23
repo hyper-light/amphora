@@ -7812,6 +7812,10 @@ mod tests {
             .collect();
         let mut pump = Pump::new(&clients);
         let leader = driven.elect(&mut pump, &clients, 0, 1);
+        // The write slot is off: since a follower's write prepares in its slot from its first try
+        // (replication.md, "the write slot"; CP-T1.8, lane V8), two writes prepared on one base,
+        // which this test builds, arise only without it.
+        driven.owner_mut(leader).slot_off = true;
         // Writes before the test's, so that each follower states a durable promise and answers
         // held at once (hyper-raft R-8).
         for n in 0..4 {
@@ -9731,6 +9735,10 @@ mod tests {
             .collect();
         let mut pump = Pump::new(&clients);
         let leader = driven.elect(&mut pump, &clients, 0, 1);
+        // The write slot is off: since a follower's write prepares in its slot from its first try
+        // (replication.md, "the write slot"; CP-T1.8, lane V8), two writes prepared on one base,
+        // which this test builds, arise only without it.
+        driven.owner_mut(leader).slot_off = true;
         let elected = terms(&clients);
         let origin = (leader + 1) % 3;
         let evaluated = Arc::new(AtomicUsize::new(0));
@@ -9849,6 +9857,12 @@ mod tests {
             let mut pump = Pump::new(&clients);
             pump.refusals = Some(0);
             let leader = driven.elect(&mut pump, &clients, 0, 1);
+            // The write slot is off: since a follower's write prepares in its slot from its first try
+            // (replication.md, "the write slot"; CP-T1.8, lane V8), two writes prepared on one base,
+            // which this test builds, arise only without it.
+            for owner in 0..3 {
+                driven.owner_mut(owner).slot_off = true;
+            }
             let origin = (leader + 1) % 3;
             // Positions 3 and 4: the lead moves while the first call, then the read after it, is
             // in flight. Each answers Ok or UnknownOutcome, and the table holds what an Ok says.
@@ -14680,6 +14694,13 @@ mod tests {
         // The lost records may cost the lead; proposals dropped in that election are counted.
         pump.refusals = Some(0);
         let leader = tracked_group(&mut driven, &mut pump, &clients);
+        // The write slot is off: since a follower's write prepares in its slot from its first try
+        // (replication.md, "the write slot"; CP-T1.8, lane V8), its barrier steps only once the
+        // leader's commit reaches its last entry, so a session passing its barrier with a write
+        // ahead committed nowhere, which this test builds, arises only without it.
+        for owner in 0..3 {
+            driven.owner_mut(owner).slot_off = true;
+        }
         quiet(&mut driven, &mut pump);
         let follower = (leader + 1) % 3;
         let member = u64::try_from(follower + 1).unwrap();
@@ -18247,8 +18268,11 @@ mod tests {
     /// class, each one write outstanding, and the leader crashed and restarted on its own files
     /// five times while they write (`Driven::restart`, a kill -9). A write refused, unanswered by
     /// a crashed member, or answered unknown is sent again at the next member, the same row
-    /// (`INSERT OR IGNORE` by its id), as the bench sends it. Expect: every writer acknowledged,
-    /// none left unanswered, and every replica holding each row once.
+    /// (`INSERT OR IGNORE` by its id), as the bench sends it. A writer acknowledged while crashes
+    /// remain writes its next row: under the write slot no follower write is refused stale (CP-T1.8,
+    /// lane V8), so the writers' first rows all land in one or two elections' settling and the
+    /// crashes need writes still to come (lane V10's trace, r1591). Expect: every writer
+    /// acknowledged, none left unanswered, and every replica holding each row once.
     #[test]
     fn writers_through_five_leader_crashes_each_land_and_every_acknowledged_row_is_held() {
         const WRITERS: usize = 32;
@@ -18283,6 +18307,8 @@ mod tests {
                 Some((via, submit(&clients[via], driven.until(), write(id))))
             })
             .collect();
+        // Each writer's row in flight: once acknowledged, it writes the next while crashes remain.
+        let mut row: Vec<usize> = (0..WRITERS).collect();
         let mut acknowledged = 0;
         let (mut crashes, mut again) = (0, 0u64);
         let mut rounds = 0;
@@ -18300,6 +18326,10 @@ mod tests {
                     Err(mpsc::TryRecvError::Disconnected) => true,
                     Ok(Ok(_)) => {
                         acknowledged += 1;
+                        if crashes < CRASHES {
+                            row[id] += WRITERS;
+                            *slot = Some((via, submit(&clients[via], driven.until(), write(row[id]))));
+                        }
                         false
                     }
                     Ok(Err(Refusal::Serialization { .. })) => true,
@@ -18314,7 +18344,7 @@ mod tests {
                 if resend {
                     again += 1;
                     let next = (via + 1) % 3;
-                    *slot = Some((next, submit(&clients[next], driven.until(), write(id))));
+                    *slot = Some((next, submit(&clients[next], driven.until(), write(row[id]))));
                 }
             }
             if crashes < CRASHES && acknowledged * (CRASHES + 1) >= WRITERS * (crashes + 1) {
@@ -18354,7 +18384,11 @@ mod tests {
                     Ok(ids)
                 })
                 .unwrap();
-            assert_eq!(ids, (0..WRITERS).collect::<Vec<_>>(), "owner {owner}");
+            let mut rows: Vec<usize> = (0..WRITERS)
+                .flat_map(|id| (id..=row[id]).step_by(WRITERS))
+                .collect();
+            rows.sort_unstable();
+            assert_eq!(ids, rows, "owner {owner}");
         }
         driven.drain(&mut pump);
         pump.finish();
@@ -18567,6 +18601,10 @@ mod tests {
             .collect();
         let mut pump = Pump::new(&clients);
         let leader = driven.elect(&mut pump, &clients, 0, 1);
+        // The write slot is off: since a follower's write prepares in its slot from its first try
+        // (replication.md, "the write slot"; CP-T1.8, lane V8), two writes prepared on one base,
+        // which this test builds, arise only without it.
+        driven.owner_mut(leader).slot_off = true;
         driven
             .call(&mut pump, &clients[leader], |db| {
                 db.exec("CREATE TABLE events(id INTEGER NOT NULL)")?;
