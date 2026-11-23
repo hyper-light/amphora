@@ -432,6 +432,13 @@ pub fn main() -> anyhow::Result<()> {
             target.exec("INSERT INTO bench_loaded VALUES (1)")?;
             write(serde_json::json!({ "record": "load", "target": target.name(), "table": "indexes and statistics", "s": began.elapsed().as_secs_f64() }))?;
         }
+        // Lane R1: AMPHORA_BENCH_CORES=n gives Amphora the ladder's setting at n cores for every
+        // query, so --answers keeps an arm's answer at each worker count. It comes after the load
+        // check: under it, `SELECT 1 FROM bench_loaded LIMIT 1` found no row and the bench reloaded.
+        let cores = std::env::var("AMPHORA_BENCH_CORES").ok().filter(|_| target.amphora().is_some());
+        if let Some(n) = cores {
+            target.set_cores(n.parse()?)?;
+        }
         targets.push(target);
     }
     let mut engines = Vec::new();

@@ -186,11 +186,6 @@ impl Amphora {
         for c in [a.conn.clone(), a.counted.clone()] {
             a.exec_on(&c, &format!("PRAGMA cache_size = -{cache_kib}"))?;
         }
-        // Lane R1: AMPHORA_BENCH_CORES=n gives every query the ladder's setting at n cores, so
-        // --answers keeps an arm's answer at each worker count (the ladder writes no answers).
-        if let Ok(n) = std::env::var("AMPHORA_BENCH_CORES") {
-            a.set_cores(n.parse()?)?;
-        }
         Ok(a)
     }
 
