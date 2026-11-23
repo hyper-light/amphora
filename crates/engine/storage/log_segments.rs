@@ -288,7 +288,8 @@ mod tests {
         for _ in 0..4 {
             let next = log.begin_read();
             assert_eq!(next.lookup_order().collect::<Vec<_>>(), [SegmentId::Second]);
-            reset = reset.or(log.end_read(under_way));
+            let ended = log.end_read(under_way);
+            reset = reset.or(ended);
             under_way = next;
         }
         assert_eq!(reset, Some(SegmentId::First));
