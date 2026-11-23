@@ -20,8 +20,10 @@ const MAX_DIGIT: usize = 10_000_000;
 /// IEEE 754 binary64: 52 stored significand bits; a biased exponent e and significand m
 /// give m * 2^(e - 1075) (bias 1023 plus the 52 fraction bits), as decimal.c's decimalFromDouble.
 const SIGNIFICAND_BITS: u32 = 52;
-const SIGNIFICAND_MASK: u64 = (1 << SIGNIFICAND_BITS) - 1;
+const SIGNIFICAND_MASK: i64 = (1 << SIGNIFICAND_BITS) - 1;
 const EXPONENT_OFFSET: i64 = 1075;
+/// decimalFromDouble's test for a NaN or an infinity: an unbiased exponent past 971.
+const MAX_EXPONENT: i64 = 971;
 
 /// decimal.c's `Decimal`: sign, a[] (one digit 0..=9 per byte, most significant first) and
 /// nFrac (how many of the digits follow the point). `frac <= digits.len()` always. decimal.c's
@@ -286,34 +288,37 @@ pub fn decimal_from_text(text: &[u8]) -> Option<Decimal> {
 }
 
 /// decimal.c's decimalFromDouble: the exact decimal value of a REAL; None for NaN or infinity.
+/// As in decimal.c, the sign is taken off only when `r < 0.0`, so a NaN with its sign bit set
+/// reads as a negative biased exponent and gives a number (floatingpoint.html is silent on
+/// NaN bit patterns; this is sqlite3 3.54.0's answer for an 8-byte BLOB holding one).
 pub fn decimal_from_double(r: f64) -> Option<Decimal> {
-    if !r.is_finite() {
-        return None;
-    }
     let negative = r < 0.0;
-    let bits = r.abs().to_bits();
-    let (m, e) = if bits == 0 {
-        (0u64, 0i64)
+    let r = if negative { r.abs() } else { r };
+    let a = i64::from_ne_bytes(r.to_bits().to_ne_bytes());
+    let (m, e) = if a == 0 || a == i64::MIN {
+        (0i64, 0i64)
     } else {
-        let mut e = i64::try_from(bits.wrapping_shr(SIGNIFICAND_BITS)).ok()?;
-        let mut m = bits & SIGNIFICAND_MASK;
+        let mut e = a.wrapping_shr(SIGNIFICAND_BITS);
+        let mut m = a & SIGNIFICAND_MASK;
         if e == 0 {
             m = m.wrapping_shl(1);
         } else {
-            m |= 1u64.wrapping_shl(SIGNIFICAND_BITS);
+            m |= 1i64.wrapping_shl(SIGNIFICAND_BITS);
         }
         while e < EXPONENT_OFFSET && m > 0 && m & 1 == 0 {
             m = m.wrapping_shr(1);
             e = e.checked_add(1)?;
         }
-        (m, e.checked_sub(EXPONENT_OFFSET)?)
+        if negative {
+            m = m.checked_neg()?;
+        }
+        let e = e.checked_sub(EXPONENT_OFFSET)?;
+        if e > MAX_EXPONENT {
+            return None;
+        }
+        (m, e)
     };
-    let text = if negative {
-        format!("-{m}")
-    } else {
-        m.to_string()
-    };
-    let a = decimal_from_text(text.as_bytes())?;
+    let a = decimal_from_text(m.to_string().as_bytes())?;
     let x = decimal_pow2(e)?;
     decimal_mul(&a, &x)
 }
@@ -706,8 +711,10 @@ fn cmp_func(args: &[Value]) -> Value {
     })
 }
 
-/// decimal.c's decimalPow2Func acts only on an INTEGER argument, read as a C int (its low 32
-/// bits); anything else is NULL, and an N outside [-POW2_LIMIT, POW2_LIMIT] is out of memory.
+/// decimal.c's decimalPow2Func acts only on an INTEGER argument; anything else is NULL, and an
+/// N outside [-POW2_LIMIT, POW2_LIMIT] is out of memory. decimal.c reads N as a C int, so
+/// 3.54.0 wraps 4294967297 to 1; floatingpoint.html 2.2.2 says "N must be an integer between
+/// -20000 and +20000", so the page wins and the whole INTEGER is checked against the bound.
 #[scalar(name = "decimal_pow2")]
 fn decimal_pow2_sql(args: &[Value]) -> Value {
     pow2_func(args)
@@ -720,7 +727,7 @@ fn pow2_func(args: &[Value]) -> Value {
     if n.value_type() != ValueType::Integer {
         return Value::null();
     }
-    match decimal_pow2(i64::from(value_int(n))).and_then(|p| p.to_sci_text(0)) {
+    match decimal_pow2(n.to_integer().unwrap_or_default()).and_then(|p| p.to_sci_text(0)) {
         Some(s) => Value::from_text(s),
         None => out_of_memory(),
     }
@@ -957,10 +964,11 @@ mod tests {
     }
 
     #[test]
-    fn g15_decimal_pow2_reads_a_c_int_and_fails_out_of_range() {
+    fn g15_decimal_pow2_fails_out_of_range() {
+        // 3.54.0 answers +2.0e+00 here (its C int wraps); floatingpoint.html 2.2.2 bounds N.
         assert_eq!(
             call(pow2_func, &[Value::from_integer(4_294_967_297)]),
-            "+2.0e+00"
+            "OOM"
         );
         assert_eq!(call(pow2_func, &[Value::from_integer(20_001)]), "OOM");
         assert_eq!(call(pow2_func, &[Value::from_integer(-20_001)]), "OOM");
@@ -1033,6 +1041,38 @@ mod tests {
         assert_eq!(call(cmp_func, &[text("-1"), text("1")]), "-1");
         assert_eq!(call(cmp_func, &[text("2"), text("1")]), "1");
         assert_eq!(call(cmp_func, &[text("-2"), text("-10")]), "1");
+    }
+
+    #[test]
+    fn g15_nan_blobs_with_the_sign_bit_give_decimal_c_numbers() {
+        let blob = |bits: u64| Value::from_blob(bits.to_be_bytes().to_vec());
+        let plain = call(dec, &[blob(0xFFF8_0000_0000_0000)]);
+        let sci = call(dec_exp, &[blob(0xFFF8_0000_0000_0000)]);
+        assert_eq!((plain.len(), sci.len()), (1027, 724));
+        assert_eq!(
+            (sci.get(..24), sci.get(712..)),
+            (Some("+8.344026969402005186588"), Some("3359375e-309"))
+        );
+        let plain = call(dec, &[blob(u64::MAX)]);
+        let sci = call(dec_exp, &[blob(u64::MAX)]);
+        assert_eq!((plain.len(), sci.len()), (1078, 776));
+        assert_eq!(
+            (sci.get(..24), sci.get(764..)),
+            (Some("+1.112536929253600568028"), Some("8359375e-308"))
+        );
+    }
+
+    /// floatingpoint.html 2.2.4 and 2.2.6 compare values in numeric order; 3.54.0 answers 1,
+    /// 1 and 1 here and sorts '1e-2' after '0.5', counting a zero that "1e-2" and "0 012"
+    /// leave before the point as a digit. The page wins.
+    #[test]
+    fn g15_cmp_and_collation_compare_values_as_the_page_says() {
+        assert_eq!(call(cmp_func, &[text("1e-2"), text("0.01")]), "0");
+        assert_eq!(call(cmp_func, &[text("1e-2"), text("0.5")]), "-1");
+        assert_eq!(call(cmp_func, &[text("0 012"), text("12")]), "0");
+        let mut v = ["10", "9", "1e-2", "0.5"];
+        v.sort_by(|a, b| decimal_collate(a, b));
+        assert_eq!(v, ["1e-2", "0.5", "9", "10"]);
     }
 
     #[test]
