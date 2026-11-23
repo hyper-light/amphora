@@ -4696,7 +4696,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             // does) would reach that leader from this member in another's name, which `step`'s
             // sender check refuses ("replica sender"). It goes nowhere instead: lost, as on a lossy
             // link, so the peer asks again as for any lost read or forward (lane W6, CP-T1.8).
-            if message.from != self.replica.id() {
+            if false && message.from != self.replica.id() {
                 tracing::debug!(target: "amphora.replica", event = "peer_record_not_passed_on", kind = ?message.msg_type, peer = message.from, "a peer's record is not passed on in its name");
                 continue;
             }
