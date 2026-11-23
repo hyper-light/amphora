@@ -26,6 +26,11 @@ Across these runs the best median fell 18.2% for new opens and 14.7% for reopens
 The record preserves only the aggregate medians for first statements. Other builds shared
 the host, so these observations do not establish an isolated cost for the scratch read (T-QT.5.5).
 
+The original example reused `first.db` and the numbered `open-<i>.db` files in the supplied
+directory. Repeating a path made an existing database count toward the new-file samples.
+The record does not retain the per-run fixture paths. The revised example creates a private
+directory on the requested device for each invocation and requires at least one measured open.
+
 The process's first open (CPU calibration, `process_calibration`, still on the first open) ranged
 2.2 ms to 1.0 s across runs on this loaded host (calibration samples until each median settles,
 bounded by a page of keys): that is the remaining §7.1 work (cache per machine across processes).
