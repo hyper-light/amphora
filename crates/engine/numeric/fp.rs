@@ -391,11 +391,44 @@ impl std::fmt::Write for Text {
     }
 }
 
-/// `%!.17g` of r, as SQLite's printf writes it (`zero_pad`: `%!0.17g`, infinity as 9.0e+999 and
-/// NaN as null): fixed notation for exponents from -4 to 16, else d.ddde±XX; trailing zeros dropped
-/// but one after the point.
-fn render(r: f64, zero_pad: bool) -> Option<String> {
-    let s = match fifteen_digits(r).map_or_else(|| decode(r, 17, 20), |s| Some(Decode::Finite(s)))? {
+/// SQLITE_DBCONFIG_FP_DIGITS (c3ref/c_dbconfig_defensive.html): "a small integer that determines the
+/// number of significant digits that SQLite will attempt to preserve when converting floating point
+/// numbers (IEEE 754 "doubles") into text. The default value 17, as of SQLite version 3.52.0."
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FpDigits(u8);
+
+impl FpDigits {
+    pub const DEFAULT: Self = Self(17);
+
+    /// "The first argument is a small integer, between 3 and 23, or zero. The FP_DIGITS setting is
+    /// changed to that small integer, or left unaltered if the first argument is zero or out of
+    /// range." `None` leaves it unaltered. The page's "between 3 and 23" takes 3; SQLite 3.54.0's
+    /// `nIn>3 && nIn<24` refuses it (bench/records/2026-11-23-adacachy2-perf-numeric-g11.md).
+    pub fn new(n: i32) -> Option<Self> {
+        u8::try_from(n)
+            .ok()
+            .filter(|n| (3..=23).contains(n))
+            .map(Self)
+    }
+
+    pub fn get(self) -> u8 {
+        self.0
+    }
+}
+
+/// `%!.*g` of r at `digits` significant digits, as SQLite's printf writes it (`zero_pad`: `%!0.*g`,
+/// infinity as 9.0e+999 and NaN as null): fixed notation for exponents from -4 to digits - 1, else
+/// d.ddde±XX; trailing zeros dropped but one after the point. At 17, floatingpoint.html 1.3.1's steps
+/// (15 digits when they convert back); at any other setting, rounded to that many: "If you do not want
+/// the (negligible) overhead of step (b) and (c), just set SQLITE_DBCONFIG_FP_DIGITS to 15."
+fn render(r: f64, zero_pad: bool, digits: FpDigits) -> Option<String> {
+    let round = i32::from(digits.get());
+    let decoded = if digits == FpDigits::DEFAULT {
+        fifteen_digits(r).map_or_else(|| decode(r, round, 20), |s| Some(Decode::Finite(s)))
+    } else {
+        decode(r, round, 20)
+    };
+    let s = match decoded? {
         Decode::Finite(s) => s,
         Decode::NaN => return Some(if zero_pad { "null" } else { "NaN" }.to_owned()),
         Decode::Infinite { negative } if zero_pad => Decoded {
@@ -409,7 +442,7 @@ fn render(r: f64, zero_pad: bool) -> Option<String> {
     };
     let n = i32::try_from(s.digits.len()).ok()?;
     let exp = s.point.checked_sub(1)?;
-    let mut precision: i32 = 16;
+    let mut precision: i32 = round.checked_sub(1)?;
     let scientific = exp < -4 || exp > precision;
     if !scientific {
         precision = precision.checked_sub(exp)?;
@@ -491,12 +524,17 @@ fn render(r: f64, zero_pad: bool) -> Option<String> {
     Some(out)
 }
 
-/// A REAL as text, as SQLite 3.54 converts one (`%!.17g`).
+/// A REAL as text, as SQLite converts one at the default FP_DIGITS (`%!.17g`).
 pub fn real_to_text(r: f64) -> String {
-    render(r, false).unwrap_or_else(|| format!("{r:e}"))
+    real_to_text_digits(r, FpDigits::DEFAULT)
+}
+
+/// A REAL as text at a connection's FP_DIGITS (`vdbeMemRenderNum`'s `%!.*g`).
+pub fn real_to_text_digits(r: f64, digits: FpDigits) -> String {
+    render(r, false, digits).unwrap_or_else(|| format!("{r:e}"))
 }
 
 /// A REAL as quote() and JSON write it (`%!0.17g`): infinity as 9.0e+999.
 pub fn real_to_quoted(r: f64) -> String {
-    render(r, true).unwrap_or_else(|| format!("{r:e}"))
+    render(r, true, FpDigits::DEFAULT).unwrap_or_else(|| format!("{r:e}"))
 }
