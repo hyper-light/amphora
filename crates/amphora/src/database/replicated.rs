@@ -97,6 +97,7 @@ const ENVELOPE_BYTES: usize = std::mem::size_of::<Envelope>();
 // Session tokens: read-your-writes on any replica (replication.md, "Decision (lane ryw-1):
 // read-your-writes by session tokens").
 mod tokens;
+mod waiting;
 pub use tokens::{ReadMode, Served, SessionCounters, Token};
 
 /// One of the floor's own sessions: the work it does on the database at its base.
@@ -953,7 +954,7 @@ struct Actor<F: BlockFile + 'static = LogDevice> {
     floor_published: Option<u32>,
     // At most the command queue's inputs' bound of admitted operations wait behind the sole
     // prepared transaction (`Control::command_bound`).
-    waiting: VecDeque<Envelope>,
+    waiting: waiting::Waiting<Envelope>,
     // The leader's write slot (replication.md, "A follower's write under steady leader writes"):
     // the members whose writes it refused, queued, and the forwards and barrier it holds, each
     // still charged to the inbound queue by its reservation; and whether this leader's own
@@ -2465,7 +2466,7 @@ fn open_on<F: BlockFile + 'static>(
         floor_requests_applied: 0,
         floor_requests_stale: 0,
         floor_published: None,
-        waiting: VecDeque::new(),
+        waiting: waiting::Waiting::new(),
         slots,
         slot_deferred: false,
         serial: 0,
@@ -2860,10 +2861,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             self.control.moved.notify_all();
             drop(closed);
         }
-        for _ in 0..self.waiting.len() {
-            let Some(envelope) = self.waiting.pop_front() else {
-                break;
-            };
+        while let Some(envelope) = self.waiting.pop_front() {
             if let Input::Submit { response, .. } = envelope.command {
                 answer(response, Err(reason.clone()));
             }
@@ -2964,14 +2962,8 @@ impl<F: BlockFile + 'static> Actor<F> {
             .ticked
             .checked_add(self.pace.period())
             .unwrap_or(self.at);
-        let waiting = self
-            .waiting
-            .iter()
-            .filter_map(|envelope| match &envelope.command {
-                Input::Submit { until, .. } => Some(*until),
-                _ => None,
-            });
         let held = [
+            self.waiting.next_deadline(),
             self.pending.as_ref().map(|pending| pending.until),
             self.changing.as_ref().map(|changing| changing.until),
             self.transferring
@@ -2979,9 +2971,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                 .map(|transferring| transferring.until),
             self.slots.until(),
         ];
-        waiting
-            .chain(held.into_iter().flatten())
-            .fold(tick, Instant::min)
+        held.into_iter().flatten().fold(tick, Instant::min)
     }
     /// One step at its clock's reading: the input first, then a tick if one is due, the core's
     /// work, deadlines, and what waits.
@@ -3493,21 +3483,11 @@ impl<F: BlockFile + 'static> Actor<F> {
         Ok(())
     }
     fn expire(&mut self) {
-        // Expired callers relinquish queued operations even while a seed or proposal is held.
-        // Rotate the bounded queue once; surviving requests retain their FIFO order.
-        let queued = self.waiting.len();
-        for _ in 0..queued {
-            let Some(envelope) = self.waiting.pop_front() else {
-                break;
-            };
-            let expired =
-                matches!(&envelope.command, Input::Submit { until, .. } if self.at >= *until);
-            if expired {
-                if let Input::Submit { response, .. } = envelope.command {
-                    answer(response, Err(Refusal::Timeout));
-                }
-            } else {
-                self.waiting.push_back(envelope);
+        // Expired callers relinquish queued operations even while a seed or proposal is held;
+        // surviving requests retain their FIFO order.
+        for envelope in self.waiting.expire(self.at) {
+            if let Input::Submit { response, .. } = envelope.command {
+                answer(response, Err(Refusal::Timeout));
             }
         }
         let Some(pending) = self.pending.as_ref() else {
@@ -3586,16 +3566,19 @@ impl<F: BlockFile + 'static> Actor<F> {
                 }),
             );
         } else {
-            self.waiting.push_front(Envelope {
-                command: Input::Submit {
-                    namespace: pending.namespace,
-                    operation,
-                    application,
-                    until: pending.until,
-                    response,
+            self.waiting.push_front(
+                pending.until,
+                Envelope {
+                    command: Input::Submit {
+                        namespace: pending.namespace,
+                        operation,
+                        application,
+                        until: pending.until,
+                        response,
+                    },
+                    _reservation: pending._reservation,
                 },
-                _reservation: pending._reservation,
-            });
+            );
         }
     }
     /// The change under way, once its barrier shows this leader current: proposed, or answered
@@ -3803,16 +3786,19 @@ impl<F: BlockFile + 'static> Actor<F> {
                             }),
                         );
                     } else {
-                        self.waiting.push_back(Envelope {
-                            command: Input::Submit {
-                                namespace,
-                                operation,
-                                application,
-                                until,
-                                response,
+                        self.waiting.push_back(
+                            until,
+                            Envelope {
+                                command: Input::Submit {
+                                    namespace,
+                                    operation,
+                                    application,
+                                    until,
+                                    response,
+                                },
+                                _reservation: reservation,
                             },
-                            _reservation: reservation,
-                        });
+                        );
                     }
                 } else {
                     let context = match self.context() {
