@@ -628,6 +628,20 @@ impl AnswerBytes for Row {
     }
 }
 
+impl AnswerBytes for api::Page {
+    fn answer_bytes(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(heap_bytes(&self.rows))
+    }
+}
+
+impl AnswerBytes for api::Change {
+    fn answer_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.key.capacity())
+            .saturating_add(self.value.as_ref().map_or(0, Vec::capacity))
+    }
+}
+
 impl AnswerBytes for api::import::ImportProgress {
     fn answer_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
@@ -2259,9 +2273,14 @@ impl Database {
     /// [`Database::call`] on the owner's own session, its SQL free to name Amphora's own tables
     /// (`__amphora_*`): for a cross-group transaction's steps (CP-T1.10, `crate::xgroup`). An
     /// attached client is refused: its closure can't cross to the owner.
-    pub(crate) fn call_internal<R, F>(&self, until: Instant, f: F) -> Result<R, Refusal>
+    pub(crate) fn call_internal<R, F>(
+        &self,
+        until: Instant,
+        answer: AnswerMax<R>,
+        f: F,
+    ) -> Result<R, Refusal>
     where
-        R: Send + 'static,
+        R: AnswerBytes + Send + 'static,
         F: FnOnce(&mut Db) -> anyhow::Result<R> + Send + 'static,
     {
         let database = self.resolve(until)?;
@@ -2271,7 +2290,7 @@ impl Database {
                 "an attached client can't run Amphora's own SQL; run it on the owner",
             ));
         }
-        database.call_db(until, f)
+        database.call_db(until, answer, f)
     }
 
     /// [`Database::call_internal`] for a cross-group step, `f` answering its value and the
@@ -2282,26 +2301,34 @@ impl Database {
     /// none left to drop, so a ring left to the caller never came (T-T1.10.W7, T-T1.10.W11). A
     /// replicated group rings once answered, as its replicas ring their own lists on applying it
     /// (`ring_unlocked`). A row no get waits on rings no one.
-    pub(crate) fn call_internal_ringing<R, F>(&self, until: Instant, f: F) -> Result<R, Refusal>
+    pub(crate) fn call_internal_ringing<R, F>(
+        &self,
+        until: Instant,
+        answer: AnswerMax<(R, Vec<Vec<u8>>)>,
+        f: F,
+    ) -> Result<R, Refusal>
     where
-        R: Send + 'static,
+        R: AnswerBytes + Send + 'static,
         F: FnOnce(&mut Db) -> anyhow::Result<(R, Vec<Vec<u8>>)> + Send + 'static,
     {
         let database = self.resolve(until)?;
         if !matches!(database.shared.writer, Writer::Local(_)) {
-            let (value, dropped) = database.call_internal(until, f)?;
+            let (value, dropped) = database.call_internal(until, answer, f)?;
             ring(&database.shared.changed, &dropped)?;
             return Ok(value);
         }
         if Instant::now() >= until {
             return Err(Refusal::Timeout);
         }
-        let call: Call = Box::new(move |db| f(db).map(|v| Box::new(v) as Box<dyn Any + Send>));
+        let call: Call = Box::new(move |db| {
+            let value = within(f(db)?, answer)?;
+            Ok(Box::new(value) as Box<dyn Any + Send>)
+        });
         let changed = Arc::clone(&database.shared.changed);
         let (tx, rx) = mpsc::sync_channel(1);
         database.submit_local(
             "",
-            Operation::Call(Mutex::new(Some(call)), api::REQUEST_MAX),
+            Operation::Call(Mutex::new(Some(call)), answer.get()),
             until,
             until,
             move |result| {
@@ -2323,12 +2350,14 @@ impl Database {
             .map_err(|_| Refusal::UnknownOutcome)?
     }
 
-    fn call_db<R, F>(&self, until: Instant, f: F) -> Result<R, Refusal>
+    /// A call on the owner's own session. `answer`: the most bytes its answer holds, charged at
+    /// admission; an answer past it rolls the call back, refused ([`AnswerMax`]).
+    fn call_db<R, F>(&self, until: Instant, answer: AnswerMax<R>, f: F) -> Result<R, Refusal>
     where
-        R: Send + 'static,
+        R: AnswerBytes + Send + 'static,
         F: FnOnce(&mut Db) -> anyhow::Result<R> + Send + 'static,
     {
-        self.call_db_session(until, api::REQUEST_MAX, f)
+        self.call_db_session(until, answer.get(), move |db| Ok(within(f(db)?, answer)?))
             .map(|(value, _)| value)
     }
 

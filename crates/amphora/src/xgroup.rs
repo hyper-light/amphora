@@ -253,6 +253,39 @@ pub enum Reply {
     },
 }
 
+impl Reply {
+    /// Gives back each list's spare capacity, so the reply holds the bytes its call declared
+    /// (`AnswerMax`): a list grown one push at a time holds more than its entries, by however
+    /// `Vec` grows.
+    pub(crate) fn trim(&mut self) {
+        match self {
+            Reply::Open { txns, .. } => txns.shrink_to_fit(),
+            Reply::Locked { reads } => trim_reads(reads),
+            Reply::Conflict { key } | Reply::Unmet { key, .. } => key.shrink_to_fit(),
+            Reply::Staging(groups) => groups.shrink_to_fit(),
+            Reply::Epoch(_)
+            | Reply::Late
+            | Reply::Fenced
+            | Reply::Decided(_)
+            | Reply::Present(_)
+            | Reply::Resolved
+            | Reply::DecidedAt { .. }
+            | Reply::PresentAt { .. } => {}
+        }
+    }
+}
+
+/// A list of reads, each a key and its value, trimmed to what it holds ([`Reply::trim`]).
+pub(crate) fn trim_reads(reads: &mut Vec<(Vec<u8>, Option<Vec<u8>>)>) {
+    reads.shrink_to_fit();
+    for (key, value) in reads.iter_mut() {
+        key.shrink_to_fit();
+        if let Some(value) = value {
+            value.shrink_to_fit();
+        }
+    }
+}
+
 impl crate::database::AnswerBytes for Reply {
     fn answer_bytes(&self) -> usize {
         let heap = match self {
