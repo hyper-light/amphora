@@ -467,6 +467,41 @@ pub(crate) struct LearnedWeights {
     pub(crate) page_miss: Option<f64>,
 }
 
+/// Amphora (AUDIT 3.3): one connection's count of its runs of each sampled operation
+/// ([`LearnedCosts::sampled`]).
+#[derive(Debug, Default)]
+pub(crate) struct RunCounts {
+    seek: RunCount,
+    hash_build: RunCount,
+    hash_probe: RunCount,
+}
+
+impl RunCounts {
+    const fn count(&self, work: Work) -> Option<&RunCount> {
+        match work {
+            Work::Seek => Some(&self.seek),
+            Work::HashBuild => Some(&self.hash_build),
+            Work::HashProbe => Some(&self.hash_probe),
+            Work::Row | Work::Sort | Work::BloomProbe | Work::WhereStep | Work::PageRead => None,
+        }
+    }
+}
+
+/// A count one connection keeps: a load and a store, not a read-modify-write, since one thread
+/// runs a connection's statement at a time; two at once can only lose a count, which moves which
+/// runs are timed, not how many in `every`.
+#[derive(Debug, Default)]
+struct RunCount(AtomicU64);
+
+impl RunCount {
+    /// This run's number, counting it.
+    fn next(&self) -> u64 {
+        let run = self.0.load(Ordering::Relaxed);
+        self.0.store(run.wrapping_add(1), Ordering::Relaxed);
+        run
+    }
+}
+
 /// A database's running cost estimator, shared by its connections.
 #[derive(Debug)]
 pub(crate) struct LearnedCosts {
@@ -494,7 +529,6 @@ pub(crate) struct LearnedCosts {
 /// every run is timed.
 #[derive(Debug)]
 struct Sampling {
-    runs: AtomicU64,
     every: AtomicU64,
     spread: Mutex<Spread>,
     /// PL.8 (T-PL.8.2, lane pl8-22): the timed runs of the batch under way, under
@@ -528,18 +562,15 @@ impl Spread {
 impl Sampling {
     fn new() -> Self {
         Self {
-            runs: AtomicU64::new(0),
             every: AtomicU64::new(1),
             spread: Mutex::new(Spread::default()),
             batch: Mutex::new(Vec::new()),
         }
     }
 
-    fn sampled(&self) -> bool {
-        let every = self.every.load(Ordering::Relaxed).max(1);
-        self.runs
-            .fetch_add(1, Ordering::Relaxed)
-            .is_multiple_of(every)
+    /// Whether the run counted `run` (from 0) is timed: one in `every`.
+    fn sampled(&self, run: u64) -> bool {
+        run.is_multiple_of(self.every.load(Ordering::Relaxed).max(1))
     }
 
     /// Adds a timed run's `nanos`; once an epoch's `epoch` samples are in, sets `every` from their
@@ -600,9 +631,18 @@ impl LearnedCosts {
     }
 
     /// Whether to time this run of `work` (step 3a: the seek, the hash build and the hash probe,
-    /// one run in their `Sampling`'s `every`).
-    pub(crate) fn sampled(&self, work: Work) -> bool {
-        self.sampling(work).is_some_and(Sampling::sampled)
+    /// one run in their `Sampling`'s `every`), counted in `runs`, the asking connection's own.
+    ///
+    /// Amphora (AUDIT 3.3): the runs were counted in one database-wide atomic, a `fetch_add` on
+    /// a cache line every connection's every seek, hash build and hash probe wrote. Each
+    /// connection counts its own now: one in `every` of its runs is timed, as one in `every` of
+    /// all of them was, so the sample (and the rate it moves) is the same systematic sample, and
+    /// the shared `every` is only read.
+    pub(crate) fn sampled(&self, work: Work, runs: &RunCounts) -> bool {
+        match (self.sampling(work), runs.count(work)) {
+            (Some(sampling), Some(count)) => sampling.sampled(count.next()),
+            _ => false,
+        }
     }
 
     /// Records a timed run of `work`, one unit in `nanos`: it moves the rate, and its spread sets
@@ -1066,16 +1106,17 @@ mod tests {
     #[test]
     fn t_qt_5_5_sampled_seeks_move_the_rate_and_thin_out() {
         let costs = LearnedCosts::from_rates(&fixed_rates(1.0, 10.0, 20.0, 15.0, 2.0));
+        let runs = RunCounts::default();
         for i in 0..100 {
-            assert!(costs.sampled(Work::Seek));
+            assert!(costs.sampled(Work::Seek, &runs));
             costs.observe_sampled(Work::Seek, if i % 2 == 0 { 100.0 } else { 150.0 });
         }
-        let timed = (0..120).filter(|_| costs.sampled(Work::Seek)).count();
+        let timed = (0..120).filter(|_| costs.sampled(Work::Seek, &runs)).count();
         assert!(timed > 0 && timed < 120, "{timed}");
         let weights = costs.weights().unwrap();
         assert!((weights.seek - 125.0).abs() < 1e-9, "{weights:?}");
         assert_eq!(weights.hash_probe, 15.0);
-        assert!(!costs.sampled(Work::Sort));
+        assert!(!costs.sampled(Work::Sort, &runs));
     }
 
     /// Do: calibrate on this machine with no operator observed. Expect: every weight a finite,
