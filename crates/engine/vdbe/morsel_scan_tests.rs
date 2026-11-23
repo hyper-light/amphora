@@ -3714,7 +3714,7 @@ fn g8_exact_real_sums_hold_the_hard_cases() {
     // Each case's exact sum from the values as the engine parsed them (its decimal parsing is
     // not this test's subject): `stored` in row order.
     type Exact = fn(&[f64]) -> Option<f64>;
-    let cases: [(&str, &[&str], Exact); 9] = [
+    let cases: [(&str, &[&str], Exact); 11] = [
         ("cancellation", &["1e16", "1.0", "-1e16"], |v| Some(v[1])),
         ("tenths", &["0.1", "0.2", "-0.3"], |v| {
             // Each is a multiple of 2^-60 below 2^4: their sum in 2^-60ths is exact in an i128,
@@ -3734,6 +3734,14 @@ fn g8_exact_real_sums_hold_the_hard_cases() {
         ("both infinities", &["9e999", "-9e999", "1.0"], |_| None),
         ("past 2^53", &["9007199254740992.0", "1.0", "1.0"], |v| {
             Some(v[0] + 2.0)
+        }),
+        // Lane R4: R1's bigpairs, a short order's +1e308s unmatched: past the range, +inf, as
+        // SQLite answers; and a running sum that passes the range and comes back, exactly.
+        ("bigpairs", &["1e308", "1e308", "-1e308", "-1e308", "1e308", "1e308"], |_| {
+            Some(f64::INFINITY)
+        }),
+        ("overflow and back", &["1e308", "1e308", "-1e308", "-1e308", "1.5"], |v| {
+            Some(v[4])
         }),
     ];
     for (at, (name, values, exact)) in cases.iter().enumerate() {

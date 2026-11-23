@@ -1992,6 +1992,46 @@ mod tests {
         assert_eq!(special.value(), f64::INFINITY);
     }
 
+    /// Lane R4: a sum stays exact past the double's range. Do: R1's bigpairs (+1e308 +1e308
+    /// -1e308 -1e308 an order, a short order's +1e308s unmatched), a running sum that overflows
+    /// and comes back, and sums at the range's edge (a tie, and a tie a tiny term breaks), each
+    /// cut in two at every place, merged both ways, and through the payload's bytes. Expect the
+    /// exact sum rounded once: +inf for bigpairs (SQLite's too), never NULL.
+    #[test]
+    fn r4_exact_sum_stays_exact_past_the_range() {
+        let max = f64::MAX;
+        let half_ulp = 2f64.powi(970);
+        let tiny = f64::from_bits(1);
+        let cases: [(&str, &[f64], f64); 6] = [
+            ("bigpairs", &[1e308, 1e308, -1e308, -1e308, 1e308, 1e308], f64::INFINITY),
+            ("overflow and back", &[1e308, 1e308, -1e308, -1e308, 1.5], 1.5),
+            ("down and back", &[-max, -max, -max, max, max, max, -0.25], -0.25),
+            ("max again", &[max, max, -max], max),
+            ("the tie past max", &[max, half_ulp], f64::INFINITY),
+            ("a tiny term breaks the tie", &[max, half_ulp, -tiny], max),
+        ];
+        for (name, terms, expected) in cases {
+            for cut in 0..=terms.len() {
+                let (left, right) = terms.split_at(cut);
+                let mut a = ExactSum::default();
+                left.iter().for_each(|t| a.add(*t).unwrap());
+                let mut b = ExactSum::default();
+                right.iter().rev().for_each(|t| b.add(*t).unwrap());
+                let mut ab = a.clone();
+                ab.merge(&b).unwrap();
+                let mut ba = b.clone();
+                ba.merge(&a).unwrap();
+                let mut bytes = crate::alloc::Vec::new();
+                ab.write_to(&mut bytes).unwrap();
+                let read = ExactSum::read_from(&bytes).unwrap();
+                for (way, sum) in [("a+b", &ab), ("b+a", &ba), ("bytes", &read)] {
+                    assert!(!sum.is_nan(), "{name}, cut at {cut}, {way}");
+                    assert_eq!(sum.value().to_bits(), expected.to_bits(), "{name}, cut at {cut}, {way}: {}", sum.value());
+                }
+            }
+        }
+    }
+
     /// T-QT.6.4: a statement whose workers together pass its memory budget is refused with the typed
     /// error at every worker count, and the budget's use never passes its limit.
     #[test]
