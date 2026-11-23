@@ -4,7 +4,17 @@
 //! enter Amphora. Each statement gets 19's verdict: its tree (`nodeToStringWithLocations`) or its
 //! refusal (SQLSTATE, message, cursor). [`split`] gives the statements psql sends for a script, so
 //! 19's regression SQL is a corpus.
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::arithmetic_side_effects, clippy::disallowed_macros))]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::disallowed_macros
+    )
+)]
 
 pub mod digest;
 pub mod split;
@@ -20,7 +30,11 @@ pub enum Verdict {
     /// Accepted: the List of RawStmt, as `nodeToStringWithLocations` prints it.
     Tree(String),
     /// Refused, with ErrorResponse's C, M and P fields (P is 0 when the error has no position).
-    Refused { sqlstate: String, cursor: u32, message: String },
+    Refused {
+        sqlstate: String,
+        cursor: u32,
+        message: String,
+    },
 }
 
 #[derive(Debug)]
@@ -74,11 +88,18 @@ impl Oracle {
     }
 
     fn start(mut command: Command) -> Result<Self, OracleError> {
-        let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()?;
         let (Some(input), Some(output)) = (child.stdin.take(), child.stdout.take()) else {
             return Err(OracleError::Ended);
         };
-        Ok(Self { child, input, output: BufReader::new(output) })
+        Ok(Self {
+            child,
+            input,
+            output: BufReader::new(output),
+        })
     }
 
     pub fn parse(&mut self, sql: &[u8]) -> Result<Verdict, OracleError> {
@@ -101,7 +122,8 @@ impl Drop for Oracle {
 }
 
 fn number<T: std::str::FromStr>(word: Option<&str>, what: &'static str) -> Result<T, OracleError> {
-    word.and_then(|w| w.parse().ok()).ok_or(OracleError::Frame(what))
+    word.and_then(|w| w.parse().ok())
+        .ok_or(OracleError::Frame(what))
 }
 
 /// One frame: `T <bytes>\n<tree>\n` or `E <SQLSTATE> <cursor> <bytes>\n<message>\n`.
@@ -110,20 +132,30 @@ pub fn read_verdict(r: &mut impl BufRead) -> Result<Verdict, OracleError> {
     if r.read_line(&mut head)? == 0 {
         return Err(OracleError::Ended);
     }
-    let head = head.strip_suffix('\n').ok_or(OracleError::Frame("a head without its newline"))?;
+    let head = head
+        .strip_suffix('\n')
+        .ok_or(OracleError::Frame("a head without its newline"))?;
     let mut words = head.split(' ');
     let kind = words.next();
     let refusal = match kind {
         Some("T") => None,
         Some("E") => {
-            let sqlstate = words.next().filter(|s| s.len() == 5 && s.bytes().all(|c| c.is_ascii_alphanumeric())).ok_or(OracleError::Frame("a SQLSTATE that isn't five characters"))?;
-            Some((sqlstate.to_owned(), number::<u32>(words.next(), "a cursor that isn't a number")?))
+            let sqlstate = words
+                .next()
+                .filter(|s| s.len() == 5 && s.bytes().all(|c| c.is_ascii_alphanumeric()))
+                .ok_or(OracleError::Frame("a SQLSTATE that isn't five characters"))?;
+            Some((
+                sqlstate.to_owned(),
+                number::<u32>(words.next(), "a cursor that isn't a number")?,
+            ))
         }
         _ => return Err(OracleError::Frame("a frame that is neither T nor E")),
     };
     let len: u64 = number(words.next(), "a length that isn't a number")?;
     if words.next().is_some() {
-        return Err(OracleError::Frame("a head with more words than its kind takes"));
+        return Err(OracleError::Frame(
+            "a head with more words than its kind takes",
+        ));
     }
     let mut body = Vec::new();
     if r.by_ref().take(len).read_to_end(&mut body)? as u64 != len {
@@ -134,10 +166,15 @@ pub fn read_verdict(r: &mut impl BufRead) -> Result<Verdict, OracleError> {
     if end != *b"\n" {
         return Err(OracleError::Frame("a body longer than its stated length"));
     }
-    let body = String::from_utf8(body).map_err(|_| OracleError::Frame("a body that isn't UTF-8"))?;
+    let body =
+        String::from_utf8(body).map_err(|_| OracleError::Frame("a body that isn't UTF-8"))?;
     Ok(match refusal {
         None => Verdict::Tree(body),
-        Some((sqlstate, cursor)) => Verdict::Refused { sqlstate, cursor, message: body },
+        Some((sqlstate, cursor)) => Verdict::Refused {
+            sqlstate,
+            cursor,
+            message: body,
+        },
     })
 }
 
@@ -160,10 +197,21 @@ pub fn tokens(body: &str) -> Result<Vec<Token>, OracleError> {
         let token = number(words.next(), "a token number that isn't one")?;
         let offset = number(words.next(), "a token offset that isn't a number")?;
         let len: usize = number(words.next(), "a token length that isn't a number")?;
-        let tail = words.next().ok_or(OracleError::Frame("a token line cut short"))?;
-        let value = tail.get(..len).ok_or(OracleError::Frame("a token value shorter than its length"))?;
-        rest = tail.get(len..).and_then(|r| r.strip_prefix('\n')).ok_or(OracleError::Frame("a token value longer than its length"))?;
-        out.push(Token { token, offset, value: value.to_owned() });
+        let tail = words
+            .next()
+            .ok_or(OracleError::Frame("a token line cut short"))?;
+        let value = tail
+            .get(..len)
+            .ok_or(OracleError::Frame("a token value shorter than its length"))?;
+        rest = tail
+            .get(len..)
+            .and_then(|r| r.strip_prefix('\n'))
+            .ok_or(OracleError::Frame("a token value longer than its length"))?;
+        out.push(Token {
+            token,
+            offset,
+            value: value.to_owned(),
+        });
     }
     Ok(out)
 }
@@ -175,9 +223,27 @@ mod tests {
     /// T-PG.4.2: the oracle's token lines read back as tokens, values with spaces and newlines whole.
     #[test]
     fn t_pg_4_2_token_lines_read_back() {
-        let t = |token, offset, value: &str| Token { token, offset, value: value.into() };
-        assert_eq!(tokens("655 0 6 select\n258 7 1 a\n44 8 0 \n261 10 4 a\nb \n").unwrap(), [t(655, 0, "select"), t(258, 7, "a"), t(44, 8, ""), t(261, 10, "a\nb ")]);
-        for bad in ["655 0 7 select\n", "655 0 5 select\n", "x 0 0 \n", "655 0", "655 0 0 "] {
+        let t = |token, offset, value: &str| Token {
+            token,
+            offset,
+            value: value.into(),
+        };
+        assert_eq!(
+            tokens("655 0 6 select\n258 7 1 a\n44 8 0 \n261 10 4 a\nb \n").unwrap(),
+            [
+                t(655, 0, "select"),
+                t(258, 7, "a"),
+                t(44, 8, ""),
+                t(261, 10, "a\nb ")
+            ]
+        );
+        for bad in [
+            "655 0 7 select\n",
+            "655 0 5 select\n",
+            "x 0 0 \n",
+            "655 0",
+            "655 0 0 ",
+        ] {
             assert!(tokens(bad).is_err(), "{bad:?}");
         }
     }
@@ -192,18 +258,38 @@ mod tests {
         assert_eq!(read("T 4\n(a\n)\n").unwrap(), Verdict::Tree("(a\n)".into()));
         assert_eq!(
             read("E 42601 8 29\ntrailing junk after parameter\n").unwrap(),
-            Verdict::Refused { sqlstate: "42601".into(), cursor: 8, message: "trailing junk after parameter".into() }
+            Verdict::Refused {
+                sqlstate: "42601".into(),
+                cursor: 8,
+                message: "trailing junk after parameter".into()
+            }
         );
         let mut two = "T 0\n\nE 0A000 0 1\nx\n".as_bytes();
-        assert_eq!(read_verdict(&mut two).unwrap(), Verdict::Tree(String::new()));
-        assert!(matches!(read_verdict(&mut two).unwrap(), Verdict::Refused { cursor: 0, .. }));
+        assert_eq!(
+            read_verdict(&mut two).unwrap(),
+            Verdict::Tree(String::new())
+        );
+        assert!(matches!(
+            read_verdict(&mut two).unwrap(),
+            Verdict::Refused { cursor: 0, .. }
+        ));
         assert!(matches!(read_verdict(&mut two), Err(OracleError::Ended)));
     }
 
     /// T-PG.3.1: a malformed frame is refused, never read past.
     #[test]
     fn t_pg_3_1_malformed_frames_are_refused() {
-        for frame in ["X 1\na\n", "T\n", "T 3\nab\n", "T 1\nab\n", "E 4260 1 1\na\n", "E 42601 x 1\na\n", "T 1 1\na\n", "T 1", "T 1\n\u{0}"] {
+        for frame in [
+            "X 1\na\n",
+            "T\n",
+            "T 3\nab\n",
+            "T 1\nab\n",
+            "E 4260 1 1\na\n",
+            "E 42601 x 1\na\n",
+            "T 1 1\na\n",
+            "T 1",
+            "T 1\n\u{0}",
+        ] {
             assert!(read(frame).is_err(), "{frame:?}");
         }
     }

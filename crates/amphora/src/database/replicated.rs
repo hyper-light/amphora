@@ -4634,8 +4634,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                 #[cfg(test)]
                 if self.turn_context.as_ref() == Some(&pending.context) {
                     self.turn_context = None;
-                    if matches!(&result, Err(Refusal::Serialization { .. }))
-                    {
+                    if matches!(&result, Err(Refusal::Serialization { .. })) {
                         self.turns.1 = self.turns.1.saturating_add(1);
                     }
                 }
@@ -9594,7 +9593,14 @@ mod tests {
             1,
             "{outcomes:?}"
         );
-        assert_eq!(outcomes.iter().filter(|r| matches!(r, Err(Refusal::Serialization { .. }))).count(), 1, "{outcomes:?}");
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|r| matches!(r, Err(Refusal::Serialization { .. })))
+                .count(),
+            1,
+            "{outcomes:?}"
+        );
         let count = driven
             .call(&mut pump, clients.get(origin).unwrap(), |db| {
                 db.exec("INSERT INTO actor_items(value) VALUES(x'03')")?;
@@ -13184,10 +13190,7 @@ mod tests {
         let compacted = {
             let owner = &mut driven.owner_mut(leader);
             let now = owner.now().unwrap();
-            owner
-                .replica
-                .compact(0, now, &owner.waker)
-                .unwrap();
+            owner.replica.compact(0, now, &owner.waker).unwrap();
             owner.replica.applied().index
         };
         for _ in 0..64 {
@@ -16172,10 +16175,7 @@ mod tests {
         let compacted = {
             let owner = driven.owner_mut(0);
             let now = owner.now().unwrap();
-            owner
-                .replica
-                .compact(0, now, &owner.waker)
-                .unwrap();
+            owner.replica.compact(0, now, &owner.waker).unwrap();
             owner.replica.applied().index
         };
         for _ in 0..64 {
@@ -16549,10 +16549,7 @@ mod tests {
             driven.quiet(pump);
             let owner = driven.owner_mut(0);
             let now = owner.now().unwrap();
-            let out = owner
-                .replica
-                .compact(0, now, &owner.waker)
-                .unwrap();
+            let out = owner.replica.compact(0, now, &owner.waker).unwrap();
             assert!(out, "no compaction went out");
             driven.quiet(pump);
         };
@@ -17920,7 +17917,11 @@ mod tests {
                     run.violations
                 );
                 assert_eq!(run.unknown, 0, "keys {keys} seed {seed}");
-                let checked = if keys == 2 { &run.streak[1..] } else { &run.streak[..] };
+                let checked = if keys == 2 {
+                    &run.streak[1..]
+                } else {
+                    &run.streak[..]
+                };
                 assert!(
                     checked.iter().all(|streak| *streak <= 1),
                     "keys {keys} seed {seed}: {:?}",
@@ -18018,8 +18019,13 @@ mod tests {
             driven.round(&mut pump);
             rounds += 1;
         }
-        assert_eq!(crashes, CRASHES, "the writers all landed before the crashes ran");
-        eprintln!("{WRITERS} writers through {crashes} leader crashes: {again} sent again, {rounds} rounds");
+        assert_eq!(
+            crashes, CRASHES,
+            "the writers all landed before the crashes ran"
+        );
+        eprintln!(
+            "{WRITERS} writers through {crashes} leader crashes: {again} sent again, {rounds} rounds"
+        );
         driven.quiet(&mut pump);
         driven.tick(&mut pump, leader);
         driven.tick(&mut pump, leader);
@@ -18084,7 +18090,11 @@ mod tests {
         let mut refused = vec![0u64; WRITERS];
         let mut rounds = 0;
         while inflight.iter().any(Option::is_some) {
-            assert!(rounds < ROUNDS, "unanswered: {:?}", inflight.iter().filter(|w| w.is_some()).count());
+            assert!(
+                rounds < ROUNDS,
+                "unanswered: {:?}",
+                inflight.iter().filter(|w| w.is_some()).count()
+            );
             for (id, slot) in inflight.iter_mut().enumerate() {
                 let Some((via, answer)) = slot.take() else {
                     continue;
@@ -18165,11 +18175,23 @@ mod tests {
         let mut landed: i64 = 0;
         for round in 0..20 {
             let mut inflight: Vec<Option<(usize, Answering)>> = (0..3)
-                .map(|via| Some((via, submit(&clients[via], driven.until(), append(round * 3 + via)))))
+                .map(|via| {
+                    Some((
+                        via,
+                        submit(&clients[via], driven.until(), append(round * 3 + via)),
+                    ))
+                })
                 .collect();
             let mut rounds = 0;
             while inflight.iter().any(Option::is_some) {
-                assert!(rounds < ROUNDS, "round {round}: unanswered {:?}", inflight.iter().map(|w| w.as_ref().map(|(via, _)| *via)).collect::<Vec<_>>());
+                assert!(
+                    rounds < ROUNDS,
+                    "round {round}: unanswered {:?}",
+                    inflight
+                        .iter()
+                        .map(|w| w.as_ref().map(|(via, _)| *via))
+                        .collect::<Vec<_>>()
+                );
                 for slot in &mut inflight {
                     let Some((via, answer)) = slot.take() else {
                         continue;
@@ -18180,7 +18202,10 @@ mod tests {
                         Ok(Ok(_)) => landed += 1,
                         Ok(Err(refused @ Refusal::Serialization { .. })) => {
                             serialization.push(refused);
-                            *slot = Some((via, submit(&clients[via], driven.until(), append(round * 3 + via))));
+                            *slot = Some((
+                                via,
+                                submit(&clients[via], driven.until(), append(round * 3 + via)),
+                            ));
                         }
                         Ok(Err(other)) => panic!("append via {via}: {other:?}"),
                     }
@@ -18192,13 +18217,24 @@ mod tests {
                 break;
             }
         }
-        let refused = serialization.first().expect("no append was refused Serialization");
-        assert_eq!(refused.to_string(), "invalid prepared transaction: the database advanced since preparation");
+        let refused = serialization
+            .first()
+            .expect("no append was refused Serialization");
+        assert_eq!(
+            refused.to_string(),
+            "invalid prepared transaction: the database advanced since preparation"
+        );
         let malformed = driven.call(&mut pump, &clients[(leader + 1) % 3], |db| {
             db.exec("INSERT INTO events VALUES (-1)")?;
             Err(api::invalid("events row", "its id is negative").into())
         });
-        assert_eq!(malformed.err(), Some(Refusal::Invalid { what: "events row".into(), why: "its id is negative".into() }));
+        assert_eq!(
+            malformed.err(),
+            Some(Refusal::Invalid {
+                what: "events row".into(),
+                why: "its id is negative".into()
+            })
+        );
         driven.quiet(&mut pump);
         driven.tick(&mut pump, leader);
         for owner in 0..3 {
@@ -18299,7 +18335,9 @@ mod tests {
                     "slot off {slot_off} attempt {attempt}: the leader's write"
                 );
             }
-            let stale = |outcome: &Result<Vec<u8>, Refusal>| matches!(outcome, Err(Refusal::Serialization { .. }));
+            let stale = |outcome: &Result<Vec<u8>, Refusal>| {
+                matches!(outcome, Err(Refusal::Serialization { .. }))
+            };
             if slot_off {
                 assert!(outcomes.iter().all(stale), "today's rule: {outcomes:?}");
             } else {
@@ -18389,7 +18427,9 @@ mod tests {
                     "off {off} attempt {attempt}: the leader's write"
                 );
             }
-            let stale = |outcome: &Result<Vec<u8>, Refusal>| matches!(outcome, Err(Refusal::Serialization { .. }));
+            let stale = |outcome: &Result<Vec<u8>, Refusal>| {
+                matches!(outcome, Err(Refusal::Serialization { .. }))
+            };
             let moved = driven.owner(leader).read_sets_moved;
             if off {
                 assert!(outcomes.iter().all(stale), "read sets off: {outcomes:?}");

@@ -278,11 +278,7 @@ impl Prepared for Kept<'_> {
             .held
             .as_mut()
             .ok_or_else(|| failed("a prepared statement ran after it was given back"))?;
-        stream(
-            params,
-            |params, row| db.run_held(held, params, row),
-            each,
-        )
+        stream(params, |params, row| db.run_held(held, params, row), each)
     }
 }
 impl Drop for Kept<'_> {
@@ -299,11 +295,13 @@ impl Drop for Kept<'_> {
 /// The memory `values` take once owned: each value and what it points to, and the row's vector.
 /// The transport's decoders count a row the same way (`transport::bounded::rows`).
 pub(crate) fn row_bytes(values: &[Value]) -> Option<usize> {
-    values.iter().try_fold(std::mem::size_of::<Vec<Value>>(), |bytes, value| {
-        bytes
-            .checked_add(std::mem::size_of::<Value>())?
-            .checked_add(payload(value))
-    })
+    values
+        .iter()
+        .try_fold(std::mem::size_of::<Vec<Value>>(), |bytes, value| {
+            bytes
+                .checked_add(std::mem::size_of::<Value>())?
+                .checked_add(payload(value))
+        })
 }
 
 fn payload(value: &Value) -> usize {
@@ -420,7 +418,10 @@ mod tests {
         db.call(until(), move |c| {
             let refused = c.execute("SELECT ?1, ?2", [half(), half()]);
             assert!(
-                matches!(refused, Err(super::Error::Refusal(Refusal::TooLarge { .. }))),
+                matches!(
+                    refused,
+                    Err(super::Error::Refusal(Refusal::TooLarge { .. }))
+                ),
                 "{refused:?}"
             );
             Ok(())
@@ -438,7 +439,10 @@ mod tests {
         db.call(until(), |c| {
             c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)")?;
             for id in 1..=3i64 {
-                c.execute("INSERT INTO t VALUES (?1, ?2)", [Value::Integer(id), Value::Blob(vec![1; 8])])?;
+                c.execute(
+                    "INSERT INTO t VALUES (?1, ?2)",
+                    [Value::Integer(id), Value::Blob(vec![1; 8])],
+                )?;
             }
             c.execute(
                 "INSERT INTO t VALUES (4, ?1)",
@@ -469,7 +473,10 @@ mod tests {
                 Ok(true)
             });
             assert!(
-                matches!(refused, Err(super::Error::Refusal(Refusal::TooLarge { .. }))),
+                matches!(
+                    refused,
+                    Err(super::Error::Refusal(Refusal::TooLarge { .. }))
+                ),
                 "{refused:?}"
             );
             assert_eq!(before, 3, "the rows before it");
