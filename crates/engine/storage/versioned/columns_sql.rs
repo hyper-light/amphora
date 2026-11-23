@@ -1422,7 +1422,8 @@ mod tests {
     /// Lane R5 (one `ExactSum`): under `RealSums::Exact` the column copy's SUM is the rows' own
     /// `morsel::ExactSum`. Do: per group, R1's bigpairs, a sum that overflows and comes back, and
     /// an infinity beside finite values that overflow the other way, summed from a copy and from
-    /// the rows. Expect +inf, 1.5 and +inf from both, with the copy read.
+    /// the rows (3,000 zeros in a group of their own, so the planner reads the copy). Expect
+    /// +inf, 1.5 and +inf from both, with the copy read.
     #[test]
     fn r5_the_copys_exact_sum_stays_exact_past_the_range() {
         let (_a, on) = connect();
@@ -1440,9 +1441,12 @@ mod tests {
                  (13, 3, -1e308), (14, 3, -1e308)",
             )
             .unwrap();
+            c.execute("INSERT INTO r SELECT value + 100, 0, 0.0 FROM generate_series(1, 3000)")
+                .unwrap();
         }
         let q = "SELECT g, sum(x) FROM r GROUP BY g";
         let want = vec![
+            vec![Value::from_i64(0), Value::from_f64(0.0)],
             vec![Value::from_i64(1), Value::from_f64(f64::INFINITY)],
             vec![Value::from_i64(2), Value::from_f64(1.5)],
             vec![Value::from_i64(3), Value::from_f64(f64::INFINITY)],
