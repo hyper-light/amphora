@@ -2842,6 +2842,7 @@ impl Database {
             temp_store: AtomicTempStore::new(TempStore::Default),
             data_sync_retry: AtomicBool::new(false),
             busy_handler: RwLock::new(BusyHandler::None),
+            busy_schedule: AtomicBool::new(false),
             progress_handler: ProgressHandler::new(),
             query_timeout_ms: AtomicU64::new(0),
             interrupt_requested: AtomicBool::new(false),

@@ -10,6 +10,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 pub use amphora_engine::LogFormat;
+use amphora_engine::busy::BusyWake;
 use amphora_engine::io::FileSyncType;
 use amphora_engine::{
     Buffer, CheckpointMode, Completion, CompletionError, ConnectOpts, Connection, Database,
@@ -26,10 +27,6 @@ pub use amphora_engine::storage::shared_pages::{Charge, SharedPages};
 
 /// How long opening waits for another process's hold on the file to go.
 const LOCK_WAIT: Duration = Duration::from_secs(15);
-/// A statement that finds the database busy (another connection writing, a checkpoint) tries again
-/// after this, this many times.
-const BUSY_WAIT: Duration = Duration::from_millis(1);
-const BUSY_TRIES: u32 = 10_000;
 /// Pages each connection keeps in memory, by what it does (docs/design/store.md, decision 5): the
 /// writer keeps the inner pages of its indexes; a reader 2,000 (8 MiB, Turso's own default), since
 /// it forgets only what commits wrote (decision 18), so its cache serves the reads after them; the
@@ -84,6 +81,18 @@ fn connect_opts() -> ConnectOpts {
     )))
 }
 
+/// A connection of `db`. A statement of it that finds the database busy (another connection
+/// writing, a checkpoint) waits for the lock's release, the engine's default ([`BusyWake`]), with no
+/// deadline of its own: every holder is a connection of this process, and each holder's transaction
+/// ends, by its end or by its request's deadline ([`Db::deadline`]), which releases the lock (lane
+/// constants-22, goal "no picked constants": the 1 ms retried 10,000 times is gone). The busy
+/// timeout isn't set per request: the engine's setter makes every cached statement prepare again.
+fn connect(db: &Arc<Database>) -> Result<Arc<Connection>, LimboError> {
+    let conn = db.connect(connect_opts())?;
+    conn.set_busy_timeout(Duration::MAX);
+    Ok(conn)
+}
+
 /// The pages a process's pool keeps at most, given the bytes of memory the process may use: a
 /// [`MEMORY_SHARE_DIVISOR`]th of them, at least [`MIN_PROCESS_PAGES`]; [`UNKNOWN_MEMORY_PAGES`]
 /// when the system doesn't say.
@@ -105,7 +114,22 @@ fn fail(e: impl std::error::Error + Send + Sync + 'static) -> anyhow::Error {
     anyhow::Error::new(e)
 }
 
-/// Parks this thread for `d` (a park ends early for no reason sometimes: the rest is parked again).
+/// Wakes the thread that made it: what a statement stepped on this thread waits on while it is busy
+/// (the release of the lock it found held, [`step`]).
+struct Unpark(std::thread::Thread);
+
+impl std::task::Wake for Unpark {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+/// Parks this thread for `d` whatever wakes it: a busy statement's wait on SQLite's schedule, the
+/// control ([`BusyWake::Schedule`]), whose engine wakes the waker at once and means the delay.
 fn pause(d: Duration) {
     let until = Instant::now().checked_add(d).unwrap_or_else(Instant::now);
     loop {
@@ -219,7 +243,7 @@ impl Db {
                 .db_opts(DatabaseOpts::new().with_without_rowid(true)),
         )
         .map_err(fail)?;
-        let conn = db.connect(connect_opts()).map_err(fail)?;
+        let conn = connect(&db).map_err(fail)?;
         conn.set_statement_journals(false);
         Ok(Self {
             io,
@@ -313,9 +337,7 @@ impl Db {
                 opened => break opened.map_err(|e| anyhow::anyhow!("opening {name}: {e}"))?,
             }
         };
-        let conn = db
-            .connect(connect_opts())
-            .map_err(|e| anyhow::anyhow!("connecting to {name}: {e}"))?;
+        let conn = connect(&db).map_err(|e| anyhow::anyhow!("connecting to {name}: {e}"))?;
         conn.set_statement_journals(false);
         let d = Self {
             io,
@@ -358,7 +380,7 @@ impl Db {
         let r = Self {
             io: self.io.clone(),
             db: self.db.clone(),
-            conn: self.db.connect(connect_opts()).map_err(fail)?,
+            conn: connect(&self.db).map_err(fail)?,
             path: self.path.clone(),
             statements: cache::Cache::default(),
             owner: self.owner.clone(),
@@ -388,7 +410,7 @@ impl Db {
             let r = Self {
                 io: held.io.clone(),
                 db: held.db.clone(),
-                conn: held.db.connect(connect_opts()).map_err(fail)?,
+                conn: connect(&held.db).map_err(fail)?,
                 path: path.clone(),
                 statements: cache::Cache::default(),
                 owner: held.owner.clone(),
@@ -1367,9 +1389,11 @@ fn step_between(
         let at = NonZero::new(i.saturating_add(1)).ok_or_else(|| anyhow::anyhow!("parameter 0"))?;
         stmt.bind_at(at, p).map_err(fail)?;
     }
-    let mut busy = 0u32;
+    // The engine wakes this thread when a lock the statement found held is released, and the
+    // statement tries again then: no delay of its own between tries (lane constants-22).
+    let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
     loop {
-        match stmt.step().map_err(fail)? {
+        match stmt.step_with_waker(&waker).map_err(fail)? {
             StepResult::Row => {
                 if let Some(row) = stmt.row()
                     && !each(row)?
@@ -1382,16 +1406,18 @@ fn step_between(
                 between()?;
                 io.step().map_err(fail)?;
             }
+            // Busy: until the waker is woken (a release), or the deadline the duration says. A park
+            // that ends early for no reason only tries the step again.
             StepResult::Sleep { duration } => {
-                pause(duration);
+                if stmt.busy_wake() == BusyWake::Schedule {
+                    pause(duration);
+                } else if !duration.is_zero() {
+                    std::thread::park_timeout(duration);
+                }
                 io.step().map_err(fail)?;
             }
             StepResult::Busy => {
-                busy = busy.saturating_add(1);
-                if busy > BUSY_TRIES {
-                    anyhow::bail!("the database stayed busy");
-                }
-                pause(BUSY_WAIT);
+                anyhow::bail!("the database stayed busy")
             }
             StepResult::Interrupt => return Err(fail(LimboError::Interrupt)),
         }
@@ -1401,6 +1427,111 @@ fn step_between(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Counts its wakes and unparks the thread that made it.
+    struct Woken {
+        thread: std::thread::Thread,
+        wakes: std::sync::atomic::AtomicUsize,
+    }
+    impl std::task::Wake for Woken {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+            self.thread.unpark();
+        }
+    }
+
+    /// T-QB.1.14 (lane constants-22; goal dfabffcc, "every wait wakes on an event"): a write busy
+    /// on another connection's write lock wakes on its release. One connection holds the write lock; the
+    /// other's insert finds it held and parks, saying so; then the first commits. Under the release
+    /// wake (the default) nothing woke the waiter before the commit, and the commit's release does;
+    /// under SQLite's schedule (the control) the engine woke it at once, before any release, and it
+    /// tries again on the schedule's delays. Each prints the time from the commit to the waiter's
+    /// insert done (its wake latency, for the A/B; nothing here asserts a time).
+    #[test]
+    fn constants_22_a_busy_write_wakes_on_the_write_locks_release() {
+        for wake in [BusyWake::Release, BusyWake::Schedule] {
+            let dir = tempfile::tempdir().unwrap();
+            let holder = Db::open(&dir.path().join("busy.db")).unwrap();
+            holder.exec("CREATE TABLE t (x INTEGER)").unwrap();
+            let waiter = holder.reader().unwrap();
+            waiter.conn.set_busy_wake(wake);
+            holder.exec("BEGIN IMMEDIATE").unwrap();
+            holder.exec("INSERT INTO t VALUES (1)").unwrap();
+            let (parked_tx, parked) = std::sync::mpsc::channel();
+            let conn = Arc::clone(&waiter.conn);
+            let io = Arc::clone(&waiter.io);
+            let thread = std::thread::spawn(move || {
+                let woken = Arc::new(Woken {
+                    thread: std::thread::current(),
+                    wakes: std::sync::atomic::AtomicUsize::new(0),
+                });
+                let waker = std::task::Waker::from(Arc::clone(&woken));
+                let mut stmt = conn.prepare("INSERT INTO t VALUES (2)").unwrap();
+                let mut woken_before = None;
+                loop {
+                    match stmt.step_with_waker(&waker).unwrap() {
+                        StepResult::Done => break,
+                        StepResult::IO | StepResult::Yield => io.step().unwrap(),
+                        StepResult::Sleep { duration } => {
+                            // The first wait it holds (a zero sleep is a try again at once).
+                            if woken_before.is_none() && !duration.is_zero() {
+                                woken_before = Some(woken.wakes.load(Ordering::SeqCst));
+                                parked_tx.send(()).unwrap();
+                            }
+                            if wake == BusyWake::Schedule {
+                                pause(duration);
+                            } else if !duration.is_zero() {
+                                std::thread::park_timeout(duration);
+                            }
+                            io.step().unwrap();
+                        }
+                        other => panic!("the waiting insert stepped to {other:?}"),
+                    }
+                }
+                (
+                    Instant::now(),
+                    woken_before,
+                    woken.wakes.load(Ordering::SeqCst),
+                )
+            });
+            parked.recv().unwrap();
+            let committed = Instant::now();
+            holder.exec("COMMIT").unwrap();
+            let (done, woken_before, wakes) = thread.join().unwrap();
+            eprintln!(
+                "constants-22 wake={wake:?} commit_to_done={:?} woken_before_release={woken_before:?} wakes={wakes}",
+                done.saturating_duration_since(committed)
+            );
+            match wake {
+                BusyWake::Release => {
+                    assert_eq!(
+                        woken_before,
+                        Some(0),
+                        "nothing wakes a busy write before a release"
+                    );
+                    assert!(wakes >= 1, "the commit's release woke the waiter");
+                }
+                BusyWake::Schedule => {
+                    assert_eq!(
+                        woken_before,
+                        Some(1),
+                        "the schedule wakes the waker at once"
+                    );
+                }
+            }
+            let mut rows = 0;
+            waiter
+                .query("SELECT x FROM t", [], |_| {
+                    rows += 1;
+                    Ok(true)
+                })
+                .unwrap();
+            assert_eq!(rows, 2, "both inserts committed");
+        }
+    }
 
     /// Says, as it drops, how many strong handles its engine still has.
     struct EngineWitness {

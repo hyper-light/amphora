@@ -237,7 +237,11 @@ fn relay(partitions: &[Partition], stop: &AtomicBool, bell: &Arc<Bell>, wait: Re
         for group in &handles {
             for (from, handle) in MEMBERS.iter().zip(group) {
                 // The member's whole queue each pass: its own bound, no count picked here.
-                for record in handle.drain(handle.outgoing_bound()).unwrap_or_default() {
+                for record in handle
+                    .outgoing_bound()
+                    .and_then(|bound| handle.drain(bound))
+                    .unwrap_or_default()
+                {
                     let to = usize::try_from(record.to).unwrap_or(0).saturating_sub(1);
                     if let Some(target) = group.get(to) {
                         let _ = target.receive(*from, record.bytes, Instant::now() + WAIT);

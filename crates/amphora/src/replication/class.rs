@@ -7,20 +7,22 @@ use amphora_api::{self as api, Refusal, replication::Durability};
 /// A class entry's prefix: a log entry kind of its own, as the seed's and the baseline delta's.
 const PREFIX: &[u8] = b"amphora.class.v1\0";
 const TABLE: &str = "CREATE TABLE IF NOT EXISTS __amphora_class (id INTEGER PRIMARY KEY CHECK(id = 1), class BLOB NOT NULL)";
-/// A class entry's bytes at most: what the largest class a replica takes encodes to. Postcard's
-/// wire format (postcard.jamesmunns.com, "Wire Format") writes an enum's tag and a u32 as
-/// varints of at most 5 bytes, a length and a u64 of at most 10. So: the prefix, `Replicated`'s
-/// tag, the fates' length, a (member, fate) pair of two u64s for each of the most members
-/// (`replicated::MEMBERS`), and the span. No class names more: the record is restricted to the
+/// A class entry's bytes at most, for a group of at most `members`: what the largest class a
+/// replica takes encodes to. Postcard's wire format (postcard.jamesmunns.com, "Wire Format")
+/// writes an enum's tag and a u32 as varints of at most 5 bytes, a length and a u64 of at most 10.
+/// So: the prefix, `Replicated`'s tag, the fates' length, a (member, fate) pair of two u64s for
+/// each member, and the span. No class names more: the record is restricted to the
 /// configuration, hyper-raft refuses a change whose configuration names more than
-/// `limits.members` (raft.rs:3633) and `Fates::validate` holds to the same limit (raft.rs:431),
-/// which the owner's settings set to `MEMBERS`.
-const ENTRY_BYTES: usize = PREFIX
-    .len()
-    .saturating_add(5)
-    .saturating_add(10)
-    .saturating_add(5)
-    .saturating_add(crate::database::replicated::MEMBERS.saturating_mul(20));
+/// `limits.members` (raft.rs:3633) and `Fates::validate` holds to the same limit (raft.rs:431).
+/// `members` is that limit, read from the core's settings (lane constants-20), not a constant.
+const fn entry_bytes(members: usize) -> usize {
+    PREFIX
+        .len()
+        .saturating_add(5)
+        .saturating_add(10)
+        .saturating_add(5)
+        .saturating_add(members.saturating_mul(20))
+}
 
 /// `durability` with its fates in member order: the same class stated in any order is one class.
 pub(crate) fn canonical(durability: &Durability) -> Durability {
@@ -109,11 +111,11 @@ pub(crate) fn recorded_all(record: &Durability, stated: &Durability, named: &[u6
     }
 }
 
-/// The log entry that states `durability` for the group.
-pub(crate) fn entry(durability: &Durability) -> Result<Vec<u8>, Refusal> {
+/// The log entry that states `durability` for a group of at most `members`.
+pub(crate) fn entry(durability: &Durability, members: usize) -> Result<Vec<u8>, Refusal> {
     let mut bytes = PREFIX.to_vec();
     bytes.extend(postcard::to_allocvec(&canonical(durability)).map_err(unavailable)?);
-    api::bound("class entry", bytes.len(), ENTRY_BYTES)?;
+    api::bound("class entry", bytes.len(), entry_bytes(members))?;
     Ok(bytes)
 }
 
@@ -122,9 +124,9 @@ pub(super) fn is_class(data: &[u8]) -> bool {
     data.starts_with(PREFIX)
 }
 
-/// The class a class entry states.
-pub(super) fn decode(data: &[u8]) -> Result<Durability, Refusal> {
-    api::bound("class entry", data.len(), ENTRY_BYTES)?;
+/// The class a class entry states, in a group of at most `members`.
+pub(super) fn decode(data: &[u8], members: usize) -> Result<Durability, Refusal> {
+    api::bound("class entry", data.len(), entry_bytes(members))?;
     let payload = data
         .strip_prefix(PREFIX)
         .ok_or_else(|| api::invalid("class entry", "the entry is not a class entry"))?;
@@ -181,6 +183,9 @@ fn unavailable(error: impl std::fmt::Display) -> Refusal {
 mod tests {
     use super::*;
     use amphora_api::replication::Fates;
+    /// A member bound for these tests: an entry is held to the bound it is given, the group's
+    /// from its log (`members`; lane constants-21), whatever that is.
+    const MOST: usize = 64;
 
     fn class(of: Vec<(u64, u64)>, spanning: u32) -> Durability {
         Durability::Replicated(Fates { of, spanning })
@@ -213,7 +218,10 @@ mod tests {
         assert!(compatible(&Durability::Persisted, &Durability::Persisted));
         let shuffled = class(vec![(3, 30), (1, 10), (2, 20)], 2);
         assert_eq!(canonical(&shuffled), three);
-        assert_eq!(decode(&entry(&shuffled).unwrap()), Ok(three.clone()));
+        assert_eq!(
+            decode(&entry(&shuffled, MOST).unwrap(), MOST),
+            Ok(three.clone())
+        );
         let four = class(vec![(1, 10), (2, 20), (3, 30), (4, 40)], 2);
         let two = class(vec![(1, 10), (2, 20)], 2);
         assert_eq!(
@@ -241,8 +249,8 @@ mod tests {
             joined(None, &Durability::Persisted, &[1]),
             Durability::Persisted
         );
-        assert!(decode(b"amphora.seed.v1\0").is_err());
-        assert!(decode(PREFIX).is_err());
+        assert!(decode(b"amphora.seed.v1\0", MOST).is_err());
+        assert!(decode(PREFIX, MOST).is_err());
     }
 
     /// AC-T1.8.5, T-T1.8.C4 (replication.md, "The class stated once per group"): the record
@@ -271,7 +279,7 @@ mod tests {
         let mut first = open("first.db", &group).unwrap();
         assert!(!first.class_agreed());
         for (index, stated) in [(1, &group), (2, &other)] {
-            let data = entry(stated).unwrap();
+            let data = entry(stated, MOST).unwrap();
             first
                 .apply(
                     &EntryRef {
@@ -329,7 +337,7 @@ mod tests {
         let mut machine = super::super::Machine::open(&dir.path().join("state.db"), conf).unwrap();
         machine.state_class(&four).unwrap();
         for (index, recorded, agreed) in [(1, &three, false), (2, &four, true)] {
-            let data = entry(recorded).unwrap();
+            let data = entry(recorded, MOST).unwrap();
             machine
                 .apply(
                     &EntryRef {
@@ -352,7 +360,7 @@ mod tests {
     /// class entry, where a picked 64 KiB took it (2026-11-11: no picked bounds).
     #[test]
     fn a_class_entry_holds_the_most_members_and_no_more() {
-        let most = crate::database::replicated::MEMBERS;
+        let most = MOST;
         let wide = |members: usize| {
             let of = (0..members)
                 .map(|m| (u64::MAX - m as u64, u64::MAX))
@@ -360,7 +368,16 @@ mod tests {
             class(of, u32::MAX)
         };
         let full = wide(most);
-        assert_eq!(decode(&entry(&full).unwrap()).unwrap(), canonical(&full));
-        assert!(entry(&wide(most + 1)).is_err(), "a class past the members");
+        assert_eq!(
+            decode(&entry(&full, most).unwrap(), most).unwrap(),
+            canonical(&full)
+        );
+        assert!(
+            entry(&wide(most + 1), most).is_err(),
+            "a class past the members"
+        );
+        // The bound is the members the group is opened for, not a constant (lane constants-20).
+        assert!(entry(&wide(2), 2).is_ok());
+        assert!(entry(&wide(3), 2).is_err(), "a class past a group of two");
     }
 }

@@ -84,6 +84,10 @@ impl ReadOnly {
             rounds: 0,
         }
     }
+    /// Raises the most members that ask and confirm a read ([`crate::Raft::grow_members`]).
+    pub fn grow_members(&mut self, members: usize) {
+        self.members = self.members.max(members);
+    }
     /// Whether a read waits that no round sent asks for.
     pub fn unasked(&self) -> bool {
         self.asked < self.queue.len()

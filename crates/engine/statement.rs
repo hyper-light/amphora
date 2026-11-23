@@ -13,7 +13,7 @@ use tracing::{instrument, Level};
 use crate::plan_cache::{CustomRun, PlanCacheMode, PlanChoice, PlanKind, PlanValues};
 use crate::{alloc::TursoIteratorExt, connection::PrepareOptions};
 use crate::{
-    busy::BusyHandlerState,
+    busy::{BusyHandler, BusyHandlerState, BusyWake, LockRelease},
     parameters,
     schema::Trigger,
     stats::{refresh_analyze_stats_nonblock, RefreshAnalyzeStatsState},
@@ -351,6 +351,11 @@ pub struct Statement {
     busy: bool,
     /// Busy handler state for tracking invocations and timeouts
     busy_handler_state: Option<BusyHandlerState>,
+    /// Amphora (lane constants-22): the release of the log's locks a busy step waits on (None: no
+    /// log, or one shared across processes), and the releases counted before the last step tried
+    /// its locks.
+    lock_release: Option<std::sync::Arc<LockRelease>>,
+    release_seen: u64,
     /// Per-execution timeout override for this statement.
     /// - `None`: use connection default
     /// - `Some(Some(duration))`: override with a query-specific timeout
@@ -491,6 +496,8 @@ impl Statement {
             query_mode,
             busy: false,
             busy_handler_state: None,
+            lock_release: None,
+            release_seen: 0,
             query_timeout_override: None,
             has_returned_row: false,
             tail_offset,
@@ -887,6 +894,11 @@ impl Statement {
         if self.analyze_refresh.is_some() {
             return self.drive_analyze_refresh(waker);
         }
+        // Amphora (lane constants-22): the releases so far, read before the step tries its locks,
+        // so a release after a failed try is seen when it waits ([`LockRelease::wait`]).
+        if let Some(release) = self.lock_release.as_ref() {
+            self.release_seen = release.generation();
+        }
         // Amphora (PL.13): a run handed to a second prepare starts again here, once.
         let res = loop {
             if matches!(self.state.execution_state, ProgramExecutionState::Init)
@@ -1145,8 +1157,36 @@ impl Statement {
                 .busy_handler_state
                 .get_or_insert_with(|| BusyHandlerState::new(now));
 
-            // Invoke the busy handler to determine if we should retry
-            if busy_state.invoke(&handler, now) {
+            // Amphora (lane constants-22): under a busy timeout, with a waker to wake and a log
+            // whose every holder is in this process, the step waits for a lock's release, the
+            // timeout its deadline only: the waker is woken by the release, not now.
+            let release = match (&*handler, waker) {
+                (BusyHandler::Timeout(max), Some(waker))
+                    if self.program.connection.busy_wake() == BusyWake::Release =>
+                {
+                    if self.lock_release.is_none() {
+                        self.lock_release =
+                            self.pager.wal.as_ref().and_then(|wal| wal.lock_release());
+                    }
+                    self.lock_release
+                        .as_ref()
+                        .map(|release| (*max, release, waker))
+                }
+                _ => None,
+            };
+            if let Some((max, release, waker)) = release {
+                if let Some(left) = busy_state.until_released(max, now) {
+                    // Registered: sleep until the release (or the deadline). A release came
+                    // since the step read the count: step again now.
+                    let duration = if release.wait(self.release_seen, waker) {
+                        left
+                    } else {
+                        Duration::ZERO
+                    };
+                    res = Ok(StepResult::Sleep { duration });
+                }
+                // else: past the deadline, res stays as Busy
+            } else if busy_state.invoke(&handler, now) {
                 // Handler says retry: ask the caller to wait out the backoff
                 // delay before stepping again.
                 if let Some(waker) = waker {
@@ -1196,6 +1236,12 @@ impl Statement {
     #[inline]
     pub fn step_with_waker(&mut self, waker: &Waker) -> Result<StepResult> {
         self._step(Some(waker))
+    }
+
+    /// Amphora (lane constants-22): how this statement waits when it finds the database busy
+    /// ([`Connection::set_busy_wake`]).
+    pub fn busy_wake(&self) -> BusyWake {
+        self.program.connection.busy_wake()
     }
 
     /// Fast step for trigger/FK subprograms: skips reprepare checks, timeout

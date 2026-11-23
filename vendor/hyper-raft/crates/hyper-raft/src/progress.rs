@@ -606,6 +606,10 @@ impl Tracker {
         tracker.apply(configuration, &[], next_index)?;
         Ok(tracker)
     }
+    /// Raises the most members a configuration may name ([`crate::Raft::grow_members`]).
+    pub fn grow_members(&mut self, members: usize) {
+        self.members = self.members.max(members);
+    }
     /// What a whole append costs every member's window, now and as members
     /// join: its fixed bytes and `max_size_per_msg` of entries.
     pub fn set_page(&mut self, max_size_per_msg: u64) {

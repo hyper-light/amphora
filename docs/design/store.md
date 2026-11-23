@@ -2125,3 +2125,35 @@ differ by more than the logs do: the run of record is the coordinator's.
 mixed log than on the page-a-frame log of the same binary (`bench/log_ab.sh`, interleaved, best of
 3); a profile of the mixed log's writer still showing the commit's images' buffer or a delta's
 buffer of a page; a row read back other than as committed (the tests above).
+
+## Decision (lane constants-22): a busy statement wakes on the lock's release (2026-11-22, not yet landed)
+
+- **What was there.** A statement that found the database busy (another connection holding the write lock, a read
+  mark or the checkpoint lock) retried on SQLite's fixed schedule (`crates/engine/busy.rs`: 1, 2, 5 ... 100 ms), and
+  `Statement` woke its waker at once with `StepResult::Sleep`, so an async caller spun until the delay passed.
+  Amphora's connections set no busy handler, so `db::step` did its own retry: 1 ms (`BUSY_WAIT`) up to 10,000 times
+  (`BUSY_TRIES`). Both are picked numbers, and both wake on time where an event says when to try again (found by
+  lane colcopy-8; goal dfabffcc).
+- **The rule.** Every release of the log's locks in this process (the write lock, a read mark, its downgrade and the
+  transient releases inside a read's start, the checkpoint lock, the vacuum lock) and every published commit fires
+  one event, `busy::LockRelease`, held in the log's shared runtime. A statement reads the event's count before it
+  tries its locks; when it finds them busy it hands its waker to the event for the next release after that count,
+  or, if one came already, tries again at once, so a release between a failed try and the wait is never missed. The
+  busy timeout is its deadline only (`BusyHandlerState::until_released`). The wakers held are those of the statements
+  busy now, each once.
+- **Amphora's connections** wait with no deadline of their own (`busy_timeout` = `Duration::MAX`): every holder is a
+  connection of this process, and each holder's transaction ends, by its end or by its own request's deadline, which
+  releases the lock. Setting the busy timeout per request was weighed and left: the engine's setter makes every
+  cached statement prepare again. `db::step` steps with a waker that unparks its thread.
+- **The control, behind a switch.** `Connection::set_busy_wake(BusyWake::Schedule)` keeps SQLite's schedule. A
+  statement stepped without a waker, or on a log shared across processes (whose holders elsewhere release unseen),
+  keeps it too.
+- **What decides it.** `db::tests::constants_22_a_busy_write_wakes_on_the_write_locks_release` prints, under each wake,
+  the time from the holder's commit to the waiter's insert done. The run of record (the coordinator's): that test
+  repeated over the concurrency ladder of waiters (1 to 4096 writers on one database), wake latency p50/p99/p99.9 and
+  CPU per wait under each switch.
+- **Still open.** `WalFile::begin_read_tx` has its own retry for a read mark that moved under it (5 at once, then
+  yields, then `(n - 9)^2 * 39` microseconds, 100 at most: SQLite's `walTryBeginRead`); it is the same kind of wait and
+  could wait on the same event.
+- **Falsified by.** A busy statement that never wakes though the lock was released (a missed release); wake latency
+  under `Release` above `Schedule`'s at any rung of the ladder.
