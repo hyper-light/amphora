@@ -733,6 +733,7 @@ fn emit_body(
         .chain(looped.on.iter())
         .chain(looped.filter.iter())
         .chain(looped.outs.iter())
+        .chain(looped.agg_filters.iter().map(|(_, filter)| filter))
     {
         walk_expr(expr, &mut |e: &Expr| -> crate::Result<WalkControl> {
             match e {
@@ -1787,6 +1788,12 @@ fn shape_chain(
     for term in &plan.where_clause {
         if matches!(term.origin, WhereTermOrigin::TableFunction(_)) {
             return None;
+        }
+        // An inferred equality fails a row a later link padded (T-QT.6.24: `u.a = v.a` from
+        // `u.a = t.a` and `v.a = t.a`, over a FULL JOIN's unmatched right row). The stated terms
+        // it came from are tested where they hold.
+        if term.origin == WhereTermOrigin::Implied {
+            continue;
         }
         // An ON term's link: its join's right table; a WHERE term has none.
         let link = match term.origin.join_origin() {
