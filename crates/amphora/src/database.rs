@@ -1533,6 +1533,7 @@ fn ring(changed: &Changed, keys: &[Vec<u8>]) -> Result<(), Refusal> {
         return Ok(());
     }
     let mut lists = locked(&changed.lock_waiters)?;
+    eprintln!("K9 ring changed={:p} keys={:?} lists={:?}", changed as *const Changed, keys, lists.iter().map(|(k, l)| (k.clone(), l.rung, l.waiters)).collect::<Vec<_>>());
     for key in keys {
         if let Some(list) = lists.get_mut(key) {
             list.rung = list.rung.wrapping_add(1);
@@ -2666,9 +2667,13 @@ impl Database {
                 None => None,
             };
             let row = match try_read()? {
-                Ok(v) => return Ok(v),
+                Ok(v) => {
+                    eprintln!("K9 wait_joined read ok changed={:p}", changed as *const Changed);
+                    return Ok(v);
+                }
                 Err(row) => row,
             };
+            eprintln!("K9 wait_joined try met row={row:?} before={before:?} joined={:?} changed={:p}", joined.as_ref().map(|j| j.0.clone()), changed as *const Changed);
             let mut lists = locked(&changed.lock_waiters)?;
             match (joined.as_ref(), before) {
                 (Some((at, bell)), Some(before)) if *at == row => {
@@ -2691,8 +2696,10 @@ impl Database {
                         )
                         .map_err(unavailable)?;
                     if timeout.timed_out() {
+                        eprintln!("K9 wait_joined TIMED OUT row={row:?}");
                         return Err(Refusal::Timeout);
                     }
+                    eprintln!("K9 wait_joined woken row={row:?}");
                     changed.locked_wakes.fetch_add(1, Ordering::AcqRel);
                 }
                 _ => {

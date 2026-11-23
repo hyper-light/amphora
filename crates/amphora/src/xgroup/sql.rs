@@ -757,9 +757,12 @@ fn step_on(
 ) -> Result<(Reply, Option<u64>), Refusal> {
     match member {
         Member::Local(group) => {
+            let what: String = format!("{:?}", envelope.step).chars().take(60).collect();
+            eprintln!("K9 step_on here={here} begin {what}");
             let (reply, dropped) = step(group, carried, until, move |db| {
                 apply_step(db, here, &envelope)
             })?;
+            eprintln!("K9 step_on here={here} applied {what} dropped={dropped:?} reply={:?}", format!("{reply:?}").chars().take(60).collect::<String>());
             group.ring_locks(&dropped)?;
             // Read after the step answered, the group's clock is at or past the step's commit:
             // the one cross-group clock as this group keeps it (lane split-merge-21,
