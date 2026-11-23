@@ -19115,40 +19115,33 @@ fn hash_probe_run(
     let payload_dest_reg = payload_dest_reg.map(|r| r as usize);
     let num_payload = *num_payload as usize;
     let probe_rowid_reg = probe_rowid_reg.map(|r| r as usize);
-    let (probe_keys, partition_idx, probe_buffered) =
-        if let Some(op_state) = state.active_op_state.hash_probe().take() {
-            if op_state.hash_table_id == hash_table_id {
-                (
-                    op_state.probe_keys,
-                    Some(op_state.partition_idx),
-                    op_state.probe_buffered,
-                )
-            } else {
-                // Different hash table, read fresh keys
-                let keys = (0..num_keys)
-                    .map(|i| {
-                        let reg = &state.registers[key_start_reg + i];
-                        reg.get_value().clone()
-                    })
-                    .try_collect()?;
-                (keys, None, false)
-            }
-        } else {
-            // First entry, read probe keys from registers
-            let keys = (0..num_keys)
-                .map(|i| {
-                    let reg = &state.registers[key_start_reg + i];
-                    reg.get_value().clone()
-                })
-                .try_collect()?;
-            (keys, None, false)
-        };
+    let resumed = state
+        .active_op_state
+        .hash_probe()
+        .take()
+        .filter(|op_state| op_state.hash_table_id == hash_table_id);
 
     let Some(hash_table) = state.hash_tables.get_mut(&hash_table_id) else {
         // Empty build side: treat as no match and jump to target.
         state.active_op_state.clear();
         state.pc = target_pc.as_offset_int();
         return Ok(InsnFunctionStepResult::Step);
+    };
+
+    let (probe_keys, partition_idx, probe_buffered) = match resumed {
+        Some(op_state) => (
+            op_state.probe_keys,
+            Some(op_state.partition_idx),
+            op_state.probe_buffered,
+        ),
+        None => {
+            let keys = hash_table.probe_keys_from(
+                state.registers[key_start_reg..key_start_reg + num_keys]
+                    .iter()
+                    .map(|reg| reg.get_value()),
+            )?;
+            (keys, None, false)
+        }
     };
 
     // For spilled hash tables, either buffer main-loop probe rows for grace

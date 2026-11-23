@@ -657,7 +657,8 @@ fn t_t1_13_1_a_member_without_drills_refuses_the_disk_request() {
 /// then read back, once with a bound parameter. Expect: each statement's table, the insert's
 /// count and rowid; the refused write typed as its statement, with its first statement rolled
 /// back too; the rows typed as written with their columns' names; the connection answering after
-/// the refusal; and a link without the cluster's secret refused before its first request.
+/// the refusal; a read and a write whose answers pass one frame answered whole (version 2); and a
+/// link without the cluster's secret refused before its first request.
 #[test]
 fn cp_t1_13_sql_takes_bound_parameters_and_answers_typed_rows_with_their_names() {
     let dir = tempfile::tempdir().unwrap();
@@ -722,6 +723,29 @@ fn cp_t1_13_sql_takes_bound_parameters_and_answers_typed_rows_with_their_names()
         (one.columns, one.rows),
         (vec!["name".to_owned()], vec![vec![Value::Text("seven".into())]])
     );
+
+    // Version 2: a read and a write whose answers pass one frame come whole, in order.
+    sql.write(vec![st("CREATE TABLE big (id INTEGER PRIMARY KEY, v BLOB)", vec![])])
+        .unwrap();
+    let mib = 1 << 20;
+    for half in 0..2i64 {
+        let rows = (1..=20i64)
+            .map(|n| st("INSERT INTO big VALUES (?1, ?2)", vec![Value::Integer(half * 20 + n), Value::Blob(vec![9; mib])]))
+            .collect();
+        sql.write(rows).unwrap();
+    }
+    let ids = |table: &Table| table.rows.iter().map(|row| row[0].clone()).collect::<Vec<_>>();
+    let every = (1..=40).map(Value::Integer).collect::<Vec<_>>();
+    let big = sql.read(st("SELECT id, v FROM big ORDER BY id", vec![])).unwrap();
+    assert_eq!(ids(&big), every);
+    assert!(big.rows.iter().all(|row| row[1] == Value::Blob(vec![9; mib])));
+    let held = sql
+        .write(vec![
+            st("INSERT INTO t (id) VALUES (9)", vec![]),
+            st("SELECT id, v FROM big ORDER BY id", vec![]),
+        ])
+        .unwrap();
+    assert_eq!((held[0].affected, ids(&held[1])), (1, every));
 
     let wrong = Keys::plain(b"not-the-cluster-secret-not-the-cluster-secret".to_vec());
     assert!(SqlClient::connect(&leader, &wrong, c.deadline).is_err());

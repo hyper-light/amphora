@@ -66,6 +66,46 @@ const fn varint_bytes(n: usize) -> usize {
     }
     bytes
 }
+/// The bytes `Machine::image` writes for `db` now, as postcard encodes it, counted without reading
+/// a page (CT.1): the baseline's prefix and declaration where one is declared, the list's length,
+/// and each page's id, length and bytes.
+fn image_len(db: &mut Db, declaration: Option<&api::replication::Bootstrap>) -> Result<u64, Refusal> {
+    let size = db.image_bytes().map_err(unavailable)?;
+    let mut page = 0i64;
+    db.query("PRAGMA page_size", [], |row| {
+        page = row.get::<i64>(0).map_err(unavailable)?;
+        Ok(false)
+    })
+    .map_err(unavailable)?;
+    let page = usize::try_from(page).map_err(unavailable)?;
+    let count = size.checked_div(page).unwrap_or(0);
+    let pages = varint_bytes(count)
+        .saturating_add(ids_bytes(count))
+        .saturating_add(count.saturating_mul(varint_bytes(page)))
+        .saturating_add(size);
+    let baseline = match declaration {
+        Some(declaration) => BASELINE_SNAPSHOT
+            .len()
+            .saturating_add(postcard::to_allocvec(declaration).map_err(unavailable)?.len()),
+        None => 0,
+    };
+    Ok(u64::try_from(pages.saturating_add(baseline)).unwrap_or(u64::MAX))
+}
+/// The bytes postcard takes for the page ids `1..=count`: each id as `varint_bytes` counts it, a
+/// band of seven bits more taking a byte more.
+fn ids_bytes(count: usize) -> usize {
+    let (mut bytes, mut low, mut width) = (0usize, 1usize, 1usize);
+    while low <= count {
+        let high = low.saturating_mul(128).saturating_sub(1).min(count);
+        bytes = bytes.saturating_add(high.saturating_sub(low).saturating_add(1).saturating_mul(width));
+        if high == count {
+            break;
+        }
+        low = high.saturating_add(1);
+        width = width.saturating_add(1);
+    }
+    bytes
+}
 /// The most bytes a declared baseline's encoding takes: its source node's varint and its 32-byte
 /// identity, which postcard writes without a length (`api::replication::Bootstrap`).
 const BOOTSTRAP_MOST: usize = U64_MOST.saturating_add(32);
@@ -290,8 +330,9 @@ pub struct Machine {
     // A test's hold on this machine's flushes of its database's log.
     #[cfg(test)]
     flush_gate: std::sync::Arc<FlushGate>,
-    // The bytes of the image this machine opened with, its pages as `image` writes them: what the
-    // compaction rule weighs a log never compacted against (`StateMachine::image_bytes`; CT.1).
+    // The bytes of the image this machine opened with, as `image` writes it: what the compaction
+    // rule weighs the log against until the member makes or installs another
+    // (`StateMachine::image_bytes`; CT.1).
     opened_bytes: u64,
     // The bytes of the last image made, and of every entry applied since the machine opened: what
     // the owner times its images and its log's replay by (`database::compacting`; CT.1).
@@ -564,8 +605,7 @@ impl Machine {
         db.transaction(|db| marker(db, point, &configuration))
             .map_err(unavailable)?;
         db.flusher()().map_err(unavailable)?;
-        let opened_bytes = db.image_bytes().map_err(unavailable)?;
-        let opened_bytes = u64::try_from(opened_bytes).unwrap_or(u64::MAX);
+        let opened_bytes = image_len(&mut db, baseline.declaration())?;
         Ok(Self {
             db,
             point,
@@ -1322,9 +1362,9 @@ impl StateMachine for Machine {
         self.imaged_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         Ok((self.point, self.configuration.clone()))
     }
-    /// The image this machine opened with, its pages' bytes (the postcard framing a page's id and
-    /// length add is not counted): asked when a member opens on a log never compacted, so the log
-    /// is weighed against the state it opened with (CT.1).
+    /// The bytes of the image this machine opened with, as `image` writes it, counted without
+    /// making it: asked when a member opens, so the log is weighed against the state it opened
+    /// with (CT.1).
     fn image_bytes(&self) -> Option<u64> {
         Some(self.opened_bytes)
     }
@@ -1489,6 +1529,45 @@ mod envelope_tests {
 mod image_room_tests {
     use super::*;
     use crate::memory::tests::{Fed, budget};
+
+    /// CT.1: do reopen a machine over a database of a few pages, then of past 128 (page ids of one
+    /// and two varint bytes). Expect: the bytes it states for the image it opened with,
+    /// counted without reading a page, are the bytes `image` writes, so a member that opens on a
+    /// compacted log weighs it as one that made the image would.
+    #[test]
+    fn ct1_the_image_a_machine_opened_with_is_counted_as_image_writes_it() {
+        let fed = Fed::new(Some(1 << 30), Some(1 << 20));
+        let (_budget, _unset) = budget(&fed);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.db");
+        for rows in [0usize, 200] {
+            {
+                let machine = Machine::open(&path, ConfState::default()).unwrap();
+                machine.db.exec("CREATE TABLE IF NOT EXISTS t(b)").unwrap();
+                machine.db.exec("BEGIN").unwrap();
+                for _ in 0..rows {
+                    machine
+                        .db
+                        .exec("INSERT INTO t VALUES(randomblob(4000))")
+                        .unwrap();
+                }
+                machine.db.exec("COMMIT").unwrap();
+            }
+            let mut machine = Machine::open(&path, ConfState::default()).unwrap();
+            let mut image = Vec::new();
+            machine.image(&mut image).unwrap();
+            assert_eq!(machine.image_bytes(), Some(image.len() as u64), "{rows} rows");
+        }
+    }
+
+    /// CT.1: postcard's bytes for the ids `1..=count` are each id's varint, summed.
+    #[test]
+    fn ct1_page_ids_are_counted_as_postcard_writes_them() {
+        for count in [0, 1, 127, 128, 16_383, 16_384, 20_000] {
+            let each: usize = (1..=count).map(varint_bytes).sum();
+            assert_eq!(ids_bytes(count), each, "{count} ids");
+        }
+    }
 
     /// SB.1: do open a machine over a database of a 128 KiB row, its process budget fed: room to
     /// spare, then 64 KiB of room, then a limit that can't be read, then room to spare under a

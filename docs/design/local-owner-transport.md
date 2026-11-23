@@ -197,7 +197,7 @@ caller's input was wrong; callers told the two apart by its text. Its text is un
 prepared transaction: the database advanced since preparation"), so a caller matching it still
 retries. A version-9 peer can't decode the variant, so an owner sends it only on a connection that
 agreed on 10 or later, and as the `Invalid` it was below that (`spoken`). The `Q` connection's
-frames (serve.rs, `SQL_VERSION` 2) do the same. The tests:
+frames (serve.rs, `SQL_VERSION` 3) do the same. The tests:
 `an_overlapping_write_is_refused_serialization_and_a_malformed_one_invalid`,
 `a_peer_before_version_10_is_sent_serialization_as_invalid`.
 
