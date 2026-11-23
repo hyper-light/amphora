@@ -2210,20 +2210,17 @@ before any frame of the current one.
   Each segment then holds at most its bound plus what the writer appends in 2D plus one copy. The A/B below measures
   that against today's twice-the-bound.
 
-**On disk.** Old files open. A database whose header says one-segment WAL opens and recovers as today. The new code
-upgrades it at its first restart, in a step that is safe to crash in. Once the log is copied whole and the file
-flushed (the moment today's restart already reaches), the file's header is written with the two-segment version and
-flushed, before the second segment exists. The version lives in the database header's read and write version bytes
-(18 and 19), where SQLite marks WAL against rollback. Each segment's header also carries a new log-format version, so
-a `-wal` of the new format is refused by code that knows only the old one. New files carry both versions from their
-first write. Old code refuses a two-segment database cleanly: an unknown version is an error at open, never a panic
-or an assert. SQLite's wal2 does the same ("Attempting to use any other version of SQLite results in an SQLITE_NOTADB
-error"). The engine already refuses both cleanly. An unknown value in bytes 18 and 19 is `Corrupt("Invalid
-read_version: …")` at open (`crates/engine/database.rs`, 2185-2190). A log header whose format `LogFormat::of` doesn't
-know is `Corrupt("the log's format … isn't known")` (`crates/engine/storage/sqlite3_ondisk.rs`, 1914-1917), and a
-segment's format is one more value in that scheme (`storage/packed.rs`). A log header whose checksum fails is read as an
-empty log, not refused, so the database header's bytes are what keep old code away from a second segment. A database
-can't return to the old code after its upgrade. That is the format's price, and it is Ada's to accept.
+**On disk (revised 2026-11-23, Ada: "There are no 'older databases' besides any ones you've created for test.
+Amphora is not even released. This is not a concern.").** The two segments replace the one log outright. There is no
+upgrade step, no reading of a one-segment format and no switch between the two, and the one-segment restart is deleted.
+Each segment's header is the log header the engine writes today (format, page size, checkpoint sequence, salts,
+checksums), so a log whose `-wal2` is absent, or holds no valid header, is one of the two-segment log's own states (one
+segment `Current`, the other `Free`), read by the same recovery. Bytes 18 and 19 of the database header carry the
+two-segment value, 3, the one SQLite's wal2 writes, from a file's first write: SQLite without wal2 then refuses the
+file ("Attempting to use any other version of SQLite results in an SQLITE_NOTADB error") instead of reading `-wal`
+without `-wal2`'s commits. Where the open rewrites a rollback file's 1 to 2 today (`crates/engine/database.rs`,
+2272-2287), it writes 3, for a 1 and for a 2 alike: a file SQLite wrote in WAL mode is the one-segment state above,
+and the rewrite changes no log. Any other value stays `Corrupt("Invalid read_version: …")` at open (2184-2190).
 
 **Crash recovery across a switch.** Recovery reads both segments' headers. A segment whose header checksum fails is
 empty. Of two valid segments, the one with the higher checkpoint sequence is current and the other closing. Each
@@ -2239,12 +2236,14 @@ the checkpointer copies the closing segment and then the current one. A crash at
 4. After a reset: the reset wrote nothing, so recovery finds the closing segment valid and recovers its frames again.
    They are already in the file, and copying them again writes the same pages before the current segment's newer
    frames are copied.
-5. During the upgrade: a one-segment database whose log is copied, or a two-segment one with one segment.
 
 **Where it lands in the engine.** Today there is one log in every structure that keys on a frame number. These are
 the places a segment is added (`crates/engine/storage/`):
 - `wal.rs` `restart_wal_header` (8142-8183) becomes the switch. `begin_restart` and `end_restart` (1731-1757) take
-  every read mark exclusively and refuse a restart while any is held: that is the rule the switch drops.
+  every read mark exclusively and refuse a restart while any is held: that is the rule the switch drops, and both are
+  deleted with the rest of the one-segment restart (the rewrite of the log from its first frame, `Readers::
+  restart_if_asked`'s gate taken for writing and `Slots::take_all` in `store.rs` 1164-1183). No path starts a log
+  again from its first frame while a read can look into it, so none is kept beside the switch.
 - `WalSharedMetadata` and `WalSharedRuntime` (3703-3787) hold one header, one file, one frame cache, one `nbackfills`
   and five read marks. Each becomes one per segment.
 - `try_begin_read_tx`'s read marks (1528-1604) and `WalSnapshot` (196-211): a snapshot names its segments.
@@ -2275,8 +2274,10 @@ prevents today: sqlite.org/wal.html, "Avoiding Excessively Large WAL Files". Dec
 - `d45_a_crash_at_each_step_of_a_switch_loses_no_commit`: `tests/crash.rs`'s power cut at each I/O of a switch, a
   reset and the upgrade (steps 1-5). After reopening, every acknowledged batch is present, nothing refused is found,
   and nothing is torn.
-- `d45_a_one_segment_database_opens_and_upgrades_at_its_first_restart`, and
-  `d45_a_two_segment_database_is_refused_by_one_segment_code` (an unknown version is an error at open).
+- `d45_the_log_stays_bounded_while_reads_overlap`: reads handed one to the next, so one is always under way, each
+  held across at most k of the writer's batches (counted, not timed), through many switches. No segment ever holds
+  more than its bound plus k batches' frames plus one copy, and the writer never finds the other segment not `Free`
+  at a switch it asks for once that segment's last read has left and its copy is done.
 
 **The A/B (main against the two segments, one binary each).** Writers at 32 and 128 clients with one slow reader
 present: a streamed read to a client that reads nothing (P4's test in `serve.rs`), held for its deadline and started
