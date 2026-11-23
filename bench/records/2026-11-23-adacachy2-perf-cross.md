@@ -570,3 +570,43 @@ Tests: `xgroup::sql::answers::a13_lock_reply_at_its_worst_case_holds_what_its_st
 
 Not reached (next lane): unit 3 (`Database::query` takes a declared bound) and unit 4 (resharding charges by
 row; deletes `store::Config::queue`, `ROOM_LOOK`, bench `AMPHORA_QUEUE`).
+
+## Unit 3 built, not merged; the group's own scan path trims (perf-A14)
+
+**Before unit 3.** r1511 at main 5f511d8d (cb9717be plus S6's bench record; adacachy2, needs
+linux/amd64,cpus=8,mem=24g, load 19-37): clippy -p amphora --all-targets clean; lib `a13_` 3/3,
+`database::across` 13/13 (1 ignored), `database::admission_charge` 3/3, `database::online` 6/6, `xgroup::`
+34/34. A13's merged tree holds; nothing to fix.
+
+**2b check: the group's own scan path did not trim.** database.rs's `Operation::Scan` grew its page by
+`push` and answered it as grown, while admission charges it `page_bytes::<Row>(limit)`. At the worst case
+(`limit` rows at the largest key and value) a pushed spine holds the next power of two: 5 rows, 8 slots, 3
+`Row`s past the charge. It is trimmed before it answers (254fc9d1). Test:
+`database::admission_charge::a14_a_group_scan_at_its_worst_case_holds_what_admission_charged`.
+
+**Unit 3 (254fc9d1; doc 82c3e84e).** `Database::query(until, answer: AnswerMax<R>, f)`, `R: AnswerBytes`:
+charged `answer` at admission where it runs as a call (a remote or replicated database, before a flat
+`REQUEST_MAX`), and checked by `within` wherever it runs. `query_session` and `query_waiting` take the bound
+for reads at the leader's latest commit; `query_local`, `query_closed` and `query_local_waiting` read on this
+node's state and take none (`query_reader`). A waiting run declares `met_max`: its answer, or the met row's
+cross-group key, trimmed, at most `KEY_MAX`. Callers: `AnswerMax::fixed()` for counts and heads (tests,
+guards.rs, xgroup's `head`, bench scale.rs and cluster.rs); xgroup's W11 reads an option plus `VALUE_MAX` (one
+Records get's value). Test: `database::admission_charge::a14_a_query_at_its_worst_case_answers_within_its_declared_bound`
+(3 blobs of 100 bytes, `LIMIT 3`: the answer holds exactly its derived bound; a byte less is refused
+`TooLarge`). Codemods: `~/.cache/amphora-perf/cross-a14-scripts/*.py`.
+
+| run | commit | result |
+|---|---|---|
+| r1550 | 254fc9d1 | clippy -p amphora --all-targets clean; lib `a14_` 2/2, `database::admission_charge` 5/5, `database::across` 13/13 (1 ignored), `database::online` 6/6, `database::guards` 13/13; `xgroup::` 33/34: `xgroup::lan::tests::ac_t1_10_5_seeded_histories_over_two_endpoints_show_no_anomaly` panicked at lan.rs:757 (`elle(..).unwrap()`, its `Err` not captured; lan.rs calls no query and no scan); bench not checked (`-p amphora-bench` matches no package: bench is outside the workspace); load 10-17 |
+| r1557 | 254fc9d1 and 5f511d8d lib binaries; 82c3e84e | the lan test alone, 3 runs a binary; then clippy `--manifest-path bench/Cargo.toml --all-targets`. Pending at hand-off |
+
+Not merged: a touched suite is red with its cause unknown, and the bench crate is unchecked. Next lane: read
+r1557. If the lan test fails on main's binary too, or flakes on both, it is not this change. With bench
+clippy clean: merge origin/main, re-run clippy and the touched tests, push HEAD:main. Unit 4 is not started.
+
+Seen on the way, not changed:
+- A local query with no free reader runs on the writer through `Store::run`, the store's own bounded channel (`Config::queue`, unit 4), charged nothing at admission.
+- `query_local`, `query_closed` and a session read served on a replica run on the caller's thread, charged nothing.
+- `query_local_waiting` now needs `R: AnswerBytes` (it shares `session_waiting`), though its read takes no bound.
+- A11's "~280 lines name `query`": the query family has 10 callers outside database.rs (5 `query`, 1 `query_waiting`, 1 `query_local_waiting`, 3 `query_session`); most `.query(` matches are `Db::query` and the engine's.
+- across.rs's `Held::Locked` keys come from `xgroup::sql::locked`, built by `record_key` with `extend`, so capacity can pass length; A13 declared `KEY_MAX` for them; whether they're trimmed is not checked.
