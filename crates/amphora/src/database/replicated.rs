@@ -18091,9 +18091,9 @@ mod tests {
     /// slot's start lands on its next try. Do: the leader appends a write of its own, W, with one
     /// follower's answers held and its appends to the other, the slot's holder, lost, so W is
     /// neither committed nor sent to the holder; then the holder, queued by a refusal, writes,
-    /// its barrier beginning its slot with W the leader's last entry. Expect: its barrier held
-    /// while W is uncommitted, and its write, prepared on W once answers and appends flow again,
-    /// applied; W too. With the tail rule alone (the barrier answered at the older commit) the
+    /// its barrier beginning its slot with W the leader's last entry; then answers and appends
+    /// flow again and the leader's clock moves a heartbeat. Expect: its barrier held while W is
+    /// uncommitted, and its write, prepared on W, applied; W too. With the tail rule alone (the barrier answered at the older commit) the
     /// holder's write was refused: the commit's red run.
     #[test]
     fn a_follower_retry_racing_the_slots_start_lands_on_its_next_try() {
@@ -18159,6 +18159,12 @@ mod tests {
         }
         pump.held.clear();
         pump.losing = None;
+        // W's lost append fills the holder's window, learned from its path (`Window::Carried`):
+        // the leader sends it again only once a heartbeat's answer shows it missing.
+        let heartbeat = driven.owner(0).replica.core().raft.config().heartbeat_tick;
+        for _ in 0..heartbeat {
+            driven.tick(&mut pump, leader);
+        }
         assert_eq!(
             driven.settle(&mut pump, &retry),
             Ok(Vec::new()),
