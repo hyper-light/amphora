@@ -2048,11 +2048,7 @@ impl Database {
             }),
         };
         // Bootstrap DDL used the same WAL; the barrier makes it durable before open succeeds.
-        database.submit_selected(
-            "",
-            Operation::Mutation(Mutation::Sql(Vec::new())),
-            until,
-        )?;
+        database.submit_selected("", Operation::Mutation(Mutation::Sql(Vec::new())), until)?;
         Ok(database)
     }
 
@@ -2290,8 +2286,7 @@ impl Database {
     {
         let call: Call = Box::new(move |db| f(db).map(|v| Box::new(v) as Box<dyn Any + Send>));
         let operation = Operation::Call(Mutex::new(Some(call)), answer);
-        match self.resolve(until)?.submit_selected("", operation, until)?
-        {
+        match self.resolve(until)?.submit_selected("", operation, until)? {
             (Answer::Called(v), token) => v
                 .downcast::<R>()
                 .map(|v| (*v, token))
@@ -2883,16 +2878,10 @@ impl Database {
             }
         }
         let (tx, rx) = mpsc::sync_channel(1);
-        self.submit_local(
-            namespace,
-            operation,
-            until,
-            until,
-            move |result| {
-                // A caller whose deadline elapsed no longer waits, but the committed result stands.
-                let _ = tx.send(result);
-            },
-        )?;
+        self.submit_local(namespace, operation, until, until, move |result| {
+            // A caller whose deadline elapsed no longer waits, but the committed result stands.
+            let _ = tx.send(result);
+        })?;
         rx.recv_timeout(until.saturating_duration_since(Instant::now()))
             .map_err(|e| match e {
                 mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected => {
