@@ -737,7 +737,12 @@ Checks:
 - r1268 at 38d99784: clippy clean, 19 of 19. With the derivation off (`if false && ...`),
   t8_q19 fails: 327,251 steps against 278,584 for reading `l` whole, plan
   `SCAN l / SEARCH p USING INTEGER PRIMARY KEY (rowid=?)`, q19's SF1 plan before the change.
+- r1276 at main ee205208 (the merge brought lane G10's REAL text changes into the engine):
+  clippy clean, 19 of 19.
 - Not run this hour: the engine's whole lib suite and the sqllogictest suites.
+- Open: a LIKE with an ESCAPE is still copied into a share. An ESCAPE of more than one
+  character raises an error on every row, so a share could raise it where the original OR,
+  reaching no joined row, would not. The fix is `escape: None` in `sole_table`'s LIKE arm.
 
 ## 4. Units 2 and 3: not started
 
