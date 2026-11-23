@@ -473,7 +473,7 @@ pub(crate) fn eval_constant_default_value(expr: &ast::Expr) -> Result<Value> {
 }
 
 fn apply_affinity_to_value(value: &mut Value, affinity: Affinity) {
-    if let Some(converted) = affinity.convert(value) {
+    if let Some(converted) = affinity.convert(value, crate::numeric::fp::FpDigits::DEFAULT) {
         *value = match converted {
             Either::Left(ValueRef::Numeric(numeric)) => Value::from(numeric),
             Either::Left(_) => {

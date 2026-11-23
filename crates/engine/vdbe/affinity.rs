@@ -2,7 +2,7 @@ use amphora_engine_parser::ast::{Expr, Literal};
 use either::Either;
 
 use crate::{
-    numeric::{format_float, Numeric},
+    numeric::Numeric,
     types::AsValueRef,
     Value, ValueRef,
 };
@@ -210,7 +210,11 @@ impl Affinity {
         Affinity::Numeric
     }
 
-    pub fn convert<'a>(&self, val: &'a impl AsValueRef) -> Option<Either<ValueRef<'a>, Value>> {
+    pub fn convert<'a>(
+        &self,
+        val: &'a impl AsValueRef,
+        digits: crate::numeric::fp::FpDigits,
+    ) -> Option<Either<ValueRef<'a>, Value>> {
         let val = val.as_value_ref();
         let is_text = matches!(val, ValueRef::Text(_));
         // Apply affinity conversions
@@ -227,7 +231,7 @@ impl Affinity {
                         Some(Either::Right(Value::Text(i.to_string().into())))
                     }
                     ValueRef::Numeric(Numeric::Float(f)) => Some(Either::Right(Value::Text(
-                        format_float(f64::from(f)).into(),
+                        crate::numeric::fp::real_to_text_digits(f64::from(f), digits).into(),
                     ))),
                     ValueRef::Text(_) => {
                         // If it's already text but looks numeric, ensure it's in canonical text form
@@ -282,6 +286,7 @@ impl Affinity {
     pub fn convert_for_compare<'a>(
         &self,
         val: &'a impl AsValueRef,
+        digits: crate::numeric::fp::FpDigits,
     ) -> Option<Either<ValueRef<'a>, Value>> {
         let val_ref = val.as_value_ref();
         let is_text = matches!(val_ref, ValueRef::Text(_));
@@ -290,7 +295,7 @@ impl Affinity {
                 .then(|| apply_numeric_affinity(val_ref, false))
                 .flatten()
                 .map(Either::Left),
-            Affinity::Text => self.convert(val),
+            Affinity::Text => self.convert(val, digits),
             Affinity::Blob | Affinity::None => None,
         }
     }

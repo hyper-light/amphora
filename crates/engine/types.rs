@@ -807,6 +807,17 @@ impl Value {
         };
     }
 
+    /// The value as text with a REAL written at `digits` (SQLITE_DBCONFIG_FP_DIGITS), as a statement
+    /// converts one on its connection. `Display` writes a REAL at the default, 17 (lane G12).
+    pub(crate) fn to_text_at(&self, digits: crate::numeric::fp::FpDigits) -> String {
+        match self {
+            Self::Numeric(Numeric::Float(fl)) => {
+                crate::numeric::fp::real_to_text_digits(f64::from(*fl), digits)
+            }
+            other => other.to_string(),
+        }
+    }
+
     /// Cast Value to String, if Value is NULL returns None
     pub fn cast_text(&self) -> Option<String> {
         Some(match self {

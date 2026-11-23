@@ -3014,7 +3014,7 @@ fn apply_column_stats(
             let Some(value) = params.constant_value(operand) else {
                 return per_distinct;
             };
-            let value = match column.affinity().convert_for_compare(&value) {
+            let value = match column.affinity().convert_for_compare(&value, crate::numeric::fp::FpDigits::DEFAULT) {
                 Some(either::Either::Left(converted)) => match converted.to_owned() {
                     Ok(converted) => converted,
                     Err(_) => return per_distinct,

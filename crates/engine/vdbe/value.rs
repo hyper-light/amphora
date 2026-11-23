@@ -2,7 +2,7 @@
 use crate::types::TextSubtype;
 use crate::{
     function::MathFunc,
-    numeric::{format_float, format_float_for_quote, nonnan::NonNan, NullableInteger, Numeric},
+    numeric::{format_float_for_quote, nonnan::NonNan, NullableInteger, Numeric},
     translate::collate::CollationSeq,
     types::{compare_immutable_single, AsValueRef, SeekOp},
     vdbe::affinity::{real_to_i64, Affinity},
@@ -1154,6 +1154,7 @@ impl Value {
     pub fn exec_cast(
         &self,
         datatype: &str,
+        digits: crate::numeric::fp::FpDigits,
     ) -> std::result::Result<Value, crate::alloc::TryReserveError> {
         if matches!(self, Value::Null) {
             return Ok(Value::Null);
@@ -1166,7 +1167,7 @@ impl Value {
                 }
                 // Convert to TEXT first, then interpret as BLOB
                 // TODO: handle encoding
-                let text = self.to_string();
+                let text = self.to_text_at(digits);
                 return Value::from_slice(text.as_bytes());
             }
             // TEXT To cast a BLOB value to TEXT, the sequence of bytes that make up the BLOB is interpreted as text encoded using the database encoding.
@@ -1174,7 +1175,7 @@ impl Value {
             Affinity::Text => {
                 // Convert everything to text representation
                 // TODO: handle encoding and whatever sqlite3_snprintf does
-                Value::build_text(self.to_string())
+                Value::build_text(self.to_text_at(digits))
             }
             Affinity::Real => match self {
                 Value::Blob(b) => {
@@ -1465,13 +1466,21 @@ impl Value {
     pub fn exec_concat(
         &self,
         rhs: &Value,
+        digits: crate::numeric::fp::FpDigits,
     ) -> std::result::Result<Value, crate::alloc::TryReserveError> {
-        // TEXT whatever the operands, two BLOBs too, as SQLite's OP_Concat gives.
-        let Some(lhs) = self.cast_text_ref() else {
+        // TEXT whatever the operands, two BLOBs too, as SQLite's OP_Concat gives; a REAL at the
+        // connection's FP_DIGITS.
+        let text = |v: &'_ Value| -> Option<std::borrow::Cow<'_, str>> {
+            match v {
+                Value::Numeric(Numeric::Float(_)) => Some(std::borrow::Cow::Owned(v.to_text_at(digits))),
+                other => other.cast_text_ref(),
+            }
+        };
+        let Some(lhs) = text(self) else {
             return Ok(Value::Null);
         };
 
-        let Some(rhs) = rhs.cast_text_ref() else {
+        let Some(rhs) = text(rhs) else {
             return Ok(Value::Null);
         };
 
@@ -1677,7 +1686,10 @@ impl Value {
         Ok(())
     }
 
-    pub fn exec_concat_strings<'a, T: Iterator<Item = &'a Self>>(registers: T) -> Self {
+    pub fn exec_concat_strings<'a, T: Iterator<Item = &'a Self>>(
+        registers: T,
+        digits: crate::numeric::fp::FpDigits,
+    ) -> Self {
         let mut result = String::new();
         for val in registers {
             match val {
@@ -1685,7 +1697,9 @@ impl Value {
                 Value::Text(s) => result.push_str(s.as_str()),
                 Value::Blob(b) => result.push_str(&String::from_utf8_lossy(b)),
                 Value::Numeric(Numeric::Integer(i)) => result.push_str(&i.to_string()),
-                Value::Numeric(Numeric::Float(f)) => result.push_str(&format_float(f64::from(*f))),
+                Value::Numeric(Numeric::Float(f)) => result.push_str(
+                    &crate::numeric::fp::real_to_text_digits(f64::from(*f), digits),
+                ),
             }
         }
         Value::build_text(result)
@@ -1694,10 +1708,13 @@ impl Value {
     /// SQLite's `concatwsFunc` and `concatFuncCore` (func.c): the separator and each argument as
     /// text, a BLOB its bytes; every argument but a NULL one written, an empty one too, with the
     /// separator between; a NULL separator makes the result NULL.
-    pub fn exec_concat_ws<'a, T: ExactSizeIterator<Item = &'a Self>>(mut registers: T) -> Self {
+    pub fn exec_concat_ws<'a, T: ExactSizeIterator<Item = &'a Self>>(
+        mut registers: T,
+        digits: crate::numeric::fp::FpDigits,
+    ) -> Self {
         let separator = match registers.next() {
             None | Some(Value::Null) => return Value::Null,
-            Some(separator) => separator.to_string(),
+            Some(separator) => separator.to_text_at(digits),
         };
         let mut result = String::new();
         let mut written = false;
@@ -1705,7 +1722,7 @@ impl Value {
             if written {
                 result.push_str(&separator);
             }
-            result.push_str(&val.to_string());
+            result.push_str(&val.to_text_at(digits));
             written = true;
         }
         Value::build_text(result)
@@ -2072,7 +2089,7 @@ mod tests {
         let rhs = blob(&[3, 4]);
 
         assert_eq!(
-            lhs.exec_concat(&rhs).unwrap(),
+            lhs.exec_concat(&rhs, crate::numeric::fp::FpDigits::DEFAULT).unwrap(),
             Value::build_text("\u{1}\u{2}\u{3}\u{4}")
         );
     }

@@ -674,6 +674,9 @@ pub struct Connection {
     /// can skip the catalog locks while no such pager can exist.
     pub(super) has_non_main_pagers: AtomicBool,
     pub(super) query_only: AtomicBool,
+    /// SQLITE_DBCONFIG_FP_DIGITS (c3ref/c_dbconfig_defensive.html; lane G12): the significant digits
+    /// this connection writes a REAL as text with (CAST, `||`, TEXT affinity, printf's text forms).
+    pub(super) fp_digits: AtomicU8,
     /// Amphora: statements prepared from now on count the rows of their table accesses and
     /// joins (`vdbe/row_counts.rs`).
     pub(super) row_counters: AtomicBool,
@@ -5033,6 +5036,23 @@ impl Connection {
 
     pub fn get_query_only(&self) -> bool {
         self.is_query_only()
+    }
+
+    /// `sqlite3_db_config(db, SQLITE_DBCONFIG_FP_DIGITS, n, &out)`: "The first argument is a small
+    /// integer, between 3 and 23, or zero. The FP_DIGITS setting is changed to that small integer, or
+    /// left unaltered if the first argument is zero or out of range." Returns the setting "after
+    /// possibly being modified by the first arguments". The default is 17.
+    pub fn db_config_fp_digits(&self, n: i32) -> u8 {
+        if let Some(digits) = crate::numeric::fp::FpDigits::new(n) {
+            self.fp_digits.store(digits.get(), Ordering::Relaxed);
+        }
+        self.fp_digits.load(Ordering::Relaxed)
+    }
+
+    /// The digits a statement on this connection writes a REAL as text with.
+    pub(crate) fn fp_digits(&self) -> crate::numeric::fp::FpDigits {
+        crate::numeric::fp::FpDigits::new(i32::from(self.fp_digits.load(Ordering::Relaxed)))
+            .unwrap_or(crate::numeric::fp::FpDigits::DEFAULT)
     }
 
     pub fn set_query_only(&self, value: bool) {

@@ -1230,8 +1230,8 @@ fn comparison_slow(
 
     // If all else failed, do an affinity-aware comparison
     let (new_lhs, new_rhs) = (
-        affinity.convert_for_compare(lhs_value),
-        affinity.convert_for_compare(rhs_value),
+        affinity.convert_for_compare(lhs_value, program.connection.fp_digits()),
+        affinity.convert_for_compare(rhs_value, program.connection.fp_digits()),
     );
 
     let lhs_for_compare = new_lhs
@@ -2943,7 +2943,7 @@ pub fn op_type_check(
                 return Ok(());
             }
             if let Some(expected_type) = col.strict_value_type() {
-                let _applied = apply_affinity_char(reg, col.affinity());
+                let _applied = apply_affinity_char(reg, col.affinity(), program.connection.fp_digits());
                 let value_type = reg.get_value().value_type();
                 if value_type != expected_type {
                     bail_constraint_error!(
@@ -3074,7 +3074,7 @@ pub fn op_array_encode(
 
         // Apply affinity coercion — same as STRICT's TypeCheck
         let mut reg_tmp = Register::Value(elem);
-        apply_affinity_char(&mut reg_tmp, *element_affinity);
+        apply_affinity_char(&mut reg_tmp, *element_affinity, program.connection.fp_digits());
         let coerced = reg_tmp.get_value().clone();
 
         // Check value type matches the declared element type — same as STRICT's TypeCheck
@@ -3668,7 +3668,11 @@ pub fn op_make_record(
         }
         let registers = &mut state.registers[start_reg..start_reg + count];
         for (register, &affinity_code) in registers.iter_mut().zip(affinity_str.as_bytes()) {
-            apply_affinity_char(register, Affinity::from_char_code(affinity_code));
+            apply_affinity_char(
+                register,
+                Affinity::from_char_code(affinity_code),
+                program.connection.fp_digits(),
+            );
         }
     }
 
@@ -6686,7 +6690,7 @@ pub fn op_idx_row_id(
 fn seek_rowid_key(key: &Value) -> Option<i64> {
     let mut numeric = Register::Value(key.clone());
     if matches!(key, Value::Text(_)) {
-        apply_affinity_char(&mut numeric, Affinity::Numeric);
+        apply_affinity_char(&mut numeric, Affinity::Numeric, crate::numeric::fp::FpDigits::DEFAULT);
     }
     match numeric.get_value() {
         Value::Numeric(Numeric::Integer(rowid)) => Some(*rowid),
@@ -10818,7 +10822,7 @@ pub fn op_function(
                     };
                     state.registers[*start_reg]
                         .get_value()
-                        .exec_cast(cast_type.as_str())?
+                        .exec_cast(cast_type.as_str(), program.connection.fp_digits())?
                 };
                 state.registers[*dest].set_value(result);
             }
@@ -10837,12 +10841,15 @@ pub fn op_function(
             ScalarFunc::Concat => {
                 let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
                 let result =
-                    Value::exec_concat_strings(reg_values.iter().map(|reg| reg.get_value()));
+                    Value::exec_concat_strings(reg_values.iter().map(|reg| reg.get_value()), program.connection.fp_digits());
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::ConcatWs => {
                 let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
-                let result = Value::exec_concat_ws(reg_values.iter().map(|reg| reg.get_value()));
+                let result = Value::exec_concat_ws(
+                    reg_values.iter().map(|reg| reg.get_value()),
+                    program.connection.fp_digits(),
+                );
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::Glob => {
@@ -10884,7 +10891,7 @@ pub fn op_function(
                 } else {
                     let pattern_cow = match pattern_value {
                         Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-                        v => match v.exec_cast("TEXT")? {
+                        v => match v.exec_cast("TEXT", program.connection.fp_digits())? {
                             Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
                             _ => unreachable!("Cast to TEXT should yield Text"),
                         },
@@ -10892,7 +10899,7 @@ pub fn op_function(
 
                     let match_cow = match match_value {
                         Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-                        v => match v.exec_cast("TEXT")? {
+                        v => match v.exec_cast("TEXT", program.connection.fp_digits())? {
                             Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
                             _ => unreachable!("Cast to TEXT should yield Text"),
                         },
@@ -10956,7 +10963,7 @@ pub fn op_function(
                             _ => {
                                 let escape_cow = match escape_value {
                                     Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-                                    v => match v.exec_cast("TEXT")? {
+                                    v => match v.exec_cast("TEXT", program.connection.fp_digits())? {
                                         Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
                                         _ => unreachable!("Cast to TEXT should yield Text"),
                                     },
@@ -10983,7 +10990,12 @@ pub fn op_function(
                             (Value::Text(pattern), Value::Text(text)) => {
                                 Value::exec_like(pattern.as_str(), text.as_str(), escape_char)?
                             }
-                            _ => exec_like_converted(pattern_value, match_value, escape_char)?,
+                            _ => exec_like_converted(
+                                pattern_value,
+                                match_value,
+                                escape_char,
+                                program.connection.fp_digits(),
+                            )?,
                         };
                         state.registers[*dest].set_int(matches as i64);
                     }
@@ -11406,7 +11418,10 @@ pub fn op_function(
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::Printf => {
-                let result = exec_printf(&state.registers[*start_reg..*start_reg + arg_count])?;
+                let result = exec_printf(
+                    &state.registers[*start_reg..*start_reg + arg_count],
+                    program.connection.fp_digits(),
+                )?;
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::TableColumnsJsonArray => {
@@ -13035,17 +13050,18 @@ fn exec_like_converted(
     pattern_value: &Value,
     match_value: &Value,
     escape_char: Option<char>,
+    digits: crate::numeric::fp::FpDigits,
 ) -> Result<bool> {
     let pattern_cow = match pattern_value {
         Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-        v => match v.exec_cast("TEXT")? {
+        v => match v.exec_cast("TEXT", digits)? {
             Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
             _ => unreachable!("Cast to TEXT should yield Text"),
         },
     };
     let match_cow = match match_value {
         Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-        v => match v.exec_cast("TEXT")? {
+        v => match v.exec_cast("TEXT", digits)? {
             Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
             _ => unreachable!("Cast to TEXT should yield Text"),
         },
@@ -17128,7 +17144,7 @@ pub fn op_concat(
     load_insn!(Concat { lhs, rhs, dest }, insn);
     let value = state.registers[*lhs]
         .get_value()
-        .exec_concat(state.registers[*rhs].get_value())?;
+        .exec_concat(state.registers[*rhs].get_value(), program.connection.fp_digits())?;
     state.registers[*dest].set_value(value);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -17650,7 +17666,11 @@ pub fn op_affinity(
 
     let registers = &mut state.registers[*start_reg..*start_reg + count.get()];
     for (register, &affinity_code) in registers.iter_mut().zip(affinities.as_bytes()) {
-        apply_affinity_char(register, Affinity::from_char_code(affinity_code));
+        apply_affinity_char(
+                register,
+                Affinity::from_char_code(affinity_code),
+                program.connection.fp_digits(),
+            );
     }
 
     state.pc += 1;
@@ -17993,7 +18013,7 @@ pub fn op_integrity_check(
     Ok(InsnFunctionStepResult::Step)
 }
 pub fn op_cast(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -18001,12 +18021,13 @@ pub fn op_cast(
     load_insn!(Cast { reg, affinity }, insn);
 
     let value = state.registers[*reg].get_value().clone();
+    let digits = program.connection.fp_digits();
     let result = match affinity {
-        Affinity::Blob | Affinity::None => value.exec_cast("BLOB"),
-        Affinity::Text => value.exec_cast("TEXT"),
-        Affinity::Numeric => value.exec_cast("NUMERIC"),
-        Affinity::Integer => value.exec_cast("INTEGER"),
-        Affinity::Real => value.exec_cast("REAL"),
+        Affinity::Blob | Affinity::None => value.exec_cast("BLOB", digits),
+        Affinity::Text => value.exec_cast("TEXT", digits),
+        Affinity::Numeric => value.exec_cast("NUMERIC", digits),
+        Affinity::Integer => value.exec_cast("INTEGER", digits),
+        Affinity::Real => value.exec_cast("REAL", digits),
     }?;
 
     state.registers[*reg].set_value(result);
@@ -20370,7 +20391,11 @@ pub fn op_hash_grace_advance_partition(
 }
 
 #[inline(always)]
-fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
+fn apply_affinity_char(
+    target: &mut Register,
+    affinity: Affinity,
+    digits: crate::numeric::fp::FpDigits,
+) -> bool {
     // handle the common cases that don't require a conversion inline
     if let Register::Value(value) = target {
         let settled = match affinity {
@@ -20390,11 +20415,15 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
             return true;
         }
     }
-    apply_affinity_char_slow(target, affinity)
+    apply_affinity_char_slow(target, affinity, digits)
 }
 
 #[inline(never)]
-fn apply_affinity_char_slow(target: &mut Register, affinity: Affinity) -> bool {
+fn apply_affinity_char_slow(
+    target: &mut Register,
+    affinity: Affinity,
+    digits: crate::numeric::fp::FpDigits,
+) -> bool {
     if let Register::Value(value) = target {
         if matches!(value, Value::Blob(_)) {
             return true;
@@ -20407,7 +20436,7 @@ fn apply_affinity_char_slow(target: &mut Register, affinity: Affinity) -> bool {
                 if matches!(value, Value::Text(_) | Value::Null) {
                     return true;
                 }
-                let text = value.to_string();
+                let text = value.to_text_at(digits);
                 *value = Value::Text(text.into());
                 return true;
             }
@@ -22825,7 +22854,7 @@ mod tests {
 
         for (input, expected_int) in ascii_whitespace_cases {
             let mut register = Register::Value(Value::Text(input.into()));
-            apply_affinity_char(&mut register, Affinity::Integer);
+            apply_affinity_char(&mut register, Affinity::Integer, program.connection.fp_digits());
 
             match register {
                 Register::Value(Value::Numeric(Numeric::Integer(i))) => {
@@ -22853,7 +22882,7 @@ mod tests {
 
         for (input, _expected_type, expected_len) in test_strings {
             let mut register = Register::Value(Value::Text(input.into()));
-            apply_affinity_char(&mut register, Affinity::Integer);
+            apply_affinity_char(&mut register, Affinity::Integer, program.connection.fp_digits());
 
             match register {
                 Register::Value(Value::Text(t)) => {
@@ -22877,7 +22906,7 @@ mod tests {
 
         for input in cases {
             let mut register = Register::Value(Value::Text(input.into()));
-            apply_affinity_char(&mut register, Affinity::Integer);
+            apply_affinity_char(&mut register, Affinity::Integer, program.connection.fp_digits());
             match register {
                 Register::Value(Value::Text(t)) => {
                     assert_eq!(t.as_str(), input, "Unexpected conversion for '{input}'");
@@ -22888,7 +22917,7 @@ mod tests {
             }
 
             let mut register = Register::Value(Value::Text(input.into()));
-            apply_affinity_char(&mut register, Affinity::Numeric);
+            apply_affinity_char(&mut register, Affinity::Numeric, program.connection.fp_digits());
             match register {
                 Register::Value(Value::Text(t)) => {
                     assert_eq!(t.as_str(), input, "Unexpected conversion for '{input}'");

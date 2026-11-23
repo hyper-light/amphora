@@ -2818,6 +2818,7 @@ impl Database {
             attached_databases: RwLock::new(DatabaseCatalog::new()),
             has_non_main_pagers: AtomicBool::new(false),
             query_only: AtomicBool::new(false),
+            fp_digits: AtomicU8::new(crate::numeric::fp::FpDigits::DEFAULT.get()),
             row_counters: AtomicBool::new(false),
             plan_cache_mode: AtomicU8::new(crate::PlanCacheMode::Auto.to_u8()),
             vdbe_trace: AtomicBool::new(false),
