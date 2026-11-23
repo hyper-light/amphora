@@ -42,9 +42,11 @@ use std::collections::HashMap;
 
 const HEADER_MAGIC: u64 = 0x4144_4548_4f52_5041;
 const JOURNAL_MAGIC: u64 = 0x4c4e_524a_4f52_5041;
-/// The word after a header's stamp: the header was written only once its checkpoint's pages were
-/// flushed (AUDIT 7.5). A header written before this order has no word after its stamp.
+/// An optional word after the stamp confirms its checkpoint's pages were flushed first
+/// (AUDIT 7.5). Old headers and stamps that fill the page have no such word.
 const PAGES_FLUSHED: u64 = 1;
+/// The seal's magic, body length and hash are each an encoded u64.
+const SEAL_LEN: usize = size_of::<[u64; 3]>();
 
 /// A checkpoint as a header or journal names it.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -125,7 +127,7 @@ impl Stamp {
 /// `magic`, the body's length and XXH3, the body.
 fn seal(magic: u64, body: &[u8]) -> Result<Vec<u8>> {
     let len = u64::try_from(body.len()).map_err(|_| LimboError::IntegerOverflow)?;
-    let mut out = Vec::with_capacity(body.len().saturating_add(24));
+    let mut out = Vec::with_capacity(body.len().saturating_add(SEAL_LEN));
     out.extend_from_slice(&magic.to_le_bytes());
     out.extend_from_slice(&len.to_le_bytes());
     out.extend_from_slice(&twox_hash::XxHash3_64::oneshot(body).to_le_bytes());
@@ -182,7 +184,7 @@ fn partition(op: &Op, parts: usize) -> usize {
 }
 
 /// A seal's own bytes ahead of its body: magic, length and hash (`seal`'s format).
-const SEAL_BYTES: u64 = 24;
+const SEAL_BYTES: u64 = SEAL_LEN as u64;
 
 /// A journal page: its number (`u64`) and its bytes (the journal's format).
 const ENTRY_BYTES: usize = 8 + PAGE_SIZE;
@@ -747,7 +749,11 @@ impl Database {
     fn write_header(disk: &dyn Disk, stamp: &Stamp) -> Result<()> {
         let mut body = Vec::new();
         stamp.encode(&mut body)?;
-        body.extend_from_slice(&PAGES_FLUSHED.to_le_bytes());
+        let marker = PAGES_FLUSHED.to_le_bytes();
+        // Preserve every root slot in the legacy page. A full page replays its journal on open.
+        if body.len() <= PAGE_SIZE - SEAL_LEN - marker.len() {
+            body.extend_from_slice(&marker);
+        }
         let mut page = seal(HEADER_MAGIC, &body)?;
         if page.len() > PAGE_SIZE {
             return Err(LimboError::TooBig);
@@ -1414,6 +1420,61 @@ mod tests {
         page.resize(PAGE_SIZE, 0);
         disk.write_at(File::Data, 0, &page).unwrap();
         disk.sync(File::Data).unwrap();
+    }
+
+    /// T-T1.3.1, AUDIT 7.5. An old checkpoint can use the whole header page for its
+    /// roots. Recover its committed row, checkpoint it again and recover after a power cut.
+    #[test]
+    fn review_a_full_legacy_header_can_reopen_and_checkpoint() {
+        let disk = Arc::new(Simulated::new(11, 1).unwrap());
+        let mut d = Descender::new();
+        let db = Database::open(disk.clone(), 2_000, 1, cmp).unwrap();
+        let mut txn = db.begin().unwrap();
+        db.put(&mut d, &mut txn, 0, b"row", b"kept").unwrap();
+        db.commit(txn, &mut d, db.lane(), true).unwrap();
+
+        let mut first = vec![0; PAGE_SIZE];
+        disk.read_at(File::Data, 0, &mut first).unwrap();
+        let mut stamp = Header::decode(unseal(HEADER_MAGIC, &first).unwrap())
+            .unwrap()
+            .stamp;
+        let mut body = Vec::new();
+        stamp.encode(&mut body).unwrap();
+        let room = PAGE_SIZE - seal(HEADER_MAGIC, &body).unwrap().len();
+        for _ in 0..room / size_of::<u64>() {
+            db.make_tree(&mut d, cmp()).unwrap();
+        }
+        stamp.seq += 1;
+        stamp.ts = db.newest();
+        stamp.roots = db.v.roots();
+        stamp.allocated = db.v.pool.allocated();
+        let epoch = db.v.pool.begin_copy().unwrap();
+        Journal::write(
+            &*disk,
+            &stamp,
+            &db.v.corrections(stamp.ts).unwrap(),
+            |each| db.v.pool.copy_owed(epoch, stamp.allocated, each),
+        )
+        .unwrap();
+        body.clear();
+        stamp.encode(&mut body).unwrap();
+        let legacy = seal(HEADER_MAGIC, &body).unwrap();
+        assert_eq!(legacy.len(), PAGE_SIZE);
+        // The old writer could persist the header before its checkpoint's journaled pages.
+        disk.write_at(File::Data, 0, &legacy).unwrap();
+        disk.sync(File::Data).unwrap();
+        drop(db);
+        disk.power_cut().unwrap();
+
+        let want = [(b"row".to_vec(), b"kept".to_vec())].into_iter().collect();
+        let db = Database::open(disk.clone(), 2_000, 1, cmp)
+            .expect("recover the full legacy header");
+        assert_eq!(rows(&db), want);
+        db.checkpoint().unwrap();
+        drop(db);
+        disk.power_cut().unwrap();
+        let db = Database::open(disk, 2_000, 1, cmp).unwrap();
+        assert_eq!(rows(&db), want);
     }
 
     /// A simulated disk that counts the data file's writes and flushes.
