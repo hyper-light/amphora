@@ -139,6 +139,8 @@ pub struct LightReady {
     /// What to apply, where storage holds it, for a `Ready` given in place.
     committed_range: Option<(u64, u64)>,
     messages: Vec<Message>,
+    /// Reads confirmed since the last `Ready` or light ready ([`RawNode::light_now`]).
+    read_states: Vec<ReadState>,
 }
 impl LightReady {
     /// The commit, when it moved. It need not be durable to be acted on, and
@@ -176,6 +178,15 @@ impl LightReady {
     pub fn take_messages(&mut self) -> Vec<Message> {
         std::mem::take(&mut self.messages)
     }
+    /// Reads that may be served once their index is applied: those confirmed since the last
+    /// `Ready` or light ready, given by [`RawNode::light_now`] alone.
+    pub fn read_states(&self) -> &[ReadState] {
+        &self.read_states
+    }
+    /// Takes the reads, leaving none.
+    pub fn take_read_states(&mut self) -> Vec<ReadState> {
+        std::mem::take(&mut self.read_states)
+    }
 }
 
 /// What the member asks of its owner at once: what to persist, send and
@@ -195,8 +206,8 @@ pub struct Ready {
     snapshot: Option<Snapshot>,
     after_persisting: bool,
     light: LightReady,
-    /// Held answers (core step R-8): sent at once whatever the write, since they promise memory
-    /// alone.
+    /// Held answers (core step R-8), and heartbeats' answers on a durable term and vote: sent at
+    /// once whatever the write, since they promise memory alone, or only what the disk holds.
     held: Vec<Message>,
     must_sync: bool,
     /// Its messages were taken: a commit can no longer be deferred, since
@@ -333,7 +344,9 @@ impl Ready {
     }
     /// Held answers (core step R-8, `docs/raft.md` §3.7): to send at once, before this `Ready`'s
     /// write and whatever it holds, since each promises only that the entries it names are in
-    /// memory. None in a group whose owner states no fates.
+    /// memory; none in a group whose owner states no fates. Beside them, heartbeats' answers made
+    /// on a durable term and vote, which state only what the member's disk holds
+    /// (`Raft::answer_beat_now`).
     pub fn held_messages(&self) -> &[Message] {
         &self.held
     }
@@ -450,9 +463,6 @@ pub struct RawNode<S> {
     /// The `Ready`s whose writes are out, oldest first; at most
     /// [`crate::Limits::readies_in_flight`].
     issued: VecDeque<Given>,
-    /// The term and vote storage holds durably: as the member opened, then
-    /// as the last write known durable stated them.
-    durable_vote: (u64, u64),
     /// What was given to apply reaches this index.
     commit_since: u64,
     /// The owner holds what it was given to apply and is given no more
@@ -484,7 +494,8 @@ impl<S> RawNode<S> {
 impl<S: Storage> RawNode<S> {
     /// The member `config` names, opened on what `store` holds.
     pub fn new(config: &Config, store: S) -> Result<Self> {
-        let raft = Raft::new(config, store)?;
+        let mut raft = Raft::new(config, store)?;
+        raft.durable_vote = (raft.term(), raft.vote());
         let mut issued = VecDeque::new();
         // Reserved once: a write issued never grows the queue.
         issued
@@ -493,7 +504,6 @@ impl<S: Storage> RawNode<S> {
         Ok(Self {
             previous_soft: raft.soft_state(),
             previous_hard: raft.hard_state(),
-            durable_vote: (raft.term(), raft.vote()),
             released: raft.classic,
             raft,
             number: 0,
@@ -868,6 +878,7 @@ impl<S: Storage> RawNode<S> {
             committed_entries,
             committed_range: None,
             messages: self.messages(release),
+            read_states: Vec::new(),
         })
     }
     /// As [`RawNode::light`] while the owner holds what it was given to
@@ -901,6 +912,7 @@ impl<S: Storage> RawNode<S> {
             committed_entries: Vec::new(),
             committed_range,
             messages: self.messages(release),
+            read_states: Vec::new(),
         })
     }
     fn messages(&mut self, release: bool) -> Vec<Message> {
@@ -926,7 +938,7 @@ impl<S: Storage> RawNode<S> {
     /// Whether the term and vote the member holds are durable.
     #[inline]
     fn vote_durable(&self) -> bool {
-        self.durable_vote == (self.raft.term(), self.raft.vote())
+        self.raft.vote_durable()
     }
     /// Whether what a notice of durability made may be sent at once (I1,
     /// I2): a leader's while its term and vote are durable; any member's
@@ -957,7 +969,7 @@ impl<S: Storage> RawNode<S> {
     /// follower's held answer when it takes the entries. What is left leaves with the next
     /// `Ready`, as before.
     pub fn messages_now(&mut self) -> Vec<Message> {
-        let mut messages = self.raft.take_held_answers();
+        let mut messages = self.raft.take_answers_now();
         if self.releases_now() && !self.raft.msgs.is_empty() {
             let queued = self.raft.msgs.take();
             if messages.is_empty() {
@@ -973,18 +985,26 @@ impl<S: Storage> RawNode<S> {
     /// [`RawNode::messages_now`]. A leader whose writes fill its pipeline then applies what it
     /// commits when it commits, not when a write of its own frees a place for the next `Ready`.
     /// `in_place` as [`RawNode::ready_in_place`]. Refused while a `Ready` is taken and not issued.
+    ///
+    /// Reads go on as well, since none waits for a write: the round for the reads asked since the
+    /// last leaves (`Raft::ask_reads`), and the reads confirmed since the last `Ready` are given
+    /// ([`LightReady::read_states`]). A leader whose writes fill its pipeline then confirms a read
+    /// when a quorum answers its round, not when a write of its own frees a place for the next
+    /// `Ready`.
     pub fn light_now(&mut self, in_place: bool) -> Result<LightReady> {
         if self.taken.is_some() {
             return Err(Error::Invariant(
                 "a light ready asked for while a ready is taken and not issued",
             ));
         }
+        self.raft.ask_reads()?;
         let release = self.releases_now();
         let mut light = self.light(in_place, release)?;
-        let held = self.raft.take_held_answers();
-        if !held.is_empty() {
-            light.messages.extend(held);
+        let now = self.raft.take_answers_now();
+        if !now.is_empty() {
+            light.messages.extend(now);
         }
+        light.read_states = std::mem::take(&mut self.raft.read_states);
         self.hold_released(&mut light);
         let hard = self.raft.hard_state();
         if hard.commit > self.previous_hard.commit {
@@ -998,7 +1018,7 @@ impl<S: Storage> RawNode<S> {
         let raft = &self.raft;
         let unstable = raft.log().unstable();
         !raft.msgs.is_empty()
-            || raft.has_held_answers()
+            || raft.has_answers_now()
             || raft.reads_unasked()
             || raft.soft_state() != self.previous_soft
             || raft.hard_state() != self.previous_hard
@@ -1140,7 +1160,7 @@ impl<S: Storage> RawNode<S> {
         // Taken, and not emptied: what the member holds when it rests is
         // what it held before.
         ready.read_states = std::mem::take(&mut self.raft.read_states);
-        ready.held = self.raft.take_held_answers();
+        ready.held = self.raft.take_answers_now();
         ready.displaced = self.raft.take_displaced();
         if !ready.proposals.is_empty() || new_entries {
             ready.must_sync = true;
@@ -1316,12 +1336,7 @@ impl<S: Storage> RawNode<S> {
         let keeps = keep.is_some();
         let mut kept = Kept::default();
         let mut in_place = false;
-        let Self {
-            raft,
-            issued,
-            durable_vote,
-            ..
-        } = self;
+        let Self { raft, issued, .. } = self;
         let term = raft.term();
         for given in issued
             .iter_mut()
@@ -1330,7 +1345,7 @@ impl<S: Storage> RawNode<S> {
             given.stable = stabilize(
                 &mut raft.log,
                 term,
-                durable_vote,
+                &mut raft.durable_vote,
                 &given.mark,
                 &mut kept,
                 keeps,
@@ -1355,7 +1370,7 @@ impl<S: Storage> RawNode<S> {
         self.raft.settle_priority();
         // A candidate's vote for itself counts once it is durable, after what
         // the writes held is: the entries a leader it makes appends are not.
-        let (term, vote) = self.durable_vote;
+        let (term, vote) = self.raft.durable_vote;
         self.raft.on_vote_durable(term, vote)?;
         // The promise those writes stated is durable (R-8).
         self.raft.held_durable(number)?;
@@ -1442,7 +1457,7 @@ impl<S: Storage> RawNode<S> {
         }
         if let Some(hard) = ready.hard_state {
             self.previous_hard = hard;
-            self.durable_vote = (hard.term, hard.vote);
+            self.raft.durable_vote = (hard.term, hard.vote);
             self.raft.commit_durable(hard.commit);
         }
         let mut kept = Kept::default();
@@ -1479,7 +1494,7 @@ impl<S: Storage> RawNode<S> {
         self.raft.settle_priority();
         // A candidate's vote for itself counts once it is durable, after what
         // the write held is: the entries a leader it makes appends are not.
-        let (term, vote) = self.durable_vote;
+        let (term, vote) = self.raft.durable_vote;
         self.raft.on_vote_durable(term, vote)?;
         self.raft.held_durable(taken.number)?;
         // Nothing is out and nothing is left to write: what follows leaves

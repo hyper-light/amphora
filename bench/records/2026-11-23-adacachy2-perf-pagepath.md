@@ -349,3 +349,62 @@ filter is wider than B6's (`storage::wal storage::log_index`): it takes btree's 
 perf/pagepath-d45 as synced when it is placed (478716f8: main 3f7624a3 with `log_segments`); queued at 16:16Z
 and stopped by the lane at 16:26Z before it started: no Mac had room, and a cold build would not have ended within the
 hour. The Mac target dir for this lane is still cold.
+
+## perf-B8 (2026-11-23, 16:46-17:41Z)
+
+**Losses first: no code, so no numbers.** None of the brief's four deliverables is built. That covers the rerouting (unit 1), the
+switch and per-segment reads with their four tests, the clean close and the SQLite mark, and the slow-reader A/B. The
+hour went to the check the brief put first (the pager's page cache), a map of the 56 `self.shared` sites by role, and a
+baseline of the merged tree. The rerouting changes the type every open path and every WAL test holds
+(`Arc<RwLock<WalFileShared>>`), so it could not be built and checked inside the hour, and a half-built one was not pushed.
+
+**The page cache, checked. Decision 45's "Where it lands" now says so.**
+- The shared pages' key is the risk. `pager.rs` 4787-4790 keys a version as `Version::Frame { generation:
+  wal.connection_wal_pos().0, frame }`, the connection's generation, which is the current segment's. With frames
+  numbered per segment, frame n of the closing segment and frame n of the current one would share a key, and a read
+  could be handed the other segment's page. So `find_frame` has to answer with its frame's segment, and the key takes
+  that segment's checkpoint sequence. Unit 1 alone (no switch) is not exposed. Unit 2 is.
+- Decision 18's forget rule needs no change (`read_change`, `wal.rs` 5114-5136). It forgets everything when the
+  checkpoint sequence differs, and a switch changes the current segment's sequence, so a connection whose last read was
+  in the other generation clears its cache, as after a restart today. The cost is one full clear per connection per
+  switch, the same as one per restart today.
+- A packed delta chains only from a version of the same generation (`chains_from`, `wal.rs` 4430-4436, called by
+  both of the commit's paths), so none chains across a switch.
+
+**The 56 `self.shared` sites by role** (`wal.rs` on fbdca171; `python3 -I ~/.cache/amphora-perf/pagepath-b8/sites.py
+crates/engine/storage/wal.rs` lists them with their functions).
+- Log-wide, to the log (7): the write lock 1410 and 1414, the checkpoint lock 1420 and 1424, `lock_release` 1450,
+  and `shared_wal_state` 2063 and 3028, through which `WalFile` takes the vacuum lock (5042, 6095, 6866).
+- Read marks, one set per segment (10): the eight helpers 1350-1404, `try_begin_read_tx` 1537 and the shm one 2708.
+- Reads by `ReadSpan::lookup_order` (2): `find_frame` 1483 and `find_frame_locked` 1331.
+- The writer's current segment (18): `load_snapshot` 1432; `publish_commit` 1436, 2596 and 2618; `wal_header` 1803;
+  `wal_file` 1807; `wal_is_initialized` 1819 and 3046; `prepare_wal_header` 1827, where the switch writes the free
+  segment's header; `mark_initialized` 1861; `cache_frame` 1869; `cache_record` 1930; `latest_frame` 1987 and
+  `page_frames` 1995 (the packed chains, which stay in one generation); `rollback_cache` 2008; `changed_pages` 2044;
+  `durable_through` 1779; `prepare_truncate` 1786.
+- The checkpointer, closing segment first (6): `publish_backfill` 1454 and 2627, `iter_latest_frames` 1501,
+  `checkpoint_epoch` 1517, and `bump_checkpoint_epoch` 1521 and 2695.
+- Deleted with the restart (1): `begin_restart` 1741.
+- The shm backend's sync with another process's authority (10): 2098-2512.
+- Tests only (2): `shared_ptr` 2059 and 3121.
+
+**The handle's type, everywhere it goes** (what unit 1 changes in one pass): `database.rs` 758 (the field), 868, the
+open paths 2372-2554 and 3028; recovery's `BuildSharedWal` (`sqlite3_ondisk.rs` 1555-1774); in `wal.rs`, the two
+backends' constructors (1302, 1317, 2137), `WalFile::new` and `new_with_shared_coordination` (6765-6790),
+`OpenSharedWal`, `open_shared_if_exists` (7987, 7999), `new_noop` (8025), `new_shared` (8073), `VacuumLockGuard`, and
+the tests' `make_test_wal_from_shared` (8764); the tests in `pager.rs` (7665, 7855) and `btree.rs` (13363).
+
+**Open: the multi-process log.** The shm backend (`ShmWalCoordination`, `wal.rs` 2080) is compiled on every 64-bit
+Unix and Windows target (`build.rs` 9). It is chosen only by `DatabaseOpts::with_multiprocess_wal(true)`, and only the
+engine's own tests set that (`multiprocess_tests.rs` 132, `database.rs` 5026 and 5054, `pager.rs` 8308, `wal.rs`
+8286). Its authority keeps one log header in shared memory. Decision 45 doesn't say what it does with two segments.
+The choice is the coordinator's: the authority carries both headers and `Segments`, or a multi-process open is refused
+with a typed error.
+
+**Checks.** Run r1233 (adacachy2, needs `linux/amd64,cpus=4,mem=16g`, placed at once with 23 of 32 cores idle, load
+18-27) on fbdca171: perf/pagepath-d45 (478716f8) with origin/main 5e6c619f merged. Main changed nothing in
+`crates/engine/storage`, `store.rs` or `db.rs` since 3f7624a3. `cargo test -p amphora-engine --lib --locked --
+storage::` passed 694, failed 3 and ignored 14 in 194 s. The three are main's own: btree's
+`wal_reuses_freelist_leaf_after_abandoned_overflowing_insert`, `cb4_a_read_only_transaction_reads_the_copy_at_its_snapshot`
+and `cb4_ab_both_rebuy_policies_at_the_extremes`. `cargo test -p amphora --locked --test store` passed 15. No new
+failure. This lane changed docs only: decision 45's list and this record.

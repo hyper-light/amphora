@@ -373,11 +373,30 @@ Checks, all on adacachy2 (runner 00aad8da...; Mac Studio 2 refused this clone's 
 
 ## 3. The leader-tail A/B
 
-In progress at this merge: r1218 on adacachy2 (needs cpus=16; Mac Studio 2 refused the sync), the bench at 78cf8028
-(perf/persisted-w5-ab: this fix, W4's switch cf62b1f3, unit 4's bench), both arms one binary and one calibration;
-`--seconds` sized from a probe so a run holds about 1000 leader writes (capped at 90 s); 3 and 32 writers, 5 rounds,
-arm order alternated by round; then 128 writers once per arm. Results file on adacachy2:
-`~/.cache/amphora-perf/persisted-w5ab/results.txt`.
+r1218 on adacachy2 (needs cpus=16; Mac Studio 2 refused this clone's sync), the bench at 78cf8028 (perf/persisted-w5-ab:
+0011, W4's switch cf62b1f3, unit 4's bench), both arms one binary, so one calibration (measured by the first probe,
+read by every run after; RULES 5e holds without a copy). In-process persisted commit, `--batch 1 --text-bytes 600
+--deadline-s 10 --relay-records 128 --spanning 2 --warmup-s 1 --seconds 90` (the probe's 15 writes/s asked for 200 s
+to reach 1000 leader writes; 90 s is the cap), arm order alternated by round; load 18-27, CPU pressure avg10 0.1-2.6%,
+I/O 3-10% (my nemesis and clippy runs beside the first rounds). Rounds 1 and 2, the leader the node with the most
+acknowledged writes and the lowest p50 (node 2 or 0; `leader` at the end agreed in every 3-writer run):
+
+| writers | arm | round | leader writes | leader p50 ms | p99 ms | p99.9 ms | leader refused per write | writes/s | missed (writers) |
+|---|---|---|---|---|---|---|---|---|---|
+| 3 | today | 1 | 617 | 118 | 524 | 680 | 0.53 (327) | 15.0 | 0 |
+| 3 | leader tail | 1 | 645 | 111 | 532 | 844 | 0.31 (202) | 15.9 | 0 |
+| 3 | leader tail | 2 | 599 | 118 | 565 | 1024 | 0.36 (216) | 15.1 | 0 |
+| 3 | today | 2 | 682 | 110 | 479 | 754 | 0.44 (301) | 15.6 | 0 |
+| 32 | today | 1 | (leader moved) | | | | | 13.3 | 11 (11) |
+| 32 | leader tail | 1 | 691 | 1065 | 4096 | 6291 | 0.37 (257) | 17.5 | 5 (5) |
+| 32 | leader tail | 2 | 520 | 1442 | 6160 | 7274 | 0.34 (176) | 12.7 | 10 (8) |
+
+Not a verdict: 2 of 5 rounds, and each run's leader holds 520 to 690 writes, under the 1000 the p99.9 needs (the bench
+gives each run's quantiles, not its samples, so runs can't be pooled). So far, as W4 saw: at 3 writers the leader's
+refusals per write fall (0.53, 0.44 today; 0.31, 0.36 with the tail rule) and its p50 and p99 show no measurable
+difference; its p99.9 is higher with the tail rule in both rounds (844, 1024 against 680, 754 ms), within 600 writes a
+run. The rest is in `~/.cache/amphora-perf/persisted-w5ab/results.txt` on adacachy2 and r1218's output when it ends
+(3 more rounds, then 128 writers once per arm). The switch stays off main.
 
 ## 4. The commit rung counts deadline misses
 
@@ -386,4 +405,8 @@ and sends the same write again unchanged (same ids, as `failover`'s writers do),
 acknowledged; one still unacknowledged at the run's end is counted and untimed. The record gains `deadline_misses`
 and `writers_missed`, beside W4's per-node latency and `Serialization` refusals (`by_node`, from cf62b1f3).
 
-On perf/persisted-w5-bench (6043acfe), not merged with unit 2. The bench at 78cf8028, the same `repl.rs`, is what r1218 builds.
+Checks on adacachy2: r1218 built the bench at 78cf8028 (the same `repl.rs`) and ran it: the 32-writer runs above
+missed 5 to 11 deadlines on 5 to 11 writers and went on, where W4's r1158 ended at the first. `cargo clippy
+--manifest-path bench/Cargo.toml --all-targets -D warnings` (r1239) is not clean on main itself: 166 errors at main
+945b633a and 166 at 6043acfe, 9 of them in `repl.rs` at each (the same 9, moved by the added lines). r1241: `cargo check
+--release` on the bench after merging main (65c59f28). Not run: a 128-writer rung of this landing (r1218 runs it last).
