@@ -5621,6 +5621,8 @@ mod tests {
     mod closed_reads;
     // Session tokens: read-your-writes on any replica (`tokens`), on the same driven shell.
     mod session_reads;
+    // A caller's session on its owner's session worker (replication.md, "Decision (lane P6)").
+    mod session_worker;
 
     thread_local! {
         /// The account the owners a test opens on its thread charge their readers to, in place of
