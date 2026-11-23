@@ -79,14 +79,46 @@ def diff(a, b):
     return n, most
 
 
+def refs():
+    """ref.json and any later ref-*.json (lane R2's q09 and TPC-H q01, q06), merged."""
+    answers, tpch_refs = {}, {}
+    for name in sorted(os.listdir(OUT)):
+        if name.startswith("ref") and name.endswith(".json"):
+            got = json.load(open(os.path.join(OUT, name)))
+            answers.update(got.get("answers", {}))
+            tpch_refs.update(got.get("tpch", {}))
+    return answers, tpch_refs
+
+
+REF, TPCH_REF = refs()
+
+
+def vs_ref(a, q, alg):
+    """Cells of answer a that differ by bits from the reference's `alg` for TPC-H query q, and the most ulps."""
+    groups = TPCH_REF.get("tpch-" + q)
+    if a is None or groups is None:
+        return None, None
+    if len(a) != len(groups):
+        return "shape", None
+    n, most = 0, 0
+    for row, group in zip(a, groups):
+        first = len(group["group"])
+        for i, cell in enumerate(group["cells"]):
+            x, y = row[first + i], value(cell[alg])
+            if key(x) != key(y):
+                n += 1
+                u = ulps(x, y)
+                most = max(most, u) if u is not None else most
+    return n, most
+
+
 def hard():
-    ref_path = os.path.join(OUT, "ref.json")
-    ref = json.load(open(ref_path))["answers"] if os.path.exists(ref_path) else {}
+    ref = REF
     root = os.path.join(OUT, "answers-hard")
     print("## Hard cases over lineitem (bench/planner/real_sums/queries), one row each\n")
     print("| query | column | Serial (1 worker) | Exact at 1/4/8/16 | RowOrder at 1/4/8/16 | SQLite 3.53.2 (bench) | SQLite ref (func.c) | PostgreSQL 19 ref (float.c) | exact ref |")
     print("|---|---|---|---|---|---|---|---|---|")
-    for q in sorted(ref) or ["q0%d" % i for i in range(1, 9)]:
+    for q in sorted(ref) or ["q0%d" % i for i in range(1, 10)]:
         base = answer(os.path.join(root, "serial-c1"), q, "amphora")
         lite = answer(os.path.join(root, "sqlite"), q, "sqlite")
         cols = len(base[0]) if base else len(ref.get(q, []))
@@ -124,19 +156,26 @@ def tpch(sub, queries, cores):
     if not os.path.isdir(root):
         return
     print("\n## TPC-H answers (%s): cells differing by bits (most ulps)\n" % sub)
-    print("| query | arm | workers | vs Serial at 1 (or 16) | vs SQLite 3.53.2 |")
-    print("|---|---|---|---|---|")
+    print("| query | arm | workers | vs Serial at %d | vs SQLite 3.53.2 | vs SQLite ref (func.c) | vs PostgreSQL 19 ref (float.c) | vs exact ref |" % cores[0])
+    print("|---|---|---|---|---|---|---|---|")
     for q in queries:
         base = answer(os.path.join(root, "serial-c%d" % cores[0]), q, "amphora")
         lite = answer(os.path.join(root, "sqlite"), q, "sqlite")
         for arm in ARMS:
             for n in cores:
                 a = answer(os.path.join(root, "%s-c%d" % (arm, n)), q, "amphora")
+                if a is None:
+                    print("| %s | %s | %d | missing | | | | |" % (q, arm, n))
+                    continue
                 d1, u1 = diff(a, base)
                 d2, u2 = diff(a, lite)
-                print("| %s | %s | %d | %s | %s |" % (q, arm, n, "%s (%s)" % (d1, u1), "%s (%s)" % (d2, u2)))
+                rs = ["%s (%s)" % vs_ref(a, q, alg) if ("tpch-" + q) in TPCH_REF else "no ref" for alg in ("sqlite", "pg", "exact")]
+                print("| %s | %s | %d | %s | %s | %s | %s | %s |" % (q, arm, n, "%s (%s)" % (d1, u1), "%s (%s)" % (d2, u2), *rs))
+        if lite and ("tpch-" + q) in TPCH_REF:
+            print("| %s | SQLite 3.53.2 | 1 | | | %s | %s | %s |" % (q, *("%s (%s)" % vs_ref(lite, q, alg) for alg in ("sqlite", "pg", "exact"))))
 
 
 hard()
 tpch("answers-tpch", ["q01", "q06"], CORES)
-tpch("answers-b", ["q03", "q05", "q07", "q08", "q09", "q10", "q11", "q14", "q15", "q17", "q19", "q22"], (16,))
+QB = ["q03", "q05", "q07", "q08", "q09", "q10", "q11", "q14", "q15", "q17", "q19", "q22"]
+tpch("answers-b", QB, CORES if os.path.isdir(os.path.join(OUT, "answers-b", "serial-c1")) else (16,))

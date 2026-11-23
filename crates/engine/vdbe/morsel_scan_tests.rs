@@ -3808,6 +3808,16 @@ fn r2_parallel_limit_finds_a_one_row_tables_row() {
     let reopened = file(&path);
     let mut wrong = Vec::new();
     for (name, conn) in [("memory", &memory), ("file reopened", &reopened)] {
+        conn.set_parallel_mode(ParallelMode::Off);
+        let control = conn.prepare("SELECT 1 FROM bench_loaded LIMIT 1").and_then(|mut s| s.run_collect_rows());
+        let all = conn.prepare("SELECT count(*) FROM bench_loaded").and_then(|mut s| s.run_collect_rows());
+        eprintln!("r2 {name} serial control: {control:?}, count(*) {all:?}");
+        conn.set_parallel_mode(ParallelMode::On);
+        conn.set_parallel_limit(false);
+        conn.set_parallel_cores(NonZeroUsize::new(4));
+        let no_limit_switch = conn.prepare("SELECT 1 FROM bench_loaded LIMIT 1").and_then(|mut s| s.run_collect_rows());
+        let no_limit = conn.prepare("SELECT 1 FROM bench_loaded").and_then(|mut s| s.run_collect_rows());
+        eprintln!("r2 {name} parallel on, LIMIT switch off, 4 cores: {no_limit_switch:?}; no LIMIT: {no_limit:?}");
         for cores in [1usize, 2, 4, 8, 16, 32] {
             conn.set_parallel_mode(ParallelMode::On);
             conn.set_parallel_limit(true);
