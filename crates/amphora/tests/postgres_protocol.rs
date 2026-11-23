@@ -465,9 +465,13 @@ fn t_pg_1_1_scram_sha_256_plus_binds_to_the_certificate() {
         )
         .unwrap_err()
     };
+    let error = refused(&binding, scram::MECHANISM, "y,,n=,r=abc");
     assert_eq!(
-        refused(&binding, scram::MECHANISM, "y,,n=,r=abc").message,
-        "SCRAM channel binding negotiation error"
+        (error.code, error.message.as_str()),
+        (
+            SqlState::INVALID_AUTHORIZATION_SPECIFICATION,
+            "SCRAM channel binding negotiation error"
+        )
     );
     assert_eq!(
         refused(&binding, scram::MECHANISM_PLUS, "n,,n=,r=abc").message,
