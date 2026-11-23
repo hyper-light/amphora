@@ -117,7 +117,8 @@ impl TimedRead {
 /// them: `run_delay`, the second field of `/proc/thread-self/schedstat` (the kernel's
 /// `Documentation/scheduler/sched-stats.rst`). The file is opened once a thread and read from its
 /// start each time (a `seq_file` read at offset 0 is made afresh). None where it can't be read, or
-/// where the kernel keeps no scheduler statistics (it writes `0 0 0`: a running thread has run).
+/// where the kernel keeps no scheduler statistics (it writes `0 0 0`: a running thread has been given
+/// a CPU at least once, its third field; its first, the time it ran, can read 0 on a new thread).
 #[cfg(target_os = "linux")]
 fn run_delay() -> Option<u64> {
     use std::os::unix::fs::FileExt;
@@ -131,10 +132,10 @@ fn run_delay() -> Option<u64> {
             let mut line = [0u8; 64];
             let read = file.as_ref()?.read_at(&mut line, 0).ok()?;
             let text = std::str::from_utf8(line.get(..read)?).ok()?;
-            let mut fields = text.split_ascii_whitespace();
-            let ran: u64 = fields.next()?.parse().ok()?;
+            let mut fields = text.split_ascii_whitespace().skip(1);
             let waited: u64 = fields.next()?.parse().ok()?;
-            if ran > 0 {
+            let slices: u64 = fields.next()?.parse().ok()?;
+            if slices > 0 {
                 Some(waited)
             } else {
                 None
