@@ -5,6 +5,7 @@
 //!
 //! cargo run --release -p amphora --example admission -- <dir> <reads> <seconds> <clients,...> [call|get]
 //! cargo run --release -p amphora --example admission -- <dir> <reads> <seconds> <clients,...> ab <rounds>
+//! cargo run --release -p amphora --example admission -- <dir> <reads> <seconds> <in-flight,...> nowait <rounds> <pool>
 //!
 //! One line a measurement: the budget's `room` in ns a call (best of five rounds of <reads>), then,
 //! for each client count, requests a second over <seconds> seconds: `Database::call`s of an empty
@@ -15,6 +16,10 @@
 //! bound (`declared`, arm a) or its measured answer (`measured`, arm b). The arms take turns,
 //! round after round, each over the client ladder; a line a run gives every call's own latency's
 //! p50, p99 and p99.9 (no sampling), calls a second, refusals and the machine's load and pressure.
+//!
+//! `nowait` is the same A/B at 1k-10k calls in flight (lane perf-A7): a pool of <pool> threads
+//! keeps each count of calls in flight through `Database::call_nowait`, each call's answer taken by
+//! its waker as it is woken; a call's latency runs from its submission to its answer.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -59,6 +64,12 @@ fn main() {
         Some("ab") => {
             let rounds: usize = args.get(5).expect(usage).parse().expect(usage);
             ab(&dir, seconds, &ladder, rounds);
+            return;
+        }
+        Some("nowait") => {
+            let rounds: usize = args.get(5).expect(usage).parse().expect(usage);
+            let pool: usize = args.get(6).expect(usage).parse().expect(usage);
+            nowait(&dir, seconds, &ladder, rounds, pool);
             return;
         }
         Some(_) => panic!("{usage}"),
@@ -279,6 +290,197 @@ fn ab(dir: &std::path::Path, seconds: f64, ladder: &[usize], rounds: usize) {
                     percentile(&latencies, 0.50),
                     percentile(&latencies, 0.99),
                     percentile(&latencies, 0.999),
+                    machine()
+                );
+            }
+        }
+    }
+}
+
+/// The calls in flight and the latencies of their answers in one run of [`nowait`].
+struct Flight {
+    room: std::sync::Mutex<usize>,
+    freed: std::sync::Condvar,
+    measuring: AtomicBool,
+    latencies: std::sync::Mutex<Vec<u64>>,
+    refused: AtomicU64,
+    full: AtomicU64,
+    failed: AtomicU64,
+}
+
+impl Flight {
+    fn end(&self, submitted: Instant, answer: Result<Rows, amphora_api::Refusal>) {
+        let took = submitted.elapsed().as_nanos() as u64;
+        if self.measuring.load(Ordering::Relaxed) {
+            match answer {
+                Ok(rows) => {
+                    black_box(rows);
+                    self.latencies.lock().unwrap().push(took);
+                }
+                Err(amphora_api::Refusal::Full { .. }) => {
+                    self.full.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    self.failed.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        *self.room.lock().unwrap() += 1;
+        self.freed.notify_one();
+    }
+}
+
+/// One call in flight: polled once by its submitter, then by its waker when its answer comes.
+struct InFlight {
+    submitted: Instant,
+    calling: std::sync::Mutex<Option<amphora::database::Calling<Rows>>>,
+    flight: Arc<Flight>,
+}
+
+impl InFlight {
+    fn poll(self: &Arc<Self>) {
+        let mut calling = self.calling.lock().unwrap();
+        let Some(pending) = calling.as_mut() else {
+            return;
+        };
+        let waker = std::task::Waker::from(Arc::clone(self));
+        if let std::task::Poll::Ready(answer) =
+            std::pin::Pin::new(pending).poll(&mut std::task::Context::from_waker(&waker))
+        {
+            *calling = None;
+            drop(calling);
+            self.flight.end(self.submitted, answer);
+        }
+    }
+}
+
+impl std::task::Wake for InFlight {
+    fn wake(self: Arc<Self>) {
+        self.poll();
+    }
+}
+
+use std::future::Future as _;
+
+fn nowait(dir: &std::path::Path, seconds: f64, ladder: &[usize], rounds: usize, pool: usize) {
+    std::fs::create_dir_all(dir).expect("dir");
+    let path = dir.join("admission-nowait.db");
+    let _ = std::fs::remove_file(&path);
+    let until = || Instant::now() + Duration::from_secs(600);
+    let db = Database::open(&path, until()).expect("open");
+    db.call(until(), |c| {
+        c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
+        for id in 0..ROWS {
+            c.execute(
+                "INSERT INTO t (id, v) VALUES (?1, ?2)",
+                vec![
+                    amphora_api::Value::Integer(id),
+                    amphora_api::Value::Text(format!("{id:0width$}", width = VALUE)),
+                ],
+            )?;
+        }
+        Ok(())
+    })
+    .expect("seed");
+    let declared = declared();
+    println!("{{\"what\":\"nowait\",\"declared_bytes\":{declared},\"rows\":{ROWS},\"limit\":{LIMIT},\"pool\":{pool}}}");
+    let arms = [
+        ("flat", AnswerCharge::Flat),
+        ("declared", AnswerCharge::Declared(declared)),
+        ("measured", AnswerCharge::Measured),
+    ];
+    for round in 0..rounds {
+        for (arm, charge) in arms {
+            for &in_flight in ladder {
+                let flight = Arc::new(Flight {
+                    room: std::sync::Mutex::new(in_flight),
+                    freed: std::sync::Condvar::new(),
+                    measuring: AtomicBool::new(false),
+                    latencies: std::sync::Mutex::new(Vec::new()),
+                    refused: AtomicU64::new(0),
+                    full: AtomicU64::new(0),
+                    failed: AtomicU64::new(0),
+                });
+                let stop = Arc::new(AtomicBool::new(false));
+                let threads: Vec<_> = (0..pool)
+                    .map(|worker| {
+                        let (db, flight, stop) = (db.clone(), flight.clone(), stop.clone());
+                        std::thread::Builder::new()
+                            .spawn(move || {
+                                let mut from = (worker as i64 * 7) % (ROWS - LIMIT as i64);
+                                while !stop.load(Ordering::Relaxed) {
+                                    {
+                                        let mut room = flight.room.lock().unwrap();
+                                        while *room == 0 && !stop.load(Ordering::Relaxed) {
+                                            room = flight.freed.wait(room).unwrap();
+                                        }
+                                        if stop.load(Ordering::Relaxed) {
+                                            break;
+                                        }
+                                        *room -= 1;
+                                    }
+                                    let start = from;
+                                    from = (from + 1) % (ROWS - LIMIT as i64);
+                                    let submitted = Instant::now();
+                                    match db.call_nowait(until(), charge, move |c| read(c, start)) {
+                                        Ok(calling) => Arc::new(InFlight {
+                                            submitted,
+                                            calling: std::sync::Mutex::new(Some(calling)),
+                                            flight: flight.clone(),
+                                        })
+                                        .poll(),
+                                        // Refused at admission: try again once a call ends.
+                                        Err(_) => {
+                                            if flight.measuring.load(Ordering::Relaxed) {
+                                                flight.refused.fetch_add(1, Ordering::Relaxed);
+                                            }
+                                            let room = flight.room.lock().unwrap();
+                                            let mut room = if stop.load(Ordering::Relaxed) {
+                                                room
+                                            } else {
+                                                flight.freed.wait(room).unwrap()
+                                            };
+                                            *room += 1;
+                                        }
+                                    }
+                                }
+                            })
+                            .expect("spawn a worker")
+                    })
+                    .collect();
+                std::thread::sleep(Duration::from_secs(1));
+                flight.measuring.store(true, Ordering::Relaxed);
+                let started = Instant::now();
+                let before = machine();
+                std::thread::sleep(Duration::from_secs_f64(seconds));
+                let window = started.elapsed().as_secs_f64();
+                flight.measuring.store(false, Ordering::Relaxed);
+                {
+                    let _room = flight.room.lock().unwrap();
+                    stop.store(true, Ordering::Relaxed);
+                }
+                flight.freed.notify_all();
+                for t in threads {
+                    t.join().expect("worker");
+                }
+                {
+                    let mut room = flight.room.lock().unwrap();
+                    while *room < in_flight {
+                        room = flight.freed.wait(room).unwrap();
+                    }
+                }
+                let mut latencies = std::mem::take(&mut *flight.latencies.lock().unwrap());
+                latencies.sort_unstable();
+                println!(
+                    "{{\"what\":\"nowait\",\"arm\":\"{arm}\",\"round\":{round},\"in_flight\":{in_flight},\"calls\":{},\"per_s\":{:.0},\"p50_us\":{:.1},\"p99_us\":{:.1},\"p999_us\":{:.1},\"refused_at_submit\":{},\"refused_full\":{},\"failed\":{},\"window_s\":{window:.1},{before},\"after\":{{{}}}}}",
+                    latencies.len(),
+                    latencies.len() as f64 / window,
+                    percentile(&latencies, 0.50),
+                    percentile(&latencies, 0.99),
+                    percentile(&latencies, 0.999),
+                    flight.refused.load(Ordering::Relaxed),
+                    flight.full.load(Ordering::Relaxed),
+                    flight.failed.load(Ordering::Relaxed),
                     machine()
                 );
             }
