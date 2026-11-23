@@ -631,6 +631,10 @@ pub struct MorselBody {
     pub keep: BranchOffset,
     pub skip: BranchOffset,
     pub columns_start: usize,
+    /// The joined row's places whose column has REAL affinity (audit 3, prototypes 2): an
+    /// INTEGER read from one becomes a REAL as it loads, as the serial loop's `RealAffinity`
+    /// after its `Column` makes it.
+    pub reals: Vec<usize>,
     pub rowid: usize,
     pub out_start: usize,
     pub out_count: usize,
