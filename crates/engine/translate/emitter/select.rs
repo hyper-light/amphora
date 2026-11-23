@@ -1054,16 +1054,35 @@ fn build_materialized_build_input_plan(
         }
     }
 
-    // Helper to decide whether an expression depends on tables outside
-    // the prefix. If it does, any access method that relies on that
-    // expression must be invalidated for the materialization subplan.
-    let expr_depends_outside_prefix = |expr: &Expr| -> Result<bool> {
+    // A hash join's probe positions its build table's cursor on each match, so a read after the
+    // probe in this subplan's loops may key on the build table's columns, as its WHERE terms do
+    // (`included_tables`). Lane T4 (TPC-H q05): lineitem's seek by orders' key, orders read
+    // through customer's probe, fell to a scan run once per customer and order, priced as a seek.
+    let mut readable_by_table: HashMap<usize, TableMask> = HashMap::default();
+    let mut probed_builds = TableMask::default();
+    for member in join_order.iter() {
+        let mut readable = join_prefix_mask.try_clone()?;
+        readable.try_extend(probed_builds.iter())?;
+        readable_by_table.insert(member.original_idx, readable);
+        if let Some(Operation::HashJoin(hash_join_op)) = table_references
+            .joined_tables()
+            .get(member.original_idx)
+            .map(|table| &table.op)
+        {
+            probed_builds.set(hash_join_op.build_table_idx)?;
+        }
+    }
+
+    // Helper to decide whether an expression depends on tables this subplan's loops have not
+    // positioned. If it does, any access method that relies on that expression must be
+    // invalidated for the materialization subplan.
+    let expr_depends_outside_prefix = |expr: &Expr, readable: &TableMask| -> Result<bool> {
         let mask = table_mask_from_expr(
             expr,
             &plan.table_references,
             &plan.non_from_clause_subqueries,
         )?;
-        Ok(!join_prefix_mask.contains_all_set_bits_of(&mask))
+        Ok(!readable.contains_all_set_bits_of(&mask))
     };
 
     // Walk each table in the cloned plan and ensure its access method is
@@ -1073,19 +1092,22 @@ fn build_materialized_build_input_plan(
         if !join_prefix_mask.get(table_idx) {
             continue;
         }
+        let readable = readable_by_table
+            .get(&table_idx)
+            .unwrap_or(&join_prefix_mask);
 
         let mut reset_op = false;
         match &joined_table.op {
             Operation::Search(Search::RowidEq { cmp_expr }) => {
                 // Rowid equality searches may depend on other tables (e.g. column = other.col).
-                reset_op = expr_depends_outside_prefix(cmp_expr)?;
+                reset_op = expr_depends_outside_prefix(cmp_expr, readable)?;
             }
             Operation::Search(Search::Seek { seek_def, .. }) => {
                 // Seek keys can include expressions bound by other tables. If so,
                 // the seek is not valid in the prefix-only subplan.
                 for component in seek_def.iter(&seek_def.start) {
                     if let SeekKeyComponent::Expr(expr) = component {
-                        if expr_depends_outside_prefix(expr)? {
+                        if expr_depends_outside_prefix(expr, readable)? {
                             reset_op = true;
                             break;
                         }
@@ -1094,7 +1116,7 @@ fn build_materialized_build_input_plan(
                 if !reset_op {
                     for component in seek_def.iter(&seek_def.end) {
                         if let SeekKeyComponent::Expr(expr) = component {
-                            if expr_depends_outside_prefix(expr)? {
+                            if expr_depends_outside_prefix(expr, readable)? {
                                 reset_op = true;
                                 break;
                             }
@@ -1106,7 +1128,7 @@ fn build_materialized_build_input_plan(
                 // Index method queries are driven by argument expressions.
                 // If any argument depends on non-prefix tables, we cannot use it.
                 for expr in arguments {
-                    if expr_depends_outside_prefix(expr)? {
+                    if expr_depends_outside_prefix(expr, readable)? {
                         reset_op = true;
                         break;
                     }
@@ -1117,7 +1139,7 @@ fn build_materialized_build_input_plan(
                 // If any constraint depends on non-prefix tables, drop the scan
                 // specialization and fall back to a full scan.
                 for expr in constraints {
-                    if expr_depends_outside_prefix(expr)? {
+                    if expr_depends_outside_prefix(expr, readable)? {
                         reset_op = true;
                         break;
                     }

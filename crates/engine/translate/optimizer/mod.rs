@@ -4249,6 +4249,84 @@ pub(crate) mod bushy_test_hook {
             assert_eq!(bushy, nested_loops, "{plan:?}");
         }
 
+        /// PL.8 (TPC-H q05's slow plan, lane T4): a bushy run `o c l` built for `s`'s hash join,
+        /// in which `c` probes `o`'s hash table and `l` is read by a seek on `o`'s key. The run's
+        /// subplan reads `o` through `c`'s probe, not a loop of its own; its seek on `l` must
+        /// stand, as the planner priced it. Expect: the run built (`APPLIED`), the answer the
+        /// plan of nested loops gives, and no table read whole more than once: the statement's
+        /// full-scan steps at most the rows of all its tables. Lane T3: the seek fell to a scan of
+        /// `l` for each of the run's `c` and `o` rows, q05's 23,291 scans of lineitem.
+        #[test]
+        fn t_pl_8_2_a_seek_on_a_probed_build_table_stands_in_its_run() {
+            let io = Arc::new(MemoryIO::new());
+            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            for sql in [
+                "CREATE TABLE r(id INTEGER PRIMARY KEY)",
+                "CREATE TABLE o(id INTEGER PRIMARY KEY, cid INT)",
+                "CREATE TABLE c(id INTEGER PRIMARY KEY, x INT)",
+                "CREATE TABLE l(id INTEGER PRIMARY KEY, oid INT, sk INT)",
+                "CREATE TABLE s(id INTEGER PRIMARY KEY, k INT)",
+                "CREATE INDEX l_oid ON l(oid)",
+                // Enough rows that `r.id = 1` seeks: one row, so `c`'s hash join stays unmaterialized.
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 1000) \
+                 INSERT INTO r SELECT i FROM x",
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 200) \
+                 INSERT INTO o SELECT i, i % 50 + 1 FROM x",
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 50) \
+                 INSERT INTO c SELECT i, i FROM x",
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 2000) \
+                 INSERT INTO l SELECT i, i % 200 + 1, i % 25 FROM x",
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 25) \
+                 INSERT INTO s SELECT i, i % 25 FROM x",
+                "ANALYZE",
+            ] {
+                conn.execute(sql).unwrap();
+            }
+            let sql = "SELECT count(*), sum(l.id), sum(s.id) FROM r, o, c, l, s \
+                       WHERE r.id = 1 AND c.id = o.cid AND l.oid = o.id AND s.k = l.sk";
+            conn.set_join_methods(JoinMethods::NestedLoopsOnly);
+            let nested_loops = rows(&conn, sql);
+            // Each table read whole once, and the run's rows once more from its input.
+            let count = |sql: &str| -> u64 { rows(&conn, sql)[0].parse().unwrap() };
+            let once = count(
+                "SELECT (SELECT count(*) FROM r) + (SELECT count(*) FROM o) \
+                 + (SELECT count(*) FROM c) + (SELECT count(*) FROM l) + (SELECT count(*) FROM s)",
+            ) + count("SELECT count(*) FROM o, c, l WHERE c.id = o.cid AND l.oid = o.id");
+            conn.set_join_methods(JoinMethods::ByCost);
+            // Loops in the FROM order, hash joins at `c` and `s`, and the run `o c l` built for `s`.
+            PIN.with(|pin| pin.set(true));
+            PIN_HASH_JOINS.with(|positions| positions.set((1 << 2) | (1 << 4)));
+            SPLIT.with(|split| split.set(Some(1)));
+            APPLIED.with(|applied| applied.set(0));
+            let mut stmt = conn.prepare(sql).unwrap();
+            let mut bushy: Vec<String> = stmt
+                .run_collect_rows()
+                .unwrap()
+                .into_iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|value| value.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .collect();
+            bushy.sort();
+            let full_scan_steps = stmt.stmt_status(crate::StatementStatusCounter::FullscanStep);
+            let made_bushy = APPLIED.with(Cell::get);
+            let plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+            SPLIT.with(|split| split.set(None));
+            PIN_HASH_JOINS.with(|positions| positions.set(0));
+            PIN.with(|pin| pin.set(false));
+            assert!(made_bushy > 0, "no plan was made bushy: {plan:?}");
+            assert!(!nested_loops.is_empty());
+            assert_eq!(bushy, nested_loops, "{plan:?}");
+            assert!(
+                full_scan_steps <= once,
+                "{full_scan_steps} full-scan steps, {once} reading each table and the run once: {plan:?}"
+            );
+        }
+
         /// PL.8 (T-PL.8.13, lane pl8-19): the hand-built bushy tree `(a ((b l c) p))` whose run
         /// holds a LEFT JOIN of `q` (as `l`) on `b`, the run's table its ON reads, matching some
         /// of `b`'s rows and not others; with an ON term no index reads, and WHERE terms on the
