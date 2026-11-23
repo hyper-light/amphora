@@ -20,8 +20,10 @@ def main() -> None:
     src = open(path, encoding="utf-8").read()
     n, body = table(src, "yy_transition")
     pairs = [(int(v), int(x)) for v, x in re.findall(r"\{\s*(-?\d+),\s*(-?\d+)\s*\}", body)]
-    if len(pairs) != int(n):
+    if len(pairs) > int(n):
         sys.exit(f"yy_transition: {len(pairs)} entries, declared {n}")
+    # flex declares more entries than it writes; C zero-fills the rest (C11 6.7.9p21).
+    pairs += [(0, 0)] * (int(n) - len(pairs))
     sn, sbody = table(src, r"\*yy_start_state_list")
     starts = [int(i) for i in re.findall(r"&yy_transition\[(\d+)\]", sbody)]
     if len(starts) != int(sn):
