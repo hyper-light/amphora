@@ -2814,6 +2814,35 @@ pub(super) mod builds {
         assert_eq!(db.skipping.claim_build(root), None);
     }
 
+    /// T-SKU.10. A background rebuild opens a versioned cursor outside a SQL statement. Once
+    /// the completed build's thread exits, a later commit must advance the collection watermark.
+    #[test]
+    fn review_a_background_build_releases_its_versioned_snapshot() {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let conn = db
+            .connect(crate::ConnectOpts::new().with_versioned_storage())
+            .unwrap();
+        let root = fill_table(&conn, 2);
+        db.skipping
+            .set(root, 0, Skipping::Measured(Box::new(cracker_due())));
+        let clock = &conn.versioned.as_ref().unwrap().storage().db().v.clock;
+        let before = clock.published();
+        let build = start_build(&conn, root, 2).unwrap();
+        assert_eq!(build.join().unwrap(), BuildEnd::Installed);
+        assert_eq!(
+            cracker_rows(&db.skipping, root),
+            Some(vec![(1, Some(0)), (2, Some(1))])
+        );
+        conn.execute("INSERT INTO t VALUES (2, 'y')").unwrap();
+        assert!(clock.published() > before);
+        assert_eq!(
+            clock.low_watermark(),
+            clock.published(),
+            "finished build kept its snapshot"
+        );
+    }
+
     /// A table `t (a INTEGER, pad TEXT)` of `rows` rows (`a` = 0, 1, ...) on `conn`, and its root.
     fn fill_table(conn: &Arc<Connection>, rows: i64) -> i64 {
         conn.execute("CREATE TABLE t (a INTEGER, pad TEXT)")

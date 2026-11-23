@@ -81,11 +81,17 @@ impl Drop for Held {
 }
 
 /// Ends the build's read transaction however the build ends.
-struct ReadTx(Arc<crate::storage::pager::Pager>);
+struct ReadTx {
+    pager: Arc<crate::storage::pager::Pager>,
+    versioned: Option<Arc<crate::storage::versioned::switch::Switch>>,
+}
 
 impl Drop for ReadTx {
     fn drop(&mut self) {
-        self.0.end_read_tx();
+        if let Some(error) = self.versioned.as_ref().and_then(|switch| switch.finish(true).err()) {
+            tracing::error!(target: "amphora.skipping", %error, "could not close the build's versioned snapshot");
+        }
+        self.pager.end_read_tx();
     }
 }
 
@@ -173,7 +179,11 @@ fn build_cracker(
                 tracing::debug!(target: "amphora.skipping", %error, "skipping build could not begin a read");
                 return BuildEnd::Failed;
             }
-            (conn, Some(ReadTx(pager)))
+            let read = ReadTx {
+                pager,
+                versioned: conn.versioned_for(crate::MAIN_DB_ID),
+            };
+            (conn, Some(read))
         }
     };
     let Some(claim) = held.claim.as_ref() else {
