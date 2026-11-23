@@ -513,6 +513,10 @@ deleted copy had this right (it returned `special`), so taking R4's unchanged wo
 | `r5_versioned_exact_sums_stay_exact_past_the_range` (SQL, versioned storage, copies on and off) | the same, per group | +inf, 1.5, +inf: pass |
 | `r4_exact_sum_stays_exact_past_the_range` (morsel) | R4's six and the infinity case | pass |
 
+SQLite 3.54.0 on the same rows (sqlite3 shell on adacachy2, 23:46Z): Inf, Inf, Inf. Exact agrees on
+bigpairs and on the infinity case, and differs on overflow and back (Exact 1.5, the exact sum;
+SQLite Inf, its KBN sum stuck at inf): a data point for the RowOrder or Exact choice.
+
 Not run red: the old copy's answers are traced from its code, not run. In row order bigpairs and
 overflow-and-back both put +inf, then -inf, into `special` (each overflowing step's sum went there),
 so both were NaN, which SQL shows as NULL. R4's guess held.
