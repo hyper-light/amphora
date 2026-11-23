@@ -253,6 +253,13 @@ pub fn translate(
         };
         resolver.set_learned_weights(Some(pinned));
     }
+    // Lane T7: a lib test's whole set of weights (`learned_costs::test_pin`).
+    #[cfg(test)]
+    if let Some(pinned) =
+        crate::translate::optimizer::learned_costs::test_pin::WEIGHTS.with(std::cell::Cell::get)
+    {
+        resolver.set_learned_weights(Some(pinned));
+    }
     // Amphora (PL.7): and, with its switch on, as its statements' measured times fit them.
     resolver.set_fitted_weights(connection.db.cost_fit.weights());
 

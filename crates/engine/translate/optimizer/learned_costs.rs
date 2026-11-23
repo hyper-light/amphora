@@ -445,6 +445,16 @@ impl Rates {
     }
 }
 
+/// Lane T7 (TPC-H q05): a lib test's whole set of weights, planned with by every prepare on its
+/// thread in place of the learned ones, so no cost input moves with the machine or the test's runs.
+#[cfg(test)]
+pub(crate) mod test_pin {
+    thread_local! {
+        pub(crate) static WEIGHTS: std::cell::Cell<Option<super::LearnedWeights>> =
+            const { std::cell::Cell::new(None) };
+    }
+}
+
 /// The four weights, each in rows' visits: what one unit of the work takes against one row read
 /// and tested; and the row's visit itself in page reads, the planner's unit, once the database has
 /// read a page from its file.
