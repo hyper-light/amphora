@@ -110,13 +110,11 @@ fn sized_store(hashes: &[u64], sizing: FilterSizing, held: usize) -> Store {
     // The bits `rate` takes over the keys (the same survey's `m = -n·ln(rate)/ln²2`), in words,
     // at most the room's: the floor's rate fills the room.
     let wanted_words = (keys * -rate.ln() / ln2_squared / 64.0).ceil();
-    let words = if wanted_words.is_finite() && wanted_words < room_words as f64 {
-        // Within the room, so within usize.
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let wanted = wanted_words as usize;
-        wanted.max(1)
-    } else {
-        room_words
+    // `wanted_words` is a whole number (its `ceil`), so the conversion is exact when it is in
+    // range; NaN, infinite or past `usize` it is `None`, and the room's words are the bits.
+    let words = match num_traits::ToPrimitive::to_usize(&wanted_words) {
+        Some(wanted) if wanted < room_words => wanted.max(1),
+        _ => room_words,
     };
     if words == 0 {
         return Store::PassAll;
