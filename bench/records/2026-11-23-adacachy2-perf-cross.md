@@ -41,3 +41,31 @@ kernel's at the ask: nothing is cached across asks but open files.
 
 room: 17-25x cheaper. At 256 clients 8-17x more calls a second, at 1024 26-71x; the ladder no
 longer falls off past 16 clients. The single-client rows vary 4x run to run on the shared host.
+
+## The flat 32 MiB charge per request (perf-A2, AUDIT §1)
+
+Verified: every local request charged `REQUEST_MAX` (32 MiB) of the room for queues whatever it
+was, so a process under a 1 GiB limit refused past ~30 requests in flight (16 GiB: ~500).
+Changed: `Admission::bytes_for` charges a request's command and answer, the bytes it carries and
+its answer's bound by the API: a Records get one row (KEY_MAX + VALUE_MAX, ~1 MiB), a Records
+write what it carries, a head / compaction step / holding a fixed answer. SQL, scans, changes,
+imports and calls keep `REQUEST_MAX` (no tighter answer bound; a call's answer is its closure's).
+
+Command (adacachy2, each label built from its own tree; scope from `systemd-run --user --scope -p
+MemoryMax=1G`; `perfx/cgroup.sh <label> 1G get`):
+
+    admission <dir> 1000 2 16,64,256,1024 get
+
+Records gets of one absent key a second / refused a second, two runs each:
+
+| clients | before (32 MiB a get) | after (~1 MiB a get) |
+|---|---|---|
+| 16 | 65,237 / 0; 65,209 / 0 | 87,971 / 0; 112,392 / 0 |
+| 64 | 62,748 / 278,832 refused; 56,781 / 212,703 | 101,367 / 0; 118,337 / 0 |
+| 256 | 63,143 / 282,569; 58,704 / 225,030 | 118,749 / 0; 116,703 / 0 |
+| 1024 | 61,215 / 280,265; 57,213 / 201,224 | 116,728 / 266,274; 111,357 / 259,398 |
+
+Under 1 GiB, refusals began between 16 and 64 in flight before, between 256 and 1024 after (the
+1024 x ~1 MiB the gets now ask passes the room: refused typed `Full`, the budget never overrun).
+Admitted gets a second ~1.8x (no client spends its turn being refused). The scope's limit held:
+no run was OOM-killed.

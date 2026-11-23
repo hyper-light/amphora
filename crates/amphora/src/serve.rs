@@ -9,7 +9,8 @@
 //! - `amphora health CONFIG`: asks every member for its status; healthy when every member answers,
 //!   all name the same leader, each holds the configured voters and none is fenced.
 //! - `amphora ask CONFIG NODE REQUEST`: one request to one member (`status`, `exec SQL`,
-//!   `count SQL`, `cut on|off` and `disk cut|hang|back` where the member's config says
+//!   `count SQL`, `cut on|off` and `disk cut|hang|held|back` (`held`: wait until the hung disk
+//!   holds an operation) where the member's config says
 //!   `drills = on`, `member …`, `reload` (its TLS files read again, for the links made from then
 //!   on: a certificate renewed), and
 //!   `leader WAIT_MS`: wait until the member knows its group's leader, at most WAIT_MS, and answer
@@ -762,11 +763,16 @@ impl Shared {
                     self.drills,
                     "drills are off in this member's config (drills = on takes disk)"
                 );
+                if rest == "held" {
+                    let held = Database::log_disk_held(&self.log, until)
+                        .map_err(|e| anyhow!("disk held: {e:?}"))?;
+                    return Ok(format!("held={held}"));
+                }
                 let disk = match rest {
                     "cut" => LogDisk::Cut,
                     "hang" => LogDisk::Hung,
                     "back" => LogDisk::Back,
-                    other => bail!("disk {other}: cut, hang or back"),
+                    other => bail!("disk {other}: cut, hang, held or back"),
                 };
                 Database::set_log_disk(&self.log, disk)
                     .map_err(|e| anyhow!("disk {rest}: {e:?}"))?;
