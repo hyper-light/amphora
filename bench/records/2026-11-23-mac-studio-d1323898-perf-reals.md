@@ -337,3 +337,74 @@ python3 -I bench/real_sums_stats.py ~/.cache/amphora-perf/reals-out/sf1     # ad
 ```
 
 `ref-r2.json` (q09, TPC-H q01 and q06 references) is already in that folder, from r1515.
+
+# Lane R3 (reals), 2026-11-23 21:02Z to 21:55Z: r1544's answers in (rerun as r1562); the one-row loss traced to its cause, not fixed; Exact's overflow not fixed
+
+## Verdict, losses first
+
+- **Not done: one-row tables still lose their row.** The cause is traced (below), not fixed. R2's
+  test fails on main; it is on branch `perf/reals-r3` (5d6fee36), not merged.
+- **Not done: Exact still answers NULL on overflow.** The mechanism is read from the code, not run
+  or fixed.
+- An API error stopped the lane from about 21:30Z to 21:50Z.
+- **Done: r1544's answers.** r1544 had failed at once: it synced the kiln checkout, not the Amphora
+  clone (`bench/real_sums_r2.sh: No such file or directory`). r1562 reran R2's command.
+
+## One-row tables lose their row in parallel mode: the cause (r1585, Mac Studio 2)
+
+R2's test with print probes, in memory and on a reopened file, parallel mode on, at 1 to 32 cores.
+
+- EXPLAIN of `SELECT 1 FROM bench_loaded` puts the loop body's copy at 5 (`start`, a Noop) and 6
+  (`skip`, a Noop), and `keep` at 14. Address 14 is `Integer 1 -> r[5]`, the result column's
+  constant, hoisted to the constant section after `Transaction`.
+- A worker runs the body from 5, meets 6 (`skip`) before 14 (`keep`), and drops the row. Probes:
+  `row 1 [Integer(1)] passed Ok(false) out []`, `rows run: leaves 0..1 ran 1 found []`, hook
+  `answered Ok(([], true))`, `MorselNext: None`. The leaf walk (`leaves 1`), the scan (`ran 1`)
+  and the dispatcher are right.
+- With LIMIT the same happens (`keep` 19, the hoisted constant; `skip` 8).
+- So the row is lost in `translate/parallel.rs` `emit_body`: `keep` is placed by
+  `preassign_label_to_next_insn` after the outputs' code, and a constant output's instruction is
+  hoisted with the label. Nothing here is particular to one-row tables. A guess from the mechanism,
+  not run: any statement whose result columns are all constants loses every row this way.
+- Next: bind `keep` to the body's own Noop after the outputs, then run R2's test (1 to 32 cores,
+  with and without LIMIT, memory and file) on main.
+
+## Exact answers NULL on overflow: the mechanism (from the code, not run)
+
+- `ExactSum::add` (`vdbe/morsel.rs`): when `x + y` overflows, the two-sum's error term
+  `low = y - (high - x)` is -inf or NaN, and `low != 0.0` stores it as a partial. Later adds and
+  the workers' merges meet it; inf plus -inf is NaN, and `is_nan` makes the answer NULL.
+- Dropping the poisoned partials is not enough. In bigpairs (+1e308 +1e308 -1e308 -1e308 within
+  each order) the running sum overflows up, then down. The exact sum is +inf only because orders
+  with fewer than four lines leave unmatched +1e308s (R1's big-integer reference). Taking "the
+  running sum overflowed" as the answer still gives NaN there. The sum has to stay exact past the
+  double's range.
+
+## r1544's answers (rerun as r1562, Mac Studio 2, 21:08Z to 21:12Z)
+
+Binary fe02d165 (r1468's), from perf/reals 294efb6a. Load 3.1 to 5.3 on 32 cores.
+`bench/real_sums_r2.sh 1 ~/.cache/amphora-perf/reals-out/sf1 fe02d165 answers-kbn answers-b limit`,
+then `python3 -I bench/real_sums_answers.py ~/.cache/amphora-perf/reals-out/sf1`.
+
+### KBN's loss case, q09
+
+| column | Serial (1 worker) | Exact at 1/4/8/16 | RowOrder at 1/4/8/16 | SQLite 3.53.2 | SQLite ref (func.c) | PostgreSQL 19 ref | exact ref |
+|---|---|---|---|---|---|---|---|
+| sum(kbnloss) | 0.0 | 1.0 at all | = Serial at all | 0.0 | 0.0 | -1e+18 | 1.0 |
+| avg(kbnloss) | 0.0 | 1.6663292349965798e-07 at all | = Serial at all | 0.0 | 0.0 | -166632923499.658 | 1.6663292349965798e-07 |
+| total(kbnloss) | 0.0 | 1.0 at all | = Serial at all | 0.0 | 0.0 | n/a | 1.0 |
+
+As the code says: Serial and RowOrder give SQLite's answer, 0.0. Exact gives the exact sum, 1.0.
+This is the one measured case where Exact and SQLite differ apart from Exact's overflow bug.
+
+### The twelve other REAL-summing TPC-H queries at 1, 4 and 8 workers
+
+q03 q05 q07 q08 q09 q10 q11 q14 q15 q17 q19 q22: every arm at 1, 4 and 8 workers (and at 16, from
+r1468) is bit-identical to Serial at 1 worker and to SQLite 3.53.2. No cell differs. These have no
+func.c, PostgreSQL or exact reference.
+
+### R2's limit phase did not run
+
+It exited 1 at every core count before opening the database: the bench wants `q02.sql` in the
+folder it is given (`limit-queries/q02.sql: No such file or directory`, in `limit.err`). It says
+nothing about the engine.
