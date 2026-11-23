@@ -6929,10 +6929,15 @@ fn timed_run(
     if !costs.sampled(work, &program.connection.cost_runs) {
         return run();
     }
+    let cpu = crate::translate::optimizer::learned_costs::thread_cpu_nanos();
     let started = std::time::Instant::now();
     let result = run();
     if matches!(result, Ok(InsnFunctionStepResult::Step)) {
-        costs.observe_sampled(work, started.elapsed().as_nanos() as f64);
+        let wall = started.elapsed().as_nanos() as f64;
+        let cpu = cpu
+            .zip(crate::translate::optimizer::learned_costs::thread_cpu_nanos())
+            .map(|(a, b)| b - a);
+        costs.observe_timed(work, wall, cpu);
     }
     result
 }

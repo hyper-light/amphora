@@ -555,6 +555,8 @@ struct Sampling {
     /// [WeightRule::BatchMeans]: at most an epoch's, the work calibration timed a sample of
     /// (`Rate::close_runs`).
     batch: Mutex<Vec<f64>>,
+    /// Lane T14 trace: the same runs' thread CPU nanoseconds.
+    cpu: Mutex<Vec<f64>>,
 }
 
 /// Welford's running mean and sum of squared deviations (Welford, "Note on a method for
@@ -585,6 +587,7 @@ impl Sampling {
             every: AtomicU64::new(1),
             spread: Mutex::new(Spread::default()),
             batch: Mutex::new(Vec::new()),
+            cpu: Mutex::new(Vec::new()),
         }
     }
 
@@ -682,6 +685,11 @@ impl LearnedCosts {
     /// how often the runs are timed. Under [WeightRule::BatchMeans] a batch of runs closes at its
     /// median run (`Rate::close_runs`); under [WeightRule::Blend], the control, each run blends in.
     pub(crate) fn observe_sampled(&self, work: Work, nanos: f64) {
+        self.observe_timed(work, nanos, None);
+    }
+
+    /// Lane T14 trace: a timed run's wall `nanos` and its thread CPU nanoseconds `cpu`.
+    pub(crate) fn observe_timed(&self, work: Work, nanos: f64, cpu: Option<f64>) {
         if !(nanos.is_finite() && nanos >= 0.0) {
             return;
         }
@@ -693,11 +701,24 @@ impl LearnedCosts {
                 (WeightRule::BatchMeans, Some(sampling)) => {
                     let mut batch = sampling.batch.lock();
                     batch.push(nanos);
+                    let mut cpus = sampling.cpu.lock();
+                    if let Some(cpu) = cpu {
+                        cpus.push(cpu);
+                    }
                     if batch.len() as f64 >= rate.epoch.max(2.0) {
+                        let standing = rate.standing;
+                        let differences = rate.batches.differences;
+                        let spread = rate.batches.spread();
                         if let Some(median) = median(&mut batch) {
                             rate.close_runs(median);
+                            let q = |v: &[f64], f: f64| v.get(saturating_usize((v.len().saturating_sub(1)) as f64 * f)).copied().unwrap_or(f64::NAN);
+                            let mut c = std::mem::take(&mut *cpus);
+                            c.sort_unstable_by(f64::total_cmp);
+                            let ratio = standing.zip(spread).map(|(st, sp)| (median.ln() - st.ln()).abs() / sp);
+                            tracing::debug!(target: "amphora::join_search", ?work, runs = batch.len(), epoch = rate.epoch, wall_p10 = q(&batch, 0.1), wall_p25 = q(&batch, 0.25), wall_median = median, wall_p75 = q(&batch, 0.75), wall_p90 = q(&batch, 0.9), wall_max = q(&batch, 1.0), cpu_p10 = q(&c, 0.1), cpu_p25 = q(&c, 0.25), cpu_median = q(&c, 0.5), cpu_p75 = q(&c, 0.75), cpu_p90 = q(&c, 0.9), cpu_max = q(&c, 1.0), ?standing, ?spread, differences, ?ratio, moved = rate.standing != standing, after = ?rate.standing, "T14 a weight batch judged");
                         }
                         batch.clear();
+                        cpus.clear();
                     }
                 }
                 _ => rate.observe(1.0, nanos),
@@ -711,7 +732,13 @@ impl LearnedCosts {
 
     /// Records that `units` of `work` took `nanos`, as an operator timed it.
     pub(crate) fn observe(&self, work: Work, units: f64, nanos: f64) {
-        self.rates.lock().rate_mut(work).observe(units, nanos);
+        let mut rates = self.rates.lock();
+        let rate = rates.rate_mut(work);
+        let before = (rate.standing, rate.batches);
+        rate.observe(units, nanos);
+        if rate.batches != before.1 {
+            tracing::debug!(target: "amphora::join_search", ?work, epoch = rate.epoch, seen = ?rate.batches.last.map(f64::exp), standing = ?before.0, spread = ?before.1.spread(), differences = before.1.differences, moved = rate.standing != before.0, after = ?rate.standing, "T14 a weight batch judged");
+        }
     }
 
     /// Nanoseconds a unit of `work` takes as the rate stands, None before any time was seen: what
@@ -759,6 +786,7 @@ impl LearnedCosts {
         rates.switch(rule);
         for sampling in [&self.seek, &self.hash_build, &self.hash_probe] {
             sampling.batch.lock().clear();
+            sampling.cpu.lock().clear();
         }
     }
 
@@ -766,6 +794,19 @@ impl LearnedCosts {
     /// (`time_page_read`), as calibration times each kind of work up to a page of it.
     pub(crate) fn page_read_epoch(&self) -> usize {
         saturating_usize(self.rates.lock().page.epoch.max(1.0))
+    }
+}
+
+/// Lane T14 trace: the calling thread's CPU time in nanoseconds, None where there is no thread CPU clock.
+pub(crate) fn thread_cpu_nanos() -> Option<f64> {
+    #[cfg(unix)]
+    {
+        let t = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
+        Some(t.tv_sec as f64 * 1e9 + t.tv_nsec as f64)
+    }
+    #[cfg(not(unix))]
+    {
+        None
     }
 }
 
