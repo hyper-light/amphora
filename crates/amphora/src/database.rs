@@ -83,7 +83,20 @@ struct Admission {
 }
 impl Admission {
     fn reserve(bytes: &Arc<AtomicUsize>, operation: &Operation) -> Result<Self, Refusal> {
-        let charged = Self::bytes_for(operation);
+        Self::charge(bytes, Self::bytes_for(operation))
+    }
+
+    /// A call charged its command and `answer` bytes for its answer ([`AnswerCharge`]) in place
+    /// of the full `REQUEST_MAX`.
+    fn reserve_call(bytes: &Arc<AtomicUsize>, answer: usize) -> Result<Self, Refusal> {
+        Self::charge(bytes, Self::fixed().saturating_add(answer))
+    }
+
+    fn fixed() -> usize {
+        std::mem::size_of::<Command>().saturating_add(std::mem::size_of::<Answer>())
+    }
+
+    fn charge(bytes: &Arc<AtomicUsize>, charged: usize) -> Result<Self, Refusal> {
         let request = u64::try_from(charged).unwrap_or(u64::MAX);
         let charge = crate::memory::process()
             .take(crate::memory::Use::Queues, request)
@@ -112,7 +125,7 @@ impl Admission {
     /// returns, which no API bound holds. Counts saturate: a sum past the address space is
     /// refused by the budget, never wrapped.
     fn bytes_for(operation: &Operation) -> usize {
-        let fixed = std::mem::size_of::<Command>().saturating_add(std::mem::size_of::<Answer>());
+        let fixed = Self::fixed();
         let carried = match operation {
             Operation::Get(namespace, key, ..) => namespace
                 .len()
@@ -392,6 +405,72 @@ enum Operation {
 }
 
 type Call = Box<dyn FnOnce(&mut Db) -> anyhow::Result<Box<dyn Any + Send>> + Send>;
+
+/// How [`Database::call_charged`] charges its answer to the queues' memory budget (MB.1) at
+/// admission (Ada's A/B of the call charge, AUDIT 2026-11-23 §1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnswerCharge {
+    /// The caller declares the most bytes its answer holds: charged that at admission, and an
+    /// answer past it is refused.
+    Declared(usize),
+    /// Charged its command alone at admission, then the answer's own bytes once the closure
+    /// has run, before it commits.
+    Measured,
+}
+
+/// The bytes an answer holds in memory, inline and on the heap, for its charge to the memory
+/// budget ([`Database::call_charged`]).
+pub trait AnswerBytes {
+    fn answer_bytes(&self) -> usize;
+}
+
+macro_rules! inline_answer {
+    ($($t:ty),*) => {$(
+        impl AnswerBytes for $t {
+            fn answer_bytes(&self) -> usize {
+                std::mem::size_of::<Self>()
+            }
+        }
+    )*};
+}
+inline_answer!((), bool, i32, i64, u32, u64, usize, f64);
+
+impl AnswerBytes for String {
+    fn answer_bytes(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(self.capacity())
+    }
+}
+
+impl<T: AnswerBytes> AnswerBytes for Vec<T> {
+    fn answer_bytes(&self) -> usize {
+        let spare = self
+            .capacity()
+            .saturating_sub(self.len())
+            .saturating_mul(std::mem::size_of::<T>());
+        self.iter().fold(
+            std::mem::size_of::<Self>().saturating_add(spare),
+            |n, item| n.saturating_add(item.answer_bytes()),
+        )
+    }
+}
+
+impl<T: AnswerBytes> AnswerBytes for Option<T> {
+    fn answer_bytes(&self) -> usize {
+        let outer = std::mem::size_of::<Self>().saturating_sub(std::mem::size_of::<T>());
+        outer.saturating_add(self.as_ref().map_or(std::mem::size_of::<T>(), T::answer_bytes))
+    }
+}
+
+impl<A: AnswerBytes, B: AnswerBytes> AnswerBytes for (A, B) {
+    fn answer_bytes(&self) -> usize {
+        let padding = std::mem::size_of::<Self>()
+            .saturating_sub(std::mem::size_of::<A>())
+            .saturating_sub(std::mem::size_of::<B>());
+        padding
+            .saturating_add(self.0.answer_bytes())
+            .saturating_add(self.1.answer_bytes())
+    }
+}
 
 enum Answer {
     Done,
@@ -1531,7 +1610,12 @@ impl Database {
             }),
         };
         // Bootstrap DDL used the same WAL; the barrier makes it durable before open succeeds.
-        database.submit_selected("", Operation::Mutation(Mutation::Sql(Vec::new())), until)?;
+        database.submit_selected(
+            "",
+            Operation::Mutation(Mutation::Sql(Vec::new())),
+            None,
+            until,
+        )?;
         Ok(database)
     }
 
@@ -1598,12 +1682,59 @@ impl Database {
                 .map(|value| (value, None))
                 .map_err(Refusal::from);
         }
-        database.call_db_session(until, move |db| {
+        database.call_db_session(until, None, move |db| {
             let mut connection = crate::sql::Connection::new(db);
             let value = f(&mut connection)?;
             connection.finish()?;
             Ok(value)
         })
+    }
+
+    /// [`Database::call`] charged at admission by [`AnswerCharge`] in place of the full
+    /// `REQUEST_MAX` (AUDIT 2026-11-23 §1, MB.1; Ada's A/B of the call charge). Its answer's
+    /// bytes ([`AnswerBytes`]) are checked inside the call's transaction, before it commits: an
+    /// answer past its declared bound, or past the budget's room when measured, rolls the call
+    /// back and is refused. A measured answer's charge is held until the caller has it. An
+    /// attached client runs it as [`Database::call`].
+    pub fn call_charged<R, F>(&self, until: Instant, charge: AnswerCharge, f: F) -> Result<R, Refusal>
+    where
+        R: AnswerBytes + Send + 'static,
+        F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + 'static,
+    {
+        let database = self.resolve(until)?;
+        if let Some(client) = database.remote_client() {
+            return client.call(until, f).map_err(Refusal::from);
+        }
+        let admitted = match charge {
+            AnswerCharge::Declared(max) => max,
+            AnswerCharge::Measured => 0,
+        };
+        database
+            .call_db_session(until, Some(admitted), move |db| {
+                let mut connection = crate::sql::Connection::new(db);
+                let value = f(&mut connection)?;
+                let bytes = value.answer_bytes();
+                let held = match charge {
+                    AnswerCharge::Declared(max) => {
+                        api::bound("call answer bytes", bytes, max)?;
+                        None
+                    }
+                    AnswerCharge::Measured => Some(
+                        crate::memory::process()
+                            .take(
+                                crate::memory::Use::Queues,
+                                u64::try_from(bytes).unwrap_or(u64::MAX),
+                            )
+                            .map_err(|refusal| match refusal {
+                                Refusal::TooLarge { limit, .. } => Refusal::Full { limit },
+                                other => other,
+                            })?,
+                    ),
+                };
+                connection.finish()?;
+                Ok((value, held))
+            })
+            .map(|((value, _held), _)| value)
     }
 
     /// [`Database::call`] on the owner's own session, its SQL free to name Amphora's own tables
@@ -1629,16 +1760,27 @@ impl Database {
         R: Send + 'static,
         F: FnOnce(&mut Db) -> anyhow::Result<R> + Send + 'static,
     {
-        self.call_db_session(until, f).map(|(value, _)| value)
+        self.call_db_session(until, None, f).map(|(value, _)| value)
     }
 
-    fn call_db_session<R, F>(&self, until: Instant, f: F) -> Result<(R, Option<Token>), Refusal>
+    /// `answer`: the bytes the call's answer is charged at admission ([`AnswerCharge`]), `None`
+    /// for the full `REQUEST_MAX`.
+    fn call_db_session<R, F>(
+        &self,
+        until: Instant,
+        answer: Option<usize>,
+        f: F,
+    ) -> Result<(R, Option<Token>), Refusal>
     where
         R: Send + 'static,
         F: FnOnce(&mut Db) -> anyhow::Result<R> + Send + 'static,
     {
         let call: Call = Box::new(move |db| f(db).map(|v| Box::new(v) as Box<dyn Any + Send>));
-        match self.submit_session("", Operation::Call(Mutex::new(Some(call))), until)? {
+        let operation = Operation::Call(Mutex::new(Some(call)));
+        match self
+            .resolve(until)?
+            .submit_selected("", operation, answer, until)?
+        {
             (Answer::Called(v), token) => v
                 .downcast::<R>()
                 .map(|v| (*v, token))
@@ -2196,13 +2338,16 @@ impl Database {
         until: Instant,
     ) -> Result<(Answer, Option<Token>), Refusal> {
         self.resolve(until)?
-            .submit_selected(namespace, operation, until)
+            .submit_selected(namespace, operation, None, until)
     }
 
+    /// `call_answer`: the bytes a call's answer is charged at admission, `None` for the
+    /// operation's own bound ([`Admission::bytes_for`]).
     fn submit_selected(
         &self,
         namespace: &str,
         operation: Operation,
+        call_answer: Option<usize>,
         until: Instant,
     ) -> Result<(Answer, Option<Token>), Refusal> {
         if Instant::now() >= until {
@@ -2234,7 +2379,10 @@ impl Database {
                 .map(|answer| (answer, None));
             }
         };
-        let admission = Admission::reserve(&self.shared.admitted, &operation)?;
+        let admission = match call_answer {
+            Some(answer) => Admission::reserve_call(&self.shared.admitted, answer)?,
+            None => Admission::reserve(&self.shared.admitted, &operation)?,
+        };
         // In flight from here to its answer, as a backed-up writer's checks yield to it.
         let _in_flight = self
             .shared

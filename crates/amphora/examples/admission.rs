@@ -4,10 +4,17 @@
 //! queues (MB.1), which reads the process's limit and resident bytes ([`amphora::memory`]).
 //!
 //! cargo run --release -p amphora --example admission -- <dir> <reads> <seconds> <clients,...> [call|get]
+//! cargo run --release -p amphora --example admission -- <dir> <reads> <seconds> <clients,...> ab <rounds>
 //!
 //! One line a measurement: the budget's `room` in ns a call (best of five rounds of <reads>), then,
 //! for each client count, requests a second over <seconds> seconds: `Database::call`s of an empty
 //! closure (`call`, the default), or Records gets of one absent key (`get`), and the refused ones.
+//!
+//! `ab` is Ada's A/B of a call's admission charge (AUDIT §1): each call reads `LIMIT` rows of a
+//! seeded table, charged the flat `REQUEST_MAX` (`flat`, today's `Database::call`), its declared
+//! bound (`declared`, arm a) or its measured answer (`measured`, arm b). The arms take turns,
+//! round after round, each over the client ladder; a line a run gives every call's own latency's
+//! p50, p99 and p99.9 (no sampling), calls a second, refusals and the machine's load and pressure.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -25,7 +32,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use amphora::database::Database;
+use amphora::database::{AnswerBytes, AnswerCharge, Database};
 use amphora::memory::{self, Use};
 use amphora_api::{Consistency, Records};
 
@@ -47,6 +54,11 @@ fn main() {
     let get = match args.get(4).map(String::as_str) {
         None | Some("call") => false,
         Some("get") => true,
+        Some("ab") => {
+            let rounds: usize = args.get(5).expect(usage).parse().expect(usage);
+            ab(&dir, seconds, &ladder, rounds);
+            return;
+        }
         Some(_) => panic!("{usage}"),
     };
 
@@ -108,5 +120,160 @@ fn main() {
             (d1 - d0) as f64 / elapsed,
             (r1 - r0) as f64 / elapsed
         );
+    }
+}
+
+const ROWS: i64 = 1_000;
+const LIMIT: usize = 8;
+const VALUE: usize = 64;
+
+type Rows = Vec<(i64, String)>;
+
+/// The most bytes the query's answer holds, from its own bounds: `LIMIT` rows of an id and a
+/// value of `VALUE` bytes.
+fn declared() -> usize {
+    let row = (0i64, "x".repeat(VALUE)).answer_bytes();
+    Vec::<(i64, String)>::with_capacity(LIMIT).answer_bytes() + LIMIT * row
+}
+
+fn read(c: &mut amphora::sql::Connection<'_>, from: i64) -> anyhow::Result<Rows> {
+    let mut statement = c.prepare_cached("SELECT id, v FROM t WHERE id >= ?1 ORDER BY id LIMIT ?2")?;
+    let rows = statement
+        .query_map(
+            vec![
+                amphora_api::Value::Integer(from),
+                amphora_api::Value::Integer(LIMIT as i64),
+            ],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    anyhow::ensure!(rows.len() == LIMIT, "read {} rows", rows.len());
+    Ok(rows)
+}
+
+fn machine() -> String {
+    let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+    let load = load.split_whitespace().take(3).collect::<Vec<_>>().join(" ");
+    let pressure = |what: &str| {
+        std::fs::read_to_string(format!("/proc/pressure/{what}"))
+            .unwrap_or_default()
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("")
+            .trim_start_matches("avg10=")
+            .to_owned()
+    };
+    format!(
+        "\"load\":\"{load}\",\"cpu_some10\":\"{}\",\"io_some10\":\"{}\"",
+        pressure("cpu"),
+        pressure("io")
+    )
+}
+
+fn percentile(sorted: &[u64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return f64::NAN;
+    }
+    let at = ((sorted.len() as f64 * p).ceil() as usize).clamp(1, sorted.len()) - 1;
+    sorted[at] as f64 / 1_000.0
+}
+
+fn ab(dir: &std::path::Path, seconds: f64, ladder: &[usize], rounds: usize) {
+    std::fs::create_dir_all(dir).expect("dir");
+    let path = dir.join("admission-ab.db");
+    let _ = std::fs::remove_file(&path);
+    let until = || Instant::now() + Duration::from_secs(600);
+    let db = Database::open(&path, until()).expect("open");
+    db.call(until(), |c| {
+        c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
+        for id in 0..ROWS {
+            c.execute(
+                "INSERT INTO t (id, v) VALUES (?1, ?2)",
+                vec![
+                    amphora_api::Value::Integer(id),
+                    amphora_api::Value::Text(format!("{id:0width$}", width = VALUE)),
+                ],
+            )?;
+        }
+        Ok(())
+    })
+    .expect("seed");
+    let declared = declared();
+    println!("{{\"what\":\"ab\",\"declared_bytes\":{declared},\"rows\":{ROWS},\"limit\":{LIMIT}}}");
+    let arms = [
+        ("flat", None),
+        ("declared", Some(AnswerCharge::Declared(declared))),
+        ("measured", Some(AnswerCharge::Measured)),
+    ];
+    for round in 0..rounds {
+        for (arm, charge) in arms {
+            for &clients in ladder {
+                let stop = Arc::new(AtomicBool::new(false));
+                let measuring = Arc::new(AtomicBool::new(false));
+                let threads: Vec<_> = (0..clients)
+                    .map(|client| {
+                        let (db, stop, measuring) = (db.clone(), stop.clone(), measuring.clone());
+                        std::thread::Builder::new()
+                            .spawn(move || {
+                                let mut latencies = Vec::new();
+                                let mut refused = 0u64;
+                                let mut from = (client as i64 * 7) % (ROWS - LIMIT as i64);
+                                while !stop.load(Ordering::Relaxed) {
+                                    let counted = measuring.load(Ordering::Relaxed);
+                                    let until = Instant::now() + Duration::from_secs(60);
+                                    let started = Instant::now();
+                                    let start = from;
+                                    let answered = match charge {
+                                        None => db.call(until, move |c| read(c, start)),
+                                        Some(charge) => {
+                                            db.call_charged(until, charge, move |c| read(c, start))
+                                        }
+                                    };
+                                    let took = started.elapsed().as_nanos() as u64;
+                                    from = (from + 1) % (ROWS - LIMIT as i64);
+                                    if !counted || stop.load(Ordering::Relaxed) {
+                                        continue;
+                                    }
+                                    match answered {
+                                        Ok(rows) => {
+                                            black_box(rows);
+                                            latencies.push(took);
+                                        }
+                                        Err(_) => refused += 1,
+                                    }
+                                }
+                                (latencies, refused)
+                            })
+                            .expect("spawn a client")
+                    })
+                    .collect();
+                // Warm up a second, then count.
+                std::thread::sleep(Duration::from_secs(1));
+                measuring.store(true, Ordering::Relaxed);
+                let started = Instant::now();
+                let before = machine();
+                std::thread::sleep(Duration::from_secs_f64(seconds));
+                stop.store(true, Ordering::Relaxed);
+                let elapsed = started.elapsed().as_secs_f64();
+                let mut latencies = Vec::new();
+                let mut refused = 0;
+                for t in threads {
+                    let (l, r) = t.join().expect("client");
+                    latencies.extend(l);
+                    refused += r;
+                }
+                latencies.sort_unstable();
+                println!(
+                    "{{\"what\":\"ab\",\"arm\":\"{arm}\",\"round\":{round},\"clients\":{clients},\"calls\":{},\"per_s\":{:.0},\"p50_us\":{:.1},\"p99_us\":{:.1},\"p999_us\":{:.1},\"refused\":{refused},{before},\"after\":{{{}}}}}",
+                    latencies.len(),
+                    latencies.len() as f64 / elapsed,
+                    percentile(&latencies, 0.50),
+                    percentile(&latencies, 0.99),
+                    percentile(&latencies, 0.999),
+                    machine()
+                );
+            }
+        }
     }
 }
