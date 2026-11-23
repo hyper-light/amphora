@@ -177,10 +177,33 @@ fn machine() -> String {
             .trim_start_matches("avg10=")
             .to_owned()
     };
+    // The process's own cgroup (v2): under a MemoryMax scope its memory pressure, use and limit.
+    let group = std::fs::read_to_string("/proc/self/cgroup")
+        .unwrap_or_default()
+        .lines()
+        .find_map(|line| line.strip_prefix("0::").map(|at| format!("/sys/fs/cgroup{at}")))
+        .unwrap_or_default();
+    let in_group = |file: &str| {
+        std::fs::read_to_string(format!("{group}/{file}"))
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
+    };
+    let group_pressure = in_group("memory.pressure")
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("")
+        .trim_start_matches("avg10=")
+        .to_owned();
     format!(
-        "\"load\":\"{load}\",\"cpu_some10\":\"{}\",\"io_some10\":\"{}\"",
+        "\"load\":\"{load}\",\"cpu_some10\":\"{}\",\"io_some10\":\"{}\",\"mem_some10\":\"{}\",\"group_mem_some10\":\"{group_pressure}\",\"group_mem_current\":\"{}\",\"group_mem_max\":\"{}\",\"queue_room\":{}",
         pressure("cpu"),
-        pressure("io")
+        pressure("io"),
+        pressure("memory"),
+        in_group("memory.current"),
+        in_group("memory.max"),
+        memory::process().room(Use::Queues).unwrap_or(0)
     )
 }
 
@@ -303,9 +326,39 @@ struct Flight {
     freed: std::sync::Condvar,
     measuring: AtomicBool,
     latencies: std::sync::Mutex<Vec<u64>>,
-    refused: AtomicU64,
-    full: AtomicU64,
-    failed: AtomicU64,
+    /// Refusals by cause, at submit and through the answer (lane perf-A8).
+    at_submit: Causes,
+    at_answer: Causes,
+}
+
+/// Refusals by cause: the memory budget's room for queues (`Full`: since lane perf-A8 the
+/// writer's queue has no count, so `Full` has no other source), the call's deadline (`Timeout`,
+/// or `UnknownOutcome` once it passed), and the rest.
+#[derive(Default)]
+struct Causes {
+    memory: AtomicU64,
+    deadline: AtomicU64,
+    other: AtomicU64,
+}
+
+impl Causes {
+    fn count(&self, refusal: &amphora_api::Refusal) {
+        match refusal {
+            amphora_api::Refusal::Full { .. } => &self.memory,
+            amphora_api::Refusal::Timeout | amphora_api::Refusal::UnknownOutcome => &self.deadline,
+            _ => &self.other,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn json(&self) -> String {
+        format!(
+            "{{\"memory\":{},\"deadline\":{},\"other\":{}}}",
+            self.memory.load(Ordering::Relaxed),
+            self.deadline.load(Ordering::Relaxed),
+            self.other.load(Ordering::Relaxed)
+        )
+    }
 }
 
 impl Flight {
@@ -317,12 +370,7 @@ impl Flight {
                     black_box(rows);
                     self.latencies.lock().unwrap().push(took);
                 }
-                Err(amphora_api::Refusal::Full { .. }) => {
-                    self.full.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(_) => {
-                    self.failed.fetch_add(1, Ordering::Relaxed);
-                }
+                Err(refusal) => self.at_answer.count(&refusal),
             }
         }
         *self.room.lock().unwrap() += 1;
@@ -397,9 +445,8 @@ fn nowait(dir: &std::path::Path, seconds: f64, ladder: &[usize], rounds: usize, 
                     freed: std::sync::Condvar::new(),
                     measuring: AtomicBool::new(false),
                     latencies: std::sync::Mutex::new(Vec::new()),
-                    refused: AtomicU64::new(0),
-                    full: AtomicU64::new(0),
-                    failed: AtomicU64::new(0),
+                    at_submit: Causes::default(),
+                    at_answer: Causes::default(),
                 });
                 let stop = Arc::new(AtomicBool::new(false));
                 let threads: Vec<_> = (0..pool)
@@ -430,9 +477,9 @@ fn nowait(dir: &std::path::Path, seconds: f64, ladder: &[usize], rounds: usize, 
                                         })
                                         .poll(),
                                         // Refused at admission: try again once a call ends.
-                                        Err(_) => {
+                                        Err(refusal) => {
                                             if flight.measuring.load(Ordering::Relaxed) {
-                                                flight.refused.fetch_add(1, Ordering::Relaxed);
+                                                flight.at_submit.count(&refusal);
                                             }
                                             let room = flight.room.lock().unwrap();
                                             let mut room = if stop.load(Ordering::Relaxed) {
@@ -472,15 +519,14 @@ fn nowait(dir: &std::path::Path, seconds: f64, ladder: &[usize], rounds: usize, 
                 let mut latencies = std::mem::take(&mut *flight.latencies.lock().unwrap());
                 latencies.sort_unstable();
                 println!(
-                    "{{\"what\":\"nowait\",\"arm\":\"{arm}\",\"round\":{round},\"in_flight\":{in_flight},\"calls\":{},\"per_s\":{:.0},\"p50_us\":{:.1},\"p99_us\":{:.1},\"p999_us\":{:.1},\"refused_at_submit\":{},\"refused_full\":{},\"failed\":{},\"window_s\":{window:.1},{before},\"after\":{{{}}}}}",
+                    "{{\"what\":\"nowait\",\"arm\":\"{arm}\",\"round\":{round},\"in_flight\":{in_flight},\"calls\":{},\"per_s\":{:.0},\"p50_us\":{:.1},\"p99_us\":{:.1},\"p999_us\":{:.1},\"refused_at_submit\":{},\"refused_at_answer\":{},\"window_s\":{window:.1},{before},\"after\":{{{}}}}}",
                     latencies.len(),
                     latencies.len() as f64 / window,
                     percentile(&latencies, 0.50),
                     percentile(&latencies, 0.99),
                     percentile(&latencies, 0.999),
-                    flight.refused.load(Ordering::Relaxed),
-                    flight.full.load(Ordering::Relaxed),
-                    flight.failed.load(Ordering::Relaxed),
+                    flight.at_submit.json(),
+                    flight.at_answer.json(),
                     machine()
                 );
             }
