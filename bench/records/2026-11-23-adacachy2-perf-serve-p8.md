@@ -50,6 +50,17 @@ write refused more than twice in a row), which passed in r1170 and r1186. It is 
 writes are closures, which item 2 leaves as they were (inferred: the slot's turn, item 4, not this change). serve
 cp_t1_13 0 of 2 (16 MiB at serve.rs:822, 20 MiB at serve.rs:759); the 16 MiB one passed in r1186 and failed here.
 
+## The admission test (b16c779f)
+
+`receive_receipts::admission_is_bounded_...` checks admission from inside a call while the owner processes nothing.
+On the worker the owner kept stepping and processed admitted records, so the bytes fell (33554704 against 33572176).
+The test now steps its driven owner until the capture is handed over (`sessions.out`), then waits for the capture's
+checks before stepping again: the state the test always meant. b16c779f (r1213, load average 6-14): clippy exit 0; session_worker 2 of 2; replicated
+134 passed, 5 failed (the admission test ok): `a_raise_another_lead_wrote_over_is_answered_unknown_outcome`,
+`a_raise_whose_base_is_joint_is_refused`, `a_refused_follower_write_lands_on_its_next_try_under_the_slot`,
+`a_slot_holder_whose_write_fails_ends_its_slot_without_waiting_its_length`,
+`a_write_at_a_follower_is_answered_on_its_groups_commit`; serve cp_t1_13 0 of 2.
+
 ## Item 5: the second stall is the leader's own check-quorum step-down
 
 Probe on branch perf/serve-p8-probe (2abf4f13, never for main): P5's `p5_probe_large_replicated_writes` back in
@@ -100,6 +111,17 @@ the durable end of its log and its durable commit", `Raft::answer_beat_now`) cha
 | 3 | Ok after 1.89 s | 257.9 ms | 1.00 ms | follower 1 lost its leader in term 1 for 238 ms, until the 21,082,349-byte append reached it; lead kept |
 
 `--test serve cp_t1_13` on 0f16b8f0: 3 of 4, the 20 MiB test failed at serve.rs:759, P5's 16 MiB one ok.
+
+A/B, r1211, back to back on adacachy2 (load average 6.7-7.4), `P5_SIZES=20,20,20,20,20`, five fresh groups an arm,
+the V4 arm first (logs ~/.cache/amphora-perf/serve-p8-ab-<sha>.log there):
+
+| arm | 20 MiB writes Ok | UnknownOutcome | a member's leader lost within a term (P8PROBE) |
+|---|---|---|---|
+| 2abf4f13 (lane, no V4) | 1 of 5 | 4 (1.23-1.24 s) | 4 |
+| 0f16b8f0 (lane + V4's 0009) | 4 of 5 | 1 (1.21 s) | 1 |
+
+With r1195 and r1209: without V4, 1 of 6 Ok; with it, 6 of 8. Every UnknownOutcome answered after 1.21-1.24 s, the
+leader's step-down, and every Ok after 1.80-2.00 s.
 So V4's change is needed but not enough (one run of three, no noise measured): the leader still steps down when its
 heartbeats' answers come later than its quorum window. Inferred from the timeline: with followers' answers no longer
 waiting for their disks, what remains is the 21 MB append ahead of the heartbeats in each peer's one FIFO, read whole
@@ -129,7 +151,5 @@ Not done here; the fix is the successor's, at these causes, none with a picked s
   a condvar, so the take must happen on the worker thread, not the owner's.
 - `a_write_at_a_follower_is_answered_on_its_groups_commit`: two overlapping follower sessions now prepare at once;
   the later one's base is stale at apply (Serialization). Before, each prepared on its tail and proposed in one step.
-- `receive_receipts::admission_is_bounded_...`: its premise ("the owner is inside this capture") no longer holds,
-  since the owner runs while the session does; the test needs another way to hold the owner.
 - The two raise tests: not traced.
 - The commit-latency A/B at 1 and 32 writers: not run (nothing merged).
