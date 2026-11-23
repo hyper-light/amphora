@@ -270,7 +270,7 @@ impl<'a> Core<'a> {
         let first = text.first().copied().unwrap_or(0);
         match rule {
             // {whitespace}; <xc>{xcinside}, {op_chars}, \*+
-            1 | 5 | 6 | 7 => {}
+            1 | 5..=7 => {}
             // {xcstart}
             2 => {
                 self.lloc = start;
@@ -317,7 +317,7 @@ impl<'a> Core<'a> {
                 }));
             }
             // {xqstart}, {xestart}, {xusstart}
-            13 | 14 | 15 => {
+            13..=15 => {
                 self.saw_non_ascii = false;
                 self.lloc = start;
                 self.condition = match rule {
