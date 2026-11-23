@@ -3398,3 +3398,25 @@ fn t_qt_6_35_joins_over_rowid_ranges_run_on_morsels_as_the_serial_loop() {
     }
     conn.set_parallel_mode(ParallelMode::Off);
 }
+
+#[test]
+fn zz_debug_6_24() {
+    let sql = "SELECT v.id IS NULL, count(*), count(v.a), sum(v.b), min(w.c), max(v.b) FROM t JOIN u ON u.a = t.a AND u.b > 694 JOIN v ON v.a = t.a AND v.b + t.b > 0 FULL JOIN w ON w.a = v.a GROUP BY v.id IS NULL";
+    for probe in [crate::OuterJoinProbe::Padded, crate::OuterJoinProbe::Kept] {
+        let conn = open(&format!(":memory:zz-6-24-{probe:?}"));
+        conn.set_parallel_outer_probe(probe);
+        let mut rng = ChaCha8Rng::seed_from_u64(624);
+        fill_with_ids(&conn, &mut rng, &[("t", 400), ("u", 120), ("v", 50), ("w", 30)]);
+        conn.set_join_methods(crate::JoinMethods::HashJoinsOnly);
+        for mode in [ParallelMode::Off, ParallelMode::On] {
+            conn.set_parallel_mode(mode);
+            *conn.morsel_costs.lock() = Some(MachineCosts::stated(NonZeroUsize::new(1).unwrap(), 1.0, 1.0));
+            let explain = sql_rows(&conn, &format!("EXPLAIN {sql}"));
+            eprintln!("=== {probe:?} {mode:?}");
+            for row in &explain {
+                eprintln!("ZZ {}", row.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" | "));
+            }
+            eprintln!("ZZ rows {:?}", sql_rows(&conn, sql));
+        }
+    }
+}
