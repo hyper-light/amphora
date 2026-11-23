@@ -684,6 +684,17 @@ fn within<R: AnswerBytes>(value: R, answer: AnswerMax<R>) -> Result<R, Refusal> 
     Ok(value)
 }
 
+/// What one run of a [`Database::query_waiting`] session holds: its answer as declared, or the
+/// cross-group key of the row it met under a lock, trimmed: a transaction's key, at most `KEY_MAX`
+/// (each passes `api::key` in `coordinator::validate`).
+fn met_max<R>(answer: AnswerMax<R>) -> AnswerMax<Result<R, Vec<u8>>> {
+    let outer = std::mem::size_of::<Result<R, Vec<u8>>>();
+    let read = outer
+        .saturating_sub(std::mem::size_of::<R>())
+        .saturating_add(answer.get());
+    AnswerMax::bytes(read.max(outer.saturating_add(api::KEY_MAX)))
+}
+
 /// A call queued by [`Database::call_nowait`]: a future of its answer, woken once, when the
 /// call has committed or with why it won't.
 #[must_use = "a call's answer comes only through its Calling"]
@@ -2408,10 +2419,12 @@ impl Database {
     /// flush, and writes nothing, its writing statements refused. A replicated database runs it
     /// past its group's barrier, on its replica's applied state, its writing statements refused
     /// as here; its barrier asks the leader for no write slot (CP-T1.8, lane V11). An attached
-    /// client runs it as a [`Database::call`].
-    pub fn query<R, F>(&self, until: Instant, f: F) -> Result<R, Refusal>
+    /// client runs it as a [`Database::call`]. `answer`: the most bytes its answer holds, derived
+    /// from what it reads, charged at admission where it runs as a replicated query or a call; an
+    /// answer past it is refused ([`AnswerMax`]).
+    pub fn query<R, F>(&self, until: Instant, answer: AnswerMax<R>, f: F) -> Result<R, Refusal>
     where
-        R: Send + 'static,
+        R: AnswerBytes + Send + 'static,
         F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + 'static,
     {
         let database = self.resolve(until)?;
@@ -2420,11 +2433,11 @@ impl Database {
             Writer::Replicated { .. } => {
                 let query: Call = Box::new(move |db| {
                     let mut connection = crate::sql::Connection::new(db);
-                    let value = f(&mut connection)?;
+                    let value = within(f(&mut connection)?, answer)?;
                     connection.finish()?;
                     Ok(Box::new(value) as Box<dyn Any + Send>)
                 });
-                let operation = Operation::Query(Mutex::new(Some(query)), api::REQUEST_MAX);
+                let operation = Operation::Query(Mutex::new(Some(query)), answer.get());
                 return match database.submit_selected("", operation, until)? {
                     (Answer::Called(value), _) => value
                         .downcast::<R>()
@@ -2435,11 +2448,21 @@ impl Database {
             }
             Writer::Client(_) => {
                 return database
-                    .session(until, api::REQUEST_MAX, f)
+                    .session(until, answer.get(), move |c| Ok(within(f(c)?, answer)?))
                     .map(|(value, _)| value);
             }
         };
-        let _in_flight = database
+        database.query_reader(store, until, move |c| Ok(within(f(c)?, answer)?))
+    }
+
+    /// [`Database::query`] on a local store: on a reader, or on the writer while it has none to
+    /// lend; admission charges it nothing.
+    fn query_reader<R, F>(&self, store: &Store<Local>, until: Instant, f: F) -> Result<R, Refusal>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + 'static,
+    {
+        let _in_flight = self
             .shared
             .foreground
             .get()
@@ -2447,7 +2470,7 @@ impl Database {
         // The store runs the session on a reader, or on the writer while it has none to lend.
         let session = Arc::new(Mutex::new(Some(f)));
         let on_writer = Arc::clone(&session);
-        let claim = database.application.clone();
+        let claim = self.application.clone();
         let on_writer_claim = claim.clone();
         store
             .read_committed(
@@ -2466,13 +2489,19 @@ impl Database {
     /// [`LockedReads::WaitOnLock`] its Records get of a row under a lock is refused, the row
     /// noted, and once the session ends the read waits as a get does and runs the session again,
     /// on a snapshot past the resolution; so `f` may run more than once and answers from its last
-    /// run only. Under [`LockedReads::Committed`] it is [`Database::query`].
-    pub fn query_waiting<R, F>(&self, until: Instant, f: F) -> Result<R, Refusal>
+    /// run only. Under [`LockedReads::Committed`] it is [`Database::query`]. `answer`: what
+    /// [`Database::query`] declares.
+    pub fn query_waiting<R, F>(
+        &self,
+        until: Instant,
+        answer: AnswerMax<R>,
+        f: F,
+    ) -> Result<R, Refusal>
     where
-        R: Send + 'static,
+        R: AnswerBytes + Send + 'static,
         F: Fn(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + Sync + 'static,
     {
-        self.session_waiting(false, until, f)
+        self.session_waiting(Some(answer), until, f)
     }
 
     /// [`Database::query_waiting`] as a local read ([`Database::query_local`]): on a replica, on
@@ -2481,42 +2510,50 @@ impl Database {
     /// xgroup-sql-12).
     pub fn query_local_waiting<R, F>(&self, until: Instant, f: F) -> Result<R, Refusal>
     where
-        R: Send + 'static,
+        R: AnswerBytes + Send + 'static,
         F: Fn(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + Sync + 'static,
     {
-        self.session_waiting(true, until, f)
+        self.session_waiting(None, until, f)
     }
 
-    /// The session of [`Database::query_waiting`] (`local`: of [`Database::query_local_waiting`]).
-    fn session_waiting<R, F>(&self, local: bool, until: Instant, f: F) -> Result<R, Refusal>
+    /// The session of [`Database::query_waiting`], at the leader's latest commit with the bound
+    /// it declared (`latest`; none: of [`Database::query_local_waiting`]).
+    fn session_waiting<R, F>(
+        &self,
+        latest: Option<AnswerMax<R>>,
+        until: Instant,
+        f: F,
+    ) -> Result<R, Refusal>
     where
-        R: Send + 'static,
+        R: AnswerBytes + Send + 'static,
         F: Fn(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + Sync + 'static,
     {
         let reads = LockedReads::of(self.shared.changed.locked_reads.load(Ordering::Acquire));
         if reads == LockedReads::Committed {
-            return if local {
-                self.query_local(until, f)
-            } else {
-                self.query(until, f)
+            return match latest {
+                Some(answer) => self.query(until, answer, f),
+                None => self.query_local(until, f),
             };
         }
         let database = self.resolve(until)?;
         let f = Arc::new(f);
+        let latest = latest.map(met_max);
         database.wait_locked(reads, until, || {
             let f = Arc::clone(&f);
             let run = move |c: &mut crate::sql::Connection<'_>| {
                 let watch = session::Watch::begin();
                 let answer = (*f)(c);
                 match watch.met() {
-                    Some(row) => Ok(Err(row)),
+                    Some(mut row) => {
+                        row.shrink_to_fit();
+                        Ok(Err(row))
+                    }
                     None => answer.map(Ok),
                 }
             };
-            if local {
-                database.query_local(until, run)
-            } else {
-                database.query(until, run)
+            match latest {
+                Some(answer) => database.query(until, answer, run),
+                None => database.query_local(until, run),
             }
         })
     }
@@ -2545,7 +2582,7 @@ impl Database {
                 .for_application(database.application.clone())
                 .query_local(until, f)
                 .map_err(Refusal::from),
-            Writer::Local(_) => database.query(until, f),
+            Writer::Local(store) => database.query_reader(store, until, f),
         }
     }
 
@@ -2580,10 +2617,10 @@ impl Database {
                 "closed-time read",
                 "an attached client's waits for the wire's next version",
             )),
-            Writer::Local(_) => {
+            Writer::Local(store) => {
                 let micros = replicated::wall_micros()?;
                 database
-                    .query(until, f)
+                    .query_reader(store, until, f)
                     .map(|value| ClosedRead { value, micros })
             }
         }
@@ -2638,27 +2675,29 @@ impl Database {
     ///   the log; with one, on this replica once it has applied the token, waiting only while it
     ///   is behind and redirected to [`Database::query`] past its measured apply lag.
     ///
-    /// Answers alike in both modes for every session that carries its tokens.
+    /// Answers alike in both modes for every session that carries its tokens. `answer`: what
+    /// [`Database::query`] declares, for a read at the leader's latest commit.
     pub fn query_session<R, F>(
         &self,
         mode: ReadMode,
         token: Option<Token>,
         until: Instant,
+        answer: AnswerMax<R>,
         f: F,
     ) -> Result<R, Refusal>
     where
-        R: Send + 'static,
+        R: AnswerBytes + Send + 'static,
         F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + 'static,
     {
         let (ReadMode::Session, Some(token)) = (mode, token) else {
             return match mode {
-                ReadMode::Latest => self.query(until, f),
+                ReadMode::Latest => self.query(until, answer, f),
                 ReadMode::Session => self.query_local(until, f),
             };
         };
         let database = self.resolve(until)?;
         let Writer::Replicated { client, .. } = &database.shared.writer else {
-            return self.query(until, f);
+            return self.query(until, answer, f);
         };
         let session = Mutex::new(Some(f));
         let claim = database.application.as_ref();
@@ -2675,7 +2714,7 @@ impl Database {
                 let f = locked(&session)?
                     .take()
                     .ok_or_else(|| api::invalid("SQL query", "was already executed"))?;
-                self.query(until, f)
+                self.query(until, answer, f)
             }
         }
     }
@@ -4034,6 +4073,8 @@ fn apply(
                     return Ok(Ok(Answer::Locked(row)));
                 }
             }
+            // Grown one push at a time, the list holds the bytes admission charged once trimmed.
+            rows.shrink_to_fit();
             Ok(Ok(Answer::Page(Page { rows, more })))
         }
         Operation::Changes(f, after, limit) => {
@@ -4492,6 +4533,99 @@ mod admission_charge {
             held: Duration::from_millis(1),
         };
         assert_eq!(stepped.answer_bytes(), std::mem::size_of_val(&stepped));
+    }
+
+    /// Do: a group's own scan at its worst case, `limit` rows each at the largest key and value,
+    /// so its page fills every byte of keys and values admission charged it. Expect: the page
+    /// holds no more than its charge, its list trimmed rather than grown by `push` past `limit`
+    /// rows (AUDIT 2026-11-23 §1; lane perf-A14).
+    #[test]
+    fn a14_a_group_scan_at_its_worst_case_holds_what_admission_charged() {
+        let until = || Instant::now() + Duration::from_secs(120);
+        let dir = tempfile::tempdir().unwrap();
+        let database = Database::open(&dir.path().join("records.db"), until()).unwrap();
+        let records = database.namespace("ns").unwrap();
+        let limit = 5u8;
+        let writes = (0..limit)
+            .map(|k| Write::Put {
+                family: "f".into(),
+                key: vec![k; api::KEY_MAX],
+                value: vec![7; api::VALUE_MAX],
+            })
+            .collect();
+        records
+            .commit(
+                Tx {
+                    conds: Vec::new(),
+                    writes,
+                },
+                until(),
+            )
+            .unwrap();
+        let limit = usize::from(limit);
+        let page = records
+            .scan(
+                "f",
+                Scan {
+                    prefix: Vec::new(),
+                    after: None,
+                    limit,
+                    at: Consistency::Linearizable,
+                },
+                until(),
+            )
+            .unwrap();
+        assert_eq!(page.rows.len(), limit);
+        let charged = page_bytes::<Row>(limit);
+        assert!(
+            heap_bytes(&page) <= charged,
+            "{} > {charged}",
+            heap_bytes(&page)
+        );
+    }
+
+    /// Do: a query at its worst case, the most blobs it reads (its `LIMIT`) each as large as
+    /// any written, collected into a list sized to them, its bound derived from that read; then
+    /// the same read declaring a byte less. Expect: the first answers, holding exactly what it
+    /// declared; the second is refused, typed (AUDIT 2026-11-23 §1, MB.1; lane perf-A14).
+    #[test]
+    fn a14_a_query_at_its_worst_case_answers_within_its_declared_bound() {
+        const ROWS: usize = 3;
+        const BLOB: usize = 100;
+        let until = || Instant::now() + Duration::from_secs(60);
+        let dir = tempfile::tempdir().unwrap();
+        let database = Database::open(&dir.path().join("query.db"), until()).unwrap();
+        database
+            .call(until(), AnswerMax::fixed(), |c| {
+                c.execute_batch("CREATE TABLE t(v BLOB NOT NULL)")?;
+                for _ in 0..ROWS {
+                    c.execute(
+                        "INSERT INTO t VALUES (?1)",
+                        vec![Value::Blob(vec![7; BLOB])],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let declared =
+            std::mem::size_of::<Vec<Vec<u8>>>() + ROWS * (std::mem::size_of::<Vec<u8>>() + BLOB);
+        let read = |answer: AnswerMax<Vec<Vec<u8>>>| {
+            database.query(until(), answer, |c| {
+                let mut s = c.prepare("SELECT v FROM t LIMIT 3")?;
+                let mut blobs = Vec::with_capacity(ROWS);
+                for blob in s.query_map(Vec::<Value>::new(), |row| row.get::<_, Vec<u8>>(0usize))? {
+                    blobs.push(blob?);
+                }
+                Ok(blobs)
+            })
+        };
+        let blobs = read(AnswerMax::bytes(declared)).unwrap();
+        assert_eq!(blobs.len(), ROWS);
+        assert_eq!(blobs.answer_bytes(), declared);
+        assert!(matches!(
+            read(AnswerMax::bytes(declared - 1)),
+            Err(Refusal::TooLarge { .. })
+        ));
     }
 
     fn put(value: usize) -> Operation {
