@@ -453,6 +453,10 @@ impl RingState {
 }
 
 impl IO for UringIO {
+    fn page_read_backend(&self) -> Option<&'static str> {
+        Some("io_uring")
+    }
+
     fn supports_shared_wal_coordination(&self) -> bool {
         true
     }
