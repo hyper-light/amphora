@@ -584,6 +584,66 @@ impl AnswerBytes for Value {
     }
 }
 
+impl<T: AnswerBytes, E: AnswerBytes> AnswerBytes for Result<T, E> {
+    fn answer_bytes(&self) -> usize {
+        let (inline, held) = match self {
+            Ok(value) => (std::mem::size_of::<T>(), value.answer_bytes()),
+            Err(error) => (std::mem::size_of::<E>(), error.answer_bytes()),
+        };
+        std::mem::size_of::<Self>()
+            .saturating_sub(inline)
+            .saturating_add(held)
+    }
+}
+
+impl<T: FixedAnswer, E: FixedAnswer> FixedAnswer for Result<T, E> {}
+
+impl AnswerBytes for Refusal {
+    fn answer_bytes(&self) -> usize {
+        let heap = match self {
+            Refusal::Conflict { family, key, .. } => {
+                family.capacity().saturating_add(key.capacity())
+            }
+            Refusal::TooLarge { what, .. } => what.capacity(),
+            Refusal::Invalid { what, why } | Refusal::Serialization { what, why } => {
+                what.capacity().saturating_add(why.capacity())
+            }
+            Refusal::Unavailable(text) | Refusal::Fenced(text) => text.capacity(),
+            Refusal::Full { .. }
+            | Refusal::Compacted { .. }
+            | Refusal::Ahead { .. }
+            | Refusal::Timeout
+            | Refusal::UnknownOutcome
+            | Refusal::NotLeader { .. } => 0,
+        };
+        std::mem::size_of::<Self>().saturating_add(heap)
+    }
+}
+
+impl AnswerBytes for Row {
+    fn answer_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.key.capacity())
+            .saturating_add(self.value.capacity())
+    }
+}
+
+impl AnswerBytes for api::import::ImportProgress {
+    fn answer_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.source.capacity())
+            .saturating_add(self.cursor.capacity())
+    }
+}
+
+/// The bytes `value` holds on the heap: its [`AnswerBytes`] past its own inline size, for an
+/// answer type that holds it as a field.
+pub(crate) fn heap_bytes<T: AnswerBytes>(value: &T) -> usize {
+    value
+        .answer_bytes()
+        .saturating_sub(std::mem::size_of::<T>())
+}
+
 /// `value`, the answer of a call that declared `answer`; past it, refused, so the session that
 /// made it rolls back.
 fn within<R: AnswerBytes>(value: R, answer: AnswerMax<R>) -> Result<R, Refusal> {
@@ -4284,6 +4344,48 @@ mod owner_table {
 #[cfg(test)]
 mod admission_charge {
     use super::*;
+
+    /// AUDIT 2026-11-23 §1 (lane perf-A12): the answers of `call_db` and `call_internal`'s
+    /// callers (cross-group steps, restores, online changes, floor raises) count their heap, so
+    /// a call answering one can declare a bound its answer is held to.
+    #[test]
+    fn a12_call_db_answers_count_their_heap() {
+        let refusal = Refusal::Invalid {
+            what: "ab".to_owned(),
+            why: "cde".to_owned(),
+        };
+        assert_eq!(refusal.answer_bytes(), std::mem::size_of::<Refusal>() + 5);
+        let failed: Result<u64, Refusal> = Err(refusal);
+        assert_eq!(
+            failed.answer_bytes(),
+            std::mem::size_of::<Result<u64, Refusal>>() + 5
+        );
+        let held: Result<String, Refusal> = Ok(String::with_capacity(7));
+        assert_eq!(
+            held.answer_bytes(),
+            std::mem::size_of::<Result<String, Refusal>>() + 7
+        );
+        let progress = api::import::ImportProgress {
+            source: "src".to_owned(),
+            cursor: vec![1, 2],
+            done: false,
+        };
+        assert_eq!(progress.answer_bytes(), std::mem::size_of_val(&progress) + 5);
+        let reads = vec![(vec![1u8; 3], Some(vec![2u8; 4])), (vec![5u8], None)];
+        let heap = 2 * std::mem::size_of::<(Vec<u8>, Option<Vec<u8>>)>() + 3 + 4 + 1;
+        let locked = crate::xgroup::Reply::Locked {
+            reads: reads.clone(),
+        };
+        assert_eq!(locked.answer_bytes(), std::mem::size_of_val(&locked) + heap);
+        let resolved = crate::xgroup::Reply::Resolved;
+        assert_eq!(resolved.answer_bytes(), std::mem::size_of_val(&resolved));
+        let committed = crate::xgroup::coordinator::Answer::Committed { reads, at: None };
+        assert_eq!(committed.answer_bytes(), std::mem::size_of_val(&committed) + heap);
+        let stepped = online::Stepped::Public {
+            held: Duration::from_millis(1),
+        };
+        assert_eq!(stepped.answer_bytes(), std::mem::size_of_val(&stepped));
+    }
 
     fn put(value: usize) -> Operation {
         Operation::Mutation(Mutation::Records {

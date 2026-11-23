@@ -253,6 +253,30 @@ pub enum Reply {
     },
 }
 
+impl crate::database::AnswerBytes for Reply {
+    fn answer_bytes(&self) -> usize {
+        let heap = match self {
+            Reply::Open { txns, .. } => txns
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(TxnId, GroupId)>()),
+            Reply::Locked { reads } => crate::database::heap_bytes(reads),
+            Reply::Conflict { key } | Reply::Unmet { key, .. } => key.capacity(),
+            Reply::Staging(groups) => groups
+                .capacity()
+                .saturating_mul(std::mem::size_of::<GroupId>()),
+            Reply::Epoch(_)
+            | Reply::Late
+            | Reply::Fenced
+            | Reply::Decided(_)
+            | Reply::Present(_)
+            | Reply::Resolved
+            | Reply::DecidedAt { .. }
+            | Reply::PresentAt { .. } => 0,
+        };
+        std::mem::size_of::<Self>().saturating_add(heap)
+    }
+}
+
 /// Whether a condition holds (lane split-merge-20, T-T1.9.R27): a key whose newest version is
 /// stamped `at` (none: it has none), against the stamp the condition names (none: the key must
 /// have none). A stamp names the key as a read saw it, a row's own stamp or any later one: the
