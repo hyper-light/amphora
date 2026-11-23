@@ -879,7 +879,7 @@ pub(super) fn add_implied_column_equalities(
                 ast::Operator::Equals,
                 Box::new(columns[member].expr.clone()),
             ),
-            origin: WhereTermOrigin::Where,
+            origin: WhereTermOrigin::Implied,
             // The inferred term can select an access path. The original
             // equalities still verify the result during execution.
             consumed: true,

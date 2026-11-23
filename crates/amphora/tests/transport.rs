@@ -7,7 +7,10 @@
     clippy::disallowed_macros
 )]
 //! CP-T1.5 / U05/U06: independent processes share the same writer and Records revisions.
-use amphora::{database::Database, transport::Client};
+use amphora::{
+    database::{AnswerMax, Database},
+    transport::Client,
+};
 use amphora_api::{self as api, Records};
 use anyhow::Context;
 use std::{
@@ -79,7 +82,7 @@ fn child(path: &Path, mode: &str) -> std::process::ExitStatus {
 fn migration_diagnostics(database: &Database) {
     // U05/U16: caller migration context and the engine cause survive either SQL session path.
     let failure = database
-        .call::<(), _>(until(), |db| {
+        .call::<(), _>(until(), AnswerMax::fixed(), |db| {
             db.execute_batch("CREATE INDEX diagnostic_index ON missing_diagnostic_table(value)")
                 .context("migration 20261023-1300_p6_records.sql")
                 .context("apply migrations")?;
@@ -99,7 +102,7 @@ fn migration_diagnostics(database: &Database) {
             "lost error context {expected}: {message}"
         );
     }
-    let refusal = database.call::<(), _>(until(), |_| {
+    let refusal = database.call::<(), _>(until(), AnswerMax::fixed(), |_| {
         Err(
             anyhow::Error::new(api::Refusal::NotLeader { leader: Some(7) })
                 .context("apply migrations"),
@@ -109,7 +112,7 @@ fn migration_diagnostics(database: &Database) {
         refusal,
         Err(api::Refusal::NotLeader { leader: Some(7) })
     ));
-    let refusal = database.call::<(), _>(until(), |_| {
+    let refusal = database.call::<(), _>(until(), AnswerMax::fixed(), |_| {
         Err(
             anyhow::Error::new(api::sql::Error::Refusal(api::Refusal::Fenced(
                 "writer fenced".into(),
@@ -164,7 +167,7 @@ fn transport_child() {
                 Database::open(path, until()).unwrap()
             };
             database
-                .call(until(), |db| {
+                .call(until(), AnswerMax::fixed(), |db| {
                     db.execute_batch(
                         "CREATE TABLE items(value INTEGER); INSERT INTO items VALUES(1)",
                     )?;
@@ -191,7 +194,7 @@ fn transport_child() {
                 "an attached client cannot mint original owner custody"
             );
             database
-                .call(until(), |db| {
+                .call(until(), AnswerMax::fixed(), |db| {
                     db.execute("INSERT INTO items VALUES(4)", [])?;
                     Ok(())
                 })
@@ -201,7 +204,7 @@ fn transport_child() {
             let database = Database::open(path, until()).unwrap();
             migration_diagnostics(&database);
             let n = database
-                .call(until(), |db| {
+                .call(until(), AnswerMax::fixed(), |db| {
                     Ok(db.query_row("SELECT count(*) FROM items", [], |r| r.get::<_, i64>(0))?)
                 })
                 .unwrap();
@@ -226,7 +229,7 @@ fn transport_child() {
                 Err(api::Refusal::Conflict { .. })
             ));
             client
-                .call(until(), |db| {
+                .call(until(), AnswerMax::fixed(), |db| {
                     let n: i64 = db.query_row("SELECT count(*) FROM items", [], |r| r.get(0))?;
                     assert_eq!(n, 1);
                     db.execute("INSERT INTO items VALUES (?1)", [n + 1])?;
@@ -253,7 +256,7 @@ fn transport_child() {
         }
         "disconnect" => {
             let client = Database::open(path, until()).unwrap();
-            let _: Result<(), _> = client.call(until(), |db| {
+            let _: Result<(), _> = client.call(until(), AnswerMax::fixed(), |db| {
                 db.execute("INSERT INTO items VALUES (99)", [])?;
                 db.records_commit(
                     "ledger",
@@ -436,7 +439,7 @@ fn sdk_client_keeps_ledger_and_becomes_owner_after_predecessor_exits() {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = calls.clone();
         successor
-            .call(until(), move |db| {
+            .call(until(), AnswerMax::fixed(), move |db| {
                 observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 assert_eq!(
                     db.query_row("SELECT value FROM items", [], |r| r.get::<_, i64>(0))?,
@@ -525,21 +528,21 @@ fn separate_memory_databases_do_not_share_sql_or_records() {
     let second = Database::in_memory(until()).unwrap();
     for database in [&first, &second] {
         database
-            .call(until(), |db| {
+            .call(until(), AnswerMax::fixed(), |db| {
                 db.execute_batch("CREATE TABLE isolated(value INTEGER)")?;
                 Ok(())
             })
             .unwrap();
     }
     first
-        .call(until(), |db| {
+        .call(until(), AnswerMax::fixed(), |db| {
             db.execute("INSERT INTO isolated VALUES(1)", [])?;
             Ok(())
         })
         .unwrap();
     assert_eq!(
         second
-            .call(until(), |db| Ok(db.query_row(
+            .call(until(), AnswerMax::fixed(), |db| Ok(db.query_row(
                 "SELECT count(*) FROM isolated",
                 [],
                 |r| r.get::<_, i64>(0)
@@ -755,7 +758,7 @@ fn independent_processes_share_cas_and_adaptive_sql_and_abort_disconnect() {
     assert!(child(&path, "application").success());
     assert_eq!(
         application
-            .call(until(), |db| Ok(db.query_row(
+            .call(until(), AnswerMax::fixed(), |db| Ok(db.query_row(
                 "SELECT count(*) FROM items",
                 [],
                 |row| row.get::<_, i64>(0)

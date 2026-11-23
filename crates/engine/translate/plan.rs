@@ -250,13 +250,18 @@ pub enum WhereTermOrigin {
     /// This term also has a join origin. The separate variant lets the
     /// unmatched-right read rebuild the argument instead of treating it as an ON term.
     TableFunction(JoinOrigin),
+    /// An equality the optimizer inferred from the WHERE and inner-join ON equalities
+    /// (`add_implied_column_equalities`), consumed: it can pick an access path, and the stated
+    /// terms verify each row. It holds only of rows those terms were tested on, not of a row an
+    /// outer join later padded with NULLs for their tables.
+    Implied,
 }
 
 impl WhereTermOrigin {
     /// Get the join origin when the term belongs to a join source.
     pub fn join_origin(self) -> Option<JoinOrigin> {
         match self {
-            Self::Where => None,
+            Self::Where | Self::Implied => None,
             Self::Join(origin) | Self::TableFunction(origin) => Some(origin),
         }
     }
@@ -269,7 +274,7 @@ impl WhereTermOrigin {
     pub fn table_function_table(self) -> Option<TableInternalId> {
         match self {
             Self::TableFunction(origin) => Some(origin.right_table()),
-            Self::Where | Self::Join(_) => None,
+            Self::Where | Self::Implied | Self::Join(_) => None,
         }
     }
 }

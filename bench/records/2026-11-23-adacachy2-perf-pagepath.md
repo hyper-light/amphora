@@ -282,3 +282,70 @@ checkpointer copying the closing segment first and calling `copied` after the fi
 `restart_wal_header`, with `begin_restart`, `end_restart`, `try_restart_log_for_write`'s restart and the store's
 `restart_if_asked` gate and `Slots::take_all` deleted; the backup's ship calling `shipped`. Then the engine- and
 store-level tests the doc names, the crash tests, and the slow-reader A/B (brief unit 3, not started).
+
+## perf-B7 (2026-11-23, 15:49-16:44Z)
+
+**Losses first: none of the four units is built.** Unit 1 (the segments wired into the log) is not started in code,
+so units 2-4 (the clean close and the mark, the tests, the slow-reader A/B) are not either. No A/B ran, so this
+section has no numbers. The hour went to the coordinator's rules in decision 45, the checks' base, and sizing unit 1.
+
+**Decision 45, what plain SQLite sees: on main as 1df94b59** (0ac0d8d0, doc only). Amphora opens SQLite's WAL-mode
+files as the one-segment state. An open or crashed Amphora database carries 3 in bytes 18 and 19 from its first
+commit on, in the file and in every later frame of page 1, so plain SQLite refuses it (it reads page 1 through `-wal`
+whenever that file exists, so the mark has to be in both). A clean close folds both segments in, syncs the file,
+truncates both segments and syncs them, and only then writes 2 in place and syncs again. A close that cannot fold leaves 3. The crash
+test now covers each step of the close in place of the deleted upgrade, and a new test has SQLite itself read a
+cleanly closed file and refuse an open one. The engine's workspace has no SQLite for that test: `rusqlite` (bundled)
+is only in `bench/`.
+
+**Unit 1, sized on d4df9ba7** (perf/pagepath-d45: B6's state machine with origin/main merged).
+- In `crates/engine/storage/wal.rs` (14,048 lines), the per-generation fields B6's list makes one per segment have
+  about 650 uses: `max_frame` 179, `last_checksum` 79, `nbackfills` 69, `wal_header` 65, `transaction_count` 45,
+  `read_locks` 37, `frame_cache` 33, `records` 22, `read_index` 22, `epoch` 18, `min_frame` 17,
+  `frame_cache_high_water` 14, `changes` 10, `runtime.file` 8, `overflow_fallback_coverage` 6, `durable` 3. The
+  shared state they live in, `self.shared` (`Arc<RwLock<WalFileShared>>`), has 56.
+- A smaller route, not built and not decided (the doc's "each becomes one per segment" allows it): today's
+  `WalFileShared` is the segment. Two of them, one per file, under a log that holds `Segments` and the few log-wide
+  fields (`write_lock` 3 uses, `checkpoint_lock` 4, `vacuum_lock` 3, `released` 12). Each segment keeps today's
+  one-log machinery whole: header, file, frame index, read marks, read index, records, changes, backfill. The routing
+  sits at the 56 `self.shared` sites: writes on the current segment, reads by `ReadSpan::lookup_order`, the
+  checkpointer on the closing segment and then the current one. A switch starts the free segment with
+  `restart_wal_header`'s logic applied to that segment: no read holds one of its marks, because it is `Free`, so it
+  takes them at once and waits for nothing. Unchecked risk: the pager's page cache forgets pages by the one log's
+  generation and its change log (decision 18), and with two segments a snapshot's identity is the pair.
+- Frame numbers must stay per segment. Read marks hold the frame as a u32 (`PaddedLock::get_value`;
+  `try_begin_read_tx` asserts `max_frame <= u32::MAX`), so one number space across both segments would overflow them
+  after 2^32 frames.
+- Two restarts go, not one. The store's (`Readers::restart_if_asked`, store.rs 1168, called at 1736 and 1748 with
+  `Db::restart_log`, db.rs 513) takes the gate for writing and every slot, so it waits for every read. The engine's
+  own at the writer's next write (`try_restart_log_for_write`, wal.rs 1759) never waits, but it is skipped while any
+  read holds a mark, so under overlapping reads it never happens. The switch replaces both. `begin_restart` and
+  `end_restart` have two implementations each (wal.rs 1731 and 2953).
+- B6's list deletes `Slots::take_all` with the restart. Only the restart's call can go: the store's `release`
+  (store.rs, before `restart_if_asked`) takes every slot at shutdown too.
+- The clean close starts at `Connection::close` (connection.rs 3424) and `Pager::checkpoint_shutdown` (pager.rs
+  6421): a TRUNCATE checkpoint today, given up silently after three `Busy` answers. A backed-up writer turns it off
+  (`Db::hold_log`, db.rs 564).
+- Unit 4's slow reader exists as a test, not as a bench: `cp_t1_13_a_sql_read_to_a_client_that_stops_reading_ends_at_its_deadline`
+  (`crates/amphora/src/serve.rs` on main) streams a read with `Spill::Sent` to the client end of `link()`, which never
+  reads, until its deadline. The A/B's harness can hold one such read open, start it again each time it ends, and
+  time the writers' commits beside it.
+
+**Checks.** Run r1146 (adacachy2, needs `linux/amd64,cpus=4,mem=16g`; refused for room three times at 15:52-16:02Z
+with 1-3 of 32 cores idle, placed at 16:04Z; load 109-114 while it ran) on d4df9ba7, whose `crates/` differ from main
+only by `log_segments.rs` and its `mod` line. `cargo clippy -p amphora-engine --all-targets --locked -- -D warnings`
+exit 0 (37 s, the lane's target dir warm). `cargo test -p amphora-engine --lib --locked -- storage::` 694 passed,
+3 failed, 14 ignored: `storage::btree::tests::wal_reuses_freelist_leaf_after_abandoned_overflowing_insert`
+(btree.rs 11226), `storage::versioned::columns_sql::tests::cb4_a_read_only_transaction_reads_the_copy_at_its_snapshot`
+(columns_sql.rs 1263) and `storage::versioned::columns_sql::tests::ab::cb4_ab_both_rebuy_policies_at_the_extremes`
+(columns_sql.rs 1875). `cargo test -p amphora --locked --test store` 15 passed. Nothing calls `log_segments`, so the
+three failures are not this change's. Run r1184 (adacachy2, needs `linux/amd64,cpus=4,mem=16g`, load 22-23) ran
+the three alone on main 3f7624a3, one at a time: all three fail there, so they are main's own. The btree test panics
+"expected a row, got Yield"; 29cd28f4 ("The integrity check yields at each read from the file", T-T1.12.C8) is a
+lead, not checked. `cb4_a_…` panics "the copy didn't answer" (`unserved: 1`); `cb4_ab_…` reports 64 statements
+"column copy refused: no generation answers the statement's snapshot". The `storage::`
+filter is wider than B6's (`storage::wal storage::log_index`): it takes btree's and versioned's tests too. Run r1180
+(macOS, needs `macos/arm64,cpus=8,mem=24g`, rule 6's disk guard; cold) has the same clippy and storage tests on
+perf/pagepath-d45 as synced when it is placed (478716f8: main 3f7624a3 with `log_segments`); queued at 16:16Z
+and stopped by the lane at 16:26Z before it started: no Mac had room, and a cold build would not have ended within the
+hour. The Mac target dir for this lane is still cold.

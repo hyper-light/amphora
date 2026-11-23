@@ -2351,6 +2351,28 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                         };
                         matched.max(rows)
                     };
+                    // Lane T7 (TPC-H q05, option i): those late terms are the visit's work too.
+                    // Every visited row runs one of them at least, whichever the emitter puts
+                    // first, and the others run on no fewer than the join's rows; each step at a
+                    // WHERE step's measured cost (`Work::WhereStep`).
+                    let late_steps = where_clause
+                        .iter()
+                        .zip(&where_terms)
+                        .filter(|(term, info)| {
+                            !term.consumed
+                                && info.table_mask.intersects(build_mask)
+                                && info.table_mask.intersects(&outer_mask)
+                        })
+                        .map(|(_, info)| info.extra_steps.saturating_add(1) as f64);
+                    let (late_least, late_all) = late_steps.fold(
+                        (f64::INFINITY, 0.0),
+                        |(least, all): (f64, f64), steps| (least.min(steps), all + steps),
+                    );
+                    let late_work = if late_all > 0.0 {
+                        visited * late_least + rows * (late_all - late_least)
+                    } else {
+                        0.0
+                    };
                     let probe_cost = Cost(
                         estimate_hash_join_cost(
                             build.output_cardinality,
@@ -2362,7 +2384,8 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                             // The probe's scan costs its own pages, as a left-deep plan's does (PL.7).
                             &params.for_table(probe_table, analyze_stats),
                         )
-                        .0 + build.output_cardinality * params.cpu_cost_per_row
+                        .0 + late_work * params.cpu_cost_per_where_step
+                            + build.output_cardinality * params.cpu_cost_per_row
                             + if left_join_probe {
                                 build.output_cardinality * outer_rows * params.cpu_cost_per_row
                             } else {

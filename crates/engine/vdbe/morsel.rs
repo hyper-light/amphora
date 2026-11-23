@@ -858,11 +858,30 @@ enum Accumulator {
         best: Option<(Value, usize)>,
         greatest: bool,
     },
+    /// SUM, AVG or TOTAL under [`RealSums::RowOrder`] (lane G9): each input with its row's
+    /// position, folded at the end by the serial loop's own steps in row order.
+    Ordered {
+        func: crate::function::AggFunc,
+        inputs: Vec<(usize, Value)>,
+    },
 }
 
 impl Accumulator {
     fn new(aggregate: Aggregate, sums: RealSums) -> Self {
+        use crate::function::AggFunc;
         match aggregate {
+            Aggregate::Sum(_) | Aggregate::Avg(_) | Aggregate::Total(_)
+                if sums == RealSums::RowOrder =>
+            {
+                Accumulator::Ordered {
+                    func: match aggregate {
+                        Aggregate::Avg(_) => AggFunc::Avg,
+                        Aggregate::Total(_) => AggFunc::Total,
+                        _ => AggFunc::Sum,
+                    },
+                    inputs: Vec::new(),
+                }
+            }
             Aggregate::CountStar | Aggregate::Count(_) => Accumulator::Count(0),
             Aggregate::Sum(_) => Accumulator::Sum {
                 integers: 0,
@@ -894,8 +913,21 @@ impl Accumulator {
         aggregate: Aggregate,
         row: &[Value],
         position: usize,
+        budget: &MemoryBudget,
     ) -> Result<(), MorselError> {
         match (self, aggregate) {
+            (
+                Accumulator::Ordered { inputs, .. },
+                Aggregate::Sum(at) | Aggregate::Avg(at) | Aggregate::Total(at),
+            ) => {
+                // The serial steps leave a sum as it was at a NULL.
+                let value = column(row, at)?;
+                if !matches!(value, Value::Null) {
+                    budget.charge(std::mem::size_of::<(usize, Value)>())?;
+                    inputs.try_reserve(1)?;
+                    inputs.push((position, value.try_clone().map_err(|_| MorselError::Alloc)?));
+                }
+            }
             (Accumulator::Count(count), Aggregate::CountStar) => *count = count.saturating_add(1),
             (Accumulator::Count(count), Aggregate::Count(at)) => {
                 if !matches!(column(row, at)?, Value::Null) {
@@ -993,6 +1025,10 @@ impl Accumulator {
 
     fn merge(&mut self, other: Accumulator) -> Result<(), MorselError> {
         match (self, other) {
+            (Accumulator::Ordered { inputs, .. }, Accumulator::Ordered { inputs: more, .. }) => {
+                inputs.try_reserve(more.len())?;
+                inputs.extend(more);
+            }
             (Accumulator::Count(count), Accumulator::Count(more)) => {
                 *count = count.saturating_add(more)
             }
@@ -1071,6 +1107,25 @@ impl Accumulator {
 
     fn finish(self) -> Result<Value, MorselError> {
         Ok(match self {
+            Accumulator::Ordered { func, mut inputs } => {
+                use crate::vdbe::execute::{finalize_agg_payload, init_agg_payload, update_agg_payload};
+                let engine = |e: crate::LimboError| MorselError::Body(Box::new(e));
+                inputs.sort_unstable_by_key(|(position, _)| *position);
+                let mut payload = crate::alloc::vec![];
+                init_agg_payload(&func, &mut payload).map_err(engine)?;
+                for (_, value) in &inputs {
+                    update_agg_payload(
+                        &func,
+                        value,
+                        None,
+                        &mut payload,
+                        crate::translate::collate::CollationSeq::Binary,
+                        || Ok(None),
+                    )
+                    .map_err(engine)?;
+                }
+                finalize_agg_payload(&func, &payload).map_err(engine)?
+            }
             Accumulator::Count(count) => {
                 Value::from_i64(i64::try_from(count).map_err(|_| MorselError::IntegerOverflow)?)
             }
@@ -1269,7 +1324,7 @@ impl ScanAggregate<'_> {
             }
         };
         for (accumulator, aggregate) in group.accumulators.iter_mut().zip(self.aggregates) {
-            accumulator.step(*aggregate, row, position)?;
+            accumulator.step(*aggregate, row, position, budget)?;
         }
         Ok(())
     }

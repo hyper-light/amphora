@@ -167,7 +167,7 @@ fn keys_between(
 ) -> Vec<HashJoinKey> {
     let mut keys = Vec::new();
     for (idx, term) in where_clause.iter().enumerate() {
-        if !matches!(term.origin, WhereTermOrigin::Where) {
+        if !matches!(term.origin, WhereTermOrigin::Where | WhereTermOrigin::Implied) {
             continue;
         }
         let Ok(Some((lhs, op, rhs))) = as_binary_components(&term.expr) else {
@@ -229,7 +229,7 @@ fn local_terms(where_clause: &[WhereTerm], dim: &JoinedTable) -> Vec<usize> {
         .iter()
         .enumerate()
         .filter(|(_, term)| {
-            matches!(term.origin, WhereTermOrigin::Where) && reads_only(&term.expr, dim)
+            matches!(term.origin, WhereTermOrigin::Where | WhereTermOrigin::Implied) && reads_only(&term.expr, dim)
         })
         .map(|(idx, _)| idx)
         .collect()

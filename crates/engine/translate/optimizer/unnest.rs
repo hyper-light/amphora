@@ -1751,7 +1751,7 @@ fn rewrite_aggregate_as_join_then_group(
             WhereTermOrigin::TableFunction(_) => {
                 WhereTermOrigin::TableFunction(JoinOrigin::Outer(inner_table_id))
             }
-            WhereTermOrigin::Where | WhereTermOrigin::Join(_) => {
+            WhereTermOrigin::Where | WhereTermOrigin::Implied | WhereTermOrigin::Join(_) => {
                 WhereTermOrigin::Join(JoinOrigin::Outer(inner_table_id))
             }
         };
