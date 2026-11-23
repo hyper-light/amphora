@@ -74,8 +74,14 @@ fn significant_digits(text: &str) -> usize {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let n: usize = args.next().ok_or("usage: real_text <n> <passes>")?.parse()?;
-    let passes: usize = args.next().ok_or("usage: real_text <n> <passes>")?.parse()?;
+    let n: usize = args
+        .next()
+        .ok_or("usage: real_text <n> <passes>")?
+        .parse()?;
+    let passes: usize = args
+        .next()
+        .ok_or("usage: real_text <n> <passes>")?
+        .parse()?;
     if let Some(corpus) = args.next() {
         let (mut total, mut differ) = (0usize, 0usize);
         for line in std::fs::read_to_string(&corpus)?.lines() {
@@ -118,7 +124,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let runs: Vec<String> = per_value.iter().map(|x| format!("{x:.1}")).collect();
         per_value.sort_by(f64::total_cmp);
-        let median = per_value.get(per_value.len() / 2).copied().unwrap_or(f64::NAN);
+        let median = per_value
+            .get(per_value.len() / 2)
+            .copied()
+            .unwrap_or(f64::NAN);
         println!(
             "{name}: n={} median_ns={median:.1} passes_ns=[{}] le15_digits={short} hash={hash:016x} bytes={bytes}",
             values.len(),
