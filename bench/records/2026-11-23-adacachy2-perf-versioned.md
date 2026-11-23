@@ -107,6 +107,14 @@ Verdict: faster. Every after median sits below every before minimum. The machine
 profiled: an fsync of the rewritten pages on a contended NVMe. Every reopen on both sides read
 back all 20,000 rows. To repeat on a quiet machine: the command above.
 
+The original example printed the number of rows it scanned. It accepted any count or contents.
+In verifier run r30 on adacachy2, requesting 16 rows after a 32-row run on the same path
+succeeded with `rows_read=[32, 32]`. With zero reopens it succeeded with three NaNs.
+The corrected example uses a fresh directory on the same device. It checks each expected key
+and its 100-byte value after timing each open and rejects an empty workload. The five pairs
+above remain the original measurements. The retained `before.log` and `after.log` in the
+named directory contain compiler output. Neither contains the per-reopen measurements.
+
 ## Not done, for the successor (verified against the code)
 
 - Access::Read for read-only statements (perf-C3 unit 3, not started): `Switch::cursor` (switch.rs) always passes
