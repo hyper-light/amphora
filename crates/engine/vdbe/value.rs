@@ -1470,17 +1470,17 @@ impl Value {
     ) -> std::result::Result<Value, crate::alloc::TryReserveError> {
         // TEXT whatever the operands, two BLOBs too, as SQLite's OP_Concat gives; a REAL at the
         // connection's FP_DIGITS.
-        let text = |v: &'_ Value| -> Option<std::borrow::Cow<'_, str>> {
+        fn text(v: &Value, digits: crate::numeric::fp::FpDigits) -> Option<std::borrow::Cow<'_, str>> {
             match v {
                 Value::Numeric(Numeric::Float(_)) => Some(std::borrow::Cow::Owned(v.to_text_at(digits))),
                 other => other.cast_text_ref(),
             }
-        };
-        let Some(lhs) = text(self) else {
+        }
+        let Some(lhs) = text(self, digits) else {
             return Ok(Value::Null);
         };
 
-        let Some(rhs) = text(rhs) else {
+        let Some(rhs) = text(rhs, digits) else {
             return Ok(Value::Null);
         };
 

@@ -22273,7 +22273,7 @@ fn morsel_rows(
 
 /// Amphora (QT.6): [Insn::MorselNext].
 pub fn op_morsel_next(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -22854,7 +22854,7 @@ mod tests {
 
         for (input, expected_int) in ascii_whitespace_cases {
             let mut register = Register::Value(Value::Text(input.into()));
-            apply_affinity_char(&mut register, Affinity::Integer, program.connection.fp_digits());
+            apply_affinity_char(&mut register, Affinity::Integer, crate::numeric::fp::FpDigits::DEFAULT);
 
             match register {
                 Register::Value(Value::Numeric(Numeric::Integer(i))) => {
@@ -22882,7 +22882,7 @@ mod tests {
 
         for (input, _expected_type, expected_len) in test_strings {
             let mut register = Register::Value(Value::Text(input.into()));
-            apply_affinity_char(&mut register, Affinity::Integer, program.connection.fp_digits());
+            apply_affinity_char(&mut register, Affinity::Integer, crate::numeric::fp::FpDigits::DEFAULT);
 
             match register {
                 Register::Value(Value::Text(t)) => {
@@ -22906,7 +22906,7 @@ mod tests {
 
         for input in cases {
             let mut register = Register::Value(Value::Text(input.into()));
-            apply_affinity_char(&mut register, Affinity::Integer, program.connection.fp_digits());
+            apply_affinity_char(&mut register, Affinity::Integer, crate::numeric::fp::FpDigits::DEFAULT);
             match register {
                 Register::Value(Value::Text(t)) => {
                     assert_eq!(t.as_str(), input, "Unexpected conversion for '{input}'");
@@ -22917,7 +22917,7 @@ mod tests {
             }
 
             let mut register = Register::Value(Value::Text(input.into()));
-            apply_affinity_char(&mut register, Affinity::Numeric, program.connection.fp_digits());
+            apply_affinity_char(&mut register, Affinity::Numeric, crate::numeric::fp::FpDigits::DEFAULT);
             match register {
                 Register::Value(Value::Text(t)) => {
                     assert_eq!(t.as_str(), input, "Unexpected conversion for '{input}'");
