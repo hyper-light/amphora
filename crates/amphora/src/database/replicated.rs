@@ -2896,8 +2896,10 @@ impl<F: BlockFile + 'static> Actor<F> {
                 Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
                 Err(mpsc::TryRecvError::Empty) if self.driving => None,
                 Err(mpsc::TryRecvError::Empty) => {
+                    let now = (self.clock)();
+                    self.ran_dry(now)?;
                     let deadline = self.deadline();
-                    let wait = deadline.saturating_duration_since((self.clock)());
+                    let wait = deadline.saturating_duration_since(now);
                     self.control.bell.wait(wait)?;
                     // A wait begun before its deadline and ended at or past it, whatever ended
                     // it, is one the timer's lateness is measured on (`hyper_timing::Lateness`).
@@ -2918,6 +2920,18 @@ impl<F: BlockFile + 'static> Actor<F> {
             };
             self.run_step(input)?;
         }
+    }
+    /// The intake found its channel empty at `now`: unless inputs wait behind a pause, the
+    /// command queue's busy time ends there (`Drain::dry`; QB.1, lane constants-K3). The owner
+    /// thread marks it before it waits; a step with no input marks it too, as whoever steps the
+    /// owner found the channel empty (lane replicated-K6).
+    fn ran_dry(&mut self, now: Instant) -> Result<(), Refusal> {
+        if self.paused_inputs.is_empty() {
+            let now = u64::try_from(now.saturating_duration_since(self.started).as_nanos())
+                .map_err(unavailable)?;
+            self.intake.dry(now);
+        }
+        Ok(())
     }
     /// The tick pace from what this owner measured (`pace`), derived once an election timeout:
     /// the core draws each timeout over that many ticks, so a pace derived oftener changes no
@@ -2983,6 +2997,12 @@ impl<F: BlockFile + 'static> Actor<F> {
         // makes no raft step; what comes waits in order, its bytes still charged to the command
         // queue, so the queue's admission bound holds the callers back.
         let paused = self.paused()?;
+        if input.is_some() {
+            // Work came to the command queue: its busy time begins (`Drain::came`).
+            self.intake.came(self.now()?);
+        } else {
+            self.ran_dry(at)?;
+        }
         let mut input = input;
         if let Some(envelope) = input.as_mut() {
             // Taken from the channel: its place there is free, its bytes still held (lane
@@ -3303,6 +3323,13 @@ impl<F: BlockFile + 'static> Actor<F> {
     fn queued(&self) -> u64 {
         u64::try_from(self.control.admitted.load(Ordering::Acquire)).unwrap_or(u64::MAX)
     }
+    /// Whether inputs wait for this owner to take them, in its channel or behind QB.2's pause: the
+    /// command queue's reader has work (QB.1, lane replicated-K6). What it took and still holds (a
+    /// write, a change or a hand-off under way) keeps its bytes charged (`queued`), but waits for
+    /// no reading: counted as work, each tick it is under way weighs as a stall.
+    fn inputs_wait(&self) -> bool {
+        self.control.commands.load(Ordering::Acquire) > 0 || !self.paused_inputs.is_empty()
+    }
     /// The most inputs the command queue holds, as this owner last learned it (QB.1): the waiting
     /// calls are held to it too.
     fn command_bound(&self) -> usize {
@@ -3378,7 +3405,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             self.pace.period(),
         );
         let queued = self.queued();
-        self.intake.sample(now, queued > 0);
+        self.intake.sample(now, self.inputs_wait());
         let mut outgoing = locked(&self.control.outgoing)?;
         let (bytes, messages) = std::mem::take(&mut outgoing.drained);
         self.outgo.drained(bytes, messages);
@@ -4233,9 +4260,8 @@ impl<F: BlockFile + 'static> Actor<F> {
         let term = self.replica.term();
         let mut refused = false;
         for entry in &message.entries {
-            if let Ok(Err(Refusal::Invalid { what, .. })) =
+            if let Ok(Err(Refusal::Serialization { .. })) =
                 crate::replication::verdict(&entry.data, before)
-                && what == "prepared transaction"
             {
                 refused = true;
             }
@@ -4608,7 +4634,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                 #[cfg(test)]
                 if self.turn_context.as_ref() == Some(&pending.context) {
                     self.turn_context = None;
-                    if matches!(&result, Err(Refusal::Invalid { what, .. }) if what == "prepared transaction")
+                    if matches!(&result, Err(Refusal::Serialization { .. }))
                     {
                         self.turns.1 = self.turns.1.saturating_add(1);
                     }
@@ -4622,7 +4648,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                             self.floor_requests_applied =
                                 self.floor_requests_applied.saturating_add(1);
                         }
-                        Err(Refusal::Invalid { what, .. }) if what == "prepared transaction" => {
+                        Err(Refusal::Serialization { .. }) => {
                             self.floor_requests_stale = self.floor_requests_stale.saturating_add(1);
                         }
                         Err(_) => {}
@@ -5788,7 +5814,8 @@ mod tests {
     /// CP-T1.8: mirror the carrier's bounded admission and observe every processed receipt.
     /// Admission never waits for another owner. All records, including retained proposals,
     /// share the command queue's bounds, its inputs and bytes; each keeps its first absolute
-    /// receive deadline. The receipts grow to the inputs' bound, which the owners learn.
+    /// receive deadline. A record is relayed only while every member's command queue has a place
+    /// for it, by that member's own learned bound.
     struct Pump<'a> {
         clients: &'a [Client],
         receipts: Vec<Option<PumpReceipt>>,
@@ -5998,13 +6025,18 @@ mod tests {
                 for offset in 0..self.clients.len() {
                     // Reserve room for any legal wire record before draining ownership from a peer.
                     // The conservative byte check needs no unbounded overflow/backpressure buffer.
-                    let (bound, commands) = self.clients.first().map_or((0, 0), |client| {
-                        (
-                            client.handle().queue_bound(),
-                            client.handle().command_bound(),
-                        )
+                    // The record may go to any member, so each must have a place left in its
+                    // command queue: its own learned bound, less the inputs its channel holds, the
+                    // test's own calls among them (lane replicated-K6).
+                    let bound = self
+                        .clients
+                        .first()
+                        .map_or(0, |client| client.handle().queue_bound());
+                    let full = self.clients.iter().any(|client| {
+                        let handle = client.handle();
+                        handle.shared.commands.load(Ordering::Acquire) >= handle.command_bound()
                     });
-                    if self.records >= commands || self.bytes + MESSAGE_BYTES > bound {
+                    if full || self.bytes + MESSAGE_BYTES > bound {
                         break;
                     }
                     let index = (first + offset) % self.clients.len();
@@ -9562,7 +9594,7 @@ mod tests {
             1,
             "{outcomes:?}"
         );
-        assert_eq!(outcomes.iter().filter(|r| matches!(r, Err(Refusal::Invalid { what, .. }) if what == "prepared transaction")).count(), 1, "{outcomes:?}");
+        assert_eq!(outcomes.iter().filter(|r| matches!(r, Err(Refusal::Serialization { .. }))).count(), 1, "{outcomes:?}");
         let count = driven
             .call(&mut pump, clients.get(origin).unwrap(), |db| {
                 db.exec("INSERT INTO actor_items(value) VALUES(x'03')")?;
@@ -9701,7 +9733,7 @@ mod tests {
             for outcome in &outcomes {
                 assert!(
                     matches!(outcome, Ok(v) if v == &vec![1])
-                        || matches!(outcome, Err(Refusal::Invalid { what, .. }) if what == "prepared transaction")
+                        || matches!(outcome, Err(Refusal::Serialization { .. }))
                         || matches!(outcome, Err(Refusal::UnknownOutcome)),
                     "position {position}: {outcomes:?}"
                 );
@@ -10962,6 +10994,48 @@ mod tests {
         }
         settled(&mut driven, &mut pump, 3, &[]);
         write(&mut driven, &mut pump, led, 1);
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// T-QB.1.17 (lane replicated-K6) on driven time: a leader's change waits at its barrier, no
+    /// relay round answering it, while the leader takes a record at one reading of its clock and
+    /// then the clock moves a second, three times. Passes when the leader then admits a burst of
+    /// three records, past the least its command queue carries (a call and a wire record): it read
+    /// each record at the reading it came, so it learned no rate, as a member whose clock stands
+    /// still. Counting the change it holds as inputs waiting, it weighed each second as reading
+    /// time, learned a record a second, and bounded its inputs at that least, 2.
+    #[test]
+    fn t_qb_1_17_a_leader_holding_a_change_admits_what_it_reads_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        let led = clients[leader].handle().clone();
+        let from = if leader == 0 { 2 } else { 1 };
+        let clock = driven.clock(leader);
+        let until = driven.base + offset(&clock) + Duration::from_secs(10);
+        let asked = change(&clients[leader], until, MemberChange::AddLearner(4));
+        driven.step();
+        for _ in 0..3 {
+            let _record = led.admit_receive(from, vec![0xff], until).unwrap();
+            driven.step();
+            let next = driven.base + offset(&clock) + Duration::from_secs(1);
+            set(&clock, driven.base, next);
+            driven.step();
+        }
+        assert!(matches!(asked.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        let burst: Vec<_> = (0..3)
+            .map(|_| led.admit_receive(from, vec![0xff], until).map(|_| ()))
+            .collect();
+        assert!(
+            burst.iter().all(Result::is_ok),
+            "{burst:?}, the leader's command bound {}",
+            led.command_bound()
+        );
         driven.drain(&mut pump);
         pump.finish();
     }
@@ -15082,7 +15156,7 @@ mod tests {
     /// kiln.host-store 7 with joins tracked: the leader appends the addition of learner 5 (never
     /// running), every append lost while heartbeats go on, so the change can't commit; a follower
     /// raises the floor to 7, prepared at a base without the change and forwarded; then the appends
-    /// go again. Expect: the raise Invalid, "prepared transaction", "the database advanced since
+    /// go again. Expect: the raise refused Serialization, "prepared transaction", "the database advanced since
     /// preparation", which writer_floor answers Unavailable, to be asked again; the change
     /// applied; and no floor on any voter.
     #[test]
@@ -15132,7 +15206,7 @@ mod tests {
         let refused = driven.answer(&mut pump, &raised).err().unwrap();
         assert_eq!(
             refused,
-            Refusal::Invalid {
+            Refusal::Serialization {
                 what: "prepared transaction".into(),
                 why: "the database advanced since preparation".into(),
             }
@@ -17626,7 +17700,7 @@ mod tests {
                         run.committed[w] += 1;
                         streaks[w] = 0;
                     }
-                    Ok(Err(Refusal::Invalid { what, .. })) if what == "prepared transaction" => {
+                    Ok(Err(Refusal::Serialization { .. })) => {
                         history[index].outcome = Outcome::Refused;
                         run.refused[w] += 1;
                         streaks[w] += 1;
@@ -17906,7 +17980,7 @@ mod tests {
                     Err(mpsc::TryRecvError::Empty) => *slot = Some((via, answer)),
                     Err(error) => panic!("owner ended: {error}"),
                     Ok(Ok(_)) => {}
-                    Ok(Err(Refusal::Invalid { what, .. })) if what == "prepared transaction" => {
+                    Ok(Err(Refusal::Serialization { .. })) => {
                         refused[id] += 1;
                         let next = (via + 1) % 3;
                         *slot = Some((next, submit(&clients[next], driven.until(), write(id))));
@@ -17940,6 +18014,95 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(ids, (0..WRITERS).collect::<Vec<_>>(), "owner {owner}");
+        }
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// T-T1.8.W1, the stale-base refusal's type (PostgreSQL's 40001): a write refused because
+    /// what it read changed is to be asked again, and nothing else is answered as if it were. Do:
+    /// on the persisted class, every member at once appends a row to one table (each write
+    /// conflicts with every other), a refused append made again at the member that refused it, up
+    /// to 20 rounds of three; then a follower's write the caller refuses itself `Invalid` (a
+    /// malformed request). Expect: some append refused `Serialization`, with the text it had as
+    /// `Invalid`; the malformed write `Invalid`; and every append held once.
+    #[test]
+    fn an_overlapping_write_is_refused_serialization_and_a_malformed_one_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        driven
+            .call(&mut pump, &clients[leader], |db| {
+                db.exec("CREATE TABLE events(id INTEGER NOT NULL)")?;
+                Ok(Vec::new())
+            })
+            .unwrap();
+        driven.tick(&mut pump, leader);
+        let append = |id: usize| {
+            move |db: &mut Db| {
+                db.exec(&format!("INSERT INTO events VALUES ({id})"))?;
+                Ok(Vec::new())
+            }
+        };
+        let mut serialization = Vec::new();
+        let mut landed: i64 = 0;
+        for round in 0..20 {
+            let mut inflight: Vec<Option<(usize, Answering)>> = (0..3)
+                .map(|via| Some((via, submit(&clients[via], driven.until(), append(round * 3 + via)))))
+                .collect();
+            let mut rounds = 0;
+            while inflight.iter().any(Option::is_some) {
+                assert!(rounds < ROUNDS, "round {round}: unanswered {:?}", inflight.iter().map(|w| w.as_ref().map(|(via, _)| *via)).collect::<Vec<_>>());
+                for slot in &mut inflight {
+                    let Some((via, answer)) = slot.take() else {
+                        continue;
+                    };
+                    match answer.try_recv() {
+                        Err(mpsc::TryRecvError::Empty) => *slot = Some((via, answer)),
+                        Err(error) => panic!("owner ended: {error}"),
+                        Ok(Ok(_)) => landed += 1,
+                        Ok(Err(refused @ Refusal::Serialization { .. })) => {
+                            serialization.push(refused);
+                            *slot = Some((via, submit(&clients[via], driven.until(), append(round * 3 + via))));
+                        }
+                        Ok(Err(other)) => panic!("append via {via}: {other:?}"),
+                    }
+                }
+                driven.round(&mut pump);
+                rounds += 1;
+            }
+            if !serialization.is_empty() {
+                break;
+            }
+        }
+        let refused = serialization.first().expect("no append was refused Serialization");
+        assert_eq!(refused.to_string(), "invalid prepared transaction: the database advanced since preparation");
+        let malformed = driven.call(&mut pump, &clients[(leader + 1) % 3], |db| {
+            db.exec("INSERT INTO events VALUES (-1)")?;
+            Err(api::invalid("events row", "its id is negative").into())
+        });
+        assert_eq!(malformed.err(), Some(Refusal::Invalid { what: "events row".into(), why: "its id is negative".into() }));
+        driven.quiet(&mut pump);
+        driven.tick(&mut pump, leader);
+        for owner in 0..3 {
+            let ids = driven
+                .owner_mut(owner)
+                .replica
+                .machine_mut()
+                .read_db(|db| {
+                    let mut ids = Vec::new();
+                    db.query_owned("SELECT id FROM events ORDER BY id", [], |row| {
+                        ids.push(row.get::<i64>(0)?);
+                        Ok(true)
+                    })?;
+                    Ok(ids)
+                })
+                .unwrap();
+            assert_eq!(ids, (0..landed).collect::<Vec<_>>(), "owner {owner}");
         }
         driven.drain(&mut pump);
         pump.finish();
@@ -18023,7 +18186,7 @@ mod tests {
                     "slot off {slot_off} attempt {attempt}: the leader's write"
                 );
             }
-            let stale = |outcome: &Result<Vec<u8>, Refusal>| matches!(outcome, Err(Refusal::Invalid { what, .. }) if what == "prepared transaction");
+            let stale = |outcome: &Result<Vec<u8>, Refusal>| matches!(outcome, Err(Refusal::Serialization { .. }));
             if slot_off {
                 assert!(outcomes.iter().all(stale), "today's rule: {outcomes:?}");
             } else {
@@ -18113,7 +18276,7 @@ mod tests {
                     "off {off} attempt {attempt}: the leader's write"
                 );
             }
-            let stale = |outcome: &Result<Vec<u8>, Refusal>| matches!(outcome, Err(Refusal::Invalid { what, .. }) if what == "prepared transaction");
+            let stale = |outcome: &Result<Vec<u8>, Refusal>| matches!(outcome, Err(Refusal::Serialization { .. }));
             let moved = driven.owner(leader).read_sets_moved;
             if off {
                 assert!(outcomes.iter().all(stale), "read sets off: {outcomes:?}");

@@ -1,0 +1,134 @@
+Subject: AUDIT 7.6 a compacted log's snapshot prepared when first asked, not at open
+Why: A member that opened on a compacted log serialized its whole database into memory at open only to know the image's size (Amphora perf-H3); the machine states that size without making it, and the image is made the first time the core asks for a snapshot
+
+diff --git a/crates/hyper-durable/src/held.rs b/crates/hyper-durable/src/held.rs
+index cfc432f32226fc7740b98ff93ad7a87954b46610..2b5de67055450aa96e4a556ebc467f191d17fbbe 100644
+--- a/crates/hyper-durable/src/held.rs
++++ b/crates/hyper-durable/src/held.rs
+@@ -1,7 +1,7 @@
+ //! The core's storage: the group's durable log as its [`LogStore`] answers for it, with what the
+ //! replica keeps beside it — the configuration it opened at and the snapshot it prepared for
+ //! members that lag behind the log's start.
+-use std::cell::RefCell;
++use std::cell::{Cell, RefCell};
+ 
+ use hyper_raft::proto::{ConfState, Entry, HardState, Snapshot};
+ use hyper_raft::{InitialState, Storage, StorageError};
+@@ -18,6 +18,9 @@ pub struct Held<L> {
+     pub(crate) opened: HardState,
+     /// The snapshot prepared for a member that needs entries the log no longer holds.
+     pub(crate) snapshot: Option<Snapshot>,
++    /// Whether the core asked for a snapshot while none was prepared: a member that opened on a
++    /// compacted log prepares its image only once one is asked for (`Replica::drive`).
++    pub(crate) asked: Cell<bool>,
+     /// The bytes of one page the core walks storage by: the store reads at most this much at a
+     /// time when the core looks at entries without taking them.
+     pub(crate) page: u64,
+@@ -33,6 +36,7 @@ impl<L: LogStore> Held<L> {
+             configuration,
+             opened,
+             snapshot: None,
++            asked: Cell::new(false),
+             page,
+             scratch: RefCell::new(Entry::default()),
+         }
+@@ -107,7 +111,11 @@ impl<L: LogStore> Storage for Held<L> {
+             Some(snapshot) if hyper_raft::proto::snapshot_index(snapshot) >= request_index => {
+                 Ok(snapshot.clone())
+             }
+-            _ => Err(StorageError::SnapshotTemporarilyUnavailable),
++            Some(_) => Err(StorageError::SnapshotTemporarilyUnavailable),
++            None => {
++                self.asked.set(true);
++                Err(StorageError::SnapshotTemporarilyUnavailable)
++            }
+         }
+     }
+ }
+diff --git a/crates/hyper-durable/src/machine.rs b/crates/hyper-durable/src/machine.rs
+index 18ea679fa1853c4268153600c195c5facb24998c..4880eea720c963dbd6023fe5f5214af8810756c6 100644
+--- a/crates/hyper-durable/src/machine.rs
++++ b/crates/hyper-durable/src/machine.rs
+@@ -59,8 +59,8 @@ pub trait StateMachine {
+     fn image(&mut self, into: &mut Vec<u8>) -> Result<(Point, ConfState), Fatal>;
+ 
+     /// The bytes [`StateMachine::image`] would write now, or none for a machine that keeps no
+-    /// image. Asked when a member opens on a log never compacted: the compaction rule weighs the
+-    /// log against the image it was last compacted to ([`crate::Compaction`]), and before the
++    /// image, counted without making it. Asked when a member opens: the compaction rule weighs
++    /// the log against the image it was last compacted to ([`crate::Compaction`]), and before the
+     /// first, against the state the member opened with, which a group formed with state (a range
+     /// split from another) holds already. A machine that keeps none is never due.
+     fn image_bytes(&self) -> Option<u64>;
+diff --git a/crates/hyper-durable/src/replica.rs b/crates/hyper-durable/src/replica.rs
+index 4d1720b9db9ecb12ed7369d73e1cdb8b6c745bc1..5288ddb5557c06d9ced2971d81def3179501fe3c 100644
+--- a/crates/hyper-durable/src/replica.rs
++++ b/crates/hyper-durable/src/replica.rs
+@@ -559,18 +559,11 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
+             heir_since: None,
+             slow_disks: Vec::new(),
+         };
+-        // A log compacted before the restart serves a lagging member only by snapshot, and its
+-        // image is what the compaction rule weighs the log against; a log never compacted is
+-        // weighed against the image of what the member opened with, as its machine states it.
+-        replica.imaged = if view.start.index > 0 {
+-            let prepared = replica.prepare().map_err(|e| match e {
+-                ReplicaError::Fenced(Cause::Machine(fatal)) => OpenError::Machine(fatal),
+-                _ => OpenError::Core(hyper_raft::Error::Invariant("a snapshot at open")),
+-            })?;
+-            Some(prepared)
+-        } else {
+-            replica.machine.image_bytes()
+-        };
++        // The compaction rule weighs the log against the image of what the member opened with,
++        // as its machine states it without making it. A log compacted before the restart serves
++        // a lagging member only by snapshot, prepared once the core first asks for one
++        // (`Replica::prepare_asked`): opening never images the whole state machine.
++        replica.imaged = replica.machine.image_bytes();
+         replica
+             .count_applied(view.start.index)
+             .map_err(|e| OpenError::Core(hyper_raft::Error::Storage(e)))?;
+@@ -1631,6 +1624,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
+                 r.take_light(out)?;
+                 r.quiet_commit(now, waker)?;
+             }
++            r.prepare_asked()?;
+             r.release_reads(out);
+             r.keep();
+             r.settle();
+@@ -2573,6 +2567,22 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
+         Ok(imaged)
+     }
+ 
++    /// Prepares the snapshot the core asked for while none was prepared: a member that opened on
++    /// a compacted log holds none until then, and the core asks again once it is ready (its
++    /// `SnapshotTemporarilyUnavailable`). A log never compacted holds every entry a member lacks.
++    fn prepare_asked(&mut self) -> Result<(), ReplicaError> {
++        let store = self.node.store();
++        if !store.asked.replace(false) || store.snapshot.is_some() {
++            return Ok(());
++        }
++        let start = store.log.bounds().map(|(start, _)| start.index);
++        let start = start.map_err(|e| self.fence(Cause::Core(hyper_raft::Error::Storage(e))))?;
++        if start > 0 {
++            self.prepare()?;
++        }
++        Ok(())
++    }
++
+     /// Makes the state machine's applied state durable and lets the log free what is before it,
+     /// keeping `keep` entries for members that lag; true when a compaction's start went out.
+     /// The start never passes the state machine's durable index (I8) nor what the log holds
+diff --git a/crates/hyper-durable/tests/shell.rs b/crates/hyper-durable/tests/shell.rs
+index ab0abd82e2a7b5a56fa167ad88fdf2303582a953..008c26aafd502ccb2fe6f86e0d31bbedb6d99c13 100644
+--- a/crates/hyper-durable/tests/shell.rs
++++ b/crates/hyper-durable/tests/shell.rs
+@@ -2192,7 +2192,7 @@ fn a_member_that_reopens_counts_what_its_log_holds() {
+         Unbounded,
+     )
+     .unwrap();
+-    // Its log compacted, the member made an image at open, of everything applied.
++    // Its log compacted, it is weighed against the image of everything applied.
+     let image = image_of(&mut r);
+     r.campaign().unwrap();
+     pump(&mut r);

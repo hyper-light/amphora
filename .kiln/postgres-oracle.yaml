@@ -1,0 +1,24 @@
+# The oracle's answers checked in (scripts/postgres-digest.sh; docs/design/postgres.md section 3):
+# whenever vendor/postgres or the oracle changes, PostgreSQL's own raw_parser is built from the
+# vendored commit and must give exactly crates/pg-oracle/corpus.digest, which `cargo test` holds the
+# Rust parser to. Needs docker on the host.
+name: postgres-oracle
+on:
+  push: { branches: [main], paths: ["vendor/postgres/**", "vendor/MANIFEST.toml", "scripts/postgres-oracle*", "scripts/postgres-digest.sh", "crates/pg-oracle/**"] }
+  pull_request: { paths: ["vendor/postgres/**", "vendor/MANIFEST.toml", "scripts/postgres-oracle*", "scripts/postgres-digest.sh", "crates/pg-oracle/**"] }
+  manual: true
+concurrency: { group: "postgres-oracle-${{ branch }}", cancel-in-progress: true }
+jobs:
+  digest:
+    name: the oracle's answers are corpus.digest
+    runs-on: [baremetal, linux]
+    toolchain: rust
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "4"
+    steps:
+      - name: toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: the oracle from vendor/postgres's commit, against the digest
+        run: JOBS=4 bash scripts/postgres-digest.sh "$PWD/.pg-oracle" --check
