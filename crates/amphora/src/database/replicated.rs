@@ -4691,6 +4691,15 @@ impl<F: BlockFile + 'static> Actor<F> {
         let mut outgoing = locked(&self.control.outgoing)?;
         let any = !output.messages.is_empty();
         for message in output.messages {
+            // A record the core passes on for a peer (a follower sends a read or a proposal a peer
+            // took it as leader for on to the leader it knows, with the peer as `from`, as raft-rs
+            // does) would reach that leader from this member in another's name, which `step`'s
+            // sender check refuses ("replica sender"). It goes nowhere instead: lost, as on a lossy
+            // link, so the peer asks again as for any lost read or forward (lane W6, CP-T1.8).
+            if message.from != self.replica.id() {
+                tracing::debug!(target: "amphora.replica", event = "peer_record_not_passed_on", kind = ?message.msg_type, peer = message.from, "a peer's record is not passed on in its name");
+                continue;
+            }
             self.pace.sent(&message, now, lost);
             let mut bytes = Vec::new();
             message.encode(&mut bytes);
@@ -12367,6 +12376,80 @@ mod tests {
         );
         driven.drain(&mut pump);
         pump.finish();
+    }
+
+    /// CP-T1.8 (lane W6): a member sends in its own name only. A peer that takes a deposed leader
+    /// for the leader sends it a read or a proposal; the deposed member, now a follower, would pass
+    /// it on to the new leader with the peer as `from`, and the new leader's sender check refuses
+    /// that record ("replica sender"; the nemesis's 1-in-16, lane W4). Do, in a group of three: the
+    /// lead moves from one member to another; the third member's record, `kind`, reaches the
+    /// deposed one from the third. Expect: every record the group then relays leaves its sender in
+    /// its sender's own name, and every member's receipt is answered (the pump fails a refusal).
+    fn a_deposed_leader_passes_no_peer_record_on(kind: hyper_raft::proto::MessageType) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let deposed = driven.elect(&mut pump, &clients, 0, 1);
+        let (leader, peer) = ((deposed + 1) % 3, (deposed + 2) % 3);
+        let id = |owner: usize| u64::try_from(owner + 1).unwrap();
+        driven.drain(&mut pump);
+        driven.transfer(&mut pump, &clients, deposed, leader);
+        driven.drain(&mut pump);
+        let data = if kind == hyper_raft::proto::MessageType::MsgPropose {
+            let (prepared, ()) = driven
+                .owner_mut(peer)
+                .replica
+                .machine_mut()
+                .prepare_db(|db| {
+                    db.exec("CREATE TABLE relayed(x)")?;
+                    Ok(())
+                })
+                .unwrap();
+            prepared.encode().unwrap()
+        } else {
+            Vec::new()
+        };
+        let mut context = id(peer).to_le_bytes().to_vec();
+        context.extend_from_slice(&[7; 24]);
+        let mut record = hyper_raft::proto::message(id(deposed), kind);
+        record.from = id(peer);
+        record.entries = vec![hyper_raft::proto::Entry {
+            data,
+            context,
+            ..hyper_raft::proto::Entry::default()
+        }];
+        let mut bytes = Vec::new();
+        record.encode(&mut bytes);
+        let in_another_name = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = std::rc::Rc::clone(&in_another_name);
+        pump.losing = Some(Box::new(move |from, record: &Message| {
+            if record.from != from {
+                seen.borrow_mut().push(format!("{:?} from {from} in {}'s name to {}", record.msg_type, record.from, record.to));
+            }
+            false
+        }));
+        let _receipt = clients[deposed]
+            .handle()
+            .admit_receive(id(peer), bytes, driven.until())
+            .unwrap();
+        driven.step();
+        driven.drain(&mut pump);
+        quiet(&mut driven, &mut pump);
+        assert_eq!(*in_another_name.borrow(), Vec::<String>::new());
+        assert_eq!(clients[deposed].handle().status().unwrap().leader, id(leader));
+    }
+
+    #[test]
+    fn a_deposed_leader_passes_no_peers_read_on_in_the_peers_name() {
+        a_deposed_leader_passes_no_peer_record_on(hyper_raft::proto::MessageType::MsgReadIndex);
+    }
+
+    #[test]
+    fn a_deposed_leader_passes_no_peers_proposal_on_in_the_peers_name() {
+        a_deposed_leader_passes_no_peer_record_on(hyper_raft::proto::MessageType::MsgPropose);
     }
 
     /// T-T1.8.A5 (CP-T1.8) on driven time (replication.md, "Attestation"; amphora-seam-owner's review
