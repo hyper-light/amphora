@@ -455,15 +455,22 @@ impl PageCache {
         let slot_page = Arc::downgrade(&value);
         let entry = PageCacheEntry::new(key, value);
 
-        // Amphora: a new page joins at the head (the queue's back), as SIEVE has it (Zhang et al.,
-        // "SIEVE is Simpler than LRU", NSDI 2024): the hand sweeps from the tail (the front) toward
-        // the head, so it reaches a new page after every older one. Inserted just after the hand,
-        // a page read once was the next the sweep examined: the pages cached before stayed while a
-        // new working set never settled (Amphora's docs/design/store.md, decision 19).
-        self.queue.push_back(entry);
-        let entry_ptr = self.queue.back().get().ok_or_else(|| {
-            CacheError::InternalError("Failed to get inserted entry pointer".into())
-        })? as *const PageCacheEntry as *mut PageCacheEntry;
+        // Amphora (decision 19, lane Q2): a new page joins just behind the hand, where the sweep
+        // looks last, so the hand reaches it after every page already cached. Inserted just after
+        // the hand, a page read once was the next one examined; at the queue's back, it came after
+        // only the pages between the hand and the back, which point lookups leave a few pages
+        // long: a count's 531 pages then evicted one another before each was read again.
+        let entry_ptr = if self.clock_hand.is_null() {
+            self.queue.push_back(entry);
+            self.queue.back().get().map(std::ptr::from_ref)
+        } else {
+            // SAFETY: the hand points into `queue` whenever it is not null.
+            let mut hand = unsafe { self.queue.cursor_mut_from_ptr(self.clock_hand) };
+            hand.insert_before(entry);
+            hand.peek_prev().get().map(std::ptr::from_ref)
+        }
+        .ok_or_else(|| CacheError::InternalError("Failed to get inserted entry pointer".into()))?
+        .cast_mut();
         self.map.insert(
             key,
             Slot {
