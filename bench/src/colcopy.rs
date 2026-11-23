@@ -263,6 +263,8 @@ fn reach(rows: i64) -> anyhow::Result<Vec<Option<&'static str>>> {
             None
         } else if after.handed == before.handed {
             Some("not_handed")
+        } else if after.skipped_defaults > before.skipped_defaults {
+            Some("defaults")
         } else if after.skipped_rows > before.skipped_rows {
             Some("rows")
         } else if after.skipped_body > before.skipped_body {
@@ -497,7 +499,7 @@ fn run(
             "longest_wait_end_ns": waiting.iter().map(|w| w.nanos).max().unwrap_or(0),
             "last_dropped": last,
             "handed": c.handed,
-            "skipped": {"rows": c.skipped_rows, "body": c.skipped_body, "join": c.skipped_join, "transaction": c.skipped_transaction},
+            "skipped": {"rows": c.skipped_rows, "body": c.skipped_body, "join": c.skipped_join, "transaction": c.skipped_transaction, "defaults": c.skipped_defaults},
             "unserved": c.unserved,
             "probe_agrees": own == left_out,
         })

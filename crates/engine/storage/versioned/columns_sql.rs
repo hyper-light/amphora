@@ -111,6 +111,7 @@ pub struct CopyCounts {
     pub skipped_body: u64,
     pub skipped_join: u64,
     pub skipped_transaction: u64,
+    pub skipped_defaults: u64,
     /// Statements on a table with a copy, at a snapshot no generation of it answers exactly (none
     /// made yet, made after it, or behind there): the rows answered (lane colcopy-10, AC-CB.4.7).
     pub unserved: u64,
@@ -123,6 +124,7 @@ impl CopyCounts {
             .saturating_add(self.skipped_body)
             .saturating_add(self.skipped_join)
             .saturating_add(self.skipped_transaction)
+            .saturating_add(self.skipped_defaults)
     }
 
     /// Whether the statements between `before` and `self` were all handed over and none was
@@ -146,6 +148,8 @@ pub enum Skip {
     /// In a transaction that changed rows: the copy holds commits alone. (A transaction that
     /// only reads reads the copy at its own snapshot, lane colcopy-10.)
     Transaction,
+    /// Short records need the added columns' defaults from the row loop.
+    Defaults,
 }
 
 impl Skip {
@@ -156,6 +160,7 @@ impl Skip {
             Skip::Body => "body",
             Skip::Join => "join",
             Skip::Transaction => "transaction",
+            Skip::Defaults => "defaults",
         }
     }
 }
@@ -424,6 +429,7 @@ impl Copies {
                 Some(Skip::Body) => &mut c.skipped_body,
                 Some(Skip::Join) => &mut c.skipped_join,
                 Some(Skip::Transaction) => &mut c.skipped_transaction,
+                Some(Skip::Defaults) => &mut c.skipped_defaults,
             };
             *n = n.saturating_add(1);
         }
@@ -801,11 +807,6 @@ pub(crate) fn aggregate(
     connection: &crate::Connection,
     statement_memory: usize,
 ) -> Result<Option<Vec<Vec<Value>>>> {
-    // A column with a default a short row reads: the copy decodes the records as written, so the
-    // serial loop reads the rows (lane qs6-17; the copy's own padding is open, executor.md 8).
-    if !data.defaults.is_empty() {
-        return Ok(None);
-    }
     let storage = switch.storage();
     let copies = &storage.copies;
     if !copies.on() {
@@ -814,6 +815,7 @@ pub(crate) fn aggregate(
     // A statement no copy can answer reads the rows, counted with its reason (lane colcopy-9,
     // AC-CB.4.6) so an A/B can leave it out: it reads the rows under either rebuy policy.
     let skip = match &data.body {
+        _ if !data.defaults.is_empty() => Some(Skip::Defaults),
         Some(body) if !body.simple && body.rows => Some(Skip::Rows),
         Some(body) if !body.simple => Some(Skip::Body),
         _ if !data.joins.is_empty() => Some(Skip::Join),
@@ -1084,6 +1086,28 @@ mod tests {
     }
 
     use crate::storage::versioned::columns_ab::QUERIES;
+
+    /// AC-CB.4.6, T-QT.6.29: a short row reads its added column's default and the
+    /// statement counts as one handing to the copies that only the rows could answer.
+    #[test]
+    fn a_default_read_is_counted_when_the_copy_defers_to_the_rows() {
+        let (_db, conn) = connect();
+        copies(&conn).set_on(true);
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("ALTER TABLE t ADD COLUMN v INTEGER DEFAULT 7")
+            .unwrap();
+        let before = copies(&conn).counts();
+        assert_eq!(
+            rows(&conn, "SELECT sum(v) FROM t"),
+            vec![vec![Value::from_i64(7)]]
+        );
+        let after = copies(&conn).counts();
+        assert_eq!(after.handed - before.handed, 1);
+        assert_eq!(after.skipped() - before.skipped(), 1);
+        assert_eq!(after.skipped_defaults - before.skipped_defaults, 1);
+    }
 
     /// Do: the same table on two versioned storages, one with the column copies' switch on; the
     /// analytic statements (filters, aggregates, GROUP BY) on both, with inserts, updates and
@@ -1781,7 +1805,7 @@ mod tests {
                 "reached_statements": reached.len(),
                 "reached_statements_per_s": reached.len() as f64 / (reached_ns as f64 / 1e9).max(f64::MIN_POSITIVE),
                 "skipped_queries": skipped_queries,
-                "skipped": {"rows": c.skipped_rows, "body": c.skipped_body, "join": c.skipped_join, "transaction": c.skipped_transaction},
+                "skipped": {"rows": c.skipped_rows, "body": c.skipped_body, "join": c.skipped_join, "transaction": c.skipped_transaction, "defaults": c.skipped_defaults},
                 "unserved": c.unserved,
                 "handed": c.handed,
                 "all_p50_ns": at(&latencies, 0.5),
