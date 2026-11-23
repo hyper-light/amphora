@@ -1160,17 +1160,20 @@ on adacachy2.
   busy, and 251 for build and 179 for probe quiet, each the median over batches.
 - The preempted runs sit at each batch's maximum. Busy wall-time maxima had medians of 990 us (seek), 509 us
   (probe) and 93 us (build). The CPU-time maxima were 6 to 8 us. The median never sees those runs.
-- Every move of these three weights moved the CPU median by the same factor. None of them was the load.
-  The moves came from three causes:
+- Every batch that moved one of these weights moved its CPU median with it: the CPU median minus the wall
+  median stayed within 190 to 250 ns. None of them was the load. Busy, seek moved 17 times (the first batch,
+  then 16 judged at ratios 2.8 to 50.3), build 54 (1 and 53, ratios 2.95 to 27.1) and probe 23 (1 and 22,
+  ratios 2.84 to 24.2). Quiet, build moved 8 times (1 and 7) and probe 5 (1 and 4). The moves came from
+  three causes:
   - The first batch replaces calibration's rate unjudged (decision pl8-15). Calibration's seek is a binary
     search over 512 keys in memory, 8.5 ns (16.88 rows' visits). The first B-tree index seek batch was
     521 ns wall and 732 ns CPU (1,035.6 rows' visits). That is T12's 16.9 to 876.5.
   - A plan change changes the work. Busy run 4 (HASH JOIN customer / SEARCH lineitem by index) seeked at
     2,264 ns wall and 2,485 CPU, against 782 and 972 before: ratio 50.3. That is T12's 3,603.6. The probe's
     71 to 541 ns move (ratio 24.2) has CPU medians of 251 and 771.
-  - Within one plan, batch medians wander 5 to 15%, and the CPU medians wander with them. Against spreads of
-    0.021 to 0.028 these batches stand 2.8 to 6.4 spreads off, past Student's t. Busy saw 15 such seek moves,
-    52 build and 21 probe. Quiet saw 7 build and 4 probe.
+  - Within one plan, batch medians wander 5 to 15%, and the CPU medians wander with them. Against seek's
+    spreads of 0.021 to 0.028 such a batch stands 2.8 to 6.4 spreads off, past Student's t. 13 of busy's 16
+    judged seek moves are of this size.
 - So T12's guess fails for these three. Load-slowed runs do not pass the test, because a batch's median
   never includes them.
 - T13's seek "stayed at 16.88 at load 46 to 49" because its plan never ran an index seek. A rowid search
