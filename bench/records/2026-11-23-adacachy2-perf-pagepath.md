@@ -468,16 +468,39 @@ hyper-raft), merged without a re-run (RULES 5).
 
 ## perf-B10 (2026-11-23, 18:11-19:10Z)
 
-**Losses first: the switch is not built, so neither A/B the brief asks for has numbers.** Of B9's eight step-2 items
-one is done: item 3, a lookup searches the lock-free index of its segment. The writer still never switches. Reads keep
-no span, `find_frame` does not answer with its segment, the checkpointer and recovery act on one segment, neither
-restart is deleted, and none of the five tests exists. The slow-reader A/B needs the switch and did not run. RULES 5b's
-point-read A/B of step 1 (after = main a3642e93, base = its other parent 0d87fcdd, `~/.cache/amphora-perf/pagepath-b10/
-ab10-point.sh` on adacachy2: both arms built in the lane's target dir, RULES 5e's calibration copied, 5 alternated
-rounds of `point_pk` and `point_secondary` at 1, 32 and 128 clients) has no result in the hour: r1362 stopped at its
-first build (`--locked`, and the bench workspace has no lock file; B6's build had no `--locked`), r1393 was refused
-(2 of 32 cores idle), and r1404 was queued for room at 18:43Z. Its records go to adacachy2
-`~/.cache/amphora-perf-bin/pagepath/ab10-point-<HHMM>.jsonl`.
+**Losses first: the switch is not built, so the slow-reader A/B has no numbers.** Of B9's eight step-2 items one is
+done: item 3, a lookup searches the lock-free index of its segment. The writer still never switches. Reads keep no
+span, `find_frame` does not answer with its segment, the checkpointer and recovery act on one segment, neither restart
+is deleted, and none of the five tests exists. The slow-reader A/B needs the switch and did not run.
+
+**RULES 5b's point-read A/B of step 1: no measurable difference.** after = main a3642e93 (step 1), base = its other
+parent 0d87fcdd. Run r1404 (adacachy2, needs `linux/amd64,cpus=16,mem=24g`) ran
+`~/.cache/amphora-perf/pagepath-b10/ab10-point.sh`: both arms built in the lane's target dir one after the other
+(release, 1 min 16 s and 1 min 12 s; the bench workspace has no lock file, so no `--locked`, as in B6's build), then
+RULES 5e: the after arm loaded the suite's database (200,000 items) and measured its calibration, the base arm ran
+once to make its own file, and the after arm's body was written under both keys (sha256 bf32a3a2c0fc1a3a under both,
+before and after the timed runs). 5 rounds, arm order alternated, `point_pk` and `point_secondary` at 1, 32 and 128
+clients, 5 s each after 1 s of warm-up, `--reuse`. Errors 0 in every run, rows per op 1.0. Records: adacachy2
+`~/.cache/amphora-perf-bin/pagepath/ab10-point-1844.jsonl`.
+
+Ops/s, median of 5 [range], after against base:
+
+| op | clients | after | base | after/base |
+|---|---|---|---|---|
+| point_pk | 1 | 309,360 [289,560-345,211] | 312,065 [234,853-332,458] | 0.99 |
+| point_pk | 32 | 895,238 [821,563-925,904] | 913,247 [404,866-971,470] | 0.98 |
+| point_pk | 128 | 775,065 [751,062-792,204] | 758,801 [378,465-838,439] | 1.02 |
+| point_secondary | 1 | 259,576 [214,477-269,074] | 242,200 [217,028-260,871] | 1.07 |
+| point_secondary | 32 | 645,361 [599,164-707,642] | 674,087 [648,965-848,525] | 0.96 |
+| point_secondary | 128 | 376,260 [308,387-458,261] | 363,879 [314,469-439,039] | 1.03 |
+
+Every median is inside the other arm's range. p99.9 at one client (ms, after / base, per round): `point_pk`
+0.007/0.035, 0.014/0.021, 0.016/0.011, 0.01/0.009, 0.007/0.007; `point_secondary` 0.023/0.022, 0.013/0.023,
+0.011/0.011, 0.009/0.013, 0.011/0.011. The host was busy: load 18-82 on 32 cores, CPU pressure (some, avg10) 1-34%, I/O
+pressure 4-45%; base's two low rounds at 32 and 128 clients (404,866 and 378,465) came at load 45-81. No profile was
+taken. The change is one acquire load of a flag written only by a switch, against a point read of 2-3 us at one
+client (p50 0.002-0.003 ms), so no measurable difference is the expected result; the limiter of the read itself is
+not named here.
 
 **Item 3, built and checked** (perf/pagepath-d45 f1351a6c, be348834, then bae557bb, rustfmt only). The in-process
 backend took the current segment's `ReadIndex` once, when it was built, so after a switch it would search the other
@@ -520,6 +543,18 @@ decides the first).
 **Checks.** Run r1344 (adacachy2, needs `linux/amd64,cpus=4,mem=16g`, load 22-31) on abb69a82, perf/pagepath-d45 with
 origin/main e7d64bbb merged: `cargo clippy -p amphora-engine --all-targets --locked -- -D warnings` exit 0. Run r1380 on
 f1351a6c found two test calls of `find_frame_locked` without the new argument (fixed in be348834). Run r1401 (same
-needs, load 12-17) on be348834: clippy exit 0; RESULTS_STORAGE; RESULTS_STORE. `cargo fmt --all --check` fails on
-origin/main itself in seven files (69 places; wal.rs's 30 are step 1's rerouted chains, the rest not traced); after
-bae557bb wal.rs is clean by the local rustfmt.
+needs, load 12-84) on be348834: clippy exit 0; `cargo test -p amphora-engine --lib --locked -- storage::
+--test-threads=4` passed 695, failed 2 and ignored 14 in 221 s, the two main's own (`cb4_a_…` and `cb4_ab_…`), which
+is the brief's baseline exactly; `cargo test -p amphora --locked --test store` passed 15. `cargo fmt --all --check` fails on
+origin/main itself in seven files (69 places; wal.rs's 30 are step 1's rerouted chains, the rest not traced).
+
+**Main's red clippy, fixed** (21850e25; the coordinator's word via lane K10). `cargo clippy --workspace --all-targets`
+failed on main at wal.rs 8425: B9's step-1 script made `replace_after_external_restore_preserves_lock_identity`'s
+restored state a `SharedLog`, which has no `read` or `into_inner`. The test is behind the `conn_raw_api` feature, which
+`cargo clippy -p amphora-engine` leaves off and the workspace turns on, so B9's checks and this lane's first ones
+missed it. The restored state is one segment's `WalFileShared` again. Step 1's lines in database.rs, lib.rs and wal.rs
+are formatted. Run r1419 (same needs, load 54-57) on 1ae4d867 (this branch with origin/main d5e901f3 merged): `cargo
+clippy --workspace --all-targets --locked -- -D warnings` exit 0; `cargo test -p amphora-engine --lib --locked
+--features conn_raw_api -- replace_after_external_restore_preserves_lock_identity` passed 1. `cargo fmt --all --check`
+then lists 35 places in five files: database.rs and wal.rs are clean, lib.rs has one left that is not step 1's export
+line, and the rest are replicated.rs (12), amphora's database.rs (3) and the optimizer's two files (19), not traced.
