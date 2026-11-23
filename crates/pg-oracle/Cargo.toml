@@ -1,0 +1,12 @@
+[package]
+name = "amphora-pg-oracle"
+description = "The parser oracle of docs/design/postgres.md section 3, test-only: PostgreSQL 19's own raw_parser run as a subprocess, and psql's statement splitting of its regression SQL"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
