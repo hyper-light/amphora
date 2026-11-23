@@ -6,7 +6,7 @@ use serde::{
 };
 use std::{fmt, marker::PhantomData};
 
-pub(super) fn vector<'de, D, T, const N: usize>(deserializer: D) -> Result<Vec<T>, D::Error>
+pub(crate) fn vector<'de, D, T, const N: usize>(deserializer: D) -> Result<Vec<T>, D::Error>
 where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
@@ -95,13 +95,13 @@ pub(super) fn transaction<'de, D: Deserializer<'de>>(d: D) -> Result<api::Tx, D:
 
 // Charge each row and value's owned representation as well as its payload. A compact stream
 // of Nulls cannot expand into an unbounded result allocation before API validation runs.
-const VALUE_COUNT: usize = api::RESULT_MAX / std::mem::size_of::<Value>();
+pub(crate) const VALUE_COUNT: usize = api::RESULT_MAX / std::mem::size_of::<Value>();
 #[derive(Deserialize)]
 struct Row(#[serde(deserialize_with = "row_values")] Vec<Value>);
 fn row_values<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Value>, D::Error> {
     vector::<D, Value, VALUE_COUNT>(d)
 }
-pub(super) fn rows<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Vec<Value>>, D::Error> {
+pub(crate) fn rows<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Vec<Value>>, D::Error> {
     struct Rows;
     impl<'de> Visitor<'de> for Rows {
         type Value = Vec<Vec<Value>>;

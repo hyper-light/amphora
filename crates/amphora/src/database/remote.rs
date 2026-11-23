@@ -164,6 +164,7 @@ pub(super) fn attach(
             admitted: Arc::new(AtomicUsize::new(0)),
             stamps: std::sync::OnceLock::new(),
             foreground: std::sync::OnceLock::new(),
+            reads: super::Reads::default(),
             _owner: None,
         }),
     })

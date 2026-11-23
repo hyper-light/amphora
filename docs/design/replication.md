@@ -2425,8 +2425,7 @@ A compaction still runs at once while the log stalls admission for room: it is w
 **The start state.** Before both costs are measured, and for a sample below the clock's resolution, the factor is
 one: with nothing measured a byte of log costs a byte of image, whose break-even is the log at its image's size.
 
-**What is left.** The image's bytes at open are its pages' (page count times page size); postcard's few bytes of
-framing a page are not counted. A configuration change's entry is not counted in the replay's bytes (it is applied
+**What is left.** A configuration change's entry is not counted in the replay's bytes (it is applied
 by `apply_change`, rarely).
 
 **Tests.** `compaction_the_factor_is_one_until_both_costs_are_measured` (T-CT.1.1),
@@ -2488,6 +2487,21 @@ the time in which the group elects another leader, so holding more serves no one
 in bytes and messages a second, the outgoing queue's in `ReplicaHandle::drain` (its reader the host) and the command
 queue's at the owner's intake, each a decaying ratio of sums with RFC 6298's gain of 1/8, as the compaction's costs are
 (CT.1; `database/drain.rs`). An interval counts when the queue held work at its start or its reader took some in it.
+The time weighed is the time the queue held work (lane constants-K3, 2026-11-23): an interval ends the moment its
+reader finds the queue empty (`Drain::dry`) and the next begins when work comes (`Drain::came`). Weighed over the time
+the reader waited too, the rate was the rate work came at, and a bound learned from it refused a burst the reader takes
+at once (driven tests' wire records `Full` at 10 inputs). A stall, work waiting and nothing read, still counts at a rate
+of zero, and the busy intervals after it raise the rate again: a rule that drops every interval in which the reader
+ran dry (BBR's application-limited samples) instead holds the bound at its least after one stall, and BBR's raise-only
+rule settles back near the rate work comes at. What a reader takes within one tick of a driven clock is weighed over
+no time, never over the empty time after it. The command queue's owner marks both moments at its intake. The outgoing
+queue's host drain does not yet: its host thread reads no owner clock, so it needs a time-stamp for the moment it ran
+dry before it can (T-QB.1.16).
+The queue holds work while inputs wait in it to be taken, in its channel or behind QB.2's pause, and only then
+(lane replicated-K6): a write, a change or a hand-off the owner took and still holds keeps its bytes charged but
+waits for no reading. Counted as work, a leader's change waiting at its barrier while its clock moved a second at a
+time weighed each second as reading time, and the leader alone learned a bound of 2 inputs, refusing records its
+followers admitted by the hundred million (`a_change_past_its_deadline_answers_what_its_stage_knows`, T-QB.1.17).
 The election timeout is learned too: `election_tick` periods of the owner's measured pace (TP.1). The bounds are read
 again at each tick of the pace (`Actor::rebound`), where the queues' bytes are charged to the budget (`Budget::take`).
 - The outgoing queue holds the lesser of its host's rate times that timeout and the memory budget's room for queues

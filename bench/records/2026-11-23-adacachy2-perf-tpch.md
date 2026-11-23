@@ -119,3 +119,96 @@ plan for a given set of statistics would take:
 ## Not done this hour
 
 - The unit test for section 1; the cause and fix of section 2; the 22-query sweep against SQLite.
+
+# Lane T4 (tpch), 2026-11-23 13:18Z to 14:13Z: the wrong-answer fix on main; the slow plan's cause found and fixed
+
+Machine: adacachy2 (runner 00aad8da), `needs linux/amd64,cpus=8,mem=24g`, load average 15 to 1,189
+on 32 cores from other lanes during the hour (kiln refused most named runs for want of 8 idle cores).
+
+## 1. t_pl_8_13 settled; d94a1077 merged (main 74e832a2)
+
+r668: T3's two saved test binaries, `t_pl_8_13 --nocapture`, alternated 3 times each:
+
+| binary | runs | fails at | query |
+|---|---|---|---|
+| 364266aa (main) | 3/3 fail | mod.rs:4590 `made_bushy > 0` | the 7th, `... AND (s.id IS NULL OR s.cat + f2.k = 11)`, planned left-deep |
+| 1bfe3b8f (fix) | 3/3 fail | mod.rs:4591 `in_runs > 0` | the 6th, `d2 LEFT JOIN d1 s ... AND s.id IS NULL`, bushy with the LEFT JOIN outside the run |
+
+- The fix cannot change these queries' programs. Every plan printed in both arms holds at most one
+  materialized build input, and with one input the fix's test (one input's prefix holds the term)
+  is the old one (the union of the prefixes holds it). Every answer reached matched NestedLoopsOnly's.
+- The per-binary split is calibration. Each executable reads back its own stored calibration
+  (`$XDG_CACHE_HOME/amphora/calibration`, keyed by CPU and executable path), measured once at
+  whatever load its first run met. r754, each binary on a fresh empty calibration cache, 3 rounds:
+  round 1 fix at 4591 (4th query), main at 4590 (6th); rounds 2 and 3 both at 4590 (6th).
+- The plan the test prints is not always the plan that ran: in r668's fix run 1, the 5th query's
+  counters say its LEFT JOIN ran inside the run, and the EXPLAIN prepared right after shows the
+  mirror plan. Each run moves the learned weights before the next prepare.
+- Verdict: the test fails on main at whatever query the weights flip (6 of 6 runs here; J2's main
+  baseline too). Section 3's versioned costs, with the test pinning a version, are its fix.
+
+The unit test T3 asked for, `t_pl_8_2_a_term_across_two_build_inputs_runs_in_the_main_plan`
+(24bfee35): q05's shape at small scale through the PIN hook, which now takes the hash joins'
+positions (`PIN_HASH_JOINS`; none keeps the last table alone). r693 at 9539c215: it passes; with
+d94a1077 reversed it fails, `[n3,90,27090; n6,60,17970; n9,60,18150]` against the nested loops'
+`[n3,10,3300]`. Touched suites (`pl_8 hash_join materializ bushy t_qt_5`): 66 passed, 1 failed
+(t_pl_8_13, as on main). Clippy (`-p amphora-engine --all-targets -D warnings`) clean.
+
+## 2. q05's slow plan: the cause, and the fix (580b04ed)
+
+The planner did not misprice it. It priced lineitem's step as a seek by `o_orderkey` on
+`l_orderkey`'s autoindex for 23,291 input rows. PL.6 had nothing to refuse, since the planner
+never chose a whole read. The emitter made the scan. A materialized build input's subplan
+(`build_materialized_build_input_plan`, `translate/emitter/select.rs`) checked each
+read's seek keys against its own loops (`join_prefix_mask`). In the run {orders, customer,
+lineitem}, customer probes orders' hash table, so orders has no loop of its own. lineitem's seek
+was judged to read a table outside the prefix and fell to `Operation::default_scan_for`. The
+subplan's WHERE terms used the wider `included_tables` and ran `l_orderkey = o_orderkey` as a
+filter, so the answer stayed right while the work became 23,291 scans of 600,572 rows. The
+EXPLAIN JSON's `"type":"scan"` with `access_cost 25,729` was the rewritten op beside the seek's
+price. The rewrite dates from the Turso import. It began to bite when PL.8's bushy runs could
+hold a seek keyed by a hash-build-only table.
+
+The fix: a probe's match positions its build table's cursor (`main_loop/hash.rs`), so a read
+after the probe in the subplan's loops may key on the build table's columns. The seek stands and
+the program does the seeks it was priced at. Test
+`t_pl_8_2_a_seek_on_a_probed_build_table_stands_in_its_run`: the run `o c l` built for `s`'s hash
+join, `c` probing `o`, `l` seeking by `o`'s key. It asserts the nested loops' answer and at most
+each table and the run's rows read whole once (the statement's `FullscanStep` counter).
+
+Checks. r782 at 580b04ed: touched suites 66 passed, 2 failed (t_pl_8_13, main's; and the new
+test, whose first table was scanned, so `c`'s hash join was materialized and the run refused:
+the test never formed the run). `--test nested_loops` 7/7 (it checks materialized chains);
+clippy clean. r800 at f986aa0b (`r` holds 1,000 rows so `r.id = 1` seeks one row): the three
+`t_pl_8_2_a_` tests pass; clippy clean; with the select.rs change reversed the new test fails
+with 399,800 full-scan steps against a bound of 5,275, on q05's slow shape (`MATERIALIZE ...
+HASH JOIN c / SCAN l / SCAN o`). Merged: main 3b7e8121.
+
+Not measured yet: q05 at SF0.1 before and after. kiln refused the A/B four times, 14:00Z to
+14:05Z, because adacachy2 had 2 to 12 of its 32 cores idle and the A/B asks for 16. Its script,
+`~/.cache/amphora-perf/tpch-t4/q05_ab.sh` (on adacachy2 and adacachy), builds T3's probe at
+74e832a2 (before) and 3b7e8121 (after) and alternates them for 3 rounds of 4 runs, with a 20 s
+timeout. Each process gets a fresh calibration cache, and each run's answer is checked against
+NestedLoopsOnly's. Load and CPU and I/O pressure are logged beside each run, and the logs go to
+`~/.cache/amphora-perf/tpch-t4/logs/q05-ab-<sha>-<round>.log`. Run it with `on` 00aad8da and
+needs `linux/amd64,cpus=16,mem=24g`.
+
+## 3. Versioned learned costs: not started this hour
+
+Where it goes, from reading `translate/optimizer/learned_costs.rs`. `LearnedCosts` holds the live
+`Rates` under a mutex. Every prepare reads them through `weights_at(miss)`, and every timed run
+moves them (`observe`, `observe_sampled`). The coordinator's design maps onto it like this:
+- Cut versions from the rates the samplers already keep. Each `Sampling` holds a Welford `Spread`,
+  which gives a standard error. A new snapshot (`Arc<LearnedWeights>` plus a version number) is
+  cut only when a rate's mean has moved past its own error.
+- `weights_at` reads the current snapshot, and the version goes into EXPLAIN and the bench's
+  `runs[i].plan`.
+- `page_miss` is per connection and live: about 1 on a cold cache and 0.05 warm (T3, section 4).
+  It needs its own versioning, or it becomes an input the plan is chosen for. Otherwise one
+  statement over one set of statistics still gets two plans.
+- Tests pin a version. That ends t_pl_8_13's flakiness (section 1). Calibration is stored per
+  executable, so two builds of the same code start from different weights; a pinned version
+  removes that too.
+- A/B against live costs: plan variance and p50/p99/p99.9 over repeated TPC-H SF0.1 and JOB runs.
+
+## 4. The bench change (1bfe3b8f) and the 22-query sweep: not started this hour
