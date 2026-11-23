@@ -176,6 +176,20 @@ the program does the seeks it was priced at. Test
 join, `c` probing `o`, `l` seeking by `o`'s key. It asserts the nested loops' answer and at most
 each table and the run's rows read whole once (the statement's `FullscanStep` counter).
 
+Checks. r782 at 580b04ed: touched suites 66 passed, 2 failed (t_pl_8_13, main's; and the new
+test, whose first table was scanned, so `c`'s hash join was materialized and the run refused:
+the test never formed the run). `--test nested_loops` 7/7 (it checks materialized chains);
+clippy clean. r800 at f986aa0b (`r` holds 1,000 rows so `r.id = 1` seeks one row): the three
+`t_pl_8_2_a_` tests pass; clippy clean; with the select.rs change reversed the new test fails
+with 399,800 full-scan steps against a bound of 5,275, on q05's slow shape (`MATERIALIZE ...
+HASH JOIN c / SCAN l / SCAN o`). Merged: main 3b7e8121.
+
+Not measured yet: q05 at SF0.1 before and after. r805 (queued 14:00Z, needs cpus=16) builds T3's
+probe at 74e832a2 (before) and 3b7e8121 (after) and alternates them 3 rounds, 4 runs each, 20 s
+timeout. Each process gets a fresh calibration cache, and each run's answer is checked against
+NestedLoopsOnly's. Load and CPU and I/O pressure are logged beside each run. Logs on adacachy2:
+`~/.cache/amphora-perf/tpch-t4/logs/q05-ab-<sha>-<round>.log`.
+
 ## 3. Versioned learned costs: not started this hour
 
 Where it goes, from reading `translate/optimizer/learned_costs.rs`. `LearnedCosts` holds the live
