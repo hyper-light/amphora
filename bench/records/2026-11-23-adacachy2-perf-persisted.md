@@ -219,4 +219,6 @@ All on adacachy2 (runner 00aad8da...), needs `linux/amd64,cpus=8,mem=24g`, CARGO
   same code. Seen once in three runs (two with this change, one without): not settled whether this change or the
   test's own timing (its flushes run off the driver's thread) caused it. For the successor: run it 10 times on both
   arms. Red arm f5a2408b: the new test failed, as it should.
+- r951 at b3b4b6d8 (merged with origin/main 952f5766, load 55-128): clippy `-p amphora --all-targets --locked -D
+  warnings` clean; the floor, slot, raise, retry, overlapping-write and new tests 38 of 38 (the nemesis among them).
 - Not run: the module suites after the merge (rule 5b), and no timing of the extra barrier.
