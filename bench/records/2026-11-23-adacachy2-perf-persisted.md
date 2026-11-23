@@ -66,6 +66,15 @@ each SHA (`~/.cache/amphora-perf/persisted-scripts/t.sh SHA cargo-args`).
   replicated-K5 fixed (2026-11-23-adacachy2-perf-replicated.md). After merging main (113bca75): 165 passed, 1 failed
   (the crash test, since moved to perf/persisted-crash). At 6d0f897a: 165 passed, the crash test failed on
   `Full { limit: 2 }`.
+- Merged to main as d4d0e096 (r749): clippy `-p amphora --all-targets -D warnings` clean; the touched tests and the
+  floor, raise, read-set and slot tests 24 of 24; the module suites with `database::application` 164 passed, 1 failed:
+  `a_change_past_its_deadline_answers_what_its_stage_knows`, main's own (lane replicated-K5, r683, the same
+  `Full { limit: 2 }`).
+- Not checked on the bench's own surface after the fix: `cargo build --release --locked --manifest-path
+  bench/Cargo.toml` at d4d0e096 with the lane's offline CARGO_HOME refused (`no matching package named awak`, r759).
+  The prediction, not measured: the 128-writer rung does not change, its rows conflicting on every write (point 5).
+- Cost not measured: every claimed write now reads the floor policy once more inside its preparation (one small
+  table read on the owner's thread).
 
 Load on adacachy2 ran 60 to 1189 through these runs (other lanes); every number above is a count from driven time, not
 a timing.
