@@ -119,3 +119,48 @@ printing `wake=Release commit_to_done=588.852µs woken_before_release=Some(0) wa
 `wake=Schedule commit_to_done=1.284473ms woken_before_release=Some(1) wakes=2` (before the fix it
 never finished); `cargo test -p amphora --lib db` 10 passed, the allocs tests among them. The
 wake latencies are one run each on a shared host, printed by the test, not asserted.
+
+## Scans and SQL batches charged their real worst case (perf-A5, on perf/cross, NOT merged)
+
+`Admission::bytes_for` on perf/cross: a scan `(limit + 1) x (size_of Row + KEY_MAX + VALUE_MAX)`
+plus its family, prefix and after; an SQL batch its statements' text and parameters byte for
+byte, a `SqlResult` envelope per statement, and `RESULT_MAX` for the rows. Calls, migrations and
+imports keep `REQUEST_MAX`. Test `database::admission_charge::mb1_...` asserts each.
+
+Checked on 37eeaef9 (r569): clippy on amphora clean; the database:: suite 217 passed, 7 failed.
+The same 7 fail alone (`--exact`, `--test-threads=1`) on main 06c77548 (r577) and on main
+486edca0, before the hang fix landed (r601), so none is this change's or the hang fix's:
+`patience::tests::a_joint_configuration_takes_the_larger_of_its_two_sets` (`Full { voter: 5,
+limit: 3 }` at patience.rs:418) and six `replicated::tests` (`a_follower_retry_racing_...`,
+`t_qb_1_9_...`, `every_falsifier_of_the_floor_holds_under_a_nemesis`,
+`a_host_waits_for_a_leader_...`, `a_member_installed_from_a_snapshot_...`,
+`compaction_waits_for_the_engines_flush`).
+
+Not merged, for a decision: a full page's worst case is real (no byte bound stops a scan page:
+1,000 rows of 1 MiB values are ~1.0 GB), but charged at admission it refuses every default-limit
+scan where the queue room is under ~1 GB (a 1 GiB process with 100 MiB resident has ~924 MiB of
+room), where today the same scan is admitted at 32 MiB. The alternative that keeps scans working
+there: end a page at a byte bound too (`RESULT_MAX`, `more = true`), which makes its real worst
+case ~32 MiB plus one row.
+
+## A page ends at RESULT_MAX bytes, and is charged that (perf-A6, the coordinator's decision)
+
+The alternative above, taken: a scan's page and a page of the changes feed end at their limit's
+rows or at `RESULT_MAX` (32 MiB) of keys and values, whichever comes first (`database::fits`),
+and say more follow: a scan by `more = true`, the feed by its head past its last revision (a
+page still never cuts a revision). The row past a page is weighed in place (`blob_len`), not
+copied. Across groups the same: each group's page ends by the rule, the union stops at the
+smallest last key of a group that has more, then ends by the rule; the feed across groups cuts
+its answer on a stamp boundary (`across::whole`).
+
+Charge (`Admission::bytes_for`): a scan its family, prefix and after, plus
+`limit x size_of Row + min(limit x (KEY_MAX + VALUE_MAX), RESULT_MAX)`; the changes feed the
+same with `Change`. A default-limit scan (1,000) is charged about 32 MiB + 1,000 envelopes, not
+~1 GiB, so it is admitted wherever it was before. A page also fits the wire's frame
+(`RESULT_MAX + 1 MiB`), which 1,000 rows of 1 MiB values did not.
+
+Test `database::admission_charge::a6_a_page_ends_at_result_max_and_continuing_reaches_every_row`:
+40 rows of 1 MiB values (five transactions of eight); scanned at limit 1,000 the first page ends
+early with `more`, every page carries at most `RESULT_MAX`, and continuing reaches all 40 keys
+once, in order; the feed's pages hold whole transactions only and reach all 40. `mb1_...` asserts
+the charge equals the bound.
