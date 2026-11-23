@@ -20,7 +20,8 @@
 //! Amphora's three members run in this process, relayed by the host's part as `cluster.rs` does; a
 //! killed member is cut off from the relay, which its peers can't tell from kill -9 (nothing more
 //! comes from it, nothing reaches it). `amphora-procs` runs each member as its own process, on the
-//! machines bench/repl_members.sh is given, over TCP (`procs`), a kill the same cut. The competitors run as
+//! machines bench/repl_members.sh is given, over TCP (`procs`), a kill its kill -9 and a start its process run
+//! again on the data it kept (a member on this host; one on another machine is refused). The competitors run as
 //! processes on this host through their scripts, `bench/servers/repl/<system>.sh up|down|kill N|start N|leader|endpoint N|about`
 //! (a kill is kill -9 of the node's recorded process group), from the release binaries
 //! `bench/servers/repl/setup.sh` fetched: every system on one platform, as Ada's fair-comparison rule asks
@@ -1025,15 +1026,19 @@ mod procs {
         durability: Durability,
         relay_records: usize,
         deadline: Duration,
+        reopen: bool,
     }
 
     fn member_opts(args: &[String]) -> anyhow::Result<MemberOpts> {
         let (mut node, mut peers, mut dir, mut class, mut spanning, mut relay_records, mut deadline) = (None, None, None, None, None, None, None);
+        let mut reopen = false;
         let mut it = args.iter();
         while let Some(a) = it.next() {
             let mut v = || it.next().cloned().ok_or_else(|| anyhow::anyhow!("{a} takes a value"));
             match a.as_str() {
                 "--repl-member" => {}
+                // Started again by the driver after a kill -9 (`Procs::start`): on the data it kept.
+                "--reopen" => reopen = true,
                 "--node" => node = Some(v()?.parse::<u64>()?),
                 "--peers" => peers = Some(v()?.split(',').map(str::to_owned).collect::<Vec<_>>()),
                 "--dir" => dir = Some(PathBuf::from(v()?)),
@@ -1058,7 +1063,7 @@ mod procs {
         };
         let relay_records = need(relay_records, "--relay-records", m)?;
         anyhow::ensure!(relay_records > 0, "--relay-records takes at least 1");
-        Ok(MemberOpts { node, peers, dir: need(dir, "--dir", m)?, durability, relay_records, deadline: need(deadline, "--deadline-s", m)? })
+        Ok(MemberOpts { node, peers, dir: need(dir, "--dir", m)?, durability, relay_records, deadline: need(deadline, "--deadline-s", m)?, reopen })
     }
 
     fn resolve(addr: &str) -> anyhow::Result<SocketAddr> {
@@ -1149,6 +1154,21 @@ mod procs {
                     let _ = self.stop.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.send(());
                     Ok(serde_json::json!({ "ok": true }))
                 }
+                // How to start this member again on its data: what `Procs::start` runs.
+                Some("launch") => {
+                    let exe = std::env::current_exe()?;
+                    let mut args: Vec<String> = std::env::args().skip(1).collect();
+                    if !args.iter().any(|a| a == "--reopen") {
+                        args.push("--reopen".to_owned());
+                    }
+                    Ok(serde_json::json!({ "exe": exe.to_string_lossy(), "args": args }))
+                }
+                // kill -9 of this process, as the competitors' scripts kill a node: nothing flushed,
+                // nothing closed in order. The asker learns it died when its connection ends.
+                Some("kill") => {
+                    let status = std::process::Command::new("kill").args(["-9", &std::process::id().to_string()]).status()?;
+                    anyhow::bail!("kill -9 of this member returned {status}")
+                }
                 other => anyhow::bail!("unknown op {other:?}"),
             }
         }
@@ -1222,7 +1242,9 @@ mod procs {
         let m = member_opts(&args)?;
         let at = usize::try_from(m.node)? - 1;
         let listen = m.peers.get(at).ok_or_else(|| anyhow::anyhow!("no peer {}", m.node))?.clone();
-        let _ = std::fs::remove_dir_all(&m.dir);
+        if !m.reopen {
+            let _ = std::fs::remove_dir_all(&m.dir);
+        }
         std::fs::create_dir_all(&m.dir)?;
         let ids: Vec<u64> = (1..=NODES as u64).collect();
         let config = ReplicaConfig { node_id: m.node, voters: ids, learners: Vec::new(), bootstrap: None };
@@ -1292,13 +1314,24 @@ mod procs {
         pools: Vec<Mutex<Vec<BufReader<TcpStream>>>>,
         cut: [AtomicBool; NODES],
         deadline: Duration,
+        /// Each killed member's program and arguments, for `start`.
+        relaunch: [Mutex<Option<(String, Vec<String>)>>; NODES],
+        /// The members `start` ran, waited for as the driver ends.
+        started: Mutex<Vec<std::process::Child>>,
     }
 
     impl Procs {
         pub fn open(o: &Opts) -> anyhow::Result<Self> {
             let members = need(o.members.clone(), "--members", &o.measure)?;
             anyhow::ensure!(members.len() == NODES, "--members names {NODES} members, not {}", members.len());
-            Ok(Self { pools: members.iter().map(|_| Mutex::new(Vec::new())).collect(), members, cut: Default::default(), deadline: o.deadline })
+            Ok(Self {
+                pools: members.iter().map(|_| Mutex::new(Vec::new())).collect(),
+                members,
+                cut: Default::default(),
+                deadline: o.deadline,
+                relaunch: Default::default(),
+                started: Mutex::new(Vec::new()),
+            })
         }
 
         fn ask(&self, n: usize, req: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
@@ -1331,12 +1364,6 @@ mod procs {
         fn is_cut(&self, n: usize) -> bool {
             self.cut.get(n).is_some_and(|c| c.load(Ordering::Relaxed))
         }
-
-        fn set_cut(&self, n: usize, to: bool) -> anyhow::Result<()> {
-            self.ask(n, &serde_json::json!({ "op": "cut", "to": to }))?;
-            self.cut.get(n).ok_or_else(|| anyhow::anyhow!("no node {n}"))?.store(to, Ordering::Relaxed);
-            Ok(())
-        }
     }
 
     impl Drop for Procs {
@@ -1344,6 +1371,13 @@ mod procs {
             for n in 0..NODES {
                 if let Err(e) = self.ask(n, &serde_json::json!({ "op": "stop" })) {
                     eprintln!("node {n} stop: {e}");
+                }
+            }
+            if let Ok(mut started) = self.started.lock() {
+                for c in started.iter_mut() {
+                    if let Err(e) = c.wait() {
+                        eprintln!("a restarted member: {e}");
+                    }
                 }
             }
         }
@@ -1387,12 +1421,29 @@ mod procs {
             Ok(None)
         }
 
+        // kill -9 of the member's process, as the competitors' `kill N` (AC-T1.8.4): a cut would
+        // keep its memory and its open log, and spare its restart the catch-up measure times.
         fn kill(&self, n: usize) -> anyhow::Result<()> {
-            self.set_cut(n, true)
+            let addr = self.members.get(n).ok_or_else(|| anyhow::anyhow!("no node {n}"))?;
+            anyhow::ensure!(resolve(addr)?.ip().is_loopback(), "node {n} at {addr} is on another machine: only a member on this one is started again from here");
+            let v = self.ask(n, &serde_json::json!({ "op": "launch" }))?;
+            let exe = v.get("exe").and_then(|e| e.as_str()).ok_or_else(|| anyhow::anyhow!("node {n}: no exe in {v}"))?.to_owned();
+            let args = v.get("args").and_then(|a| a.as_array()).ok_or_else(|| anyhow::anyhow!("node {n}: no args in {v}"))?;
+            let args = args.iter().map(|a| a.as_str().map(str::to_owned).ok_or_else(|| anyhow::anyhow!("node {n}: an argument in {v}"))).collect::<anyhow::Result<Vec<_>>>()?;
+            *self.relaunch.get(n).ok_or_else(|| anyhow::anyhow!("no node {n}"))?.lock().map_err(|_| anyhow::anyhow!("poisoned"))? = Some((exe, args));
+            self.cut.get(n).ok_or_else(|| anyhow::anyhow!("no node {n}"))?.store(true, Ordering::Relaxed);
+            // The member's process ends inside this request: its connection ending is the answer.
+            anyhow::ensure!(self.ask(n, &serde_json::json!({ "op": "kill" })).is_err(), "node {n} answered after its kill -9");
+            self.pools.get(n).ok_or_else(|| anyhow::anyhow!("no node {n}"))?.lock().map_err(|_| anyhow::anyhow!("pool poisoned"))?.clear();
+            Ok(())
         }
 
         fn start(&self, n: usize) -> anyhow::Result<()> {
-            self.set_cut(n, false)
+            let (exe, args) = self.relaunch.get(n).ok_or_else(|| anyhow::anyhow!("no node {n}"))?.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.take().ok_or_else(|| anyhow::anyhow!("node {n} wasn't killed"))?;
+            let child = std::process::Command::new(&exe).args(&args).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).spawn()?;
+            self.started.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.push(child);
+            self.cut.get(n).ok_or_else(|| anyhow::anyhow!("no node {n}"))?.store(false, Ordering::Relaxed);
+            Ok(())
         }
     }
 }

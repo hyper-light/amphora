@@ -7,7 +7,10 @@
 //! The rate is a decaying ratio of sums, bytes and messages over the nanoseconds the queue held
 //! work, each sum kept at seven eighths of itself before a sample is added: RFC 6298 §2's gain of
 //! 1/8 (Jacobson, "Congestion Avoidance and Control", SIGCOMM 1988), as the compaction's costs are
-//! (CT.1), the eighth taken rounded up so that a sum no sample feeds decays to nothing. An
+//! (CT.1), the eighth taken rounded up so that a sum no sample feeds decays to nothing. The sums
+//! are 64.64 fixed point, as many bits below the point as a sample has above it (u64), so the
+//! eighth rounded up is 2^-64 at most (lane constants-K4): rounded up in whole units, a sum fed one
+//! message an interval settled at one, not eight, and learned an eighth of the reader's rate. An
 //! interval counts when the queue held work at its start or its reader took some in it: one with
 //! nothing to read and nothing read tells nothing of how fast it reads. The election timeout is
 //! learned too: `election_tick` periods of the owner's measured pace (TP.1). Each bound is the lesser of the rate times that
@@ -30,9 +33,9 @@ pub(super) struct Bound {
 /// What a queue's reader drained, and the rate learned from it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Drain {
-    bytes: u64,
-    messages: u64,
-    nanos: u64,
+    bytes: u128,
+    messages: u128,
+    nanos: u128,
     /// Bytes and messages drained since the last sample, not yet weighed.
     pending: (u64, u64),
     /// The clock reading the interval under way began at, and whether the queue held work then.
@@ -55,11 +58,7 @@ impl Drain {
         match self.since {
             Some((at, held)) if now > at => {
                 if held || self.pending.1 > 0 {
-                    // RFC 6298 §2's gain: the old sums keep seven eighths, the eighth rounded up.
-                    let decay = |sum: u64| sum.saturating_sub(sum.div_ceil(8));
-                    self.nanos = decay(self.nanos).saturating_add(now.saturating_sub(at));
-                    self.bytes = decay(self.bytes).saturating_add(self.pending.0);
-                    self.messages = decay(self.messages).saturating_add(self.pending.1);
+                    self.weigh(now.saturating_sub(at));
                 }
                 self.pending = (0, 0);
                 self.since = Some((now, busy));
@@ -73,6 +72,18 @@ impl Drain {
         }
     }
 
+    /// Adds an interval of `nanos` and what was drained in it to the sums.
+    fn weigh(&mut self, nanos: u64) {
+        // RFC 6298 §2's gain: the old sums keep seven eighths, the eighth rounded up.
+        let add = |sum: u128, sample: u64| {
+            sum.saturating_sub(sum.div_ceil(8))
+                .saturating_add(u128::from(sample).saturating_mul(ONE))
+        };
+        self.nanos = add(self.nanos, nanos);
+        self.bytes = add(self.bytes, self.pending.0);
+        self.messages = add(self.messages, self.pending.1);
+    }
+
     /// The bound in force: what the reader drains in `timeout` at its measured rate, no less than
     /// `least` (one record), its bytes no more than `room` (the memory budget's room for queues).
     pub(super) fn bound(&self, timeout: Duration, least: Bound, room: u64) -> Bound {
@@ -84,15 +95,7 @@ impl Drain {
                 messages: u64::MAX,
             };
         }
-        let timeout = timeout.as_nanos();
-        // sum × timeout / nanos, in u128: no product of a u64 and a u64-sized duration overflows.
-        let within = |sum: u64| -> u64 {
-            u128::from(sum)
-                .saturating_mul(timeout)
-                .checked_div(u128::from(self.nanos))
-                .and_then(|over| u64::try_from(over).ok())
-                .unwrap_or(u64::MAX)
-        };
+        let within = |sum: u128| scaled(sum, timeout.as_nanos(), self.nanos);
         Bound {
             bytes: within(self.bytes).max(least.bytes).min(room),
             messages: within(self.messages).max(least.messages),
@@ -107,14 +110,32 @@ impl Drain {
         if self.nanos == 0 {
             return None;
         }
-        Some(
-            u128::from(self.bytes)
-                .saturating_mul(over.as_nanos())
-                .checked_div(u128::from(self.nanos))
-                .and_then(|bytes| u64::try_from(bytes).ok())
-                .unwrap_or(u64::MAX),
-        )
+        Some(scaled(self.bytes, over.as_nanos(), self.nanos))
     }
+}
+
+/// One in the sums' 64.64 fixed point.
+const ONE: u128 = 1 << u64::BITS;
+
+/// `sum` × `by` / `over`, rounded down, a u64's most past it; `sum` and `over` share their scale.
+/// As `sum` = whole × `over` + part with part under `over`, the product is whole × `by` plus part ×
+/// `by` / `over`, under `by`; when part × `by` passes a u128, part and `over` drop the same low
+/// bits first, below the sums' own 2^-64.
+fn scaled(sum: u128, by: u128, over: u128) -> u64 {
+    let (Some(whole), Some(part)) = (sum.checked_div(over), sum.checked_rem(over)) else {
+        return u64::MAX;
+    };
+    let width = |n: u128| u128::BITS.saturating_sub(n.leading_zeros());
+    let drop = width(part)
+        .saturating_add(width(by))
+        .saturating_sub(u128::BITS);
+    let rest = part
+        .checked_shr(drop)
+        .unwrap_or(0)
+        .saturating_mul(by)
+        .checked_div(over.checked_shr(drop).unwrap_or(0))
+        .unwrap_or(0);
+    u64::try_from(whole.saturating_mul(by).saturating_add(rest)).unwrap_or(u64::MAX)
 }
 
 /// The window a leader keeps in flight to each member (lane constants-21): two candidates behind
@@ -286,5 +307,28 @@ mod tests {
             drain.sample(now, true);
         }
         assert_eq!(drain.bound(timeout, LEAST, u64::MAX), LEAST);
+    }
+
+    /// Lane constants-K4 (K3's finding): a reader that takes one message of 99 bytes in each 10 ms
+    /// it holds work, under a 105 ms election timeout. Passes when the bound is what it takes in
+    /// the timeout, 10.5 messages and 1039.5 bytes rounded down, from the first interval on and
+    /// 400 intervals later. With the eighth taken in whole messages, the sum of one message an
+    /// interval settled at one, not eight, and the bound was one message: an eighth of the rate.
+    #[test]
+    fn a_reader_taking_one_message_an_interval_learns_its_rate() {
+        let mut drain = Drain::default();
+        let timeout = Duration::from_millis(105);
+        let rate = Bound {
+            bytes: 1039,
+            messages: 10,
+        };
+        drain.sample(0, true);
+        for step in 1..=400u64 {
+            drain.drained(99, 1);
+            drain.sample(step * 10 * MS, true);
+            if step == 1 || step == 400 {
+                assert_eq!(drain.bound(timeout, LEAST, u64::MAX), rate, "{step}");
+            }
+        }
     }
 }
