@@ -13,6 +13,7 @@ HERE=$(pwd)
 BASE="$HOME/.cache/amphora-perf-versioned-base-rel"
 BASE_SHA=${BASE_SHA:-$(git merge-base HEAD origin/main)}
 if [ ! -d "$BASE" ]; then git worktree add --detach "$BASE" "$BASE_SHA"; else (cd "$BASE" && git checkout -q --detach "$BASE_SHA"); fi
+mkdir -p "$BASE/crates/engine/examples"
 cp crates/engine/examples/versioned_point_reads.rs "$BASE/crates/engine/examples/"
 CARGO_TARGET_DIR="$HOME/.cache/amphora-perf-target/versioned-rel" nice -n 10 cargo build --release --locked -p amphora-engine --example versioned_point_reads > "$OUT/after.log" 2>&1 &
 A=$!
