@@ -589,6 +589,8 @@ impl Owner {
             .spawn(move || {
                 let _guard = guard;
                 while !stopping.load(Ordering::Acquire) {
+                    // Read before accepting: a give-back after it is the event a refusal waits for.
+                    let releases = descriptors.releases();
                     match listener.accept() {
                         // Stopping's own wake-up connection, or one that raced it.
                         Ok(_) if stopping.load(Ordering::Acquire) => break,
@@ -638,7 +640,17 @@ impl Owner {
                                 tracing::error!(target: "amphora.transport", event = "listener_failed", %error);
                                 break;
                             }
-                            thread::park_timeout(Duration::from_millis(10))
+                            if descriptors.holds_any() {
+                                // AUDIT 6: the budget holds descriptors, so one is given back
+                                // as a connection ends: the listener waits for that event (or
+                                // stopping, which unparks it), not a sleep.
+                                descriptors.wait_release(releases, &stopping);
+                            } else {
+                                // Everything open is outside the budget (the host's own): no
+                                // give-back of its will come, and closing a host's file raises
+                                // no event here, so the listener tries again after a park.
+                                thread::park_timeout(Duration::from_millis(10))
+                            }
                         }
                         Err(error) => {
                             tracing::error!(target: "amphora.transport", event = "listener_failed", %error);
