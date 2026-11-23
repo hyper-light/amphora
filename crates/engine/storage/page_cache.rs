@@ -476,7 +476,7 @@ impl PageCache {
             Slot {
                 entry: entry_ptr,
                 page: slot_page,
-                ref_bit: AtomicU8::new(CLEAR),
+                ref_bit: AtomicU8::new(1),
                 hits: AtomicU32::new(0),
                 born: self.inserts,
             },
