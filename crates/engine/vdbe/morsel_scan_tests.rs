@@ -2965,6 +2965,11 @@ fn t_qt_6_30_avg_and_total_run_on_morsels_as_the_serial_loop() {
                 format!("{serial:?}"),
                 "{sql} on {cores} cores"
             );
+            if hooked && !(after[0] > before[0] || after[1] > before[1]) && cores == 1 {
+                for row in sql_rows(&conn, &format!("EXPLAIN {sql}")) {
+                    eprintln!("ZZ630 {}", row.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" | "));
+                }
+            }
             if hooked {
                 assert!(
                     after[0] > before[0] || after[1] > before[1],
@@ -3255,6 +3260,13 @@ fn t_qt_6_33_a_rowid_range_runs_on_the_morsels_of_its_leaves() {
                 );
             }
             let ran = after - before;
+            if hooked && ran >= rows {
+                let root = conn.schema.read().get_table("t").unwrap().get_root_page().unwrap();
+                let mut table = TableSource::open(conn.get_pager(), root, 5, Some(0), Vec::new()).unwrap();
+                eprintln!("ZZ633 {sql} cores={cores} ran={ran} leaves={} upper[..4]={:?} le101={:?}", table.leaves(), table.upper.iter().take(4).collect::<Vec<_>>(), sql_rows(&conn, "SELECT count(*), max(id) FROM t WHERE id <= 101"));
+                table.restrict(Some(101), Some(6999));
+                eprintln!("ZZ633 restricted leaves={} floor={:?}", table.leaves(), table.floor);
+            }
             if hooked {
                 assert!(
                     ran < rows,
@@ -3390,6 +3402,11 @@ fn t_qt_6_35_joins_over_rowid_ranges_run_on_morsels_as_the_serial_loop() {
                 .morsel_join_links
                 .load(std::sync::atomic::Ordering::Relaxed);
             same_answer(sql, rows, &parallel, &serial, &format!("on {cores} cores"));
+            if after <= before && cores == 1 {
+                for row in sql_rows(&conn, &format!("EXPLAIN {sql}")) {
+                    eprintln!("ZZ635 {}", row.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" | "));
+                }
+            }
             assert!(
                 after > before,
                 "{sql} on {cores} cores: the hook built no link"
