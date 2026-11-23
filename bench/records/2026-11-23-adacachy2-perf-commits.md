@@ -255,8 +255,9 @@ Two changes, each at its cause:
   recorded change (`scripts/vendor.py record hyper-raft`, then `check hyper-raft`).
 - **A follower's heartbeat answer at once when it states nothing its disk doesn't hold:** its term and vote durable
   (the leader's I1 rule) and no position past its durable log. That answer confirms the leader's term for the
-  ReadIndex quorum and promises nothing about the log. Vendored hyper-raft as well. Check first whether
-  `HeartbeatAnswers::Position` is on for Amphora: a position must then name the durable end, not the last index.
+  ReadIndex quorum and promises nothing about the log. Vendored hyper-raft as well. Amphora keeps the core's
+  default `HeartbeatAnswers::Position` (raft.rs `Config::new`), so such an answer's position must name the
+  durable end of its log, not its last index (`handle_heartbeat` sets `answer.index = last_index` today).
 
 Either alone leaves the other flush in the path. Neither changes what a commit or an answer promises.
 
