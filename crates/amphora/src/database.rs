@@ -183,7 +183,7 @@ impl Admission {
                     .saturating_add(results)
                     .saturating_add(api::RESULT_MAX)
             }
-            Operation::Call(_, answer) => *answer,
+            Operation::Call(_, answer) | Operation::Query(_, answer) => *answer,
             Operation::Mutation(Mutation::Migrate(_))
             | Operation::Import(_)
             | Operation::ImportProgress => api::REQUEST_MAX,
@@ -425,6 +425,25 @@ enum Operation {
     Call(Mutex<Option<Call>>, usize),
     Import(amphora_api::import::ImportPage),
     ImportProgress,
+    /// A replicated database's query ([`Database::query`]), and the bytes its answer holds: a
+    /// call whose writing statements are refused.
+    Query(Mutex<Option<Call>>, usize),
+}
+
+impl Operation {
+    /// Whether the operation may write. A replicated owner's barrier for one that can't asks its
+    /// leader for no write slot (CP-T1.8, lane V11).
+    fn writes(&self) -> bool {
+        match self {
+            Operation::Mutation(_) | Operation::Call(..) | Operation::Import(_) => true,
+            Operation::Get(..)
+            | Operation::Scan(..)
+            | Operation::Changes(..)
+            | Operation::Head
+            | Operation::ImportProgress
+            | Operation::Query(..) => false,
+        }
+    }
 }
 
 type Call = Box<dyn FnOnce(&mut Db) -> anyhow::Result<Box<dyn Any + Send>> + Send>;
@@ -2386,18 +2405,39 @@ impl Database {
 
     /// Runs one read-only SQL session on a reader beside the writer (docs/design/store.md,
     /// decision 33): it sees what was committed when it began, waits for neither the writer nor a
-    /// flush, and writes nothing, its writing statements refused. A remote or replicated database
-    /// runs it as a [`Database::call`].
+    /// flush, and writes nothing, its writing statements refused. A replicated database runs it
+    /// past its group's barrier, on its replica's applied state, its writing statements refused
+    /// as here; its barrier asks the leader for no write slot (CP-T1.8, lane V11). An attached
+    /// client runs it as a [`Database::call`].
     pub fn query<R, F>(&self, until: Instant, f: F) -> Result<R, Refusal>
     where
         R: Send + 'static,
         F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + 'static,
     {
         let database = self.resolve(until)?;
-        let Writer::Local(store) = &database.shared.writer else {
-            return database
-                .session(until, api::REQUEST_MAX, f)
-                .map(|(value, _)| value);
+        let store = match &database.shared.writer {
+            Writer::Local(store) => store,
+            Writer::Replicated { .. } => {
+                let query: Call = Box::new(move |db| {
+                    let mut connection = crate::sql::Connection::new(db);
+                    let value = f(&mut connection)?;
+                    connection.finish()?;
+                    Ok(Box::new(value) as Box<dyn Any + Send>)
+                });
+                let operation = Operation::Query(Mutex::new(Some(query)), api::REQUEST_MAX);
+                return match database.submit_selected("", operation, until)? {
+                    (Answer::Called(value), _) => value
+                        .downcast::<R>()
+                        .map(|value| *value)
+                        .map_err(|_| unavailable("wrong SQL query answer")),
+                    _ => Err(unavailable("wrong SQL query answer")),
+                };
+            }
+            Writer::Client(_) => {
+                return database
+                    .session(until, api::REQUEST_MAX, f)
+                    .map(|(value, _)| value);
+            }
         };
         let _in_flight = database
             .shared
@@ -3800,7 +3840,7 @@ fn apply(
             return import::progress(db, namespace)
                 .map(|progress| Ok(Answer::ImportProgress(progress)));
         }
-        Operation::Call(..) => {
+        Operation::Call(..) | Operation::Query(..) => {
             return Err(anyhow::anyhow!(
                 "SQL session reached replayable command dispatch"
             ));
@@ -4039,6 +4079,7 @@ fn apply(
         Operation::Import(_)
         | Operation::ImportProgress
         | Operation::Call(..)
+        | Operation::Query(..)
         | Operation::Mutation(Mutation::Sql(_) | Mutation::Migrate(_) | Mutation::Holding(_)) => {
             Err(anyhow::anyhow!(
                 "SQL operation reached the Records dispatch"

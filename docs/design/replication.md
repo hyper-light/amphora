@@ -2006,6 +2006,16 @@ pure core is `database/slot.rs`, driven by the owner (`Actor::keep_slots`, `star
   learned slot expired). A leader of any version reads the second barrier so, so this adds nothing to the wire; the
   barrier's own read state matches nothing at the member and is dropped. Agreed there
   (amphora-owner-t1-g-slot-878285a-20261111), as better than the ruling it departs from.
+- *Which barriers ask* (CP-T1.8, lanes V8 and V11). Since lane V8 a follower's write asks for its slot from its
+  first try: the leader queues every write's barrier (`Slots::ask`), not only a refused member's, so the base it
+  prepares on is current when its write appends. A read never asks (lane V11): work that writes nothing (a
+  Records get, scan, changes, head or import progress, and `Database::query`, which a replicated database runs
+  with its writing statements refused, as a local one does) marks its barrier's context with one byte past the
+  request identity (`READ_BARRIER`), and the leader steps a marked barrier at once (`Slots::pass`), ending a
+  slot its member holds `released`. So a follower's read never waits behind another member's slot, nor holds
+  the leader's writes for its own round trip. The second barrier a write that forwarded nothing sends is marked
+  too. A leader before this echoes the byte unread and takes the barrier as a write's, as it did; a read's
+  context is never an entry's, since a read never proposes.
 - *What a slot holds* (Q1). Everything the leader would append between the holder's base and its retry: its own
   writes and floor sessions (`prepare` defers them, `slot_deferred`), its class entry (`propose_class`), and other
   members' forwarded proposals, held after the sender and origin checks. A change of members or a hand-off ends the
