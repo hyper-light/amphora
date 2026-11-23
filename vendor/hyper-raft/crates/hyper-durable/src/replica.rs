@@ -1775,12 +1775,16 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
 
     /// What the core may apply and send without a write, whatever the writes out
     /// (`RawNode::light_now`): a leader's appends when it proposes and what it commits when it
-    /// commits, a follower's held answers when it takes the entries (core step R-8). Without it
-    /// they wait for a write of the member's own to free a place for the next `Ready`.
+    /// commits, its read rounds and the reads they confirm, a follower's held answers when it
+    /// takes the entries (core step R-8) and its heartbeats' answers on a durable term and vote.
+    /// Without it they wait for a write of the member's own to free a place for the next `Ready`.
     fn take_light(&mut self, out: &mut Output<M::Answer>) -> Result<(), ReplicaError> {
         let light = self.node.light_now(true);
         let mut light = self.must(light)?;
         self.emit(light.take_messages(), out);
+        for read in light.take_read_states() {
+            self.reads.push_back((read.index, read.request_ctx));
+        }
         if let Some((first, last)) = light.committed_range() {
             self.apply_range(first, last, out)?;
         }
