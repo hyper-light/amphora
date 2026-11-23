@@ -6450,7 +6450,11 @@ mod tests {
                     let writes = if parked { 0 } else { owner.replica.in_flight() };
                     let flush = matches!(owner.flushing, Flushing::Thread { out: true, .. })
                         && !owner.replica.machine().flush_gate().is_held();
-                    (writes != 0 || flush).then_some((at, writes, flush))
+                    if writes != 0 || flush {
+                        Some((at, writes, flush))
+                    } else {
+                        None
+                    }
                 })
                 .collect()
         }
