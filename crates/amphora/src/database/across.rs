@@ -23,7 +23,7 @@ use amphora_api::{self as api, Change, Changes, Consistency, Page, Refusal, Rev,
 
 use super::{blob, blob_len, bytes, fits, integer, rev, text, unavailable};
 use crate::backup::Hooks;
-use crate::database::{AnswerBytes, Database};
+use crate::database::{AnswerBytes, AnswerMax, Database};
 use crate::db::Db;
 use crate::xgroup::sql::Member;
 
@@ -601,7 +601,7 @@ pub(super) fn head(
     let cut = cut(&groups, point)?;
     // Each writer's commits that took their stamps before the cut end before this call runs.
     for (group, _) in &groups {
-        group.call_internal(until, |_| Ok(()))?;
+        group.call_internal(until, AnswerMax::fixed(), |_| Ok(()))?;
     }
     Ok(cut)
 }
@@ -1129,7 +1129,7 @@ mod tests {
 
     /// Each stamped revision of `ns` here, and each revision a version of it is kept at.
     fn stamps_and_versions(db: &Database, ns: &'static str) -> (Vec<Rev>, Vec<Rev>) {
-        db.call_internal(until(), move |db| {
+        db.call_internal(until(), AnswerMax::bytes(api::RESULT_MAX), move |db| {
             let (mut stamps, mut versions) = (Vec::new(), Vec::new());
             db.query(
                 "SELECT rev FROM __amphora_rev_stamps WHERE namespace = ?1 ORDER BY rev",
@@ -2104,7 +2104,7 @@ mod tests {
         let read = |g: usize, stamp: u64| {
             let k = key(g);
             dbs[g]
-                .call_internal(until(), move |db| {
+                .call_internal(until(), AnswerMax::fixed(), move |db| {
                     Ok(match row_at(db, "n", "f", &k, stamp)? {
                         Ok(Held::Read(row)) => Some(row.map(|r| r.rev)),
                         Ok(Held::Locked(_)) => None,
@@ -2156,7 +2156,7 @@ mod tests {
 
         put(&dbs[1], vec![1, b'z']);
         let later = dbs[1]
-            .call_internal(until(), |db| {
+            .call_internal(until(), AnswerMax::fixed(), |db| {
                 crate::database::newest_stamp(db, "n", "f", &[1, b'z'])
             })
             .unwrap()

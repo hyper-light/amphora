@@ -2263,9 +2263,14 @@ impl Database {
     /// [`Database::call`] on the owner's own session, its SQL free to name Amphora's own tables
     /// (`__amphora_*`): for a cross-group transaction's steps (CP-T1.10, `crate::xgroup`). An
     /// attached client is refused: its closure can't cross to the owner.
-    pub(crate) fn call_internal<R, F>(&self, until: Instant, f: F) -> Result<R, Refusal>
+    pub(crate) fn call_internal<R, F>(
+        &self,
+        until: Instant,
+        answer: AnswerMax<R>,
+        f: F,
+    ) -> Result<R, Refusal>
     where
-        R: Send + 'static,
+        R: AnswerBytes + Send + 'static,
         F: FnOnce(&mut Db) -> anyhow::Result<R> + Send + 'static,
     {
         let database = self.resolve(until)?;
@@ -2275,15 +2280,17 @@ impl Database {
                 "an attached client can't run Amphora's own SQL; run it on the owner",
             ));
         }
-        database.call_db(until, f)
+        database.call_db(until, answer, f)
     }
 
-    fn call_db<R, F>(&self, until: Instant, f: F) -> Result<R, Refusal>
+    /// A call on the owner's own session. `answer`: the most bytes its answer holds, charged at
+    /// admission; an answer past it rolls the call back, refused ([`AnswerMax`]).
+    fn call_db<R, F>(&self, until: Instant, answer: AnswerMax<R>, f: F) -> Result<R, Refusal>
     where
-        R: Send + 'static,
+        R: AnswerBytes + Send + 'static,
         F: FnOnce(&mut Db) -> anyhow::Result<R> + Send + 'static,
     {
-        self.call_db_session(until, api::REQUEST_MAX, f)
+        self.call_db_session(until, answer.get(), move |db| Ok(within(f(db)?, answer)?))
             .map(|(value, _)| value)
     }
 

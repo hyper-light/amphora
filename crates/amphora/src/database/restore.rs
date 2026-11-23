@@ -5,6 +5,10 @@ use amphora_api::restore::RestorePage;
 
 pub(super) const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS __amphora_restore (id INTEGER PRIMARY KEY CHECK(id = 1), source TEXT NOT NULL, cursor BLOB NOT NULL, done INTEGER NOT NULL)";
 const CURSOR_MAX: usize = 4096;
+/// The most bytes a restore's source names.
+const SOURCE_MAX: usize = 256;
+/// The heap a restore's progress holds: its source and cursor at their bounds.
+const PROGRESS_HEAP_MAX: usize = SOURCE_MAX + CURSOR_MAX;
 
 /// The only handle exposed while SQL pages are restored with foreign keys temporarily disabled.
 /// Completion validates every FK before returning the normal, enforcing Database handle.
@@ -36,7 +40,11 @@ impl Database {
         if let Some(client) = database.remote_client() {
             return client.restore_progress(until).map_err(Refusal::from);
         }
-        database.call_db(until, |db| progress(db))
+        database.call_db(
+            until,
+            AnswerMax::bytes(std::mem::size_of::<Option<ImportProgress>>() + PROGRESS_HEAP_MAX),
+            |db| progress(db),
+        )
     }
 }
 pub(super) fn incomplete(db: &Db) -> anyhow::Result<bool> {
@@ -55,7 +63,7 @@ impl Restore {
         if source.is_empty() {
             return Err(api::invalid("restore source", "empty"));
         }
-        api::bound("restore source", source.len(), 256)?;
+        api::bound("restore source", source.len(), SOURCE_MAX)?;
         let database = Database::open_owned(path, until, true, None, |db| {
             db.exec(super::SCHEMA).map_err(unavailable)?;
             db.exec(SCHEMA).map_err(unavailable)?;
@@ -83,7 +91,7 @@ impl Restore {
     }
 
     pub fn progress(&self, until: Instant) -> Result<ImportProgress, Refusal> {
-        self.database.call_db(until, |db| {
+        self.database.call_db(until, AnswerMax::bytes(std::mem::size_of::<ImportProgress>() + PROGRESS_HEAP_MAX), |db| {
             progress(db)?.ok_or_else(|| anyhow::anyhow!("restore metadata missing"))
         })
     }
@@ -114,7 +122,7 @@ impl Restore {
         }
         api::bound("restore page bytes", size, api::REQUEST_MAX)?;
         let source = self.source.clone();
-        self.database.call_db(until, move |db| {
+        self.database.call_db(until, AnswerMax::fixed(), move |db| {
             if fence(db, &source, &page.expected_cursor)?.done {
                 return Err(api::invalid("restore", "already complete").into());
             }
@@ -140,7 +148,7 @@ impl Restore {
 
     pub fn finish(self, expected_cursor: Vec<u8>, until: Instant) -> Result<Database, Refusal> {
         let source = self.source.clone();
-        self.database.call_db(until, move |db| {
+        self.database.call_db(until, AnswerMax::fixed(), move |db| {
             fence(db, &source, &expected_cursor)?;
             db.validate_foreign_keys()?;
             db.query(
