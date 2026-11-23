@@ -30,7 +30,7 @@
 use crate::alloc::TryClone;
 use crate::error::LimboError;
 use crate::storage::btree::{BTreeCursor, TableLeafUnderCursor};
-use crate::storage::versioned::cursor::{LeafUnderCursor, VersionedCursor};
+use crate::storage::versioned::cursor::{CopyId, LeafUnderCursor, VersionedCursor};
 use crate::vdbe::builder::{CursorKey, CursorType};
 use crate::vdbe::insn::Insn;
 use crate::vdbe::row_header::RowHeader;
@@ -206,7 +206,7 @@ enum LeafId {
         id: usize,
         peers_epoch: u64,
     },
-    Copy(u64),
+    Copy(CopyId),
 }
 
 /// The leaf under a scanned table's cursor.

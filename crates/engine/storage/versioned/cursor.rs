@@ -195,7 +195,7 @@ enum Point<'a> {
 struct Rows {
     /// Amphora (QT.7 on the versioned storage): this copy among every copy the process made, so
     /// a column batch decoded from it is known for it alone (`vdbe/leaf_batch.rs`).
-    copy: u64,
+    copy: CopyId,
     leaf: u64,
     version: u64,
     low: Option<Vec<u8>>,
@@ -297,7 +297,7 @@ impl Rows {
         leaf: Leaf<'_>,
         after: bool,
     ) -> Result<()> {
-        self.copy = COPIES.fetch_add(1, AtomicOrdering::Relaxed);
+        self.copy = CopyId::next();
         self.leaf = leaf.no;
         self.version = leaf.version;
         keep(&mut self.low, leaf.low);
@@ -392,14 +392,49 @@ pub struct VersionedCursor {
     yield_instance: u64,
 }
 
-/// The leaf copies the process has made: each copy's number (`Rows::copy`).
-static COPIES: AtomicU64 = AtomicU64::new(1);
+/// One leaf copy among every copy the process made (`Rows::copy`): the copying thread's number
+/// (one per thread, from [`THREADS`]) and the copy's count on that thread. Unique as the one
+/// process-wide count it replaces was, without every copy on every thread taking that count's
+/// cache line (AUDIT 2.4): only a thread's first copy, and one whose count would overflow, take a
+/// new thread number.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CopyId {
+    thread: u64,
+    n: u64,
+}
+
+/// The thread numbers handed out (`CopyId::thread`); 0 is no copy's.
+static THREADS: AtomicU64 = AtomicU64::new(1);
+
+std::thread_local! {
+    /// The last copy this thread made; thread 0 until its first.
+    static LAST_COPY: std::cell::Cell<CopyId> = const { std::cell::Cell::new(CopyId { thread: 0, n: 0 }) };
+}
+
+impl CopyId {
+    /// The next copy's: this thread's next count, or a new thread number with count 0 for its
+    /// first copy and once its count is spent.
+    fn next() -> Self {
+        LAST_COPY.with(|last| {
+            let was = last.get();
+            let next = match was.n.checked_add(1) {
+                Some(n) if was.thread != 0 => CopyId { thread: was.thread, n },
+                _ => CopyId {
+                    thread: THREADS.fetch_add(1, AtomicOrdering::Relaxed),
+                    n: 0,
+                },
+            };
+            last.set(next);
+            next
+        })
+    }
+}
 
 /// Amphora (QT.7 on the versioned storage, G7 step 2): the copy of the table leaf a cursor stands
 /// on, for the executor's column batches (`vdbe/leaf_batch.rs`): the copy's number, the row the
 /// cursor is on, and each row's record.
 pub(crate) struct LeafUnderCursor<'a> {
-    pub(crate) copy: u64,
+    pub(crate) copy: CopyId,
     pub(crate) cell: usize,
     rows: &'a Rows,
 }
@@ -1324,5 +1359,28 @@ impl CursorTrait for VersionedCursor {
     fn get_skip_advance(&self) -> bool {
         // A move after a delete starts from the removed row's key (`At::Gap`): nothing to skip.
         false
+    }
+}
+
+#[cfg(test)]
+mod copy_id_tests {
+    use super::CopyId;
+
+    /// AUDIT 2.4: take leaf copies' ids on several threads at once; expect every id distinct and
+    /// none the never-copied default, as the process-wide count gave (`vdbe/leaf_batch.rs` knows a
+    /// column batch by its copy's id).
+    #[test]
+    fn audit_2_4_copy_ids_are_unique_across_threads() {
+        let threads: Vec<_> = (0..8)
+            .map(|_| std::thread::spawn(|| (0..1000).map(|_| CopyId::next()).collect::<Vec<_>>()))
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        for t in threads {
+            for id in t.join().unwrap() {
+                assert_ne!(id, CopyId::default());
+                assert!(seen.insert(id), "copy id {id:?} handed out twice");
+            }
+        }
+        assert_eq!(seen.len(), 8000);
     }
 }
