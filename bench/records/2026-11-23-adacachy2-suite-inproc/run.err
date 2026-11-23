@@ -1,0 +1,20 @@
+== amphora load=23.12 05:07:27
+== turso load=29.80 05:11:35
+== sqlite load=52.79 05:16:22
+records: /home/adalundhe/.cache/amphora-perf/bench-s/bench/records/2026-11-23-adacachy2-suite-inproc/records.jsonl
+== sqlite load=423.98 05:23:48
+== turso load=137.92 05:31:31
+== amphora load=55.67 05:36:07
+records: /home/adalundhe/.cache/amphora-perf/bench-s/bench/records/2026-11-23-adacachy2-suite-inproc/records.jsonl
+== amphora load=15.13 05:40:13
+== turso load=15.92 05:44:19
+== sqlite load=34.85 05:48:52
+records: /home/adalundhe/.cache/amphora-perf/bench-s/bench/records/2026-11-23-adacachy2-suite-inproc/records.jsonl
+== sqlite load=17.45 05:56:30
+== turso load=24.74 06:03:56
+== amphora load=55.44 06:08:26
+records: /home/adalundhe/.cache/amphora-perf/bench-s/bench/records/2026-11-23-adacachy2-suite-inproc/records.jsonl
+== amphora load=41.30 06:12:31
+== turso load=53.96 06:16:38
+== sqlite load=49.78 06:21:08
+records: /home/adalundhe/.cache/amphora-perf/bench-s/bench/records/2026-11-23-adacachy2-suite-inproc/records.jsonl
