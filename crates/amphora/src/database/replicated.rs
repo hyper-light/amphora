@@ -5370,10 +5370,11 @@ impl<F: BlockFile + 'static> Actor<F> {
     /// new on the wire, and a stray barrier's read state matches nothing here and is dropped. Work
     /// handed to the session worker ends when it comes back (`Actor::decide`).
     fn prepare(&mut self) -> Result<(), Refusal> {
-        let work = self.pending.as_ref().and_then(|pending| {
-            matches!(pending.phase, Phase::Barrier(Some(_)))
-                .then_some((pending.term, pending.leader))
-        });
+        let work = self
+            .pending
+            .as_ref()
+            .filter(|pending| matches!(pending.phase, Phase::Barrier(Some(_))))
+            .map(|pending| (pending.term, pending.leader));
         self.prepare_barrier()?;
         let ended = !self
             .pending
