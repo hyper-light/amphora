@@ -7,6 +7,7 @@
 # usage: bench/real_sums_ab.sh <scale factor> <out dir> <phase>...
 #   build    release amphora-bench with the root's shipping profile, copied to ~/.cache/amphora-perf-bin/reals/<sha>
 #   data     dbgen at the scale factor (an existing dbgen output of the same revision is reused)
+#   ref      bench/real_sums_ref.py's SQLite, PostgreSQL 19 and exact answers (in the background; timed phases wait for it)
 #   load     load amphora, sqlite and duckdb-mt once (--only -)
 #   answers  each arm at 1, 4, 8 and 16 workers (AMPHORA_BENCH_CORES) with --answers, and SQLite's
 #            own, on bench/planner/real_sums/queries (hard cases) and TPC-H q01, q06
@@ -35,9 +36,8 @@ note() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $* load $(sysctl -n vm.loadavg 2>/
 
 data_dir() {
   local d
-  for d in $(find "$HOME/.cache" -maxdepth 5 -type f -name REVISION -path "*tpch-sf$SF/REVISION" 2>/dev/null); do
-    d=$(dirname "$d")
-    if [ "$(cat "$d/REVISION")" = "$REV" ] && [ -s "$d/lineitem.tbl" ]; then echo "$d"; return; fi
+  for d in "$HOME"/.cache/*/tpch-sf$SF "$HOME"/.cache/*/*/tpch-sf$SF; do
+    if [ -f "$d/REVISION" ] && [ "$(cat "$d/REVISION")" = "$REV" ] && [ -s "$d/lineitem.tbl" ]; then echo "$d"; return; fi
   done
   echo "$HOME/.cache/amphora-perf/reals-data/tpch-sf$SF"
 }
@@ -92,6 +92,9 @@ for phase in "$@"; do
         TPCH_DBGEN_SRC=$src bench/planner/tpch/dbgen.sh "$SF" "$DATA"
       fi
       ;;
+    ref)
+      python3 -I bench/real_sums_ref.py "$DATA" >"$OUT/ref.json" 2>"$OUT/ref.err" &
+      ;;
     load)
       bench serial - --queries bench/planner/tpch/queries --targets amphora,sqlite,duckdb-mt --only - --runs 1 --out "$OUT/load.jsonl" 2>>"$OUT/load.err"
       ;;
@@ -106,8 +109,8 @@ for phase in "$@"; do
       bench serial - --queries bench/planner/real_sums/queries --targets sqlite --only $HARD --runs 1 --timeout-s 600 --answers "$OUT/answers-hard/sqlite" --out "$OUT/answers-hard-sqlite.jsonl" 2>>"$OUT/answers.err"
       bench serial - --queries bench/planner/tpch/queries --targets sqlite --only $QA --runs 1 --timeout-s 600 --answers "$OUT/answers-tpch/sqlite" --out "$OUT/answers-tpch-sqlite.jsonl" 2>>"$OUT/answers.err"
       ;;
-    timed-a) rounds timed-a "$QA" "${ROUNDS:-5}" "${RUNS:-5}" ;;
-    timed-b) rounds timed-b "$QB" "${ROUNDS_B:-1}" "${RUNS_B:-3}" ;;
+    timed-a) wait; rounds timed-a "$QA" "${ROUNDS:-5}" "${RUNS:-5}" ;;
+    timed-b) wait; rounds timed-b "$QB" "${ROUNDS_B:-1}" "${RUNS_B:-3}" ;;
     answers-b)
       for arm in serial exact roworder; do
         note "answers-b $arm 16"
@@ -118,4 +121,5 @@ for phase in "$@"; do
     *) echo "unknown phase $phase"; exit 2 ;;
   esac
 done
+wait
 note "end"
