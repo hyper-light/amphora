@@ -4302,6 +4302,8 @@ impl<F: BlockFile + 'static> Actor<F> {
         // A leader without the closed time's table holds no write that carries a read set
         // (`Machine::prepare_db`): its refusal leaves the write to the exact base.
         let Ok(applied) = self.replica.machine().applied_pages() else {
+            #[cfg(test)]
+            eprintln!("K7 unknown_base (applied_pages) base {:?} before {:?}", write.base, before);
             Self::read_set_event("unknown_base", write.base, before);
             return Ok(None);
         };
@@ -4310,6 +4312,8 @@ impl<F: BlockFile + 'static> Actor<F> {
         if write.base.index < held
             || log.term(write.base.index).map_err(unavailable)? != write.base.term
         {
+            #[cfg(test)]
+            eprintln!("K7 unknown_base (held {held}) base {:?} before {:?}", write.base, before);
             Self::read_set_event("unknown_base", write.base, before);
             return Ok(None);
         }
@@ -4328,6 +4332,8 @@ impl<F: BlockFile + 'static> Actor<F> {
                     readsets::Wrote::Opaque
                 };
                 if !write.untouched_by(&wrote, &applied) {
+                    #[cfg(test)]
+                    eprintln!("K7 conflict base {:?} before {:?} at entry {} wrote {:?}", write.base, before, entry.index, wrote);
                     Self::read_set_event("conflict", write.base, before);
                     return Ok(None);
                 }
@@ -5124,7 +5130,10 @@ impl<F: BlockFile + 'static> Actor<F> {
                 index: last,
                 term: log.term(last).map_err(unavailable)?,
             };
-            if let Ok(Err(_)) = crate::replication::verdict(&stamped, before)
+            let stale = matches!(crate::replication::verdict(&stamped, before), Ok(Err(_)));
+            #[cfg(test)]
+            eprintln!("K7 leader own write at last {} stale {stale}", before.index);
+            if stale
                 && let Some(data) = self.rebase(&stamped, before)?
             {
                 stamped = data;
@@ -17716,6 +17725,7 @@ mod tests {
                         streaks[w] = 0;
                     }
                     Ok(Err(Refusal::Serialization { .. })) => {
+                        eprintln!("K7 refused writer {w} attempt {index} key {} other {} streak {}", history[index].key, history[index].other, streaks[w] + 1);
                         history[index].outcome = Outcome::Refused;
                         run.refused[w] += 1;
                         streaks[w] += 1;
