@@ -1658,7 +1658,9 @@ mod tests {
     /// `AMPHORA_AB_SCALE=200 AMPHORA_AB_OUT=bench/records/<date>-<host>-colcopy-ab.jsonl cargo test -p amphora-engine --release --lib storage::versioned::columns_sql::tests::ab -- --nocapture`
     mod ab {
         use super::*;
-        use crate::storage::versioned::columns_ab::{scenarios, schema, Press, Scenario, Traces};
+        use crate::storage::versioned::columns_ab::{
+            scenarios, schema, Handoffs, Press, Scenario, Traces,
+        };
         use std::time::Instant;
 
         fn scale() -> i64 {
@@ -1704,6 +1706,7 @@ mod tests {
             let mut latencies = Vec::with_capacity(s.statements);
             let mut reached = Vec::with_capacity(s.statements);
             let mut skipped_queries = std::collections::BTreeSet::new();
+            let mut handoffs = Handoffs::default();
             let (mut held_sum, mut held_peak, mut equal, mut waited_most) =
                 (0u64, 0u64, true, 0u64);
             let (mut writes_refused, mut write_refusal) = (0u64, None::<String>);
@@ -1753,7 +1756,9 @@ mod tests {
                 let got = rows(&on, &q);
                 let took = u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 latencies.push(took);
-                if copies(&on).counts().reached_since(&before, 1) {
+                let after = copies(&on).counts();
+                handoffs.record(&before, &after);
+                if after.reached_since(&before, 1) {
                     reached.push(took);
                 } else {
                     skipped_queries.insert(k % QUERIES.len());
@@ -1820,9 +1825,9 @@ mod tests {
                 "reached_statements": reached.len(),
                 "reached_statements_per_s": reached.len() as f64 / (reached_ns as f64 / 1e9).max(f64::MIN_POSITIVE),
                 "skipped_queries": skipped_queries,
-                "skipped": {"rows": c.skipped_rows, "body": c.skipped_body, "join": c.skipped_join, "transaction": c.skipped_transaction, "defaults": c.skipped_defaults},
+                "skipped": handoffs.skipped,
                 "unserved": c.unserved,
-                "handed": c.handed,
+                "handed": handoffs.handed,
                 "all_p50_ns": at(&latencies, 0.5),
                 "all_p99_ns": at(&latencies, 0.99),
                 "all_p999_ns": at(&latencies, 0.999),
@@ -1880,6 +1885,10 @@ mod tests {
                         o.insert("traces_compiled".into(), Traces::compiled().into());
                     }
                     assert_eq!(line["equal"], true, "{line}");
+                    assert!(
+                        line["handed"].as_u64().unwrap() <= s.statements as u64,
+                        "{line}"
+                    );
                     // Lane colcopy-9 (T-CB.4.4): the A/B counts only statements a copy could
                     // answer, so there must be some, and each statement handed over is either
                     // one of them or counted with its reason.

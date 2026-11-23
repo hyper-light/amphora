@@ -50,7 +50,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use amphora_engine::storage::versioned::columns_ab::{
-    QUERIES, Scenario, Traces, scenarios, schema,
+    Handoffs, QUERIES, Scenario, Traces, scenarios, schema,
 };
 use amphora_engine::storage::versioned::columns_sql::{Dropped, Rebuy};
 use amphora_engine::storage::versioned::memory::{Capped, Source};
@@ -377,6 +377,7 @@ fn run(
             d.conn.execute_batch(&fill(true, i, 1, s.rows))?;
         }
     }
+    let mut handoffs = Handoffs::default();
     let mut t = Tally {
         equal: true,
         ..Tally::default()
@@ -443,6 +444,7 @@ fn run(
             t.cap_peak = t.cap_peak.max(cap);
         }
         let q = s.query(k);
+        let before = amphora.as_ref().map(|a| a.storage.copy_counts());
         let clock = Instant::now();
         let got = match (&amphora, &duck) {
             (Some(a), _) => a.rows(&q),
@@ -450,6 +452,9 @@ fn run(
             _ => anyhow::bail!("no engine"),
         };
         let took = u64::try_from(clock.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        if let (Some(a), Some(before)) = (&amphora, before) {
+            handoffs.record(&before, &a.storage.copy_counts());
+        }
         match got {
             Ok(got) => {
                 t.all.push(took);
@@ -485,9 +490,8 @@ fn run(
     let copies = amphora.as_ref().map(|a| {
         let c = a.storage.copy_counts();
         // The statements its own counts left out: skipped, or never handed over.
-        let own = c
-            .skipped()
-            .saturating_add((s.statements as u64).saturating_sub(c.handed));
+        let skipped = handoffs.skipped.values().copied().fold(0u64, u64::saturating_add);
+        let own = skipped.saturating_add((s.statements as u64).saturating_sub(handoffs.handed));
         let waiting = a.storage.copy_waiting();
         let last = a.storage.copy_dropped().map(
             |Dropped::Memory {
@@ -510,8 +514,8 @@ fn run(
             "waiting_bytes_end": waiting.iter().fold(0u64, |b, w| b.saturating_add(w.bytes)),
             "longest_wait_end_ns": waiting.iter().map(|w| w.nanos).max().unwrap_or(0),
             "last_dropped": last,
-            "handed": c.handed,
-            "skipped": {"rows": c.skipped_rows, "body": c.skipped_body, "join": c.skipped_join, "transaction": c.skipped_transaction, "defaults": c.skipped_defaults},
+            "handed": handoffs.handed,
+            "skipped": handoffs.skipped,
             "unserved": c.unserved,
             "probe_agrees": own == left_out,
         })
