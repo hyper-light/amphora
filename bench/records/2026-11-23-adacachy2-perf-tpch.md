@@ -405,6 +405,9 @@ Checks: r1042 at b876567c on adacachy2 (load 62 to 71):
   failed once ("MATERIALIZE" missing from a 3-table plan). The change cannot reach it: a bushy pair
   needs a run of 2 tables or more plus a probe and an outer table, so 3 tables make no pair. It
   passed at b876567c and on main with the test (a9ca008d).
+- r1084 at 1a7ccc1b (the fix merged with main c82891fd): clippy clean; the same suites 68 passed,
+  1 failed (t_pl_8_13, main's); `--test nested_loops` 7 of 7. Merged to main as 70a12ac3 (main
+  had moved by one record file only).
 - The new test is not a regression guard. On main with the test alone (a9ca008d, r1042) it
   passes too: at this scale the old cost does not choose the late match. It holds the work bound
   for whatever plan is chosen, nothing more.
