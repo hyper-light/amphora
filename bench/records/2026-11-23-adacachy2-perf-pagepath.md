@@ -190,3 +190,28 @@ thread from 1 to 16), 120-150x the lock at 16. So nothing a lookup writes is sha
 20 ns, the three `ArcSwap` loads. The fix (4da616cf) answers a page past the words as absent; its
 own A/B (this bench, its binary against `lookup-old-2b58`, 32,612 pages) is still to run, as are its
 clippy and the release storage suite (run r335, queued at hand-over; r312/r314 died on a sync link error).
+
+## perf-B5: the header's A/B not yet run; B4's fix checked; decision 45 written (AUDIT 2.1, P4's finding)
+
+**Checks of 76a62c3d** (B4's 4da616cf and the header ae729b06, with origin/main merged; run r864, needs cpus=8):
+`cargo clippy -p amphora-engine --all-targets --locked -- -D warnings` exit 0, and `cargo test -p amphora-engine
+--lib -- storage::wal storage::log_index` 105 passed, 0 failed, 1 ignored. That run includes
+`audit_2_1_a_page_past_the_logs_highest_is_absent_without_the_lock`,
+`g3_2_lock_free_page_reads_find_the_frame_the_locked_index_finds` and
+`audit_2_1_default_header_reads_race_a_writer_and_stay_current`.
+
+**The header's A/B (5b: it lands only with its A/B): not run.** The script is `.git/perf-ab6.sh` in the pagepath
+clone. It builds after = 639245cc (perf/pagepath: the header, B4's fix, origin/main e56f44e7) and base = the same tree
+with only ae729b06's `crates/` diff reversed (checked: `git apply -R --check` holds on that tree). Both are built one
+after the other in the lane's target dir. It then runs 5 alternated rounds of `point_pk` and `point_secondary` at 1,
+32 and 128 clients, with one shared `XDG_CACHE_HOME` (5e), recording load and CPU and I/O pressure before and after
+each run, and errors and rows per op. Run r836's first build of 76a62c3d failed in `amphora`: main's `bench/Cargo.toml`
+did not patch `hyper-rt`, which the postgres listener (f8f65110) uses, so cargo took crates.io's. Main has patched it
+since, and 639245cc has that patch. After that, adacachy2 refused the run for room five times between 14:25 and
+14:50Z, with 0-5 of 32 cores idle. Pass the script's body to `run` (needs `linux/amd64,cpus=16,mem=24g`, `on`
+adacachy2, sync false) and retry until it is placed.
+
+**B4's fix alone on main.** 3a30e5f1 (branch `perf/pagepath-b4-pick`) is 4da616cf cherry-picked onto origin/main
+9a7b14bb, clean. It is not merged: its clippy and storage tests on that tree were refused for room (0 of 32 cores idle).
+
+**Decision 45** (docs/design/store.md, commit 4d0ead88) is the two-segment log's design. Nothing is built yet.
