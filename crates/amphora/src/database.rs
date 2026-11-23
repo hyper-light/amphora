@@ -2415,7 +2415,8 @@ impl Database {
         database.query_reader(store, until, move |c| Ok(within(f(c)?, answer)?))
     }
 
-    /// [`Database::query`] on a local writer's reader, which takes no place in its queue.
+    /// [`Database::query`] on a local store: on a reader, or on the writer while it has none to
+    /// lend; admission charges it nothing.
     fn query_reader<R, F>(&self, store: &Store<Local>, until: Instant, f: F) -> Result<R, Refusal>
     where
         R: Send + 'static,
