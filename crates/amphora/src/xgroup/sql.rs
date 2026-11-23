@@ -2770,15 +2770,20 @@ mod sessions {
 
     /// Namespace `ns`'s head as `db` reads it in a session carrying `token` (none: a local read,
     /// which waits for nothing); none before its first commit is there.
+    /// The newest revision of the rows these tests' transactions write (`puts`' keys 0 and 1 in
+    /// family "rows" of namespace "ns") that this group holds, read in a session carrying `token`:
+    /// each commit that reaches the group moves it, as it moves the namespace's head. Read
+    /// through Records, as a client would: the session's SQL refuses the `__amphora_*` tables that
+    /// hold them (product metadata).
     fn head(db: &Database, token: Option<Token>) -> Result<Option<i64>, Refusal> {
-        use crate::sql::OptionalExtension;
         db.query_session(crate::database::ReadMode::Session, token, until(), |c| {
-            Ok(c.query_row(
-                "SELECT head FROM __amphora_namespaces WHERE name = ?1",
-                ["ns"],
-                |r| r.get::<_, i64>(0usize),
-            )
-            .optional()?)
+            let mut newest = None;
+            for key in 0..2u8 {
+                if let Some(row) = c.records_get("ns", "rows", &[key])? {
+                    newest = newest.max(Some(i64::try_from(row.rev)?));
+                }
+            }
+            Ok(newest)
         })
     }
 
