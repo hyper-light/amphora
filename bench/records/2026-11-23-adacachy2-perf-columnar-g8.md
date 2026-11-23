@@ -1,4 +1,4 @@
-# Columnar lane G8 on adacachy2: the SUM-over-REAL switch with arm (b) built, unchecked; arm (a) and the A/B not built (2026-11-23)
+# Columnar lane G8 on adacachy2: the SUM-over-REAL switch with arm (b) on main, default unchanged; arm (a) and the A/B not built (2026-11-23)
 
 Ada's goal: Amphora about 10x faster than DuckDB on analytics, with answers identical to the serial
 engine. TPC-H q01 and q06 still run on one thread because they SUM or AVG over REAL. Ada decides
@@ -9,15 +9,23 @@ the switch with today's behaviour as the default.
 
 ## Verdict, losses first
 
-- **Nothing merged to main.** The code is on branch `perf/columnar-g8`, merged with main
-  ea04b5b7 (clean), but it has never been compiled. Clippy and the unit tests never ran: kiln refused every check run for room
-  on adacachy2 (0 or 1 of 32 cores idle, 15:22Z to 15:27Z). The first run (r952) started but
-  stopped at `git checkout`: `~/.cache/amphora-perf/columnar-remote` on adacachy2 holds untracked
-  files a sync left. The command below uses a new folder, `columnar-g8-remote`.
+- **Merged to main: the switch and arm (b), default unchanged (`Serial`).** Gate on fb8d0710
+  (r1035, adacachy2, load 55 to 77 on 32 cores): `cargo fmt` clean; `cargo clippy -p
+  amphora-engine --all-targets --locked -D warnings` clean; `cargo test -p amphora-engine --lib`
+  over `g8_ audit_3_p2 vdbe::morsel:: vdbe::execute::tests agg window sum_ avg_ total_`, 138
+  passed and 3 failed. The failures are t_qt_6_31 and 6_32, which panic at builder.rs:2131 as main
+  227d65ee does in the same run, and t_qt_6_30 at its "the hook didn't run" assertion (line 2971;
+  its answers matched). 6_30 passed on main in that run. G7 traced this flake to per-executable
+  calibration, and lane T5 is pinning cost versions. Main moved only in docs after r1035.
+- **The first hard-case test was wrong, not the sum.** On 9336a4d6 (r997), both paths answered
+  9.999999999999999e-301 for 1e300 + 1e-300 - 1e300, where the test expected Rust's 1e-300. The
+  engine stores the literal `1e-300` one ulp lower than Rust parses it. The oracle now takes the
+  stored values (fb8d0710).
 - **Arm (a), row-order KBN on the workers, is not built.** The switch has no `RowOrder` value yet.
   G7's design for it, checked against the code, is unchanged (G7's record, "Arm (a)").
-- **No A/B numbers.** The release bench build was refused for room too. No TPC-H timing, peak
-  memory or answer-drift figure exists for either arm.
+- **No A/B numbers.** Check runs were refused for room from 15:22Z to 15:27Z and again at
+  15:33Z, and the release bench build never started. No TPC-H timing, peak memory or
+  answer-drift figure exists for either arm.
 - **Arm (b) gaps, by design for this hour:**
   - A join still refuses REAL columns at plan time, so q09 stays on the serial loop under both
     arms. Under `Exact`, q09's serial loop sums exactly; the workers do not take it.
@@ -27,7 +35,7 @@ the switch with today's behaviour as the default.
     the same limit. A fix is a superaccumulator (a fixed-point array over the whole exponent
     range); it was not attempted.
 
-## What the branch holds (unchecked)
+## What landed
 
 The switch is `Connection::set_real_sums(RealSums)` (`crates/engine/connection.rs`), read when a
 statement runs, so one prepared statement can be timed under either arm. `RealSums::Serial` is
@@ -103,4 +111,5 @@ The A/B (unit 2), after the gate:
 
 - Branch `perf/columnar-g8`: bec8f463 (switch and arm b), 840e7443 (window frames), f53fe695
   (a borrow fix), this record, and the merge of main ea04b5b7.
-- On adacachy2: `~/.cache/amphora-g8/` (empty until a check runs).
+- On adacachy2 in `~/.cache/amphora-g8/`: `fmt-`, `clippy-` and `tests-` for 9336a4d6 (r997) and
+  fb8d0710 (r1035), and `tests-main-227d65ee.txt`.
