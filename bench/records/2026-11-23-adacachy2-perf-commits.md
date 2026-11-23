@@ -699,15 +699,16 @@ paths Ada asked for. Neither path is built.
 
 1. **Neither design is built, and no ladder ran (units 2 and 3).** The hour went to unit 1's profile and the port fix.
    Both designs are sketched below with the data shape, the switch, where each change goes and the tests, so the
-   successor can build them. The architect skill's multi-model arena did not run, so this is one design pass.
+   successor can build them. The architect skill's multi-model arena did not run, so this is one design pass. Test
+   5 is written and red on `perf/commits-v7` (below), not merged.
 2. **0009 is worse than V6 measured.** At 32 writers spread over three members, 6 of 6 runs of `2431406e` (0009)
    aborted with "the database advanced since preparation" (a write still refused at its 10 s deadline), against 1 of
    6 for `924fbe5c` (before 0009), over r1312 and r1346. V6's r1238 still got 13.2 commits/s from it. Both arms sit
    at the deadline's edge: before 0009 the slowest write took 6.7 to 10.4 s.
 3. **0009's mechanism is inferred, not traced.** The profile shows where the loss is (followers' writes, not the
    leader's own path). The line in the code that makes followers lose more often is a guess, labelled below.
-4. **The profile ran at cpus=8, not 16.** kiln refused cpus=16 (14 of 32 cores idle). Three members and the driver
-   used about 3.2 cores. Load (1 min) 23 to 30, CPU pressure "some" avg10 1.2 to 7.6%, I/O "some" 3.0 to 8.4%.
+4. **The profile ran at cpus=8, not 16.** kiln refused cpus=16 (14 of 32 cores idle). The three members used about
+   3.2 cores, most of it one spinning thread each; the driver wasn't measured. Load (1 min) 23 to 30, CPU pressure "some" avg10 1.2 to 7.6%, I/O "some" 3.0 to 8.4%.
 5. **The dqlite fix has one smoke run, not a ladder.** dqlite started in 2 of 2 phases on the new ports, after 0 of 5
    rounds in r1238 on the old ones. One run per system and writer count measures nothing yet.
 
@@ -720,7 +721,7 @@ leader, the control: it takes the followers' write path out.
 
 | route | arm | commits/s, per round | median | p99 ms | slowest ms | aborted |
 |---|---|---|---|---|---|---|
-| leader | `924fbe5c` before | 23.25, 20.75, 45.75 | 23.25 | 1,688, 1,917, 1,622 | 1,706 to 1,954 | 0 of 3 |
+| leader | `924fbe5c` before | 23.25, 20.75, 45.75 | 23.25 | 1,688, 1,917, 1,622 | 1,659 to 1,954 | 0 of 3 |
 | leader | `2431406e` 0009 | 45.25, 23.25, 25.25 | 25.25 | 1,229, 1,589, 1,376 | 1,250 to 1,612 | 0 of 3 |
 | spread | `924fbe5c` before | 19.25, 18.75, 19.88 | 19.25 | 7,799, 9,175, 6,029 | 6,740 to 10,357 | 0 of 3 |
 | spread | `2431406e` 0009 | none | none | none | none | 3 of 3 |
@@ -847,6 +848,16 @@ for each entry, at one write an entry.
 4. a deadline passing mid-batch times out only that write;
 5. at 128 writers spread over three members, every write is answered before its deadline, none is refused for a
    stale base, and the run ends (no livelock). Today that run fails (V6's r1238 and this hour's 32-writer spread runs).
+
+Test 5 is built and red, on `perf/commits-v7` at `bd3f6153` (not merged, since it fails by design):
+`v7_a_hundred_and_twenty_eight_spread_writers_are_each_answered_with_no_stale_base` (replicated.rs, beside
+`a_hundred_and_twenty_eight_writers_each_land_and_every_acknowledged_row_is_held`, on driven time). Each class runs
+128 writers, writer w at member w % 3, all into one table. A stale-base refusal is retried at the same member, as the
+bench's driver does, and counted. The test asserts at the end that no class refused one. Run at 18:30Z on
+adacachy2 (cpus=4): red, with 52 stale-base refusals over 50 writes (at most 2 for one) in the persisted class, and 86 over
+45 writes (at most 6 for one) in the replicated class. Every write still landed, and the existing 128-writer test passed
+beside it. clippy `-p amphora --all-targets` is clean. On driven time no write reached its deadline, so the red part is
+the refusals, not the bench's timeouts. The successor makes it green under each switch.
 
 ## Unit 3: the ladder (not run)
 
