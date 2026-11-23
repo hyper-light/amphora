@@ -614,7 +614,7 @@ impl JoinN {
                     }
                 };
                 *joined = Some(node);
-                if *end != position + 1 || open.len() == 1 {
+                if position.checked_add(1) != Some(*end) || open.len() == 1 {
                     break;
                 }
                 open.pop();
@@ -1303,10 +1303,10 @@ fn join_lhs_and_rhs<'a>(
                                     );
                                 // The materialized input's visits are the merge's as well.
                                 let merge_join_cost = if *materialize_build_input {
-                                    merge_join_cost
-                                        + Cost(
-                                            effective_build_cardinality * params.cpu_cost_per_row,
-                                        )
+                                    Cost(
+                                        merge_join_cost.0
+                                            + effective_build_cardinality * params.cpu_cost_per_row,
+                                    )
                                 } else {
                                     merge_join_cost
                                 };
@@ -2364,32 +2364,35 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                                 && info.table_mask.intersects(&outer_mask)
                         })
                         .map(|(_, info)| info.extra_steps.saturating_add(1) as f64);
-                    let (late_least, late_all) = late_steps.fold(
-                        (f64::INFINITY, 0.0),
-                        |(least, all): (f64, f64), steps| (least.min(steps), all + steps),
-                    );
+                    let (late_least, late_all) = late_steps
+                        .fold((f64::INFINITY, 0.0), |(least, all): (f64, f64), steps| {
+                            (least.min(steps), all + steps)
+                        });
                     let late_work = if late_all > 0.0 {
                         visited * late_least + rows * (late_all - late_least)
                     } else {
                         0.0
                     };
-                    let probe_cost = estimate_hash_join_cost(
-                        build.output_cardinality,
-                        *probe_rows,
-                        visited,
-                        HashJoinType::Inner,
-                        mem_budget,
-                        outer_rows,
-                        // The probe's scan costs its own pages, as a left-deep plan's does (PL.7).
-                        &params.for_table(probe_table, analyze_stats),
-                    ) + Cost(late_work * params.cpu_cost_per_where_step)
-                        + Cost(build.output_cardinality * params.cpu_cost_per_row)
-                        + Cost(if left_join_probe {
-                            build.output_cardinality * outer_rows * params.cpu_cost_per_row
-                        } else {
-                            0.0
-                        });
-                    let cost = outer.cost + build.cost + probe_cost;
+                    let probe_cost = Cost(
+                        estimate_hash_join_cost(
+                            build.output_cardinality,
+                            *probe_rows,
+                            visited,
+                            HashJoinType::Inner,
+                            mem_budget,
+                            outer_rows,
+                            // The probe's scan costs its own pages, as a left-deep plan's does (PL.7).
+                            &params.for_table(probe_table, analyze_stats),
+                        )
+                        .0 + late_work * params.cpu_cost_per_where_step
+                            + build.output_cardinality * params.cpu_cost_per_row
+                            + if left_join_probe {
+                                build.output_cardinality * outer_rows * params.cpu_cost_per_row
+                            } else {
+                                0.0
+                            },
+                    );
+                    let cost = Cost(outer.cost.0 + build.cost.0 + probe_cost.0);
                     let Some(method) = access_methods_arena.get_mut(probe_method) else {
                         access_methods_arena.truncate(arena_len);
                         continue;
@@ -2562,7 +2565,11 @@ fn bushy_core(
             }
         })
     });
-    (core >= 3 && free && ordered).then_some(core)
+    if core >= 3 && free && ordered {
+        Some(core)
+    } else {
+        None
+    }
 }
 
 /// PL.8 (lane pl8-19): whether `table` is the right table of a LEFT JOIN the search may move, one

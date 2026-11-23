@@ -1799,11 +1799,15 @@ mod tests {
         // descriptor before it waits for a connection, so a listener back in accept after taking
         // the first would otherwise hold the last number and refuse the second's socket
         // (EMFILE) whenever it ran ahead of this thread (perf-I3: the module-run failure).
-        let client = || socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        let client =
+            || socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
         let (first, second) = (client(), client());
         first.connect_timeout(&address.into(), HANG).unwrap();
         second.connect_timeout(&address.into(), HANG).unwrap();
-        let (_first, mut second) = (std::net::TcpStream::from(first), std::net::TcpStream::from(second));
+        let (_first, mut second) = (
+            std::net::TcpStream::from(first),
+            std::net::TcpStream::from(second),
+        );
         second.set_read_timeout(Some(HANG)).unwrap();
         // The listener meets the limit: its accept refused while the first is held, it waits
         // for the budget's give-back.

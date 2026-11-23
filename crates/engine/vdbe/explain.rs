@@ -2832,7 +2832,7 @@ pub fn insn_to_row(
         ),
         Insn::JoinSwitchStep { data } => (
             "JoinSwitchStep",
-            data.switch_id as i64,
+            i64::try_from(data.switch_id).unwrap_or(i64::MAX),
             data.build_pc.as_debug_int() as i64,
             data.probe_pc.as_debug_int() as i64,
             Value::build_text(""),
@@ -2854,7 +2854,7 @@ pub fn insn_to_row(
             target_pc,
         } => (
             "JoinSwitchHash",
-            *switch_id as i64,
+            i64::try_from(*switch_id).unwrap_or(i64::MAX),
             target_pc.as_debug_int() as i64,
             0,
             Value::build_text(""),
@@ -2863,8 +2863,8 @@ pub fn insn_to_row(
         ),
         Insn::JoinSwitchBuilt { data } => (
             "JoinSwitchBuilt",
-            data.switch_id as i64,
-            data.hash_table_id as i64,
+            i64::try_from(data.switch_id).unwrap_or(i64::MAX),
+            i64::try_from(data.hash_table_id).unwrap_or(i64::MAX),
             data.target_pc.as_debug_int() as i64,
             Value::build_text(""),
             0,
@@ -2936,7 +2936,7 @@ pub fn insn_to_row(
             };
             (
                 "HashNextUnmatched",
-                *hash_table_id as i64,
+                i64::try_from(*hash_table_id).unwrap_or(i64::MAX),
                 *dest_reg as i64,
                 target_pc.as_debug_int() as i64,
                 Value::build_text(""),
