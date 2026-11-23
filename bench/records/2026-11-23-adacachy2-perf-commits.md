@@ -1378,5 +1378,5 @@ What the trace says:
     python3 -I bench/records/2026-11-23-adacachy2-perf-commits-v12/stages_table.py ~/.cache/amphora-perf/commits-v12-out/trace-233603/<class>-<writers>-<route>
     # clippy on the bench crate (the one this lane changed: --route in bench/src/repl.rs), needs linux/amd64,cpus=4,mem=12g:
     # red on main dd9c3ce7 itself, 166 errors (disallowed println/args/temp_dir, items after a test module, ...); the
-    # same 166 at b67ea4df and at the merged 2e662d8b, the 9 in repl.rs main's own, none in the lines changed (r1766, r1771)
+    # same 166 at b67ea4df and at the merged 2e662d8b, the 9 in repl.rs main's own, none in the lines changed (r1766, then two foreground runs whose ids were not shown)
     cargo clippy --release --manifest-path bench/Cargo.toml --all-targets --locked -- -D warnings
