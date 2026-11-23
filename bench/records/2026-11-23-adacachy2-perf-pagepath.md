@@ -16,13 +16,16 @@ on adacachy2). Queries a second, median of 3 [min-max]; SQLite one run, same bin
 
 The change landed as `e74813c8`. The original record labels the measured after binary
 `bf23ccb1`; that object is absent from the fetched history. The runs below exercised
-`PagePath::Today` with `LOG_READ_INDEX=locked`. The table retains throughput only.
+`PagePath::Today` with `LOG_READ_INDEX=locked`. In the raw `ab-0051.jsonl`, all 60
+reported Today cells have zero errors, zero retries and 1.0 rows per operation.
 
 For AUDIT 2.3, the distribution test in `a02e4b20` covers the first pages of 64 files and
 consecutive pages of one file. The later record in `820614f8` selects `AMPHORA_PAGE_PATH=plain`
 and alternates three runs per arm. Eight-client point reads increased from 1.42M to 1.79M/s
 in that sample. The base predates the WAL change and the host load ranged from 42 to 71, so the
-sample does not isolate the single-lookup change.
+sample does not isolate the single-lookup change. In the raw `ab2-0110.jsonl`, all 60
+Plain cells also have zero errors, zero retries and 1.0 rows per operation. The exact
+eight-client primary-key medians are 1,424,040.6 and 1,794,026.6 reads/s.
 
 | op | clients | base | after | after/base | SQLite |
 |---|---|---|---|---|---|
