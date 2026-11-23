@@ -87,10 +87,14 @@ const CLIENT: u8 = b'C';
 const SQL: u8 = b'Q';
 /// The newest version of a `Q` connection's frames this side speaks. A variant appended to
 /// [`SqlRequest`] or [`SqlAnswer`] raises it and is sent only at a version agreed that takes it
-/// (docs/design/client-protocol.md, decision 2). A format value.
-pub const SQL_VERSION: u32 = 2;
+/// (docs/design/client-protocol.md, decision 2). A format value. 3: Refusal gained
+/// Serialization ([`SQL_VERSION_SERIALIZATION`]).
+pub const SQL_VERSION: u32 = 3;
 /// The oldest version of a `Q` connection's frames this side speaks. A format value.
 const SQL_VERSION_MIN: u32 = 1;
+/// The first `Q` version whose clients take [`Refusal::Serialization`]; an older one is sent the
+/// `Invalid` it was (local-owner-transport.md, "Version 10").
+const SQL_VERSION_SERIALIZATION: u32 = 3;
 /// The challenge's length: SHA-256's output length (FIPS 180-4), HMAC-SHA256's block of proof.
 const NONCE: usize = 32;
 /// HMAC-SHA256's tag length (RFC 2104 with SHA-256: 32 bytes).
@@ -1163,7 +1167,10 @@ impl Shared {
         };
         match result {
             Ok(frames) => Ok(frames),
-            Err(refusal) => Ok(vec![refused_frame(refusal)?]),
+            Err(refusal) if agreed.is_some_and(|v| v >= SQL_VERSION_SERIALIZATION) => {
+                Ok(vec![refused_frame(refusal)?])
+            }
+            Err(refusal) => Ok(vec![refused_frame(refusal.without_serialization())?]),
         }
     }
 

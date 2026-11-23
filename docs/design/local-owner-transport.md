@@ -188,6 +188,19 @@ sent at 8. The tests: `a_version_8_client_and_a_version_9_owner_exchange_what_bo
 Falsified by: a version-8 peer refused by a version-9 one, a variant sent on a connection that
 agreed on a version without it, or a greeting with its `Speaks` cut off that authenticates.
 
+## Version 10 (2026-11-23)
+
+`Refusal` gained `Serialization` at its end: a write refused because what it read changed before it
+applied (the stale-base rule, replication.md), nothing of it written, to be asked again, as
+PostgreSQL's 40001 `serialization_failure` says. Until then it was `Invalid`, which says the
+caller's input was wrong; callers told the two apart by its text. Its text is unchanged ("invalid
+prepared transaction: the database advanced since preparation"), so a caller matching it still
+retries. A version-9 peer can't decode the variant, so an owner sends it only on a connection that
+agreed on 10 or later, and as the `Invalid` it was below that (`spoken`). The `Q` connection's
+frames (serve.rs, `SQL_VERSION` 3) do the same. The tests:
+`an_overlapping_write_is_refused_serialization_and_a_malformed_one_invalid`,
+`a_peer_before_version_10_is_sent_serialization_as_invalid`.
+
 ## The tests' budgets (2026-10-31)
 
 None of the transport tests is about latency. Their budgets were real-clock guesses, and a loaded
