@@ -249,3 +249,77 @@ arm was refused at submit, and by Little's law (p50 x calls/s) about 3-5k were i
 bench counts `Full` at submit without its cause (budget room or queue), so it can't say that the
 charge never bound; on a host with ~98 GB free it most likely did not. The charge's purpose,
 admitting more under a memory limit, was not exercised (no `MemoryMax` scope this run).
+
+## The writer's queue has no count; the call charge at 1k and 10k truly in flight (perf-A8)
+
+**Unit 1, the queue's 4,096 removed (on main).** The writer's queue held 4,096 messages
+(`store::Config::queue`, a picked count: "a channel of this bound takes its slots at once ... so it
+needn't be deep"), and `call_nowait` refused `Full` past it. A database already charges every
+request to the memory budget's room for queues at admission (MB.1), which bounds its queue in
+bytes; the count refused calls the budget had room for (A7's 10k rows). Removing the count beats
+waiting for room under it: there is no second bound to wait on, so nothing polls (`ROOM_LOOK`, the
+5 ms re-look, now serves only counted queues: `Groups` and the store's own tests, which keep
+`Some(4096)` and `Some(1)`). `Config::queue` is `Option<usize>`; a `Database`'s store passes
+`None` (an unbounded `mpsc::channel`, its blocks allocated as used). A queued call is still bounded
+by its deadline: the writer answers `Timeout` for a call whose `until` passed before it ran.
+Test `tests/database.rs::a8_ten_thousand_nowait_calls_in_flight_are_all_answered_none_refused_for_queue_room`:
+the writer held by one call, a pool of one thread a core queues 10,000 `call_nowait`s behind it
+(the old bound refused the 4,097th), all 10,000 answered with their own value. Memory refusal stays
+typed: `a7_a_refused_or_oversize_nowait_call_is_typed_and_rolls_back`. r921 (b01eb1e7): clippy -p
+amphora --all-targets clean; tests database 13/13, store 15/15, call_nowait_charge 1/1, lib store::
+4/4.
+
+**Unit 2, refusals by cause.** The `nowait` bench counts refusals at submit and through the answer
+by cause: `memory` (`Full`, now with one source, the budget's room for queues), `deadline`
+(`Timeout`, `UnknownOutcome`) and `other`; there is no queue cause left to count. Each line also
+records memory pressure (system and the process's cgroup), the cgroup's `memory.current` and
+`memory.max`, and the budget's room for queues.
+
+**Unit 3, the A/B (r949, adacachy2, needs cpus=16,mem=48g, release binary admission-b01eb1e7;
+on main as 5703a869, whose later commits only reformat the call path).** `admission <dir> 1000 3
+1000,10000 nowait 5 16`: 16 pool threads, arms alternated in each of 5 rounds (3 s windows after
+1 s warm-up), once unconstrained, then once inside one `systemd-run --user --scope -p
+MemoryMax=1G` (the bench read `memory.max` 1,073,741,824 in every line). One shared
+`XDG_CACHE_HOME` for both runs (RULES 5e). Load 51-137 on 32 cores (other lanes' work), CPU
+pressure avg10 5-70%, I/O 2-15%, memory 1-4%; the scope's own memory pressure 0.00 throughout.
+"in flight" is Little's law (p50 x calls/s), median of rounds. Median [range] of 5 rounds:
+
+| cond | arm | offered | in flight | p50 ms | p99 ms | p99.9 ms | calls/s | refused (memory, at submit, per 3 s) |
+|---|---|---|---|---|---|---|---|---|
+| free | flat | 1k | 857 | 20.2 [14.9-22.4] | 70.0 [17.1-112.1] | 78.3 [19.0-116.0] | 40,467 [27,527-67,722] | 0 |
+| free | declared | 1k | 794 | 20.0 [15.7-23.9] | 73.8 [56.8-89.7] | 83.7 [63.0-103.3] | 39,767 [30,231-47,979] | 0 |
+| free | measured | 1k | 822 | 32.4 [24.7-61.4] | 94.1 [71.8-257.1] | 114.2 [85.6-269.0] | 26,936 [11,420-33,251] | 0 |
+| free | flat | 10k | 2,950 | 76.5 [58.6-109.3] | 241.4 [72.8-623.8] | 250.9 [74.6-648.2] | 38,568 [20,793-67,068] | 18,020 [2,866-39,104] |
+| free | declared | 10k | 7,969 | 245.0 [199.3-324.3] | 720.0 [356.0-1,058] | 735.6 [362.1-1,101] | 37,032 [24,574-41,505] | 0 |
+| free | measured | 10k | 7,422 | 276.1 [193.1-656.2] | 853.7 [461.0-949.4] | 878.1 [470.5-970.3] | 28,158 [14,944-38,227] | 0 |
+| 1G | flat | 1k | 26 | 0.6 [0.5-0.8] | 2.1 [1.0-2.8] | 4.3 [1.5-5.3] | 40,875 [27,693-55,042] | 97,800 [58,897-147,677] |
+| 1G | declared | 1k | 877 | 18.9 [15.1-31.8] | 36.3 [19.0-84.3] | 43.4 [22.1-91.5] | 50,820 [26,065-66,198] | 0 |
+| 1G | measured | 1k | 881 | 26.9 [18.9-36.5] | 65.5 [25.0-121.4] | 68.4 [25.8-152.9] | 32,295 [24,066-50,901] | 0 |
+| 1G | flat | 10k | 22 | 0.6 [0.5-0.7] | 2.4 [0.8-3.6] | 5.1 [1.1-10.0] | 35,387 [30,103-60,735] | 86,338 [63,984-164,540] |
+| 1G | declared | 10k | 9,994 | 215.7 [151.3-324.2] | 470.1 [164.0-512.5] | 493.8 [165.1-525.5] | 40,575 [29,853-66,045] | 0 |
+| 1G | measured | 10k | 9,950 | 273.7 [182.9-329.8] | 298.6 [198.1-626.9] | 300.8 [199.3-633.3] | 36,350 [26,792-54,610] | 0 |
+
+No refusal had a deadline or other cause, and none came through an answer, in any arm. Losses
+first:
+
+- **Flat loses admission.** Its 32 MiB charge per call held at most ~3,930 calls in the budget's
+  132 GB room unconstrained (2,950 in flight at 10k, 18k refused per 3 s) and 32 in the 1 GiB
+  scope (22-26 in flight, 86-98k refused per 3 s). Its low latency at 1G measures those ~25
+  admitted calls, not the offered load: refused callers wait outside the timed region.
+- **Measured is slower than declared at p50 and in calls/s in all four cells** (p50 +62%, +13%,
+  +42%, +27%; calls/s -32%, -24%, -36%, -10%), A6's and A7's sign again. At 1k unconstrained
+  the p50 ranges don't overlap; elsewhere they do.
+- **Measured's tails are lower at 10k in the 1 GiB scope** (p99 299 vs 470 ms, p99.9 301 vs
+  494 ms by median, ranges overlapping). Every other tail favours declared, also overlapping.
+- **The scope was short only for flat.** Declared and measured charge ~1-2 KB a call: 10k of them
+  are ~20 MB, and the scope's `memory.current` stayed 17-35 MB of 1 GiB. So the case where the
+  charge decides who gets in between declared and measured (answers near the room) is still not
+  exercised; it needs a smaller scope or larger answers.
+- **Limiter (inferred, not profiled):** calls/s is ~27-51k in every arm at both 1k and 10k, and
+  p50 ≈ in flight / calls/s (10k / 40k/s = 250 ms), so latency at 10k is queueing behind the one
+  writer; the charge moves p50 through the writer's throughput (measured's second budget take runs
+  on the writer). A busy host (load 51-137) adds round-to-round spread.
+
+Verdict: no arm wins every cell. Declared wins p50 and calls/s everywhere and the tails in three
+of four cells; measured wins the 10k tails under the 1 GiB scope, within overlapping ranges. Flat
+is out of the running on admission. Not decided (Ada's call by data); no arm deleted.

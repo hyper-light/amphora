@@ -247,6 +247,7 @@ fn t_qt_6_7_leaf_morsels_answer_as_the_serial_vdbe() {
             filter: &filter,
             group_by: &group_by,
             aggregates: &aggregates,
+            sums: crate::RealSums::Serial,
         };
         let pipeline = TableAggregate {
             table: &table,
@@ -395,6 +396,7 @@ fn t_qt_6_9_rowid_alias_and_empty_table() {
         filter: &filter,
         group_by: &[],
         aggregates: &aggregates,
+        sums: crate::RealSums::Serial,
     };
     let pipeline = TableAggregate {
         table: &table,
@@ -3495,4 +3497,172 @@ fn audit_3_p2_real_and_numeric_columns_run_in_parallel_as_the_serial_loop() {
         hooked > parallel_queries.len(),
         "workers ran {hooked} times"
     );
+}
+
+/// The answer at each stated core count, after the serial loop's, with the copied body run over
+/// every one of `rows` rows each time (the parallel path answered, not the serial loop).
+fn g8_answers_at_every_core_count(conn: &Arc<Connection>, sql: &str, rows: u64) -> String {
+    conn.set_parallel_mode(ParallelMode::Off);
+    let serial = format!("{:?}", sql_rows(conn, sql));
+    conn.set_parallel_mode(ParallelMode::On);
+    for cores in [1usize, 2, 4, 8, 16] {
+        *conn.morsel_costs.lock() = Some(MachineCosts::stated(
+            NonZeroUsize::new(cores).unwrap(),
+            1.0,
+            1.0,
+        ));
+        let before = conn
+            .morsel_body_rows
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let parallel = format!("{:?}", sql_rows(conn, sql));
+        let after = conn
+            .morsel_body_rows
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(parallel, serial, "{sql} on {cores} cores");
+        assert_eq!(
+            after - before,
+            rows,
+            "{sql} on {cores} cores: the body's rows"
+        );
+    }
+    conn.set_parallel_mode(ParallelMode::Off);
+    serial
+}
+
+/// Lane G8, arm (b) of the SUM-over-REAL A/B (`RealSums::Exact`): SUM, AVG and TOTAL over REALs,
+/// INTEGERs and both mixed run on the workers and answer bit for bit as the serial loop at 1, 2,
+/// 4, 8 and 16 stated cores, grouped or not, on prices, magnitudes from 1e-300 to 1e300 and
+/// integers past 2^53 before and after the first REAL.
+#[test]
+fn g8_exact_real_sums_answer_as_the_serial_loop_at_every_worker_count() {
+    if crate::storage::versioned::switch::pager_only(
+        "its subject is the morsel hook over the pager's leaf pages (that the workers ran)",
+    ) {
+        return;
+    }
+    let conn = open(":memory:g8-exact");
+    conn.set_real_sums(crate::RealSums::Exact);
+    let mut rng = ChaCha8Rng::seed_from_u64(88);
+    let pad = "x".repeat(64);
+    let rows = 3000u64;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, g INTEGER, r REAL, a INTEGER, p TEXT)")
+        .unwrap();
+    let reals = [
+        "NULL", "-0.0", "1e300", "-1e300", "1e-300", "5e-324", "0.1", "-0.3", "1e16",
+    ];
+    let integers = [
+        "NULL",
+        "0",
+        "1",
+        "-7",
+        "9007199254740993",
+        "-4611686018427387905",
+    ];
+    conn.execute("BEGIN").unwrap();
+    for _ in 0..rows {
+        let g = rng.random_range(0i64..4);
+        let r = if rng.random_range(0..3) == 0 {
+            reals[rng.random_range(0..reals.len())].to_string()
+        } else {
+            format!(
+                "{}.{:02}",
+                rng.random_range(-100_000i64..100_000),
+                rng.random_range(0..100)
+            )
+        };
+        let a = integers[rng.random_range(0..integers.len())];
+        conn.execute(format!(
+            "INSERT INTO t(g, r, a, p) VALUES ({g}, {r}, {a}, '{pad}')"
+        ))
+        .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    for sql in [
+        "SELECT SUM(r), AVG(r), TOTAL(r) FROM t",
+        "SELECT g, SUM(r), AVG(r), TOTAL(r), COUNT(*) FROM t GROUP BY g",
+        "SELECT SUM(r * 3), AVG(r + a), TOTAL(r - g) FROM t WHERE g > 0",
+        "SELECT g, SUM(CASE WHEN id % 3 = 0 THEN a ELSE r END), TOTAL(a), AVG(a) FROM t GROUP BY g",
+    ] {
+        g8_answers_at_every_core_count(&conn, sql, rows);
+    }
+}
+
+/// Lane G8, arm (b): the exact sum rounded once, on the serial loop and the workers alike, on the
+/// cases a compensated sum can get wrong or that SQLite gives meaning to: cancellation, huge with
+/// tiny, subnormals, both signs of zero, infinities (both met: NULL).
+#[test]
+fn g8_exact_real_sums_hold_the_hard_cases() {
+    if crate::storage::versioned::switch::pager_only(
+        "its subject is the morsel hook over the pager's leaf pages (that the workers ran)",
+    ) {
+        return;
+    }
+    let conn = open(":memory:g8-hard");
+    conn.set_real_sums(crate::RealSums::Exact);
+    let pad = "x".repeat(64);
+    let rows = 1500usize;
+    // Each case's exact sum from the values as the engine parsed them (its decimal parsing is
+    // not this test's subject): `stored` in row order.
+    type Exact = fn(&[f64]) -> Option<f64>;
+    let cases: [(&str, &[&str], Exact); 9] = [
+        ("cancellation", &["1e16", "1.0", "-1e16"], |v| Some(v[1])),
+        ("tenths", &["0.1", "0.2", "-0.3"], |v| {
+            // Each is a multiple of 2^-60 below 2^4: their sum in 2^-60ths is exact in an i128,
+            // and an i128's conversion rounds to nearest, ties to even.
+            let sixtieths: i128 = v.iter().map(|x| (x * 2f64.powi(60)) as i128).sum();
+            Some(sixtieths as f64 * 2f64.powi(-60))
+        }),
+        ("huge with tiny", &["1e300", "1e-300", "-1e300"], |v| {
+            Some(v[1])
+        }),
+        ("subnormals", &["5e-324"; 7], |v| Some(v[0] * 7.0)),
+        ("zeros", &["-0.0", "-0.0"], |_| Some(0.0)),
+        ("plus infinity", &["9e999", "1.0"], |_| Some(f64::INFINITY)),
+        ("minus infinity", &["-9e999", "-1.0"], |_| {
+            Some(f64::NEG_INFINITY)
+        }),
+        ("both infinities", &["9e999", "-9e999", "1.0"], |_| None),
+        ("past 2^53", &["9007199254740992.0", "1.0", "1.0"], |v| {
+            Some(v[0] + 2.0)
+        }),
+    ];
+    for (at, (name, values, exact)) in cases.iter().enumerate() {
+        let table = format!("h{at}");
+        conn.execute(format!(
+            "CREATE TABLE {table}(id INTEGER PRIMARY KEY, r REAL, p TEXT)"
+        ))
+        .unwrap();
+        conn.execute("BEGIN").unwrap();
+        for row in 0..rows {
+            // The case's values spread over the table's leaves, NULLs between them.
+            let place = (0..values.len()).find(|k| (k + 1) * rows / (values.len() + 1) == row);
+            let r = place.map_or("NULL", |k| values[k]);
+            conn.execute(format!("INSERT INTO {table}(r, p) VALUES ({r}, '{pad}')"))
+                .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+        let sql = format!("SELECT SUM(r), TOTAL(r), AVG(r) FROM {table}");
+        let answer = g8_answers_at_every_core_count(&conn, &sql, rows as u64);
+        let stored: Vec<f64> = sql_rows(
+            &conn,
+            &format!("SELECT r FROM {table} WHERE r IS NOT NULL ORDER BY id"),
+        )
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Numeric(crate::numeric::Numeric::Float(f)) => f64::from(*f),
+            other => panic!("{name}: a stored REAL is {other:?}"),
+        })
+        .collect();
+        let sum = exact(&stored);
+        let real = |value: Option<f64>| match value {
+            Some(value) => Value::from_f64(value),
+            None => Value::Null,
+        };
+        let expected = vec![vec![
+            real(sum),
+            real(sum),
+            real(sum.map(|sum| sum / values.len() as f64)),
+        ]];
+        assert_eq!(answer, format!("{expected:?}"), "{name}");
+    }
 }
