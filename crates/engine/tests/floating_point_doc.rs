@@ -297,6 +297,7 @@ mod fp_digits {
         assert_eq!(real_to_text_digits(1.0 / 3.0, at(3)), "0.333");
         assert_eq!(real_to_text_digits(2.0 / 3.0, at(5)), "0.66667");
         assert_eq!(real_to_text_digits(123_456.0, at(3)), "1.23e+05");
-        assert_eq!(real_to_text_digits(0.1, at(20)), "0.100000000000000006");
+        // sqlite3FpDecode carries 19 digits at most (its 64-bit product), so 20 asks more than it has
+        assert_eq!(real_to_text_digits(0.1, at(20)), "0.1000000000000000056");
     }
 }
