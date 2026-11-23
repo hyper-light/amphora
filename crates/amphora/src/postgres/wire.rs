@@ -36,6 +36,8 @@ impl SqlState {
     pub const CHARACTER_NOT_IN_REPERTOIRE: Self = Self("22021");
     pub const SYNTAX_ERROR: Self = Self("42601");
     pub const INTERNAL_ERROR: Self = Self("XX000");
+    pub const OUT_OF_MEMORY: Self = Self("53200");
+    pub const TOO_MANY_CONNECTIONS: Self = Self("53300");
 
     #[must_use]
     pub fn code(self) -> &'static str {
