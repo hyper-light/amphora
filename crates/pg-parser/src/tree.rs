@@ -60,13 +60,7 @@ pub enum Node {
         with_clause: Option<NodeId>,
         override_kind: i32,
     },
-    /// SelectStmt as a simple SELECT or VALUES builds it (`op` SETOP_NONE, no set operands).
-    SelectStmt {
-        target_list: Vec<NodeId>,
-        from_clause: Vec<NodeId>,
-        where_clause: Option<NodeId>,
-        values_lists: Vec<NodeId>,
-    },
+    SelectStmt(Box<SelectStmt>),
     RangeVar {
         catalogname: Option<String>,
         schemaname: Option<String>,
@@ -106,6 +100,31 @@ pub enum Node {
         typmod: i32,
         location: i32,
     },
+}
+
+/// parsenodes.h's SelectStmt, fields in struct order; `default()` is makeNode's zeroed node.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SelectStmt {
+    pub distinct_clause: Vec<NodeId>,
+    pub into_clause: Option<NodeId>,
+    pub target_list: Vec<NodeId>,
+    pub from_clause: Vec<NodeId>,
+    pub where_clause: Option<NodeId>,
+    pub group_clause: Vec<NodeId>,
+    pub group_distinct: bool,
+    pub having_clause: Option<NodeId>,
+    pub window_clause: Vec<NodeId>,
+    pub values_lists: Vec<NodeId>,
+    pub sort_clause: Vec<NodeId>,
+    pub limit_offset: Option<NodeId>,
+    pub limit_count: Option<NodeId>,
+    pub limit_option: i32,
+    pub locking_clause: Vec<NodeId>,
+    pub with_clause: Option<NodeId>,
+    pub op: i32,
+    pub all: bool,
+    pub larg: Option<NodeId>,
+    pub rarg: Option<NodeId>,
 }
 
 /// A tree's arena: a node index that isn't in it, or an arena past `u32` nodes.
@@ -229,7 +248,11 @@ impl Tree {
                     Token(savepoint_name.as_deref()),
                     Text(" :gid "),
                     Token(gid.as_deref()),
-                    Text(if *chain { " :chain true" } else { " :chain false" }),
+                    Text(if *chain {
+                        " :chain true"
+                    } else {
+                        " :chain false"
+                    }),
                 ]);
                 location(p, " :location ", *at);
                 p.push(Text("}"));
@@ -281,22 +304,52 @@ impl Tree {
                 Int(i64::from(*override_kind)),
                 Text("}"),
             ]),
-            Node::SelectStmt {
-                target_list,
-                from_clause,
-                where_clause,
-                values_lists,
-            } => p.extend([
-                Text("{SELECTSTMT :distinctClause <> :intoClause <> :targetList "),
-                List(target_list),
-                Text(" :fromClause "),
-                List(from_clause),
-                Text(" :whereClause "),
-                N(*where_clause),
-                Text(" :groupClause <> :groupDistinct false :havingClause <> :windowClause <> :valuesLists "),
-                List(values_lists),
-                Text(" :sortClause <> :limitOffset <> :limitCount <> :limitOption 0 :lockingClause <> :withClause <> :op 0 :all false :larg <> :rarg <>}"),
-            ]),
+            Node::SelectStmt(n) => {
+                let truth = |b: bool| if b { "true" } else { "false" };
+                p.extend([
+                    Text("{SELECTSTMT :distinctClause "),
+                    List(&n.distinct_clause),
+                    Text(" :intoClause "),
+                    N(n.into_clause),
+                    Text(" :targetList "),
+                    List(&n.target_list),
+                    Text(" :fromClause "),
+                    List(&n.from_clause),
+                    Text(" :whereClause "),
+                    N(n.where_clause),
+                    Text(" :groupClause "),
+                    List(&n.group_clause),
+                    Text(" :groupDistinct "),
+                    Text(truth(n.group_distinct)),
+                    Text(" :havingClause "),
+                    N(n.having_clause),
+                    Text(" :windowClause "),
+                    List(&n.window_clause),
+                    Text(" :valuesLists "),
+                    List(&n.values_lists),
+                    Text(" :sortClause "),
+                    List(&n.sort_clause),
+                    Text(" :limitOffset "),
+                    N(n.limit_offset),
+                    Text(" :limitCount "),
+                    N(n.limit_count),
+                    Text(" :limitOption "),
+                    Int(i64::from(n.limit_option)),
+                    Text(" :lockingClause "),
+                    List(&n.locking_clause),
+                    Text(" :withClause "),
+                    N(n.with_clause),
+                    Text(" :op "),
+                    Int(i64::from(n.op)),
+                    Text(" :all "),
+                    Text(truth(n.all)),
+                    Text(" :larg "),
+                    N(n.larg),
+                    Text(" :rarg "),
+                    N(n.rarg),
+                    Text("}"),
+                ]);
+            }
             Node::RangeVar {
                 catalogname,
                 schemaname,

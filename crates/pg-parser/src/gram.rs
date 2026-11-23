@@ -11,7 +11,7 @@ use crate::gram_tables::{
     R1, R2, TABLE, TABLE_ERROR, TRANSLATE,
 };
 use crate::lex::{self, Lexer, ScanError, cursor};
-use crate::tree::{Node, NodeId, TransactionStmtKind, Tree, TreeFault, Val};
+use crate::tree::{Node, NodeId, SelectStmt, TransactionStmtKind, Tree, TreeFault, Val};
 
 /// yacc.c's YYMAXDEPTH, 10000 when the grammar doesn't define it (gram.y doesn't): a parse whose
 /// stack would hold that many states is refused "memory exhausted", as 19 refuses it.
@@ -110,6 +110,11 @@ pub enum Value {
     /// `List *`, NIL as empty.
     List(Vec<NodeId>),
     Bool(bool),
+    /// gram.y's GroupClause: GROUP BY's list and whether it said DISTINCT.
+    Group {
+        distinct: bool,
+        list: Vec<NodeId>,
+    },
     /// A value an unported action would have made: the statement is answered 0A000.
     Unported,
 }
@@ -158,6 +163,13 @@ impl Reduce<'_> {
     fn boolean(&mut self, n: usize) -> Result<bool, Refusal> {
         match self.take(n) {
             Value::Bool(b) => Ok(b),
+            _ => Err(fault()),
+        }
+    }
+
+    fn group(&mut self, n: usize) -> Result<(bool, Vec<NodeId>), Refusal> {
+        match self.take(n) {
+            Value::Group { distinct, list } => Ok((distinct, list)),
             _ => Err(fault()),
         }
     }
@@ -216,6 +228,20 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         1516 => (0xcafd_31ef_0f34_4799, |_| Ok(Value::Bool(true))),
         // opt_transaction_chain: AND NO CHAIN | /* EMPTY */
         1517 | 1518 => (0xc7dd_6751_cbba_2e22, |_| Ok(Value::Bool(false))),
+        // InsertStmt: opt_with_clause INSERT INTO insert_target insert_rest
+        1642 => (0x2105_41e7_4a78_96e0, insert_stmt),
+        // insert_target: qualified_name
+        1643 => (0x85ed_2683_fbb2_8bba, top),
+        // insert_rest: '(' insert_column_list ')' SelectStmt
+        1647 => (0xdb9b_ea3e_cc7b_6905, insert_rest),
+        // insert_column_list: insert_column_item
+        1652 => (0x971e_4de7_6334_f2bf, list1),
+        // insert_column_list: insert_column_list ',' insert_column_item
+        1653 => (0x4811_b036_e1ca_20fe, append),
+        // insert_column_item: ColId opt_indirection
+        1654 => (0x35fc_0e09_2286_8396, column_target),
+        // opt_on_conflict: /* EMPTY */
+        1658 => (0x0f49_8f67_e462_b676, null),
         // returning_clause: /* EMPTY */
         1663 => (0x90e3_6cac_3351_2d39, null),
         // UpdateStmt: opt_with_clause UPDATE relation_expr_opt_alias
@@ -226,14 +252,38 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         1693 => (0x4bef_6d70_91a3_86ad, set_clause),
         // set_target: ColId opt_indirection
         1695 => (0x5914_3a79_afda_e407, column_target),
+        // select_no_parens: simple_select
+        1735 => (0xfd2f_9ec2_19c8_d787, top),
+        // simple_select: SELECT opt_all_clause opt_target_list
+        1745 => (0x5a6d_b6e1_b8fa_52e2, simple_select),
+        // simple_select: values_clause
+        1747 => (0x9113_5026_c13a_e4a7, top),
         // opt_with_clause: /* EMPTY */
         1768 => (0xf8ee_ad8a_b545_1b54, null),
+        // into_clause: /* EMPTY */
+        1770 => (0xb6f0_5cf7_ff18_9c86, null),
+        // group_clause: /* EMPTY */
+        1825 => (0x0321_6edd_97cb_a203, no_group),
+        // having_clause: /* EMPTY */
+        1838 => (0x2ef6_8e2d_5a42_4abc, null),
+        // values_clause: VALUES '(' expr_list ')'
+        1854 => (0x3037_617e_9420_4e91, values_clause),
+        // from_clause: FROM from_list
+        1856 => (0x1509_2582_214f_28d3, top),
         // from_clause: /* EMPTY */
         1857 => (0x1e2a_fd0a_a524_9ce8, nil),
+        // from_list: table_ref
+        1858 => (0x41fd_9d1b_bdab_ed5c, list1),
+        // table_ref: relation_expr opt_alias_clause
+        1860 => (0x35dd_dca3_624f_7135, aliased_relation),
+        // opt_alias_clause: /* EMPTY */
+        1883 => (0xd843_f1a2_034c_c3a2, null),
         // relation_expr: qualified_name
         1899 => (0x0f6f_0ebf_dca7_954d, relation_expr),
         // relation_expr_opt_alias: relation_expr
         1906 => (0x85ed_2683_fbb2_8bba, top),
+        // where_clause: WHERE a_expr
+        1921 => (0x9113_5026_c13a_e4a7, top),
         // where_or_current_clause: WHERE a_expr
         1923 => (0x9113_5026_c13a_e4a7, top),
         // a_expr: c_expr
@@ -250,10 +300,28 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         2141 => (0x9113_5026_c13a_e4a7, top),
         // c_expr: PARAM opt_indirection
         2142 => (0x251d_c253_e0dc_bc54, param),
+        // c_expr: func_expr
+        2145 => (0xcc48_388e_3a70_ab47, top),
+        // func_expr: func_expr_common_subexpr
+        2163 => (0xcc48_388e_3a70_ab47, top),
+        // func_expr_common_subexpr: CURRENT_TIMESTAMP
+        2171 => (0x0be0_fa0f_61cc_cb63, current_timestamp),
+        // window_clause: /* EMPTY */
+        2263 => (0x1e2a_fd0a_a524_9ce8, nil),
+        // expr_list: a_expr
+        2324 => (0x57a1_7057_3bfa_0539, list1),
+        // expr_list: expr_list ',' a_expr
+        2325 => (0x3f88_1f70_44bd_239a, append),
         // columnref: ColId
         2372 => (0xe7f0_4492_1ba8_ebf2, columnref),
         // opt_indirection: /* EMPTY */
         2382 => (0x1e2a_fd0a_a524_9ce8, nil),
+        // opt_target_list: target_list
+        2454 => (0x8af9_73ea_c57a_9113, top),
+        // target_list: target_el
+        2456 => (0x5aa0_8862_5693_2d5f, list1),
+        // target_el: a_expr
+        2460 => (0xfe9d_afba_fed1_0593, target_el),
         // qualified_name: ColId
         2464 => (0x74ff_14c1_e4b9_74b6, qualified_name),
         // AexprConst: Iconst
@@ -480,6 +548,127 @@ fn columnref(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
     let field = r.push(Node::String(name))?;
     r.make(Node::ColumnRef {
         fields: vec![field],
+        location,
+    })
+}
+
+fn simple_select(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let target_list = r.list(3)?;
+    let into_clause = r.node(4)?;
+    let from_clause = r.list(5)?;
+    let where_clause = r.node(6)?;
+    let (group_distinct, group_clause) = r.group(7)?;
+    let having_clause = r.node(8)?;
+    let window_clause = r.list(9)?;
+    r.make(Node::SelectStmt(Box::new(SelectStmt {
+        target_list,
+        into_clause,
+        from_clause,
+        where_clause,
+        group_clause,
+        group_distinct,
+        having_clause,
+        window_clause,
+        ..SelectStmt::default()
+    })))
+}
+
+fn no_group(_: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    Ok(Value::Group {
+        distinct: false,
+        list: Vec::new(),
+    })
+}
+
+/// `VALUES '(' expr_list ')'`: the row as a List node, the one element of valuesLists.
+fn values_clause(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let row = r.list(3)?;
+    let row = r.push(Node::List(row))?;
+    r.make(Node::SelectStmt(Box::new(SelectStmt {
+        values_lists: vec![row],
+        ..SelectStmt::default()
+    })))
+}
+
+/// `list_make1($1)`.
+fn list1(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    Ok(Value::List(vec![r.node(1)?.ok_or_else(fault)?]))
+}
+
+/// `lappend($1, $3)`.
+fn append(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let mut list = r.list(1)?;
+    list.push(r.node(3)?.ok_or_else(fault)?);
+    Ok(Value::List(list))
+}
+
+/// `table_ref: relation_expr opt_alias_clause`.
+fn aliased_relation(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let relation = r.node(1)?.ok_or_else(fault)?;
+    let to = r.node(2)?;
+    let Node::RangeVar { alias, .. } = r.tree.get_mut(relation)? else {
+        return Err(fault());
+    };
+    *alias = to;
+    Ok(Value::Node(Some(relation)))
+}
+
+/// `target_el: a_expr`: a ResTarget with no name.
+fn target_el(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let val = r.node(1)?;
+    let location = r.at(1)?;
+    r.make(Node::ResTarget {
+        name: None,
+        indirection: Vec::new(),
+        val,
+        location,
+    })
+}
+
+/// `insert_rest: '(' insert_column_list ')' SelectStmt`.
+fn insert_rest(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let cols = r.list(2)?;
+    let select_stmt = r.node(4)?;
+    r.make(Node::InsertStmt {
+        relation: None,
+        cols,
+        select_stmt,
+        on_conflict_clause: None,
+        returning_clause: None,
+        with_clause: None,
+        override_kind: 0,
+    })
+}
+
+fn insert_stmt(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let with = r.node(1)?;
+    let target = r.node(4)?;
+    let stmt = r.node(5)?.ok_or_else(fault)?;
+    let on_conflict = r.node(6)?;
+    let returning = r.node(7)?;
+    let Node::InsertStmt {
+        relation,
+        on_conflict_clause,
+        returning_clause,
+        with_clause,
+        ..
+    } = r.tree.get_mut(stmt)?
+    else {
+        return Err(fault());
+    };
+    *relation = target;
+    *on_conflict_clause = on_conflict;
+    *returning_clause = returning;
+    *with_clause = with;
+    Ok(Value::Node(Some(stmt)))
+}
+
+/// makeSQLValueFunction(SVFOP_CURRENT_TIMESTAMP, -1, @1); primnodes.h numbers that op 3.
+fn current_timestamp(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let location = r.at(1)?;
+    r.make(Node::SqlValueFunction {
+        op: 3,
+        typmod: -1,
         location,
     })
 }
@@ -722,7 +911,7 @@ mod tests {
                 n += 1;
             }
         }
-        assert_eq!(n, 33);
+        assert_eq!(n, 61);
     }
 
     /// T-PG.5.1: a syntax error is 42601 at the token 19 names (1-based characters), the end of
