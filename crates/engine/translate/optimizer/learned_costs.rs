@@ -603,8 +603,21 @@ fn sample_every(timing_nanos: f64, epoch: f64, sd: Option<f64>) -> Option<u64> {
         return None;
     }
     let k = (timing_nanos * epoch.sqrt() / sd).powf(2.0 / 3.0);
-    // The nearest whole number of runs.
-    Some(k.round().clamp(1.0, epoch) as u64)
+    // The nearest whole number of runs: finite and at least 1 (its parts positive, the clamp's
+    // bounds finite); past `u64::MAX`, `u64::MAX`, saturating.
+    let runs = num_traits::ToPrimitive::to_u64(&k.round().clamp(1.0, epoch));
+    Some(runs.unwrap_or(u64::MAX))
+}
+
+/// `x` truncated toward zero as a `usize`, saturating as a float's `as` cast does: NaN or
+/// negative, 0; past `usize::MAX` (or infinite), `usize::MAX`. Exact for every whole count in
+/// range.
+fn saturating_usize(x: f64) -> usize {
+    match num_traits::ToPrimitive::to_usize(&x) {
+        Some(whole) => whole,
+        None if x > 0.0 => usize::MAX,
+        None => 0,
+    }
 }
 
 impl LearnedCosts {
@@ -740,7 +753,7 @@ impl LearnedCosts {
     /// The page reads an epoch of the page read's rate holds: the most the open's anchor times
     /// (`time_page_read`), as calibration times each kind of work up to a page of it.
     pub(crate) fn page_read_epoch(&self) -> usize {
-        self.rates.lock().page.epoch.max(1.0) as usize
+        saturating_usize(self.rates.lock().page.epoch.max(1.0))
     }
 }
 
@@ -787,9 +800,17 @@ const CALIBRATED: [Work; 7] = [
     Work::WhereStep,
 ];
 
+/// The 8-byte keys of one page (`BufferPool::DEFAULT_PAGE_SIZE`): calibration's repetition
+/// bound (`calibrate`, `cost_fit::clock_read_nanos`).
+pub(crate) const PAGE_KEYS: usize = match PAGE_BYTES.checked_div(std::mem::size_of::<u64>()) {
+    Some(keys) => keys,
+    None => 0,
+};
+const PAGE_BYTES: usize = crate::storage::buffer_pool::BufferPool::DEFAULT_PAGE_SIZE;
+
 /// The keys of one page calibration times each kind of work over (`calibrate`).
 fn calibration_keys() -> usize {
-    crate::storage::buffer_pool::BufferPool::DEFAULT_PAGE_SIZE / std::mem::size_of::<u64>()
+    PAGE_KEYS
 }
 
 impl Calibration {
@@ -1109,13 +1130,20 @@ fn measure_calibration(clock: &mut dyn FnMut() -> f64) -> Calibration {
     let mut filter =
         crate::vdbe::bloom_filter::BloomFilter::sized(crate::vdbe::bloom_filter::FilterSizing {
             fp_per_key,
-            max_bytes: n.saturating_mul(2 * std::mem::size_of::<u64>()),
+            max_bytes: n
+                .saturating_mul(std::mem::size_of::<u64>())
+                .saturating_mul(2),
         });
     for k in &keys {
-        filter.insert_i64(*k as i64);
+        // The key's bits as they are: a mixed key, not a number.
+        filter.insert_i64(i64::from_ne_bytes(k.to_ne_bytes()));
     }
     filter.seal();
-    let absent: Vec<i64> = (n as u64..2 * n as u64).map(|i| mix(i) as i64).collect();
+    // The page's next `n` keys, none of them the page's own.
+    let absent: Vec<i64> = (n as u64..)
+        .take(n)
+        .map(|i| i64::from_ne_bytes(mix(i).to_ne_bytes()))
+        .collect();
     let mut bloom = || {
         for k in &absent {
             black_box(filter.contains_i64(black_box(*k)));
@@ -1124,7 +1152,7 @@ fn measure_calibration(clock: &mut dyn FnMut() -> f64) -> Calibration {
     // A condition's step: each key, as one of the engine's values, compared with another.
     let values: Vec<crate::Value> = keys
         .iter()
-        .map(|k| crate::Value::from_i64(*k as i64))
+        .map(|k| crate::Value::from_i64(i64::from_ne_bytes(k.to_ne_bytes())))
         .collect();
     let pivot = crate::Value::from_i64(0);
     let mut step = || {
@@ -1161,7 +1189,7 @@ fn measure_calibration(clock: &mut dyn FnMut() -> f64) -> Calibration {
     // at a time.
     let mut sampled: [(usize, Vec<f64>, bool); 7] = Default::default();
     for ((_, _, work), (reps, _, _)) in kinds.iter_mut().zip(sampled.iter_mut()) {
-        *reps = measure(clock, target, n, &mut **work).0 as usize;
+        *reps = saturating_usize(measure(clock, target, n, &mut **work).0);
     }
     for round in 1..=n {
         for ((_, _, work), (reps, samples, settled)) in kinds.iter_mut().zip(sampled.iter_mut()) {
@@ -1230,9 +1258,9 @@ fn median_se(samples: &mut [f64]) -> Option<f64> {
     samples.sort_unstable_by(f64::total_cmp);
     let half = count as f64 / 2.0;
     let reach = (count as f64).sqrt() / 2.0;
-    let last = (count - 1) as f64;
-    let low = (half - reach).floor().clamp(0.0, last) as usize;
-    let high = (half + reach).ceil().clamp(0.0, last) as usize;
+    let last = count.checked_sub(1)? as f64;
+    let low = saturating_usize((half - reach).floor().clamp(0.0, last));
+    let high = saturating_usize((half + reach).ceil().clamp(0.0, last));
     match (samples.get(low), samples.get(high)) {
         (Some(low), Some(high)) => Some((high - low) / 2.0),
         _ => None,
@@ -1346,7 +1374,13 @@ pub(crate) fn time_page_read(
     page_size: usize,
     most_reads: usize,
 ) -> Option<(f64, f64)> {
-    let page: Vec<u8> = (0..page_size).map(|i| mix(i as u64) as u8).collect();
+    // Each byte a mix's low byte.
+    let page: Vec<u8> = (0..page_size)
+        .map(|i| {
+            let [low, ..] = mix(i as u64).to_le_bytes();
+            low
+        })
+        .collect();
     let scratch = if crate::database::is_memory_like(db_path) {
         format!(":memory:-page-read-{}", uuid::Uuid::new_v4().simple())
     } else {
@@ -1385,11 +1419,11 @@ fn read_through_io(
             let read = file.pread(
                 0,
                 Completion::new_read(Arc::new(Buffer::new(vec![0; len])), move |res| match res {
-                    Ok((_, n)) if n as usize == len => None,
+                    Ok((_, n)) if usize::try_from(n).ok() == Some(len) => None,
                     Ok((_, n)) => Some(crate::error::CompletionError::ShortRead {
                         page_idx: 0,
                         expected: len,
-                        actual: n.max(0) as usize,
+                        actual: usize::try_from(n).unwrap_or(0),
                     }),
                     Err(err) => Some(err),
                 }),

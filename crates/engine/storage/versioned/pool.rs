@@ -244,8 +244,12 @@ impl Fit {
     /// ([`Pool::read_run`]).
     fn target(&self) -> u64 {
         match self.line() {
-            // A float's cast saturates: past `u64::MAX`, `u64::MAX`.
-            Some((fixed, each)) => (fixed / each).ceil() as u64,
+            // Both positive and finite, so the quotient is positive: past `u64::MAX` (or
+            // infinite), `u64::MAX`, saturating.
+            Some((fixed, each)) => {
+                let pages = num_traits::ToPrimitive::to_u64(&(fixed / each).ceil());
+                pages.unwrap_or(u64::MAX)
+            }
             None => self.largest.max(1).saturating_mul(2),
         }
     }
@@ -571,7 +575,7 @@ impl Pool {
         if i >= self.capacity {
             return None;
         }
-        let k = usize::BITS - 1 - i.checked_add(1)?.leading_zeros();
+        let k = i.checked_add(1)?.checked_ilog2()?;
         let start = run_start(k);
         let cell = self.runs.get(usize::try_from(k).ok()?)?;
         if let Some(run) = cell.get() {
