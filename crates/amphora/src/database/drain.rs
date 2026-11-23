@@ -297,6 +297,27 @@ mod tests {
         assert!((90..=110).contains(&bound.messages), "{bound:?}");
     }
 
+    /// Lane constants-K2's reproducer: do a reader stall for one interval with work waiting before
+    /// anything is measured, then take 10 messages each 10 ms, finding the queue empty each time,
+    /// under a 100 ms election timeout; expect a bound of at least the 100 messages it showed it
+    /// takes, not the least a queue carries.
+    #[test]
+    fn a_stall_then_a_reader_that_keeps_up_is_not_held_to_the_least() {
+        let mut drain = Drain::default();
+        let timeout = Duration::from_millis(100);
+        drain.sample(0, true);
+        let mut now = 10 * MS;
+        drain.sample(now, true);
+        for _ in 0..40 {
+            now += 10 * MS;
+            drain.drained(100, 10);
+            drain.starved();
+            drain.sample(now, true);
+        }
+        let bound = drain.bound(timeout, LEAST, u64::MAX);
+        assert!(bound.messages >= 100, "{bound:?}");
+    }
+
     /// T-QB.1.3: the reader slows to a tenth: passes when the bound follows it down as the old
     /// samples decay, never below one record; and an interval with no time on the clock adds none.
     #[test]
