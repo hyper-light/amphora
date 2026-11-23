@@ -585,7 +585,10 @@ guard into change 0009, and left batching (V's unit 2) to the successor.
    shorten a lone write on this disk.
 3. **No dqlite numbers.** dqlite's node 2 never started in any round: "create node: failed to set bind address
    127.0.0.1:54252: 1". Nothing listened on 54252 when checked afterwards (`ss -ltn`), and the error is the same in
-   every round, so it is not a port left over from the round before (inferred). Not diagnosed this hour.
+   every round, so it is not a port left over from the round before (inferred). The bench's ports (54200 to 54252)
+   sit inside adacachy2's ephemeral range (`ip_local_port_range` 32768 to 60999), so any outbound connection can hold
+   one as its local port and refuse a bind; no socket of any state held 54252 at 17:55Z (`ss -tan`). That is a
+   hazard, not a proven cause. Not diagnosed further this hour.
 4. **rqlite has 3 rounds, not 5.** Rounds 1 and 2 couldn't bind 127.0.0.1:54210 ("address already in use"), most
    likely members the failing Amphora arm left running (round 1's own Amphora run hit "Address already in use"
    too). Rounds 3 to 5 ran.
