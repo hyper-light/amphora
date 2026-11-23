@@ -2720,6 +2720,42 @@ mod builds {
         assert_eq!(registry.claim_build(ROOT), None);
     }
 
+    /// T-SKU.10, AC-NS.2.1: pin after an unrelated commit while a told writer is
+    /// open, then after a write between the snapshot sample and the pin.
+    #[test]
+    fn t_sku_10_versioned_build_pins_respect_writes() {
+        use crate::skipping::SkipRefusal;
+        let insert = RowWrite::Insert {
+            rowid: 3,
+            value: Some(1),
+        };
+        for mode in [BuildMode::Replay, BuildMode::VoidOnWrite] {
+            let registry = registry_over(&[], mode);
+            registry.on_write_told(ROOT, 9, AT, insert, &mut || 0);
+            let claim = registry.claim_build(ROOT).unwrap();
+            let other_commit = (0, 2);
+            assert!(
+                !registry.pin_build(&claim, 1, other_commit, other_commit),
+                "another commit cannot end this writer"
+            );
+            registry.abandon_build(claim);
+            registry.rolled_back(9);
+            assert_eq!(
+                registry.candidates(ROOT, 1, other_commit, other_commit, 1, 1),
+                Err(SkipRefusal::Stale)
+            );
+
+            let registry = registry_over(&[], mode);
+            let claim = registry.claim_build(ROOT).unwrap();
+            registry.on_write_told(ROOT, 9, AT, insert, &mut || 0);
+            registry.committed(9);
+            assert!(
+                !registry.pin_build(&claim, 1, AT, AT),
+                "the sampled snapshot predates the write"
+            );
+        }
+    }
+
     /// Do: a real table whose summary's cracker is due a build, and eight connections that find
     /// it due at once start the build. Expect: one build starts, on its own thread and
     /// connection, and installs a cracker holding every row of the table; none is due after.

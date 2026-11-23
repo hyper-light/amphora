@@ -25,7 +25,8 @@
 //! [`SkipRegistry::claim_build`]: super::SkipRegistry::claim_build
 //! [`SkipRegistry::pin_build`]: super::SkipRegistry::pin_build
 
-use super::{cracker_of_table, nanos_since, BuildClaim, BuildEnd, SkipMethod};
+use super::leaves::LeafCursor;
+use super::{nanos_since, BuildClaim, BuildEnd, SkipMethod};
 use crate::sync::Arc;
 use crate::thread;
 use crate::{ConnectOpts, Connection, Database, EncryptionKey, PageCodec};
@@ -182,13 +183,22 @@ fn build_cracker(
             (conn, Some(ReadTx(pager)))
         }
     };
-    let Some((builder_pos, committed)) = conn.skipping_positions() else {
-        return BuildEnd::Failed;
-    };
     let Some(claim) = held.claim.as_ref() else {
         return BuildEnd::Superseded;
     };
     let root = claim.root_page;
+    // Opening the versioned cursor begins its transaction. Pin that snapshot before
+    // recording writes to replay, so the same write cannot also be in the base copy.
+    let mut cursor = match LeafCursor::open(&conn, root, columns) {
+        Ok(cursor) => cursor,
+        Err(error) => {
+            tracing::debug!(target: "amphora.skipping", root, %error, "cracker could not open its table");
+            return BuildEnd::Failed;
+        }
+    };
+    let Some((builder_pos, committed)) = conn.skipping_positions() else {
+        return BuildEnd::Failed;
+    };
     if !held
         .db
         .skipping
@@ -196,7 +206,7 @@ fn build_cracker(
     {
         return BuildEnd::OlderSnapshot;
     }
-    let cracker = match cracker_of_table(&conn, root, column, columns) {
+    let cracker = match cursor.cracker(column) {
         Ok(cracker) => cracker,
         Err(error) => {
             tracing::debug!(target: "amphora.skipping", root, %error, "cracker could not be built again");

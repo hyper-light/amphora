@@ -736,14 +736,14 @@ impl SkipRegistry {
             || !entry
                 .building
                 .as_ref()
-                .is_some_and(|building| building.ticket == claim.ticket)
+                .is_some_and(|building| building.ticket == claim.ticket && !building.invalidated)
         {
             return false;
         }
         match &entry.pending {
             Some(p) if p.writer == builder => {}
-            // The writer committed since its writes: the newest commit holds them.
-            Some(p) if p.base != committed => entry.pending = None,
+            // Only the single-writer WAL can infer a commit from the position.
+            Some(p) if !p.told && p.base != committed => entry.pending = None,
             Some(_) => return false,
             None => {}
         }
@@ -753,7 +753,6 @@ impl SkipRegistry {
         let replay = entry.build_mode == BuildMode::Replay;
         let bound = held_rows(&entry.skipping);
         if let Some(building) = entry.building.as_mut() {
-            building.invalidated = false;
             building.record = replay.then(Vec::new);
             building.bound = bound;
         }
