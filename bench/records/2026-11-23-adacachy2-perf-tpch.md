@@ -1234,5 +1234,5 @@ then `cargo clippy -p amphora-engine --all-targets --locked -- -D warnings`, the
 amphora-engine --lib --locked -- learned_costs t13_ storage::pager::tests`.
 - r1696 (44515444): check-production passed ("engine-ratchet: 10913 left in the engine's production code
   across 17 lints, as the ratchet holds"), clippy clean, tests 43 of 43.
-- r1705 (59d6e2cd, the merge with main, whose new commits touched `crates/amphora` only): the same three, at
-  `cpus=4,mem=12g`.
+- r1709 (59d6e2cd, the merge with main, whose new commits touched `crates/amphora` only): the same three, at
+  `cpus=2,mem=8g` (r1705 at `cpus=4,mem=12g` was refused: 2 of 32 cores idle).
