@@ -2974,3 +2974,147 @@ differs from the one published only in its fence wakes the waiters; one that dif
 - an answer under `Session` that differs from `Latest`'s for a session carrying its tokens;
 - a read with no token that waits for the log;
 - redirects above 1 in 100 under steady lag (the bound learned is too short).
+
+## Decision (lane snapshots): catch-up pulls pages, never a whole image (2026-11-23)
+
+Ada's goal: replication holds at agentic Meta scale, millions of groups and thousands a host, with members joining,
+restarting and lagging all the time. A lagging member's catch-up never needs the whole database in memory, never
+fences or stalls a healthy member, and never pushes serving p99.9 out. A member that "stays up and says not yet"
+and a member that fences both accept the root problem, so neither is the answer.
+
+### The root problem (read at origin/main 6bcb4838)
+
+- A snapshot is one `data: Vec<u8>` (`vendor/hyper-raft/crates/hyper-raft/src/proto.rs:66-72`).
+- The sender keeps it and clones it for every member that asks (`hyper-durable/src/held.rs:105-111`). Raft's log
+  copies it again (`hyper-raft/src/log.rs`, `copy_snapshot`).
+- `StateMachine::image(&mut Vec<u8>)` builds it whole and `install(&[u8])` takes it whole
+  (`hyper-durable/src/machine.rs`). Amphora's `Db::image_pages` reads every page into one `Vec` under one `BEGIN`
+  (`crates/amphora/src/db.rs`), and `replication.rs` encodes that again.
+
+So one catch-up of an N-byte database holds several N-byte copies at once. SB.1 above can only refuse an image past
+the memory room, and a database past that room never catches a member up.
+
+### The decision (SS.1)
+
+1. Raft carries which snapshot, not its bytes. `MsgSnapshot` keeps record kind 5 with empty `data` and a new
+   presence bit for a descriptor: point, term, configuration, member bound, page count and page size.
+   `Storage::snapshot` returns the descriptor alone, so `held.rs` and `copy_snapshot` copy no bytes.
+2. The follower pulls the pages. A new `Request::Pages`, appended after every variant and sent only at `VERSION` 10
+   (`Request::since`), goes to any member whose applied point is at least the descriptor's. An ask names page
+   ranges, a since-point per range, and a byte budget: the window measured for that path (`Replica::set_carriage`,
+   `hyper_timing::inflight_window`, "The window to each member" above), never a picked size. The source answers from
+   one short read view at its applied point Q: every page in the ranges whose version is past the range's
+   since-point, until the budget is spent, with Q, its term, its configuration, and where it stopped. A source keeps
+   nothing per follower between asks. The next ask goes when the last answer is staged, an event, never a timer.
+   An ask is a request, so it passes serving's own admission, and its answer is charged to the source's one memory
+   budget, which serving shares. That budget has no event today: it re-reads its limit and resident memory at each
+   check, and compaction waits by checking again at each step (lane H4's reading). So this decision adds one: a
+   released charge wakes the oldest parked waiter that fits, and an ask with no room parks there instead of being
+   refused. Pacing by the follower's window alone is not enough. The window bounds the path, not the source's
+   memory, so a source full from serving could only refuse, and the follower would have no event to ask again on
+   but a poll.
+3. A page's version is the index of the entry that last wrote it, kept by apply beside the pages and durable with
+   them. Replication is physical: every entry carries its resolved pages (`Prepared::pages`), so apply knows each
+   page it writes. The delta to a member at F is the pages whose version is past F, found without hashing or
+   reading the database.
+4. The follower writes each answer to a staging file and a journal of (range, point the range was read at), synced
+   per answer. A crash or a lost link resumes from the journal by asking again with each range's staged point as its
+   since-point. Resume and delta are one mechanism.
+5. The pull is done when one answer covers the whole page space from one view, that is, when everything changed
+   since the least staged point fits one budget. The staged image then equals the database at that answer's Q: a
+   page not sent was last written at or before its range's staged point, so its staged bytes are its bytes at Q.
+   The member installs at Q, at least the descriptor's point. An applied point is committed, so every member that
+   applied Q holds the same entry there, and the core restores at Q with the source's term and configuration. Only
+   then does the log's start move (I8).
+6. It converges when the path carries faster than the group writes. When it doesn't, the member stays behind with a
+   typed reason and the counts that show why. No source holds a view longer than one answer, so no healthy member
+   stalls or fences for a follower.
+
+Members that don't speak `VERSION` 10 keep today's whole-image path within SB.1's room. When `VERSION_MIN` reaches
+10, that path is deleted: `image`, `install(&[u8])`, the image's memory room, and SB.1 with them.
+
+### What it keeps from the coordinator's target, and what it changes
+
+- Raft carries metadata only: kept.
+- Pages pushed on a stream from a view pinned for the whole transfer: overturned. The source's read mark keeps a
+  checkpoint from copying past it and its WAL from restarting (`crates/engine/storage/wal.rs`, the checkpoint and
+  restart paths), so its WAL grows by every write it takes for as long as the slowest follower pulls. The follower
+  pulls instead, and each view lasts one answer.
+- Chunks sized from the measured window: kept, as each ask's budget, drawn from the member's one in-flight budget
+  so catch-up and appends together never exceed what the path carries.
+- Staging, sync, verify, atomic swap, then I8: kept, with the journal as the durable progress.
+- Any caught-up member serves: kept. It falls out of the pull, since any member at or past the point answers.
+- A follower with an older copy receives only changed pages: kept, by page versions instead of a hash manifest.
+- Admission shared with serving: kept. It falls out of the pull, since an ask is a request, and it needs the budget's
+  new release event to be event-driven (point 2).
+
+### The options weighed, and whether each meets Meta scale
+
+| Option | Memory per catch-up | A healthy member | Meets Meta scale? |
+|---|---|---|---|
+| Today: the whole image in memory, refused past SB.1's room | Several copies of the database | Builds and holds images | No. Memory grows with the database, and a database past the room never catches a member up. |
+| Stay up and say "not yet" (the deferral on perf/coldstart) | None until it fits | Unaffected | No. A database past the room waits forever. |
+| Fence the member | None | Fenced | No. Churn fences members all the time. |
+| Chunks inside Raft's own message (an offset and a done flag, as etcd's raft and HashiCorp's InstallSnapshot carry) | One chunk on the wire | The leader still images and holds it per member, and a lost link restarts from zero | No. The leader's memory grows with the database and the number of lagging members. |
+| Push from a view pinned for the whole transfer | One window | Its WAL grows with the follower's slowness, and its checkpoint stops | No. Thousands of groups a host multiply the held WAL. |
+| Pull against a hash manifest | One window plus the manifest | Reads its whole database to hash it at each catch-up | Partly. Memory is bounded, but every catch-up reads the database, even for a small delta. |
+| A fuzzy image, then the log replayed over it (ZooKeeper's fuzzy snapshot; whole pages make replay idempotent) | One window | Its log must reach back to where the pull began | No as the only path: the leader keeps its log for the slowest follower. Kept as the fallback if the final consistent answer fails to converge in the A/B. |
+| Chosen: pull, a view an answer long, page versions | One window a side | Holds a view for one answer | Yes, inferred, not yet measured. Nothing grows with database size or member count except the versions on disk, 8 bytes a page. |
+
+### Units, in order, each merged with its tests
+
+- B, the streamed path end to end: the descriptor and data split, the source reading pages from disk, the staged
+  install. Tests: a follower catches up a database ten times the test's memory budget, with peak memory within one
+  window (a counting allocator); killing the source and the follower mid-pull leaves the follower identical to the
+  leader, its pages and answers matching.
+- C, resume from the journal. Test: a crash after every synced answer resumes and ends identical.
+- D, any member serves. Test: the leader is cut off mid-pull and the follower finishes from another member.
+- E, page versions and the delta. Test: after random applies and crashes at every write, every page's version is at
+  least its last writer's index, and a member at F receives only pages written past F.
+
+### The A/B (Ada's rule: build both, force the extremes, decide on the data)
+
+The pull against today's whole-image path: a database ten times the memory budget, many catch-ups at once on one host
+(`bench/repl_lab.sh`), kills mid-pull, and steady memory pressure. Measured: catch-up time, peak memory, bytes sent,
+and serving p50, p99 and p99.9 during catch-up, each side at least five runs alternated, with the load recorded beside
+each.
+
+### Open
+
+- Installing a whole database through one WAL transaction needs WAL room and frames equal to the database. For a full
+  pull the staging file is a whole database file, swapped in by rename; a delta goes through the one-commit WAL
+  install. Which path a pull takes is decided by its staged bytes against the WAL's room, measured, not picked.
+- The page version table costs a write beside each page written. E measures it against no delta (a full pull) and a
+  hash manifest.
+- A member's measured window exists from the leader to each member today. A pull from another follower needs that
+  path's own measure before its first answer; until then, the memory room for queues bounds it, as QB.1 starts.
+
+The adversarial review (two reviewers, each finding re-read in the code) left these, each to settle in the unit named:
+- Every member writes the replica marker and the closed time by SQL after the shipped frames (`replication.rs`,
+  `marker` and `closed::record`). Page versions stamp every frame a commit writes, not only the shipped pages (E).
+  Those local writes must leave the same bytes on every member before another member serves (D) or a delta trusts the
+  follower's own copy (E): a test applies the same entries on two members and compares every page at every index first.
+- Install writes its marker at the point it is given and reads the member bound, the class and the closed time from
+  the pages (`replication.rs`, `install`), so it installs at Q, and the descriptor carries the baseline declaration
+  install checks (B).
+- hyper-raft restores only from the leader's message (`raft.rs`, `handle_snapshot`). Restoring at Q needs a new entry
+  point, a patch (B). The leader leaves Snapshot state once a member's match reaches its pending snapshot
+  (`progress.rs`, `is_snapshot_caught_up`), so a member at Q at or past S frees it.
+- An answer is one frame, held whole: `FRAME_MAX` is `RESULT_MAX` (32 MiB) and 1 MiB more (`transport/wire.rs`). An
+  ask's budget is the smaller of the window and a frame until answers stream in frames (B).
+- Today's install takes `&[(u32, Vec<u8>)]` and puts every page in the WAL before one commit (`db.rs`,
+  `apply_pages`); B gives it the staging file to read from.
+- The disk reserve keeps room for one image across all logs (`log_bound.rs`, `image_disk_room`). A staged install
+  needs the staging file, the WAL and the checkpoint's growth, and concurrent installs on a host need a bound on how
+  many run at once, measured (B).
+- The declared baseline still images whole (`replication/bootstrap.rs`, `capture`), and `Request::Pull` stays at
+  `VERSION_MIN`. Deleting the whole-image path covers both.
+- Peer requests (`Request::Pull`, `Request::Blob`) are answered with no budget call today (`transport/common.rs`), so
+  `Request::Pages` goes through the actor's admission, which is new code (B).
+
+### Falsified by
+
+- a catch-up whose peak memory grows with the database;
+- a source whose checkpoint or writes wait on a follower's pull;
+- an installed member whose pages or answers differ from the leader's at its point;
+- serving p99.9 during catch-up past its run-to-run noise without catch-up.
