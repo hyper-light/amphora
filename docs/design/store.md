@@ -219,7 +219,10 @@ a flush that began after its commit, and a failed batch's ticket refused.
 
 **Decision.** When a flush fails, the store makes nothing more durable: the flusher stops, every
 sender waiting for a batch to be durable is refused (`Refused::Disk`), and new batches are refused,
-until the store is started again on what its disk holds.
+until the store is started again on what its disk holds. With more than one flusher (decision 6), a
+flush's commits are made durable only once it and every flush begun before it have ended well
+(`Claims` in `store.rs`): a flush that failed never ends well, so another flusher's success after it
+makes nothing durable, however the two flushes overlap.
 
 **Sources.** Rebello et al., "Can Applications Recover from fsync Failures?" (USENIX ATC 2020):
 after a failed `fsync`, Linux file systems may mark the pages they couldn't write clean, so a later
@@ -228,7 +231,12 @@ after a failed `fsync`, Linux file systems may mark the pages they couldn't writ
 
 **Evidence.** The store retried a failed flush every 10 ms: a retry that then succeeded would have
 acknowledged writes the disk never took. The crash test cuts a disk's power mid-flush: the senders
-waiting are refused at once, where before they waited out their deadline.
+waiting are refused at once, where before they waited out their deadline. Lane W4, 2026-11-23: with
+two flushers, each flusher made durable what its own flush covered. The crash test's two-flusher
+case (`a_flush_that_succeeds_beside_a_failed_one_acknowledges_nothing_the_disk_dropped`) fails one
+flush on the simulated disk, which drops what it was writing, while the other flusher's flush, begun
+before the failure, succeeds: the store acknowledged both batches durable, and neither was on the
+disk after a restart. Made durable in the order the flushes began, both are refused.
 
 **Falsified by.** A file system that keeps failed pages dirty and reports a later flush truthfully,
 on every platform Amphora runs on (then a bounded retry could be safe).

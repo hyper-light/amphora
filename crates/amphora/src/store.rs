@@ -294,7 +294,8 @@ pub struct Config {
     /// How often the writer asks its engine's upkeep while nothing comes, unless it asks sooner.
     pub idle_every: Duration,
     /// Flusher threads: with more than one, a commit that lands while a flush is under way starts
-    /// a flush of its own on an idle flusher instead of waiting for that one to end.
+    /// a flush of its own on an idle flusher instead of waiting for that one to end; it is durable
+    /// once that flush and every one begun before it have ended well.
     pub flushers: usize,
 }
 
@@ -491,11 +492,45 @@ struct Sends {
     /// batch's bytes are given back under it before its waiters are woken, so no wakeup is lost
     /// between a sender's look and its wait.
     room: (Mutex<u64>, Condvar),
-    /// The most batches any flusher has begun a flush for: an idle flusher begins one once more are
-    /// committed.
-    claimed: Mutex<u64>,
+    claims: Mutex<Claims>,
     notices: Mutex<Notices>,
     noticed: Condvar,
+}
+
+/// The flushes begun ([`flusher`]): a flush's target is made durable only once it and every flush
+/// begun before it have ended well (docs/design/store.md, decision 9). A flush that failed never ends
+/// well, so nothing begun after it is made durable: the disk may have dropped what it was writing,
+/// and a later flush that succeeds doesn't vouch for that.
+#[derive(Default)]
+struct Claims {
+    /// The most batches any flusher has begun a flush for: an idle flusher begins one once more are
+    /// committed.
+    batches: u64,
+    /// The flushes not yet made durable, in the order they began: each one's target, and whether it
+    /// ended well. A run of those that ended well is kept as its last, which makes the rest durable
+    /// with it, so at most two a flusher are kept.
+    under_way: VecDeque<(Progress, bool)>,
+}
+
+impl Claims {
+    /// The flush of `target` ended well: what is durable now, if anything is.
+    fn ended_well(&mut self, target: Progress) -> Option<Progress> {
+        let mut kept = VecDeque::with_capacity(self.under_way.len());
+        for (t, done) in self.under_way.drain(..) {
+            let done = done || t == target;
+            if done && kept.back().is_some_and(|&(_, d)| d) {
+                kept.pop_back();
+            }
+            kept.push_back((t, done));
+        }
+        let mut durable = None;
+        while let Some(&(t, true)) = kept.front() {
+            kept.pop_front();
+            durable = Some(t);
+        }
+        self.under_way = kept;
+        durable
+    }
 }
 
 /// A key's batches handed and committed, under its entry's number.
@@ -542,7 +577,7 @@ impl Default for Sends {
             stopping: AtomicBool::new(false),
             disk_failed: AtomicBool::new(false),
             room: (Mutex::new(0), Condvar::new()),
-            claimed: Mutex::new(0),
+            claims: Mutex::default(),
             notices: Mutex::default(),
             noticed: Condvar::new(),
         }
@@ -848,9 +883,10 @@ fn notifier(sends: &Sends) {
 }
 
 /// A flusher: flushes what was committed as soon as there is some no flusher has begun a flush
-/// for, again and again; each flush makes durable what was committed before it began. With one
-/// flusher a commit waits for the flush under way and the next; with more, an idle one begins the
-/// next at once. A flush that fails is the last.
+/// for, again and again; each flush makes durable what was committed before it began, once every
+/// flush begun before it has ended well too ([`Claims`]). With one flusher a commit waits for the
+/// flush under way and the next; with more, an idle one begins the next at once. A flush that fails
+/// is the last.
 ///
 /// It never waits for more to be committed before it begins: what is committed during a flush
 /// joins the next (docs/design/store.md, decision 14).
@@ -860,9 +896,10 @@ fn flusher(sends: &Sends, flush: &Flush, meter: &Meter) {
             let mut committed = locked(&sends.committed);
             loop {
                 {
-                    let mut claimed = locked(&sends.claimed);
-                    if committed.batches > *claimed {
-                        *claimed = committed.batches;
+                    let mut claims = locked(&sends.claims);
+                    if committed.batches > claims.batches {
+                        claims.batches = committed.batches;
+                        claims.under_way.push_back((*committed, false));
                         break *committed;
                     }
                 }
@@ -882,7 +919,10 @@ fn flusher(sends: &Sends, flush: &Flush, meter: &Meter) {
         match flush() {
             Ok(()) => {
                 meter.flushed(began.elapsed());
-                sends.made_durable(target);
+                let durable = locked(&sends.claims).ended_well(target);
+                if let Some(through) = durable {
+                    sends.made_durable(through);
+                }
             }
             Err(e) => {
                 // The last: after a failed flush the system may have dropped what it couldn't
