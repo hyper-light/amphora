@@ -54,10 +54,47 @@ pub trait Session: Send {
     /// `stmts` with `params` (a list each): a read's rows taken whole, how many came; a write's
     /// statements in one transaction, returned once durable.
     fn run(&mut self, kind: Kind, stmts: &[String], params: &[Vec<P>]) -> anyhow::Result<usize>;
+    /// A read's rows with every value as [`Cell::text`] writes it, untimed: the answer check
+    /// (`bench/suite_answers.py`) holds each database's to another's.
+    fn answer(&mut self, stmts: &[String], params: &[Vec<P>]) -> anyhow::Result<Vec<Vec<Option<String>>>> {
+        let _ = (stmts, params);
+        anyhow::bail!("no answer check here")
+    }
     /// The plan the database makes for `sql` with `params` (its EXPLAIN), a line a step.
     fn explain(&mut self, sql: &str, params: &[P]) -> anyhow::Result<Vec<String>> {
         let _ = (sql, params);
         anyhow::bail!("no EXPLAIN here")
+    }
+}
+
+/// A value of a read's answer, whatever the database returned it as.
+pub enum Cell<'a> {
+    Null,
+    Int(i64),
+    Real(f64),
+    Text(&'a str),
+    Blob(&'a [u8]),
+}
+
+impl Cell<'_> {
+    /// The value as the answer check compares it: an integer in decimal; a real as Rust writes an
+    /// f64 (the shortest text that reads back as the same f64), `.0` added to a whole one so it
+    /// stays apart from an integer; text as it is; a blob as `x'..'` in hex; NULL as none.
+    pub fn text(&self) -> Option<String> {
+        Some(match self {
+            Cell::Null => return None,
+            Cell::Int(i) => i.to_string(),
+            Cell::Real(f) => {
+                let s = f.to_string();
+                if s.bytes().all(|b| b.is_ascii_digit() || b == b'-') {
+                    format!("{s}.0")
+                } else {
+                    s
+                }
+            }
+            Cell::Text(t) => (*t).to_owned(),
+            Cell::Blob(b) => format!("x'{}'", b.iter().map(|x| format!("{x:02x}")).collect::<String>()),
+        })
     }
 }
 
@@ -131,6 +168,29 @@ mod amphora_target {
             P::Z(z) => Value::from_i64(i64::from(*z)),
             P::N => Value::Null,
         }
+    }
+
+    fn cell(v: &Value) -> Option<String> {
+        match v {
+            Value::Null => Cell::Null,
+            Value::Numeric(amphora_engine::Numeric::Integer(i)) => Cell::Int(*i),
+            Value::Numeric(amphora_engine::Numeric::Float(f)) => Cell::Real(f64::from(*f)),
+            Value::Text(t) => Cell::Text(t.as_str()),
+            Value::Blob(b) => Cell::Blob(b),
+        }
+        .text()
+    }
+
+    /// Every row of each statement, every value as the answer check writes it.
+    fn answer_all(db: &mut Db, stmts: &[&'static str], params: &[Vec<P>]) -> anyhow::Result<Vec<Vec<Option<String>>>> {
+        let mut rows = Vec::new();
+        for (sql, ps) in stmts.iter().zip(params) {
+            db.query(sql, ps.iter().map(value), |r| {
+                rows.push(r.get_values().map(cell).collect());
+                Ok(true)
+            })?;
+        }
+        Ok(rows)
     }
 
     /// Every row of each statement, every column taken: how many rows.
@@ -223,6 +283,13 @@ mod amphora_target {
 
         fn checkpoint(reader: &mut Db) -> anyhow::Result<Checkpointed> {
             reader.checkpoint()
+        }
+
+        // As Amphora's own engine reports it (database.rs): the checkpointer then leaves a log
+        // within its bound uncopied (docs/design/store.md, decision 35). Without it the store can't
+        // tell and copies the log into the file every period, with a flush of the file each time.
+        fn uncopied(reader: &mut Db) -> anyhow::Result<Option<Checkpointed>> {
+            Ok(Some(reader.uncopied()))
         }
 
         fn restart_log(&mut self) -> anyhow::Result<bool> {
@@ -374,6 +441,13 @@ mod amphora_target {
                     Ok(0)
                 }
             }
+        }
+
+        fn answer(&mut self, stmts: &[String], params: &[Vec<P>]) -> anyhow::Result<Vec<Vec<Option<String>>>> {
+            let leaked = Arc::new(stmts.iter().map(|s| leak(&self.sql, s)).collect::<anyhow::Result<Vec<_>>>()?);
+            let (s1, p1) = (leaked.clone(), params.to_vec());
+            let (s2, p2) = (leaked, params.to_vec());
+            self.groups.read_committed("", Instant::now() + WAIT, move |db| answer_all(db, &s1, &p1), move |e: &mut SqlEngine| answer_all(&mut e.db, &s2, &p2))
         }
 
         fn explain(&mut self, sql: &str, params: &[P]) -> anyhow::Result<Vec<String>> {
@@ -750,7 +824,41 @@ impl TursoSession {
     }
 }
 
+fn turso_cell(v: &turso_core::Value) -> Option<String> {
+    match v {
+        turso_core::Value::Null => Cell::Null,
+        turso_core::Value::Numeric(turso_core::Numeric::Integer(i)) => Cell::Int(*i),
+        turso_core::Value::Numeric(turso_core::Numeric::Float(f)) => Cell::Real(f64::from(*f)),
+        turso_core::Value::Text(t) => Cell::Text(t.as_str()),
+        turso_core::Value::Blob(b) => Cell::Blob(b),
+    }
+    .text()
+}
+
 impl Session for TursoSession {
+    fn answer(&mut self, stmts: &[String], params: &[Vec<P>]) -> anyhow::Result<Vec<Vec<Option<String>>>> {
+        let mut out = Vec::new();
+        for (sql, ps) in stmts.iter().zip(params) {
+            let mut stmt = self.conn.prepare(sql).map_err(|e| anyhow::anyhow!("{e}"))?;
+            for (i, p) in ps.iter().enumerate() {
+                stmt.bind_at(NonZero::new(i + 1).ok_or_else(|| anyhow::anyhow!("parameter 0"))?, turso_value(p)).map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+            loop {
+                match stmt.step().map_err(|e| anyhow::anyhow!("{e}"))? {
+                    turso_core::StepResult::Row => {
+                        if let Some(r) = stmt.row() {
+                            out.push(r.get_values().map(turso_cell).collect());
+                        }
+                    }
+                    turso_core::StepResult::Done => break,
+                    turso_core::StepResult::IO | turso_core::StepResult::Yield => self.io.step().map_err(|e| anyhow::anyhow!("{e}"))?,
+                    other => anyhow::bail!("the answer stopped: {other:?}"),
+                }
+            }
+        }
+        Ok(out)
+    }
+
     fn explain(&mut self, sql: &str, params: &[P]) -> anyhow::Result<Vec<String>> {
         let mut stmt = self.conn.prepare(format!("EXPLAIN QUERY PLAN {sql}")).map_err(|e| anyhow::anyhow!("{e}"))?;
         for (i, p) in params.iter().enumerate() {
@@ -875,6 +983,33 @@ struct SqliteSession {
 }
 
 impl Session for SqliteSession {
+    fn answer(&mut self, stmts: &[String], params: &[Vec<P>]) -> anyhow::Result<Vec<Vec<Option<String>>>> {
+        use rusqlite::types::ValueRef;
+        let mut out = Vec::new();
+        for (sql, ps) in stmts.iter().zip(params) {
+            let mut stmt = self.c.prepare_cached(sql)?;
+            let columns = stmt.column_count();
+            let mut rows = stmt.query(rusqlite::params_from_iter(ps.iter().map(sqlite_value)))?;
+            while let Some(r) = rows.next()? {
+                let mut row = Vec::with_capacity(columns);
+                for col in 0..columns {
+                    row.push(
+                        match r.get_ref(col)? {
+                            ValueRef::Null => Cell::Null,
+                            ValueRef::Integer(i) => Cell::Int(i),
+                            ValueRef::Real(f) => Cell::Real(f),
+                            ValueRef::Text(t) => Cell::Text(std::str::from_utf8(t)?),
+                            ValueRef::Blob(b) => Cell::Blob(b),
+                        }
+                        .text(),
+                    );
+                }
+                out.push(row);
+            }
+        }
+        Ok(out)
+    }
+
     fn explain(&mut self, sql: &str, params: &[P]) -> anyhow::Result<Vec<String>> {
         let mut stmt = self.c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
         let mut rows = stmt.query(rusqlite::params_from_iter(params.iter().map(sqlite_value)))?;
@@ -928,6 +1063,81 @@ impl<'a> postgres::types::FromSql<'a> for Raw {
     fn accepts(_: &postgres::types::Type) -> bool {
         true
     }
+}
+
+/// A column's value decoded by its type for the answer check: a boolean as SQLite keeps one (1 or
+/// 0), NUMERIC in decimal, JSONB as its text.
+struct PgCell(Option<String>);
+
+impl<'a> postgres::types::FromSql<'a> for PgCell {
+    fn from_sql(ty: &postgres::types::Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        use postgres::types::Type;
+        let cell = match *ty {
+            Type::BOOL => Cell::Int(i64::from(<bool as postgres::types::FromSql>::from_sql(ty, raw)?)),
+            Type::INT2 => Cell::Int(i64::from(<i16 as postgres::types::FromSql>::from_sql(ty, raw)?)),
+            Type::INT4 => Cell::Int(i64::from(<i32 as postgres::types::FromSql>::from_sql(ty, raw)?)),
+            Type::INT8 => Cell::Int(<i64 as postgres::types::FromSql>::from_sql(ty, raw)?),
+            Type::FLOAT4 => Cell::Real(f64::from(<f32 as postgres::types::FromSql>::from_sql(ty, raw)?)),
+            Type::FLOAT8 => Cell::Real(<f64 as postgres::types::FromSql>::from_sql(ty, raw)?),
+            Type::NUMERIC => return Ok(PgCell(Some(numeric_text(raw).ok_or("a NUMERIC cut short")?))),
+            Type::BYTEA => Cell::Blob(raw),
+            // JSONB's binary form is a version byte, then the document's text.
+            Type::JSONB => Cell::Text(std::str::from_utf8(raw.get(1..).unwrap_or_default())?),
+            _ => Cell::Text(std::str::from_utf8(raw)?),
+        };
+        Ok(PgCell(cell.text()))
+    }
+
+    fn from_sql_null(_: &postgres::types::Type) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(PgCell(None))
+    }
+
+    fn accepts(_: &postgres::types::Type) -> bool {
+        true
+    }
+}
+
+/// NUMERIC's binary form (PostgreSQL's numeric.c, `numeric_send`) in decimal: digit count, weight
+/// of the first base-10000 digit, sign, display scale, then the digits.
+fn numeric_text(raw: &[u8]) -> Option<String> {
+    let u = |i: usize| raw.get(i..i + 2).map(|b| b.iter().fold(0u16, |n, &x| (n << 8) | u16::from(x)));
+    let (n, weight, sign, scale) = (usize::from(u(0)?), u(2)?.cast_signed(), u(4)?, usize::from(u(6)?));
+    match sign {
+        0xC000 => return Some("NaN".into()),
+        0xD000 => return Some("Infinity".into()),
+        0xF000 => return Some("-Infinity".into()),
+        _ => {}
+    }
+    let digits: Vec<u16> = (0..n).map(|i| u(8 + 2 * i)).collect::<Option<_>>()?;
+    // The digit at exponent `e` (base 10000) sits at index weight - e.
+    let at = |e: i16| usize::try_from(weight.checked_sub(e)?).ok().and_then(|i| digits.get(i).copied()).or(Some(0));
+    let mut s = String::new();
+    if sign == 0x4000 {
+        s.push('-');
+    }
+    if weight < 0 {
+        s.push('0');
+    }
+    for e in (0..=weight).rev() {
+        let d = at(e)?;
+        if e == weight {
+            s.push_str(&d.to_string());
+        } else {
+            s.push_str(&format!("{d:04}"));
+        }
+    }
+    if scale > 0 {
+        let mut frac = String::new();
+        let mut e: i16 = -1;
+        while frac.len() < scale {
+            frac.push_str(&format!("{:04}", at(e)?));
+            e = e.checked_sub(1)?;
+        }
+        frac.truncate(scale);
+        s.push('.');
+        s.push_str(&frac);
+    }
+    Some(s)
 }
 
 fn pg_params(params: &[P]) -> Vec<Box<dyn postgres::types::ToSql + Sync>> {
@@ -1029,6 +1239,19 @@ fn pg_rows(rows: &[postgres::Row]) -> anyhow::Result<usize> {
 }
 
 impl Session for PgSession {
+    fn answer(&mut self, stmts: &[String], params: &[Vec<P>]) -> anyhow::Result<Vec<Vec<Option<String>>>> {
+        let mut out = Vec::new();
+        for (sql, ps) in stmts.iter().zip(params) {
+            let s = self.statement(sql)?;
+            let owned = pg_params(ps);
+            let refs: Vec<&(dyn postgres::types::ToSql + Sync)> = owned.iter().map(|b| b.as_ref()).collect();
+            for r in self.c.query(&s, &refs)? {
+                out.push((0..r.len()).map(|i| r.try_get::<_, PgCell>(i).map(|c| c.0)).collect::<Result<_, _>>()?);
+            }
+        }
+        Ok(out)
+    }
+
     fn explain(&mut self, sql: &str, params: &[P]) -> anyhow::Result<Vec<String>> {
         let owned = pg_params(params);
         let refs: Vec<&(dyn postgres::types::ToSql + Sync)> = owned.iter().map(|b| b.as_ref()).collect();
@@ -1282,5 +1505,38 @@ impl Session for ClickHouseSession {
             }
         }
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{numeric_text, Cell};
+
+    #[test]
+    fn answer_values_keep_reals_apart_from_integers() {
+        assert_eq!(Cell::Real(50.0).text().as_deref(), Some("50.0"));
+        assert_eq!(Cell::Real(-3.0).text().as_deref(), Some("-3.0"));
+        assert_eq!(Cell::Real(49.5).text().as_deref(), Some("49.5"));
+        assert_eq!(Cell::Int(50).text().as_deref(), Some("50"));
+        assert_eq!(Cell::Text("a b").text().as_deref(), Some("a b"));
+        assert_eq!(Cell::Blob(&[0, 255]).text().as_deref(), Some("x'00ff'"));
+        assert_eq!(Cell::Null.text(), None);
+    }
+
+    #[test]
+    fn numeric_binary_reads_as_its_decimal() {
+        // 12345.6780: 3 digits, weight 1, positive, scale 4; digits 1, 2345, 6780.
+        let raw = [0, 3, 0, 1, 0, 0, 0, 4, 0, 1, 0x09, 0x29, 0x1a, 0x7c];
+        assert_eq!(numeric_text(&raw).as_deref(), Some("12345.6780"));
+        // -0.00001234: 1 digit, weight -2, negative, scale 8; digit 1234.
+        let raw = [0, 1, 0xff, 0xfe, 0x40, 0, 0, 8, 0x04, 0xd2];
+        assert_eq!(numeric_text(&raw).as_deref(), Some("-0.00001234"));
+        // 10000: 1 digit, weight 1, scale 0: the trailing zero digit isn't sent.
+        let raw = [0, 1, 0, 1, 0, 0, 0, 0, 0, 1];
+        assert_eq!(numeric_text(&raw).as_deref(), Some("10000"));
+        // 0 at scale 2: no digits.
+        let raw = [0, 0, 0, 0, 0, 0, 0, 2];
+        assert_eq!(numeric_text(&raw).as_deref(), Some("0.00"));
+        assert_eq!(numeric_text(&[0, 1, 0, 0]), None);
     }
 }

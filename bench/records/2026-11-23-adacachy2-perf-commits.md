@@ -1027,3 +1027,65 @@ So a follower's read waits behind other members' slots, and holds the leader's w
     cargo test -p amphora --lib --locked --no-run
     v9-tests-<sha> --test-threads=8 database::replicated:: replication::      # r1500: eb365f3d 9c0ece85; r1545: eb365f3d a8f1d857
     ~/.cache/commits-v6/am.sh a8f1d857   # cargo clippy -p amphora --all-targets --locked -- -D warnings: clean (r1546)
+
+# Lane V10 (commits) on adacachy2: one of V9's three failures traced and its test fixed (2026-11-23, 21:07Z to 22:01Z)
+
+Ada's goal is replicated commits about 10x faster than rqlite and dqlite, never refusing writes under load. This
+lane's deliverable: V9's, finished (the three V8-only failures fixed and 6 of 6, and part 2 built). An API outage
+stopped the lane from about 21:30Z to 21:50Z.
+
+## Losses first
+
+1. **The deliverable is not finished.** One test's fix (81530482) is merged: 6 of 6 alone with 5 crashes each, clippy
+   clean (r1602). The suite was not run on it against eb365f3d, 6 rounds; that is the successor's first run.
+2. **Only `writers_through_five_leader_crashes_each_land_and_every_acknowledged_row_is_held` was traced.** The other
+   two (`seed_and_delta_hold_through_an_election_at_each_step`, `a_read_on_a_wholly_copied_log_...`) did not fail in
+   r1570's 4 rounds and were not traced.
+3. **Part 2 is not started.** V9's design below it stands.
+
+## r1570: the suite on main b85ca877 against eb365f3d (4 rounds, arm order reversed each round)
+
+`database::replicated:: replication::`, 8 threads, needs cpus=8,mem=24g; load (1 min) 23.5 to 37.5, CPU "some"
+avg10 2.2 to 6.1%, I/O under 1.6%.
+
+| arm | failures per round | time per round |
+|---|---|---|
+| eb365f3d, main before V8 | 0, 0, 0, 0 (167 passed) | 33 to 36 s |
+| b85ca877, main | 1, 0, 1, 1 (168 or 169 passed) | 31 to 33 s |
+
+Each failure was the five-crash test, "the writers all landed before the crashes ran", 3 crashes of 5.
+
+## r1591: the five-crash test traced, alone, 6 runs each arm, alternated
+
+Diagnostic branches (not for main): `diag/commits-v10-a-eb` (f5239515, eb365f3d plus the trace) and
+`diag/commits-v10-a-main` (5174b409, b85ca877 plus the trace). The trace prints each sweep's acknowledgments and
+resends (with the refusal), the driven clock, and each crash's round and count.
+
+| arm | result | crashes at (round: acknowledged) | resends: stale base, unknown outcome |
+|---|---|---|---|
+| eb365f3d | 6 of 6 pass | r43-56: 6; then 15-17, 22-25, 24-26, 27 | 13 to 15, 1 to 2 |
+| b85ca877 (V8) | 6 of 6 fail | r38-42: 6; then 24; then 32 (3 crashes) | 0, 0 |
+
+The first difference is the sweep after crash 1. The test crashes the leader once a sixth of the writers more has
+been acknowledged, and checks once a sweep. The crash's restart and election run `Driven::tick` and `quiet`, which
+settle the group: every write that can land without a clock moving lands there. Before V8, 13 to 15 follower writes
+were refused as stale and sent again only at the next sweep, so acknowledgments came a few per sweep and five
+crashes ran with writes outstanding. Under V8's slot no write is refused, so 18 writers land in crash 1's settle and
+the other 8 in crash 2's. Nothing is lost or refused: the product does what V8 promises ("a follower's write
+prepares in a slot from its first try", replication.md's write slot, CP-T1.8 lane V8). What broke is the test's
+pacing, which relied on refusals to spread the acknowledgments.
+
+**The fix (81530482, test only, citing V8's design).** Writes stay outstanding through all five crashes: each
+writer, once acknowledged and while crashes remain, writes its next row (id `writer + WRITERS * k`, `INSERT OR
+IGNORE` as before); every replica must hold exactly the rows written, once. r1602, the test alone at 81530482:
+6 of 6 pass, 5 crashes each, 21 to 65 sent again, 171 to 421 rounds; `cargo clippy -p amphora --all-targets
+--locked -- -D warnings` clean. Next: the suite 6 rounds against eb365f3d (`suites.sh`), and the other two tests
+traced the same way if they fail.
+
+## Commands
+
+    # kiln run on 00aad8daff2fa3c9daa65d53c425d450, needs linux/amd64,cpus=8,mem=24g, sync false
+    ~/.cache/commits-v10/suites.sh 4 b85ca877 eb365f3d          # r1570 (V9's suites.sh, logs ~/.cache/amphora-perf/commits-v10-logs/211521)
+    # r1591: built f5239515 and 5174b409 in turn (one target dir), each run 6 times alternated:
+    v10-diag-<sha> --exact database::replicated::tests::writers_through_five_leader_crashes_each_land_and_every_acknowledged_row_is_held --nocapture
+    # logs ~/.cache/amphora-perf/commits-v10-logs/diag-a-213229; the patch: ~/.cache/amphora-perf/commits-v10-scripts/diag_a.py (on adacachy)
