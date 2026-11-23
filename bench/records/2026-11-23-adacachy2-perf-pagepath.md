@@ -605,4 +605,7 @@ it counts on no closing segment. Neither is built: rule 2 belongs to unit 2, rul
 **Checks.** Run r1436 (adacachy2, needs `linux/amd64,cpus=8,mem=24g`, load 21-30) on main 4a62875e: `cargo clippy
 --workspace --all-targets --locked -- -D warnings` exit 0 in 34 s. Run r1467 (same needs, load 26-36) on 416fe658: the
 workspace clippy exit 0; `cargo test -p amphora-engine --lib --locked -- storage:: vdbe::vacuum --test-threads=8` passed 715,
-failed 2 and ignored 14 in 205 s. The two are main's own (`cb4_a_…` and `cb4_ab_…`, as in B9's and B10's runs).
+failed 2 and ignored 14 in 205 s. The two are main's own (`cb4_a_…` and `cb4_ab_…`, as in B9's and B10's runs). `cargo test -p amphora --locked
+--test store` passed 15. Run r1475 (same needs, load 25-54) on c5963de9, this branch with origin/main eb365f3d merged (main
+touched none of this lane's files): the workspace clippy exit 0; the same engine tests passed 715, failed the same 2 and
+ignored 14 in 203 s; the store test passed 15.
