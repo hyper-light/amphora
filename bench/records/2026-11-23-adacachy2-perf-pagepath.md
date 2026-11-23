@@ -408,3 +408,56 @@ storage::` passed 694, failed 3 and ignored 14 in 194 s. The three are main's ow
 `wal_reuses_freelist_leaf_after_abandoned_overflowing_insert`, `cb4_a_read_only_transaction_reads_the_copy_at_its_snapshot`
 and `cb4_ab_both_rebuy_policies_at_the_extremes`. `cargo test -p amphora --locked --test store` passed 15. No new
 failure. This lane changed docs only: decision 45's list and this record.
+
+## perf-B9 (2026-11-23, 17:20-18:20Z)
+
+**Losses first: step 2 (the switch) is not built, and step 1 routes three roles to the current segment only.** No
+writer moves to a free segment yet. Reads are not counted per segment, `find_frame` does not carry its segment, neither
+restart is deleted, and none of the five step-2 tests exists. Of B8's roles, three get their two-segment behaviour only
+with the switch, because before it there is never a closing segment to act on: the lookups (2 sites) search the current
+segment alone, the checkpointer (6) copies the current segment alone, and the multi-process authority (10) still
+carries one header. No A/B ran. Step 1 changes no behaviour, and decision 45's slow-reader A/B needs step 2.
+
+**Step 1: the log handle is `SharedLog`** (perf/pagepath-d45 0fbf0de8, 4871ad86, 779b6f0c; merged to main with
+origin/main as below).
+- `SharedLog` (`crates/engine/storage/wal.rs`) holds two of today's `WalFileShared`: `first` for `-wal`, `second` for
+  `-wal2`. It also holds B6's `Segments` under a spin lock and the four log-wide locks, moved out of `WalSharedRuntime`
+  (`write_lock`, `checkpoint_lock`, `vacuum_lock`, `released`). The second segment is free and empty (`new_noop`): a
+  log with no valid `-wal2` is that state (decision 45, on disk).
+- `current()` reads a published flag (`second_current`), not the spin lock. Every access to the current segment's state
+  then costs a plain load and writes no shared cache line. The flag is to be written only with `Segments`, by the
+  switch.
+- Every `Arc<RwLock<WalFileShared>>` that stood for the log is now `Arc<SharedLog>`: `Database::shared_wal`, both
+  coordination backends, `WalFile::new` and `new_with_shared_coordination`, `VacuumLockGuard`, `shared_wal_state` and
+  the tests' `new_shared`. Recovery stays per segment (`BuildSharedWal`, `open_shared_if_exists`,
+  `open_shared_from_authority_if_exists` and `new_noop` each build one segment), and `Database` puts the recovered
+  segment in a log (`SharedLog::new`).
+- B8's 56 sites, by role. The log-wide locks (7) now take the log's locks without any segment's lock. The read marks
+  (10), the lookups (2), the writer's sites (18), the checkpointer's (6), the restart (1) and the shm sync (10) are on
+  `current()`. The two test-only sites return the log. `database.rs`, `connection.rs`, the pager's, btree's, mvcc's and
+  multiprocess tests reach a segment through `shared_wal.current()`.
+- A script did the rerouting: `~/.cache/amphora-perf/pagepath-b9/d45_step1.py`, then `d45_step1_tests.py`, run from
+  the clone's root on f2c8a85c. It fails on any site it does not find exactly as expected.
+
+**Checks.** Run r1297 (adacachy2, needs `linux/amd64,cpus=4,mem=16g`, load 18-32) on 779b6f0c: step 1 with
+origin/main 93b6458c merged. `cargo clippy -p amphora-engine --all-targets --locked -- -D warnings` exit 0.
+`cargo test -p amphora-engine --lib --locked -- storage::` passed 694, failed 3 and ignored 14 in 204 s. The three are
+main's own, as in r1233: btree's `wal_reuses_freelist_leaf_after_abandoned_overflowing_insert`, `cb4_a_…` and
+`cb4_ab_…`. `cargo test -p amphora --locked --test store` passed 15. That is r1233's baseline exactly. Run r1279 (on
+0fbf0de8) and r1288 (on 4871ad86) found the compile errors that 4871ad86 and 779b6f0c fixed.
+
+**Step 2, what is left, in order.**
+1. The switch on `SharedLog`, under the write lock: `Segments::switch`, then `second_current`, then the free segment's
+   header (`restart_wal_header`'s salts, the checkpoint sequence one past the current one's) written and synced
+   before any frame. The second segment needs its file: `database.rs` opens `-wal2` beside `-wal`.
+2. A read's span. `WalSnapshot` is `Copy` and `ReadSpan` is not, so the connection state keeps the span, and
+   `ReadGuardKind::ReadMark` names its segment so that a read mark is given back on the segment that holds it.
+3. The in-process backend's `read_index` is taken from the current segment when the backend is built. Decision 40's
+   index is per segment, so it must follow the segment a lookup searches.
+4. `find_frame` answers with its segment, and the pager's `Version::Frame` key takes that segment's checkpoint sequence
+   (B8's cache risk).
+5. The checkpointer copies the closing segment, then the current one, and calls `copied` after the file's flush.
+6. Recovery reads both files and orders them with `Segments::recover`. The shm authority carries both headers.
+7. `begin_restart`, `end_restart`, `try_restart_log_for_write`'s restart, the store's `restart_if_asked` gate and its
+   call of `Slots::take_all` are deleted.
+8. The five tests in the brief.
