@@ -1879,11 +1879,12 @@ impl Database {
         let slot = Arc::new(Mutex::new(Slot::Waiting(None)));
         let mut answerer = Answerer(Some(Arc::clone(&slot)));
         self.submit_local(
+            "",
             Operation::Call(Mutex::new(Some(call))),
             admitted_answer(charge),
             until,
             Instant::now(),
-            move |result| {
+            move |result: Result<Answer, Refusal>| {
                 answerer.answer(result.and_then(|answer| match answer {
                     Answer::Called(v) => v
                         .downcast::<(R, Option<crate::memory::Charge>)>()
