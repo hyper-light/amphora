@@ -3,12 +3,16 @@
 //! file database. Prints one line: storage, rows, clients, reads, seconds, reads per second.
 //!
 //! usage: versioned_point_reads <versioned|default> <dir> <rows> <clients> <reads per client>
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 #![allow(clippy::arithmetic_side_effects, clippy::disallowed_macros)]
 
 use amphora_engine::{
-    ConnectOpts, Database, DatabaseOpts, OpenOptions, PlatformIO, SqliteDialect, StepResult,
-    Value,
+    ConnectOpts, Database, DatabaseOpts, OpenOptions, PlatformIO, SqliteDialect, StepResult, Value,
 };
 use std::num::NonZero;
 use std::sync::{Arc, Barrier};

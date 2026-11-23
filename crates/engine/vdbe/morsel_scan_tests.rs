@@ -3398,3 +3398,101 @@ fn t_qt_6_35_joins_over_rowid_ranges_run_on_morsels_as_the_serial_loop() {
     }
     conn.set_parallel_mode(ParallelMode::Off);
 }
+
+/// Audit 3, prototypes 2 (morsel parallelism for REAL and NUMERIC): a one-table scan reading
+/// columns of REAL and NUMERIC affinity runs its loop body's copy in the workers, a REAL column's
+/// INTEGER loading as a REAL (`typeof` says so), GROUP BY values and MIN and MAX comparing as
+/// numbers, and answers as the serial loop at 1, 2, 4, 8 and 16 stated cores. A SUM, AVG or TOTAL
+/// over REALs still sends the statement to the serial loop (its compensated double sum is not the
+/// exact one), which answers the same.
+#[test]
+fn audit_3_p2_real_and_numeric_columns_run_in_parallel_as_the_serial_loop() {
+    if crate::storage::versioned::switch::pager_only(
+        "its subject is the morsel hook over the pager's leaf pages (that the workers ran); on the versioned storage the hook hands the statement to the table's column copy or the serial loop (G11 step 5, CS.5)",
+    ) {
+        return;
+    }
+    let conn = open(":memory:audit-3-p2");
+    let mut rng = ChaCha8Rng::seed_from_u64(32);
+    let pad = "x".repeat(64);
+    let rows = 2500u64;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, r REAL, n NUMERIC, p TEXT)")
+        .unwrap();
+    let reals = [
+        "NULL", "0", "-0.0", "1", "2.5", "-3", "3.0", "1e300", "-2.5", "'7'", "'x'",
+    ];
+    let numerics = [
+        "NULL", "0", "1", "'2'", "2.5", "'3.0'", "1e30", "-1.5", "'abc'", "4",
+    ];
+    conn.execute("BEGIN").unwrap();
+    for _ in 0..rows {
+        let a = rng.random_range(-50i64..50);
+        let r = reals[rng.random_range(0..reals.len())];
+        let n = numerics[rng.random_range(0..numerics.len())];
+        conn.execute(format!(
+            "INSERT INTO t(a, r, n, p) VALUES ({a}, {r}, {n}, '{pad}')"
+        ))
+        .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    let parallel_queries = [
+        "SELECT COUNT(*), MIN(r), MAX(r), MIN(n), MAX(n) FROM t",
+        "SELECT r, COUNT(*), SUM(a), MIN(n), MAX(n) FROM t GROUP BY r",
+        "SELECT n, COUNT(*), MIN(r), MAX(a) FROM t GROUP BY n",
+        "SELECT typeof(r), typeof(n), COUNT(*), MIN(r), MAX(n) FROM t GROUP BY typeof(r), typeof(n)",
+        "SELECT COUNT(*), SUM(a) FROM t WHERE r < 2",
+        "SELECT COUNT(*), SUM(a) FROM t WHERE n >= 2 AND r BETWEEN -3 AND 3",
+        "SELECT r * 2, COUNT(*) FROM t WHERE n <> 1 GROUP BY r * 2",
+        "SELECT COUNT(*) FROM t WHERE r = 3 OR n = 3",
+        "SELECT MIN(r + n), MAX(r - a) FROM t WHERE r IS NOT NULL",
+        "SELECT id, r, n, typeof(r) FROM t WHERE r > 0 AND n < 3",
+    ];
+    let serial_queries = [
+        "SELECT SUM(r) FROM t",
+        "SELECT AVG(r), TOTAL(n) FROM t WHERE a > 0",
+    ];
+    let mut hooked = 0usize;
+    for sql in parallel_queries.iter().chain(&serial_queries) {
+        let parallel_expected = parallel_queries.contains(sql);
+        conn.set_parallel_mode(ParallelMode::Off);
+        let serial = sql_rows(&conn, sql);
+        conn.set_parallel_mode(ParallelMode::On);
+        for cores in [1usize, 2, 4, 8, 16] {
+            *conn.morsel_costs.lock() = Some(MachineCosts::stated(
+                NonZeroUsize::new(cores).unwrap(),
+                1.0,
+                1.0,
+            ));
+            let before = conn
+                .morsel_body_rows
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let parallel = sql_rows(&conn, sql);
+            let after = conn
+                .morsel_body_rows
+                .load(std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(parallel, serial, "{sql} on {cores} cores");
+            if parallel_expected {
+                // The copied body ran over every row once: the parallel path answered.
+                assert_eq!(
+                    after - before,
+                    rows,
+                    "{sql} on {cores} cores: the body's rows"
+                );
+                if conn
+                    .morsel_costs
+                    .lock()
+                    .as_ref()
+                    .is_some_and(|costs| costs.worker_start().samples() > 1)
+                {
+                    hooked += 1;
+                }
+            }
+        }
+    }
+    conn.set_parallel_mode(ParallelMode::Off);
+    // Non-vacuity: more than one worker ran the body for most statements.
+    assert!(
+        hooked > parallel_queries.len(),
+        "workers ran {hooked} times"
+    );
+}

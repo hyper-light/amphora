@@ -8,5 +8,8 @@ rust-version.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[dev-dependencies]
+amphora-pg-oracle = { path = "../pg-oracle" }
+
 [lints]
 workspace = true

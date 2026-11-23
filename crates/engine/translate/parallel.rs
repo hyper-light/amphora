@@ -115,6 +115,7 @@ pub(crate) fn emit_morsel_hook(
         keep: program.allocate_label(),
         skip: program.allocate_label(),
         columns_start: program.alloc_registers(looped.width),
+        reals: real_places(&looped.places),
         rowid: program.alloc_register(),
         out_start: program.alloc_registers(looped.outs.len()),
         out_count: looped.outs.len(),
@@ -434,10 +435,36 @@ fn body_outputs(plan: &SelectPlan, rows: bool) -> Option<BodyOutputs<'_>> {
     })
 }
 
+/// The places in the joined row of the columns of REAL affinity (audit 3, prototypes 2), which
+/// the workers turn from INTEGER to REAL as they load a row ([`MorselBody::reals`]).
+fn real_places(places: &[BodyTable]) -> Vec<usize> {
+    places
+        .iter()
+        .flat_map(|p| {
+            p.table
+                .columns()
+                .iter()
+                .enumerate()
+                .filter(|(_, col)| col.affinity() == Affinity::Real)
+                .filter_map(move |(at, _)| p.offset.checked_add(at))
+        })
+        .collect()
+}
+
 /// Whether every column `exprs` read is one of `places`' tables', stored as written and compared
 /// bytewise (the pipeline compares GROUP BY values and MIN and MAX bytewise), every rowid one the
 /// row holds; no COLLATE, no subquery.
 fn body_reads(exprs: &[&Expr], places: &[BodyTable]) -> Option<()> {
+    body_reads_numeric(exprs, places, false)
+}
+
+/// [`body_reads`], with `numeric` also columns of REAL and NUMERIC affinity (audit 3, prototypes
+/// 2): a one-table scan's, whose workers load a REAL column's INTEGER as a REAL
+/// ([`MorselBody::reals`]), compare GROUP BY values as numbers (`morsel::key_part`: an integral
+/// REAL is its INTEGER) and MIN and MAX by `Value`'s order (an INTEGER against a REAL by value),
+/// ties keeping the earliest row in scan order as the serial loop does. A join keeps them out:
+/// its probe row's matches come in its hash tables' order, not the serial loop's.
+fn body_reads_numeric(exprs: &[&Expr], places: &[BodyTable], numeric: bool) -> Option<()> {
     let place = |id: TableInternalId| places.iter().find(|p| p.id == id);
     for expr in exprs {
         let mut fine = true;
@@ -448,16 +475,18 @@ fn body_reads(exprs: &[&Expr], places: &[BodyTable]) -> Option<()> {
                 } => {
                     fine &= place(*t).is_some_and(|p| {
                         p.table.columns().get(*column).is_some_and(|col| {
-                            matches!(
+                            (matches!(
                                 col.affinity(),
                                 Affinity::Integer
                                     | Affinity::Text
                                     | Affinity::Blob
                                     | Affinity::None
-                            ) && matches!(
-                                col.collation(),
-                                CollationSeq::Binary | CollationSeq::Unset
-                            )
+                            ) || (numeric
+                                && matches!(col.affinity(), Affinity::Real | Affinity::Numeric)))
+                                && matches!(
+                                    col.collation(),
+                                    CollationSeq::Binary | CollationSeq::Unset
+                                )
                         })
                     });
                 }
@@ -518,9 +547,9 @@ fn body_plan(plan: &SelectPlan) -> Option<BodyPlan<'_>> {
         offset: 0,
         rowid: RowidAt::Own,
     }];
-    body_reads(&filter, &places)?;
-    body_reads(&outs, &places)?;
-    body_reads(&filter_exprs(&agg_filters), &places)?;
+    body_reads_numeric(&filter, &places, true)?;
+    body_reads_numeric(&outs, &places, true)?;
+    body_reads_numeric(&filter_exprs(&agg_filters), &places, true)?;
     Some(BodyPlan {
         table,
         places,

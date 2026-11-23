@@ -10187,12 +10187,27 @@ pub mod test {
                 build(&frame_cache, high_water);
             };
             for page in [101, 128, 4096, 1 << 40] {
-                assert_eq!(read_index.find(page, 1, 100, &index), Lookup::Absent, "{mode:?} page {page}");
-                assert_eq!(coordination.find_frame(page, 1, 100, None), None, "{mode:?} page {page}");
+                assert_eq!(
+                    read_index.find(page, 1, 100, &index),
+                    Lookup::Absent,
+                    "{mode:?} page {page}"
+                );
+                assert_eq!(
+                    coordination.find_frame(page, 1, 100, None),
+                    None,
+                    "{mode:?} page {page}"
+                );
             }
             let held = read_index.find(100, 1, 100, &index);
-            assert!(matches!(held, Lookup::Frame(100) | Lookup::Ask), "{mode:?}: {held:?}");
-            assert_eq!(coordination.find_frame(100, 1, 100, None), Some(100), "{mode:?}");
+            assert!(
+                matches!(held, Lookup::Frame(100) | Lookup::Ask),
+                "{mode:?}: {held:?}"
+            );
+            assert_eq!(
+                coordination.find_frame(100, 1, 100, None),
+                Some(100),
+                "{mode:?}"
+            );
         }
     }
 
