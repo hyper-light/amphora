@@ -10958,6 +10958,48 @@ mod tests {
         pump.finish();
     }
 
+    /// T-QB.1.17 (lane replicated-K6) on driven time: a leader's change waits at its barrier, no
+    /// relay round answering it, while the leader takes a record at one reading of its clock and
+    /// then the clock moves a second, three times. Passes when the leader then admits a burst of
+    /// three records, past the least its command queue carries (a call and a wire record): it read
+    /// each record at the reading it came, so it learned no rate, as a member whose clock stands
+    /// still. Counting the change it holds as inputs waiting, it weighed each second as reading
+    /// time, learned a record a second, and bounded its inputs at that least, 2.
+    #[test]
+    fn t_qb_1_17_a_leader_holding_a_change_admits_what_it_reads_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        let led = clients[leader].handle().clone();
+        let from = if leader == 0 { 2 } else { 1 };
+        let clock = driven.clock(leader);
+        let until = driven.base + offset(&clock) + Duration::from_secs(10);
+        let asked = change(&clients[leader], until, MemberChange::AddLearner(4));
+        driven.step();
+        for _ in 0..3 {
+            let _record = led.admit_receive(from, vec![0xff], until).unwrap();
+            driven.step();
+            let next = driven.base + offset(&clock) + Duration::from_secs(1);
+            set(&clock, driven.base, next);
+            driven.step();
+        }
+        assert!(matches!(asked.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        let burst: Vec<_> = (0..3)
+            .map(|_| led.admit_receive(from, vec![0xff], until).map(|_| ()))
+            .collect();
+        assert!(
+            burst.iter().all(Result::is_ok),
+            "{burst:?}, the leader's command bound {}",
+            led.command_bound()
+        );
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
     /// QB.2's scenario, the A/B of what an owner does past its outgoing bound (`Egress`): the
     /// fence (the control), shedding the oldest records, or pausing the owner. Do, for each: a
     /// group of `QB2_MEMBERS` voters (5 when unset) on driven time, every clock a tick on each
