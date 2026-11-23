@@ -89,8 +89,10 @@ pub struct Meter {
     /// Flushes of what was committed, and how long they took, in µs.
     flushes: AtomicU64,
     flush_us: AtomicU64,
-    /// Batches refused because the writer's queue was full.
+    /// Batches refused: the memory budget's room for queues had no room for them.
     dropped: AtomicU64,
+    /// Times a batch's sender waited for its store's commits to give back room.
+    room_waits: AtomicU64,
     /// Batches whose commit failed, each refused to its sender.
     failed: AtomicU64,
     /// Passive checkpoints, and how long they took, in µs.
@@ -122,6 +124,8 @@ pub struct Counters {
     pub flushes: u64,
     pub flush_ms: u64,
     pub dropped: u64,
+    /// Times a batch's sender waited for its store's commits to give back room.
+    pub room_waits: u64,
     pub failed: u64,
     pub checkpoints: u64,
     pub checkpoint_ms: u64,
@@ -193,6 +197,11 @@ impl Meter {
             .saturating_add(1)
     }
 
+    /// A batch's sender waits for its store's commits to give back room.
+    pub fn waited_for_room(&self) {
+        self.room_waits.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// A batch whose commit failed: how many have, this one too.
     pub fn failed(&self) -> u64 {
         self.failed
@@ -222,6 +231,7 @@ impl Meter {
             flushes: self.flushes.load(Ordering::Relaxed),
             flush_ms: self.flush_us.load(Ordering::Relaxed) / 1000,
             dropped: self.dropped.load(Ordering::Relaxed),
+            room_waits: self.room_waits.load(Ordering::Relaxed),
             failed: self.failed.load(Ordering::Relaxed),
             checkpoints: self.checkpoints.load(Ordering::Relaxed),
             checkpoint_ms: self.checkpoint_us.load(Ordering::Relaxed) / 1000,
