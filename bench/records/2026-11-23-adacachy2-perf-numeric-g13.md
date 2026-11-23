@@ -91,7 +91,7 @@ CARGO_INCREMENTAL=0`:
 |---|---|---|---|
 | r1476 | 6a10d6f2 | clippy `--all-targets --features bench`; lib `decimal:: ieee754::` | clippy: `Decimal::is_null` unused (removed in 73dfa992); 23 passed |
 | r1486 | 73dfa992 (merged with main 392d9aac) | the same clippy; `--test floating_point_doc`; lib `decimal:: ieee754:: numeric:: printf json::` | page tests did not compile (`IO` not imported, fixed in feacf80c); lib 241 passed, 0 failed |
-| r1495 | feacf80c (pushed to main) | clippy; `--test floating_point_doc` | clippy clean; 45 passed, 0 failed |
+| foreground run, 12:02 adacachy2 clock (no id returned) | feacf80c (pushed to main) | clippy; `--test floating_point_doc` | clippy clean; 45 passed, 0 failed |
 
     cargo clippy -p amphora-engine --all-targets --features bench --locked -- -D warnings
     cargo test -p amphora-engine --features bench --locked --test floating_point_doc -- --test-threads=8
