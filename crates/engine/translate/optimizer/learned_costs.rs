@@ -908,14 +908,18 @@ mod stored {
         let body = text.strip_prefix(&key.header())?.strip_suffix('\n')?;
         let mut lines = body.split('\n');
         let number = |word: &str| -> Option<f64> {
-            (word.len() == 16 && word.bytes().all(|b| b.is_ascii_hexdigit())).then_some(())?;
+            if word.len() != 16 || !word.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return None;
+            }
             u64::from_str_radix(word, 16).ok().map(f64::from_bits)
         };
         let timing_nanos = number(lines.next()?.strip_prefix("timing ")?)?;
         let mut kinds = [(0.0, 0.0); 7];
         for (slot, kind) in kinds.iter_mut().zip(CALIBRATED) {
             let (name, pair) = lines.next()?.split_once(' ')?;
-            (name == format!("{kind:?}")).then_some(())?;
+            if name != format!("{kind:?}") {
+                return None;
+            }
             let (units, nanos) = pair.split_once(' ')?;
             *slot = (number(units)?, number(nanos)?);
         }
@@ -926,7 +930,11 @@ mod stored {
             timing_nanos,
             kinds,
         };
-        kept.timed().then_some(kept)
+        if kept.timed() {
+            Some(kept)
+        } else {
+            None
+        }
     }
 
     pub(super) fn render(key: &Key, calibration: &Calibration) -> String {
