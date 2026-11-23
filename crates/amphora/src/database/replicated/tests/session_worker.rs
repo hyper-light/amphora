@@ -133,6 +133,8 @@ fn cp_t1_13_a_leader_keeps_its_lead_and_answers_local_reads_while_a_session_runs
             .read_local(Instant::now() + HANG_READ, values),
         Ok(vec![7])
     );
+    driven.drain(&mut pump);
+    pump.finish();
 }
 
 /// CP-T1.13 (replication.md, "Decision (lane P6)"): a write whose lead moved while its session
@@ -180,4 +182,6 @@ fn cp_t1_13_a_write_whose_lead_moved_while_its_session_ran_is_refused_not_leader
             "no member holds the refused write's row"
         );
     }
+    driven.drain(&mut pump);
+    pump.finish();
 }
