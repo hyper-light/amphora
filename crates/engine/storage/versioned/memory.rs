@@ -237,7 +237,7 @@ mod tests {
         assert_eq!(source.held(), total / 2);
         let refused = source.take("a test's versions", total - total / 2 + 1);
         assert!(
-            matches!(refused, Err(LimboError::MemoryBudget(full)) if full.what == "a test's versions")
+            matches!(&refused, Err(LimboError::MemoryBudget(full)) if full.what == "a test's versions")
         );
         source.give(total / 2);
         assert_eq!(source.held(), 0);
