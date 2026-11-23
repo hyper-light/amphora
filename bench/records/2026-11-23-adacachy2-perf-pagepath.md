@@ -213,6 +213,8 @@ load 64 at its start). Its numbers land in `~/.cache/amphora-perf-bin/pagepath/a
 the summary at the end of r902's output. If it dies, pass the script's body to `run` again and retry until placed.
 
 **B4's fix alone on main.** 3a30e5f1 (branch `perf/pagepath-b4-pick`) is 4da616cf cherry-picked onto origin/main
-9a7b14bb, clean. Its clippy and storage tests on that tree are run r901.
+9a7b14bb, clean. On that tree (run r901) clippy exited 0 and `storage::wal storage::log_index` passed 104, failed 0,
+ignored 1. It is on main as e956abf0, pushed at 14:50Z, with the checks in its message. Its own binary A/B
+(the lookup bench, this binary against perf-B2's `lookup-old-2b58`) is still to run.
 
 **Decision 45** (docs/design/store.md, commit 4d0ead88) is the two-segment log's design. Nothing is built yet.
