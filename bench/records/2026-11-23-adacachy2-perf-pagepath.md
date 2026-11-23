@@ -558,3 +558,51 @@ clippy --workspace --all-targets --locked -- -D warnings` exit 0; `cargo test -p
 --features conn_raw_api -- replace_after_external_restore_preserves_lock_identity` passed 1. `cargo fmt --all --check`
 then lists 35 places in five files: database.rs and wal.rs are clean, lib.rs has one left that is not step 1's export
 line, and the rest are replicated.rs (12), amphora's database.rs (3) and the optimizer's two files (19), not traced.
+
+## perf-B11 (2026-11-23, 19:04-20:04Z)
+
+**Losses first: the hour failed its deliverable. The switch is not built.** Rule 0's deliverable was decision 45's switch
+working end to end, all five units merged and the five tests passing. One unit of five is built and checked: unit 1.
+Unit 2 (a read's span) is designed below but not written. Units 3, 4 and 5 are not started, neither restart is deleted,
+none of the five tests exists, and no A/B ran (rule 0: none before the switch works).
+
+**The branch.** The brief named `perf/pagepath`. That branch holds ae729b06 (the default path reads the log's header
+lock-free), a choice Ada said to decide by data, which RULES 5b lets land only with its own A/B, and it is not on main.
+Building on it would have merged it at this lane's first merge. This lane worked on `perf/pagepath-d45`, where steps 1 and
+2 have been built since B9, which main contains.
+
+**Unit 1: `find_frame` answers a `FrameRef`** (perf/pagepath-d45 416fe658). `Wal::find_frame` answers `FrameRef { segment,
+frame }`. `read_frame` and `read_frames_batch` take one and read the file of its segment (`WalCoordination::segment_file`;
+`current_segment` names the writer's). The pager's shared pages key a frame by `Wal::frame_generation`: the connection's
+checkpoint sequence for the current segment, one before it for the closing one (a switch writes the current sequence plus
+one, and the sequence wraps). Without it, frame n of each segment would share a key (lane B8's cache risk). VACUUM refuses a
+target WAL whose pages it finds in two segments. `read_frame_raw` keeps its frame number, the current segment's. A script
+moved the four production callers and the tests: `~/.cache/amphora-perf/pagepath-b11/d45_unit1.py`, run from the clone's
+root on 9b8fa0fc. It fails on any site it does not find exactly as expected. No behaviour change: with no switch the segment
+is always the current one, and its generation is the connection's checkpoint sequence, which the key used before.
+Until unit 2, `frame_generation` and `find_frame` name the log's current segment at the lookup, not the read's. That is
+the same segment only while no switch can happen, so unit 2 must give both the read's span.
+
+**Decision 45's two rules are in the design doc** (store.md, The shape and Checkpoints). The checkpointer copies the current
+segment only once the closing one is reset, which the coordinator chose from B10's two ways. A read takes read mark 0 only when
+it counts on no closing segment. Neither is built: rule 2 belongs to unit 2, rule 1 to unit 4.
+
+**Unit 2, the simplest correct span, for the successor** (not built).
+- `WalFile` keeps the read's `ReadSpan` beside its connection state, in a field of its own (`WalConnectionState` is
+  `Copy` and stored in atomics; `ReadSpan` is neither). The coordination gains `begin_read_span` and `end_read_span`, which
+  take `SharedLog::segments`' spin lock (the in-process backend's `self.log`; the shared-memory backend delegates to its
+  fallback), so `WalFile` never clones the log's `Arc` on a read.
+- The span is taken inside the coordination's `try_begin_read_tx`, before the read mark is chosen, so that rule 2 can refuse
+  read mark 0 when the span has a closing segment, and given back on every path that returns no guard.
+- `ReadGuardKind::ReadMark` and `DbFile` name their segment. Today the guard is kept as a slot index in
+  `max_frame_read_lock_index` (an `AtomicUsize`), and `unlock_read_mark` takes the current segment's lock: after a switch
+  that would unlock a slot on the wrong segment. Encode the segment in that index, or keep the guard with the span.
+- `find_frame` searches the span's segments in `lookup_order`, and `frame_generation` compares against the span's current
+  segment, not `SharedLog::current_id`.
+- The shared-memory backend counts only this process's reads in its fallback's `Segments`. Counting other processes' reads
+  needs the authority (unit 3).
+
+**Checks.** Run r1436 (adacachy2, needs `linux/amd64,cpus=8,mem=24g`, load 21-30) on main 4a62875e: `cargo clippy
+--workspace --all-targets --locked -- -D warnings` exit 0 in 34 s. Run r1467 (same needs, load 26-36) on 416fe658: the
+workspace clippy exit 0; `cargo test -p amphora-engine --lib --locked -- storage:: vdbe::vacuum --test-threads=8` passed 715,
+failed 2 and ignored 14 in 205 s. The two are main's own (`cb4_a_…` and `cb4_ab_…`, as in B9's and B10's runs).
