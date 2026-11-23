@@ -91,9 +91,11 @@ impl Store {
                 }
                 Err(error) => return Err(error.into()),
             };
-        self.inner.database.call(deadline(), AnswerMax::fixed(), move |conn| {
-            migrations::require_installed(conn, required)
-        })?;
+        self.inner
+            .database
+            .call(deadline(), AnswerMax::fixed(), move |conn| {
+                migrations::require_installed(conn, required)
+            })?;
         Ok(StoreWriterBoundary {
             store: self.clone(),
             boundary,

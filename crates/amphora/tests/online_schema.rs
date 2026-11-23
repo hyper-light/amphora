@@ -16,8 +16,8 @@
 
 use std::time::{Duration, Instant};
 
-use amphora::database::{AnswerMax, Database};
 use amphora::database::online::{self, Plan, Stepped};
+use amphora::database::{AnswerMax, Database};
 use amphora::db::Db;
 use amphora_api::{Migration, Refusal};
 use amphora_engine::Value;
@@ -551,13 +551,17 @@ fn t_t1_12_1_a_constraint_change_is_refused_unless_it_only_adds_the_constraint()
     };
     let table_sql = || {
         database
-            .call(until(), AnswerMax::fixed(), |c| {
-                let sql: String =
-                    c.query_row("SELECT sql FROM sqlite_schema WHERE name = 't'", [], |r| {
-                        r.get(0usize)
-                    })?;
-                Ok(sql)
-            })
+            .call(
+                until(),
+                AnswerMax::bytes(size_of::<String>() + amphora_api::SQL_MAX),
+                |c| {
+                    let sql: String =
+                        c.query_row("SELECT sql FROM sqlite_schema WHERE name = 't'", [], |r| {
+                            r.get(0usize)
+                        })?;
+                    Ok(sql)
+                },
+            )
             .unwrap()
     };
     let before = table_sql();
@@ -770,7 +774,7 @@ fn t_t1_12_1_a_drop_is_refused_where_the_engine_refuses_it_and_its_slot_keeps_th
     };
     let schema = || {
         database
-            .call(until(), AnswerMax::fixed(), |c| {
+            .call(until(), AnswerMax::bytes(size_of::<String>() + amphora_api::SQL_MAX), |c| {
                 let sql: String = c.query_row(
                     "SELECT group_concat(sql, ';') FROM sqlite_schema WHERE name NOT LIKE '__amphora%'",
                     [],

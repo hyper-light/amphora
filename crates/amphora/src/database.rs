@@ -567,8 +567,8 @@ tuple_answer!(A.0, B.1, C.2, D.3);
 
 impl<T: AnswerBytes, const N: usize> AnswerBytes for [T; N] {
     fn answer_bytes(&self) -> usize {
-        let inline = std::mem::size_of::<Self>()
-            .saturating_sub(std::mem::size_of::<T>().saturating_mul(N));
+        let inline =
+            std::mem::size_of::<Self>().saturating_sub(std::mem::size_of::<T>().saturating_mul(N));
         self.iter()
             .fold(inline, |n, item| n.saturating_add(item.answer_bytes()))
     }
@@ -2192,12 +2192,14 @@ impl Database {
             until,
             Instant::now(),
             move |result: Result<Answer, Refusal>| {
-                answerer.answer(result.and_then(|answer| match answer {
-                    Answer::Called(v) => v
-                        .downcast::<R>()
-                        .map(|v| *v)
-                        .map_err(|_| unavailable("wrong SQL session answer")),
-                    _ => Err(unavailable("wrong SQL session answer")),
+                answerer.answer(result.and_then(|answer| {
+                    match answer {
+                        Answer::Called(v) => v
+                            .downcast::<R>()
+                            .map(|v| *v)
+                            .map_err(|_| unavailable("wrong SQL session answer")),
+                        _ => Err(unavailable("wrong SQL session answer")),
+                    }
                 }));
             },
         )?;

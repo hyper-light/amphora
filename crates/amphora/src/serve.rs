@@ -2215,13 +2215,17 @@ mod tests {
     {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(&dir.path().join("q.db"), sql_until()).unwrap();
-        db.call(sql_until(), crate::database::AnswerMax::bytes(amphora_api::RESULT_MAX), |c| {
-            answered(
-                c,
-                vec![statement("CREATE TABLE t (id INTEGER PRIMARY KEY)", vec![])],
-                Spill::None,
-            )
-        })
+        db.call(
+            sql_until(),
+            crate::database::AnswerMax::bytes(amphora_api::RESULT_MAX),
+            |c| {
+                answered(
+                    c,
+                    vec![statement("CREATE TABLE t (id INTEGER PRIMARY KEY)", vec![])],
+                    Spill::None,
+                )
+            },
+        )
         .unwrap();
         let half = || Value::Blob(vec![0; amphora_api::RESULT_MAX / 2 + 1]);
         let read = db.query_local(sql_until(), move |c| {
@@ -2236,16 +2240,20 @@ mod tests {
             "{:?}",
             read.map(|e| e.len())
         );
-        let write = db.call(sql_until(), crate::database::AnswerMax::bytes(amphora_api::RESULT_MAX), move |c| {
-            answered(
-                c,
-                vec![
-                    statement("INSERT INTO t VALUES (1)", vec![]),
-                    statement("SELECT ?1, ?1", vec![half()]),
-                ],
-                Spill::None,
-            )
-        });
+        let write = db.call(
+            sql_until(),
+            crate::database::AnswerMax::bytes(amphora_api::RESULT_MAX),
+            move |c| {
+                answered(
+                    c,
+                    vec![
+                        statement("INSERT INTO t VALUES (1)", vec![]),
+                        statement("SELECT ?1, ?1", vec![half()]),
+                    ],
+                    Spill::None,
+                )
+            },
+        );
         assert!(
             matches!(write, Err(Refusal::TooLarge { .. })),
             "{:?}",
@@ -2430,16 +2438,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = blobs(dir.path(), 40, MIB);
         let frames = db
-            .call(sql_until(), crate::database::AnswerMax::bytes(amphora_api::RESULT_MAX), |c| {
-                answered(
-                    c,
-                    vec![
-                        statement("INSERT INTO t VALUES (41, NULL)", vec![]),
-                        statement("SELECT id, v FROM t WHERE id <= 40 ORDER BY id", vec![]),
-                    ],
-                    Spill::Held(Vec::new()),
-                )
-            })
+            .call(
+                sql_until(),
+                crate::database::AnswerMax::bytes(amphora_api::RESULT_MAX),
+                |c| {
+                    answered(
+                        c,
+                        vec![
+                            statement("INSERT INTO t VALUES (41, NULL)", vec![]),
+                            statement("SELECT id, v FROM t WHERE id <= 40 ORDER BY id", vec![]),
+                        ],
+                        Spill::Held(Vec::new()),
+                    )
+                },
+            )
             .unwrap();
         assert!(frames.len() > 1, "{} frames", frames.len());
         assert!(

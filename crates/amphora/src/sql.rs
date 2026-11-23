@@ -584,20 +584,22 @@ mod tests {
                 .unwrap();
             assert_eq!(records.wait("policy", first, until()).unwrap(), committed);
 
-            let stale: std::result::Result<(), Refusal> = db.call(until(), crate::database::AnswerMax::fixed(), move |c| {
-                c.execute("INSERT INTO reservations VALUES (2)", [])?;
-                c.records_commit("tenant", policy(Some(first), b"stale"))?;
-                Ok(())
-            });
+            let stale: std::result::Result<(), Refusal> =
+                db.call(until(), crate::database::AnswerMax::fixed(), move |c| {
+                    c.execute("INSERT INTO reservations VALUES (2)", [])?;
+                    c.records_commit("tenant", policy(Some(first), b"stale"))?;
+                    Ok(())
+                });
             assert!(
                 matches!(stale, Err(Refusal::Conflict { at: Some(at), .. }) if at == committed)
             );
 
-            let failed: std::result::Result<(), Refusal> = db.call(until(), crate::database::AnswerMax::fixed(), move |c| {
-                c.execute("INSERT INTO reservations VALUES (3)", [])?;
-                c.records_commit("tenant", policy(Some(committed), b"discarded"))?;
-                anyhow::bail!("policy decision refused")
-            });
+            let failed: std::result::Result<(), Refusal> =
+                db.call(until(), crate::database::AnswerMax::fixed(), move |c| {
+                    c.execute("INSERT INTO reservations VALUES (3)", [])?;
+                    c.records_commit("tenant", policy(Some(committed), b"discarded"))?;
+                    anyhow::bail!("policy decision refused")
+                });
             assert!(failed.is_err());
             // A nested savepoint discards both APIs and must not publish its provisional revision.
             db.call(until(), crate::database::AnswerMax::fixed(), move |c| {
@@ -701,7 +703,7 @@ mod tests {
         FROM ci_log_grams p WHERE p.gram=?1 AND (p.finished,p.leg_order,p.leg,p.block)<(?5,?6,?7,?8) ORDER BY p.finished DESC,p.leg_order DESC,p.leg DESC,p.block DESC LIMIT 8";
         let db = crate::database::Database::in_memory(until()).unwrap();
         let (pages, prepared, text) = db
-            .call(until(), crate::database::AnswerMax::fixed(), |c| {
+            .call(until(), crate::database::AnswerMax::bytes(amphora_api::RESULT_MAX), |c| {
                 c.execute_batch(
                     "CREATE TABLE parsed_once(a INTEGER, b TEXT);
                      CREATE TABLE ci_log_grams(gram TEXT, finished INTEGER, leg_order INTEGER, leg TEXT, block INTEGER, bits BLOB);

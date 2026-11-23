@@ -187,11 +187,12 @@ fn independent_memory_databases_keep_sql_and_records_isolated() {
         .unwrap();
     assert_eq!(
         second
-            .call(until(), AnswerMax::fixed(), |connection| Ok(connection.query_row(
-                "SELECT count(*) FROM sqlite_schema WHERE name = 'private_row'",
-                [],
-                |row| row.get::<_, i64>(0usize)
-            )?))
+            .call(until(), AnswerMax::fixed(), |connection| Ok(connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_schema WHERE name = 'private_row'",
+                    [],
+                    |row| row.get::<_, i64>(0usize)
+                )?))
             .unwrap(),
         0
     );
