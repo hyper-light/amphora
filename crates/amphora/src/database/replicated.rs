@@ -3062,6 +3062,30 @@ impl<F: BlockFile + 'static> Actor<F> {
             .replica
             .drive(nanos, &self.waker, &mut output)
             .map_err(raft_error)?;
+        {
+            thread_local!(static SEEN: std::cell::Cell<(u64, u64, u64, u64)> = const { std::cell::Cell::new((0, 0, 0, 0)) });
+            let log = self.replica.core().raft.log();
+            let now = (
+                log.last_index().unwrap_or(0),
+                log.persisted(),
+                log.committed(),
+                self.replica.applied().index,
+            );
+            if SEEN.with(|seen| seen.replace(now)) != now || driven.flushed.is_some() {
+                v12_stages::log(format_args!(
+                    "drive role={} last={} persisted={} committed={} applied={} flush={} answers={}",
+                    if self.replica.is_leader() { "L" } else { "F" },
+                    now.0,
+                    now.1,
+                    now.2,
+                    now.3,
+                    driven
+                        .flushed
+                        .map_or_else(|| String::from("-"), |(a, b)| b.saturating_sub(a).to_string()),
+                    output.answers.len()
+                ));
+            }
+        }
         // What the drive applied, and the time it took: a byte of log's replay (CT.1).
         let replayed = self
             .replica
@@ -3745,6 +3769,9 @@ impl<F: BlockFile + 'static> Actor<F> {
                 until,
                 response,
             } => {
+                if operation.writes() {
+                    v12_stages::log(format_args!("submit until={}", v12_stages::key(until)));
+                }
                 if self.at >= until {
                     answer(response, Err(Refusal::Timeout));
                 } else if let Some(full) = &self.log_full {
@@ -3791,6 +3818,12 @@ impl<F: BlockFile + 'static> Actor<F> {
                     };
                     match self.replica.read(context.clone()) {
                         Ok(()) => {
+                            v12_stages::log(format_args!(
+                                "barrier ctx={} until={} w={}",
+                                v12_stages::hex(&context),
+                                v12_stages::key(until),
+                                operation.writes()
+                            ));
                             self.pending = Some(Pending {
                                 context,
                                 term: self.replica.term(),
@@ -4574,10 +4607,19 @@ impl<F: BlockFile + 'static> Actor<F> {
             self.publish_closed()?;
         }
         for applied in output.answers {
+            v12_stages::log(format_args!(
+                "applied ctx={} idx={} ok={}",
+                v12_stages::hex(&applied.context),
+                applied.index,
+                applied.result.is_ok()
+            ));
             let matches = self
                 .pending
                 .as_ref()
                 .is_some_and(|p| p.context == applied.context);
+            if matches {
+                v12_stages::log(format_args!("answer ctx={} idx={}", v12_stages::hex(&applied.context), applied.index));
+            }
             if matches && let Some(mut pending) = self.pending.take() {
                 let result = match pending.phase {
                     // The write's own token: its entry's index and time (`tokens`).
@@ -4827,6 +4869,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             },
         ) && let Some(response) = pending.response.take()
         {
+            v12_stages::log(format_args!("answer_commit ctx={} idx={index}", v12_stages::hex(&pending.context)));
             // The write's own token (`tokens`): its index, and its stamp for its time. A read with
             // it here waits for this member to apply the entry.
             answer(
@@ -5350,6 +5393,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                 return Ok(());
             }
         }
+        v12_stages::log(format_args!("prep0 ctx={}", v12_stages::hex(&pending.context)));
         let prepared = if let Operation::Mutation(Mutation::CompactStep { before, .. }) = &operation
         {
             let room = self.entry_room(pending.context.len())?;
@@ -5397,6 +5441,7 @@ impl<F: BlockFile + 'static> Actor<F> {
         // The preparation ran the caller's work, which takes time of its own: its deadline is
         // judged at the clock's reading after it, never at the step's start.
         self.at = (self.clock)();
+        v12_stages::log(format_args!("prep1 ctx={}", v12_stages::hex(&pending.context)));
         // A failed whole rollback poisons this machine. Stop its existing owner instead of
         // accepting another request against an unverified speculative base.
         if bounded && let Err(Refusal::Fenced(reason)) = &prepared {
@@ -5420,6 +5465,11 @@ impl<F: BlockFile + 'static> Actor<F> {
                         .and_then(|bytes| self.propose(&pending.context, bytes))
                     {
                         Ok(()) => {
+                            v12_stages::log(format_args!(
+                                "proposed ctx={} leader={}",
+                                v12_stages::hex(&pending.context),
+                                self.replica.is_leader()
+                            ));
                             if self.replica.is_leader() {
                                 #[cfg(test)]
                                 if self.slots.turn() {
@@ -19364,5 +19414,47 @@ mod tests {
         driven.quiet(&mut pump);
         driven.drain(&mut pump);
         pump.finish();
+    }
+}
+
+/// Lane V12's stage log (diagnostic branch `diag/commits-v12-stages`, never main): one line an event,
+/// `<CLOCK_MONOTONIC ns> <event> ...`, to the file `AMPHORA_STAGES` names; nothing when unset.
+pub(crate) mod v12_stages {
+    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+    static OUT: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+    /// An `Instant` as CLOCK_MONOTONIC nanoseconds (std's Linux `Instant` is that clock; its Debug
+    /// form names `tv_sec` and `tv_nsec`), the clock lane W2's shim stamps syscalls with.
+    pub(crate) fn key(at: Instant) -> u128 {
+        let s = format!("{at:?}");
+        let num = |key: &str| -> u128 {
+            s.split(key)
+                .nth(1)
+                .map(|r| {
+                    r.chars()
+                        .skip_while(|c| !c.is_ascii_digit())
+                        .take_while(char::is_ascii_digit)
+                        .collect::<String>()
+                })
+                .and_then(|d| d.parse().ok())
+                .unwrap_or(0)
+        };
+        num("tv_sec") * 1_000_000_000 + num("tv_nsec")
+    }
+    pub(crate) fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+    pub(crate) fn log(line: std::fmt::Arguments<'_>) {
+        let out = OUT.get_or_init(|| {
+            std::env::var_os("AMPHORA_STAGES")
+                .and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok())
+                .map(Mutex::new)
+        });
+        if let Some(file) = out
+            && let Ok(mut f) = file.lock()
+        {
+            let _ = f.write_all(format!("{} {line}\n", key(Instant::now())).as_bytes());
+        }
     }
 }
