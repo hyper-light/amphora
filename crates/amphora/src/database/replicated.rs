@@ -5370,22 +5370,31 @@ impl<F: BlockFile + 'static> Actor<F> {
     /// new on the wire, and a stray barrier's read state matches nothing here and is dropped. Work
     /// handed to the session worker ends when it comes back (`Actor::decide`).
     fn prepare(&mut self) -> Result<(), Refusal> {
-        let work = self
+        let work = self.pending.as_ref().and_then(|pending| {
+            matches!(pending.phase, Phase::Barrier(Some(_)))
+                .then_some((pending.term, pending.leader))
+        });
+        self.prepare_barrier()?;
+        let ended = !self
             .pending
             .as_ref()
-            .is_some_and(|pending| matches!(pending.phase, Phase::Barrier(Some(_))));
-        self.prepare_barrier()?;
-        let ended = !self.pending.as_ref().is_some_and(|pending| {
-            matches!(pending.phase, Phase::Barrier(_) | Phase::Running)
-        });
-        if work && ended {
-            self.end_slot()?;
+            .is_some_and(|pending| matches!(pending.phase, Phase::Barrier(_) | Phase::Running));
+        if let Some(lead) = work
+            && ended
+        {
+            self.end_slot(lead)?;
         }
         Ok(())
     }
-    /// A follower's work in its slot ended: if it forwarded nothing, its second barrier.
-    fn end_slot(&mut self) -> Result<(), Refusal> {
-        if self.pending.is_none() && !self.replica.is_leader() {
+    /// A follower's work in its slot ended: if it forwarded nothing, its second barrier, to the
+    /// leader that gave the slot in its term (`lead`). A slot dies with its term (`Slots::lead`),
+    /// and a new leader never gave one, so a close sent after the lead moved would ask it for a
+    /// slot no work ends (replication.md, "the write slot"; lane P14's trace).
+    fn end_slot(&mut self, lead: (u64, u64)) -> Result<(), Refusal> {
+        if self.pending.is_none()
+            && !self.replica.is_leader()
+            && (self.replica.term(), self.replica.leader()) == lead
+        {
             let context = self.context()?;
             self.replica.read(context).map_err(raft_error)?;
         }
@@ -5634,8 +5643,9 @@ impl<F: BlockFile + 'static> Actor<F> {
             self.requeue(pending);
             return Ok(());
         }
+        let lead = (pending.term, pending.leader);
         self.settle(pending, ran, moved)?;
-        self.end_slot()
+        self.end_slot(lead)
     }
     /// A prepared write proposed, or answered: at once if it wrote nothing, refused if past its
     /// deadline, or `NotLeader` if the lead `moved` while its session ran.

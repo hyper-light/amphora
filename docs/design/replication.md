@@ -2010,7 +2010,9 @@ pure core is `database/slot.rs`, driven by the owner (`Actor::keep_slots`, `star
   ended (its length passed while the work ran, or a release) asked for a new slot that no work ends, holding the
   leader and every member queued behind it for its length (lane P13's trace, CP-T1.13). A slot begun for a member
   waits for its close until one comes (`Gap::from`), so a barrier from a member whose slot ended before its close came
-  is that close: it ends nothing and asks for nothing, and it steps. A slot ends once (lane P14).
+  is that close: it ends nothing and asks for nothing, and it steps. A slot ends once (lane P14). A member sends its
+  close only to the leader that gave the slot, in that term (`Actor::end_slot`): a slot dies with its term, and a new
+  leader, which gave none, would take the close as an ask (lane P14's trace, the same stuck state).
 - *What a slot holds* (Q1). Everything the leader would append between the holder's base and its retry: its own
   writes and floor sessions (`prepare` defers them, `slot_deferred`), its class entry (`propose_class`), and other
   members' forwarded proposals, held after the sender and origin checks. A change of members or a hand-off ends the
