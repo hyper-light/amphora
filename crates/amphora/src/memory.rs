@@ -196,13 +196,197 @@ pub trait Readings: Send + Sync {
 }
 
 /// The system's readings, taken again at every ask: a host may change a limit while the process runs.
-struct System;
+/// On Linux each file is opened once and read again in place at every ask ([`Opened`]): the same
+/// readings, exact at each ask, without the opens, path walks and `/proc/meminfo` they cost.
+struct System {
+    #[cfg(target_os = "linux")]
+    opened: std::sync::RwLock<Option<Arc<Opened>>>,
+}
 
+impl System {
+    fn new() -> Self {
+        Self {
+            #[cfg(target_os = "linux")]
+            opened: std::sync::RwLock::new(None),
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
 impl Readings for System {
     fn read(&self) -> Reading {
         Reading {
             limit: limit(),
             resident: resident(),
+        }
+    }
+}
+
+/// Linux's reading files, open (AUDIT 2026-11-23 §1: the budget read every file again at every
+/// request). `/proc/self/cgroup` is read again at every ask, and the groups' limit files opened
+/// anew when it changed (the process was moved); each limit file and `/proc/self/statm` is read
+/// again in place (`pread`), so every reading is the kernel's at the ask. The machine's memory is
+/// `sysinfo`'s `totalram`, the count `/proc/meminfo`'s `MemTotal` prints, without the rest of that
+/// file's work. Opened again in a child of a `fork`, whose `/proc/self` is its own.
+#[cfg(target_os = "linux")]
+struct Opened {
+    pid: u32,
+    cgroup: std::fs::File,
+    /// `/proc/self/cgroup`'s text when `limits` were opened.
+    seen: Vec<u8>,
+    /// Each group's limit file above this process, v2's `memory.max` and v1's
+    /// `memory.limit_in_bytes`, deepest first.
+    limits: Vec<std::fs::File>,
+    /// The `cgroup.controllers` of each v2 group above this process with no `memory.max`: one
+    /// grows one when its parent enables the memory controller, so these files say when to open
+    /// the groups' limit files again.
+    unlimited: Vec<std::fs::File>,
+    statm: Option<std::fs::File>,
+}
+
+/// The most of a file read in place: `/proc/self/cgroup` past it is read whole instead. Not a
+/// tuning: a limit file's text is one number, statm's seven, and a cgroup file longer than this is
+/// read by [`whole`].
+#[cfg(target_os = "linux")]
+const IN_PLACE: usize = 4096;
+
+/// `file`'s text from its start, read in place; None where it can't be read.
+#[cfg(target_os = "linux")]
+fn read_at(file: &std::fs::File, buf: &mut [u8; IN_PLACE]) -> Option<usize> {
+    use std::os::unix::fs::FileExt;
+    let mut at = 0usize;
+    loop {
+        let rest = buf.get_mut(at..)?;
+        if rest.is_empty() {
+            return Some(at);
+        }
+        let n = file.read_at(rest, u64::try_from(at).ok()?).ok()?;
+        if n == 0 {
+            return Some(at);
+        }
+        at = at.checked_add(n)?;
+    }
+}
+
+/// `file`'s whole text from its start.
+#[cfg(target_os = "linux")]
+fn whole(file: &std::fs::File) -> Option<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+    let mut out = Vec::new();
+    let mut buf = [0u8; IN_PLACE];
+    loop {
+        let n = file.read_at(&mut buf, u64::try_from(out.len()).ok()?).ok()?;
+        if n == 0 {
+            return Some(out);
+        }
+        out.extend_from_slice(buf.get(..n)?);
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Opened {
+    fn open() -> Option<Self> {
+        let cgroup = std::fs::File::open("/proc/self/cgroup").ok()?;
+        let seen = whole(&cgroup)?;
+        let text = String::from_utf8_lossy(&seen);
+        let (mut limits, mut unlimited) = (Vec::new(), Vec::new());
+        for (v2, group, root, file) in [
+            (true, v2_group(&text), "/sys/fs/cgroup", "memory.max"),
+            (false, v1_group(&text), "/sys/fs/cgroup/memory", "memory.limit_in_bytes"),
+        ] {
+            for at in group.map(ancestors).unwrap_or_default() {
+                let dir = format!("{root}{}", if at == "/" { "" } else { at.as_str() });
+                match std::fs::File::open(format!("{dir}/{file}")) {
+                    Ok(open) => limits.push(open),
+                    // v2's root has no limit file, and never grows one.
+                    Err(_) if v2 && at != "/" => {
+                        if let Ok(open) = std::fs::File::open(format!("{dir}/cgroup.controllers")) {
+                            unlimited.push(open);
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+        Some(Self {
+            pid: std::process::id(),
+            cgroup,
+            seen,
+            limits,
+            unlimited,
+            statm: std::fs::File::open("/proc/self/statm").ok(),
+        })
+    }
+
+    /// Whether these files are still this process's: its own (not a forked parent's), and its
+    /// groups the ones they were opened for.
+    fn current(&self) -> bool {
+        if self.pid != std::process::id() {
+            return false;
+        }
+        let mut buf = [0u8; IN_PLACE];
+        let same = match read_at(&self.cgroup, &mut buf) {
+            Some(n) if n < IN_PLACE => buf.get(..n) == Some(self.seen.as_slice()),
+            _ => whole(&self.cgroup).as_deref() == Some(self.seen.as_slice()),
+        };
+        same && !self.unlimited.iter().any(|controllers| {
+            read_at(controllers, &mut buf)
+                .and_then(|n| buf.get(..n))
+                .is_some_and(|text| text.split(u8::is_ascii_whitespace).any(|c| c == b"memory"))
+        })
+    }
+
+    fn limit(&self) -> Option<u64> {
+        let mut buf = [0u8; IN_PLACE];
+        let groups = self.limits.iter().filter_map(|file| {
+            let n = read_at(file, &mut buf)?;
+            std::str::from_utf8(buf.get(..n)?).ok().and_then(group_limit)
+        });
+        let machine = rustix::system::sysinfo();
+        let machine = u64::from(machine.mem_unit.max(1)).checked_mul(machine.totalram);
+        groups
+            .chain(machine)
+            .chain(process_limits())
+            .min()
+    }
+
+    /// `/proc/self/statm`'s resident pages (its second field) in bytes, as memory-stats reads it.
+    fn resident(&self) -> Option<u64> {
+        let mut buf = [0u8; IN_PLACE];
+        let n = read_at(self.statm.as_ref()?, &mut buf)?;
+        let pages = std::str::from_utf8(buf.get(..n)?)
+            .ok()?
+            .split_whitespace()
+            .nth(1)?
+            .parse::<u64>()
+            .ok()?;
+        pages.checked_mul(u64::try_from(rustix::param::page_size()).ok()?)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Readings for System {
+    fn read(&self) -> Reading {
+        let held = self.opened.read().ok().and_then(|o| o.clone());
+        let opened = match held {
+            Some(opened) if opened.current() => Some(opened),
+            _ => {
+                let fresh = Opened::open().map(Arc::new);
+                if let Ok(mut slot) = self.opened.write() {
+                    slot.clone_from(&fresh);
+                }
+                fresh
+            }
+        };
+        match opened {
+            Some(opened) => Reading {
+                limit: opened.limit(),
+                resident: opened.resident().or_else(resident),
+            },
+            None => Reading {
+                limit: limit(),
+                resident: resident(),
+            },
         }
     }
 }
@@ -435,7 +619,7 @@ pub fn process() -> Arc<Budget> {
     }
     static PROCESS: OnceLock<Arc<Budget>> = OnceLock::new();
     PROCESS
-        .get_or_init(|| Budget::new(Box::new(System)))
+        .get_or_init(|| Budget::new(Box::new(System::new())))
         .clone()
 }
 
@@ -585,6 +769,27 @@ pub(crate) mod tests {
         assert!(resident.is_some_and(|r| r > 0));
         assert!(resident <= limit);
         assert!(process().room(Use::Images).is_ok());
+    }
+
+    /// AUDIT 2026-11-23 §1: the system's readings from files opened once are the readings taken
+    /// afresh. Do: read the limit both ways, and the resident bytes from the open statm. Expect:
+    /// the same limit (MemTotal through `sysinfo`), resident bytes read and within it, and the
+    /// files still this process's (MB.1, AC-MB.1.1).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mb1_opened_files_read_what_a_fresh_read_does() {
+        let opened = Opened::open().unwrap();
+        assert!(opened.current());
+        assert_eq!(opened.limit(), limit());
+        let resident = opened.resident();
+        assert!(resident.is_some_and(|r| r > 0));
+        assert!(resident <= opened.limit());
+        let system = System::new();
+        let first = system.read();
+        let again = system.read();
+        assert_eq!(first.limit, limit());
+        assert_eq!(again.limit, first.limit);
+        assert!(again.resident.is_some());
     }
 
     /// Do: parse a cgroup v2 process's `/proc/self/cgroup`, a v1 process's, and a hybrid's. Expect:
