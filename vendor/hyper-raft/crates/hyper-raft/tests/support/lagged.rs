@@ -199,6 +199,19 @@ fn check_message(disk: &Disk, message: &Message, member: u64) -> bool {
                 disk.last_index()
             );
         }
+        // A heartbeat's answer naming a position of its term (`HeartbeatAnswers::Position`) is
+        // taken by its leader as an append's answer, for the classic quorum and the reads it
+        // confirms, and it may leave while writes are out: the disk holds what it names. A leader
+        // takes no position of an older term (`handle_heartbeat_response`): one named by an answer
+        // that waited for the write of a new term may be a tail that write replaced.
+        MessageType::MsgHeartbeatResponse if current && message.log_term == message.term => {
+            assert!(
+                message.index <= disk.last_index(),
+                "member {member}: a heartbeat's answer named {} with {} durable",
+                message.index,
+                disk.last_index()
+            );
+        }
         _ if current && kind == hyper_raft::fast::FAST_VOTE => {
             for entry in &message.entries {
                 // Once the log reaches the index, what it holds there was the
@@ -227,13 +240,14 @@ impl Lagged {
         let id = raw.raft.id();
         let leads = raw.raft.state() == hyper_raft::StateRole::Leader;
         let messages = light.take_messages();
+        let reads = light.take_read_states();
         let committed = committed_of(
             raw,
             in_place,
             light.take_committed_entries(),
             light.committed_range(),
         );
-        if messages.is_empty() && committed.is_empty() {
+        if messages.is_empty() && committed.is_empty() && reads.is_empty() {
             return false;
         }
         for message in messages.iter().filter(|_| !self.judged) {
@@ -257,6 +271,11 @@ impl Lagged {
             }
         }
         self.output.messages.extend(messages);
+        self.output.reads.extend(
+            reads
+                .into_iter()
+                .map(|read| (read.index, read.request_ctx)),
+        );
         self.apply(committed);
         self.node
             .raw
@@ -619,8 +638,14 @@ impl Lagged {
 impl Replica for Lagged {
     const LAGGED: bool = true;
     fn open(id: u64, store: Store, settings: &Settings, seed: u64, members: usize) -> Self {
+        // A member driven ahead of its persistence answers heartbeats at once, so that its
+        // answers, which leave while its writes are out, are held to its disk (`check_message`).
+        let settings = Settings {
+            answer_beats_now: true,
+            ..*settings
+        };
         Self {
-            node: New::open(id, store, settings, seed, members),
+            node: New::open(id, store, &settings, seed, members),
             depth: settings.depth,
             writes: Writes::new(settings.depth),
             output: Output::default(),

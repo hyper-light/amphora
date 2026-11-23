@@ -47,6 +47,7 @@ fn drain(node: &mut RawNode<Memory>) -> Vec<Message> {
             let hard = *hard;
             node.store_mut().hard_state = hard;
         }
+        messages.extend(ready.take_held_messages());
         messages.extend(ready.take_messages());
         messages.extend(ready.take_persisted_messages());
         let mut applied = ready.committed_entries().last().map(|entry| entry.index);
@@ -1489,6 +1490,49 @@ fn a_followers_answer_waits_for_the_write_that_holds_what_it_says() {
     assert_eq!(light.messages()[0].index, 5);
 }
 
+/// Under `Config::answer_beats_now`, a follower whose term and vote are durable answers a heartbeat
+/// at once, whatever its writes out, and names only what its disk holds: the durable end of its
+/// log, not its last index.
+#[test]
+fn a_followers_heartbeat_answer_names_only_what_its_disk_holds() {
+    let mut node = follower_with(Config {
+        answer_beats_now: true,
+        ..with_depth(2, 2)
+    });
+    let mut taken = Vec::new();
+    for index in [4, 5] {
+        let mut append = answer(MessageType::MsgAppend, 1, 2, 1);
+        append.index = index - 1;
+        append.log_term = 1;
+        append.commit = 2;
+        append.entries = vec![entry(index, 1)];
+        node.step(append).unwrap();
+        let mut ready = node.ready().unwrap();
+        ready.take_persisted_messages();
+        taken.push(ready.entries().to_vec());
+        node.advance_issued(ready).unwrap();
+    }
+    // The log goes to 5 and the disk holds 3: the answer names 3, and leaves at once.
+    let mut beat = answer(MessageType::MsgHeartbeat, 1, 2, 1);
+    beat.commit = 2;
+    node.step(beat.clone()).unwrap();
+    let said = node.messages_now();
+    assert_eq!(said.len(), 1);
+    assert_eq!((said[0].index, said[0].log_term), (3, 1));
+    assert!(node.raft.messages().is_empty());
+    node.store_mut().append(&taken[0]);
+    let light = node.on_persist(1).unwrap();
+    assert!(light.messages().is_empty());
+    node.store_mut().append(&taken[1]);
+    let light = node.on_persist(2).unwrap();
+    assert!(light.messages().is_empty());
+    // Both writes durable: the next answer names 5.
+    node.step(beat).unwrap();
+    let said = node.messages_now();
+    assert_eq!(said.len(), 1);
+    assert_eq!((said[0].index, said[0].log_term), (5, 1));
+}
+
 /// Election Safety across a crash: a candidate counts its vote for itself only once the hard state
 /// naming it is durable, so a sole voter leads only from then. Counted at once, the sole voter led on
 /// a vote it could lose: hyper-durable's simulation, seed 206 of its first shape, had member 3 elected
@@ -2701,6 +2745,7 @@ fn drain_applying(node: &mut RawNode<Memory>) -> Vec<Message> {
             let hard = *hard;
             node.store_mut().hard_state = hard;
         }
+        messages.extend(ready.take_held_messages());
         messages.extend(ready.take_messages());
         messages.extend(ready.take_persisted_messages());
         let mut committed = ready.take_committed_entries();

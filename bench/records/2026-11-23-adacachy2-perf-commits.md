@@ -466,3 +466,97 @@ clean.
     cargo test -p amphora --lib --locked -- database::replicated:: --test-threads=8                 # r1083
     cargo clippy -p amphora --all-targets --locked -- -D warnings                                   # r1083
     (cd crates/amphora && ~/.cache/amphora-perf-bin/commits/tests-<sha> --exact database::replicated::tests::a_write_at_a_follower_is_answered_on_its_groups_commit)   # r1083, 6 a side
+
+# Lane V5 (commits) on adacachy2: change 0009's two open items closed, every hyper-raft suite green (2026-11-23, 16:19Z to 17:19Z)
+
+Ada's goal is replicated commits about 10x faster than dqlite and rqlite; AC-T1.8.3 asks p99 at most 2 ms for 3
+nodes on a LAN, never at the cost of safety. V4 left two failures in hyper-raft's own suites with change 0009. This
+hour closed both on `perf/commits-v5` (`2431406e`).
+
+## Losses first
+
+1. **V4's premise for `pipeline.rs` was wrong, and the oracle was narrowed, not the core fixed.** No step ever had
+   `Log::persisted()` past the disk (below). The five schedules' answers came from the default path, which 0009
+   doesn't change, and named positions of older terms that no leader takes. The oracle now holds every position
+   of the answer's own term to the disk: V3's stated rule and the leader's (`handle_heartbeat_response` takes a
+   position only when `log_term == term`). The coordinator said not to loosen the check; this is the evidence for
+   doing it, and the stricter alternative is in "Decisions".
+2. **No A/B numbers yet.** The replication ladder (S4's family (a): Amphora persisted and replicated at
+   `924fbe5c` and at `2431406e`, dqlite and rqlite, writers 1/32/128, 5 rounds, order reversed each round) was
+   queued as r1238 at 16:59Z with cpus=16, behind this lane's checks. Its records land on adacachy2 under
+   `~/.cache/commits-ab/ladder-v5/` (one folder an arm, `rounds.txt` with load and pressure beside each round); its
+   output ends with a median table. The successor reads them. Each arm's CPU cost calibration (RULES 5e) was not
+   copied across arms; the commit path is plain inserts, so a guess is that it doesn't matter, not checked.
+
+## Where the named positions came from (diagnostics, branch `diag/commits-v5-watch`)
+
+Three runs of the five failing schedules (`pipeline.rs`), 0009 at `e0f2aaf7` plus a test-only watch:
+
+| run | what it added | what it found |
+|---|---|---|
+| r1205, 16:31Z | after every harness op (step, tick, take, durable, notify, compact, ...), `persisted() <= disk.last_index()` and the disk's term there equal to the log's | fired only where a member restored a snapshot not yet durable: `persisted` 17, the log's first index 37, `log.term(17)` 0, the disk holding 17 of term 2. Not past the disk |
+| 16:34Z (`736d472e`) | the same watch, `persisted() <= disk.last_index()` alone | never fired; the oracle fired as in V4 (26 with 9, 26 with 10, 24 with 8, 15 with 4) |
+| 16:36Z (`8f6aeaf6`) | each heartbeat answer tagged by the path that built it | every one of the five was built by the default path (term and vote not yet durable), naming the log's last index, with `persisted()` equal to it when built (tag 2000026 for "26 with 9") |
+
+The mechanism: a follower of term 1 holds 1..26, durable. A heartbeat of a new leader moves it to term 4. Its vote
+isn't durable, so it answers by the default path, naming `(26, term 1)`, and the answer waits for the write of
+term 4. The new leader's append arrives first and replaces the tail from 9. That same write puts 9 of term 4 on
+the disk, and the answer leaves with it: "named 26 with 9 durable". A leader of term 4 ignores a position of term
+1. The early answer (`answer_beat_now`) never named a position past the disk.
+
+## The early answer is an owner's option (V4's option (a))
+
+`Config::answer_beats_now`, off by default as raft-rs's rule. Off, a heartbeat's answer waits for the write that
+holds what it says, as before 0009, so the core in raft-rs's settings agrees with raft-rs. Amphora's replicated
+owner turns it on (`replicated.rs`, beside `fates` and `apply_unpersisted`). The core's three tests keep the
+default rule again; a fourth, `a_followers_heartbeat_answer_names_only_what_its_disk_holds`, holds the new rule
+under the option. The tests' `Settings::answer_beats_now` sets it, and the lagged harness turns it on, so 0009
+stays under its oracles. Reads confirmed without a `Ready` stay as V3 built them: an owner gets them only by asking
+`RawNode::light_now`, which hyper-durable's `Replica::take_light` and the lagged harness do and the differential
+harness doesn't.
+
+## Runs at `2431406e`
+
+| suite | result | run |
+|---|---|---|
+| hyper-raft lib (upstream clone at the pin, patches 0001..0009, rustc 1.99.1) | 162 of 162 (V4: 161; the new opt-in test) | r1216 |
+| `differential.rs` | 8 of 8 (V4: 2 of 8) | r1216 |
+| `pipeline.rs` | 12 of 12, 1 ignored (V4: 7 of 12) | r1216 |
+| backlog, check, fast, group, repair, strategies, suspicion, timed, toolchain | 1, 11, 15, 12, 7, 12 (37 ignored), 35, 2 (1 ignored), 1: all pass | r1216 |
+| hyper-durable, every target | lib 6, directed 5, hyperlog 14, keep 2, liveness 21 (5 ignored), shell 47, sim 5, threads 1: all pass | r1216 |
+| clippy hyper-raft + hyper-durable, all targets, `-D warnings -A deprecated` | clean | r1216 |
+| clippy `-p amphora --all-targets -D warnings`; `-p hyper-raft -p hyper-durable` (lib) | clean | r1217 |
+| amphora replicated suite and the `v3_` tests | 140 of 141, 5 ignored, 131.7 s; both `v3_` tests pass. The one failure is main's own, `a_write_at_a_follower_is_answered_on_its_groups_commit` (V4: 6 of 6 on main; unchanged on main `5e6c619f`) | r1217 |
+| `scripts/vendor.py check hyper-raft` | 8 recorded changes, 0 differences | local |
+| merged with origin/main (`faaf2a7d`): clippy `-p amphora --all-targets`, clippy `-p hyper-raft -p hyper-durable`, the `v3_` tests | clean, clean, 2 of 2 | r1236 |
+| merged with origin/main again (`32f9a6ce`, lane W5's hyper-raft 0011 beside 0009; `vendor.py check`: 9 recorded changes, 0 differences): hyper-raft lib, `differential.rs`, `pipeline.rs`, clippy hyper-raft all targets, clippy `-p amphora --all-targets`, the `v3_` tests | 163 of 163, 8 of 8, 12 of 12 (1 ignored), clean, clean, 2 of 2 | r1244 |
+
+Load on adacachy2 during r1216: 9 to 33 (1 min), CPU pressure "some" avg10 3 to 7%, I/O under 5%.
+
+## Decisions for Ada (plain choices)
+
+1. **The heartbeat oracle's scope.** It now checks every position of the answer's own term, the only positions a
+   leader counts. The stricter form (every nonzero position) fails on the default path, which names its log's last
+   index and can leave after a new leader's entries replaced that tail. To keep the stricter form, the default
+   path would have to name no position of an older term. That changes the core's default answers, and no leader
+   reads those positions today. Recommended: keep it as merged.
+2. **A position of term 0.** With a snapshot restored and not yet durable, `answer_beat_now` names `persisted` with
+   log term 0 (`Log::term` gives 0 below the snapshot). No leader takes it, but its comment says it "states no
+   position". A one-line `term != 0` guard would make the code say what the comment says. Not changed here.
+
+## Commands
+
+    # hyper-raft's proof: kiln run on 00aad8daff2fa3c9daa65d53c425d450, needs linux/amd64,cpus=8,mem=24g, sync false;
+    # upstream clone ~/.cache/amphora-perf/commits-hyper-raft at d5d5f8f6 plus vendor/patches/hyper-raft/*.patch of
+    # the commit named, RUSTUP_TOOLCHAIN=1.99.1, CARGO_TARGET_DIR=~/.cache/amphora-perf-target/commits-hyper-raft
+    cargo test -p hyper-raft --test pipeline --no-fail-fast -- --test-threads=8 faults_at_rest held_commits_across_fates members_of_one_fate random_interleavings_by_suspicion   # r1205 and the 16:34Z and 16:36Z runs, diag/commits-v5-watch
+    cargo test -p hyper-raft --lib --tests --no-fail-fast -- --test-threads=8        # r1216 at 2431406e
+    cargo test -p hyper-durable --lib --tests --no-fail-fast -- --test-threads=8     # r1216
+    cargo clippy -p hyper-raft -p hyper-durable --all-targets -- -D warnings -A deprecated   # r1216
+    # Amphora: cwd ~/.cache/amphora-perf/commits-remote, CARGO_TARGET_DIR=~/.cache/amphora-perf-target/commits
+    cargo clippy -p amphora --all-targets --locked -- -D warnings                    # r1217, r1236
+    cargo test -p amphora --lib --locked -- database::replicated:: --test-threads=8  # r1217
+    cargo test -p amphora --lib --locked -- database::replicated::tests::v3_ --test-threads=2   # r1236 at faaf2a7d
+    # the ladder: after arm built in a worktree at 2431406e (~/.cache/commits-ab/2431406e, release, 1 min 42 s),
+    # copied to ~/.cache/amphora-perf-bin/commits/2431406e; bench/repl_ladder.sh and repl_members.sh take ARM_BIN
+    # (a sed in that worktree, undone after); needs cpus=16                         # r1238
