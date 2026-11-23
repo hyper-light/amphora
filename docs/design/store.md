@@ -2219,22 +2219,25 @@ segment `Current`, the other `Free`), read by the same recovery.
 **What plain SQLite sees (the coordinator, 2026-11-23, on lane B6's question).** Three rules.
 - *Amphora opens the WAL-mode files SQLite writes.* Such a file is the one-segment state above, read at no cost.
 - *Plain SQLite refuses an open Amphora database, and one a crash left.* Bytes 18 and 19 of the database header carry
-  3, the value SQLite's wal2 writes. SQLite refuses a read version above 2 ("If the read version is greater than 2,
-  then that database cannot be read or written", sqlite.org/fileformat2.html, file format version numbers; wal2.md:
-  "Attempting to use any other version of SQLite results in an SQLITE_NOTADB error"), so it never reads `-wal`
-  without `-wal2`'s commits. The open writes 3 where it rewrites a rollback file's 1 to 2 today
+  3, the value SQLite's wal2 writes. SQLite refuses a read version above 2 ("If a database file with a read version
+  greater than 2 is encountered, then that database cannot be read or written", sqlite.org/fileformat2.html, 1.3.3;
+  `btree.c` `lockBtree` returns `SQLITE_NOTADB` for `page1[19]>2`; wal2.md: "Attempting to use any other version of
+  SQLite results in an SQLITE_NOTADB error"), so it never reads `-wal` without `-wal2`'s commits. The open writes 3 where it rewrites a rollback file's 1 to 2 today
   (`crates/engine/database.rs`, 2272-2287), for a 1 and a 2 alike, in the database's first commit, before any other
-  frame. The header in memory then carries 3, so every later frame of page 1 does too. SQLite reads page 1 through
-  `-wal` whenever that file exists, so the mark must be in the log's frames of page 1 as well as in the file, and from
-  that first commit on it is in both. Any other value stays `Corrupt("Invalid read_version: …")` at open (2184-2190).
+  frame. The header in memory then carries 3, so every later frame of page 1 does too. Whenever `-wal` exists and the
+  file is not empty, SQLite opens `-wal` before it reads page 1 (`pager.c` `pagerOpenWalIfPresent`, called from
+  `sqlite3PagerSharedLock`) and takes page 1 from its frame there if it has one, so the mark must be in the log's
+  frames of page 1 as well as in the file. From that first commit on it is in both. Any other value stays `Corrupt("Invalid read_version: …")` at open (2184-2190).
 - *A cleanly closed Amphora database is a plain SQLite file.* The last connection's close (`Connection::close`,
   `Pager::checkpoint_shutdown`) folds both segments into the file. It copies the closing segment, then the current
-  one, syncs the file, and truncates both segments to nothing. Only then does it write 2 into bytes 18 and 19 of the
-  file's first page, in place and not through the log, and sync the file again. sqlite3 and other tools then read a
-  WAL-mode file with an empty log. The order is the rule. A 2 written while either segment still holds frames lets
-  SQLite read `-wal` alone: it misses `-wal2`'s commits, or reads the closing segment's older frames over the newer
-  pages in the file. A 2 written through the log is such a frame. A crash at any step of the close before the 2's
-  sync leaves 3: SQLite refuses the file, and Amphora recovers it as it recovers any crash. A close that cannot fold
+  one, syncs the file, truncates both segments to nothing and syncs them. Only then does it write 2 into bytes 18 and
+  19 of the file's first page, in place and not through the log, and sync the file again. sqlite3 and other tools
+  then read a WAL-mode file with an empty log. The order is the rule. A 2 that is durable while either segment still
+  holds frames, or while a truncation is not, lets SQLite read `-wal` alone: it misses `-wal2`'s commits, or reads the
+  closing segment's older frames over the newer pages in the file. A 2 written through the log is such a frame. A
+  crash before the 2 is written leaves 3: SQLite refuses the file, and Amphora recovers it as it recovers any crash.
+  A crash while it is written leaves 3 or 2, and with 2 every commit is already in the file and both segments are
+  empty. A close that cannot fold
   (the shutdown checkpoint gives up after three `Busy` answers, as it does today) also leaves 3: that database was not
   closed cleanly, and SQLite refuses it.
 
