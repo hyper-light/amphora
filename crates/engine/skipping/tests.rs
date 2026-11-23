@@ -3890,14 +3890,31 @@ mod versioned {
                         let conn = db
                             .connect(ConnectOpts::new().with_versioned_storage())
                             .unwrap();
+                        let mut conflicts = 0usize;
                         for t in 0..txns {
                             let id = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let a = (w * 31 + t * 7) % 1000;
-                            conn.execute(format!(
+                            let insert = format!(
                                 "INSERT INTO t (rowid, a, pad) VALUES ({id}, {a}, 'w')"
-                            ))
-                            .unwrap();
+                            );
+                            // Concurrent appends can validate the same end-of-table gap.
+                            // A serialization refusal rolled this insert back; repeat the
+                            // same row. Only the other writers' commits can invalidate it.
+                            let mut attempts = 0;
+                            loop {
+                                match conn.execute(&insert) {
+                                    Ok(()) => break,
+                                    Err(crate::LimboError::SerializationFailure) => {
+                                        conflicts += 1;
+                                        attempts += 1;
+                                        assert!(attempts <= writers.saturating_sub(1) * txns,
+                                            "a single row exceeded the other writers' total commits");
+                                    }
+                                    Err(error) => panic!("{insert}: {error}"),
+                                }
+                            }
                         }
+                        conflicts
                     })
                 })
                 .collect();
@@ -3926,9 +3943,21 @@ mod versioned {
                     "{policy:?}"
                 );
             }
-            for thread in threads {
-                thread.join().unwrap();
-            }
+            let conflicts: usize = threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .sum();
+            let total = builder
+                .prepare("SELECT count(*) FROM t")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap();
+            assert_eq!(
+                total,
+                vec![vec![Value::from_i64(
+                    3000 + i64::try_from(writers * txns).unwrap()
+                )]]
+            );
             latencies.sort_unstable();
             // The latency at `per_mille` of the builds (nearest rank).
             let at = |per_mille: usize| {
@@ -3937,7 +3966,7 @@ mod versioned {
             };
             let (waits, rebuilds) = db.skipping.wait_counts();
             eprintln!(
-                "skip_ab policy={policy:?} writers={writers} txns={txns} builds={builds} build_ns_p50={} p99={} p999={} max={} built_stale={stale} waits={waits} rebuilds={rebuilds} filter_rows_read={read}",
+                "skip_ab policy={policy:?} writers={writers} txns={txns} builds={builds} serialization_refusals={conflicts} build_ns_p50={} p99={} p999={} max={} built_stale={stale} waits={waits} rebuilds={rebuilds} filter_rows_read={read}",
                 at(500),
                 at(990),
                 at(999),
