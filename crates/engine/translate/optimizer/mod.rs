@@ -72,7 +72,7 @@ use join::{
     compute_best_join_order_with_context, count_subquery_calls_for_plan, BestJoinOrderResult,
     CorrelatedSubqueryEstimate, JoinN, JoinPlanningContext,
 };
-use lift_common_subexpressions::rewrite_or_terms;
+use lift_common_subexpressions::{column_read_can_raise, rewrite_or_terms};
 use order::{
     compute_order_target, plan_satisfies_order_target, simple_aggregate_order_target,
     EliminatesSortBy, OrderTargetPurpose,
@@ -1210,7 +1210,9 @@ fn find_select_plan_form(
     let available_indexes =
         AvailableIndexes::for_table_references(resolver, &plan.table_references)
             .with_primary_roots(&plan.table_references)?;
-    rewrite_or_terms(&mut plan.where_clause, &available_indexes)?;
+    rewrite_or_terms(&mut plan.where_clause, &available_indexes, &|table, column| {
+        column_read_can_raise(&plan.table_references, resolver, table, column)
+    })?;
     if let ConstantConditionEliminationResult::ImpossibleCondition = eliminate_constant_conditions(
         &mut plan.where_clause,
         plan.table_references.has_right_or_full_join(),
@@ -1494,7 +1496,9 @@ fn optimize_delete_plan(plan: &mut DeletePlan, resolver: &Resolver) -> Result<()
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause, resolver, &plan.table_references)?;
 
-    rewrite_or_terms(&mut plan.where_clause, &available_indexes)?;
+    rewrite_or_terms(&mut plan.where_clause, &available_indexes, &|table, column| {
+        column_read_can_raise(&plan.table_references, resolver, table, column)
+    })?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause, false)?
     {
@@ -1544,7 +1548,9 @@ fn optimize_update_plan(
     transform_match_to_fts_match(&mut plan.where_clause, resolver, &target_tables)?;
     let available_indexes = AvailableIndexes::for_table_references(resolver, &target_tables)
         .with_primary_roots(&target_tables)?;
-    rewrite_or_terms(&mut plan.where_clause, &available_indexes)?;
+    rewrite_or_terms(&mut plan.where_clause, &available_indexes, &|table, column| {
+        column_read_can_raise(&target_tables, resolver, table, column)
+    })?;
     if let ConstantConditionEliminationResult::ImpossibleCondition = eliminate_constant_conditions(
         &mut plan.where_clause,
         plan.from_tables.has_right_or_full_join(),
@@ -4533,6 +4539,47 @@ pub(crate) mod bushy_test_hook {
                 steps < whole_l,
                 "{steps} steps, reading l whole with its own filters takes {whole_l}: {plan:?}"
             );
+        }
+
+        /// Lane T9 (T8's open edge): a table's share of a WHERE OR runs on rows the OR itself may
+        /// never reach. Here no line joins a part, so the OR, and its LIKE with an ESCAPE of two
+        /// characters, runs on no row: the query answers as the same OR inside a CASE (which no
+        /// share is taken from) does, rather than raising the ESCAPE's error from a share.
+        #[test]
+        fn t9_a_share_of_an_or_raises_no_error_the_or_would_not() {
+            let io = Arc::new(MemoryIO::new());
+            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            for sql in [
+                "CREATE TABLE p(id INTEGER PRIMARY KEY, name TEXT, size INT)",
+                "CREATE TABLE l(id INTEGER PRIMARY KEY, pk INT, qty INT)",
+                "CREATE INDEX l_pk ON l(pk)",
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 2000) \
+                 INSERT INTO p SELECT i, char(97 + i % 26) || i, i % 50 FROM x",
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 60000) \
+                 INSERT INTO l SELECT i, 100000 + i % 2000, i % 50 FROM x",
+                "ANALYZE",
+            ] {
+                conn.execute(sql).unwrap();
+            }
+            let outcome = |sql: &str| -> std::result::Result<Vec<String>, String> {
+                let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+                let rows = stmt.run_collect_rows().map_err(|e| e.to_string())?;
+                Ok(rows
+                    .into_iter()
+                    .map(|row| row.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","))
+                    .collect())
+            };
+            let branches = "(p.id = l.pk AND p.name LIKE 'a%' ESCAPE 'xy' AND p.size < 5 \
+                 AND l.qty = 1) \
+                 OR (p.id = l.pk AND p.name LIKE 'b%' ESCAPE 'xy' AND p.size < 10 AND l.qty = 2)";
+            let unshared = outcome(&format!(
+                "SELECT count(*) FROM l, p WHERE p.id = l.pk \
+                 AND CASE WHEN {branches} THEN 1 ELSE 0 END = 1"
+            ));
+            assert_eq!(unshared, Ok(vec!["0".to_string()]));
+            let sql = format!("SELECT count(*) FROM l, p WHERE {branches}");
+            assert_eq!(outcome(&sql), unshared, "{:?}", outcome(&format!("EXPLAIN QUERY PLAN {sql}")));
         }
 
         /// PL.8 (T-PL.8.13, lane pl8-19): the hand-built bushy tree `(a ((b l c) p))` whose run
