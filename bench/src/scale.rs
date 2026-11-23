@@ -1511,7 +1511,7 @@ mod inproc {
     use std::collections::VecDeque;
     use std::sync::Arc;
 
-    use amphora::database::{Database, ReadMode};
+    use amphora::database::{AnswerMax, Database, ReadMode};
     use amphora::xgroup;
     use amphora_api::Value;
     use amphora_api::replication::{Durability, Fates, ReplicaConfig};
@@ -1867,7 +1867,7 @@ mod inproc {
         /// (Database::call_session).
         fn exec(&self, g: usize, rows: Vec<(String, Vec<Value>)>) -> anyhow::Result<Mark> {
             self.leader(g)?
-                .call_session(Instant::now() + self.deadline, move |c| {
+                .call_session(Instant::now() + self.deadline, AnswerMax::fixed(), move |c| {
                     for (sql, args) in rows {
                         c.prepare_cached(&sql)?.execute(args)?;
                     }
@@ -2128,7 +2128,7 @@ mod inproc {
                             m
                         }
                     };
-                    let refused = match member.call(until, |c| Ok(c.execute_batch(EVENTS)?)) {
+                    let refused = match member.call(until, AnswerMax::fixed(), |c| Ok(c.execute_batch(EVENTS)?)) {
                         Ok(()) => break,
                         Err(e) => e,
                     };

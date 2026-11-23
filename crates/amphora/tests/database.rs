@@ -11,7 +11,7 @@
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
-use amphora::database::Database;
+use amphora::database::{AnswerMax, Database};
 use amphora_api::{
     Cond, Consistency, Migration, Records, Refusal, Scan, Statement, Tx, Value, Write,
 };
@@ -82,7 +82,7 @@ fn adaptive_sql_runs_once_rolls_back_errors_and_returns_after_persistence() {
     {
         let db = Database::open(&path, until()).unwrap();
         let counted = Arc::clone(&calls);
-        let result: Result<(), Refusal> = db.call(until(), move |c| {
+        let result: Result<(), Refusal> = db.call(until(), AnswerMax::fixed(), move |c| {
             counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             c.execute_batch("CREATE TABLE discarded(x)")?;
             anyhow::bail!("application refused its transaction")
@@ -90,7 +90,7 @@ fn adaptive_sql_runs_once_rolls_back_errors_and_returns_after_persistence() {
         assert!(result.is_err());
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         let value = db
-            .call(until(), |c| {
+            .call(until(), AnswerMax::fixed(), |c| {
                 let count: i64 = c.query_row(
                     "SELECT count(*) FROM sqlite_schema WHERE name = 'discarded'",
                     [],
@@ -107,7 +107,7 @@ fn adaptive_sql_runs_once_rolls_back_errors_and_returns_after_persistence() {
             })
             .unwrap();
         assert_eq!(value, 42);
-        db.call(until(), |connection| {
+        db.call(until(), AnswerMax::fixed(), |connection| {
             assert_eq!(
                 connection
                     .prepare_cached("SELECT * FROM decisions")?
@@ -133,7 +133,7 @@ fn adaptive_sql_runs_once_rolls_back_errors_and_returns_after_persistence() {
     }
     let db = Database::open(&path, until()).unwrap();
     assert_eq!(
-        db.call(until(), |c| Ok(c.query_row(
+        db.call(until(), AnswerMax::fixed(), |c| Ok(c.query_row(
             "SELECT n FROM decisions",
             [],
             |r| r.get::<_, i64>(0usize)
@@ -693,7 +693,7 @@ fn sql_and_records_share_one_transaction_and_publish_only_durable_changes() {
     let db = Database::open(&path, until()).unwrap();
     let records = db.namespace("server").unwrap();
     let at = db
-        .call(until(), |connection| {
+        .call(until(), AnswerMax::fixed(), |connection| {
             connection
                 .execute_batch("CREATE TABLE paired(n INTEGER); INSERT INTO paired VALUES (1)")?;
             let at = connection.records_commit(
@@ -714,7 +714,7 @@ fn sql_and_records_share_one_transaction_and_publish_only_durable_changes() {
         })
         .unwrap();
     assert_eq!(records.try_wait("items", 0).unwrap(), Some(at));
-    let refused: Result<(), Refusal> = db.call(until(), |connection| {
+    let refused: Result<(), Refusal> = db.call(until(), AnswerMax::fixed(), |connection| {
         connection.execute("UPDATE paired SET n = 2", [])?;
         connection.records_commit(
             "server",
@@ -728,7 +728,7 @@ fn sql_and_records_share_one_transaction_and_publish_only_durable_changes() {
     assert!(matches!(refused, Err(Refusal::Conflict { .. })));
     assert_eq!(records.head(until()).unwrap(), at);
     assert_eq!(
-        db.call(until(), |c| Ok(c.query_row(
+        db.call(until(), AnswerMax::fixed(), |c| Ok(c.query_row(
             "SELECT n FROM paired",
             [],
             |row| row.get::<_, i64>(0usize)
@@ -758,7 +758,7 @@ fn sql_and_records_share_one_transaction_and_publish_only_durable_changes() {
 fn a_query_answers_beside_a_held_writer_and_writes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(Database::open(&dir.path().join("queries.db"), until()).unwrap());
-    db.call(until(), |c| {
+    db.call(until(), AnswerMax::fixed(), |c| {
         c.execute_batch("CREATE TABLE t(n INTEGER); INSERT INTO t VALUES (1)")?;
         Ok(())
     })
@@ -775,7 +775,7 @@ fn a_query_answers_beside_a_held_writer_and_writes_nothing() {
     let writer = {
         let db = Arc::clone(&db);
         std::thread::spawn(move || {
-            db.call(until(), move |c| {
+            db.call(until(), AnswerMax::fixed(), move |c| {
                 c.execute("INSERT INTO t VALUES (2)", [])?;
                 held.send(())?;
                 released.recv_timeout(guard)?;
@@ -800,20 +800,20 @@ fn a_query_answers_beside_a_held_writer_and_writes_nothing() {
     assert_eq!(count(&db).unwrap(), 2);
 }
 
-/// AUDIT 2026-11-23 §1, MB.1: a call charged by its answer answers within its bound, and an
-/// answer past its declared bound is refused and rolled back, never committed.
+/// AUDIT 2026-11-23 §1, MB.1: a call answers within the bound it declared, and an answer past
+/// its declared bound is refused and rolled back, never committed.
 #[test]
 fn mb_1_a_charged_call_past_its_declared_answer_rolls_back() {
-    use amphora::database::{AnswerBytes, AnswerCharge};
+    use amphora::database::AnswerBytes;
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(&dir.path().join("charged.db"), until()).unwrap();
-    db.call(until(), |c| {
+    db.call(until(), AnswerMax::fixed(), |c| {
         c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
         Ok(())
     })
     .unwrap();
-    let write = |id: i64, charge: AnswerCharge| {
-        db.call_charged(until(), charge, move |c| {
+    let write = |id: i64, answer: AnswerMax<String>| {
+        db.call(until(), answer, move |c| {
             c.execute(
                 "INSERT INTO t (id, v) VALUES (?1, 'x')",
                 vec![Value::Integer(id)],
@@ -822,14 +822,13 @@ fn mb_1_a_charged_call_past_its_declared_answer_rolls_back() {
         })
     };
     let answer = "y".repeat(100).answer_bytes();
-    assert_eq!(write(1, AnswerCharge::Declared(answer)).unwrap().len(), 100);
-    assert_eq!(write(2, AnswerCharge::Measured).unwrap().len(), 100);
+    assert_eq!(write(1, AnswerMax::bytes(answer)).unwrap().len(), 100);
     assert!(matches!(
-        write(3, AnswerCharge::Declared(answer - 1)),
+        write(2, AnswerMax::bytes(answer - 1)),
         Err(Refusal::TooLarge { .. })
     ));
     let ids = db
-        .call(until(), |c| {
+        .call(until(), AnswerMax::bytes(amphora_api::RESULT_MAX), |c| {
             let mut s = c.prepare("SELECT id FROM t ORDER BY id")?;
             let ids = s
                 .query_map(Vec::<Value>::new(), |row| row.get::<_, i64>(0))?
@@ -837,7 +836,7 @@ fn mb_1_a_charged_call_past_its_declared_answer_rolls_back() {
             Ok(ids)
         })
         .unwrap();
-    assert_eq!(ids, vec![1, 2]);
+    assert_eq!(ids, vec![1]);
 }
 
 /// Runs `future` on this thread, parked until its waker is woken; counts the wakes.
@@ -863,7 +862,7 @@ fn block_on<T>(future: impl std::future::Future<Output = T>) -> (T, usize) {
 }
 
 fn ids(db: &Database) -> Vec<i64> {
-    db.call(until(), |c| {
+    db.call(until(), AnswerMax::bytes(amphora_api::RESULT_MAX), |c| {
         let mut s = c.prepare("SELECT id FROM t ORDER BY id")?;
         let ids = s
             .query_map(Vec::<Value>::new(), |row| row.get::<_, i64>(0))?
@@ -873,27 +872,20 @@ fn ids(db: &Database) -> Vec<i64> {
     .unwrap()
 }
 
-/// Lane perf-A7: a call queued without blocking answers through its `Calling` once, whatever its
-/// charge, and a second poll gets no second answer.
+/// Lane perf-A7: a call queued without blocking answers through its `Calling` once, and a second
+/// poll gets no second answer.
 #[test]
 fn a7_a_nowait_call_answers_exactly_once() {
-    use amphora::database::AnswerCharge;
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(&dir.path().join("nowait.db"), until()).unwrap();
-    db.call(until(), |c| {
+    db.call(until(), AnswerMax::fixed(), |c| {
         c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
         Ok(())
     })
     .unwrap();
-    let charges = [
-        AnswerCharge::Flat,
-        AnswerCharge::Declared(1 << 20),
-        AnswerCharge::Measured,
-    ];
     let calling: Vec<_> = (1..=3i64)
-        .zip(charges)
-        .map(|(id, charge)| {
-            db.call_nowait(until(), charge, move |c| {
+        .map(|id| {
+            db.call_nowait(until(), AnswerMax::fixed(), move |c| {
                 c.execute(
                     "INSERT INTO t (id, v) VALUES (?1, 'x')",
                     vec![Value::Integer(id)],
@@ -917,16 +909,16 @@ fn a7_a_nowait_call_answers_exactly_once() {
 /// answer is refused through its `Calling` and rolled back.
 #[test]
 fn a7_a_refused_or_oversize_nowait_call_is_typed_and_rolls_back() {
-    use amphora::database::{AnswerBytes, AnswerCharge};
+    use amphora::database::AnswerBytes;
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(&dir.path().join("refused.db"), until()).unwrap();
-    db.call(until(), |c| {
+    db.call(until(), AnswerMax::fixed(), |c| {
         c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
         Ok(())
     })
     .unwrap();
-    let write = |id: i64, charge: AnswerCharge| {
-        db.call_nowait(until(), charge, move |c| {
+    let write = |id: i64, answer: AnswerMax<String>| {
+        db.call_nowait(until(), answer, move |c| {
             c.execute(
                 "INSERT INTO t (id, v) VALUES (?1, 'x')",
                 vec![Value::Integer(id)],
@@ -935,18 +927,18 @@ fn a7_a_refused_or_oversize_nowait_call_is_typed_and_rolls_back() {
         })
     };
     assert!(matches!(
-        write(1, AnswerCharge::Declared(usize::MAX)),
+        write(1, AnswerMax::bytes(usize::MAX)),
         Err(Refusal::Full { .. })
     ));
     let past = Instant::now() - Duration::from_millis(1);
     assert!(matches!(
-        db.call_nowait(past, AnswerCharge::Measured, |_| Ok(0i64)),
+        db.call_nowait(past, AnswerMax::fixed(), |_| Ok(0i64)),
         Err(Refusal::Timeout)
     ));
     let answer = "y".repeat(100).answer_bytes();
-    let (over, _) = block_on(write(2, AnswerCharge::Declared(answer - 1)).unwrap());
+    let (over, _) = block_on(write(2, AnswerMax::bytes(answer - 1)).unwrap());
     assert!(matches!(over, Err(Refusal::TooLarge { .. })), "{over:?}");
-    let (fits, _) = block_on(write(3, AnswerCharge::Declared(answer)).unwrap());
+    let (fits, _) = block_on(write(3, AnswerMax::bytes(answer)).unwrap());
     assert_eq!(fits.unwrap().len(), 100);
     assert_eq!(ids(&db), vec![3]);
 }
@@ -956,13 +948,12 @@ fn a7_a_refused_or_oversize_nowait_call_is_typed_and_rolls_back() {
 /// (it held 4,096 before), its memory charge is its only bound.
 #[test]
 fn a8_ten_thousand_nowait_calls_in_flight_are_all_answered_none_refused_for_queue_room() {
-    use amphora::database::AnswerCharge;
     const IN_FLIGHT: usize = 10_000;
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(&dir.path().join("in-flight.db"), until()).unwrap();
     let (release, held) = std::sync::mpsc::channel::<()>();
     let holding = db
-        .call_nowait(until(), AnswerCharge::Declared(0), move |_| {
+        .call_nowait(until(), AnswerMax::fixed(), move |_| {
             let _ = held.recv();
             Ok(())
         })
@@ -977,7 +968,7 @@ fn a8_ten_thousand_nowait_calls_in_flight_are_all_answered_none_refused_for_queu
                 let calling: Vec<_> = mine
                     .iter()
                     .map(|&n| {
-                        db.call_nowait(until(), AnswerCharge::Declared(8), move |_| Ok(n))
+                        db.call_nowait(until(), AnswerMax::fixed(), move |_| Ok(n))
                             .unwrap()
                     })
                     .collect();

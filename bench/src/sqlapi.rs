@@ -25,7 +25,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use amphora::database::Database;
+use amphora::database::{AnswerMax, Database};
 use amphora_api::Value;
 use amphora_engine_parser::{
     ast::fmt::{BlankContext, ToTokens, TokenStream},
@@ -177,11 +177,11 @@ fn fold(mut h: u64, value: &Value) -> u64 {
 }
 
 fn reapi_setup(db: &Database, digests: &[String]) -> anyhow::Result<()> {
-    db.call(until(), |c| Ok(c.execute_batch(REAPI_SCHEMA)?)).map_err(refused)?;
+    db.call(until(), AnswerMax::fixed(), |c| Ok(c.execute_batch(REAPI_SCHEMA)?)).map_err(refused)?;
     for (n, chunk) in digests.chunks(1_000).enumerate() {
         let chunk = chunk.to_vec();
         let first = n as i64 * 1_000;
-        db.call(until(), move |c| {
+        db.call(until(), AnswerMax::fixed(), move |c| {
             let mut record = c.prepare_cached("INSERT INTO work_records (family, key, value, at) VALUES (?1, ?2, ?3, ?4)")?;
             let mut object = c.prepare_cached("INSERT INTO cas_index (digest, size, created_at, last_used_at) VALUES (?1, ?2, ?3, ?3)")?;
             for (i, d) in chunk.iter().enumerate() {
@@ -201,7 +201,7 @@ fn reapi_run(db: &Database, digests: &[String], per_call: u64) -> anyhow::Result
         let chunk = chunk.to_vec();
         let began = Instant::now();
         let (executes, inside, cpu) = db
-            .call(until(), move |c| {
+            .call(until(), AnswerMax::fixed(), move |c| {
                 let (started, cpu) = (Instant::now(), cpu_ns());
                 let mut held = c.prepare_cached(EXISTS)?;
                 let mut size = c.prepare_cached(SIZE)?;
@@ -221,8 +221,8 @@ fn reapi_run(db: &Database, digests: &[String], per_call: u64) -> anyhow::Result
 }
 
 fn logsearch_setup(db: &Database, docs: u64) -> anyhow::Result<()> {
-    db.call(until(), |c| Ok(c.execute_batch(LOG_SCHEMA)?)).map_err(refused)?;
-    db.call(until(), |c| {
+    db.call(until(), AnswerMax::fixed(), |c| Ok(c.execute_batch(LOG_SCHEMA)?)).map_err(refused)?;
+    db.call(until(), AnswerMax::fixed(), |c| {
         let mut run = c.prepare_cached("INSERT INTO runs (id, number, repo_id, workflow_id, pipeline, branch, conclusion, status, created_at) VALUES (?1, ?2, ?3, 'build', NULL, 'main', 'success', 'done', ?4)")?;
         let mut job = c.prepare_cached("INSERT INTO jobs (id, run_id, key, finished_at) VALUES (?1, ?2, 'test', ?3)")?;
         let mut step = c.prepare_cached("INSERT INTO steps (job_id, idx, name) VALUES (?1, ?2, ?3)")?;
@@ -242,7 +242,7 @@ fn logsearch_setup(db: &Database, docs: u64) -> anyhow::Result<()> {
     let ids: Vec<u64> = (1..=docs).collect();
     for chunk in ids.chunks(1_000) {
         let chunk = chunk.to_vec();
-        db.call(until(), move |c| {
+        db.call(until(), AnswerMax::fixed(), move |c| {
             let mut doc = c.prepare_cached("INSERT INTO ci_log_docs (id, text, leg, step, line) VALUES (?1, ?2, ?3, ?4, ?5)")?;
             let mut gram = c.prepare_cached(POSTING)?;
             for &i in &chunk {
@@ -267,7 +267,7 @@ fn logsearch_run(db: &Database, pages: u64, per_call: u64) -> anyhow::Result<Tim
         let (h, start) = (t.checksum, cursor);
         let began = Instant::now();
         let (h, next, inside, cpu) = db
-            .call(until(), move |c| {
+            .call(until(), AnswerMax::fixed(), move |c| {
                 let (started, cpu) = (Instant::now(), cpu_ns());
                 let (mut h, mut cursor) = (h, start);
                 let mut page = c.prepare_cached(PAGE)?;
@@ -356,7 +356,7 @@ fn parse_run(parses: u64) -> anyhow::Result<Vec<(&'static str, f64, Option<f64>)
 }
 
 fn insert_run(db: &Database, rows: u64, per_call: u64) -> anyhow::Result<Timed> {
-    db.call(until(), |c| Ok(c.execute_batch("CREATE TABLE ci_log_grams (gram INTEGER NOT NULL, doc INTEGER NOT NULL, PRIMARY KEY (gram, doc)); CREATE INDEX ci_log_grams_doc ON ci_log_grams (doc, gram);")?))
+    db.call(until(), AnswerMax::fixed(), |c| Ok(c.execute_batch("CREATE TABLE ci_log_grams (gram INTEGER NOT NULL, doc INTEGER NOT NULL, PRIMARY KEY (gram, doc)); CREATE INDEX ci_log_grams_doc ON ci_log_grams (doc, gram);")?))
         .map_err(refused)?;
     let mut t = Timed::new();
     let (mut next, step) = (0u64, per_call.max(1));
@@ -364,7 +364,7 @@ fn insert_run(db: &Database, rows: u64, per_call: u64) -> anyhow::Result<Timed> 
         let (from, to) = (next, rows.min(next + step));
         let began = Instant::now();
         let (inside, cpu) = db
-            .call(until(), move |c| {
+            .call(until(), AnswerMax::fixed(), move |c| {
                 let (started, cpu) = (Instant::now(), cpu_ns());
                 let mut posting = c.prepare_cached(POSTING)?;
                 for i in from..to {

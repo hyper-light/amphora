@@ -323,3 +323,26 @@ first:
 Verdict: no arm wins every cell. Declared wins p50 and calls/s everywhere and the tails in three
 of four cells; measured wins the 10k tails under the 1 GiB scope, within overlapping ranges. Flat
 is out of the running on admission. Not decided (Ada's call by data); no arm deleted.
+
+## The call charge is the declared bound alone (perf-A9, Ada's decision on A8's A/B)
+
+**Unit 1.** `Database::call`, `call_session` and `call_nowait` take the caller's `AnswerMax<R>`: charged at
+admission, and the answer's bytes (`AnswerBytes`) checked inside the call's transaction before it commits, past
+it refused `TooLarge` and rolled back. `AnswerCharge::{Flat, Measured}`, `call_charged`, the measured answer's
+second budget take on the writer and the arm switch are deleted; `AnswerBytes` stays (the declared check needs
+it). Every caller in the workspace declares, none by a picked number: `AnswerMax::fixed()` for a heap-free
+answer (its type's size; the type system refuses `fixed()` for a `String` or `Vec`, `FixedAnswer`), the
+table's SQL `size_of::<String>() + SQL_MAX`, an exact `Vec` its length's bytes, an SQL write's frames over the
+wire and test row lists `RESULT_MAX` (the API's bound on a result, as an SQL batch is charged, lane perf-A5).
+The codemod is `~/.cache/amphora-perf/cross-a9-scripts/declare.py`. The `admission` example keeps its `ab` and
+`nowait` modes with the declared arm alone. Decision record: docs/design/store.md, "Decision (lane perf-A9)".
+
+Checks (adacachy2, needs cpus=8,mem=24g, load 64-96 on 32 cores): r1105 at 091c2025, tests database 13/13,
+call_nowait_charge 1/1, store 15/15, transport 6+1+1+1 passed, online_schema 10/10, lib `serve::` 11/11; lib
+`sql::` 25/27, the two failures `xgroup::sql::sessions::t_t1_10_w7_*` and `t_t1_10_w11_*` (`query_waiting` on a
+replicated reader, no `Database::call` on their path; see below). Clippy at 091c2025 found two `without_rowid`
+row lists declared `fixed()`, fixed in 54a8bdf7.
+
+What is left (not this unit): the cross-group steps' `call_internal` and a replicated owner's command queue
+still charge a call `REQUEST_MAX` (replication.md, "A call is charged its worst case"); the bound would travel
+in `Operation::Call`.
