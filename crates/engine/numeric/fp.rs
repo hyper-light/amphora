@@ -9,9 +9,36 @@
 //! product with a power of ten (Russ Cox's fpfmt as SQLite adapts it), the first 18 rounded and then
 //! rounded at the 18th, which is the rounding the document's own example shows (2.8781999999999997).
 //!
+//! Past 17 digits the product runs out, so those are the double's exact digits (`exact_digits`).
+//!
 //! Every shift here moves by an amount the algorithm keeps within the word (SQLite asserts as much);
 //! a shift out of range, which no double reaches, ends the conversion with `None`, and the caller
 //! writes the double as Rust does.
+
+use crate::decimal::decimal_from_double;
+
+/// The most significant digits the page's rounding writes: "Rounding to 17 significant digits or
+/// more results in text that, when coverted back into binary-64, gives the exact same value"
+/// (floatingpoint.html 1.3), and 1.3.1's steps round to 15, else 17.
+const PAGE_DIGITS: i32 = 17;
+
+/// printf.html: "limited in precision to 16 significant digits or 26 significant digits if the "!"
+/// alternate-form-2 flag is used". SQLite 3.54.0 stops at 20 (`flag_altform2 ? 20 : 16`); the
+/// document wins.
+const ALT_FORM_2_DIGITS: i32 = 26;
+
+/// r's significant digits (0..=9) and where the point falls among them (|r| = 0.d1d2... x 10^point)
+/// when more than 17 are kept: its exact decimal expansion (decimal.c's decimalFromDouble), since
+/// the fixed-point products here and in printf carry 19 digits at most. `None` when 17 or fewer are
+/// kept, and for zero, NaN and infinity.
+pub(crate) fn exact_digits(r: f64, kept: i32) -> Option<(Vec<u8>, i32)> {
+    if kept <= PAGE_DIGITS {
+        return None;
+    }
+    let exact = decimal_from_double(r)?;
+    let (digits, point) = exact.significant_digits()?;
+    Some((digits.to_vec(), point))
+}
 
 /// The powers of ten the conversions scale by, from 10^-348 to 10^347.
 const POWERS_OF_10_FIRST: i32 = -348;
@@ -218,6 +245,39 @@ enum Decode {
     NaN,
 }
 
+/// A positive double's digits from the fixed-point product (`bits` its encoding, `biased` its
+/// exponent field): the first `round` + 1, at most 18, behind a 0 kept for a carry, and where the
+/// point falls among them.
+fn fixed_point_digits(bits: u64, biased: i32, round: i32) -> Option<(Vec<u8>, i32)> {
+    let mut v = bits & 0x000f_ffff_ffff_ffff;
+    let e = if biased == 0 {
+        let nn = v.leading_zeros();
+        v = v.checked_shl(nn)?;
+        (-1074_i32).checked_sub(i32::try_from(nn).ok()?)?
+    } else {
+        v = v.wrapping_shl(11) | BIT63;
+        biased.checked_sub(1086)?
+    };
+    let (mut v, exp) = fp2_convert10(
+        v,
+        e,
+        if round >= 18 {
+            18
+        } else {
+            round.checked_add(1)?
+        },
+    )?;
+    let mut buf: Vec<u8> = Vec::with_capacity(21);
+    while v > 0 {
+        buf.push(b'0'.checked_add(u8::try_from(v.checked_rem(10)?).ok()?)?);
+        v = v.checked_div(10)?;
+    }
+    buf.push(b'0');
+    buf.reverse();
+    let n = i32::try_from(buf.len().checked_sub(1)?).ok()?;
+    Some((buf, n.checked_add(exp)?))
+}
+
 /// sqlite3FpDecode(r, round, max_round) for round > 0 (the `%g` its printf renders; `%f`'s round <= 0
 /// isn't needed here): `round` significant digits at most, or `max_round`. 17 digits are the first 18
 /// rounded, then rounded at the 18th (5 or more rounds up): floatingpoint.html's "If you round to 17
@@ -241,35 +301,20 @@ fn decode(r: f64, round: i32, max_round: i32) -> Option<Decode> {
             Decode::NaN
         });
     }
-    let mut v = bits & 0x000f_ffff_ffff_ffff;
-    let e = if biased == 0 {
-        let nn = v.leading_zeros();
-        v = v.checked_shl(nn)?;
-        (-1074_i32).checked_sub(i32::try_from(nn).ok()?)?
-    } else {
-        v = v.wrapping_shl(11) | BIT63;
-        biased.checked_sub(1086)?
-    };
-    let (mut v, exp) = fp2_convert10(
-        v,
-        e,
-        if round >= 18 {
-            18
-        } else {
-            round.checked_add(1)?
-        },
-    )?;
     // the digits, most significant first, with room for a carry into a new first digit
-    let mut buf: Vec<u8> = Vec::with_capacity(21);
-    while v > 0 {
-        buf.push(b'0'.checked_add(u8::try_from(v.checked_rem(10)?).ok()?)?);
-        v = v.checked_div(10)?;
-    }
-    buf.push(b'0');
-    buf.reverse();
+    let (mut buf, mut point) = match exact_digits(r, round.min(max_round)) {
+        Some((digits, point)) => {
+            let mut buf = Vec::with_capacity(digits.len().checked_add(1)?);
+            buf.push(b'0');
+            for d in digits {
+                buf.push(b'0'.checked_add(d)?);
+            }
+            (buf, point)
+        }
+        None => fixed_point_digits(bits, biased, round)?,
+    };
     let mut start = 1usize;
     let mut n = i32::try_from(buf.len().checked_sub(1)?).ok()?;
-    let mut point = n.checked_add(exp)?;
     let digit = |buf: &Vec<u8>, start: usize, i: i32| -> Option<u8> {
         buf.get(start.checked_add(usize::try_from(i).ok()?)?)
             .copied()
@@ -420,13 +465,17 @@ impl FpDigits {
 /// infinity as 9.0e+999 and NaN as null): fixed notation for exponents from -4 to digits - 1, else
 /// d.ddde±XX; trailing zeros dropped but one after the point. At 17, floatingpoint.html 1.3.1's steps
 /// (15 digits when they convert back); at any other setting, rounded to that many: "If you do not want
-/// the (negligible) overhead of step (b) and (c), just set SQLITE_DBCONFIG_FP_DIGITS to 15."
+/// the (negligible) overhead of step (b) and (c), just set SQLITE_DBCONFIG_FP_DIGITS to 15." Past 17,
+/// the double's exact digits rounded to that many, where SQLite 3.54.0 writes 19 at most.
 fn render(r: f64, zero_pad: bool, digits: FpDigits) -> Option<String> {
     let round = i32::from(digits.get());
     let decoded = if digits == FpDigits::DEFAULT {
-        fifteen_digits(r).map_or_else(|| decode(r, round, 20), |s| Some(Decode::Finite(s)))
+        fifteen_digits(r).map_or_else(
+            || decode(r, round, ALT_FORM_2_DIGITS),
+            |s| Some(Decode::Finite(s)),
+        )
     } else {
-        decode(r, round, 20)
+        decode(r, round, ALT_FORM_2_DIGITS)
     };
     let s = match decoded? {
         Decode::Finite(s) => s,

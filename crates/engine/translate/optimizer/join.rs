@@ -1758,6 +1758,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
         bound = ?naive_plan.as_ref().map(|plan| plan.cost.0),
         executions = planning_context.search_budget.executions,
         tables = num_tables,
+        names = ?joined_tables.iter().map(|t| t.table.get_name()).collect::<Vec<_>>(),
         "join search budget"
     );
 
@@ -2071,6 +2072,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
             let has_all_tables = mask.count() == num_tables;
             if has_all_tables {
                 for rel in best_for_mask_by_last.into_values() {
+                    tracing::debug!(target: "amphora::join_search", cost = rel.cost.0, plan = ?rel, methods = ?rel.data.iter().map(|&(_, method)| access_methods_arena.get(method).map(|m| &m.params)).collect::<Vec<_>>(), "a whole plan weighed");
                     if cost_upper_bound <= rel.cost {
                         continue;
                     }
@@ -2481,6 +2483,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                         joined.inner_joins = vec![run];
                         plan = joined;
                     }
+                    tracing::debug!(target: "amphora::join_search", cost = plan.cost.0, plan = ?plan, "a whole bushy plan weighed");
                     let cheaper = plan.data.len() == num_tables
                         && plan.cost < cost_upper_bound
                         && best_plan.as_ref().is_none_or(|best| plan.cost < best.cost);
