@@ -2908,6 +2908,7 @@ impl Database {
             parallel_searched_links: crate::connection::AtomicSearchedLinks::new(
                 crate::connection::SearchedLinks::Off,
             ),
+            real_sums: crate::connection::AtomicRealSums::new(crate::connection::RealSums::Serial),
             morsel_searched_links: AtomicU64::new(0),
             morsel_seek_links: AtomicU64::new(0),
             vectorized_scans: AtomicBool::new(false),

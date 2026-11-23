@@ -7715,6 +7715,279 @@ fn kbn_init_from_int(acc: &mut Value, i: i64, state: &mut SumAggState) {
     }
 }
 
+/// Lane G8 (`RealSums::Exact`, arm b of the SUM-over-REAL A/B): SUM, TOTAL and AVG that sum
+/// exactly ([`crate::vdbe::morsel::ExactSum`]) and round once, as the morsel workers do, so either
+/// path answers alike at any worker count. Their payload is the usual one and one slot more; once
+/// the sum is no exact INTEGER its first slot holds the exact sum's bytes, which the fast paths
+/// (they take only numbers there) leave to the slow path.
+const EXACT_SUM_SLOTS: usize = 5;
+const EXACT_AVG_SLOTS: usize = 3;
+
+fn exact_error(error: crate::vdbe::morsel::MorselError) -> LimboError {
+    LimboError::InternalError(format!("exact sum: {error}"))
+}
+
+/// Makes a SUM, TOTAL or AVG payload `init_agg_payload` made an exact one.
+fn exact_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> Result<()> {
+    use crate::vdbe::morsel::ExactSum;
+    match func {
+        AggFunc::Sum => {}
+        AggFunc::Total | AggFunc::Avg => {
+            let first = payload.first_mut().ok_or_else(|| {
+                LimboError::InternalError("an exact sum's payload is empty".into())
+            })?;
+            *first = exact_sum_value(&ExactSum::default())?;
+        }
+        _ => return Ok(()),
+    }
+    payload.try_reserve_exact(1)?;
+    payload.push(Value::from_i64(1));
+    Ok(())
+}
+
+/// The exact sum as its payload slot holds it: both infinities met are SQLite's NULL.
+fn exact_sum_value(sum: &crate::vdbe::morsel::ExactSum) -> Result<Value> {
+    if sum.is_nan() {
+        return Ok(Value::Null);
+    }
+    let mut bytes = crate::alloc::Vec::new();
+    sum.write_to(&mut bytes).map_err(exact_error)?;
+    Ok(Value::Blob(bytes))
+}
+
+fn exact_sum_of(acc: &Value) -> Result<crate::vdbe::morsel::ExactSum> {
+    match acc {
+        Value::Blob(bytes) => crate::vdbe::morsel::ExactSum::read_from(bytes).map_err(exact_error),
+        _ => Err(LimboError::InternalError(
+            "an exact sum's slot does not hold its bytes".into(),
+        )),
+    }
+}
+
+/// Adds an integer exactly, in the two parts `kbn_init_from_int` splits a large one into, each
+/// a double holds exactly.
+fn exact_add_int(sum: &mut crate::vdbe::morsel::ExactSum, i: i64) -> Result<()> {
+    if i.unsigned_abs() >= KBN_EXACT_INTEGER_LIMIT {
+        let low = i.checked_rem(16384).or_overflow()?;
+        let high = i.checked_sub(low).or_overflow()?;
+        sum.add(high as f64).map_err(exact_error)?;
+        sum.add(low as f64).map_err(exact_error)
+    } else {
+        sum.add(i as f64).map_err(exact_error)
+    }
+}
+
+/// The exact sum rounded once. `+0.0` joins it first, as the serial loop's compensated sum starts
+/// from it: an all-zero sum is `+0.0`, as SQLite's is.
+fn exact_rounded(acc: &Value) -> Result<f64> {
+    let mut sum = exact_sum_of(acc)?;
+    sum.add(0.0).map_err(exact_error)?;
+    Ok(sum.value())
+}
+
+/// A SUM or TOTAL step under `RealSums::Exact`: SQLite's sumStep with the exact sum in place of
+/// the compensated one. An exact INTEGER total while every value is an integer; from the first
+/// value that is none, or the first integer that overflows it, the exact sum.
+fn exact_sum_step(arg: &Value, payload: &mut [Value]) -> Result<()> {
+    use crate::vdbe::morsel::ExactSum;
+    let [acc, _, approx_val, ovrfl_val, count_val, ..] = payload else {
+        return Err(LimboError::InternalError(
+            "Sum/Total: payload too short".to_string(),
+        ));
+    };
+    let Value::Numeric(Numeric::Integer(count)) = count_val else {
+        return Err(LimboError::InternalError(
+            "Sum/Total: payload[4] is not an integer".to_string(),
+        ));
+    };
+    let arg = classify_numeric_arg(arg);
+    if matches!(arg, NumericArg::Null) {
+        return Ok(());
+    }
+    *count = count.checked_add(1).or_overflow()?;
+    let approx = matches!(approx_val, Value::Numeric(Numeric::Integer(n)) if *n != 0);
+    // Both infinities met: NULL, which stays.
+    if matches!(acc, Value::Null) && approx {
+        return Ok(());
+    }
+    let total = match acc {
+        Value::Null => Some(None),
+        Value::Numeric(Numeric::Integer(total)) => Some(Some(*total)),
+        _ => None,
+    };
+    let sum = match (arg, total) {
+        (NumericArg::Integer(i), Some(None)) => {
+            *acc = Value::from_i64(i);
+            return Ok(());
+        }
+        (NumericArg::Integer(i), Some(Some(total))) => match total.checked_add(i) {
+            Some(total) => {
+                *acc = Value::from_i64(total);
+                return Ok(());
+            }
+            // sum() reports the overflow at the end unless a value that is no integer clears
+            // it; total() never reports it.
+            None => {
+                *approx_val = Value::from_i64(1);
+                *ovrfl_val = Value::from_i64(1);
+                let mut sum = ExactSum::default();
+                exact_add_int(&mut sum, total)?;
+                exact_add_int(&mut sum, i)?;
+                sum
+            }
+        },
+        (NumericArg::Integer(i), None) => {
+            let mut sum = exact_sum_of(acc)?;
+            exact_add_int(&mut sum, i)?;
+            sum
+        }
+        (NumericArg::Float(r), total) => {
+            let mut sum = match total {
+                Some(None) => ExactSum::default(),
+                Some(Some(total)) => {
+                    let mut sum = ExactSum::default();
+                    exact_add_int(&mut sum, total)?;
+                    sum
+                }
+                None => exact_sum_of(acc)?,
+            };
+            *approx_val = Value::from_i64(1);
+            *ovrfl_val = Value::from_i64(0);
+            sum.add(r).map_err(exact_error)?;
+            sum
+        }
+        (NumericArg::Null, _) => return Ok(()),
+    };
+    *acc = exact_sum_value(&sum)?;
+    Ok(())
+}
+
+/// An AVG step under `RealSums::Exact`.
+fn exact_avg_step(arg: &Value, payload: &mut [Value]) -> Result<()> {
+    let [acc, _, count_val, ..] = payload else {
+        return Err(LimboError::InternalError(
+            "Avg: payload too short".to_string(),
+        ));
+    };
+    // Both infinities met: NULL, which stays.
+    if matches!(acc, Value::Null) {
+        return Ok(());
+    }
+    let Value::Numeric(Numeric::Integer(count)) = count_val else {
+        return Err(LimboError::InternalError(
+            "Avg: payload[2] is not an integer".to_string(),
+        ));
+    };
+    let mut sum = exact_sum_of(acc)?;
+    match classify_numeric_arg(arg) {
+        NumericArg::Null => return Ok(()),
+        NumericArg::Integer(i) => exact_add_int(&mut sum, i)?,
+        NumericArg::Float(f) => sum.add(f).map_err(exact_error)?,
+    }
+    *acc = exact_sum_value(&sum)?;
+    *count = count.checked_add(1).or_overflow()?;
+    Ok(())
+}
+
+/// A window frame's row leaving an exact SUM, TOTAL or AVG (its count in slot `count_at`): the
+/// value subtracted exactly; sumInverse's exact INTEGER subtract while the sum is one.
+fn exact_inverse(arg: NumericArg, payload: &mut [Value], count_at: usize) -> Result<()> {
+    use crate::vdbe::morsel::ExactSum;
+    let Some(Value::Numeric(Numeric::Integer(count))) = payload.get_mut(count_at) else {
+        return Err(LimboError::InternalError(
+            "an exact sum's count slot is not an integer".to_string(),
+        ));
+    };
+    *count = count.checked_sub(1).or_overflow()?;
+    let integer_sum =
+        count_at == 4 && matches!(payload.get(2), Some(Value::Numeric(Numeric::Integer(0))));
+    let Some(acc) = payload.first_mut() else {
+        return Err(LimboError::InternalError(
+            "an exact sum's payload is empty".to_string(),
+        ));
+    };
+    if let (true, Value::Numeric(Numeric::Integer(total)), NumericArg::Integer(sub)) =
+        (integer_sum, &mut *acc, &arg)
+    {
+        if let Some(rest) = total.checked_sub(*sub) {
+            *total = rest;
+            return Ok(());
+        }
+    }
+    let was_integer = matches!(acc, Value::Numeric(Numeric::Integer(_)));
+    let mut sum = match &*acc {
+        // Both infinities met: NULL, which stays.
+        Value::Null => return Ok(()),
+        Value::Numeric(Numeric::Integer(total)) => {
+            let mut sum = ExactSum::default();
+            exact_add_int(&mut sum, *total)?;
+            sum
+        }
+        acc => exact_sum_of(acc)?,
+    };
+    match arg {
+        NumericArg::Null => return Ok(()),
+        NumericArg::Integer(i) => match i.checked_neg() {
+            Some(negated) => exact_add_int(&mut sum, negated)?,
+            // -i64::MIN is 2^63, a double exactly.
+            None => sum.add(9_223_372_036_854_775_808.0).map_err(exact_error)?,
+        },
+        NumericArg::Float(f) => sum.add(-f).map_err(exact_error)?,
+    }
+    *acc = exact_sum_value(&sum)?;
+    if integer_sum && was_integer {
+        // The INTEGER subtract overflowed: sum() reports it at the end, as the step does.
+        if let Some(slot) = payload.get_mut(2) {
+            *slot = Value::from_i64(1);
+        }
+        if let Some(slot) = payload.get_mut(3) {
+            *slot = Value::from_i64(1);
+        }
+    }
+    Ok(())
+}
+
+fn exact_avg_final(payload: &[Value]) -> Result<Value> {
+    let count = payload.get(2).and_then(Value::as_int).unwrap_or(0);
+    match payload.first() {
+        Some(acc @ Value::Blob(_)) if count > 0 => {
+            Ok(Value::from_f64(exact_rounded(acc)? / count as f64))
+        }
+        _ => Ok(Value::Null),
+    }
+}
+
+fn exact_sum_final(func: &AggFunc, payload: &[Value]) -> Result<Value> {
+    let flag = |at: usize| payload.get(at).and_then(Value::as_int).unwrap_or(0) != 0;
+    let (approx, ovrfl) = (flag(2), flag(3));
+    let Some(acc) = payload.first() else {
+        return Err(LimboError::InternalError(
+            "an exact sum's payload is empty".to_string(),
+        ));
+    };
+    if matches!(func, AggFunc::Total) {
+        return Ok(match acc {
+            Value::Null if approx => Value::Null,
+            Value::Null => Value::from_f64(0.0),
+            Value::Numeric(Numeric::Integer(i)) => Value::from_f64(*i as f64),
+            acc => Value::from_f64(exact_rounded(acc)?),
+        });
+    }
+    if payload.get(4).and_then(Value::as_int).unwrap_or(0) == 0 {
+        return Ok(Value::Null);
+    }
+    // As sumFinalize: an overflow no value that is no integer cleared is reported at the end.
+    if approx && ovrfl {
+        mark_unlikely();
+        return Err(LimboError::IntegerOverflow);
+    }
+    Ok(match acc {
+        Value::Null => Value::Null,
+        Value::Numeric(Numeric::Integer(i)) => Value::from_i64(*i),
+        acc => Value::from_f64(exact_rounded(acc)?),
+    })
+}
+
 /// Initialize aggregate payload with default values.
 /// Payload layout by aggregate type:
 /// - Count/Count0: [Integer(0)]
@@ -7876,6 +8149,9 @@ fn update_agg_payload(
             if matches!(arg, Value::Null) {
                 return Ok(());
             }
+            if payload.len() > EXACT_AVG_SLOTS {
+                return exact_avg_step(arg, payload);
+            }
             // invariant as per init_agg_payload: payload[0] is Float (sum), payload[1] is Float (r_err), payload[2] is Integer (count)
             let [sum_val, r_err_val, count_val, ..] = payload.as_mut_slice() else {
                 mark_unlikely();
@@ -7906,6 +8182,9 @@ fn update_agg_payload(
             *count = count.checked_add(1).or_overflow()?;
         }
         AggFunc::Sum | AggFunc::Total => {
+            if payload.len() > EXACT_SUM_SLOTS {
+                return exact_sum_step(arg, payload);
+            }
             // invariant as per init_agg_payload: payload[0] is acc (Null/Integer/Float),
             // payload[1] is Float (r_err), payload[2] is Integer (approx),
             // payload[3] is Integer (ovrfl), payload[4] is Integer (count)
@@ -8203,6 +8482,13 @@ const SPARE_AGG_PAYLOADS: usize = 8;
 /// - **GroupConcat/StringAgg**: Returns the accumulated string
 /// - **JsonGroup***: Parses accumulated raw JSONB bytes into proper JSON output
 fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
+    match func {
+        AggFunc::Avg if payload.len() > EXACT_AVG_SLOTS => return exact_avg_final(payload),
+        AggFunc::Sum | AggFunc::Total if payload.len() > EXACT_SUM_SLOTS => {
+            return exact_sum_final(func, payload)
+        }
+        _ => {}
+    }
     let val = match func {
         AggFunc::Count | AggFunc::Count0 => payload[0].clone(),
         AggFunc::Avg => {
@@ -9134,6 +9420,9 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
             if matches!(parsed, NumericArg::Null) {
                 return Ok(());
             }
+            if payload.len() > EXACT_SUM_SLOTS {
+                return exact_inverse(parsed, payload, 4);
+            }
             let [acc, r_err_val, approx_val, ovrfl_val, count_val, ..] = payload else {
                 unreachable!(
                     "Sum/Total payload has acc/r_err/approx/ovrfl/count per init_agg_payload"
@@ -9197,6 +9486,9 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
             let parsed = classify_numeric_arg(&arg);
             if matches!(parsed, NumericArg::Null) {
                 return Ok(());
+            }
+            if payload.len() > EXACT_AVG_SLOTS {
+                return exact_inverse(parsed, payload, 2);
             }
             let [sum_val, r_err_val, count_val, ..] = payload else {
                 unreachable!("Avg payload has sum/r_err/count per init_agg_payload");
@@ -9540,6 +9832,9 @@ pub(crate) fn op_agg_step_slow(
             .pop()
             .unwrap_or_else(|| crate::alloc::vec![]);
         init_agg_payload(func, &mut payload)?;
+        if program.connection.real_sums() == crate::RealSums::Exact {
+            exact_agg_payload(func, &mut payload)?;
+        }
         state.registers[*acc_reg] = Register::Aggregate(AggContext::Builtin(payload));
     }
 
@@ -21499,8 +21794,8 @@ pub fn op_morsel_aggregate(
         MachineCosts, MemoryBudget, MorselError, ParallelMode, Partitioner, ScanAggregate,
     };
     use crate::vdbe::morsel_scan::{
-        JoinStage, SeekLink, TableAggregate, TableBodyAggregate, TableBodyRows, TableBuild,
-        TableChain, TableJoinAggregate, TableJoinRows, TableOuterJoin, TableSource,
+        no_real_outputs, JoinStage, SeekLink, TableAggregate, TableBodyAggregate, TableBodyRows,
+        TableBuild, TableChain, TableJoinAggregate, TableJoinRows, TableOuterJoin, TableSource,
     };
     load_insn!(MorselAggregate { data }, insn);
     let refused = |error: MorselError| -> Box<LimboError> {
@@ -21583,7 +21878,9 @@ pub fn op_morsel_aggregate(
                     filter: &[],
                     group_by: &body.group_by,
                     aggregates: &body.aggregates,
+                    sums: connection.real_sums(),
                 };
+                let no_real = no_real_outputs(body, connection.real_sums())?;
                 let pipeline = TableBodyAggregate {
                     table: &table,
                     body,
@@ -21594,6 +21891,7 @@ pub fn op_morsel_aggregate(
                     shape: &shape,
                     ran: &connection.morsel_body_rows,
                     direct: None,
+                    no_real: &no_real,
                 };
                 // A scan's rows: kept in leaf order, the result columns as they stand (lane qs6-8).
                 if body.rows {
@@ -21622,6 +21920,7 @@ pub fn op_morsel_aggregate(
                 filter: &data.filter,
                 group_by: &data.group_by,
                 aggregates: &data.aggregates,
+                sums: connection.real_sums(),
             };
             let pipeline = TableAggregate {
                 table: &table,
@@ -21731,6 +22030,7 @@ pub fn op_morsel_aggregate(
             filter: &[],
             group_by: &body.group_by,
             aggregates: &body.aggregates,
+            sums: connection.real_sums(),
         };
         // A join's body of nothing but reads is copied without running it when the switch says so
         // (lane qs6-13, T-QT.6.21); its rows are counted apart.
@@ -21739,6 +22039,7 @@ pub fn op_morsel_aggregate(
         } else {
             None
         };
+        let no_real = no_real_outputs(body, connection.real_sums())?;
         let looped = TableBodyAggregate {
             table: &table,
             body,
@@ -21753,6 +22054,7 @@ pub fn op_morsel_aggregate(
                 &connection.morsel_body_rows
             },
             direct,
+            no_real: &no_real,
         };
         // A RIGHT or FULL JOIN among three or more tables, or more than one outer join (lane
         // qs6-14): the chain walks in phases, its links' bitmaps merged between them.

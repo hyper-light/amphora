@@ -2323,11 +2323,39 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                         .get(probe)
                         .copied()
                         .unwrap_or_else(|| RowCountEstimate::hardcoded_fallback(params));
+                    // Lane T6 (TPC-H q05): the probe's match joins the run to the probe table
+                    // alone. A term reading the run and an outer table runs after the match, at
+                    // the probe's loop, as the emitter places it (no input's prefix holds it,
+                    // `prune_join_order_for_materialized_inputs`), so it cuts the join's rows but
+                    // not the rows the match visits: each outer row's probe rows times the run's
+                    // rows each of them matches.
+                    let after_match = where_terms.iter().any(|term| {
+                        term.table_mask.intersects(build_mask)
+                            && term.table_mask.intersects(&outer_mask)
+                    });
+                    let visited = if !after_match {
+                        rows
+                    } else {
+                        let mut outer_and_probe = outer_mask.try_clone()?;
+                        outer_and_probe.set(probe)?;
+                        let mut run_and_probe = build_mask.try_clone()?;
+                        run_and_probe.set(probe)?;
+                        let mut probe_alone = TableMask::default();
+                        probe_alone.set(probe)?;
+                        let probe_kept = set_rows.rows(&probe_alone);
+                        let matched = if probe_kept > 0.0 {
+                            set_rows.rows(&outer_and_probe) * set_rows.rows(&run_and_probe)
+                                / probe_kept
+                        } else {
+                            0.0
+                        };
+                        matched.max(rows)
+                    };
                     let probe_cost = Cost(
                         estimate_hash_join_cost(
                             build.output_cardinality,
                             *probe_rows,
-                            rows,
+                            visited,
                             HashJoinType::Inner,
                             mem_budget,
                             outer_rows,

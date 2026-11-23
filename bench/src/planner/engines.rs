@@ -172,6 +172,15 @@ impl Amphora {
         counted.set_vectorized_scans(vectorized);
         conn.set_adaptive_joins(adaptive);
         counted.set_adaptive_joins(adaptive);
+        // Lane G8: AMPHORA_REAL_SUMS=exact runs the SUM-over-REAL A/B's arm (b); unset or `serial`
+        // is today's. One binary for both arms, so both plan from one calibration (RULES 5e).
+        let sums = match std::env::var("AMPHORA_REAL_SUMS").as_deref() {
+            Err(_) | Ok("serial") => amphora_engine::RealSums::Serial,
+            Ok("exact") => amphora_engine::RealSums::Exact,
+            Ok(other) => anyhow::bail!("AMPHORA_REAL_SUMS takes serial or exact, not {other}"),
+        };
+        conn.set_real_sums(sums);
+        counted.set_real_sums(sums);
         let mut a = Self { io, _db: db, conn, counted, cache_kib, vectorized, adaptive };
         for c in [a.conn.clone(), a.counted.clone()] {
             a.exec_on(&c, &format!("PRAGMA cache_size = -{cache_kib}"))?;
