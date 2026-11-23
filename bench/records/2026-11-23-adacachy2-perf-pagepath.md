@@ -18,6 +18,12 @@ The change landed as `e74813c8`. The original record labels the measured after b
 `bf23ccb1`; that object is absent from the fetched history. The runs below exercised
 `PagePath::Today` with `LOG_READ_INDEX=locked`. The table retains throughput only.
 
+For AUDIT 2.3, the distribution test in `a02e4b20` covers the first pages of 64 files and
+consecutive pages of one file. The later record in `820614f8` selects `AMPHORA_PAGE_PATH=plain`
+and alternates three runs per arm. Eight-client point reads increased from 1.42M to 1.79M/s
+in that sample. The base predates the WAL change and the host load ranged from 42 to 71, so the
+sample does not isolate the single-lookup change.
+
 | op | clients | base | after | after/base | SQLite |
 |---|---|---|---|---|---|
 | point_pk | 1 | 192,905 [159,502-279,074] | 249,427 [185,384-310,574] | 1.29 | 523,323 |
@@ -35,8 +41,3 @@ Reading: no regression outside the noise; point_pk at 64 and 128 clients is abov
 (+14%, +6%). The 10x isn't here: the header was already read lock-free under the non-default read
 indexes (decision 40), and the default's per-read cost is elsewhere (AUDIT 2.1's frame_cache lock,
 2.2). To re-measure on a quiet host.
-
-## AUDIT 2.3. Single shared-page lookup and shard selection
-
-The distribution test in `a02e4b20` checks the first pages of 64 files and consecutive pages of
-one file. This record contains no paired timed run of the changed `PagePath::Plain` lookup.
