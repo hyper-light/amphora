@@ -403,7 +403,9 @@ mod tests {
     #[test]
     fn a5_a_steps_own_releases_never_end_its_wait() {
         let release = LockRelease::default();
-        let waker = Waker::from(std::sync::Arc::new(Count(std::sync::atomic::AtomicUsize::new(0))));
+        let waker = Waker::from(std::sync::Arc::new(Count(
+            std::sync::atomic::AtomicUsize::new(0),
+        )));
         let step = release.own_releases();
         let seen = release.generation();
         release.notify();

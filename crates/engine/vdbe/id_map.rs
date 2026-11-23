@@ -151,7 +151,11 @@ mod tests {
         map.insert(1usize, "internal".into());
         assert!(map.slots.len() <= 4, "{} slots", map.slots.len());
         assert_eq!(map.get(&base).map(String::as_str), Some("first allocated"));
-        assert_eq!(map.get(&u32::try_from(base + 1).unwrap()).map(String::as_str), Some("second allocated"));
+        assert_eq!(
+            map.get(&u32::try_from(base + 1).unwrap())
+                .map(String::as_str),
+            Some("second allocated")
+        );
         assert_eq!(map.get(&1usize).map(String::as_str), Some("internal"));
         assert_eq!(map.get(&0usize), None);
         map.insert(1usize, "d".into());

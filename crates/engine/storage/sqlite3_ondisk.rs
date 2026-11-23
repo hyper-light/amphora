@@ -58,7 +58,9 @@ use super::changes::ChangeLog;
 use super::packed::{self, LogFormat, Record, Records};
 use super::pager::PageRef;
 pub use super::pager::{PageContent, PageInner};
-use super::wal::{OverflowFallbackCoverage, PaddedLock, TursoRwLock, WalSharedMetadata, WalSharedRuntime};
+use super::wal::{
+    OverflowFallbackCoverage, PaddedLock, TursoRwLock, WalSharedMetadata, WalSharedRuntime,
+};
 use crate::error::LimboError;
 use crate::fast_lock::SpinLock;
 use crate::io::{Buffer, Completion, CompletionGroup, FileSyncType, ReadComplete};

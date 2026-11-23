@@ -98,11 +98,9 @@ impl State {
     /// Makes `current` the schema entries are kept under. A change of schema hands back every
     /// entry kept under the old one, for the caller to drop once the lock is released.
     fn align(&mut self, current: &Arc<Schema>) -> Option<State> {
-        if self
-            .schema
-            .as_ref()
-            .is_some_and(|(held, version)| Arc::ptr_eq(held, current) && *version == current.schema_version)
-        {
+        if self.schema.as_ref().is_some_and(|(held, version)| {
+            Arc::ptr_eq(held, current) && *version == current.schema_version
+        }) {
             return None;
         }
         let previous = std::mem::take(self);
@@ -329,7 +327,12 @@ mod tests {
         };
         put(&bytes, &db, "SELECT 2", db.conn.prepare("SELECT 2")?)?;
         put(&bytes, &db, "SELECT 3", db.conn.prepare("SELECT 3")?)?;
-        put(&bytes, &db, "SELECT 12345", db.conn.prepare("SELECT 12345")?)?;
+        put(
+            &bytes,
+            &db,
+            "SELECT 12345",
+            db.conn.prepare("SELECT 12345")?,
+        )?;
         assert!(
             take(&bytes, &db, "SELECT 2")?.is_none() && take(&bytes, &db, "SELECT 3")?.is_none(),
             "SQL byte budget evicts while entry slots remain"
