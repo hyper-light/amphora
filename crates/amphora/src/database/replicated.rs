@@ -13,7 +13,7 @@ use crate::meter::{
 };
 use crate::store::Checkpointed;
 use api::replication::{
-    CatchUp, Durability, MemberChange, Outbound, ReplicaConfig, ReplicaStatus, Verdict,
+    CatchUp, Durability, MemberChange, Outbound, ReplicaConfig, ReplicaStatus, Route, Verdict,
 };
 use hyper_block::block::BlockFile;
 use hyper_block::file::{CachingRequest, DeviceFile};
@@ -1519,6 +1519,16 @@ fn nanos_between(from: Instant, to: Instant) -> u64 {
 
 fn fenced(reason: impl std::fmt::Display) -> Refusal {
     Refusal::Fenced(reason.to_string())
+}
+/// The path `message` takes to its peer (CP-T1.13, replication.md "Decision (lane P9)"): only
+/// the records that carry entries go behind the log; a heartbeat, a vote and their answers never
+/// wait for one.
+fn route(message: &Message) -> Route {
+    use hyper_raft::proto::MessageType;
+    match message.msg_type {
+        MessageType::MsgAppend | MessageType::MsgSnapshot => Route::Log,
+        _ => Route::Control,
+    }
 }
 /// Whether `now` tells a leader waiter something `was` didn't (lane ryw-6, CP-T1.13): another
 /// leader or term ([`ReplicaHandle::wait_leader`]'s answer), or a fence come or gone (its
@@ -4927,6 +4937,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             outgoing.messages.push_back(Outbound {
                 to: message.to,
                 bytes,
+                route: route(&message),
             });
         }
         self.control.sent.notify_all();
@@ -5863,6 +5874,7 @@ mod tests {
                 outgoing.messages.push_back(Outbound {
                     to: 2,
                     bytes: vec![n],
+                    route: Route::Log,
                 });
             }
         }
