@@ -9,7 +9,12 @@
 //! 1/8 (Jacobson, "Congestion Avoidance and Control", SIGCOMM 1988), as the compaction's costs are
 //! (CT.1), the eighth taken rounded up so that a sum no sample feeds decays to nothing. An
 //! interval counts when the queue held work at its start or its reader took some in it: one with
-//! nothing to read and nothing read tells nothing of how fast it reads. The election timeout is
+//! nothing to read and nothing read tells nothing of how fast it reads. The time weighed is the
+//! time the queue held work (lane constants-K3): an interval ends the moment the reader finds the
+//! queue empty (`Drain::dry`) and the next begins when work comes (`Drain::came`), so the time the
+//! reader waits for work, which tells only how fast work comes, never counts as reading time. A
+//! stall, work waiting and nothing read, counts at a rate of zero, and the busy intervals after
+//! it raise the rate again. The election timeout is
 //! learned too: `election_tick` periods of the owner's measured pace (TP.1). Each bound is the lesser of the rate times that
 //! timeout and the memory budget's room for queues (MB.1), no less than the least a queue can
 //! carry and still work (the outgoing queue's: a record to each peer, one broadcast); before
@@ -55,11 +60,7 @@ impl Drain {
         match self.since {
             Some((at, held)) if now > at => {
                 if held || self.pending.1 > 0 {
-                    // RFC 6298 §2's gain: the old sums keep seven eighths, the eighth rounded up.
-                    let decay = |sum: u64| sum.saturating_sub(sum.div_ceil(8));
-                    self.nanos = decay(self.nanos).saturating_add(now.saturating_sub(at));
-                    self.bytes = decay(self.bytes).saturating_add(self.pending.0);
-                    self.messages = decay(self.messages).saturating_add(self.pending.1);
+                    self.weigh(now.saturating_sub(at));
                 }
                 self.pending = (0, 0);
                 self.since = Some((now, busy));
@@ -71,6 +72,37 @@ impl Drain {
                 self.since = Some((now, busy));
             }
         }
+    }
+
+    /// The reader found the queue empty at `now`: the interval under way ends there, weighed if
+    /// work waited in it as time passed or the reader took some, and an empty one begins. What the
+    /// reader took in less than a tick of the clock is weighed over no time: carried on, it would
+    /// be weighed over the time the queue then stands empty.
+    pub(super) fn dry(&mut self, now: u64) {
+        if let Some((at, held)) = self.since
+            && (self.pending.1 > 0 || (held && now > at))
+        {
+            self.weigh(now.saturating_sub(at));
+        }
+        self.pending = (0, 0);
+        self.since = Some((now, false));
+    }
+
+    /// Work came at `now`: an interval begun with the queue empty and nothing taken in it is time
+    /// the reader waited for work, so it ends unweighed and one holding work begins.
+    pub(super) fn came(&mut self, now: u64) {
+        if matches!(self.since, None | Some((_, false))) && self.pending.1 == 0 {
+            self.since = Some((now, true));
+        }
+    }
+
+    /// Adds an interval of `nanos` and what was drained in it to the sums.
+    fn weigh(&mut self, nanos: u64) {
+        // RFC 6298 §2's gain: the old sums keep seven eighths, the eighth rounded up.
+        let decay = |sum: u64| sum.saturating_sub(sum.div_ceil(8));
+        self.nanos = decay(self.nanos).saturating_add(nanos);
+        self.bytes = decay(self.bytes).saturating_add(self.pending.0);
+        self.messages = decay(self.messages).saturating_add(self.pending.1);
     }
 
     /// The bound in force: what the reader drains in `timeout` at its measured rate, no less than
@@ -286,5 +318,77 @@ mod tests {
             drain.sample(now, true);
         }
         assert_eq!(drain.bound(timeout, LEAST, u64::MAX), LEAST);
+    }
+
+    /// T-QB.1.15 (lane constants-K3): ten messages come each 10 ms and the reader takes them in
+    /// 1 ms, then finds the queue empty, its owner's tick between bursts finding it empty too,
+    /// under a 100 ms election timeout. Passes when the bound is what the reader takes in the
+    /// timeout, about 1000 messages, not the 100 that come in it.
+    #[test]
+    fn drain_weighs_only_the_time_the_queue_held_work() {
+        let mut drain = Drain::default();
+        let timeout = Duration::from_millis(100);
+        drain.sample(0, false);
+        let mut now = 0;
+        for _ in 0..40 {
+            now += 10 * MS;
+            drain.came(now);
+            drain.drained(100, 10);
+            drain.dry(now + MS);
+            drain.sample(now + 5 * MS, false);
+        }
+        let bound = drain.bound(timeout, LEAST, u64::MAX);
+        assert!((900..=1100).contains(&bound.messages), "{bound:?}");
+        assert!((9_000..=11_000).contains(&bound.bytes), "{bound:?}");
+    }
+
+    /// Lane constants-K2's reproducer: do a reader stall for one interval with work waiting before
+    /// anything is measured, then take the 10 messages that come each 10 ms in 5 ms, finding the
+    /// queue empty each time, under a 100 ms election timeout; expect a bound of at least the 100
+    /// messages that come in it, not the least a queue carries.
+    #[test]
+    fn a_stall_then_a_reader_that_keeps_up_is_not_held_to_the_least() {
+        let mut drain = Drain::default();
+        let timeout = Duration::from_millis(100);
+        drain.sample(0, true);
+        let mut now = 10 * MS;
+        drain.sample(now, true);
+        assert_eq!(drain.bound(timeout, LEAST, u64::MAX), LEAST, "the stall");
+        for _ in 0..40 {
+            drain.came(now);
+            drain.drained(100, 10);
+            drain.dry(now + 5 * MS);
+            now += 10 * MS;
+        }
+        let bound = drain.bound(timeout, LEAST, u64::MAX);
+        assert!(bound.messages >= 100, "{bound:?}");
+    }
+
+    /// Lane constants-K3, on driven time: do the reader take 10 messages and find the queue empty
+    /// at the reading work came at, then nothing for 990 ms; expect the room, as a reader faster
+    /// than the clock measures, not those messages weighed over the empty time. And an interval
+    /// begun holding work and found empty at the same reading, nothing taken, weighs nothing.
+    #[test]
+    fn what_is_taken_within_a_tick_is_not_weighed_over_the_empty_time_after() {
+        let mut drain = Drain::default();
+        let timeout = Duration::from_millis(100);
+        let room = Bound {
+            bytes: 4000,
+            messages: u64::MAX,
+        };
+        drain.sample(0, false);
+        drain.came(10 * MS);
+        drain.drained(100, 10);
+        drain.dry(10 * MS);
+        drain.sample(1000 * MS, false);
+        drain.came(1000 * MS);
+        drain.sample(1000 * MS, true);
+        assert_eq!(drain.bound(timeout, LEAST, 4000), room);
+        let before = drain;
+        drain.dry(1000 * MS);
+        assert_eq!(
+            drain.bound(timeout, LEAST, 4000),
+            before.bound(timeout, LEAST, 4000)
+        );
     }
 }
