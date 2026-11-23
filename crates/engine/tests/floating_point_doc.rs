@@ -466,7 +466,7 @@ mod fp_digits_per_connection {
 /// where it shows one, else sqlite3 3.54.0's (bench/records/2026-11-23-adacachy2-perf-numeric-g13.md).
 mod page_sentences {
     use super::{open, texts};
-    use amphora_engine::StepResult;
+    use amphora_engine::{StepResult, IO};
 
     fn one(sql: &str) -> String {
         let (io, conn) = open();
