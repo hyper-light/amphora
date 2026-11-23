@@ -37,46 +37,27 @@ pub(crate) enum Work {
     /// comparison compares them (`cpu_cost_per_where_step`).
     WhereStep,
     /// One page read from the database's file, as the pager times it from the read's submission
-    /// to its completion (`sqlite3_ondisk::begin_read_page`). The planner's unit of cost.
+    /// to its completion, less what the reading thread waited for a CPU meanwhile
+    /// (`sqlite3_ondisk::begin_read_page`, `PageReadTimer`). The planner's unit of cost.
     PageRead,
 }
 
-/// Lane T15 (lane T14's record, section 3; the A/B Ada decided): how a page read is timed and its
-/// batch closed, read once a process from `AMPHORA_PAGE_READ_TIMING` (`median`, `run_delay`;
-/// anything else, the mean). The arm the A/B keeps becomes the only way, and this switch goes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PageReadTiming {
-    /// Before lane T15: every read's wall time, a batch closed at its mean. One preempted read
-    /// lifts its batch's mean past the spread between batches (lane T14).
-    Mean,
-    /// Arm A: every read's wall time, a batch closed at its median, as the seeks' are
-    /// (`Rate::close_runs`).
-    Median,
-    /// Arm B: one read in `every` (`Sampling`), its wall time less what its thread waited for a
-    /// CPU meanwhile (`run_delay`), a batch closed at its mean. Arm A where the wait can't be read.
-    RunDelay,
-}
-
-pub(crate) fn page_read_timing() -> PageReadTiming {
-    static FROM_ENV: OnceLock<PageReadTiming> = OnceLock::new();
-    *FROM_ENV.get_or_init(|| match std::env::var("AMPHORA_PAGE_READ_TIMING").as_deref() {
-        Ok("median") => PageReadTiming::Median,
-        Ok("run_delay") => PageReadTiming::RunDelay,
-        _ => PageReadTiming::Mean,
-    })
-}
-
-/// Lane T15: a page read's timer, started before the read is submitted.
+/// Lane T15 (lane T14's record, section 3): a page read's timer, started before the read is
+/// submitted. A read's wall time holds whatever else kept its thread from a CPU: one read preempted
+/// for milliseconds lifted its batch's mean 20 to 40 times past the spread between batches, and under
+/// outside load the page read's rate swung 37x and q03's plans flipped (kiln run r1673). So the time
+/// the thread waited on a run queue is taken out, and the device's own latency, the read's work,
+/// stays in (the A/B against closing batches at their median: kiln run r1770, the record's lane T15).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PageReadTimer {
     wall: Instant,
-    /// Arm B: the thread that submitted the read, its run-queue wait so far, and what reading
-    /// that wait took.
+    /// The thread that submitted the read, its run-queue wait so far, and what reading that wait
+    /// took; None where the wait can't be read (`run_delay`).
     waited: Option<(std::thread::ThreadId, u64, f64)>,
 }
 
-/// One timed page read: its wall nanoseconds; under arm B, what its thread waited for a CPU
-/// meanwhile and what reading those waits took, in nanoseconds.
+/// One timed page read: its wall nanoseconds; and what its thread waited for a CPU meanwhile and
+/// what reading those waits took, in nanoseconds, where the wait could be read.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct TimedRead {
     pub(crate) wall: f64,
@@ -84,31 +65,27 @@ pub(crate) struct TimedRead {
 }
 
 impl PageReadTimer {
-    /// Starts timing a read; with `subtract_wait`, the thread's run-queue wait is read before the
-    /// clock starts and again after it stops (`stop`), so every wait that ends inside the timed span
-    /// is in the difference. A preemption on the way out of the first read of the wait lands inside
-    /// the span and is subtracted with the rest.
-    fn start(subtract_wait: bool) -> Self {
-        let waited = if subtract_wait {
-            let before = Instant::now();
-            run_delay().map(|delay| {
-                (
-                    std::thread::current().id(),
-                    delay,
-                    before.elapsed().as_nanos() as f64,
-                )
-            })
-        } else {
-            None
-        };
+    /// Starts timing a read: the thread's run-queue wait is read before the clock starts and again
+    /// after it stops (`stop`), so every wait that ends inside the timed span is in the difference.
+    /// A preemption on the way out of the first read of the wait lands inside the span and is
+    /// subtracted with the rest.
+    fn start() -> Self {
+        let before = Instant::now();
+        let waited = run_delay().map(|delay| {
+            (
+                std::thread::current().id(),
+                delay,
+                before.elapsed().as_nanos() as f64,
+            )
+        });
         Self {
             wall: Instant::now(),
             waited,
         }
     }
 
-    /// Stops the timer. None under arm B when the read completed on another thread than it was
-    /// submitted on, or the wait could not be read again: what the read waited can't be told.
+    /// Stops the timer. None when the read completed on another thread than it was submitted on,
+    /// or the wait could not be read again: what the read waited can't be told.
     fn stop(self) -> Option<TimedRead> {
         let wall = self.wall.elapsed().as_nanos() as f64;
         let Some((thread, before, cost)) = self.waited else {
@@ -136,8 +113,8 @@ impl TimedRead {
     }
 }
 
-/// Lane T15 (arm B): the nanoseconds the calling thread has waited on a run queue for a CPU, as
-/// Linux keeps them: `run_delay`, the second field of `/proc/thread-self/schedstat` (the kernel's
+/// Lane T15: the nanoseconds the calling thread has waited on a run queue for a CPU, as Linux keeps
+/// them: `run_delay`, the second field of `/proc/thread-self/schedstat` (the kernel's
 /// `Documentation/scheduler/sched-stats.rst`). The file is opened once a thread and read from its
 /// start each time (a `seq_file` read at offset 0 is made afresh). None where it can't be read, or
 /// where the kernel keeps no scheduler statistics (it writes `0 0 0`: a running thread has run).
@@ -167,6 +144,10 @@ fn run_delay() -> Option<u64> {
         .flatten()
 }
 
+/// macOS and Windows keep no wait of a thread for a CPU that this crate can read: their thread
+/// times (`thread_info`, `GetThreadTimes`) count running, not waiting, and asking either takes a
+/// system call through unsafe code (CLAUDE.md, section 12). Their page reads are timed whole, and a
+/// batch closes at its median (`LearnedCosts::observe_page_read`).
 #[cfg(not(target_os = "linux"))]
 fn run_delay() -> Option<u64> {
     None
@@ -669,9 +650,8 @@ pub(crate) struct LearnedCosts {
     timing_nanos: f64,
     /// PL.8: the join search's measured time a candidate, and what it chose.
     search: super::search_budget::SearchRate,
-    /// Lane T15: how page reads are timed (`PageReadTiming`); the reads counted, which are timed
-    /// and the batch under way; and under arm B, what timing each read of the epoch under way took.
-    page_timing: PageReadTiming,
+    /// Lane T15: the page reads counted, which are timed and the batch under way, and what timing
+    /// each read of the epoch under way took (`observe_page_read`).
     page_runs: RunCount,
     page: Sampling,
     page_costs: Mutex<Vec<f64>>,
@@ -787,29 +767,19 @@ impl LearnedCosts {
             hash_probe: Sampling::new(),
             timing_nanos: rates.timing_nanos,
             search: super::search_budget::SearchRate::default(),
-            page_timing: page_read_timing(),
             page_runs: RunCount::default(),
             page: Sampling::new(),
             page_costs: Mutex::new(Vec::new()),
         }
     }
 
-    #[cfg(test)]
-    fn with_page_timing(mut self, timing: PageReadTiming) -> Self {
-        self.page_timing = timing;
-        self
-    }
-
-    /// Lane T15: starts timing a page read about to be submitted; None if this one isn't timed
-    /// (arm B times one in its `every`).
+    /// Lane T15: starts timing a page read about to be submitted; None if this one isn't timed. One
+    /// read in the page `Sampling`'s `every` is, as the seeks are; every read where the wait can't be
+    /// read (`every` is set only from reads whose wait was).
     pub(crate) fn start_page_read(&self) -> Option<PageReadTimer> {
-        match self.page_timing {
-            PageReadTiming::Mean | PageReadTiming::Median => Some(PageReadTimer::start(false)),
-            PageReadTiming::RunDelay => self
-                .page
-                .sampled(self.page_runs.next())
-                .then(|| PageReadTimer::start(true)),
-        }
+        self.page
+            .sampled(self.page_runs.next())
+            .then(PageReadTimer::start)
     }
 
     /// Lane T15: a page read `timer` timed has completed.
@@ -819,13 +789,17 @@ impl LearnedCosts {
         }
     }
 
-    /// Lane T15: moves the page read's rate by one timed read, as `page_timing` says.
+    /// Lane T15: moves the page read's rate by one timed read. A read whose thread's waits were read
+    /// counts its time less them, its batch closed at the mean, as `Rate::observe` closes one: the
+    /// device's slow reads are its work and stay in. A read whose waits couldn't be read (macOS,
+    /// Windows; `run_delay`) counts its wall time, its batch closed at the median as the seeks' are
+    /// (`Rate::close_runs`): a preempted read is one rank, not a share of the mean.
     pub(crate) fn observe_page_read(&self, read: TimedRead) {
         let mut rates = self.rates.lock();
         let rate = &mut rates.page;
         let epoch = rate.epoch;
-        match (rate.rule, self.page_timing, read.less_waits()) {
-            (WeightRule::BatchMeans, PageReadTiming::RunDelay, Some(nanos)) => {
+        match (rate.rule, read.less_waits()) {
+            (WeightRule::BatchMeans, Some(nanos)) => {
                 rate.observe(1.0, nanos);
                 drop(rates);
                 let cost = read.waited.map_or(0.0, |(_, cost)| cost);
@@ -842,7 +816,7 @@ impl LearnedCosts {
                 };
                 self.page.add(nanos, epoch, cost);
             }
-            (WeightRule::BatchMeans, PageReadTiming::Median | PageReadTiming::RunDelay, _) => {
+            (WeightRule::BatchMeans, None) => {
                 let mut batch = self.page.batch.lock();
                 batch.push(read.wall);
                 if batch.len() as f64 >= epoch.max(2.0) {
@@ -1600,9 +1574,11 @@ pub(crate) fn page_read_anchor(
 /// process's first read took 121.7 us, the reads after it 24.7 to 38.9 us; lane qs5-5's probe,
 /// kiln run r558), and a single read anchored on it flipped the key joins of
 /// `tests/records_plans.rs`'s `a_join_on_a_whole_key_searches_it_without_statistics` (kiln run
-/// r546; it passes with this, run r649). So the reads after it are timed, doubling in number, until
-/// their time reaches the first's or they number `most_reads`, as calibration times each kind of
-/// work until its time reaches the slowest single run (`measure`).
+/// r546; it passes with this, run r649). So the reads after it are timed, until their time reaches
+/// the first's or they number `most_reads`, as calibration times each kind of work until its time
+/// reaches the slowest single run (`measure`). Each is timed alone as the database's own reads
+/// are (lane T15, `time_single_reads`): the open's anchor read 33,746 ns under outside load against
+/// 5,126 ns without it (kiln run r1673).
 pub(crate) fn time_page_read(
     db_path: &str,
     io: &crate::sync::Arc<dyn crate::io::IO>,
@@ -1669,22 +1645,7 @@ fn read_through_io(
         read_once()?;
         let first = start.elapsed().as_nanos() as f64;
         let most_reads = most_reads.max(1);
-        let timing = page_read_timing();
-        if timing != PageReadTiming::Mean {
-            return time_single_reads(timing, first, most_reads, &read_once);
-        }
-        let mut reads: usize = 1;
-        loop {
-            let start = std::time::Instant::now();
-            for _ in 0..reads {
-                read_once()?;
-            }
-            let nanos = start.elapsed().as_nanos() as f64;
-            match reads.checked_mul(2) {
-                Some(next) if nanos < first && next <= most_reads => reads = next,
-                _ => return Ok((reads as f64, nanos)),
-            }
-        }
+        time_single_reads(first, most_reads, &read_once)
     })();
     drop(file);
     let removed = io.remove_file(scratch);
@@ -1694,11 +1655,11 @@ fn read_through_io(
 }
 
 /// Lane T15: the open's reads after the first, timed one at a time as the database's own are
-/// (`PageReadTiming`), until their wall time reaches `first`'s or they number `most_reads`:
-/// (reads, nanoseconds), the nanoseconds the reads' median times their count (arm A), or their
-/// times less their thread's waits summed (arm B; arm A if a wait can't be read).
+/// (`PageReadTimer`), until their wall time reaches `first`'s or they number `most_reads`:
+/// (reads, nanoseconds), the nanoseconds their times less their thread's waits summed, or where a
+/// wait can't be read, the reads' median wall time times their count
+/// (`LearnedCosts::observe_page_read`).
 fn time_single_reads(
-    timing: PageReadTiming,
     first: f64,
     most_reads: usize,
     read_once: &dyn Fn() -> crate::Result<()>,
@@ -1707,7 +1668,7 @@ fn time_single_reads(
     let mut own = Some(0.0);
     let mut total = 0.0;
     while walls.is_empty() || (total < first && walls.len() < most_reads) {
-        let timer = PageReadTimer::start(timing == PageReadTiming::RunDelay);
+        let timer = PageReadTimer::start();
         read_once()?;
         let read = timer.stop();
         let wall = read.map_or_else(|| timer.wall.elapsed().as_nanos() as f64, |read| read.wall);
@@ -1717,8 +1678,8 @@ fn time_single_reads(
     }
     let reads = walls.len() as f64;
     match own {
-        Some(nanos) if timing == PageReadTiming::RunDelay => Ok((reads, nanos)),
-        _ => Ok((reads, median(&mut walls).unwrap_or(0.0) * reads)),
+        Some(nanos) => Ok((reads, nanos)),
+        None => Ok((reads, median(&mut walls).unwrap_or(0.0) * reads)),
     }
 }
 
@@ -2168,16 +2129,15 @@ mod tests {
     }
 
     /// The page read's rate after batches of reads 10% either way of 1,000 ns, then one batch whose
-    /// reads are `last`, each read as `timing` takes it (lane T15).
-    fn t15_rate_after(timing: PageReadTiming, last: [TimedRead; 4]) -> (f64, f64) {
-        let costs = LearnedCosts::from_rates(&fixed_rates(2.0, 10.0, 20.0, 15.0, 2.0))
-            .with_page_timing(timing);
+    /// reads are `last` (lane T15); each read's wait read, or none (`waits`).
+    fn t15_rate_after(waits: bool, last: [TimedRead; 4]) -> (f64, f64) {
+        let costs = LearnedCosts::from_rates(&fixed_rates(2.0, 10.0, 20.0, 15.0, 2.0));
         for i in 0..8 {
             let wall = if i % 2 == 0 { 900.0 } else { 1100.0 };
             for _ in 0..4 {
                 costs.observe_page_read(TimedRead {
                     wall,
-                    waited: Some((0.0, 500.0)),
+                    waited: if waits { Some((0.0, 500.0)) } else { None },
                 });
             }
         }
@@ -2188,11 +2148,12 @@ mod tests {
         (before, costs.weights().unwrap().row_in_pages.unwrap())
     }
 
-    /// T14's failure (lane T15): a batch with one read preempted for 2 ms of its 2,001 us.
-    fn t15_one_preempted() -> [TimedRead; 4] {
+    /// T14's failure (lane T15): a batch with one read preempted for 2 ms of its 2,001 us; each
+    /// read's wait read, or none (`waits`).
+    fn t15_one_preempted(waits: bool) -> [TimedRead; 4] {
         let read = |wall, waited| TimedRead {
             wall,
-            waited: Some((waited, 500.0)),
+            waited: if waits { Some((waited, 500.0)) } else { None },
         };
         [
             read(1000.0, 0.0),
@@ -2202,26 +2163,24 @@ mod tests {
         ]
     }
 
-    /// Do (lane T15, arm A): settle the page read's rate, then close a batch with one read preempted
-    /// for 2 ms. Expect: the rate stands where it stood (the median holds the preempted read at one
-    /// rank); the mean it replaces moved it 500-fold.
+    /// Do (lane T15): settle the page read's rate, then close a batch with one read preempted for
+    /// 2 ms, its thread's wait read. Expect: the rate stands where it stood (the 2 ms wait
+    /// subtracted, the read's own 1 us kept; the wall times' mean moved it 500-fold, kiln run r1673).
     #[test]
-    fn t15_a_preempted_read_does_not_move_the_page_rate_median() {
-        let (before, after) = t15_rate_after(PageReadTiming::Median, t15_one_preempted());
-        assert_eq!(after, before);
-        let (before, after) = t15_rate_after(PageReadTiming::Mean, t15_one_preempted());
-        assert!(after < before / 100.0, "{before} {after}");
-    }
-
-    /// Do (lane T15, arm B): as above, each read's wait for a CPU given. Expect: the rate stands
-    /// where it stood (the preempted read's 2 ms wait subtracted, its own 1 us kept).
-    #[test]
-    fn t15_a_preempted_read_does_not_move_the_page_rate_run_delay() {
-        let (before, after) = t15_rate_after(PageReadTiming::RunDelay, t15_one_preempted());
+    fn t15_a_preempted_read_does_not_move_the_page_rate() {
+        let (before, after) = t15_rate_after(true, t15_one_preempted(true));
         assert_eq!(after, before);
     }
 
-    /// Do (lane T15, arm B): read the thread's run-queue wait twice. Expect: a count, never falling.
+    /// Do (lane T15): as above where no wait can be read (macOS, Windows). Expect: the rate stands
+    /// where it stood (the batch closes at its median, the preempted read one rank of it).
+    #[test]
+    fn t15_a_preempted_read_does_not_move_the_page_rate_without_its_wait() {
+        let (before, after) = t15_rate_after(false, t15_one_preempted(false));
+        assert_eq!(after, before);
+    }
+
+    /// Do (lane T15): read the thread's run-queue wait twice. Expect: a count, never falling.
     #[cfg(target_os = "linux")]
     #[test]
     fn t15_the_run_queue_wait_is_read_on_linux() {
