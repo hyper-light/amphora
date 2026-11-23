@@ -264,3 +264,21 @@ the closing segment whole, so reads that overlap with no gap would never let its
 could never switch again. A read begun once the closing segment is copied into a flushed file now takes the current
 segment alone and reads the rest from the file. The reset's events are three: the last read's give-back, the copy
 with the file's flush, and a backed-up database's ship.
+
+**Decision 45's first unit: the segments' state machine, on branch `perf/pagepath-d45` (cdf48fe9), not merged.**
+`crates/engine/storage/log_segments.rs`: always one current segment, the other free or closing (`Segments`, so two
+current segments can't be written down). `switch` goes only into a free segment and returns None, never waits, while
+the other closes. `begin_read` counts on the current segment, and on the closing one only until it is copied;
+`end_read` takes the read's span by value (not `Copy`, so a read can't be given back twice). `end_read`, `copied` and
+`shipped` each return the segment they reset, when theirs was the last of its three events. `recover` takes the
+segment whose checkpoint sequence is one past the other's as current, wrap-aware, and refuses a pair no switch leaves.
+Run r1061 (adacachy2, needs cpus=8): `cargo clippy -p amphora-engine --all-targets --locked -- -D warnings` exit 0;
+`cargo test -p amphora-engine --lib -- storage::log_segments` 7 passed, 0 failed. Nothing calls it yet. The next
+units, each checked by the storage suite before the next: the log's per-generation state (`WalSharedMetadata`'s
+header, frames and checksums; `WalSharedRuntime`'s file, frame cache, read marks, records, changes, read index and
+durable mark) made one per segment, with `Segments` beside them and every path on the current one; recovery and
+`database.rs` reading `-wal2` through `Segments::recover`; reads looking up by `ReadSpan::lookup_order`; the
+checkpointer copying the closing segment first and calling `copied` after the file's flush; the switch in place of
+`restart_wal_header`, with `begin_restart`, `end_restart`, `try_restart_log_for_write`'s restart and the store's
+`restart_if_asked` gate and `Slots::take_all` deleted; the backup's ship calling `shipped`. Then the engine- and
+store-level tests the doc names, the crash tests, and the slow-reader A/B (brief unit 3, not started).
