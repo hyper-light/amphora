@@ -86,6 +86,13 @@ def ask(addr, obj):
     return json.loads(buf or b"{}")
 
 
+def counters(addr):
+    try:
+        return ask(addr, {"op": "counters"})
+    except (OSError, ValueError) as e:
+        return {"error": str(e)}
+
+
 def io(pid):
     out = {}
     for line in (rd(f"/proc/{pid}/io") or "").splitlines():
@@ -126,6 +133,7 @@ def main():
          "--writers", str(writers)] + flags, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     time.sleep(after)
     pids = [m.pid for m in members]
+    k0 = [counters(a) for a in peers]
     c0 = {(p, t): cpu(p, t) for p in pids for t in tids(p)}
     io0 = {p: io(p) for p in pids}
     seen, sweeps, began = collections.Counter(), 0, time.monotonic()
@@ -139,6 +147,7 @@ def main():
     elapsed = time.monotonic() - began
     c1 = {(p, t): cpu(p, t) for p in pids for t in tids(p)}
     io1 = {p: io(p) for p in pids}
+    k1 = [counters(a) for a in peers]
     comms = {(p, t): (rd(f"/proc/{p}/task/{t}/comm") or "?").strip() for p in pids for t in tids(p)}
     _, err = driver.communicate(timeout=300)
     for m in members:
@@ -176,7 +185,9 @@ def main():
             groups[sig]["cpu"] = round(groups[sig]["cpu"] + th["cpu"], 3)
         busy = [th for th in threads if th["cpu"] >= 0.02 or th["comm"] == "hyper-log-io" or (th["top"] and not th["top"][0][0].startswith("S futex"))]
         d = {k: io1[p].get(k, 0) - io0[p].get(k, 0) for k in ("syscr", "syscw", "write_bytes", "wchar")}
+        counted = {k: k1[i][k] - k0[i][k] for k in k1[i] if k in k0[i] and isinstance(k1[i][k], (int, float))}
         per_member.append({"node": i + 1, "is_leader": i + 1 == leader, "io_per_s": {k: round(v / elapsed) for k, v in d.items()},
+                           "counters_in_span": counted or k1[i],
                            "cpu_total": round(sum(th["cpu"] for th in threads), 3),
                            "groups": [{"comm": c, "top": s, **v} for (c, s), v in sorted(groups.items(), key=lambda kv: -kv[1]["cpu"])][:12],
                            "busy": busy[:16]})
