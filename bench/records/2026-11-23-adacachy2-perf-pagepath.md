@@ -12,7 +12,11 @@ alternating, three reps each:
 (script: perf/pagepath's `.git/perf-ab.sh`, records `~/.cache/amphora-perf-bin/pagepath/ab-0051.jsonl`
 on adacachy2). Queries a second, median of 3 [min-max]; SQLite one run, same binary and client.
 
-## AUDIT 2.1 (bf23ccb1): header guard publishes only after a write; WAL locks padded. Default path (PagePath::Today, LOG_READ_INDEX=locked)
+## AUDIT 2.1. WAL header publication and lock padding on the default path
+
+The change landed as `e74813c8`. The original record labels the measured after binary
+`bf23ccb1`; that object is absent from the fetched history. The runs below exercised
+`PagePath::Today` with `LOG_READ_INDEX=locked`. The table retains throughput only.
 
 | op | clients | base | after | after/base | SQLite |
 |---|---|---|---|---|---|
@@ -31,3 +35,8 @@ Reading: no regression outside the noise; point_pk at 64 and 128 clients is abov
 (+14%, +6%). The 10x isn't here: the header was already read lock-free under the non-default read
 indexes (decision 40), and the default's per-read cost is elsewhere (AUDIT 2.1's frame_cache lock,
 2.2). To re-measure on a quiet host.
+
+## AUDIT 2.3. Single shared-page lookup and shard selection
+
+The distribution test in `a02e4b20` checks the first pages of 64 files and consecutive pages of
+one file. This record contains no paired timed run of the changed `PagePath::Plain` lookup.
