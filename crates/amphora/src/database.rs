@@ -103,11 +103,14 @@ impl Admission {
     /// MB.1): its command and answer, the bytes it carries, and the most its answer can carry by
     /// the API's own bounds. A Records get answers one row (a key of at most `KEY_MAX`, a value of
     /// at most `VALUE_MAX`); a Records write, a head, a compaction's step and a holding answer a
-    /// revision or a fixed-size progress. The rest keep the full request bound, `REQUEST_MAX`:
-    /// SQL and scans answer up to `RESULT_MAX`/`SCAN_MAX` rows, an import's page and its
-    /// publication up to `REQUEST_MAX`, and a call's answer is whatever its closure returns,
-    /// which no API bound holds. Counts saturate: a sum past the address space is refused by the
-    /// budget, never wrapped.
+    /// revision or a fixed-size progress. A scan answers its limit's rows and reads one past them
+    /// to know whether more follow, each row a key and value at most `KEY_MAX` and `VALUE_MAX`;
+    /// an SQL batch carries its statements and parameters and answers a result per statement,
+    /// their rows' bytes at most `RESULT_MAX` (Ada, AUDIT §1: their real worst case, lane
+    /// perf-A5). The rest keep the full request bound, `REQUEST_MAX`: a migration, an import's
+    /// page and its publication up to `REQUEST_MAX`, and a call's answer is whatever its closure
+    /// returns, which no API bound holds. Counts saturate: a sum past the address space is
+    /// refused by the budget, never wrapped.
     fn bytes_for(operation: &Operation) -> usize {
         let fixed = std::mem::size_of::<Command>().saturating_add(std::mem::size_of::<Answer>());
         let carried = match operation {
@@ -147,8 +150,35 @@ impl Admission {
             ) => namespace.len().saturating_mul(2),
             Operation::Mutation(Mutation::Holding(holding)) => holding.len(),
             Operation::Head => 0,
-            Operation::Mutation(Mutation::Sql(_) | Mutation::Migrate(_))
-            | Operation::Scan(..)
+            Operation::Scan(family, scan, _) => {
+                let row = std::mem::size_of::<Row>()
+                    .saturating_add(api::KEY_MAX)
+                    .saturating_add(api::VALUE_MAX);
+                family
+                    .len()
+                    .saturating_add(scan.prefix.len())
+                    .saturating_add(scan.after.as_ref().map_or(0, Vec::len))
+                    .saturating_add(scan.limit.saturating_add(1).saturating_mul(row))
+            }
+            Operation::Mutation(Mutation::Sql(statements)) => {
+                let request = statements.iter().fold(0usize, |n, statement| {
+                    statement.params.iter().fold(
+                        n.saturating_add(std::mem::size_of::<Statement>())
+                            .saturating_add(statement.sql.len()),
+                        |n, value| {
+                            n.saturating_add(std::mem::size_of::<Value>())
+                                .saturating_add(value_bytes(value))
+                        },
+                    )
+                });
+                let results = statements
+                    .len()
+                    .saturating_mul(std::mem::size_of::<SqlResult>());
+                request
+                    .saturating_add(results)
+                    .saturating_add(api::RESULT_MAX)
+            }
+            Operation::Mutation(Mutation::Migrate(_))
             | Operation::Changes(..)
             | Operation::Call(_)
             | Operation::Import(_)
@@ -3603,10 +3633,11 @@ mod admission_charge {
     }
 
     /// Do: size the admission charge of a Records get, small and largest Records writes, a head,
-    /// and a call, an SQL batch and a scan. Expect: a get charged its one row's bound (a
-    /// largest key and value) and no more; a write charged what it carries, its value counted
-    /// byte for byte; a head its command alone; a call, SQL and a scan, whose answers no tighter
-    /// bound holds, the full `REQUEST_MAX` as before (AUDIT 2026-11-23 §1, MB.1).
+    /// a call, SQL batches and scans. Expect: a get charged its one row's bound (a largest key
+    /// and value) and no more; a write charged what it carries, its value counted byte for byte;
+    /// a head its command alone; a call, whose answer no API bound holds, the full `REQUEST_MAX`;
+    /// a scan its limit's rows and one more at their largest; an SQL batch what it carries and a
+    /// result per statement on top of `RESULT_MAX` (AUDIT 2026-11-23 §1, MB.1; lane perf-A5).
     #[test]
     fn mb1_a_request_is_charged_what_it_and_its_answer_can_hold() {
         let fixed = std::mem::size_of::<Command>() + std::mem::size_of::<Answer>();
@@ -3624,22 +3655,45 @@ mod admission_charge {
         assert_eq!(largest - small, api::VALUE_MAX - 100);
         assert_eq!(Admission::bytes_for(&Operation::Head), fixed);
         let call: Call = Box::new(|_| Ok(Box::new(()) as Box<dyn Any + Send>));
-        for unbounded in [
-            Operation::Call(Mutex::new(Some(call))),
-            Operation::Mutation(Mutation::Sql(Vec::new())),
-            Operation::Scan(
+        assert_eq!(
+            Admission::bytes_for(&Operation::Call(Mutex::new(Some(call)))),
+            fixed + api::REQUEST_MAX
+        );
+        let row = std::mem::size_of::<Row>() + api::KEY_MAX + api::VALUE_MAX;
+        let scan = |limit| {
+            Admission::bytes_for(&Operation::Scan(
                 "ns".into(),
                 Scan {
-                    prefix: Vec::new(),
+                    prefix: b"p".to_vec(),
                     after: None,
-                    limit: 1,
+                    limit,
                     at: Consistency::Linearizable,
                 },
                 LockedReads::Committed,
-            ),
-        ] {
-            assert_eq!(Admission::bytes_for(&unbounded), fixed + api::REQUEST_MAX);
-        }
+            ))
+        };
+        assert_eq!(scan(1), fixed + 2 + 2 * row, "a one-row page and the row past it");
+        assert_eq!(
+            scan(api::SCAN_MAX),
+            fixed + 2 + (api::SCAN_MAX + 1) * row,
+            "the largest page: ~1 GiB, past the flat 32 MiB it was charged"
+        );
+        assert!(scan(api::SCAN_MAX) > api::REQUEST_MAX);
+        let empty = Admission::bytes_for(&Operation::Mutation(Mutation::Sql(Vec::new())));
+        assert_eq!(empty, fixed + api::RESULT_MAX);
+        let one = Admission::bytes_for(&Operation::Mutation(Mutation::Sql(vec![Statement {
+            sql: "SELECT ?1".into(),
+            params: vec![Value::Blob(vec![0; 1000])],
+        }])));
+        assert_eq!(
+            one - empty,
+            std::mem::size_of::<Statement>()
+                + "SELECT ?1".len()
+                + std::mem::size_of::<Value>()
+                + 1000
+                + std::mem::size_of::<SqlResult>(),
+            "a statement's text and parameters byte for byte, and its result's envelope"
+        );
     }
 }
 
