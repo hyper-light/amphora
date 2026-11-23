@@ -786,3 +786,30 @@ fn cp_t1_13_sql_takes_bound_parameters_and_answers_typed_rows_with_their_names()
     let wrong = Keys::plain(b"not-the-cluster-secret-not-the-cluster-secret".to_vec());
     assert!(SqlClient::connect(&leader, &wrong, c.deadline).is_err());
 }
+
+#[test]
+fn p5_probe_large_replicated_writes() {
+    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).with_writer(std::io::stderr).try_init();
+    let dir = tempfile::tempdir().unwrap();
+    let configs = three(dir.path());
+    start(&configs);
+    let c = &configs[0];
+    healthy(c);
+    let keys = c.keys().unwrap();
+    let (_, leader) = Client::connect(&c.members[0].addr, &keys, c.deadline).unwrap().leader(Duration::from_secs(60)).unwrap();
+    let mut sql = SqlClient::connect(&leader, &keys, c.deadline).unwrap();
+    let st = |text: &str, params: Vec<Value>| Statement { sql: text.to_owned(), params };
+    sql.write(vec![st("CREATE TABLE big (id INTEGER PRIMARY KEY, v BLOB)", vec![])]).unwrap();
+    let mib = 1 << 20;
+    let mut next = 0i64;
+    for count in [8i64, 15, 16, 20] {
+        let rows = (0..count).map(|n| st("INSERT INTO big VALUES (?1, ?2)", vec![Value::Integer(next + n), Value::Blob(vec![9; mib])])).collect();
+        let began = Instant::now();
+        let got = sql.write(rows);
+        eprintln!("P5PROBE write {count} MiB: {:?} after {:?}", got.as_ref().map(|t| t.len()).map_err(|e| format!("{e:#}")), began.elapsed());
+        if got.is_ok() { next += count; } else { sql = SqlClient::connect(&leader, &keys, c.deadline).unwrap(); }
+    }
+    let began = Instant::now();
+    let held = sql.write(vec![st("INSERT INTO big (id) VALUES (100000)", vec![]), st("SELECT id, v FROM big ORDER BY id", vec![])]);
+    eprintln!("P5PROBE write+select {next} rows: {:?} after {:?}", held.as_ref().map(|t| t.len()).map_err(|e| format!("{e:#}")), began.elapsed());
+}
