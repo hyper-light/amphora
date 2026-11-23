@@ -174,3 +174,40 @@ database:: 225 passed, 1 failed, the known patience test
 differently"); alone (r716, load 833 to 908) it passed on be247a75 and on main ce73cba1, so it is
 the host's load (an admission A/B of this lane's had ~8,400 threads up then, since stopped), not
 this change. Its pages are far under RESULT_MAX, where the new rule cuts exactly as the limit did.
+
+## The call charge's A/B (perf-A6, branch perf/cross-call at fbf7dbdb, NOT merged: no winner)
+
+Built: `Database::call_charged(until, AnswerCharge, f)`, `AnswerCharge::Declared(max)` (arm a)
+or `AnswerCharge::Measured` (arm b), answers sized by a new `AnswerBytes` trait required only
+there; `call`, `call_session`, `query` and the remote call are unchanged. Both arms check the
+answer's size inside the call's transaction, before `connection.finish()`: past its bound (a) or
+past the budget's room (b) the call is refused and rolled back (test
+`tests/database.rs::mb_1_a_charged_call_past_its_declared_answer_rolls_back`). Checked at
+62c605cc (r737): clippy clean, `tests/database.rs` 10 passed.
+
+`admission <dir> 1000 5 4,8 ab 5` (r737, needs cpus=8): arms flat (today's `REQUEST_MAX`),
+declared and measured alternated in each of 5 rounds of 5 s; each call `SELECT id, v ... LIMIT 8`
+over 1000 rows; every call timed. Load 465 falling to 94, CPU pressure avg10 0.5-51%. Median
+[range] of 5 rounds, microseconds:
+
+| arm | workers | p50 | p99 | p99.9 | calls/s | refused |
+|---|---|---|---|---|---|---|
+| flat | 4 | 60 [57-81] | 450 [132-1204] | 804 [383-2432] | 37363 [24922-63370] | 0 |
+| declared | 4 | 59 [57-96] | 936 [248-1037] | 1702 [568-1931] | 29196 [27494-55693] | 0 |
+| measured | 4 | 75 [71-76] | 672 [124-1133] | 1204 [331-2004] | 32261 [21506-52903] | 0 |
+| flat | 8 | 123 [110-197] | 884 [182-1453] | 1638 [443-2950] | 33842 [33030-69334] | 0 |
+| declared | 8 | 118 [113-121] | 1070 [234-1361] | 1593 [504-2648] | 35291 [32167-65920] | 0 |
+| measured | 8 | 154 [146-202] | 1330 [253-1437] | 1953 [470-2273] | 25575 [23672-52023] | 0 |
+
+Verdict: inconclusive. Nothing was refused, so the charge never bound admission at 4-8 calls in
+flight. Declared and flat are alike within noise; measured's p50 is about 25% higher in each round
+at both worker counts (a guess, not profiled: its second budget take, on the writer thread, for
+every call). The tails' ranges overlap in every arm on a host this loaded.
+
+1k and 10k calls in flight were not measured: `Database::call` blocks until its answer, so each
+call in flight is an OS thread. The 10k-thread runs (r661, r685) drove adacachy2 past load 1000
+and were discarded at the coordinator's word. What they showed, unvetted (the OS scheduler was the
+likely limiter): at 10k, flat refused about half the calls as Full and kept 36-43k calls/s, while
+declared and measured admitted every call and fell to 120-900 calls/s with p50 7-12 s. Measuring
+1k/10k fairly needs a call submitted without blocking (a submit that answers through a callback,
+as the writer's `put_then` already does inside), so a core-sized pool keeps that many queued.
