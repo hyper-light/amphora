@@ -3422,6 +3422,13 @@ fn snapshot(at: Consistency, head: Rev, horizon: Rev) -> Result<Rev, Refusal> {
         Consistency::Snapshot(r) => Ok(r),
     }
 }
+/// Whether a Records row has a value at `at` (its newest version by then is no deletion), as
+/// [`get`] would say by answering one, without copying the value out (AUDIT 4.2).
+fn live_at(db: &Db, ns: &str, family: &str, key: &[u8], at: Rev) -> anyhow::Result<bool> {
+    let mut live = false;
+    db.query("SELECT value IS NOT NULL FROM __amphora_versions WHERE namespace = ?1 AND family = ?2 AND key = ?3 AND rev <= ?4 ORDER BY rev DESC LIMIT 1", [text(ns), text(family), blob(key)?, integer(at)?], |r| { live = r.get::<i64>(0).map_err(unavailable)? != 0; Ok(false) })?;
+    Ok(live)
+}
 fn get(db: &Db, ns: &str, family: &str, key: &[u8], at: Rev) -> anyhow::Result<Option<Row>> {
     let mut out = None;
     db.query("SELECT rev, value FROM __amphora_versions WHERE namespace = ?1 AND family = ?2 AND key = ?3 AND rev <= ?4 ORDER BY rev DESC LIMIT 1", [text(ns), text(family), blob(key)?, integer(at)?], |r| { out = bytes(r, 1)?.map(|value| Ok::<_, anyhow::Error>(Row { key: key.into(), value, rev: rev(r, 0)? })).transpose()?; Ok(false) })?;
@@ -3588,7 +3595,7 @@ fn commit(
     }
     let mut live = live;
     for ((family, key), (_, w)) in &final_writes {
-        let before = get(db, ns, family, key, head)?.is_some();
+        let before = live_at(db, ns, family, key, head)?;
         match (before, matches!(w, Write::Put { .. })) {
             (false, true) => {
                 live = live
