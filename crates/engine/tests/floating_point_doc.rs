@@ -417,3 +417,261 @@ mod fp_digits_per_connection {
         assert_eq!(values.iter().map(ToString::to_string).collect::<Vec<_>>(), vec!["0.30000000000000004", "0.3"]);
     }
 }
+
+/// Lane G13: the page's remaining sentences, each a test. The expected texts are the page's own
+/// where it shows one, else sqlite3 3.54.0's (bench/records/2026-11-23-adacachy2-perf-numeric-g13.md).
+mod page_sentences {
+    use super::{open, texts};
+    use amphora_engine::StepResult;
+
+    fn one(sql: &str) -> String {
+        let (io, conn) = open();
+        texts(&io, &conn, sql).join("|")
+    }
+
+    fn fails(sql: &str) -> bool {
+        let (io, conn) = open();
+        let Ok(mut stmt) = conn.prepare(sql) else {
+            return true;
+        };
+        loop {
+            match stmt.step() {
+                Err(_) => return true,
+                Ok(StepResult::IO) => io.step().unwrap(),
+                Ok(StepResult::Row) => {}
+                Ok(_) => return false,
+            }
+        }
+    }
+
+    /// "This gives a range of positive values between approximately 1.7976931348623157e+308 and
+    /// 4.9406564584124654e-324 with an equivalent range of negative values."
+    #[test]
+    fn g13_reals_range_from_the_largest_to_the_smallest_binary64_either_sign() {
+        assert_eq!(
+            one("SELECT 1.7976931348623157e+308 = ieee754_from_blob(x'7fefffffffffffff'), 4.9406564584124654e-324 = ieee754_from_blob(x'0000000000000001'), -1.7976931348623157e+308 = ieee754_from_blob(x'ffefffffffffffff'), -4.9406564584124654e-324 = ieee754_from_blob(x'8000000000000001')"),
+            "1|1|1|1"
+        );
+    }
+
+    /// "The binary-64 floating-point format uses 64 bits per number."
+    #[test]
+    fn g13_a_real_is_64_bits() {
+        assert_eq!(
+            one("SELECT quote(ieee754_to_blob(47.49)), length(ieee754_to_blob(47.49))"),
+            "X'4047BEB851EB851F'|8"
+        );
+    }
+
+    /// "Floating point values are approximate."
+    #[test]
+    fn g13_floating_point_values_are_approximate() {
+        assert_eq!(
+            one("SELECT 0.1 + 0.2 = 0.3, decimal(0.1)"),
+            "0|0.1000000000000000055511151231257827021181583404541015625"
+        );
+    }
+
+    /// "But if you do this computation using binary-64 floating-point, the answer you get is
+    /// 0.00000095367431640625"
+    #[test]
+    fn g13_the_near_equal_subtraction_is_exactly_the_pages_binary64() {
+        assert_eq!(
+            one("SELECT decimal(1152693165.1106291898 - 1152693165.1106280772)"),
+            "0.00000095367431640625"
+        );
+    }
+
+    /// "An IEEE 754 floating-point value is an integer multiplied by a power of two: M × 2^E";
+    /// 47.49 "will be represented in binary-64 as: 6683623321994527 × 2^-47".
+    #[test]
+    fn g13_a_real_is_m_times_2_to_the_e() {
+        assert_eq!(
+            one("SELECT ieee754(47.49), ieee754_mantissa(47.49), ieee754_exponent(47.49)"),
+            "ieee754(6683623321994527,-47)|6683623321994527|-47"
+        );
+    }
+
+    /// "For Binary-64, M is a 53-bit integer and E is an 11-bit integer that is offset so that
+    /// represents a range of values between -1074 and +972, inclusive."
+    #[test]
+    fn g13_e_runs_from_minus_1074_to_972() {
+        assert_eq!(
+            one("SELECT ieee754_exponent(4.9406564584124654e-324), ieee754_exponent(1e999), ieee754(1.7976931348623157e+308)"),
+            "-1074|972|ieee754(9007199254740991,971)"
+        );
+    }
+
+    /// "Which works out to be: 47.49000000000000198951966012828052043914794921875" / "If we reduce M
+    /// by one to 6683623321994526 ... we get: 47.4899999999999948840923025272786617279052734375" /
+    /// "The first number is closer to the desired value of 47.49, so that is the one that gets used."
+    #[test]
+    fn g13_47_49_and_the_next_smaller_double() {
+        assert_eq!(
+            one("SELECT decimal(ieee754(6683623321994527,-47)), decimal(ieee754(6683623321994526,-47)), ieee754(6683623321994526,-47) < 47.49"),
+            "47.49000000000000198951966012828052043914794921875|47.4899999999999948840923025272786617279052734375|1"
+        );
+    }
+
+    /// "the only cents value that can be exactly represented are 0.00, 0.25, 0.50, and 0.75."
+    #[test]
+    fn g13_only_quarter_cents_are_exact() {
+        assert_eq!(
+            one("WITH RECURSIVE c(v) AS (SELECT 0 UNION ALL SELECT v+1 FROM c WHERE v<99) SELECT group_concat(v) FROM c WHERE decimal_cmp(decimal(v/100.0), printf('0.%02d', v)) = 0"),
+            "0,25,50,75"
+        );
+    }
+
+    /// "the price is going up by about 0.0000000301 dollars per second. The error in the recorded
+    /// value of 47.49 represents about 66 nanoseconds worth of inflation." / "the value actually
+    /// stored (47.4900000000000019895196601282805204391479492187)"
+    #[test]
+    fn g13_the_error_in_47_49_is_66_nanoseconds_of_inflation() {
+        assert_eq!(
+            one("SELECT substr(decimal(47.49),1,49), round(47.49*0.02/(365.25*86400),10), round(CAST(decimal_sub(decimal(47.49), '47.49') AS REAL) / (47.49*0.02/(365.25*86400)) * 1e9)"),
+            "47.4900000000000019895196601282805204391479492187|3.01e-08|66.0"
+        );
+    }
+
+    /// "One rarely wants to see all 49 signficant digits of 6683623321994527×pow(2,-47)."
+    #[test]
+    fn g13_47_49_has_49_significant_digits() {
+        assert_eq!(one("SELECT length(decimal(47.49)) - 1"), "49");
+    }
+
+    /// "Rounding to 15 significant digits or less can often gives this exact round-trip result,
+    /// but not always."
+    #[test]
+    fn g13_15_digits_round_trip_often_but_not_always() {
+        assert_eq!(
+            one("SELECT printf('%.15g', 47.49), CAST(printf('%.15g', 47.49) AS REAL) = 47.49, printf('%.15g', 1.23*2.34), CAST(printf('%.15g', 1.23*2.34) AS REAL) = 1.23*2.34"),
+            "47.49|1|2.8782|0"
+        );
+    }
+
+    /// "The number 1.23 is: 2769713770832855 × 2^-51 = 1.229999999999999982236431605997495353221893310546875"
+    /// / "And 2.34 is: 5269211564023480 × 2^-51 = 2.339999999999999857891452847979962825775146484375"
+    #[test]
+    fn g13_1_23_and_2_34_as_binary64() {
+        assert_eq!(
+            one("SELECT ieee754(2769713770832855,-51) = 1.23, decimal(1.23), ieee754(5269211564023480,-51) = 2.34, decimal(2.34)"),
+            "1|1.229999999999999982236431605997495353221893310546875|1|2.339999999999999857891452847979962825775146484375"
+        );
+    }
+
+    /// "If you do an exact multiplication of those two values you get:
+    /// 2.878199999999999783639736961049495926597557229698714817531408904915934954260592348873615264892578125"
+    #[test]
+    fn g13_the_exact_product_of_1_23_and_2_34() {
+        assert_eq!(
+            one("SELECT decimal_mul(decimal(1.23), decimal(2.34))"),
+            "2.878199999999999783639736961049495926597557229698714817531408904915934954260592348873615264892578125"
+        );
+    }
+
+    /// "The floating point hardware in your CPU truncates this to: 6481130223748880 × 2^-51 =
+    /// 2.87819999999999964757080306299030780792236328125"
+    #[test]
+    fn g13_the_binary64_product_of_1_23_and_2_34() {
+        assert_eq!(
+            one("SELECT ieee754(6481130223748880,-51) = 1.23*2.34, decimal(1.23*2.34)"),
+            "1|2.87819999999999964757080306299030780792236328125"
+        );
+    }
+
+    /// "However, 2.8782 and 2.8781999999999997 are not the same number in binary-64." /
+    /// "2.8782 → 6481130223748881 × 2^-51" / "2.8781999999999997 → 6481130223748880 × 2^-51"
+    #[test]
+    fn g13_2_8782_and_2_8781999999999997_differ_by_one_in_m() {
+        assert_eq!(
+            one("SELECT ieee754(6481130223748881,-51) = 2.8782, ieee754(6481130223748880,-51) = 2.8781999999999997, 2.8782 = 2.8781999999999997"),
+            "1|1|0"
+        );
+    }
+
+    /// §2.1.1: "the 2-argument version of ieee754() takes the M and E values and converts them into
+    /// the corresponding F value: select ieee754(6683623321994527,-47) as x; ... 47.49"
+    #[test]
+    fn g13_ieee754_of_m_and_e_is_the_real() {
+        assert_eq!(one("SELECT ieee754(6683623321994527,-47)"), "47.49");
+    }
+
+    /// §2.1.3: "SELECT ieee754_from_blob(x'0000000000000001') AS F; ... 4.94065645841247e-324" and
+    /// "SELECT quote(ieee754_to_blob(4.94065645841247e-324)) ... X'0000000000000001'". sqlite3 3.54.0
+    /// writes 4.9406564584124654e-324; the page's 15 digits convert back, so 1.3.1 writes those.
+    #[test]
+    fn g13_ieee754_blobs_are_the_big_endian_encoding() {
+        assert_eq!(
+            one("SELECT ieee754_from_blob(x'0000000000000001'), quote(ieee754_to_blob(4.94065645841247e-324))"),
+            "4.94065645841247e-324|X'0000000000000001'"
+        );
+    }
+
+    /// §2.2.1: "These functions compute the sum, difference, and product, respectively, of the two
+    /// inputs A and B and return the result as text. The inputs can be either decimal text or numeric
+    /// values. Numeric inputs are converted into decimal text before the computation is performed."
+    #[test]
+    fn g13_decimal_add_sub_mul_return_text() {
+        assert_eq!(
+            one("SELECT decimal_add('0.1','0.2'), decimal_sub('1','0.9'), decimal_mul('1.23','2.34'), decimal_add(0.1, 0.2), typeof(decimal_add(1, 2)), decimal_add('1.10','2.205'), decimal_mul('0.5','0.20')"),
+            "0.3|0.1|2.8782|0.3|text|3.305|0.1"
+        );
+    }
+
+    /// §2.2.1: "There is no "decimal_div(A,B)" function"
+    #[test]
+    fn g13_there_is_no_decimal_div() {
+        assert!(fails("SELECT decimal_div(1,2)"));
+    }
+
+    /// §2.2.2: "The decimal_pow2(N) function computes the exact decimal representation of the N-th
+    /// power of 2. N must be an integer between -20000 and +20000."
+    #[test]
+    fn g13_decimal_pow2_is_exact_between_minus_and_plus_20000() {
+        assert_eq!(
+            one("SELECT decimal_pow2(-1), decimal_pow2(10), length(decimal_pow2(20000)), length(decimal_pow2(-20000))"),
+            "+5.0e-01|+1.024e+03|6029|13988"
+        );
+        assert!(fails("SELECT decimal_pow2(20001)"));
+        assert!(fails("SELECT decimal_pow2(-20001)"));
+    }
+
+    /// §2.2.3: "If the input X is a floating point value, it is expanded to its exact decimal
+    /// equivalent" / "The decimal_exp(X) function returns the result in exponential notation (with a
+    /// "e+NN" at the end) and decimal(X) returns a pure decimal (without the "e+NN")."
+    #[test]
+    fn g13_decimal_and_decimal_exp_expand_exactly() {
+        assert_eq!(
+            one("SELECT decimal(47.49), decimal_exp(47.49), decimal(12), decimal_exp(12), decimal('0012.500')"),
+            "47.49000000000000198951966012828052043914794921875|+4.749000000000000198951966012828052043914794921875e+01|12|+1.2e+01|12.500"
+        );
+    }
+
+    /// §2.2.4: "The result will be negative, zero, or positive if A is less than, equal to, or
+    /// greater than B, respectively."
+    #[test]
+    fn g13_decimal_cmp_orders_by_value() {
+        assert_eq!(
+            one("SELECT decimal_cmp('1.5','10'), decimal_cmp('10','10.0'), decimal_cmp('-1','1'), decimal_cmp(2, 1)"),
+            "-1|0|-1|1"
+        );
+    }
+
+    /// §2.2.5: "decimal_sum() computes its result to arbitrary precision and is therefore precise."
+    #[test]
+    fn g13_decimal_sum_is_precise() {
+        assert_eq!(
+            one("SELECT decimal_sum(x) FROM (SELECT '0.1' AS x UNION ALL SELECT '0.2' UNION ALL SELECT '0.3')"),
+            "0.6"
+        );
+    }
+
+    /// §2.2.6: "the "decimal" collating sequence that compares decimal text strings in numeric order."
+    #[test]
+    fn g13_the_decimal_collation_orders_numerically() {
+        assert_eq!(
+            one("SELECT group_concat(x, ',') FROM (SELECT x FROM (SELECT '10' AS x UNION ALL SELECT '9' UNION ALL SELECT '1.5' UNION ALL SELECT '-2') ORDER BY x COLLATE decimal)"),
+            "-2,1.5,9,10"
+        );
+    }
+}

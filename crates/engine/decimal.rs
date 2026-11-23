@@ -520,7 +520,7 @@ fn decimal_pow2_sql(args: &[Value]) -> Value {
     if !(-POW2_LIMIT..=POW2_LIMIT).contains(&n) {
         return Value::error_with_message("decimal_pow2(N): N must be an integer between -20000 and +20000".into());
     }
-    text_result(decimal_pow2(n), false)
+    text_result(decimal_pow2(n), true)
 }
 
 #[derive(Default)]
