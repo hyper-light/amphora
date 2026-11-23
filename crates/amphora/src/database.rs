@@ -2828,7 +2828,12 @@ impl Database {
             &self.application,
             until,
         )? {
-            ReadRoute::Answered(answer) => return answer.map(|answer| (answer, None)),
+            ReadRoute::Answered(answer) => {
+                drop(admission);
+                drop(in_flight);
+                reply(answer);
+                return Ok(());
+            }
             ReadRoute::Writer(operation) => operation,
         };
         let wake = matches!(&operation, Operation::Mutation(Mutation::Records { tx, .. }) if !tx.writes.is_empty())
