@@ -78,3 +78,21 @@ test, and it passes, merged. Started 19:12Z from main 4a62875e.
 at ±20000), decimal_mul trimming to the shorter input fraction (`decimal_mul('0.5','0.20')` = `0.1`),
 add/sub/mul reading a REAL as its text (`decimal_mul(1.23, 2.34)` = `2.8782`), quote of the blob of
 47.49 (`X'4047BEB851EB851F'`), the cents `0,25,50,75`, the inflation figures `3.01e-08` and `66.0`.
+
+## Checks
+
+On adacachy2 (`on` 00aad8daff2fa3c9daa65d53c425d450, needs `linux/amd64,cpus=8,mem=24g`, sync false,
+`~/.cache/amphora-perf/numeric-remote` at the commit named; the macOS placement r1448 was lost, the
+Mac could not reach this machine for the sync), `CARGO_HOME=~/.cache/cargo-home-perf-numeric
+CARGO_NET_OFFLINE=true CARGO_TARGET_DIR=~/.cache/amphora-perf-target/numeric CARGO_BUILD_JOBS=8
+CARGO_INCREMENTAL=0`:
+
+| run | head | what | result |
+|---|---|---|---|
+| r1476 | 6a10d6f2 | clippy `--all-targets --features bench`; lib `decimal:: ieee754::` | clippy: `Decimal::is_null` unused (removed in 73dfa992); 23 passed |
+| r1486 | 73dfa992 (merged with main 392d9aac) | the same clippy; `--test floating_point_doc`; lib `decimal:: ieee754:: numeric:: printf json::` | page tests did not compile (`IO` not imported, fixed in feacf80c); lib 241 passed, 0 failed |
+| r1495 | feacf80c (pushed to main) | clippy; `--test floating_point_doc` | clippy clean; 45 passed, 0 failed |
+
+    cargo clippy -p amphora-engine --all-targets --features bench --locked -- -D warnings
+    cargo test -p amphora-engine --features bench --locked --test floating_point_doc -- --test-threads=8
+    cargo test -p amphora-engine --features bench --locked --lib -- decimal:: ieee754:: numeric:: printf json:: --test-threads=8
