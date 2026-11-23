@@ -918,7 +918,7 @@ impl Switch {
     /// or rolls it back. A cursor still holding it is refused its next write.
     /// Trees the transaction made are dropped if it rolls back; trees it dropped, once it commits.
     pub fn finish(&self, rollback: bool) -> Result<()> {
-        self.end(rollback, || Ok(()))
+        self.end(rollback, None::<fn() -> Result<()>>)
     }
 
     /// Commits the connection's transaction with `with` (the pager's commit of its header, the
@@ -928,16 +928,23 @@ impl Switch {
     /// back, and a failure of `with` rolls the storage's back. With no transaction open here,
     /// `with` alone runs.
     pub fn commit_with(&self, with: impl FnOnce() -> Result<()>) -> Result<()> {
-        self.end(false, || {
-            with()?;
-            #[cfg(test)]
-            self.committed_with();
-            Ok(())
-        })
+        self.end(
+            false,
+            Some(|| {
+                with()?;
+                #[cfg(test)]
+                self.committed_with();
+                Ok(())
+            }),
+        )
     }
 
-    /// [`Switch::finish`] and [`Switch::commit_with`]: `with` runs only on a commit.
-    fn end(&self, rollback: bool, with: impl FnOnce() -> Result<()>) -> Result<()> {
+    /// [`Switch::finish`] and [`Switch::commit_with`]: `with` runs only on a commit. A commit
+    /// with no `with` (the pager wrote nothing) of a transaction that wrote nothing ends it
+    /// without a timestamp, a redo record or the publish lock (AUDIT 2.4,
+    /// [`Database::end_unwritten`](super::durable::Database::end_unwritten)): what it saw is
+    /// durable before it returns, as before.
+    fn end(&self, rollback: bool, with: Option<impl FnOnce() -> Result<()>>) -> Result<()> {
         self.statements.lock().clear();
         self.named.lock().clear();
         let made = std::mem::take(&mut *self.made.lock());
@@ -951,13 +958,24 @@ impl Switch {
                 if rollback {
                     self.db.abort(txn, &mut d)
                 } else {
-                    self.db
-                        .commit_with(txn, &mut d, self.db.lane(), true, with)
-                        .map(|_| ())
+                    let unwritten = match with {
+                        Some(_) => Ok(Some(txn)),
+                        None => self.db.end_unwritten(txn),
+                    };
+                    match unwritten {
+                        Ok(Some(txn)) => self
+                            .db
+                            .commit_with(txn, &mut d, self.db.lane(), true, || {
+                                with.map_or(Ok(()), |with| with())
+                            })
+                            .map(|_| ()),
+                        Ok(None) => Ok(()),
+                        Err(e) => Err(e),
+                    }
                 }
             }
             None if rollback => Ok(()),
-            None => with(),
+            None => with.map_or(Ok(()), |with| with()),
         };
         // A transaction that didn't commit leaves the trees it made named by no schema row: they
         // are dropped, a failed commit's too. A commit whose flush failed may be durable, but its
@@ -978,6 +996,37 @@ mod tests {
     use crate::io::{MemoryIO, IO};
     use crate::sync::Arc;
     use crate::{ConnectOpts, Database, LimboError, SqliteDialect};
+
+    /// AUDIT 2.4, AC-NS.2.1: do autocommit SELECTs, then an INSERT; expect the SELECTs to log
+    /// no redo record and flush nothing (they wrote nothing), the INSERT to flush its record
+    /// before it returns as before, and a SELECT after it to read the row.
+    #[test]
+    fn audit_2_4_read_only_autocommit_logs_and_flushes_nothing() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new().with_versioned_storage())
+            .unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y TEXT)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        let switch = conn.versioned.as_ref().unwrap().clone();
+        let before = switch.db.log_counters();
+        for _ in 0..10 {
+            let mut stmt = conn.prepare("SELECT y FROM t WHERE x = 1").unwrap();
+            let rows = stmt.run_collect_rows().unwrap();
+            assert_eq!(rows.len(), 1);
+        }
+        let read = switch.db.log_counters();
+        assert_eq!(read.records, before.records, "a read logged a record");
+        assert_eq!(read.flushes, before.flushes, "a read flushed");
+        conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+        let wrote = switch.db.log_counters();
+        assert_eq!(wrote.records, read.records + 1, "the write's record");
+        assert_eq!(wrote.flushes, read.flushes + 1, "the write flushed before it returned");
+        let mut stmt = conn.prepare("SELECT count(*) FROM t").unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+        assert_eq!(rows.len(), 1);
+    }
 
     /// AC-NS.2.1: a rollback of the versioned storage that failed where no caller could be given
     /// its error (the pager's `rollback_tx`, ending an aborted statement) is not only logged: the
