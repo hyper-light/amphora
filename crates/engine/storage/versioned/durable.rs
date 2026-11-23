@@ -951,6 +951,20 @@ impl Database {
         Ok(ts)
     }
 
+    /// Ends `txn` if it wrote nothing ([`Versioned::end_unwritten`], AUDIT 2.4, `AC-NS.2.1`):
+    /// no timestamp, no redo record, no publish lock. Durable as a commit of it was: every commit
+    /// its snapshot saw is durable before this returns (a commit's record is appended before its
+    /// timestamp is published, so each is in a lane by then), and a log refused since is refused
+    /// here too. `txn` back when it must commit ([`Database::commit_with`]).
+    pub fn end_unwritten(&self, txn: Txn) -> Result<Option<Txn>> {
+        let start = txn.start;
+        if let Some(txn) = self.v.end_unwritten(txn)? {
+            return Ok(Some(txn));
+        }
+        self.redo.sync_all(&*self.disk, start)?;
+        Ok(None)
+    }
+
     /// `ops` as a column copy reads them (`AC-NS.2.4`): each put of a value that continues in
     /// chunks with the chunks put after it in the same commit (every put of a long value writes
     /// all of its chunks, in order, right after its cell), the overflow tree's own changes left
