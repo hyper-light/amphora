@@ -2787,6 +2787,8 @@ fn t_qt_6_27_joins_through_seeks_run_on_morsels_as_the_serial_loop() {
 #[test]
 fn t_qt_6_29_short_rows_read_their_columns_defaults_as_the_serial_loop() {
     let conn = open(":memory:qt-6-29");
+    // The join cases exercise the hash morsel worker. A chosen merge join stays serial.
+    conn.set_join_methods(crate::JoinMethods::HashJoinsOnly);
     let mut rng = ChaCha8Rng::seed_from_u64(629);
     let pad = "x".repeat(64);
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, p TEXT)")
