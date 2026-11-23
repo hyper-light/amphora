@@ -77,10 +77,22 @@ impl Segments {
         }
     }
 
-    /// A log recovered with two valid segments: the one with the lower checkpoint sequence closes,
-    /// with nothing of it copied since the crash. `shipped` says no backup still needs its frames.
-    pub const fn recovered(current: SegmentId, shipped: bool) -> Self {
-        Self {
+    /// The log recovery finds, from the checkpoint sequence in each segment's header (None where
+    /// the file is absent or its header's checksum fails). One valid segment is current and the
+    /// other free. Of two, the one whose sequence is one past the other's is current (a switch
+    /// writes the other's plus one, and the sequence is a u32 that wraps, so "the higher" is
+    /// wrong at the wrap), and the other closes with nothing of it copied since the crash;
+    /// `shipped` says no backup still needs its frames. None for two valid segments neither of
+    /// which follows the other: no switch leaves such a pair.
+    pub fn recover(first: Option<u32>, second: Option<u32>, shipped: bool) -> Option<Self> {
+        let current = match (first, second) {
+            (_, None) => return Some(Self::new(SegmentId::First)),
+            (None, Some(_)) => return Some(Self::new(SegmentId::Second)),
+            (Some(first), Some(second)) if second == first.wrapping_add(1) => SegmentId::Second,
+            (Some(first), Some(second)) if first == second.wrapping_add(1) => SegmentId::First,
+            (Some(_), Some(_)) => return None,
+        };
+        Some(Self {
             current,
             reads: 0,
             other: Some(Closing {
@@ -88,7 +100,7 @@ impl Segments {
                 copied: false,
                 shipped,
             }),
-        }
+        })
     }
 
     pub const fn current(&self) -> SegmentId {
@@ -329,12 +341,33 @@ mod tests {
     /// for its copy (and, backed up, its ship) before it is reset; no read is counted on either.
     #[test]
     fn d45_a_recovered_closing_segment_waits_for_its_copy() {
-        let mut log = Segments::recovered(SegmentId::Second, true);
+        let mut log = Segments::recover(Some(4), Some(5), true).expect("a switch's pair");
         assert_eq!(log.switch(false), None);
         assert_eq!(log.copied(), Some(SegmentId::First));
-        let mut backed_up = Segments::recovered(SegmentId::First, false);
+        let mut backed_up = Segments::recover(Some(6), Some(5), false).expect("a switch's pair");
         assert_eq!(backed_up.copied(), None);
         assert_eq!(backed_up.shipped(), Some(SegmentId::Second));
         assert_eq!(backed_up.switch(true), Some(SegmentId::Second));
+    }
+
+    /// Do: recover from each pair of headers a switch or a crash in one can leave, at the
+    /// sequence's wrap too, and from pairs no switch writes. Expect: the segment one past the
+    /// other is current and the other closing; a lone valid segment is current and the other
+    /// free; a pair neither of which follows the other is refused.
+    #[test]
+    fn d45_recovery_takes_the_segment_one_past_the_other_as_current() {
+        use SegmentId::{First, Second};
+        let found = |first: Option<u32>, second: Option<u32>| {
+            Segments::recover(first, second, true).map(|log| (log.current(), log.closing()))
+        };
+        assert_eq!(found(None, None), Some((First, None)));
+        assert_eq!(found(Some(7), None), Some((First, None)));
+        assert_eq!(found(None, Some(7)), Some((Second, None)));
+        assert_eq!(found(Some(7), Some(8)), Some((Second, Some(First))));
+        assert_eq!(found(Some(8), Some(7)), Some((First, Some(Second))));
+        assert_eq!(found(Some(u32::MAX), Some(0)), Some((Second, Some(First))));
+        assert_eq!(found(Some(0), Some(u32::MAX)), Some((First, Some(Second))));
+        assert_eq!(found(Some(7), Some(7)), None);
+        assert_eq!(found(Some(7), Some(9)), None);
     }
 }
