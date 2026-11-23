@@ -1978,9 +1978,18 @@ impl Database {
             shared: Arc::new(Shared {
                 transport: Mutex::new(None),
                 path: OnceLock::new(),
+                // No count bounds the writer's queue: every request is admitted by its charge to
+                // the memory budget's room for queues (MB.1), so a call waits on that room alone,
+                // never on a count picked apart from it (lane perf-A8).
                 writer: Writer::Local(
-                    Store::start(Local { db, restoring }, store::Config::default())
-                        .map_err(unavailable)?,
+                    Store::start(
+                        Local { db, restoring },
+                        store::Config {
+                            queue: None,
+                            ..store::Config::default()
+                        },
+                    )
+                    .map_err(unavailable)?,
                 ),
                 changed: Arc::new(changed),
                 restoring: AtomicBool::new(restoring),
@@ -2095,8 +2104,8 @@ impl Database {
     /// [`Database::call_charged`] without blocking its caller (lane perf-A7): admitted and queued
     /// at once, its answer handed to the returned [`Calling`], a future woken once the call has
     /// committed or with why it won't, so a pool of a few threads holds any number of calls in
-    /// flight. Admission refuses here, typed: past the budget's room, or at a writer queue already
-    /// full (`Full`, where `call` would wait for room). Only a local owner queues a call with no
+    /// flight. Admission refuses here, typed: past the budget's room for queues (`Full`), the only
+    /// bound on the writer's queue (lane perf-A8). Only a local owner queues a call with no
     /// thread waiting on it: an attached client or a replicated database is refused here
     /// ([`Database::call_charged`] answers there). A dropped [`Calling`] leaves the call to run
     /// and commit; its charge goes back with its answer.
