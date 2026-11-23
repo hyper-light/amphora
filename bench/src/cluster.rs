@@ -42,7 +42,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use amphora::database::{Database, ReadMode};
+use amphora::database::{AnswerMax, Database, ReadMode};
 use amphora_api::Refusal;
 use amphora_api::replication::ReplicaConfig;
 
@@ -285,7 +285,7 @@ fn schema_on(partition: &Partition) -> anyhow::Result<()> {
         let led = handle
             .wait_leader(past, until)
             .map_err(|e| anyhow::anyhow!("no leader past term {past} for the schema: {e:?} (last refusal: {refused:?})"))?;
-        match member.call(until, |c| {
+        match member.call(until, AnswerMax::fixed(), |c| {
             for s in schema::SCHEMA {
                 c.execute_batch(s)?;
             }
@@ -305,7 +305,7 @@ fn schema_on(partition: &Partition) -> anyhow::Result<()> {
 fn write(partition: &Partition, events: Vec<crate::Event>) -> anyhow::Result<Option<amphora::database::Token>> {
     partition
         .member(1)?
-        .call_session(Instant::now() + WAIT, move |c| {
+        .call_session(Instant::now() + WAIT, AnswerMax::fixed(), move |c| {
             let mut upsert = c.prepare_cached(schema::EVENT_UPSERT)?;
             for e in events {
                 upsert.execute(vec![

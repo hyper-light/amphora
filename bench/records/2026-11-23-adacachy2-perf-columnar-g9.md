@@ -1,4 +1,4 @@
-# Columnar lane G9 on adacachy2: decimal text and literals round correctly; arm (a) built, unchecked; no A/B (2026-11-23)
+# Columnar lane G9 on adacachy2: decimal text and literals round correctly; arm (a) on main; no A/B yet (2026-11-23)
 
 Ada's goal: Amphora about 10x faster than DuckDB on analytics, with answers identical to the serial
 engine. TPC-H q01 and q06 run on one thread because they SUM or AVG over REAL, and Ada picks that
@@ -17,10 +17,15 @@ make every decimal literal and text-to-REAL conversion correctly rounded, (2) bu
   `3.5396731312839863e+70`). SQLite keeps about 19 digits and drops the rest. The engine now
   rounds every digit, as asked. Data with at most 19 significant digits, TPC-H's prices and
   discounts included, reads the same as SQLite's. Ada's choice is below.
-- **Arm (a), `RowOrder`, is built but not merged, and the A/B has no numbers.** It is on branch
-  `perf/columnar-g9-roworder` (f668352e). Its check (r1157: clippy, then `g9_ g8_ audit_3_p2
-  vdbe::morsel:: sum_ avg_ total_`) was still running at the hand-over. kiln refused room on
-  adacachy2 six times this hour (1 to 3 of 32 cores idle, load 59 to 97).
+- **The A/B has no numbers.** Unit 3 did not start: the hour went to units 1 and 2 and their
+  checks, and kiln refused room on adacachy2 seven times (0 to 3 of 32 cores idle, load 59 to
+  97). The release bench binary of 62110f56 (both arms in one binary) was building at the
+  hand-over (r1173, into `~/.cache/amphora-perf-bin/columnar/62110f56`).
+- **Arm (a) holds every SUM, AVG and TOTAL input until the end.** That is its memory cost, not yet
+  measured (unit 2 below).
+- **One known flake showed once.** On f668352e, before the merge with main, t_qt_6_30 failed at
+  its "the hook didn't run" assertion (line 2971), as on main in G7's and G8's runs (r1157). It
+  passed on the merged head (r1172).
 - **The release bench build did not finish.** r1112 built main 7001bf5d, not the lane's head:
   in the worktree, `git checkout --detach FETCH_HEAD` read the worktree's own empty FETCH_HEAD.
   It was stopped to give the merge check room. It compiled part of the release dependencies
@@ -77,7 +82,7 @@ per literal), not literals.
 - **SQLite's digits.** Keep only the first 19 significant digits, as SQLite does. Literals of
   20+ digits would then read as SQLite reads them, which is not the nearest double.
 
-## Unit 2: arm (a), `RowOrder`, on branch perf/columnar-g9-roworder (f668352e), not merged
+## Unit 2: arm (a), `RowOrder`, on main with the default unchanged
 
 - The switch. `RealSums::RowOrder` (`crates/engine/connection.rs`), and
   `AMPHORA_REAL_SUMS=roworder` in `amphora-bench --planner`. The default stays `Serial`.
@@ -96,10 +101,35 @@ per literal), not literals.
   reorders equal keys would fail it.
 - A gap the test shares with G8's helper: an error in `finish` sends the statement back to the
   serial loop, and the helper's row count still passes.
+
+| run | head | what | result |
+|---|---|---|---|
+| r1157 | f668352e | clippy, then `g9_ g8_ audit_3_p2 vdbe::morsel:: sum_ avg_ total_` | clean (36 s); 60 passed, 1 failed (t_qt_6_30, the known flake) |
+| r1172 | 62110f56 (unit 1 and main merged) | clippy, then those and `numeric:: vdbe::affinity util::tests` | clean (29 s); 181 passed, 0 failed (63 s), `g9_row_order_...` among them |
+
+The grouped statements pass at every core count, so the serial loop steps a group's rows in row
+order for these shapes.
 - The cost to measure: every input is held until the end, then folded on one thread. q01 has 7
   REAL aggregates over 5.9 M rows, about 41 M inputs; at 16 bytes or more each (inferred, not
   measured) that is 0.7 GB or more. G7's sequencer, which folds each morsel's run as soon as the
   runs before it are in, holds only the runs that arrive early.
+
+## Successor: the A/B (unit 3)
+
+On adacachy2 (where the earlier numbers are), `needs linux/amd64,cpus=12,mem=48g`, from the one
+binary `~/.cache/amphora-perf-bin/columnar/62110f56` (r1173; if it is missing, rebuild as r1173
+does), so both arms share one calibration (RULES 5e: one executable, one key):
+
+1. Alternate the arms 5 times: `AMPHORA_REAL_SUMS=roworder`, then `=exact`, each `amphora-bench
+   --planner --bench tpch --sf 1 --targets amphora,duckdb-mt --only q01,q06,q09 --cores
+   1,2,4,8,12 --runs 1 --answers <dir per arm and round>`.
+2. Beside each run, record peak RSS (`VmHWM` from `/proc/<pid>/status`), the load average, and
+   CPU and I/O pressure (`/proc/pressure/{cpu,io}`). G6's `scale.sh` and `summ.py` under
+   `~/.cache/amphora-g6` do most of it.
+3. Count drift against SQLite with `python3 -I bench/planner/answers.py <dir>`, and count bit
+   differences from the tsv files too, since answers.py compares REALs within 1e-9.
+4. q09 stays serial under both arms: a join still refuses REAL columns at plan time. Say so in
+   the table.
 
 ## Successor: commands
 

@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use amphora::backup::{self, Archive, BaseCopy, Hooks, SECOND_NS, Shipper, plan::Unrestorable};
-use amphora::database::Database;
+use amphora::database::{AnswerMax, Database};
 use amphora::db::Db;
 use amphora::memory::Use;
 use amphora_api::blobs::{Blobs, SimBlobs};
@@ -289,7 +289,7 @@ fn write_seconds(
         );
         let written = v.clone();
         database
-            .call(until(), move |c| {
+            .call(until(), AnswerMax::fixed(), move |c| {
                 c.execute(
                     "INSERT INTO t (id, v) VALUES (?1, ?2)",
                     vec![
@@ -321,7 +321,7 @@ fn t_t1_12_d2_a_database_backed_up_ships_as_it_commits() {
 
     let (database, shipping) = open_backed_up(&path, &blobs, &now);
     database
-        .call(until(), |c| {
+        .call(until(), AnswerMax::fixed(), |c| {
             c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
             Ok(())
         })
@@ -368,7 +368,7 @@ fn oracle_digest(dir: &std::path::Path, name: &str, rows: &Rows) -> backup::RowD
     }
     let database = Database::open(&path, until()).unwrap();
     database
-        .call(until(), move |c| {
+        .call(until(), AnswerMax::fixed(), move |c| {
             c.execute_batch(&sql)?;
             Ok(())
         })
@@ -403,7 +403,7 @@ fn t_t1_12_c3_the_shipping_thread_checks_itself() {
     };
     let (database, shipping) = Database::open_backed_up(&path, archive, until()).unwrap();
     database
-        .call(until(), |c| {
+        .call(until(), AnswerMax::fixed(), |c| {
             c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
             Ok(())
         })
@@ -459,7 +459,7 @@ fn t_t1_12_c1_restore_and_check_on_a_folder() {
     let mut history: Vec<(u64, Rows)> = Vec::new();
     let (database, shipping) = open_backed_up(&path, &blobs, &now);
     database
-        .call(until(), |c| {
+        .call(until(), AnswerMax::fixed(), |c| {
             c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
             Ok(())
         })
@@ -845,7 +845,7 @@ fn t_t1_12_c4_continuous_drills_are_on_by_default() {
     assert_eq!(archive.check, backup::CheckPolicy::Scratch(None));
     let (database, shipping) = Database::open_backed_up(&path, archive, until()).unwrap();
     database
-        .call(until(), |c| {
+        .call(until(), AnswerMax::fixed(), |c| {
             c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
             Ok(())
         })
@@ -894,7 +894,7 @@ fn t_t1_12_d3_restore_drill_after_a_load() {
     let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS + 1));
     let (database, shipping) = open_backed_up(&path, &blobs, &now);
     database
-        .call(until(), |c| {
+        .call(until(), AnswerMax::fixed(), |c| {
             c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
             Ok(())
         })
@@ -919,7 +919,7 @@ fn t_t1_12_d3_restore_drill_after_a_load() {
                     now.fetch_add(1 + rng.below(SECOND_NS), Ordering::SeqCst);
                     let written = v.clone();
                     database
-                        .call(until(), move |c| {
+                        .call(until(), AnswerMax::fixed(), move |c| {
                             if delete {
                                 c.execute(
                                     "DELETE FROM t WHERE id = ?1",
@@ -1022,7 +1022,7 @@ fn t_t1_12_c5_checks_competing_with_foreground_load() {
         };
         let (database, shipping) = Database::open_backed_up(&path, archive, until()).unwrap();
         database
-            .call(until(), |c| {
+            .call(until(), AnswerMax::fixed(), |c| {
                 c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
                 Ok(())
             })
@@ -1042,7 +1042,7 @@ fn t_t1_12_c5_checks_competing_with_foreground_load() {
                             let id = i64::try_from(i * writers as u64 + w as u64 + 1).unwrap();
                             now.fetch_add(SECOND_NS, Ordering::SeqCst);
                             let began = Instant::now();
-                            let wrote = database.call(until(), move |c| {
+                            let wrote = database.call(until(), AnswerMax::fixed(), move |c| {
                                 c.execute(
                                     "INSERT INTO t (id, v) VALUES (?1, ?2)",
                                     vec![
@@ -1154,7 +1154,7 @@ fn t_t1_12_c8_replay_and_integrity_check_pause_in_steps() {
     let mut history: Vec<(u64, Rows)> = Vec::new();
     let (database, shipping) = open_backed_up(&path, &blobs, &now);
     database
-        .call(until(), |c| {
+        .call(until(), AnswerMax::fixed(), |c| {
             c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
             Ok(())
         })
@@ -1285,7 +1285,7 @@ fn restore_bench_amphora() {
         };
         let (database, shipping) = Database::open_backed_up(&path, archive, bar()).unwrap();
         database
-            .call(bar(), |c| {
+            .call(bar(), AnswerMax::fixed(), |c| {
                 c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
                 Ok(())
             })
@@ -1297,7 +1297,7 @@ fn restore_bench_amphora() {
             now.fetch_add(SECOND_NS, Ordering::SeqCst);
             let first = id;
             database
-                .call(bar(), move |c| {
+                .call(bar(), AnswerMax::fixed(), move |c| {
                     for i in first..end {
                         c.execute(
                             "INSERT INTO t (id, v) VALUES (?1, ?2)",
