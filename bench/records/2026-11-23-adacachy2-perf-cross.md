@@ -119,3 +119,26 @@ printing `wake=Release commit_to_done=588.852µs woken_before_release=Some(0) wa
 `wake=Schedule commit_to_done=1.284473ms woken_before_release=Some(1) wakes=2` (before the fix it
 never finished); `cargo test -p amphora --lib db` 10 passed, the allocs tests among them. The
 wake latencies are one run each on a shared host, printed by the test, not asserted.
+
+## Scans and SQL batches charged their real worst case (perf-A5, on perf/cross, NOT merged)
+
+`Admission::bytes_for` on perf/cross: a scan `(limit + 1) x (size_of Row + KEY_MAX + VALUE_MAX)`
+plus its family, prefix and after; an SQL batch its statements' text and parameters byte for
+byte, a `SqlResult` envelope per statement, and `RESULT_MAX` for the rows. Calls, migrations and
+imports keep `REQUEST_MAX`. Test `database::admission_charge::mb1_...` asserts each.
+
+Checked on 37eeaef9 (r569): clippy on amphora clean; the database:: suite 217 passed, 7 failed.
+The same 7 fail alone (`--exact`, `--test-threads=1`) on main 06c77548 (r577) and on main
+486edca0, before the hang fix landed (r601), so none is this change's or the hang fix's:
+`patience::tests::a_joint_configuration_takes_the_larger_of_its_two_sets` (`Full { voter: 5,
+limit: 3 }` at patience.rs:418) and six `replicated::tests` (`a_follower_retry_racing_...`,
+`t_qb_1_9_...`, `every_falsifier_of_the_floor_holds_under_a_nemesis`,
+`a_host_waits_for_a_leader_...`, `a_member_installed_from_a_snapshot_...`,
+`compaction_waits_for_the_engines_flush`).
+
+Not merged, for a decision: a full page's worst case is real (no byte bound stops a scan page:
+1,000 rows of 1 MiB values are ~1.0 GB), but charged at admission it refuses every default-limit
+scan where the queue room is under ~1 GB (a 1 GiB process with 100 MiB resident has ~924 MiB of
+room), where today the same scan is admitted at 32 MiB. The alternative that keeps scans working
+there: end a page at a byte bound too (`RESULT_MAX`, `more = true`), which makes its real worst
+case ~32 MiB plus one row.
