@@ -6241,8 +6241,8 @@ mod tests {
             *self.count.lock().unwrap()
         }
         /// Waits until something happens past `seen`, up to the transport tests' hang guard: a
-        /// hang, never a verdict.
-        fn wait_past(&self, seen: u64) {
+        /// hang, never a verdict, which names the work `out` it waited on ([`Driven::movers`]).
+        fn wait_past(&self, seen: u64, out: &[(usize, usize, bool)]) {
             let count = self.count.lock().unwrap();
             let (_count, waited) = self
                 .rang
@@ -6250,7 +6250,7 @@ mod tests {
                 .unwrap();
             assert!(
                 !waited.timed_out(),
-                "work was out off the driver's thread and none ended or came to a held gate in {:?}: a hang",
+                "work was out off the driver's thread and none ended or came to a held gate in {:?}: a hang; out (owner, log writes, database flush): {out:?}",
                 crate::transport::HANG
             );
         }
@@ -6431,28 +6431,40 @@ mod tests {
             assert!(told.is_ok(), "an owner's bell told twice");
             actor
         }
-        /// Whether work is out off the driver's thread that ends, or comes to a held gate, on its
-        /// own, and so rings [`OffThread`]: a log write or compaction on a member whose gate is
-        /// open, or held with no flush at it yet; or a flush of a member's database on its
-        /// flushing thread. Only such work can move a group whose round relayed nothing.
-        fn moving(&self) -> bool {
-            self.owners.iter().enumerate().any(|(at, owner)| {
-                owner.as_ref().is_some_and(|(owner, _)| {
+        /// Each owner with work out off the driver's thread that ends, or comes to a held gate, on
+        /// its own, and so rings [`OffThread`], as (owner, log writes out, database flush out): a
+        /// log write or compaction on a member whose gate is open, or held with no flush at it
+        /// yet; or a flush of a member's database on its flushing thread. Only such work can move
+        /// a group whose round relayed nothing.
+        fn movers(&self) -> Vec<(usize, usize, bool)> {
+            self.owners
+                .iter()
+                .enumerate()
+                .filter_map(|(at, owner)| {
+                    let (owner, _) = owner.as_ref()?;
                     let parked = self
                         .gates
                         .get(&at)
                         .is_some_and(|gate| gate.is_held() && gate.waiting());
-                    (owner.replica.in_flight() != 0 && !parked)
-                        || matches!(owner.flushing, Flushing::Thread { out: true, .. })
+                    let writes = if parked { 0 } else { owner.replica.in_flight() };
+                    let flush = matches!(owner.flushing, Flushing::Thread { out: true, .. });
+                    (writes != 0 || flush).then_some((at, writes, flush))
                 })
-            })
+                .collect()
+        }
+        /// Whether any work is out that [`Driven::movers`] names.
+        fn moving(&self) -> bool {
+            !self.movers().is_empty()
         }
         /// After a round that relayed nothing and left nothing in transit, the driver waits for
-        /// work out off its thread to end or come to a held gate ([`Driven::moving`]); with none
+        /// work out off its thread to end or come to a held gate ([`Driven::movers`]); with none
         /// out it waits for nothing, as only its own steps can move the group.
         fn wait_if_moving(&self, relayed: usize, pump: &Pump<'_>) {
-            if relayed == 0 && pump.records == 0 && self.moving() {
-                self.moved.wait_past(self.looked);
+            if relayed == 0 && pump.records == 0 {
+                let out = self.movers();
+                if !out.is_empty() {
+                    self.moved.wait_past(self.looked, &out);
+                }
             }
         }
         /// A call's or a record's budget on these clocks: it runs out only if the test moves a
