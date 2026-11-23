@@ -41,7 +41,9 @@ enum View {
     Held,
 }
 
-/// The log after one commit and the store's two log steps (a passive checkpoint, then a restart).
+/// The log after one commit and the store's two log steps (a passive checkpoint, then a restart):
+/// its file's bytes, its frames and those of them the checkpoint left uncopied (both before the
+/// restart), and whether the restart happened.
 #[derive(Clone, Copy, Debug)]
 struct Sample {
     commit: usize,
@@ -57,7 +59,7 @@ const ROWS_A_COMMIT: i64 = 4;
 /// A table of `ROWS` rows of a page each, then `commits` commits that each rewrite `ROWS_A_COMMIT`
 /// of them (the database's size stays put, so only the log can grow), each followed by the
 /// store's checkpoint and restart, the most often the store could run them.
-fn run(view: View, commits: usize) -> (Vec<Sample>, Db, tempfile::TempDir) {
+fn run(view: View, commits: usize) -> (Vec<Sample>, u64, Db, tempfile::TempDir) {
     let dir = lab();
     let path = dir.path().join("t.db");
     let mut db = Db::open(&path).unwrap();
@@ -74,8 +76,29 @@ fn run(view: View, commits: usize) -> (Vec<Sample>, Db, tempfile::TempDir) {
         Ok(())
     })
     .unwrap();
+    // The load's log cut to nothing, so the log's file holds what the commits below write; then no
+    // restart cuts it, as within the store's default bound.
     db.checkpoint().unwrap();
+    db.keep_log(0);
     assert!(db.restart_log().unwrap(), "the log starts empty");
+    db.keep_log(u64::MAX);
+    let rewrite = |db: &mut Db, first: i64| {
+        db.transaction(|db| {
+            for n in first..first + ROWS_A_COMMIT {
+                db.query(
+                    "UPDATE t SET body = randomblob(4000) WHERE n = ?1",
+                    [Value::from_i64(n)],
+                    |_| Ok(true),
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    };
+    // One commit before any view, so a view begun now marks a point inside the log, as a
+    // transfer's view would, not an empty log.
+    rewrite(&mut db, 0);
+    let mark = db.uncopied().log;
     let reader = db.reader().unwrap();
     let read_one = |n: i64| {
         let mut seen = 0i64;
@@ -98,26 +121,14 @@ fn run(view: View, commits: usize) -> (Vec<Sample>, Db, tempfile::TempDir) {
             read_one(i64::try_from(commit).unwrap() % ROWS);
             reader.exec("ROLLBACK").unwrap();
         }
-        let first = (i64::try_from(commit).unwrap() * ROWS_A_COMMIT) % ROWS;
-        db.transaction(|db| {
-            for n in first..first + ROWS_A_COMMIT {
-                db.query(
-                    "UPDATE t SET body = randomblob(4000) WHERE n = ?1",
-                    [Value::from_i64(n)],
-                    |_| Ok(true),
-                )?;
-            }
-            Ok(())
-        })
-        .unwrap();
+        rewrite(&mut db, (i64::try_from(commit).unwrap() * ROWS_A_COMMIT) % ROWS);
         db.checkpoint().unwrap();
         let after = db.uncopied();
         let restarted = db.restart_log().unwrap();
-        let now = db.uncopied();
         samples.push(Sample {
             commit: commit + 1,
             log_bytes: log_bytes(&path),
-            frames: if restarted { now.log } else { after.log },
+            frames: after.log,
             uncopied: after.left,
             restarted,
         });
@@ -125,7 +136,7 @@ fn run(view: View, commits: usize) -> (Vec<Sample>, Db, tempfile::TempDir) {
     if view == View::Held {
         reader.exec("ROLLBACK").unwrap();
     }
-    (samples, db, dir)
+    (samples, mark, db, dir)
 }
 
 fn table(view: View, samples: &[Sample]) {
@@ -134,45 +145,50 @@ fn table(view: View, samples: &[Sample]) {
         .filter(|s| [1, 10, 100, 1000, 2000].contains(&s.commit))
     {
         eprintln!(
-            "{view:?}\tcommit {}\tlog {} bytes\t{} frames in use\t{} uncopied after the checkpoint\trestarted {}",
+            "{view:?}\tcommit {}\tlog file {} bytes\t{} frames\t{} uncopied after the checkpoint\trestarted {}",
             s.commit, s.log_bytes, s.frames, s.uncopied, s.restarted
         );
     }
 }
 
-/// Do: 2000 commits of four rewritten rows each, every one followed by a checkpoint and a restart,
-/// once with no reader, once with a short view before each commit (a pull's answers), and once
-/// with one view held across all of them (a push from a pinned view). Expect: without a held view
-/// the log starts again after every commit and its file stays the size of one commit's frames;
-/// with one, the checkpoint copies nothing past the view, no restart happens, and the log's file
-/// grows by every commit's frames, until the view ends and the next restart empties it.
+/// Do: one commit, then 2000 commits of four rewritten rows each, every one followed by a
+/// checkpoint and a restart, once with no reader, once with a short view before each commit (a
+/// pull's answers), and once with one view begun after the first commit and held across all the
+/// rest (a push from a pinned view). Expect: without a held view the log starts again after every
+/// commit and holds one commit's frames; with one, the checkpoint copies nothing past the view's
+/// mark, no restart happens, and the log grows by every commit's frames, until the view ends and
+/// the next restart empties it.
 #[test]
 fn snapshots_a_view_held_across_writes_stops_the_checkpoint_and_grows_the_log() {
     const COMMITS: usize = 2000;
     let mut bounded = Vec::new();
     for view in [View::None, View::PerAnswer] {
-        let (samples, _db, _dir) = run(view, COMMITS);
+        let (samples, _, _db, _dir) = run(view, COMMITS);
         table(view, &samples);
         assert!(
             samples.iter().all(|s| s.restarted && s.uncopied == 0),
             "{view:?}: every commit's frames are copied and its log starts again"
         );
-        let most = samples.iter().map(|s| s.log_bytes).max().unwrap();
-        let last = samples.last().unwrap().log_bytes;
-        assert_eq!(most, last, "{view:?}: the log's file stops at one commit's length");
-        bounded.push(most);
+        let early = samples[..10].iter().map(|s| s.frames).max().unwrap();
+        let most = samples.iter().map(|s| s.frames).max().unwrap();
+        assert!(most <= early, "{view:?}: the log holds one commit's frames ({most} > {early})");
+        let file = samples.iter().map(|s| s.log_bytes).max().unwrap();
+        assert_eq!(file, samples.last().unwrap().log_bytes, "{view:?}: the log's file stops growing");
+        bounded.push(file);
     }
-    let (held, mut db, _dir) = run(View::Held, COMMITS);
+    let (held, mark, mut db, _dir) = run(View::Held, COMMITS);
     table(View::Held, &held);
+    eprintln!("Held\tthe view's mark: {mark} frames");
+    assert!(mark > 0, "the view marks a point inside the log");
     assert!(
         held.iter().all(|s| !s.restarted),
         "no restart while the view is held"
     );
     assert!(
-        held.iter().all(|s| s.uncopied == s.frames),
-        "the checkpoint copies nothing past the held view"
+        held.iter().all(|s| s.uncopied >= s.frames - mark),
+        "the checkpoint copies nothing past the held view's mark"
     );
-    let per_commit = held[0].frames;
+    let per_commit = held[0].frames - mark;
     assert!(per_commit >= u64::try_from(ROWS_A_COMMIT).unwrap(), "a commit writes its rows' pages");
     assert!(
         held.windows(2).all(|w| w[1].frames > w[0].frames),
@@ -180,7 +196,7 @@ fn snapshots_a_view_held_across_writes_stops_the_checkpoint_and_grows_the_log() 
     );
     let grown = held.last().unwrap();
     assert!(
-        grown.frames >= per_commit * u64::try_from(COMMITS).unwrap() / 2,
+        grown.frames >= mark + per_commit * u64::try_from(COMMITS).unwrap() / 2,
         "{} frames after {COMMITS} commits of {per_commit}",
         grown.frames
     );

@@ -13166,16 +13166,16 @@ mod tests {
         let (mut differ, mut compared) = (Vec::new(), 0);
         for owner in owners {
             for (index, pages) in driven.owner(*owner).replica.machine().images() {
-                let Some(seen) = first.get(index) else {
+                let Some(&seen) = first.get(index) else {
                     first.insert(*index, pages);
                     continue;
                 };
                 let ids = |p: &crate::db::Pages| p.iter().map(|(id, _)| *id).collect::<Vec<_>>();
                 assert_eq!(ids(seen), ids(pages), "owner {owner}'s pages at {index}");
                 for ((id, a), (_, b)) in seen.iter().zip(pages) {
-                    let body = |p: &Vec<u8>| p.len().saturating_sub(8);
+                    let body = a.len().max(b.len()).saturating_sub(8);
                     compared += 1;
-                    if let Some(at) = (0..body(a).max(body(b))).find(|i| a.get(*i) != b.get(*i)) {
+                    if let Some(at) = (0..body).find(|i| a.get(*i) != b.get(*i)) {
                         differ.push((*owner, *index, *id, at));
                     }
                 }
