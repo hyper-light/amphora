@@ -115,7 +115,7 @@ pub(crate) fn emit_morsel_hook(
         keep: program.allocate_label(),
         skip: program.allocate_label(),
         columns_start: program.alloc_registers(looped.width),
-        reals: real_places(&looped.places),
+        reals: { let _ = real_places(&looped.places); Vec::new() },
         rowid: program.alloc_register(),
         out_start: program.alloc_registers(looped.outs.len()),
         out_count: looped.outs.len(),
