@@ -576,7 +576,7 @@ fn commit(c: &dyn Cluster, o: &Opts) -> anyhow::Result<serde_json::Value> {
     let by_node: Vec<_> = nodes
         .into_iter()
         .zip(&refused)
-        .map(|(h, r)| serde_json::json!({ "latency_ms": summary(h), "refused": r.load(Ordering::Relaxed) }))
+        .map(|(h, r)| serde_json::json!({ "buckets_us": h.buckets(), "max_us": h.max, "latency_ms": summary(h), "refused": r.load(Ordering::Relaxed) }))
         .collect();
     let leader = c.leader(Instant::now() + o.deadline).ok().flatten();
     let secs = seconds.as_secs_f64();
@@ -2015,6 +2015,34 @@ mod procs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W6 (CP-T1.8): runs' bucket lists summed by least value are the merged runs' histogram, so
+    // `bench/pool.py` pools rounds into quantiles over all their samples; each sample reads back as
+    // its bucket's least value, within 1/64 of itself.
+    #[test]
+    fn w6_buckets_of_runs_pool_into_the_merged_histogram() {
+        let (mut a, mut b, mut merged) = (Hist::new(), Hist::new(), Hist::new());
+        let mut rng = Rng(7);
+        for i in 0..20_000u64 {
+            let us = 1 + rng.next() % 5_000_000;
+            if i % 3 == 0 { a.record(us) } else { b.record(us) }
+            merged.record(us);
+            if i % 10 == 0 {
+                let mut one = Hist::new();
+                one.record(us);
+                let least = one.buckets()[0][0].as_u64().unwrap();
+                assert!(least <= us && us - least <= us / 64, "{us} reads back as {least}");
+            }
+        }
+        let mut pooled = std::collections::BTreeMap::<u64, u64>::new();
+        for h in [&a, &b] {
+            for p in h.buckets().as_array().into_iter().flatten() {
+                *pooled.entry(p[0].as_u64().unwrap()).or_default() += p[1].as_u64().unwrap();
+            }
+        }
+        let pooled: Vec<_> = pooled.into_iter().map(|(least, n)| serde_json::json!([least, n])).collect();
+        assert_eq!(serde_json::Value::from(pooled), merged.buckets());
+    }
 
     fn args(s: &str) -> Vec<String> {
         s.split_whitespace().map(str::to_owned).collect()
