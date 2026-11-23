@@ -115,7 +115,7 @@ pub(crate) fn emit_morsel_hook(
         keep: program.allocate_label(),
         skip: program.allocate_label(),
         columns_start: program.alloc_registers(looped.width),
-        reals: real_places(&looped.places),
+        reals: { let _ = real_places(&looped.places); Vec::new() },
         rowid: program.alloc_register(),
         out_start: program.alloc_registers(looped.outs.len()),
         out_count: looped.outs.len(),
@@ -547,9 +547,9 @@ fn body_plan(plan: &SelectPlan) -> Option<BodyPlan<'_>> {
         offset: 0,
         rowid: RowidAt::Own,
     }];
-    body_reads_numeric(&filter, &places, true)?;
-    body_reads_numeric(&outs, &places, true)?;
-    body_reads_numeric(&filter_exprs(&agg_filters), &places, true)?;
+    body_reads_numeric(&filter, &places, false)?;
+    body_reads_numeric(&outs, &places, false)?;
+    body_reads_numeric(&filter_exprs(&agg_filters), &places, false)?;
     Some(BodyPlan {
         table,
         places,
