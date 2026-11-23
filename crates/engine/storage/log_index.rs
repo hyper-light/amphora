@@ -421,10 +421,10 @@ impl ReadIndex {
     }
 
     /// The header without the shared state's lock or the header's, or None (then read it there).
+    /// Every way reads it so, `Locked` (the default) included (AUDIT 2.1; decision 40's revision,
+    /// Ada 2026-11-23): every guard that writes the header refreshes the copy before it lets the
+    /// lock go, so the copy is never older than a write that finished.
     pub(crate) fn header(&self) -> Option<WalHeader> {
-        if self.mode() == LogReadIndex::Locked {
-            return None;
-        }
         self.header.load().as_ref()?.copy().load()
     }
 

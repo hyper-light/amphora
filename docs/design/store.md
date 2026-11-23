@@ -1881,6 +1881,13 @@ settle `point_pk`'s instructions per statement at one client fall by less than 1
 `table_count` at 32 clients rises less than 3x. The step's own bars: the log's and locks' share of
 point reads at 32 clients is at most 5%, and `point_pk` at 32 clients is at least 4x one client.
 
+**Revised (Ada, 2026-11-23; AUDIT 2.1): the header is read lock-free on every way, `locked` included.**
+The header's copy is kept whatever the switch says (every guard that writes the header refreshes it
+before letting the lock go), so the default way reads it too, as a seqlock: one try, then under the
+lock only while a writer is mid-change. A read is one whole write and never older than a write that
+finished before it began (`storage::wal::tests::audit_2_1_default_header_reads_race_a_writer_and_stay_current`).
+`locked` now names the frame index's way only: the index read under the shared state's lock and its own.
+
 ## 41. Skipping the descent: an adaptive hash against a learned leaf locator (prototypes, behind a switch)
 
 G3 step 5 (G3.5, kiln plan 01a16b0f464172dc80c7a3b9a14acbce): the descent is within B-tree search's

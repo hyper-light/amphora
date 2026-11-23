@@ -10260,6 +10260,75 @@ pub mod test {
         }
     }
 
+    /// AUDIT 2.1 (decision 40's revision): the default way (`Locked`) reads the header without its
+    /// lock too. A writer changes every word of the header through its lock, round after round,
+    /// while readers read it through the coordination. Expect: every read is one whole write (no
+    /// word of another round), and never older than the last write finished before the read began;
+    /// and the default way answers from the copy itself (not under the lock) once the writer stops.
+    #[test]
+    fn audit_2_1_default_header_reads_race_a_writer_and_stay_current() {
+        use super::super::log_index::LogReadIndex;
+        use crate::sync::atomic::{AtomicBool, AtomicU32};
+        let write = |shared: &Arc<RwLock<WalFileShared>>, round: u32| {
+            let guard = shared.read();
+            let mut header = guard.metadata.wal_header.lock();
+            header.checkpoint_seq = round;
+            header.salt_1 = round.wrapping_mul(3);
+            header.salt_2 = round.wrapping_mul(7);
+            header.checksum_1 = round.wrapping_mul(11);
+            header.checksum_2 = round.wrapping_mul(13);
+        };
+        for mode in [LogReadIndex::Locked]
+            .into_iter()
+            .chain(LOCK_FREE_WAYS)
+        {
+            let shared = WalFileShared::new_noop();
+            shared.read().runtime.read_index.set_mode(mode);
+            let coordination = make_test_coordination(&shared);
+            write(&shared, 0);
+            let finished = AtomicU32::new(0);
+            let done = AtomicBool::new(false);
+            let rounds = 20_000u32;
+            std::thread::scope(|scope| {
+                for _ in 0..4 {
+                    let (coordination, finished, done) = (&coordination, &finished, &done);
+                    scope.spawn(move || {
+                        let mut reads = 0u64;
+                        while !done.load(Ordering::Acquire) || reads < 1_000 {
+                            reads += 1;
+                            let before = finished.load(Ordering::Acquire);
+                            let header = coordination.wal_header();
+                            let round = header.checkpoint_seq;
+                            assert_eq!(
+                                (header.salt_1, header.salt_2, header.checksum_1, header.checksum_2),
+                                (
+                                    round.wrapping_mul(3),
+                                    round.wrapping_mul(7),
+                                    round.wrapping_mul(11),
+                                    round.wrapping_mul(13)
+                                ),
+                                "{mode:?}: a torn header at round {round}"
+                            );
+                            assert!(
+                                round >= before,
+                                "{mode:?}: read round {round} after round {before} finished"
+                            );
+                        }
+                    });
+                }
+                for round in 1..=rounds {
+                    write(&shared, round);
+                    finished.store(round, Ordering::Release);
+                }
+                done.store(true, Ordering::Release);
+            });
+            let read_index = shared.read().runtime.read_index.clone();
+            let copy = read_index.header().map(|header| header.checkpoint_seq);
+            assert_eq!(copy, Some(rounds), "{mode:?}: the copy answers, current");
+            assert_eq!(coordination.wal_header().checkpoint_seq, rounds, "{mode:?}");
+        }
+    }
+
     /// AUDIT 2.1 (decision 40): what a page read's frame lookup costs with the log full, each way,
     /// at one reader and at every thread the machine runs. The suite's reads can't show it: its
     /// settle truncates the log, so `find_frame` is reached with no frames. Run it, release:
