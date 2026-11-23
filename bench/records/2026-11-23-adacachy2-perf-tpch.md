@@ -748,3 +748,82 @@ Checks:
 
 Unit 2 (the versioned cost snapshot) stands where T7 left it (its section 4). Unit 3, the next
 worst of T6's table after q19: q03 (15.6x DuckDB's time), q06 (11.4x) and q01 (10.8x).
+
+# Lane T9 (tpch), 2026-11-23 17:47Z to 18:42Z: shares of an OR raise nothing new; the whole cost set pinned
+
+Machine: adacachy2 (runner 00aad8da), every run named onto it (`on`), `needs linux/amd64,cpus=4,mem=24g`,
+from a GitHub clone there (`~/.cache/amphora-perf/tpch-remote`, one worktree per SHA), the lane's one
+target dir. Load 13 to 32 on 32 cores.
+
+## 1. A table's share of a WHERE OR copies only terms that cannot raise (7ba31166, 5aeebee2; on main 9dce97b8)
+
+T8's open edge. A share runs on rows the OR never evaluates (rows no other table joins, terms an
+earlier false term skips), so a term that can raise there must stay out. Copying fewer terms keeps the
+share implied by the OR: answers cannot change, only the share's strength. `sole_table`
+(`optimizer/lift_common_subexpressions.rs`) now admits, from the VM's code:
+- LIKE and GLOB only with no ESCAPE and a text literal pattern of at most `MAX_LIKE_PATTERN_LENGTH`
+  bytes. `Insn::Like` raises "ESCAPE expression must be a single character" (execute.rs) and
+  `exec_like`/`exec_glob` raise "pattern too complex" past 50,000 bytes. The two local consts are
+  now one, `vdbe/value.rs` (SQLite's SQLITE_MAX_LIKE_PATTERN_LENGTH).
+- binary operators by name: comparisons, IS, AND, OR, arithmetic, bitwise. `exec_add` through
+  `exec_shift_right` return a `Value`, never an error. `||` stays out: `exec_concat`'s allocation can fail.
+- no column of a custom type (`find_custom_type_operator` routes its operators to functions; its
+  reads decode) or a virtual generated column (its read runs an expression): `column_read_can_raise`,
+  passed to `rewrite_or_terms` by its three callers.
+
+Test `t9_a_share_of_an_or_raises_no_error_the_or_would_not`: no line joins a part; each branch has a
+LIKE with `ESCAPE 'xy'` on each table, so whichever table a plan reads first holds one. Expected: the
+answer of the same OR inside a CASE (no share), `Ok(["0"])`.
+- r1349, T8's LIKE arm put back (probe 3159a190, not on main): fails, `left: Err("ESCAPE expression
+  must be a single character")`, `right: Ok(["0"])`, plan `SCAN l / SEARCH p USING INTEGER PRIMARY KEY`.
+  The first version (one LIKE on p only) passed there (r1335), inferred because l was read first and
+  p's share never ran (that run printed no plan).
+- r1315 at 2994c36c, r1342 at the merge 0a9db015, r1349 at 5aeebee2: clippy (`-p amphora-engine
+  --all-targets --locked -D warnings`) clean; `--lib -- t9_ t8_q19 t6_q05 t7_q05
+  lift_common_subexpressions`: 16 of 16.
+
+Not changed, open:
+- `in_filters_implied_by_or_branches` (SQLite's rule, older than T8) copies `column = literal` into an
+  IN filter with no such check. On a custom-typed column that IN may run the type's code. Not checked.
+- If the Postgres dialect gives its columns custom types (`requires_custom_types`), it now gets no
+  shares at all, q19's included. Not checked or measured.
+- q19 at SF1 not re-run: its terms are comparisons, IN, BETWEEN and literal arithmetic, all still
+  copied, and t8_q19 (its shape, VM steps under reading `l` whole) passes. Inferred, not measured.
+
+## 2. Versioned costs: the whole set pinned (722c0887, on main 615fce72); the rest not built
+
+- `LearnedWeights` is public (re-exported under `simulator`), and `Connection::pin_cost_weights`
+  takes all 8 (test or simulator builds). Prepare plans with the pin whole, `page_miss` included.
+  Before, it pinned seek, hash build and hash probe and took the other 5 from the live learned
+  weights. `learned_costs::test_pin` is gone; t7_q05, t_pl_8_2, t_pl_8_9 (statement.rs) and
+  `tests/adaptive_joins.rs` (a `pinned()` helper: the other 5 nothing, no page read timed) migrated.
+  With no pin, prepare is unchanged, so no production plan moves.
+- r1335 (fd26057c) and r1361 (722c0887): clippy clean, default and `--features simulator`;
+  `--features simulator --lib -- t9_ t8_q19 t7_q05 t6_q05 t_pl_8 pl_13 lift_common_subexpressions
+  learned_costs`: 87 passed, 1 failed, t_pl_8_13 (main's own, below); `--test adaptive_joins` 23 of 23.
+  `clippy --all-features` stops on main's `storage/page_cache.rs` (clone_on_copy) and one E0425 in the
+  lib test build, not traced to its file.
+- Not built: the first batch judged (`Batches::judge`'s `_ => true`), `page_miss` versioned outside a pin.
+
+### t_pl_8_13 pinned at its start, 6 runs (r1353, r1371; probe 31b5816a, not on main)
+
+The probe pins `db.learned_costs.weights()` read right after `facts()` for the whole test (env
+`T9_PIN`). Each run had a fresh `XDG_CACHE_HOME`, so each calibrated afresh (the state T4's r754 failed
+in). Same debug test binary, run 4 at a time, pinned and learned interleaved.
+
+| arm | runs | passed | failed, and how |
+|---|---|---|---|
+| pinned after facts() | 6 | 0 | 6: "no LEFT JOIN inside a run", the first query (no ON extra, no filter above) |
+| learned (main's behaviour) | 7 | 5 | 1 "no LEFT JOIN inside a run", 1 "not planned bushy", same query |
+
+- The pinned versions across the 6 runs: seek 8.12 to 8.24 rows' visits, hash build 24.87 to 25.38,
+  hash probe 9.19 to 9.23, sort 3.03 to 3.07, Bloom probe 10.07 to 10.17, a row's visit 0.0023 to
+  0.0039 page reads.
+- Plan variance: pinned, one outcome in 6; learned, three outcomes in 7.
+- Verdict (T5's premise): at the weights the test starts with, it fails the same way every time. The
+  assert (the LEFT JOIN planned inside a bushy run) and the cost model disagree there. It passes only
+  when batches its own earlier queries close move the weights. That is a decision, not flakiness: the
+  test's expectation, or the cost model's price of that run.
+- Not measured: p50, p99 and p99.9 of any timed query with and without a pin. No timed runs this hour.
+
+## 3. q03, q06, q01: not started

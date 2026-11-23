@@ -279,6 +279,10 @@ impl From<SeekOp> for ComparisonOp {
     }
 }
 
+/// The longest LIKE or GLOB pattern, in bytes; a longer one raises an error. SQLite's
+/// SQLITE_MAX_LIKE_PATTERN_LENGTH default (sqlite.org/limits.html, item 8).
+pub(crate) const MAX_LIKE_PATTERN_LENGTH: usize = 50000;
+
 #[inline]
 pub(crate) fn sqlite_text_prefix(s: &str) -> &str {
     match first_nul(s.as_bytes()) {
@@ -1513,7 +1517,6 @@ impl Value {
     }
 
     pub fn exec_like(pattern: &str, text: &str, escape: Option<char>) -> Result<bool, LimboError> {
-        const MAX_LIKE_PATTERN_LENGTH: usize = 50000;
         if pattern.len() > MAX_LIKE_PATTERN_LENGTH {
             return Err(LimboError::Constraint(
                 "LIKE or GLOB pattern too complex".to_string(),
@@ -1612,10 +1615,9 @@ impl Value {
     }
 
     pub fn exec_glob(pattern: &str, text: &str) -> Result<bool, LimboError> {
-        const MAX_GLOB_PATTERN_LENGTH: usize = 50000;
         const GLOB_CHARS: [char; 3] = ['*', '?', '['];
 
-        if pattern.len() > MAX_GLOB_PATTERN_LENGTH {
+        if pattern.len() > MAX_LIKE_PATTERN_LENGTH {
             return Err(LimboError::Constraint(
                 "GLOB pattern too complex".to_string(),
             ));

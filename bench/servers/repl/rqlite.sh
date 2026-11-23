@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # rqlite, three voters over Raft, each rqlited a process on this host (setup.sh's release binary):
-# HTTP on 127.0.0.1:54200-54202, Raft on 54210-54212. A write to a follower is forwarded to the
+# HTTP on 127.0.0.1:29200-29202, Raft on 29210-29212. A write to a follower is forwarded to the
 # leader; it's acknowledged once a quorum's Raft logs hold it, fsynced. Reads with level=none come
 # from the node's own copy.
 #
@@ -19,7 +19,7 @@
 # harness doesn't use them.)
 set -euo pipefail
 SYS=rqlite
-PORT=${AMPHORA_BENCH_REPL_PORT:-54200}
+PORT=${AMPHORA_BENCH_REPL_PORT:-29200}
 DURABILITY="acknowledged once a quorum (2 of 3) of Raft logs hold it, each fdatasynced (BoltDB without NoSync); rqlited's defaults, which no flag weakens or strengthens"
 # The comparability rule's column (lib.sh): a commit acknowledged by a quorum's Raft logs (above).
 COLUMN="quorum"
