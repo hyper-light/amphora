@@ -5061,6 +5061,46 @@ pub(crate) mod bushy_search_tests {
             }
         }
 
+        #[test]
+        fn t10_probe_which_weight_puts_the_left_join_in_the_run() {
+            if std::env::var("T10_SWEEP").is_err() {
+                return;
+            }
+            let (db, conn) = facts();
+            let start = db.learned_costs.weights().unwrap();
+            eprintln!("T10 start {start:?}");
+            let sql = "SELECT count(*), sum(f1.id), sum(f2.id), count(s.id), sum(s.cat) \
+                       FROM d1 LEFT JOIN d2 s ON s.id = d1.id * 12 \
+                       JOIN f1 ON f1.d1 = d1.id JOIN f2 ON f2.k = f1.k \
+                       JOIN d2 ON f2.d2 = d2.id WHERE d1.cat < 3 AND d2.id = 7";
+            for name in ["seek", "hash_build", "hash_probe", "sort", "bloom_probe", "where_step", "row_in_pages"] {
+                for factor in [1.0 / 64.0, 1.0 / 16.0, 0.25, 4.0, 16.0, 64.0] {
+                    let mut w = start;
+                    match name {
+                        "seek" => w.seek *= factor,
+                        "hash_build" => w.hash_build *= factor,
+                        "hash_probe" => w.hash_probe *= factor,
+                        "sort" => w.sort *= factor,
+                        "bloom_probe" => w.bloom_probe *= factor,
+                        "where_step" => w.where_step *= factor,
+                        _ => w.row_in_pages = w.row_in_pages.map(|r| r * factor),
+                    }
+                    conn.pin_cost_weights(Some(w));
+                    BUSHY_PLANS.with(|plans| plans.set(0));
+                    LEFT_JOINS_IN_RUNS.with(|runs| runs.set(0));
+                    LAST_JOIN_COST.with(|cost| cost.set(0.0));
+                    drop(conn.prepare(sql).unwrap());
+                    let (bushy, in_runs, cost) = (
+                        BUSHY_PLANS.with(Cell::get),
+                        LEFT_JOINS_IN_RUNS.with(Cell::get),
+                        LAST_JOIN_COST.with(Cell::get),
+                    );
+                    let plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+                    eprintln!("T10 {name} x{factor}: bushy={bushy} in_runs={in_runs} cost={cost:.1} {plan:?}");
+                }
+            }
+        }
+
         /// The bushy tests' queries over `facts` (lanes pl8-14 to pl8-20): the fact queries, with
         /// LEFT JOINs after the core and inside it, with semi and anti joins, and (lane pl8-20) a
         /// LEFT JOIN of the second fact on the first fact and the outer dimension, followed by an
