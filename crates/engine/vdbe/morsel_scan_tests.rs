@@ -3120,6 +3120,7 @@ fn t_qt_6_32_having_over_aggregates_runs_on_morsels_as_the_serial_loop() {
                 1.0,
             ));
             let before = ran(&conn);
+            eprintln!("K7 6_32 running {sql} on {cores} cores");
             let parallel = sql_rows(&conn, sql);
             let after = ran(&conn);
             assert_eq!(
@@ -3665,4 +3666,45 @@ fn g8_exact_real_sums_hold_the_hard_cases() {
         ]];
         assert_eq!(answer, format!("{expected:?}"), "{name}");
     }
+}
+
+#[test]
+fn t_qt_6_3_k7_probe() {
+    let conn = open(":memory:qt-6-33-probe");
+    let mut rng = ChaCha8Rng::seed_from_u64(633);
+    let pad = "x".repeat(64);
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT, p TEXT)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    let mut id = 0i64;
+    for _ in 0..3000u64 {
+        id += rng.random_range(1i64..4);
+        let a = rng.random_range(-30i64..30);
+        let b = match rng.random_range(0..5) {
+            0 => "NULL".to_string(),
+            _ => rng.random_range(-1000i64..1000).to_string(),
+        };
+        let c = ["NULL", "'x'", "'y'", "'z'"][rng.random_range(0..4)];
+        conn.execute(format!(
+            "INSERT INTO t(id, a, b, c, p) VALUES ({id}, {a}, {b}, {c}, '{pad}')"
+        ))
+        .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    eprintln!("K7 max id {id}");
+    conn.set_parallel_mode(ParallelMode::On);
+    conn.set_parallel_limit(true);
+    for cores in [1usize, 4] {
+        *conn.morsel_costs.lock() = Some(MachineCosts::stated(NonZeroUsize::new(cores).unwrap(), 1.0, 1.0));
+        for lo in [0, 50, 80, 90, 95, 100, 105, 110, 120, 150, 200, 300, 1000] {
+            let sql = format!("SELECT c, count(*) FROM t WHERE id > {lo} AND id < 7000 AND c IS NOT NULL GROUP BY c");
+            let before = conn.morsel_body_rows.load(std::sync::atomic::Ordering::Relaxed);
+            let _ = sql_rows(&conn, &sql);
+            let after = conn.morsel_body_rows.load(std::sync::atomic::Ordering::Relaxed);
+            let below = sql_rows(&conn, &format!("SELECT count(*) FROM t WHERE id <= {lo}"));
+            eprintln!("K7 6_33 cores {cores} lo {lo}: ran {} rows at or below lo {:?}", after - before, below);
+        }
+    }
+    conn.set_parallel_limit(false);
+    conn.set_parallel_mode(ParallelMode::Off);
 }
