@@ -28,4 +28,5 @@ fn t_pg_4_3_scanner_against_the_corpus_digest() {
     }
     println!("tokens match 19's digest for {matched} of {total} statements");
     assert!(total > 0, "the digest names statements");
+    assert_eq!(matched, total, "every statement scans to 19's tokens");
 }
