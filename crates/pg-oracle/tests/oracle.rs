@@ -66,9 +66,9 @@ fn t_pg_3_4_every_regression_statement_gets_a_verdict() {
 #[ignore = "needs AMPHORA_PG_ORACLE, built by scripts/postgres-oracle-extract.sh"]
 fn t_pg_4_2_tokens_are_what_19s_grammar_receives() {
     let mut oracle = Oracle::spawn_tokens(&env("AMPHORA_PG_ORACLE")).unwrap();
-    let Verdict::Tree(body) = oracle.parse(b"SELECT NOT a LIKE b, NOT c").unwrap() else { panic!("refused") };
+    let Verdict::Tree(body) = oracle.parse(b"SELECT a NOT LIKE b, NOT c").unwrap() else { panic!("refused") };
     let got: Vec<Token> = tokens(&body).unwrap();
     let names: Vec<(&str, u32)> = got.iter().map(|t| (t.value.as_str(), t.offset)).collect();
-    assert_eq!(names, [("select", 0), ("not", 7), ("a", 11), ("like", 13), ("b", 18), ("", 19), ("not", 21), ("c", 25)]);
-    assert_ne!(got[1].token, got[6].token, "NOT before a LIKE is NOT_LA, NOT before c is NOT");
+    assert_eq!(names, [("select", 0), ("a", 7), ("not", 9), ("like", 13), ("b", 18), ("", 19), ("not", 21), ("c", 25)]);
+    assert_ne!(got[2].token, got[6].token, "NOT before LIKE is NOT_LA, NOT before c is NOT");
 }
