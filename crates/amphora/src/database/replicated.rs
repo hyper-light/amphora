@@ -1108,8 +1108,17 @@ impl Sessions {
         std::thread::Builder::new()
             .name("amphora.replica.session".into())
             .spawn(move || {
+                // The owner's bell rings as the worker ends, however it ends: a session that
+                // unwound ends the worker, its connection closed and its transaction with it, and
+                // the owner, woken, finds the worker gone and fences, as its own unwinding does.
+                let _ring = Ring(Arc::clone(&bell));
                 for session in asked {
-                    if finished.send(session(&mut db)).is_err() {
+                    let Ok(ran) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        session(&mut db)
+                    })) else {
+                        return;
+                    };
+                    if finished.send(ran).is_err() {
                         return;
                     }
                     bell.ring();
