@@ -23,7 +23,7 @@
 //! conservatism, never correctness: if the authority cannot prove a slot is
 //! dead, it must leave that slot in place.
 
-use crate::storage::log_segments::{ReadSpan, SegmentId, Segments};
+use crate::storage::log_segments::{ReadSpan, Segments, SlotReads};
 use crate::{
     io::{Completion, File, FileSyncType, OpenFlags, SharedWalLockKind, SharedWalMappedRegion, IO},
     sync::{
@@ -1262,62 +1262,45 @@ impl MappedSharedWalCoordination {
         }
     }
 
-    /// The log's segments as every process has counted its reads on them.
+    /// The log's segments, with the reads every live process counts on each: the
+    /// slots of readers proven dead are reclaimed first, so a crash leaks no read.
     pub(crate) fn segments(&self) -> Segments {
-        Segments::unpack(self.header().segments.load(Ordering::Acquire))
+        self.reclaim_stale_reader_slots();
+        let reads = self
+            .reader_reads()
+            .iter()
+            .map(|word| SlotReads(word.load(Ordering::Acquire)))
+            .fold(SlotReads::default(), SlotReads::plus);
+        Segments::unpack(self.header().segments.load(Ordering::Acquire)).with_reads(reads)
     }
 
-    /// A read begins in some process: counted on the segments it reaches, where
-    /// every process sees it. None when a count is at the most its bits hold: the
-    /// read is refused and tried again. The swap is lock-free: it is tried again
-    /// only after another read's begin or end changed the word, and that one's
-    /// swap held.
-    pub(crate) fn begin_read(&self) -> Option<ReadSpan> {
-        let word = &self.header().segments;
-        let mut seen = word.load(Ordering::Acquire);
-        loop {
-            let mut segments = Segments::unpack(seen);
-            let span = segments.begin_read();
-            let next = segments.pack()?;
-            match word.compare_exchange_weak(seen, next, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => return Some(span),
-                Err(now) => seen = now,
-            }
+    /// Count a read begun with `span` on `slot`, the reader slot that guards it,
+    /// where every process sees it. False when a count of the slot is at the most
+    /// its bits hold: the read is refused and tried again.
+    pub(crate) fn count_read(&self, slot: SharedReaderSlot, span: &ReadSpan) -> bool {
+        self.slot_reads(slot.slot_index as usize).is_some_and(|word| {
+            word.fetch_update(Ordering::AcqRel, Ordering::Acquire, |reads| {
+                SlotReads(reads).with(span).map(|reads| reads.0)
+            })
+            .is_ok()
+        })
+    }
+
+    /// The read [`Self::count_read`] counted on `slot` with `span` is done.
+    pub(crate) fn uncount_read(&self, slot: SharedReaderSlot, span: &ReadSpan) {
+        if let Some(word) = self.slot_reads(slot.slot_index as usize) {
+            let _ = word.fetch_update(Ordering::AcqRel, Ordering::Acquire, |reads| {
+                Some(SlotReads(reads).without(span).0)
+            });
         }
     }
 
-    /// The read that began with `span` is done: the segment this resets, if the
-    /// read was the last thing it waited for. A state loaded and lowered always
-    /// packs; were it not to, the count would stay, holding the segment rather
-    /// than freeing it under a read.
-    pub(crate) fn end_read(&self, span: ReadSpan) -> Option<SegmentId> {
-        let word = &self.header().segments;
-        let mut seen = word.load(Ordering::Acquire);
-        loop {
-            let mut segments = Segments::unpack(seen);
-            let reset = segments.release(&span);
-            let next = segments.pack()?;
-            match word.compare_exchange_weak(seen, next, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => return reset,
-                Err(now) => seen = now,
-            }
-        }
-    }
-
-    /// Publish what this process recovered at open (which segment is current, and
-    /// the other's state), keeping every read already counted.
+    /// Publish which segment is current and the other's state, as this process
+    /// recovered them at open. Reads are counted in the reader slots, not here.
     pub(crate) fn seed_segments(&self, recovered: Segments) {
-        let word = &self.header().segments;
-        let mut seen = word.load(Ordering::Acquire);
-        loop {
-            let Some(next) = recovered.with_reads_of(Segments::unpack(seen)).pack() else {
-                return;
-            };
-            match word.compare_exchange_weak(seen, next, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => return,
-                Err(now) => seen = now,
-            }
-        }
+        self.header()
+            .segments
+            .store(recovered.pack(), Ordering::Release);
     }
 
     /// The header of the segment that is not current.
@@ -1470,6 +1453,7 @@ impl MappedSharedWalCoordination {
                 Ok(true) => {
                     self.reader_frames()[slot_index as usize]
                         .store(UNUSED_READER_FRAME, Ordering::Release);
+                    self.forget_slot_reads(slot_index as usize);
                     self.reader_owners()[slot_index as usize]
                         .store(UNOWNED_LOCK, Ordering::Release);
                     let word_idx = (slot_index >> 6) as usize;
@@ -1818,6 +1802,7 @@ impl MappedSharedWalCoordination {
                 return false;
             }
             self.reader_frames()[slot_index as usize].store(UNUSED_READER_FRAME, Ordering::Release);
+            self.forget_slot_reads(slot_index as usize);
             let word_idx = (slot_index >> 6) as usize;
             let bit = slot_index & 63;
             self.reader_bitmap_words()[word_idx].fetch_or(1u64 << bit, Ordering::Release);
@@ -1839,6 +1824,7 @@ impl MappedSharedWalCoordination {
             return false;
         }
         self.reader_frames()[slot_index as usize].store(UNUSED_READER_FRAME, Ordering::Release);
+        self.forget_slot_reads(slot_index as usize);
         let word_idx = (slot_index >> 6) as usize;
         let bit = slot_index & 63;
         self.reader_bitmap_words()[word_idx].fetch_or(1u64 << bit, Ordering::Release);
@@ -2086,6 +2072,7 @@ impl MappedSharedWalCoordination {
                 return false;
             }
             self.reader_frames()[slot_index as usize].store(UNUSED_READER_FRAME, Ordering::Release);
+            self.forget_slot_reads(slot_index as usize);
             self.reader_owners()[slot_index as usize].store(UNOWNED_LOCK, Ordering::Release);
             let word_idx = (slot_index >> 6) as usize;
             let bit = slot_index & 63;
@@ -2425,6 +2412,7 @@ impl MappedSharedWalCoordination {
                     Ok(true) => {
                         self.reader_frames()[slot_index]
                             .store(UNUSED_READER_FRAME, Ordering::Release);
+                        self.forget_slot_reads(slot_index);
                         self.reader_owners()[slot_index].store(UNOWNED_LOCK, Ordering::Release);
                         let word_idx = slot_index >> 6;
                         let bit = slot_index & 63;
@@ -2689,10 +2677,10 @@ impl MappedSharedWalCoordination {
 
     fn base_mapped_len(reader_slot_count: u32) -> usize {
         let reader_bitmap_words = (reader_slot_count / 64) as usize;
-        // Layout after header: reader_bitmap | reader_frames | reader_owners
-        // Only 3 arrays are currently used; the remaining 2 are reserved space
-        // for future per-reader arrays (e.g. backfill proof bitmaps) and must
-        // not be removed without a coordinated file format version bump.
+        // Layout after header: reader_bitmap | reader_frames | reader_owners |
+        // reserved (reader_bitmap's size) | reader_reads. The reserved array is
+        // space for a future per-reader bitmap and must not be removed without a
+        // coordinated file format version bump.
         let raw_len = size_of::<SharedWalCoordinationMapHeader>()
             + reader_bitmap_words * size_of::<AtomicU64>()
             + reader_slot_count as usize * size_of::<AtomicU64>()
@@ -2763,6 +2751,35 @@ impl MappedSharedWalCoordination {
                 .cast::<AtomicU64>()
         };
         unsafe { std::slice::from_raw_parts(ptr, header.reader_slot_count as usize) }
+    }
+
+    /// Each reader slot's reads by segment ([`SlotReads`]), the fifth array.
+    fn reader_reads(&self) -> &[AtomicU64] {
+        let header = self.header();
+        let bitmap_words = header.reader_bitmap_word_count as usize;
+        let slots = header.reader_slot_count as usize;
+        let ptr = unsafe {
+            self.base_ptr
+                .as_ptr()
+                .add(size_of::<SharedWalCoordinationMapHeader>())
+                .cast::<AtomicU64>()
+                .add(bitmap_words)
+                .add(slots)
+                .add(slots)
+                .add(bitmap_words)
+        };
+        unsafe { std::slice::from_raw_parts(ptr, slots) }
+    }
+
+    fn slot_reads(&self, slot_index: usize) -> Option<&AtomicU64> {
+        self.reader_reads().get(slot_index)
+    }
+
+    /// A slot freed from a reader that is gone: the reads it counted hold no segment.
+    fn forget_slot_reads(&self, slot_index: usize) {
+        if let Some(word) = self.slot_reads(slot_index) {
+            word.store(0, Ordering::Release);
+        }
     }
 
     /// Map one frame-index block on demand.
@@ -3056,6 +3073,9 @@ impl MappedSharedWalCoordination {
         }
         for owner in self.reader_owners() {
             owner.store(UNOWNED_LOCK, Ordering::Release);
+        }
+        for reads in self.reader_reads() {
+            reads.store(0, Ordering::Release);
         }
     }
 

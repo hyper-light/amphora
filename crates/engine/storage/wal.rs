@@ -42,7 +42,8 @@ use crate::storage::page_transform::{
 use crate::storage::shared_wal_coordination::SharedWalCoordinationOpenMode;
 #[cfg(host_shared_wal)]
 use crate::storage::shared_wal_coordination::{
-    MappedSharedWalCoordination, SharedOwnerRecord, SharedReaderSlot, SharedWalCoordinationHeader,
+    MappedSharedWalCoordination, SharedOwnerRecord, SharedReaderSlot, SharedSegmentHeader,
+    SharedWalCoordinationHeader,
 };
 use crate::storage::sqlite3_ondisk::{
     begin_read_wal_frame, begin_read_wal_frame_raw, finish_read_page, prepare_wal_frame_header,
@@ -130,6 +131,11 @@ pub(crate) fn coordination_path_for_wal_path(wal_path: &str) -> String {
     } else {
         format!("{wal_path}-tshm")
     }
+}
+
+/// The log's second segment's file beside its first (`<db>-wal2` beside `<db>-wal`, decision 45).
+pub(crate) fn second_segment_path(wal_path: &str) -> String {
+    format!("{wal_path}2")
 }
 
 bitflags! {
@@ -2180,8 +2186,8 @@ struct ShmWalCoordination {
 #[cfg(host_shared_wal)]
 impl ShmWalCoordination {
     /// The read mark that guards a read of `snapshot` begun with `span`, taken on the segment
-    /// current when the read began (decision 45). This process's reads alone count in `span`:
-    /// other processes' reads are counted once the authority carries both segments.
+    /// current when the read began (decision 45). The read is counted on `span`'s segments in
+    /// its shared reader slot, where every process sees it.
     fn try_read_mark(&self, snapshot: WalSnapshot, span: &ReadSpan) -> Option<ReadGuardKind> {
         turso_assert!(
             snapshot.max_frame <= u32::MAX as u64,
@@ -2202,7 +2208,7 @@ impl ShmWalCoordination {
                 read_locks[0].unlock();
                 return None;
             }
-            if !self.publish_shared_reader(read_locks, snapshot, 0) {
+            if !self.publish_shared_reader(read_locks, snapshot, 0, span) {
                 return None;
             }
             return Some(ReadGuardKind::DbFile(segment));
@@ -2247,7 +2253,7 @@ impl ShmWalCoordination {
         }
 
         let read_mark_index = NonZeroUsize::new(best_idx as usize)?;
-        if !self.publish_shared_reader(read_locks, snapshot, best_idx as usize) {
+        if !self.publish_shared_reader(read_locks, snapshot, best_idx as usize, span) {
             return None;
         }
         Some(ReadGuardKind::ReadMark(segment, read_mark_index))
@@ -2619,10 +2625,12 @@ impl ShmWalCoordination {
         if Self::authority_is_uninitialized(snapshot) {
             self.sync_authority_from_local();
             self.sync_authority_frames_from_local();
+            self.seed_segments_from_local();
         } else if local_wal_view_loaded_from_disk
             && !self.authority.writer_or_checkpoint_lock_active()
         {
             self.repair_or_reseed_authority_from_local_disk_scan(snapshot);
+            self.seed_segments_from_local();
         } else {
             let needs_zero_frame_header_rewrite = snapshot.max_frame == 0 && {
                 let shared = self.log.current().read();
@@ -2647,6 +2655,25 @@ impl ShmWalCoordination {
                 self.sync_authority_frames_from_local();
             }
         }
+    }
+
+    /// Publish the log's segments as this process recovered them at open, and the header of
+    /// the one not current (decision 45).
+    fn seed_segments_from_local(&self) {
+        let segments = *self.log.segments.lock();
+        self.authority.seed_segments(segments);
+        let other = self.log.segment(segments.current().other()).read();
+        let header = other.metadata.wal_header.lock();
+        self.authority.install_other_segment(SharedSegmentHeader {
+            max_frame: other.metadata.max_frame.load(Ordering::Acquire),
+            nbackfills: other.metadata.nbackfills.load(Ordering::Acquire),
+            checkpoint_seq: header.checkpoint_seq,
+            page_size: header.page_size,
+            salt_1: header.salt_1,
+            salt_2: header.salt_2,
+            checksum_1: other.metadata.last_checksum.0,
+            checksum_2: other.metadata.last_checksum.1,
+        });
     }
 
     fn restart_snapshot_from_authority(
@@ -2881,6 +2908,7 @@ impl WalCoordination for ShmWalCoordination {
 
     fn end_read_tx(&self, guard: ReadGuardKind, span: ReadSpan) {
         if let Some(reader) = self.active_reader.lock().take() {
+            self.authority.uncount_read(reader, &span);
             self.authority.unregister_reader_for_snapshot(reader);
         }
         self.fallback.end_read_tx(guard, span);
@@ -3272,6 +3300,7 @@ impl ShmWalCoordination {
         read_locks: &[PaddedLock; 5],
         snapshot: WalSnapshot,
         read_lock_idx: usize,
+        span: &ReadSpan,
     ) -> bool {
         aristo::intent_stmt!(
             "A reader that reads only the database file registers in the shared reader \
@@ -3297,6 +3326,13 @@ impl ShmWalCoordination {
             read_locks[read_lock_idx].unlock();
             return false;
         };
+        // Decision 45: the read counts on its segments in its slot, where every process's
+        // checkpointer sees it, before the snapshot's check below.
+        if !self.authority.count_read(reader, span) {
+            self.authority.unregister_reader_for_snapshot(reader);
+            read_locks[read_lock_idx].unlock();
+            return false;
+        }
         aristo::intent_stmt!(
             "After the slot is registered, the shared snapshot is compared again, and any \
              difference releases both the slot and the local read lock. A checkpoint that \
@@ -3308,6 +3344,7 @@ impl ShmWalCoordination {
             parent = "checkpoint_safe_frame_below_every_reader"
         );
         if self.load_snapshot() != snapshot {
+            self.authority.uncount_read(reader, span);
             self.authority.unregister_reader_for_snapshot(reader);
             read_locks[read_lock_idx].unlock();
             return false;
@@ -3988,7 +4025,45 @@ impl SharedLog {
     /// The log whose first segment is `first`, the second free and empty: a log with no valid
     /// `-wal2` is this state (decision 45, on disk).
     pub fn new(first: Arc<RwLock<WalFileShared>>) -> Arc<Self> {
-        let second = WalFileShared::new_noop();
+        Self::with_segments(
+            first,
+            WalFileShared::new_noop(),
+            Segments::new(SegmentId::First),
+        )
+    }
+
+    /// The log recovered at open from its two segments' files: of two valid segments, the one
+    /// whose checkpoint sequence follows the other's is current and the other closing, nothing of
+    /// it copied since the crash (decision 45, [`Segments::recover`]). A closing segment is taken
+    /// as shipped: the engine knows of no backup still waiting on its frames. Corrupt for two
+    /// valid segments neither of which follows the other, a pair no switch leaves.
+    pub fn recover(
+        first: Arc<RwLock<WalFileShared>>,
+        second: Arc<RwLock<WalFileShared>>,
+    ) -> Result<Arc<Self>> {
+        let sequence = |segment: &Arc<RwLock<WalFileShared>>| {
+            let shared = segment.read();
+            shared
+                .metadata
+                .initialized
+                .load(Ordering::Acquire)
+                .then(|| shared.metadata.wal_header.lock().checkpoint_seq)
+        };
+        let (first_seq, second_seq) = (sequence(&first), sequence(&second));
+        let segments = Segments::recover(first_seq, second_seq, true).ok_or_else(|| {
+            LimboError::Corrupt(format!(
+                "the log's segments have checkpoint sequences {first_seq:?} and {second_seq:?}, \
+                 neither one past the other: no switch leaves such a pair"
+            ))
+        })?;
+        Ok(Self::with_segments(first, second, segments))
+    }
+
+    fn with_segments(
+        first: Arc<RwLock<WalFileShared>>,
+        second: Arc<RwLock<WalFileShared>>,
+        segments: Segments,
+    ) -> Arc<Self> {
         let read_index = |segment: &Arc<RwLock<WalFileShared>>| {
             let guard = segment.read();
             let read_index = guard.runtime.read_index.clone();
@@ -4000,8 +4075,8 @@ impl SharedLog {
             first,
             second,
             read_indexes,
-            segments: SpinLock::new(Segments::new(SegmentId::First)),
-            second_current: AtomicBool::new(false),
+            second_current: AtomicBool::new(segments.current() == SegmentId::Second),
+            segments: SpinLock::new(segments),
             vacuum_lock: PaddedLock::new(TursoRwLock::new()),
             write_lock: PaddedLock::new(TursoRwLock::new()),
             checkpoint_lock: PaddedLock::new(TursoRwLock::new()),
@@ -8227,6 +8302,22 @@ impl WalFileShared {
     ) -> Result<Arc<RwLock<WalFileShared>>> {
         let mut driver = Self::open_shared_if_exists_begin(io, path, flags)?;
         io.block(|| driver.poll())
+    }
+
+    /// The log's second segment (decision 45) recovered from its file at `path` if the file
+    /// exists, else free and empty: the writer's first switch makes the file, never an open.
+    pub fn open_second_segment_if_exists(
+        io: &Arc<dyn IO>,
+        path: &str,
+        flags: crate::OpenFlags,
+    ) -> Result<Arc<RwLock<WalFileShared>>> {
+        match Self::open_shared_if_exists(io, path, flags.difference(crate::OpenFlags::Create)) {
+            Err(LimboError::CompletionError(CompletionError::IOError(
+                std::io::ErrorKind::NotFound,
+                _,
+            ))) => Ok(Self::new_noop()),
+            opened => opened,
+        }
     }
 
     /// Non-blocking entry point for [`WalFileShared::open_shared_if_exists`].

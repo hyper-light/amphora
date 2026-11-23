@@ -5,13 +5,9 @@
 
 use std::iter;
 
-/// [`Segments::pack`]'s word: bits 0-29 count the current segment's reads and bits 30-59 the
-/// closing one's; bit 60 says the closing segment is shipped, 61 that it is copied, 62 that the
-/// other segment is closing rather than free, and 63 that the second segment is current. The
-/// word is 64 bits, the widest every platform swaps without a lock; the four flags take four, and
-/// the two counts take half each of the 60 left.
-const READS: u64 = 0x3FFF_FFFF;
-const CLOSING_READS_SHIFT: u32 = 30;
+/// [`Segments::pack`]'s word: bit 60 says the closing segment is shipped, 61 that it is copied,
+/// 62 that the other segment is closing rather than free, and 63 that the second segment is
+/// current. Reads are not in it: each reader slot counts its own ([`SlotReads`]).
 const SHIPPED: u64 = 0x1000_0000_0000_0000;
 const COPIED: u64 = 0x2000_0000_0000_0000;
 const CLOSING: u64 = 0x4000_0000_0000_0000;
@@ -164,13 +160,6 @@ impl Segments {
     /// thing it waited for. A segment a read counts on is never reset under it, so each segment in
     /// `span` is still current or closing.
     pub fn end_read(&mut self, span: ReadSpan) -> Option<SegmentId> {
-        self.release(&span)
-    }
-
-    /// [`Self::end_read`] for a state kept in the shared memory, which another process can change
-    /// between a load and the swap that stores the result: the caller applies the same span to
-    /// what it loads again until its swap holds.
-    pub fn release(&mut self, span: &ReadSpan) -> Option<SegmentId> {
         for segment in span.lookup_order() {
             if segment == self.current {
                 self.reads = self.reads.saturating_sub(1);
@@ -217,36 +206,28 @@ impl Segments {
         self.reset_if_done()
     }
 
-    /// This state with the read counts of `counted`: what a process recovered at open, published
-    /// over the shared memory's word without losing a read another connection counted there.
-    pub fn with_reads_of(self, counted: Self) -> Self {
+    /// This state with `reads` on each segment: what the multi-process shared memory's reader
+    /// slots count ([`SlotReads`]).
+    pub fn with_reads(self, reads: SlotReads) -> Self {
         Self {
             current: self.current,
-            reads: counted.reads,
+            reads: reads.on(self.current),
             other: self.other.map(|closing| Closing {
-                reads: counted.other.map_or(0, |counted| counted.reads),
+                reads: reads.on(self.current.other()),
                 ..closing
             }),
         }
     }
 
-    /// This state as one word of the multi-process shared memory, so that every process's reads
-    /// count where every process's checkpointer sees them, and a read's begin and its end each
-    /// change it with one swap. None when a count is past what its bits hold: the read that would
-    /// take it there is refused.
-    pub fn pack(&self) -> Option<u64> {
-        let mut word = self.reads;
-        if word > READS {
-            return None;
-        }
+    /// This state's segments and flags as one word of the multi-process shared memory, its read
+    /// counts left out: every process's reads are in the reader slots ([`SlotReads`]).
+    pub fn pack(&self) -> u64 {
+        let mut word = 0;
         if self.current == SegmentId::Second {
             word |= SECOND_CURRENT;
         }
         if let Some(closing) = self.other {
-            if closing.reads > READS {
-                return None;
-            }
-            word |= CLOSING | closing.reads.wrapping_shl(CLOSING_READS_SHIFT);
+            word |= CLOSING;
             if closing.copied {
                 word |= COPIED;
             }
@@ -254,10 +235,10 @@ impl Segments {
                 word |= SHIPPED;
             }
         }
-        Some(word)
+        word
     }
 
-    /// The state [`Self::pack`] stored in `word`.
+    /// The state [`Self::pack`] stored in `word`, with no read counted.
     pub fn unpack(word: u64) -> Self {
         let current = if word & SECOND_CURRENT == 0 {
             SegmentId::First
@@ -266,9 +247,9 @@ impl Segments {
         };
         Self {
             current,
-            reads: word & READS,
+            reads: 0,
             other: (word & CLOSING != 0).then(|| Closing {
-                reads: word.wrapping_shr(CLOSING_READS_SHIFT) & READS,
+                reads: 0,
                 copied: word & COPIED != 0,
                 shipped: word & SHIPPED != 0,
             }),
@@ -287,6 +268,59 @@ impl Segments {
             }
             _ => None,
         }
+    }
+}
+
+/// The reads that count on each segment: one reader slot's in the multi-process shared memory, or
+/// the sum of every live slot's. Bits 0-31 count the reads on the first segment and bits 32-63 on
+/// the second. One slot serves every read of a snapshot in its process, so it counts rather than
+/// flags them; a slot reclaimed from a dead process is zeroed, so its reads stop counting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SlotReads(pub u64);
+
+impl SlotReads {
+    const COUNT: u64 = 0xFFFF_FFFF;
+    const SECOND_SHIFT: u32 = 32;
+
+    pub const fn on(self, segment: SegmentId) -> u64 {
+        match segment {
+            SegmentId::First => self.0 & Self::COUNT,
+            SegmentId::Second => self.0.wrapping_shr(Self::SECOND_SHIFT),
+        }
+    }
+
+    const fn one(segment: SegmentId) -> u64 {
+        match segment {
+            SegmentId::First => 1,
+            SegmentId::Second => 1u64.wrapping_shl(Self::SECOND_SHIFT),
+        }
+    }
+
+    /// These reads and the one begun with `span`. None when a count is at the most its bits hold:
+    /// the read is refused and tried again.
+    pub fn with(self, span: &ReadSpan) -> Option<Self> {
+        span.lookup_order().try_fold(self, |reads, segment| {
+            (reads.on(segment) < Self::COUNT)
+                .then(|| Self(reads.0.wrapping_add(Self::one(segment))))
+        })
+    }
+
+    /// These reads without the one begun with `span`, which [`Self::with`] counted.
+    pub fn without(self, span: &ReadSpan) -> Self {
+        span.lookup_order().fold(self, |reads, segment| {
+            if reads.on(segment) == 0 {
+                reads
+            } else {
+                Self(reads.0.wrapping_sub(Self::one(segment)))
+            }
+        })
+    }
+
+    /// These reads and `other`'s, each segment's count stopping at the most its bits hold.
+    pub fn plus(self, other: Self) -> Self {
+        let first = self.on(SegmentId::First).saturating_add(other.on(SegmentId::First));
+        let second = self.on(SegmentId::Second).saturating_add(other.on(SegmentId::Second));
+        Self(first.min(Self::COUNT) | second.min(Self::COUNT).wrapping_shl(Self::SECOND_SHIFT))
     }
 }
 
@@ -438,10 +472,10 @@ mod tests {
         assert_eq!(backed_up.switch(true), Some(SegmentId::Second));
     }
 
-    /// Do: pack each kind of state into the shared memory's word, counts at their widest too, and
-    /// one count past it. Expect: each unpacks to itself, and a count past its bits is refused.
+    /// Do: pack each kind of state into the shared memory's word, with reads under way. Expect:
+    /// each unpacks to itself with no read counted, and the reads the slots count fill it back.
     #[test]
-    fn d45_the_shared_word_holds_every_state_and_refuses_a_count_past_its_bits() {
+    fn d45_the_shared_word_holds_every_state() {
         let mut log = Segments::new(SegmentId::Second);
         let mut states = vec![log];
         let read = log.begin_read();
@@ -450,32 +484,63 @@ mod tests {
         states.push(log);
         assert_eq!(log.copied(), None);
         states.push(log);
-        let widest = Segments {
-            current: SegmentId::First,
-            reads: READS,
-            other: Some(Closing {
-                reads: READS,
-                copied: false,
-                shipped: true,
-            }),
-        };
-        states.push(widest);
+        assert_eq!(log.shipped(), None);
+        states.push(log);
         for state in states {
-            let word = state.pack().expect("fits");
-            assert_eq!(Segments::unpack(word), state);
+            let unpacked = Segments::unpack(state.pack());
+            assert_eq!(unpacked.current(), state.current());
+            assert_eq!(unpacked.closing(), state.closing());
+            let counted = SlotReads::default()
+                .with(&ReadSpan {
+                    current: state.current(),
+                    closing: state.closing(),
+                })
+                .expect("one read fits");
+            let filled = unpacked.with_reads(counted);
+            assert!(matches!(filled.state(filled.current()), Segment::Current { reads: 1 }));
+            if let Some(closing) = filled.closing() {
+                let Segment::Closing(closing) = filled.state(closing) else {
+                    panic!("closing");
+                };
+                assert_eq!(closing.reads, 1);
+            }
         }
-        let past = Segments {
-            reads: READS + 1,
-            ..widest
+        assert_eq!(log.end_read(read), Some(SegmentId::Second));
+    }
+
+    /// Do: count reads on a slot, on one segment and on both, to the most a count holds, and take
+    /// them off. Expect: each segment counts its own; the read past the most is refused and changes
+    /// nothing; taking a read off a segment with none leaves the other's count whole.
+    #[test]
+    fn d45_a_slot_counts_each_segments_reads_and_refuses_one_past_its_bits() {
+        use SegmentId::{First, Second};
+        let both = ReadSpan {
+            current: Second,
+            closing: Some(First),
         };
-        assert_eq!(past.pack(), None);
-        let mut closing_past = widest;
-        closing_past.reads = 0;
-        if let Some(closing) = &mut closing_past.other {
-            closing.reads = READS + 1;
-        }
-        assert_eq!(closing_past.pack(), None);
-        assert_eq!(log.end_read(read), None);
+        let first_only = ReadSpan {
+            current: First,
+            closing: None,
+        };
+        let reads = SlotReads::default().with(&both).expect("fits");
+        let reads = reads.with(&first_only).expect("fits");
+        assert_eq!((reads.on(First), reads.on(Second)), (2, 1));
+        let full = SlotReads(SlotReads::COUNT);
+        assert_eq!(full.with(&first_only), None);
+        assert_eq!(full.with(&both), None);
+        let second_only = ReadSpan {
+            current: Second,
+            closing: None,
+        };
+        let one_second = full.with(&second_only).expect("the second's count is free");
+        assert_eq!((one_second.on(First), one_second.on(Second)), (SlotReads::COUNT, 1));
+        assert_eq!(SlotReads::default().without(&both), SlotReads::default());
+        assert_eq!(reads.without(&both).without(&first_only), SlotReads::default());
+        assert_eq!(
+            full.plus(SlotReads(1)).on(First),
+            SlotReads::COUNT,
+            "a sum stops at the most a count holds"
+        );
     }
 
     /// Do: recover from each pair of headers a switch or a crash in one can leave, at the
