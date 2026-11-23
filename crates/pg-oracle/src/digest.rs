@@ -117,13 +117,15 @@ impl std::error::Error for Malformed {}
 
 fn answer(word: &str) -> Option<Answer> {
     if let Some(hex) = word.strip_prefix('T') {
-        return (hex.len() == 16)
-            .then(|| u64::from_str_radix(hex, 16).ok())
-            .flatten()
-            .map(Answer::Accepted);
+        if hex.len() != 16 || !hex.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        return u64::from_str_radix(hex, 16).ok().map(Answer::Accepted);
     }
     let (sqlstate, cursor) = word.strip_prefix('E')?.split_once(':')?;
-    (sqlstate.len() == 5 && sqlstate.bytes().all(|c| c.is_ascii_alphanumeric())).then_some(())?;
+    if sqlstate.len() != 5 || !sqlstate.bytes().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
     Some(Answer::Refused {
         sqlstate: sqlstate.to_owned(),
         cursor: cursor.parse().ok()?,
@@ -202,6 +204,7 @@ mod tests {
         for (text, line) in [
             ("T0000000000000001 T0000000000000001\n", 1),
             ("@ a.sql\nT01 T0000000000000001\n", 2),
+            ("@ a.sql\nT+000000000000001 T0000000000000001\n", 2),
             ("@ a.sql\nE4260:1 E42601:1\n", 2),
             ("@ a.sql\nE42601:x -\n", 2),
             ("@ a.sql\nx\n", 2),
