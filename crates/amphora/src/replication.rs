@@ -287,6 +287,9 @@ pub struct Machine {
     // A test's record of this member's image digest at each applied index.
     #[cfg(test)]
     digests: Option<Vec<(u64, u64)>>,
+    // A test's record of this member's every page at each applied index.
+    #[cfg(test)]
+    images: Option<Vec<(u64, crate::db::Pages)>>,
     // A test's hold on this machine's flushes of its database's log.
     #[cfg(test)]
     flush_gate: std::sync::Arc<FlushGate>,
@@ -591,6 +594,8 @@ impl Machine {
             #[cfg(test)]
             digests: None,
             #[cfg(test)]
+            images: None,
+            #[cfg(test)]
             flush_gate: std::sync::Arc::default(),
             opened_bytes,
             imaged_bytes: 0,
@@ -776,6 +781,16 @@ impl Machine {
     pub(crate) fn digests(&self) -> &[(u64, u64)] {
         self.digests.as_deref().unwrap_or_default()
     }
+    /// Records every page at each applied index from now, beside the digests.
+    #[cfg(test)]
+    pub(crate) fn record_images(&mut self) {
+        self.record_digests();
+        self.images = Some(Vec::new());
+    }
+    #[cfg(test)]
+    pub(crate) fn images(&self) -> &[(u64, crate::db::Pages)] {
+        self.images.as_deref().unwrap_or_default()
+    }
     #[cfg(test)]
     fn record_digest(&mut self, at: u64) -> Result<(), Fatal> {
         use std::hash::{Hash, Hasher};
@@ -794,6 +809,9 @@ impl Machine {
         }
         if let Some(digests) = self.digests.as_mut() {
             digests.push((at, hasher.finish()));
+        }
+        if let Some(images) = self.images.as_mut() {
+            images.push((at, pages));
         }
         Ok(())
     }

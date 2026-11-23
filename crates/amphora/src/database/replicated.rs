@@ -13104,6 +13104,91 @@ mod tests {
         pump.finish();
     }
 
+    /// Every page of `owners` at each applied index two of them recorded, compared byte for byte
+    /// but for a page's last eight bytes, the engine's checksum of the rest (engine
+    /// storage/checksum.rs: a function of the page's other bytes alone, written at write-out): each
+    /// difference as (owner, index, page, first byte that differs), and the pages compared.
+    fn pages_differ(driven: &Driven, owners: &[usize]) -> (Vec<(usize, u64, u32, usize)>, usize) {
+        let mut first: BTreeMap<u64, &crate::db::Pages> = BTreeMap::new();
+        let (mut differ, mut compared) = (Vec::new(), 0);
+        for owner in owners {
+            for (index, pages) in driven.owner(*owner).replica.machine().images() {
+                let Some(seen) = first.get(index) else {
+                    first.insert(*index, pages);
+                    continue;
+                };
+                let ids = |p: &crate::db::Pages| p.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+                assert_eq!(ids(seen), ids(pages), "owner {owner}'s pages at {index}");
+                for ((id, a), (_, b)) in seen.iter().zip(pages) {
+                    let body = |p: &Vec<u8>| p.len().saturating_sub(8);
+                    compared += 1;
+                    if let Some(at) = (0..body(a).max(body(b))).find(|i| a.get(*i) != b.get(*i)) {
+                        differ.push((*owner, *index, *id, at));
+                    }
+                }
+            }
+        }
+        (differ, compared)
+    }
+
+    /// Lane snapshots (replication.md, "Decision (lane snapshots)", Open: the page-identity item
+    /// that gates units D and E): every member writes its applied marker and closed time itself,
+    /// after the pages it was shipped (`replication.rs`, `marker` and `closed::record`). Do, as
+    /// `a_member_installed_from_a_snapshot_holds_the_floors_rows`: three voters write, the leader
+    /// compacts, learner 4 catches up only by the leader's image, then more writes; every member's
+    /// pages recorded at each index it applies. Expect: at every index two members both applied,
+    /// every page byte-identical but for the checksum trailer, the installed member's included.
+    #[test]
+    fn snapshots_every_member_writes_the_same_page_bytes_at_every_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = three_and_a_learner(&mut driven, dir.path());
+        for owner in 0..4 {
+            driven.owner_mut(owner).replica.machine_mut().record_images();
+        }
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients[..3], 0, 1);
+        for value in 1..=4 {
+            write(&mut driven, &mut pump, &clients[leader], value);
+        }
+        quiet(&mut driven, &mut pump);
+        driven.flushed(&mut pump, leader);
+        let compacted = {
+            let owner = &mut driven.owner_mut(leader);
+            let now = owner.now().unwrap();
+            owner
+                .replica
+                .compact(0, now, std::task::Waker::noop())
+                .unwrap();
+            owner.replica.applied().index
+        };
+        for _ in 0..64 {
+            driven.round(&mut pump);
+        }
+        let until = driven.until();
+        driven
+            .answer(
+                &mut pump,
+                &change(&clients[leader], until, MemberChange::AddLearner(4)),
+            )
+            .unwrap();
+        catch_up(&mut driven, &mut pump, &clients, leader, 3);
+        for value in 5..=8 {
+            write(&mut driven, &mut pump, &clients[leader], value);
+        }
+        quiet(&mut driven, &mut pump);
+        let installed = driven.owner(3).replica.machine().images().first().map(|(i, _)| *i);
+        assert!(
+            installed.is_some_and(|i| i >= compacted),
+            "4 began at {installed:?}, not the image at {compacted}"
+        );
+        let (differ, compared) = pages_differ(&driven, &[0, 1, 2, 3]);
+        assert!(compared > 0, "no page compared");
+        assert!(differ.is_empty(), "pages differ (owner, index, page, byte): {differ:?} of {compared}");
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
     /// The `seen` of each attestation row of member `member` owner `owner` holds.
     fn seen_rows(driven: &mut Driven, owner: usize, member: u64) -> Vec<u64> {
         floor_rows(driven, owner)
