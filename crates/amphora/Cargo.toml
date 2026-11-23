@@ -34,6 +34,8 @@ private-fs = "=0.2.1"
 socket2 = { git = "https://github.com/rust-lang/socket2", rev = "8b8b96fdaa1301698fd2b6f4de188635df4a8bd1", features = ["all"] }
 hyper-durable = "0.1.0"
 hyper-raft = "0.1.0"
+# The PostgreSQL listener's event loop and sockets (docs/design/postgres.md, decision 2).
+hyper-rt = "0.1.0"
 # The owner's tick pace: hyper-timing's law over what the owner measures (database/pace.rs).
 hyper-timing = "0.1.0"
 # The owner transport between machines: mutual TLS 1.3 as the replicated transport's (hyper-transport

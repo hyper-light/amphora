@@ -59,13 +59,16 @@ protocol 3.0 and 3.2 as PostgreSQL 19 does:
   direct TLS (libpq's `sslnegotiation=direct`) only with ALPN `postgresql` (`pqcomm.h:189`),
   refused without it as PostgreSQL refuses it (`src/backend/tcop/backend_startup.c:472-476`).
   StartupMessage at 3.0 or 3.2; a newer minor or any `_pq_.` option answered with
-  NegotiateProtocolVersion listing them (`backend_startup.c:834`, `:883`).
+  NegotiateProtocolVersion listing them (`backend_startup.c:834`, `:883`). A startup length out of
+  range closes the connection with nothing sent and is logged, as PostgreSQL logs it and closes
+  (`backend_startup.c:566-571`, COMMERROR), so a client can't tell Amphora from PostgreSQL by it.
 - **Authentication.** SCRAM-SHA-256 and SCRAM-SHA-256-PLUS (RFC 5802, RFC 7677), with channel
   binding `tls-server-end-point` (RFC 5929), the only type PostgreSQL uses
   (`src/backend/libpq/auth-scram.c:20-21`); the user name inside SCRAM ignored as PostgreSQL ignores
   it. Verifiers are kept as PostgreSQL keeps them, with its default 4096 iterations
-  (`src/include/common/scram-common.h:50`, the floor RFC 7677 sets). OAUTHBEARER and MD5 are out of
-  this record (Choices for Ada).
+  (`src/include/common/scram-common.h:50`, the floor RFC 7677 sets). OAUTHBEARER, PostgreSQL 18
+  and later's OAuth (RFC 7628, `src/backend/libpq/auth-oauth.c`), is a unit of section 11; MD5 is
+  refused (Choices for Ada, decided).
 - **Session.** The 15 ParameterStatus values PostgreSQL 19 reports (`application_name`,
   `client_encoding`, `DateStyle`, `default_transaction_read_only`, `in_hot_standby`,
   `integer_datetimes`, `IntervalStyle`, `is_superuser`, `scram_iterations`, `search_path`,
@@ -300,7 +303,8 @@ min and max, IN lists, window partitions, statistics, columnar copies): one miss
 wrong answer. Keys the engine already orders can't be missed, and compare as integers or one memcmp,
 which is also the faster path for the 10x bar. What the key design can't express is refused: a
 nondeterministic (case-insensitive) collation and a user `CREATE OPERATOR CLASS` are `0A000` until a
-key for them is designed; ICU collations are Ada's to bring in (Choices for Ada).
+key for them is designed. ICU and libc collations are in scope (Choices for Ada, decided): each
+comes with its key design and is refused `0A000` until then.
 
 **Falsified by.** Any value pair whose order or equality in Amphora differs from PostgreSQL 19's
 (a differential test over -0, NaN, 1.5 and 1.50, '1 mon' and '30 days', trailing spaces, enum values
@@ -357,8 +361,9 @@ work every level below needs.
 
 - **SERIALIZABLE** refuses with `40001`. Precision refuses different transactions than
   PostgreSQL's SSI does, and the versioned storage's `Ssi` validation is not yet PostgreSQL's
-  algorithm as PostgreSQL builds it; which transactions abort is Ada's choice below (Choices for
-  Ada), measured by the isolation suite's serializable specs.
+  algorithm as PostgreSQL builds it. Ada decided that SERIALIZABLE aborts exactly the transactions
+  PostgreSQL would (Choices for Ada), so PostgreSQL's predicate locks are ported at their
+  granularity, measured by the isolation suite's serializable specs.
 - **REPEATABLE READ** is snapshot isolation, which needs the `Snapshot` validation chosen per
   transaction: under Precision a writing transaction is refused when something it read changed,
   which PostgreSQL's REPEATABLE READ never does. A second difference to close: Amphora's first writer
@@ -440,7 +445,7 @@ what it answers.
   The suite assumes what a PostgreSQL server has: C functions from `regress.so` (`test_setup.sql`
   `:250-253`; 18 files load it), COPY from files on the server's disk (`:137-138`; 13 files name
   `abs_srcdir`, 15 with `abs_builddir`), an in-place tablespace (`:27-28`) and a superuser (Choices
-  for Ada asks how to count these).
+  for Ada, decided: the four C functions written natively).
 - **The drivers' own suites,** at pinned versions: libpq (PostgreSQL's `libpq_pipeline` binary,
   called directly with a conninfo and `max_protocol_version=latest`, its usage at
   `src/test/modules/libpq_pipeline/libpq_pipeline.c:2156`, its traces compared by our harness, since
@@ -509,8 +514,8 @@ and p99.9, measured on the part either server can change: (PostgreSQL's time les
 
 **The diminishing-returns stop.** A workload stops when it is done, or when Amphora's time less the
 floor is within the floor's own run-to-run noise (nothing is left for a server to remove), with the
-numbers recorded. A failing regression file stops when what it still needs is outside the scope Ada
-sets (Choices for Ada); it is reported as failing, never removed from the count.
+numbers recorded. Ada declared nothing out of scope (Choices for Ada), so a failing regression
+file is reported as failing, never removed from the count, and worked until it passes.
 
 ## 11. The order of delivery: one-hour units, each ending in its check
 
@@ -539,26 +544,32 @@ correctly. A unit that outgrows its hour splits at its check.
 | 18 | The A/B of section 2: session transactions on the versioned path against a writer held per session | Both arms at 1 to 10,000 sessions, clients prompt and pausing between statements: throughput, p50, p99 and p99.9 recorded, and the design kept or changed by them |
 
 After milestone one, units follow the regression suite's failing files and the benchmark's largest
-server-attributable gaps, alternating, with TLS (SCRAM-PLUS, direct TLS), CancelRequest and
-LISTEN/NOTIFY each a unit with a driver-suite check.
+server-attributable gaps, alternating, with TLS (SCRAM-PLUS, direct TLS), CancelRequest,
+LISTEN/NOTIFY and OAuth each a unit with a driver-suite check.
+
+The OAuth unit is OAUTHBEARER as PostgreSQL 18 and later serve it (RFC 7628,
+`src/backend/libpq/auth-oauth.c`; the `oauth` method, `src/include/libpq/hba.h:41`): offered in
+AuthenticationSASL to a role whose login names it, the client's `auth=Bearer` token taken from its
+initial response, and a client that sends no token answered with PostgreSQL's discovery error (the
+issuer's `openid-configuration` and the scope) so libpq's device flow can start. PostgreSQL checks a
+token through a validator module it loads (`oauth_validator_libraries`); Amphora checks it through a
+validator seam of its own, with a simulator and a conformance suite (CLAUDE.md §9). Its check: libpq
+19 logs in with `oauth_issuer` and `oauth_client_id` against a test issuer, and a bad, expired or
+wrong-audience token is refused `28000` as PostgreSQL refuses it.
 
 ## Choices for Ada
 
-Each is a plain choice; the default holds until she says otherwise.
+Ada answered all four on 2026-11-23. Her answers bind.
 
-1. **The regression suite's C functions.** `test_setup.sql` loads four C functions from PostgreSQL's
-   `regress.so`, and 18 files use it. Amphora can't load PostgreSQL's C. Either write those functions
-   natively in Amphora, present only in a database made for the suite (most files can then run), or
-   count every file that needs them as failing. Default: write them natively.
-2. **Scope.** What may be declared out of scope, counted as failing rather than built: PL/pgSQL
-   (the regression suite and HammerDB need it), C-language functions and extensions, ICU and libc
-   locales (the default keeps `C` and builtin `C.UTF-8`, whose order is SQLite's BINARY), XML,
-   full-text search, geometric and range types, large objects, logical replication
-   (`CREATE PUBLICATION`, `WAIT FOR LSN`), tablespaces beyond a catalog row. Default: everything in
-   scope, ordered by what the suite and the benchmarks hit first.
-3. **SERIALIZABLE's aborts.** PostgreSQL guarantees serializability, not which transaction aborts.
-   Either match PostgreSQL's abort choices exactly (port its predicate-lock granularity) so the
-   isolation suite's serializable specs pass byte for byte, or keep Amphora's `Ssi` validation and
-   report those specs' differences. Default: match exactly, since done is 139 of 139.
-4. **OAUTHBEARER and MD5.** PostgreSQL 19 offers OAuth and still allows MD5 with a warning. Default:
-   SCRAM only, MD5 refused, OAuth later if a client needs it.
+1. **The regression suite's C functions.** Decided: `regress.so`'s four C functions that
+   `test_setup.sql` loads are written natively in Amphora, present only in a database made for the
+   test suite.
+2. **Scope.** Decided: nothing is out of scope. PL/pgSQL, C-language functions and extensions, ICU
+   and libc locales, XML, full-text search, geometric and range types, large objects and logical
+   replication (`CREATE PUBLICATION`, `WAIT FOR LSN`) are all built, ordered by what the suite and
+   the benchmarks hit first.
+3. **SERIALIZABLE's aborts.** Decided: SERIALIZABLE aborts exactly the transactions PostgreSQL
+   would. PostgreSQL's predicate-lock granularity is ported, so the isolation suite's serializable
+   specs pass byte for byte.
+4. **Logins.** Decided: SCRAM-SHA-256, with channel binding (SCRAM-SHA-256-PLUS), and OAuth
+   (OAUTHBEARER, section 11's OAuth unit). MD5 is refused.

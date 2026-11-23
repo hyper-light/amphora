@@ -163,7 +163,7 @@ print(next((r["tag_name"] for r in json.load(sys.stdin) if not r["draft"] and no
   else
     gdq_mod=github.com/canonical/go-dqlite gdq=${GO_DQLITE:-v1.22.0}
   fi
-  if [[ -n "$gdq" ]] && (cd "$s" && export PATH="$BIN/go/bin:$PATH" GOPATH="$WORK/gopath" GOCACHE="$WORK/gocache" PKG_CONFIG_PATH="${DQ_PC}${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" \
+  if [[ -n "$gdq" ]] && (cd "$s" && export GOROOT="$BIN/go" PATH="$BIN/go/bin:$PATH" GOPATH="$WORK/gopath" GOCACHE="$WORK/gocache" PKG_CONFIG_PATH="${DQ_PC}${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" \
       && export CGO_CFLAGS="$(pkg-config --cflags dqlite) ${CGO_CFLAGS:-}" CGO_LDFLAGS="$(pkg-config --libs-only-L dqlite) ${CGO_LDFLAGS:-}" \
       && go mod init shim >/dev/null 2>&1 && go get "$gdq_mod@$gdq" github.com/mattn/go-sqlite3 >&2 && go mod tidy >&2 \
       && CGO_LDFLAGS_ALLOW="-Wl,-z,now" go build -tags libsqlite3 -o "$BIN/shim" .); then
