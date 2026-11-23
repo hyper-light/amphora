@@ -767,6 +767,14 @@ one table, so read sets can't rebase any of them (they share the rightmost leaf 
 forwards one write at a time while about 10 of its writers queue behind it, so a write at the back of a follower's
 queue waits through about 10 rounds, plus a refusal and a slot for each stale base. Past 10 s it is refused for good.
 
+**Half of the guess tested on driven time (18:36Z, adacachy2, cpus=4).** Amphora turns on 0009's early heartbeat
+answer with `answer_beats_now: true` (replicated.rs, the core's config). Test 5 (below) ran 3 times with it on and 3
+with it off, alternating, from one tree with that line flipped. Stale-base refusals with it on were 55, 72 and 78
+(persisted) and 84, 83 and 84 (replicated). With it off they were 58, 72 and 78, and 83, 84 and 85. No difference, so
+the early heartbeat answer alone doesn't raise refusals on driven time. The other half, reads confirmed without a
+`Ready`, has no switch and wasn't tested. Driven time may not model the flush timing the guess rests on. The guess
+stays a guess, and the bench's numbers above stand as measured.
+
 **Recommendation on 0009: revert it from main, with this evidence.** No gain was measured anywhere on this disk: at 1
 writer 14.0 against 14.0 commits/s (r1238), leader-routed at 32 writers 25.25 against 23.25 (r1312, ranges overlap).
 It has a functional loss: 1 of 6 to 6 of 6 runs aborted at 32 spread writers (r1312, r1346), and 17.0 to 11.6
