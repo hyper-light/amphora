@@ -1646,7 +1646,7 @@ fn an_answer_a_notice_releases_states_the_durable_commit() {
     node.step(beat).unwrap();
     let mut ready = node.ready().unwrap();
     assert!(ready.hard_state().is_none());
-    assert_eq!(beat_answers(&ready.take_persisted_messages()), vec![3]);
+    assert_eq!(beat_answers(&ready.take_held_messages()), vec![3]);
 }
 
 /// R-6's apply pause (etcd's `applyingEntsPaused`): while the owner holds

@@ -340,7 +340,7 @@ index 493c154146d0c2a2ce686eccbd2f366e8673c464..352901252f26457f9393a77067731366
  }
  
 diff --git a/crates/hyper-raft/src/tests.rs b/crates/hyper-raft/src/tests.rs
-index ff63b51f43a87ddab6f170c43a07ecb66b6ce5cb..bf96664520cd8700b90435544abe1527414577d5 100644
+index ff63b51f43a87ddab6f170c43a07ecb66b6ce5cb..4d066bf5462b7272414ae6687b84132dd0816f04 100644
 --- a/crates/hyper-raft/src/tests.rs
 +++ b/crates/hyper-raft/src/tests.rs
 @@ -47,6 +47,7 @@ fn drain(node: &mut RawNode<Memory>) -> Vec<Message> {
@@ -425,6 +425,15 @@ index ff63b51f43a87ddab6f170c43a07ecb66b6ce5cb..bf96664520cd8700b90435544abe1527
      assert_eq!(node.store().hard_state.commit, 2);
      assert!(!node.has_ready());
      // The owner writes the commit and says so.
+@@ -1638,7 +1646,7 @@ fn an_answer_a_notice_releases_states_the_durable_commit() {
+     node.step(beat).unwrap();
+     let mut ready = node.ready().unwrap();
+     assert!(ready.hard_state().is_none());
+-    assert_eq!(beat_answers(&ready.take_persisted_messages()), vec![3]);
++    assert_eq!(beat_answers(&ready.take_held_messages()), vec![3]);
+ }
+ 
+ /// R-6's apply pause (etcd's `applyingEntsPaused`): while the owner holds
 @@ -1661,7 +1669,7 @@ fn an_owner_that_pauses_apply_is_given_nothing_more() {
      node.step(beat).unwrap();
      let mut ready = node.ready().unwrap();
