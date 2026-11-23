@@ -100,3 +100,23 @@ the node list) and the lines the ReadIndex's fields share. The fix to try next: 
 `Arc<PageBits>`/`Arc<Latest>` and checks them against `generation` (one plain load) instead of an
 `ArcSwap::load` per lookup, then this bench again at 1-32 threads. Default left at `locked`: the
 graduation is Ada's decision (below), and the suite shows no end-to-end gain while its log is empty.
+
+## AUDIT 2.1, decision 40 revised (Ada): the default way reads the header lock-free (ae729b06, perf/pagepath only)
+
+Quick A/B (script `.git/perf-ab5.sh`, records `ab5-0229.jsonl`, load 59-90): ae729b06's bench binary
+against bench-after2 (a02e4b20: header under its lock). CONFOUNDED: the after binary also carries
+main's merges since (planner `learned_costs.rs`, vdbe). Median [reps]:
+
+| op | clients | header locked (a02e4b20) | header lock-free (ae729b06) |
+|---|---|---|---|
+| point_pk | 1 | 294,357 [294,357 327,192 254,550] | 331,801 [328,539 331,801 333,732] |
+| point_pk | 32 | 1,007,478 [1,040,832 912,363 1,007,478] | 948,410 [1,020,096 891,522 948,410] |
+| point_pk | 128 | 799,975 [908,250 762,278 799,975] | 843,650 [863,913 794,409 843,650] |
+| point_secondary | 1 | 265,780 [278,549 265,780 220,180] | 260,021 [260,021 215,147 272,757] |
+| point_secondary | 32 | 787,423 [810,096 752,693 787,423] | 682,090 [391,727 706,333 682,090] |
+| point_secondary | 128 | 578,757 [578,757 583,735 464,105] | 337,271 [380,134 307,379 337,271] |
+
+Reading: point_secondary at 128 clients falls 42%, outside the noise (after's best is below base's
+worst); A/B 3 above, one binary, also had every lock-free-header way under `locked` there (397-493k vs
+557k). Not landed on main until a same-tree A/B (`.git/perf-ab4.sh`, base = HEAD^ built beside HEAD)
+says whether the header or main's merge does it.
