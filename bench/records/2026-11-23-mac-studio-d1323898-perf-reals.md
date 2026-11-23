@@ -415,7 +415,8 @@ nothing about the engine.
 
 - **The module suites after the fix did not finish in this lane.** r1639 ran `vdbe::morsel` and
   `translate::parallel` for 17 min without ending and was stopped so clippy could run. Rule 5b puts
-  them after the merge: the successor's first run.
+  them after the merge. r1665 (Mac Studio 2, from 22:43Z, on main 55513d95) runs them and prints
+  each test as it ends, so a slow or stuck one shows by name: read it with kiln's `output`.
 - **No timings.** Parallel mode adds one Noop per row to each worker's body run (a fence `keep` is
   placed after). Its cost is not measured.
 - **Done: the lost-row bug is fixed** (9a83c1eb). R2's test and the new constant-columns test pass.
