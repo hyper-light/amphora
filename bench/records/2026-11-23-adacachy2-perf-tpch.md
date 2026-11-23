@@ -351,3 +351,163 @@ the premises a versioned snapshot rests on:
   Its record is `~/.cache/amphora-perf/tpch-t5/out/sweep-sf1.jsonl` on adacachy2, its answers
   `tpch-t5/ans/sweep`, and r898's output ends with the `answers.py` verdict. The table, losses
   first, is the successor's first item.
+
+# Lane T6 (tpch), 2026-11-23 15:14Z to 16:14Z: q05's SF1 plan priced as it runs; the 22-query table
+
+Machine: adacachy2 (runner 00aad8da). Builds and tests asked `needs linux/amd64,cpus=8,mem=24g`,
+the timed A/B `cpus=12,mem=24g`, every run named onto adacachy2 (`on`).
+
+## 1. q05's cost trace at SF1, and the fix (579d22e4)
+
+Every B timed run at SF1 in T5's r898 planned one bushy pair: the run {supplier, nation}, built
+for region's hash join, under the outer loops {customer, orders, lineitem} (customer and orders
+materialized for lineitem's hash join). The planner's estimates are that plan's EXPLAIN FORMAT=JSON
+(`tpch-t5/out/q05-sf1-b122f970-r1.jsonl`). The actual rows are counted by SQL on the bench's SF1
+SQLite database (`tpch-t5/db-sf1-B/sqlite/bench.db`, r971), one count per step of the plan as the
+emitter runs it:
+
+| step | estimated rows | actual rows |
+|---|---|---|
+| orders' build input (customer x orders in 1994) | 191,894 | 227,597 |
+| lineitem's probe of it (the outer rows) | 767,733 | 910,519 |
+| the run {supplier, nation} | 10,000 | 10,000 |
+| region (`r_name = 'ASIA'`) | 1 | 1 |
+| region's match: the rows its hash join visits | 6,141 | 1,823,769,557 (910,519 x 2,003 suppliers in ASIA) |
+| after `l_suppkey = s_suppkey` | | 182,183 |
+| after `c_nationkey = s_nationkey` (the join's rows) | 6,141 | 7,243 |
+
+T5's guess holds, and the gap is wider than the nation match. The bushy pair's cost
+(`optimizer/join.rs`) priced the probe's visits at the whole join's rows, as if
+`l_suppkey = s_suppkey` and `c_nationkey = s_nationkey` cut the match. The emitter runs both
+after it, at region's loop: no input's prefix holds either term
+(`prune_join_order_for_materialized_inputs`), and region's hash join is keyed by
+`n_regionkey = r_regionkey` alone. So the match visits each outer row times the run's rows in
+ASIA, 297,000x the estimate. At 10 to 20 ns a visit (a guess, not measured) that is 18 to 36 s,
+which would fit every SF1 timed run passing 10 s.
+
+The fix prices the match where the emitter places the terms (579d22e4, b876567c). Where a WHERE
+term reads both the run and the outer loops, the match visits rows(outer + probe) x
+rows(run + probe) / rows(probe), never fewer than the join's rows, so those terms count only
+after the match. A pair with no such term keeps the join's rows as its visits, as before. For
+this plan that is 767,733 x 2,000 / 1 = 1.54e9 estimated visits, against 1.82e9 counted.
+
+Test: `t6_q05_terms_from_a_run_to_the_outer_loops_are_priced_after_its_match` (optimizer/mod.rs).
+It runs q05's shape at small scale by cost (6 tables, 60,000 lines, 500 suppliers in ASIA). It
+asserts the nested loops' answer, and fewer VM steps than the late match alone visits (the outer
+rows times the run's rows in ASIA). That is a count of work, not a time.
+
+Checks: r1042 at b876567c on adacachy2 (load 62 to 71):
+- clippy (`cargo clippy -p amphora-engine --all-targets --locked -- -D warnings`): clean.
+- `cargo test -p amphora-engine --lib -- t6_q05 pl_8 hash_join materializ bushy t_qt_5`: 68 passed,
+  1 failed. The failure is `t_pl_8_13_a_left_join_inside_a_bushy_run_keeps_its_null_rows`, "not
+  planned bushy" at its 7th query, which fails the same way on main (T4's r668 and r754).
+- `--test nested_loops`: 7 of 7. At 579d22e4 (r994), `a_materialized_chain_leaves_its_prefix_out_of_the_main_plan`
+  failed once ("MATERIALIZE" missing from a 3-table plan). The change cannot reach it: a bushy pair
+  needs a run of 2 tables or more plus a probe and an outer table, so 3 tables make no pair. It
+  passed at b876567c and on main with the test (a9ca008d).
+- r1084 at 1a7ccc1b (the fix merged with main c82891fd): clippy clean; the same suites 68 passed,
+  1 failed (t_pl_8_13, main's); `--test nested_loops` 7 of 7. Merged to main as 70a12ac3 (main
+  had moved by one record file only).
+- The new test is not a regression guard. On main with the test alone (a9ca008d, r1042) it
+  passes too: at this scale the old cost does not choose the late match. It holds the work bound
+  for whatever plan is chosen, nothing more.
+
+## 2. q05 before and after, against SQLite and DuckDB
+
+r1006, `~/.cache/amphora-perf/tpch-t6/ab.sh` on adacachy2 (needs `cpus=12,mem=24g`). Arms:
+A = main 952f5766, B = 579d22e4 (the fix; b876567c changes only plans with no late term, so q05's
+pair is priced the same). Both are release builds of `amphora-bench --planner` in the lane's one
+target dir. Data: T5's loaded SF0.1 and SF1 directories, reflink-copied per arm. Calibration per
+RULES 5e: each arm opened once, then B's body was written under A's key (both hash to sha256
+e611e52b204e77f7). 5 rounds alternated, each a process: the counted warm-up, then 3 timed runs
+(10 s timeout; the bench ends a process at its first timeout). SQLite and DuckDB ran 5 times
+each, right after. Every finished run's answer went to `answers.py`: 0 differ at SF0.1 and SF1.
+The load average was 41 to 51 at SF0.1 and 52 to 106 at SF1, with CPU pressure (avg10) 45% to 65%
+at SF1. That is a loaded machine, and every engine's SF1 times here are above T5's.
+
+SF1, ms:
+
+| arm | processes that finished | timed runs | median | range | plan of the runs |
+|---|---|---|---|---|---|
+| A (main) | 0 of 5 | 5 timed out | over 10,000 | | 5 of 5 the late-match bushy pair |
+| B (fix) | 4 of 5 | 12 done, 1 timed out | 3,439 (13 runs, the timeout counted as over 10 s) | 1,129 to 5,438, and one over 10 s | 8 seek chains (6 `SCAN orders / SEARCH customer / SEARCH lineitem / SEARCH supplier ... (s_nationkey=?) / SCAN region / HASH JOIN nation`, 2 with customer by hash join), 4 hash-then-seek (`HASH JOIN lineitem / SEARCH supplier ... (s_nationkey=?)`), 1 late-match pair |
+| SQLite | | 5 | 3,708 | 2,596 to 4,811 | |
+| DuckDB | | 5 | 189 | 180 to 235 | |
+
+- B's plans apply the nation match early in 12 of 13 runs: supplier is read by
+  `supplier_nationkey` keyed on the customer's nation. That is October's keyed-seek chain, with
+  the region and nation hash join last.
+- Not October's 636 to 661 ms. B's best run was 1,129 ms, its median 3.4 s, about SQLite's
+  3.7 s measured beside it under the same load, and 18x DuckDB's.
+- One B process (round 3) still chose the late-match pair and timed out. Its plan JSON prices
+  region's step at 620,439 (A's same plan: 199,821), so the fix took effect, and the plan cost
+  1,209,924 in all. In round 2 the seek chain the planner took cost 595,717. Round 3's counted
+  run took 6,930 ms, the slowest of B's. After it, the learned weights put every other plan above
+  1.21M. A visit is priced at cpu_cost_per_row, about 0.00027 here (420,618 / 1.54e9). At that
+  rate 1.82e9 visits rank only 2x above a chain that runs 10x faster or more. The visit runs two
+  filters on the payload's columns, and the model charges them nothing (`ready_where_work` counts
+  only terms with extra steps). The next lane's first item: price a late term's steps per visited
+  row, then measure again.
+
+SF0.1, ms:
+
+| arm | timed runs | median | range |
+|---|---|---|---|
+| A (main) | 15 done | 452 | 215 to 1,461 |
+| B (fix) | 15 done | 390 | 220 to 3,513 |
+| SQLite | 5 | 169 | 121 to 180 |
+| DuckDB | 5 | 296 | 240 to 378 |
+
+- No measurable difference at SF0.1: the ranges overlap almost entirely, and both arms change
+  plan from run to run (2 to 3 distinct plans per process in both). Both are behind SQLite
+  (2.3x to 2.7x at the median).
+
+## 3. Versioned learned costs: not started this hour
+
+What the successor needs, from reading the code at 579d22e4:
+- The pin (`Connection::pin_cost_weights`, simulator feature) takes 3 of the 8 weights, and
+  `translate/mod.rs` fills the other 5 from the live `weights_at(page_miss)` at every prepare.
+  It has four callers: `statement.rs` (order flips), `optimizer/mod.rs`
+  (`t_pl_8_2_the_bushy_plan_is_cheapest_at_every_corner_of_the_weights`), and
+  `tests/adaptive_joins.rs` twice (lines 66, 455). That last one is an integration test, so a pin
+  of all 8 needs a public weight type behind the simulator feature: `LearnedWeights` is
+  `pub(crate)`.
+- T5's experiment (the whole set pinned at t_pl_8_13's start, 6 runs) needs that pin first.
+
+## 4. The 22 queries at SF1 (T5's r898 sweep), losses first
+
+All 22 at SF1, one process: each engine's counted warm-up, then 3 timed runs per query.
+Medians in ms. "against the faster" is Amphora against the faster of SQLite and DuckDB. The load
+average was 38 to 99 on 32 cores during Amphora's runs (per run in `sweep-sf1.jsonl`). It is one
+process per engine with no alternation, so read a ratio under 2x as noise. answers.py: 22 queries
+compared, 0 differ. Amphora's answers match SQLite's and DuckDB's on every query.
+
+| query | Amphora ms (median, range) | SQLite ms | DuckDB ms | Amphora against SQLite | against DuckDB | against the faster | answers |
+|---|---|---|---|---|---|---|---|
+| q19 | 577 (575 to 3,426) | 33.6 | 106 | 17.2x slower | 5.5x slower | 17.2x slower | same |
+| q03 | 2,330 (1,494 to 3,078) | 681 | 149 | 3.4x slower | 15.6x slower | 15.6x slower | same |
+| q06 | 652 (521 to 884) | 314 | 57.3 | 2.1x slower | 11.4x slower | 11.4x slower | same |
+| q01 | 3,578 (2,959 to 3,770) | 5,431 | 332 | 1.5x faster | 10.8x slower | 10.8x slower | same |
+| q14 | 683 (628 to 2,258) | 7,453 | 75.7 | 10.9x faster | 9.0x slower | 9.0x slower | same |
+| q09 | 2,116 (1,244 to 2,311) | 1,402 | 268 | 1.5x slower | 7.9x slower | 7.9x slower | same |
+| q05 | 1,589 (1,191 to 1,976) | 2,579 | 227 | 1.6x faster | 7.0x slower | 7.0x slower | same |
+| q22 | 288 (284 to 328) | 43.9 | 125 | 6.6x slower | 2.3x slower | 6.6x slower | same |
+| q07 | 2,035 (1,146 to 3,156) | 9,771 | 363 | 4.8x faster | 5.6x slower | 5.6x slower | same |
+| q21 | 1,004 (869 to 1,107) | 428 | 186 | 2.3x slower | 5.4x slower | 5.4x slower | same |
+| q12 | 669 (608 to 705) | 769 | 130 | 1.1x faster | 5.2x slower | 5.2x slower | same |
+| q10 | 807 (647 to 831) | 1,215 | 159 | 1.5x faster | 5.1x slower | 5.1x slower | same |
+| q20 | 277 (277 to 715) | 71.7 | 176 | 3.9x slower | 1.6x slower | 3.9x slower | same |
+| q18 | 3,121 (2,410 to 3,223) | 839 | 58,626 | 3.7x slower | 18.8x faster | 3.7x slower | same |
+| q04 | 255 (250 to 325) | 154 | 74.3 | 1.7x slower | 3.4x slower | 3.4x slower | same |
+| q11 | 94.1 (73.8 to 110) | 35.6 | 104 | 2.6x slower | 1.1x faster | 2.6x slower | same |
+| q15 | 1,893 (1,839 to 2,294) | 7,974 | 788 | 4.2x faster | 2.4x slower | 2.4x slower | same |
+| q13 | 2,014 (1,913 to 2,058) | 1,219 | 900 | 1.7x slower | 2.2x slower | 2.2x slower | same |
+| q17 | 149 (142 to 153) | 85.7 | 100 | 1.7x slower | 1.5x slower | 1.7x slower | same |
+| q16 | 163 (154 to 248) | 95.8 | 482 | 1.7x slower | 3.0x faster | 1.7x slower | same |
+| q08 | 166 (164 to 206) | 12,066 | 250 | 72.7x faster | 1.5x faster | 1.5x faster | same |
+| q02 | 25.7 (23.6 to 34.4) | 136 | 47.4 | 5.3x faster | 1.8x faster | 1.8x faster | same |
+
+- Against the bar (10x faster than both): 0 of 22. Faster than both: 2 of 22 (q08, q02).
+- q05 here ran 1,589 ms (1,191 to 1,976) with another plan, while every SF1 timed run in T5's
+  q05-only A/B passed 10 s. In one process after 4 other queries, the learned weights stood
+  elsewhere and q05 planned differently. That is section 3's instability in the sweep itself.

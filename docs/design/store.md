@@ -2214,12 +2214,29 @@ Amphora is not even released. This is not a concern.").** The two segments repla
 upgrade step, no reading of a one-segment format and no switch between the two, and the one-segment restart is deleted.
 Each segment's header is the log header the engine writes today (format, page size, checkpoint sequence, salts,
 checksums), so a log whose `-wal2` is absent, or holds no valid header, is one of the two-segment log's own states (one
-segment `Current`, the other `Free`), read by the same recovery. Bytes 18 and 19 of the database header carry the
-two-segment value, 3, the one SQLite's wal2 writes, from a file's first write: SQLite without wal2 then refuses the
-file ("Attempting to use any other version of SQLite results in an SQLITE_NOTADB error") instead of reading `-wal`
-without `-wal2`'s commits. Where the open rewrites a rollback file's 1 to 2 today (`crates/engine/database.rs`,
-2272-2287), it writes 3, for a 1 and for a 2 alike: a file SQLite wrote in WAL mode is the one-segment state above,
-and the rewrite changes no log. Any other value stays `Corrupt("Invalid read_version: …")` at open (2184-2190).
+segment `Current`, the other `Free`), read by the same recovery.
+
+**What plain SQLite sees (the coordinator, 2026-11-23, on lane B6's question).** Three rules.
+- *Amphora opens the WAL-mode files SQLite writes.* Such a file is the one-segment state above, read at no cost.
+- *Plain SQLite refuses an open Amphora database, and one a crash left.* Bytes 18 and 19 of the database header carry
+  3, the value SQLite's wal2 writes. SQLite refuses a read version above 2 ("If the read version is greater than 2,
+  then that database cannot be read or written", sqlite.org/fileformat2.html, file format version numbers; wal2.md:
+  "Attempting to use any other version of SQLite results in an SQLITE_NOTADB error"), so it never reads `-wal`
+  without `-wal2`'s commits. The open writes 3 where it rewrites a rollback file's 1 to 2 today
+  (`crates/engine/database.rs`, 2272-2287), for a 1 and a 2 alike, in the database's first commit, before any other
+  frame. The header in memory then carries 3, so every later frame of page 1 does too. SQLite reads page 1 through
+  `-wal` whenever that file exists, so the mark must be in the log's frames of page 1 as well as in the file, and from
+  that first commit on it is in both. Any other value stays `Corrupt("Invalid read_version: …")` at open (2184-2190).
+- *A cleanly closed Amphora database is a plain SQLite file.* The last connection's close (`Connection::close`,
+  `Pager::checkpoint_shutdown`) folds both segments into the file. It copies the closing segment, then the current
+  one, syncs the file, and truncates both segments to nothing. Only then does it write 2 into bytes 18 and 19 of the
+  file's first page, in place and not through the log, and sync the file again. sqlite3 and other tools then read a
+  WAL-mode file with an empty log. The order is the rule. A 2 written while either segment still holds frames lets
+  SQLite read `-wal` alone: it misses `-wal2`'s commits, or reads the closing segment's older frames over the newer
+  pages in the file. A 2 written through the log is such a frame. A crash at any step of the close before the 2's
+  sync leaves 3: SQLite refuses the file, and Amphora recovers it as it recovers any crash. A close that cannot fold
+  (the shutdown checkpoint gives up after three `Busy` answers, as it does today) also leaves 3: that database was not
+  closed cleanly, and SQLite refuses it.
 
 **Crash recovery across a switch.** Recovery reads both segments' headers. A segment whose header checksum fails is
 empty. Of two valid segments, the one whose checkpoint sequence is one past the other's is current and the other
@@ -2274,8 +2291,12 @@ prevents today: sqlite.org/wal.html, "Avoiding Excessively Large WAL Files". Dec
 - `d45_the_closing_segment_is_reset_when_its_last_read_leaves`: copied whole and held by one read, the closing segment
   is not reset. The read gives back, and it is reset with no other event between.
 - `d45_a_crash_at_each_step_of_a_switch_loses_no_commit`: `tests/crash.rs`'s power cut at each I/O of a switch, a
-  reset and the upgrade (steps 1-5). After reopening, every acknowledged batch is present, nothing refused is found,
-  and nothing is torn.
+  reset and a clean close (steps 1-4, and each step of the close). After reopening, every acknowledged batch is
+  present, nothing refused is found, and nothing is torn.
+- `d45_sqlite3_reads_a_cleanly_closed_database_and_refuses_an_open_one`: SQLite itself, not Amphora's reader, opens
+  a copy of an open database's files with commits in both segments (the files a crash leaves) and is refused; after a
+  clean close it opens the file and reads every committed row. The engine's workspace has no SQLite today: the bench
+  workspace's `rusqlite` (bundled) is one source of it.
 - `d45_the_log_stays_bounded_while_reads_overlap`: reads handed one to the next, so one is always under way, each
   held across at most k of the writer's batches (counted, not timed), through many switches. No segment ever holds
   more than its bound plus k batches' frames plus one copy, and the writer never finds the other segment not `Free`
@@ -2287,5 +2308,6 @@ again each time it ends. Commit p50, p99 and p99.9; read p50, p99 and p99.9; the
 or restarts counted. 5 alternated rounds, cpus=16, load and pressure recorded beside each run.
 
 **Falsified by.** A write that waits for a read (the first test failing, or the A/B's commit p99.9 still at the
-deadline); a closing segment never reset while reads come and go (the log growing without bound in the A/B); an
+deadline); SQLite reading an open or crashed Amphora database, or refusing a cleanly closed one; a closing segment
+never reset while reads come and go (the log growing without bound in the A/B); an
 acknowledged commit lost, or a database refused, after a crash in a switch.
