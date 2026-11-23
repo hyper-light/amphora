@@ -810,7 +810,7 @@ pub fn main() -> anyhow::Result<()> {
 /// Amphora's three members in this process (`cluster.rs`'s relay), a kill a cut from the relay.
 mod inproc {
     use super::*;
-    use amphora::database::Database;
+    use amphora::database::{AnswerMax, Database};
     use amphora_api::replication::{Durability, Fates, ReplicaConfig};
 
     pub struct Amphora {
@@ -955,7 +955,7 @@ mod inproc {
             );
             let stmts = stmts.to_vec();
             self.member(via)?
-                .call(until, move |c| {
+                .call(until, AnswerMax::fixed(), move |c| {
                     for (sql, args) in stmts {
                         if args.is_empty() {
                             c.execute_batch(&sql)?;
@@ -1359,7 +1359,7 @@ mod http {
 ///        (--peers: every member's address, as its peers reach it, this one's the Nth: it listens there)
 mod procs {
     use super::*;
-    use amphora::database::Database;
+    use amphora::database::{AnswerMax, Database};
     use amphora_api::replication::{Durability, Fates, ReplicaConfig};
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -1520,7 +1520,7 @@ mod procs {
                     anyhow::ensure!(!self.cut.load(Ordering::Relaxed), "this member is cut");
                     let stmts = stmts_of(r.get("stmts"))?;
                     self.db
-                        .call(until, move |c| {
+                        .call(until, AnswerMax::fixed(), move |c| {
                             for (sql, args) in stmts {
                                 if args.is_empty() {
                                     c.execute_batch(&sql)?;

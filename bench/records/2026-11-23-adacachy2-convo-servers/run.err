@@ -1,0 +1,194 @@
+info: syncing channel updates for 1.99.1-x86_64-unknown-linux-gnu
+info: latest update on 2026-10-15 for version 1.99.1 (58cf8f9c3 2026-10-13)
+info: downloading 7 components
+warn: the missing active toolchain `1.99.1-x86_64-unknown-linux-gnu` has been auto-installed
+warn: this might cause rustup commands to take longer time to finish than expected
+info: you may opt out with `RUSTUP_AUTO_INSTALL=0` or `rustup set auto-install disable`
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+DEPRECATED: The legacy builder is deprecated and will be removed in a future release.
+            Install the buildx component to build images with BuildKit:
+            https://docs.docker.com/go/buildx/
+
+Error: the store holds its most rows (1)
+info: syncing channel updates for 1.99.1-x86_64-unknown-linux-gnu
+info: latest update on 2026-10-15 for version 1.99.1 (58cf8f9c3 2026-10-13)
+info: downloading 7 components
+warn: the missing active toolchain `1.99.1-x86_64-unknown-linux-gnu` has been auto-installed
+warn: this might cause rustup commands to take longer time to finish than expected
+info: you may opt out with `RUSTUP_AUTO_INSTALL=0` or `rustup set auto-install disable`
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+DEPRECATED: The legacy builder is deprecated and will be removed in a future release.
+            Install the buildx component to build images with BuildKit:
+            https://docs.docker.com/go/buildx/
+
+Error: the store holds its most rows (1)
+info: syncing channel updates for 1.99.1-x86_64-unknown-linux-gnu
+info: latest update on 2026-10-15 for version 1.99.1 (58cf8f9c3 2026-10-13)
+info: downloading 7 components
+warn: the missing active toolchain `1.99.1-x86_64-unknown-linux-gnu` has been auto-installed
+warn: this might cause rustup commands to take longer time to finish than expected
+info: you may opt out with `RUSTUP_AUTO_INSTALL=0` or `rustup set auto-install disable`
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+DEPRECATED: The legacy builder is deprecated and will be removed in a future release.
+            Install the buildx component to build images with BuildKit:
+            https://docs.docker.com/go/buildx/
+
+Error: the store holds its most rows (1)
+info: syncing channel updates for 1.99.1-x86_64-unknown-linux-gnu
+info: latest update on 2026-10-15 for version 1.99.1 (58cf8f9c3 2026-10-13)
+info: downloading 7 components
+warn: the missing active toolchain `1.99.1-x86_64-unknown-linux-gnu` has been auto-installed
+warn: this might cause rustup commands to take longer time to finish than expected
+info: you may opt out with `RUSTUP_AUTO_INSTALL=0` or `rustup set auto-install disable`
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+DEPRECATED: The legacy builder is deprecated and will be removed in a future release.
+            Install the buildx component to build images with BuildKit:
+            https://docs.docker.com/go/buildx/
+
+Error: the store holds its most rows (1)
+amphora-bench-cedardb didn't come up; its log ends:
+2026-11-23 16:29:05.912989054 UTC	INFO:    Running under cgroup memory limit: 8192 MB (host has 125871 MB)
+2026-11-23 16:29:05.913018108 UTC	INFO:    Using 3712 MB buffers, 3712 MB work memory
+2026-11-23 16:29:05.924474667 UTC	INFO:    Using 4096 MB swap space
+2026-11-23 16:29:06.132313876 UTC	WARNING: Could not determine storage write cache behavior. Write durability might be delayed. See: https://cedardb.com/docs/references/writecache
+2026-11-23 16:29:06.133172501 UTC	INFO:    You're running CEDARDB COMMUNITY EDITION - using 0 GB out of 64 GB. Our General Terms and Conditions apply to the use of the CedarDB Community Edition. Run "cedardb --license" for more information.
+2026-11-23 16:29:06.133217064 UTC	LOG:     bind: Address already in use
+2026-11-23 16:29:06.133219689 UTC	ERROR:   unable to create inet socket endpoint
+Please check file paths and permissions.
+2026-11-23 16:29:06.266293624 UTC	LOG:     Checkpointer: Removing log segment file "28", as it is outside of the active segment range (29,28)
+2026-11-23 16:29:06.591730549 UTC	WARNING: Your CedarDB version (v2026-10-08) is out of date!
+Please upgrade to the newest version (v2026-11-18) at https://cedardb.com/docs/releases
+
+
+info: syncing channel updates for 1.99.1-x86_64-unknown-linux-gnu
+info: latest update on 2026-10-15 for version 1.99.1 (58cf8f9c3 2026-10-13)
+info: downloading 7 components
+warn: the missing active toolchain `1.99.1-x86_64-unknown-linux-gnu` has been auto-installed
+warn: this might cause rustup commands to take longer time to finish than expected
+info: you may opt out with `RUSTUP_AUTO_INSTALL=0` or `rustup set auto-install disable`
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+DEPRECATED: The legacy builder is deprecated and will be removed in a future release.
+            Install the buildx component to build images with BuildKit:
+            https://docs.docker.com/go/buildx/
+
+Error: the store holds its most rows (1)

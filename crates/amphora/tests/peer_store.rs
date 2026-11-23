@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use amphora::backup::{self, Archive, SECOND_NS};
-use amphora::database::Database;
+use amphora::database::{AnswerMax, Database};
 use amphora::db::Db;
 use amphora::transport::{PeerBlobs, PeerStore};
 use amphora_api::blobs::{Blobs, conformance};
@@ -111,7 +111,7 @@ fn t_t1_12_n1_a_peer_store_in_another_process() {
     let (database, shipping) =
         Database::open_backed_up(&source.path().join("source.db"), archive, until()).unwrap();
     database
-        .call(until(), |c| {
+        .call(until(), AnswerMax::fixed(), |c| {
             c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
             Ok(())
         })
@@ -126,7 +126,7 @@ fn t_t1_12_n1_a_peer_store_in_another_process() {
         );
         let written = v.clone();
         database
-            .call(until(), move |c| {
+            .call(until(), AnswerMax::fixed(), move |c| {
                 c.execute(
                     "INSERT INTO t (id, v) VALUES (?1, ?2)",
                     vec![
