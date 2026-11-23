@@ -248,3 +248,60 @@ fn g10_real_text_corpus() {
     }
     std::fs::write(path, out).unwrap();
 }
+
+/// Lane G11: SQLITE_DBCONFIG_FP_DIGITS (c3ref/c_dbconfig_defensive.html), read by the `bench`
+/// feature's public `numeric`.
+#[cfg(feature = "bench")]
+mod fp_digits {
+    use amphora_engine::numeric::fp::{real_to_text_digits, FpDigits};
+
+    fn at(n: i32) -> FpDigits {
+        FpDigits::new(n).unwrap()
+    }
+
+    /// "The default value 17, as of SQLite version 3.52.0."
+    #[test]
+    fn g11_fp_digits_default_is_17_and_takes_the_pages_steps() {
+        assert_eq!(FpDigits::DEFAULT.get(), 17);
+        assert_eq!(real_to_text_digits(0.1 + 0.2, FpDigits::DEFAULT), "0.30000000000000004");
+        assert_eq!(real_to_text_digits(47.49, FpDigits::DEFAULT), "47.49");
+    }
+
+    /// "The first argument is a small integer, between 3 and 23, or zero. The FP_DIGITS setting is
+    /// changed to that small integer, or left unaltered if the first argument is zero or out of
+    /// range." SQLite 3.54.0 refuses 3 (`nIn>3`); the page takes it.
+    #[test]
+    fn g11_fp_digits_takes_3_to_23_and_leaves_zero_or_out_of_range_unaltered() {
+        for n in 3..=23 {
+            assert_eq!(FpDigits::new(n).map(FpDigits::get), u8::try_from(n).ok());
+        }
+        for n in [0, 1, 2, 24, 255, 256, -1, i32::MIN, i32::MAX] {
+            assert_eq!(FpDigits::new(n), None, "{n}");
+        }
+    }
+
+    /// floatingpoint.html 1.3.1: "In C-code, one can choose option (A) by running code like this:
+    /// sqlite3_db_config(db, SQLITE_DBCONFIG_FP_DIGITS, 15, 0);" and "If you do not want the
+    /// (negligible) overhead of step (b) and (c), just set SQLITE_DBCONFIG_FP_DIGITS to 15."
+    #[test]
+    fn g11_fp_digits_15_rounds_to_15_always() {
+        let product = 6_481_130_223_748_880.0 * 2f64.powi(-51);
+        assert_eq!(real_to_text_digits(product, FpDigits::DEFAULT), "2.8781999999999997");
+        assert_eq!(real_to_text_digits(product, at(15)), "2.8782");
+        assert_eq!(real_to_text_digits(0.1 + 0.2, at(15)), "0.3");
+        assert_eq!(real_to_text_digits(1e16, at(15)), "1.0e+16");
+        assert_eq!(real_to_text_digits(1e16, FpDigits::DEFAULT), "10000000000000000.0");
+        assert_eq!(real_to_text_digits(-0.5, at(15)), "-0.5");
+    }
+
+    /// "a small integer that determines the number of significant digits that SQLite will attempt to
+    /// preserve when converting floating point numbers (IEEE 754 "doubles") into text."
+    #[test]
+    fn g11_fp_digits_keeps_that_many_significant_digits() {
+        assert_eq!(real_to_text_digits(1.0 / 3.0, at(3)), "0.333");
+        assert_eq!(real_to_text_digits(2.0 / 3.0, at(5)), "0.66667");
+        assert_eq!(real_to_text_digits(123_456.0, at(3)), "1.23e+05");
+        // sqlite3FpDecode carries 19 digits at most (its 64-bit product), so 20 asks more than it has
+        assert_eq!(real_to_text_digits(0.1, at(20)), "0.1000000000000000056");
+    }
+}
