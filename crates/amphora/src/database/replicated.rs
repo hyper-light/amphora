@@ -17978,7 +17978,7 @@ mod tests {
             Err(api::invalid("events row", "its id is negative").into())
         };
         let mut serialization = Vec::new();
-        let mut landed = 0;
+        let mut landed: i64 = 0;
         for round in 0..20 {
             let mut inflight: Vec<Option<(usize, Answering)>> = (0..3)
                 .map(|via| Some((via, submit(&clients[via], driven.until(), append(round * 3 + via)))))
@@ -17986,7 +17986,13 @@ mod tests {
             let mut bad = Some(submit(&clients[(leader + 1) % 3], driven.until(), malformed));
             let mut rounds = 0;
             while inflight.iter().any(Option::is_some) || bad.is_some() {
-                assert!(rounds < ROUNDS, "unanswered");
+                assert!(
+                    rounds < ROUNDS,
+                    "round {round}: appends unanswered {:?}, malformed unanswered {}, refused {}",
+                    inflight.iter().map(|w| w.as_ref().map(|(via, _)| *via)).collect::<Vec<_>>(),
+                    bad.is_some(),
+                    serialization.len()
+                );
                 for (at, slot) in inflight.iter_mut().enumerate() {
                     let Some((via, answer)) = slot.take() else {
                         continue;
@@ -18038,7 +18044,7 @@ mod tests {
                     Ok(ids)
                 })
                 .unwrap();
-            assert_eq!(ids, (0..i64::try_from(landed).unwrap()).collect::<Vec<_>>(), "owner {owner}");
+            assert_eq!(ids, (0..landed).collect::<Vec<_>>(), "owner {owner}");
         }
         driven.drain(&mut pump);
         pump.finish();
