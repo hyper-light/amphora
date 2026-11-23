@@ -18727,7 +18727,9 @@ mod tests {
             driven.round(&mut pump);
         }
         assert!(
-            answered.expect("the holder's write was never answered").is_err(),
+            answered
+                .expect("the holder's write was never answered")
+                .is_err(),
             "the holder's write"
         );
         let own = submit(&clients[0], driven.until(), |db| {
@@ -18738,8 +18740,16 @@ mod tests {
             db.exec("INSERT INTO t VALUES (2, 'member 2')")?;
             Ok(Vec::new())
         });
-        assert_eq!(driven.settle(&mut pump, &own), Ok(Vec::new()), "the leader's write");
-        assert_eq!(driven.settle(&mut pump, &other), Ok(Vec::new()), "member 2's write");
+        assert_eq!(
+            driven.settle(&mut pump, &own),
+            Ok(Vec::new()),
+            "the leader's write"
+        );
+        assert_eq!(
+            driven.settle(&mut pump, &other),
+            Ok(Vec::new()),
+            "member 2's write"
+        );
         assert!(began, "the holder's slot never began");
         assert!(!driven.owner(0).slots.holds());
         assert_eq!(driven.lapses, 0, "a slot ended by its length");
