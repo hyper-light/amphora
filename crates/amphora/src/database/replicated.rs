@@ -12639,7 +12639,7 @@ mod tests {
         let fourth = waiter(&voter[0], term);
         let gate = lone.owner(0).replica.machine().flush_gate();
         gate.fill();
-        let written = submit(&voter[0], Instant::now() + HANG_READ, |db| {
+        let written = submit(&voter[0], lone.until(), |db| {
             db.exec("CREATE TABLE IF NOT EXISTS member_items(value)")?;
             Ok(Vec::new())
         });
