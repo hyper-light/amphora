@@ -1164,7 +1164,9 @@ impl Database {
             let rows = sizer.rows();
             let stepping = Arc::clone(&plan);
             let began = Instant::now();
-            let stepped = database.call_db(until, move |db| step(db, &stepping, rows));
+            let stepped = database.call_db(until, AnswerMax::fixed(), move |db| {
+                step(db, &stepping, rows)
+            });
             let took = began.elapsed();
             match stepped {
                 Ok(Stepped::Already) => return Ok(change),
@@ -1188,7 +1190,7 @@ impl Database {
                 }
                 Err(Refusal::Invalid { what, why }) if what == BROKEN => {
                     let undoing = Arc::clone(&plan);
-                    database.call_db(until, move |db| abandon(db, &undoing))?;
+                    database.call_db(until, AnswerMax::fixed(), move |db| abandon(db, &undoing))?;
                     return Err(Refusal::Invalid { what, why });
                 }
                 Err(refusal) => return Err(refusal),
