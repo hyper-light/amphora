@@ -2690,7 +2690,7 @@ pub(crate) fn folded_default(default_expr: &ast::Expr, affinity: Affinity) -> Op
     // sqlite3ColumnDefault which calls sqlite3ValueFromExpr with
     // pCol->affinity. This ensures e.g. ALTER TABLE ADD COLUMN c TEXT
     // DEFAULT 0 returns text "0" rather than integer 0 for pre-existing rows.
-    if let Some(converted) = affinity.convert(&value) {
+    if let Some(converted) = affinity.convert(&value, crate::numeric::fp::FpDigits::DEFAULT) {
         value = match converted {
             either::Either::Left(ValueRef::Numeric(numeric)) => Value::from(numeric),
             either::Either::Left(_) => {

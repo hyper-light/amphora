@@ -1210,9 +1210,11 @@ fn find_select_plan_form(
     let available_indexes =
         AvailableIndexes::for_table_references(resolver, &plan.table_references)
             .with_primary_roots(&plan.table_references)?;
-    rewrite_or_terms(&mut plan.where_clause, &available_indexes, &|table, column| {
-        column_read_can_raise(&plan.table_references, resolver, table, column)
-    })?;
+    rewrite_or_terms(
+        &mut plan.where_clause,
+        &available_indexes,
+        &|table, column| column_read_can_raise(&plan.table_references, resolver, table, column),
+    )?;
     if let ConstantConditionEliminationResult::ImpossibleCondition = eliminate_constant_conditions(
         &mut plan.where_clause,
         plan.table_references.has_right_or_full_join(),
@@ -1496,9 +1498,11 @@ fn optimize_delete_plan(plan: &mut DeletePlan, resolver: &Resolver) -> Result<()
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause, resolver, &plan.table_references)?;
 
-    rewrite_or_terms(&mut plan.where_clause, &available_indexes, &|table, column| {
-        column_read_can_raise(&plan.table_references, resolver, table, column)
-    })?;
+    rewrite_or_terms(
+        &mut plan.where_clause,
+        &available_indexes,
+        &|table, column| column_read_can_raise(&plan.table_references, resolver, table, column),
+    )?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause, false)?
     {
@@ -1548,9 +1552,11 @@ fn optimize_update_plan(
     transform_match_to_fts_match(&mut plan.where_clause, resolver, &target_tables)?;
     let available_indexes = AvailableIndexes::for_table_references(resolver, &target_tables)
         .with_primary_roots(&target_tables)?;
-    rewrite_or_terms(&mut plan.where_clause, &available_indexes, &|table, column| {
-        column_read_can_raise(&target_tables, resolver, table, column)
-    })?;
+    rewrite_or_terms(
+        &mut plan.where_clause,
+        &available_indexes,
+        &|table, column| column_read_can_raise(&target_tables, resolver, table, column),
+    )?;
     if let ConstantConditionEliminationResult::ImpossibleCondition = eliminate_constant_conditions(
         &mut plan.where_clause,
         plan.from_tables.has_right_or_full_join(),
@@ -4566,7 +4572,12 @@ pub(crate) mod bushy_test_hook {
                 let rows = stmt.run_collect_rows().map_err(|e| e.to_string())?;
                 Ok(rows
                     .into_iter()
-                    .map(|row| row.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","))
+                    .map(|row| {
+                        row.iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
                     .collect())
             };
             let branches = "(p.id = l.pk AND p.name LIKE 'a%' ESCAPE 'xy' AND p.size < 5 \
@@ -4579,7 +4590,12 @@ pub(crate) mod bushy_test_hook {
             ));
             assert_eq!(unshared, Ok(vec!["0".to_string()]));
             let sql = format!("SELECT count(*) FROM l, p WHERE {branches}");
-            assert_eq!(outcome(&sql), unshared, "{:?}", outcome(&format!("EXPLAIN QUERY PLAN {sql}")));
+            assert_eq!(
+                outcome(&sql),
+                unshared,
+                "{:?}",
+                outcome(&format!("EXPLAIN QUERY PLAN {sql}"))
+            );
         }
 
         /// PL.8 (T-PL.8.13, lane pl8-19): the hand-built bushy tree `(a ((b l c) p))` whose run
@@ -5175,11 +5191,11 @@ pub(crate) mod bushy_search_tests {
                     for build in [learned.hash_build / 4.0, learned.hash_build * 4.0] {
                         conn.pin_cost_weights(Some(
                             crate::translate::optimizer::learned_costs::LearnedWeights {
-                            seek,
-                            hash_build: build,
-                            hash_probe: probe,
-                            ..learned
-                        },
+                                seek,
+                                hash_build: build,
+                                hash_probe: probe,
+                                ..learned
+                            },
                         ));
                         for sql in FACT_QUERIES {
                             BUSHY_PLANS.with(|plans| plans.set(0));
