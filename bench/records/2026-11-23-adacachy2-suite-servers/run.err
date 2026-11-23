@@ -1,0 +1,30 @@
+== postgres load=17.55 06:29:20
+== mysql load=46.13 06:33:40
+== clickhouse load=28.14 06:38:18
+== orioledb load=48.97 06:41:38
+== cedardb load=45.60 06:45:51
+records: /home/adalundhe/.cache/amphora-perf/bench-s/bench/records/2026-11-23-adacachy2-suite-servers/records.jsonl
+== cedardb load=38.00 06:50:07
+== orioledb load=29.76 06:54:17
+== clickhouse load=39.98 06:58:23
+== mysql load=53.25 07:01:36
+== postgres load=32.15 07:05:56
+records: /home/adalundhe/.cache/amphora-perf/bench-s/bench/records/2026-11-23-adacachy2-suite-servers/records.jsonl
+== postgres load=42.53 07:10:01
+== mysql load=46.65 07:14:05
+== clickhouse load=36.29 07:18:28
+== orioledb load=53.64 07:21:41
+== cedardb load=81.85 07:25:50
+records: /home/adalundhe/.cache/amphora-perf/bench-s/bench/records/2026-11-23-adacachy2-suite-servers/records.jsonl
+== cedardb load=46.34 07:30:03
+== orioledb load=47.64 07:34:13
+== clickhouse load=72.83 07:38:23
+== mysql load=48.82 07:41:38
+== postgres load=29.60 07:45:54
+records: /home/adalundhe/.cache/amphora-perf/bench-s/bench/records/2026-11-23-adacachy2-suite-servers/records.jsonl
+== postgres load=52.39 07:50:00
+== mysql load=51.13 07:54:06
+== clickhouse load=58.33 07:58:32
+== orioledb load=68.52 08:01:47
+== cedardb load=79.54 08:05:56
+records: /home/adalundhe/.cache/amphora-perf/bench-s/bench/records/2026-11-23-adacachy2-suite-servers/records.jsonl

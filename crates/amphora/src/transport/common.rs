@@ -1733,7 +1733,6 @@ mod tests {
     /// the first. Expect: the second answered; the gap from the end to its answer printed.
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "passes run alone (5 of 5 on adacachy2); failed once beside transport::common's suite, not yet explained (perf-I2)"]
     fn audit6_at_the_descriptor_limit_the_listener_waits_for_a_give_back() {
         const TEST: &str = "transport::common::tests::audit6_at_the_descriptor_limit_the_listener_waits_for_a_give_back";
         if std::env::var_os("AMPHORA_AUDIT6_EMFILE").is_none() {
@@ -1796,8 +1795,15 @@ mod tests {
         // The budget reads the lowered limit and counts what is open now, while it can.
         let budget = crate::descriptors::process().unwrap();
         drop(budget.take("a connection", 0).unwrap());
-        let _first = std::net::TcpStream::connect_timeout(&address, HANG).unwrap();
-        let mut second = std::net::TcpStream::connect_timeout(&address, HANG).unwrap();
+        // Both clients' sockets made before the first connects: Linux's accept reserves its
+        // descriptor before it waits for a connection, so a listener back in accept after taking
+        // the first would otherwise hold the last number and refuse the second's socket
+        // (EMFILE) whenever it ran ahead of this thread (perf-I3: the module-run failure).
+        let client = || socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        let (first, second) = (client(), client());
+        first.connect_timeout(&address.into(), HANG).unwrap();
+        second.connect_timeout(&address.into(), HANG).unwrap();
+        let (_first, mut second) = (std::net::TcpStream::from(first), std::net::TcpStream::from(second));
         second.set_read_timeout(Some(HANG)).unwrap();
         // The listener meets the limit: its accept refused while the first is held, it waits
         // for the budget's give-back.
