@@ -3098,7 +3098,37 @@ impl<F: BlockFile + 'static> Actor<F> {
                     }
                 }
             };
+            let p8_began = std::time::Instant::now();
+            let p8_before = (self.replica.term(), self.replica.leader());
+            let p8_kind = match input.as_ref().map(|envelope| &envelope.command) {
+                Some(Input::Receive { from, bytes, .. }) => format!("receive from {from} {} bytes", bytes.len()),
+                Some(Input::Submit { .. }) => "submit".to_string(),
+                Some(_) => "other".to_string(),
+                None => "none".to_string(),
+            };
             self.run_step(input)?;
+            self.p8_probe(p8_began, p8_before, &p8_kind);
+        }
+    }
+    fn p8_probe(&self, began: std::time::Instant, before: (u64, u64), kind: &str) {
+        static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let epoch = *EPOCH.get_or_init(std::time::Instant::now);
+        let took = began.elapsed();
+        let period = self.pace.period();
+        let after = (self.replica.term(), self.replica.leader());
+        let (bytes, messages, paused, bound) = match self.control.outgoing.lock() {
+            Ok(outgoing) => (outgoing.bytes, outgoing.messages.len(), outgoing.paused, format!("{:?}", outgoing.bound)),
+            Err(_) => (0, 0, false, String::new()),
+        };
+        let size = kind.split(' ').nth(3).and_then(|b| b.parse::<usize>().ok()).unwrap_or(0);
+        if after != before || took > period || paused || size > (1 << 16) || bytes > (1 << 16) {
+            let raft = self.replica.core().raft.config();
+            eprintln!(
+                "P8PROBE at {:?} id {} term,leader {:?}->{:?} took {:?} period {:?} election_tick {} heartbeat_tick {} last {:?} applied {} held {} out {} bytes {} msgs paused {} bound {} input {}",
+                epoch.elapsed(), self.replica.id(), before, after, took, period, raft.election_tick, raft.heartbeat_tick,
+                self.replica.core().raft.log().last_index().ok(), self.replica.applied().index, self.replica.apply_held(),
+                bytes, messages, paused, bound, kind
+            );
         }
     }
     /// The intake found its channel empty at `now`: unless inputs wait behind a pause, the
