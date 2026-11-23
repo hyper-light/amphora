@@ -4591,6 +4591,9 @@ impl<S: Storage> Raft<S> {
     fn answer_beat_now(&mut self, mut answer: Message) -> Result<()> {
         answer.from = self.id;
         answer.term = self.term;
+        // As `Raft::send` states it on every answer: marked through a promise of its term, the
+        // member asks its leader where its log ends (R-8).
+        answer.incarnation = self.held_asking();
         answer.commit = self.durable_commit.min(self.log.committed());
         if self.config.heartbeat_answers == HeartbeatAnswers::Position {
             let durable = self.log.persisted();
