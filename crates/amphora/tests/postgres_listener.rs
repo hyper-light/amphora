@@ -19,7 +19,6 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::rc::Rc;
-use std::sync::Arc;
 
 use amphora::memory::{Budget, Reading, Readings};
 use amphora::postgres::listener::{Listener, StoredRoles};
