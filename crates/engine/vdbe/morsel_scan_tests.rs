@@ -3776,3 +3776,48 @@ fn g8_exact_real_sums_hold_the_hard_cases() {
         assert_eq!(answer, format!("{expected:?}"), "{name}");
     }
 }
+
+/// Lane R2 (reals), the bounded check of R1's side finding (r1455): with the bench's ladder
+/// setting (parallel mode on, parallel LIMIT on, a core cap), `SELECT 1 FROM bench_loaded LIMIT 1`
+/// on a one-row table found no row or failed. Here in memory and on a file reopened by a fresh
+/// database, as the bench's next process opened it.
+#[test]
+fn r2_parallel_limit_finds_a_one_row_tables_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("r2.db").to_str().unwrap().to_string();
+    let file = |path: &str| {
+        let io = Arc::new(crate::io::PlatformIO::new().unwrap());
+        Database::open_file_with_flags(io, path, OpenFlags::default(), DatabaseOpts::new(), None, Arc::new(SqliteDialect))
+            .unwrap()
+            .connect(ConnectOpts::new())
+            .unwrap()
+    };
+    let fill = |conn: &Arc<Connection>| {
+        conn.execute("CREATE TABLE big (a INTEGER, b TEXT)").unwrap();
+        conn.execute("BEGIN").unwrap();
+        for i in 0..20000 {
+            conn.execute(format!("INSERT INTO big VALUES ({i}, 'row {i}')")).unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+        conn.execute("CREATE TABLE bench_loaded (done INTEGER)").unwrap();
+        conn.execute("INSERT INTO bench_loaded VALUES (1)").unwrap();
+    };
+    let memory = open(":memory:r2-limit");
+    fill(&memory);
+    fill(&file(&path));
+    let reopened = file(&path);
+    let mut wrong = Vec::new();
+    for (name, conn) in [("memory", &memory), ("file reopened", &reopened)] {
+        for cores in [1usize, 2, 4, 8, 16, 32] {
+            conn.set_parallel_mode(ParallelMode::On);
+            conn.set_parallel_limit(true);
+            conn.set_parallel_cores(NonZeroUsize::new(cores));
+            let got = conn.prepare("SELECT 1 FROM bench_loaded LIMIT 1").and_then(|mut s| s.run_collect_rows());
+            eprintln!("r2 {name} at {cores} cores: {got:?}");
+            if !matches!(&got, Ok(rows) if rows.len() == 1) {
+                wrong.push(format!("{name} at {cores} cores: {got:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:?}");
+}
