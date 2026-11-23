@@ -1034,3 +1034,74 @@ where no whole plan was logged (the counted run's and run 2's prepares).
    yet in docs/design/planner.md: write it there with the trace above as its evidence.
 2. A test: two plannings against one version choose one plan, with the alternatives' costs logged.
 3. r1568 again on the snapshot: five runs of q03, one plan.
+
+# Lane T13 (tpch), 2026-11-23 21:29Z to 22:23Z: plans read one version of their cost inputs; q03 kept one plan over five runs
+
+Losses first:
+- The inputs the plans read still moved within the five runs, three times, and the plan held on a
+  narrow gap. The page-miss share read 0.984, then 0.596 before its first epoch closed (the share so
+  far, as designed), then 0.298 standing. A row's visit in pages moved at run 1: a weight batch
+  passed its own test. At the end the plan led the next one by 0.55% (86,083 against 86,557). This
+  is one trace at one load, not a proof that the plan is robust.
+- The standing share lags a warm cache. Run 4's epoch read 0.0 and did not replace 0.298: after one
+  difference the measured spread was 0.298, and Student's t at 1 degree of freedom is far past the
+  gap. The warm cache is priced at 0.298 until enough warm epochs agree (the decision's Limits).
+- No A/B and no timing claim: the times below come from a trace at load 46 to 49.
+
+Machine: adacachy2 (runner 00aad8da), every run named onto it, `needs linux/amd64,cpus=8,mem=24g`,
+from the GitHub clone there (`tpch-remote`, worktree `~/.cache/tpch-ab/t13`), the lane's one target
+dir. Scripts: `~/.cache/tpch-t13/run.sh` (clippy, the touched tests, then the trace) and
+`~/.cache/tpch-t13/trace.sh` (T12's, with the epoch events printed).
+
+## 1. The change (9ac9687b, 6212b9e7, 603d1ca4; merged as f9385553)
+
+- `Batches` (`learned_costs.rs`) judges a standing value on one scale with what it judges, so a
+  share can use it. The weights pass their logarithms, as before.
+- `PageMissWindow::read` (`pager.rs`): when an epoch of fetches closes (as many as the cache holds
+  pages, at the next prepare past it), its share is judged against the standing share by
+  `Batches::judge`, the test the weights move by. `Pager::page_miss_ratio` returns the standing
+  share, or the share so far before the first epoch closes. A debug event on
+  `amphora::join_search` logs each closed epoch: its share, the standing one, whether it moved, and
+  the spread.
+- The decision, its noise figure and where that comes from: `docs/design/planner.md`, "Decision
+  (lane T13)".
+
+## 2. The trace (r1627, 603d1ca4; load 48.6 to 45.8, CPU pressure avg10 23 to 16%)
+
+`SHA=603d1ca4 bash ~/.cache/tpch-t13/run.sh`, the trace half as T12's r1568: T11's `db-sf1` and its
+calibration (body sha256 faba8ac5eb119381), q03 at SF1, target `amphora`, the counted run, then
+5 timed runs on one connection, `AMPHORA_PLAN_TRACE=1`. Output:
+`~/.cache/tpch-t13/trace-q03-603d1ca4.{jsonl,log}` on adacachy2.
+
+| prepare | seek | hash build | hash probe | row in pages | page miss read | epoch closed | plans weighed (cost) | ms |
+|---|---|---|---|---|---|---|---|---|
+| record, counted | 16.88 | 24.83 | 4.59 | 0.000121 | 0.984, 0.988 (so far) | none | no whole plan logged | 2,271.5 (counted) |
+| run 0 | 16.88 | 278.3 | 99.4 | 0.000133 | 0.984 (so far) | none | lineitem first 264,899; orders first, lineitem by index 279,597 | 1,213.5 |
+| run 1 | 16.88 | 278.3 | 99.4 | 0.000106 | 0.596 (so far) | none | 162,770; 170,128 | 1,039.7 |
+| run 2 | 16.88 | 278.3 | 99.4 | 0.000106 | 0.298 | 0.298, the first: stands | 86,083; 86,557 | 1,061.8 |
+| run 3 | 16.88 | 278.3 | 99.4 | 0.000106 | 0.298 | none | 86,083; 86,557 | 1,337.7 |
+| run 4 | 16.88 | 278.3 | 99.4 | 0.000106 | 0.298 | 0.0: not moved (spread 0.298, 1 difference) | 86,083; 86,557 | 1,198.2 |
+
+Every run chose `SCAN lineitem / SEARCH orders USING INTEGER PRIMARY KEY / SEARCH customer USING
+INTEGER PRIMARY KEY / USE HASH TABLE FOR GROUP BY / USE SORTER FOR ORDER BY`. T12's five runs on
+5694e705 gave four plans. Both prepares of each run read the same inputs and weighed the same costs.
+
+One line each, untraced:
+- The seek weight stayed at 16.88 through all five runs at load 46 to 49. In T12's runs at load 83
+  to 88 it went 16.9, 876.5, 3,603.6. That fits T12's guess (load-slowed samples pass the noise
+  test) but does not show it. That is the next lane's work.
+- The first epoch closed only at run 2's prepare, so the pager counted fewer fetches than its cache
+  holds pages over the counted run and run 0. The record's two prepares read 245 of 249 and 244 of
+  247, so the counted run fetched few pages through this pager. Which path the scans read through
+  was not traced.
+
+## 3. Checks
+
+- r1616 (9ac9687b) and r1627 (603d1ca4): `cargo clippy -p amphora-engine --all-targets --locked --
+  -D warnings` clean; `cargo test -p amphora-engine --lib --locked -- t13_ learned_costs
+  storage::pager::tests`: 42 of 42, then 43 of 43 (with the planning test).
+- The tests: `t13_a_page_miss_share_within_its_measured_noise_keeps_the_standing_share` (pager.rs)
+  and `t13_two_plannings_against_one_version_choose_one_plan` (optimizer/mod.rs: q05's shape planned
+  twice against one pinned version, with the learned seek rate moved a millionfold between; one plan).
+- r1637 (f9385553, the merge with main): clippy clean; the same tests 43 of 43. Main's commits since
+  the branch point touch no engine file.
