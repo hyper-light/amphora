@@ -40,7 +40,10 @@ fn main() -> ExitCode {
 fn run() -> Result<String, String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
-        [mode, path, gib] if mode == "fill" => fill(PathBuf::from(path), gib.parse().map_err(|e| format!("{e}"))?),
+        [mode, path, gib] if mode == "fill" => fill(
+            PathBuf::from(path),
+            gib.parse().map_err(|e| format!("{e}"))?,
+        ),
         [mode, path, step] if mode == "open" => open(PathBuf::from(path), step),
         _ => Err("usage: replica_open fill <path> <gib> | open <path> image|count".into()),
     }
@@ -50,7 +53,8 @@ fn fill(path: PathBuf, gib: u64) -> Result<String, String> {
     // The machine's own tables first: a member's database, not a local one it would import.
     drop(Machine::open(&path, ConfState::default()).map_err(|e| e.to_string())?);
     let db = Db::open(&path).map_err(|e| e.to_string())?;
-    db.exec("CREATE TABLE IF NOT EXISTS t(b)").map_err(|e| e.to_string())?;
+    db.exec("CREATE TABLE IF NOT EXISTS t(b)")
+        .map_err(|e| e.to_string())?;
     let blob = 1u64 << 16;
     let rows = (gib << 30) / blob;
     let batch = 1024;
@@ -58,7 +62,8 @@ fn fill(path: PathBuf, gib: u64) -> Result<String, String> {
     while written < rows {
         db.exec("BEGIN").map_err(|e| e.to_string())?;
         for _ in 0..batch.min(rows - written) {
-            db.exec(&format!("INSERT INTO t VALUES(randomblob({blob}))")).map_err(|e| e.to_string())?;
+            db.exec(&format!("INSERT INTO t VALUES(randomblob({blob}))"))
+                .map_err(|e| e.to_string())?;
         }
         db.exec("COMMIT").map_err(|e| e.to_string())?;
         written += batch.min(rows - written);
@@ -84,7 +89,11 @@ fn open(path: PathBuf, step: &str) -> Result<String, String> {
     };
     let total = began.elapsed();
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-    let hwm = status.lines().find(|l| l.starts_with("VmHWM:")).and_then(|l| l.split_whitespace().nth(1)).unwrap_or("?");
+    let hwm = status
+        .lines()
+        .find(|l| l.starts_with("VmHWM:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .unwrap_or("?");
     Ok(format!(
         "{step} machine_open_ms={:.1} open_ms={:.1} image_bytes={bytes} peak_rss_kib={hwm}",
         opened.as_secs_f64() * 1e3,

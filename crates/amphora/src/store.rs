@@ -3,7 +3,8 @@
 //! - **One writer.** A thread owns the engine. Rows reach it by channel, never by lock, and are
 //!   committed as soon as it takes them, with whatever else came while it committed the last: a
 //!   group commit, no row waiting for a timer. A full queue refuses rows ([`Refused::Full`]) rather
-//!   than growing without bound; [`Store::put_wait`] waits for room instead.
+//!   than growing without bound; [`Store::put_wait`] waits for room instead. A queue with no count
+//!   ([`Config::queue`] None) is bounded by what its senders admit.
 //! - **Durable beside the writer.** A commit doesn't wait for the disk: a flusher thread flushes
 //!   what was committed, over and over, and a write is durable once a flush that began after its
 //!   commit ends ([`Store::durable`] waits for that, by the [`Ticket`] its batch was handed with).
@@ -272,8 +273,10 @@ pub enum ForReaders {
 /// A store's bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
-    /// Batches of rows waiting for the writer, at most.
-    pub queue: usize,
+    /// Batches of rows waiting for the writer, at most. None: no count bounds the queue, and
+    /// what its senders admit bounds what waits (a [`crate::database::Database`] charges every
+    /// request to the memory budget's room for queues, MB.1).
+    pub queue: Option<usize>,
     /// Rows that make a commit at once, however many more wait. A commit of fewer rows still ends
     /// where its engine's commit is full (decision 23).
     pub commit_rows: usize,
@@ -296,8 +299,9 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             // A channel of this bound takes its slots at once: a full queue refuses (`put`) or
-            // waits for room (`put_wait`), so it needn't be deep.
-            queue: 4096,
+            // waits for room (`put_wait`), so it needn't be deep. A database's store has none
+            // (lane perf-A8): the memory budget bounds its queue in bytes.
+            queue: Some(4096),
             // A commit's pages fit its writer's cache: at 10,000 writers a commit of 512 rows wrote
             // 35,000-41,000 rows a second, of 2,048 rows 22,000-24,000 (fedora, 2026-10-20).
             commit_rows: 512,
@@ -1263,9 +1267,35 @@ impl<R: Send + 'static> Readers<R> {
     }
 }
 
+/// The writer's queue: bounded by a count ([`Config::queue`]), or by what its senders admit.
+enum Queue<T> {
+    Bounded(mpsc::SyncSender<T>),
+    Unbounded(mpsc::Sender<T>),
+}
+
+impl<T> Clone for Queue<T> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Bounded(tx) => Self::Bounded(tx.clone()),
+            Self::Unbounded(tx) => Self::Unbounded(tx.clone()),
+        }
+    }
+}
+
+impl<T> Queue<T> {
+    fn try_send(&self, m: T) -> Result<(), mpsc::TrySendError<T>> {
+        match self {
+            Self::Bounded(tx) => tx.try_send(m),
+            Self::Unbounded(tx) => tx
+                .send(m)
+                .map_err(|mpsc::SendError(m)| mpsc::TrySendError::Disconnected(m)),
+        }
+    }
+}
+
 /// A handle to a store: cheap to clone, usable from any thread.
 pub struct Store<E: Engine> {
-    tx: mpsc::SyncSender<Msg<E>>,
+    tx: Queue<Msg<E>>,
     meter: Arc<Meter>,
     watchers: Arc<Mutex<Vec<Watcher>>>,
     sends: Arc<Sends>,
@@ -1292,7 +1322,16 @@ impl<E: Engine> Store<E> {
 
     /// [`Store::start`], its engine's flusher replaced by `flush` when given (tests).
     pub fn start_with(engine: E, config: Config, flush: Option<Flush>) -> anyhow::Result<Self> {
-        let (tx, rx) = mpsc::sync_channel::<Msg<E>>(config.queue.max(1));
+        let (tx, rx) = match config.queue {
+            Some(bound) => {
+                let (tx, rx) = mpsc::sync_channel::<Msg<E>>(bound.max(1));
+                (Queue::Bounded(tx), rx)
+            }
+            None => {
+                let (tx, rx) = mpsc::channel::<Msg<E>>();
+                (Queue::Unbounded(tx), rx)
+            }
+        };
         let meter: Arc<Meter> = Arc::default();
         let watchers: Arc<Mutex<Vec<Watcher>>> = Arc::default();
         let sends: Arc<Sends> = Arc::default();

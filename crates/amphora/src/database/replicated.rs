@@ -947,6 +947,11 @@ struct Actor<F: BlockFile + 'static = LogDevice> {
     // A floor session, a follower's write, or the leader's in its turn after a slot, past its
     // barrier, waiting for this member to apply its own log up to the last index it held then.
     tail: Option<u64>,
+    // The term in which one of this follower's writes was refused as stale, so its leader queued
+    // it for a write slot its next barrier begins: if that barrier's work forwards nothing, a
+    // second barrier tells the leader at once, which ends the slot (`Slots::read`) instead of its
+    // length (replication.md, "the write slot").
+    slotted: Option<u64>,
     floor_requests_applied: u64,
     floor_requests_stale: u64,
     // The floor version this owner last published, none before its first: a raise is it rising.
@@ -2462,6 +2467,7 @@ fn open_on<F: BlockFile + 'static>(
         floor_failures: 0,
         floor_requesting: false,
         tail: None,
+        slotted: None,
         floor_requests_applied: 0,
         floor_requests_stale: 0,
         floor_published: None,
@@ -4596,6 +4602,9 @@ impl<F: BlockFile + 'static> Actor<F> {
                 .as_ref()
                 .is_some_and(|p| p.context == applied.context);
             if matches && let Some(mut pending) = self.pending.take() {
+                if matches!(pending.phase, Phase::Proposed(_)) {
+                    self.queued_by(&applied.result);
+                }
                 let result = match pending.phase {
                     // The write's own token: its entry's index and time (`tokens`).
                     Phase::Proposed(value) => applied.result.map(|()| Answered {
@@ -4634,8 +4643,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                 #[cfg(test)]
                 if self.turn_context.as_ref() == Some(&pending.context) {
                     self.turn_context = None;
-                    if matches!(&result, Err(Refusal::Serialization { .. }))
-                    {
+                    if matches!(&result, Err(Refusal::Serialization { .. })) {
                         self.turns.1 = self.turns.1.saturating_add(1);
                     }
                 }
@@ -4825,6 +4833,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             // A malformed entry fences at its apply, which answers.
             Err(_) => return,
         };
+        self.queued_by(&result);
         let Some(mut pending) = self.pending.take() else {
             return;
         };
@@ -5172,7 +5181,40 @@ impl<F: BlockFile + 'static> Actor<F> {
         self.control.moved.notify_all();
         Ok(())
     }
+    /// A follower's write refused as stale queued it at its leader (`Slots::refused`).
+    fn queued_by<T>(&mut self, result: &Result<T, Refusal>) {
+        if matches!(result, Err(Refusal::Serialization { .. })) && !self.replica.is_leader() {
+            self.slotted = Some(self.replica.term());
+        }
+    }
+    /// Prepares the operation past its barrier. A follower whose barrier began its write slot and
+    /// whose work ended forwarding nothing (a read, a refused or failed write) sends a second
+    /// barrier, which ends the slot at its leader at once; a forward ends it there itself. A
+    /// leader of any version ends a holder's slot on its second barrier, so this needs nothing new
+    /// on the wire, and a stray barrier's read state matches nothing here and is dropped.
     fn prepare(&mut self) -> Result<(), Refusal> {
+        let work = self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| matches!(pending.phase, Phase::Barrier(Some(_))));
+        self.prepare_barrier()?;
+        let ended = !self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| matches!(pending.phase, Phase::Barrier(_)));
+        if work
+            && ended
+            && let Some(term) = self.slotted.take()
+            && self.pending.is_none()
+            && term == self.replica.term()
+            && !self.replica.is_leader()
+        {
+            let context = self.context()?;
+            self.replica.read(context).map_err(raft_error)?;
+        }
+        Ok(())
+    }
+    fn prepare_barrier(&mut self) -> Result<(), Refusal> {
         let Some(mut pending) = self.pending.take() else {
             return Ok(());
         };
@@ -9757,7 +9799,14 @@ mod tests {
             1,
             "{outcomes:?}"
         );
-        assert_eq!(outcomes.iter().filter(|r| matches!(r, Err(Refusal::Serialization { .. }))).count(), 1, "{outcomes:?}");
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|r| matches!(r, Err(Refusal::Serialization { .. })))
+                .count(),
+            1,
+            "{outcomes:?}"
+        );
         let count = driven
             .call(&mut pump, clients.get(origin).unwrap(), |db| {
                 db.exec("INSERT INTO actor_items(value) VALUES(x'03')")?;
@@ -13347,10 +13396,7 @@ mod tests {
         let compacted = {
             let owner = &mut driven.owner_mut(leader);
             let now = owner.now().unwrap();
-            owner
-                .replica
-                .compact(0, now, &owner.waker)
-                .unwrap();
+            owner.replica.compact(0, now, &owner.waker).unwrap();
             owner.replica.applied().index
         };
         for _ in 0..64 {
@@ -14171,10 +14217,6 @@ mod tests {
             .unwrap();
         let refusal = answered.err().unwrap();
         assert_eq!(refusal, Refusal::UnknownOutcome);
-        assert_eq!(
-            crate::database::application::overtaken(refusal),
-            Refusal::UnknownOutcome
-        );
         settled(&mut driven, &mut pump, 3, &[]);
         for owner in 0..3 {
             assert_eq!(floor_version(&mut driven, owner), None, "owner {owner}");
@@ -15320,7 +15362,7 @@ mod tests {
     /// running), every append lost while heartbeats go on, so the change can't commit; a follower
     /// raises the floor to 7, prepared at a base without the change and forwarded; then the appends
     /// go again. Expect: the raise refused Serialization, "prepared transaction", "the database advanced since
-    /// preparation", which writer_floor answers Unavailable, to be asked again; the change
+    /// preparation", which writer_floor answers as it is, like any write's, to be asked again; the change
     /// applied; and no floor on any voter.
     #[test]
     fn a_raise_a_change_overtakes_is_refused_by_the_stale_base_rule() {
@@ -15373,13 +15415,6 @@ mod tests {
                 what: "prepared transaction".into(),
                 why: "the database advanced since preparation".into(),
             }
-        );
-        // What writer_floor answers its caller for it: ask again.
-        assert_eq!(
-            crate::database::application::overtaken(refused),
-            Refusal::Unavailable(
-                "the database advanced since preparation: the group changed while the raise was proven; raise again".into()
-            )
         );
 
         driven.answer(&mut pump, &added).unwrap();
@@ -16335,10 +16370,7 @@ mod tests {
         let compacted = {
             let owner = driven.owner_mut(0);
             let now = owner.now().unwrap();
-            owner
-                .replica
-                .compact(0, now, &owner.waker)
-                .unwrap();
+            owner.replica.compact(0, now, &owner.waker).unwrap();
             owner.replica.applied().index
         };
         for _ in 0..64 {
@@ -16712,10 +16744,7 @@ mod tests {
             driven.quiet(pump);
             let owner = driven.owner_mut(0);
             let now = owner.now().unwrap();
-            let out = owner
-                .replica
-                .compact(0, now, &owner.waker)
-                .unwrap();
+            let out = owner.replica.compact(0, now, &owner.waker).unwrap();
             assert!(out, "no compaction went out");
             driven.quiet(pump);
         };
@@ -18083,7 +18112,11 @@ mod tests {
                     run.violations
                 );
                 assert_eq!(run.unknown, 0, "keys {keys} seed {seed}");
-                let checked = if keys == 2 { &run.streak[1..] } else { &run.streak[..] };
+                let checked = if keys == 2 {
+                    &run.streak[1..]
+                } else {
+                    &run.streak[..]
+                };
                 assert!(
                     checked.iter().all(|streak| *streak <= 1),
                     "keys {keys} seed {seed}: {:?}",
@@ -18181,8 +18214,13 @@ mod tests {
             driven.round(&mut pump);
             rounds += 1;
         }
-        assert_eq!(crashes, CRASHES, "the writers all landed before the crashes ran");
-        eprintln!("{WRITERS} writers through {crashes} leader crashes: {again} sent again, {rounds} rounds");
+        assert_eq!(
+            crashes, CRASHES,
+            "the writers all landed before the crashes ran"
+        );
+        eprintln!(
+            "{WRITERS} writers through {crashes} leader crashes: {again} sent again, {rounds} rounds"
+        );
         driven.quiet(&mut pump);
         driven.tick(&mut pump, leader);
         driven.tick(&mut pump, leader);
@@ -18247,7 +18285,11 @@ mod tests {
         let mut refused = vec![0u64; WRITERS];
         let mut rounds = 0;
         while inflight.iter().any(Option::is_some) {
-            assert!(rounds < ROUNDS, "unanswered: {:?}", inflight.iter().filter(|w| w.is_some()).count());
+            assert!(
+                rounds < ROUNDS,
+                "unanswered: {:?}",
+                inflight.iter().filter(|w| w.is_some()).count()
+            );
             for (id, slot) in inflight.iter_mut().enumerate() {
                 let Some((via, answer)) = slot.take() else {
                     continue;
@@ -18328,11 +18370,23 @@ mod tests {
         let mut landed: i64 = 0;
         for round in 0..20 {
             let mut inflight: Vec<Option<(usize, Answering)>> = (0..3)
-                .map(|via| Some((via, submit(&clients[via], driven.until(), append(round * 3 + via)))))
+                .map(|via| {
+                    Some((
+                        via,
+                        submit(&clients[via], driven.until(), append(round * 3 + via)),
+                    ))
+                })
                 .collect();
             let mut rounds = 0;
             while inflight.iter().any(Option::is_some) {
-                assert!(rounds < ROUNDS, "round {round}: unanswered {:?}", inflight.iter().map(|w| w.as_ref().map(|(via, _)| *via)).collect::<Vec<_>>());
+                assert!(
+                    rounds < ROUNDS,
+                    "round {round}: unanswered {:?}",
+                    inflight
+                        .iter()
+                        .map(|w| w.as_ref().map(|(via, _)| *via))
+                        .collect::<Vec<_>>()
+                );
                 for slot in &mut inflight {
                     let Some((via, answer)) = slot.take() else {
                         continue;
@@ -18343,7 +18397,10 @@ mod tests {
                         Ok(Ok(_)) => landed += 1,
                         Ok(Err(refused @ Refusal::Serialization { .. })) => {
                             serialization.push(refused);
-                            *slot = Some((via, submit(&clients[via], driven.until(), append(round * 3 + via))));
+                            *slot = Some((
+                                via,
+                                submit(&clients[via], driven.until(), append(round * 3 + via)),
+                            ));
                         }
                         Ok(Err(other)) => panic!("append via {via}: {other:?}"),
                     }
@@ -18355,13 +18412,24 @@ mod tests {
                 break;
             }
         }
-        let refused = serialization.first().expect("no append was refused Serialization");
-        assert_eq!(refused.to_string(), "invalid prepared transaction: the database advanced since preparation");
+        let refused = serialization
+            .first()
+            .expect("no append was refused Serialization");
+        assert_eq!(
+            refused.to_string(),
+            "invalid prepared transaction: the database advanced since preparation"
+        );
         let malformed = driven.call(&mut pump, &clients[(leader + 1) % 3], |db| {
             db.exec("INSERT INTO events VALUES (-1)")?;
             Err(api::invalid("events row", "its id is negative").into())
         });
-        assert_eq!(malformed.err(), Some(Refusal::Invalid { what: "events row".into(), why: "its id is negative".into() }));
+        assert_eq!(
+            malformed.err(),
+            Some(Refusal::Invalid {
+                what: "events row".into(),
+                why: "its id is negative".into()
+            })
+        );
         driven.quiet(&mut pump);
         driven.tick(&mut pump, leader);
         for owner in 0..3 {
@@ -18462,7 +18530,9 @@ mod tests {
                     "slot off {slot_off} attempt {attempt}: the leader's write"
                 );
             }
-            let stale = |outcome: &Result<Vec<u8>, Refusal>| matches!(outcome, Err(Refusal::Serialization { .. }));
+            let stale = |outcome: &Result<Vec<u8>, Refusal>| {
+                matches!(outcome, Err(Refusal::Serialization { .. }))
+            };
             if slot_off {
                 assert!(outcomes.iter().all(stale), "today's rule: {outcomes:?}");
             } else {
@@ -18552,7 +18622,9 @@ mod tests {
                     "off {off} attempt {attempt}: the leader's write"
                 );
             }
-            let stale = |outcome: &Result<Vec<u8>, Refusal>| matches!(outcome, Err(Refusal::Serialization { .. }));
+            let stale = |outcome: &Result<Vec<u8>, Refusal>| {
+                matches!(outcome, Err(Refusal::Serialization { .. }))
+            };
             let moved = driven.owner(leader).read_sets_moved;
             if off {
                 assert!(outcomes.iter().all(stale), "read sets off: {outcomes:?}");
@@ -18770,6 +18842,80 @@ mod tests {
             "the leader's write"
         );
         assert!(held, "the holder's barrier was never held");
+        driven.quiet(&mut pump);
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// Lane W3 (lane W2's finding, r831; replication.md, "the write slot"): a slot's holder whose
+    /// write fails before it forwards anything tells its leader at once. Do, in a group of three:
+    /// the holder (member 3), queued by an earlier refusal and knowing it, writes to a table that
+    /// does not exist; then the leader and member 2 each write. Expect: the holder's slot began,
+    /// its write refused; the leader's and member 2's writes applied; and no slot ended by its
+    /// length (`Driven::lapses` 0, the driven clock never moved past a slot). Without the holder's
+    /// second barrier the harness moves the leader's clock past the slot for them to commit.
+    #[test]
+    fn a_slot_holder_whose_write_fails_ends_its_slot_without_waiting_its_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        assert_eq!(leader, 0);
+        driven
+            .call(&mut pump, &clients[0], |db| {
+                db.exec("CREATE TABLE t(k INTEGER PRIMARY KEY, v TEXT)")?;
+                Ok(Vec::new())
+            })
+            .unwrap();
+        driven.quiet(&mut pump);
+        let holder = 3;
+        driven.owner_mut(0).slots.refused(holder);
+        let term = driven.owner(2).replica.term();
+        driven.owner_mut(2).slotted = Some(term);
+        let failed = submit(&clients[2], driven.until(), |db| {
+            db.exec("INSERT INTO missing VALUES (1)")?;
+            Ok(Vec::new())
+        });
+        let mut began = false;
+        let mut answered = None;
+        for _ in 0..ROUNDS {
+            began |= driven.owner(0).slots.holds();
+            if let Ok(result) = failed.try_recv() {
+                answered = Some(result);
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        assert!(
+            answered
+                .expect("the holder's write was never answered")
+                .is_err(),
+            "the holder's write"
+        );
+        let own = submit(&clients[0], driven.until(), |db| {
+            db.exec("INSERT INTO t VALUES (1, 'leader')")?;
+            Ok(Vec::new())
+        });
+        let other = submit(&clients[1], driven.until(), |db| {
+            db.exec("INSERT INTO t VALUES (2, 'member 2')")?;
+            Ok(Vec::new())
+        });
+        assert_eq!(
+            driven.settle(&mut pump, &own),
+            Ok(Vec::new()),
+            "the leader's write"
+        );
+        assert_eq!(
+            driven.settle(&mut pump, &other),
+            Ok(Vec::new()),
+            "member 2's write"
+        );
+        assert!(began, "the holder's slot never began");
+        assert!(!driven.owner(0).slots.holds());
+        assert_eq!(driven.lapses, 0, "a slot ended by its length");
         driven.quiet(&mut pump);
         driven.drain(&mut pump);
         pump.finish();

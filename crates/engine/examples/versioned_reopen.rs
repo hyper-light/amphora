@@ -44,7 +44,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let db = Database::open(Arc::new(Files::open(&dir, 1)?), frames, 1, cmp)?;
         micros.push(start.elapsed().as_secs_f64() * 1e6);
         let snap = db.snapshot()?;
-        read.push(db.scan(&mut Descender::new(), &snap, 0, None, usize::MAX)?.len());
+        read.push(
+            db.scan(&mut Descender::new(), &snap, 0, None, usize::MAX)?
+                .len(),
+        );
         db.close_snapshot(snap);
     }
     micros.sort_by(f64::total_cmp);

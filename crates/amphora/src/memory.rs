@@ -284,7 +284,9 @@ fn whole(file: &std::fs::File) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let mut buf = [0u8; IN_PLACE];
     loop {
-        let n = file.read_at(&mut buf, u64::try_from(out.len()).ok()?).ok()?;
+        let n = file
+            .read_at(&mut buf, u64::try_from(out.len()).ok()?)
+            .ok()?;
         if n == 0 {
             return Some(out);
         }
@@ -301,7 +303,12 @@ impl Opened {
         let (mut limits, mut unlimited) = (Vec::new(), Vec::new());
         for (v2, group, root, file) in [
             (true, v2_group(&text), "/sys/fs/cgroup", "memory.max"),
-            (false, v1_group(&text), "/sys/fs/cgroup/memory", "memory.limit_in_bytes"),
+            (
+                false,
+                v1_group(&text),
+                "/sys/fs/cgroup/memory",
+                "memory.limit_in_bytes",
+            ),
         ] {
             for at in group.map(ancestors).unwrap_or_default() {
                 let dir = format!("{root}{}", if at == "/" { "" } else { at.as_str() });
@@ -349,14 +356,13 @@ impl Opened {
         let mut buf = [0u8; IN_PLACE];
         let groups = self.limits.iter().filter_map(|file| {
             let n = read_at(file, &mut buf)?;
-            std::str::from_utf8(buf.get(..n)?).ok().and_then(group_limit)
+            std::str::from_utf8(buf.get(..n)?)
+                .ok()
+                .and_then(group_limit)
         });
         let machine = rustix::system::sysinfo();
         let machine = u64::from(machine.mem_unit.max(1)).checked_mul(machine.totalram);
-        groups
-            .chain(machine)
-            .chain(process_limits())
-            .min()
+        groups.chain(machine).chain(process_limits()).min()
     }
 
     /// `/proc/self/statm`'s resident pages (its second field) in bytes, as memory-stats reads it.

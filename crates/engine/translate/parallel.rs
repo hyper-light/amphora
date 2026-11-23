@@ -484,9 +484,9 @@ fn body_reads_numeric(exprs: &[&Expr], places: &[BodyTable], numeric: bool) -> O
                             ) || (numeric
                                 && matches!(col.affinity(), Affinity::Real | Affinity::Numeric)))
                                 && matches!(
-                                col.collation(),
-                                CollationSeq::Binary | CollationSeq::Unset
-                            )
+                                    col.collation(),
+                                    CollationSeq::Binary | CollationSeq::Unset
+                                )
                         })
                     });
                 }
