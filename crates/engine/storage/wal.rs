@@ -11609,7 +11609,7 @@ pub mod test {
             "open_shared_from_authority_if_exists should not republish authority before coordination reconciliation"
         );
 
-        let exclusive_coordination = ShmWalCoordination::new(exclusive, authority.clone());
+        let exclusive_coordination = ShmWalCoordination::new(SharedLog::new(exclusive), authority.clone());
         assert_eq!(authority.iter_latest_frames(0, u64::MAX), vec![(7, 1)]);
         assert_eq!(exclusive_coordination.find_frame(7, 0, 1, None), Some(1));
 
