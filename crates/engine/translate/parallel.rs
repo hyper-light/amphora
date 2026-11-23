@@ -547,9 +547,9 @@ fn body_plan(plan: &SelectPlan) -> Option<BodyPlan<'_>> {
         offset: 0,
         rowid: RowidAt::Own,
     }];
-    body_reads_numeric(&filter, &places, true)?;
-    body_reads_numeric(&outs, &places, true)?;
-    body_reads_numeric(&filter_exprs(&agg_filters), &places, true)?;
+    body_reads_numeric(&filter, &places, false)?;
+    body_reads_numeric(&outs, &places, false)?;
+    body_reads_numeric(&filter_exprs(&agg_filters), &places, false)?;
     Some(BodyPlan {
         table,
         places,
