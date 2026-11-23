@@ -5363,7 +5363,12 @@ impl<F: BlockFile + 'static> Actor<F> {
         }
         self.replica
             .propose(context.to_vec(), stamped)
-            .map_err(raft_error)
+            .map_err(raft_error)?;
+        // A proposal made after this step's drive (a worker's session decided, `Actor::decide`)
+        // is the next drive's work: the owner steps again at once to send its append and write
+        // it, never waiting for its next tick or input (CP-T1.13).
+        self.driving = true;
+        Ok(())
     }
     /// This owner's wall clock: the wall clock when it started, moved on by its own clock, in
     /// microseconds since the Unix epoch.
@@ -14560,8 +14565,28 @@ mod tests {
                 Some(Phase::Proposed(_))
             )
         });
-        // What goes on is what the proposal's round hadn't sent: its entry is lost with this.
-        clients[leader].handle().drain(usize::MAX).unwrap();
+        // What goes on is what the proposal's round hadn't sent: its entry is lost with this. A
+        // write from the session worker is proposed after its step's drive (`Actor::decide`), so
+        // its append leaves on the leader's next drive: the leader steps, nothing relayed, until
+        // an append was queued and lost.
+        let lost = |driven: &Driven| {
+            let appending = locked(&driven.owner(leader).control.outgoing)
+                .unwrap()
+                .messages
+                .iter()
+                .any(|message| message.route == api::replication::Route::Log);
+            clients[leader].handle().drain(usize::MAX).unwrap();
+            appending
+        };
+        let mut appended = lost(&driven);
+        for _ in 0..ROUNDS {
+            if appended {
+                break;
+            }
+            driven.step();
+            appended = lost(&driven);
+        }
+        assert!(appended, "the raise's append was never queued");
         let others: Vec<usize> = (0..3).filter(|owner| *owner != leader).collect();
         let answered = (0..ROUNDS)
             .find_map(|_| {
