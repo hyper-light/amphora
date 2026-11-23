@@ -1046,6 +1046,11 @@ struct Actor<F: BlockFile + 'static = LogDevice> {
     // Stale bases this leader moved by their read sets. Read by tests: non-vacuity.
     #[cfg(test)]
     read_sets_moved: u64,
+    // Stale bases this leader left to the exact base for a read-set conflict, and of those its
+    // own writes'. Read by tests: a leader refusal is a real conflict (replication.md, "The
+    // leader's turn").
+    #[cfg(test)]
+    read_sets_conflicts: (u64, u64),
     // The leader's writes made in its turn after a slot, and those refused as stale; and the one
     // in flight. Read by tests: a turn is a turn in fact.
     #[cfg(test)]
@@ -2501,6 +2506,8 @@ fn open_on<F: BlockFile + 'static>(
         read_sets_unchecked: false,
         #[cfg(test)]
         read_sets_moved: 0,
+        #[cfg(test)]
+        read_sets_conflicts: (0, 0),
         #[cfg(test)]
         turns: (0, 0),
         #[cfg(test)]
@@ -4332,6 +4339,10 @@ impl<F: BlockFile + 'static> Actor<F> {
                 };
                 if !write.untouched_by(&wrote, &applied) {
                     Self::read_set_event("conflict", write.base, before);
+                    #[cfg(test)]
+                    {
+                        self.read_sets_conflicts.0 = self.read_sets_conflicts.0.saturating_add(1);
+                    }
                     return Ok(None);
                 }
             }
@@ -5127,10 +5138,17 @@ impl<F: BlockFile + 'static> Actor<F> {
                 index: last,
                 term: log.term(last).map_err(unavailable)?,
             };
+            #[cfg(test)]
+            let conflicts = self.read_sets_conflicts.0;
             if let Ok(Err(_)) = crate::replication::verdict(&stamped, before)
                 && let Some(data) = self.rebase(&stamped, before)?
             {
                 stamped = data;
+            }
+            #[cfg(test)]
+            {
+                let own = self.read_sets_conflicts.0.saturating_sub(conflicts);
+                self.read_sets_conflicts.1 = self.read_sets_conflicts.1.saturating_add(own);
             }
         }
         self.replica
@@ -17760,6 +17778,8 @@ mod tests {
         turns: (u64, u64),
         // Stale bases the leader moved by their read sets.
         moved: u64,
+        // The leader's own writes it left to the exact base for a read-set conflict.
+        leader_conflicts: u64,
     }
     type Answering = mpsc::Receiver<Result<Answered, Refusal>>;
     fn list(db: &mut Db, key: u64) -> anyhow::Result<Vec<String>> {
@@ -17840,6 +17860,7 @@ mod tests {
             unknown: 0,
             turns: (0, 0),
             moved: 0,
+            leader_conflicts: 0,
         };
         let mut rounds = 0;
         while run.committed.iter().any(|done| *done < ops) {
@@ -17913,6 +17934,7 @@ mod tests {
         run.violations = list_violations(&history, &finals);
         run.turns = driven.owner(leader).turns;
         run.moved = driven.owner(leader).read_sets_moved;
+        run.leader_conflicts = driven.owner(leader).read_sets_conflicts.1;
         driven.drain(&mut pump);
         pump.finish();
         run
@@ -18081,19 +18103,22 @@ mod tests {
     /// too. Do: the leader and both followers each append 15 times to two hot lists, then to 32
     /// spread over pages, every record delayed up to three relay rounds, three seeds each.
     /// Expect: every write committed, none unknown, the history serializable; no follower refused
-    /// twice in a row; and over spread pages, where nothing a write read was written since its
-    /// base, not the leader either. Before the leader's own appends took the read-set check its
-    /// members' forwards take, its writes over spread pages were refused up to 5 times in a row
-    /// (11 to 17 refusals for 15 commits). On hot lists its writes outside its turn keep the
-    /// exact base (replication.md, "The leader's turn": the general tail rule is still open).
+    /// twice in a row; and over spread pages every refusal of the leader's own writes a real
+    /// read-set conflict: a write between its base and its append wrote a page it read. Before
+    /// the leader's own appends took the read-set check its members' forwards take, its writes
+    /// over spread pages were refused up to 5 times in a row (11 to 17 refusals for 15 commits)
+    /// with nothing they read written. A write that read a page written since its base is
+    /// refused, however many times in a row (replication.md, "A follower's write that read
+    /// nothing written since its base: read sets"); on hot lists its writes outside its turn keep
+    /// the exact base ("The leader's turn": the general tail rule is still open).
     #[test]
     fn no_writer_is_refused_twice_in_a_row_when_every_member_writes() {
         for keys in [2, 32] {
             for seed in 1..=3 {
                 let run = list_append_run(&[0, 1, 2], false, seed, keys, 15);
                 eprintln!(
-                    "three writers keys {keys} seed {seed}: committed {:?} refused {:?} in a row {:?} moved {}",
-                    run.committed, run.refused, run.streak, run.moved
+                    "three writers keys {keys} seed {seed}: committed {:?} refused {:?} in a row {:?} moved {} leader conflicts {}",
+                    run.committed, run.refused, run.streak, run.moved, run.leader_conflicts
                 );
                 assert!(
                     run.violations.is_empty(),
@@ -18101,16 +18126,17 @@ mod tests {
                     run.violations
                 );
                 assert_eq!(run.unknown, 0, "keys {keys} seed {seed}");
-                let checked = if keys == 2 {
-                    &run.streak[1..]
-                } else {
-                    &run.streak[..]
-                };
                 assert!(
-                    checked.iter().all(|streak| *streak <= 1),
+                    run.streak[1..].iter().all(|streak| *streak <= 1),
                     "keys {keys} seed {seed}: {:?}",
                     run.streak
                 );
+                if keys == 32 {
+                    assert_eq!(
+                        run.refused[0], run.leader_conflicts,
+                        "keys {keys} seed {seed}: a leader refusal without a read-set conflict"
+                    );
+                }
             }
         }
     }
