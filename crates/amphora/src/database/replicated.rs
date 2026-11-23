@@ -5210,8 +5210,6 @@ impl<F: BlockFile + 'static> Actor<F> {
             && term == self.replica.term()
             && !self.replica.is_leader()
         {
-            let context = self.context()?;
-            self.replica.read(context).map_err(raft_error)?;
         }
         Ok(())
     }
