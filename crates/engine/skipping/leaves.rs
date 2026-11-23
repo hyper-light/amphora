@@ -379,6 +379,16 @@ pub fn set_skipping_with_until(
                 };
                 conn.execute("COMMIT")?;
                 if wait && missed.is_some() {
+                    if deadline
+                        .is_some_and(|end| conn.get_pager().io.current_time_monotonic() >= end)
+                    {
+                        // This checked install is already the stale fallback. A writer can
+                        // commit during every build without being open at the next wait.
+                        conn.db.skipping.count_refused(
+                            crate::storage::versioned::version::UnwrittenRefusal::Deadline,
+                        );
+                        return Ok(());
+                    }
                     again = true;
                     continue;
                 }

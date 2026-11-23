@@ -3724,6 +3724,41 @@ mod versioned {
         }
     }
 
+    #[test]
+    fn a_waiting_build_stops_rebuilding_when_commits_cross_its_deadline() {
+        let (db, writer, root) = waiting_table();
+        let switch = writer.versioned_for(crate::MAIN_DB_ID).unwrap();
+        let (paused, go_on) = switch.pause_next_build(root);
+        let build = {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                let conn = db
+                    .connect(ConnectOpts::new().with_versioned_storage())
+                    .unwrap();
+                let deadline = conn.get_pager().io.current_time_monotonic();
+                let result =
+                    set_skipping_until(&conn, "t", "a", Some(SkipKind::Cracking), Some(deadline));
+                conn.versioned_for(crate::MAIN_DB_ID)
+                    .unwrap()
+                    .clear_build_pause();
+                result
+            })
+        };
+        paused.recv().unwrap();
+        writer
+            .execute("INSERT INTO t VALUES (110, 'slipped in')")
+            .unwrap();
+        go_on.send(()).unwrap();
+        build.join().unwrap().unwrap();
+        assert_eq!(
+            db.skipping.wait_counts(),
+            (0, 0),
+            "retried past the deadline"
+        );
+        assert_eq!(db.skipping.wait_refusals(), (0, 1));
+        assert_eq!(rowids(&writer, FILTER).0, with_the_new_row());
+    }
+
     /// Do (lane g7s2-17, `AC-NS.2.1`): under `BuildPolicy::Wait`, a build on a thread of its own
     /// is paused by the storage's hook once it has read its rows, before it checks for writers
     /// (`Switch::pause_next_build`); then a writer inserts a row the filter matches, and either
