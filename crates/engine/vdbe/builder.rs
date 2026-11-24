@@ -1984,6 +1984,10 @@ impl ProgramBuilder {
                 } => {
                     resolve(target_pc, "NotExists")?;
                 }
+                Insn::LockRow { held, gone, .. } => {
+                    resolve(held, "LockRow")?;
+                    resolve(gone, "LockRow")?;
+                }
                 Insn::MustBeInt {
                     target_pc: Some(target_pc),
                     ..

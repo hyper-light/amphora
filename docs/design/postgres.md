@@ -584,20 +584,48 @@ transaction_isolation names it (READ UNCOMMITTED by its own name, run as READ CO
 COMMITTED is the default. Each transaction has its validation and whether it waits (`Rules`,
 `crates/engine/storage/versioned/version.rs`): READ COMMITTED and REPEATABLE READ are `Snapshot`, and SERIALIZABLE
 keeps the storage's `Precision` until SSI is ported. READ COMMITTED's snapshot moves to every commit published when a
-statement starts (`Clock::renew`), under the open snapshots' lock. A statement that changes a row another open
-transaction changed is undone to the savepoint the session put before it and its transaction kept
-(`LimboError::RowTaken`); the session then waits for that transaction's end, told of it by a waker
-(`Clock::wait_for`, called as it ends by `Clock::forget`), with no timer, and runs the statement again on a new
-snapshot (READ COMMITTED) or has it refused `40001` where its row was changed by a commit after the snapshot. The listener's
-other sessions run meanwhile. What differs from 19's recheck, EvalPlanQual (unit 15's): the statement is run again
-whole, so a row it changed before the wait is undone and can be changed by another session in the interval, and a WHERE
-is judged by the newer snapshot on every row, not on the waited-for row alone; a single row by its key answers as
-19's does (T-PG.14.1). A wait that would close a ring of waits is refused `40P01` at once, the session that closes it
-being the victim, where 19 waits out `deadlock_timeout` and refuses whichever session's check runs first. A statement
+statement starts (`Clock::renew`), under the open snapshots' lock. A statement that comes to a row another open
+transaction changed waits for that transaction's end, told of it by a waker (`Clock::wait_for`, called as it ends by
+`Clock::forget`), with no timer. The listener's other sessions run meanwhile. A statement
 that changes the catalog (CREATE TABLE, ALTER TABLE) is validated by the storage's own validation at any level
 (`Txn::validate_fully`), since an index it built beside a commit that added rows would lack them (19 locks the table
 against the writers); and a transaction that wrote rows and stayed open while another session's schema change
 committed is refused at COMMIT, as before (PG20).
+
+**EvalPlanQual, deadlocks and lock_timeout** (lane PG22, unit 15). 19's rule, read in REL_19_0: `ExecUpdate` calls
+`table_tuple_update`, which waits for the transaction that holds the row; where that one committed a change
+(`TM_Updated`), a READ COMMITTED statement locks the row's last version and runs the plan's quals on it alone
+(`EvalPlanQual`, src/backend/executor/execMain.c:2686), computing the new row from that version where it still
+qualifies and passing it by where it doesn't or was deleted (src/backend/executor/nodeModifyTable.c:2645-2735);
+the statement's scan goes on at its own snapshot, and what it changed before stays. `table_tuple_lock` keeps the lock
+it took to the transaction's end, so a row passed by stays locked, and a lock is no change: a REPEATABLE READ update
+of the row after the locker's commit is not refused. REPEATABLE READ is refused at `TM_Updated` (`40001`). As built:
+
+- `Insn::LockRow` comes before an UPDATE reads the row it is to change (only on a connection whose transactions wait,
+  `Connection::locks_rows`). `VTree::lock` takes the row as a change does, before the statement judges it, so no other
+  session changes it in between. It answers that the row is as the statement's snapshot sees it, or that a later commit
+  changed or removed it. After a change, the WHERE, all of it and read from the table's cursor whatever index found the
+  row, is judged on that version (`RowRecheck`, `crates/engine/translate/emitter/update.rs`); the assignments and the
+  index entries that go are that version's too.
+- A row of an open transaction yields the statement there: the same instruction runs again once the holder has ended.
+  The session's `Executor` keeps the statement, and its Query goes on from it.
+- The statement reads at its snapshot to its end while its changes are made against the commits it followed
+  (`Txn::reading`, `Clock::follow`); the snapshot stays counted open, so nothing it sees is collected.
+- A row locked at a later version and then passed by is put back unchanged at the commit (`put_back_unwritten`).
+- A wait that its holder's end doesn't end has 19's two deadlines (`ProcSleep`, src/backend/storage/lmgr/proc.c), each
+  once, from when the wait began. At `deadlock_timeout` (1 s) the session looks for a ring of waits its own closes
+  (`Clock::deadlock`) and is refused `40P01` if there is one, with `DeadLockReport`'s detail and hint; a session that
+  looked and found none waits on. So the victim is the session whose check finds the ring. At `lock_timeout` (0, none)
+  it is refused `55P03`. The listener's timer is hyper-rt's, armed for the two deadlines alone.
+- `deadlock_timeout` (a superuser's to set, `PGC_SUSET`) and `lock_timeout` are set with SET, SET LOCAL and RESET and
+  named by SHOW, in guc.c's units, and follow the transaction that set them (`crates/amphora/src/postgres/settings.rs`).
+- A refusal in a block ends the engine's transaction at once, as `AbortCurrentTransaction` does: who waits for a row of
+  it goes on before the client's ROLLBACK.
+
+What differs from 19: a unique key another open transaction inserted (an INSERT's, or an UPDATE's index entry) still
+undoes the statement and runs it again; sessions that wait for one row go on in the order they come back to it, where
+19 queues them by the tuple's lock; a refusal has no CONTEXT, since 19's names a ctid; and DELETE and SELECT ... FOR UPDATE,
+which take rows the same way, aren't ported.
 
 An error inside a transaction block puts the session in PostgreSQL's aborted state (`25P02` until
 ROLLBACK); SAVEPOINT and ROLLBACK TO map to the engine's savepoints (`crates/engine/translate/rollback.rs`).
