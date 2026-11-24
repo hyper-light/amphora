@@ -1,0 +1,1051 @@
+# SQLite 3.54.0: bench/sqlite_on_terms.py
+db	small
+sql	CREATE TABLE a(id INTEGER PRIMARY KEY, u INT UNIQUE, x INT, y INT, t TEXT UNIQUE, p INT)
+sql	CREATE INDEX a_x ON a(x)
+sql	CREATE INDEX a_y ON a(y)
+sql	WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM n WHERE i < 24) INSERT INTO a SELECT i, CASE WHEN i % 7 <> 0 THEN i * 3 END, CASE WHEN i % 5 <> 0 THEN i % 5 END, CASE WHEN i % 6 <> 0 THEN i * 7 % 6 END, CASE WHEN i % 9 <> 0 THEN printf('%05d', i * 37 % 10007) END, i % 4 FROM n
+sql	CREATE TABLE b(id INTEGER PRIMARY KEY, u INT UNIQUE, x INT, y INT, t TEXT UNIQUE, p INT)
+sql	CREATE INDEX b_x ON b(x)
+sql	CREATE INDEX b_y ON b(y)
+sql	WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM n WHERE i < 16) INSERT INTO b SELECT i, CASE WHEN i % 7 <> 0 THEN i * 3 END, CASE WHEN i % 5 <> 0 THEN i % 5 END, CASE WHEN i % 6 <> 0 THEN i * 7 % 6 END, CASE WHEN i % 9 <> 0 THEN printf('%05d', i * 37 % 10007) END, i % 4 FROM n
+sql	CREATE TABLE c(id INTEGER PRIMARY KEY, u INT UNIQUE, x INT, y INT, t TEXT UNIQUE, p INT)
+sql	CREATE INDEX c_x ON c(x)
+sql	CREATE INDEX c_y ON c(y)
+sql	WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM n WHERE i < 10) INSERT INTO c SELECT i, CASE WHEN i % 7 <> 0 THEN i * 3 END, CASE WHEN i % 5 <> 0 THEN i % 5 END, CASE WHEN i % 6 <> 0 THEN i * 7 % 6 END, CASE WHEN i % 9 <> 0 THEN printf('%05d', i * 37 % 10007) END, i % 4 FROM n
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 JOIN c t1 ON t1.x = t0.p LEFT JOIN b t2 ON t2.id = t1.id AND t2.y BETWEEN 0 AND 4 AND NOT t1.t > '00111' LEFT JOIN b t3 ON (t0.u = 42 OR t0.x = 0) AND t2.id + 1 = t3.id WHERE t0.x = 3 AND (t3.id IS NULL OR t2.y IS NULL)	8:f72d7fe4d3a69dd2
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN a t1 ON t0.id + 1 = t1.id AND t0.x <> 1 LEFT JOIN c t2 ON t2.id < t0.x AND (t1.x = 1 OR t1.y = 1) WHERE (t1.y = 1 OR t1.x = 3) AND (t1.y = 3 OR t1.x = 3)	5:a7412775a2033c0d
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN b t1 ON t0.x = 0	16:75ed4667641b335a
+q	SELECT t0.id, t1.id, t2.id FROM b t0 RIGHT JOIN a t1 ON t0.x + 0 = 4 LEFT JOIN b t2 ON t2.id = t1.x WHERE t0.y > 3 AND t0.x > 0 AND t0.t NOT IN ('00518', '00037')	24:142f05d6b67c6ba9
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 LEFT JOIN b t1 ON (t0.x = 1 AND t0.y >= 0 OR t0.id = 5) AND t1.u = t0.u RIGHT JOIN a t2 ON t0.u = 66 AND t2.id = t0.id AND t1.x IN (3, 4) LEFT JOIN b t3 ON t3.id = t2.x AND t2.u = 42 WHERE (t3.id IS NULL OR t3.t = '00370')	24:6292072179f60dfb
+q	SELECT t0.id, t1.id, t2.id FROM a t0 FULL JOIN a t1 ON t1.u <= 15 AND t0.u <= 57 LEFT JOIN b t2 ON t2.y > 4	222:49369fa8b0d30daa
+q	SELECT t0.id, t1.id, t2.id FROM b t0 RIGHT JOIN b t1 ON t0.x = 1 RIGHT JOIN c t2 ON 3 < t0.x AND t1.t = '00518' WHERE t0.x = 4 AND t0.p = 0	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN b t1 ON t1.id = t0.id AND t1.x + 0 = 4 AND t0.t = '00666' LEFT JOIN c t2 ON 4 >= t0.x WHERE t0.id = 20	1:34a8383f6f7b21c9
+q	SELECT t0.id, t1.id, t2.id FROM b t0 JOIN c t1 ON t1.id = t0.id AND t1.x = 3 AND 48 < t0.u JOIN c t2 ON t2.id = t0.id AND t1.u <> 30 AND t0.y = 1 WHERE t1.x BETWEEN 0 AND 4 AND (t2.y = 5 OR t2.x = 1)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM c t0 JOIN c t1 ON t1.x = t0.x AND (t0.x = 3 OR t0.x = 3)	4:d8068c0d157783c1
+q	SELECT t0.id, t1.id, t2.id FROM c t0 JOIN a t1 ON t0.t >= '00370' JOIN b t2 ON 4 <= t2.id WHERE (t1.x = 2 AND t1.y >= 4 OR t1.id = 17) AND t0.t GLOB '0*'	26:2181c45f6721f1c5
+q	SELECT t0.id, t1.id, t2.id FROM c t0 LEFT JOIN c t1 ON t0.t GLOB '0*' LEFT JOIN c t2 ON 4 >= t1.y	739:998bc78ae396fd0b
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t1.u = t0.u WHERE t1.t >= '00333'	1:1bcf3a761fa39d61
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN b t1 ON (t0.u = 42 OR t0.y = 3) AND t0.y = 3 FULL JOIN a t2 ON t2.x <= 3 AND '00074' <= t0.t AND t0.id + 1 = t2.id AND (t0.x = 3 AND t0.y >= 0 OR t0.id = 2) WHERE t2.y BETWEEN 3 AND 7 AND t2.t = '00777'	1:e95ba577e8d541ae
+q	SELECT t0.id, t1.id, t2.id FROM b t0 RIGHT JOIN b t1 ON t0.u = 18 AND t0.x <= 3 AND t1.u = t0.u FULL JOIN b t2 ON t2.x + 0 = 1 AND t2.id < t0.x AND t1.y = 4 AND t1.y = 5	32:fb248c6040350e64
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 LEFT JOIN b t1 ON t1.id = t0.id AND coalesce(t0.y, 1) < 3 LEFT JOIN a t2 ON t2.x = 4 AND t1.y = t2.y FULL JOIN b t3 ON t0.y BETWEEN 2 AND 6 AND t2.y = 3 WHERE t3.y = 4 AND t0.t = '00259' AND 3 > t0.u	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 RIGHT JOIN c t1 ON (t0.t = '00666' OR t0.y = 5) AND t1.id = t0.id AND t1.x <= 4 LEFT JOIN a t2 ON (t0.u = 24 OR t0.x = 4) AND t2.id = t0.id AND t2.u IN (36, 37) FULL JOIN b t3 ON 24 > t1.u AND t3.id < t2.x WHERE t1.t = '00222' AND (t2.id IS NULL OR t1.t = '00148')	1:95d0a6853ea1239c
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN b t1 ON t1.t = t0.t WHERE t1.x = 4	2:7aae0edd534e8d7f
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t0.t <= '00074' AND (t0.x = 0 OR t0.y = 4) AND t1.x = 0	24:d9790ee11730f207
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN b t1 ON t0.y = t1.y WHERE t0.t NOT IN ('00185', '00222') AND t0.y < 2	9:b244220f2330489f
+q	SELECT t0.id, t1.id FROM b t0 RIGHT JOIN b t1 ON t0.y IN (3, 4) AND t1.t = t0.t WHERE NOT t1.u > 30	9:32601385704cdaa4
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM b t0 FULL JOIN b t1 ON t0.id + 1 = t1.id AND t1.x IS NULL RIGHT JOIN a t2 ON t1.x IS NULL JOIN c t3 ON t3.t = t0.t WHERE (t1.x = 2 OR t1.x = 2) AND (t1.x = 2 OR t1.x = 2)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 JOIN a t1 ON t0.t > '00074' AND t0.id + 1 = t1.id AND coalesce(t1.y, 1) < 0 LEFT JOIN b t2 ON NOT t1.id > 6 AND t2.id = t0.id LEFT JOIN b t3 ON t3.u < 9 AND t2.y IS NULL WHERE t2.y = 2 AND t2.id IS NOT NULL	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN c t1 ON t0.id = 8 AND t1.u = t0.u WHERE coalesce(t0.y, 1) < 1 AND t0.u IN (39, 40)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM b t0 RIGHT JOIN b t1 ON 2 <= t1.y FULL JOIN c t2 ON (t2.x = 3 AND t2.y >= 3 OR t2.id = 10) AND t0.u = 27 AND t1.y = t2.y WHERE t2.y IS NULL AND t0.t GLOB '0*'	165:249e850edf36e58a
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 JOIN a t1 ON (t1.x = 0 AND t1.y >= 1 OR t1.id = 6) RIGHT JOIN c t2 ON t2.id = t1.x AND t0.y = 2 FULL JOIN c t3 ON t3.t > '00333' AND t3.id = t1.id AND (t2.t = '00333' OR t2.x = 0) WHERE coalesce(t3.y, 1) < 5	20:be999c5b94307da3
+q	SELECT t0.id, t1.id, t2.id FROM c t0 LEFT JOIN b t1 ON t1.t = '00074' FULL JOIN a t2 ON t0.t = '00074' AND t1.id + 1 = t2.id	33:89a6a6b4d4afa684
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN c t1 ON t0.x IN (3, 4) FULL JOIN c t2 ON 1 = t1.id WHERE t1.u < 12 AND t2.x BETWEEN 2 AND 6 AND t1.x = 1	60:a2b2038f5de8fb8b
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t1.id < t0.x AND t0.t >= '00259' AND t1.u = 36	24:d9790ee11730f207
+q	SELECT t0.id, t1.id, t2.id FROM c t0 FULL JOIN a t1 ON t0.p = 0 AND t0.y = t1.y LEFT JOIN a t2 ON t2.u = t0.u AND t0.y = 5 AND t2.u = 54 AND t1.t = '00703' WHERE t0.u = 3	1:94543f8d9945d036
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t1.t = t0.t AND t0.y = 1 AND t1.u = 12 WHERE t0.u BETWEEN 64 AND 68 AND t0.x IS NULL	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN b t1 ON t0.t >= '00037' JOIN c t2 ON t2.t = t1.t AND t0.y = 3 AND t1.id = 2	3:49ee3efcc366a6bd
+q	SELECT t0.id, t1.id, t2.id FROM a t0 JOIN b t1 ON t0.id + 1 = t1.id LEFT JOIN a t2 ON t1.id = 5	38:2cc4da513a0bda44
+q	SELECT t0.id, t1.id FROM b t0 FULL JOIN a t1 ON t1.x = t0.p AND t1.x BETWEEN 1 AND 5 AND t0.x >= 4	38:76c9e2d652a7d84a
+q	SELECT t0.id, t1.id FROM b t0 JOIN b t1 ON t0.id = 6 WHERE t0.t <= '00518' AND t0.x = 1	16:34f4a1e53c5cb1f2
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN c t1 ON t1.id < t0.x AND t0.u IS NULL LEFT JOIN b t2 ON t0.u = 51 WHERE t2.x IS 2 AND (t1.id IS NULL OR t0.y >= 4) AND t1.p = 2 AND t0.id BETWEEN 2 AND 6	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM b t0 FULL JOIN c t1 ON t1.t = t0.t AND t0.x < 0 AND t0.u > 3	26:031fb0d2dc10b456
+q	SELECT t0.id, t1.id, t2.id FROM c t0 RIGHT JOIN c t1 ON t1.id = t0.id RIGHT JOIN a t2 ON NOT t1.u > 18 AND t2.x = t1.x WHERE t1.y = 4 AND t1.id IS NOT NULL	5:7031a867258651eb
+q	SELECT t0.id, t1.id, t2.id FROM c t0 LEFT JOIN a t1 ON t0.x = 0 AND t1.x = t0.x AND t0.y BETWEEN -1 AND 3 LEFT JOIN c t2 ON t1.id > 23 AND t0.y = t2.y WHERE t1.t <= '00222' AND t1.y <= 4	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM b t0 RIGHT JOIN a t1 ON t0.id NOT IN (12, 13) AND t0.y = t1.y WHERE t0.y IS NOT NULL AND t0.u = 45	4:bf5775015151057a
+q	SELECT t0.id, t1.id, t2.id FROM a t0 JOIN a t1 ON t0.t IS NOT NULL AND (t1.x = 0 AND t1.y >= 0 OR t1.id = 19) RIGHT JOIN c t2 ON t2.u = t1.u WHERE (t0.y = 3 OR t0.x = 4)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN a t1 ON t0.u IS NULL AND '00111' >= t0.t AND t1.x = t0.p JOIN b t2 ON t2.y NOT IN (2, 3) AND t1.t = '00592' AND t2.id = t1.id WHERE t1.x < 3 AND t1.y IS NOT NULL	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM b t0 JOIN b t1 ON t1.id < t0.x AND (t1.x = 2 OR t1.y = 4) AND t0.t IS NULL RIGHT JOIN c t2 ON t2.t = '00074' AND t1.t = '00037' AND t2.id = t0.id	10:43254adae4e8661b
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN b t1 ON t0.u >= 12 AND t0.x <> 2 AND t1.u = 39 WHERE t1.id IS NOT NULL	4:4640c397e08e86a2
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN c t1 ON t1.t = t0.t AND t0.x BETWEEN -1 AND 3 WHERE t0.y <= 4 AND t0.y = 1	3:6cf47e2eb8176fc6
+q	SELECT t0.id, t1.id, t2.id FROM c t0 RIGHT JOIN c t1 ON t0.p = 3 AND t0.p = 0 AND t1.id = t0.id JOIN b t2 ON t2.t > '00111' AND t0.u > 21 WHERE t2.x BETWEEN 2 AND 6 AND t0.t IS '00296' AND t1.id IS NOT NULL	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN a t1 ON t0.y > 1 AND t1.t = t0.t AND t1.u = 27 WHERE t0.y <> 3 AND t0.p = 3	2:b9b26bcd02eb82d4
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN a t1 ON t1.x = 0 AND t1.id = t0.id AND t0.x > 4 AND t0.y = 4 WHERE t0.id = 12 AND t0.id <= 16 AND t0.x <= 0	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM b t0 LEFT JOIN a t1 ON (t0.id = 2 OR t0.x = 4) RIGHT JOIN c t2 ON t1.p = 2 LEFT JOIN a t3 ON t1.x = 0 WHERE t1.x = 2 AND t1.y IN (0, 1) AND t2.x = 4	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM c t0 JOIN b t1 ON t1.x BETWEEN 0 AND 4 AND t0.p = 3 AND t0.t <= '00259' AND t1.id = t0.x	2:3dc31a78ad9e78a6
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN c t1 ON t1.u = t0.u AND t0.p = 3 AND t1.u = 21 WHERE '00222' < t0.t AND (t0.y = 5 OR t0.y = 5)	1:d9b0a2104f42cc70
+q	SELECT t0.id, t1.id, t2.id FROM a t0 FULL JOIN b t1 ON (t0.u = 15 OR t0.y = 1) AND t1.id = t0.id AND t1.x = 4 AND t0.t GLOB '0*' LEFT JOIN a t2 ON t2.id = t1.id AND (t1.x = 3 OR t1.x = 3) WHERE t1.t = '00222'	1:7b4c643d5f413cd3
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 LEFT JOIN b t1 ON (t0.x = 2 OR t0.y = 3) RIGHT JOIN b t2 ON t1.y < 0 LEFT JOIN a t3 ON t3.t > '00481' AND t0.y < 3 AND t3.id = t2.x WHERE t1.t > '00407' AND t1.y = 4	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN b t1 ON (t0.u = 30 OR t0.x = 3) AND t1.x = t0.x WHERE '00222' < t0.t AND t0.y BETWEEN 2 AND 6 AND t0.t NOT IN ('00370', '00148')	3:a7c319db231f726c
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM b t0 RIGHT JOIN c t1 ON 4 > t1.x LEFT JOIN a t2 ON (t1.x = 4 AND t1.y >= 1 OR t1.id = 5) AND t2.id = t1.id LEFT JOIN b t3 ON t2.y = t3.y AND t2.y = 5 WHERE t2.t IN ('00370', '00148')	1:f7f44a948ef05915
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM b t0 LEFT JOIN c t1 ON (t0.t = '00592' OR t0.x = 4) AND t1.id = t0.id LEFT JOIN b t2 ON t2.x = t1.p AND t1.t IS NULL LEFT JOIN b t3 ON t3.x = 2 AND t0.y = t3.y WHERE t1.t = '00370'	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM c t0 RIGHT JOIN b t1 ON t0.x = 2 AND t1.id = t0.x LEFT JOIN b t2 ON t0.x = 2 AND t2.t = t0.t AND t0.t IS NOT NULL WHERE 24 >= t0.u AND t0.y >= 2 AND (t2.id IS NULL OR t2.x = 4) AND t1.id IS NOT NULL	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN c t1 ON t1.id = t0.id AND t1.t = '00370' AND t0.u IS NULL WHERE coalesce(t0.y, 1) < 4	11:9712054643ffac2a
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM b t0 JOIN a t1 ON (t1.y = 3 OR t1.x = 2) AND t0.t >= '00333' LEFT JOIN b t2 ON t0.t <= '00407' AND t2.id < t1.x LEFT JOIN a t3 ON t0.u < 45 AND t2.id + 1 = t3.id WHERE t2.id IS NULL AND (t0.x = 1 OR t0.x = 1) AND t0.t > '00444'	9:f1ff802175e09a49
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN a t1 ON t0.id + 1 = t1.id AND t0.u = 15 WHERE t1.id IS NOT NULL AND t0.id NOT IN (7, 8)	1:2322111804cda446
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t1.id = t0.id AND t0.u NOT IN (24, 25) WHERE t0.p = 1 AND t1.x > 1	2:bf59bc6dfb6be929
+q	SELECT t0.id, t1.id, t2.id FROM a t0 JOIN a t1 ON t1.id = t0.id AND t1.y <= 0 AND '00333' > t0.t LEFT JOIN a t2 ON t2.id < t1.x WHERE t0.y <> 2 AND t0.t = '00222' AND t1.t = '00814'	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 JOIN b t1 ON t0.t IN ('00259', '00037') LEFT JOIN b t2 ON t2.y IS NULL AND t2.t = t0.t AND (t1.x = 0 OR t1.y = 0) LEFT JOIN b t3 ON (t0.x = 3 OR t0.y = 0)	32:533bf7405076d023
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN b t1 ON t0.t = '00407' AND t0.t > '00703' AND t0.y = t1.y WHERE t0.x = 3	5:d37bc6cc764ca21f
+q	SELECT t0.id, t1.id, t2.id FROM b t0 RIGHT JOIN a t1 ON t1.t = '00148' LEFT JOIN a t2 ON t2.u = t1.u AND t0.t = '00111' AND t2.id IS NULL WHERE t0.u = 15 AND t0.u > 3	1:50cc25ffa9f149d1
+q	SELECT t0.id, t1.id, t2.id FROM a t0 FULL JOIN a t1 ON t0.y = 2 AND 2 >= t0.x RIGHT JOIN c t2 ON t2.id = t0.id AND (t0.id = 8 OR t0.y = 4)	10:e4c92357e1b670cf
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t1.u IS NULL AND t1.id = t0.x AND t0.y IN (2, 3) WHERE t0.t >= '00148' AND t0.u = 12 AND t0.t IS '00592'	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN c t1 ON (t0.id = 8 OR t0.x = 4) AND t1.id = t0.id LEFT JOIN a t2 ON t0.t IN ('00222', '00259') AND t2.u IN (39, 40) AND t2.id = t0.id WHERE (t0.u = 48 OR t0.x = 3) AND t2.id IS NOT NULL	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN a t1 ON t1.u = 51 AND t0.id + 1 = t1.id AND 4 <= t0.y WHERE (t1.id IS NULL OR (t0.x = 2 AND t0.y >= 1 OR t0.id = 15)) AND t1.u BETWEEN 40 AND 44 AND t0.y = 2	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN c t1 ON t1.x = t0.x AND t0.t = '00518' WHERE t0.y = 3	3:a8dda74ab02e4d42
+q	SELECT t0.id, t1.id FROM a t0 RIGHT JOIN b t1 ON t0.t > '00037' AND t0.id > 3 AND t1.id = t0.id WHERE (t0.x = 4 AND t0.y >= 5 OR t0.id = 6) AND t0.y <= 5	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM b t0 RIGHT JOIN c t1 ON t0.t <= '00407' AND t1.id = t0.id AND t0.u IS NULL LEFT JOIN b t2 ON t2.t = '00074' AND t1.y = 2 AND t2.id = t1.id AND t1.id <= 8 WHERE t1.t = '00111' AND t1.x + 0 = 3	1:d08ecea752d0d92a
+q	SELECT t0.id, t1.id, t2.id FROM a t0 JOIN b t1 ON t0.id >= 10 AND t1.y IS NOT NULL AND t1.t = t0.t LEFT JOIN c t2 ON t1.t = '00555' AND t2.id = t0.id WHERE t1.y IS NULL	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM b t0 JOIN c t1 ON t0.u = 33 AND t1.id = t0.x LEFT JOIN a t2 ON t2.id = t1.id LEFT JOIN c t3 ON coalesce(t1.y, 1) < 4 AND t3.u = t1.u WHERE t3.y = 1 AND t2.y = 2	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN a t1 ON t1.id = t0.x LEFT JOIN a t2 ON t1.x = 4 AND t2.x = t0.p	36:7931db36e4484324
+q	SELECT t0.id, t1.id FROM c t0 JOIN a t1 ON (t1.u = 57 OR t1.x = 1) WHERE t0.t >= '00037'	54:00e7011d0aa7c642
+q	SELECT t0.id, t1.id, t2.id FROM b t0 RIGHT JOIN c t1 ON t1.t = t0.t AND (t0.x = 4 AND t0.y >= 0 OR t0.id = 4) LEFT JOIN a t2 ON t0.y = 2 AND t2.t IN ('00703', '00222')	10:0c932d10f4c0f546
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 JOIN c t1 ON t0.x IN (4, 5) AND t1.x = t0.x LEFT JOIN a t2 ON t2.t IS NOT NULL AND t0.y BETWEEN 1 AND 5 LEFT JOIN b t3 ON t3.u = t1.u AND t1.t = '00037'	178:9cc67d79c3035a66
+q	SELECT t0.id, t1.id, t2.id FROM a t0 RIGHT JOIN c t1 ON (t1.u = 12 OR t1.x = 4) FULL JOIN c t2 ON t2.x = t1.x AND t1.t IS NOT NULL WHERE t2.id IS NOT NULL AND (t0.t = '00185' OR t0.x = 2) AND t1.u >= 9 AND (t1.id = 2 OR t1.x = 4)	12:b4a07f56ca9387bf
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN b t1 ON t1.id = t0.id AND t0.y IS 0 LEFT JOIN c t2 ON t2.u BETWEEN 25 AND 29 WHERE t0.x < 3 AND t0.x IS 2	3:42d9d3c024ae29dd
+q	SELECT t0.id, t1.id, t2.id FROM c t0 JOIN c t1 ON t1.id = t0.id RIGHT JOIN c t2 ON t2.y < 5 AND (t1.u = 6 OR t1.x = 3) AND t2.id = t1.id WHERE t2.t IN ('00185', '00222') AND t2.x = 1	1:b4ae86160ce4db77
+q	SELECT t0.id, t1.id, t2.id FROM a t0 RIGHT JOIN b t1 ON t0.y = 0 AND t0.u NOT IN (12, 13) RIGHT JOIN a t2 ON t2.x < 4 AND t1.x NOT IN (0, 1) AND '00185' = t0.t AND t2.id = t1.x WHERE t1.t >= '00333' AND t1.x > 2	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t0.t < '00185' AND t0.x > 0 WHERE NOT t0.t > '00740' AND t0.u = 69	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM c t0 FULL JOIN b t1 ON t0.x = 0 AND (t0.u = 30 OR t0.x = 3) AND t1.id = t0.id WHERE t0.x IS NULL AND (t0.t = '00222' OR t0.y = 4) AND (t1.id IS NULL OR t1.y > 4)	1:3da018b978419355
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN a t1 ON t1.t <= '00222' WHERE t1.id IS NOT NULL AND 2 >= t0.x AND t0.t >= '00407'	36:0e37b6502f047e0b
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN a t1 ON t1.x = t0.x AND t0.x + 0 = 0 WHERE t0.y = 2 AND t0.t < '00592'	3:3dccd691db0ebd19
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN a t1 ON t1.u = t0.u AND t0.u < 21 LEFT JOIN c t2 ON t0.y = t2.y WHERE t0.x BETWEEN 0 AND 4 AND (t2.id IS NULL OR coalesce(t0.y, 1) < 4) AND coalesce(t0.y, 1) < 4	18:47da089166ca47a5
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN a t1 ON t1.y IN (2, 3) AND t1.t = t0.t LEFT JOIN c t2 ON t1.y = 1 WHERE t1.id >= 2 AND t1.t = '00518'	1:e271117eef3cd842
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN a t1 ON (t0.u = 33 OR t0.x = 3) WHERE t1.id IS NULL AND t0.x <= 2	6:0102075e554673fd
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN b t1 ON t0.y BETWEEN -2 AND 2 AND t1.t = t0.t WHERE t0.x = 0 AND t1.id IS NOT NULL	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 RIGHT JOIN a t1 ON t0.t >= '00777' AND t1.id NOT IN (9, 10) JOIN b t2 ON t1.id > 7 AND t1.y = t2.y AND t2.x = 3 FULL JOIN c t3 ON t0.id = 19 AND t0.id + 1 = t3.id AND t1.x IS 3 WHERE t0.id <= 22 AND t1.p = 0	4:964e2546b540a927
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 LEFT JOIN c t1 ON coalesce(t0.y, 1) < 3 AND t1.id = t0.id FULL JOIN a t2 ON t1.y = t2.y AND t2.id IS NULL AND (t1.x = 4 OR t1.y = 1) FULL JOIN c t3 ON t3.x <= 1 AND (t2.x = 2 AND t2.y >= 0 OR t2.id = 20) WHERE t1.t = '00074' AND t2.y IS NULL	1:705ce6dcd27f9ad5
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN c t1 ON t0.id + 1 = t1.id AND (t0.t = '00111' OR t0.x = 4) WHERE t0.p = 1	4:3b891fac1126fb96
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 LEFT JOIN b t1 ON t0.x = 4 AND t0.y = t1.y FULL JOIN b t2 ON t2.id = t1.id AND t0.p = 3 LEFT JOIN a t3 ON 12 <= t0.u AND t1.y = t3.y AND t3.x >= 3 WHERE t0.u = 51 AND t0.x < 1 AND (t1.id IS NULL OR t3.y = 4)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM b t0 LEFT JOIN a t1 ON t0.t <= '00222' AND t0.id + 1 = t1.id AND t1.y < 3 FULL JOIN a t2 ON t1.t <= '00037' AND t2.x = t0.x LEFT JOIN c t3 ON t3.id IN (8, 9) AND t1.x + 0 = 4 AND t3.id = t1.id WHERE t1.p = 3 AND '00629' > t1.t	1:c59d18b08607dd02
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN c t1 ON t0.x = 3 AND t1.x = 4 LEFT JOIN b t2 ON t1.t NOT IN ('00222', '00259') AND t2.id = t1.id AND 4 > t1.x WHERE 15 < t1.u	3:c92953ee71d17cbe
+q	SELECT t0.id, t1.id FROM b t0 JOIN a t1 ON t0.id + 1 = t1.id WHERE t0.x = 4	3:d1b81a1405bdecf7
+q	SELECT t0.id, t1.id, t2.id FROM c t0 LEFT JOIN a t1 ON t0.y IS NULL AND t0.t = '00074' FULL JOIN c t2 ON t0.t = '00037' AND t2.u = t1.u WHERE t0.p = 0 AND t1.id IS NULL	2:7fe7b37002c346b1
+q	SELECT t0.id, t1.id FROM a t0 JOIN a t1 ON t0.y = t1.y AND t0.y < 2	16:62c719ad98fa2629
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 RIGHT JOIN c t1 ON t0.x IS 3 AND t0.id + 1 = t1.id AND t0.id = 5 LEFT JOIN b t2 ON t2.x = t1.p AND (t1.t = '00259' OR t1.x = 4) LEFT JOIN b t3 ON t2.t < '00185' AND t3.id < 11 AND t3.x = t1.x WHERE t2.u >= 24	4:cf1c69fc654d69d2
+q	SELECT t0.id, t1.id FROM b t0 RIGHT JOIN b t1 ON t1.id = t0.id AND t0.id >= 3 WHERE t1.y <= 3 AND (t1.t = '00296' OR t1.y = 3)	4:1c27516ab4613d25
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM b t0 RIGHT JOIN a t1 ON t1.x = t0.x JOIN b t2 ON t1.x IS NOT NULL AND t2.t = '00555' LEFT JOIN a t3 ON t3.id = t1.x AND t2.x >= 4 AND t1.u = 15	65:b5fb731255ee2fc6
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN a t1 ON t1.y IS NULL AND t0.id = 3 WHERE (t0.t = '00148' OR t0.y = 2)	3:dd33b9eec6ab30ec
+q	SELECT t0.id, t1.id FROM b t0 FULL JOIN c t1 ON t0.id NOT IN (6, 7) AND t1.p = 1 AND t1.id = t0.id	23:ef1be336f948553c
+q	SELECT t0.id, t1.id, t2.id FROM b t0 RIGHT JOIN c t1 ON t0.p = 0 AND t0.t IS NULL LEFT JOIN a t2 ON t1.t GLOB '0*' AND t0.y = t2.y WHERE (t1.u = 24 OR t1.x = 0)	1:b6167bfad82834d1
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN a t1 ON t1.id = t0.id WHERE (t1.id IS NULL OR t0.t > '00518')	2:542db17919d5330b
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN a t1 ON t0.y IS NOT NULL AND t0.y = 5 AND t1.t >= '00481' WHERE NOT t0.x > 0 AND (t1.id IS NULL OR t0.x = 4)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM c t0 RIGHT JOIN b t1 ON t0.t NOT IN ('00296', '00074') AND (t1.x = 1 AND t1.y >= 5 OR t1.id = 16) AND t1.x = t0.x WHERE (t1.y = 1 OR t1.y = 1) AND t0.x NOT IN (3, 4)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN c t1 ON t0.y = 1 AND t1.id = t0.id	16:0bc28449442b4d40
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t0.u = 18 AND (t0.u = 36 OR t0.x = 1) WHERE t1.y = 1 AND (t0.x = 3 AND t0.y >= 5 OR t0.id = 18)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM b t0 JOIN a t1 ON t1.x = t0.x AND (t0.t = '00148' OR t0.y = 1) WHERE t0.x > 0	20:7bd678f357b06167
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN a t1 ON (t0.u = 69 OR t0.y = 2) AND t1.u = 18 AND t0.t = '00777' JOIN a t2 ON t0.y BETWEEN 2 AND 6 AND t2.u >= 9 AND t0.u IS NOT NULL WHERE (t1.id IS NULL OR (t1.y = 1 OR t1.x = 0)) AND t0.id < 21	228:7708dc448649a376
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN c t1 ON t1.x = t0.p AND t0.t <= '00185' WHERE t0.y <= 4	11:70806e4df704b700
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN c t1 ON t0.y IN (2, 3) WHERE t1.u = 9 AND '00222' <= t0.t	1:947ba31845374906
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t0.y NOT IN (5, 6) WHERE t0.p = 2 AND (t1.id = 1 OR t1.y = 2)	12:3cf1a3303d7332bf
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN b t1 ON t0.y >= 4 WHERE t0.t = '00296'	1:059458bcf1eefea0
+q	SELECT t0.id, t1.id FROM a t0 JOIN a t1 ON t1.y > 1 AND t0.x BETWEEN -2 AND 2 WHERE t0.u IS NULL AND t0.t GLOB '0*'	32:0db0d5d3a9d82c2f
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN a t1 ON t1.id = t0.x WHERE t1.x < 2	9:6a21e76b898aa2c7
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN b t1 ON t0.u IS NULL AND t0.y = t1.y WHERE t0.u = 33 AND t0.x = 2	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 LEFT JOIN c t1 ON t0.t IS '00148' LEFT JOIN b t2 ON 9 > t1.id AND 0 <= t2.y LEFT JOIN a t3 ON t1.x IS NULL AND t3.y <= 4 AND t3.u = t0.u AND coalesce(t2.y, 1) < 2 WHERE (t1.u = 27 OR t1.x = 2) AND t2.u = 6	2:b808b4f37f9107f2
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN a t1 ON t0.id = 10 AND t1.id = 17 AND t1.x = t0.p WHERE (t0.t = '00333' OR t0.y = 4) AND 0 <= t0.x	1:d6c5686f1a66cfec
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN c t1 ON t1.t = t0.t WHERE (t1.id IS NULL OR t1.u = 3) AND t0.t IS NOT NULL	7:52b341186db31bfc
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 LEFT JOIN a t1 ON t1.id < t0.x AND NOT t0.y > 1 FULL JOIN b t2 ON t1.t < '00037' AND t0.y NOT IN (1, 2) AND t2.x = 1 JOIN b t3 ON t3.id = t2.id WHERE t2.id IS NOT NULL AND t0.y IS NULL AND '00296' < t2.t	7:1fb6ff56c2ec9a91
+q	SELECT t0.id, t1.id, t2.id FROM c t0 JOIN a t1 ON t0.y = 1 AND t1.t = t0.t LEFT JOIN b t2 ON t0.y = t2.y WHERE t2.id IS NOT NULL AND t0.id = 7	3:e580326013c9bec9
+q	SELECT t0.id, t1.id FROM c t0 RIGHT JOIN c t1 ON t0.id = 6 WHERE t0.u = 12 AND (t0.x = 4 AND t0.y >= 0 OR t0.id = 10) AND t0.t >= '00222'	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN a t1 ON t0.p = 1 AND t0.y = t1.y AND coalesce(t0.y, 1) < 3	50:eb3619edc13e457c
+q	SELECT t0.id, t1.id, t2.id FROM b t0 JOIN a t1 ON 3 >= t1.y AND t0.t GLOB '0*' FULL JOIN c t2 ON t0.u <= 18 AND t0.y = t2.y AND t0.y <> 3 WHERE t2.x < 2 AND t0.x IN (1, 2) AND t0.id = 5	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM a t0 FULL JOIN b t1 ON t0.x = 1 AND t1.u <= 45 LEFT JOIN c t2 ON t2.id = t1.id AND t0.y IS NOT NULL WHERE t1.id IS NULL	19:0444c40900a84c88
+q	SELECT t0.id, t1.id, t2.id FROM a t0 FULL JOIN c t1 ON t0.y = t1.y AND t1.t = '00111' AND t0.u = 30 FULL JOIN c t2 ON t2.id = t0.id AND t1.p = 0 WHERE (t2.id IS NULL OR NOT t0.t > '00370') AND t1.u = 18 AND t1.x > 0	1:7b4c643d5f413cd3
+q	SELECT t0.id, t1.id FROM a t0 JOIN a t1 ON t1.id = t0.x AND t0.u = 48 AND t1.id IN (2, 3) WHERE t0.t = '00481' AND t0.t = '00851' AND t1.x > 2	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM c t0 JOIN b t1 ON t0.u IS NULL AND t0.y = t1.y WHERE t0.p = 3 AND (t1.x = 4 OR t1.y = 3)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 FULL JOIN a t1 ON t1.id = t0.id AND t0.u IS NULL LEFT JOIN b t2 ON t0.u IN (45, 46) AND t2.id < t0.x AND t0.u IS NULL LEFT JOIN a t3 ON t2.id + 1 = t3.id WHERE t0.t IS NULL AND t0.t IS NOT NULL	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM c t0 FULL JOIN a t1 ON t0.y IS NOT NULL AND (t1.x = 3 AND t1.y >= 5 OR t1.id = 5) WHERE t0.x BETWEEN 0 AND 4 AND t0.y = 1	4:dcd50791d3723681
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 LEFT JOIN a t1 ON t0.t = '00037' AND t1.y <= 2 LEFT JOIN c t2 ON (t1.x = 2 OR t1.y = 1) AND t1.y = t2.y AND t2.x = 4 FULL JOIN a t3 ON t3.y = 3 AND t3.id = t1.x WHERE t3.t < '00814' AND t1.u <> 9	2:f267880d9e71288f
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN a t1 ON t0.p = 2 AND t1.x = t0.p	22:dcf7d765e4087d0c
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN c t1 ON t0.t IN ('00518', '00037') LEFT JOIN a t2 ON t0.p = 3	180:ca90d472ba438f1e
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 JOIN a t1 ON t0.id + 1 = t1.id AND NOT t0.u > 60 RIGHT JOIN c t2 ON t2.id = t0.id AND t1.y BETWEEN -2 AND 2 FULL JOIN c t3 ON (t2.x = 3 OR t2.y = 3) AND t3.x = t0.p WHERE t3.u = 3 AND t1.u IS NULL AND t3.id IS NOT NULL	1:b6a34308a13279a5
+q	SELECT t0.id, t1.id, t2.id FROM a t0 JOIN c t1 ON t0.t IS NULL LEFT JOIN c t2 ON t2.t > '00259' AND t2.x = t1.p AND t1.u <= 6 WHERE (t2.id IS NULL OR t2.x = 3) AND t1.x = 4 AND t1.u = 27	2:5051ac65065a345b
+q	SELECT t0.id, t1.id, t2.id FROM a t0 RIGHT JOIN c t1 ON t1.u = t0.u AND 51 = t0.u LEFT JOIN c t2 ON t2.id = t1.id AND t0.t GLOB '0*' WHERE t1.u = 18 AND t0.x IS NULL	1:7b4c643d5f413cd3
+q	SELECT t0.id, t1.id FROM a t0 JOIN c t1 ON t1.y IS NULL AND t0.y > 5 AND t0.y = t1.y WHERE (t0.x = 4 AND t0.y >= 5 OR t0.id = 15) AND t0.x > 1	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM b t0 JOIN c t1 ON (t0.x = 1 AND t0.y >= 4 OR t0.id = 8) WHERE t0.y NOT IN (3, 4)	20:bdb739544c09b2ff
+q	SELECT t0.id, t1.id FROM b t0 FULL JOIN a t1 ON t0.id = 9 AND (t1.x = 4 OR t1.y = 4) WHERE t0.x >= 4	10:cd86540e2fd7b0be
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN a t1 ON t1.id = t0.x WHERE t1.id IS NOT NULL AND (t1.u = 24 OR t1.x = 4)	5:3ca8f8ec644b563b
+q	SELECT t0.id, t1.id, t2.id FROM c t0 FULL JOIN b t1 ON t1.id = t0.id AND t0.y BETWEEN -2 AND 2 LEFT JOIN c t2 ON (t2.u = 15 OR t2.x = 2) AND t2.u = t1.u WHERE t0.id = 7 AND 33 <= t1.u AND t1.x = 1	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN b t1 ON t0.id + 1 = t1.id AND t0.t <= '00185' AND t1.x = 1 WHERE t0.x = 4 AND t0.id < 6	1:d6c5686f1a66cfec
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 LEFT JOIN a t1 ON t1.id = t0.id RIGHT JOIN b t2 ON (t1.t = '00444' OR t1.x = 4) AND t2.id = t0.x LEFT JOIN b t3 ON t3.t = t0.t AND t1.id >= 20 WHERE t1.x IS NOT NULL AND t1.y <= 1	1:42cce7451cae3144
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN a t1 ON t1.x > 2 AND t0.y IN (1, 2) WHERE t1.y IS 0 AND t1.y < 3	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN b t1 ON t1.x = t0.x AND t0.p = 2 WHERE (t0.x = 1 AND t0.y >= 0 OR t0.id = 13) AND t0.y = 5	1:d9b0a2104f42cc70
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN b t1 ON t0.y = 4 AND t1.id = t0.id AND t0.u IS NULL AND t1.y = 4 JOIN c t2 ON t2.y = 4 AND t1.u BETWEEN 40 AND 44	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM c t0 JOIN a t1 ON t0.y IS NOT NULL WHERE t1.id IN (3, 4) AND t0.p = 2	4:ffbb42b934fa7961
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN c t1 ON t1.u < 27 AND t0.y > 0 LEFT JOIN b t2 ON t1.t IS NULL AND t2.id = t1.x WHERE t2.id IS NULL AND NOT t1.t > '00296' AND (t1.id IS NULL OR (t0.x = 1 AND t0.y >= 5 OR t0.id = 10))	14:579de862b95490f8
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM b t0 LEFT JOIN a t1 ON t0.y = 1 RIGHT JOIN a t2 ON t2.id = t0.id AND t1.id = 17 AND (t2.u = 21 OR t2.y = 1) LEFT JOIN c t3 ON t0.x = 1	33:6856050109ede766
+q	SELECT t0.id, t1.id, t2.id FROM c t0 FULL JOIN a t1 ON t0.x < 0 AND t1.t = t0.t AND 3 <= t0.x FULL JOIN c t2 ON t2.x = t0.x AND t0.x + 0 = 4 AND t0.t GLOB '0*' WHERE t2.t GLOB '0*'	9:bc2d37a030867587
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN c t1 ON t0.t <= '00629' AND t1.id = t0.id	25:b4508268d0850fab
+q	SELECT t0.id, t1.id FROM c t0 RIGHT JOIN c t1 ON (t0.t = '00185' OR t0.y = 5) WHERE t0.id > 5 AND t1.t IS NULL	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM a t0 RIGHT JOIN a t1 ON t0.x NOT IN (4, 5) LEFT JOIN a t2 ON t0.p = 3 AND t1.y = t2.y AND t2.id = 10 WHERE t0.x >= 2 AND t1.u <= 33	100:ddf6d9921294d2d3
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN a t1 ON t1.x = t0.p AND (t0.x = 4 OR t0.y = 5) WHERE (t0.x = 4 AND t0.y >= 0 OR t0.id = 23) AND (t0.y = 3 OR t0.x = 1)	5:a77482e7e6b0ad39
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t1.t = t0.t AND (t0.t = '00111' OR t0.y = 3) AND t0.t = '00222' WHERE (t0.x = 4 OR t0.y = 5) AND t0.y = 1 AND t1.id IS NULL	1:c1fd8e7f61d73e48
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN c t1 ON t1.t = t0.t AND 24 >= t0.u RIGHT JOIN b t2 ON t2.u = t1.u WHERE t0.u < 24 AND t2.id = 3	1:3e641db5f83a3c32
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN b t1 ON t0.y BETWEEN 0 AND 4 AND (t0.t = '00370' OR t0.y = 4) WHERE t0.t = '00222'	1:c75dc8ad91df5ff2
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN b t1 ON t0.u IN (3, 4) AND t0.u > 18 LEFT JOIN a t2 ON t2.id = t0.id AND t0.y = 4 WHERE t0.u = 3 AND (t2.id IS NULL OR t0.u = 42)	1:94543f8d9945d036
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN b t1 ON t0.u >= 3 WHERE t0.y NOT IN (0, 1) AND t0.id = 2	16:ce0ee4d6ba2bddba
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 JOIN c t1 ON t0.x IS NULL AND t0.id + 1 = t1.id AND t1.p = 2 LEFT JOIN c t2 ON t0.t IN ('00222', '00259') AND t1.id + 1 = t2.id AND t1.t = '00259' FULL JOIN a t3 ON t3.id < t2.x AND t1.u = 27 WHERE 0 < t1.y	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 LEFT JOIN a t1 ON t1.x = t0.p LEFT JOIN a t2 ON t1.u BETWEEN 61 AND 65 AND t2.u = t0.u LEFT JOIN a t3 ON t1.x <= 0 AND t3.u = t1.u AND t1.id <= 21 WHERE coalesce(t3.y, 1) < 1 AND t3.id = 15	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM a t0 JOIN a t1 ON t0.u IS 42 AND t1.x = t0.p LEFT JOIN c t2 ON t0.u = 51 WHERE t0.u IS 57 AND t0.u = 3	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN b t1 ON t1.id = t0.id AND t0.u = 27 RIGHT JOIN b t2 ON t2.x = t0.x AND t0.u IS NULL WHERE (t0.x = 2 OR t0.y = 3)	3:ca6ac7a9d1b1425d
+q	SELECT t0.id, t1.id, t2.id FROM b t0 FULL JOIN a t1 ON t1.id = t0.id AND t0.x = 3 FULL JOIN b t2 ON t1.x + 0 = 4 AND t2.u = t0.u WHERE t1.u < 30 AND t1.x + 0 = 3 AND (t1.x = 0 AND t1.y >= 0 OR t1.id = 14)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 JOIN b t1 ON t0.u = 15 AND t1.x = t0.p	4:313f8fb6f2b2e2eb
+q	SELECT t0.id, t1.id, t2.id FROM a t0 RIGHT JOIN c t1 ON t0.y = 5 AND t1.id = t0.id AND 2 <= t1.y LEFT JOIN b t2 ON t2.t >= '00148'	120:7e190c7ebed27da1
+q	SELECT t0.id, t1.id, t2.id FROM a t0 FULL JOIN a t1 ON t0.p = 2 AND t0.x > 1 JOIN c t2 ON t0.id = 21 AND t2.u IS NULL AND (t1.x = 0 AND t1.y >= 5 OR t1.id = 2) AND t2.id = t0.x WHERE t1.x <> 0	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t1.x = t0.x AND t1.x >= 0 WHERE t0.p = 1	11:52df69ceace587a6
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN c t1 ON t1.x = t0.p LEFT JOIN c t2 ON t0.x IS NULL AND t0.x + 0 = 1 AND t2.u = t0.u AND t2.u IS NOT NULL WHERE t0.y = 4 AND t0.t = '00111'	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN b t1 ON t0.id + 1 = t1.id AND coalesce(t0.y, 1) < 5 WHERE t0.x = 2	5:d1ad81c3f35a55c4
+q	SELECT t0.id, t1.id, t2.id FROM b t0 JOIN b t1 ON t1.y = 1 LEFT JOIN b t2 ON (t1.x = 1 OR t1.x = 1) AND t1.y = t2.y AND t2.x > 0	80:9485f3f59cef494c
+q	SELECT t0.id, t1.id, t2.id FROM b t0 RIGHT JOIN c t1 ON t1.x = t0.x AND t0.id < 7 LEFT JOIN c t2 ON t2.t = t0.t AND 24 > t1.u AND t2.u > 21 WHERE 18 < t1.u AND t2.t <= '00296'	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN b t1 ON t1.id < 16 AND t0.id IN (4, 5) LEFT JOIN c t2 ON t0.y IS 3 AND t0.id IN (17, 18)	52:3465ec2906ec01a3
+q	SELECT t0.id, t1.id, t2.id FROM b t0 FULL JOIN b t1 ON t1.x = t0.x LEFT JOIN b t2 ON (t1.x = 2 AND t1.y >= 5 OR t1.id = 3) AND t2.t = t1.t WHERE t1.x + 0 = 1	16:a7091e2c784df6c9
+q	SELECT t0.id, t1.id FROM c t0 FULL JOIN c t1 ON t1.x IS NULL AND t0.y > 0 AND t0.x IS NULL AND t0.y = t1.y WHERE t1.id <= 8 AND t1.p = 1	2:f20771f11fbbf905
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN b t1 ON t1.u = t0.u AND (t1.x = 3 OR t1.y = 0) AND t0.u = 48 WHERE t0.t = '00370'	1:3da018b978419355
+q	SELECT t0.id, t1.id FROM b t0 JOIN c t1 ON t0.t = '00407' WHERE t0.t = '00037'	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM c t0 FULL JOIN b t1 ON t0.y = t1.y AND t1.y IS NULL AND t0.t = '00185' LEFT JOIN c t2 ON t2.id < t1.x	35:305608a1062c2eeb
+q	SELECT t0.id, t1.id, t2.id FROM b t0 RIGHT JOIN c t1 ON t1.t = t0.t AND t0.y = 4 RIGHT JOIN b t2 ON t2.x = t1.x AND t0.u = 21 WHERE t0.t IS NULL	16:3a4ae952f5c4f9d2
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN c t1 ON t0.x > 1 WHERE t0.u < 21 AND (t1.id IS NULL OR t0.y <> 0) AND t0.x IN (1, 2)	12:99e57178643c2610
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t1.id = 1 WHERE t1.t IS NULL AND t1.x = 0	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM b t0 JOIN a t1 ON t1.u = 69 AND t0.t = '00370' AND t0.id + 1 = t1.id AND t0.id = 3 RIGHT JOIN c t2 ON t2.x = t0.p AND t0.x = 2 AND (t2.t = '00370' OR t2.x = 0) WHERE (t2.u = 3 OR t2.x = 4)	3:baf3b8bd9ae60d75
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN c t1 ON t0.y >= 3 AND t1.x = t0.x AND t0.u < 39 RIGHT JOIN b t2 ON t2.x = t0.p WHERE (t1.id IS NULL OR t0.u IS NULL) AND t0.x = 2	6:f71a1a2c6122dd17
+q	SELECT t0.id, t1.id FROM b t0 FULL JOIN c t1 ON t0.x IS NULL AND t1.x = 1 WHERE t1.id IS NULL	13:f90fb5b1b3dd9013
+q	SELECT t0.id, t1.id, t2.id FROM a t0 JOIN a t1 ON t0.p = 1 AND t1.id = t0.id LEFT JOIN b t2 ON t2.id = t0.id AND t2.t > '00185' AND t1.x >= 3 WHERE t1.t GLOB '0*' AND t1.y = 0	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM a t0 FULL JOIN c t1 ON t1.t = t0.t AND t0.x = 4 AND t1.y > 4 LEFT JOIN a t2 ON t0.u < 63 AND t1.y = t2.y WHERE (t1.id IS NULL OR '00148' <= t0.t)	24:36a08045a626b343
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t0.t >= '00592' AND (t0.x = 4 AND t0.y >= 2 OR t0.id = 4) AND t1.id = t0.x WHERE t0.t = '00703' AND (t0.id = 2 OR t0.y = 0) AND t0.y = 0 AND (t1.id IS NULL OR (t0.y = 2 OR t0.y = 2))	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN a t1 ON NOT t1.u > 60 WHERE t1.x = 2 AND t1.t > '00370' AND (t1.id IS NULL OR (t1.x = 4 AND t1.y >= 2 OR t1.id = 4))	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN c t1 ON t1.id < t0.x AND t0.y IS NULL AND t0.x IS NOT NULL WHERE t0.t = '00370'	1:3da018b978419355
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN c t1 ON 12 = t0.u AND t1.id = t0.x LEFT JOIN b t2 ON t2.u IS 36 AND t1.y >= 1	16:2e009605f51dac29
+q	SELECT t0.id, t1.id, t2.id FROM a t0 JOIN a t1 ON t0.x = 0 AND t0.id + 1 = t1.id RIGHT JOIN b t2 ON t2.id = t0.x AND (t1.x = 0 OR t1.y = 4) WHERE t1.u = 51 AND t1.y > 0	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN a t1 ON t1.id = t0.id AND t1.t > '00148' WHERE t0.u > 54	5:eac050d8e92655f5
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN c t1 ON t1.x + 0 = 3 WHERE t0.id = 8 AND t1.x < 4	2:a4c8daefce990370
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN c t1 ON t0.y = t1.y AND t0.y >= 1 AND t1.x = 3 WHERE t0.id = 6 AND t0.u IS NULL AND (t1.id IS NULL OR t0.x BETWEEN 1 AND 5) AND t0.t = '00851'	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN a t1 ON t0.x <> 3 AND t1.u = t0.u AND t0.y = 5 WHERE t0.x < 2 AND t0.y = 4	1:396f5dcd203d94a7
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN c t1 ON t1.id < t0.x AND (t0.t = '00407' OR t0.y = 0) LEFT JOIN a t2 ON t2.u = t0.u AND t1.id IN (1, 2) WHERE t1.x IS NOT NULL AND (t1.x = 4 OR t1.x = 4) AND t1.id IS NOT NULL	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN b t1 ON t1.id = t0.id FULL JOIN a t2 ON t1.x = 4 WHERE t1.u = 30 AND NOT t1.t > '00555'	1:ba044cafc50c577a
+q	SELECT t0.id, t1.id FROM c t0 FULL JOIN c t1 ON t1.id < t0.x WHERE t1.x IS NOT NULL	17:acd311130941eff8
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN c t1 ON t1.t = '00333' JOIN b t2 ON 2 = t0.y WHERE t0.u > 6 AND 16 > t2.id AND 4 > t0.x	15:73a34b3a217d179c
+q	SELECT t0.id, t1.id FROM b t0 JOIN a t1 ON t0.t = '00148' AND t0.id + 1 = t1.id AND t0.x = 3 WHERE (t0.u = 18 OR t0.y = 1) AND t0.x = 1 AND t0.x >= 1	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM c t0 FULL JOIN a t1 ON t1.y >= 1 AND '00111' > t0.t	52:160baab4036f6c52
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN a t1 ON (t1.y = 0 OR t1.y = 0) AND t0.id <= 7 AND t1.x = t0.x	10:1ea4710a2076fc95
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 RIGHT JOIN c t1 ON t1.t = '00333' AND t0.t IS NULL LEFT JOIN b t2 ON (t1.x = 2 OR t1.y = 5) AND t2.u = t0.u AND t1.t < '00148' AND t2.t = '00074' LEFT JOIN b t3 ON t2.u = 15 AND t3.id = t2.id	10:4682ea38cbd37b23
+q	SELECT t0.id, t1.id FROM c t0 FULL JOIN c t1 ON t0.t = '00148' AND t1.id < t0.x AND 2 < t0.x	19:66406408b39601fb
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 JOIN a t1 ON t0.t = '00555' AND t1.u <= 72 AND t0.u = 18 AND t1.id < t0.x FULL JOIN c t2 ON t0.x = 3 JOIN c t3 ON t2.x BETWEEN -2 AND 2 AND t1.x BETWEEN 0 AND 4 WHERE t2.t = '00222' AND t2.y = 4	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN b t1 ON t1.id = t0.id AND t1.y = 4 AND t0.y IS NULL AND t0.u = 63 LEFT JOIN a t2 ON t0.t = '00037'	47:da7365f40b081f7e
+q	SELECT t0.id, t1.id, t2.id FROM a t0 RIGHT JOIN c t1 ON t0.y = 2 LEFT JOIN a t2 ON coalesce(t1.y, 1) < 3 AND t2.u = 36 AND t0.u BETWEEN 55 AND 59 AND t2.u = t0.u	40:7f8a041c8c246019
+q	SELECT t0.id, t1.id FROM b t0 RIGHT JOIN c t1 ON t0.t = '00111' WHERE t0.id BETWEEN -1 AND 3	10:8c3b472c909c61af
+q	SELECT t0.id, t1.id FROM b t0 RIGHT JOIN b t1 ON t0.y <= 1 AND t1.id < t0.x WHERE t0.x IS NULL	14:d719e684ff5f5aef
+q	SELECT t0.id, t1.id, t2.id FROM b t0 RIGHT JOIN c t1 ON t0.x = 1 AND t1.id = t0.x LEFT JOIN c t2 ON t2.x <= 1 WHERE t0.x = 1 AND t0.t >= '00592'	2:69ed0b584b4c6aca
+q	SELECT t0.id, t1.id FROM b t0 FULL JOIN b t1 ON t0.y = t1.y WHERE (t0.t = '00481' OR t0.y = 1) AND t0.id BETWEEN 0 AND 4	3:bfa570cae289bfb6
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN c t1 ON t1.id = t0.x AND (t0.y = 1 OR t0.y = 1) AND t0.u = 21 WHERE t0.t = '00148'	1:d6c5686f1a66cfec
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t0.id + 1 = t1.id AND t0.p = 3 AND (t1.x = 1 AND t1.y >= 1 OR t1.id = 10) WHERE t1.id IS NULL	24:d9790ee11730f207
+q	SELECT t0.id, t1.id, t2.id FROM b t0 FULL JOIN a t1 ON t0.x IS NOT NULL AND t1.x = t0.x JOIN a t2 ON t1.x >= 1 WHERE t1.t <= '00037' AND t1.t GLOB '0*'	96:c70528b1628ed715
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN a t1 ON t0.t NOT IN ('00185', '00222') AND t0.x = 3 AND t1.x = t0.p	14:6bab8fe593023343
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN c t1 ON t0.id + 1 = t1.id AND t1.u >= 21 WHERE t0.x BETWEEN -2 AND 2 AND t0.x > 1	3:59475aa988fd72eb
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 LEFT JOIN b t1 ON t0.u = 24 AND t1.x = t0.p LEFT JOIN c t2 ON 0 <= t2.y AND (t0.x = 0 AND t0.y >= 0 OR t0.id = 10) LEFT JOIN a t3 ON t3.p = 3 AND t2.u >= 18 WHERE t0.p = 2 AND t1.id IS NOT NULL	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN a t1 ON t1.u <= 69 FULL JOIN a t2 ON t2.id = t0.id WHERE t0.t <= '00444' AND t1.t = '00370' AND t1.y = 4	11:7bff59799275beec
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN a t1 ON '00333' > t0.t AND t0.u = 36 FULL JOIN b t2 ON t1.y = 1 WHERE t1.id < 15 AND (t1.u = 72 OR t1.x = 2)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN a t1 ON t0.t = '00370'	33:6f4a77f9b040f4a1
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN b t1 ON (t0.u = 12 OR t0.x = 3) AND t1.x IS 4 JOIN c t2 ON t0.y BETWEEN -1 AND 3 WHERE 2 <= t0.id	170:47e57cb9aa7b09f3
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM b t0 LEFT JOIN a t1 ON t0.y = t1.y AND t0.x = 3 AND t1.u <= 45 RIGHT JOIN a t2 ON t2.u = t1.u AND t1.y >= 4 AND t1.y IS NOT NULL LEFT JOIN a t3 ON t1.u = 72 WHERE 3 = t1.x AND t1.u = 6	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN b t1 ON t0.x >= 2 WHERE t0.x = 2	48:09159095cf5abdfe
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN b t1 ON t0.y IS NULL AND t0.u >= 9 WHERE t0.y = 1 AND 15 > t0.u	1:3a3a2ba88b96c57d
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 LEFT JOIN a t1 ON t0.y > 0 LEFT JOIN a t2 ON t2.x = 1 JOIN c t3 ON 1 <= t0.y AND t3.id = t1.x WHERE (t1.u = 15 OR t1.x = 3) AND t2.u = 33 AND (t2.id IS NULL OR (t3.x = 3 AND t3.y >= 1 OR t3.id = 2))	45:00ef1a1bbbfe0879
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN a t1 ON t1.x BETWEEN 0 AND 4 AND (t0.y = 0 OR t0.x = 0) AND t1.id = t0.id WHERE t0.id = 2 AND (t0.t = '00185' OR t0.x = 3)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM c t0 RIGHT JOIN c t1 ON t0.x > 0 AND t1.x + 0 = 1 RIGHT JOIN b t2 ON coalesce(t2.y, 1) < 4 WHERE t2.u = 15	1:b4ae87160ce4dd2a
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN a t1 ON t1.id >= 24 WHERE t0.x = 1 AND '00555' <= t0.t	1:5137fc6524af8948
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN b t1 ON t0.y = t1.y WHERE t1.x < 4 AND t1.t = '00074' AND t1.id IS NOT NULL	2:f46d21ada56f02ef
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM b t0 LEFT JOIN a t1 ON t1.id IN (11, 12) LEFT JOIN b t2 ON t2.x = t1.p AND t1.x = 4 FULL JOIN c t3 ON t1.x + 0 = 1 AND t2.y = t3.y WHERE (t1.t = '00407' OR t1.x = 2)	32:64e81f58eca1713b
+q	SELECT t0.id, t1.id FROM c t0 JOIN c t1 ON t0.t = '00259' AND t1.x = t0.x WHERE (t0.y = 4 OR t0.y = 4)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN a t1 ON coalesce(t0.y, 1) < 3 AND t1.u = t0.u WHERE t0.id = 15	1:4831d383062aca44
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN b t1 ON t1.y = 0 AND t0.p = 2 AND t1.x = t0.x WHERE t1.y BETWEEN 1 AND 5 AND (t0.u = 21 OR t0.x = 0) AND 4 < t1.x	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM c t0 JOIN b t1 ON (t0.x = 2 AND t0.y >= 4 OR t0.id = 8) AND t1.id = t0.id WHERE t0.y IS NOT NULL	1:947baa18453754eb
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN c t1 ON 3 = t0.x WHERE NOT t0.id > 9	27:110618f006cf25ac
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 LEFT JOIN c t1 ON t1.x = 3 AND t1.x = t0.x AND t0.t = '00148' AND t0.t > '00222' RIGHT JOIN c t2 ON t2.id = t0.x AND 2 < t0.y LEFT JOIN c t3 ON t1.u >= 24 AND t3.x = 3 AND t2.t = '00185' WHERE (t2.y = 5 OR t2.x = 3) AND t2.y IS 2	1:a75f7aac5ebe20e2
+q	SELECT t0.id, t1.id FROM c t0 FULL JOIN b t1 ON (t1.u = 45 OR t1.y = 1) WHERE t1.u > 27 AND t1.t NOT IN ('00037', '00074')	24:365cf2ed4e34618c
+q	SELECT t0.id, t1.id FROM a t0 RIGHT JOIN c t1 ON t1.id = 2 AND t0.t = '00481' WHERE t1.t < '00148' AND t0.t IS NOT NULL	1:271fd0f106f5a0a3
+q	SELECT t0.id, t1.id, t2.id FROM c t0 LEFT JOIN b t1 ON t1.y = 0 AND t1.x = t0.p AND t0.y NOT IN (4, 5) LEFT JOIN a t2 ON t2.p = 0 AND t0.u = 27 AND t2.x = t0.x	11:dc1f6881abd82fae
+q	SELECT t0.id, t1.id FROM b t0 RIGHT JOIN a t1 ON t0.x >= 2 AND t1.t = t0.t AND (t1.u = 24 OR t1.y = 2)	24:485e89d1e502b8f5
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN c t1 ON t1.x = 1 AND t0.x = 4 AND t1.x = t0.p AND t0.t > '00481' RIGHT JOIN a t2 ON t1.t = '00333' AND t2.u = 57 WHERE t2.x = 4	5:483b9a5c2a4a3761
+q	SELECT t0.id, t1.id FROM b t0 RIGHT JOIN a t1 ON coalesce(t0.y, 1) < 3 AND t1.y <= 1 WHERE t1.y = 3	4:6a2eb166ba72e69c
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t0.x IS 4 WHERE (t1.id IS NULL OR t1.y IS NOT NULL) AND (t0.x = 4 AND t0.y >= 3 OR t0.id = 23)	19:f775a9336ab83874
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN b t1 ON t0.id <= 4 JOIN c t2 ON t2.id BETWEEN 6 AND 10 WHERE t0.u BETWEEN 25 AND 29 AND t0.y = 2	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN a t1 ON '00629' <= t1.t WHERE 0 < t1.x AND t0.x = 2 AND t1.u IS NULL	5:2ac86b572b883b26
+q	SELECT t0.id, t1.id FROM b t0 RIGHT JOIN c t1 ON t1.t = t0.t WHERE (t1.id = 7 OR t1.x = 3) AND NOT t0.y > 3	3:df25f9896dda3b63
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN c t1 ON t0.x BETWEEN -2 AND 2 AND t0.y = t1.y AND (t0.t = '00333' OR t0.y = 1) WHERE (t0.y = 0 OR t0.x = 3)	3:46093fa7d30f36fd
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN b t1 ON (t0.u = 24 OR t0.y = 3) AND t0.id + 1 = t1.id AND t0.id > 22 WHERE t0.t > '00444' AND t0.t = '00888'	1:553e34f5a2cdf25c
+q	SELECT t0.id, t1.id FROM a t0 JOIN a t1 ON t0.x = 2 AND t1.u = t0.u WHERE (t0.t = '00740' OR t0.x = 2) AND (t0.t = '00074' OR t0.x = 3)	1:6082be1827c74beb
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN c t1 ON t1.t = '00259' LEFT JOIN a t2 ON t2.id = t1.id AND (t1.u = 27 OR t1.y = 1) WHERE 15 <= t0.u AND t0.x = 3	2:d092d4c2b9c905ef
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t1.id < t0.x AND t0.x = 4 WHERE t0.y = 2 AND t1.t IS NULL	3:8a63703fde5519a6
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t0.y = 1 AND t1.x = t0.x AND t0.x <= 4	33:4c7ba776a60ac1a5
+q	SELECT t0.id, t1.id, t2.id FROM c t0 LEFT JOIN b t1 ON t1.id = t0.x AND t0.t = '00074' AND (t1.u = 27 OR t1.y = 2) FULL JOIN a t2 ON (t0.id = 9 OR t0.y = 4) AND t0.x <> 3 AND t2.id = t0.x WHERE t0.u IS 18	1:f313e89448382ceb
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN c t1 ON t0.u = 42	16:75ed4667641b335a
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON 4 < t0.x AND t1.x = t0.p WHERE (t0.x = 0 AND t0.y >= 1 OR t0.id = 8) AND t0.id IS NOT NULL	1:059458bcf1eefea0
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN a t1 ON t1.x = t0.p AND t0.y = 1 AND t1.u <= 39 WHERE t1.u >= 57 AND t1.u = 6 AND 0 <= t0.x	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM b t0 JOIN c t1 ON t1.u <= 21 AND t0.x IN (0, 1) AND t1.id = t0.id	2:7a877489bd953a15
+q	SELECT t0.id, t1.id, t2.id FROM b t0 FULL JOIN b t1 ON t1.p = 3 LEFT JOIN b t2 ON NOT t0.t > '00222' AND t2.x = t0.x WHERE t0.u BETWEEN 40 AND 44 AND t2.u IN (21, 22)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 FULL JOIN c t1 ON coalesce(t1.y, 1) < 2 AND t0.y >= 1 LEFT JOIN a t2 ON t0.y = t2.y AND t0.t IS '00185' LEFT JOIN c t3 ON t3.id = t1.id AND t2.y IS NOT NULL WHERE t0.t = '00037'	3:945b3dd63a46f51a
+q	SELECT t0.id, t1.id, t2.id FROM c t0 FULL JOIN a t1 ON t1.y = 3 RIGHT JOIN c t2 ON t1.t IN ('00222', '00259') AND t0.y = 1 WHERE t1.y BETWEEN 1 AND 5	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM b t0 FULL JOIN b t1 ON t0.y >= 5 AND '00481' > t0.t WHERE t0.u < 39	41:64e0d3b4a1cd898b
+q	SELECT t0.id, t1.id FROM c t0 JOIN c t1 ON 2 >= t0.y AND t1.id = t0.id AND t0.x IS NULL WHERE t0.u < 6 AND t1.t = '00296'	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM b t0 FULL JOIN a t1 ON t0.x + 0 = 3 AND t1.id = t0.id LEFT JOIN c t2 ON t0.y BETWEEN -1 AND 3 AND t2.id = t1.x WHERE t0.t <= '00370'	9:b8dfead99c9b8791
+q	SELECT t0.id, t1.id FROM b t0 RIGHT JOIN c t1 ON t1.u < 21 WHERE (t1.y = 5 OR t1.x = 1)	48:336995610b723ed8
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN a t1 ON t0.y BETWEEN 2 AND 6	392:62cb45699d0ceb5d
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN c t1 ON t0.y = t1.y AND (t0.x = 2 OR t0.y = 4) AND t1.p = 1 LEFT JOIN a t2 ON t2.id = 3 AND 3 >= t1.id WHERE (t1.u = 12 OR t1.x = 1)	1:1bb634dee8771c60
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN b t1 ON t1.x = t0.x AND t0.y = 5 LEFT JOIN b t2 ON t1.id + 1 = t2.id WHERE t0.id NOT IN (24, 25) AND t0.y IS NOT NULL	27:92f6461006b616ae
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN c t1 ON t0.x >= 0 AND t1.id < t0.x WHERE t0.u = 18 AND t0.x BETWEEN 1 AND 5	1:c75dc8ad91df5ff2
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 FULL JOIN c t1 ON (t0.x = 1 AND t0.y >= 0 OR t0.id = 4) AND t0.u IS NULL LEFT JOIN b t2 ON t0.y = 5 AND t1.y IS NULL LEFT JOIN c t3 ON (t1.x = 2 AND t1.y >= 4 OR t1.id = 5) AND t2.y = t3.y WHERE t3.u IS NULL	35:0826130c5f031d36
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN c t1 ON t0.u = 72 AND t1.id = t0.id AND t1.x = 3 LEFT JOIN c t2 ON t1.t IN ('00296', '00074') AND t1.u IS NULL AND t2.u = t1.u	24:36a08045a626b343
+q	SELECT t0.id, t1.id FROM a t0 JOIN a t1 ON t0.id + 1 = t1.id AND t0.y = 4 WHERE t1.u = 39 AND t0.y = 5	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN a t1 ON t0.t <= '00370' LEFT JOIN b t2 ON t1.y >= 2	2383:17c7e129b56b7873
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM b t0 LEFT JOIN a t1 ON t0.x = 1 AND t1.x = t0.x FULL JOIN b t2 ON t0.x = 3 AND t2.x = t0.x FULL JOIN c t3 ON t2.p = 3 AND t3.y >= 0 AND (t2.x = 2 AND t2.y >= 2 OR t2.id = 1) AND t3.id = t0.x WHERE t3.x = 1	2:577fb90a2b628af8
+q	SELECT t0.id, t1.id, t2.id FROM b t0 FULL JOIN a t1 ON t0.id IS NULL AND t1.x + 0 = 2 AND t1.x = t0.x RIGHT JOIN c t2 ON 4 < t0.x AND t2.id < t0.x AND t0.id <= 8	10:43254adae4e8661b
+q	SELECT t0.id, t1.id, t2.id FROM b t0 JOIN a t1 ON t0.y IN (4, 5) AND t1.x NOT IN (2, 3) AND t1.id < t0.x LEFT JOIN b t2 ON t0.id + 1 = t2.id WHERE t1.t IS NOT NULL AND t0.y = 3	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM c t0 RIGHT JOIN a t1 ON t1.id = t0.id AND t0.x = 2 AND t0.t >= '00111' WHERE (t0.t = '00370' OR t0.x = 3) AND t0.y = 2	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 FULL JOIN b t1 ON t1.x = t0.p AND t0.id IS 4 AND t1.id IN (14, 15) JOIN a t2 ON t2.id = t1.id AND t1.id <= 5 FULL JOIN a t3 ON (t0.x = 2 OR t0.y = 4)	29:46a6e9c4009358e9
+q	SELECT t0.id, t1.id, t2.id FROM c t0 LEFT JOIN b t1 ON '00407' = t1.t AND t0.x IS NOT NULL AND t1.id = t0.id JOIN b t2 ON t1.t = '00370' AND t2.id < t0.x AND (t2.x = 2 OR t2.x = 2) AND t0.u < 24 WHERE t1.y = 2	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t1.u = 3 WHERE t0.y NOT IN (1, 2) AND t0.u = 63 AND (t1.id IS NULL OR (t1.x = 4 AND t1.y >= 5 OR t1.id = 7)) AND t1.t IS '00111'	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN a t1 ON t1.id < t0.x AND t0.t < '00148' WHERE t1.id IS NULL	8:83b5784a761e3d4a
+q	SELECT t0.id, t1.id FROM c t0 JOIN c t1 ON t0.u = 18 WHERE t0.x = 1	10:3404e3956d27d72b
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN c t1 ON t0.y = 1 AND t1.x = t0.x JOIN a t2 ON t2.u IS NOT NULL AND 21 >= t1.u AND t1.id + 1 = t2.id WHERE t1.id IS NULL	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM b t0 JOIN b t1 ON t0.y = t1.y RIGHT JOIN b t2 ON t2.id = t1.id AND t1.t = '00296' JOIN b t3 ON t3.x = t2.x AND t2.t > '00407'	13:1b7f2ecb0bc20074
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 RIGHT JOIN a t1 ON (t0.t = '00333' OR t0.x = 2) AND t0.t >= '00148' FULL JOIN c t2 ON t0.y IS NULL AND (t2.x = 4 AND t2.y >= 5 OR t2.id = 5) AND t0.id + 1 = t2.id JOIN b t3 ON t2.id IN (7, 8) AND (t0.x = 1 AND t0.y >= 2 OR t0.id = 8) AND t3.p = 1 WHERE t0.t IS '00074' AND t1.u IN (9, 10)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t0.t GLOB '0*' AND t1.x = t0.p WHERE '00111' > t0.t	7:c8f51c5fbbebb001
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN a t1 ON t0.t = '00333' AND t1.id = t0.x WHERE 18 = t0.u	1:c75dc8ad91df5ff2
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN a t1 ON t1.x = t0.x AND t0.id <= 7 WHERE t0.t = '00185' AND t0.id = 2 AND t1.id IS NULL	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 LEFT JOIN a t1 ON t1.id = t0.id AND t0.t <= '00296' LEFT JOIN a t2 ON t0.u IN (18, 19) LEFT JOIN c t3 ON t3.x = 3 WHERE t1.id BETWEEN 8 AND 12 AND t0.x <= 4	2:3cf85004466321a4
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN a t1 ON t1.id = t0.x AND t0.t = '00074'	16:7760c4fedde193cb
+q	SELECT t0.id, t1.id, t2.id FROM a t0 FULL JOIN b t1 ON t0.x >= 2 AND t1.u = 3 AND t0.id + 1 = t1.id LEFT JOIN b t2 ON 4 >= t0.x WHERE t0.t GLOB '0*'	292:6f70740f0a420fff
+q	SELECT t0.id, t1.id FROM b t0 FULL JOIN b t1 ON t1.id = t0.id AND t0.x = 4 AND t1.t IS '00185' WHERE t1.id BETWEEN 0 AND 4 AND t0.y > 1	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM b t0 JOIN a t1 ON t0.t NOT IN ('00444', '00222')	312:bd339bc927350a53
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM b t0 LEFT JOIN b t1 ON t1.t GLOB '0*' AND t1.id = t0.id FULL JOIN a t2 ON (t1.u = 48 OR t1.y = 0) RIGHT JOIN a t3 ON t3.x IS 4 AND (t0.x = 1 OR t0.x = 1) AND (t1.y = 0 OR t1.x = 4) WHERE t3.id IS NULL AND t0.y >= 5	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM c t0 LEFT JOIN a t1 ON t0.y BETWEEN 1 AND 5 AND t0.y = 5 AND 6 >= t1.u LEFT JOIN b t2 ON t1.t GLOB '0*' AND t2.y = 3 AND (t1.y = 4 OR t1.x = 1) WHERE t1.id BETWEEN 0 AND 4	4:3954da9cd6bfb3b7
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 LEFT JOIN b t1 ON t0.id = 10 AND t1.id = t0.id JOIN b t2 ON t1.y IS 0 AND t2.id = t1.id FULL JOIN c t3 ON t3.x IS NULL AND t1.u = 12 AND t3.id = t1.x WHERE t3.id IS NULL AND t1.x = 2	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t1.id NOT IN (13, 14) AND (t0.x = 4 AND t0.y >= 5 OR t0.id = 13) WHERE t1.id IS NULL	23:aa83ee244360daac
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN c t1 ON t0.y > 3 AND (t1.t = '00074' OR t1.x = 4) WHERE (t0.x = 2 OR t0.x = 2) AND t0.y IS NULL	1:8db092cb8fe04e33
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN a t1 ON t0.t = '00814' WHERE t1.id IS NULL	23:f2411e2be492e11e
+q	SELECT t0.id, t1.id FROM b t0 FULL JOIN b t1 ON 27 < t0.u AND t1.id < t0.x AND t0.id <= 12	31:b1133035c005026f
+q	SELECT t0.id, t1.id FROM b t0 JOIN b t1 ON t1.x = t0.p WHERE t1.u = 33	4:73c76933bfdf5de8
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 LEFT JOIN c t1 ON (t0.y = 0 OR t0.x = 1) AND t1.id < t0.x LEFT JOIN a t2 ON t0.u < 69 AND t2.id < t1.x LEFT JOIN b t3 ON t3.id < t0.x WHERE 51 >= t0.u AND t0.x IN (1, 2)	7:310d05bfa8139e9d
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON (t0.x = 3 AND t0.y >= 1 OR t0.id = 9) AND t0.p = 3 AND t1.u = 18 AND t0.y = t1.y WHERE t0.u IS NOT NULL	21:f90ec18f9a947d87
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN b t1 ON t0.p = 0 AND t1.t = t0.t LEFT JOIN b t2 ON t0.y IS NULL AND t2.id = t1.id AND t1.x < 1	16:a3c07515de4adac8
+q	SELECT t0.id, t1.id FROM c t0 RIGHT JOIN a t1 ON t0.id + 1 = t1.id AND coalesce(t0.y, 1) < 2 AND t0.u > 12 WHERE (t1.id IS NULL OR (t1.u = 48 OR t1.y = 0))	1:db0ca4715febfc47
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN a t1 ON t1.id = 4 AND 0 > t0.y WHERE (t0.x = 1 OR t0.x = 1) AND t0.id = 3	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN b t1 ON 4 >= t0.x FULL JOIN b t2 ON t0.t NOT IN ('00259', '00037') AND t0.u = 9 WHERE t2.x IN (3, 4) AND t0.x IN (3, 4)	96:5e284f898b6b4b5b
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN c t1 ON (t0.t = '00259' OR t0.y = 5) AND t1.x = t0.p WHERE t0.t GLOB '0*'	11:a17e09a185e8ddb7
+q	SELECT t0.id, t1.id, t2.id FROM b t0 JOIN c t1 ON t0.p = 1 LEFT JOIN b t2 ON t1.y = t2.y AND t1.u IS NULL WHERE t2.id IS NULL AND t1.u NOT IN (21, 22)	36:9fa0267678ec707e
+q	SELECT t0.id, t1.id, t2.id FROM c t0 LEFT JOIN b t1 ON t0.t = '00148' FULL JOIN b t2 ON t2.x = t1.x WHERE t2.id < 14 AND t2.t IS NULL	3:fa7dd9540e3288a4
+q	SELECT t0.id, t1.id FROM b t0 RIGHT JOIN a t1 ON t0.t IN ('00444', '00222') WHERE t1.t GLOB '0*'	44:f03ee387679cbea3
+q	SELECT t0.id, t1.id, t2.id FROM a t0 RIGHT JOIN c t1 ON t1.u = t0.u LEFT JOIN b t2 ON t1.y > 2	85:4a00ca366675842d
+q	SELECT t0.id, t1.id, t2.id FROM b t0 RIGHT JOIN c t1 ON t0.id + 1 = t1.id FULL JOIN b t2 ON t0.u > 27 AND t2.id = t0.id AND (t2.x = 4 AND t2.y >= 0 OR t2.id = 6)	26:b7536e9e3d90e964
+q	SELECT t0.id, t1.id FROM c t0 JOIN c t1 ON 2 < t0.y AND t1.y >= 2	35:49ea19f8a641942b
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN c t1 ON (t1.t = '00111' OR t1.y = 4) AND t0.id IS 6	12:7921dfc749d8767e
+q	SELECT t0.id, t1.id, t2.id FROM c t0 FULL JOIN c t1 ON t0.t = '00111' LEFT JOIN b t2 ON t0.y = t2.y AND t0.t = '00259'	21:dec7dd501bf09be1
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN a t1 ON t0.y <= 4 WHERE t1.t = '00148' AND t0.t < '00333' AND t0.id = 8	1:947ba61845374e1f
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN b t1 ON t1.y = 0 WHERE t1.id = 5 AND t1.t < '00259'	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN a t1 ON t1.x = t0.x AND t0.y = 4 RIGHT JOIN a t2 ON t2.x = t0.x WHERE t2.x > 3 AND t2.t >= '00518'	27:a12107513356dfe8
+q	SELECT t0.id, t1.id, t2.id FROM b t0 RIGHT JOIN c t1 ON t0.y <> 5 AND t1.u = t0.u RIGHT JOIN c t2 ON t2.u = t1.u AND t0.t IS NULL WHERE t2.id IS NOT NULL	10:c50a93ad7e7bb2a0
+q	SELECT t0.id, t1.id FROM b t0 FULL JOIN c t1 ON t0.y = 5 AND t1.x = t0.x WHERE t0.p = 2	4:08ea44250ff8a8a3
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN b t1 ON t0.y = 0 AND t1.u = t0.u LEFT JOIN b t2 ON t2.x = 1 AND t1.t < '00481' WHERE t0.x = 2 AND (t0.x = 2 AND t0.y >= 3 OR t0.id = 4)	2:2814f0bddddc0ce5
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON 45 > t0.u WHERE 42 <= t0.u AND t0.t GLOB '0*'	8:699c3b495e63a431
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN c t1 ON t1.t IS NOT NULL AND t1.id = t0.id AND coalesce(t0.y, 1) < 4 WHERE t0.y <= 1 AND t1.t = '00259'	1:353374180f3f83db
+q	SELECT t0.id, t1.id FROM b t0 RIGHT JOIN b t1 ON t0.u <= 45	208:be5440cdf7f5cc9c
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 LEFT JOIN c t1 ON t0.id IS NULL AND t1.x = t0.x FULL JOIN c t2 ON t1.y = t2.y LEFT JOIN c t3 ON t1.x = 4 AND t3.t = t1.t AND t3.id IS NULL WHERE t0.u = 12 AND t2.u IS NULL	1:f5f5bbef258b65a6
+q	SELECT t0.id, t1.id FROM b t0 FULL JOIN a t1 ON t1.id = t0.x WHERE t1.id IS NOT NULL AND t1.y BETWEEN 2 AND 6 AND t1.u IS NULL	2:f61b2d079f04be3d
+q	SELECT t0.id, t1.id, t2.id FROM c t0 LEFT JOIN c t1 ON t0.id <= 1 LEFT JOIN c t2 ON t2.id > 7 AND (t0.x = 0 AND t0.y >= 3 OR t0.id = 6) AND 4 >= t1.x WHERE t2.id IS NULL	19:ca31271b1e32d918
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN b t1 ON t1.id < t0.x AND 24 >= t0.u AND t0.x = 2 WHERE t0.p = 1 AND t1.id IS NOT NULL	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN c t1 ON t1.x = t0.p AND t0.x <> 4 WHERE t0.y < 5	17:83cbbcaa5ba2b9df
+q	SELECT t0.id, t1.id, t2.id FROM c t0 LEFT JOIN a t1 ON 17 >= t1.id AND t1.x = t0.x AND t0.t <= '00259' RIGHT JOIN a t2 ON (t2.y = 4 OR t2.x = 3) AND t0.x >= 2 AND t2.x = t1.p WHERE t1.id IS NOT NULL	22:6cd7fae502df32a8
+q	SELECT t0.id, t1.id FROM c t0 FULL JOIN b t1 ON t1.u BETWEEN 4 AND 8 AND t1.t = t0.t AND t0.x > 2	26:75ecadc0b22076b2
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN c t1 ON t0.x >= 0 AND t1.t = t0.t WHERE t0.t = '00074'	1:6082be1827c74beb
+q	SELECT t0.id, t1.id FROM b t0 RIGHT JOIN c t1 ON t1.t = '00259' AND t0.u > 12 WHERE t1.u IS NULL	10:6eb110c100bafcac
+q	SELECT t0.id, t1.id FROM c t0 FULL JOIN a t1 ON t0.id + 1 = t1.id AND t1.t IS NULL WHERE (t1.u = 24 OR t1.x = 4)	6:368f0258446e44c2
+q	SELECT t0.id, t1.id, t2.id FROM b t0 JOIN a t1 ON t0.u = 18 AND t1.id < t0.x LEFT JOIN c t2 ON t2.y = 3 AND t2.x = t1.x AND t1.y IS NULL WHERE t1.x = 3	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM c t0 JOIN a t1 ON t1.x = t0.p AND t0.u IS NULL WHERE t0.x IS NULL AND t0.t = '00222'	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM c t0 LEFT JOIN b t1 ON t1.id = t0.id AND t0.y >= 0 AND '00222' = t0.t RIGHT JOIN a t2 ON t2.u <= 48	150:9f0635c041c73ea6
+q	SELECT t0.id, t1.id, t2.id FROM a t0 FULL JOIN b t1 ON t0.y = 2 AND t1.id = t0.id AND t0.t = '00592' AND t1.y IN (4, 5) FULL JOIN c t2 ON t0.y = 5 AND t2.x = t0.x AND t0.x = 2	49:99b89dbfdada1f16
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 FULL JOIN a t1 ON t1.id = t0.id AND t0.x = 0 LEFT JOIN b t2 ON t2.t GLOB '0*' LEFT JOIN c t3 ON t3.x = t1.x AND t0.x IS NULL WHERE t0.t <= '00185' AND t0.x >= 1	60:1838a38ec7082bc5
+q	SELECT t0.id, t1.id, t2.id FROM b t0 JOIN b t1 ON t1.x = 3 LEFT JOIN c t2 ON t2.u = t0.u AND t1.u = 48 AND t0.y IN (4, 5) WHERE (t2.id IS NULL OR t2.id IS NOT NULL) AND t1.u >= 12 AND t0.x = 2	6:c34d94c7c221fb35
+q	SELECT t0.id, t1.id FROM a t0 RIGHT JOIN a t1 ON t0.id = 17	24:a43707f2e723b7f1
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN b t1 ON t1.id < t0.x AND t0.t >= '00296' WHERE t0.x IS NOT NULL AND t0.y >= 2 AND t0.u >= 9	5:bd6fe956a3980ae3
+q	SELECT t0.id, t1.id FROM b t0 FULL JOIN a t1 ON t0.y = t1.y WHERE 21 >= t1.id AND (t1.id = 2 OR t1.x = 2)	9:0028ee6e85c1091e
+q	SELECT t0.id, t1.id, t2.id FROM c t0 FULL JOIN a t1 ON (t1.t = '00370' OR t1.x = 3) LEFT JOIN a t2 ON t2.id = t0.x AND (t0.y = 2 OR t0.x = 1) WHERE t1.x IS 3	50:577da4c39bce9d52
+q	SELECT t0.id, t1.id FROM c t0 FULL JOIN c t1 ON t0.y >= 4 WHERE 0 < t1.x AND t1.t = '00037'	3:7d7f62f9be2d1cac
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN a t1 ON (t0.u = 27 OR t0.x = 4) AND t1.t = t0.t WHERE (t1.id IS NULL OR t1.y < 4) AND t0.x + 0 = 3 AND t0.t < '00555'	3:46093fa7d30f36fd
+q	SELECT t0.id, t1.id FROM b t0 JOIN c t1 ON t1.id = t0.id AND t0.y = 3 WHERE t0.t >= '00222'	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM b t0 FULL JOIN a t1 ON t0.x = 0 LEFT JOIN c t2 ON t2.x = 3 AND (t1.y = 3 OR t1.x = 3) WHERE t1.u = 51	1:f6be390175395c85
+q	SELECT t0.id, t1.id, t2.id FROM c t0 FULL JOIN c t1 ON t1.id = t0.id LEFT JOIN c t2 ON t2.id = 9 AND t0.x = 4 WHERE t1.y IN (4, 5) AND t0.t >= '00185'	2:a0ca030219c0c785
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 RIGHT JOIN a t1 ON t0.t GLOB '0*' AND t1.u = 54 AND t0.y = t1.y LEFT JOIN c t2 ON t0.id + 1 = t2.id AND t0.x = 3 LEFT JOIN b t3 ON t2.t = '00296' AND t3.id < t0.x WHERE t0.u IS NULL	24:f27490716d464f51
+q	SELECT t0.id, t1.id FROM c t0 FULL JOIN b t1 ON t0.x >= 0 AND t1.t = t0.t WHERE t0.t IS NOT NULL	9:303e26c0159067e7
+q	SELECT t0.id, t1.id, t2.id FROM a t0 FULL JOIN b t1 ON t1.x = 1 AND (t0.u = 36 OR t0.x = 4) AND t0.id + 1 = t1.id LEFT JOIN c t2 ON t2.u = t0.u AND t1.u >= 21 AND t2.t <= '00333' AND t1.y = 1 WHERE t1.u <> 36	13:11aa16987b94a967
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN c t1 ON t1.y BETWEEN 2 AND 6 AND t1.id = t0.id WHERE t1.t = '00370' AND t0.x = 2	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN a t1 ON t1.id = t0.id AND 2 >= t0.x WHERE (t1.id IS NULL OR (t0.t = '00222' OR t0.x = 0))	10:1fb1e66ba26f77db
+q	SELECT t0.id, t1.id, t2.id FROM b t0 JOIN b t1 ON t0.y = t1.y AND t0.x > 4 LEFT JOIN a t2 ON t1.x <= 3 AND t2.id IS NULL AND t1.t < '00148' WHERE t1.t < '00333' AND t1.u < 45	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN b t1 ON t0.x < 4 AND t1.x = t0.x	24:52fa8a4e5358dd92
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN c t1 ON t0.t > '00370' LEFT JOIN a t2 ON (t2.x = 1 AND t2.y >= 1 OR t2.id = 1) AND t1.y = t2.y WHERE (t1.id IS NULL OR 24 < t2.id)	11:d8a7a1d01ba50f10
+q	SELECT t0.id, t1.id, t2.id FROM c t0 JOIN a t1 ON t1.id = t0.x AND t0.x = 1 LEFT JOIN b t2 ON t2.id = t1.id AND t1.x = 4 WHERE t1.x = 2 AND t1.y > 5	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM a t0 FULL JOIN c t1 ON t1.u = t0.u AND t0.id >= 24 AND t0.u = 24 LEFT JOIN c t2 ON t0.t >= '00666' WHERE t2.id IS NOT NULL	60:6809c52b6b665f01
+q	SELECT t0.id, t1.id, t2.id FROM a t0 JOIN a t1 ON t1.x = t0.p AND t0.u > 6 LEFT JOIN c t2 ON t2.x >= 4 WHERE (t2.t = '00333' OR t2.x = 1)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM c t0 FULL JOIN c t1 ON 10 < t0.id AND t1.u BETWEEN 1 AND 5 AND t1.id < t0.x LEFT JOIN b t2 ON t2.id < t0.x AND t0.p = 1 WHERE t1.id = 5 AND t0.t IS '00333'	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN c t1 ON t0.p = 1 AND t1.x = t0.p RIGHT JOIN a t2 ON t0.y BETWEEN 0 AND 4 AND t2.id IS 18 AND coalesce(t1.y, 1) < 1 AND t0.y = t2.y WHERE t2.x < 4 AND t2.y > 0	12:4fa4e17b0149e83b
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN a t1 ON t0.x BETWEEN -2 AND 2 AND t1.u = t0.u AND t0.u >= 24	10:1ea4710a2076fc95
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN b t1 ON t0.t GLOB '0*' WHERE t1.u IS NULL AND t0.t <> '00333'	18:52f4d5d2ff75b1dd
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN b t1 ON t1.u = t0.u AND '00222' > t0.t LEFT JOIN a t2 ON t0.u NOT IN (69, 70) AND t2.id = t0.id WHERE (t0.x = 4 AND t0.y >= 3 OR t0.id = 24) AND t2.id IS NOT NULL	3:f42ce83222ce6a2d
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 FULL JOIN b t1 ON t1.t = t0.t AND t0.u BETWEEN 46 AND 50 LEFT JOIN a t2 ON t2.t = t1.t AND t1.x < 4 LEFT JOIN c t3 ON t3.t = t0.t AND t0.x > 0 WHERE coalesce(t1.y, 1) < 5 AND (t3.id IS NULL OR t1.t IN ('00333', '00111'))	30:a0d44817d0f276fd
+q	SELECT t0.id, t1.id, t2.id FROM c t0 FULL JOIN b t1 ON (t0.x = 3 OR t0.y = 1) AND t1.t = t0.t LEFT JOIN c t2 ON t1.x = 2 AND t2.t IN ('00296', '00074') AND t0.u = 27 AND t2.id < t0.x WHERE t1.u NOT IN (48, 49) AND t1.id IS NOT NULL AND t0.u IN (21, 22)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN c t1 ON t1.u = t0.u AND t1.u = 3 WHERE (t0.y = 5 OR t0.y = 5)	1:c5fc1ac1727801a1
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN b t1 ON t0.t = '00111' AND t0.y = t1.y	18:ade015cdddcacf5b
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN b t1 ON t1.id = t0.id AND t0.y <= 1 WHERE t1.u IS NULL	14:e80aa8918edd86af
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t0.u < 57 WHERE (t1.x = 0 AND t1.y >= 3 OR t1.id = 11)	16:f320195b9cc5db41
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN b t1 ON t0.y IS NULL AND t0.y = t1.y WHERE t0.t IS NULL AND (t0.id = 1 OR t0.y = 3)	1:13765e2cdba7a685
+q	SELECT t0.id, t1.id, t2.id FROM c t0 FULL JOIN c t1 ON t1.x = t0.p AND (t0.x = 0 AND t0.y >= 3 OR t0.id = 4) RIGHT JOIN a t2 ON t2.id = t1.x AND t2.x <= 3 WHERE t2.t > '00185'	17:5e0b5ef67faf2ca6
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t1.x = t0.p WHERE (t0.x = 3 AND t0.y >= 0 OR t0.id = 10)	9:47df30f11c99b05e
+q	SELECT t0.id, t1.id FROM c t0 JOIN a t1 ON t0.y = t1.y WHERE t0.y > 1 AND t0.id BETWEEN 0 AND 4	12:7d7bcb8c874ef1f7
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t1.x = t0.p AND (t0.u = 36 OR t0.x = 4) AND t1.u = 24 WHERE t0.u BETWEEN 10 AND 14 AND t1.u = 33	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM c t0 JOIN b t1 ON 3 < t0.x AND t1.u = t0.u FULL JOIN c t2 ON t0.u IN (24, 25) AND t2.t = t0.t WHERE t2.y IS NOT NULL AND t0.x BETWEEN 1 AND 5 AND t0.x = 1	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM b t0 JOIN a t1 ON t0.p = 1 AND t0.y = t1.y LEFT JOIN c t2 ON t0.x >= 0 WHERE (t2.t = '00296' OR t2.y = 4) AND t2.t < '00370'	24:2e6307499fef019f
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN a t1 ON t0.id IS NULL AND 4 = t1.id AND t1.x = t0.p WHERE t0.x <= 0 AND t0.x = 2	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM c t0 LEFT JOIN a t1 ON t1.id = 23 AND t0.y = t1.y LEFT JOIN a t2 ON t2.id < t1.x AND t0.t = '00148' AND t2.u NOT IN (72, 73) WHERE t0.x IS NOT NULL AND t0.t <= '00296' AND t0.y >= 2	4:818f5f55b5b7e262
+q	SELECT t0.id, t1.id, t2.id FROM a t0 JOIN b t1 ON t1.u = 12 LEFT JOIN c t2 ON t2.t = t0.t AND t0.y IS NULL WHERE t0.id = 7 AND (t1.x = 4 AND t1.y >= 0 OR t1.id = 3) AND (t0.id = 10 OR t0.x = 2)	1:0edc3b08ac3a39f7
+q	SELECT t0.id, t1.id FROM c t0 FULL JOIN a t1 ON t1.u = t0.u AND t0.u IS 30 WHERE t0.t < '00259'	6:90b32eca77a22172
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN b t1 ON t1.id < 14 AND t0.x = 0 AND t1.id = t0.id WHERE t0.u <= 12 AND t0.x < 2	1:3a3a2ba88b96c57d
+q	SELECT t0.id, t1.id FROM b t0 JOIN c t1 ON t0.y = t1.y AND t0.x = 4	6:64ebeba6401cd668
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN a t1 ON t0.x IS NULL AND (t0.x = 4 AND t0.y >= 0 OR t0.id = 15) LEFT JOIN c t2 ON t2.x = t1.p AND t2.id = 7 WHERE t1.x = 4 AND (t0.x = 4 AND t0.y >= 1 OR t0.id = 18)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 LEFT JOIN b t1 ON t1.y <= 5 LEFT JOIN a t2 ON t1.x = 1 AND t0.y = 1 AND t2.t = t1.t LEFT JOIN a t3 ON t3.id = t1.id AND t3.u < 21 AND t1.u IS NULL AND t0.x + 0 = 1 WHERE t0.x <= 2	140:cd5bd32eaad2bfd7
+q	SELECT t0.id, t1.id FROM c t0 JOIN b t1 ON t0.t IS NULL AND t1.id = t0.id WHERE 21 < t0.u AND t0.u >= 18 AND 2 = t0.x	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN a t1 ON t1.t = t0.t WHERE t0.y NOT IN (5, 6) AND t1.id IS NOT NULL AND t0.x = 2	2:b69ffdad82197235
+q	SELECT t0.id, t1.id FROM c t0 FULL JOIN c t1 ON t0.y = 5 AND t1.x > 0 AND t1.id = t0.id AND t0.x >= 2 WHERE t0.x + 0 = 3	2:7f46dd605657ed3a
+q	SELECT t0.id, t1.id FROM b t0 RIGHT JOIN b t1 ON t1.y = 3 WHERE t0.id = 8	3:a3c5b0b35d0fa5e1
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t1.t = t0.t AND t1.id IS NULL AND (t0.x = 4 AND t0.y >= 3 OR t0.id = 18) WHERE t0.x IN (3, 4) AND t0.x > 2	10:c94fd1dac9b7926c
+q	SELECT t0.id, t1.id, t2.id FROM c t0 RIGHT JOIN a t1 ON t1.x = 3 AND t0.x < 1 AND t1.id = t0.id RIGHT JOIN c t2 ON 69 > t1.u AND t0.t > '00037' WHERE t1.x IN (2, 3) AND t0.u = 18	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM b t0 FULL JOIN c t1 ON t0.id + 1 = t1.id AND t0.x = 1 LEFT JOIN b t2 ON t2.u = t0.u AND t2.p = 2 AND t0.u = 18	24:2debb85da0d1d953
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN c t1 ON t1.y = 1 AND t0.y = 1 WHERE t0.t <= '00111'	4:d0c4bc5b0a220934
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN a t1 ON 1 < t0.x AND t1.t = '00592'	24:4fba7af60fb65bcd
+q	SELECT t0.id, t1.id FROM b t0 JOIN b t1 ON t1.t = t0.t AND t0.u = 48 WHERE t0.t GLOB '0*'	1:5142706524b8a2e9
+q	SELECT t0.id, t1.id FROM c t0 RIGHT JOIN a t1 ON t1.id = t0.id	24:0de25ae90a89169f
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN a t1 ON t0.x + 0 = 1 AND t0.id + 1 = t1.id AND (t0.y = 2 OR t0.x = 3) AND (t1.t = '00555' OR t1.x = 3) WHERE t1.id IS NULL AND t0.t = '00333'	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM b t0 RIGHT JOIN a t1 ON t1.x = t0.p	69:f1a4652f9d6f8243
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 LEFT JOIN c t1 ON t1.id = t0.x AND t1.t = '00222' AND t0.u IN (3, 4) RIGHT JOIN a t2 ON t0.y = 1 AND t0.id BETWEEN 5 AND 9 AND t2.id = t0.id FULL JOIN a t3 ON coalesce(t3.y, 1) < 3 AND t3.x = t2.p AND t0.t = '00037' AND (t1.y = 5 OR t1.y = 5) WHERE t1.u IS NULL	48:9cf86a8af863297b
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN a t1 ON t1.u = 60 WHERE t1.t > '00629' AND t1.id IS NOT NULL AND t0.y = 4 AND t1.t < '00777'	3:760ef5c06b50d989
+q	SELECT t0.id, t1.id, t2.id FROM c t0 LEFT JOIN c t1 ON 2 > t0.x AND t1.t = '00037' AND t1.id = t0.id FULL JOIN a t2 ON t2.x = t1.x WHERE t0.u IS NOT NULL AND t0.t > '00111' AND t0.t > '00296'	1:8d44787fc47eb91e
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM b t0 LEFT JOIN c t1 ON t1.u IS 24 AND t1.t = t0.t LEFT JOIN b t2 ON (t1.t = '00259' OR t1.x = 2) AND t2.u = t0.u AND 3 >= t2.x LEFT JOIN b t3 ON t2.y >= 2 AND t3.u = t1.u	16:94e7be3f29b4d51b
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN c t1 ON (t0.u = 60 OR t0.x = 2) AND t1.id = t0.id AND t1.x = 3 WHERE t1.u < 30 AND t1.x IS NOT NULL AND (t1.t = '00333' OR t1.y = 5)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t0.x = 3 AND t0.y = t1.y AND t1.u = 21 WHERE t0.x BETWEEN -2 AND 2 AND t0.x = 2 AND (t1.id IS NULL OR t1.y = 3)	5:403e21492eea1816
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN a t1 ON t0.y BETWEEN 0 AND 4 WHERE t1.x = 3	60:26b2aafee9799b02
+q	SELECT t0.id, t1.id, t2.id FROM c t0 LEFT JOIN b t1 ON t1.id < t0.x RIGHT JOIN b t2 ON t2.u IS NOT NULL WHERE t1.p = 2 AND t2.y = 3	12:3c0065a5e372566d
+q	SELECT t0.id, t1.id FROM a t0 JOIN a t1 ON t1.id = t0.x AND t0.id < 24 WHERE t0.x NOT IN (2, 3) AND t0.y = 4	2:7b858cf83ed9e3c3
+q	SELECT t0.id, t1.id FROM c t0 RIGHT JOIN c t1 ON t0.p = 3 WHERE t0.y BETWEEN 3 AND 7	10:8c3b472c909c61af
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN c t1 ON t1.x = t0.p AND 5 >= t0.y WHERE t1.y IS NOT NULL AND t0.x + 0 = 2	7:0717a7fc09881237
+q	SELECT t0.id, t1.id FROM b t0 JOIN a t1 ON (t0.x = 3 AND t0.y >= 3 OR t0.id = 8) AND t1.t = t0.t WHERE t0.id < 2 AND t0.x IN (3, 4) AND t0.x = 3	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM a t0 RIGHT JOIN a t1 ON t0.y = t1.y AND t1.x = 1 LEFT JOIN a t2 ON t2.y IS NULL AND (t1.y = 1 OR t1.y = 1) AND t2.id < t0.x AND '00370' = t1.t WHERE t1.u >= 24 AND t2.id = 4 AND t1.id IS NOT NULL	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN c t1 ON t1.u IS NOT NULL AND t1.t = t0.t AND '00259' < t0.t LEFT JOIN c t2 ON t2.u = t1.u AND t0.u BETWEEN 4 AND 8	16:3bcfb9866cf5587f
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN a t1 ON t1.x = 2 AND coalesce(t0.y, 1) < 0 AND t1.id < t0.x WHERE t0.y IN (1, 2)	6:e5867454ee9a55dc
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN c t1 ON t0.t GLOB '0*' AND t1.t = t0.t WHERE (t1.id IS NULL OR t1.t >= '00259')	10:cea881a47de425c0
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 RIGHT JOIN a t1 ON t0.t = '00037' AND t0.u = 3 AND t1.id < t0.x FULL JOIN b t2 ON t1.p = 1 LEFT JOIN a t3 ON t3.u = 57 AND t3.id = t1.id AND t0.x IS 2 AND t2.u = 33 WHERE t3.id = 17 AND t0.x IS 1	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM c t0 FULL JOIN b t1 ON t0.id + 1 = t1.id AND t0.y < 3 LEFT JOIN c t2 ON t1.x <= 2 AND t2.id = t1.id AND t2.u > 18 WHERE t1.y IS 1 AND t1.y IS NULL	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN a t1 ON t1.t = '00777' WHERE t1.x IS 0 AND t0.t IS NULL AND t1.id IS NOT NULL	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN c t1 ON t0.u BETWEEN 7 AND 11 AND t0.y > 5 LEFT JOIN a t2 ON t1.x = 0 AND t2.x = t0.x	24:36a08045a626b343
+q	SELECT t0.id, t1.id FROM c t0 RIGHT JOIN a t1 ON t1.x <= 4 WHERE t1.id IS NULL AND t1.x IN (0, 1) AND 4 <= t1.y	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN a t1 ON t1.t = t0.t WHERE t1.y IS NULL AND t0.x IN (3, 4)	1:13765e2cdba7a685
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN b t1 ON 3 >= t0.y AND t1.x = t0.x WHERE t0.id BETWEEN 0 AND 4 AND t0.x IS 1	4:1fea088f1f6ff2a3
+q	SELECT t0.id, t1.id FROM b t0 FULL JOIN a t1 ON t1.t = t0.t AND t0.id >= 2	26:6189cdcfa5c2dce6
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN a t1 ON t1.id = t0.id AND t0.u = 36 LEFT JOIN a t2 ON t2.x = t1.x AND t0.t = '00481' WHERE t0.t IS '00074' AND (t0.y = 2 OR t0.y = 2)	1:dafd394f5e97c747
+q	SELECT t0.id, t1.id FROM c t0 RIGHT JOIN b t1 ON t0.t = '00037' AND 24 >= t1.u AND t1.id = t0.id WHERE t1.id NOT IN (5, 6) AND (t1.t = '00259' OR t1.y = 5) AND (t1.id IS NULL OR t0.x IS NULL)	2:3b88903ecb766118
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 LEFT JOIN c t1 ON (t0.x = 4 OR t0.y = 4) AND t1.u = t0.u FULL JOIN a t2 ON t1.x = 3 AND t2.p = 2 AND t2.x = t1.p FULL JOIN c t3 ON t1.x IS NULL AND t1.u <= 9 AND t3.id = t0.x WHERE (t1.x = 2 AND t1.y >= 0 OR t1.id = 4)	1:8650076e20ef2b35
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN b t1 ON t1.t = t0.t AND t0.y BETWEEN -1 AND 3 AND (t1.x = 0 AND t1.y >= 3 OR t1.id = 5) RIGHT JOIN a t2 ON t0.y = t2.y AND t0.y = 5 AND t0.u = 30 WHERE t0.u = 42	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM c t0 RIGHT JOIN c t1 ON t0.y <= 4 AND t1.x = t0.x LEFT JOIN c t2 ON t2.u = t1.u AND t0.y < 4 WHERE t0.x >= 4	4:f35e3454e5cf142e
+q	SELECT t0.id, t1.id FROM c t0 FULL JOIN b t1 ON t1.y = 1 AND t1.id = t0.id AND (t0.u = 15 OR t0.x = 3) WHERE t1.x > 3 AND t1.x IS NULL	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN c t1 ON t1.x = t0.x WHERE t1.u IN (15, 16)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t1.id = t0.x AND t0.x = 4 AND t0.t IN ('00259', '00037') WHERE t0.u BETWEEN 28 AND 32	1:3da018b978419355
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t0.t >= '00037' AND t1.t IN ('00074', '00111') AND t0.id + 1 = t1.id WHERE '00037' < t1.t AND '00592' >= t0.t	2:9d5a60b4d8b4517b
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN a t1 ON t1.u < 51 AND t0.t IS '00629' WHERE (t0.y = 5 OR t0.y = 5) AND t0.p = 3	2:bf9518ccb838462e
+q	SELECT t0.id, t1.id FROM b t0 JOIN b t1 ON t0.x >= 0 AND t1.id < t0.x WHERE t0.u < 30	11:a4c86b1ba4091019
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN c t1 ON t0.u = 9 AND 3 <= t0.x AND t1.id = t0.id RIGHT JOIN c t2 ON t2.x = 4 WHERE t2.u IS 9	1:b4ae81160ce4d2f8
+q	SELECT t0.id, t1.id FROM c t0 RIGHT JOIN b t1 ON '00074' <= t0.t AND t1.id > 10 AND t1.id = t0.x WHERE '00185' >= t1.t	5:d499c5e11bf81297
+q	SELECT t0.id, t1.id FROM a t0 JOIN b t1 ON (t0.x = 2 AND t0.y >= 2 OR t0.id = 1) WHERE t0.y >= 4 AND t0.y = 5	16:39b81d52fa3298b4
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN a t1 ON t0.x > 1 AND t1.x = t0.p WHERE t0.u = 6 AND (t0.x = 2 OR t0.y = 0)	5:388c3909a8fb2ba7
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON 3 <= t0.y AND t0.u = 27 AND (t1.t = '00333' OR t1.x = 2) WHERE (t0.x = 3 AND t0.y >= 5 OR t0.id = 17)	2:df6e2a68722e9f48
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN a t1 ON t1.y >= 1 AND t1.id = t0.id WHERE t1.y >= 3 AND t1.u = 27	1:8bd20018404f0663
+q	SELECT t0.id, t1.id FROM a t0 JOIN c t1 ON t1.t = t0.t WHERE t1.id IN (2, 3)	2:944b5dad6ebe4fd5
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN c t1 ON t1.id = t0.id FULL JOIN b t2 ON t2.x = t1.x AND t1.u IN (12, 13) WHERE t1.y >= 1 AND (t1.y = 5 OR t1.y = 5)	1:38903e4a31ba81dc
+q	SELECT t0.id, t1.id, t2.id FROM b t0 FULL JOIN a t1 ON t0.id IN (5, 6) AND t1.id = t0.x LEFT JOIN b t2 ON t2.id = t0.id AND t2.id = 13	39:bc5495566756202e
+q	SELECT t0.id, t1.id, t2.id FROM c t0 JOIN b t1 ON t0.p = 0 AND t0.id = 4 LEFT JOIN b t2 ON t1.t >= '00037' AND t2.t < '00037' AND t2.id = t1.id WHERE 3 > t1.y AND t2.id IS NULL	6:a18dd0fbc3d8e37c
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN c t1 ON t0.y NOT IN (3, 4) WHERE t1.t IS NULL AND 4 >= t0.x	13:8ce8a4ef418159d7
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN c t1 ON t0.id = 7 AND t1.p = 0 AND t1.x = t0.x WHERE t1.id >= 6 AND t1.p = 0 AND t1.id = 4	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN a t1 ON t0.x = 0 WHERE t0.u = 9 AND (t1.id IS NULL OR t0.t NOT IN ('00259', '00037')) AND 4 >= t0.id AND t0.x IS NULL	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t0.x = 4 AND t1.id < t0.x AND t1.x = 2 WHERE (t0.u = 6 OR t0.x = 3) AND t1.id IS NULL AND 27 > t1.u AND t0.x + 0 = 0	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM c t0 RIGHT JOIN c t1 ON t1.u = 3 AND NOT t0.id > 8 AND t0.u = 27 AND t0.y = t1.y WHERE t1.id IS NULL AND t1.id IS NULL	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t0.y = 3 AND t1.id = t0.id AND (t0.t = '00444' OR t0.x = 2) WHERE (t1.id IS NULL OR 3 >= t1.x) AND t1.id IS NOT NULL	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 RIGHT JOIN b t1 ON t0.y = 2 AND 4 <= t0.x AND t1.id = t0.id WHERE t0.x > 0	1:80f74e55d98c2359
+q	SELECT t0.id, t1.id FROM b t0 FULL JOIN b t1 ON t0.t IS '00407' WHERE (t1.x = 1 AND t1.y >= 2 OR t1.id = 4) AND (t1.t = '00074' OR t1.y = 5)	1:e68ebb7fb02fdb93
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t1.id = t0.id AND t1.id <> 6 AND t0.y = 3 WHERE t0.x BETWEEN 2 AND 6	15:281361da726e37d1
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t0.p = 3 AND t1.id < t0.x AND t1.t IS '00037' WHERE t0.x IS NULL AND t0.x >= 0	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM c t0 LEFT JOIN b t1 ON t0.t = '00370' AND t0.t IS NULL FULL JOIN a t2 ON t2.u = 54	33:41da53723325c0b0
+q	SELECT t0.id, t1.id, t2.id FROM a t0 JOIN c t1 ON t0.u < 63 AND t0.u IS NULL FULL JOIN c t2 ON t2.id < t0.x	10:43254adae4e8661b
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN a t1 ON t0.x = 3 WHERE t0.u IS NULL	3:7a971c60f9d99c0b
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN c t1 ON t0.y IS NOT NULL AND t1.id = t0.id WHERE (t0.t = '00222' OR t0.y = 1)	4:5ce43732dd48901f
+q	SELECT t0.id, t1.id FROM b t0 FULL JOIN c t1 ON t0.p = 2 WHERE t0.u = 9	1:c7fc839170e0879b
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN b t1 ON t0.id + 1 = t1.id AND t0.x IS NOT NULL AND t1.u IS 21 AND t0.y = 2 WHERE t0.x + 0 = 3 AND (t1.x = 1 AND t1.y >= 3 OR t1.id = 1)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN b t1 ON t0.t IS '00074'	25:242682b1ab839451
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN c t1 ON t0.t < '00185' AND t1.x = 3 AND t0.id + 1 = t1.id FULL JOIN c t2 ON t2.u = t0.u AND t1.u NOT IN (27, 28) WHERE t2.x + 0 = 0 AND '00259' < t1.t AND t1.u >= 18	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM b t0 JOIN a t1 ON t1.t <= '00148' AND t0.u >= 48 WHERE t0.t >= '00370'	4:4de0a13c5f414f21
+q	SELECT t0.id, t1.id, t2.id FROM a t0 RIGHT JOIN c t1 ON t1.t = t0.t FULL JOIN a t2 ON (t1.y = 3 OR t1.x = 1) AND t2.id = t1.id WHERE (t1.x = 3 AND t1.y >= 3 OR t1.id = 5) AND t2.t = '00148'	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM b t0 RIGHT JOIN b t1 ON t0.u BETWEEN 37 AND 41 AND t0.t = '00222' WHERE t0.t = '00555'	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM b t0 FULL JOIN a t1 ON t1.t >= '00666' AND t0.u = 48	39:40c7e362bc1b771c
+q	SELECT t0.id, t1.id FROM c t0 RIGHT JOIN b t1 ON t1.x = t0.p WHERE t0.u IN (6, 7) AND t1.p = 3 AND t1.y IS 1	1:6082c11827c75104
+q	SELECT t0.id, t1.id, t2.id FROM c t0 LEFT JOIN b t1 ON t0.t = '00222' AND t0.t GLOB '0*' AND t1.t = '00037' AND t1.u = t0.u RIGHT JOIN a t2 ON t2.u > 27 AND t1.u IS NULL AND t0.y = 0 WHERE t1.y < 1	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN a t1 ON t1.x = t0.x AND (t0.u = 12 OR t0.x = 4) WHERE t0.x = 4	10:cd90827d2dddbafe
+q	SELECT t0.id, t1.id, t2.id FROM a t0 JOIN b t1 ON t1.t IN ('00333', '00111') AND (t0.y = 3 OR t0.y = 3) AND t1.id = t0.id LEFT JOIN b t2 ON t2.u <= 33 AND t1.x IS NULL WHERE t1.t <= '00592' AND 9 = t1.u	1:de905524ae1a5d14
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t1.x = t0.p AND 48 = t0.u	24:d9790ee11730f207
+q	SELECT t0.id, t1.id FROM c t0 JOIN c t1 ON t1.t <= '00037' AND t0.id + 1 = t1.id AND t0.x = 3 WHERE t0.id = 2 AND t1.u IS 12 AND t1.y >= 2	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN c t1 ON t1.x BETWEEN -2 AND 2 AND t0.id + 1 = t1.id WHERE (t0.t = '00481' OR t0.x = 4) AND t0.t GLOB '0*'	3:562332f0bb1037dd
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM b t0 FULL JOIN b t1 ON t0.u <= 30 AND (t0.t = '00518' OR t0.y = 3) AND t1.id = t0.id JOIN a t2 ON t2.x = t0.p FULL JOIN a t3 ON t0.y BETWEEN 1 AND 5 AND t3.u IS NULL AND t0.id + 1 = t3.id WHERE t3.x IS NULL	59:81e8038274e6768d
+q	SELECT t0.id, t1.id FROM b t0 JOIN b t1 ON t1.x > 2	96:95dae24da0506629
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN c t1 ON 4 > t0.id AND t1.u >= 18 WHERE t0.x = 4	2:e63c98788a34cf6a
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN c t1 ON t0.t IS NULL AND t1.x = t0.x AND t0.x >= 0 WHERE t0.y IS NULL	2:b58a8ad126802cd0
+q	SELECT t0.id, t1.id FROM c t0 JOIN c t1 ON (t0.x = 0 AND t0.y >= 0 OR t0.id = 2) AND t0.y = t1.y WHERE t0.y BETWEEN -2 AND 2 AND t0.x + 0 = 2	2:9dce8dad745f72cf
+q	SELECT t0.id, t1.id FROM b t0 JOIN a t1 ON t0.y = t1.y WHERE t1.p = 1	16:bc7a381f0680c086
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN b t1 ON (t0.y = 2 OR t0.x = 1) AND t1.x >= 3 AND t0.y = t1.y LEFT JOIN b t2 ON t2.x IN (3, 4) WHERE t0.u IS NULL	30:ff2a6f176496d91a
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 RIGHT JOIN b t1 ON t1.t = t0.t AND t0.x + 0 = 0 LEFT JOIN b t2 ON t0.y = t2.y AND (t1.y = 0 OR t1.y = 0) LEFT JOIN a t3 ON t3.t < '00333' AND t3.id < t1.x AND t0.y IN (1, 2) WHERE (t1.id IS NULL OR (t1.t = '00333' OR t1.y = 2)) AND (t0.u = 15 OR t0.x = 1) AND t0.t NOT IN ('00037', '00074')	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM c t0 RIGHT JOIN b t1 ON t1.id = t0.x AND t0.y IN (0, 1) AND (t0.t = '00259' OR t0.x = 3) WHERE t1.id IS NOT NULL AND (t0.y = 1 OR t0.y = 1) AND t0.t IS NOT NULL	1:353377180f3f88f4
+q	SELECT t0.id, t1.id FROM c t0 JOIN b t1 ON NOT t0.id > 8 WHERE t0.x NOT IN (0, 1) AND t0.x = 3	32:e5173cf881ea0e9d
+q	SELECT t0.id, t1.id FROM a t0 JOIN c t1 ON coalesce(t0.y, 1) < 1 AND 6 <= t1.id AND t0.t IS NULL AND t0.id + 1 = t1.id	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 LEFT JOIN a t1 ON t0.u BETWEEN 58 AND 62 AND t1.x = t0.x FULL JOIN a t2 ON t1.t IN ('00888', '00148') AND t2.t = t0.t LEFT JOIN b t3 ON t1.x >= 0 AND coalesce(t2.y, 1) < 0 AND t3.id = t0.x AND t3.u < 12 WHERE t0.u = 54	1:6eacdb37d93fbcff
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 RIGHT JOIN b t1 ON t0.y = 0 AND t1.id = t0.x LEFT JOIN a t2 ON t2.y = 5 AND t1.t IN ('00296', '00074') AND t2.t = t0.t LEFT JOIN a t3 ON t2.y IS NULL AND t3.id < t0.x AND t1.y <= 5 WHERE t3.id IS NOT NULL AND t0.id = 8 AND 9 <= t1.u	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM c t0 RIGHT JOIN b t1 ON t1.id >= 10 AND (t0.x = 1 AND t0.y >= 0 OR t0.id = 4) JOIN c t2 ON t2.x = t0.x AND t0.u = 12 WHERE t1.x <= 2	6:a16e4880d2d55ec2
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t1.id = t0.x AND t0.u > 54 AND t1.x + 0 = 3	24:5559dcdcb3b911ab
+q	SELECT t0.id, t1.id, t2.id FROM c t0 LEFT JOIN c t1 ON t1.id = 8 LEFT JOIN c t2 ON t1.t = '00259' WHERE t0.u > 12 AND coalesce(t1.y, 1) < 3	5:cd4fc459e8fd7271
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN a t1 ON t1.t = '00074' AND t0.x <= 1	10:d0aea638daad09bb
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN a t1 ON t0.x >= 1 AND t0.y = t1.y WHERE t0.p = 2	10:0fba4b3b8f99c6fc
+q	SELECT t0.id, t1.id FROM c t0 FULL JOIN c t1 ON t0.u BETWEEN 1 AND 5 AND t0.y >= 5 AND t1.id = t0.id	20:2664abff2628369f
+q	SELECT t0.id, t1.id, t2.id FROM c t0 RIGHT JOIN c t1 ON 24 = t0.u LEFT JOIN c t2 ON t0.y = t2.y WHERE (t0.x = 4 AND t0.y >= 3 OR t0.id = 3) AND t0.x BETWEEN 1 AND 5 AND t0.x + 0 = 0	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 JOIN b t1 ON t1.p = 0 AND t0.t < '00666' AND t0.x IN (3, 4) WHERE t0.t = '00555'	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN b t1 ON t1.y >= 2 AND 4 < t0.x AND t1.u = t0.u FULL JOIN b t2 ON t2.id < t0.x WHERE t0.y < 4 AND t0.t IS NULL AND t2.id IS NOT NULL	3:46538631b076bae1
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN c t1 ON t1.y > 5	10:1ea4710a2076fc95
+q	SELECT t0.id, t1.id, t2.id FROM c t0 RIGHT JOIN a t1 ON t0.id + 1 = t1.id FULL JOIN a t2 ON t2.x IS NOT NULL WHERE t2.y = 4 AND t0.y <= 1 AND (t2.id IS NULL OR (t1.x = 2 AND t1.y >= 2 OR t1.id = 2))	3:8e1aa270880d9af1
+q	SELECT t0.id, t1.id FROM c t0 JOIN c t1 ON t0.id + 1 = t1.id AND t1.x BETWEEN 2 AND 6	6:960e773ae0866bd3
+q	SELECT t0.id, t1.id, t2.id FROM c t0 LEFT JOIN a t1 ON t1.y >= 1 AND t0.x IS NULL RIGHT JOIN a t2 ON t0.id = 5 WHERE t0.t GLOB '0*' AND t0.t > '00037' AND (t1.t = '00481' OR t1.y = 0)	24:d1513e0ee2447c41
+q	SELECT t0.id, t1.id FROM c t0 RIGHT JOIN b t1 ON t0.y = 4 AND t1.id = t0.id WHERE t0.t = '00370' AND t1.y BETWEEN 2 AND 6	1:1bcf3a761fa39d61
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN a t1 ON t0.y < 5 AND t1.id = t0.x WHERE t0.y < 3 AND t0.x <= 3	5:7cd058374de3fda6
+q	SELECT t0.id, t1.id FROM c t0 FULL JOIN c t1 ON t0.id + 1 = t1.id WHERE (t1.id IS NULL OR t1.y < 5) AND t1.y >= 5	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN a t1 ON (t0.x = 2 AND t0.y >= 4 OR t0.id = 5) AND t1.u = t0.u	16:df436b22bee145d6
+q	SELECT t0.id, t1.id FROM c t0 FULL JOIN b t1 ON t1.u = t0.u AND t0.y BETWEEN -2 AND 2 WHERE (t1.id IS NULL OR t1.y BETWEEN 0 AND 4) AND t1.id IS NOT NULL AND t0.y IS NOT NULL AND t0.y NOT IN (2, 3)	1:457630181827eb73
+q	SELECT t0.id, t1.id, t2.id FROM b t0 FULL JOIN a t1 ON t0.x = 3 JOIN b t2 ON t2.u = t0.u AND t1.u = 21	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 JOIN b t1 ON t0.t < '00259' AND t1.t = t0.t WHERE t0.x BETWEEN 0 AND 4	5:7476033c069b20e3
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 RIGHT JOIN b t1 ON t1.id = 1 AND t1.id = t0.id AND t0.x IS NULL LEFT JOIN b t2 ON t0.u = 39 AND t1.y = t2.y AND t2.u = 3 LEFT JOIN a t3 ON t1.t = '00481' AND t3.u = t0.u WHERE t1.u = 42	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 RIGHT JOIN b t1 ON t0.id >= 5 WHERE t0.id = 16 AND (t0.id = 12 OR t0.y = 4)	16:4062f9cbb633e30a
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 LEFT JOIN a t1 ON t1.y = 3 LEFT JOIN a t2 ON t1.t = '00037' AND t2.id = t1.x LEFT JOIN a t3 ON (t0.x = 0 AND t0.y >= 0 OR t0.id = 11)	188:dd82ec52f3d787b4
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN b t1 ON t0.id IN (4, 5) AND t1.u = t0.u RIGHT JOIN b t2 ON t2.id = t1.id AND t0.u = 24 WHERE t2.t IN ('00407', '00185') AND t2.id IS NOT NULL	2:ba2b258995caf5da
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN a t1 ON t1.x = t0.p	96:24f0b58be26c3629
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN a t1 ON t0.u = 9 AND t1.y = 4 AND t0.y = t1.y WHERE t0.p = 1 AND (t0.x = 3 OR t0.x = 3)	1:c89fe8e0194534f6
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 RIGHT JOIN a t1 ON t1.x IS 0 AND t1.x = t0.p AND t0.u = 51 FULL JOIN a t2 ON t2.u = t1.u LEFT JOIN b t3 ON t2.x IS NULL AND t3.x = 1 AND t3.x = t0.x WHERE (t2.x = 0 AND t2.y >= 3 OR t2.id = 24)	1:74402c94bc513b09
+q	SELECT t0.id, t1.id FROM a t0 RIGHT JOIN b t1 ON t1.x = t0.p	66:9b916cd213556ae9
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN a t1 ON t0.t >= '00629' AND t1.t = '00518' LEFT JOIN b t2 ON t0.t <= '00740' AND t0.t = '00185' WHERE t0.y = 4	4:85307e7fdd911abb
+q	SELECT t0.id, t1.id FROM a t0 RIGHT JOIN a t1 ON t0.y = t1.y AND t0.x IS NULL AND t1.x BETWEEN 1 AND 5 WHERE t1.u <> 12 AND t1.t < '00740'	14:8a87790dce54beb0
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN a t1 ON t1.id = 21 WHERE t0.x >= 0	13:ee89aca147bc9e43
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN c t1 ON t1.x IN (3, 4) AND t1.t = t0.t AND t0.x = 3 LEFT JOIN c t2 ON t2.x = t1.p WHERE (t0.y = 5 OR t0.x = 2) AND t0.y BETWEEN 0 AND 4	2:963017c92a3516aa
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN a t1 ON t1.id BETWEEN 3 AND 7 WHERE t1.t = '00222' AND t1.id IS NOT NULL	24:d386bcf903e5544b
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t0.t <= '00222' AND (t0.u = 66 OR t0.x = 3) WHERE t0.x = 4 AND t0.u NOT IN (21, 22)	4:0989683682845f0e
+q	SELECT t0.id, t1.id FROM b t0 RIGHT JOIN c t1 ON (t0.t = '00037' OR t0.y = 2) WHERE (t0.y = 4 OR t0.x = 3) AND t0.t NOT IN ('00407', '00185')	10:3dc5973571ce6a1b
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN c t1 ON t0.x NOT IN (3, 4) AND t1.id = t0.id AND t1.t = '00222' WHERE (t1.id IS NULL OR coalesce(t1.y, 1) < 5) AND t0.t GLOB '0*' AND t0.u <= 21	6:b9b94f47f26a75ab
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN c t1 ON t1.u = t0.u AND t0.y <= 3	16:bcc0214cac47b664
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN a t1 ON t1.u = t0.u WHERE t1.y > 2 AND t1.id IS NOT NULL	5:a280524feae54649
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 LEFT JOIN c t1 ON t0.id + 1 = t1.id AND t0.t = '00148' LEFT JOIN c t2 ON t1.t <= '00222' AND t2.x = 4 AND t2.id = t0.x RIGHT JOIN c t3 ON t3.u = t2.u AND t3.t = '00222' AND t0.x IN (1, 2) WHERE t3.u IS NULL	1:b6a33d08a1326f73
+q	SELECT t0.id, t1.id FROM c t0 RIGHT JOIN b t1 ON t1.u = 12 AND t0.id + 1 = t1.id AND t0.t IS NULL WHERE t1.id IS NOT NULL	16:4742bc225de4d9da
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN b t1 ON t0.y = t1.y LEFT JOIN c t2 ON t1.y = t2.y AND (t0.x = 2 OR t0.x = 2) AND t2.u = 15 WHERE t0.u BETWEEN 13 AND 17	2:6344d8b8a6d1878e
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 JOIN b t1 ON t1.id = t0.id AND t1.t NOT IN ('00222', '00259') FULL JOIN a t2 ON t2.x >= 3 AND t0.y < 0 LEFT JOIN c t3 ON t1.y > 4 WHERE t2.x IS NULL AND t2.t > '00518' AND t2.y IN (2, 3)	2:0047c5878896375d
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN a t1 ON t0.x IS NULL AND t0.id + 1 = t1.id WHERE t0.u < 15 AND t0.y > 2	2:50176d9b595d2d9e
+q	SELECT t0.id, t1.id FROM b t0 FULL JOIN c t1 ON t0.y IS 1 WHERE t0.x IS NULL AND t1.u > 12 AND (t0.x = 3 OR t0.y = 0)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 RIGHT JOIN a t1 ON t1.u IS NOT NULL AND t0.y = 3 AND t0.y = t1.y AND t0.u = 21 LEFT JOIN a t2 ON (t0.t = '00851' OR t0.y = 2) AND t2.x = t1.p JOIN c t3 ON t3.id = t1.id WHERE t1.x IS 3 AND t1.x IN (1, 2) AND (t1.id IS NULL OR t2.t = '00888')	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM b t0 RIGHT JOIN a t1 ON t0.x IN (0, 1) AND t1.id < t0.x AND t0.x IN (1, 2) RIGHT JOIN a t2 ON t1.y = 1 AND t2.t = t1.t JOIN a t3 ON t3.x = t1.p AND t0.y = 4 WHERE t0.u IN (6, 7) AND t3.x IS NULL AND t0.x IS NULL	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN b t1 ON t0.t = '00074' AND t1.id < t0.x AND t0.t = '00037' LEFT JOIN c t2 ON t2.id < t0.x AND t2.id IS NOT NULL AND (t1.y = 2 OR t1.x = 1)	16:273c2e1936ff5c9a
+q	SELECT t0.id, t1.id FROM b t0 RIGHT JOIN a t1 ON t0.id IN (12, 13) AND t0.id + 1 = t1.id WHERE t1.id IS NOT NULL	24:ad24ac7355418e7c
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN b t1 ON t0.u = 57 AND t0.id + 1 = t1.id RIGHT JOIN c t2 ON t0.t GLOB '0*' WHERE (t0.t = '00481' OR t0.y = 2) AND t0.x < 4	30:1765b1ec1e075407
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN a t1 ON t0.y BETWEEN 3 AND 7 AND t1.id = t0.id WHERE '00037' <= t0.t AND (t1.u = 69 OR t1.y = 0)	1:5021db14dc6d82b1
+q	SELECT t0.id, t1.id FROM c t0 JOIN c t1 ON t1.u = 15 WHERE t1.y NOT IN (4, 5)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 FULL JOIN b t1 ON t0.u = 18 AND t1.t < '00111' LEFT JOIN c t2 ON t0.id IS NOT NULL AND t2.id = 9 LEFT JOIN a t3 ON t1.t NOT IN ('00074', '00111')	324:21437cefc1408dec
+q	SELECT t0.id, t1.id FROM b t0 JOIN c t1 ON t1.x IS NOT NULL WHERE t1.id = 1 AND 4 > t1.id	16:26054ac7431d8392
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN c t1 ON t0.x IS NULL AND t1.id = t0.x WHERE t0.y <= 0 AND t1.y = 1 AND (t1.id IS NULL OR t0.t IS NULL)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN a t1 ON t0.y IS NULL AND t1.id = t0.x AND t1.y > 5 LEFT JOIN b t2 ON t0.t >= '00481' AND t2.id = t1.id WHERE t0.y IN (2, 3)	6:219a1547ae699808
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t1.id = 4 AND t1.id = t0.x WHERE t1.x >= 2	5:3ca8f8ec644b563b
+q	SELECT t0.id, t1.id FROM a t0 JOIN b t1 ON t1.id = t0.id AND t0.u IS 30 WHERE t1.y NOT IN (2, 3)	1:1bcf3a761fa39d61
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN c t1 ON t0.y = t1.y WHERE t1.u = 24 AND (t0.x = 2 AND t0.y >= 1 OR t0.id = 5)	1:6082b81827c741b9
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN c t1 ON t0.x = 4 FULL JOIN c t2 ON t2.y = 5 AND (t0.u = 45 OR t0.x = 3) AND (t1.id = 10 OR t1.y = 5) WHERE t2.x + 0 = 1 AND t2.u IS 24	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 LEFT JOIN b t1 ON t0.id + 1 = t1.id AND '00259' = t0.t AND t1.t = '00259' JOIN b t2 ON t0.x <= 4 LEFT JOIN b t3 ON t3.x > 3 AND 21 > t0.u AND t1.y = t3.y WHERE (t0.y = 1 OR t0.y = 1)	32:82d817e137e9bc5b
+q	SELECT t0.id, t1.id FROM a t0 JOIN a t1 ON t1.id < 18 WHERE t0.p = 0 AND t0.t NOT IN ('00592', '00111')	85:6a99382df7738b03
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN a t1 ON (t0.t = '00222' OR t0.y = 3) AND t1.id < t0.x AND (t1.id = 8 OR t1.x = 1) WHERE t0.x NOT IN (1, 2)	4:0c0846170ba8ad0d
+q	SELECT t0.id, t1.id, t2.id FROM c t0 FULL JOIN b t1 ON t0.id IS NOT NULL JOIN a t2 ON t2.id = t1.id AND t1.t IS '00518' AND (t0.t = '00370' OR t0.y = 3) WHERE t0.y BETWEEN 3 AND 7	3:ce3b1ee1b7844d78
+q	SELECT t0.id, t1.id, t2.id FROM b t0 FULL JOIN b t1 ON t0.u IN (45, 46) AND t1.id = t0.x JOIN a t2 ON t0.x = 0 AND t2.id = t1.id	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t1.id = t0.id AND t0.y < 4 WHERE t1.id IS NULL	15:03f83b3e6d5bd669
+q	SELECT t0.id, t1.id, t2.id FROM c t0 LEFT JOIN a t1 ON t1.id = t0.id AND t0.u = 27 LEFT JOIN c t2 ON t2.id < t0.x AND t0.y IN (2, 3) WHERE t2.t IN ('00037', '00074')	7:f9a00a8dc30632ca
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN c t1 ON t1.u = t0.u WHERE t1.id IS NULL AND t0.t <= '00518'	5:657d0a2bac7d4c0b
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 LEFT JOIN c t1 ON (t0.u = 9 OR t0.x = 4) RIGHT JOIN c t2 ON t1.t = '00333' AND t2.x = 1 FULL JOIN b t3 ON t3.id < t0.x AND t3.y IS 5 AND t1.t IS NOT NULL	26:19fb07f7eaded0fa
+q	SELECT t0.id, t1.id FROM b t0 FULL JOIN c t1 ON t1.t > '00222' WHERE t1.x IS NOT NULL	38:379389fc8b87400c
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 JOIN a t1 ON (t0.u = 3 OR t0.y = 0) AND t1.u = t0.u LEFT JOIN c t2 ON t2.u = t0.u AND t0.t IN ('00037', '00074') LEFT JOIN c t3 ON t0.x = 1 WHERE t3.y <= 3 AND t2.id IS NOT NULL	6:33ee208baa525a37
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN c t1 ON t1.u = 15 AND t1.u = t0.u FULL JOIN b t2 ON (t2.y = 3 OR t2.x = 1) AND t2.x = t1.x WHERE t2.t = '00222'	1:b4ae86160ce4db77
+# small: FULL JOIN, left-only: 161
+# small: FULL JOIN, mixed: 114
+# small: FULL JOIN, right-only: 59
+# small: JOIN, left-only: 116
+# small: JOIN, mixed: 83
+# small: JOIN, right-only: 46
+# small: LEFT JOIN, left-only: 463
+# small: LEFT JOIN, mixed: 321
+# small: LEFT JOIN, right-only: 189
+# small: RIGHT JOIN, left-only: 133
+# small: RIGHT JOIN, mixed: 84
+# small: RIGHT JOIN, right-only: 46
+# small: where, 0: 103
+# small: where, 1: 170
+# small: where, 2: 203
+# small: where, 3: 74
+# small: where, 4: 10
+db	partial
+sql	CREATE TABLE a(id INTEGER PRIMARY KEY, u INT UNIQUE, x INT, y INT, t TEXT UNIQUE, p INT)
+sql	CREATE INDEX a_x ON a(x) WHERE p = 1
+sql	CREATE INDEX a_y ON a(y) WHERE x IS NOT NULL
+sql	WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM n WHERE i < 24) INSERT INTO a SELECT i, CASE WHEN i % 7 <> 0 THEN i * 3 END, CASE WHEN i % 5 <> 0 THEN i % 5 END, CASE WHEN i % 6 <> 0 THEN i * 7 % 6 END, CASE WHEN i % 9 <> 0 THEN printf('%05d', i * 37 % 10007) END, i % 4 FROM n
+sql	CREATE TABLE b(id INTEGER PRIMARY KEY, u INT UNIQUE, x INT, y INT, t TEXT UNIQUE, p INT)
+sql	CREATE INDEX b_x ON b(x) WHERE p = 1
+sql	CREATE INDEX b_y ON b(y) WHERE x IS NOT NULL
+sql	WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM n WHERE i < 16) INSERT INTO b SELECT i, CASE WHEN i % 7 <> 0 THEN i * 3 END, CASE WHEN i % 5 <> 0 THEN i % 5 END, CASE WHEN i % 6 <> 0 THEN i * 7 % 6 END, CASE WHEN i % 9 <> 0 THEN printf('%05d', i * 37 % 10007) END, i % 4 FROM n
+sql	CREATE TABLE c(id INTEGER PRIMARY KEY, u INT UNIQUE, x INT, y INT, t TEXT UNIQUE, p INT)
+sql	CREATE INDEX c_x ON c(x) WHERE p = 1
+sql	CREATE INDEX c_y ON c(y) WHERE x IS NOT NULL
+sql	WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM n WHERE i < 10) INSERT INTO c SELECT i, CASE WHEN i % 7 <> 0 THEN i * 3 END, CASE WHEN i % 5 <> 0 THEN i % 5 END, CASE WHEN i % 6 <> 0 THEN i * 7 % 6 END, CASE WHEN i % 9 <> 0 THEN printf('%05d', i * 37 % 10007) END, i % 4 FROM n
+q	SELECT t0.id, t1.id FROM c t0 FULL JOIN b t1 ON t0.u = 30 AND t1.u = t0.u WHERE 3 = t0.u AND t0.x IS NOT NULL AND (t0.x = 3 AND t0.y >= 5 OR t0.id = 1)	1:3a3a2ba88b96c57d
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN a t1 ON t1.u = t0.u AND t0.id <= 12 WHERE 1 = t0.y AND t0.u = 42	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN b t1 ON t1.u = t0.u RIGHT JOIN b t2 ON t2.y > 2 WHERE t1.y BETWEEN 1 AND 5 AND t2.u >= 48	12:cfb0ababe86da209
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 LEFT JOIN c t1 ON t1.id = 2 AND t0.t GLOB '0*' AND t1.id = t0.x LEFT JOIN c t2 ON t2.id = 2 FULL JOIN b t3 ON t3.u IS 42 WHERE t3.y >= 1 AND t3.u BETWEEN 10 AND 14	1:b6a33e08a1327126
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM b t0 FULL JOIN a t1 ON t0.y <= 3 JOIN c t2 ON t2.id = t1.id AND t1.y BETWEEN 1 AND 5 LEFT JOIN c t3 ON (t0.x = 4 OR t0.y = 1) WHERE 9 <= t2.u AND (t0.u = 45 OR t0.y = 2)	78:933999a1d2c32923
+q	SELECT t0.id, t1.id FROM c t0 FULL JOIN a t1 ON t0.id = 2 WHERE t0.t = '00185' AND t0.u = 15	1:c5fc1ac1727801a1
+q	SELECT t0.id, t1.id, t2.id FROM b t0 FULL JOIN b t1 ON t1.t >= '00222' LEFT JOIN a t2 ON t0.x IN (0, 1) AND t2.x = t1.p WHERE t0.y <= 2 AND t0.x IS 1	38:7577182abe92aafd
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN b t1 ON t1.t = '00592' AND t0.id + 1 = t1.id AND t0.y = 1 WHERE t0.x IN (2, 3) AND t0.y = 2	2:4c5dd213afe7fe8d
+q	SELECT t0.id, t1.id, t2.id FROM a t0 JOIN b t1 ON t0.x = 2 AND t0.t GLOB '0*' FULL JOIN a t2 ON t1.x = 4	425:e77af3f7bafc08e5
+q	SELECT t0.id, t1.id, t2.id FROM b t0 RIGHT JOIN b t1 ON t1.x = t0.x AND t0.id < 14 AND t0.u >= 15 JOIN a t2 ON t2.x = t0.p AND t0.u = 12 WHERE 45 > t0.u AND t0.x IS NULL	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t0.id + 1 = t1.id AND t0.u = 21 WHERE t0.id <= 15 AND (t0.y = 1 OR t0.y = 1) AND (t1.id IS NULL OR t0.x IS 2)	3:d0d31d2c93c408f2
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN a t1 ON t1.id <= 10 AND t0.id <= 3 AND t1.x = t0.x AND t0.u > 21 WHERE t0.u IS 36	1:8db092cb8fe04e33
+q	SELECT t0.id, t1.id, t2.id FROM c t0 LEFT JOIN b t1 ON (t0.id = 9 OR t0.x = 0) AND t0.id + 1 = t1.id AND t0.y = 4 FULL JOIN c t2 ON (t0.id = 3 OR t0.x = 2) WHERE t0.u NOT IN (21, 22) AND (t0.x = 0 OR t0.y = 1)	1:94543f8d9945d036
+q	SELECT t0.id, t1.id FROM c t0 FULL JOIN c t1 ON t1.x = t0.x AND t0.id <= 9 WHERE t0.u IS NULL	4:8ac2ce5c84a1ccf2
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t0.t = '00888' WHERE t0.x < 3 AND t0.p = 3	2:b9b26bcd02eb82d4
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t0.x BETWEEN 0 AND 4 AND t1.x = t0.x	69:be06e41ba9319019
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN c t1 ON 22 > t0.id AND t1.u = t0.u LEFT JOIN a t2 ON t2.y IS 3 AND t1.y IS NOT NULL AND t2.t = t0.t AND (t0.t = '00074' OR t0.x = 4) WHERE (t1.id IS NULL OR t1.x <= 2) AND (t0.id = 8 OR t0.y = 1)	4:ee228ce2bc8f8e5b
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN c t1 ON t0.id + 1 = t1.id AND t0.y = 0 AND t1.id BETWEEN 7 AND 11 RIGHT JOIN a t2 ON t1.y <= 1 AND t2.p = 3 WHERE t2.t = '00444' AND t2.t <= '00888'	1:e95f2a77e8d85984
+q	SELECT t0.id, t1.id FROM c t0 RIGHT JOIN a t1 ON t0.id + 1 = t1.id AND (t0.t = '00111' OR t0.x = 3) WHERE t0.u IS NULL AND t1.y = 2	4:0801a9b0037e1978
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 LEFT JOIN c t1 ON t1.x = t0.p LEFT JOIN a t2 ON t2.x = t0.p AND t0.x IN (2, 3) LEFT JOIN a t3 ON t2.y = 5 AND t3.x = t1.x WHERE t3.t >= '00296' AND t1.p = 2 AND t2.id <= 23	3:f37c310f7efe6298
+q	SELECT t0.id, t1.id, t2.id FROM c t0 LEFT JOIN c t1 ON t1.t = t0.t AND (t1.u = 27 OR t1.y = 3) AND t0.y = 2 LEFT JOIN a t2 ON t2.id = t0.id AND t2.u = 27 WHERE t0.x >= 3	4:34e67c93104d08bd
+q	SELECT t0.id, t1.id FROM b t0 FULL JOIN c t1 ON t0.x BETWEEN 2 AND 6 AND t1.u = 27 WHERE t1.y IN (3, 4) AND t1.id <= 9	11:c7b5b37105c529de
+q	SELECT t0.id, t1.id, t2.id FROM a t0 FULL JOIN c t1 ON t1.id = t0.x AND (t0.t = '00518' OR t0.x = 1) RIGHT JOIN a t2 ON t0.id IS NOT NULL AND t2.t = t1.t	28:2d86e673cc2afd7c
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t1.id < t0.x WHERE t0.u > 15	26:b0fbe05248d06e58
+q	SELECT t0.id, t1.id, t2.id FROM c t0 RIGHT JOIN c t1 ON t1.id = t0.id AND (t0.x = 3 OR t0.y = 5) LEFT JOIN a t2 ON t2.u = t0.u AND coalesce(t1.y, 1) < 4 WHERE (t2.id IS NULL OR t2.t >= '00074')	10:5db6c02754534745
+q	SELECT t0.id, t1.id FROM c t0 RIGHT JOIN b t1 ON t1.y IN (5, 6) AND t0.y = t1.y WHERE t1.t = '00407' AND NOT t1.x > 4	1:809192d02976e5ea
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN b t1 ON t1.x = t0.x WHERE t1.id = 8 AND t1.id IS NULL	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM b t0 RIGHT JOIN b t1 ON t0.u IS 36 AND (t1.u = 6 OR t1.x = 4) AND t0.id = 3 AND t1.id = t0.id JOIN a t2 ON t1.y < 1 AND t2.u = t0.u RIGHT JOIN b t3 ON t1.u > 48 WHERE t1.id IS NULL	16:3322d573b71a3fba
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN c t1 ON t0.x < 2 AND t0.u <= 6 AND t1.t = t0.t JOIN a t2 ON t0.id + 1 = t2.id WHERE (t1.id IS NULL OR t2.y <= 4) AND t0.t = '00592'	1:b289b5e4d7640575
+q	SELECT t0.id, t1.id FROM c t0 RIGHT JOIN a t1 ON t1.y >= 2 AND t1.u = t0.u AND t0.x = 2 WHERE t0.y > 1	1:6082be1827c74beb
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM b t0 JOIN c t1 ON t0.x = 2 AND t1.u = t0.u AND t1.t IS '00074' LEFT JOIN a t2 ON t2.t = t1.t AND t1.t <= '00148' RIGHT JOIN a t3 ON t1.id + 1 = t3.id AND t2.id IS NULL	24:b436b0ef44fa0321
+q	SELECT t0.id, t1.id FROM b t0 FULL JOIN b t1 ON t1.u > 30 WHERE t1.x IS 2	18:584d9fdae12fa21b
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 LEFT JOIN b t1 ON t0.y = 4 LEFT JOIN b t2 ON t1.x = 0 AND t1.y = t2.y LEFT JOIN a t3 ON t2.x IN (2, 3) AND t0.id + 1 = t3.id	40:13efd7cbc821bbe8
+q	SELECT t0.id, t1.id FROM c t0 JOIN b t1 ON (t0.id = 5 OR t0.y = 2) AND t1.id < t0.x	3:46db8456db036477
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t1.y IS NULL WHERE '00370' = t1.t	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM a t0 RIGHT JOIN a t1 ON t0.y = t1.y AND t1.x = 3 AND t0.x = 4 JOIN a t2 ON t1.u IS 27 WHERE t1.id IS NOT NULL	24:527c3984d5c16e35
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN c t1 ON t1.x NOT IN (4, 5) AND t0.y <> 1 AND t1.t = t0.t LEFT JOIN b t2 ON t2.x = t0.p AND t0.x IS NOT NULL WHERE t2.id IS NULL AND t0.y >= 3	5:79317d15bbfc0c08
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM b t0 RIGHT JOIN b t1 ON t1.u < 48 AND t1.id = t0.id AND t0.u <= 33 LEFT JOIN a t2 ON t1.id + 1 = t2.id AND t2.t IS '00814' AND (t1.t = '00074' OR t1.x = 0) JOIN a t3 ON t3.id = t1.x WHERE t1.y <= 3 AND (t1.t = '00518' OR t1.x = 2)	3:766e757be322f64e
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN a t1 ON t1.x = t0.x AND t0.id = 19 WHERE t0.x = 2 AND t0.y BETWEEN 2 AND 6 AND t1.id IS NULL	3:8b1acd965b90ec08
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN a t1 ON coalesce(t0.y, 1) < 5 AND t1.id = t0.id RIGHT JOIN a t2 ON 45 = t1.u AND t1.y = 2 AND t2.t = t0.t AND t2.x > 3	24:ddd5cce20fd10eeb
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t1.id = t0.x AND t1.t = '00333' AND t0.t = '00629' WHERE (t1.x = 4 AND t1.y >= 1 OR t1.id = 5) AND (t1.x = 2 AND t1.y >= 2 OR t1.id = 10)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t0.u BETWEEN 58 AND 62 AND t1.t IN ('00111', '00148') WHERE t0.x + 0 = 1	5:58c20004ce6c6f57
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN a t1 ON (t0.u = 48 OR t0.x = 0) AND t1.x = t0.x LEFT JOIN a t2 ON t2.t = t0.t AND t1.t <= '00370' WHERE t0.t = '00185' AND '00703' <= t1.t	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM b t0 JOIN c t1 ON t1.t = t0.t AND t0.t IS NULL	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM c t0 JOIN b t1 ON t1.x = t0.p	27:4f3a9b01b565d2b8
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN c t1 ON t0.t >= '00222' AND t1.y NOT IN (1, 2) AND t0.y = 4 WHERE t0.x = 2 AND t0.u = 6	1:5a5ceee4a1f9c65e
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN c t1 ON t1.y = 3 AND t1.x = t0.x AND t0.u < 3	10:1ea4710a2076fc95
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM b t0 LEFT JOIN a t1 ON t0.y IN (3, 4) AND t1.x = t0.p LEFT JOIN a t2 ON t0.y IN (0, 1) AND t2.y = 1 AND t0.u = 48 LEFT JOIN b t3 ON t3.u = t1.u WHERE (t3.u = 24 OR t3.y = 2)	3:5d14b8c21ff5fc30
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t1.id = t0.id	24:8ae521d33c258d33
+q	SELECT t0.id, t1.id FROM c t0 FULL JOIN b t1 ON t0.t = '00222' AND t1.u = t0.u WHERE (t1.u = 24 OR t1.x = 0)	1:6bf060a7657179e0
+q	SELECT t0.id, t1.id FROM c t0 JOIN c t1 ON t0.y = t1.y WHERE t1.t GLOB '0*' AND t0.u <= 30	13:ea1cb12892dd10bf
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN b t1 ON t0.t GLOB '0*' AND t1.u = t0.u WHERE (t0.x = 4 AND t0.y >= 1 OR t0.id = 8) AND t0.id <= 14	4:2c3d463d980839e1
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t0.x > 3 AND t1.id = t0.id WHERE t0.t <= '00222' AND t1.x IS NULL AND (t1.id IS NULL OR t0.y = 3)	5:ad814b59cd88770d
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN c t1 ON t1.x = t0.p WHERE t0.t NOT IN ('00370', '00148') AND t0.t = '00037'	2:612df789af678b00
+q	SELECT t0.id, t1.id FROM b t0 FULL JOIN b t1 ON t1.u = t0.u AND t0.x + 0 = 0 WHERE t0.t NOT IN ('00370', '00148') AND t0.y IS NULL	2:b58a8ad126802cd0
+q	SELECT t0.id, t1.id FROM b t0 FULL JOIN a t1 ON t1.id = t0.id AND t1.y >= 2 WHERE t1.t > '00222'	16:6ca24493c83c493d
+q	SELECT t0.id, t1.id FROM c t0 JOIN a t1 ON t0.x = 2 AND t1.id = t0.x WHERE 0 <= t0.y AND '00222' <= t0.t AND t0.t IS NULL	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 LEFT JOIN a t1 ON t0.u = 3 LEFT JOIN a t2 ON t2.u = t0.u AND t0.x = 0 RIGHT JOIN c t3 ON (t2.x = 4 OR t2.x = 4)	10:54071e899eae8357
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN a t1 ON t0.u IS NULL AND t1.x = t0.x WHERE t1.y <> 3	16:316d7f7f1ae0dc06
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 LEFT JOIN c t1 ON t1.x + 0 = 4 AND t0.y = t1.y AND NOT t0.y > 4 LEFT JOIN b t2 ON t1.id + 1 = t2.id AND t1.u > 12 AND t0.u >= 15 LEFT JOIN a t3 ON t1.u IS NOT NULL AND t3.y = 3 WHERE t3.x + 0 = 1 AND t3.y IN (3, 4)	4:5d420f199df6ffd0
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN b t1 ON t0.t <= '00074' WHERE t1.u IS NULL AND 45 < t0.u	1:396f5dcd203d94a7
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 LEFT JOIN a t1 ON t0.y = t1.y AND t0.x = 3 FULL JOIN c t2 ON t1.y = t2.y AND t2.t GLOB '0*' AND t1.y <= 2 LEFT JOIN c t3 ON t3.x = t2.p AND t3.x IN (2, 3) AND t0.y IS NULL WHERE t0.u = 45 AND 0 = t2.y	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM b t0 RIGHT JOIN a t1 ON t0.y = t1.y WHERE (t0.x = 2 OR t0.x = 2)	8:079ea700f92e7820
+q	SELECT t0.id, t1.id, t2.id FROM c t0 FULL JOIN b t1 ON t0.id + 1 = t1.id AND t0.u = 21 AND (t0.x = 4 AND t0.y >= 0 OR t0.id = 5) LEFT JOIN c t2 ON t0.t GLOB '0*' WHERE t2.t = '00185' AND t1.id IS NULL AND t0.t > '00296'	1:e130a4d98f3709aa
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN c t1 ON t0.t IS NULL AND t0.x IS NULL	10:1ea4710a2076fc95
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM b t0 FULL JOIN c t1 ON t0.id <= 13 AND t0.id + 1 = t1.id FULL JOIN b t2 ON t1.y = t2.y AND t0.y IS NULL RIGHT JOIN c t3 ON t1.x = 4 AND t1.y = t3.y AND t1.u NOT IN (21, 22) WHERE (t1.t = '00037' OR t1.x = 1) AND t3.id IS NULL AND t1.x IS 3	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN a t1 ON (t0.x = 2 AND t0.y >= 5 OR t0.id = 2) AND t1.x = t0.p WHERE t0.y = 5 AND t0.t = '00185'	1:c5fc1ac1727801a1
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN c t1 ON t1.u = t0.u LEFT JOIN b t2 ON (t0.t = '00370' OR t0.x = 0) WHERE (t2.id IS NULL OR coalesce(t2.y, 1) < 1)	23:e3943da2afae7966
+q	SELECT t0.id, t1.id FROM c t0 FULL JOIN b t1 ON t1.id = t0.id AND t0.p = 0 AND t0.x IS 1 WHERE t0.y = 2 AND (t1.id IS NULL OR (t0.t = '00333' OR t0.x = 0))	2:4c5dd213afe7fe8d
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t0.u >= 3 AND (t0.y = 5 OR t0.x = 2) AND t1.y = 1 WHERE 5 < t0.y AND t0.u >= 51 AND t0.y = 1	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM c t0 JOIN c t1 ON t0.y = t1.y WHERE (t1.u = 9 OR t1.y = 2) AND t0.u = 6 AND t0.u BETWEEN 4 AND 8	2:9dce8dad745f72cf
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN a t1 ON t1.y < 2 AND t0.x = 3	39:15fb138c8e251aaf
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN c t1 ON t0.y = 4 AND t0.t GLOB '0*' AND t1.id = t0.id WHERE t0.p = 2	4:2a3bbe23049e8097
+q	SELECT t0.id, t1.id, t2.id FROM c t0 FULL JOIN c t1 ON t0.u = 3 AND NOT t1.u > 24 FULL JOIN a t2 ON t2.id < t0.x AND t0.x < 4 WHERE t1.t IS NULL	34:ddac30824075c66d
+q	SELECT t0.id, t1.id, t2.id FROM c t0 LEFT JOIN c t1 ON t0.y = 5 AND t1.x = t0.x JOIN a t2 ON t2.id = t0.id AND t1.id > 6 WHERE t1.p = 0 AND (t1.id IS NULL OR t1.u = 9) AND t1.t = '00037'	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN a t1 ON (t0.id = 7 OR t0.y = 4) AND t1.u IS NULL AND t0.id + 1 = t1.id WHERE t0.id = 16	1:396f5dcd203d94a7
+q	SELECT t0.id, t1.id FROM c t0 FULL JOIN b t1 ON t1.y IS NOT NULL AND (t0.t = '00333' OR t0.y = 2) AND t1.id < t0.x AND (t0.y = 5 OR t0.y = 5) WHERE t0.u = 3 AND t1.id IS NULL	1:3a3a2ba88b96c57d
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN b t1 ON (t0.t = '00296' OR t0.y = 3) AND t0.id = 6 AND t1.x = t0.p JOIN a t2 ON t1.y < 1 AND t0.y = t2.y AND t2.u <= 39 WHERE t0.t = '00518' AND (t0.t = '00444' OR t0.x = 0)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON (t1.id = 8 OR t1.x = 3) AND t0.p = 1 WHERE t0.id = 14 AND t1.u IS NULL	1:e25e68f33fd4baf9
+q	SELECT t0.id, t1.id FROM c t0 RIGHT JOIN a t1 ON t0.y NOT IN (4, 5) AND t1.u = t0.u WHERE t1.x = 1 AND (t0.x = 0 AND t0.y >= 5 OR t0.id = 5)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 JOIN b t1 ON t1.id < t0.x WHERE t0.x = 4	15:108b55969e225c8d
+q	SELECT t0.id, t1.id, t2.id FROM a t0 RIGHT JOIN a t1 ON t0.id <= 15 JOIN c t2 ON t0.id + 1 = t2.id AND t1.y < 0 AND t0.x < 0 WHERE t1.y = 2 AND t1.t = '00518' AND (t1.id IS NULL OR t2.t = '00296')	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t1.y BETWEEN 1 AND 5 WHERE t1.t >= '00222'	72:48e8bb3a03260ca9
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN b t1 ON t1.id < t0.x AND t0.y = 5	16:75ed4667641b335a
+q	SELECT t0.id, t1.id, t2.id FROM a t0 FULL JOIN a t1 ON 30 = t0.u AND t1.u = t0.u AND t0.id IS NULL LEFT JOIN b t2 ON t0.u = 21 WHERE t0.p = 1 AND (t2.id IS NULL OR (t1.y = 0 OR t1.y = 0)) AND t0.x < 2	2:6c29f82e2aeb377b
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN c t1 ON t1.id = t0.id AND t0.x < 3 WHERE (t1.id IS NULL OR t1.y IS NULL) AND t0.t IS NULL AND t0.u > 24 AND 0 < t0.y	1:13765e2cdba7a685
+q	SELECT t0.id, t1.id FROM a t0 JOIN a t1 ON t1.id = t0.x AND t1.t IN ('00259', '00037') AND t0.u IS NOT NULL WHERE 1 <= t0.x	4:bae4bb10cb188c73
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 LEFT JOIN a t1 ON t1.x = t0.x LEFT JOIN b t2 ON t1.p = 3 RIGHT JOIN b t3 ON t3.x IS NULL AND t3.t = t2.t AND (t2.t = '00555' OR t2.y = 3) WHERE (t1.id IS NULL OR t1.y BETWEEN 0 AND 4)	30:5016609ce8e7438a
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t1.t IS NULL	24:b117a3cb650db7e9
+q	SELECT t0.id, t1.id FROM b t0 FULL JOIN a t1 ON t0.id + 1 = t1.id WHERE t1.t < '00555' AND t1.u IS NULL	2:d658827409d31e1b
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM b t0 FULL JOIN a t1 ON t0.id IS NULL AND t1.id < t0.x JOIN a t2 ON t1.x >= 0 AND t2.t IS NOT NULL LEFT JOIN a t3 ON t3.u = t1.u AND t1.x = 0 WHERE t0.x IS NULL AND t1.x + 0 = 3 AND 69 <= t1.u	22:ad567feefac8ad0b
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN c t1 ON t0.y = t1.y WHERE t1.t = '00037' AND NOT t1.y > 4	3:b65440ad0a1f5d8c
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t1.x = t0.x AND t0.x = 0 WHERE t0.u < 27	7:8bbea445bea61761
+q	SELECT t0.id, t1.id, t2.id FROM a t0 JOIN a t1 ON t1.x > 0 AND t1.id = t0.id LEFT JOIN c t2 ON t1.x IS 4 AND t2.id = t0.id WHERE t0.u IS NULL	3:d9e20a8d19e30d4a
+q	SELECT t0.id, t1.id, t2.id FROM a t0 JOIN c t1 ON t1.t IS NOT NULL AND t0.y = 5 FULL JOIN b t2 ON t2.t = '00333' WHERE t0.y <= 5	36:9ed62fca40019f91
+q	SELECT t0.id, t1.id FROM b t0 FULL JOIN b t1 ON t1.p = 0 AND t1.id < t0.x WHERE t0.id IS NULL	16:4742bc225de4d9da
+q	SELECT t0.id, t1.id FROM c t0 FULL JOIN b t1 ON t1.id = t0.x AND 9 = t0.u	25:fdf51ca60b3b1fb0
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN c t1 ON t1.x IN (3, 4) AND t0.id + 1 = t1.id WHERE (t1.id IS NULL OR t1.u BETWEEN 25 AND 29) AND (t0.y = 5 OR t0.x = 3) AND (t0.u = 3 OR t0.x = 3)	1:947ba91845375338
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t0.t = '00666' AND t1.y = 2 AND t1.id = t0.x WHERE (t0.y = 2 OR t0.y = 2) AND '00222' <= t0.t AND t0.u IS NULL	1:e25e68f33fd4baf9
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON '00740' >= t0.t WHERE t0.id < 7 AND t0.t GLOB '0*'	60:6d4cfa6add37f819
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t1.id = t0.id AND t0.id = 23 AND t0.t = '00407' WHERE t1.id IS NULL AND t1.y < 0	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN b t1 ON t0.x = 0 JOIN b t2 ON t2.x = t1.p WHERE t1.id IS NOT NULL AND t1.y < 5 AND t2.x IS NULL	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM c t0 FULL JOIN c t1 ON t0.u = 18 AND t1.u = t0.u LEFT JOIN a t2 ON t0.x < 2 AND (t2.x = 3 OR t2.x = 3) WHERE t2.t >= '00333' AND (t0.x = 2 AND t0.y >= 2 OR t0.id = 2) AND t0.u = 6	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN c t1 ON (t0.u = 24 OR t0.y = 5)	28:72d1d3511105cb0e
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN b t1 ON t1.u = t0.u AND t0.x >= 3 AND t0.t IN ('00814', '00074') LEFT JOIN a t2 ON t2.u = t1.u AND t1.y = 2 WHERE t1.y IN (4, 5) AND (t1.id = 7 OR t1.y = 1) AND t1.y < 2	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN a t1 ON t1.y = 3 AND (t0.y = 1 OR t0.x = 0) AND t0.y = 0 AND t1.id = t0.id WHERE (t1.id IS NULL OR t0.u < 21) AND t0.id = 13	1:c89fe8e0194534f6
+q	SELECT t0.id, t1.id FROM c t0 JOIN a t1 ON t1.u NOT IN (39, 40) WHERE t0.u = 9	20:98249d671c36f234
+q	SELECT t0.id, t1.id, t2.id FROM c t0 RIGHT JOIN a t1 ON t0.t < '00222' AND t1.id = t0.id LEFT JOIN b t2 ON t2.id < t0.x AND t0.t IS NULL WHERE t0.t = '00148' AND t1.t GLOB '0*'	1:8b95524261eff104
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t0.y = t1.y AND t0.u = 48 AND t0.p = 3 WHERE t0.t = '00851' AND t0.id NOT IN (20, 21)	1:f4624bea6a6ae58b
+q	SELECT t0.id, t1.id FROM c t0 FULL JOIN a t1 ON t0.y = 1 AND t0.y IS NULL AND t1.x = t0.x WHERE t0.t < '00259' AND t0.t < '00222'	5:da060ef1af13a84d
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 LEFT JOIN a t1 ON t0.id = 22 AND (t0.t = '00592' OR t0.x = 1) AND t1.t GLOB '0*' RIGHT JOIN b t2 ON t2.t = t0.t AND t2.t = '00481' FULL JOIN a t3 ON t0.y = 0 AND t0.id + 1 = t3.id AND t2.x = 1 WHERE t2.x NOT IN (4, 5)	10:be1769d318edaaa3
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN a t1 ON t0.u = 30 AND t1.x BETWEEN 1 AND 5 AND t1.id < t0.x WHERE t0.y BETWEEN 3 AND 7 AND t0.y BETWEEN 1 AND 5	5:e384be084726df8a
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 LEFT JOIN b t1 ON '00777' <= t0.t LEFT JOIN b t2 ON t1.u IS NOT NULL AND 3 > t1.y FULL JOIN a t3 ON t3.x = t1.x WHERE t0.x < 3 AND t0.x = 2	372:c8ce412b55f8cbfe
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN a t1 ON t0.y = 1 AND t0.y = t1.y RIGHT JOIN b t2 ON t2.u = t1.u AND t1.id <= 17 WHERE (t2.id IS NULL OR t0.x <= 2)	4:19394d176df2d5d5
+q	SELECT t0.id, t1.id FROM a t0 RIGHT JOIN a t1 ON t1.u = t0.u AND t1.t GLOB '0*' AND t0.x <= 0 WHERE t1.x >= 3	10:6c5e7d61d997775a
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN c t1 ON t0.y > 5 AND t1.t = t0.t WHERE t0.u < 48 AND t0.u = 27	1:13765e2cdba7a685
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN c t1 ON t1.x IS NULL WHERE t0.u = 24 AND t0.u >= 9	2:2d4839059175a76d
+q	SELECT t0.id, t1.id, t2.id FROM c t0 FULL JOIN a t1 ON t1.t IS NULL JOIN c t2 ON t2.id < t0.x AND t1.x IN (2, 3) AND t0.y = 3 WHERE t1.u = 66	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM b t0 LEFT JOIN b t1 ON t0.id + 1 = t1.id AND t0.y = 2 AND t0.u = 15 LEFT JOIN c t2 ON t2.x = t1.x LEFT JOIN c t3 ON t0.y >= 4 AND t2.u IN (27, 28) AND t3.id = t0.x WHERE 4 <= t2.x	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM a t0 RIGHT JOIN c t1 ON t0.u NOT IN (69, 70) AND t1.u = t0.u AND t0.id = 17 LEFT JOIN a t2 ON t1.y >= 1 AND (t1.u = 6 OR t1.y = 2) AND t2.y NOT IN (5, 6) WHERE (t0.x = 2 OR t0.y = 3) AND t0.x IS NOT NULL AND t1.id IS NULL AND 5 = t0.y	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM b t0 JOIN c t1 ON NOT t0.y > 4 AND t0.u = 27 AND t1.id = t0.x	1:8bd20b18404f1914
+q	SELECT t0.id, t1.id, t2.id FROM a t0 FULL JOIN a t1 ON t0.x = 3 AND t0.y = t1.y FULL JOIN c t2 ON t0.y > 0 AND t2.id < t0.x WHERE t0.y IS NULL AND t0.x <= 4	4:a368b94f67a72cbb
+q	SELECT t0.id, t1.id FROM c t0 FULL JOIN c t1 ON (t0.t = '00296' OR t0.y = 0) AND t1.x = t0.p WHERE 2 = t0.x AND t0.y BETWEEN 2 AND 6	1:5a5ceee4a1f9c65e
+q	SELECT t0.id, t1.id FROM c t0 RIGHT JOIN c t1 ON t1.x = t0.x AND t0.x = 3 WHERE t0.u = 9	2:1b6f04789a4440c4
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN a t1 ON t0.t >= '00296' AND 0 > t0.y AND t1.t IN ('00666', '00185')	24:d9790ee11730f207
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM b t0 LEFT JOIN b t1 ON t0.t IN ('00407', '00185') AND t1.t = t0.t LEFT JOIN a t2 ON t2.id < t0.x LEFT JOIN b t3 ON t0.u = 9 AND t3.id < t0.x WHERE t0.x > 2 AND t0.y BETWEEN 2 AND 6	15:a879778b8eb54606
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 RIGHT JOIN b t1 ON t0.y = 5 AND (t1.x = 2 AND t1.y >= 3 OR t1.id = 12) LEFT JOIN c t2 ON t1.y < 2 AND t2.x = t0.x AND t1.t <> '00074' FULL JOIN b t3 ON t0.y < 0 WHERE t3.y >= 1	14:893b4a1bdd9b1297
+q	SELECT t0.id, t1.id FROM b t0 RIGHT JOIN b t1 ON t0.t = '00444'	16:b9699b750959a1e2
+q	SELECT t0.id, t1.id FROM b t0 JOIN a t1 ON t0.y >= 1 AND t1.id = t0.x WHERE t0.u < 30 AND t1.y = 3 AND t0.t GLOB '0*'	2:7ab74278d03c1f6c
+q	SELECT t0.id, t1.id, t2.id FROM a t0 RIGHT JOIN a t1 ON t1.u = t0.u AND t1.y = 2 JOIN a t2 ON t2.x = t1.p WHERE t0.t = '00185' AND '00555' <= t0.t	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM a t0 JOIN b t1 ON (t0.t = '00629' OR t0.y = 3) AND t1.id = t0.id FULL JOIN a t2 ON t2.y = 2 AND t2.x = t0.x AND t0.t = '00333'	27:e0a4caa26c56603a
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN c t1 ON t1.id = t0.id WHERE t0.x <> 3	15:b3bf2ee5c3539768
+q	SELECT t0.id, t1.id FROM c t0 FULL JOIN c t1 ON t0.u < 21 AND t1.u <= 12	34:59f092e0d555e3f4
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t0.u = 57 AND t1.id = t0.x AND (t0.x = 4 AND t0.y >= 5 OR t0.id = 7) WHERE t0.t = '00814' AND t1.id IS NULL AND t0.t GLOB '0*'	1:585ff0c96287d40e
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN a t1 ON t1.id = t0.id AND t0.id = 2	10:a15143f25d26970e
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN b t1 ON '00518' >= t1.t AND t0.y > 4 AND t1.id = t0.id	16:ac30acfef94dbecb
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM b t0 LEFT JOIN b t1 ON t0.u >= 12 RIGHT JOIN b t2 ON 12 <= t1.u AND t2.x IN (1, 2) LEFT JOIN a t3 ON t2.id + 1 = t3.id AND t1.t <> '00444' WHERE (t1.t = '00185' OR t1.x = 0) AND t1.u <= 33	77:b57ac4b27c46980c
+q	SELECT t0.id, t1.id, t2.id FROM b t0 RIGHT JOIN a t1 ON t1.id = t0.x AND (t0.u = 21 OR t0.x = 2) AND t1.t < '00111' LEFT JOIN a t2 ON t2.id = t1.x AND (t1.t = '00777' OR t1.x = 2) AND t2.u > 24	26:640b576778cbacaa
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN c t1 ON t1.u > 3 AND t0.y IS NOT NULL WHERE t0.x = 4 AND t1.id IS NOT NULL AND (t1.x = 0 AND t1.y >= 3 OR t1.id = 4)	3:4c2353bd1fe2e507
+q	SELECT t0.id, t1.id FROM b t0 FULL JOIN a t1 ON t1.x <= 1 WHERE t0.y BETWEEN 3 AND 7 AND t1.y > 3 AND (t1.id IS NULL OR t0.x = 4)	4:6d5cdef80181becb
+q	SELECT t0.id, t1.id FROM a t0 RIGHT JOIN b t1 ON t0.id + 1 = t1.id AND 2 < t0.x WHERE t0.u = 6 AND t0.x = 1	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t1.x = t0.p AND t0.t = '00777' AND (t0.t = '00592' OR t0.x = 1)	27:6b10284ed9dccfa1
+q	SELECT t0.id, t1.id, t2.id FROM c t0 FULL JOIN c t1 ON t0.p = 0 AND t1.id < t0.x FULL JOIN c t2 ON t0.y = t2.y AND t0.y BETWEEN -1 AND 3 WHERE t0.y >= 0	19:e47865e4324bf658
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON 24 < t0.u AND (t0.x = 2 AND t0.y >= 0 OR t0.id = 12) WHERE t1.u > 30	15:17830fb0b82c8a7a
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 LEFT JOIN a t1 ON t0.y IS NULL AND t1.id = t0.id AND t0.t = '00555' LEFT JOIN a t2 ON t1.u IS NULL LEFT JOIN c t3 ON t2.x IS NULL	1440:e0d8d02af1d24b59
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN b t1 ON t1.u = t0.u AND t0.t = '00333' AND t0.y <= 1	10:1ea4710a2076fc95
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM b t0 LEFT JOIN a t1 ON t1.id = t0.id FULL JOIN b t2 ON '00333' = t1.t AND t2.id < t0.x JOIN a t3 ON t1.y BETWEEN -1 AND 3 AND t1.u = 39 AND t3.id = t1.x WHERE t1.t < '00555' AND t1.u > 30 AND t3.t = '00814'	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 LEFT JOIN c t1 ON t0.y = 3 AND t1.t = t0.t LEFT JOIN c t2 ON t2.t = t0.t AND t1.y >= 0 AND t0.x <= 4 LEFT JOIN a t3 ON t3.u = t0.u AND t2.x IS NULL WHERE (t2.t = '00111' OR t2.y = 4)	1:ad3c171d23fdcdab
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 JOIN c t1 ON t1.t <> '00074' AND t0.y <= 1 AND t1.u = t0.u FULL JOIN c t2 ON t0.u = 69 JOIN b t3 ON t3.id < t0.x AND t3.t = '00148' WHERE t0.y = 4 AND (t3.y = 4 OR t3.x = 4) AND t0.t < '00185'	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM b t0 FULL JOIN b t1 ON (t1.t = '00185' OR t1.x = 4) WHERE t1.x < 4	10:f5960c92f1cbbd7c
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN a t1 ON t0.y IS NULL AND (t1.x = 4 AND t1.y >= 3 OR t1.id = 5) AND t0.t GLOB '0*' AND t1.u = t0.u	10:1ea4710a2076fc95
+q	SELECT t0.id, t1.id FROM c t0 JOIN a t1 ON (t0.x = 1 OR t0.y = 2) AND t1.id = t0.id WHERE t0.u IS NOT NULL AND t0.id BETWEEN 6 AND 10	2:c7b48f42f953ed2d
+q	SELECT t0.id, t1.id FROM b t0 JOIN b t1 ON t0.u BETWEEN 37 AND 41 AND t1.t = t0.t	1:70b4218ed362f19f
+q	SELECT t0.id, t1.id, t2.id FROM b t0 RIGHT JOIN a t1 ON t1.x = t0.x AND t0.u = 18 LEFT JOIN b t2 ON (t0.t = '00481' OR t0.y = 2) AND t2.t = t1.t	24:b1c702b9b1a6362e
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN a t1 ON t0.x = 0 AND t1.x IS 3 AND t0.id + 1 = t1.id WHERE t0.p = 1 AND t0.t < '00037'	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM c t0 FULL JOIN a t1 ON (t1.t = '00777' OR t1.y = 1) WHERE t1.t IN ('00777', '00037') AND t1.x > 0	20:a8d7628048aa816d
+q	SELECT t0.id, t1.id FROM c t0 RIGHT JOIN c t1 ON t0.u = 3 AND t1.y = 4	10:f3d307b4c6c55e53
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN a t1 ON t1.x = t0.p AND t1.t GLOB '0*' AND t0.t < '00296' WHERE t1.id = 15 AND t0.x = 2	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN c t1 ON t1.y = 2 AND t1.x = t0.p WHERE t0.t IS NULL	1:13765e2cdba7a685
+q	SELECT t0.id, t1.id, t2.id FROM a t0 RIGHT JOIN c t1 ON t0.x = 4 LEFT JOIN b t2 ON t1.u = 24 AND t2.id = t0.id AND t2.x + 0 = 0 WHERE t1.y <= 5 AND t0.t IS '00518'	9:1fca15dc90fee037
+q	SELECT t0.id, t1.id FROM b t0 FULL JOIN a t1 ON t0.y = 1 WHERE t0.x = 1 AND (t0.id = 9 OR t0.x = 2) AND (t0.t = '00444' OR t0.x = 3) AND (t1.id IS NULL OR t0.id >= 9)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM c t0 LEFT JOIN c t1 ON t0.u >= 24 AND t1.t = t0.t FULL JOIN a t2 ON t2.id = t1.id AND t0.u <= 15 WHERE t0.t < '00333' AND (t2.id IS NULL OR t2.x >= 3)	8:603d40eceb520478
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM b t0 FULL JOIN a t1 ON t1.x = 0 LEFT JOIN a t2 ON t0.y = 4 LEFT JOIN a t3 ON t1.u NOT IN (48, 49) AND t3.x = t2.x WHERE t1.x = 1 AND (t2.id IS NULL OR t2.u IS 66) AND 4 < t1.y	1:5dceca7e5a336f30
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN b t1 ON t0.u >= 6 AND t1.id = t0.id AND (t1.y = 3 OR t1.y = 3) AND t0.u = 33 RIGHT JOIN b t2 ON t1.x + 0 = 4 AND t1.y = t2.y	16:3a4ae952f5c4f9d2
+q	SELECT t0.id, t1.id FROM c t0 FULL JOIN c t1 ON t0.y >= 1 AND '00185' < t1.t	43:35c593a0adeba3d4
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 LEFT JOIN b t1 ON t1.u >= 45 RIGHT JOIN c t2 ON t0.u >= 6 AND t2.id = t1.id AND t2.t <= '00259' LEFT JOIN c t3 ON t1.u = 27 WHERE t1.id IS 12 AND (t1.u = 27 OR t1.y = 3)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM a t0 FULL JOIN b t1 ON t0.t IS '00111' LEFT JOIN b t2 ON t0.u < 69 AND t1.x <> 1 AND t2.x = t0.p WHERE (t2.id IS NULL OR t2.t = '00407')	30:9c39ac7162908fda
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 JOIN b t1 ON t1.t = t0.t AND t1.y > 1 AND coalesce(t0.y, 1) < 4 LEFT JOIN b t2 ON t2.y <= 1 AND t0.u < 15 AND t2.id = t1.x AND t1.y = 3 RIGHT JOIN b t3 ON t0.x = 2 AND t0.y = t3.y AND (t1.x = 2 AND t1.y >= 4 OR t1.id = 1) WHERE t1.u = 45 AND t1.x BETWEEN 2 AND 6 AND t1.u = 45	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN c t1 ON t1.u >= 6 WHERE t1.y >= 4	48:9df712ceef89e82e
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN c t1 ON t1.x = t0.p AND t0.x IS NULL FULL JOIN a t2 ON t1.u < 15 AND t1.id + 1 = t2.id WHERE t1.id <= 4	3:71321aca23d66148
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 LEFT JOIN c t1 ON t0.u = 6 AND (t0.u = 6 OR t0.y = 3) AND t1.id = t0.x LEFT JOIN c t2 ON t2.x IS NULL AND t2.u = t1.u RIGHT JOIN c t3 ON t0.y = t3.y AND t0.u >= 15 WHERE t0.t IS NULL	5:81846704cf1ce77a
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN c t1 ON t0.id + 1 = t1.id AND t0.u < 12 WHERE t0.u >= 21	3:8fc51212f3d00f36
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN b t1 ON t0.p = 2 JOIN b t2 ON t1.u IS NULL AND t2.u = 33 WHERE t1.y BETWEEN 2 AND 6 AND (t1.x = 2 OR t1.y = 4)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 LEFT JOIN a t1 ON t1.u BETWEEN 22 AND 26 AND t0.u = 9 FULL JOIN a t2 ON t0.y = t2.y AND t0.t = '00888' FULL JOIN b t3 ON t2.u IS NULL	453:e6557c3796281512
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN b t1 ON t0.x = 0 AND t1.u = t0.u LEFT JOIN a t2 ON t0.x = 1 AND t2.y < 3 AND t2.x = t1.p AND t0.t <= '00481' WHERE t0.y = 4	4:72995bc3e316363b
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN a t1 ON t1.u BETWEEN 37 AND 41 AND t1.id = t0.id AND (t0.y = 0 OR t0.x = 3)	10:1ea4710a2076fc95
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN a t1 ON t1.id < t0.x AND t0.y NOT IN (4, 5) WHERE t0.u = 12 AND 3 <= t1.id AND t1.id IS NOT NULL AND t0.y > 2	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM b t0 FULL JOIN a t1 ON t0.u = 12 AND t1.x = t0.p LEFT JOIN b t2 ON t1.p = 2 AND t2.u = t1.u FULL JOIN c t3 ON t3.x = t2.x AND t2.x <= 1 WHERE t2.y BETWEEN -2 AND 2 AND t1.t GLOB '0*' AND t2.t GLOB '0*'	1:9898b753c68b730d
+q	SELECT t0.id, t1.id, t2.id FROM c t0 LEFT JOIN b t1 ON t0.t = '00222' AND t0.t GLOB '0*' LEFT JOIN b t2 ON t2.x = t1.p AND t1.y = 3 WHERE (t1.id IS NULL OR t0.t IN ('00074', '00111'))	9:43b7f5471d2d48c9
+q	SELECT t0.id, t1.id, t2.id FROM c t0 FULL JOIN b t1 ON t1.t = t0.t AND NOT t0.t > '00148' LEFT JOIN b t2 ON t2.t = t0.t AND t1.x = 3 AND t0.x = 3 WHERE t1.u IS NULL AND t1.t >= '00518'	1:d42b02b78cb21c26
+q	SELECT t0.id, t1.id, t2.id FROM c t0 JOIN a t1 ON t1.t = t0.t LEFT JOIN c t2 ON t1.t <= '00222' AND t2.id = t1.x WHERE t1.u = 24	1:789ba17019f83624
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t0.u <= 54 AND t1.u IN (24, 25) AND t1.t = t0.t WHERE t0.x + 0 = 3 AND t0.y > 2	2:21d33e5ab7fc8c71
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN a t1 ON t0.y = 5 LEFT JOIN b t2 ON t2.id < t0.x AND t2.y = 4 WHERE (t0.y = 0 OR t0.y = 0) AND (t2.id IS NULL OR t1.x < 3)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN b t1 ON t1.x = t0.p RIGHT JOIN a t2 ON t0.t IS NULL WHERE t0.x BETWEEN 2 AND 6	96:6a0d6753c2dbcbb5
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 LEFT JOIN a t1 ON t0.u > 3 AND t1.id = t0.id AND t1.x >= 4 AND t0.y = 3 RIGHT JOIN a t2 ON t2.t = t1.t AND t1.y < 3 LEFT JOIN a t3 ON t1.y IN (1, 2)	24:6292072179f60dfb
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN c t1 ON t1.y >= 3 AND t1.t = t0.t AND t0.u NOT IN (27, 28) WHERE t1.u IS NOT NULL AND (t0.x = 0 AND t0.y >= 2 OR t0.id = 7)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM a t0 FULL JOIN c t1 ON t0.u = 18 LEFT JOIN b t2 ON t0.y NOT IN (5, 6) AND t2.id = t1.id AND t2.t NOT IN ('00037', '00074') WHERE t2.x = 4 AND t0.y = 5 AND t2.id IS NOT NULL	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 RIGHT JOIN b t1 ON (t0.u = 63 OR t0.x = 3) AND t1.id = t0.id AND t0.u = 57 AND 42 > t1.u WHERE t1.t < '00592' AND (t1.x = 1 AND t1.y >= 2 OR t1.id = 15)	2:9f82cbb3ba38a8cd
+q	SELECT t0.id, t1.id FROM a t0 JOIN b t1 ON t0.x IS NULL WHERE t1.x IS NULL AND t1.id = 12	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM b t0 FULL JOIN c t1 ON t0.y = 5 AND t0.id + 1 = t1.id AND t1.id BETWEEN -1 AND 3 WHERE t0.t IS NULL AND (t1.id IS NULL OR t0.y = 1) AND t1.id IS NULL AND t0.id >= 2	1:13765e2cdba7a685
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON (t0.x = 2 OR t0.y = 3) AND t1.id = t0.id WHERE t1.u IS NULL	19:55cc44604b0f3e0f
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN b t1 ON t1.p = 3 WHERE t1.t < '00296'	32:8004d8da117d157f
+q	SELECT t0.id, t1.id FROM a t0 JOIN c t1 ON t0.y = t1.y WHERE t0.y >= 2 AND t0.id = 22	2:352c1f04ad8a23ac
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN b t1 ON t1.id = t0.x WHERE t0.t <= '00222' AND t1.x = 2 AND (t1.id IS NULL OR t1.id IS NULL)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN b t1 ON t1.x NOT IN (3, 4) AND t0.u = 24 LEFT JOIN a t2 ON t2.id = t0.id AND t0.id NOT IN (24, 25) WHERE t0.y >= 1 AND t0.p = 2	4:176f0da2edb4dfaf
+q	SELECT t0.id, t1.id FROM c t0 FULL JOIN b t1 ON t1.id = t0.x AND t0.y IS 5 WHERE t0.y = 5 AND t0.u <= 27	1:c5fc1ac1727801a1
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t0.id > 24 AND t0.u = 63 AND t1.x < 0 AND t1.t = t0.t	24:d9790ee11730f207
+q	SELECT t0.id, t1.id, t2.id FROM c t0 FULL JOIN b t1 ON t1.x IS NULL FULL JOIN b t2 ON t0.t = '00222' AND t2.id = t0.id WHERE (t0.x = 1 OR t0.x = 1) AND (t2.id IS NULL OR t1.id NOT IN (13, 14))	6:fca709f232cf8227
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN b t1 ON t1.x = t0.x AND t0.x >= 2 RIGHT JOIN a t2 ON t0.u >= 57 AND t0.x = 2 WHERE (t1.t = '00333' OR t1.y = 4)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN c t1 ON '00222' >= t0.t AND t0.x < 3 AND t0.id + 1 = t1.id WHERE '00370' >= t0.t AND (t0.t = '00222' OR t0.y = 0)	1:3dc19d1814102f78
+# partial: FULL JOIN, left-only: 58
+# partial: FULL JOIN, mixed: 44
+# partial: FULL JOIN, right-only: 21
+# partial: JOIN, left-only: 31
+# partial: JOIN, mixed: 32
+# partial: JOIN, right-only: 11
+# partial: LEFT JOIN, left-only: 177
+# partial: LEFT JOIN, mixed: 118
+# partial: LEFT JOIN, right-only: 57
+# partial: RIGHT JOIN, left-only: 46
+# partial: RIGHT JOIN, mixed: 31
+# partial: RIGHT JOIN, right-only: 18
+# partial: where, 0: 39
+# partial: where, 1: 54
+# partial: where, 2: 72
+# partial: where, 3: 30
+# partial: where, 4: 5
+db	large
+sql	CREATE TABLE a(id INTEGER PRIMARY KEY, u INT UNIQUE, x INT, y INT, t TEXT UNIQUE, p INT)
+sql	CREATE INDEX a_x ON a(x)
+sql	CREATE INDEX a_y ON a(y)
+sql	WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM n WHERE i < 3000) INSERT INTO a SELECT i, CASE WHEN i % 7 <> 0 THEN i * 3 END, CASE WHEN i % 5 <> 0 THEN i % 20 END, CASE WHEN i % 6 <> 0 THEN i * 7 % 15 END, CASE WHEN i % 9 <> 0 THEN printf('%05d', i * 37 % 10007) END, i % 4 FROM n
+sql	CREATE TABLE b(id INTEGER PRIMARY KEY, u INT UNIQUE, x INT, y INT, t TEXT UNIQUE, p INT)
+sql	CREATE INDEX b_x ON b(x)
+sql	CREATE INDEX b_y ON b(y)
+sql	WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM n WHERE i < 12) INSERT INTO b SELECT i, CASE WHEN i % 7 <> 0 THEN i * 3 END, CASE WHEN i % 5 <> 0 THEN i % 20 END, CASE WHEN i % 6 <> 0 THEN i * 7 % 15 END, CASE WHEN i % 9 <> 0 THEN printf('%05d', i * 37 % 10007) END, i % 4 FROM n
+sql	CREATE TABLE c(id INTEGER PRIMARY KEY, u INT UNIQUE, x INT, y INT, t TEXT UNIQUE, p INT)
+sql	CREATE INDEX c_x ON c(x)
+sql	CREATE INDEX c_y ON c(y)
+sql	WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM n WHERE i < 8) INSERT INTO c SELECT i, CASE WHEN i % 7 <> 0 THEN i * 3 END, CASE WHEN i % 5 <> 0 THEN i % 20 END, CASE WHEN i % 6 <> 0 THEN i * 7 % 15 END, CASE WHEN i % 9 <> 0 THEN printf('%05d', i * 37 % 10007) END, i % 4 FROM n
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN c t1 ON t0.y IS 13 WHERE t0.y = 9	100:710a2ab5a1a6cc98
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 LEFT JOIN a t1 ON t1.t = t0.t AND t0.u >= 18 AND t0.u IS NOT NULL JOIN c t2 ON t2.t IS NULL RIGHT JOIN b t3 ON t1.id = 2741 AND t3.x = 8 WHERE t0.x = 17	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM b t0 RIGHT JOIN b t1 ON t0.x = 0 LEFT JOIN a t2 ON t2.x = 0 AND t2.id = t0.x WHERE t0.y = 8 AND 11 <= t0.id	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t0.t = '00678' AND t1.x = t0.p AND t0.t > '07739' WHERE t0.u <> 7359	2571:766eb3d8bc45e2e5
+q	SELECT t0.id, t1.id FROM a t0 RIGHT JOIN c t1 ON t1.p = 3 AND t1.t = t0.t AND t0.id <= 330 WHERE t1.u = 15	1:6bf06da765718ff7
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 RIGHT JOIN b t1 ON t0.x IS NOT NULL AND t1.id = t0.id AND t1.u IS NOT NULL RIGHT JOIN c t2 ON t1.y = 5 FULL JOIN b t3 ON t3.id < t0.x AND t3.x = 15 WHERE t3.t GLOB '0*' AND (t1.id IS NULL OR (t2.u = 21 OR t2.y = 8))	11:fa1891891b916060
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN b t1 ON t1.x < 16 AND t0.u <> 6810 LEFT JOIN c t2 ON t0.x BETWEEN 16 AND 20 AND t2.t = '00185' AND t2.t = t1.t WHERE t0.u = 3300 AND t0.u = 6510	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN c t1 ON t0.t > '02565' WHERE t0.t = '03444' AND t0.t = '01623'	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 LEFT JOIN b t1 ON coalesce(t0.y, 1) < 9 LEFT JOIN b t2 ON t1.u >= 18 AND t1.y <= 4 LEFT JOIN c t3 ON t3.id > 2 AND t0.x = 12 WHERE t1.x IS NULL AND (t0.y = 0 OR t0.x = 4)	450:28033734823f78a7
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t0.u IS NULL WHERE NOT t0.y > 4 AND 4 = t0.y	519:2106856da68c001d
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t1.y <= 6 AND t1.id < t0.x AND (t0.u = 2241 OR t0.x = 13) WHERE t0.id = 2501 AND t0.t GLOB '0*'	1:7e5121c47f8d0f3c
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN b t1 ON t1.u >= 21 AND t1.id = t0.id AND t0.y BETWEEN 9 AND 13 LEFT JOIN c t2 ON t2.id < 7 WHERE t0.y = 4 AND t0.y <= 7	1200:810d22781c6cbb1d
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 LEFT JOIN b t1 ON t0.x = 11 LEFT JOIN b t2 ON t2.t = '00222' AND t2.x = t1.p LEFT JOIN c t3 ON t3.id = t0.x AND t3.u >= 15 AND t1.t = '00111' WHERE t1.t IS NULL AND t0.u = 2064 AND t3.id <= 4	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM c t0 JOIN a t1 ON 3 < t0.id WHERE t1.u IS NULL AND '00222' > t0.t	856:e40e519cf6f0cf39
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN c t1 ON t1.y = 5 AND t0.x IS 2 AND t1.id = t0.id LEFT JOIN b t2 ON t0.id + 1 = t2.id WHERE (t2.x = 15 OR t2.y = 10) AND t0.id >= 2694 AND t0.y = 9	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t1.t = t0.t AND t0.u > 1899	3000:4272ded1ac62dad8
+q	SELECT t0.id, t1.id, t2.id FROM a t0 RIGHT JOIN b t1 ON t1.x = 9 AND t1.x = t0.x LEFT JOIN c t2 ON t1.id + 1 = t2.id AND t1.u = 36 WHERE t1.t = '00333'	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 JOIN c t1 ON t0.id IS NULL AND t1.x = t0.p WHERE (t0.t = '02983' OR t0.y = 4)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM a t0 FULL JOIN b t1 ON t0.y = 5 AND t1.u = t0.u FULL JOIN c t2 ON (t1.x = 6 AND t1.y >= 0 OR t1.id = 3) AND t0.y > 9 WHERE t0.t < '05994' AND t1.y IS NOT NULL	1:38903e4a31ba81dc
+q	SELECT t0.id, t1.id, t2.id FROM a t0 RIGHT JOIN c t1 ON t1.id < t0.x AND t0.u = 6189 FULL JOIN c t2 ON t2.p = 1 AND t1.t < '00222' WHERE (t0.x = 7 AND t0.y >= 13 OR t0.id = 1326) AND t2.t <= '00037'	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN c t1 ON (t0.t = '05636' OR t0.y = 0) AND t1.t = t0.t WHERE t0.id IN (1918, 1919)	2:e333b951cfcfcb2c
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t1.t = '00185' AND t0.y = t1.y WHERE (t1.id IS NULL OR t0.y >= 6) AND t0.u NOT IN (561, 562)	2400:48cb8f3093a0526d
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN c t1 ON NOT t0.id > 2298 JOIN b t2 ON t1.t = '00222' AND t1.x BETWEEN 5 AND 9	27576:f63faa72161444f1
+q	SELECT t0.id, t1.id FROM b t0 RIGHT JOIN a t1 ON t1.p = 2 WHERE t0.id = 4 AND t1.id IS NOT NULL	750:4fe57dfd5125514a
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t1.id = t0.id AND (t1.u = 24 OR t1.x = 3) WHERE t0.t < '04588' AND t1.t GLOB '0*' AND t1.t >= '00222' AND t1.id IS NULL	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON (t0.t = '06490' OR t0.x = 7) AND NOT t0.t > '09413' AND t1.u = 18 AND t1.x = t0.p WHERE t0.u IS NULL AND t0.y IN (1, 2)	58:92c7ed1243c912b7
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t1.t = t0.t WHERE t1.x IS NULL	2993:ca3354120c366dd2
+q	SELECT t0.id, t1.id, t2.id FROM a t0 JOIN c t1 ON t0.id + 1 = t1.id AND coalesce(t0.y, 1) < 7 AND t1.y < 12 LEFT JOIN b t2 ON t2.u = t1.u AND t0.y <= 13	2:9bec8c1a96a5c8da
+q	SELECT t0.id, t1.id, t2.id FROM a t0 FULL JOIN c t1 ON t0.id + 1 = t1.id LEFT JOIN c t2 ON t2.y = 6 AND t1.y IS NULL	3001:7a09078df4457689
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t0.y = 0 AND t1.x = t0.p WHERE t0.t > '04822' AND (t0.id = 427 OR t0.y = 3)	34:5b3b34f3706a679c
+q	SELECT t0.id, t1.id FROM a t0 RIGHT JOIN b t1 ON t0.u < 5475 AND t1.id = t0.id AND t1.t = '00111'	12:f8dc399bce8f25a0
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN a t1 ON t1.id = t0.id AND t1.x = 18 AND t0.u = 15 LEFT JOIN b t2 ON t1.x = 14 AND t1.y = t2.y AND (t2.t = '00407' OR t2.y = 9) WHERE coalesce(t1.y, 1) < 4	12:bae3527a7e18d556
+q	SELECT t0.id, t1.id FROM a t0 JOIN b t1 ON t0.id + 1 = t1.id WHERE t1.y < 7	5:943f8a790fc51dd6
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN a t1 ON t0.y = 11 WHERE t0.x = 5	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t0.x <= 16 AND t0.id + 1 = t1.id AND t0.x = 19 WHERE t0.y = 2	200:26d8f2a94c70c856
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t0.x <= 8 AND t0.id + 1 = t1.id	3000:0cfcd8dceeb0bb25
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 LEFT JOIN c t1 ON t0.id + 1 = t1.id AND t0.y IS NULL LEFT JOIN c t2 ON t0.y NOT IN (2, 3) AND t1.t IS NOT NULL LEFT JOIN c t3 ON t1.y = 1 AND t3.x IN (11, 12) WHERE t2.id IS NOT NULL AND '00259' < t1.t AND 11 = t3.y	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN b t1 ON t1.u < 30 FULL JOIN b t2 ON t1.y < 1 AND t1.id = 8 WHERE t1.y = 8	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 RIGHT JOIN c t1 ON t0.u > 5781 AND t1.x = t0.x WHERE t0.x IS NOT NULL AND t0.y IS NOT NULL	256:593a1885cc05d880
+q	SELECT t0.id, t1.id FROM a t0 RIGHT JOIN b t1 ON t1.u = 18	3011:d127227751f21116
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t0.id + 1 = t1.id AND t1.y = 0 AND t0.t IS NULL WHERE t0.t = '02118'	1:d9e7d36a50da989f
+q	SELECT t0.id, t1.id, t2.id FROM a t0 JOIN b t1 ON t0.p = 0 AND (t0.t = '01987' OR t0.x = 7) AND t1.u = t0.u LEFT JOIN c t2 ON t0.t = '05496' AND t0.y = 5 AND t2.u <= 3 AND t2.u = t0.u	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t1.x = t0.x AND t0.id = 501 WHERE t0.y >= 12	500:07e81046f88af974
+q	SELECT t0.id, t1.id FROM a t0 JOIN b t1 ON t1.t = t0.t AND t0.t = '00817' WHERE 498 = t0.u	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN b t1 ON t0.id + 1 = t1.id WHERE t1.p = 2 AND t1.id IS NOT NULL	3:efb85ea2ab736275
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN b t1 ON t0.p = 2 AND t1.t = t0.t LEFT JOIN b t2 ON t2.id < t0.x AND t2.y = 9 AND t0.u >= 1773 AND t1.y = 12 WHERE t0.id < 2290 AND (t0.t = '05738' OR t0.y = 8)	153:93a279a4ac03e62e
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t1.x IS 2 AND t0.u IS NOT NULL WHERE t0.u NOT IN (5301, 5302) AND coalesce(t0.y, 1) < 7	1371:df8f42bd8e57a00d
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM b t0 LEFT JOIN a t1 ON t0.t <= '00111' AND t1.id < 2764 AND t1.x = t0.p AND (t0.t = '00333' OR t0.y = 0) LEFT JOIN b t2 ON t0.y = t2.y AND t1.y = 12 LEFT JOIN c t3 ON (t0.y = 13 OR t0.x = 9) AND t3.id = t2.id WHERE t2.id IS NOT NULL AND t0.x = 5	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN b t1 ON t0.x = 7 AND t1.y > 11 FULL JOIN b t2 ON (t2.u = 21 OR t2.y = 4) AND t1.t = '00296' AND t2.t = t1.t WHERE t2.t = '00296' AND t2.x <> 2	1:b4ae7c160ce4ca79
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN b t1 ON t0.y NOT IN (4, 5) AND t1.t > '00444' LEFT JOIN c t2 ON t2.x = t0.p AND coalesce(t2.y, 1) < 2 WHERE t0.t NOT IN ('09868', '00111')	2665:4f253a852c781d62
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t1.x = t0.x WHERE t1.id = 7 AND t1.id IS NOT NULL	150:bdfde2750ded0770
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t0.y = t1.y WHERE t1.id IS NULL AND t0.x = 13 AND t1.x = 9	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t0.y IS 0 AND (t0.t = '06262' OR t0.x = 3) WHERE t0.u >= 7779 AND (t0.u = 2871 OR t0.x = 3)	18:2afeaa936b43d546
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN b t1 ON t1.u IS NULL AND t1.t = t0.t AND t0.u = 7188 AND coalesce(t0.y, 1) < 14 WHERE t1.y NOT IN (7, 8) AND (t1.t = '00407' OR t1.y = 1)	1:db0ca1715febf72e
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t0.t IS NULL AND t1.t > '00074' AND t1.id = t0.id WHERE t0.y > 1 AND (t0.x = 11 OR t0.x = 11)	150:47b1696040745700
+q	SELECT t0.id, t1.id FROM a t0 JOIN c t1 ON t1.x <= 11 AND t1.x = t0.p WHERE t0.x = 6 AND (t0.y = 4 OR t0.x = 11)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN c t1 ON t0.y > 6 AND t1.u = 3 AND t0.y = t1.y LEFT JOIN c t2 ON (t1.t = '00111' OR t1.y = 0) AND t2.u = 9 WHERE t0.y IN (10, 11) AND t1.x IS NULL	400:2cc42f42a915c93a
+q	SELECT t0.id, t1.id, t2.id FROM a t0 FULL JOIN c t1 ON t0.y < 0 AND t1.id < t0.x FULL JOIN c t2 ON 6 < t1.u AND t2.t = t0.t AND t2.y IS 3 WHERE t1.x <= 15 AND t1.u > 12	2:923d021f33dfefd3
+q	SELECT t0.id, t1.id FROM a t0 JOIN b t1 ON t0.u IS 6120 AND t1.u = t0.u AND t1.y IS NOT NULL WHERE t0.t = '06834'	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN b t1 ON t0.x < 19 WHERE t0.u < 6 AND t0.t GLOB '0*'	12:4e1ea59919969a4c
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 FULL JOIN b t1 ON t1.t = t0.t AND t0.y > 4 JOIN b t2 ON t2.y BETWEEN 11 AND 15 AND t2.id = t0.x JOIN c t3 ON t3.x = t0.x WHERE t0.id NOT IN (1946, 1947) AND t0.y IN (9, 10) AND t0.id >= 706	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM c t0 LEFT JOIN a t1 ON t0.y IS NULL AND (t0.x = 19 AND t0.y >= 5 OR t0.id = 1) AND t1.y >= 1 RIGHT JOIN c t2 ON t1.id <= 2909 AND t2.y = 5 AND t2.id < t0.x	8:3beb5ca512d1353d
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM c t0 JOIN b t1 ON t0.p = 1 AND t0.u = 15 LEFT JOIN c t2 ON t0.y BETWEEN 0 AND 4 LEFT JOIN a t3 ON t3.id = t0.x AND t1.u > 6 AND t0.x = 0	12:84dd3b695278b850
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN b t1 ON t0.y = 1 LEFT JOIN c t2 ON t2.id = t1.id AND t1.x < 5 WHERE t1.y = 5	200:46cf93a11904913c
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 FULL JOIN b t1 ON t0.t NOT IN ('00743', '00074') JOIN c t2 ON t2.id < t0.x AND t1.x <= 14 LEFT JOIN b t3 ON t3.t <= '00111' AND t3.t = t1.t WHERE t0.t = '04995' AND t2.t > '00148'	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t1.u = t0.u AND (t0.t = '03800' OR t0.y = 5) AND t0.x <= 12 WHERE (t1.id IS NULL OR t1.id < 2) AND t0.y < 6 AND t0.t NOT IN ('00487', '00148')	932:e36c7d15c0001b18
+q	SELECT t0.id, t1.id FROM c t0 FULL JOIN a t1 ON t0.u = 15 AND t0.y IS NOT NULL AND t1.x = t0.x WHERE 5 = t1.x	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM c t0 LEFT JOIN c t1 ON t0.t IS NOT NULL AND t0.id + 1 = t1.id RIGHT JOIN a t2 ON t2.id = t1.id AND t1.t <= '00148' AND t2.x + 0 = 4 WHERE t2.x IN (19, 20) AND t2.id IS NOT NULL	150:db84bdc92cd9886a
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN c t1 ON t0.y = t1.y AND t1.id IS NULL AND t0.y = 13	3008:930e9db02bccdc08
+q	SELECT t0.id, t1.id FROM b t0 LEFT JOIN a t1 ON t0.id + 1 = t1.id WHERE (t1.x = 3 AND t1.y >= 13 OR t1.id = 2353) AND t1.t IS NULL AND t1.y >= 3	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN b t1 ON t1.x = t0.p JOIN c t2 ON '00444' >= t1.t AND t0.y = t2.y WHERE t1.id IS NOT NULL	1000:12ad518005e97d27
+q	SELECT t0.id, t1.id FROM a t0 RIGHT JOIN c t1 ON t0.x = 16 AND t1.x = t0.p WHERE (t1.u = 12 OR t1.y = 5)	2:8542f75d035cf740
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 FULL JOIN b t1 ON t0.id = 1535 AND t1.x = t0.x LEFT JOIN c t2 ON t0.p = 1 LEFT JOIN b t3 ON t1.p = 3 WHERE 5 >= t1.y AND t1.u >= 24	13:0ca0b63c4208e90a
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t1.x IS NULL AND t1.id = t0.id	3000:b0a59fe62acc360a
+q	SELECT t0.id, t1.id FROM a t0 JOIN b t1 ON t1.t = t0.t AND t0.y < 7 AND t1.x = 11 AND t0.x = 2 WHERE t0.t GLOB '0*' AND t0.u >= 2628	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 RIGHT JOIN b t1 ON t0.t = '05121' AND t1.y > 13 WHERE t0.id = 1746 AND 14 = t1.y AND (t1.id IS NULL OR t1.x < 15) AND t0.u <= 1455	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t1.t = t0.t AND t0.y IN (5, 6) WHERE t1.id IS NOT NULL AND (t0.x = 15 AND t0.y >= 10 OR t0.id = 2960)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t0.t NOT IN ('00829', '00185') AND t0.x = 17 WHERE t0.y = 5	200:c02f52b6b71abc39
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN a t1 ON t0.t IS NULL AND t1.x = t0.x AND t1.x <= 4 WHERE 6 = t0.y	1:c7fc839170e0879b
+q	SELECT t0.id, t1.id FROM b t0 FULL JOIN a t1 ON t0.x = 7 AND t1.id = t0.x AND t0.y <= 5	3011:340058ac04fa7fed
+q	SELECT t0.id, t1.id, t2.id FROM b t0 RIGHT JOIN b t1 ON t0.y IS NOT NULL AND t1.u = t0.u LEFT JOIN a t2 ON t2.id = t0.id AND t1.t = '00037' WHERE t1.t = '00444' AND t1.id IS NOT NULL AND t0.p = 1	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN a t1 ON t1.u = t0.u AND t0.x >= 18 WHERE t0.y IN (7, 8) AND t1.id IS NULL	1:3a3a2ba88b96c57d
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN b t1 ON t1.id = t0.x AND t1.y = 5 AND t0.t IN ('02152', '00259') WHERE t1.t >= '00370' AND t1.id IS NOT NULL	3:16efc9feb136dc4c
+q	SELECT t0.id, t1.id FROM a t0 JOIN b t1 ON (t1.u = 18 OR t1.y = 10) WHERE t0.t = '03120'	2:4ab8355f9e472e32
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN c t1 ON (t0.id = 3 OR t0.x = 19) AND t1.y IS NULL AND t0.y = t1.y AND t0.y = 3 JOIN a t2 ON t2.x > 6 WHERE t0.id >= 6 AND t0.x = 9	1650:d098e0716304292a
+q	SELECT t0.id, t1.id FROM a t0 JOIN c t1 ON t0.u IS NULL	3424:9aba1b1d18bf4e75
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN c t1 ON t0.x >= 17 AND (t1.x = 2 OR t1.y = 2) AND t0.id + 1 = t1.id FULL JOIN c t2 ON t0.y = 10 AND t0.id + 1 = t2.id WHERE t0.t = '08266' AND t0.x < 15	1:5c2a30aa62ef7590
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t0.x >= 0 WHERE t0.u BETWEEN 4336 AND 4340	8:e05669e18068e07d
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN a t1 ON 4 < t1.x AND t0.id + 1 = t1.id AND t0.y = 9	8:43df30e121e1b265
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 FULL JOIN c t1 ON t1.id <= 8 AND t0.x NOT IN (2, 3) AND t1.id = t0.id LEFT JOIN b t2 ON t2.t = t0.t AND t2.t = '00296' LEFT JOIN b t3 ON t3.id = t2.id AND 15 <= t0.x AND t1.u = 3 WHERE t3.id IS NULL AND t0.y >= 10 AND t0.y = 13 AND t0.p = 0	50:0417cbdb2be58a72
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t1.id = t0.id AND t0.y = 6 WHERE t0.x < 10	1200:538ad3d207406fd7
+q	SELECT t0.id, t1.id FROM a t0 JOIN b t1 ON t0.id + 1 = t1.id	11:29e0a1d2e6198771
+q	SELECT t0.id, t1.id FROM a t0 RIGHT JOIN c t1 ON t1.t = t0.t WHERE t0.x NOT IN (16, 17) AND t1.u IS 18	1:3dc19e181410312b
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t0.u NOT IN (2304, 2305) AND t0.y = 7 AND t1.id IS NULL WHERE (t1.id IS NULL OR 10 = t0.x) AND t0.id = 1139 AND t0.u = 1677	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM a t0 JOIN c t1 ON t1.id = t0.id AND 6 = t0.x AND '00185' > t1.t FULL JOIN c t2 ON t0.x IS 3 AND t2.x = 7	8:3beb5ca512d1353d
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN a t1 ON t1.id = t0.id WHERE t0.t <= '00111'	3:ca5df53674848e23
+q	SELECT t0.id, t1.id FROM a t0 JOIN c t1 ON t1.id < t0.x AND t1.u > 21	1350:7c5eeff80889f0c0
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN c t1 ON t0.y = 3 AND t0.id = 575 WHERE NOT t0.y > 13 AND t0.x >= 10	900:58ef3fae10058cbf
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t1.x = t0.x WHERE t0.u IS NULL	428:29be3563d476a03c
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t0.y IS 4 AND t0.t IS NOT NULL AND (t1.x = 5 AND t1.y >= 14 OR t1.id = 9) AND t0.y = t1.y WHERE t0.x = 10 AND t1.t = '00185'	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM b t0 JOIN a t1 ON t1.t NOT IN ('05394', '00111') AND t0.id IS NOT NULL AND t1.id = t0.x WHERE t0.u <= 27	5:a9c56ecd2b72b933
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t0.x <= 14 AND t1.id = t0.x WHERE t0.id >= 1687	1314:b9e6a388e5337103
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 JOIN b t1 ON t0.x = 5 LEFT JOIN c t2 ON t2.id = t0.x AND t0.y = 9 AND t2.t GLOB '0*' AND t1.t = '00111' FULL JOIN b t3 ON t3.t = t2.t AND t2.x = 11	12:5b88fca4e38bcb32
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t1.u = t0.u WHERE t0.p = 2 AND t0.y = 7	50:4b626e31e28ede75
+q	SELECT t0.id, t1.id, t2.id FROM c t0 RIGHT JOIN a t1 ON t1.t = t0.t FULL JOIN b t2 ON t0.u = 9 AND t2.id = t0.id	3011:65f4c592c4f66a38
+q	SELECT t0.id, t1.id, t2.id FROM a t0 FULL JOIN c t1 ON (t0.y = 7 OR t0.x = 16) AND t1.u = t0.u LEFT JOIN b t2 ON t0.x <= 8 AND t1.t <= '00296' AND t2.u = t0.u WHERE (t2.id IS NULL OR t1.x = 9) AND t0.u = 4728	1:7545589adc0077e8
+q	SELECT t0.id, t1.id FROM c t0 RIGHT JOIN a t1 ON (t0.t = '00037' OR t0.y = 3) AND t0.y = t1.y WHERE t1.id > 975 AND t1.id IS NOT NULL	2025:c09ba59743e92f1b
+q	SELECT t0.id, t1.id, t2.id FROM a t0 RIGHT JOIN b t1 ON t0.x = 6 AND t0.y = t1.y FULL JOIN b t2 ON t0.id + 1 = t2.id AND t0.u IS 7041 WHERE (t1.id IS NULL OR t0.x NOT IN (15, 16)) AND t0.id <= 2526	84:cd2443bb08583fa5
+q	SELECT t0.id, t1.id, t2.id FROM c t0 RIGHT JOIN a t1 ON t1.u < 8235 AND t0.id + 1 = t1.id AND (t0.x = 12 AND t0.y >= 8 OR t0.id = 1) LEFT JOIN c t2 ON t1.y = 1 WHERE t1.u BETWEEN 3193 AND 3197 AND t1.u <= 5502	1:318de1c611d93291
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN c t1 ON t1.t = t0.t AND t0.x = 5 AND 1 <= t0.y AND (t1.t = '00148' OR t1.x = 3) LEFT JOIN c t2 ON t1.x = 11 WHERE (t1.x = 0 AND t1.y >= 0 OR t1.id = 2) AND t2.y <= 13	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN b t1 ON t1.y IS NULL AND t0.t = '00217' AND t1.id < t0.x WHERE t1.id IS NULL	3000:4272ded1ac62dad8
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 FULL JOIN c t1 ON t1.u = 3 AND t0.y > 2 JOIN b t2 ON t1.y = t2.y AND t2.x < 0 RIGHT JOIN b t3 ON t1.u = 6 AND t1.y = 13 WHERE t3.id IS NULL	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM c t0 RIGHT JOIN a t1 ON t1.y = 4 AND t0.t = '00111' WHERE t1.t = '08385'	1:7d8d100e8c11386a
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 LEFT JOIN b t1 ON t1.u = 21 RIGHT JOIN c t2 ON t1.p = 1 AND t2.id >= 6 AND t2.x = t1.p RIGHT JOIN c t3 ON t2.id IS NULL AND t3.x = t2.x AND (t3.y = 5 OR t3.y = 5) WHERE t1.u < 36 AND (t3.x = 14 OR t3.y = 5)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t1.id = 4 AND t0.u = 7557 WHERE t0.u IS NULL AND t0.y = 8	29:dab9eb28a246e28f
+q	SELECT t0.id, t1.id FROM b t0 JOIN a t1 ON t0.u < 36 WHERE t0.y NOT IN (9, 10) AND t1.y < 7	8800:ef32981a8b51b767
+q	SELECT t0.id, t1.id FROM a t0 JOIN b t1 ON t0.y = t1.y AND t0.u = 318 AND t0.x <= 13 WHERE t0.id = 1750	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN b t1 ON t1.y IS NULL AND t0.id + 1 = t1.id AND t0.y = 13 AND t0.y = 12 WHERE t1.id BETWEEN -1 AND 3	3:6b6767dca1106db2
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t0.t >= '06646' WHERE 1 <= t0.x	7384:a9ded5b6da8d6a57
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 LEFT JOIN c t1 ON t1.id < t0.x AND t0.y BETWEEN 4 AND 8 LEFT JOIN c t2 ON t2.t = t1.t AND 1722 = t0.id LEFT JOIN b t3 ON 17 >= t3.x AND t0.t > '05314' AND t1.x IS NULL AND t3.id < t1.x WHERE t3.u = 33	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t0.x IS NULL AND t1.x = t0.x	3000:4272ded1ac62dad8
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t0.y = t1.y AND t0.u = 6567 AND t1.t >= '00148' WHERE t0.t <= '04719' AND t0.y = 12	34:1e6d3ea5bb0d01d6
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN c t1 ON t0.y = t1.y AND coalesce(t0.y, 1) < 14 WHERE 1 > t0.y	100:997d2588f3b5abd5
+q	SELECT t0.id, t1.id FROM a t0 RIGHT JOIN b t1 ON 15 <= t1.x AND t0.id = 2121	12:dfd5247363c0f0e6
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN c t1 ON (t0.u = 7095 OR t0.x = 17) AND t0.x = 6 AND t1.x = t0.p JOIN b t2 ON t1.t = '00037'	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 LEFT JOIN c t1 ON t0.id + 1 = t1.id AND 2433 <= t0.u LEFT JOIN b t2 ON (t1.x = 12 OR t1.y = 0) RIGHT JOIN b t3 ON t3.id = t1.id AND t3.x IS NULL WHERE (t3.id IS NULL OR t0.x BETWEEN 10 AND 14) AND t2.u IN (36, 37)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t1.u = t0.u AND t0.t = '02827' WHERE t1.id IS NULL AND t0.t IS NULL	333:615f857302f7aee0
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN c t1 ON t0.y = t1.y AND t0.y = 7 RIGHT JOIN c t2 ON 2499 <= t0.u AND t2.t = '00111' WHERE t2.x NOT IN (14, 15) AND t2.x IS NOT NULL	1864:aad50b1278d2019d
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t0.t = '05468' WHERE NOT t0.x > 13 AND 8730 <= t0.u	39:e06b7439982f6794
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t0.t = '02112' AND (t0.x = 16 OR t0.x = 16) AND t1.t = t0.t WHERE t0.x = 1 AND NOT t0.t > '09535'	129:6e9e63a4f94e64b4
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t1.id = t0.id WHERE (t0.y = 0 OR t0.x = 16)	250:e0ffb4dc7e99a1ea
+q	SELECT t0.id, t1.id, t2.id FROM c t0 FULL JOIN c t1 ON t1.t = t0.t AND t1.id = 5 LEFT JOIN a t2 ON t1.id = 7 AND t2.y = 12 AND t2.id = t1.id WHERE (t1.t = '00148' OR t1.y = 13)	1:2deeff677b56aaf5
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN c t1 ON t0.x = 10 JOIN b t2 ON t2.t = t0.t AND t1.u = 9	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t0.t = '01808' WHERE t0.x <= 6 AND (t1.id IS NULL OR 9 > t1.u) AND '05462' >= t0.t AND t1.id IS NOT NULL	2:d21b0e2d10333cd4
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t1.t = t0.t	3000:7baa9b7c83ff6197
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t1.id = 8 AND t1.id = t0.id WHERE t0.x IS 1	150:c58d383587040718
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t1.id = t0.id WHERE t0.p = 3 AND t1.y > 14	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 RIGHT JOIN b t1 ON t1.id = t0.x AND t0.t = '03703' WHERE t0.t GLOB '0*' AND t0.t = '07170'	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM a t0 JOIN b t1 ON t1.u = 21 AND t0.t > '02926' FULL JOIN b t2 ON t0.y <> 9 WHERE (t0.x = 17 AND t0.y >= 11 OR t0.id = 519) AND coalesce(t0.y, 1) < 12	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN b t1 ON (t0.x = 13 AND t0.y >= 9 OR t0.id = 652) AND t1.t = t0.t WHERE t1.id IS NULL	3000:4272ded1ac62dad8
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t0.id <> 2821 WHERE t0.y IS NOT NULL AND t1.id IS NOT NULL AND t0.t IS NULL	1336:13cc730d02a99ce5
+q	SELECT t0.id, t1.id FROM c t0 LEFT JOIN a t1 ON t0.x = 3 WHERE t0.y BETWEEN 9 AND 13	2:e8fc0e49e5469207
+q	SELECT t0.id, t1.id FROM b t0 FULL JOIN a t1 ON t1.id < t0.x AND t1.p = 3 WHERE t1.y = 12 AND (t1.x = 14 OR t1.x = 14)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN a t1 ON t1.t >= '04904' AND t0.u = 21 RIGHT JOIN c t2 ON t1.t = '02206' AND t0.id = 4	8:3beb5ca512d1353d
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN b t1 ON t1.u = t0.u AND t1.t >= '00296' AND t0.y IN (5, 6) AND (t0.t = '04002' OR t0.y = 10) FULL JOIN b t2 ON t2.id = t0.id AND t1.t IS NULL	3000:ecfaf8e3fd51efd3
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t0.id + 1 = t1.id AND t0.y < 6 WHERE '09327' = t0.t	1:f1ccc9acbe381b93
+q	SELECT t0.id, t1.id FROM a t0 JOIN c t1 ON t1.t >= '00222'	9000:fed790dd64ac5546
+q	SELECT t0.id, t1.id, t2.id FROM a t0 JOIN c t1 ON t1.t = t0.t AND t0.x IS NULL LEFT JOIN c t2 ON t0.u = 7095 AND t1.y = t2.y AND t0.x IN (2, 3) AND (t2.u = 9 OR t2.x = 7) WHERE t0.x > 12 AND t0.y IN (8, 9)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 RIGHT JOIN c t1 ON t0.t IN ('07423', '00185') AND t1.t = t0.t LEFT JOIN b t2 ON (t2.u = 33 OR t2.x = 18) AND t1.x IN (13, 14) JOIN c t3 ON t3.x <= 15 AND t1.id < 5 AND t3.id < t2.x WHERE t0.u = 4113 AND t2.x = 5 AND t1.u < 18	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 RIGHT JOIN b t1 ON t1.u = 9	3011:34338e2f158d8a8f
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN c t1 ON t0.id + 1 = t1.id AND (t0.y = 6 OR t0.x = 14) AND t0.u > 4149 WHERE (t1.id IS NULL OR t1.x = 2) AND 7755 <= t0.u	357:2551107496cc1fbb
+q	SELECT t0.id, t1.id, t2.id FROM b t0 RIGHT JOIN c t1 ON t0.id + 1 = t1.id AND (t0.t = '00444' OR t0.x = 16) AND t0.u > 18 LEFT JOIN a t2 ON (t1.y = 3 OR t1.x = 18) AND t1.y > 4 WHERE t1.y NOT IN (5, 6)	5:b0f4b6a978f960f1
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t1.id = t0.x AND t0.t = '04577' WHERE (t1.id IS NULL OR NOT t0.t > '05738') AND t1.u IS 21	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM c t0 LEFT JOIN a t1 ON t1.x = t0.x AND t1.x NOT IN (7, 8) AND t0.y = 3 RIGHT JOIN b t2 ON t2.id = t1.x AND (t0.y = 11 OR t0.x = 1)	12:636e6210b476770e
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 FULL JOIN c t1 ON t0.x <= 0 AND t0.u <= 8493 RIGHT JOIN b t2 ON t2.t = '00370' AND t1.x <> 18 FULL JOIN b t3 ON t3.t IS '00111' WHERE t2.id = 11 AND t2.u = 27 AND t0.id <= 1780	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN c t1 ON (t0.x = 14 OR t0.y = 6) AND t1.id = t0.x RIGHT JOIN c t2 ON t0.x = 18 AND (t2.y = 4 OR t2.x = 5) AND t0.y = t2.y	8:3beb5ca512d1353d
+q	SELECT t0.id, t1.id, t2.id FROM a t0 FULL JOIN b t1 ON t0.u <= 4170 AND t1.x = t0.x LEFT JOIN b t2 ON (t0.x = 11 OR t0.x = 11) AND t1.p = 2 AND t2.u = t1.u WHERE t0.u < 8673 AND t1.t > '00333'	118:84d85f0bddbdf725
+q	SELECT t0.id, t1.id FROM a t0 RIGHT JOIN c t1 ON t1.x = t0.p AND t1.p = 0 WHERE (t1.x = 3 AND t1.y >= 9 OR t1.id = 1)	1:6bf069a76571892b
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t1.x = t0.p AND t1.u > 3 WHERE t0.t IS NOT NULL AND t1.y >= 10	667:a5f749f6554e9a77
+q	SELECT t0.id, t1.id FROM a t0 RIGHT JOIN c t1 ON t0.y < 14 WHERE t0.id IS NOT NULL	18400:290cf6b9b0fbf005
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t1.u = t0.u AND t0.x IS NOT NULL WHERE t0.t < '04329'	1166:281d8fba2fa31e07
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t0.id + 1 = t1.id AND t0.p = 1 WHERE t1.id IS NULL	2997:a72262fd932078f4
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN c t1 ON t0.x IS 13 AND t1.x + 0 = 11 AND t1.x = t0.x JOIN b t2 ON t0.id + 1 = t2.id AND (t2.x = 7 AND t2.y >= 14 OR t2.id = 11) AND t1.p = 0 WHERE (t1.x = 5 AND t1.y >= 7 OR t1.id = 6)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM b t0 JOIN a t1 ON '05491' < t1.t AND t1.x = t0.p JOIN c t2 ON (t0.x = 2 OR t0.y = 1) AND t2.id < t1.x AND t1.id NOT IN (695, 696)	57:e65ea3e3e1fbbf18
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN c t1 ON '01315' > t0.t LEFT JOIN b t2 ON t2.u = t0.u AND t1.u BETWEEN 10 AND 14 AND t2.u > 18 WHERE t1.y > 8	1110:427f73f4c7f16e4a
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t1.id BETWEEN 0 AND 4 AND t0.y IN (6, 7) WHERE t1.id IS NULL AND t0.t = '01372'	1:5bfa3b38982d9b60
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 RIGHT JOIN b t1 ON t0.x IN (16, 17) AND (t0.y = 1 OR t0.x = 19) AND t1.id < t0.x LEFT JOIN c t2 ON t2.t = t1.t AND t1.x = 14 LEFT JOIN b t3 ON t3.x = t0.x AND (t0.x = 17 AND t0.y >= 10 OR t0.id = 996) WHERE t0.y = 7	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN c t1 ON t0.id = 2914 AND t0.y = t1.y AND (t1.y = 10 OR t1.x = 18) WHERE t1.t = '00074'	1:6bf06aa765718ade
+q	SELECT t0.id, t1.id, t2.id FROM c t0 LEFT JOIN a t1 ON t0.t = '00037' LEFT JOIN b t2 ON t1.t = '04167' AND t2.id = t1.x AND t2.y < 9 AND t1.t = '01068'	3007:572c28ba8e22c00b
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t0.id IS NULL WHERE t0.x >= 17 AND t0.p = 2	150:52c30bb016cbf9fa
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t1.x = t0.p AND t0.y > 7 WHERE (t0.x = 2 AND t0.y >= 7 OR t0.id = 34) AND t0.x + 0 = 15	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 JOIN b t1 ON t0.u IS 6378 AND t1.y = 7	1:37623838e51b07ab
+q	SELECT t0.id, t1.id, t2.id FROM a t0 JOIN b t1 ON t0.id = 2558 AND 2253 = t0.u JOIN b t2 ON t2.x = t0.x AND (t0.x = 18 AND t0.y >= 14 OR t0.id = 2763) WHERE t1.x = 14 AND t0.u IS NULL	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 JOIN c t1 ON '04631' < t0.t AND (t0.x = 2 OR t0.y = 11) WHERE (t1.x = 10 AND t1.y >= 10 OR t1.id = 6) AND t1.id <> 8	175:13f8cc582da79c92
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM b t0 LEFT JOIN b t1 ON t1.id < t0.x AND t0.u IN (30, 31) AND t1.t = '00333' LEFT JOIN c t2 ON t0.u <> 3 FULL JOIN a t3 ON t0.y < 10 AND t3.id = t0.id AND coalesce(t3.y, 1) < 10	3076:be61edd8d7d63aa9
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t1.x = t0.p WHERE t1.y > 3	2250:052eb9dcd06a32d0
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN c t1 ON t1.y IS NULL WHERE '00222' > t1.t AND t1.t > '00074'	3:38fa017943359ad4
+q	SELECT t0.id, t1.id FROM a t0 RIGHT JOIN c t1 ON (t0.u = 8916 OR t0.y = 14) WHERE t1.id IS NULL AND t1.x IN (19, 20)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t1.x = t0.p AND t0.x = 3 WHERE t0.x > 4	1800:97645d29e487c251
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t0.t <= '02639' AND t1.x = t0.p WHERE t0.u >= 3183 AND t0.x = 9	83:3d87175ec60df4a0
+q	SELECT t0.id, t1.id, t2.id FROM a t0 FULL JOIN b t1 ON (t1.x = 17 AND t1.y >= 2 OR t1.id = 7) AND t1.id = t0.x AND t0.id IS NULL LEFT JOIN b t2 ON 7 <= t0.x WHERE '02989' <= t0.t AND t0.t = '00783'	0:cbf29ce484222325
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t0.x >= 8 WHERE t0.x BETWEEN 14 AND 18 AND t1.id IS NOT NULL	4800:a523ac93e396484d
+q	SELECT t0.id, t1.id, t2.id FROM c t0 FULL JOIN a t1 ON t1.id = t0.id LEFT JOIN b t2 ON 9 < t2.id WHERE t0.y BETWEEN 8 AND 12	3:17b45d5af21ac7cd
+q	SELECT t0.id, t1.id, t2.id FROM a t0 RIGHT JOIN b t1 ON t1.id < t0.x AND t0.t = '06797' LEFT JOIN c t2 ON t0.x IS NULL AND t2.id = t0.id WHERE t0.x >= 0	12:533185ef916f4c42
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN c t1 ON (t0.u = 4635 OR t0.y = 11) AND t0.y = 5 AND t1.x = t0.x WHERE t0.u = 2997	1:5694ab47b182f933
+q	SELECT t0.id, t1.id, t2.id FROM a t0 FULL JOIN b t1 ON t1.x = t0.p LEFT JOIN b t2 ON t2.id = t1.id AND t0.u IS NULL AND t1.x = 2 WHERE t1.t <= '00407'	2257:ab19b62b4335717c
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t1.x = t0.p WHERE t0.x >= 2 AND t1.t < '00296' AND (t1.id IS NULL OR t0.x < 19)	1500:4030833d62ba51a1
+q	SELECT t0.id, t1.id, t2.id FROM a t0 FULL JOIN c t1 ON t1.x = t0.x AND t0.y IN (12, 13) AND 8583 <= t0.u AND t1.id IN (5, 6) RIGHT JOIN b t2 ON t2.id < t0.x AND t2.t = '00148' WHERE t1.x IS NULL	1811:5007ee3f199bb32a
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN b t1 ON t0.x + 0 = 1 AND t1.id = t0.x WHERE t1.x IS NULL	2850:4ed3eba11e4e0407
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 RIGHT JOIN b t1 ON t0.t IS '03484' AND t0.x IS NULL LEFT JOIN c t2 ON t2.id = t0.id AND NOT t2.x > 11 AND 2 > t1.y LEFT JOIN c t3 ON t3.x = t2.p AND t1.x > 15 WHERE t1.y < 5 AND t0.y < 13 AND t1.x IN (16, 17)	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM b t0 FULL JOIN c t1 ON t0.t GLOB '0*' AND t0.p = 2 AND t1.x = t0.p LEFT JOIN a t2 ON t2.x = t1.p AND '00333' > t0.t AND t2.id < 174 WHERE t0.u = 18 AND t1.u = 6 AND t2.x <= 18	9:bda975d1dccf2be9
+q	SELECT t0.id, t1.id, t2.id, t3.id FROM a t0 LEFT JOIN c t1 ON t0.id + 1 = t1.id AND t1.t > '00185' LEFT JOIN b t2 ON t2.p = 0 AND t2.id = t1.id LEFT JOIN c t3 ON t3.u = 21 AND t3.id = t0.id WHERE t0.u > 7935	304:76899b2a8dd0e498
+q	SELECT t0.id, t1.id, t2.id FROM a t0 LEFT JOIN b t1 ON t0.u = 3768 AND t1.id = t0.id LEFT JOIN c t2 ON t0.y BETWEEN -1 AND 3 AND t2.x = 18 AND t2.id < t0.x WHERE t0.x = 6 AND t0.y = 7	50:bcbdb06bb72d09a1
+q	SELECT t0.id, t1.id, t2.id FROM a t0 RIGHT JOIN c t1 ON t0.t IS NULL RIGHT JOIN c t2 ON coalesce(t1.y, 1) < 5 WHERE t1.x < 19 AND (t2.id IS NULL OR (t1.id = 6 OR t1.x = 11)) AND '00148' < t1.t	2664:fc12a8c8d2dea8fd
+q	SELECT t0.id, t1.id FROM a t0 FULL JOIN c t1 ON t1.id = t0.x AND t0.u IS NOT NULL WHERE t0.id = 1027	1:a037a32be6742eea
+q	SELECT t0.id, t1.id FROM a t0 RIGHT JOIN c t1 ON t0.id >= 696 AND t1.id < t0.x WHERE t0.x = 16 AND '08505' > t0.t	680:979f7f70ce5f551d
+q	SELECT t0.id, t1.id FROM a t0 LEFT JOIN c t1 ON t1.t IS '00074' WHERE t1.t IS NULL AND t0.y <= 6 AND (t1.id IS NULL OR t1.t = '00037')	0:cbf29ce484222325
+q	SELECT t0.id, t1.id, t2.id FROM b t0 LEFT JOIN b t1 ON t1.id < t0.x AND t0.u IS NULL AND t0.y NOT IN (3, 4) JOIN a t2 ON 18 > t2.x WHERE t0.y <= 11 AND t2.id >= 428	14400:53ed6547466e1b45
+q	SELECT t0.id, t1.id FROM a t0 JOIN c t1 ON (t0.id = 1001 OR t0.y = 6)	808:e25528b5534ecded
+q	SELECT t0.id, t1.id, t2.id FROM a t0 JOIN b t1 ON t1.t = t0.t LEFT JOIN b t2 ON t2.u = 33 AND t2.x = t0.p WHERE t0.u = 2106	0:cbf29ce484222325
+# large: FULL JOIN, left-only: 56
+# large: FULL JOIN, mixed: 39
+# large: FULL JOIN, right-only: 20
+# large: JOIN, left-only: 37
+# large: JOIN, mixed: 26
+# large: JOIN, right-only: 19
+# large: LEFT JOIN, left-only: 158
+# large: LEFT JOIN, mixed: 111
+# large: LEFT JOIN, right-only: 67
+# large: RIGHT JOIN, left-only: 42
+# large: RIGHT JOIN, mixed: 28
+# large: RIGHT JOIN, right-only: 22
+# large: where, 0: 36
+# large: where, 1: 65
+# large: where, 2: 78
+# large: where, 3: 17
+# large: where, 4: 4
