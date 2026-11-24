@@ -831,3 +831,43 @@ A19 changed: no new caller of `Admission`, `read_frame`, `answer`, `Frame::Held`
   - No bench drives a local `Database` from more than one client (cluster.rs and scale.rs open replicated groups).
 - On the way: `Store::charge` with no deadline (`Store::put`) now reads the clock once a batch
   (`until.unwrap_or_else(Instant::now)`), where it read none before. Not measured.
+
+## A replicated write charged on the memory budget; not merged (perf-A21)
+
+**Not merged.** The change works and its clippy and `scripts/check-production.sh` pass. Its last test fix
+(f2cb8681) is unverified: at 03:52Z adacachy2 refused cpus=8 and cpus=4 (0 of 32 cores idle), and the Mac's
+target dir was held by a main build (r140). Branch `perf/cross-a21` holds it all.
+
+**The change (8a2c25bd, replicated.rs only).** `ReplicaHandle::enqueue` charges a write (`Input::Submit`) its
+bytes (its operation's real or declared size, `Admission::bytes_for`, and its envelope) through
+`Budget::take_until` on `Use::Queues` before it takes a place in the queue: the lock-free first try,
+`TooLarge` at once past the whole limit, a wait woken only by bytes given back until the write's deadline, then
+`Full`. The `Charge` lives in the write's `Reservation`, which already lasts from `enqueue` to the write's answer
+(the channel, `waiting`, `paused_inputs`, `Pending`), so it is given back on every path: applied, refused, a term
+change, an input dropped untaken, the owner's stop. `Control::charged` counts those bytes, and `rebound`'s
+per-tick queues charge leaves them out (it charged `admitted` whole before), so no byte is charged twice.
+QB.1's per-owner bounds (`commands`, `called <= applications`, `admitted <= queued`) still refuse at once after
+the budget admits; `unknown_leader_application_pressure_keeps_wire_admission_available` asserts that refusal.
+
+**Runs.**
+
+| run | where, commit | result |
+|---|---|---|
+| r108 | MacBook Pro 2, needs cpus=8, 8a2c25bd, load 63-88 | clippy -p amphora --all-targets clean (8m59s); `a21_` 4/5 (term change: the write answered Ok); `database::` 260 passed, 5 failed (checkpoint-pass, image-install-read, past_its_room, the a21 term change, `v13_thirty_two_spread_writers…`); `memory::` 9/9, `store::` 6/6 |
+| r138 | MacBook Pro 2, 8a2c25bd's test binary | `v13_thirty_two…` alone, 3 runs: 3 failed, `Persisted: row N at member 1: UnknownOutcome` (twice) and `Timeout` (once). main on macOS not yet run (r140 was building it) |
+| r150 | adacachy2, needs cpus=8, d0f6a606 and main 7de5344d | clippy clean (37 s); check-production rc 0 (engine ratchet holds, 10903); `a21_` 4/5 (term change: `reach` timed out); suite r1 (`database::replicated:: replication::`): d0f6a606 172 passed, 6 failed (checkpoint-pass, the a21 term change, image-install-read, past_its_room, `session_reads::t_t1_10_r1…`, `every_falsifier_of_the_floor_holds_under_a_nemesis`); main 168 passed, 5 failed (image-install-read, past_its_room, `v3_two_replicated_writes…`, `a_local_read_holds_off…`, `a_restart_due_waits…`); load 52-59. `v13_thirty_two…` passed on d0f6a606. Stopped after round 1 to re-gate f2cb8681 |
+
+**Why the term-change test failed twice.** At 8a2c25bd it dropped the leader's records one step after queueing
+the write, before its barrier had sent any; at d0f6a606 it waited for the write's proposal, but its call wrote
+nothing, so it passed a read barrier (`READ_BARRIER`) and never proposed. f2cb8681's write creates a table
+through the driven `submit` helper, so it proposes, as 11873's change does.
+
+**Open for the successor.**
+1. f2cb8681: `cargo clippy -p amphora --all-targets` and the five `a21_` tests.
+2. `v13_thirty_two…` on macOS against main 7de5344d (it passes on Linux with the change).
+3. The replicated suites, rounds 2 and 3, both arms (`check21l.sh` in `cross-a21-scripts`), then V13's ladder
+   at 32 and 128 writers, both classes (`ladder13.sh`), for zero refusals.
+
+    # r150 (and its successor): kiln run on 00aad8daff2fa3c9daa65d53c425d450, needs linux/amd64,cpus=8,mem=24g,
+    # sync false; ~/.cache/amphora-perf/cross-a21-scripts/check21l.sh BASE FIX ROUNDS LROUNDS OUT
+    bash check21l.sh 7de5344d41dc850c022e829bdc285440c89c2095 f2cb8681fd80cfb95e82edfd83eb62e29485bc03 3 1 OUT
