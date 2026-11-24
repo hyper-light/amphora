@@ -56,6 +56,39 @@ pub enum ExprKind {
     CurrentTimestamp,
 }
 
+/// A coercion to make (`coerce_to_target_type`'s arguments): the type and type modifier, what asks for
+/// it, how it shows, and where.
+#[derive(Debug, Clone, Copy)]
+pub struct Cast {
+    pub target: u32,
+    pub typmod: i32,
+    pub context: Context,
+    pub form: Form,
+    pub location: i32,
+}
+
+impl Cast {
+    /// The coercion an argument's or a result's place asks for.
+    pub fn implicit(target: u32) -> Self {
+        Self {
+            target,
+            typmod: -1,
+            context: Context::Implicit,
+            form: Form::ImplicitCast,
+            location: -1,
+        }
+    }
+
+    /// The coercion an assignment asks for.
+    pub fn assignment(target: u32, typmod: i32) -> Self {
+        Self {
+            typmod,
+            context: Context::Assignment,
+            ..Self::implicit(target)
+        }
+    }
+}
+
 /// An expression with its type (`exprType`), type modifier (`exprTypmod`) and location.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Expr {
@@ -254,15 +287,14 @@ impl Analysis<'_> {
                 };
                 let arg = single(&args)?;
                 let input = self.type_of(arg)?;
-                self.coerce_to_target(
-                    arg,
+                let cast = Cast {
                     target,
                     typmod,
-                    Context::Explicit,
-                    Form::ExplicitCast,
+                    context: Context::Explicit,
+                    form: Form::ExplicitCast,
                     location,
-                )?
-                .ok_or_else(|| {
+                };
+                self.coerce_to_target(arg, cast)?.ok_or_else(|| {
                     Error::new(
                         sqlstate::CANNOT_COERCE,
                         format!(
@@ -562,14 +594,7 @@ impl Analysis<'_> {
     fn arguments(&mut self, args: Vec<ExprId>, declared: &[u32]) -> Result<Vec<ExprId>, Error> {
         let mut coerced = Vec::with_capacity(args.len());
         for (arg, target) in args.into_iter().zip(declared.iter().copied()) {
-            coerced.push(self.coerce_type(
-                arg,
-                target,
-                -1,
-                Context::Implicit,
-                Form::ImplicitCast,
-                -1,
-            )?);
+            coerced.push(self.coerce_type(arg, Cast::implicit(target))?);
         }
         Ok(coerced)
     }
@@ -598,14 +623,16 @@ impl Analysis<'_> {
         )
         .map_err(|e| e.at(location))?;
         match call {
-            Call::Coercion(target) => self.coerce_type(
-                single(&args)?,
-                target,
-                -1,
-                Context::Explicit,
-                Form::ExplicitCall,
-                location,
-            ),
+            Call::Coercion(target) => {
+                let cast = Cast {
+                    target,
+                    typmod: -1,
+                    context: Context::Explicit,
+                    form: Form::ExplicitCall,
+                    location,
+                };
+                self.coerce_type(single(&args)?, cast)
+            }
             Call::Function {
                 function,
                 args: declared,
@@ -643,15 +670,8 @@ impl Analysis<'_> {
         if type_oid == type_oid::BOOL {
             return Ok(id);
         }
-        self.coerce_to_target(
-            id,
-            type_oid::BOOL,
-            -1,
-            Context::Assignment,
-            Form::ImplicitCast,
-            -1,
-        )?
-        .ok_or_else(|| {
+        let cast = Cast::assignment(type_oid::BOOL, -1);
+        self.coerce_to_target(id, cast)?.ok_or_else(|| {
             Error::new(
                 sqlstate::DATATYPE_MISMATCH,
                 format!(
@@ -664,35 +684,23 @@ impl Analysis<'_> {
     }
 
     /// `coerce_to_target_type` (parse_coerce.c:79): none when the cast isn't allowed here.
-    pub fn coerce_to_target(
-        &mut self,
-        id: ExprId,
-        target: u32,
-        typmod: i32,
-        context: Context,
-        form: Form,
-        location: i32,
-    ) -> Result<Option<ExprId>, Error> {
+    pub fn coerce_to_target(&mut self, id: ExprId, cast: Cast) -> Result<Option<ExprId>, Error> {
         let input = self.type_of(id)?;
-        if !coerce::can_coerce(&[input], &[target], context) {
+        if !coerce::can_coerce(&[input], &[cast.target], cast.context) {
             return Ok(None);
         }
-        let result = self.coerce_type(id, target, typmod, context, form, location)?;
-        Ok(Some(self.coerce_typmod(
-            result, target, typmod, context, form, location,
-        )?))
+        let result = self.coerce_type(id, cast)?;
+        Ok(Some(self.coerce_typmod(result, cast)?))
     }
 
     /// `coerce_type` (parse_coerce.c:158), where `can_coerce` has allowed it.
-    pub fn coerce_type(
-        &mut self,
-        id: ExprId,
-        target: u32,
-        typmod: i32,
-        context: Context,
-        form: Form,
-        location: i32,
-    ) -> Result<ExprId, Error> {
+    pub fn coerce_type(&mut self, id: ExprId, cast: Cast) -> Result<ExprId, Error> {
+        let Cast {
+            target,
+            form,
+            location,
+            ..
+        } = cast;
         let e = self.exprs.get(id)?;
         let input = e.type_oid;
         if input == target {
@@ -723,7 +731,7 @@ impl Analysis<'_> {
                 _ => {}
             }
         }
-        match coerce::pathway(target, input, context) {
+        match coerce::pathway(target, input, cast.context) {
             Path::Relabel => {
                 self.exprs
                     .push(ExprKind::Relabel { arg: id, form }, target, -1, location)
@@ -733,22 +741,19 @@ impl Analysis<'_> {
                 format_type(input),
                 format_type(target)
             ))),
-            path => self.coercion(id, path, target, typmod, context, form, location),
+            path => self.coercion(id, path, cast),
         }
     }
 
     /// `build_coercion_expression` (parse_coerce.c:842).
-    #[allow(clippy::too_many_arguments)]
-    fn coercion(
-        &mut self,
-        id: ExprId,
-        path: Path,
-        target: u32,
-        typmod: i32,
-        context: Context,
-        form: Form,
-        location: i32,
-    ) -> Result<ExprId, Error> {
+    fn coercion(&mut self, id: ExprId, path: Path, cast: Cast) -> Result<ExprId, Error> {
+        let Cast {
+            target,
+            typmod,
+            context,
+            form,
+            location,
+        } = cast;
         match path {
             Path::Func(oid) => {
                 let function = proc_by_oid(oid)
@@ -806,15 +811,14 @@ impl Analysis<'_> {
     }
 
     /// `coerce_type_typmod` (parse_coerce.c:756).
-    fn coerce_typmod(
-        &mut self,
-        id: ExprId,
-        target: u32,
-        typmod: i32,
-        context: Context,
-        form: Form,
-        location: i32,
-    ) -> Result<ExprId, Error> {
+    fn coerce_typmod(&mut self, id: ExprId, cast: Cast) -> Result<ExprId, Error> {
+        let Cast {
+            target,
+            typmod,
+            form,
+            location,
+            ..
+        } = cast;
         let e = self.exprs.get(id)?;
         if e.typmod == typmod {
             return Ok(id);
@@ -831,7 +835,7 @@ impl Analysis<'_> {
                 typmod,
                 location,
             ),
-            path => self.coercion(id, path, target, typmod, context, form, location),
+            path => self.coercion(id, path, cast),
         }
     }
 
