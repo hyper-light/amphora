@@ -68,6 +68,24 @@ for step in "$@"; do
       grep -aE "^[0-9]+ runs" "$O/rq-$seed.log" | awk '{r+=$1; w+=$3; a+=$5} END {print r, "runs", w, "wrong", a, "answered"}'
       grep -aE "^    Amphora" "$O/rq-$seed.log" | sed -E 's/[0-9]+/#/g' | cut -c1-110 | sort | uniq -c | sort -rn | head -8
       grep -a -A 9 "^WRONG.*default" "$O/rq-$seed.log" | cut -c1-500 | head -${RQ_LINES:-30} ;;
+    draw:*)  # draw:upsert|window:COUNT:SEED   another draw in the fixture's place, the test rebuilt and run
+      IFS=: read -r _ what count seed <<< "$step"
+      case $what in upsert) g=sqlite_upsert_checks.py; f=upsert_checks;; window) g=sqlite_window_columns.py; f=window_columns;; esac
+      python3 bench/$g "$count" "$seed" > crates/engine/tests/fixtures/$f.tsv || exit 9
+      timeout 600 nice -n 10 cargo test -p amphora-engine --locked --features simulator --test $f --no-run > "$O/draw.log" 2>&1 || { tail -20 "$O/draw.log"; exit 8; }
+      timeout ${WIDE_TIMEOUT:-420} nice -n 10 "$(bin $f)" --nocapture --test-threads=${JOBS:-8} > "$O/draw-$what-$seed.log" 2>&1; rc=$?
+      echo "== draw $what $count $seed rc=$rc $(( $(date +%s) - s ))s load $(load)"
+      grep -aE "^[0-9]+ runs" "$O/draw-$what-$seed.log" | awk '{r+=$1; w+=$3} END {print r, "runs", w, "wrong"}'
+      echo "panics: $(grep -ac 'PANIC' "$O/draw-$what-$seed.log")"
+      python3 "$S/classify.py" "$O/draw-$what-$seed.log" ${CLASS_MAX:-14} | cut -c1-${CUT:-420} ;;
+    swept:*)  # swept:NAME  the fixture as it stands, classified
+      name=${step#swept:}
+      timeout ${WIDE_TIMEOUT:-420} nice -n 10 "$(bin $name)" --nocapture --test-threads=${JOBS:-8} > "$O/swept-$name.log" 2>&1; rc=$?
+      echo "== swept $name rc=$rc $(( $(date +%s) - s ))s load $(load)"
+      grep -aE "^test .*(ok|FAILED)$|test result" "$O/swept-$name.log" | sort | uniq -c | head -30
+      grep -aE "^[0-9]+ runs" "$O/swept-$name.log" | awk '{r+=$1; w+=$3} END {print r, "runs", w, "wrong"}'
+      echo "panics: $(grep -ac 'PANIC' "$O/swept-$name.log")"
+      python3 "$S/classify.py" "$O/swept-$name.log" ${CLASS_MAX:-14} | cut -c1-${CUT:-420} ;;
     clippy)
       timeout 1500 nice -n 10 cargo clippy -p amphora-engine -p amphora-engine-parser --all-targets --locked -- -D warnings > "$O/clippy.log" 2>&1; rc=$?
       echo "== clippy rc=$rc $(( $(date +%s) - s ))s"; grep -E "Checking amphora-engine|^(error|warning)" -A 12 "$O/clippy.log" | head -80 ;;
