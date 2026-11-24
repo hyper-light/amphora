@@ -2,12 +2,14 @@
 
 Deliverable status, losses first.
 
-- Not merged. The fix (8574888e) and its test (f3100b2c) are on `perf/analytics`. The merge gate
-  (clippy on amphora-engine, the `storage::page_cache` tests) is run r1788 on adacachy2, with r1780
-  queued on macOS. The hour ended before either was read.
 - The A/B in S8's order is not run. `q2_ab.sh` is written for it: before and after alternated, with
   Turso and SQLite in every round and the load recorded.
-- The new test has not been run against the old code, so it has not been shown to fail there.
+- Merged to main: the fix (8574888e), its test (f3100b2c) and this record. The merge gate passed on
+  adacachy2. At f3100b2c (r1788), `storage::page_cache` passed 44, failed 0, ignored 1, and clippy on
+  amphora-engine `--all-targets -D warnings` exited 0. On the tree merged with main (dbe0200b, r1793)
+  the same results held.
+- The test fails on the old code. With the test alone on main's f0fb3688 (0c90521f, r1791), the file
+  reads per count were `[51, 50, 50, 50]`: every count re-read its index.
 - Measured and done: the cause, from the reader cache's own numbers, and the fix's effect on those
   numbers in the real run (below).
 
@@ -85,6 +87,7 @@ All on adacachy2 (runner 00aad8daff2fa3c9daa65d53c425d450), from the GitHub clon
 - r1773: `JOBS=4 q2_census.sh 44995423`, then `76e70d9f` (cpus=4,mem=12g after a refusal at 8).
 - `q2_agg.py` over the three census folders under `~/.cache/analytics-q2/`.
 - r1788: `cargo test -p amphora-engine --lib storage::page_cache` and
-  `cargo clippy -p amphora-engine --all-targets --locked -- -D warnings` at f3100b2c.
+  `cargo clippy -p amphora-engine --all-targets --locked -- -D warnings` at f3100b2c; r1793 the same
+  at the merge dbe0200b; r1791 the new test alone at 0c90521f (old cache code).
 - Next: `q2_ab.sh <main before> <main after>`, with both binaries built by `q2_census.sh`'s build
   step or Q1's `q1_build.sh`.
