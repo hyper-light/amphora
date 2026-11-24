@@ -6446,6 +6446,25 @@ pub fn op_program(
                             state.set_fk_immediate_violations_during_stmt(
                                 statement.fk_immediate_violations(),
                             );
+                            let fails = match &err {
+                                LimboError::Raise(action, _) => *action == ResolveType::Fail,
+                                LimboError::Constraint(_) => {
+                                    state.constraint_action == ResolveType::Fail
+                                }
+                                _ => false,
+                            };
+                            // What FAIL keeps ends the statement's own transaction, where a
+                            // deferred key is checked (SQLite's sqlite3VdbeHalt).
+                            let err = if fails
+                                && !program.is_trigger_subprogram()
+                                && state.can_autocommit_now(&program.connection, true)
+                                && violates_deferred_fk(program)
+                            {
+                                state.constraint_action = ResolveType::Abort;
+                                fk_constraint_failed()
+                            } else {
+                                err
+                            };
                             finish_subprogram(
                                 program,
                                 &statement,

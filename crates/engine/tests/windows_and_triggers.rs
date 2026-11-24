@@ -2,7 +2,7 @@
 //! WITHOUT ROWID tables, and the cursors a grouped outer join's subqueries and an automatic index read,
 //! answer as SQLite 3.54.0 does, with no panic (CLAUDE.md 1; AC-T1.1.1: reads as committed; AC-T1.8.6:
 //! the differential suite). A conflict in a trigger's statement is judged by that statement's clause
-//! (lane C22).
+//! (lane C22). Foreign keys are counted and checked as SQLite counts and checks them (lane C26).
 
 use amphora_engine::{
     ConnectOpts, Connection, Database, DatabaseOpts, MemoryIO, Numeric, OpenOptions, SqliteDialect,
@@ -13,8 +13,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// A line of a fixture (`bench/sqlite_windows.py`, `bench/sqlite_triggers.py`,
-/// `bench/sqlite_unread_cursors.py`, `bench/sqlite_trigger_conflicts.py`): a statement that fills the
-/// database, or a query or a statement with what SQLite answered.
+/// `bench/sqlite_unread_cursors.py`, `bench/sqlite_trigger_conflicts.py`,
+/// `bench/sqlite_foreign_keys.py`): a statement that fills the database, or a query or a statement with
+/// what SQLite answered.
 enum Step {
     Fill(&'static str),
     Ask(&'static str, &'static str),
@@ -114,8 +115,8 @@ fn answer(io: &MemoryIO, conn: &Arc<Connection>, sql: &str) -> Result<String, St
 }
 
 /// What `sql` answers, or the panic it ended in. SQLite's refusal of a statement is held as a refusal
-/// alone, `ERROR` and no words, but for a constraint's in `trigger_conflicts.tsv`: which one refused a
-/// statement says whose clause judged it.
+/// alone, `ERROR` and no words, but for a constraint's in `trigger_conflicts.tsv` and
+/// `foreign_keys.tsv`: which one refused a statement says whose clause judged it.
 fn outcome(io: &MemoryIO, conn: &Arc<Connection>, sql: &str) -> String {
     match catch_unwind(AssertUnwindSafe(|| answer(io, conn, sql))) {
         Ok(Ok(rows)) => rows,
@@ -217,6 +218,14 @@ fn triggers_fire_as_sqlite_fires_them() {
 #[test]
 fn a_conflict_is_judged_by_the_clause_of_the_statement_that_meets_it() {
     answers_as_sqlite(include_str!("fixtures/trigger_conflicts.tsv"));
+}
+
+/// Lane C26: foreign keys under every action, immediate and deferred, of tables of every shape, beside
+/// triggers that write them, and the order a WITHOUT ROWID table's rows go in. Expect what the tables
+/// and the triggers' log hold, whether the transaction stands, and which constraint refused.
+#[test]
+fn foreign_keys_and_triggers_leave_what_sqlite_leaves() {
+    answers_as_sqlite(include_str!("fixtures/foreign_keys.tsv"));
 }
 
 /// Finding DC: subqueries of grouped and aggregate outer joins, and row-value ranges across a join.
