@@ -2357,3 +2357,42 @@ No A/B of the ladder against main was run, and the load was other lanes', so no 
 Branch perf/commits-v20: a83c5de2 (the tests, red), 32ba72e3 (the change), f09699b9 (docs). Merged with main 60993be4 (9efdff4d), b53a29b1 (1e4b65b3, checked as above) and
 135ed91c (eaf61d96). The last merge moved only crates/engine/vdbe/morsel_scan_tests.rs, which is `#[cfg(test)]` in the engine (so no build of amphora compiles it), and
 records, so no check was run again on it. Pushed to main at 07:33:58Z, fast-forward. check-production and clippy were run on Linux only.
+
+# Lane V21 (commits): an image is read on a snapshot of its own (landed, main d120b5f7); a slow local read gives way to a write that needs the room (built on the branch, not landed) (2026-11-24, 07:47:50Z to 08:46Z)
+
+Two deliverables. The coordinator put a correctness item ahead of the lane's own at 07:54Z. The item is landed. The lane's own is built and not landed: three of its tests fail in the suite, so it stays on `perf/commits-v21` at ed3760bf.
+
+## Losses first
+
+1. **The room rule is not landed.** On ed3760bf's tree the suite (`--test-threads=2 database::replicated:: replication:: database::log_bound::`) ran 196 passed, 3 failed on Linux (119 s, load 31 to 51) and 196 passed, 3 failed on macOS (178 s, 8 threads, load 3 to 7). The failures: `a_local_read_holds_off_no_restart_of_the_log_and_one_after_waits_for_nothing` (both) and `a_follower_past_its_room_applies_on_and_fences_when_its_disk_fills` (both), whose set-ups count on a read that keeps its segment for good (the design above gives it up); `past_its_room_...`, rewritten here, failed in the Linux suite ("None": no refusal in 254 writes) and passed alone on both machines; and `v13_thirty_two_spread_writers_...` ("row 0 at member 1: Timeout") on macOS, main's own there.
+2. **Not done for the room rule:** the three rounds of suites a side against main, the 32/128 ladder, and any check of the two segments' bytes against the disk's own free space: the new test checks the files' lengths. The red run of the new test and of T2's successor on main's code is macOS only.
+3. **What the room rule leaves (by the code, not tested):** the early end uses what the last pass's time let the log grow by, as measured, so a burst larger than that can pass the room before the pass that frees the segment is done, and submits are refused until then, as they are today. A read ended in the middle of a page read whose bytes were already read is let through: it read before its segment was given back.
+4. `local_readers_are_bounded_...` (1 of 3 alone on macOS b53a29b1) and `--test replication`'s `stale_preparations_...` were not reached.
+5. I ran `cargo check -p amphora-engine` on adacachy (production) by mistake for about 110 s (a background task of mine, stopped by its id; no process of it was left). Its `target` folder (639 MB) in the clone `~/.cache/amphora-perf/commits` was still being removed when I ended.
+
+## The correctness item: the image was read on no snapshot (main since 32ba72e3)
+
+`a_local_read_open_across_an_image_install_sees_one_side_whole` alone on Mac Studio 2 (macOS, load 1.9 to 3, so not load; `--exact`, `--test-threads=1`, 5 rounds each, debug build):
+
+| tree | result |
+|---|---|
+| a83c5de2 (32ba72e3's parent) | 5 of 5 passed |
+| 32ba72e3 (V20's switch) | 0 of 5 passed |
+| cc6f33d8 (main) | 0 of 5 passed |
+| 8f7212ed (fix), e11b9211, 3bf58d0f, eaee67bf (merged with main each time) | 5 of 5, 3 of 3, 3 of 3, 3 of 3 passed |
+
+The first wrong stage (r1102, `Machine::failed` printing its error): the learner's `record_digest`, at `Db::image_pages`: "I/O error: short read on page 42: expected 4096 bytes, got 0". At that moment (the probe's run at 08:02:36Z, the engine's events traced) the learner's log had switched (its closing segment, frames 70 to 315, not copied, held by the open read), and the digest read pages from its file, which had 41 (a short read at page 42).
+**The cause (by the code, and by the fix turning it green):** `Db::image_pages` and `Db::image_bytes` ran raw page reads under a deferred `BEGIN`, which opens no read transaction (`translate/transaction.rs`: only `AutoCommit`). The connection then looks a page up with what its last transaction left: after its read ended, no closing segment (`closing_max_frame` is 0). One log had no such case, as the connection's last view held every frame. Since V20's switch copies nothing, a page only the closing segment held was read from the file: stale if the file had an older page (no error), short if it had none. **It is also the shipped path of a snapshot image** (`Machine::image`, `bootstrap::capture`).
+**The change** (8f7212ed): both take a read transaction first (`Db::on_snapshot`).
+**Test** (7e315357, red; `db::tests::an_image_holds_the_pages_of_a_closing_segment_not_yet_copied`): red 3 of 3 on macOS ("short read on page 3"), green 3 of 3 on 8f7212ed, and green on Linux at e11b9211 and eaee67bf's suites above. A red run on Linux was not made; the test does not depend on timing.
+
+## The room rule (on `perf/commits-v21`, ed3760bf, not landed)
+
+Engine: `SharedLog::end_closing_reads` gives back the mark and the counts of each read that counts on the closing segment, once the read is told it is over (a flag set before anything is given back), and a page a read brings after it (from the log or the file) is checked once its bytes have arrived; `LimboError::SnapshotTooOld`, found at the next page, the next statement, or the next 1,024 instructions. Owner: `Actor::flush` ends them when the current segment's frames and what the last pass's time let it grow by pass the room. `Refusal::Serialization` ("snapshot too old"): the wire's typed retry, no new variant. Docs: replication.md B, C, D and store.md 45 on the branch.
+
+- New test `a_slow_local_read_past_the_logs_room_ends_typed_and_no_write_is_refused`: macOS 3 of 3 (alone), Linux 1 of 1; red 3 of 3 on main's code with the tests alone (1df4c51d, macOS, r1325; its panic text was not read). `a_restart_due_waits_for_no_read_and_the_next_ends_the_one_that_holds_its_segment` (T2's successor): 1 of 1 each, red on main's code (it ran into the 120 s limit).
+- Linux on ed3760bf: fmt 0, clippy 0 (36 s), check-production 0 (10,617 left, as the ratchet holds; 60 s); five tests alone passed.
+
+## Runs
+
+r1093 (main 5 rounds, macOS); r1102 (diagnosis, a83c5de2 and 32ba72e3); r1188 (8f7212ed: clippy, fmt, `db::`, suite: 197 passed, 1 failed, `v13_...`); r1192 (Linux, main: build and clippy); r1232 (Linux, e11b9211: build, clippy 0, check-production 0, image test; its first lines, the tree and the fmt result, were read from its log afterwards: fmt-fix.log is empty, no diff, and the tree is e11b9211); r1222, r1296, r1310 (macOS re-checks of the merged trees); r1319 (macOS suite, ed3760bf), r1321 (Linux, ed3760bf), r1325 (red arm).
