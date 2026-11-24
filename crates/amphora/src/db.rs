@@ -1883,6 +1883,50 @@ mod tests {
         );
     }
 
+    /// AC-T1.8.D1, T-T1.10.L4 (store.md, decision 45): an image is the database as of when it is
+    /// taken, whichever segment of the log holds its pages. Do: a database whose file holds one
+    /// table; a second table, of more pages than the file holds, committed and not copied; the log
+    /// switched, so that the segment holding it closes uncopied; an image taken on the writer's own
+    /// connection, after a write to it, and applied to a new database. Expect: its bytes are its
+    /// pages', and every row of both tables is there.
+    #[test]
+    fn an_image_holds_the_pages_of_a_closing_segment_not_yet_copied() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut source = Db::open(&dir.path().join("source.db")).unwrap();
+        source.exec("CREATE TABLE kept(value)").unwrap();
+        source.flusher()().unwrap();
+        source.checkpoint().unwrap();
+        source.exec("CREATE TABLE spread(data)").unwrap();
+        source
+            .exec("INSERT INTO spread SELECT zeroblob(3000) FROM (WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<200) SELECT x FROM n)")
+            .unwrap();
+        assert!(source.switch_log().unwrap(), "the log didn't switch");
+        assert!(!source.closing_copied(), "the closing segment was copied");
+        source.exec("INSERT INTO kept VALUES (7)").unwrap();
+        let bytes = source.image_bytes().unwrap();
+        let image = source.image_pages(1 << 30).unwrap();
+        assert_eq!(
+            bytes,
+            image.iter().map(|(_, page)| page.len()).sum::<usize>()
+        );
+        let mut target = Db::open(&dir.path().join("target.db")).unwrap();
+        target
+            .apply_pages(&image, |db| db.exec("CREATE TABLE applied(n)"))
+            .unwrap();
+        let count = |sql: &'static str| {
+            let mut count = 0;
+            target
+                .query(sql, [], |row| {
+                    count = row.get::<i64>(0).unwrap();
+                    Ok(false)
+                })
+                .unwrap();
+            count
+        };
+        assert_eq!(count("SELECT count(*) FROM spread"), 200);
+        assert_eq!(count("SELECT value FROM kept"), 7);
+    }
+
     /// U05/U15, bug 68a308b7: Db::exec of a statement its deadline interrupts reports the
     /// engine's interrupt, never busy, which is another connection's activity
     /// (sqlite.org/rescode.html: SQLITE_INTERRUPT, SQLITE_BUSY). Do: exec a long insert under a
