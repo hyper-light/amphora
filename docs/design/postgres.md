@@ -461,6 +461,11 @@ file is unchanged. It is the analogue of PostgreSQL's control file.
 - **Why the header.** CREATE TABLE writes it anyway, and nothing drops it. A row in an internal table
   would add a b-tree page to every CREATE TABLE and a table to keep out of `pg_class`. A value kept
   in the tables' own definitions would be dropped with the newest table.
+- **The engine's own tables take none.** A table the engine makes for itself under a reserved name
+  (`schema::is_system_table`, as `PRAGMA journal_mode = mvcc` makes `__turso_internal_mvcc_meta`)
+  stores no OID, so it has no `pg_class` row and spends none. The first table a client creates
+  takes `FirstNormalObjectId`, as PostgreSQL's first CREATE TABLE does after initdb (varsup.c:578-605).
+  T-PG.7.10.
 - **The wrap.** As GetNewObjectId (varsup.c:578-596) inside GetNewOidWithIndex's loop
   (`src/backend/catalog/catalog.c:489-535`, which GetNewRelFileNumber runs on `pg_class` for a new
   relation, catalog.c:598-645 and `src/backend/catalog/heap.c:1578`). Past 4294967295 the counter

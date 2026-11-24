@@ -241,6 +241,14 @@ impl super::Dialect for PostgresDialect {
         body: &ast::CreateTableBody,
     ) -> crate::Result<String> {
         let definition = definition_sql(tbl_name, body)?;
+        // A table the engine makes for itself under a reserved name (the MVCC store's metadata
+        // table, which `PRAGMA journal_mode = mvcc` creates) is no PostgreSQL relation: it has no
+        // row in pg_class and spends no OID, so the first table a client creates takes
+        // FirstNormalObjectId, as PostgreSQL gives it (REL_19_0
+        // src/backend/access/transam/varsup.c:578-605, src/backend/catalog/heap.c:1578).
+        if crate::schema::is_system_table(tbl_name.name.as_str()) {
+            return Ok(definition);
+        }
         Ok(stored(self.allocate_oid(&live_oids(conn)?)?, &definition))
     }
 
@@ -605,8 +613,11 @@ mod tests {
     }
 
     /// T-PG.7.10: under MVCC the counter reaches the page header through a checkpoint, and comes
-    /// back from the page and from the log's recovery: after a dropped table and a reopen, each
-    /// way, a new table takes an OID past the dropped one's.
+    /// back from the page and from the log's recovery: a table created after a dropped one and a
+    /// reopen takes the OID after the dropped one's, each way. The engine's own MVCC metadata
+    /// table, made as `PRAGMA journal_mode = mvcc` switches, is no PostgreSQL relation: it takes no
+    /// OID, so the first table takes FirstNormalObjectId as PostgreSQL's does, and `pg_class`
+    /// doesn't show it.
     #[test]
     fn t_pg_7_10_the_counter_survives_mvcc_checkpoint_and_recovery() {
         if crate::storage::versioned::switch::pager_only(
@@ -617,38 +628,41 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("mvcc.db");
         let path = path.to_str().unwrap();
-        let gone = {
+        {
             let (_db, conn) = open(path);
             conn.execute("PRAGMA journal_mode = mvcc").unwrap();
+            let internal = query(
+                &conn,
+                "SELECT relname FROM pg_class WHERE relname = '__turso_internal_mvcc_meta'",
+            );
+            assert!(internal.is_empty(), "pg_class shows the engine's own table");
             conn.execute("CREATE TABLE kept (a int4)").unwrap();
             conn.execute("CREATE TABLE gone (a int4)").unwrap();
-            let gone = oid(&conn, "gone");
-            assert!(gone > oid(&conn, "kept"));
+            assert_eq!(oid(&conn, "kept"), 16384, "the first table's OID");
+            assert_eq!(oid(&conn, "gone"), 16385);
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
             conn.execute("DROP TABLE gone").unwrap();
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
             conn.close().unwrap();
-            gone
-        };
-        let checkpointed = {
+        }
+        {
             let (_db, conn) = open(path);
             conn.execute("CREATE TABLE checkpointed (a int4)").unwrap();
-            let checkpointed = oid(&conn, "checkpointed");
+            assert_eq!(
+                oid(&conn, "checkpointed"),
+                16386,
+                "from the page: past gone's 16385"
+            );
             conn.execute("DROP TABLE checkpointed").unwrap();
             conn.close().unwrap();
-            checkpointed
-        };
-        assert!(
-            checkpointed > gone,
-            "from the page: {checkpointed} is past the dropped {gone}"
-        );
-
+        }
         let (_db, conn) = open(path);
         conn.execute("CREATE TABLE recovered (a int4)").unwrap();
-        let recovered = oid(&conn, "recovered");
-        assert!(
-            recovered > checkpointed,
-            "from the log: {recovered} is past the dropped {checkpointed}"
+        assert_eq!(oid(&conn, "kept"), 16384);
+        assert_eq!(
+            oid(&conn, "recovered"),
+            16387,
+            "gone took 16385 and checkpointed 16386, so neither comes back"
         );
     }
 }
