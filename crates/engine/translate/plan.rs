@@ -822,6 +822,9 @@ pub enum SimpleAggregate {
     MinMax(Box<MinMaxDef>),
 }
 
+/// An ORDER BY's terms: each expression, its direction and where its NULLs come.
+pub(crate) type OrderTerms = Vec<(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)>;
+
 #[derive(Debug, Clone)]
 pub struct SelectPlan {
     pub table_references: TableReferences,
@@ -836,6 +839,9 @@ pub struct SelectPlan {
     pub group_by: Option<GroupBy>,
     /// order by clause
     pub order_by: Vec<(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)>,
+    /// Amphora (QT.6): the ORDER BY the chosen loops give by themselves, taken from `order_by` with
+    /// its sort. Rows made another way (the morsel hook's workers) are sorted by it.
+    pub(crate) loop_order: OrderTerms,
     /// all the aggregates collected from the result columns, order by, and (TODO) having clauses
     pub aggregates: Vec<Aggregate>,
     /// limit clause

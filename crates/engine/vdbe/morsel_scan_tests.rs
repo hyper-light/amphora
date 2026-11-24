@@ -3510,6 +3510,139 @@ fn t_qt_6_35_joins_over_rowid_ranges_run_on_morsels_as_the_serial_loop() {
     conn.set_parallel_mode(ParallelMode::Off);
 }
 
+/// Whether `rows` are in the order of their first values, each `descending` or not, NULLs least as
+/// in SQLite or where `nulls` puts them (`true`: NULLS LAST).
+fn in_stated_order(rows: &[Vec<Value>], descending: &[bool], nulls: Option<bool>) -> bool {
+    use std::cmp::Ordering;
+    rows.windows(2).all(|pair| {
+        for (key, desc) in descending.iter().enumerate() {
+            let order = match (&pair[0][key], &pair[1][key], nulls) {
+                (Value::Null, Value::Null, _) => Ordering::Equal,
+                (Value::Null, _, Some(true)) | (_, Value::Null, Some(false)) => Ordering::Greater,
+                (Value::Null, _, Some(false)) | (_, Value::Null, Some(true)) => Ordering::Less,
+                (a, b, _) if *desc => b.cmp(a),
+                (a, b, _) => a.cmp(b),
+            };
+            if order.is_ne() {
+                return order.is_lt();
+            }
+        }
+        true
+    })
+}
+
+/// T-QT.6.36: a statement whose ORDER BY the planner took out, because its loops give it (a
+/// forward or a backward scan, an outer join's kept table) or its GROUP BY does, comes out in that
+/// order from morsels, which run neither. Joins' rows ordered by one table's id and by both, up and
+/// down, inner and LEFT and FULL, over whole tables and rowid ranges, with and without a LIMIT and an
+/// OFFSET, and groups of a scan and of a join in their keys' order, up and down and with NULLS LAST,
+/// are in the order stated and answer as the serial loop at 1, 2, 3, 4 and 8 stated cores at each
+/// orientation of an outer join, planned by cost and by hash joins, and the hook ran joins and groups.
+#[test]
+fn t_qt_6_36_morsels_keep_an_order_the_planner_took_from_the_loops() {
+    let conn = open(":memory:qt-6-36");
+    let mut rng = ChaCha8Rng::seed_from_u64(636);
+    fill_with_ids(&conn, &mut rng, &[("f", 900), ("d", 200)]);
+    let mut queries: Vec<(String, Vec<bool>, Option<bool>)> = Vec::new();
+    for desc in [false, true] {
+        let dir = if desc { " DESC" } else { "" };
+        for join in ["JOIN", "LEFT JOIN", "FULL JOIN"] {
+            for filter in ["", " WHERE f.id > 850", " WHERE f.id < 60 AND d.id > 150"] {
+                let from = format!("FROM f {join} d ON f.a = d.a{filter}");
+                queries.push((
+                    format!("SELECT f.id, d.id, d.b {from} ORDER BY f.id{dir} -- keys 1"),
+                    vec![desc],
+                    None,
+                ));
+                queries.push((
+                    format!("SELECT d.id, f.id {from} ORDER BY d.id{dir}, f.id{dir} -- keys 2"),
+                    vec![desc, desc],
+                    None,
+                ));
+                queries.push((
+                    format!("SELECT f.id, d.id {from} ORDER BY f.id{dir}, d.id{dir} LIMIT 30 OFFSET 3 -- keys 2"),
+                    vec![desc, desc],
+                    None,
+                ));
+                queries.push((
+                    format!("SELECT f.id, count(*), sum(d.b) {from} GROUP BY f.id ORDER BY f.id{dir} -- keys 1"),
+                    vec![desc],
+                    None,
+                ));
+                queries.push((
+                    format!("SELECT d.c, count(*), min(f.b) {from} GROUP BY d.c ORDER BY d.c{dir} NULLS LAST -- keys 1"),
+                    vec![desc],
+                    Some(true),
+                ));
+            }
+        }
+        for (key, nulls, last) in [
+            ("c", "", None),
+            ("a", "", None),
+            ("a", " NULLS LAST", Some(true)),
+            ("a", " NULLS FIRST", Some(false)),
+        ] {
+            queries.push((
+                format!("SELECT {key}, count(*), sum(b) FROM f GROUP BY {key} ORDER BY {key}{dir}{nulls} -- keys 1"),
+                vec![desc],
+                last,
+            ));
+        }
+        queries.push((
+            format!("SELECT c, a, count(*) FROM f GROUP BY a, c ORDER BY c{dir}, a DESC -- keys 2"),
+            vec![desc, true],
+            None,
+        ));
+    }
+    let (mut joins, mut groups) = (0usize, 0usize);
+    for methods in [
+        crate::JoinMethods::ByCost,
+        crate::JoinMethods::HashJoinsOnly,
+    ] {
+        conn.set_join_methods(methods);
+        for (sql, descending, nulls) in &queries {
+            conn.set_parallel_mode(ParallelMode::Off);
+            let serial = sql_rows(&conn, sql);
+            let stated = |rows: &[Vec<Value>]| in_stated_order(rows, descending, *nulls);
+            assert!(stated(&serial), "{sql}: the serial loop's order");
+            conn.set_parallel_mode(ParallelMode::On);
+            for probe in [crate::OuterJoinProbe::Padded, crate::OuterJoinProbe::Kept] {
+                conn.set_parallel_outer_probe(probe);
+                for cores in [1usize, 2, 3, 4, 8] {
+                    *conn.morsel_costs.lock() = Some(MachineCosts::stated(
+                        NonZeroUsize::new(cores).unwrap(),
+                        1.0,
+                        1.0,
+                    ));
+                    let counts = || {
+                        [&conn.morsel_join_links, &conn.morsel_body_rows]
+                            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+                    };
+                    let before = counts();
+                    let parallel = sql_rows(&conn, sql);
+                    let after = counts();
+                    let at = format!("on {cores} cores, {methods:?}, {probe:?}");
+                    assert!(stated(&parallel), "{sql} {at}: the order");
+                    if sql.contains("LIMIT") {
+                        // The keys hold both ids: the very rows.
+                        assert_eq!(parallel, serial, "{sql} {at}");
+                    } else {
+                        same_answer(sql, true, &parallel, &serial, &at);
+                    }
+                    joins += usize::from(after[0] > before[0]);
+                    groups += usize::from(sql.contains("GROUP BY") && after[1] > before[1]);
+                }
+            }
+            conn.set_parallel_outer_probe(crate::OuterJoinProbe::Padded);
+        }
+    }
+    conn.set_join_methods(crate::JoinMethods::ByCost);
+    conn.set_parallel_mode(ParallelMode::Off);
+    // Non-vacuity: joins and groups ran on morsels.
+    assert!(joins > queries.len(), "{joins} joins took the hook");
+    assert!(groups > queries.len() / 4, "{groups} groups took the hook");
+}
+
 /// Audit 3, prototypes 2 (morsel parallelism for REAL and NUMERIC): a one-table scan reading
 /// columns of REAL and NUMERIC affinity runs its loop body's copy in the workers, a REAL column's
 /// INTEGER loading as a REAL (`typeof` says so), GROUP BY values and MIN and MAX comparing as

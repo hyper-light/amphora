@@ -731,6 +731,17 @@ row fails a term of an inner join, so in a statement with an outer join every ra
 whole and the terms decide (a kept table's row outside an ON term's range is still kept).
 T-QT.6.35 checks inner and outer joins over ranges against the serial loop.
 
+**An ORDER BY the planner took out** (lane C1). The planner takes an ORDER BY out of the plan where
+its loops give that order (`apply_table_access_plan`: a table scanned forward or backward by rowid,
+the kept table of an outer join) and where its GROUP BY does (`compute_order_target`, which leaves
+the directions and the NULLs' places in `GroupBy::sort_order` and `nulls_order`). The morsel hook
+runs neither: a join's rows come out in its own probe's order (an outer join's probe is the padded
+table), and the groups came out ascending. So the plan keeps the ORDER BY its loops give
+(`SelectPlan::loop_order`), which a join's workers sort by as they sort by one the planner kept, and
+the groups are sorted in their keys' directions (`MorselAggregateData::group_order`, compared as the
+serial sorter compares them). The versioned storage's column copy hands its groups over the same
+way. T-QT.6.36 holds both to the order stated and to the serial loop.
+
 **A scan's rows under ORDER BY on morsels** (lane qs6-17). A one-table scan's rows under an ORDER
 BY ran serially. They now sort as a join's rows do: `scan_order` takes keys that are the table's
 columns (or its rowid) of INTEGER or TEXT affinity and BINARY collation, no NULLS FIRST or LAST

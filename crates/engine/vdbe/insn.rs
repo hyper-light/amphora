@@ -553,6 +553,10 @@ pub struct MorselAggregateData {
     pub rowid_range: (Option<i64>, Option<i64>),
     pub filter: Vec<crate::vdbe::morsel::Predicate>,
     pub group_by: Vec<usize>,
+    /// How the groups come out: each GROUP BY value's direction and where its NULLs come, those of
+    /// the ORDER BY the planner merged into the GROUP BY (`compute_order_target`), ascending where
+    /// it merged none.
+    pub group_order: Vec<crate::types::KeyInfo>,
     pub aggregates: Vec<crate::vdbe::morsel::Aggregate>,
     /// For each result column, its place in the pipeline's row (the GROUP BY values, then the
     /// aggregates).
