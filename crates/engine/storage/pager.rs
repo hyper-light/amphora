@@ -5941,11 +5941,14 @@ impl Pager {
         let state = self.checkpoint_state.read();
         let result = state.result.as_ref().expect("result should be set");
         let mode = state.mode.expect("mode should be set");
+        // A pass over the closing segment restarts nothing, so it publishes its backfill whatever
+        // its mode (decision 45).
         if result.wal_checkpoint_backfilled > 0
-            && !matches!(
-                mode,
-                CheckpointMode::Restart | CheckpointMode::Truncate { .. }
-            )
+            && (result.closing.is_some()
+                || !matches!(
+                    mode,
+                    CheckpointMode::Restart | CheckpointMode::Truncate { .. }
+                ))
         {
             // if we are using a custom codec, then we might have to read the whole page 1 so that
             // it can be decoded. Otherwise reading the header is enough.
@@ -5966,7 +5969,7 @@ impl Pager {
                 },
             };
         }
-        if matches!(mode, CheckpointMode::Truncate { .. }) {
+        if matches!(mode, CheckpointMode::Truncate { .. }) && result.closing.is_none() {
             CheckpointPhase::TruncateWalFile { clear_page_cache }
         } else {
             CheckpointPhase::Finalize { clear_page_cache }
@@ -6055,6 +6058,7 @@ impl Pager {
                     if matches!(mode, CheckpointMode::Truncate { .. })
                         // `should_truncate` will be true for successful truncate checkpoint
                         && res.should_truncate()
+                        && res.closing.is_none()
                     {
                         state.phase = CheckpointPhase::TruncateDbFile {
                             sync_mode,
@@ -6318,7 +6322,8 @@ impl Pager {
                     wal.publish_backfill(max_frame);
                     let next_phase = {
                         let state = self.checkpoint_state.read();
-                        if matches!(state.mode, Some(CheckpointMode::Truncate { .. })) {
+                        let closing = state.result.as_ref().is_some_and(|r| r.closing.is_some());
+                        if matches!(state.mode, Some(CheckpointMode::Truncate { .. })) && !closing {
                             CheckpointPhase::TruncateWalFile { clear_page_cache }
                         } else {
                             CheckpointPhase::Finalize { clear_page_cache }
@@ -6359,6 +6364,13 @@ impl Pager {
                 CheckpointPhase::Finalize { clear_page_cache } => {
                     let mut state = self.checkpoint_state.write();
                     let mut res = state.result.take().expect("result should be set");
+                    // A Restart or Truncate whose pass copied the closing segment did not restart
+                    // the log: the current segment isn't copied yet (decision 45).
+                    let not_restarted = res.closing.is_some()
+                        && matches!(
+                            state.mode,
+                            Some(CheckpointMode::Restart | CheckpointMode::Truncate { .. })
+                        );
                     state.phase = CheckpointPhase::NotCheckpointing;
                     state.mode = None;
                     state.lock_source = CheckpointLockSource::Acquire;
@@ -6375,6 +6387,9 @@ impl Pager {
                     // Release checkpoint guard
                     res.release_guard();
 
+                    if not_restarted {
+                        return Err(LimboError::Busy.into());
+                    }
                     return Ok(IOResult::Done(res));
                 }
             }

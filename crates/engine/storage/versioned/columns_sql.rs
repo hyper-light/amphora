@@ -317,6 +317,58 @@ pub(crate) struct Copies {
     absent: Mutex<HashMap<u64, u64>>,
     /// Each tree's rows as its copy's last build read them.
     rows_known: Mutex<HashMap<u64, u64>>,
+    /// Each tree's row path as measured (lane R6): the nanoseconds the engine's serial loop took
+    /// for the statements the copies handed it, and the rows of the table they were charged per
+    /// ([`Copies::rows_measured`]), as the copy's own scans are charged ([`Columns::measured_scan`]).
+    rows_cost: Mutex<HashMap<u64, (u128, u128)>>,
+}
+
+/// A statement the copies handed to its serial loop, timed for its table's row path (lane R6):
+/// the table's tree, and its rows at the statement's snapshot when the copy's view knew them (the
+/// copy's own charge per row of the table); else the rows the loop reads count, which for a
+/// whole-table statement are the table's.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RowsTimed {
+    tree: u64,
+    table_rows: Option<u64>,
+}
+
+/// What the copies answer a statement the scan hook hands them.
+pub(crate) enum Handed {
+    /// The copy answered: its rows.
+    Copy(Vec<Vec<Value>>),
+    /// The serial loop answers; timed for the table's row path when `Some`.
+    Rows(Option<RowsTimed>),
+}
+
+/// The serial loop of a statement the copies handed back, timed while it runs (lane R6): the
+/// engine's own time, from the hand-over to the statement's end, not the time its caller holds a
+/// row between steps.
+#[derive(Debug)]
+pub(crate) struct RowsTiming {
+    of: RowsTimed,
+    /// The rows the statement's cursors had read at the hand-over.
+    read_before: u64,
+    nanos: u128,
+    /// When the current run of the loop began: the hand-over, or the step that resumed it.
+    since: Instant,
+}
+
+impl RowsTiming {
+    pub(crate) fn start(of: RowsTimed, read_before: u64) -> Self {
+        Self {
+            of,
+            read_before,
+            nanos: 0,
+            since: Instant::now(),
+        }
+    }
+
+    /// The loop ran from `since` (the step's start, or the hand-over within it) until now.
+    pub(crate) fn ran(&mut self, since: Option<Instant>) {
+        let from = since.unwrap_or(self.since);
+        self.nanos = self.nanos.saturating_add(from.elapsed().as_nanos());
+    }
 }
 
 fn nanos(base: Instant) -> u128 {
@@ -347,7 +399,30 @@ impl Copies {
             waiting: Mutex::new(HashMap::new()),
             absent: Mutex::new(HashMap::new()),
             rows_known: Mutex::new(HashMap::new()),
+            rows_cost: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// A statement's serial loop ended, `timed`, its cursors having read `read_now` rows in all:
+    /// charged to its table's row path per row of the table.
+    pub(crate) fn rows_measured(&self, timed: RowsTiming, read_now: u64) {
+        let read = read_now.saturating_sub(timed.read_before);
+        let rows = timed.of.table_rows.unwrap_or(read);
+        if rows == 0 {
+            return;
+        }
+        let mut cost = self.rows_cost.lock();
+        let e = cost.entry(timed.of.tree).or_insert((0, 0));
+        e.0 = e.0.saturating_add(timed.nanos);
+        e.1 = e.1.saturating_add(u128::from(rows));
+    }
+
+    /// `tree`'s row path's measured nanoseconds per row of the table; None before a statement's
+    /// serial loop was timed on it.
+    fn rows_rate(&self, tree: u64) -> Option<f64> {
+        let cost = self.rows_cost.lock();
+        let (nanos, rows) = cost.get(&tree).copied()?;
+        (rows > 0).then(|| nanos as f64 / rows as f64)
     }
 
     /// How a copy let go is bought again.
@@ -598,6 +673,7 @@ impl Copies {
         self.waiting.lock().remove(&tree);
         self.absent.lock().remove(&tree);
         self.rows_known.lock().remove(&tree);
+        self.rows_cost.lock().remove(&tree);
         db.drop_columns(tree);
     }
 }
@@ -796,23 +872,24 @@ fn query(data: &MorselAggregateData, budget: usize) -> Result<Query> {
 }
 
 /// Answers the scan hook's statement `data` from its table's column copy when the planner chooses
-/// the copy: its rows (the GROUP BY values, then the aggregates, groups in key order). None: the
-/// statement's serial loop reads the rows.
+/// the copy: its rows (the GROUP BY values, then the aggregates, groups in key order). Else the
+/// statement's serial loop reads the rows, timed for its table's row path when a copy could have
+/// answered it (lane R6).
 pub(crate) fn aggregate(
     switch: &Switch,
     data: &MorselAggregateData,
     connection: &crate::Connection,
     statement_memory: usize,
-) -> Result<Option<Vec<Vec<Value>>>> {
+) -> Result<Handed> {
     // A column with a default a short row reads: the copy decodes the records as written, so the
     // serial loop reads the rows (lane qs6-17; the copy's own padding is open, executor.md 8).
     if !data.defaults.is_empty() {
-        return Ok(None);
+        return Ok(Handed::Rows(None));
     }
     let storage = switch.storage();
     let copies = &storage.copies;
     if !copies.on() {
-        return Ok(None);
+        return Ok(Handed::Rows(None));
     }
     // A statement no copy can answer reads the rows, counted with its reason (lane colcopy-9,
     // AC-CB.4.6) so an A/B can leave it out: it reads the rows under either rebuy policy.
@@ -825,13 +902,16 @@ pub(crate) fn aggregate(
     };
     copies.handed(skip);
     if skip.is_some() {
-        return Ok(None);
+        return Ok(Handed::Rows(None));
     }
     let db = storage.db();
     let tree = tree_of(data.root_page)?;
     let Some(copy) = copies.for_statement(db, tree)? else {
         copies.by_rows(tree, true);
-        return Ok(None);
+        return Ok(Handed::Rows(Some(RowsTimed {
+            tree,
+            table_rows: None,
+        })));
     };
     let q = query(data, statement_memory)?;
     // At the transaction's own snapshot (lane colcopy-10, AC-CB.4.7); in autocommit with none
@@ -847,7 +927,7 @@ pub(crate) fn aggregate(
             // What the copy answered is kept as read, the whole table, for the transaction's
             // validation: a superset of the rows the aggregate depends on refuses more, never
             // less, as the rows' cursor walking every row would keep.
-            if matches!(answered, Ok(Some(_))) {
+            if matches!(answered, Ok(Handed::Copy(_))) {
                 let mut guard = shared.lock();
                 let txn = guard.as_mut().ok_or_else(ended)?;
                 db.v.keep_read(txn, tree, None, None)?;
@@ -861,7 +941,7 @@ pub(crate) fn aggregate(
             answered
         }
     };
-    if matches!(answered, Ok(None)) {
+    if matches!(answered, Ok(Handed::Rows(_))) {
         copies.by_rows(tree, !copies.has(tree));
     }
     answered
@@ -881,21 +961,46 @@ fn read(
     data: &MorselAggregateData,
     q: &Query,
     connection: &crate::Connection,
-) -> Result<Option<Vec<Vec<Value>>>> {
+) -> Result<Handed> {
     let base = copies.base;
     let clock = move || nanos(base);
     let rows = At { db, snap, tree };
+    let timed = |table_rows: Option<u64>| Handed::Rows(Some(RowsTimed { tree, table_rows }));
     // The queued commits applied, each change's bytes granted first (AC-CB.1.1); refused, the copy
     // is let go, expecting what it held and the bytes asked, and the rows answer.
     if let Err(refused) = copy.columns.catch_up(tick(base)) {
         let expected = as_u64(copy.columns.granted()).saturating_add(asked(&refused));
         copies.let_go(db, tree, refused, expected)?;
-        return Ok(None);
+        return Ok(timed(None));
     }
-    // Unknown rates price nothing: the rows.
-    let rates = RowRates::learned(&connection.db.learned_costs);
+    // Both paths priced as measured on this table (lane R6): the copy by its scans' time per row of
+    // the table, the rows by the time the engine's serial loop took for the statements the copies
+    // handed it, per row of the table too; a seek (a queued key's read) by the database's learned
+    // rate. Rows never timed on this table, or unknown rates, price nothing: the rows, which their
+    // statement then measures.
+    let rates = RowRates::learned(&connection.db.learned_costs).and_then(|learned| {
+        copies.rows_rate(tree).map(|row| RowRates {
+            row,
+            seek: learned.seek,
+        })
+    });
     let chosen =
         rates.map(|r| columns_path::aggregate_choice(&copy.columns, snap.start, q, r, true));
+    if let (Some((choice, view)), Some(r)) = (&chosen, rates) {
+        tracing::debug!(
+            target: "amphora::column_path",
+            tree,
+            rows = view.rows,
+            queued = view.queued,
+            exact = view.exact,
+            copy_nanos_per_row = ?view.nanos_per_row,
+            rows_nanos_per_row = r.row,
+            rows_cost = choice.rows_cost,
+            copy_cost = ?choice.copy_cost,
+            path = ?choice.path,
+            "column copy or rows: the choice and its two costs"
+        );
+    }
     let answer = match chosen {
         Some((choice, view)) if choice.path == Path::Copy => {
             let budget = MemoryBudget::new(q.budget);
@@ -930,9 +1035,11 @@ fn read(
                     for row in answer {
                         out.push(row.into_iter().map(value).collect::<Result<Vec<_>>>()?);
                     }
-                    Some(out)
+                    Handed::Copy(out)
                 }
-                Err(_) if scan.declined.get() => None,
+                Err(_) if scan.declined.get() => {
+                    timed(Some(as_u64(view.rows.saturating_add(view.queued))))
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -945,12 +1052,18 @@ fn read(
                 c.unserved = c.unserved.saturating_add(1);
             }
             tracing::debug!(target: "amphora::columns", tree, snapshot = snap.start, "column copy refused: no generation answers the statement's snapshot");
-            None
+            timed(None)
         }
-        _ => {
+        Some((_, view)) => {
             let mut c = copies.counts.lock();
             c.rows = c.rows.saturating_add(1);
-            None
+            timed(Some(as_u64(view.rows.saturating_add(view.queued))))
+        }
+        None => {
+            tracing::debug!(target: "amphora::column_path", tree, "column copy or rows: the rows, not yet timed on this table, answer and are timed");
+            let mut c = copies.counts.lock();
+            c.rows = c.rows.saturating_add(1);
+            timed(None)
         }
     };
     // The copy's own upkeep, after the statement's choice: a copy behind its snapshot was not
@@ -1018,8 +1131,32 @@ mod tests {
         connect_in(None)
     }
 
+    /// `AMPHORA_PLAN_TRACE`: the copies' choices, each with its two costs, to stderr, each line
+    /// named by its test's thread.
+    fn trace() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        if std::env::var_os("AMPHORA_PLAN_TRACE").is_none() {
+            return;
+        }
+        ONCE.call_once(|| {
+            use tracing_subscriber::filter::{LevelFilter, Targets};
+            use tracing_subscriber::layer::SubscriberExt;
+            use tracing_subscriber::util::SubscriberInitExt;
+            let only = Targets::new().with_target("amphora::column_path", LevelFilter::DEBUG);
+            let shown = tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_ansi(false)
+                .with_thread_names(true);
+            let _ = tracing_subscriber::registry()
+                .with(shown)
+                .with(only)
+                .try_init();
+        });
+    }
+
     /// A connection on a versioned storage whose memory source is `room` (None: the machine's).
     fn connect_in(room: Option<Arc<dyn Source>>) -> (Arc<Database>, Arc<crate::Connection>) {
+        trace();
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
         let opts = ConnectOpts::new().with_versioned_storage();

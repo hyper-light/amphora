@@ -1,3 +1,4 @@
+141 nil
 148 |_| Ok(Value::Int(0))
 215 set_stmt
 221 generic_set
@@ -51,7 +52,11 @@
 580 make_string
 582 nil
 606 nil
+607 top
 608 null
+609 partition_spec
+610 list1
+612 part_elem
 616 null
 617 top
 619 nil
@@ -69,6 +74,7 @@
 981 any_name
 987 truncate_stmt
 990 |_| Ok(Value::Bool(false))
+1139 nil
 1140 |_| Ok(Value::Int(1))
 1145 |_| Ok(Value::Int(0))
 1233 nil
