@@ -1833,10 +1833,10 @@ pub struct CteScope {
     pub(super) with: crate::sync::Arc<CteWith>,
     /// The CTE's place in its WITH clause.
     pub(super) index: usize,
-    /// The CTE is read by another of its WITH clause, whose own uses of it share the entry's plan:
-    /// they are counted together, and materialized once where there are several. A CTE that is
-    /// defined inside that other one is counted apart, and has a plan of its own.
-    pub(super) uses_share_plan: bool,
+    /// Whether a use has taken the plan the entry holds, where one may: the entry is in the body of
+    /// another CTE of the WITH clause. Each further use has a plan of its own, but one beside it in a
+    /// FROM clause, which is materialized with it once.
+    pub(super) plan_taken: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[derive(Debug, Clone)]

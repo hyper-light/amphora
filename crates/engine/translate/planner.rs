@@ -1286,11 +1286,11 @@ fn plan_cte(
     let outer_query_refs: Result<Vec<OuterQueryReference>> = (|| {
         let mut outer_query_refs = with.outer_query_refs.clone();
         for &referenced_cte_index in &cte_definition.referenced_cte_indices {
-            let uses_share_plan = true;
+            let may_take_the_plan = true;
             outer_query_refs.push(cte_name_entry(
                 referenced_cte_index,
                 with,
-                uses_share_plan,
+                may_take_the_plan,
                 resolver,
                 program,
                 connection,
@@ -1373,14 +1373,14 @@ fn plan_cte(
 fn cte_name_entry(
     cte_definition_index: usize,
     with: &Arc<CteWith>,
-    uses_share_plan: bool,
+    may_take_the_plan: bool,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<OuterQueryReference> {
-    // A use that shares this plan is as much a use as one that has its own, which checks the
-    // explicit column list itself.
-    let validate_explicit_column_count = uses_share_plan;
+    // A use that takes this plan is as much a use as one that has its own, which checks the explicit
+    // column list itself.
+    let validate_explicit_column_count = may_take_the_plan;
     let cte_table = plan_cte(
         cte_definition_index,
         with,
@@ -1402,7 +1402,7 @@ fn cte_name_entry(
         cte_scope: Some(CteScope {
             with: Arc::clone(with),
             index: cte_definition_index,
-            uses_share_plan,
+            plan_taken: may_take_the_plan.then(Default::default),
         }),
         cte_definition_only: true,
         rowid_referenced: false,
@@ -1766,11 +1766,11 @@ fn parse_from_clause_table(
                 if has_its_entry {
                     continue;
                 }
-                let uses_share_plan = false;
+                let may_take_the_plan = false;
                 outer_query_refs_for_subquery.push(cte_name_entry(
                     cte_definition_index,
                     &with,
-                    uses_share_plan,
+                    may_take_the_plan,
                     resolver,
                     program,
                     connection,
@@ -2168,17 +2168,30 @@ fn parse_table(
             }
             let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
             let definition = table_references.cte_definition(outer_ref);
-            let outer_table = definition.table.clone();
-            let reads_an_outer_row = matches!(
-                &outer_table,
-                Table::FromClauseSubquery(subquery)
-                    if plan_has_outer_scope_dependency(&subquery.plan)
-            );
-            // A CTE that reads a row of a query around it is never materialized for several uses.
-            let scope = definition
-                .cte_scope
-                .clone()
-                .filter(|scope| !scope.uses_share_plan || reads_an_outer_row);
+            let mut outer_table = definition.table.clone();
+            let mut scope = definition.cte_scope.clone();
+            if let Some(taken) = scope.as_ref().and_then(|scope| scope.plan_taken.as_ref()) {
+                let reads_an_outer_row = matches!(
+                    &outer_table,
+                    Table::FromClauseSubquery(subquery)
+                        if plan_has_outer_scope_dependency(&subquery.plan)
+                );
+                let beside = table_references.joined_tables().iter().find(|joined| {
+                    matches!(
+                        &joined.table,
+                        Table::FromClauseSubquery(subquery) if subquery.cte_id() == definition.cte_id
+                    )
+                });
+                // A CTE that reads a row of a query around it is never materialized for several uses.
+                match beside.filter(|_| !reads_an_outer_row) {
+                    Some(beside) => {
+                        outer_table = beside.table.clone();
+                        scope = None;
+                    }
+                    None if !taken.swap(true, std::sync::atomic::Ordering::Relaxed) => scope = None,
+                    None => {}
+                }
+            }
 
             if let Some(scope) = scope {
                 // Plan each use separately so two uses do not receive the same
@@ -2498,7 +2511,7 @@ fn cte_with(
         .cloned()
         .map(|mut entry| {
             if let Some(scope) = &mut entry.cte_scope {
-                scope.uses_share_plan = false;
+                scope.plan_taken = None;
             }
             entry
         })
@@ -2616,11 +2629,11 @@ fn add_ctes_read_by_subqueries_as_outer_refs(
         if !read {
             continue;
         }
-        let uses_share_plan = false;
+        let may_take_the_plan = false;
         let entry = cte_name_entry(
             cte_definition_index,
             &with,
-            uses_share_plan,
+            may_take_the_plan,
             resolver,
             program,
             connection,
