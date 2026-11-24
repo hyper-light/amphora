@@ -12,13 +12,16 @@ use amphora_pg_catalog::Proc;
 use amphora_pg_catalog::data::type_oid;
 use amphora_pg_parser::tree::BoolOp;
 
-use crate::expr::{ExprId, ExprKind};
+use crate::expr::{ExprId, ExprKind, Table};
 use crate::func::{self, Value};
 use crate::stmt::{Command, Query, Target};
-use crate::{Error, Session};
+use crate::{Error, Session, sqlstate};
 
 /// The prefix of the names the engine's PostgreSQL dialect knows built-in functions by: an OID follows.
 pub const PROC_FUNCTION: &str = "pg_proc_";
+
+/// The engine's name of the rows of a generate_series.
+const SERIES: &str = "pg_generate_series";
 
 /// A result column, as RowDescription describes it (doc/src/sgml/protocol.sgml).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,15 +61,15 @@ pub fn lower(
     };
     let table = writer.table()?;
     let fields = fields(query)?;
+    writer.with_series(query.source.as_ref().or(query.table.as_ref()))?;
     match query.command {
         Command::Select => {
             if query.targets.is_empty() {
                 return Err(Error::unsupported("a SELECT of no columns"));
             }
             writer.list("SELECT ", &query.targets, |w, target| w.expr(target.expr))?;
-            if let Some(table) = &table {
-                writer.sql.push_str(" FROM ");
-                writer.sql.push_str(table);
+            if let Some(from) = &query.table {
+                writer.from(from)?;
             }
             writer.filter()?;
         }
@@ -86,10 +89,19 @@ pub fn lower(
             writer.sql.push_str("INSERT INTO ");
             writer.sql.push_str(&table);
             writer.list(" (", &query.targets, |w, target| w.assigned_name(target))?;
-            writer.list(") VALUES (", &query.targets, |w, target| {
-                w.expr(target.expr)
-            })?;
-            writer.sql.push(')');
+            match &query.source {
+                None => {
+                    writer.list(") VALUES (", &query.targets, |w, target| {
+                        w.expr(target.expr)
+                    })?;
+                    writer.sql.push(')');
+                }
+                Some(source) => {
+                    writer.list(") SELECT ", &query.targets, |w, target| w.expr(target.expr))?;
+                    writer.from(source)?;
+                    writer.filter()?;
+                }
+            }
         }
     }
     Ok(Lowered {
@@ -108,7 +120,7 @@ pub fn fields(query: &Query) -> Result<Vec<Field>, Error> {
     for target in &query.targets {
         let expr = query.exprs.get(target.expr)?;
         let (table, attnum) = match (&expr.kind, &query.table) {
-            (ExprKind::Var { attnum }, Some(table)) => (table.oid, *attnum),
+            (ExprKind::Var { attnum }, Some(table)) if table.oid != 0 => (table.oid, *attnum),
             _ => (0, 0),
         };
         fields.push(Field {
@@ -143,9 +155,9 @@ struct Writer<'a> {
 
 impl Writer<'_> {
     /// The quoted name of the table the statement is over: an engine table by that name, a catalog by
-    /// its own.
+    /// its own. None where it is none, or a series.
     fn table(&self) -> Result<Option<String>, Error> {
-        let Some(table) = &self.query.table else {
+        let Some(table) = self.query.table.as_ref().filter(|t| t.series.is_none()) else {
             return Ok(None);
         };
         let (_, name) = self
@@ -154,6 +166,73 @@ impl Writer<'_> {
             .name(table.oid)
             .ok_or_else(|| Error::internal("the statement's table is missing"))?;
         Ok(Some(quoted(&name)))
+    }
+
+    /// ` FROM` what a SELECT reads: a relation, or the rows [`Self::with_series`] names.
+    fn from(&mut self, table: &Table) -> Result<(), Error> {
+        self.sql.push_str(" FROM ");
+        if table.series.is_some() {
+            self.sql.push_str(SERIES);
+            return Ok(());
+        }
+        let (_, name) = self
+            .session
+            .relations
+            .name(table.oid)
+            .ok_or_else(|| Error::internal("the statement's table is missing"))?;
+        self.sql.push_str(&quoted(&name));
+        Ok(())
+    }
+
+    /// `generate_series_step_int8` (src/backend/utils/adt/int8.c) as the engine's own rows, ahead of the statement that
+    /// reads them: a NULL bound or step has none, and a step of 0 is refused as it runs. One whose next value would
+    /// pass the largest bigint is refused, as the engine's sum of integers would then be a number that isn't one.
+    fn with_series(&mut self, table: Option<&Table>) -> Result<(), Error> {
+        let Some(series) = table.and_then(|table| table.series.as_ref()) else {
+            return Ok(());
+        };
+        let query = self.query;
+        let mut bounds = [None, None, Some(1i64)];
+        let given = [Some(series.start), Some(series.stop), series.step];
+        for (bound, expr) in bounds.iter_mut().zip(given) {
+            let Some(expr) = expr else { continue };
+            *bound = match func::eval(&query.exprs, expr, self.session, self.params)? {
+                None => None,
+                Some(Value::Int4(i)) => Some(i64::from(i)),
+                Some(Value::Int8(i)) => Some(i),
+                Some(_) => return Err(Error::internal("a series' bound isn't an integer")),
+            };
+        }
+        // A NULL's: no rows.
+        let (start, stop, step) = match bounds {
+            [Some(start), Some(stop), Some(step)] => (start, stop, step),
+            _ => (1, 0, 1),
+        };
+        if step == 0 {
+            return Err(Error::new(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "step size cannot equal zero".to_owned(),
+            )
+            .of_its_run());
+        }
+        let rows = (step > 0) == (start <= stop);
+        let past = i128::from(stop).saturating_add(i128::from(step));
+        if rows && i64::try_from(past).is_err() {
+            return Err(
+                Error::unsupported("a generate_series this near the largest bigint")
+                    .at(series.location),
+            );
+        }
+        let mut bind = |value: i64| {
+            self.binds.push((type_oid::INT8, Some(Value::Int8(value))));
+            format!("?{}", self.binds.len())
+        };
+        let (first, last, by) = (bind(start), bind(stop), bind(step));
+        let within = if step > 0 { "<=" } else { ">=" };
+        self.sql.push_str(&format!(
+            "WITH RECURSIVE {SERIES}(value) AS (SELECT {first} WHERE {first} {within} {last} UNION ALL SELECT value + {by} FROM {SERIES} WHERE value + {by} {within} {last}) "
+        ));
+        Ok(())
     }
 
     fn list(
@@ -182,12 +261,17 @@ impl Writer<'_> {
     }
 
     fn column(&self, attnum: usize) -> Result<String, Error> {
-        self.query
-            .table
-            .as_ref()
-            .and_then(|t| attnum.checked_sub(1).and_then(|i| t.columns.get(i)))
-            .map(|c| c.name.clone())
-            .ok_or_else(|| Error::internal("a column of the statement's table is missing"))
+        column_of(self.query.table.as_ref(), attnum)
+    }
+
+    /// The name of a column read: of what the statement reads, which is a series' `value` for one.
+    fn read_name(&self, attnum: usize) -> Result<String, Error> {
+        let query = self.query;
+        let scope = query.source.as_ref().or(query.table.as_ref());
+        if scope.is_some_and(|table| table.series.is_some()) {
+            return Ok("value".to_owned());
+        }
+        column_of(scope, attnum)
     }
 
     fn filter(&mut self) -> Result<(), Error> {
@@ -227,7 +311,7 @@ impl Writer<'_> {
         let refuse = |what: &str| Err(Error::unsupported(what).at(expr.location));
         match &expr.kind {
             ExprKind::Var { attnum } => {
-                Ok(vec![Piece::Text(quoted(&self.column(*attnum)?).into())])
+                Ok(vec![Piece::Text(quoted(&self.read_name(*attnum)?).into())])
             }
             ExprKind::Op { function, args, .. } | ExprKind::Func { function, args, .. } => {
                 match (args.as_slice(), comparison(function.src)) {
@@ -311,6 +395,14 @@ impl Writer<'_> {
         pieces.push(Piece::Text(")".into()));
         pieces
     }
+}
+
+/// A column's name, by its `attnum`.
+fn column_of(table: Option<&Table>, attnum: usize) -> Result<String, Error> {
+    table
+        .and_then(|t| attnum.checked_sub(1).and_then(|i| t.columns.get(i)))
+        .map(|c| c.name.clone())
+        .ok_or_else(|| Error::internal("a column of the statement's table is missing"))
 }
 
 /// The arguments of a BoolExpr of several, joined.
