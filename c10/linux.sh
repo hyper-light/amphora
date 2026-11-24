@@ -6,8 +6,12 @@ export CARGO_HOME=$HOME/.cache/cargo-home-perf-planner-c10 CARGO_NET_OFFLINE=tru
 O=$HOME/.cache/amphora-perf/planner-c10-out; mkdir -p "$O"
 load() { echo "$(cut -d' ' -f1-3 /proc/loadavg)"; }
 cd "$HOME/.cache/amphora-perf/planner-c10-remote" || exit 2
+if [ "$SHA" != - ]; then
 git fetch -q origin 2>&1 | tail -2
 git checkout -q --detach "$SHA" || exit 3
+git show origin/diag/planner-c10:c10/c10_sql.rs > crates/engine/tests/c10_sql.rs
+for f in $(git ls-tree --name-only origin/diag/planner-c10 c10/ | grep sql$); do git show origin/diag/planner-c10:$f > $O/$(basename $f); done
+fi
 echo "== $(hostname) $(date -u +%T) tree $(git rev-parse --short=8 HEAD) load $(load)"
 D=$CARGO_TARGET_DIR/debug/deps
 bin() { ls -t "$D"/$1-* | grep -v '\.d$' | head -1; }
@@ -32,6 +36,10 @@ for step in "$@"; do
       echo "== fixture rc=$rc $(( $(date +%s) - s ))s load $(load)"
       grep -E "answers differ|test result" "$O/fixture.log" | cut -c1-200
       echo "panics: $(grep -c '^    PANIC' "$O/fixture.log") errors: $(grep -c '^    Amphora Err' "$O/fixture.log") wrong: $(grep -c '^    Amphora Ok' "$O/fixture.log")" ;;
+    wides:*)  # wides:COUNT:SEED SEED ... each in a process of its own
+      IFS=: read -r _ count seeds <<< "$step"
+      for seed in $seeds; do JOBS=1 bash "$0" - "wide:$count:$seed" > "$O/wide-run-$seed.txt" 2>&1 & done; wait
+      for seed in $seeds; do grep -E "^== wide|panics|PANIC|Amphora Err|differ" "$O/wide-run-$seed.txt" | cut -c1-200; done ;;
     sql:*)
       C10_SQL=$O/${step#sql:} timeout 120 "$(bin c10_sql)" --nocapture 2>"$O/sql.err" | cut -c1-400
       grep -E "panicked|required" "$O/sql.err" | sort | uniq -c | head ;;
