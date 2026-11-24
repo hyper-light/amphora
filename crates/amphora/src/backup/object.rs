@@ -1,8 +1,11 @@
 //! The archive's objects as bytes: each is its SHA-256 and then its body, so a restore refuses an
 //! object the store gave back other than as it was made (CLAUDE.md §3). Bodies are postcard.
 
+use amphora_engine::storage::log_segments::SegmentId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+use super::plan::{BaseLack, Link};
 
 /// The archive's format: a format value, raised when a body's layout changes.
 pub(super) const FORMAT: u8 = 1;
@@ -54,9 +57,76 @@ pub(super) struct SegmentHead {
     pub frames: u64,
 }
 
-/// The manifest's own format: a format value. 1 had no `from` (every chunk its base's own); 2
-/// names the base each chunk is stored under, so a base reuses an earlier base's unchanged chunks.
-pub(super) const MANIFEST_FORMAT: u8 = 2;
+/// The manifest's own format: a format value. 3 says what the base's file held as its copy began
+/// ([`Held`]); 1 and 2 didn't, so no restore takes their bases (lane B26).
+pub(super) const MANIFEST_FORMAT: u8 = 3;
+
+/// The log's file a closing segment is in (decision 45).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) enum LogFile {
+    Wal,
+    Wal2,
+}
+
+impl LogFile {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Wal => "-wal",
+            Self::Wal2 => "-wal2",
+        }
+    }
+}
+
+impl From<SegmentId> for LogFile {
+    fn from(segment: SegmentId) -> Self {
+        match segment {
+            SegmentId::First => Self::Wal,
+            SegmentId::Second => Self::Wal2,
+        }
+    }
+}
+
+/// The log's segment the last switch left (decision 45), as a base's copy began.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct Closed {
+    pub file: LogFile,
+    /// Its generation: its header's checkpoint sequence.
+    pub seq: u32,
+    /// The frames committed in it, and how many of them the base's file held.
+    pub frames: u64,
+    pub copied: u64,
+}
+
+/// What a base's file held as its copy began (lane B26): every frame committed before the generation
+/// it began in, which a restore replays from its first frame, or the base restores short.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct Held {
+    /// The log's generation the base began in, as its header names it.
+    pub own: Identity,
+    /// The generation before it; None where no segment held one.
+    pub closed: Option<Closed>,
+}
+
+impl Held {
+    /// What the file is not shown to hold, its generation begun in the archive on `link`: none, it
+    /// held every frame before it. A switch is the one way a generation begins whole on the one
+    /// before ([`super::Fence`]), so the segment it left is then known, by its last frame.
+    pub fn lacks(&self, link: Option<Link>) -> Option<BaseLack> {
+        let held = self.closed.map_or(0, |c| c.frames);
+        match (link, self.closed) {
+            (_, Some(c)) if c.copied < c.frames => Some(BaseLack::Uncopied {
+                segment: c.file.name(),
+                seq: c.seq,
+                frames: c.frames,
+                copied: c.copied,
+            }),
+            (Some(Link::Whole(archived)), _) if archived != held => {
+                Some(BaseLack::Before { archived, held })
+            }
+            _ => None,
+        }
+    }
+}
 
 /// A base: its pages are in `chunks` objects of `chunk_bytes` (the last shorter), `file_bytes` in
 /// all. `from`: the base each chunk is stored under, in runs of (base id, chunks), in chunk order.
@@ -70,26 +140,12 @@ pub(super) struct Manifest {
     pub chunk_bytes: u64,
     pub chunks: u64,
     pub from: Vec<(u64, u64)>,
-}
-
-/// A manifest of format 1, as archives made before format 2 hold them.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ManifestV1 {
-    format: u8,
-    id: u64,
-    start_gen: u64,
-    end: (u64, u64),
-    file_bytes: u64,
-    chunk_bytes: u64,
-    chunks: u64,
+    pub held: Held,
 }
 
 impl Manifest {
     /// The base each chunk is stored under, chunk by chunk.
     pub fn chunk_bases(&self) -> anyhow::Result<Vec<u64>> {
-        if self.from.is_empty() {
-            return Ok(vec![self.id; usize::try_from(self.chunks)?]);
-        }
         let mut out = Vec::with_capacity(usize::try_from(self.chunks)?);
         for &(base, run) in &self.from {
             if u64::try_from(out.len())?.saturating_add(run) > self.chunks {
@@ -116,25 +172,15 @@ pub(super) fn runs(bases: &[u64]) -> Vec<(u64, u64)> {
     out
 }
 
-/// A manifest of either format.
-pub(super) fn manifest(key: &str, object: &[u8]) -> anyhow::Result<Manifest> {
+/// The manifest at `key`; None where it is of a format before one that says what its base's file
+/// held ([`Held`]): no restore takes that base.
+pub(super) fn manifest(key: &str, object: &[u8]) -> anyhow::Result<Option<Manifest>> {
     let body = opened(key, object)?;
-    let bad = |e: postcard::Error| anyhow::anyhow!("archive object {key} doesn't decode: {e}");
     match body.first() {
-        Some(1) => {
-            let v1: ManifestV1 = postcard::from_bytes(body).map_err(bad)?;
-            Ok(Manifest {
-                format: v1.format,
-                id: v1.id,
-                start_gen: v1.start_gen,
-                end: v1.end,
-                file_bytes: v1.file_bytes,
-                chunk_bytes: v1.chunk_bytes,
-                chunks: v1.chunks,
-                from: Vec::new(),
-            })
-        }
-        Some(&MANIFEST_FORMAT) => postcard::from_bytes(body).map_err(bad),
+        Some(&MANIFEST_FORMAT) => postcard::from_bytes(body)
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("archive object {key} doesn't decode: {e}")),
+        Some(earlier) if (1..MANIFEST_FORMAT).contains(earlier) => Ok(None),
         other => anyhow::bail!("archive object {key} is a manifest of no known format ({other:?})"),
     }
 }
@@ -224,6 +270,55 @@ pub(super) fn segment_overhead(segment: &Segment) -> anyhow::Result<usize> {
 mod tests {
     use super::*;
 
+    const OWN: Identity = Identity {
+        seq: 6,
+        salt1: 2,
+        salt2: 3,
+    };
+
+    fn held(closed: Option<(u64, u64)>) -> Held {
+        Held {
+            own: OWN,
+            closed: closed.map(|(frames, copied)| Closed {
+                file: LogFile::Wal,
+                seq: 5,
+                frames,
+                copied,
+            }),
+        }
+    }
+
+    /// AC-T1.12.4 (lane B26): what a base's file is not shown to hold. Do: compare what manifests say
+    /// with how the archive's generation before ended. Expect: a closing segment not copied whole
+    /// lacks its later frames, whatever the archive says; one that ended at another frame than the
+    /// archive's, or none where the archive names one, lacks the log before; one copied whole that
+    /// ends where the archive says lacks nothing, nor does a generation begun on a gap, or the log's
+    /// first.
+    #[test]
+    fn a_base_says_what_its_file_holds() {
+        let whole = |last| Some(Link::Whole(last));
+        let uncopied = BaseLack::Uncopied {
+            segment: "-wal",
+            seq: 5,
+            frames: 41,
+            copied: 20,
+        };
+        for link in [whole(41), Some(Link::Gap), None] {
+            assert_eq!(
+                held(Some((41, 20))).lacks(link),
+                Some(uncopied.clone()),
+                "{link:?}"
+            );
+        }
+        let before = |archived, held| Some(BaseLack::Before { archived, held });
+        assert_eq!(held(Some((20, 20))).lacks(whole(41)), before(41, 20));
+        assert_eq!(held(None).lacks(whole(41)), before(41, 0));
+        assert_eq!(held(Some((41, 41))).lacks(whole(41)), None);
+        assert_eq!(held(Some((41, 41))).lacks(Some(Link::Gap)), None);
+        assert_eq!(held(None).lacks(Some(Link::Gap)), None);
+        assert!(uncopied.to_string().contains("frames 21 to 41 are missing"));
+    }
+
     /// T-T1.12.P10: an object round-trips; a byte changed is refused.
     #[test]
     fn t_t1_12_p10_sealed_objects() {
@@ -236,9 +331,10 @@ mod tests {
             chunk_bytes: 4096,
             chunks: 2,
             from: vec![(1, 2)],
+            held: held(None),
         };
         let mut bytes = encode(&m).unwrap();
-        assert_eq!(manifest("k", &bytes).unwrap(), m);
+        assert_eq!(manifest("k", &bytes).unwrap(), Some(m));
         let last = bytes.len() - 1;
         bytes[last] ^= 1;
         assert!(manifest("k", &bytes).is_err());
@@ -307,21 +403,21 @@ mod tests {
         ));
     }
 
-    /// T-T1.12.I2: a manifest of format 1 still reads, every chunk its own base's; a format 2
-    /// manifest's runs give each chunk's base, and runs that don't add up to its chunks are refused.
+    /// T-T1.12.I2: a manifest of a format before one that says what its base's file held names no
+    /// base a restore takes (lane B26; Amphora is unreleased), and one of no known format is
+    /// refused; a manifest's runs give each chunk's base, and runs that don't add up to its chunks
+    /// are refused.
     #[test]
     fn t_t1_12_i2_manifest_formats() {
-        let v1 = ManifestV1 {
-            format: 1,
-            id: 7,
-            start_gen: 1,
-            end: (1, 9),
-            file_bytes: 3 * 4096,
-            chunk_bytes: 4096,
-            chunks: 3,
-        };
-        let read = manifest("k", &encode(&v1).unwrap()).unwrap();
-        assert_eq!(read.chunk_bases().unwrap(), vec![7, 7, 7]);
+        // Formats 1 and 2 as they were laid out: their fields in order, 2's with its runs last.
+        let earlier = (7u64, 1u64, (1u64, 9u64), 3u64 * 4096, 4096u64, 3u64);
+        let v1 = encode(&(1u8, earlier)).unwrap();
+        let v2 = encode(&(2u8, earlier, vec![(7u64, 3u64)])).unwrap();
+        assert_eq!(manifest("k", &v1).unwrap(), None);
+        assert_eq!(manifest("k", &v2).unwrap(), None);
+        for unknown in [0u8, MANIFEST_FORMAT + 1] {
+            assert!(manifest("k", &encode(&(unknown, earlier)).unwrap()).is_err());
+        }
         let bases = [3, 3, 9, 3, 9, 9];
         let m = Manifest {
             format: MANIFEST_FORMAT,
@@ -332,6 +428,7 @@ mod tests {
             chunk_bytes: 4096,
             chunks: 6,
             from: runs(&bases),
+            held: held(None),
         };
         assert_eq!(m.from, vec![(3, 2), (9, 1), (3, 1), (9, 2)]);
         assert_eq!(m.chunk_bases().unwrap(), bases.to_vec());

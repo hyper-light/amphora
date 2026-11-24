@@ -682,23 +682,27 @@ fn connection(shared: &Shared, s: TcpStream) -> anyhow::Result<()> {
                 timed: AtomicBool::new(false),
             });
             let mut agreed = None;
+            let replica = shared.db.replica().ok_or_else(|| anyhow!("no replica"))?;
             loop {
                 let frame = read_frame(
                     &mut *answering.lock()?,
                     amphora_api::REQUEST_MAX,
                     shared.deadline,
+                    replica.ending(),
                 )?;
                 let answer = match frame {
                     None => return Ok(()),
                     Some(Frame::Refused(refusal)) => Frames::one(refused_frame(refusal)?),
                     Some(Frame::Held(bytes, _charge, until)) => {
                         match postcard::from_bytes::<SqlRequest>(&bytes) {
-                            Ok(request) => match request_charge(&request, until) {
-                                Ok(_decoded) => {
-                                    shared.sql(request, until, &mut agreed, &answering)?
+                            Ok(request) => {
+                                match request_charge(&request, until, replica.ending()) {
+                                    Ok(_decoded) => {
+                                        shared.sql(request, until, &mut agreed, &answering)?
+                                    }
+                                    Err(refusal) => Frames::one(refused_frame(refusal)?),
                                 }
-                                Err(refusal) => Frames::one(refused_frame(refusal)?),
-                            },
+                            }
                             Err(e) => Frames::one(refused_frame(amphora_api::invalid(
                                 "SQL request",
                                 &format!(
@@ -786,8 +790,14 @@ enum Frame {
 /// One frame of at most `max` bytes ([`SqlRequest`], [`SqlAnswer`]); `None` at the end of the
 /// stream. Its bytes are charged to the process's memory budget before they are read, waiting
 /// for room until its request's deadline, `deadline` from its first byte, woken only by charges
-/// given back ([`memory::Budget::take_until`]; lane perf-A19).
-fn read_frame(r: &mut impl Read, max: usize, deadline: Duration) -> anyhow::Result<Option<Frame>> {
+/// given back and by the end of `owner`, the replica the request is for
+/// ([`memory::Budget::take_until`]; lanes perf-A19 and perf-A28).
+fn read_frame(
+    r: &mut impl Read,
+    max: usize,
+    deadline: Duration,
+    owner: &memory::Ending,
+) -> anyhow::Result<Option<Frame>> {
     let mut first = [0u8; 1];
     let n = loop {
         match r.read(&mut first) {
@@ -808,7 +818,8 @@ fn read_frame(r: &mut impl Read, max: usize, deadline: Duration) -> anyhow::Resu
         Ok(()) => match after(deadline) {
             Err(e) => amphora_api::invalid("deadline", &e.to_string()),
             Ok(until) => {
-                match memory::process().take_until(Use::Queues, u64::from(len), until, || {}) {
+                match memory::process().take_until(Use::Queues, u64::from(len), until, owner, || {})
+                {
                     Ok(charge) => {
                         let mut bytes = vec![0u8; size];
                         r.read_exact(&mut bytes)?;
@@ -829,10 +840,14 @@ fn read_frame(r: &mut impl Read, max: usize, deadline: Duration) -> anyhow::Resu
 }
 
 /// A decoded request's memory, charged while it runs, waiting for room until its deadline `until`
-/// as its frame did: its frame was charged by its length, but a value decodes to [`Value`]'s size
-/// from as little as one byte (bounded in count by `transport::bounded`'s decoders, as `C`
-/// connections' requests are).
-fn request_charge(request: &SqlRequest, until: Instant) -> Result<memory::Charge, Refusal> {
+/// or its `owner`'s end as its frame did: its frame was charged by its length, but a value decodes to
+/// [`Value`]'s size from as little as one byte (bounded in count by `transport::bounded`'s decoders,
+/// as `C` connections' requests are).
+fn request_charge(
+    request: &SqlRequest,
+    until: Instant,
+    owner: &memory::Ending,
+) -> Result<memory::Charge, Refusal> {
     let statement = |s: &Statement| {
         s.params.iter().map(value_bytes).fold(
             std::mem::size_of::<Statement>().saturating_add(s.sql.len()),
@@ -848,7 +863,7 @@ fn request_charge(request: &SqlRequest, until: Instant) -> Result<memory::Charge
         SqlRequest::Read(s) => statement(s),
     };
     let bytes = u64::try_from(bytes).map_err(|_| amphora_api::invalid("SQL bytes", "past u64"))?;
-    memory::process().take_until(Use::Queues, bytes, until, || {})
+    memory::process().take_until(Use::Queues, bytes, until, owner, || {})
 }
 
 fn write_frame(w: &mut impl Write, bytes: &[u8]) -> anyhow::Result<()> {
@@ -1668,11 +1683,12 @@ impl SqlClient {
 
 /// The answer to a request of `statements` statements, read from `r`: its last frame, the rows of
 /// the frames before it put ahead of each table's own. Each frame waits for room `deadline` from
-/// its first byte.
+/// its first byte: its client's own connection, whose owner no end comes to.
 fn answer(r: &mut impl Read, statements: usize, deadline: Duration) -> anyhow::Result<SqlAnswer> {
     let mut early: Vec<Vec<Vec<Value>>> = Vec::new();
     loop {
-        let answer = match read_frame(r, amphora_api::RESULT_MAX, deadline)? {
+        let answer = match read_frame(r, amphora_api::RESULT_MAX, deadline, &memory::Ending::new())?
+        {
             Some(Frame::Held(bytes, _charge, _)) => postcard::from_bytes(&bytes)?,
             // Not the member's refusal: a write's outcome is unknown here, so no `Refusal` to read
             // as rolled back.
@@ -2289,6 +2305,7 @@ mod tests {
                 &mut sent.as_slice(),
                 amphora_api::REQUEST_MAX,
                 Duration::from_secs(3600),
+                &memory::Ending::new(),
             ) {
                 Ok(Some(Frame::Held(bytes, charge, _))) => Some((bytes, charge.bytes())),
                 _ => None,
@@ -2300,6 +2317,138 @@ mod tests {
         drop(other);
         assert_eq!(reader.join().unwrap(), Some((b"hello".to_vec(), 5)));
         assert_eq!(budget.held(Use::Queues), 0);
+    }
+
+    /// A member of one over `dir`, as `serve` opens it, its drills on.
+    fn member_of_one(dir: &Path, deadline: Duration) -> Arc<Shared> {
+        let replica = ReplicaConfig {
+            node_id: 1,
+            voters: vec![1],
+            learners: Vec::new(),
+            bootstrap: None,
+        };
+        let db = Database::open_replicated_with(
+            &dir.join("state.db"),
+            &dir.join("raft.log"),
+            replica,
+            Durability::Persisted,
+            sql_until(),
+        )
+        .unwrap();
+        Arc::new(Shared {
+            node: 1,
+            ids: BTreeSet::from([1]),
+            db,
+            cut: AtomicBool::new(false),
+            deadline,
+            keys: Keys {
+                secret: vec![7; 32],
+                tls: None,
+            },
+            drills: true,
+            log: dir.join("raft.log"),
+            addrs: BTreeMap::new(),
+            links: Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    /// What `waits` ("a frame": a `Q` request's; "its values": decoded, its frame held; "a call" on the
+    /// member's replica) does on a member of one while another use holds all but `room` bytes of the
+    /// budget it waits for: its log's disk is cut and the next write fences its owner; it is refused
+    /// `Fenced` (the request's answer `Refused` with it), none waiting and nothing held after.
+    fn hears_its_replicas_end(waits: &'static str, room: u64) {
+        use crate::memory::tests::{BUDGET, Fed};
+        const LIMIT: u64 = 1 << 20;
+        let dir = tempfile::tempdir().unwrap();
+        let shared = member_of_one(dir.path(), crate::transport::HANG);
+        shared
+            .db
+            .call(sql_until(), crate::database::AnswerMax::fixed(), |c| {
+                c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")?;
+                Ok(())
+            })
+            .unwrap();
+        let budget = memory::Budget::new(Box::new(Fed::new(Some(LIMIT), Some(0))));
+        let began = Instant::now();
+        // Its deadline past the member's own, so that the member's answer is what it reads.
+        let far = crate::transport::HANG * 2;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let served = {
+            let (shared, on_served) = (Arc::clone(&shared), Arc::clone(&budget));
+            std::thread::spawn(move || {
+                BUDGET.with(|slot| *slot.borrow_mut() = Some(on_served));
+                let (s, _) = listener.accept().unwrap();
+                connection(&shared, s)
+            })
+        };
+        let mut client = SqlClient::connect(&addr, &shared.keys, far).unwrap();
+        let other = budget.take(Use::Images, LIMIT - room).unwrap();
+        let on_request = Arc::clone(&budget);
+        let called = Arc::clone(&shared);
+        let asked = std::thread::spawn(move || -> anyhow::Result<()> {
+            if waits == "a call" {
+                BUDGET.with(|slot| *slot.borrow_mut() = Some(on_request));
+                let until = after(crate::transport::HANG)?;
+                called
+                    .db
+                    .call(until, crate::database::AnswerMax::fixed(), |c| {
+                        c.execute_batch("INSERT INTO t VALUES (1)")?;
+                        Ok(())
+                    })?;
+            } else {
+                let nulls = vec![Value::Null; amphora_api::TX_MAX];
+                client.read(statement("SELECT 1", nulls))?;
+            }
+            Ok(())
+        });
+        while budget.waiting() == 0 {
+            assert!(!asked.is_finished(), "{waits}: answered");
+            assert!(began.elapsed() < crate::transport::HANG, "{waits}: a hang");
+            std::thread::yield_now();
+        }
+        Database::set_log_disk(&shared.log, LogDisk::Cut).unwrap();
+        let fenced = shared
+            .db
+            .call(sql_until(), crate::database::AnswerMax::fixed(), |c| {
+                c.execute_batch("INSERT INTO t VALUES (2)")?;
+                Ok(())
+            });
+        assert!(fenced.is_err(), "{waits}: a write on a cut disk");
+        while !asked.is_finished() {
+            assert!(began.elapsed() < far, "{waits}: a hang");
+            std::thread::yield_now();
+        }
+        let refused = asked.join().unwrap().unwrap_err();
+        assert!(
+            matches!(refused.downcast_ref::<Refusal>(), Some(Refusal::Fenced(_))),
+            "{waits}: {refused:#} after {:?}",
+            began.elapsed()
+        );
+        assert_eq!(budget.waiting(), 0, "{waits}");
+        drop(other);
+        drop(shared);
+        let _ = served;
+        assert_eq!(budget.held(Use::Queues), 0, "{waits}");
+    }
+
+    /// MB.1 (T-MB.1.7, lane perf-A28): a `Q` request's frame that waits for the memory budget's room
+    /// hears its replica end. Do: [`hears_its_replicas_end`]'s frame. Expect: its refusal.
+    #[test]
+    fn a28_a_frame_waiting_for_room_hears_its_replicas_end_holding_nothing() {
+        hears_its_replicas_end("a frame", 0);
+    }
+
+    /// MB.1 (T-MB.1.7, lane perf-A28): a request's decoded values that wait for room hear it too.
+    #[test]
+    fn a28_a_requests_values_waiting_for_room_hear_its_replicas_end_holding_nothing() {
+        hears_its_replicas_end("its values", 8 << 10);
+    }
+
+    /// MB.1 (T-MB.1.7, lane perf-A28): a call on the replica that waits for room hears it too.
+    #[test]
+    fn a28_a_call_waiting_for_room_hears_its_replicas_end_holding_nothing() {
+        hears_its_replicas_end("a call", 0);
     }
 
     /// CP-T1.13, AC-T1.2.3 (decision 2's bounds): do decode a `Q` request with one parameter past
@@ -2323,7 +2472,7 @@ mod tests {
         let at = SqlRequest::Read(statement("SELECT 1", nulls(amphora_api::TX_MAX)));
         let decoded: SqlRequest =
             postcard::from_bytes(&postcard::to_allocvec(&at).unwrap()).unwrap();
-        let charged = request_charge(&decoded, sql_until()).unwrap();
+        let charged = request_charge(&decoded, sql_until(), &memory::Ending::new()).unwrap();
         assert!(
             charged.bytes()
                 >= u64::try_from(amphora_api::TX_MAX * std::mem::size_of::<Value>()).unwrap(),
@@ -2424,9 +2573,13 @@ mod tests {
             s.write_all(&[0u8; NONCE]).unwrap();
             let mut tag = [0u8; TAG];
             s.read_exact(&mut tag).unwrap();
-            let Some(Frame::Held(hello, ..)) =
-                read_frame(&mut s, amphora_api::REQUEST_MAX, Duration::from_secs(30)).unwrap()
-            else {
+            let Some(Frame::Held(hello, ..)) = read_frame(
+                &mut s,
+                amphora_api::REQUEST_MAX,
+                Duration::from_secs(30),
+                &memory::Ending::new(),
+            )
+            .unwrap() else {
                 panic!("no greeting");
             };
             assert!(matches!(
@@ -2439,14 +2592,24 @@ mod tests {
             )
             .unwrap();
             assert!(
-                read_frame(&mut s, amphora_api::REQUEST_MAX, Duration::from_secs(30))
-                    .unwrap()
-                    .is_some(),
+                read_frame(
+                    &mut s,
+                    amphora_api::REQUEST_MAX,
+                    Duration::from_secs(30),
+                    &memory::Ending::new(),
+                )
+                .unwrap()
+                .is_some(),
                 "the request"
             );
             wait.recv().unwrap();
             matches!(
-                read_frame(&mut s, amphora_api::REQUEST_MAX, Duration::from_secs(30)),
+                read_frame(
+                    &mut s,
+                    amphora_api::REQUEST_MAX,
+                    Duration::from_secs(30),
+                    &memory::Ending::new(),
+                ),
                 Ok(None)
             )
         });

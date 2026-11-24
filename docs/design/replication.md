@@ -2705,6 +2705,26 @@ A call whose budget room went after its place was granted gives the place back, 
 it, and waits for the budget again (T-QB.1.21). A stress of the line from every thread runs under ThreadSanitizer
 (T-QB.1.22).
 
+**Amendment (lane perf-A28, 2026-11-24): a write that waits for the memory budget hears its owner's end.** A write waits
+for the budget's room before it has a place in the queue (`Room::submit_by`, lane perf-A21), and the line's calls were told
+of the owner's end while it was not: with the budget's room held by another use, a cut log disk, a fence or a crash left it
+in `Budget::take_until` until room came or its deadline passed, then `Full`, though its owner had ended and could take
+nothing. The wait now hears it (`memory::Ending`, held by the line and shared with it): it ends as the owner does with the
+owner's reason, `Fenced`, as every call in line is, holding no charge (docs/design/store.md, "Decision (lane perf-A28)").
+The same wait takes the frames and the decoded values of a member's `Q` requests (serve.rs), whose owner is that member's
+replica. The models of the line and of the budget's wait (T-QB.1.19, T-MB.1.5) are in `scripts/gates.sh`.
+- *A term change is no end.* The member that lost the lead forwards what its callers ask to the new leader, so a write that
+  waits for the budget across a term change is answered by the owner it was asked of once the room comes (T-QB.1.23).
+- *A record with no room beside a held call waits for that call.* A wire record is refused at once and raft sends it again,
+  so an image the queue has no room for beside the largest call it holds alone is refused until that call is answered or its
+  deadline passes: what bounds it. A call behind in line takes the place first (T-QB.1.24), so a steady line of calls that
+  large holds an image back as long as it lasts; nothing changes that here.
+- *A call that declares `REQUEST_MAX` on a small queue* stays refused `TooLarge` at once (lane perf-A27's choice, kept): what
+  one call may hold alone is the queue less a whole command's record (`Bounds::alone`), so where the queue's room is under
+  twice `REQUEST_MAX` (64 MiB and a few KB, from `queue_bounds`), no call declaring `REQUEST_MAX` fits beside the records
+  its group needs, and refusing it at once costs its caller nothing a wait could make good. It is so in a group of one too,
+  where no record needs the room: the bounds learned at open don't know the group's members.
+
 **A bound that starts small grows before it fences.** A full outgoing queue fenced the owner. Now a queue past the
 budget's room fences at once, since memory can't be lent; one past what its host drains in an election timeout fences
 only once it has stayed past it for a whole election timeout, so that a burst at start, before any drain is measured,

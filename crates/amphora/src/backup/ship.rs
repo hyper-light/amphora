@@ -15,9 +15,9 @@ use amphora_api::blobs::{BlobRefusal, Blobs};
 use amphora_engine::storage::log_segments::SegmentId;
 
 use super::object::{
-    self, FORMAT, Identity, MANIFEST_FORMAT, Manifest, Segment, StoredMark, Through,
+    self, Closed, FORMAT, Held, Identity, MANIFEST_FORMAT, Manifest, Segment, StoredMark, Through,
 };
-use super::plan::{self, BaseKey, Link, Rates, SegmentKey, ThroughKey};
+use super::plan::{self, BaseKey, Lacks, Link, Rates, SegmentKey, ThroughKey};
 use super::restore::read_segment;
 use super::{Hooks, Mark, SECOND_NS, second_of};
 use crate::db::{Db, PAGE_BYTES};
@@ -190,6 +190,8 @@ pub struct BaseCopy {
     chunk_bytes: u64,
     file_bytes: u64,
     next: u64,
+    /// What the file held as the copy began.
+    held: Held,
     reuse: Option<Reuse>,
     /// The base each chunk so far is stored under: this one's id, or the earlier base's it reuses.
     bases: Vec<u64>,
@@ -239,11 +241,16 @@ pub struct Shipper {
     through: u64,
     archived_through: u64,
     next_link: Option<Link>,
+    /// How the generation shipped now began, as its first segment's key says.
+    began: Option<Link>,
     unknown: Option<u64>,
     /// The generation the log last began in on a gap (0: none): a base begun before it restores
     /// nothing after it. And the generation the latest base began in.
     gap: u64,
     base_start: Option<u64>,
+    /// Where the log ended as a base was last begun for what a restore found the archive to lack
+    /// ([`Shipper::mend`]).
+    mended: Option<(u32, u64)>,
     /// Since the latest base: the bytes shipped, and that base's bytes.
     since_base: u64,
     base_bytes: Option<u64>,
@@ -347,7 +354,8 @@ fn same(
     Ok(blobs.get_range(key, at, 1, until)?.is_empty())
 }
 
-fn identity_of(header: &[u8]) -> anyhow::Result<Identity> {
+/// The generation a log's header names.
+pub(super) fn identity_of(header: &[u8]) -> anyhow::Result<Identity> {
     let word = |at: usize| -> anyhow::Result<u32> {
         let bytes: [u8; 4] = header
             .get(at..at.saturating_add(4))
@@ -409,9 +417,11 @@ impl Shipper {
             through: 0,
             archived_through: 0,
             next_link: None,
+            began: None,
             unknown: None,
             gap: 0,
             base_start: None,
+            mended: None,
             since_base: 0,
             base_bytes: None,
             older: Touched::default(),
@@ -459,9 +469,9 @@ impl Shipper {
             shipper.archived_through = last.through;
             // The log is in that generation still, or in the one after it, the writer having
             // switched since (decision 45) and the segment it closed shipped to its end.
-            let closed = db.log_before().filter(|(_, _, frame)| *frame == last.last);
+            let closed = db.log_before().filter(|b| b.frames == last.last);
             let closed_head = match closed {
-                Some((segment, _, _)) => db.segment_header(segment)?,
+                Some(closed) => db.segment_header(closed.segment)?,
                 None => None,
             };
             let current_head = db.log_header()?.map(|(_, head)| head);
@@ -470,12 +480,16 @@ impl Shipper {
                 if identity_of(&head)? != body.identity {
                     continue;
                 }
-                if let Some((_, seq, frame)) = ended {
-                    shipper.hooks.fence.opened(seq, frame)?;
+                if let Some(ended) = ended {
+                    shipper.hooks.fence.opened(ended.generation, ended.frames)?;
                 }
                 shipper.identity = Some(body.identity);
                 shipper.header = head;
                 shipper.shipped = last.last;
+                shipper.began = keys
+                    .iter()
+                    .filter(|s| s.generation == last.generation && s.first == 1)
+                    .find_map(|s| s.link);
                 break;
             }
             // A through mark after the last segment says how long the log stayed as it left it;
@@ -496,14 +510,18 @@ impl Shipper {
                 shipper.through_mark = Some(key);
             }
         }
-        // The latest base and what was shipped after it.
+        // The latest base and what was shipped after it: none where it doesn't say what its file holds
+        // ([`Held`]), as no restore takes it.
         let bases = list_all(blobs, &format!("{prefix}/base/"), until)?;
-        let latest = bases
+        let latest = match bases
             .iter()
             .filter_map(|(k, _)| BaseKey::parse(prefix, k).ok().map(|b| (b, k)))
-            .max_by_key(|(b, _)| (b.end, b.id));
-        if let Some((base, key)) = latest {
-            let manifest = object::manifest(key, &blobs.get(key, until)?)?;
+            .max_by_key(|(b, _)| (b.end, b.id))
+        {
+            Some((base, key)) => object::manifest(key, &blobs.get(key, until)?)?.map(|m| (base, m)),
+            None => None,
+        };
+        if let Some((base, manifest)) = latest {
             shipper.base_bytes = Some(manifest.file_bytes);
             shipper.base_start = Some(manifest.start_gen);
             for (key, bytes) in &segments {
@@ -813,6 +831,7 @@ impl Shipper {
         self.shipped = 0;
         self.unfinished = None;
         self.next_link = Some(link);
+        self.began = Some(link);
         Ok(())
     }
 
@@ -1005,6 +1024,60 @@ impl Shipper {
         self.base_start.is_none_or(|start| start < self.gap)
     }
 
+    /// Takes in that a restore found the archive to lack `lacks` (lane B26): whether a base is needed
+    /// for it that wasn't, the latest begun too early or not shown to hold what it must. The next base
+    /// is whole, as nothing the archive holds vouches for a chunk kept from an earlier one.
+    ///
+    /// Frames of the generation shipped now are lacking from any base begun in it, which a restore
+    /// replays from its first frame: the log, which holds them still, is shipped from that frame
+    /// again as a generation of its own, as after a break. The same log gives the same archive, so
+    /// none is begun again for one until a commit moves the log's end.
+    pub fn mend(&mut self, db: &Db, lacks: Lacks) -> anyhow::Result<bool> {
+        let end = db.log_end();
+        let needed = match lacks {
+            Lacks::Base { id } => self.last_base.as_ref().is_some_and(|b| b.id == id),
+            Lacks::Frames { generation } => {
+                self.gap <= generation && self.base_start.is_some_and(|start| start <= generation)
+            }
+        };
+        if !needed || self.mended == Some(end) {
+            return Ok(false);
+        }
+        match lacks {
+            Lacks::Base { .. } => self.base_start = None,
+            Lacks::Frames { generation } => {
+                self.gap = generation
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("the archive's generations overflow"))?;
+                if generation == self.generation {
+                    self.begin_again();
+                }
+            }
+        }
+        self.last_base = None;
+        self.traced_from = None;
+        self.mended = Some(end);
+        Ok(true)
+    }
+
+    /// Ships the log's generation again from its first frame, as a generation of the archive's own
+    /// begun on a gap: the next round finds it new ([`Shipper::begin_generation`]). Its frames shipped
+    /// so far are commits stamped by the time the archive is whole through, and no other is, so a
+    /// mark at that time says what a second since it holds.
+    fn begin_again(&mut self) {
+        let Some(identity) = self.identity.take() else {
+            return;
+        };
+        if self.shipped > 0 {
+            self.pending.push_front(Mark {
+                seq: identity.seq,
+                frame: self.shipped,
+                ns: self.archived_through,
+                unknown_from: None,
+            });
+        }
+    }
+
     /// Whether the log broke since `copy` began: no restore takes it then ([`plan::chain`]), and
     /// [`Shipper::end_base`] refuses it.
     #[must_use]
@@ -1055,6 +1128,9 @@ impl Shipper {
     /// ([`copy_charge`]); each chunk is charged as it's held ([`Shipper::copy_base`]). So a file
     /// far larger than memory is copied in chunks that fit together with every other stream's,
     /// and a restore with the room this copy had fetches one ([`super::restore_within`]).
+    ///
+    /// What the file holds as the copy begins goes in the base's manifest ([`Held`]), and a copy a
+    /// restore would refuse for it is refused here.
     pub fn begin_base(
         &mut self,
         db: &Db,
@@ -1063,13 +1139,32 @@ impl Shipper {
         cap: usize,
     ) -> anyhow::Result<BaseCopy> {
         let (seq, _) = db.log_end();
-        if self.identity.is_none_or(|i| i.seq != seq) {
+        let Some(own) = self.identity.filter(|i| i.seq == seq) else {
             anyhow::bail!("ship the log's generation before copying a base in it");
-        }
+        };
         if !db.closing_copied() {
             anyhow::bail!(
                 "a base begins once the log's closing segment is copied into the file: a read under way holds it"
             );
+        }
+        let held = Held {
+            own,
+            closed: db.log_before().map(|before| Closed {
+                file: before.segment.into(),
+                seq: before.generation,
+                frames: before.frames,
+                copied: before.copied,
+            }),
+        };
+        // The writer may switch at any moment: what was read is of this generation's start only if
+        // it is the current one still.
+        if db.log_end().0 != seq {
+            anyhow::bail!(
+                "the log started again as a base was to begin: ship its generation first"
+            );
+        }
+        if let Some(lack) = held.lacks(self.began) {
+            anyhow::bail!("a base can't begin: {lack}");
         }
         let stream = memory.stream(Use::Chunks);
         let share = memory.stream_room(Use::Chunks)?;
@@ -1136,6 +1231,7 @@ impl Shipper {
             chunk_bytes,
             file_bytes: db.file_bytes()?,
             next: 0,
+            held,
             reuse,
             bases: Vec::new(),
             memory: Arc::clone(memory),
@@ -1232,6 +1328,7 @@ impl Shipper {
             chunk_bytes: copy.chunk_bytes,
             chunks: copy.next,
             from: object::runs(&copy.bases),
+            held: copy.held,
         };
         let key = BaseKey {
             end: manifest.end,

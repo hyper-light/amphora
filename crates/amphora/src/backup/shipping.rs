@@ -15,21 +15,23 @@
 //! foreground's calls in flight ([`Pacer`], T-T1.12.C7, C8).
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, TryRecvError, TrySendError};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use amphora_api::blobs::Blobs;
 
 use super::check::step_bytes;
 use super::drill::{Foreground, Pace, Pacer, Unpaced};
+use super::plan::Lacks;
+use super::restore::remove;
 use super::ship::FRAME_BYTES;
 use super::{
-    BaseCopy, Budget, Check, CheckCounters, CheckPolicy, ChunkGrowth, Clock, DrillMeter, Drills,
-    Hooks, RowDigest, Shipped, Shipper, Stopped, admit, check_due, digest_paced, newest_second,
-    next_random, plan, restore_and_check_at,
+    BaseCopy, Budget, Check, CheckCounters, CheckFailure, CheckPolicy, ChunkGrowth, Clock,
+    DrillMeter, Drills, Hooks, RowDigest, Shipped, Shipper, Stopped, admit, check_due,
+    digest_paced, newest_second, next_random, plan, restore_and_check_at,
 };
-use crate::db::{Db, PAGE_BYTES, log_paths};
+use crate::db::{Db, PAGE_BYTES, log_paths, restoring_path};
 use crate::store::Watcher;
 
 /// Where and how a database is backed up ([`crate::database::Database::open_backed_up`]).
@@ -49,7 +51,7 @@ pub struct Archive {
     /// to know (Needs Ada's word: no measured default yet).
     pub patience: Duration,
     /// Whether and where the thread restores its archive to check it (T-T1.12.C3, C4): a new file
-    /// each check, removed once it passes and kept on a failure to look into. By default
+    /// each check, removed once it passes and kept where it restored and failed, to look into. By default
     /// ([`CheckPolicy::Continuous`]) beside the database, within the machine's budget.
     pub check: CheckPolicy,
     /// Whether a new base's chunks grow with the room or keep the latest base's size
@@ -163,6 +165,40 @@ pub(crate) struct Prepared {
     meter: Arc<DrillMeter>,
     /// Whether a base that was to begin waits for the log's closing segment to be copied.
     base_waits: bool,
+    mends: Arc<Mends>,
+}
+
+/// What the check thread asks of the shipping thread: a base for what a check's restore found the
+/// archive to lack (the latest ask; an earlier one untaken, the next check finds again), and that
+/// thread's wake, held weakly: the thread ends once the store's own is gone.
+#[derive(Default)]
+struct Mends {
+    asked: Mutex<(Option<Lacks>, Weak<SyncSender<()>>)>,
+}
+
+impl Mends {
+    /// Asks, and wakes the shipping thread: its next round begins the base, with no commit to wait for.
+    fn ask(&self, lacks: Lacks) {
+        let Ok(mut state) = self.asked.lock() else {
+            return;
+        };
+        let (asked, wake) = &mut *state;
+        *asked = Some(lacks);
+        // Full, a wake is pending already: the round that takes this.
+        if let Some(wake) = wake.upgrade() {
+            let _pending = wake.try_send(());
+        }
+    }
+
+    fn take(&self) -> Option<Lacks> {
+        self.asked.lock().ok()?.0.take()
+    }
+
+    fn wakes(&self, wake: Weak<SyncSender<()>>) {
+        if let Ok(mut state) = self.asked.lock() {
+            state.1 = wake;
+        }
+    }
 }
 
 /// What the shipping thread tells the check thread: rounds ended, the latest base, the log shipped
@@ -237,6 +273,7 @@ struct Checker {
     pacer: Option<Pacer>,
     /// What the pending check's digest cost.
     pending_cost: u64,
+    mends: Arc<Mends>,
 }
 
 fn elapsed_ns(since: Instant) -> u64 {
@@ -296,6 +333,7 @@ impl Prepared {
         let foreground = Arc::new(Foreground::default());
         let counters: Arc<CheckCounters> = Arc::default();
         let meter: Arc<DrillMeter> = Arc::default();
+        let mends: Arc<Mends> = Arc::default();
         let checker = match scratch {
             Some(scratch) => {
                 let reader = db.reader()?;
@@ -324,6 +362,7 @@ impl Prepared {
                         Pacer::new(Arc::clone(&foreground), Arc::clone(&meter), policy)
                     }),
                     pending_cost: 0,
+                    mends: Arc::clone(&mends),
                 })
             }
             None => None,
@@ -346,6 +385,7 @@ impl Prepared {
             counters,
             meter,
             base_waits: false,
+            mends,
         })
     }
 
@@ -357,6 +397,8 @@ impl Prepared {
         // The first round runs at once: what the database committed as it opened is shipped, and
         // its first base begins, without waiting for a commit.
         wake.try_send(())?;
+        let wake = Arc::new(wake);
+        self.mends.wakes(Arc::downgrade(&wake));
         let foreground = Arc::clone(&self.foreground);
         on_commit(Box::new(move || {
             foreground.committed();
@@ -473,6 +515,12 @@ impl Prepared {
     /// Ships, then moves a base on by one chunk while one is due: what it shipped, and whether a
     /// base ended.
     fn round(&mut self, copy: &mut Option<BaseCopy>) -> anyhow::Result<(Shipped, bool)> {
+        if let Some(lacks) = self.mends.take()
+            && self.shipper.mend(&self.reader, lacks)?
+        {
+            tracing::warn!(target: "amphora.backup", event = "backup.base_begun_again", prefix = %self.archive.prefix, lacks = ?lacks, "a check found the archive short: a new base begins");
+            *copy = None;
+        }
         let generation = self.shipper.generation();
         let shipped = self.ship()?;
         let blobs = self.archive.blobs.as_ref();
@@ -706,6 +754,13 @@ impl Checker {
             pacer.end_check(check.is_ok());
         }
         let check = check?;
+        if let Check::Failed {
+            why: CheckFailure::Lacking { lacks, .. },
+            ..
+        } = &check
+        {
+            self.mends.ask(*lacks);
+        }
         let cost = self.pending_cost.saturating_add(elapsed_ns(began));
         self.meter.cost(cost);
         self.last_check = Some(match &check {
@@ -725,16 +780,12 @@ impl Checker {
     }
 }
 
-/// Removes a check's scratch database and its log, if there.
+/// Removes a check's scratch database and its log, and what a restore to it that ended midway (its
+/// process killed) left, if there.
 fn remove_scratch(scratch: &Path) -> anyhow::Result<()> {
-    let [first, second] = log_paths(scratch);
-    for file in [scratch, &first, &second, &suffixed(scratch, "-shm")] {
-        match std::fs::remove_file(file) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
-            _ => {}
-        }
-    }
-    Ok(())
+    remove(scratch)?;
+    remove(&suffixed(scratch, "-shm"))?;
+    remove(&restoring_path(scratch))
 }
 
 #[cfg(test)]
@@ -1014,7 +1065,9 @@ mod tests {
         prepared.ship().unwrap();
         let listed = blobs.list("db/base/", None, 10, until()).unwrap().objects;
         let (key, _) = listed.first().unwrap();
-        let first = object::manifest(key, &blobs.get(key, until()).unwrap()).unwrap();
+        let first = object::manifest(key, &blobs.get(key, until()).unwrap())
+            .unwrap()
+            .unwrap();
         let useless = object::Manifest {
             id: first.id + 1,
             end: (2, prepared.shipper.frames_in_generation()),
@@ -1045,6 +1098,143 @@ mod tests {
                 prepared.shipper.base_needed()
             ),
         }
+    }
+
+    /// AC-T1.12.4 (lane B26): a check that finds the archive lacking gets one base for it, and another
+    /// only where that one lacks too and a commit moved the log since: a check that fails again and
+    /// again never keeps a base copying for nothing. Do: end a first base of 400 rows; ask for one
+    /// for frames of the generation shipped now and run rounds; ask again for the same frames, for
+    /// frames of the generation after, which the base begun began in, and for that base's proof; change a
+    /// row over two generations, ask for its proof again, and run rounds; restore the last second.
+    /// Expect: a base ends at the first ask, in a generation of its own with the log shipped again,
+    /// and at the last, keeping no chunk; none in between; the second restores with every row.
+    #[test]
+    fn a_check_that_finds_the_archive_lacking_gets_one_base_until_a_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = Arc::new(SimBlobs::new(64 * 1024, 1_000_000, 1 << 30));
+        let (mut db, mut prepared, now) = backed_up(
+            &dir.path().join("source.db"),
+            &blobs,
+            None,
+            CheckPolicy::Off,
+        );
+        write(&db, &now, 0, 400);
+        let mut copy = None;
+        assert!(rounds(&mut prepared, &mut copy), "the first base ends");
+        let generation = prepared.shipper.generation();
+        prepared.mends.ask(Lacks::Frames { generation });
+        assert!(rounds(&mut prepared, &mut copy), "a base for the frames");
+        assert_eq!(prepared.shipper.generation(), generation + 1);
+        let id = prepared.shipper.latest_base().unwrap();
+        for lacks in [
+            Lacks::Frames { generation },
+            Lacks::Frames {
+                generation: generation + 1,
+            },
+            Lacks::Base { id },
+        ] {
+            prepared.mends.ask(lacks);
+            assert!(!rounds(&mut prepared, &mut copy), "{lacks:?}, no commit");
+        }
+        let change = |db: &Db, v: &str| {
+            now.fetch_add(SECOND_NS, Ordering::SeqCst);
+            db.exec(&format!("UPDATE t SET v = '{v}' WHERE id = 5"))
+                .unwrap();
+        };
+        // Twice: the second's base could keep the first's chunks, whose generation wrote few pages.
+        let mut whole = id;
+        for (before, after) in [("a", "b"), ("c", "d")] {
+            change(&db, before);
+            prepared.ship().unwrap();
+            assert!(db.restart_log().unwrap(), "shipped, so it starts again");
+            change(&db, after);
+            prepared.mends.ask(Lacks::Base { id: whole });
+            assert!(rounds(&mut prepared, &mut copy), "a base for the proof");
+            let ended = prepared.shipper.latest_base().unwrap();
+            assert_ne!(ended, whole);
+            whole = ended;
+        }
+        let listed = blobs.list("db/base/", None, 10, until()).unwrap().objects;
+        let (key, _) = listed.last().unwrap();
+        let manifest = crate::backup::object::manifest(key, &blobs.get(key, until()).unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(
+            manifest.chunks > 4,
+            "non-vacuous: {} chunks",
+            manifest.chunks
+        );
+        assert_eq!(
+            manifest.from,
+            vec![(whole, manifest.chunks)],
+            "no chunk of another base's"
+        );
+        now.fetch_add(SECOND_NS, Ordering::SeqCst);
+        prepared.round(&mut copy).unwrap();
+        assert_eq!(restored_now(dir.path(), &blobs, &now).unwrap(), ids(&db));
+    }
+
+    /// AC-T1.12.4 (lane B26): a check that fails wakes the shipping thread for the base it asks for: no
+    /// commit does. Do: end a first base, commit and ship; zero the last frame of the log's
+    /// generation in the archive, sealed again; start the threads, whose wakes are the test's to make; once
+    /// the check thread took its snapshot, make one, so the round after it checks that second; make no
+    /// other.
+    /// Expect: the check fails, and a base begun after the short generation ends.
+    #[test]
+    fn a_check_that_fails_wakes_the_round_that_begins_a_base() {
+        use crate::backup::object;
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = Arc::new(SimBlobs::new(64 * 1024, 1_000_000, 1 << 30));
+        let (db, mut prepared, now) = backed_up(
+            &dir.path().join("source.db"),
+            &blobs,
+            None,
+            CheckPolicy::Scratch(None),
+        );
+        write(&db, &now, 0, 10);
+        let mut copy = None;
+        assert!(rounds(&mut prepared, &mut copy), "the first base ends");
+        write(&db, &now, 10, 1);
+        prepared.ship().unwrap();
+        let generation = prepared.shipper.generation();
+        let listed = blobs.list("db/log/", None, 100, until()).unwrap().objects;
+        let (key, _) = listed.last().unwrap();
+        let sealed = blobs.get(key, until()).unwrap();
+        let mut segment: object::Segment =
+            postcard::from_bytes(object::opened(key, &sealed).unwrap()).unwrap();
+        let tail = segment.frames.len() - usize::try_from(FRAME_BYTES).unwrap();
+        segment.frames[tail..].fill(0);
+        blobs.delete(key, until()).unwrap();
+        blobs
+            .create(key, &object::encode(&segment).unwrap(), until())
+            .unwrap();
+        now.fetch_add(2 * SECOND_NS, Ordering::SeqCst);
+
+        let hooks = prepared.hooks();
+        let mut wake = None;
+        let shipping = prepared.start(|watcher| wake = Some(watcher)).unwrap();
+        let deadline = until();
+        while hooks.marks.state().unwrap().watch.is_none() {
+            assert!(Instant::now() < deadline, "no snapshot was taken");
+            std::thread::yield_now();
+        }
+        assert!(wake.as_ref().unwrap()(), "the thread runs");
+        let failed = |s: &Status| match &s.last_check {
+            Some(Check::Failed {
+                why: CheckFailure::Lacking { lacks, .. },
+                ..
+            }) => *lacks == Lacks::Frames { generation },
+            _ => false,
+        };
+        shipping
+            .wait(until(), |s| s.bases > 0 && failed(s))
+            .unwrap_or_else(|e| panic!("no base ended: {e:#}; {:?}", shipping.status()));
+        let bases = blobs.list("db/base/", None, 10, until()).unwrap().objects;
+        let (newest, _) = bases.last().unwrap();
+        let newest = plan::BaseKey::parse("db", newest).unwrap();
+        assert_eq!(newest.start_gen, generation + 1);
+        drop(wake);
+        shipping.wait(until(), |s| s.ended).unwrap();
     }
 
     /// The most bytes the files in a restore's folder held together, seen at each of its steps.
