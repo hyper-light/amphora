@@ -1,0 +1,176 @@
+# SQLite 3.54.0
+db	the example
+sql	CREATE TABLE t(k TEXT PRIMARY KEY, a INT)
+sql	CREATE TABLE u(k TEXT PRIMARY KEY, n INT UNIQUE)
+sql	INSERT INTO u VALUES ('a', 1), ('b', 2)
+sql	INSERT INTO t VALUES ('x', 1)
+sql	CREATE TRIGGER g AFTER UPDATE ON t BEGIN UPDATE u SET n = 2 WHERE k = 'a'; END
+q	INSERT OR IGNORE INTO t VALUES ('x', 5) ON CONFLICT(k) DO UPDATE SET a = excluded.a	ERROR UNIQUE constraint failed: u.n
+q	SELECT * FROM t	1:x,1
+q	SELECT * FROM u	2:a,1;b,2
+db	without rowid order
+sql	CREATE TABLE t(k TEXT PRIMARY KEY, c INT UNIQUE ON CONFLICT IGNORE) WITHOUT ROWID
+sql	INSERT INTO t VALUES ('a', 1), ('b', 2)
+q	INSERT INTO t VALUES ('a', 2)	0:
+q	SELECT * FROM t	2:a,1;b,2
+db	do nothing beside a unique on conflict ignore
+sql	CREATE TABLE t(k TEXT PRIMARY KEY, c INT UNIQUE ON CONFLICT IGNORE)
+sql	INSERT INTO t VALUES ('a', 1)
+q	INSERT INTO t VALUES ('b', 1) ON CONFLICT(k) DO NOTHING	0:
+q	SELECT * FROM t	1:a,1
+db	or rollback datatype mismatch
+sql	CREATE TABLE t(k INTEGER PRIMARY KEY)
+q	BEGIN	0:
+q	INSERT INTO t VALUES (1)	0:
+q	INSERT OR ROLLBACK INTO t VALUES ('x')	ERROR datatype mismatch
+q	COMMIT	0:
+q	SELECT * FROM t	1:1
+db	or fail datatype mismatch, rows
+sql	CREATE TABLE t(k INTEGER PRIMARY KEY)
+q	BEGIN	0:
+q	INSERT OR FAIL INTO t VALUES (2), ('x')	ERROR datatype mismatch
+q	SELECT * FROM t	0:
+q	INSERT OR IGNORE INTO t VALUES (2), ('x')	ERROR datatype mismatch
+q	SELECT * FROM t	0:
+q	INSERT OR ROLLBACK INTO t VALUES (2), ('x')	ERROR datatype mismatch
+q	SELECT * FROM t	0:
+q	INSERT INTO t VALUES (2), ('x')	ERROR datatype mismatch
+q	SELECT * FROM t	0:
+q	COMMIT	0:
+q	SELECT * FROM t	0:
+q	INSERT OR FAIL INTO t VALUES (2), ('x')	ERROR datatype mismatch
+q	SELECT * FROM t	0:
+db	update or fail datatype mismatch, rows
+sql	CREATE TABLE t(k INTEGER PRIMARY KEY, a)
+sql	INSERT INTO t VALUES (1, 11), (2, 'x')
+q	BEGIN	0:
+q	UPDATE OR FAIL t SET k = a	ERROR datatype mismatch
+q	SELECT * FROM t	2:1,11;2,x
+q	UPDATE OR IGNORE t SET k = a	ERROR datatype mismatch
+q	SELECT * FROM t	2:1,11;2,x
+q	UPDATE t SET k = a	ERROR datatype mismatch
+q	SELECT * FROM t	2:1,11;2,x
+q	COMMIT	0:
+q	SELECT * FROM t	2:1,11;2,x
+db	strict type under or fail, rows
+sql	CREATE TABLE t(a INT) STRICT
+q	BEGIN	0:
+q	INSERT OR FAIL INTO t VALUES (2), ('x')	ERROR cannot store TEXT value in INT column t.a
+q	SELECT * FROM t	1:2
+q	INSERT OR IGNORE INTO t VALUES (2), ('x')	ERROR cannot store TEXT value in INT column t.a
+q	SELECT * FROM t	2:2;2
+q	INSERT INTO t VALUES (2), ('x')	ERROR cannot store TEXT value in INT column t.a
+q	SELECT * FROM t	3:2;2;2
+q	INSERT OR ROLLBACK INTO t VALUES (2), ('x')	ERROR cannot store TEXT value in INT column t.a
+q	SELECT * FROM t	4:2;2;2;2
+q	COMMIT	0:
+q	SELECT * FROM t	4:2;2;2;2
+db	function error, rows
+sql	CREATE TABLE s(x)
+sql	INSERT INTO s VALUES (1), (2), (-9223372036854775807 - 1)
+sql	CREATE TABLE t(a)
+sql	CREATE TABLE tu(a UNIQUE)
+q	BEGIN	0:
+q	INSERT INTO t SELECT abs(x) FROM s	ERROR integer overflow
+q	SELECT * FROM t	0:
+q	INSERT OR FAIL INTO t SELECT abs(x) FROM s	ERROR integer overflow
+q	SELECT * FROM t	0:
+q	INSERT OR FAIL INTO tu SELECT abs(x) FROM s	ERROR integer overflow
+q	SELECT * FROM tu	0:
+q	INSERT OR IGNORE INTO tu SELECT abs(x) FROM s	ERROR integer overflow
+q	SELECT * FROM tu	0:
+q	INSERT OR ROLLBACK INTO tu SELECT abs(x) FROM s	ERROR integer overflow
+q	SELECT * FROM tu	0:
+q	COMMIT	0:
+q	SELECT * FROM t	0:
+q	UPDATE s SET x = abs(x)	ERROR integer overflow
+q	SELECT * FROM s	3:-9223372036854775808;1;2
+db	json error under or fail, rows
+sql	CREATE TABLE s(x)
+sql	INSERT INTO s VALUES ('[1]'), ('['), ('[2]')
+sql	CREATE TABLE tu(a UNIQUE)
+q	BEGIN	0:
+q	INSERT OR FAIL INTO tu SELECT json(x) FROM s	ERROR malformed JSON
+q	SELECT * FROM tu	0:
+q	INSERT OR ROLLBACK INTO tu SELECT json(x) FROM s	ERROR malformed JSON
+q	SELECT * FROM tu	0:
+q	COMMIT	0:
+q	SELECT * FROM tu	0:
+q	INSERT OR FAIL INTO tu SELECT json(x) FROM s	ERROR malformed JSON
+q	SELECT * FROM tu	0:
+db	not null fail and rollback
+sql	CREATE TABLE t(a INT NOT NULL ON CONFLICT FAIL, b INT NOT NULL ON CONFLICT ROLLBACK)
+q	INSERT INTO t VALUES (1, 1), (NULL, 2), (3, 3)	ERROR NOT NULL constraint failed: t.a
+q	SELECT * FROM t	1:1,1
+q	BEGIN	0:
+q	INSERT INTO t VALUES (7, 7)	0:
+q	INSERT INTO t VALUES (8, NULL)	ERROR NOT NULL constraint failed: t.b
+q	SELECT * FROM t	1:1,1
+q	COMMIT	ERROR cannot commit - no transaction is active
+q	UPDATE t SET a = NULL	ERROR NOT NULL constraint failed: t.a
+q	UPDATE t SET b = NULL	ERROR NOT NULL constraint failed: t.b
+q	SELECT * FROM t	1:1,1
+db	fk action: child's clause
+sql	PRAGMA foreign_keys = ON
+sql	CREATE TABLE p(k INTEGER PRIMARY KEY)
+sql	INSERT INTO p VALUES (1), (2), (9)
+sql	CREATE TABLE c(k INT DEFAULT 9 UNIQUE ON CONFLICT REPLACE REFERENCES p(k) ON DELETE SET DEFAULT, v)
+sql	INSERT INTO c VALUES (1, 'a'), (2, 'b')
+q	DELETE FROM p WHERE k = 1	0:
+q	SELECT * FROM c	2:2,b;9,a
+q	DELETE FROM p WHERE k = 2	ERROR UNIQUE constraint failed: c.k
+q	SELECT * FROM c	2:2,b;9,a
+q	SELECT * FROM p	2:2;9
+db	fk action: its trigger's clause
+sql	PRAGMA foreign_keys = ON
+sql	CREATE TABLE p(k INTEGER PRIMARY KEY)
+sql	INSERT INTO p VALUES (1)
+sql	CREATE TABLE c(k INT REFERENCES p(k) ON DELETE SET NULL, v)
+sql	INSERT INTO c VALUES (1, 'a')
+sql	CREATE TABLE u(n INT UNIQUE)
+sql	INSERT INTO u VALUES (5)
+sql	CREATE TRIGGER g AFTER UPDATE ON c BEGIN INSERT OR IGNORE INTO u VALUES (5); END
+q	DELETE FROM p WHERE k = 1	ERROR UNIQUE constraint failed: u.n
+q	SELECT * FROM c	1:1,a
+q	SELECT * FROM p	1:1
+q	SELECT * FROM u	1:5
+db	delete in a trigger: what it fires keeps its own
+sql	CREATE TABLE t(k INT PRIMARY KEY, a)
+sql	CREATE TABLE w(k INT)
+sql	INSERT INTO w VALUES (1)
+sql	CREATE TABLE u(n INT UNIQUE, m)
+sql	INSERT INTO u VALUES (5, 0)
+sql	CREATE TRIGGER g AFTER INSERT ON t BEGIN DELETE FROM w; END
+sql	CREATE TRIGGER h AFTER DELETE ON w BEGIN INSERT INTO u VALUES (5, 1); END
+q	INSERT OR IGNORE INTO t VALUES (1, 2)	ERROR UNIQUE constraint failed: u.n
+q	SELECT * FROM t	0:
+q	SELECT * FROM u	1:5,0
+q	SELECT * FROM w	1:1
+q	INSERT OR FAIL INTO t VALUES (1, 2)	ERROR UNIQUE constraint failed: u.n
+q	SELECT * FROM t	0:
+q	SELECT * FROM w	1:1
+db	recursive triggers pragma
+sql	CREATE TABLE t(k INTEGER PRIMARY KEY, n INT)
+sql	CREATE TABLE lg(x)
+sql	CREATE TRIGGER g AFTER INSERT ON t WHEN new.n < 4 BEGIN INSERT INTO t(n) VALUES (new.n + 1); END
+sql	CREATE TRIGGER d AFTER DELETE ON t BEGIN INSERT INTO lg VALUES (old.k); END
+q	PRAGMA recursive_triggers	1:0
+q	INSERT INTO t VALUES (1, 1)	0:
+q	SELECT * FROM t	2:1,1;2,2
+q	PRAGMA recursive_triggers = ON	0:
+q	PRAGMA recursive_triggers	1:1
+q	INSERT INTO t VALUES (100, 1)	0:
+q	SELECT * FROM t	6:1,1;100,1;101,2;102,3;103,4;2,2
+q	REPLACE INTO t VALUES (1, 9)	0:
+q	SELECT * FROM lg	1:1
+db	multi column words
+sql	CREATE TABLE t(k TEXT, a INT, PRIMARY KEY (k, a))
+sql	CREATE TABLE w(k TEXT, a INT, PRIMARY KEY (k, a)) WITHOUT ROWID
+sql	INSERT INTO t VALUES ('a', 1), ('b', 2)
+sql	INSERT INTO w VALUES ('a', 1), ('b', 2)
+q	INSERT INTO t VALUES ('a', 1)	ERROR UNIQUE constraint failed: t.k, t.a
+q	UPDATE t SET k = 'a', a = 1	ERROR UNIQUE constraint failed: t.k, t.a
+q	INSERT INTO t VALUES ('a', 1) ON CONFLICT(k, a) DO UPDATE SET k = 'b', a = 2	ERROR UNIQUE constraint failed: t.k, t.a
+q	INSERT INTO w VALUES ('a', 1)	ERROR UNIQUE constraint failed: w.k, w.a
+q	UPDATE w SET k = 'a', a = 1	ERROR UNIQUE constraint failed: w.k, w.a
+q	INSERT INTO w VALUES ('a', 1) ON CONFLICT(k, a) DO UPDATE SET k = 'b', a = 2	ERROR UNIQUE constraint failed: w.k, w.a
