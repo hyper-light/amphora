@@ -10,7 +10,7 @@ Ada, 11-24: "Examine our work on perf/hillclimb and benchmark on a studio or oth
 - **Regression:** table_count (COUNT(*)) is 0.35x at 1, 0.28x at 32, 0.21x at 128 clients of A, the only cells where every B round is below every A round, and 0.16 to 0.29x of Turso. The ablation names the default: with AMPHORA_READER_PAGES=2000 (2,000 private pages a reader, shared pages still on) B's table_count is 63,074 at 1 client (21,338 by default, A 61,642) and 911,773 at 32 (80,722 by default, A 265,119); with shared pages off 61,656 and 437,833. The reader cache sized from the L1 data cache (a floor of 200 pages against A's 2,000; commit aee3dae8) is what costs it: one switch, one pass each. With that default at 2,000, table_count at 32 clients would be 3.4x A and 2.3x Turso. (A with its own shared pages and Slots on answered 56 table_counts a second at 1 client, one pass: a fault of A's opt-in combination, not of B.)
 - **Against the best competitor (same durability):** B reaches 10x it in 30 of 51 cells (A in 14), and is behind it (every round) in 5; at 1 client the read ratios are 0.29 to 4.67. The 10x cells are the 32- and 128-client rows, where SQLite's and Turso's own CPU time is mostly the kernel's on macOS (below), which Linux doesn't show (lane S7): not a Linux number.
 - **Memory.** A whole pass, peak resident set (median MiB): A 2,149, B 416, Bd 641, C 2,172, S 400, T 1,245, Sf 90, Tf 192. B is below A over a pass and at 128, 512 and 1,024 clients (278, 321 and 350 MiB against 1,543, 1,767 and 3,054 for A), and ABOVE it at 1 client: 186 MiB against 88 (`many.jsonl`), a finding. At 512 and 1,024 clients A nearly stops: point_pk 20,769 and 127 ops/s against 2,105,561 and 1,575,234 for B (one pass).
-- **Correctness:** see `answers.txt` (every read answer against SQLite's of the same round) and TABLES.md 5 (errors and retries).
+- **Correctness:** 0 of the read answers differ from SQLite: 1,026 answers a pass for A, B, Bd, C and Turso in every round, 0 errors and 0 retries in every cell, no failed pass (`answers.txt`, TABLES.md 5). Round 4 and 5 compare with round 1's SQLite answers (no SQLite pass in them); the answers are functions of the row ids and the clients, the same in every pass. Write statements' final states were not compared.
 
 ## Losses first
 
@@ -211,6 +211,19 @@ On macOS `fsync()` leaves the drive's own cache unflushed; `fcntl(F_FULLFSYNC)` 
 - Reads at 32 and 128 clients: SQLite's and Turso's process time is system time (S: 4,084 s of system and 74 s of user CPU in a 201 s pass; T: 1,888 s and 1,645 s; `cpu_sys_s` in `round*.jsonl`), as A's is (1,072 s and 288 s); B's is user time (899 s user, 20 s system). That is a measured fact about CPU time, not a cause. It also means the gap to SQLite and Turso at 32 and 128 clients is macOS's: on Linux lane S7 (adacachy2) had Turso at 1,032,340 point reads a second with 32 clients, where here it has about 156,000. Don't carry these ratios to Linux.
 - Latency resolution: the harness records in whole microseconds (log-linear buckets within 1/64), so a p50 under about 5 us moves in steps; read those rows by ops/s.
 - A statement that takes longer than the 1 s window at 128 clients answers none in it (0 ops/s, no latency). That is a property of the window, not an error: it is marked `inf` where the other arm answered.
+
+## Conditions
+
+- Load, CPU idle, memory and the other processes' CPU at each round's start and end are in TABLES.md section 8, every pass's in section 7, and every 5 s in `phases.log`. Thermal state: no warning recorded at any round's start or end. Memory: 93% free, pressure level 1 (normal) throughout. Between rounds the machine was 95 to 98% idle.
+- Other people's load: six samples over 200% of a core, all within round 2's SQLite pass (16:58:22Z to 16:59:03Z, another user's `rustc`, up to 8 of 32 cores for about 40 s: the end of that pass, its write statements). Round 2's SQLite write cells are noisy for that reason and are marked so here; its median is over three rounds. Round 2's Turso pass and round 3's SQLite pass had one other core busy (`rustc`, 1 to 1.8 cores). No other pass had another process over 2 cores. The bench ran at nice 20 (kiln's), the same for every arm.
+- Run time of a pass (s, median): A 95, B 82, Bd 98, C 96, SQLite 201, Turso 149, Sf 58, Tf 62. The analytics statements of A, C, SQLite and Turso at 128 clients overrun the 1 s window, which is most of that.
+
+## Not done
+
+- Extra scenarios (b) a cold open and first query and (c) a transaction larger than the writer cache; (a) ran in part (`many.jsonl`: each statement on its own, not mixed).
+- 5 rounds for every arm: SQLite and Turso 3 (their passes take 149 and 201 s here), main 2, Bd, Sf and Tf 1. The ablation, the many-connections run and the profiles are single passes.
+- Linux was not run; the competitor gap at 32 and 128 clients is macOS's (see above).
+- No fix was made and no switch of B's was changed.
 
 ## Files
 
