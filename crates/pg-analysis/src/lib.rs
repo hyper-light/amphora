@@ -24,11 +24,13 @@ pub mod lower;
 pub mod resolve;
 pub mod stmt;
 pub mod tz;
+pub mod utility;
 
 pub use expr::{Expr, ExprId, ExprKind, Exprs, Form};
 pub use func::{Value, call, eval, input, output};
 pub use lower::{Field, Lowered, lower};
 pub use stmt::{Query, Target, analyze};
+pub use utility::{Utility, utility};
 
 use amphora_pg_catalog::{SearchPath, data::type_oid, type_by_oid};
 
@@ -55,6 +57,7 @@ pub mod sqlstate {
     pub const CANNOT_COERCE: &str = "42846";
     pub const UNDEFINED_FUNCTION: &str = "42883";
     pub const UNDEFINED_TABLE: &str = "42P01";
+    pub const DUPLICATE_TABLE: &str = "42P07";
     pub const UNDEFINED_PARAMETER: &str = "42P02";
     pub const AMBIGUOUS_PARAMETER: &str = "42P08";
     pub const INDETERMINATE_DATATYPE: &str = "42P18";
@@ -119,6 +122,7 @@ pub struct Column {
     pub name: String,
     pub type_oid: u32,
     pub typmod: i32,
+    pub not_null: bool,
 }
 
 /// What analysis asks of the schema.

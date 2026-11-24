@@ -1,0 +1,745 @@
+{
+  "duplicates": 0,
+  "findings": {
+    "diff-04a580d9f3e79dc0": {
+      "at_seconds": 1465.413541924,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-0b50307a52731bf5": {
+      "at_seconds": 238.687467543,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-0f8cbb6ea7b18ad4": {
+      "at_seconds": 885.295594141,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-25b1ad7fb5d7a0d2": {
+      "at_seconds": 1458.270610844,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-27095caabb6110f6": {
+      "at_seconds": 781.63106489,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-2dc7de853bd1f622": {
+      "at_seconds": 1346.480060904,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-2ed9660852b7d7b8": {
+      "at_seconds": 517.641604556,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-387d1e742750945d": {
+      "at_seconds": 863.643570849,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-3d568a34ec020e1a": {
+      "at_seconds": 475.068050508,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-424cdb8db1eddd7c": {
+      "at_seconds": 311.199208745,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-478be18598c59c6c": {
+      "at_seconds": 1010.670702644,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-4b95815bd569f30d": {
+      "at_seconds": 343.671071091,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-4c73ddd13a0cb278": {
+      "at_seconds": 1143.093210117,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-4ce946f0c3ee5228": {
+      "at_seconds": 101.157636065,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-4fab2d80233bb9f1": {
+      "at_seconds": 572.118608615,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-531b806bb00e52ef": {
+      "at_seconds": 1155.61131961,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-566f5c083f1a15b0": {
+      "at_seconds": 517.329727259,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    },
+    "diff-571279bd5f7600fb": {
+      "at_seconds": 922.824961752,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-580812a4b76e5488": {
+      "at_seconds": 1503.623094525,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-598fd752481456eb": {
+      "at_seconds": 1224.887739255,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-59c378f29d28c25e": {
+      "at_seconds": 870.933293533,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-5a7812eb13e13348": {
+      "at_seconds": 583.124499504,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-5e12d7d409b0c856": {
+      "at_seconds": 1176.243235361,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-61e4245c56f5bc06": {
+      "at_seconds": 1406.871431547,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-62af14d23c15170f": {
+      "at_seconds": 1473.900161167,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-662f86cef0b12673": {
+      "at_seconds": 781.152776667,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-680826e28369770d": {
+      "at_seconds": 1004.990857685,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    },
+    "diff-6a752c0cf26504d6": {
+      "at_seconds": 1239.171569674,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-6b0391ba3847a41f": {
+      "at_seconds": 1116.596501828,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-70f62220d866d259": {
+      "at_seconds": 464.99851663,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-716f7d68d2367409": {
+      "at_seconds": 1282.25892163,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    },
+    "diff-7739dac176403a5c": {
+      "at_seconds": 125.985213813,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    },
+    "diff-775f55fc211ee1fb": {
+      "at_seconds": 1120.24924428,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-7bd84ca54c641ccb": {
+      "at_seconds": 1252.220059793,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-7eee75b2ee284e5f": {
+      "at_seconds": 62.155555353,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-838b79234e3d3aab": {
+      "at_seconds": 1109.031942018,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-86ce44968be6f00c": {
+      "at_seconds": 859.126691219,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-89ae1dcc1133e91c": {
+      "at_seconds": 1118.014656728,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-8bc49a037f7c0536": {
+      "at_seconds": 203.837432968,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    },
+    "diff-905a9d532d37eb95": {
+      "at_seconds": 442.244504717,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-9227d3398273d407": {
+      "at_seconds": 224.186235123,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-92968e1026d1b282": {
+      "at_seconds": 1418.281623339,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-97b5e8e020ed3799": {
+      "at_seconds": 254.947404668,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-9a58347affd5aa36": {
+      "at_seconds": 328.714234388,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-9b4e500340601274": {
+      "at_seconds": 1338.804631674,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-9bd45c0b17aa6a52": {
+      "at_seconds": 444.859508504,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-9ff8745bd0e368c8": {
+      "at_seconds": 408.180652274,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-a2213a7bbc77ce2d": {
+      "at_seconds": 679.818252716,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    },
+    "diff-a2a9decccb63b84d": {
+      "at_seconds": 376.03858041,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-a31a27b8c5ed7016": {
+      "at_seconds": 48.613270086,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-a3b961f4ce48834b": {
+      "at_seconds": 412.456477655,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-a3ef4e7b22051e1d": {
+      "at_seconds": 1055.687212892,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-a54aec583460b31e": {
+      "at_seconds": 778.61624275,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-a91cc9535a8a24ae": {
+      "at_seconds": 1437.665523519,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-adbd8e024d5732b4": {
+      "at_seconds": 918.575542465,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-b064f1038d908e40": {
+      "at_seconds": 851.503967994,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-b0eebbff808b6ba5": {
+      "at_seconds": 1029.82779881,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-ba9583ade1c5524b": {
+      "at_seconds": 1021.438451018,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-bce8f58ccc772d95": {
+      "at_seconds": 205.905563019,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-bf3bd641ac7ed99f": {
+      "at_seconds": 1134.234407588,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-c21498baaa94fe38": {
+      "at_seconds": 613.383537195,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    },
+    "diff-c429be099e8ea28a": {
+      "at_seconds": 209.9127328,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-c6278a86dcf9cb8c": {
+      "at_seconds": 350.682939072,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-c6ed71cb12af4335": {
+      "at_seconds": 824.287133179,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-c92b381352339c0f": {
+      "at_seconds": 981.919416169,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-cfe5abad27002f44": {
+      "at_seconds": 621.471680583,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-d197d8a414bce862": {
+      "at_seconds": 1463.180185125,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-d25f07570cb46f8f": {
+      "at_seconds": 367.776334333,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-d5e40cfac2a1c822": {
+      "at_seconds": 395.596040376,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-d95a5380cefa601a": {
+      "at_seconds": 141.825286084,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-dd206172cd77f31d": {
+      "at_seconds": 392.834405825,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-e5b432001fd51187": {
+      "at_seconds": 1020.126515085,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-eb2d552ee3920fe8": {
+      "at_seconds": 1474.319869972,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-fd4de8d358c6a96b": {
+      "at_seconds": 745.66446274,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "norec-d683f574f319ea5f": {
+      "at_seconds": 177.946756339,
+      "detail": "indexbtree_seek_unpacked: index_info required",
+      "kind": "Panic",
+      "oracle": "norec",
+      "statements": 5
+    },
+    "pqs-e29579156e091cd0": {
+      "at_seconds": 1105.370673088,
+      "detail": "the pivot (rowid 12), whose predicate SQLite rectified to TRUE, is missing",
+      "kind": "Wrong",
+      "oracle": "pqs",
+      "statements": 9
+    }
+  },
+  "functions": 101,
+  "label": "main-3501c68a",
+  "oracles": {
+    "diff": {
+      "checks": 450574,
+      "failed": 74,
+      "passed": 368325,
+      "plans_changed": 0,
+      "refused": {
+        "ESCAPE expression must be a single character": 14,
+        "FLAGS parameter to json_valid() must be between # and ##": 17,
+        "JSON cannot hold BLOB values": 52,
+        "JSON path error near: \"#\"": 21,
+        "JSON path error near: \"##\"": 2,
+        "JSON path error near: \"###\"": 4,
+        "JSON path error near: \"####\"": 2,
+        "JSON path error near: \"################\"": 2,
+        "JSON path error near: \"###################\"": 7,
+        "JSON path error near: \"################.#\"": 2,
+        "JSON path error near: \"####.#\"": 1,
+        "JSON path error near: \"##.#\"": 1,
+        "JSON path error near: \"#.#\"": 17,
+        "JSON path error near: \"#.#e+###\"": 3,
+        "JSON path error near: \"-#\"": 2,
+        "JSON path error near: \"-###\"": 3,
+        "JSON path error near: \"-###################\"": 4,
+        "JSON path error near: \"-###.#\"": 3,
+        "JSON path error near: \"-#.#\"": 4,
+        "JSON path error near: \"-#.################e+##\"": 1,
+        "JSON path error near: \"-#.#e-###\"": 3,
+        "Parse error: Unexpected character": 51,
+        "Parse error: Unexpected end of input": 17,
+        "Parse error: bad JSON path: '\u0001\u0002'": 2,
+        "Parse error: bad JSON path: ' '": 3,
+        "Parse error: bad JSON path: ' a'": 1,
+        "Parse error: bad JSON path: '################'": 1,
+        "Parse error: bad JSON path: '################.#'": 1,
+        "Parse error: bad JSON path: '##'": 2,
+        "Parse error: bad JSON path: '#'": 4,
+        "Parse error: bad JSON path: '#.#'": 5,
+        "Parse error: bad JSON path: '#.#e+###'": 1,
+        "Parse error: bad JSON path: '#x##'": 2,
+        "Parse error: bad JSON path: '%'": 3,
+        "Parse error: bad JSON path: ''": 6,
+        "Parse error: bad JSON path: '-###'": 1,
+        "Parse error: bad JSON path: '-#'": 5,
+        "Parse error: bad JSON path: 'A'": 2,
+        "Parse error: bad JSON path: 'ABC'": 2,
+        "Parse error: bad JSON path: '_'": 1,
+        "Parse error: bad JSON path: 'a '": 4,
+        "Parse error: bad JSON path: 'a'": 1,
+        "Parse error: bad JSON path: 'abc'": 4,
+        "Parse error: bad JSON path: 'true'": 4,
+        "Parse error: bad JSON path: 'x'": 3,
+        "Parse error: bad JSON path: 'é'": 2,
+        "Parse error: bad JSON path: 'ÿ'": 2,
+        "Parse error: malformed JSON": 210,
+        "integer overflow": 3,
+        "json_array_insert() needs an odd number of arguments": 23,
+        "json_insert() needs an odd number of arguments": 31,
+        "json_object() labels must be TEXT": 20,
+        "json_object() requires an even number of arguments": 52,
+        "json_replace() needs an odd number of arguments": 28,
+        "json_set() needs an odd number of arguments": 33,
+        "string or blob too big": 25
+      },
+      "skipped": {
+        "SQLite's answer holds ill-formed UTF-8 (garbage in, garbage out)": 21,
+        "a LIMIT no longer keeps certain rows": 5477,
+        "a bare column: its row is any of its group's": 41011,
+        "sqlite refused": 34946
+      }
+    },
+    "dqp": {
+      "checks": 450574,
+      "failed": 0,
+      "passed": 344769,
+      "plans_changed": 118527,
+      "refused": {},
+      "skipped": {
+        "a LIMIT no longer keeps certain rows": 5402,
+        "a bare column: its row is any of its group's": 41020,
+        "a derived query meets a value's error (evaluation order)": 585,
+        "amphora refused the base": 33668,
+        "the index can't serve the query": 25130
+      }
+    },
+    "eet": {
+      "checks": 450574,
+      "failed": 0,
+      "passed": 363593,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "a LIMIT no longer keeps certain rows": 5393,
+        "a bare column: its row is any of its group's": 47683,
+        "a derived query errors on SQLite too": 351,
+        "a derived query meets a value's error (evaluation order)": 502,
+        "amphora refused the base": 33052
+      }
+    },
+    "norec": {
+      "checks": 450574,
+      "failed": 1,
+      "passed": 414792,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "a derived query meets a value's error (evaluation order)": 4528,
+        "amphora refused both": 31253
+      }
+    },
+    "pqs": {
+      "checks": 407938,
+      "failed": 1,
+      "passed": 377553,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "a derived query meets a value's error (evaluation order)": 10,
+        "sqlite can't evaluate it": 23023,
+        "sqlite misses its own pivot": 7351
+      }
+    },
+    "same": {
+      "checks": 67587,
+      "failed": 0,
+      "passed": 67587,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {}
+    },
+    "tlp": {
+      "checks": 450573,
+      "failed": 0,
+      "passed": 387795,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "a REAL sum's partitions round apart from it": 4013,
+        "a derived query meets a value's error (evaluation order)": 13647,
+        "a partition's sum overflows": 22,
+        "amphora refused the base": 45096
+      }
+    }
+  },
+  "seconds": 1503.624794952,
+  "seed": 1012,
+  "setup_refused": {},
+  "sqlite": "3.54.0",
+  "sqlite_options": [
+    "ATOMIC_INTRINSICS=1",
+    "COMPILER=gcc-16.2.1 20260810",
+    "DEFAULT_AUTOVACUUM",
+    "DEFAULT_CACHE_SIZE=-2000",
+    "DEFAULT_FILE_FORMAT=4",
+    "DEFAULT_JOURNAL_SIZE_LIMIT=-1",
+    "DEFAULT_MMAP_SIZE=0",
+    "DEFAULT_PAGE_SIZE=4096",
+    "DEFAULT_PCACHE_INITSZ=20",
+    "DEFAULT_RECURSIVE_TRIGGERS",
+    "DEFAULT_SECTOR_SIZE=4096",
+    "DEFAULT_SYNCHRONOUS=2",
+    "DEFAULT_WAL_AUTOCHECKPOINT=1000",
+    "DEFAULT_WAL_SYNCHRONOUS=2",
+    "DEFAULT_WORKER_THREADS=0",
+    "DIRECT_OVERFLOW_READ",
+    "ENABLE_COLUMN_METADATA",
+    "ENABLE_DBSTAT_VTAB",
+    "ENABLE_FTS3",
+    "ENABLE_FTS3_PARENTHESIS",
+    "ENABLE_FTS4",
+    "ENABLE_FTS5",
+    "ENABLE_MATH_FUNCTIONS",
+    "ENABLE_PERCENTILE",
+    "ENABLE_PREUPDATE_HOOK",
+    "ENABLE_RTREE",
+    "ENABLE_SESSION",
+    "ENABLE_STAT4",
+    "ENABLE_STMTVTAB",
+    "ENABLE_UNLOCK_NOTIFY",
+    "HAVE_ISNAN",
+    "LIKE_DOESNT_MATCH_BLOBS",
+    "MALLOC_SOFT_LIMIT=1024",
+    "MAX_ATTACHED=10",
+    "MAX_COLUMN=2000",
+    "MAX_COMPOUND_SELECT=500",
+    "MAX_DEFAULT_PAGE_SIZE=8192",
+    "MAX_EXPR_DEPTH=10000",
+    "MAX_FUNCTION_ARG=1000",
+    "MAX_LENGTH=1000000000",
+    "MAX_LIKE_PATTERN_LENGTH=50000",
+    "MAX_MMAP_SIZE=0x7fff0000",
+    "MAX_PAGE_COUNT=0xfffffffe",
+    "MAX_PAGE_SIZE=65536",
+    "MAX_SCHEMA=10000000",
+    "MAX_SQL_LENGTH=1000000000",
+    "MAX_TRIGGER_DEPTH=1000",
+    "MAX_VARIABLE_NUMBER=250000",
+    "MAX_VDBE_OP=250000000",
+    "MAX_WORKER_THREADS=8",
+    "MUTEX_PTHREADS",
+    "SECURE_DELETE",
+    "SYSTEM_MALLOC",
+    "TEMP_STORE=1",
+    "THREADSAFE=1"
+  ],
+  "states": 67587
+}

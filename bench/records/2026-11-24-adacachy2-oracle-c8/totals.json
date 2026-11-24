@@ -1,0 +1,176 @@
+{
+ "diff": {
+  "checks": 1338470,
+  "passed": 1094766,
+  "failed": 202,
+  "plans_changed": 0,
+  "skipped": {
+   "SQLite's answer holds ill-formed UTF-8 (garbage in, garbage out)": 65,
+   "a LIMIT no longer keeps certain rows": 16056,
+   "a bare column: its row is any of its group's": 122225,
+   "sqlite refused": 103036
+  },
+  "refused": {
+   "ESCAPE expression must be a single character": 35,
+   "FLAGS parameter to json_valid() must be between # and ##": 48,
+   "JSON cannot hold BLOB values": 139,
+   "JSON path error near: \"#\"": 70,
+   "JSON path error near: \"##\"": 6,
+   "JSON path error near: \"###\"": 19,
+   "JSON path error near: \"####\"": 3,
+   "JSON path error near: \"################\"": 7,
+   "JSON path error near: \"################.#\"": 10,
+   "JSON path error near: \"#.#\"": 57,
+   "JSON path error near: \"#.#e+###\"": 6,
+   "JSON path error near: \"-#\"": 14,
+   "JSON path error near: \"-##\"": 1,
+   "JSON path error near: \"-###\"": 7,
+   "JSON path error near: \"-###################\"": 11,
+   "JSON path error near: \"-#.#\"": 10,
+   "JSON path error near: \"-#.#e-###\"": 8,
+   "Parse error: Unexpected character": 169,
+   "Parse error: Unexpected end of input": 60,
+   "Parse error: bad JSON path: '###################'": 1,
+   "Parse error: bad JSON path: '################'": 2,
+   "Parse error: bad JSON path: '##'": 7,
+   "Parse error: bad JSON path: '#'": 13,
+   "Parse error: bad JSON path: '#.#'": 15,
+   "Parse error: bad JSON path: '#e#'": 6,
+   "Parse error: bad JSON path: '#x##'": 6,
+   "Parse error: bad JSON path: '%'": 11,
+   "Parse error: bad JSON path: ''": 34,
+   "Parse error: bad JSON path: '-#'": 11,
+   "Parse error: bad JSON path: 'A'": 12,
+   "Parse error: bad JSON path: 'ABC'": 4,
+   "Parse error: bad JSON path: '_'": 9,
+   "Parse error: bad JSON path: 'a '": 10,
+   "Parse error: bad JSON path: 'a'": 4,
+   "Parse error: bad JSON path: 'abc'": 9,
+   "Parse error: bad JSON path: 'x'": 9,
+   "Parse error: bad JSON path: '\u00ff'": 6,
+   "Parse error: malformed JSON": 598,
+   "integer overflow": 11,
+   "json_array_insert() needs an odd number of arguments": 70,
+   "json_insert() needs an odd number of arguments": 84,
+   "json_object() labels must be TEXT": 63,
+   "json_object() requires an even number of arguments": 150,
+   "json_replace() needs an odd number of arguments": 89,
+   "json_set() needs an odd number of arguments": 88,
+   "string or blob too big": 47,
+   "JSON path error near: \"###################\"": 11,
+   "JSON path error near: \"-###.#\"": 5,
+   "Parse error: bad JSON path: '\u0001\u0002'": 6,
+   "Parse error: bad JSON path: ' '": 6,
+   "Parse error: bad JSON path: '###'": 3,
+   "Parse error: bad JSON path: '#.#e+###'": 2,
+   "Parse error: bad JSON path: 'true'": 11,
+   "Parse error: bad JSON path: '\u00e9'": 10,
+   "Parse error: bad JSON path: '################.#'": 2,
+   "Parse error: bad JSON path: '-###'": 2,
+   "Parse error: bad JSON path: '-#.#e-###'": 1,
+   "Parse error: bad JSON path: '{\"a\":#,\"b\":[#,#]}'": 1,
+   "JSON path error near: \"###.#\"": 1,
+   "JSON path error near: \"#.###################\"": 1,
+   "JSON path error near: \"#.################e+##\"": 2,
+   "Parse error: bad JSON path: ' a'": 2,
+   "Parse error: bad JSON path: '##:##:##'": 1,
+   "Parse error: bad JSON path: '-###################'": 1,
+   "JSON path error near: \"####.#\"": 1,
+   "JSON path error near: \"##.#\"": 1,
+   "JSON path error near: \"-#.################e+##\"": 1
+  }
+ },
+ "dqp": {
+  "checks": 1849855,
+  "passed": 1416562,
+  "failed": 1,
+  "plans_changed": 488915,
+  "skipped": {
+   "a LIMIT no longer keeps certain rows": 22277,
+   "a bare column: its row is any of its group's": 167890,
+   "a derived query meets a value's error (evaluation order)": 2515,
+   "amphora refused the base": 138185,
+   "the index can't serve the query": 102423,
+   "the relation fails on SQLite too": 2
+  },
+  "refused": {}
+ },
+ "eet": {
+  "checks": 1849855,
+  "passed": 1493748,
+  "failed": 0,
+  "plans_changed": 0,
+  "skipped": {
+   "a LIMIT no longer keeps certain rows": 22175,
+   "a bare column: its row is any of its group's": 194611,
+   "a derived query errors on SQLite too": 1416,
+   "a derived query meets a value's error (evaluation order)": 2058,
+   "amphora refused the base": 135846,
+   "the relation fails on SQLite too": 1
+  },
+  "refused": {}
+ },
+ "norec": {
+  "checks": 1849853,
+  "passed": 1704133,
+  "failed": 4,
+  "plans_changed": 0,
+  "skipped": {
+   "a derived query meets a value's error (evaluation order)": 18486,
+   "amphora refused both": 127230
+  },
+  "refused": {}
+ },
+ "pqs": {
+  "checks": 1674635,
+  "passed": 1550664,
+  "failed": 3,
+  "plans_changed": 0,
+  "skipped": {
+   "a derived query meets a value's error (evaluation order)": 39,
+   "sqlite can't evaluate it": 93814,
+   "sqlite misses its own pivot": 30115
+  },
+  "refused": {}
+ },
+ "same": {
+  "checks": 268876,
+  "passed": 268876,
+  "failed": 0,
+  "plans_changed": 0,
+  "skipped": {},
+  "refused": {}
+ },
+ "tlp": {
+  "checks": 1849853,
+  "passed": 1592576,
+  "failed": 2,
+  "plans_changed": 0,
+  "skipped": {
+   "a REAL sum's partitions round apart from it": 16848,
+   "a derived query meets a value's error (evaluation order)": 56170,
+   "a partition's sum overflows": 66,
+   "amphora refused the base": 184189,
+   "the relation fails on SQLite too": 2
+  },
+  "refused": {}
+ },
+ "cert": {
+  "checks": 83521,
+  "passed": 83420,
+  "failed": 94,
+  "plans_changed": 0,
+  "skipped": {
+   "sqlite refused": 7
+  },
+  "refused": {}
+ },
+ "order": {
+  "checks": 83521,
+  "passed": 83457,
+  "failed": 64,
+  "plans_changed": 0,
+  "skipped": {},
+  "refused": {}
+ }
+}

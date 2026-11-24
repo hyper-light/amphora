@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """What a real PostgreSQL 19 server answers pgbench's TPC-B statements, message by message (docs/design/postgres.md,
-section 11, unit 9; T-PG.9.1). Reads crates/amphora/tests/tpcb/statements.txt (`session|sql`, `$$..$$` is a
-quoted literal as PostgreSQL writes it), runs each line on its session over the wire protocol in order, and writes
-every backend message it answered: `@ session sql`, then `<type> <hex body>` a line. The DDL that makes the tables is
-pgbench's own (pgbench.c, createTables), here. usage: postgres-tpcb-answers.py <host> <port> <statements> > answers.txt
+section 11, unit 9; T-PG.9.1, T-PG.9.3). Reads a list of statements (crates/amphora/tests/tpcb/statements.txt or
+listener.txt: `session|sql`, `$$..$$` is a quoted literal as PostgreSQL writes it), runs each line on its session over
+the wire protocol in order, in a database made for the run, and writes every backend message it answered:
+`@ session sql`, then `<type> <hex body>` a line. A list that makes no table is given pgbench's own (pgbench.c,
+createTables). usage: postgres-tpcb-answers.py <host> <port> <statements> > answers.txt
 """
 import socket
 import struct
@@ -21,9 +22,9 @@ DDL = [
 
 
 class Client:
-    def __init__(self, host, port):
+    def __init__(self, host, port, database):
         self.sock = socket.create_connection((host, port))
-        body = struct.pack("!i", 196608) + b"user\0postgres\0database\0postgres\0\0"
+        body = struct.pack("!i", 196608) + b"user\0postgres\0database\0%s\0\0" % database.encode()
         self.sock.sendall(struct.pack("!i", len(body) + 4) + body)
         while True:
             kind, body = self.read()
@@ -57,12 +58,18 @@ class Client:
                 return messages
 
 
+DATABASE = "tpcb_answers"
 host, port, path = sys.argv[1], int(sys.argv[2]), sys.argv[3]
-sessions = {"s1": Client(host, port), "s2": Client(host, port)}
-setup = Client(host, port)
-for statement in DDL:
-    setup.query(statement)
-for line in open(path, encoding="utf-8").read().splitlines():
+lines = open(path, encoding="utf-8").read().splitlines()
+admin = Client(host, port, "postgres")
+admin.query("drop database if exists %s" % DATABASE)
+admin.query("create database %s" % DATABASE)
+setup = Client(host, port, DATABASE)
+if not any("create table" in line for line in lines):
+    for statement in DDL:
+        setup.query(statement)
+sessions = {"s1": Client(host, port, DATABASE), "s2": Client(host, port, DATABASE)}
+for line in lines:
     session, sql = line.split("|", 1)
     print("@ %s %s" % (session, sql))
     for kind, body in sessions[session].query(sql):

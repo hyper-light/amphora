@@ -2,7 +2,8 @@
 //! by a protocol client written here: SCRAM-SHA-256 against a verifier given in PostgreSQL's stored
 //! form, a statement refused `0A000`, a session past `max_connections` or the memory budget refused
 //! `53300` after its startup packet, a frame past the budget refused `53200`, and an invalid
-//! startup length closed with nothing sent.
+//! startup length closed with nothing sent; and pgbench's and psql's statements on two sessions,
+//! answered as a PostgreSQL 19 server answered them.
 
 #![cfg_attr(
     test,
@@ -16,11 +17,15 @@
     )
 )]
 
+mod tpcb;
+
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::rc::Rc;
 
 use amphora::memory::{Budget, Reading, Readings};
+use amphora::postgres::execute::Database;
 use amphora::postgres::listener::{Listener, StoredRoles};
 use amphora::postgres::scram;
 use hmac::{Hmac, Mac};
@@ -97,9 +102,16 @@ fn stored_roles() -> StoredRoles {
     StoredRoles::parse(&line).unwrap()
 }
 
-fn listener(limit: u64, max_connections: usize) -> Listener {
+/// A listener on a database of `dir`'s, its sessions' room `limit` bytes.
+fn listener(dir: &tempfile::TempDir, limit: u64, max_connections: usize) -> Listener {
+    let path = dir.path().join("postgres.db");
     Listener::new(
         stored_roles(),
+        Database::open(
+            path.to_str().unwrap(),
+            amphora_engine::storage::versioned::memory::machine(),
+        )
+        .unwrap(),
         Budget::new(Box::new(Limit(limit))),
         max_connections,
     )
@@ -178,6 +190,22 @@ impl Client {
                 return None;
             }
             self.held.extend_from_slice(&chunk[..n]);
+        }
+    }
+
+    /// A Query's answer, through its ReadyForQuery.
+    async fn query(&mut self, sql: &str) -> Vec<(u8, Vec<u8>)> {
+        let mut body = sql.as_bytes().to_vec();
+        body.push(0);
+        self.send(&frontend(b'Q', &body)).await;
+        let mut answer = Vec::new();
+        loop {
+            let message = self.recv().await.unwrap();
+            let ended = message.0 == b'Z';
+            answer.push(message);
+            if ended {
+                return answer;
+            }
         }
     }
 
@@ -274,10 +302,14 @@ fn fields(body: &[u8]) -> Vec<(u8, String)> {
 
 #[test]
 fn t_pg_2_1_a_client_logs_in_with_scram_over_a_socket_and_a_statement_is_refused_0a000() {
-    run(listener(u64::MAX, 4), |addr| async move {
+    let dir = tempfile::tempdir().unwrap();
+    run(listener(&dir, u64::MAX, 4), |addr| async move {
         let mut client = Client::connect(addr).await;
         client.log_in().await;
-        client.send(&frontend(b'Q', b"SELECT 1\0")).await;
+        // A set operation's rules aren't ported (section 3), so 19 takes it and the parser refuses it.
+        client
+            .send(&frontend(b'Q', b"SELECT 1 UNION SELECT 2\0"))
+            .await;
         let (tag, body) = client.recv().await.unwrap();
         assert_eq!(tag, b'E');
         assert!(
@@ -293,7 +325,8 @@ fn t_pg_2_1_a_client_logs_in_with_scram_over_a_socket_and_a_statement_is_refused
 
 #[test]
 fn t_pg_2_2_a_session_past_max_connections_is_refused_53300_after_its_startup_packet() {
-    run(listener(u64::MAX, 1), |addr| async move {
+    let dir = tempfile::tempdir().unwrap();
+    run(listener(&dir, u64::MAX, 1), |addr| async move {
         let mut first = Client::connect(addr).await;
         first.log_in().await;
         let mut second = Client::connect(addr).await;
@@ -308,7 +341,7 @@ fn t_pg_2_2_a_session_past_max_connections_is_refused_53300_after_its_startup_pa
         first.send(&frontend(b'Q', b"SELECT 1\0")).await;
         assert_eq!(
             first.recv().await.unwrap().0,
-            b'E',
+            b'T',
             "the live session still answers"
         );
     });
@@ -316,7 +349,8 @@ fn t_pg_2_2_a_session_past_max_connections_is_refused_53300_after_its_startup_pa
 
 #[test]
 fn t_pg_2_2_a_session_the_memory_budget_has_no_room_for_is_refused_53300() {
-    run(listener(0, 4), |addr| async move {
+    let dir = tempfile::tempdir().unwrap();
+    run(listener(&dir, 0, 4), |addr| async move {
         let mut client = Client::connect(addr).await;
         client.send(&startup_packet()).await;
         let (tag, body) = client.recv().await.unwrap();
@@ -328,7 +362,8 @@ fn t_pg_2_2_a_session_the_memory_budget_has_no_room_for_is_refused_53300() {
 
 #[test]
 fn t_pg_2_3_a_frame_past_the_memory_budget_is_refused_53200_before_it_is_held() {
-    run(listener(1 << 16, 4), |addr| async move {
+    let dir = tempfile::tempdir().unwrap();
+    run(listener(&dir, 1 << 16, 4), |addr| async move {
         let mut client = Client::connect(addr).await;
         client.log_in().await;
         // Only the header goes out: the refusal comes from its length alone.
@@ -346,7 +381,8 @@ fn t_pg_2_3_a_frame_past_the_memory_budget_is_refused_53200_before_it_is_held() 
 
 #[test]
 fn t_pg_2_4_an_invalid_startup_length_closes_with_nothing_sent() {
-    run(listener(u64::MAX, 4), |addr| async move {
+    let dir = tempfile::tempdir().unwrap();
+    run(listener(&dir, u64::MAX, 4), |addr| async move {
         for length in [7u32, 10_009, u32::MAX] {
             let mut client = Client::connect(addr).await;
             client.send(&length.to_be_bytes()).await;
@@ -356,5 +392,72 @@ fn t_pg_2_4_an_invalid_startup_length_closes_with_nothing_sent() {
                 "length {length}: closed with nothing sent"
             );
         }
+    });
+}
+
+/// T-PG.9.3: the statements psql and pgbench send (pgbench's tables, its rows, its TPC-B script on two
+/// sessions statement by statement, ROLLBACK, comparisons, refusals, several statements in one Query),
+/// each a Query to the listener, answer as a PostgreSQL 19.0 server answered the same statements
+/// (scripts/postgres-tpcb-answers.sh): every message of each, but a table's OID, a CURRENT_TIMESTAMP's
+/// value, and an error's or a notice's source file, line and routine.
+#[test]
+fn t_pg_9_3_psql_and_pgbench_statements_answer_as_a_19_server_does() {
+    let dir = tempfile::tempdir().unwrap();
+    run(listener(&dir, u64::MAX, 4), |addr| async move {
+        let mut sessions = BTreeMap::new();
+        for name in ["s1", "s2"] {
+            let mut client = Client::connect(addr).await;
+            client.log_in().await;
+            sessions.insert(name.to_owned(), client);
+        }
+        let answers = tpcb::answers(include_str!("tpcb/listener-answers.txt"));
+        let statements: Vec<&str> = include_str!("tpcb/listener.txt").lines().collect();
+        assert_eq!(answers.len(), statements.len());
+        let mut wrong = Vec::new();
+        let mut compared = 0;
+        for ((session, sql, theirs), line) in answers.iter().zip(statements) {
+            assert_eq!(line, format!("{session}|{sql}"));
+            let ours = sessions.get_mut(session).unwrap().query(sql).await;
+            let (got, want) = (tpcb::told(sql, &ours), tpcb::told(sql, theirs));
+            compared += want.len();
+            if got != want {
+                wrong.push(format!(
+                    "{session}|{sql}:\n  here: {got:#?}\n  19:   {want:#?}"
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+        assert!(
+            compared > 200,
+            "every message of every statement is compared: {compared}"
+        );
+    });
+}
+
+/// T-PG.9.3: a client that ends its session in an open transaction leaves none of its writes, and
+/// nothing held: the row it wrote is another session's to write.
+#[test]
+fn t_pg_9_3_a_session_that_ends_in_a_transaction_leaves_nothing_of_it() {
+    let dir = tempfile::tempdir().unwrap();
+    run(listener(&dir, u64::MAX, 4), |addr| async move {
+        let mut first = Client::connect(addr).await;
+        first.log_in().await;
+        for sql in [
+            "create table t(a int not null, b int)",
+            "insert into t(a, b) values (1, 10)",
+            "begin",
+            "update t set b = 20 where a = 1",
+        ] {
+            let answer = first.query(sql).await;
+            assert_eq!(answer[0].0, b'C', "{sql}: {answer:?}");
+        }
+        first.send(&frontend(b'X', b"")).await;
+        assert_eq!(first.recv().await, None, "Terminate closes the connection");
+        let mut second = Client::connect(addr).await;
+        second.log_in().await;
+        let answer = second.query("update t set b = b + 1 where a = 1").await;
+        assert_eq!(answer[0], (b'C', b"UPDATE 1\0".to_vec()));
+        let answer = second.query("select b from t where a = 1").await;
+        assert_eq!(answer[1], (b'D', b"\x00\x01\x00\x00\x00\x0211".to_vec()));
     });
 }

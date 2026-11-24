@@ -217,8 +217,17 @@ fn write_finding(
     Ok(())
 }
 
+/// The settings a user meets a statement under: a database as it opens, one whose connection has the
+/// parallel mode on, one with statistics gathered, and one with both.
+const SETTINGS: [(&str, bool, bool); 4] = [
+    ("default", false, false),
+    ("parallel", true, false),
+    ("statistics", false, true),
+    ("parallel, statistics", true, true),
+];
+
 /// `--replay FINDING.md`: the finding's statements on both engines, then each of its queries with
-/// both answers and Amphora's plan (text and JSON), for triage.
+/// both answers, Amphora's under each of [SETTINGS], and Amphora's plan (text and JSON), for triage.
 fn replay(path: &str) -> anyhow::Result<()> {
     let text = std::fs::read_to_string(path)?;
     let blocks: Vec<&str> = text
@@ -226,47 +235,52 @@ fn replay(path: &str) -> anyhow::Result<()> {
         .skip(1)
         .filter_map(|b| b.split("```").next())
         .collect();
-    let stmts: Vec<String> = blocks
-        .first()
-        .map(|b| {
-            b.split(";\n")
-                .map(str::trim)
-                .filter(|x| !x.is_empty())
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default();
-    let queries: Vec<String> = blocks
-        .get(1)
-        .map(|b| {
-            b.split(";\n")
-                .map(str::trim)
-                .filter(|x| !x.is_empty())
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default();
-    let (mut a, mut s, kept, refused) = setup(&stmts, 0)?;
-    println!(
-        "statements: {} run, {} refused by Amphora {refused:?}",
-        kept.len(),
-        stmts.len() - kept.len()
-    );
-    for q in &queries {
+    let split = |b: &&str| -> Vec<String> {
+        b.split(";\n")
+            .map(str::trim)
+            .filter(|x| !x.is_empty())
+            .map(str::to_owned)
+            .collect()
+    };
+    let stmts: Vec<String> = blocks.first().map(split).unwrap_or_default();
+    let queries: Vec<String> = blocks.get(1).map(split).unwrap_or_default();
+    for (n, (name, parallel, statistics)) in (0u64..).zip(SETTINGS) {
+        let (mut a, mut s, kept, refused) = setup(&stmts, n)?;
+        if parallel {
+            a.conn
+                .set_parallel_mode(amphora_engine::morsel::ParallelMode::On);
+        }
+        if statistics {
+            a.run("ANALYZE").map_err(|e| anyhow::anyhow!(e))?;
+        }
         println!(
-            "\n== {q}\n-- SQLite:  {}\n-- Amphora: {}",
-            engines::show_up_to(&s.run(q), usize::MAX),
-            engines::show_up_to(&a.run(q), usize::MAX)
+            "\n#### {name}: {} statements run, {} refused by Amphora {refused:?}",
+            kept.len(),
+            stmts.len() - kept.len()
         );
-        if q.trim_start().to_ascii_uppercase().starts_with("SELECT") {
+        for q in &queries {
+            let (want, got) = (s.run(q), a.run(q));
+            let same = match (&want, &got) {
+                (Ok(x), Ok(y)) => engines::same_rows_by(x, y, false),
+                (Err(_), Err(_)) => true,
+                _ => false,
+            };
             println!(
-                "-- Amphora's plan: {}",
-                engines::show(&a.run(&format!("EXPLAIN QUERY PLAN {q}")))
+                "\n== {} {q}\n-- SQLite:  {}\n-- Amphora: {}",
+                if same { "same" } else { "DIFFERS" },
+                engines::show_up_to(&want, usize::MAX),
+                engines::show_up_to(&got, usize::MAX)
             );
-            println!(
-                "-- Amphora's plan (JSON): {}",
-                engines::show(&a.run(&format!("EXPLAIN QUERY PLAN FORMAT=JSON {q}")))
-            );
+            if q.trim_start().to_ascii_uppercase().starts_with("SELECT") {
+                println!(
+                    "-- Amphora's plan: {}",
+                    engines::show(&a.run(&format!("EXPLAIN QUERY PLAN {q}")))
+                );
+                println!(
+                    "-- Amphora's plan (JSON): {}",
+                    engines::show(&a.run(&format!("EXPLAIN QUERY PLAN FORMAT=JSON {q}")))
+                );
+            }
         }
     }
     Ok(())
