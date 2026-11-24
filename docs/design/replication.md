@@ -2591,7 +2591,12 @@ wire records queued beside them (`Control::called`).
 - `CHECKPOINT_EVERY` (25 ms, measured once on fedora): learned from this host's checkpoint costs, as `compacting`
   learns compaction's.
 - The log device's alignment (4096): the device's logical block size, read at open.
-- `serve::OUTGOING_MESSAGES` (4096, CP-T1.13's peer senders): the outgoing queue's learned bound in messages.
+- CP-T1.13 peer senders (QB.1, MB.1). Replace `serve::OUTGOING_MESSAGES` and its count-bounded
+  `sync_channel` with a charge for each record's bytes against the process queue budget. The
+  owner keeps each queued record until its peer's sender takes it. A producer whose record
+  does not fit waits for a budget release until its own deadline. On expiry it receives a
+  typed refusal and retains the record. QB counts throughput at the handoff to the peer's sender.
+  An unreachable peer leaves records queued and producers can observe the refusals.
 - `compaction::ENVELOPE` (81): stated as a format value; it could be worked out from the encoding as
   `COMMAND_ENVELOPE` is.
 Format and requirement values, not picked: `PAGE_BYTES`, `FRAME_BYTES`, `U64_MOST`, `U32_MOST`, `LAG_SAMPLES` (the
