@@ -7305,6 +7305,22 @@ mod tests {
         /// refuses), every clock standing still; rounds go on until every owner follows `to`.
         fn transfer(&mut self, pump: &mut Pump<'_>, clients: &[Client], from: usize, to: usize) {
             let id = u64::try_from(to + 1).unwrap();
+            {
+                let raft = &self.owner_mut(from).replica.core().raft;
+                eprintln!(
+                    "P19 pre-xfer to={id} xferee={:?} last={:?} prog={:?}",
+                    raft.lead_transferee(),
+                    raft.log().last_index().ok(),
+                    raft.tracker().get(id).map(|p| (
+                        p.matched,
+                        p.next_index,
+                        p.state,
+                        p.paused,
+                        p.held,
+                        p.asking
+                    ))
+                );
+            }
             self.owner_mut(from).replica.transfer(id).unwrap();
             let mut seen = String::new();
             if id == 2 {
@@ -7319,7 +7335,7 @@ mod tests {
                     .map(|(a, _)| {
                         let log = a.replica.core().raft.log();
                         format!(
-                            "[m{} lead{} term{} applied{} commit{} last{:?} xferee{:?} transferring{} pending{:?} out{} held{} waiting{} changing{}] ",
+                            "[m{} lead{} term{} applied{} commit{} last{:?} xferee{:?} transferring{} pending{:?} out{} held{} waiting{} changing{} prog{:?}] ",
                             a.replica.id(),
                             a.replica.leader(),
                             a.replica.term(),
@@ -7332,7 +7348,13 @@ mod tests {
                             a.sessions.out,
                             a.replica.apply_held(),
                             a.waiting.len(),
-                            a.changing.is_some()
+                            a.changing.is_some(),
+                            a.replica.core().raft.tracker().get(id).map(|p| (
+                                p.matched,
+                                p.next_index,
+                                p.state,
+                                p.paused
+                            ))
                         )
                     })
                     .collect();
