@@ -3268,6 +3268,11 @@ fn emit_unique_index_check(
                 ctx,
                 preflight.table_references,
             )?;
+        } else if matches!(preflight.effective_on_conflict, ResolveType::Ignore) {
+            // No upsert covers this constraint and IGNORE settles it: skip this row.
+            program.emit_insn(Insn::Goto {
+                target_pc: ctx.loop_labels.row_done,
+            });
         } else {
             // No matching UPSERT handler so we emit constraint error
             // (if conflict clause matched - VM will jump to later instructions and skip halt)
@@ -4596,7 +4601,6 @@ fn without_rowid_preflight(
                     ctx.table,
                     index.map(|i| i.as_ref()),
                     effective,
-                    false,
                 ),
             }
         }
