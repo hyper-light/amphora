@@ -563,3 +563,146 @@ fn t_pg_15_3_a_deadlock_and_a_lock_timeout_end_a_wait_by_themselves() {
         assert_eq!(answer[0], (b'C', b"UPDATE 1\0".to_vec()));
     });
 }
+
+/// Parse, Bind of text parameters and Execute of the unnamed statement and portal.
+fn statement(sql: &str, params: &[&str]) -> Vec<u8> {
+    let count = |n: usize| u16::try_from(n).unwrap().to_be_bytes();
+    let mut parse = vec![0];
+    parse.extend_from_slice(sql.as_bytes());
+    parse.extend_from_slice(&[0, 0, 0]);
+    let mut bind = vec![0, 0, 0, 0];
+    bind.extend_from_slice(&count(params.len()));
+    for param in params {
+        bind.extend_from_slice(&u32::try_from(param.len()).unwrap().to_be_bytes());
+        bind.extend_from_slice(param.as_bytes());
+    }
+    bind.extend_from_slice(&count(0));
+    let mut messages = frontend(b'P', &parse);
+    messages.extend(frontend(b'B', &bind));
+    messages.extend(frontend(b'E', &[0, 0, 0, 0, 0]));
+    messages
+}
+
+/// T-PG.10.2: over sockets, an Execute that waits for a row another session's open transaction changed
+/// is answered once that transaction ends, and what a Flush before it asked for is sent meanwhile; one
+/// whose `lock_timeout` passes is refused, and the messages until Sync with it, and what its transaction
+/// had changed is gone.
+#[test]
+fn t_pg_10_2_an_execute_waits_and_what_was_flushed_before_it_is_sent() {
+    let dir = tempfile::tempdir().unwrap();
+    run(listener(&dir, u64::MAX, 4), |addr| async move {
+        let mut clients = Vec::new();
+        for _ in 0..2 {
+            let mut client = Client::connect(addr).await;
+            client.log_in().await;
+            clients.push(client);
+        }
+        let [holder, waiter] = clients.as_mut_slice() else {
+            panic!("two clients");
+        };
+        for sql in [
+            "create table t(a int not null, b int)",
+            "insert into t(a, b) values (1, 10)",
+            "insert into t(a, b) values (2, 20)",
+            "begin",
+            "update t set b = b + 1 where a = 1",
+        ] {
+            let answer = holder.query(sql).await;
+            assert_eq!(answer[0].0, b'C', "{sql}: {answer:?}");
+        }
+        let mut batch = statement("select b from t where a = $1", &["1"]);
+        batch.extend(frontend(b'H', b""));
+        batch.extend(statement(
+            "update t set b = b + $1 where a = $2",
+            &["100", "1"],
+        ));
+        batch.extend(frontend(b'S', b""));
+        waiter.send(&batch).await;
+        for expected in [
+            (b'1', Vec::new()),
+            (b'2', Vec::new()),
+            (b'D', b"\x00\x01\x00\x00\x00\x0210".to_vec()),
+            (b'C', b"SELECT 1\0".to_vec()),
+        ] {
+            assert_eq!(
+                waiter.recv().await,
+                Some(expected),
+                "flushed before the wait"
+            );
+        }
+        let answer = holder.query("commit").await;
+        assert_eq!(answer[0], (b'C', b"COMMIT\0".to_vec()));
+        for expected in [
+            (b'1', Vec::new()),
+            (b'2', Vec::new()),
+            (b'C', b"UPDATE 1\0".to_vec()),
+            (b'Z', b"I".to_vec()),
+        ] {
+            assert_eq!(waiter.recv().await, Some(expected), "once the holder ended");
+        }
+        let answer = holder.query("select b from t where a = 1").await;
+        assert_eq!(answer[1], (b'D', b"\x00\x01\x00\x00\x00\x03111".to_vec()));
+
+        waiter.query("set lock_timeout = '1ms'").await;
+        holder.query("begin").await;
+        holder.query("update t set b = 0 where a = 1").await;
+        let mut batch = statement("update t set b = $1 where a = 2", &["21"]);
+        batch.extend(statement("update t set b = $1 where a = 1", &["2"]));
+        batch.extend(statement("select b from t where a = 2", &[]));
+        batch.extend(frontend(b'S', b""));
+        waiter.send(&batch).await;
+        for tag in [b'1', b'2', b'C', b'1', b'2'] {
+            assert_eq!(waiter.recv().await.unwrap().0, tag);
+        }
+        let (tag, body) = waiter.recv().await.unwrap();
+        assert_eq!(tag, b'E');
+        assert!(fields(&body).contains(&(b'C', "55P03".to_owned())));
+        assert_eq!(waiter.recv().await, Some((b'Z', b"I".to_vec())));
+        holder.query("rollback").await;
+        let answer = holder.query("select b from t where a = 2").await;
+        assert_eq!(
+            answer[1],
+            (b'D', b"\x00\x01\x00\x00\x00\x0220".to_vec()),
+            "the refusal undid the Execute before it"
+        );
+    });
+}
+
+/// T-PG.10.3: a session's prepared statements are charged to the process's budget: one there is no room
+/// for is refused `53200`, the session goes on, and the room a Close gives back is the next one's.
+#[test]
+fn t_pg_10_3_prepared_statements_are_charged_to_the_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    run(listener(&dir, 1 << 16, 4), |addr| async move {
+        let mut client = Client::connect(addr).await;
+        client.log_in().await;
+        let parse = |name: &str| {
+            let mut body = name.as_bytes().to_vec();
+            body.extend_from_slice(b"\0SELECT 1 + 2 + 3\0\0\0");
+            frontend(b'P', &body)
+        };
+        let sync = frontend(b'S', b"");
+        let mut held = 0;
+        let refused = loop {
+            client.send(&parse(&format!("s{held}"))).await;
+            client.send(&sync).await;
+            let (tag, body) = client.recv().await.unwrap();
+            assert_eq!(client.recv().await, Some((b'Z', b"I".to_vec())));
+            if tag == b'E' {
+                break fields(&body);
+            }
+            assert_eq!(tag, b'1');
+            held += 1;
+            assert!(held < 10_000, "65,536 bytes hold this many statements");
+        };
+        assert!(held > 0);
+        assert!(refused.contains(&(b'S', "ERROR".to_owned())), "{refused:?}");
+        assert!(refused.contains(&(b'C', "53200".to_owned())), "{refused:?}");
+        client.send(&frontend(b'C', b"Ss0\0")).await;
+        client.send(&parse("again")).await;
+        client.send(&sync).await;
+        for tag in [b'3', b'1', b'Z'] {
+            assert_eq!(client.recv().await.unwrap().0, tag);
+        }
+    });
+}
