@@ -135,9 +135,17 @@ const ENVELOPE_BYTES: usize = std::mem::size_of::<Envelope>();
 
 // Session tokens: read-your-writes on any replica (replication.md, "Decision (lane ryw-1):
 // read-your-writes by session tokens").
+mod line;
+/// What `line` shares between threads: std's, where `crates/line-loom` puts loom's.
+mod sync {
+    pub(super) use std::sync::atomic::{AtomicUsize, fence};
+    pub(super) use std::sync::{Arc, Mutex};
+    pub(super) use std::time::Instant;
+}
 mod tokens;
 mod waiting;
 pub use tokens::{ReadMode, Served, SessionCounters, Token};
+use line::{Reservation, Room};
 
 /// One of the floor's own sessions: the work it does on the database at its base.
 type FloorSession = Box<dyn FnOnce(&mut Db) -> anyhow::Result<()> + Send>;
@@ -397,26 +405,9 @@ pub(super) fn wall_micros() -> Result<u64, Refusal> {
         .ok_or_else(|| unavailable("the wall clock reads before the Unix epoch or past u64"))
 }
 struct Control {
-    admitted: AtomicUsize,
-    /// The inputs in the command queue's channel, not yet taken by the owner: no more than
-    /// `command_bound` (QB.1, lane constants-20), as a channel of that many slots held them.
-    commands: AtomicUsize,
-    /// The calls waiting for the command queue's room (lane perf-A26).
-    line: Line,
-    /// The most inputs the command queue holds, as the owner last learned it (`Bounds::commands`).
-    command_bound: AtomicUsize,
-    /// The bytes the application calls waiting in the command queue hold, each its own real or
-    /// declared size (`Admission::bytes_for`), held to `applications` apart from the wire records
-    /// beside them (QB.1, lane perf-A11). Calls are not counted: the bytes bound them.
-    called: AtomicUsize,
-    /// The bytes of `admitted` that their writes hold on the memory budget themselves
-    /// (`ReplicaHandle::submit_by`, lane perf-A21): the queues' charge each tick takes leaves them
-    /// out (`Actor::rebound`), so no byte is charged twice.
-    charged: AtomicUsize,
-    // The command queue's bound in bytes and a wire record's most, as the owner last learned them
-    // (`queue_bounds`; QB.1).
-    queued: AtomicUsize,
-    applications: AtomicUsize,
+    /// The command queue's room, and the calls waiting for it.
+    room: Arc<Room>,
+    // A wire record's most bytes, as the owner last learned it (`queue_bounds`; QB.1).
     wire: AtomicUsize,
     // The application this member's handles last bound, so that binding it again asks nothing.
     attesting: Mutex<Option<crate::database::Application>>,
@@ -813,152 +804,6 @@ struct Outgoing {
     /// drain rings the owner, which beats once the queue has room for a record to each peer, so
     /// each member's answer brings what it lacks (QB.2). Woken by the drain, never by a tick.
     owed: bool,
-}
-struct Reservation {
-    control: Arc<Control>,
-    /// An input's place in the command queue's channel (`Control::commands`), given back once the
-    /// owner takes it or it is dropped untaken (QB.1, lane constants-20).
-    slot: bool,
-    bytes: usize,
-    /// An application call's bytes in `called`, given back with it.
-    called: usize,
-    /// A write's bytes held on the memory budget (`ReplicaHandle::submit_by`, lane perf-A21) and
-    /// counted in `charged`: given back with the rest, whether the write applied or was refused.
-    charge: Option<crate::memory::Charge>,
-}
-impl Reservation {
-    /// With the charge its write's `bytes` hold on the memory budget.
-    fn charged(mut self, charge: crate::memory::Charge, bytes: usize) -> Self {
-        self.control.charged.fetch_add(bytes, Ordering::AcqRel);
-        self.charge = Some(charge);
-        self
-    }
-    /// The owner took its input from the channel: its place there is free, its bytes still held.
-    fn taken(&mut self) {
-        if std::mem::take(&mut self.slot) {
-            self.control.commands.fetch_sub(1, Ordering::SeqCst);
-            self.control.line.room_came();
-        }
-    }
-}
-impl Drop for Reservation {
-    fn drop(&mut self) {
-        self.taken();
-        self.control
-            .admitted
-            .fetch_sub(self.bytes, Ordering::SeqCst);
-        self.control.called.fetch_sub(self.called, Ordering::SeqCst);
-        if let Some(charge) = self.charge.take() {
-            let bytes = usize::try_from(charge.bytes()).unwrap_or(usize::MAX);
-            self.control.charged.fetch_sub(bytes, Ordering::AcqRel);
-        }
-        self.control.line.room_came();
-    }
-}
-/// The calls waiting for the command queue's room ([`ReplicaHandle::place_by`]; QB.1, lane
-/// perf-A26), first come, first served: one entry a waiting caller's thread, gone by that caller's
-/// deadline. Only the first looks for room, rung by each event that may make some (a place given
-/// back, bytes given back, the bounds learned again), and the next is rung as the first leaves, so
-/// an event wakes one thread however many wait.
-#[derive(Default)]
-struct Line {
-    /// The calls in line: read without the lock by what makes room, so that room made with none
-    /// waiting takes no lock.
-    waiting: AtomicUsize,
-    turns: Mutex<Turns>,
-}
-#[derive(Default)]
-struct Turns {
-    /// Each waiting call's bell by its turn, the first in line first.
-    line: std::collections::BTreeMap<u64, Arc<Bell>>,
-    next: u64,
-    /// The owner ended: its reason, which every call in line is refused with.
-    ended: Option<Refusal>,
-}
-impl Line {
-    /// The queue's room moved, by a sequentially consistent change made before this: the first in
-    /// line looks again. Pairs with [`Line::join`]'s fence (C++ [atomics.order], the single total
-    /// order): either this sees the call that joined, or that call's look sees the room.
-    fn room_came(&self) {
-        if self.waiting.load(Ordering::SeqCst) == 0 {
-            return;
-        }
-        // A poisoned line is heard by its own calls, each of whose looks fails on the poison.
-        if let Ok(turns) = self.turns.lock()
-            && let Some(first) = turns.line.values().next()
-        {
-            first.ring();
-        }
-    }
-    /// A call joins the line, last.
-    fn join(&self) -> Result<Turn<'_>, Refusal> {
-        let bell = Bell::new();
-        let mut turns = locked(&self.turns)?;
-        let turn = turns.next;
-        turns.next = turn
-            .checked_add(1)
-            .ok_or_else(|| unavailable("the queue's line ran out of turns"))?;
-        turns.line.insert(turn, Arc::clone(&bell));
-        self.waiting.fetch_add(1, Ordering::SeqCst);
-        drop(turns);
-        std::sync::atomic::fence(Ordering::SeqCst);
-        Ok(Turn {
-            line: self,
-            turn,
-            bell,
-        })
-    }
-    /// The owner ended: every call in line, and each that joins after, is refused with `reason`.
-    fn end(&self, reason: &Refusal) {
-        if let Ok(mut turns) = self.turns.lock() {
-            turns.ended.get_or_insert_with(|| reason.clone());
-            for bell in turns.line.values() {
-                bell.ring();
-            }
-        }
-    }
-}
-/// A call's turn in the line; it leaves the line as this drops, and the first behind it looks.
-struct Turn<'a> {
-    line: &'a Line,
-    turn: u64,
-    bell: Arc<Bell>,
-}
-impl Turn<'_> {
-    /// Whether this call is the first in line, or the owner's reason once it ended.
-    fn first(&self) -> Result<bool, Refusal> {
-        let turns = locked(&self.line.turns)?;
-        match &turns.ended {
-            Some(reason) => Err(reason.clone()),
-            None => Ok(turns.line.keys().next() == Some(&self.turn)),
-        }
-    }
-}
-impl Drop for Turn<'_> {
-    fn drop(&mut self) {
-        if let Ok(mut turns) = self.line.turns.lock() {
-            turns.line.remove(&self.turn);
-            self.line.waiting.fetch_sub(1, Ordering::SeqCst);
-            if let Some(first) = turns.line.values().next() {
-                first.ring();
-            }
-        }
-    }
-}
-/// What the calls' bytes hold with `bytes` more, within their `limit`; holding none, they take one
-/// call of up to `alone`, as a window that holds nothing sends one entry however large (hyper-raft's
-/// `Inflights::full`): what the memory budget has room for never waits for room no one can make.
-fn within(held: usize, bytes: usize, limit: usize, alone: usize) -> Option<usize> {
-    let limit = if held == 0 { limit.max(alone) } else { limit };
-    held.checked_add(bytes).filter(|next| *next <= limit)
-}
-/// The most bytes one call may hold of a command queue of `queued` bytes: all but a record without
-/// entries (`RECORD_BYTES`) and its envelope, so that a vote or a heartbeat, the record that finds
-/// a leader, enters beside it (QB.1).
-fn alone(queued: usize) -> usize {
-    queued
-        .saturating_sub(RECORD_BYTES)
-        .saturating_sub(ENVELOPE_BYTES)
 }
 struct Envelope {
     command: Input,
@@ -1623,7 +1468,7 @@ fn queue_bounds(
 /// at its learned message rate, at least a call and a wire record, and no more than `room` holds of
 /// an input's least, its own envelope (a wire record may carry no bytes). Before anything is
 /// measured, what the room holds. Application calls are not counted apart: their waiting bytes
-/// bound them, and the queue's last input stays a wire record's (`ReplicaHandle::place`).
+/// bound them, and the queue's last input stays a wire record's (`Room::place`).
 fn command_counts(intake: &super::drain::Drain, timeout: Duration, room: u64) -> u64 {
     let envelope = u64::try_from(ENVELOPE_BYTES).unwrap_or(u64::MAX);
     let input = super::drain::Bound {
@@ -1736,22 +1581,22 @@ fn answer<T>(response: Response<T>, result: Result<T, Refusal>) {
 impl ReplicaHandle {
     /// Queues `command`, charged `bytes` for what it carries and its envelope beside them
     /// (`ENVELOPE_BYTES`). A call waits for the queue's room until its deadline, in line
-    /// ([`Self::place_by`]); any other input is refused at once without it, and its sender sends
+    /// ([`Room::place_by`]); any other input is refused at once without it, and its sender sends
     /// again.
     fn enqueue(&self, command: Input, bytes: usize) -> Result<(), Refusal> {
         let bytes = bytes.saturating_add(ENVELOPE_BYTES);
         let reservation = match &command {
-            Input::Submit { until, .. } => self.submit_by(bytes, *until)?,
+            Input::Submit { until, .. } => Room::submit_by(&self.shared.room, bytes, *until)?,
             // They carry nothing past their envelope: a place free now is theirs without a turn, so
             // that no line of writes holds off the group's own changes.
             Input::Change { until, .. }
             | Input::Transfer { until, .. }
-            | Input::CatchUp { until, .. } => match self.place(bytes, true) {
+            | Input::CatchUp { until, .. } => match Room::place(&self.shared.room, bytes, true) {
                 Ok(place) => place,
-                Err(_) => self.place_by(bytes, *until)?,
+                Err(_) => Room::place_by(&self.shared.room, bytes, *until)?,
             },
             Input::Receive { .. } | Input::Verdict { .. } | Input::Attest { .. } => {
-                self.place(bytes, false)?
+                Room::place(&self.shared.room, bytes, false)?
             }
         };
         self.sender
@@ -1762,148 +1607,6 @@ impl ReplicaHandle {
             .map_err(|_| fenced("replica owner ended; reopen from durable state"))?;
         self.shared.bell.ring();
         Ok(())
-    }
-
-    /// The room a write of `bytes` takes, on the memory budget and in the command queue, waited
-    /// for until its deadline on the events that make it, holding none of it meanwhile. Its bytes
-    /// are charged to the budget's room for queues as a local writer's admission charges them
-    /// (`Admission`, lane perf-A21): past the budget's whole limit refused `TooLarge` at once, with
-    /// no room at its deadline `Full`. A write in line holds no charge (lane perf-A26): charges held
-    /// by writes the queue has no room for would take the images' and the caches' room.
-    fn submit_by(&self, bytes: usize, until: Instant) -> Result<Reservation, Refusal> {
-        let budget = crate::memory::process();
-        let size = u64::try_from(bytes).unwrap_or(u64::MAX);
-        loop {
-            let charge = budget.take_until(crate::memory::Use::Queues, size, until, || {})?;
-            if self.shared.line.waiting.load(Ordering::Acquire) == 0
-                && let Ok(place) = self.place(bytes, true)
-            {
-                return Ok(place.charged(charge, bytes));
-            }
-            drop(charge);
-            let place = self.place_by(bytes, until)?;
-            match budget.take(crate::memory::Use::Queues, size) {
-                Ok(charge) => return Ok(place.charged(charge, bytes)),
-                // The budget's room went meanwhile: it is waited for again, the place given back.
-                Err(Refusal::TooLarge { .. }) => drop(place),
-                Err(refusal) => return Err(refusal),
-            }
-        }
-    }
-
-    /// A call's place in the command queue, waited for in line (`Line`) until `until`, holding
-    /// nothing meanwhile: refused `Full` at the bound it is past once `until` has passed, with the
-    /// owner's reason once it ended, and `TooLarge` at once past what one call may hold (`alone`),
-    /// which no bytes given back make room for.
-    fn place_by(&self, bytes: usize, until: Instant) -> Result<Reservation, Refusal> {
-        let line = &self.shared.line;
-        if line.waiting.load(Ordering::Acquire) == 0
-            && let Ok(place) = self.place(bytes, true)
-        {
-            return Ok(place);
-        }
-        let turn = line.join()?;
-        loop {
-            let queued = self.shared.queued.load(Ordering::Acquire);
-            api::bound("replica command queue bytes", bytes, alone(queued))?;
-            // Looked at before it is taken: a place taken in part and given back would ring this
-            // call again, and it would look without end.
-            let past = self.past(bytes);
-            if turn.first()?
-                && past.is_none()
-                && let Ok(place) = self.place(bytes, true)
-            {
-                return Ok(place);
-            }
-            let left = until.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Err(past.unwrap_or(Refusal::Full {
-                    limit: self.shared.applications.load(Ordering::Acquire),
-                }));
-            }
-            turn.bell.wait(left)?;
-        }
-    }
-
-    /// The bound of the command queue a call of `bytes` is past now, as the refusal naming it.
-    fn past(&self, bytes: usize) -> Option<Refusal> {
-        let control = &self.shared;
-        let commands = control.command_bound.load(Ordering::Acquire);
-        if control.commands.load(Ordering::Acquire) >= commands.saturating_sub(1) {
-            return Some(Refusal::Full { limit: commands });
-        }
-        let queued = control.queued.load(Ordering::Acquire);
-        let applications = control.applications.load(Ordering::Acquire);
-        let called = control.called.load(Ordering::Acquire);
-        if within(called, bytes, applications, alone(queued)).is_none() {
-            return Some(Refusal::Full {
-                limit: applications,
-            });
-        }
-        let admitted = control.admitted.load(Ordering::Acquire);
-        if admitted.saturating_add(bytes) > queued {
-            return Some(Refusal::Full { limit: queued });
-        }
-        None
-    }
-
-    /// A place in the command queue for an input of `bytes`, a call's (`call`) or another's, or the
-    /// refusal naming the bound it is past. Calls leave room for a wire record, the one that finds
-    /// a leader above all: the last place, and the queue's bytes past the calls' bound (QB.1).
-    fn place(&self, bytes: usize, call: bool) -> Result<Reservation, Refusal> {
-        let limit = self.shared.queued.load(Ordering::Acquire);
-        let application_limit = self.shared.applications.load(Ordering::Acquire);
-        let command_limit = self.shared.command_bound.load(Ordering::Acquire);
-        // Built before any refusal below, so that dropping it gives back what it took.
-        let mut reservation = Reservation {
-            control: Arc::clone(&self.shared),
-            slot: false,
-            bytes: 0,
-            called: 0,
-            charge: None,
-        };
-        // Every input takes a place in the channel, held to the inputs' bound (lane constants-20); a
-        // call never the last, which stays a wire record's.
-        let places = if call {
-            command_limit.saturating_sub(1)
-        } else {
-            command_limit
-        };
-        self.shared
-            .commands
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
-                held.checked_add(1).filter(|next| *next <= places)
-            })
-            .map_err(|_| Refusal::Full {
-                limit: command_limit,
-            })?;
-        reservation.slot = true;
-        // A call's bytes are held to the calls' bound on their own: the wire records queued beside
-        // it are the rest of the queue's, not the calls'.
-        if call {
-            self.shared
-                .called
-                .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
-                    within(held, bytes, application_limit, alone(limit))
-                })
-                .map_err(|_| Refusal::Full {
-                    limit: application_limit,
-                })?;
-            reservation.called = bytes;
-        }
-        self.shared
-            .admitted
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |charged| {
-                charged.checked_add(bytes).filter(|next| *next <= limit)
-            })
-            .map_err(|charged| match charged.checked_add(bytes) {
-                Some(next) => api::bound("replica command queue bytes", next, limit)
-                    .err()
-                    .unwrap_or(Refusal::Full { limit }),
-                None => Refusal::Full { limit },
-            })?;
-        reservation.bytes = bytes;
-        Ok(reservation)
     }
 
     pub(super) fn submit(
@@ -2058,17 +1761,17 @@ impl ReplicaHandle {
     /// The command queue's bound in bytes in force (QB.1).
     #[cfg(test)]
     fn queue_bound(&self) -> usize {
-        self.shared.queued.load(Ordering::Acquire)
+        self.shared.room.queued.load(Ordering::Acquire)
     }
     /// The bytes application calls may hold of the command queue in force (QB.1).
     #[cfg(test)]
     fn application_bound(&self) -> usize {
-        self.shared.applications.load(Ordering::Acquire)
+        self.shared.room.applications.load(Ordering::Acquire)
     }
     /// The most inputs the command queue holds in force (QB.1, lane constants-20).
     #[cfg(test)]
     fn command_bound(&self) -> usize {
-        self.shared.command_bound.load(Ordering::Acquire)
+        self.shared.room.command_bound.load(Ordering::Acquire)
     }
     /// A wire record's most bytes in force (QB.1): a host's transport refuses a longer record
     /// before it reads it (`crate::serve`).
@@ -2800,14 +2503,7 @@ fn open_on<F: BlockFile + 'static>(
         replica.core().raft.config().limits.members,
     )?;
     let control = Arc::new(Control {
-        admitted: AtomicUsize::new(0),
-        commands: AtomicUsize::new(0),
-        line: Line::default(),
-        command_bound: AtomicUsize::new(first.commands),
-        called: AtomicUsize::new(0),
-        charged: AtomicUsize::new(0),
-        queued: AtomicUsize::new(first.queued),
-        applications: AtomicUsize::new(first.applications),
+        room: Room::new(first.queued, first.applications, first.commands),
         wire: AtomicUsize::new(first.wire),
         attesting: Mutex::new(None),
         floor: Mutex::new(None),
@@ -3158,6 +2854,7 @@ impl<F: BlockFile + 'static> Drop for Actor<F> {
         self.control.listened();
         // And calls waiting in line for the queue's room.
         self.control
+            .room
             .line
             .end(&fenced("replica owner ended; reopen from durable state"));
     }
@@ -3277,7 +2974,7 @@ impl<F: BlockFile + 'static> Actor<F> {
         }
         // And calls waiting in line for the queue's room, before its inputs are answered below: no
         // place their leaving frees is taken by one that waited.
-        self.control.line.end(&reason);
+        self.control.room.line.end(&reason);
         // A host waiting on its listener hears the owner ended: its drain now answers the reason.
         self.control.listened();
         // So do the member's senders, waiting for its next record (CP-T1.13).
@@ -3295,7 +2992,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             }
         }
         // The ingress channel holds the inputs `commands` counts. Notify callers before closing it.
-        for _ in 0..self.control.commands.load(Ordering::Acquire) {
+        for _ in 0..self.control.room.commands.load(Ordering::Acquire) {
             let Ok(envelope) = receiver.try_recv() else {
                 break;
             };
@@ -3751,14 +3448,14 @@ impl<F: BlockFile + 'static> Actor<F> {
     /// waiting behind the prepared transaction, each envelope's reservation. Past u64's range it
     /// says the most it can.
     fn queued(&self) -> u64 {
-        u64::try_from(self.control.admitted.load(Ordering::Acquire)).unwrap_or(u64::MAX)
+        u64::try_from(self.control.room.admitted.load(Ordering::Acquire)).unwrap_or(u64::MAX)
     }
     /// Whether inputs wait for this owner to take them, in its channel or behind QB.2's pause: the
     /// command queue's reader has work (QB.1, lane replicated-K6). What it took and still holds (a
     /// write, a change or a hand-off under way) keeps its bytes charged (`queued`), but waits for
     /// no reading: counted as work, each tick it is under way weighs as a stall.
     fn inputs_wait(&self) -> bool {
-        self.control.commands.load(Ordering::Acquire) > 0 || !self.paused_inputs.is_empty()
+        self.control.room.commands.load(Ordering::Acquire) > 0 || !self.paused_inputs.is_empty()
     }
     /// The queue bounds from what this owner measured, at each tick of its pace (QB.1): each
     /// queue's drain weighed on the owner's clock, the bounds learned from them and the election
@@ -3829,9 +3526,9 @@ impl<F: BlockFile + 'static> Actor<F> {
             self.replica.core().raft.config().election_tick,
             self.pace.period(),
         );
-        // The writes hold their own bytes on the budget (`ReplicaHandle::submit_by`); the rest of the
+        // The writes hold their own bytes on the budget (`Room::submit_by`); the rest of the
         // queue's are charged here.
-        let charged = self.control.charged.load(Ordering::Acquire);
+        let charged = self.control.room.charged.load(Ordering::Acquire);
         let queued = self
             .queued()
             .saturating_sub(u64::try_from(charged).unwrap_or(u64::MAX));
@@ -3857,16 +3554,18 @@ impl<F: BlockFile + 'static> Actor<F> {
             outgoing.over = None;
         }
         drop(outgoing);
-        self.control.queued.store(bounds.queued, Ordering::SeqCst);
+        self.control.room.queued.store(bounds.queued, Ordering::SeqCst);
         self.control
+            .room
             .applications
             .store(bounds.applications, Ordering::SeqCst);
         self.control
+            .room
             .command_bound
             .store(bounds.commands, Ordering::SeqCst);
         self.control.wire.store(bounds.wire, Ordering::Release);
         // A call in line fits the bounds just learned, if they rose.
-        self.control.line.room_came();
+        self.control.room.line.room_came();
         self.queues = None;
         self.queues = crate::memory::process()
             .take(crate::memory::Use::Queues, queued.saturating_add(held))
@@ -5467,13 +5166,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             author: Author::Owner,
             response: None,
             phase: Phase::Barrier(None),
-            _reservation: Reservation {
-                control: Arc::clone(&self.control),
-                slot: false,
-                bytes: 0,
-                called: 0,
-                charge: None,
-            },
+            _reservation: Reservation::none(&self.control.room),
         });
         Ok(())
     }
@@ -5648,13 +5341,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                 Mutex::new(Some(call)),
                 AnswerMax::<()>::fixed().get(),
             ))),
-            _reservation: Reservation {
-                control: Arc::clone(&self.control),
-                slot: false,
-                bytes: 0,
-                called: 0,
-                charge: None,
-            },
+            _reservation: Reservation::none(&self.control.room),
         });
         self.floor_inflight = true;
         Ok(())
@@ -6277,14 +5964,14 @@ mod tests {
         let client = driven.open(dir.path(), 1, vec![1, 2, 3], None);
         let handle = client.handle();
         let until = driven.until();
-        let before = handle.shared.admitted.load(Ordering::Acquire);
+        let before = handle.shared.room.admitted.load(Ordering::Acquire);
         let _record = handle.admit_receive(2, vec![0xff], until).unwrap();
         let (response, _answer) = mpsc::sync_channel(1);
         handle
             .enqueue(Input::CatchUp { until, response }, 0)
             .unwrap();
         assert_eq!(
-            handle.shared.admitted.load(Ordering::Acquire) - before,
+            handle.shared.room.admitted.load(Ordering::Acquire) - before,
             1 + 2 * ENVELOPE_BYTES
         );
     }
@@ -6602,7 +6289,7 @@ mod tests {
             waiting_call(&handle, 48 << 20, driven.until(), &evaluated)
         });
         assert!(first.is_ok(), "{:?}", first.err());
-        let admitted = handle.shared.admitted.load(Ordering::Acquire);
+        let admitted = handle.shared.room.admitted.load(Ordering::Acquire);
         let soon = Instant::now() + Duration::from_millis(100);
         let refused = on_budget(&budget, || {
             waiting_call(&handle, 32 << 20, soon, &evaluated)
@@ -6611,7 +6298,7 @@ mod tests {
         assert!(matches!(refused, Some(Refusal::Full { .. })), "{refused:?}");
         assert_eq!(budget.held(crate::memory::Use::Queues), written(48 << 20));
         assert_eq!(budget.waiting(), 0);
-        assert_eq!(handle.shared.admitted.load(Ordering::Acquire), admitted);
+        assert_eq!(handle.shared.room.admitted.load(Ordering::Acquire), admitted);
     }
 
     /// AUDIT 2026-11-23 §1, lane perf-A21: a replicated write past the memory budget's whole limit
@@ -6701,7 +6388,7 @@ mod tests {
         let status = clients[others[0]].handle().status().unwrap();
         assert!(status.term > term, "{status:?}");
         assert_eq!(budget.held(crate::memory::Use::Queues), 0);
-        assert_eq!(handle.shared.charged.load(Ordering::Acquire), 0);
+        assert_eq!(handle.shared.room.charged.load(Ordering::Acquire), 0);
         pump.abandon();
     }
 
@@ -6732,13 +6419,13 @@ mod tests {
         );
         drop(driven);
         assert_eq!(budget.held(crate::memory::Use::Queues), 0);
-        assert_eq!(handle.shared.charged.load(Ordering::Acquire), 0);
+        assert_eq!(handle.shared.room.charged.load(Ordering::Acquire), 0);
     }
 
     /// Until `calls` wait in `handle`'s line for the command queue's room, or `ended` says that what
     /// was to wait did not.
     fn in_line(handle: &ReplicaHandle, calls: usize, ended: impl Fn() -> bool) {
-        while handle.shared.line.waiting.load(Ordering::Acquire) < calls {
+        while handle.shared.room.line.waiting.load(Ordering::Acquire) < calls {
             assert!(!ended(), "a call to wait for the queue's room was answered");
             std::thread::yield_now();
         }
@@ -6747,11 +6434,11 @@ mod tests {
     fn holds_nothing(handle: &ReplicaHandle, budget: &crate::memory::Budget) {
         let control = &handle.shared;
         for (what, held) in [
-            ("bytes", &control.admitted),
-            ("calls' bytes", &control.called),
-            ("bytes charged", &control.charged),
-            ("inputs", &control.commands),
-            ("calls in line", &control.line.waiting),
+            ("bytes", &control.room.admitted),
+            ("calls' bytes", &control.room.called),
+            ("bytes charged", &control.room.charged),
+            ("inputs", &control.room.commands),
+            ("calls in line", &control.room.line.waiting),
         ] {
             assert_eq!(held.load(Ordering::Acquire), 0, "{what}");
         }
@@ -6782,7 +6469,7 @@ mod tests {
         driven.quiet(&mut pump);
         let budget = budget_of(1 << 40);
         let handle = clients[leader].handle().clone();
-        handle.shared.command_bound.store(8, Ordering::SeqCst);
+        handle.shared.room.command_bound.store(8, Ordering::SeqCst);
         let until = driven.until();
         let writers: Vec<_> = (0..WRITERS)
             .map(|id| {
@@ -6809,7 +6496,7 @@ mod tests {
                 began.elapsed() < crate::transport::HANG,
                 "unanswered: {}, in line {}, held {}",
                 writers.iter().filter(|w| !w.is_finished()).count(),
-                handle.shared.line.waiting.load(Ordering::Acquire),
+                handle.shared.room.line.waiting.load(Ordering::Acquire),
                 driven.owner(leader).waiting.len(),
             );
             driven.round(&mut pump);
@@ -6859,7 +6546,7 @@ mod tests {
         let mut driven = Driven::new();
         let client = driven.open(dir.path(), 1, vec![1, 2, 3], None);
         let handle = client.handle().clone();
-        handle.shared.command_bound.store(3, Ordering::SeqCst);
+        handle.shared.room.command_bound.store(3, Ordering::SeqCst);
         let until = driven.until();
         let evaluated = Arc::new(AtomicUsize::new(0));
         // Each call declares its turn past a fixed answer: what it holds says which it is.
@@ -6910,7 +6597,7 @@ mod tests {
         let mut driven = Driven::new();
         let client = driven.open(dir.path(), 1, vec![1, 2, 3], None);
         let handle = client.handle().clone();
-        handle.shared.command_bound.store(2, Ordering::SeqCst);
+        handle.shared.room.command_bound.store(2, Ordering::SeqCst);
         let until = driven.until();
         let evaluated = Arc::new(AtomicUsize::new(0));
         let budget = budget_of(1 << 40);
@@ -6951,7 +6638,7 @@ mod tests {
         let mut driven = Driven::new();
         let client = driven.open(dir.path(), 1, vec![1, 2, 3], None);
         let handle = client.handle().clone();
-        handle.shared.command_bound.store(2, Ordering::SeqCst);
+        handle.shared.room.command_bound.store(2, Ordering::SeqCst);
         let until = driven.until();
         let evaluated = Arc::new(AtomicUsize::new(0));
         let budget = budget_of(1 << 40);
@@ -7027,7 +6714,7 @@ mod tests {
             let client = driven.open(dir.path(), 1, vec![1, 2, 3], None);
             let handle = client.handle().clone();
             let until = driven.until();
-            let declared = alone(handle.queue_bound()) - usize::try_from(written(0)).unwrap();
+            let declared = line::alone(handle.queue_bound()) - usize::try_from(written(0)).unwrap();
             let call = on_budget(&budget, || {
                 waiting_call(&handle, declared + past, until, &evaluated)
             });
@@ -7091,7 +6778,7 @@ mod tests {
         let before = last(&driven);
         pump.appends_lost = true;
         let budget = budget_of(1 << 40);
-        handle.shared.command_bound.store(2, Ordering::SeqCst);
+        handle.shared.room.command_bound.store(2, Ordering::SeqCst);
         let until = driven.until();
         let writers: Vec<_> = (0..WRITERS)
             .map(|id| {
@@ -7503,7 +7190,7 @@ mod tests {
                         .map_or(0, |client| client.handle().queue_bound());
                     let full = self.clients.iter().any(|client| {
                         let handle = client.handle();
-                        handle.shared.commands.load(Ordering::Acquire) >= handle.command_bound()
+                        handle.shared.room.commands.load(Ordering::Acquire) >= handle.command_bound()
                     });
                     if full || self.bytes + MESSAGE_BYTES > bound {
                         break;
@@ -19134,6 +18821,7 @@ mod tests {
                 let commands = handle.command_bound().min(64);
                 handle
                     .shared
+                    .room
                     .command_bound
                     .store(commands, Ordering::Release);
                 let mut receipts = Vec::new();
@@ -19155,12 +18843,12 @@ mod tests {
                 // envelope for each of them all, the capture's too (lane constants-21).
                 let held = api::REQUEST_MAX + commands + (commands + 1) * ENVELOPE_BYTES;
                 for _ in 0..ROUNDS {
-                    if handle.shared.admitted.load(Ordering::Acquire) == held {
+                    if handle.shared.room.admitted.load(Ordering::Acquire) == held {
                         break;
                     }
                     std::thread::park_timeout(POLL);
                 }
-                assert_eq!(handle.shared.admitted.load(Ordering::Acquire), held);
+                assert_eq!(handle.shared.room.admitted.load(Ordering::Acquire), held);
                 assert!(matches!(
                     finishing.try_recv(),
                     Err(mpsc::TryRecvError::Empty)
