@@ -413,38 +413,20 @@ fn translate_in_subquery_condition(
     condition_metadata: ConditionMetadata,
     resolver: &Resolver,
 ) -> Result<()> {
-    let lhs_columns: Vec<&ast::Expr> = match unwrap_parens(lhs)? {
-        ast::Expr::Parenthesized(exprs) => exprs.iter().map(|e| e.as_ref()).collect(),
-        expr => vec![expr],
-    };
-    let count = lhs_columns.len();
-    let start = program.alloc_registers(count);
     // A row the list doesn't hold fails: on past the condition where it jumps on TRUE.
     let not_true = if condition_metadata.jump_if_condition_is_true {
         program.allocate_label()
     } else {
         condition_metadata.jump_target_when_false
     };
-    for (reg, column) in (start..).zip(lhs_columns) {
-        translate_expr(program, Some(referenced_tables), column, reg, resolver)?;
-        program.emit_insn(Insn::IsNull {
-            reg,
-            target_pc: not_true,
-        });
-    }
-    if affinity_str
-        .chars()
-        .map(Affinity::from_char)
-        .any(|a| a != Affinity::Blob)
-    {
-        if let Ok(count) = std::num::NonZeroUsize::try_from(count) {
-            program.emit_insn(Insn::Affinity {
-                start_reg: start,
-                count,
-                affinities: affinity_str.to_owned(),
-            });
-        }
-    }
+    let (start, count) = translate_in_subquery_lhs(
+        program,
+        Some(referenced_tables),
+        lhs,
+        affinity_str,
+        not_true,
+        resolver,
+    )?;
     if condition_metadata.jump_if_condition_is_true {
         program.emit_insn(Insn::Found {
             cursor_id,

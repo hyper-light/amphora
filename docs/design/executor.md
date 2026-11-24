@@ -41,7 +41,10 @@ condition fails on NULL as on FALSE, so it never asks whether the list holds a N
 differ (`NOT IN`, or the answer used as a value), a one-column list reads its first entry alone: the
 list is an ascending index, whose NULLs sort first, so its first entry is NULL if any is. A row
 value's list (`(a, b) IN (SELECT ...)`) is still read through on a miss, as which of its rows are
-equal but for NULLs depends on more than its first.
+equal but for NULLs depends on more than its first. The left side's fields are all computed, and
+converted as the list's rows are, before any is tested for NULL: a NULL says nothing of the other
+fields, which still tell the row from the list's (`(NULL, 8)` is not in `(SELECT 'eu', 7)`; whether
+`(NULL, 7)` is can't be told).
 
 **Why.** On every miss the bytecode rewound the list and read all of it for a NULL, a step for each
 entry. The suite's `subquery_in` (`grp = ? AND owner IN (SELECT id FROM owners WHERE region = ?)
@@ -53,7 +56,10 @@ one it codes the search as a single `OP_NotFound`; otherwise, for a scalar left 
 the list's first row alone ("for a scalar LHS, it is sufficient to check just the first row of the
 RHS"), and it reads a row value's list through. The answers themselves: SQLite's table of the IN and
 NOT IN operators (`lang_expr.html`, "The IN and NOT IN operators"), ISO/IEC 9075-2's <in predicate>
-as `= ANY` over the subquery's rows.
+as `= ANY` over the subquery's rows; for a row with a NULL, `rowvalue.html` 2.1 ("The overall result
+of comparison is NULL if it is possible to make the result either true or false by substituting
+alternative values in place of the constituent NULLs"). SQLite 3.54.0's program for a row on the left
+is a Column for each field, one Affinity over them, an IsNull for each, then the Found.
 
 **Evidence.** `crates/engine/tests/in_subquery.rs`: 1,000 probes of a list of 2,000, 990 of them
 misses, ran 5,961,023 instructions as a condition (bound 120,000) and 11,919,990 as values (bound
@@ -64,7 +70,10 @@ before the change and after; mutants that drop the left side's NULL test, skip t
 check or read its last entry instead of its first each fail it. Release binaries on fedora (200,000
 items, best of 3 in turns, each run started at load under 2, not recorded runs): `subquery_in` 213
 → 784 statements a second at 1 client and 2,846 → 6,833 at 32; `exists_subquery` and
-`left_join_anti` unchanged.
+`left_join_anti` unchanged. `crates/engine/tests/row_values.rs` holds row values to SQLite 3.54.0's
+answers (lane C15, the oracles' finding CT): until 2026-11-24 the first NULL field jumped past the
+computing of the rest, which were then compared as the row before had left them. The model test above
+missed it: its left sides are parameters, computed once before the loop, so no field was skipped.
 
 **Falsified by.** An `IN` or `NOT IN` that answers other than SQL's three values; a list kept where
 a NULL does not sort first (a descending or `NULLS LAST` index would make the first entry say
