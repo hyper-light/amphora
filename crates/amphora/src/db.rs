@@ -1208,25 +1208,21 @@ impl Db {
 
     /// The bytes an image of this database would hold now, as `image_pages` counts them.
     pub(crate) fn image_bytes(&mut self) -> anyhow::Result<usize> {
-        self.exec("BEGIN")?;
-        let result = self.image_extent().map(|(_, size)| size);
-        self.exec("ROLLBACK")?;
-        result
+        self.on_snapshot(|db| db.image_extent().map(|(_, size)| size))
     }
 
     pub(crate) fn image_pages(&mut self, max_bytes: usize) -> anyhow::Result<Pages> {
-        self.exec("BEGIN")?;
-        let result = (|| {
-            let (count, size) = self.image_extent()?;
+        self.on_snapshot(|db| {
+            let (count, size) = db.image_extent()?;
             if size > max_bytes {
                 anyhow::bail!("snapshot exceeds its byte budget");
             }
-            let pager = self.conn.get_pager();
+            let pager = db.conn.get_pager();
             let mut pages = Vec::with_capacity(usize::try_from(count)?);
             for id in 1..=count {
-                let (page, completion) = self.io.block(|| pager.read_page(i64::from(id)))?;
+                let (page, completion) = db.io.block(|| pager.read_page(i64::from(id)))?;
                 if let Some(completion) = completion {
-                    self.io.wait_for_completion(completion).map_err(fail)?;
+                    db.io.wait_for_completion(completion).map_err(fail)?;
                 }
                 if !page.is_loaded() {
                     anyhow::bail!("snapshot page was not loaded");
@@ -1234,7 +1230,22 @@ impl Db {
                 pages.push((id, page.get_contents().as_ptr().to_vec()));
             }
             Ok(pages)
-        })();
+        })
+    }
+
+    /// `f` in a read transaction on one snapshot of what was committed when it began. `BEGIN` is
+    /// deferred: it takes no snapshot until a statement reads, and a raw page read is no statement.
+    /// Without one the connection looks a page up in the log as its last transaction left it, and
+    /// that view knows no segment a switch has closed since (store.md, decision 45): its pages
+    /// would be read from the file, stale or not there yet.
+    fn on_snapshot<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        self.exec("BEGIN")?;
+        let result = self
+            .query("SELECT 1 FROM sqlite_schema LIMIT 1", [], |_| Ok(false))
+            .and_then(|()| f(self));
         self.exec("ROLLBACK")?;
         result
     }
