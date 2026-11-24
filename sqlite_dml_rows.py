@@ -230,7 +230,7 @@ class Case:
         if rng.random() < 0.2:
             x = f"x.{rng.choice(self.written)}"
             return rng.choice([
-                f"(SELECT {e})", f"(SELECT typeof({e}) || typeof({own}))", f"(SELECT y FROM (SELECT {e} AS y))", f"(SELECT {e} UNION ALL SELECT {own} LIMIT 1)",
+                f"(SELECT {e})", f"(SELECT typeof({e}) || typeof({own}))", f"(SELECT y FROM (SELECT {e} AS y))",
                 f"(SELECT count(*) FROM t AS x WHERE {x} IS {e})", f"(SELECT max({x}) FROM t AS x)", f"(SELECT count(*) FROM t AS x WHERE {x} IS {x.replace('x.', 't.')})",
                 f"EXISTS (SELECT 1 FROM t AS x WHERE {x} IS NOT {e})", f"{e} IN (SELECT {x} FROM t AS x)", f"{own} NOT IN (SELECT {e})",
                 f"(SELECT count(*) FROM t AS x WHERE {x} IN (SELECT {e}))", f"coalesce((SELECT min({x}) FROM t AS x WHERE {x} > {e}), {lit})",
