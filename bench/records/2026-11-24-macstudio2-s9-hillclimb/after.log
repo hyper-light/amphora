@@ -1,0 +1,21 @@
+Tue Nov 24 17:16:37 UTC 2026
+== ablation
+('point_pk', 1) {'default': [509580], 'A_default': [315551], 'A_shared+slots': [437524], 'shared=0': [404922], 'page_path=today': [520690], 'checkout=pool': [539040], 'reader_pages=2000': [547135], 'writer_pages=1024': [537916], 'all_old': [358629]}
+('point_pk', 32) {'default': [5933316], 'A_default': [441758], 'A_shared+slots': [571463], 'shared=0': [695312], 'page_path=today': [6621151], 'checkout=pool': [587432], 'reader_pages=2000': [6030208], 'writer_pages=1024': [6044886], 'all_old': [487777]}
+('table_count', 1) {'default': [21338], 'A_default': [61642], 'A_shared+slots': [56], 'shared=0': [61656], 'page_path=today': [6737], 'checkout=pool': [20384], 'reader_pages=2000': [63074], 'writer_pages=1024': [19105], 'all_old': [60919]}
+('table_count', 32) {'default': [80722], 'A_default': [265119], 'A_shared+slots': [67829], 'shared=0': [437833], 'page_path=today': [62065], 'checkout=pool': [81794], 'reader_pages=2000': [911773], 'writer_pages=1024': [80264], 'all_old': [279074]}
+Tue Nov 24 17:17:49 UTC 2026
+== profiles
+B table_count 1 rc=0 30354 bytes; ops/s 22462.5 {'max': 0.117, 'n': 89850, 'p50': 0.043, 'p90': 0.044, 'p99': 0.078, 'p999': 0.095}
+B table_count 32 rc=0 1374816 bytes; ops/s 81492.0 {'max': 5.915, 'n': 325968, 'p50': 0.344, 'p90': 0.576, 'p99': 0.8, 'p999': 1.328}
+B aggregates_range 1 rc=0 31055 bytes; ops/s 6514.5 {'max': 0.282, 'n': 26058, 'p50': 0.15, 'p90': 0.182, 'p99': 0.214, 'p999': 0.248}
+Tue Nov 24 17:18:15 UTC 2026
+== many connections
+A 1 0 87.6 21.3 [['point_pk', 319921, 0.003, 0.004, 0, 0, None], ['insert_one', 201, 4.992, 9.6, 0, 0, None], ['txn_read_write', 180, 5.184, 9.984, 0, 0, None]]
+B 1 0 185.8 134.4 [['point_pk', 534320, 0.001, 0.002, 0, 0, None], ['insert_one', 195, 5.184, 10.368, 0, 0, None], ['txn_read_write', 196, 5.12, 10.24, 0, 0, None]]
+A 128 0 1542.6 1346.0 [['point_pk', 435285, 0.039, 5.248, 0, 0, None], ['insert_one', 12870, 9.344, 14.464, 0, 0, None], ['txn_read_write', 10319, 12.288, 17.664, 0, 0, None]]
+B 128 0 278.2 219.3 [['point_pk', 3679070, 0.005, 0.896, 0, 0, None], ['insert_one', 12796, 10.112, 13.312, 0, 0, None], ['txn_read_write', 12136, 10.24, 12.672, 0, 0, None]]
+B 512 0 321.4 237.4 [['point_pk', 2105561, 0.002, 0.007, 0, 0, None], ['insert_one', 29696, 15.488, 67.584, 0, 0, None], ['txn_read_write', 18944, 26.624, 28.928, 0, 0, None]]
+A 512 0 1766.9 1488.5 [['point_pk', 20769, 5.632, 1097.728, 0, 0, None], ['insert_one', 24029, 20.992, 29.696, 0, 0, None], ['txn_read_write', 8827, 36.352, 48.128, 0, 0, None]]
+B 1024 0 350.3 258.2 [['point_pk', 1575234, 0.002, 0.007, 0, 0, None], ['insert_one', 40098, 24.832, 32.768, 0, 0, None], ['txn_read_write', 21504, 46.592, 51.2, 0, 0, None]]
+A 1024 0 3053.6 2641.8 [['point_pk', 127, 26.88, 1359.872, 0, 0, None], ['insert_one', 25707, 38.912, 62.464, 0, 0, None], ['txn_read_write', 19345, 54.784, 79.872, 0, 0, None]]

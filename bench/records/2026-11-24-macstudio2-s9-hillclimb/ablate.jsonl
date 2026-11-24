@@ -1,0 +1,9 @@
+{"label": "default", "repeat": 1, "results": [["point_pk", 1, 509580.0, 0.001, 0], ["point_pk", 32, 5933316.0, 0.004, 0], ["table_count", 1, 21338.0, 0.046, 0], ["table_count", 32, 80722.0, 0.36, 0]]}
+{"label": "A_default", "repeat": 1, "results": [["point_pk", 1, 315551.0, 0.003, 0], ["point_pk", 32, 441758.0, 0.03, 0], ["table_count", 1, 61642.0, 0.015, 0], ["table_count", 32, 265119.0, 0.095, 0]]}
+{"label": "A_shared+slots", "repeat": 1, "results": [["point_pk", 1, 437524.0, 0.002, 0], ["point_pk", 32, 571463.0, 0.035, 0], ["table_count", 1, 56.0, 17.664, 0], ["table_count", 32, 67829.0, 0.023, 0]]}
+{"label": "shared=0", "repeat": 1, "results": [["point_pk", 1, 404922.0, 0.002, 0], ["point_pk", 32, 695312.0, 0.047, 0], ["table_count", 1, 61656.0, 0.016, 0], ["table_count", 32, 437833.0, 0.069, 0]]}
+{"label": "page_path=today", "repeat": 1, "results": [["point_pk", 1, 520690.0, 0.001, 0], ["point_pk", 32, 6621151.0, 0.004, 0], ["table_count", 1, 6737.0, 0.146, 0], ["table_count", 32, 62065.0, 0.452, 0]]}
+{"label": "checkout=pool", "repeat": 1, "results": [["point_pk", 1, 539040.0, 0.001, 0], ["point_pk", 32, 587432.0, 0.006, 0], ["table_count", 1, 20384.0, 0.048, 0], ["table_count", 32, 81794.0, 0.356, 0]]}
+{"label": "reader_pages=2000", "repeat": 1, "results": [["point_pk", 1, 547135.0, 0.001, 0], ["point_pk", 32, 6030208.0, 0.004, 0], ["table_count", 1, 63074.0, 0.015, 0], ["table_count", 32, 911773.0, 0.023, 0]]}
+{"label": "writer_pages=1024", "repeat": 1, "results": [["point_pk", 1, 537916.0, 0.001, 0], ["point_pk", 32, 6044886.0, 0.004, 0], ["table_count", 1, 19105.0, 0.051, 0], ["table_count", 32, 80264.0, 0.364, 0]]}
+{"label": "all_old", "repeat": 1, "results": [["point_pk", 1, 358629.0, 0.002, 0], ["point_pk", 32, 487777.0, 0.018, 0], ["table_count", 1, 60919.0, 0.016, 0], ["table_count", 32, 279074.0, 0.092, 0]]}

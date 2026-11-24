@@ -1,0 +1,22 @@
+reference when a round has no SQLite pass: SQLite's answers of round1.jsonl (the data and the parameters drawn are functions of the row ids and the client, the same in every pass)
+round1.jsonl A vs sqlite: 1026 answers compared, 0 differ or failed, 0 with no sqlite answer
+round1.jsonl B vs sqlite: 1026 answers compared, 0 differ or failed, 0 with no sqlite answer
+round1.jsonl Bd vs sqlite: 1026 answers compared, 0 differ or failed, 0 with no sqlite answer
+round1.jsonl C vs sqlite: 1026 answers compared, 0 differ or failed, 0 with no sqlite answer
+round1.jsonl Sf: writes only, no read answers to compare
+round1.jsonl T vs sqlite: 1026 answers compared, 0 differ or failed, 0 with no sqlite answer
+round1.jsonl Tf: writes only, no read answers to compare
+round2.jsonl A vs sqlite: 1026 answers compared, 0 differ or failed, 0 with no sqlite answer
+round2.jsonl B vs sqlite: 1026 answers compared, 0 differ or failed, 0 with no sqlite answer
+round2.jsonl C vs sqlite: 1026 answers compared, 0 differ or failed, 0 with no sqlite answer
+round2.jsonl T vs sqlite: 1026 answers compared, 0 differ or failed, 0 with no sqlite answer
+round3.jsonl A vs sqlite: 1026 answers compared, 0 differ or failed, 0 with no sqlite answer
+round3.jsonl B vs sqlite: 1026 answers compared, 0 differ or failed, 0 with no sqlite answer
+round4.jsonl: no SQLite pass in this round; compared with the reference round's
+round4.jsonl A vs sqlite: 1026 answers compared, 0 differ or failed, 0 with no sqlite answer
+round4.jsonl B vs sqlite: 1026 answers compared, 0 differ or failed, 0 with no sqlite answer
+round4.jsonl T vs sqlite: 1026 answers compared, 0 differ or failed, 0 with no sqlite answer
+round5.jsonl: no SQLite pass in this round; compared with the reference round's
+round5.jsonl A vs sqlite: 1026 answers compared, 0 differ or failed, 0 with no sqlite answer
+round5.jsonl B vs sqlite: 1026 answers compared, 0 differ or failed, 0 with no sqlite answer
+answers rc=0

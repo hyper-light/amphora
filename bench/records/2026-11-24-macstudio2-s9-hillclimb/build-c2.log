@@ -1,0 +1,32 @@
+arm c sha aef6fc8a4363c1a60a0fd4471b96190be396419d jobs 8 (resumed with arm A's compiled libduckdb-sys and duckdb, same lock, profile and toolchain) rustc 1.99.1 (58cf8f9c3 2026-10-13) start 2026-11-24T16:32:50Z
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /Users/adalundhe/.cache/amphora-s9/c/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /Users/adalundhe/.cache/amphora-s9/c/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+   Compiling libduckdb-sys v1.20001.0
+   Compiling duckdb v1.20001.0
+   Compiling amphora-bench v0.1.0 (/Users/adalundhe/.cache/amphora-s9/c/bench)
+    Finished `release` profile [optimized + debuginfo] target(s) in 4m 05s
+arm c end 2026-11-24T16:36:56Z sha256 704ee038fbd5881bd432bb58f091a24fd1c100f72b79e7489a8dbdd81bb36b67

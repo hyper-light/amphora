@@ -1,0 +1,2 @@
+== sqlite insert_one clients=1
+s9sync: fsync=166 F_FULLFSYNC=0 F_BARRIERFSYNC=0

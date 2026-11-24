@@ -1,0 +1,2 @@
+== amphora insert_one clients=1
+s9sync: fsync=5 F_FULLFSYNC=131 F_BARRIERFSYNC=0
