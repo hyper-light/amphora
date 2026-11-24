@@ -2041,22 +2041,24 @@ pure core is `database/slot.rs`, driven by the owner (`Actor::keep_slots`, `star
 - *What bounds a lost forward* (CP-T1.8, lanes V15 and V18; an event since V18). A holder's forward lost on the way
   leaves the slot without its event: nothing after the forward reaches the leader for it, and the holder is live, so
   nobody suspects it. Lane V15 measured that wait on real time (three members in one process, relayed by the test
-  pump, which lost member 3's forward): the leader's other writes waited the holder's whole 10 s deadline (10,027.9 ms
-  and more). Since lane V18 a follower's forward is followed, in the same drive and so on the same ordered link, by a
-  close: a barrier marked a read's (`Actor::close_behind`, the second barrier a write that forwarded nothing already
-  sent). The leader steps a marked barrier at once and ends a slot its member holds `released` (`Slots::pass`), so a
-  forward lost on the way holds the slot only until that close arrives; a forward that did arrive ended the slot
-  `forwarded` before it, and the close is then only a read's round. The wire is unchanged: a leader of any version
-  steps a marked barrier at once, and the close's own read state matches nothing at the member and is dropped. Lane
-  V18's red test (`replicated::v18_a_lost_forward_is_bounded_by_the_close_behind_it`, the forward lost, no clock moved)
-  fails without the close: the leader's write never answers while the slot holds. Lane V15's stages, run again with
-  the close (both classes, real clock, the same 10 ms tick): the leader's other write answered in 12.3 and 17.9 ms, with
-  the slot ended `released` at 2.8 and 2.9 ms; before, its wait was 10,021 and 10,017 ms. What the close costs a
-  follower's write on the normal path (message counts, both arms): bench/records, lane V18. The bound is the
-  close's arrival, so a loss that takes both (a link reset between the two) is still the deadline's, or the
-  detector's: the close leaves with its forward in one drive, so a whole `Ready` lost takes both. Lane V15 named a
-  second design (the forward sent again when the transport reports the link reset or the record refused), not
-  built: it needs a report from the host's transport and a typed drop of a copy at the leader.
+  pump, which lost member 3's forward): the leader's other writes waited the holder's whole 10 s deadline. Since lane
+  V18 a follower's forward is followed, in the same drive and so on the same ordered link, by a close: a barrier marked
+  a read's (`Actor::close_behind`, the second barrier a write that forwarded nothing already sent). The leader steps a
+  marked barrier at once and ends a slot its member holds `released` (`Slots::pass`), so a forward lost on the way
+  holds the slot only until that close arrives. A close behind a forward that arrived has nothing to end and its
+  answer is read by nothing (the member's own read state for it matches no request and is dropped), so the leader
+  consumes it unstepped: it knows it as that member's close by the request identity of the last forward it took from
+  the member, whose serial it follows by one (`follows`), in the same term and incarnation. No other barrier has that
+  serial, since an owner names each request once and makes none between its forward and its close. The wire is
+  unchanged: a leader of any version, and a leader that missed the forward, steps the close as the read it is.
+  Two designs were named by lane V15, and lane V18 measured what each costs a follower's write on the normal path, on
+  the driven harness with no loss (records a write, both classes). The close behind every forward: 1 more record a
+  write (the close; before the leader consumed it, 9.4 more, a read round's). A forward sent again when the
+  transport reports the link reset or the record refused: no more records, but a copy of the forward's entries kept
+  for each write in flight (4,133 bytes here), a report from each host's transport, and a typed drop of a copy at the
+  leader. The close was built: it needs nothing from a host, adds one small record, and its bound is the close's
+  arrival at the leader. What it does not bound: a loss of the whole `Ready` that held both (a link reset between
+  them), which the deadline or the detector still bounds. Numbers: bench/records, lane V18.
 - *What a slot holds* (Q1). Everything the leader would append between the holder's base and its retry: its own
   writes and floor sessions (`prepare` defers them, `slot_deferred`), its class entry (`propose_class`), and other
   members' forwarded proposals, held after the sender and origin checks. A change of members or a hand-off ends the
