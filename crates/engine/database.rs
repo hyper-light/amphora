@@ -732,10 +732,11 @@ pub struct Database<
     /// verify its local snapshot is current with a single `Acquire` load instead of contending on
     /// `schema.lock()` on every statement.
     pub(crate) schema_epoch: AtomicU64,
-    /// Schema version for which `ANALYZE` statistics were already loaded into `schema`
-    /// (`u64::MAX` until loaded): prevents every new connection from re-scanning `sqlite_stat1`
-    /// and deep-cloning `Schema` + column samples.
-    pub(crate) analyze_stats_version: AtomicU64,
+    /// Freshness witness for `ANALYZE` statistics cached on `schema` (schema version, schema
+    /// epoch, whether `sqlite_stat1` exists, and the in-process WAL token at scan time): avoids
+    /// redundant connect-time `sqlite_stat1` scans while guaranteeing any direct `sqlite_stat1`
+    /// DML, explicit-transaction `ANALYZE`, or external restore invalidates the cache.
+    pub(crate) analyze_stats_freshness: Mutex<Option<crate::stats::AnalyzeStatsFreshness>>,
     /// Monotonic counter used to stagger per-connection `LearnedCosts::RunCounts` phases so
     /// concurrent connections do not all sample on the exact same iteration.
     pub(crate) cost_run_seed: AtomicU64,
@@ -940,7 +941,7 @@ impl Database {
                 s
             }))),
             schema_epoch: AtomicU64::new(0),
-            analyze_stats_version: AtomicU64::new(u64::MAX),
+            analyze_stats_freshness: Mutex::new(None),
             cost_run_seed: AtomicU64::new(0),
             _shared_page_cache: shared_page_cache,
             learned_costs,
@@ -2972,8 +2973,7 @@ impl Database {
             fk_pragma: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),
             n_active_writes: AtomicI32::new(0),
-            n_active_blob_statements: AtomicI32::new(0),
-            statement_activity: Arc::new(AtomicI32::new(0)),
+            statement_activity: Arc::new(AtomicU64::new(0)),
             check_constraints_pragma: AtomicBool::new(false),
             vtab_txn_states: RwLock::new(HashSet::default()),
             index_method_tx_cursors: crate::sync::Mutex::new(Vec::new()),

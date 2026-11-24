@@ -2900,6 +2900,7 @@ impl Program {
 
     #[inline(never)]
     fn periodic_checks(&self, state: &mut ProgramState, pager: &Arc<Pager>) -> Option<ProgramStep> {
+        let elapsed_interval = state.check_interval;
         let progress_ops = self.connection.progress_ops();
         state.check_interval = if progress_ops == 0 || progress_ops >= MAX_CHECK_INTERVAL {
             MAX_CHECK_INTERVAL
@@ -2920,7 +2921,7 @@ impl Program {
         if quiet {
             return None;
         }
-        self.periodic_interrupt_checks(state, pager)
+        self.periodic_interrupt_checks(state, pager, elapsed_interval)
     }
 
     #[inline(never)]
@@ -2928,8 +2929,9 @@ impl Program {
         &self,
         state: &mut ProgramState,
         pager: &Arc<Pager>,
+        elapsed_interval: u64,
     ) -> Option<ProgramStep> {
-        let prev_steps = state.metrics.vm_steps.saturating_sub(state.check_interval);
+        let prev_steps = state.metrics.vm_steps.saturating_sub(elapsed_interval);
         if self.maybe_request_interrupt(state, pager.io.as_ref(), prev_steps) {
             return self.interrupted_during_step(state, pager);
         }

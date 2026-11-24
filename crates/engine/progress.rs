@@ -38,7 +38,6 @@ pub(crate) struct ProgressHandler {
     callback_ops: AtomicU64,
     deadline_nanos: AtomicU64,
     deadline_ops: AtomicU64,
-    ops: AtomicU64,
 }
 
 impl std::fmt::Debug for ProgressHandler {
@@ -55,39 +54,31 @@ impl ProgressHandler {
         Self::default()
     }
 
-    fn refresh_ops(&self) {
-        let effective = min_nonzero(
-            self.callback_ops.load(Ordering::Acquire),
-            self.deadline_ops.load(Ordering::Acquire),
-        );
-        self.ops.store(effective, Ordering::Release);
-    }
-
     /// Install or clear the progress handler.
     ///
     /// SQLite disables the handler when `N < 1` or the callback is null, so we
     /// do the same here by clearing both the callback and opcode interval.
+    /// Callback state and deadline state live in independent atomics so clearing
+    /// or installing one can never overwrite or disable the other.
     pub(crate) fn set(&self, ops: u64, callback: Option<ProgressHandlerCallback>) {
+        let mut slot = self.callback.write();
         if ops == 0 || callback.is_none() {
-            self.has_callback.store(false, Ordering::Release);
-            *self.callback.write() = None;
             self.callback_ops.store(0, Ordering::Release);
-            self.refresh_ops();
+            self.has_callback.store(false, Ordering::Release);
+            *slot = None;
             return;
         }
-        *self.callback.write() = callback;
+        *slot = callback;
         self.has_callback.store(true, Ordering::Release);
         self.callback_ops.store(ops, Ordering::Release);
-        self.refresh_ops();
     }
 
     /// Install or clear a monotonic wall-clock deadline checked approximately every `ops` VM steps
     /// without allocating a closure or taking the callback lock.
     pub(crate) fn set_deadline(&self, ops: u64, until: Option<Instant>) {
         let Some(until) = until.filter(|_| ops > 0) else {
-            self.deadline_nanos.store(DEADLINE_NONE, Ordering::Release);
             self.deadline_ops.store(0, Ordering::Release);
-            self.refresh_ops();
+            self.deadline_nanos.store(DEADLINE_NONE, Ordering::Release);
             return;
         };
         let epoch = *DEADLINE_EPOCH.get_or_init(Instant::now);
@@ -98,11 +89,13 @@ impl ProgressHandler {
         };
         self.deadline_nanos.store(encoded, Ordering::Release);
         self.deadline_ops.store(ops, Ordering::Release);
-        self.refresh_ops();
     }
 
     pub(crate) fn ops(&self) -> u64 {
-        self.ops.load(Ordering::Acquire)
+        min_nonzero(
+            self.callback_ops.load(Ordering::Acquire),
+            self.deadline_ops.load(Ordering::Acquire),
+        )
     }
 
     pub(crate) fn is_enabled(&self) -> bool {
@@ -112,29 +105,29 @@ impl ProgressHandler {
     /// Returns true when the callback or deadline requests interruption for the VM steps
     /// executed in `(prev_steps, vm_steps]`.
     ///
-    /// The cadence is approximate by design, matching SQLite's documentation:
-    /// the callback is consulted only when the VM-step count crosses a
-    /// configured multiple of `ops`. Callers that consult this once per step
-    /// pass `prev_steps = vm_steps - 1`; callers that batch several steps per
-    /// consultation pass the count from the previous consultation.
+    /// Each mechanism is consulted only on crossings of its own configured cadence so a shorter
+    /// deadline check interval never triggers a longer-interval progress callback early.
     pub(crate) fn should_interrupt(&self, prev_steps: u64, vm_steps: u64) -> bool {
-        let ops = self.ops.load(Ordering::Acquire);
-        if ops == 0 || prev_steps / ops == vm_steps / ops {
-            return false;
-        }
-        let deadline = self.deadline_nanos.load(Ordering::Acquire);
-        if deadline != DEADLINE_NONE {
-            if deadline == DEADLINE_EXPIRED {
-                return true;
-            }
-            if let Some(epoch) = DEADLINE_EPOCH.get() {
-                let now = u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                if now >= deadline {
+        let deadline_ops = self.deadline_ops.load(Ordering::Acquire);
+        if deadline_ops != 0 && prev_steps / deadline_ops != vm_steps / deadline_ops {
+            let deadline = self.deadline_nanos.load(Ordering::Acquire);
+            if deadline != DEADLINE_NONE {
+                if deadline == DEADLINE_EXPIRED {
                     return true;
+                }
+                if let Some(epoch) = DEADLINE_EPOCH.get() {
+                    let now = u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    if now >= deadline {
+                        return true;
+                    }
                 }
             }
         }
-        if self.has_callback.load(Ordering::Acquire) {
+        let callback_ops = self.callback_ops.load(Ordering::Acquire);
+        if callback_ops != 0
+            && prev_steps / callback_ops != vm_steps / callback_ops
+            && self.has_callback.load(Ordering::Acquire)
+        {
             let callback = self.callback.read();
             if let Some(callback) = callback.as_ref() {
                 return callback();
@@ -211,5 +204,68 @@ mod tests {
         handler.set(0, None);
         assert!(!handler.should_interrupt(1, 2));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// P1 regression: a shorter deadline check interval (1,024 ops) must not invoke a longer
+    /// progress callback (10,000 ops) on every 1,024-op tick, while still interrupting promptly
+    /// when the deadline expires.
+    #[test]
+    fn p1_deadline_interval_does_not_accelerate_longer_callback_interval() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler = ProgressHandler::new();
+        let callback_calls = Arc::clone(&calls);
+        handler.set(
+            10_000,
+            Some(Box::new(move || {
+                callback_calls.fetch_add(1, Ordering::SeqCst);
+                false
+            })),
+        );
+        let far = Instant::now() + std::time::Duration::from_secs(3600);
+        handler.set_deadline(1_024, Some(far));
+        assert_eq!(handler.ops(), 1_024);
+
+        let mut prev = 0u64;
+        for tick in 1..=20u64 {
+            let cur = tick * 1_024;
+            assert!(!handler.should_interrupt(prev, cur));
+            prev = cur;
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "10,000-op callback must run only on 10,000-op crossings, not every 1,024 ops"
+        );
+
+        let expired = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+        handler.set_deadline(1_024, Some(expired));
+        assert!(handler.should_interrupt(prev, prev + 1_024));
+    }
+
+    /// P1 regression: concurrently removing a progress callback while installing a deadline must
+    /// never overwrite the effective interval with zero and disable deadline checks.
+    #[test]
+    fn p1_clearing_callback_concurrently_never_disables_active_deadline() {
+        let handler = Arc::new(ProgressHandler::new());
+        let far = Instant::now() + std::time::Duration::from_secs(3600);
+        std::thread::scope(|s| {
+            let h1 = Arc::clone(&handler);
+            let h2 = Arc::clone(&handler);
+            s.spawn(move || {
+                for _ in 0..5_000 {
+                    h1.set(10_000, Some(Box::new(|| false)));
+                    h1.set(0, None);
+                }
+            });
+            s.spawn(move || {
+                for _ in 0..5_000 {
+                    h2.set_deadline(1_024, Some(far));
+                }
+            });
+        });
+        assert_eq!(handler.ops(), 1_024);
+        assert!(handler.is_enabled());
     }
 }

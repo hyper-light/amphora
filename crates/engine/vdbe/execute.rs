@@ -6114,8 +6114,8 @@ pub fn op_savepoint(
                 conn.invalidate_local_schema_epoch();
                 if let Some(temp_db) = conn.temp.database.read().as_ref() {
                     match info.temp_schema_snapshot {
-                        Some(snap) => *temp_db.db.schema.lock() = snap,
-                        None => *temp_db.db.schema.lock() = conn.empty_temp_schema(),
+                        Some(snap) => temp_db.db.replace_schema(snap),
+                        None => temp_db.db.replace_schema(conn.empty_temp_schema()),
                     }
                 }
                 *conn.database_schemas().write() = info.staged_schema_snapshot;
@@ -16915,7 +16915,7 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                         if let Some(cookie) = temp_db.pager.get_schema_cookie_cached() {
                             schema.schema_version = cookie;
                         }
-                        *temp_db.db.schema.lock() = schema_arc;
+                        temp_db.db.replace_schema(schema_arc);
                     }
                 } else if db != crate::MAIN_DB_ID {
                     conn.database_schemas().write().insert(db, schema_arc);

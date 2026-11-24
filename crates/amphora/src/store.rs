@@ -476,19 +476,27 @@ struct Progress {
     commits: u64,
 }
 
+#[derive(Default)]
+struct TicketWaiters {
+    next_id: u64,
+    /// `(waiter_id, target_commit, thread)`: `waiter_id` allows O(n) removal of an expired or
+    /// cancelled registration on timeout so repeated timeouts never grow the queue.
+    entries: Vec<(u64, u64, std::thread::Thread)>,
+}
+
 /// Cache-line-isolated shard of per-ticket blocking waiters parked in [`Sends::wait_ticket`],
 /// sized to hardware parallelism so 1k–10k concurrent writers never serialize on one wait queue.
 #[repr(align(128))]
 struct PaddedTicketShard {
     count: AtomicUsize,
-    waiters: Mutex<Vec<(u64, std::thread::Thread)>>,
+    waiters: Mutex<TicketWaiters>,
 }
 
 impl Default for PaddedTicketShard {
     fn default() -> Self {
         Self {
             count: AtomicUsize::new(0),
-            waiters: Mutex::new(Vec::new()),
+            waiters: Mutex::new(TicketWaiters::default()),
         }
     }
 }
@@ -901,19 +909,20 @@ impl Sends {
             let mut waiters = locked(&shard.waiters);
             let mut removed = 0usize;
             let mut i = 0;
-            while i < waiters.len() {
+            while i < waiters.entries.len() {
                 let ready = waiters
+                    .entries
                     .get(i)
-                    .is_some_and(|(commit, _)| *commit <= durable_commits);
+                    .is_some_and(|(_, commit, _)| *commit <= durable_commits);
                 if ready {
-                    wake.push(waiters.swap_remove(i).1);
+                    wake.push(waiters.entries.swap_remove(i).2);
                     removed = removed.saturating_add(1);
                 } else {
                     i = i.saturating_add(1);
                 }
             }
             if removed > 0 {
-                shard.count.store(waiters.len(), Ordering::SeqCst);
+                shard.count.store(waiters.entries.len(), Ordering::SeqCst);
                 self.ticket_waiter_total
                     .fetch_sub(removed, Ordering::SeqCst);
             }
@@ -935,9 +944,9 @@ impl Sends {
                 continue;
             }
             let mut waiters = locked(&shard.waiters);
-            let removed = waiters.len();
+            let removed = waiters.entries.len();
             if removed > 0 {
-                wake.extend(waiters.drain(..).map(|(_, thread)| thread));
+                wake.extend(waiters.entries.drain(..).map(|(_, _, thread)| thread));
                 shard.count.store(0, Ordering::SeqCst);
                 self.ticket_waiter_total
                     .fetch_sub(removed, Ordering::SeqCst);
@@ -948,19 +957,58 @@ impl Sends {
         }
     }
 
+    fn remove_ticket_waiter_locked(
+        &self,
+        shard: &PaddedTicketShard,
+        waiters: &mut TicketWaiters,
+        id: u64,
+    ) {
+        if let Some(pos) = waiters
+            .entries
+            .iter()
+            .position(|(entry_id, _, _)| *entry_id == id)
+        {
+            let _ = waiters.entries.swap_remove(pos);
+            shard.count.store(waiters.entries.len(), Ordering::SeqCst);
+            self.ticket_waiter_total.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    fn remove_ticket_waiter(&self, shard: &PaddedTicketShard, id: u64) {
+        if shard.count.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        let mut waiters = locked(&shard.waiters);
+        self.remove_ticket_waiter_locked(shard, &mut waiters, id);
+    }
+
     /// Waits until the batch whose fate is `fate` is committed and then flushed, up to `until`; see
     /// [`Store::durable`]. Uses sharded per-thread `park`/`unpark` with lock-free post-wakeup
-    /// checks so 1k–10k concurrent writers never contend on a shared mutex as a group commit flushes.
+    /// checks so 1k–10k concurrent writers never contend on a shared mutex as a group commit flushes,
+    /// while removing expired or superseded registrations on timeout/spurious wakeup so the queue
+    /// stays strictly bounded by active waiters.
     fn wait_ticket(&self, fate: &Fate, until: Instant) -> Result<(), Refused> {
         let shard = self.ticket_shard();
+        let mut registered_id: Option<u64> = None;
         loop {
             match fate.state.load(Ordering::Acquire) {
-                FAILED => return Err(Refused::Failed),
+                FAILED => {
+                    if let Some(id) = registered_id.take() {
+                        self.remove_ticket_waiter(shard, id);
+                    }
+                    return Err(Refused::Failed);
+                }
                 UNSETTLED => {
                     if self.disk_failed.load(Ordering::SeqCst) {
+                        if let Some(id) = registered_id.take() {
+                            self.remove_ticket_waiter(shard, id);
+                        }
                         return Err(Refused::Disk);
                     }
                     if self.stopping.load(Ordering::SeqCst) {
+                        if let Some(id) = registered_id.take() {
+                            self.remove_ticket_waiter(shard, id);
+                        }
                         return Err(Refused::Stopped);
                     }
                 }
@@ -969,17 +1017,26 @@ impl Sends {
                         return Ok(());
                     }
                     if self.disk_failed.load(Ordering::SeqCst) {
+                        if let Some(id) = registered_id.take() {
+                            self.remove_ticket_waiter(shard, id);
+                        }
                         return Err(Refused::Disk);
                     }
                 }
             }
             let left = until.saturating_duration_since(Instant::now());
             if left.is_zero() {
+                if let Some(id) = registered_id.take() {
+                    self.remove_ticket_waiter(shard, id);
+                }
                 return Err(Refused::Timeout);
             }
             {
                 let mut waiters = locked(&shard.waiters);
-                let prev_len = waiters.len();
+                if let Some(prev_id) = registered_id.take() {
+                    self.remove_ticket_waiter_locked(shard, &mut waiters, prev_id);
+                }
+                let prev_len = waiters.entries.len();
                 shard
                     .count
                     .store(prev_len.saturating_add(1), Ordering::SeqCst);
@@ -1017,7 +1074,10 @@ impl Sends {
                         commit
                     }
                 };
-                waiters.push((commit, std::thread::current()));
+                let id = waiters.next_id;
+                waiters.next_id = waiters.next_id.wrapping_add(1);
+                waiters.entries.push((id, commit, std::thread::current()));
+                registered_id = Some(id);
             }
             std::thread::park_timeout(left);
         }
@@ -2097,5 +2157,81 @@ mod tests {
         assert_eq!(b.counters().room_waits, 1);
         assert_eq!(a.counters().dropped + b.counters().dropped, 0);
         assert_eq!(budget.held(crate::memory::Use::Queues), 0);
+    }
+
+    /// P2 regression: repeated durability timeouts while the flusher is stalled must remove their
+    /// ticket-waiter registrations instead of growing the waiter queue indefinitely.
+    #[test]
+    fn p2_durability_timeouts_do_not_grow_ticket_waiter_queue() {
+        struct StalledFlush {
+            release: Arc<Mutex<Option<mpsc::Receiver<()>>>>,
+            started: Arc<Mutex<Option<mpsc::Sender<()>>>>,
+        }
+        impl Engine for StalledFlush {
+            type Row = String;
+            type Reader = ();
+            fn key(row: &Self::Row) -> &str {
+                row
+            }
+            fn row_bytes(_: &Self::Row) -> usize {
+                0
+            }
+            fn apply(&mut self, rows: &[Self::Row]) -> anyhow::Result<usize> {
+                Ok(rows.len())
+            }
+            fn flusher(&self) -> Option<Flush> {
+                let release = Arc::clone(&self.release);
+                let started = Arc::clone(&self.started);
+                Some(Box::new(move || {
+                    if let Some(tx) = locked(&started).take() {
+                        let _ = tx.send(());
+                    }
+                    if let Some(rx) = locked(&release).take() {
+                        let _ = rx.recv();
+                    }
+                    Ok(())
+                }))
+            }
+        }
+
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let store = Store::start(
+            StalledFlush {
+                release: Arc::new(Mutex::new(Some(release_rx))),
+                started: Arc::new(Mutex::new(Some(started_tx))),
+            },
+            Config::default(),
+        )
+        .unwrap();
+
+        let ticket = store.put(vec!["k".to_owned()]).unwrap();
+        started_rx.recv().unwrap();
+
+        for _ in 0..100 {
+            let err = store
+                .durable(&ticket, Instant::now() + Duration::from_micros(200))
+                .unwrap_err();
+            assert_eq!(err, Refused::Timeout);
+        }
+
+        assert_eq!(
+            store.sends.ticket_waiter_total.load(Ordering::SeqCst),
+            0,
+            "expired durability waits must not leave entries behind"
+        );
+        for shard in std::iter::once(&store.sends.ticket_shards_first)
+            .chain(store.sends.ticket_shards_rest.iter())
+        {
+            assert!(
+                locked(&shard.waiters).entries.is_empty(),
+                "ticket waiter shard must be empty after all timeouts returned"
+            );
+        }
+
+        release_tx.send(()).unwrap();
+        store
+            .durable(&ticket, Instant::now() + Duration::from_secs(10))
+            .unwrap();
     }
 }

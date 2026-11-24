@@ -900,7 +900,7 @@ impl PartitionBuffer {
     }
 
     fn clear(&mut self) {
-        self.entries.clear();
+        self.entries = Vec::new();
         self.mem_used = 0;
     }
 
@@ -1887,13 +1887,15 @@ impl HashTable {
         Ok(())
     }
 
-    /// Redistribute existing slab entries into partition buffers for grace hash join.
+    /// Redistribute existing slab entries into partition buffers for grace hash join, releasing
+    /// the in-memory slab and bucket allocations that are accounted as freed.
     fn redistribute_to_partitions(&mut self) -> Result<()> {
         let partitioning = {
             let spill_state = self.spill_state.as_ref().expect("spill state must exist");
             spill_state.partitioning
         };
-        for entry in self.entries.drain(..) {
+        let entries = std::mem::take(&mut self.entries);
+        for entry in entries {
             let partition_idx = partitioning.index(entry.hash);
             self.spill_state
                 .as_mut()
@@ -1901,11 +1903,11 @@ impl HashTable {
                 .partition_buffers[partition_idx]
                 .insert(entry)?;
         }
-        // Clear in-memory slab metadata; spilled partitions will have their own.
-        self.heads.clear();
-        self.next.clear();
-        self.matched_bits.clear();
-        self.non_empty_buckets.clear();
+        // Release in-memory slab and bucket allocations; spilled partitions own their own buffers.
+        self.heads = Vec::new();
+        self.next = Vec::new();
+        self.matched_bits = Vec::new();
+        self.non_empty_buckets = Vec::new();
         self.bucket_mem = 0;
         Ok(())
     }
@@ -5899,5 +5901,53 @@ mod hashtests {
         expected_unmatched.sort_unstable();
         actual_unmatched.sort_unstable();
         assert_eq!(actual_unmatched, expected_unmatched);
+    }
+
+    /// P2 regression: redistributing entries and spilling partitions must drop the backing
+    /// allocations whose bytes are accounted as freed, not retain them via `.drain(..)`/`.clear()`.
+    #[test]
+    fn p2_hash_spill_releases_redistributed_and_spilled_allocations() {
+        let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 64,
+            mem_budget: 2048,
+            num_keys: 1,
+            collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
+            track_matched: true,
+            partition_count: Some(16),
+        };
+        let mut ht = HashTable::new(config, io).unwrap();
+        let payload = vec![Value::from_text("x".repeat(64))];
+        for i in 0..200i64 {
+            let _ = ht
+                .insert(vec![Value::from_i64(i)], i, payload.clone(), None)
+                .unwrap();
+        }
+        assert!(ht.has_spilled(), "table must spill under small budget");
+        assert_eq!(ht.entries.capacity(), 0, "slab capacity must be released");
+        assert_eq!(ht.heads.capacity(), 0, "heads capacity must be released");
+        assert_eq!(ht.next.capacity(), 0, "next capacity must be released");
+        assert_eq!(
+            ht.matched_bits.capacity(),
+            0,
+            "matched_bits capacity must be released"
+        );
+        assert_eq!(
+            ht.non_empty_buckets.capacity(),
+            0,
+            "non_empty_buckets capacity must be released"
+        );
+        let spill_state = ht.spill_state.as_ref().unwrap();
+        for spilled in &spill_state.partitions {
+            let buf = &spill_state.partition_buffers[spilled.partition_idx];
+            if buf.is_empty() {
+                assert_eq!(
+                    buf.entries.capacity(),
+                    0,
+                    "spilled partition buffer capacity must be released"
+                );
+            }
+        }
     }
 }

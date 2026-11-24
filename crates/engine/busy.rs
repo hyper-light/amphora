@@ -1,4 +1,4 @@
-use crate::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use crate::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use crate::sync::Mutex;
 use crate::MonotonicInstant;
 use crossbeam_utils::CachePadded;
@@ -28,12 +28,14 @@ pub enum BusyWake {
 #[derive(Debug)]
 pub struct LockRelease {
     generation: AtomicU64,
-    /// Whether any waker is held, so a release with nobody waiting takes no lock.
-    armed: AtomicBool,
-    /// Number of statements currently retrying/waiting on a busy lock and therefore interested in
-    /// shared-read lock releases (`notify_shared`). Kept on its own cache line so uncontended
-    /// shared-read unlocks stay read-only and never dirty `generation` across cores.
-    shared_interest: CachePadded<AtomicU32>,
+    /// Packed waiter state kept on its own cache line so uncontended shared-read unlocks
+    /// (`notify_shared`) stay read-only and never dirty `generation` across cores:
+    /// - bit 0 ([`Self::ARMED_BIT`]): at least one waker is registered in `wakers`
+    /// - bits 1..32 (step [`Self::INTEREST_INC`]): active [`SharedInterestGuard`] count
+    ///
+    /// Checking `wait_state != 0` in `notify_shared()` wakes both crate-internal retrying
+    /// statements and direct public [`Self::wait`] callers without an extra cache-line read.
+    wait_state: CachePadded<AtomicU32>,
     wakers: Mutex<Vec<Waker>>,
 }
 
@@ -41,8 +43,7 @@ impl Default for LockRelease {
     fn default() -> Self {
         Self {
             generation: AtomicU64::new(0),
-            armed: AtomicBool::new(false),
-            shared_interest: CachePadded::new(AtomicU32::new(0)),
+            wait_state: CachePadded::new(AtomicU32::new(0)),
             wakers: Mutex::new(Vec::new()),
         }
     }
@@ -51,17 +52,22 @@ impl Default for LockRelease {
 /// RAII registration keeping [`LockRelease::notify_shared`] active while a busy statement retries
 /// and waits for a lock release.
 #[derive(Debug)]
-pub(crate) struct SharedInterestGuard {
+pub struct SharedInterestGuard {
     release: Arc<LockRelease>,
 }
 
 impl Drop for SharedInterestGuard {
     fn drop(&mut self) {
-        self.release.shared_interest.fetch_sub(1, Ordering::Release);
+        self.release
+            .wait_state
+            .fetch_sub(LockRelease::INTEREST_INC, Ordering::Release);
     }
 }
 
 impl LockRelease {
+    const ARMED_BIT: u32 = 1;
+    const INTEREST_INC: u32 = 2;
+
     /// The releases so far.
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)
@@ -72,9 +78,12 @@ impl LockRelease {
     pub fn wait(&self, seen: u64, step: &OwnReleases, waker: &Waker) -> bool {
         let own = step.count(self);
         let mut wakers = self.wakers.lock();
-        self.armed.store(true, Ordering::SeqCst);
+        self.wait_state.fetch_or(Self::ARMED_BIT, Ordering::SeqCst);
         if self.generation.load(Ordering::SeqCst) != seen.wrapping_add(own) {
-            self.armed.store(!wakers.is_empty(), Ordering::SeqCst);
+            if wakers.is_empty() {
+                self.wait_state
+                    .fetch_and(!Self::ARMED_BIT, Ordering::SeqCst);
+            }
             return false;
         }
         if !wakers.iter().any(|held| held.will_wake(waker)) {
@@ -130,19 +139,20 @@ impl LockRelease {
     /// Registers interest in shared-read lock releases (`notify_shared`) with `SeqCst` visibility
     /// so any reader that unlocks after a subsequent failed exclusive lock attempt observes the
     /// interest and calls `notify()`.
-    pub(crate) fn interest(self: &Arc<Self>) -> SharedInterestGuard {
-        self.shared_interest.fetch_add(1, Ordering::SeqCst);
+    pub fn interest(self: &Arc<Self>) -> SharedInterestGuard {
+        self.wait_state
+            .fetch_add(Self::INTEREST_INC, Ordering::SeqCst);
         SharedInterestGuard {
             release: Arc::clone(self),
         }
     }
 
-    /// A shared-read lock was released: wakes waiters only when a contending statement has
-    /// registered interest via [`Self::interest`]. With no contending waiter, this performs a
-    /// single read of an uncontended cache line and avoids dirtying `generation` across cores.
+    /// A shared-read lock was released: wakes waiters whenever any waker is armed or any
+    /// contending caller has registered interest via [`Self::interest`]. With nobody waiting, this
+    /// performs a single read of an uncontended cache line and avoids dirtying `generation`.
     #[inline]
     pub fn notify_shared(&self) {
-        if self.shared_interest.load(Ordering::SeqCst) != 0 {
+        if self.wait_state.load(Ordering::SeqCst) != 0 {
             self.notify();
         }
     }
@@ -157,12 +167,13 @@ impl LockRelease {
                 own.set((held, made.wrapping_add(1)));
             }
         });
-        if !self.armed.load(Ordering::SeqCst) {
+        if (self.wait_state.load(Ordering::SeqCst) & Self::ARMED_BIT) == 0 {
             return;
         }
         let woken = {
             let mut wakers = self.wakers.lock();
-            self.armed.store(false, Ordering::SeqCst);
+            self.wait_state
+                .fetch_and(!Self::ARMED_BIT, Ordering::SeqCst);
             std::mem::take(&mut *wakers)
         };
         for waker in woken {
@@ -191,9 +202,11 @@ impl Drop for ReleaseWait {
     fn drop(&mut self) {
         let mut wakers = self.release.wakers.lock();
         wakers.retain(|held| !held.will_wake(&self.waker));
-        self.release
-            .armed
-            .store(!wakers.is_empty(), Ordering::SeqCst);
+        if wakers.is_empty() {
+            self.release
+                .wait_state
+                .fetch_and(!LockRelease::ARMED_BIT, Ordering::SeqCst);
+        }
     }
 }
 
@@ -776,5 +789,25 @@ mod tests {
         // Check delay from `now` - should be 1ms
         let delay = state.get_delay(now);
         assert_eq!(delay, Duration::from_millis(1));
+    }
+
+    /// P2 regression: a direct public `LockRelease::wait` caller that did not acquire a
+    /// `SharedInterestGuard` must still be woken when the last reader calls `notify_shared()`.
+    #[test]
+    fn p2_public_wait_is_woken_by_notify_shared_without_interest_guard() {
+        let release = LockRelease::default();
+        let count = std::sync::Arc::new(Count(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = Waker::from(std::sync::Arc::clone(&count));
+        let step = release.own_releases();
+        let seen = release.generation();
+        assert!(release.wait(seen, &step, &waker));
+        std::thread::scope(|s| {
+            s.spawn(|| release.notify_shared());
+        });
+        assert_eq!(
+            count.0.load(Ordering::SeqCst),
+            1,
+            "public waiter must be woken by notify_shared()"
+        );
     }
 }

@@ -15,7 +15,6 @@
 //! the readers' release take every slot, so no read is under way meanwhile.
 
 use std::cell::Cell;
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering, fence};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::Thread;
@@ -102,19 +101,149 @@ struct PaddedCount(AtomicUsize, AtomicUsize);
 struct WaiterSlot {
     thread: Option<Thread>,
     assigned: Option<usize>,
-    cancelled: bool,
+    prev: Option<usize>,
+    next: Option<usize>,
+    seq: u64,
+    queued: bool,
 }
 
 #[derive(Default)]
 struct SlotQueue {
-    /// Strict FIFO queue of waiter indices into `entries`.
-    fifo: VecDeque<usize>,
-    /// Reusable waiter slots (grows lazily to peak concurrent waiters on this slot).
+    /// Head and tail of the intrusive FIFO doubly-linked list inside `entries` so any waiter
+    /// timing out at any position unlinks and recycles its slot in O(1) without growing the queue.
+    head: Option<usize>,
+    tail: Option<usize>,
+    live_len: usize,
+    next_seq: u64,
+    /// Reusable waiter slots (bounded by peak concurrent live waiters on this slot).
     entries: Vec<WaiterSlot>,
     /// Free indices in `entries`.
     free: Vec<usize>,
     /// Threads currently inside `take_all()` waiting for this slot to become free.
     drain_waiters: Vec<Thread>,
+}
+
+impl SlotQueue {
+    fn push_back(&mut self, thread: Thread) -> (usize, usize) {
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        let prev = self.tail;
+        let id = match self.free.pop() {
+            Some(id) => {
+                if let Some(entry) = self.entries.get_mut(id) {
+                    entry.thread = Some(thread);
+                    entry.assigned = None;
+                    entry.prev = prev;
+                    entry.next = None;
+                    entry.seq = seq;
+                    entry.queued = true;
+                }
+                id
+            }
+            None => {
+                let id = self.entries.len();
+                self.entries.push(WaiterSlot {
+                    thread: Some(thread),
+                    assigned: None,
+                    prev,
+                    next: None,
+                    seq,
+                    queued: true,
+                });
+                id
+            }
+        };
+        if let Some(prev_id) = prev {
+            if let Some(prev_entry) = self.entries.get_mut(prev_id) {
+                prev_entry.next = Some(id);
+            }
+        } else {
+            self.head = Some(id);
+        }
+        self.tail = Some(id);
+        let rank = self.live_len;
+        self.live_len = self.live_len.saturating_add(1);
+        (id, rank)
+    }
+
+    fn pop_front(&mut self) -> Option<usize> {
+        let front_id = self.head?;
+        let next = self.entries.get(front_id).and_then(|e| e.next);
+        self.head = next;
+        if let Some(next_id) = next {
+            if let Some(next_entry) = self.entries.get_mut(next_id) {
+                next_entry.prev = None;
+            }
+        } else {
+            self.tail = None;
+        }
+        if let Some(entry) = self.entries.get_mut(front_id) {
+            entry.prev = None;
+            entry.next = None;
+            entry.queued = false;
+        }
+        self.live_len = self.live_len.saturating_sub(1);
+        Some(front_id)
+    }
+
+    fn unlink(&mut self, id: usize) -> bool {
+        let Some((prev, next, queued)) = self
+            .entries
+            .get(id)
+            .map(|entry| (entry.prev, entry.next, entry.queued))
+        else {
+            return false;
+        };
+        if !queued {
+            return false;
+        }
+        if let Some(entry) = self.entries.get_mut(id) {
+            entry.prev = None;
+            entry.next = None;
+            entry.queued = false;
+        }
+        if let Some(prev_id) = prev {
+            if let Some(prev_entry) = self.entries.get_mut(prev_id) {
+                prev_entry.next = next;
+            }
+        } else {
+            self.head = next;
+        }
+        if let Some(next_id) = next {
+            if let Some(next_entry) = self.entries.get_mut(next_id) {
+                next_entry.prev = prev;
+            }
+        } else {
+            self.tail = prev;
+        }
+        self.live_len = self.live_len.saturating_sub(1);
+        true
+    }
+
+    fn recycle(&mut self, id: usize) {
+        if let Some(entry) = self.entries.get_mut(id) {
+            entry.thread = None;
+            entry.assigned = None;
+            entry.prev = None;
+            entry.next = None;
+            entry.queued = false;
+            self.free.push(id);
+        }
+    }
+
+    fn rank_of(&self, id: usize) -> usize {
+        if self.head == Some(id) {
+            return 0;
+        }
+        let Some(head_seq) = self.head.and_then(|h| self.entries.get(h)).map(|e| e.seq) else {
+            return 0;
+        };
+        let Some(my_seq) = self.entries.get(id).map(|e| e.seq) else {
+            return 0;
+        };
+        let delta = usize::try_from(my_seq.wrapping_sub(head_seq)).unwrap_or(usize::MAX);
+        delta.min(self.live_len.saturating_sub(1))
+    }
 }
 
 /// The slots and their per-slot eventual-fairness FIFO queues.
@@ -214,28 +343,36 @@ impl<R> Slots<R> {
         thread_number().checked_rem(len).unwrap_or(0)
     }
 
-    /// Discards cancelled entries at the head of `queue.fifo` and clears `slot.next_handoff_ns`
-    /// when the queue becomes empty.
-    fn refresh_front(slot: &Slot<R>, queue: &mut SlotQueue) -> Option<usize> {
-        while let Some(&front_id) = queue.fifo.front() {
-            let cancelled = queue
-                .entries
-                .get(front_id)
-                .is_none_or(|entry| entry.cancelled);
-            if cancelled {
-                let _ = queue.fifo.pop_front();
-                if let Some(entry) = queue.entries.get_mut(front_id) {
-                    entry.cancelled = false;
-                    entry.thread = None;
-                    entry.assigned = None;
-                    queue.free.push(front_id);
-                }
-            } else {
-                return Some(front_id);
-            }
+    /// Returns the front live waiter id and clears `slot.next_handoff_ns` when the queue is empty.
+    fn front_live(slot: &Slot<R>, queue: &SlotQueue) -> Option<usize> {
+        if let Some(front_id) = queue.head {
+            Some(front_id)
+        } else {
+            slot.next_handoff_ns.store(0, Ordering::Relaxed);
+            None
         }
-        slot.next_handoff_ns.store(0, Ordering::Relaxed);
-        None
+    }
+
+    /// Marks `slot` free and wakes any `take_all()` drainers registered on it.
+    ///
+    /// Every transition back to `SLOT_FREE` must go through this helper so a concurrent `take_all()`
+    /// that registered and parked on `slot` can never miss its wakeup.
+    #[inline]
+    fn free_and_wake_drainers(&self, slot: &Slot<R>) -> bool {
+        slot.state.store(SLOT_FREE, Ordering::Release);
+        fence(Ordering::SeqCst);
+        if self.waiting.1.load(Ordering::Acquire) > 0 {
+            let drainers = {
+                let mut queue = Self::lock_slot_queue(slot);
+                std::mem::take(&mut queue.drain_waiters)
+            };
+            for thread in drainers {
+                thread.unpark();
+            }
+            true
+        } else {
+            false
+        }
     }
 
     /// Claims one free slot via atomic CAS, probing `first` first without writing cache lines of
@@ -300,8 +437,7 @@ impl<R> Slots<R> {
         assigned_idx: usize,
         now_ns: u64,
     ) -> Option<Thread> {
-        let front_id = Self::refresh_front(owner_slot, queue)?;
-        let _ = queue.fifo.pop_front();
+        let front_id = queue.pop_front()?;
         self.dec_local_waiting(owner_slot);
         let thread = if let Some(entry) = queue.entries.get_mut(front_id) {
             entry.assigned = Some(assigned_idx);
@@ -309,7 +445,7 @@ impl<R> Slots<R> {
         } else {
             None
         };
-        if Self::refresh_front(owner_slot, queue).is_some() {
+        if Self::front_live(owner_slot, queue).is_some() {
             owner_slot
                 .next_handoff_ns
                 .store(now_ns.saturating_add(FAIR_HANDOFF_NS), Ordering::Relaxed);
@@ -345,7 +481,7 @@ impl<R> Slots<R> {
                     let handed = self.handoff_from_slot(other, &mut queue, idx, monotonic_ns());
                     let next =
                         if handed.is_some() && other.state.load(Ordering::Acquire) == SLOT_FREE {
-                            Self::refresh_front(other, &mut queue).and_then(|front_id| {
+                            Self::front_live(other, &queue).and_then(|front_id| {
                                 queue
                                     .entries
                                     .get(front_id)
@@ -395,7 +531,7 @@ impl<R> Slots<R> {
         let (waiter_id, mut rank) = {
             let mut queue = Self::lock_slot_queue(home);
             self.inc_local_waiting(home);
-            let front_empty = Self::refresh_front(home, &mut queue).is_none();
+            let front_empty = Self::front_live(home, &queue).is_none();
             if self.waiting.1.load(Ordering::SeqCst) == 0
                 && front_empty
                 && let Some(idx) = self.try_claim_free_from(home_idx, false)
@@ -404,28 +540,7 @@ impl<R> Slots<R> {
                 drop(queue);
                 return self.wrap_claimed(idx);
             }
-            let current = std::thread::current();
-            let id = match queue.free.pop() {
-                Some(id) => {
-                    if let Some(entry) = queue.entries.get_mut(id) {
-                        entry.thread = Some(current);
-                        entry.assigned = None;
-                        entry.cancelled = false;
-                    }
-                    id
-                }
-                None => {
-                    let id = queue.entries.len();
-                    queue.entries.push(WaiterSlot {
-                        thread: Some(current),
-                        assigned: None,
-                        cancelled: false,
-                    });
-                    id
-                }
-            };
-            let rank = queue.fifo.len();
-            queue.fifo.push_back(id);
+            let (id, rank) = queue.push_back(std::thread::current());
             if front_empty {
                 home.next_handoff_ns.store(
                     monotonic_ns().saturating_add(FAIR_HANDOFF_NS),
@@ -453,29 +568,21 @@ impl<R> Slots<R> {
                 .get_mut(waiter_id)
                 .and_then(|entry| entry.assigned.take());
             if let Some(idx) = assigned {
-                if let Some(entry) = queue.entries.get_mut(waiter_id) {
-                    entry.thread = None;
-                    entry.cancelled = false;
-                }
-                queue.free.push(waiter_id);
+                queue.recycle(waiter_id);
                 drop(queue);
                 return self.wrap_claimed(idx);
             }
-            let front = Self::refresh_front(home, &mut queue);
+            let front = Self::front_live(home, &queue);
             let is_front = front == Some(waiter_id);
             // If we are at the head of this slot's queue and a slot is free, claim it cleanly.
             if self.waiting.1.load(Ordering::Acquire) == 0
                 && is_front
                 && let Some(idx) = self.try_claim_free_from(home_idx, false)
             {
-                let _ = queue.fifo.pop_front();
+                let _ = queue.pop_front();
                 self.dec_local_waiting(home);
-                if let Some(entry) = queue.entries.get_mut(waiter_id) {
-                    entry.thread = None;
-                    entry.cancelled = false;
-                }
-                queue.free.push(waiter_id);
-                if Self::refresh_front(home, &mut queue).is_some() {
+                queue.recycle(waiter_id);
+                if Self::front_live(home, &queue).is_some() {
                     home.next_handoff_ns.store(
                         monotonic_ns().saturating_add(FAIR_HANDOFF_NS),
                         Ordering::Relaxed,
@@ -485,12 +592,13 @@ impl<R> Slots<R> {
                 return self.wrap_claimed(idx);
             }
             if until.saturating_duration_since(Instant::now()).is_zero() {
-                if let Some(entry) = queue.entries.get_mut(waiter_id) {
-                    entry.cancelled = true;
-                    entry.thread = None;
+                if queue.unlink(waiter_id) {
                     self.dec_local_waiting(home);
                 }
-                if is_front && let Some(new_front) = Self::refresh_front(home, &mut queue) {
+                queue.recycle(waiter_id);
+                if let Some(new_front) = Self::front_live(home, &queue)
+                    && is_front
+                {
                     wake_next_front = queue
                         .entries
                         .get(new_front)
@@ -502,15 +610,7 @@ impl<R> Slots<R> {
                 }
                 return None;
             }
-            rank = if is_front {
-                0
-            } else {
-                queue
-                    .fifo
-                    .iter()
-                    .position(|&id| id == waiter_id)
-                    .unwrap_or(0)
-            };
+            rank = queue.rank_of(waiter_id);
             if let Some(entry) = queue.entries.get_mut(waiter_id)
                 && entry.thread.is_none()
             {
@@ -555,21 +655,12 @@ impl<R> Slots<R> {
             }
         }
 
-        slot.state.store(SLOT_FREE, Ordering::Release);
-        fence(Ordering::SeqCst);
-
-        if self.waiting.1.load(Ordering::Acquire) > 0 {
-            let drainers = {
-                let mut queue = Self::lock_slot_queue(slot);
-                std::mem::take(&mut queue.drain_waiters)
-            };
-            for thread in drainers {
-                thread.unpark();
-            }
+        if self.free_and_wake_drainers(slot) {
             return;
         }
 
-        if slot.local_waiting.load(Ordering::Acquire) == 0
+        if self.waiting.1.load(Ordering::Acquire) == 0
+            && slot.local_waiting.load(Ordering::Acquire) == 0
             && self.waiting.0.load(Ordering::Acquire) > 0
             && slot
                 .state
@@ -579,7 +670,7 @@ impl<R> Slots<R> {
             if let Some(thread) = self.try_steal_handoff(idx) {
                 thread.unpark();
             } else {
-                slot.state.store(SLOT_FREE, Ordering::Release);
+                let _ = self.free_and_wake_drainers(slot);
             }
         }
     }
@@ -639,17 +730,20 @@ impl<R> All<'_, R> {
 impl<R> Drop for All<'_, R> {
     fn drop(&mut self) {
         let indices: Vec<usize> = self.held.drain(..).map(|(idx, _)| idx).collect();
-        let remaining_drainers = self.slots.waiting.1.fetch_sub(1, Ordering::SeqCst);
-        let other_draining = remaining_drainers > 1;
+        let _ = self.slots.waiting.1.fetch_sub(1, Ordering::SeqCst);
         let mut to_wake = Vec::new();
         for idx in indices {
-            if !other_draining {
+            if self.slots.waiting.1.load(Ordering::Acquire) == 0 {
                 let handed = if let Some(home) = self.slots.slots.get(idx)
                     && home.local_waiting.load(Ordering::Acquire) > 0
                 {
                     let mut queue = Slots::<R>::lock_slot_queue(home);
-                    self.slots
-                        .handoff_from_slot(home, &mut queue, idx, monotonic_ns())
+                    if self.slots.waiting.1.load(Ordering::Acquire) == 0 {
+                        self.slots
+                            .handoff_from_slot(home, &mut queue, idx, monotonic_ns())
+                    } else {
+                        None
+                    }
                 } else {
                     self.slots.try_steal_handoff(idx)
                 };
@@ -659,11 +753,7 @@ impl<R> Drop for All<'_, R> {
                 }
             }
             if let Some(slot) = self.slots.slots.get(idx) {
-                slot.state.store(SLOT_FREE, Ordering::Release);
-                if other_draining {
-                    let mut queue = Slots::<R>::lock_slot_queue(slot);
-                    to_wake.append(&mut queue.drain_waiters);
-                }
+                let _ = self.slots.free_and_wake_drainers(slot);
             }
         }
         for thread in to_wake {
@@ -867,7 +957,7 @@ mod tests {
                     .unwrap()
                     .unwrap();
                 }));
-                while super::Slots::lock_slot_queue(&slots.slots[0]).fifo.len() < id {
+                while super::Slots::lock_slot_queue(&slots.slots[0]).live_len < id {
                     std::thread::yield_now();
                 }
             }
@@ -879,5 +969,84 @@ mod tests {
         });
 
         assert_eq!(*order.lock().unwrap(), vec![1, 2, 3, 4]);
+    }
+
+    /// P1 regression: racing `take_all()` against returning readers attempting cross-slot steal
+    /// handoffs must never leave the drainer parked on a free slot.
+    #[test]
+    fn p1_take_all_never_parks_forever_when_racing_release_steal_backout() {
+        let (readers, _, _) = readers(2);
+        let slots = readers.slots.as_ref().unwrap();
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            for _ in 0..6 {
+                let readers = readers.clone();
+                let stop = &stop;
+                s.spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = readers.with(Instant::now() + Duration::from_millis(5), |_| Ok(()));
+                    }
+                });
+            }
+            for _ in 0..250 {
+                let all = slots.take_all();
+                drop(all);
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+    }
+
+    /// P2 regression: repeated reader timeouts behind a long-lived head waiter must unlink and
+    /// recycle their queue entries immediately rather than growing the queue indefinitely.
+    #[test]
+    fn p2_reader_timeouts_behind_head_do_not_grow_queue() {
+        let (readers, _, _) = readers(1);
+        let slots = readers.slots.as_ref().unwrap();
+        let (hold_tx, hold_rx) = mpsc::channel::<()>();
+        let (held_tx, held_rx) = mpsc::channel::<()>();
+
+        std::thread::scope(|s| {
+            let r_hold = readers.clone();
+            let holder = s.spawn(move || {
+                r_hold
+                    .with(far(), |_| {
+                        held_tx.send(()).unwrap();
+                        hold_rx.recv().unwrap();
+                        Ok(())
+                    })
+                    .unwrap()
+                    .unwrap();
+            });
+            held_rx.recv().unwrap();
+
+            let r_head = readers.clone();
+            let head_waiter = s.spawn(move || r_head.with(far(), |_| Ok(99)).unwrap().unwrap());
+            while super::Slots::lock_slot_queue(&slots.slots[0]).live_len < 1 {
+                std::thread::yield_now();
+            }
+
+            // Time out 200 waiters behind the long-lived head waiter.
+            for _ in 0..200 {
+                let res = readers.with(Instant::now() + Duration::from_micros(50), |_| Ok(()));
+                assert!(matches!(
+                    res.unwrap().unwrap_err().downcast_ref::<Refused>(),
+                    Some(Refused::Timeout)
+                ));
+            }
+
+            {
+                let queue = super::Slots::lock_slot_queue(&slots.slots[0]);
+                assert_eq!(queue.live_len, 1, "only the head waiter may remain queued");
+                assert!(
+                    queue.entries.len() <= 2,
+                    "cancelled behind-head waiters must be recycled, got {} entries",
+                    queue.entries.len()
+                );
+            }
+
+            hold_tx.send(()).unwrap();
+            holder.join().unwrap();
+            assert_eq!(head_waiter.join().unwrap(), 99);
+        });
     }
 }

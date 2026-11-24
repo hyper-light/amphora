@@ -96,7 +96,14 @@ impl ShardedWindow {
         }
     }
 
-    fn take_merged(&self, most: usize) -> Weights {
+    /// Atomically advances the elapsed-work counter and drains every histogram shard under the
+    /// window's measurement lock so simultaneous [`Groups::measure`] callers cannot divide a
+    /// completed window between them.
+    fn take_window(&self, read_apply_us: impl FnOnce() -> u64, most: usize) -> (u64, Weights) {
+        let mut prev = self.apply_us.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = read_apply_us();
+        let load = now.saturating_sub(*prev);
+        *prev = now.max(*prev);
         let mut merged = Weights::default();
         for shard in std::iter::once(&self.first).chain(self.rest.iter()) {
             let taken = {
@@ -107,7 +114,7 @@ impl ShardedWindow {
                 merged.merge(taken, most);
             }
         }
-        merged
+        (load, merged)
     }
 }
 
@@ -1278,17 +1285,7 @@ impl<E: Engine> Groups<E> {
         for (group, store, window) in held {
             let (bytes, by_size) = store.run(until, |e| Ok((e.bytes()?, e.size_cut()?)))?;
             let bytes = bytes.unwrap_or(0);
-            let now = store.counters().apply_us;
-            let load = {
-                let mut prev = window
-                    .apply_us
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                let load = now.saturating_sub(*prev);
-                *prev = now;
-                load
-            };
-            let written = window.take_merged(most);
+            let (load, written) = window.take_window(|| store.counters().apply_us, most);
             out.push(GroupLoad {
                 group,
                 bytes,
@@ -1469,5 +1466,50 @@ mod tests {
             batch_memory(None),
             u64::try_from(crate::db::default_pages(None)).unwrap() * crate::db::PAGE_BYTES
         );
+    }
+
+    /// P2 regression: two simultaneous `ShardedWindow::take_window` calls on an already-complete
+    /// window spanning multiple shards must never split the shards between them so that both miss
+    /// the reshard split point.
+    #[test]
+    fn p2_simultaneous_window_measurements_do_not_divide_shards_and_miss_split() {
+        let window = ShardedWindow::new();
+        let barrier = std::sync::Barrier::new(2);
+        for round in 1..=200u64 {
+            // Place two distinct positions on two distinct shards when multiple shards exist.
+            {
+                let mut w = window.first.0.lock().unwrap();
+                w.add(10, 1, 64);
+            }
+            if let Some(second) = window.rest.first() {
+                let mut w = second.0.lock().unwrap();
+                w.add(20, 1, 64);
+            } else {
+                let mut w = window.first.0.lock().unwrap();
+                w.add(20, 1, 64);
+            }
+
+            let apply_us = round * 100;
+            let (a, b) = std::thread::scope(|s| {
+                let t = s.spawn(|| {
+                    barrier.wait();
+                    window.take_window(|| apply_us, 64)
+                });
+                barrier.wait();
+                let here = window.take_window(|| apply_us, 64);
+                (here, t.join().unwrap())
+            });
+
+            let cuts = usize::from(a.1.cut().is_some()) + usize::from(b.1.cut().is_some());
+            assert_eq!(
+                cuts, 1,
+                "exactly one concurrent measurement must receive the complete window and split point"
+            );
+            assert_eq!(
+                a.0 + b.0,
+                100,
+                "elapsed apply_us must be attributed cleanly to one measurement"
+            );
+        }
     }
 }

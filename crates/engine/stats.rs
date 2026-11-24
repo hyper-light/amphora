@@ -1,3 +1,4 @@
+use crate::storage::wal::WalStatsToken;
 use crate::sync::Arc;
 use crate::types::IOResultOr;
 use rustc_hash::FxHashMap as HashMap;
@@ -218,9 +219,34 @@ pub fn refresh_analyze_stats_on_connect(conn: &Arc<Connection>) {
     }
 }
 
-/// Non-blocking connect-time stats refresh: skips scanning `sqlite_stat1` when the shared database
-/// schema already has loaded statistics for the current schema version, syncing `conn.schema` to
-/// the shared `Arc<Schema>` if another connection finished loading them concurrently.
+/// Freshness witness for `ANALYZE` statistics cached on `Database::schema`.
+///
+/// - When `has_stats_table == false`, `sqlite_stat1` does not exist in `schema_version`; creating
+///   it always bumps `schema_version`, so matching `schema_version` + absent table is exact.
+/// - When `has_stats_table == true`, direct DML on `sqlite_stat1`, a repeat `ANALYZE` inside an
+///   explicit write transaction, or an external restore can change statistics without bumping
+///   `schema_version`. Reusing cached stats therefore also requires an exact match on both
+///   `schema_epoch` and the in-process WAL token (`checkpoint_seq`, `max_frame`,
+///   `transaction_count`, `last_checksum`, `restore_epoch`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AnalyzeStatsFreshness {
+    pub schema_version: u32,
+    pub schema_epoch: u64,
+    pub has_stats_table: bool,
+    pub wal_token: Option<WalStatsToken>,
+}
+
+fn current_wal_stats_token(conn: &Connection) -> Option<WalStatsToken> {
+    conn.pager
+        .load()
+        .wal
+        .as_ref()
+        .and_then(|wal| wal.in_process_stats_token())
+}
+
+/// Non-blocking connect-time stats refresh: skips scanning `sqlite_stat1` only when the shared
+/// database schema's cached statistics are provably current for the database's current schema and
+/// WAL commit state, syncing `conn.schema` to the shared `Arc<Schema>` to preserve sample sharing.
 pub fn refresh_analyze_stats_on_connect_nonblock(
     conn: &Arc<Connection>,
     st: &mut RefreshAnalyzeStatsState,
@@ -228,30 +254,37 @@ pub fn refresh_analyze_stats_on_connect_nonblock(
     // MVCC transactions can have preparing/concurrent updates to `sqlite_stat1` without bumping
     // `schema_version`, and `connect_async` must surface commit-dependency waits on those writes.
     if matches!(st, RefreshAnalyzeStatsState::Start) && conn.mv_store().as_ref().is_none() {
-        let schema_version = conn.schema.read().schema_version;
-        if conn
-            .db
-            .analyze_stats_version
-            .load(crate::sync::atomic::Ordering::Acquire)
-            == u64::from(schema_version)
-        {
-            let (shared, epoch) = {
-                let guard = conn.db.schema.lock();
-                (
-                    guard.clone(),
-                    conn.db
-                        .schema_epoch
-                        .load(crate::sync::atomic::Ordering::Acquire),
-                )
-            };
-            if shared.schema_version == schema_version {
-                let mut current = conn.schema.write();
-                if !Arc::ptr_eq(&current, &shared) {
-                    *current = shared;
+        let local_version = conn.schema.read().schema_version;
+        let freshness = *conn.db.analyze_stats_freshness.lock();
+        if let Some(fresh) = freshness {
+            if fresh.schema_version == local_version {
+                let (shared, epoch) = {
+                    let guard = conn.db.schema.lock();
+                    (
+                        guard.clone(),
+                        conn.db
+                            .schema_epoch
+                            .load(crate::sync::atomic::Ordering::Acquire),
+                    )
+                };
+                let reusable = if !fresh.has_stats_table {
+                    shared.schema_version == local_version
+                        && shared.get_btree_table(STATS_TABLE).is_none()
+                } else {
+                    shared.schema_version == local_version
+                        && epoch == fresh.schema_epoch
+                        && fresh.wal_token.is_some()
+                        && current_wal_stats_token(conn) == fresh.wal_token
+                };
+                if reusable {
+                    let mut current = conn.schema.write();
+                    if !Arc::ptr_eq(&current, &shared) {
+                        *current = shared;
+                    }
+                    conn.local_schema_epoch
+                        .store(epoch, crate::sync::atomic::Ordering::Relaxed);
+                    return Ok(IOResult::Done(()));
                 }
-                conn.local_schema_epoch
-                    .store(epoch, crate::sync::atomic::Ordering::Relaxed);
-                return Ok(IOResult::Done(()));
             }
         }
     }
@@ -268,6 +301,7 @@ pub enum RefreshAnalyzeStatsState {
         stmt: Box<Statement>,
         schema_snapshot: Arc<Schema>,
         stats: AnalyzeStats,
+        wal_token_before: Option<WalStatsToken>,
     },
 }
 
@@ -290,12 +324,21 @@ pub fn refresh_analyze_stats_nonblock(
                 }
                 let schema_snapshot = { conn.schema.read().clone() };
                 if schema_snapshot.get_btree_table(STATS_TABLE).is_none() {
-                    conn.db.analyze_stats_version.store(
-                        u64::from(schema_snapshot.schema_version),
-                        crate::sync::atomic::Ordering::Release,
-                    );
+                    let epoch = conn
+                        .db
+                        .schema_epoch
+                        .load(crate::sync::atomic::Ordering::Acquire);
+                    *conn.db.analyze_stats_freshness.lock() = Some(AnalyzeStatsFreshness {
+                        schema_version: schema_snapshot.schema_version,
+                        schema_epoch: epoch,
+                        has_stats_table: false,
+                        wal_token: None,
+                    });
                     return Ok(IOResult::Done(()));
                 }
+                // Capture the WAL token before preparing/scanning `sqlite_stat1` so any write
+                // committed concurrently with the scan cannot be falsely marked fresh.
+                let wal_token_before = current_wal_stats_token(conn);
                 let mv_tx = conn.get_mv_tx();
                 let query = if schema_snapshot
                     .get_btree_table(crate::translate::analyze::COLUMN_STATS_TABLE)
@@ -311,20 +354,23 @@ pub fn refresh_analyze_stats_nonblock(
                     stmt: Box::new(stmt),
                     schema_snapshot,
                     stats: AnalyzeStats::default(),
+                    wal_token_before,
                 };
             }
             RefreshAnalyzeStatsState::Running {
                 stmt,
                 schema_snapshot,
                 stats,
+                wal_token_before,
             } => {
                 let scan = load_sqlite_stat1_rows_nonblock(stmt, schema_snapshot, stats);
                 match scan {
                     Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
                     Ok(IOResult::Done(())) => {
                         let mut stats = std::mem::take(stats);
+                        let wal_token = *wal_token_before;
                         stats.count_index_rows_per_page();
-                        if let Err(e) = install_analyze_stats(conn, stats) {
+                        if let Err(e) = install_analyze_stats(conn, stats, wal_token) {
                             tracing::warn!("Failed to refresh analyze stats: {e}");
                         }
                         *st = RefreshAnalyzeStatsState::Start;
@@ -346,7 +392,11 @@ pub fn refresh_analyze_stats_nonblock(
 /// preserving `Arc` sharing of multi-MiB column samples across connections.
 ///
 /// The shared schema lock and connection schema lock are never held together.
-fn install_analyze_stats(conn: &Arc<Connection>, stats: AnalyzeStats) -> Result<()> {
+fn install_analyze_stats(
+    conn: &Arc<Connection>,
+    stats: AnalyzeStats,
+    wal_token: Option<WalStatsToken>,
+) -> Result<()> {
     let local_version = conn.schema.read().schema_version;
     let mut pending = Some(stats);
     let updated_shared = {
@@ -356,10 +406,12 @@ fn install_analyze_stats(conn: &Arc<Connection>, stats: AnalyzeStats) -> Result<
                 Schema::try_make_mut(&mut shared)?.analyze_stats = stats;
             }
             let epoch = conn.db.bump_schema_epoch();
-            conn.db.analyze_stats_version.store(
-                u64::from(local_version),
-                crate::sync::atomic::Ordering::Release,
-            );
+            *conn.db.analyze_stats_freshness.lock() = Some(AnalyzeStatsFreshness {
+                schema_version: local_version,
+                schema_epoch: epoch,
+                has_stats_table: true,
+                wal_token,
+            });
             Some((Arc::clone(&shared), epoch))
         } else {
             None
@@ -827,5 +879,92 @@ mod tests {
         assert_eq!(parse_stat_numbers("10 5 3 1").unwrap(), vec![10, 5, 3, 1]);
         assert_eq!(parse_stat_numbers("  42\t7 ").unwrap(), vec![42, 7]);
         assert!(parse_stat_numbers("abc 1").is_none());
+    }
+
+    /// P2 regression: new WAL connections must observe both direct `sqlite_stat1` DML (which does
+    /// not bump the schema cookie) and a repeat `ANALYZE` committed inside an explicit write
+    /// transaction, while unchanged WAL connections continue to share the cached `Arc<Schema>`.
+    #[test]
+    fn p2_wal_connect_sees_direct_stat1_update_and_explicit_tx_analyze() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal_stats.db");
+        let io: std::sync::Arc<dyn crate::IO> =
+            std::sync::Arc::new(crate::PlatformIO::new().unwrap());
+        let db = crate::Database::open_file_with_flags(
+            io,
+            path.to_str().unwrap(),
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new(),
+            None,
+            std::sync::Arc::new(crate::SqliteDialect),
+        )
+        .unwrap();
+
+        let writer = db.connect(crate::ConnectOpts::new()).unwrap();
+        writer
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER)")
+            .unwrap();
+        writer.execute("CREATE INDEX idx_k ON t(k)").unwrap();
+        for i in 0..10 {
+            writer
+                .execute(format!("INSERT INTO t VALUES ({i}, {})", i % 2))
+                .unwrap();
+        }
+        writer.execute("ANALYZE").unwrap();
+
+        let reader1 = db.connect(crate::ConnectOpts::new()).unwrap();
+        let reader2 = db.connect(crate::ConnectOpts::new()).unwrap();
+        assert_eq!(
+            reader1
+                .schema
+                .read()
+                .analyze_stats
+                .table_stats("t")
+                .and_then(|s| s.row_count),
+            Some(10)
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&reader1.schema.read(), &reader2.schema.read()),
+            "unchanged WAL connections should share cached Arc<Schema>"
+        );
+
+        // 1. Direct DML on sqlite_stat1 changes stats without bumping schema_version.
+        writer
+            .execute("UPDATE sqlite_stat1 SET stat = '987654 1' WHERE tbl = 't'")
+            .unwrap();
+        let reader3 = db.connect(crate::ConnectOpts::new()).unwrap();
+        assert_eq!(
+            reader3
+                .schema
+                .read()
+                .analyze_stats
+                .table_stats("t")
+                .and_then(|s| s.row_count),
+            Some(987_654),
+            "new WAL connection must observe direct sqlite_stat1 update"
+        );
+
+        // 2. Repeat ANALYZE inside an explicit write transaction skips in-tx refresh; new
+        //    connections after COMMIT must still observe the newly committed estimates.
+        writer.execute("BEGIN").unwrap();
+        for i in 10..35 {
+            writer
+                .execute(format!("INSERT INTO t VALUES ({i}, {})", i % 5))
+                .unwrap();
+        }
+        writer.execute("ANALYZE").unwrap();
+        writer.execute("COMMIT").unwrap();
+
+        let reader4 = db.connect(crate::ConnectOpts::new()).unwrap();
+        assert_eq!(
+            reader4
+                .schema
+                .read()
+                .analyze_stats
+                .table_stats("t")
+                .and_then(|s| s.row_count),
+            Some(35),
+            "new WAL connection must observe repeat ANALYZE committed in an explicit transaction"
+        );
     }
 }

@@ -543,12 +543,28 @@ pub(crate) fn new_read_locks() -> Arc<[ShardedRwLock; 5]> {
     Arc::new(locks)
 }
 
+/// Authoritative in-process WAL state token used by connect-time `ANALYZE` statistics caching:
+/// changes on every committed WAL transaction, checkpoint-sequence rollover, or external restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalStatsToken {
+    pub checkpoint_seq: u32,
+    pub max_frame: u64,
+    pub transaction_count: u64,
+    pub last_checksum: (u32, u32),
+    pub restore_epoch: u64,
+}
+
 /// Lock-free seqlock-protected authoritative WAL snapshot fields shared between `WalFileShared`
 /// and `SharedLog` so readers snapshot all 5 fields without taking `RwLock<WalFileShared>::read()`.
+///
+/// Writers serialize under `committed` (a blocking OS mutex, never a spinlock), which also serves
+/// as the cold blocking fallback for readers if a writer is descheduled while `seq` is odd, so
+/// readers never spin unboundedly.
 #[derive(Debug)]
 pub struct SnapshotCell {
     seq: AtomicU64,
-    write_guard: SpinLock<()>,
+    committed: crate::sync::Mutex<WalSnapshot>,
+    restore_epoch: AtomicU64,
     pub max_frame: AtomicU64,
     pub nbackfills: AtomicU64,
     pub transaction_count: AtomicU64,
@@ -564,9 +580,17 @@ impl SnapshotCell {
         last_checksum: (u32, u32),
         checkpoint_seq: u32,
     ) -> Self {
+        let initial = WalSnapshot {
+            max_frame,
+            nbackfills,
+            last_checksum,
+            checkpoint_seq,
+            transaction_count,
+        };
         Self {
             seq: AtomicU64::new(0),
-            write_guard: SpinLock::new(()),
+            committed: crate::sync::Mutex::new(initial),
+            restore_epoch: AtomicU64::new(0),
             max_frame: AtomicU64::new(max_frame),
             nbackfills: AtomicU64::new(nbackfills),
             transaction_count: AtomicU64::new(transaction_count),
@@ -599,45 +623,95 @@ impl SnapshotCell {
         });
     }
 
+    #[cfg(feature = "conn_raw_api")]
+    #[inline]
+    pub(crate) fn bump_restore_epoch(&self) {
+        self.restore_epoch.fetch_add(1, Ordering::Release);
+    }
+
+    #[inline]
+    pub(crate) fn stats_token(&self) -> WalStatsToken {
+        let snap = self.load_snapshot();
+        let restore_epoch = self.restore_epoch.load(Ordering::Acquire);
+        WalStatsToken {
+            checkpoint_seq: snap.checkpoint_seq,
+            max_frame: snap.max_frame,
+            transaction_count: snap.transaction_count,
+            last_checksum: snap.last_checksum,
+            restore_epoch,
+        }
+    }
+
     #[inline]
     pub fn update(&self, f: impl FnOnce(&Self)) {
-        let _guard = self.write_guard.lock();
+        let mut committed = self.committed.lock();
         let s = self.seq.load(Ordering::Relaxed);
         self.seq.store(s.wrapping_add(1), Ordering::Relaxed);
         std::sync::atomic::fence(Ordering::Release);
         f(self);
+        let packed = self.last_checksum_packed.load(Ordering::Relaxed);
+        *committed = WalSnapshot {
+            max_frame: self.max_frame.load(Ordering::Relaxed),
+            nbackfills: self.nbackfills.load(Ordering::Relaxed),
+            last_checksum: (
+                u32::try_from(packed >> 32).unwrap_or(0),
+                u32::try_from(packed & u64::from(u32::MAX)).unwrap_or(0),
+            ),
+            checkpoint_seq: self.checkpoint_seq.load(Ordering::Relaxed),
+            transaction_count: self.transaction_count.load(Ordering::Relaxed),
+        };
         self.seq.store(s.wrapping_add(2), Ordering::Release);
+    }
+
+    /// Single non-blocking lock-free snapshot attempt (zero spinning). Returns `None` if a writer
+    /// is concurrently mutating the snapshot so callers holding shared locks (e.g. `vacuum_lock`)
+    /// can release them and retry cleanly without spinning past a deadline.
+    #[inline]
+    fn try_load_snapshot(&self) -> Option<WalSnapshot> {
+        let s1 = self.seq.load(Ordering::Acquire);
+        if (s1 & 1) != 0 {
+            return None;
+        }
+        let max_frame = self.max_frame.load(Ordering::Relaxed);
+        let nbackfills = self.nbackfills.load(Ordering::Relaxed);
+        let packed = self.last_checksum_packed.load(Ordering::Relaxed);
+        let checkpoint_seq = self.checkpoint_seq.load(Ordering::Relaxed);
+        let transaction_count = self.transaction_count.load(Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::Acquire);
+        let s2 = self.seq.load(Ordering::Relaxed);
+        if s1 == s2 {
+            Some(WalSnapshot {
+                max_frame,
+                nbackfills,
+                last_checksum: (
+                    u32::try_from(packed >> 32).unwrap_or(0),
+                    u32::try_from(packed & u64::from(u32::MAX)).unwrap_or(0),
+                ),
+                checkpoint_seq,
+                transaction_count,
+            })
+        } else {
+            None
+        }
     }
 
     #[inline]
     fn load_snapshot(&self) -> WalSnapshot {
-        loop {
-            let s1 = self.seq.load(Ordering::Acquire);
-            if (s1 & 1) != 0 {
-                crate::thread::spin_loop();
-                continue;
-            }
-            let max_frame = self.max_frame.load(Ordering::Relaxed);
-            let nbackfills = self.nbackfills.load(Ordering::Relaxed);
-            let packed = self.last_checksum_packed.load(Ordering::Relaxed);
-            let checkpoint_seq = self.checkpoint_seq.load(Ordering::Relaxed);
-            let transaction_count = self.transaction_count.load(Ordering::Relaxed);
-            std::sync::atomic::fence(Ordering::Acquire);
-            let s2 = self.seq.load(Ordering::Relaxed);
-            if s1 == s2 {
-                return WalSnapshot {
-                    max_frame,
-                    nbackfills,
-                    last_checksum: (
-                        u32::try_from(packed >> 32).unwrap_or(0),
-                        u32::try_from(packed & u64::from(u32::MAX)).unwrap_or(0),
-                    ),
-                    checkpoint_seq,
-                    transaction_count,
-                };
-            }
-            crate::thread::spin_loop();
+        if let Some(snap) = self.try_load_snapshot() {
+            return snap;
         }
+        self.load_snapshot_slow()
+    }
+
+    /// Blocking fallback when a concurrent writer holds `seq` odd: retries once lock-free in case
+    /// the writer just finished, then blocks on the OS mutex instead of busy-spinning.
+    #[cold]
+    #[inline(never)]
+    fn load_snapshot_slow(&self) -> WalSnapshot {
+        if let Some(snap) = self.try_load_snapshot() {
+            return snap;
+        }
+        *self.committed.lock()
     }
 }
 
@@ -1211,6 +1285,18 @@ trait WalCoordination: Debug + Send + Sync {
     /// Load the current authoritative WAL snapshot.
     fn load_snapshot(&self) -> WalSnapshot;
 
+    /// Non-blocking snapshot attempt used during read-transaction startup so a reader holding the
+    /// shared vacuum lock never spins or blocks behind a descheduled writer.
+    fn try_load_snapshot(&self) -> Option<WalSnapshot> {
+        Some(self.load_snapshot())
+    }
+
+    /// Authoritative in-process WAL token for connect-time `ANALYZE` stats freshness (`None` for
+    /// cross-process shared-memory WALs whose state can advance outside this process).
+    fn in_process_stats_token(&self) -> Option<WalStatsToken> {
+        None
+    }
+
     /// Amphora (lane constants-22): the event every release of this log's locks fires, when every
     /// holder is in this process: None for a log shared across processes, whose holders elsewhere
     /// release unseen.
@@ -1446,6 +1532,12 @@ pub trait Wal: Debug + Send + Sync {
     /// Amphora (lane constants-22): the event a statement busy on this log's locks waits on
     /// ([`LockRelease`]); None when a release may come from another process unseen.
     fn lock_release(&self) -> Option<Arc<LockRelease>> {
+        None
+    }
+
+    /// Authoritative in-process WAL token for connect-time `ANALYZE` statistics freshness (`None`
+    /// when external processes can modify the WAL outside this process).
+    fn in_process_stats_token(&self) -> Option<WalStatsToken> {
         None
     }
 
@@ -1862,7 +1954,7 @@ impl InProcessWalCoordination {
             && span.closing().is_none()
             && read_locks[0].read_on(shard)
         {
-            if snap_cell.load_snapshot() != snapshot {
+            if snap_cell.try_load_snapshot() != Some(snapshot) {
                 read_locks[0].unlock_read_on(shard);
                 self.log.released.notify_shared();
                 return None;
@@ -1909,9 +2001,9 @@ impl InProcessWalCoordination {
             return None;
         }
 
-        let snapshot_after_lock = snap_cell.load_snapshot();
+        let snapshot_after_lock = snap_cell.try_load_snapshot();
         let current_slot_mark = chosen.get_value();
-        if current_slot_mark != best_mark || snapshot_after_lock != snapshot {
+        if current_slot_mark != best_mark || snapshot_after_lock != Some(snapshot) {
             chosen.unlock_read_on(shard);
             self.log.released.notify_shared();
             return None;
@@ -1942,6 +2034,14 @@ impl InProcessWalCoordination {
 impl WalCoordination for InProcessWalCoordination {
     fn load_snapshot(&self) -> WalSnapshot {
         self.log.snapshot(self.log.current_id()).load_snapshot()
+    }
+
+    fn try_load_snapshot(&self) -> Option<WalSnapshot> {
+        self.log.snapshot(self.log.current_id()).try_load_snapshot()
+    }
+
+    fn in_process_stats_token(&self) -> Option<WalStatsToken> {
+        Some(self.log.snapshot(self.log.current_id()).stats_token())
     }
 
     fn publish_commit(&self, commit: WalCommitState) {
@@ -2033,7 +2133,7 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn closing_copied(&self) {
-        let _ = self.log.segments.update(Segments::copied);
+        let _ = self.log.segments.copied();
     }
 
     fn iter_segment_frames(
@@ -6091,9 +6191,12 @@ impl WalFile {
             shard: Some(vshard),
         };
 
-        // Snapshot the shared WAL state. We haven't taken a read lock yet, so we need
-        // to validate these values later.
-        let shared_snapshot = self.load_coordination_snapshot();
+        // Snapshot the shared WAL state without spinning while holding `vacuum_lock`. If a writer
+        // is concurrently updating the snapshot (or descheduled mid-update), drop `vacuum_rollback`
+        // immediately via `Retry` so read startup never spins past a deadline under vacuum_lock.
+        let Some(shared_snapshot) = self.coordination.try_load_snapshot() else {
+            return TryBeginReadResult::Retry;
+        };
         turso_assert!(
             shared_snapshot.nbackfills <= shared_snapshot.max_frame,
             "WAL snapshot cannot have backfills beyond max frame",
@@ -6193,6 +6296,10 @@ impl WalFile {
 impl Wal for WalFile {
     fn lock_release(&self) -> Option<Arc<LockRelease>> {
         self.coordination.lock_release()
+    }
+
+    fn in_process_stats_token(&self) -> Option<WalStatsToken> {
+        self.coordination.in_process_stats_token()
     }
 
     fn begin_read_tx(&self, most: usize) -> Result<ReadChange> {
@@ -9431,10 +9538,54 @@ impl WalFileShared {
         // must never cover them, including a pre-restore sync publishing after this replacement.
         *self.runtime.durable.lock() = None;
         self.runtime.legacy_durable_allowed = false;
-        self.metadata = restored.metadata;
-        // Also reject a caller-supplied restored state that happened to retain the old header Arc.
-        let header = *self.metadata.wal_header.lock();
-        self.metadata.wal_header = Arc::new(HeaderCell::new(header));
+        let restored_snap = restored.metadata.snap.load_snapshot();
+        let header = *restored.metadata.wal_header.lock();
+        // Preserve `self.metadata.snap`'s `Arc<SnapshotCell>` identity because `SharedLog` caches
+        // that `Arc` at construction and in-process readers load snapshots through it.
+        self.metadata.snap.update(|s| {
+            s.max_frame
+                .store(restored_snap.max_frame, Ordering::Relaxed);
+            s.nbackfills
+                .store(restored_snap.nbackfills, Ordering::Relaxed);
+            s.transaction_count
+                .store(restored_snap.transaction_count, Ordering::Relaxed);
+            s.last_checksum_packed.store(
+                pack_checksum(restored_snap.last_checksum),
+                Ordering::Relaxed,
+            );
+            s.checkpoint_seq
+                .store(header.checkpoint_seq, Ordering::Relaxed);
+        });
+        self.metadata.snap.bump_restore_epoch();
+        self.metadata.enabled.store(
+            restored.metadata.enabled.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+        self.metadata.min_frame.store(
+            restored.metadata.min_frame.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+        self.metadata.loaded.store(
+            restored.metadata.loaded.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+        self.metadata.loaded_from_disk_scan.store(
+            restored
+                .metadata
+                .loaded_from_disk_scan
+                .load(Ordering::Acquire),
+            Ordering::Release,
+        );
+        self.metadata.initialized.store(
+            restored.metadata.initialized.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+        // Also reject a caller-supplied restored state that happened to retain the old header Arc,
+        // while keeping the new HeaderCell wired to the preserved SnapshotCell.
+        self.metadata.wal_header = Arc::new(HeaderCell::with_snapshot(
+            header,
+            Some(Arc::clone(&self.metadata.snap)),
+        ));
         self.runtime
             .read_index
             .set_header(self.metadata.wal_header.clone());
@@ -16025,5 +16176,136 @@ pub mod test {
             result.everything_backfilled(),
             "checkpoint must succeed after rollback, not return Busy"
         );
+    }
+
+    /// P1 regression: external WAL restore must preserve `SnapshotCell`'s `Arc` identity so
+    /// in-process readers using `SharedLog` observe both restored rows and subsequent commits.
+    #[cfg(feature = "conn_raw_api")]
+    #[test]
+    fn p1_external_restore_preserves_shared_log_snapshot_for_in_process_readers() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let io = shared_wal_test_io();
+        let path = temp_dir.path().join("restore-live.db");
+        let donor_path = temp_dir.path().join("restore-live-donor.db");
+
+        let db = Database::open_file(io.clone(), path.to_str().unwrap(), Arc::new(SqliteDialect))
+            .unwrap();
+        let donor = Database::open_file(
+            io.clone(),
+            donor_path.to_str().unwrap(),
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+
+        let writer = db.connect(ConnectOpts::new()).unwrap();
+        let reader = db.connect(ConnectOpts::new()).unwrap();
+        let donor_conn = donor.connect(ConnectOpts::new()).unwrap();
+
+        for (conn, val) in [(&writer, "old"), (&donor_conn, "restored")] {
+            conn.execute("pragma wal_autocheckpoint=0").unwrap();
+            conn.execute("create table t(id integer primary key, v text)")
+                .unwrap();
+            conn.execute(format!("insert into t values(1, '{val}')"))
+                .unwrap();
+        }
+        donor_conn
+            .execute("insert into t values(2, 'from_donor')")
+            .unwrap();
+
+        let read_rows = |conn: &Arc<Connection>| -> Vec<(i64, String)> {
+            let mut stmt = conn.prepare("select id, v from t order by id").unwrap();
+            let mut out = Vec::new();
+            stmt.run_with_row_callback(|row| {
+                out.push((row.get::<i64>(0)?, row.get::<&str>(1)?.to_string()));
+                Ok(())
+            })
+            .unwrap();
+            out
+        };
+        assert_eq!(read_rows(&reader), vec![(1, "old".to_string())]);
+
+        // Copy donor db + wal files onto target and replace shared WAL state in place.
+        std::fs::copy(&donor_path, &path).unwrap();
+        std::fs::copy(
+            format!("{}-wal", donor_path.display()),
+            format!("{}-wal", path.display()),
+        )
+        .unwrap();
+        let restored = WalFileShared::open_shared_if_exists(
+            &io,
+            &format!("{}-wal", path.display()),
+            OpenFlags::default(),
+        )
+        .unwrap();
+        let restored = Arc::try_unwrap(restored)
+            .expect("restored fixture should own its WAL view")
+            .into_inner();
+        db.shared_wal
+            .current()
+            .write()
+            .replace_after_external_restore(restored);
+
+        // In-process reader going through SharedLog::snapshots must see the restored rows.
+        assert_eq!(
+            read_rows(&reader),
+            vec![(1, "restored".to_string()), (2, "from_donor".to_string()),],
+            "in-process reader must see restored rows through SharedLog's snapshot cell"
+        );
+
+        // Subsequent commits must also remain visible to in-process readers.
+        writer
+            .execute("insert into t values(3, 'after_restore')")
+            .unwrap();
+        assert_eq!(
+            read_rows(&reader),
+            vec![
+                (1, "restored".to_string()),
+                (2, "from_donor".to_string()),
+                (3, "after_restore".to_string()),
+            ],
+            "in-process reader must see post-restore commits through SharedLog's snapshot cell"
+        );
+    }
+
+    /// P2 regression: when a writer is descheduled while `SnapshotCell::seq` is odd, read startup
+    /// must not spin indefinitely or hold `vacuum_lock` while waiting, and `load_snapshot()` must
+    /// unblock cleanly once the writer finishes.
+    #[test]
+    fn p2_wal_snapshot_read_does_not_spin_or_hold_vacuum_lock_when_writer_paused() {
+        let (shared, wal) = make_test_wal();
+        let snap_cell = Arc::clone(&shared.snapshots[0]);
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+
+        let entered_w = Arc::clone(&entered);
+        let release_w = Arc::clone(&release);
+        let snap_w = Arc::clone(&snap_cell);
+        let writer = std::thread::spawn(move || {
+            snap_w.update(|s| {
+                s.max_frame.store(42, Ordering::Relaxed);
+                entered_w.wait();
+                release_w.wait();
+            });
+        });
+
+        // Wait until the writer has marked `seq` odd and paused inside `update()`.
+        entered.wait();
+
+        // `try_begin_read_tx` must return `Retry` immediately without spinning AND must have
+        // released `vacuum_lock`.
+        assert!(matches!(
+            wal.try_begin_read_tx(0),
+            TryBeginReadResult::Retry
+        ));
+        assert!(
+            shared.vacuum_lock.write(),
+            "vacuum_lock must not remain held when read startup retries on an odd seqlock"
+        );
+        shared.vacuum_lock.unlock_write();
+
+        // Unblock the writer and confirm `load_snapshot()` observes the completed snapshot.
+        release.wait();
+        writer.join().unwrap();
+        assert_eq!(snap_cell.load_snapshot().max_frame, 42);
     }
 }

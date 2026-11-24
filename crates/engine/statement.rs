@@ -664,6 +664,7 @@ impl Statement {
     }
 
     pub fn interrupt(&mut self) {
+        self.clean_reset = false;
         self.state.interrupt();
     }
 
@@ -754,17 +755,10 @@ impl Statement {
 
     fn release_active_root_if_counted(&mut self) {
         if self.counted_as_active_root {
-            // Blob count drops before the root count so a concurrent
-            // checkpoint-guard read never sees fewer non-blob statements
-            // than are really active (a stale-high read only causes a
-            // spurious StatementsInProgress, never a missed one).
-            if self.is_blob_handle {
-                self.program
-                    .connection
-                    .n_active_blob_statements
-                    .fetch_sub(1, Ordering::SeqCst);
-            }
-            let previous = self.program.connection.finish_root_statement();
+            let previous = self
+                .program
+                .connection
+                .finish_root_statement(self.is_blob_handle);
             if previous == 1 {
                 self.program.connection.clear_interrupt_if_idle();
                 // Amphora (PL.8, lane pl8-17): the connection went idle between statements.
@@ -1021,16 +1015,10 @@ impl Statement {
     #[inline(never)]
     fn prepare_step(&mut self, waker: Option<&Waker>) -> Result<Option<StepResult>> {
         if !self.counted_as_active_root && matches!(self.origin, StatementOrigin::Root) {
-            self.program.connection.start_root_statement()?;
+            self.program
+                .connection
+                .start_root_statement(self.is_blob_handle)?;
             self.counted_as_active_root = true;
-            // After the root count, so the checkpoint guard's subtraction
-            // can only read stale-high (see release_active_root_if_counted).
-            if self.is_blob_handle {
-                self.program
-                    .connection
-                    .n_active_blob_statements
-                    .fetch_add(1, Ordering::SeqCst);
-            }
         }
         if matches!(self.state.execution_state, ProgramExecutionState::Init)
             && self.origin != StatementOrigin::InternalHelper
@@ -2074,7 +2062,7 @@ impl Statement {
     }
 
     pub fn reset(&mut self) -> Result<()> {
-        if self.clean_reset {
+        if self.clean_reset && matches!(self.state.execution_state, ProgramExecutionState::Init) {
             return Ok(());
         }
         self.close_custom_run();
@@ -3159,6 +3147,38 @@ mod tests {
             stmt.metrics().rows_written,
             6,
             "cumulative metrics should include root and trigger writes"
+        );
+    }
+
+    /// P2 regression: interrupting a freshly prepared statement before its first `step()` must
+    /// clear `clean_reset` so an explicit `reset()` restores `Init` and the subsequent `step()`
+    /// runs plan and schema-generation checks normally.
+    #[test]
+    fn p2_interrupt_freshly_prepared_statement_then_reset_runs_init_checks() {
+        let conn = open_test_connection().unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
+        conn.execute("INSERT INTO t VALUES (7)").unwrap();
+
+        let mut stmt = conn.prepare("SELECT x FROM t").unwrap();
+        assert_eq!(stmt.execution_state(), ProgramExecutionState::Init);
+        stmt.interrupt();
+        assert_eq!(stmt.execution_state(), ProgramExecutionState::Interrupting);
+
+        stmt.reset().unwrap();
+        assert_eq!(
+            stmt.execution_state(),
+            ProgramExecutionState::Init,
+            "reset() after interrupt() on a fresh statement must restore Init"
+        );
+
+        // Alter the schema before the next step so we verify the Init-gated reprepare path runs.
+        conn.execute("ALTER TABLE t ADD COLUMN y INTEGER DEFAULT 9")
+            .unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+        assert_eq!(rows, vec![vec![Value::from_i64(7)]]);
+        assert!(
+            stmt.stmt_status(StatementStatusCounter::Reprepare) >= 1,
+            "Init-gated schema/prepare-context check must trigger reprepare after reset()"
         );
     }
 }

@@ -389,6 +389,7 @@ impl SharedPages {
                 return false;
             }
             if (old_gen, old_frame) != (generation, frame) {
+                shard.latest_frame.remove(&(key.file, key.page));
                 let old_key = Key {
                     file: key.file,
                     page: key.page,
@@ -468,8 +469,8 @@ impl SharedPages {
     }
 
     /// Drops any cached WAL frame (or stale file image) of `(file, page)` superseded by a commit
-    /// at `(generation, new_frame)`, and advances its watermark so lagging readers do not
-    /// re-insert the evicted frame.
+    /// at `(generation, new_frame)` and removes its metadata entry so `latest_frame` stays
+    /// strictly bounded by the resident frames in the shard (`latest_frame.len() <= map.len()`).
     pub fn supersede_frame(&self, file: u64, page: u64, generation: u32, new_frame: u64) {
         if self.frame_entries.load(Ordering::Acquire) == 0 {
             return;
@@ -478,10 +479,9 @@ impl SharedPages {
             return;
         };
         let mut shard = cell.shard.write();
-        if let Some(slot) = shard.latest_frame.get_mut(&(file, page)) {
-            let (old_gen, old_frame) = *slot;
+        if let Some(&(old_gen, old_frame)) = shard.latest_frame.get(&(file, page)) {
             if old_gen != generation || old_frame < new_frame {
-                *slot = (generation, new_frame);
+                shard.latest_frame.remove(&(file, page));
                 let old_key = Key {
                     file,
                     page,
@@ -1001,20 +1001,27 @@ mod tests {
             ))
             .is_none());
         assert_eq!(pool.len(), 1);
-        // Commit superseding frame 20 at frame 30 drops frame 20 and rejects lagging re-publish.
-        f.supersede_frame(7, 1, 30);
-        assert_eq!(pool.len(), 0);
+        // Lagging publish of an already-superseded frame is rejected while frame 20 is resident.
         assert!(!pool.publish(
             f.key(
                 7,
                 Version::Frame {
                     generation: 1,
-                    frame: 20
+                    frame: 10
                 }
             ),
             buffer(4)
         ));
+        assert_eq!(pool.len(), 1);
+        // Commit superseding frame 20 at frame 30 drops frame 20 and its metadata entry.
+        f.supersede_frame(7, 1, 30);
         assert_eq!(pool.len(), 0);
+        let meta_entries: usize = pool
+            .shards
+            .iter()
+            .map(|cell| cell.shard.read().latest_frame.len())
+            .sum();
+        assert_eq!(meta_entries, 0);
         assert!(pool.publish(
             f.key(
                 7,
@@ -1026,5 +1033,36 @@ mod tests {
             buffer(5)
         ));
         assert_eq!(pool.len(), 1);
+    }
+
+    /// P2 regression: superseding distinct pages must not retain per-page watermark metadata
+    /// once their frames are removed, keeping metadata strictly bounded by resident frames.
+    #[test]
+    fn p2_supersede_does_not_leak_metadata_when_cache_is_empty() {
+        let pool = Arc::new(SharedPages::new(256));
+        let f = SharedFile::join(pool.clone());
+        for page in 1..=5_000u64 {
+            assert!(pool.publish(
+                f.key(
+                    page,
+                    Version::Frame {
+                        generation: 1,
+                        frame: page
+                    }
+                ),
+                buffer(1)
+            ));
+            f.supersede_frame(page, 1, page + 1);
+        }
+        assert_eq!(pool.len(), 0);
+        let meta_entries: usize = pool
+            .shards
+            .iter()
+            .map(|cell| cell.shard.read().latest_frame.len())
+            .sum();
+        assert_eq!(
+            meta_entries, 0,
+            "latest_frame metadata must be empty when zero frames are resident"
+        );
     }
 }

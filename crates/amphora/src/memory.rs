@@ -9,7 +9,7 @@
 //! The parsers are pure, so tests give them each file's text; [`limit`] reads the files.
 
 use amphora_api::Refusal;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering, fence};
+use std::sync::atomic::{AtomicU64, Ordering, fence};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::Instant;
 
@@ -220,74 +220,146 @@ pub trait Readings: Send + Sync {
     fn read(&self) -> Reading;
 }
 
-/// One slot of the double-buffered single-flight reading: holds the last completed kernel reading
-/// in atomics so concurrent callers arriving while another thread is already inside kernel syscalls
-/// read it lock-free without piling duplicate syscalls onto the OS, while every sequential call
-/// still reads the kernel afresh (MB.1; no time constant or TTL).
-struct ReadingSlot {
-    limit: AtomicU64,
-    resident: AtomicU64,
-    /// Bit 0: `limit` is `Some`; bit 1: `resident` is `Some`.
-    flags: AtomicU8,
+/// Strictly linearizable two-phase single-flight coalescer for [`Readings`] (`AC-MB.1.1`).
+///
+/// Every caller receives a fresh reading whose `R::read()` **started after** the caller entered
+/// `SingleFlight::read()` and **finished before** it returned. When a reading is already in flight,
+/// arriving callers never reuse the previous completed sample (which could predate a memory limit
+/// reduction); instead they coalesce onto the next flight, which one leader executes once the
+/// current flight finishes.
+struct FlightState {
+    in_flight: bool,
+    active_gen: u64,
+    completed_gen: u64,
+    last: Reading,
+    #[cfg(test)]
+    waiters: usize,
 }
 
-impl ReadingSlot {
-    fn new() -> Self {
+impl Default for FlightState {
+    fn default() -> Self {
         Self {
-            limit: AtomicU64::new(0),
-            resident: AtomicU64::new(0),
-            flags: AtomicU8::new(0),
+            in_flight: false,
+            active_gen: 0,
+            completed_gen: 0,
+            last: Reading {
+                limit: None,
+                resident: None,
+            },
+            #[cfg(test)]
+            waiters: 0,
         }
-    }
-
-    fn store(&self, reading: Reading) {
-        let mut flags = 0u8;
-        if let Some(limit) = reading.limit {
-            self.limit.store(limit, Ordering::Relaxed);
-            flags |= 1;
-        }
-        if let Some(resident) = reading.resident {
-            self.resident.store(resident, Ordering::Relaxed);
-            flags |= 2;
-        }
-        self.flags.store(flags, Ordering::Relaxed);
-    }
-
-    fn load(&self) -> Reading {
-        let flags = self.flags.load(Ordering::Relaxed);
-        let limit = (flags & 1 != 0).then(|| self.limit.load(Ordering::Relaxed));
-        let resident = (flags & 2 != 0).then(|| self.resident.load(Ordering::Relaxed));
-        Reading { limit, resident }
     }
 }
 
-/// The system's readings, taken again at every ask: a host may change a limit while the process runs.
-/// On Linux each file is opened once and read again in place at every ask ([`Opened`]): the same
-/// readings, exact at each ask, without the opens, path walks and `/proc/meminfo` they cost.
-/// Under concurrency, overlapping asks coalesce via a lock-free double-buffered single-flight so
-/// only one thread executes the kernel syscalls at a time; sequential asks always query the kernel.
-struct System {
+#[inline]
+fn gen_reached(completed: u64, target: u64) -> bool {
+    completed.wrapping_sub(target) < (1u64 << 63)
+}
+
+struct SingleFlight<R> {
+    inner: R,
+    state: Mutex<FlightState>,
+    done: Condvar,
+}
+
+impl<R> SingleFlight<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            state: Mutex::new(FlightState::default()),
+            done: Condvar::new(),
+        }
+    }
+}
+
+impl<R: Readings> Readings for SingleFlight<R> {
+    fn read(&self) -> Reading {
+        let my_gen = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if state.in_flight {
+                let target_gen = state.active_gen.wrapping_add(1);
+                loop {
+                    while state.in_flight && !gen_reached(state.completed_gen, target_gen) {
+                        #[cfg(test)]
+                        {
+                            state.waiters = state.waiters.saturating_add(1);
+                        }
+                        state = self
+                            .done
+                            .wait(state)
+                            .unwrap_or_else(PoisonError::into_inner);
+                        #[cfg(test)]
+                        {
+                            state.waiters = state.waiters.saturating_sub(1);
+                        }
+                    }
+                    if gen_reached(state.completed_gen, target_gen) {
+                        return state.last;
+                    }
+                    if !state.in_flight {
+                        let next_gen = state.completed_gen.wrapping_add(1);
+                        state.in_flight = true;
+                        state.active_gen = next_gen;
+                        break next_gen;
+                    }
+                }
+            } else {
+                let next_gen = state.completed_gen.wrapping_add(1);
+                state.in_flight = true;
+                state.active_gen = next_gen;
+                next_gen
+            }
+        };
+
+        struct FlightGuard<'a> {
+            state: &'a Mutex<FlightState>,
+            done: &'a Condvar,
+            finished: bool,
+        }
+        impl Drop for FlightGuard<'_> {
+            fn drop(&mut self) {
+                if !self.finished {
+                    let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                    state.in_flight = false;
+                    drop(state);
+                    self.done.notify_all();
+                }
+            }
+        }
+        let mut guard = FlightGuard {
+            state: &self.state,
+            done: &self.done,
+            finished: false,
+        };
+        let reading = self.inner.read();
+        {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.last = reading;
+            state.completed_gen = my_gen;
+            state.in_flight = false;
+            guard.finished = true;
+        }
+        self.done.notify_all();
+        reading
+    }
+}
+
+/// The system's raw kernel readings, taken afresh on every call: a host may change a limit while
+/// the process runs. On Linux each file is opened once and read again in place at every ask
+/// ([`Opened`]): the same readings, exact at each ask, without the opens, path walks and
+/// `/proc/meminfo` they cost.
+struct RawSystem {
     #[cfg(target_os = "linux")]
     opened: std::sync::RwLock<Option<Arc<Opened>>>,
-    /// Even `2 * gen`: idle, last completed reading is in `slots[(gen - 1) & 1]` when `gen > 0`.
-    /// Odd `2 * gen + 1`: one thread is querying the kernel and will write `slots[gen & 1]`.
-    flight: AtomicU64,
-    slots: [ReadingSlot; 2],
 }
 
-impl System {
+impl RawSystem {
     fn new() -> Self {
         Self {
             #[cfg(target_os = "linux")]
             opened: std::sync::RwLock::new(None),
-            flight: AtomicU64::new(0),
-            slots: [ReadingSlot::new(), ReadingSlot::new()],
         }
-    }
-
-    fn slot(&self, index: u64) -> &ReadingSlot {
-        let [even, odd] = &self.slots;
-        if index & 1 == 0 { even } else { odd }
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -316,55 +388,26 @@ impl System {
     }
 }
 
+impl Readings for RawSystem {
+    fn read(&self) -> Reading {
+        self.read_fresh()
+    }
+}
+
+/// The system's readings, strictly linearizable (`AC-MB.1.1`) via [`SingleFlight`] so concurrent
+/// callers coalesce onto a reading started strictly after they arrived rather than reusing an
+/// obsolete pre-reduction sample.
+struct System(SingleFlight<RawSystem>);
+
+impl System {
+    fn new() -> Self {
+        Self(SingleFlight::new(RawSystem::new()))
+    }
+}
+
 impl Readings for System {
     fn read(&self) -> Reading {
-        loop {
-            let state = self.flight.load(Ordering::Acquire);
-            if state & 1 == 1 {
-                let generation = state >> 1;
-                if let Some(prev) = generation.checked_sub(1) {
-                    let reading = self.slot(prev).load();
-                    // Pairs with the writer's Release store and AcqRel CAS: `prev` is untouched
-                    // until `flight` advances to `state + 2`.
-                    fence(Ordering::Acquire);
-                    let after = self.flight.load(Ordering::Relaxed);
-                    if after == state || after == state.wrapping_add(1) {
-                        return reading;
-                    }
-                    continue;
-                }
-                return self.read_fresh();
-            }
-            let in_flight = state.wrapping_add(1);
-            if self
-                .flight
-                .compare_exchange(state, in_flight, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                struct Guard<'a> {
-                    flight: &'a AtomicU64,
-                    restore: u64,
-                    done: bool,
-                }
-                impl Drop for Guard<'_> {
-                    fn drop(&mut self) {
-                        if !self.done {
-                            self.flight.store(self.restore, Ordering::Release);
-                        }
-                    }
-                }
-                let mut guard = Guard {
-                    flight: &self.flight,
-                    restore: state,
-                    done: false,
-                };
-                let reading = self.read_fresh();
-                self.slot(state >> 1).store(reading);
-                guard.done = true;
-                self.flight.store(state.wrapping_add(2), Ordering::Release);
-                return reading;
-            }
-        }
+        self.0.read()
     }
 }
 
@@ -1137,10 +1180,10 @@ pub(crate) mod tests {
         cached.limits = vec![std::fs::File::open(dir.path()).unwrap()];
         let cached = Arc::new(cached);
         let system = System::new();
-        *system.opened.write().unwrap() = Some(cached.clone());
+        *system.0.inner.opened.write().unwrap() = Some(cached.clone());
         assert_eq!(system.read().limit, limit());
         assert!(!Arc::ptr_eq(
-            system.opened.read().unwrap().as_ref().unwrap(),
+            system.0.inner.opened.read().unwrap().as_ref().unwrap(),
             &cached
         ));
     }
@@ -1199,5 +1242,98 @@ pub(crate) mod tests {
         let got = limit();
         assert!(got.is_some());
         assert!(got <= machine);
+    }
+
+    /// P2 regression (AC-MB.1.1): when a memory limit is reduced while one thread is mid-sample,
+    /// callers arriving after the reduction must never reuse the previous completed sample; they
+    /// must coalesce onto a fresh reading started after they arrived and observe the reduced limit.
+    #[test]
+    fn p2_ac_mb1_1_single_flight_never_serves_obsolete_limit_after_reduction() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct GateReadings {
+            limit: AtomicU64,
+            calls: AtomicUsize,
+            pause_on_call: AtomicUsize,
+            entered: (Mutex<bool>, Condvar),
+            release: (Mutex<bool>, Condvar),
+        }
+
+        impl Readings for GateReadings {
+            fn read(&self) -> Reading {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                let value = self.limit.load(Ordering::SeqCst);
+                if n == self.pause_on_call.load(Ordering::SeqCst) {
+                    {
+                        let mut flag = self.entered.0.lock().unwrap();
+                        *flag = true;
+                        self.entered.1.notify_all();
+                    }
+                    let mut go = self.release.0.lock().unwrap();
+                    while !*go {
+                        go = self.release.1.wait(go).unwrap();
+                    }
+                }
+                Reading {
+                    limit: Some(value),
+                    resident: Some(0),
+                }
+            }
+        }
+
+        let sf = Arc::new(SingleFlight::new(GateReadings {
+            limit: AtomicU64::new(100 << 20),
+            calls: AtomicUsize::new(0),
+            pause_on_call: AtomicUsize::new(2),
+            entered: (Mutex::new(false), Condvar::new()),
+            release: (Mutex::new(false), Condvar::new()),
+        }));
+
+        // Populate a completed prior sample at 100 MiB (call #1).
+        assert_eq!(sf.read().limit, Some(100 << 20));
+        assert_eq!(sf.inner.calls.load(Ordering::SeqCst), 1);
+
+        // Thread 1 begins call #2 (reads 100 MiB, then pauses mid-flight).
+        let sf1 = Arc::clone(&sf);
+        let t1 = std::thread::spawn(move || sf1.read());
+        {
+            let mut flag = sf.inner.entered.0.lock().unwrap();
+            while !*flag {
+                flag = sf.inner.entered.1.wait(flag).unwrap();
+            }
+        }
+
+        // System limit drops to 10 MiB while call #2 is still in flight.
+        sf.inner.limit.store(10 << 20, Ordering::SeqCst);
+
+        // Spawn 4 callers arriving strictly AFTER the limit reduction.
+        let followers: Vec<_> = (0..4)
+            .map(|_| {
+                let sf_f = Arc::clone(&sf);
+                std::thread::spawn(move || sf_f.read())
+            })
+            .collect();
+
+        // Wait deterministically until all 4 followers are parked on the next flight, then release
+        // call #2 so all 4 coalesce onto one fresh reading started strictly after the reduction.
+        while sf.state.lock().unwrap().waiters < 4 {
+            std::thread::yield_now();
+        }
+        {
+            let mut go = sf.inner.release.0.lock().unwrap();
+            *go = true;
+            sf.inner.release.1.notify_all();
+        }
+
+        assert_eq!(t1.join().unwrap().limit, Some(100 << 20));
+        for f in followers {
+            assert_eq!(
+                f.join().unwrap().limit,
+                Some(10 << 20),
+                "AC-MB.1.1: ask after limit reduction must never observe obsolete 100 MiB sample"
+            );
+        }
+        // Initial read + t1 + exactly 1 coalesced fresh read shared by all 4 followers.
+        assert_eq!(sf.inner.calls.load(Ordering::SeqCst), 3);
     }
 }

@@ -501,9 +501,11 @@ impl SegmentsCell {
     pub fn update<T>(&self, mut step: impl FnMut(&mut Segments) -> T) -> Option<T> {
         let _guard = self.transition.lock();
         let word = self.state.load(Ordering::SeqCst);
+        let was_closing_uncopied = (word & CLOSING) != 0 && (word & COPIED) == 0;
+        let prev_current = Segments::unpack(word).current();
         let (before_first, before_second) = self.sum_reads();
         let mut segments = Self::assemble(word, before_first, before_second);
-        let out = step(&mut segments);
+        let mut out = step(&mut segments);
         let closing_reads = segments.other.map_or(0, |c| c.reads);
         if segments.reads > READS || closing_reads > READS {
             return None;
@@ -539,6 +541,39 @@ impl SegmentsCell {
                 }
             }
         }
+        // If `step` cleared a previously uncopied closing segment using the pre-publication read
+        // count, publish `COPIED | SHIPPED` first (SeqCst) and recount all shards (SeqCst) before
+        // deciding whether the closing segment is actually free. Otherwise a reader that validated
+        // the old `!COPIED` state before our store could still depend on the closing segment.
+        if was_closing_uncopied && segments.other.is_none() && segments.current == prev_current {
+            let saturated = after_first >= READS || after_second >= READS;
+            let interim_ver = word.wrapping_add(1) & VERSION_MASK;
+            let interim = ((word | Self::READY_TO_RESET) & !SATURATED & !VERSION_MASK)
+                | if saturated { SATURATED } else { 0 }
+                | interim_ver;
+            self.state.store(interim, Ordering::SeqCst);
+            let (f, s) = self.sum_reads();
+            let closing_id = prev_current.other();
+            let rem = match closing_id {
+                SegmentId::First => f,
+                SegmentId::Second => s,
+            };
+            if rem != 0 {
+                let mut active = Self::assemble(interim, f, s);
+                out = step(&mut active);
+                return Some(out);
+            }
+            let cleared_ver = interim.wrapping_add(1) & VERSION_MASK;
+            let cleared = segments.pack()
+                | if f >= READS || s >= READS {
+                    SATURATED
+                } else {
+                    0
+                }
+                | cleared_ver;
+            self.state.store(cleared, Ordering::SeqCst);
+            return Some(out);
+        }
         let saturated = after_first >= READS || after_second >= READS;
         let next_ver = word.wrapping_add(1) & VERSION_MASK;
         let next_word = segments.pack() | if saturated { SATURATED } else { 0 } | next_ver;
@@ -560,6 +595,35 @@ impl SegmentsCell {
             }
         }
         Some(out)
+    }
+
+    /// Publishes `COPIED` on the closing segment before counting active readers across shards
+    /// (SeqCst Dekker ordering), and frees the closing segment only if it is also shipped and no
+    /// reader still counts on it.
+    pub fn copied(&self) -> Option<SegmentId> {
+        let _guard = self.transition.lock();
+        let word = self.state.load(Ordering::SeqCst);
+        if (word & CLOSING) == 0 {
+            return None;
+        }
+        let with_copied = ((word | COPIED) & !VERSION_MASK) | (word.wrapping_add(1) & VERSION_MASK);
+        self.state.store(with_copied, Ordering::SeqCst);
+        if (with_copied & Self::READY_TO_RESET) != Self::READY_TO_RESET {
+            return None;
+        }
+        let closing_id = Segments::unpack(with_copied).current().other();
+        let (first, second) = self.sum_reads();
+        let rem = match closing_id {
+            SegmentId::First => first,
+            SegmentId::Second => second,
+        };
+        if rem != 0 {
+            return None;
+        }
+        let cleared = (with_copied & !(CLOSING | COPIED | SHIPPED) & !VERSION_MASK)
+            | (with_copied.wrapping_add(1) & VERSION_MASK);
+        self.state.store(cleared, Ordering::SeqCst);
+        Some(closing_id)
     }
 
     #[cold]
@@ -667,7 +731,8 @@ impl SegmentsCell {
                 });
             }
             shard.fetch_sub(delta, Ordering::SeqCst);
-            if (w2 & Self::READY_TO_RESET) == Self::READY_TO_RESET {
+            let w3 = self.state.load(Ordering::SeqCst);
+            if (w3 & Self::READY_TO_RESET) == Self::READY_TO_RESET {
                 let _ = self.try_reset_closing();
             }
         }
@@ -1121,5 +1186,51 @@ mod tests {
         assert_eq!(found(Some(0), Some(u32::MAX)), Some((First, Some(Second))));
         assert_eq!(found(Some(7), Some(7)), None);
         assert_eq!(found(Some(7), Some(9)), None);
+    }
+
+    /// P1 regression: publishing `COPIED` must happen before deciding whether the closing segment
+    /// is free so a reader that validated `!COPIED` never sees its closing segment recycled while
+    /// holding a `ReadSpan` on it.
+    #[test]
+    fn p1_copied_publishes_flag_before_deciding_segment_is_free() {
+        use std::sync::atomic::AtomicBool;
+
+        let cell = SegmentsCell::new(Segments::new(SegmentId::First));
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        if let Some(span) = cell.begin_read() {
+                            if let Some(closing) = span.closing() {
+                                assert_ne!(
+                                    cell.load().state(closing),
+                                    Segment::Free,
+                                    "closing segment recycled under an active reader"
+                                );
+                            }
+                            cell.end_read(span);
+                        }
+                    }
+                });
+            }
+            for i in 0..2_000usize {
+                while matches!(cell.update(|s| s.switch(false)), Some(None)) {
+                    std::thread::yield_now();
+                }
+                if i % 2 == 0 {
+                    let _ = cell.copied();
+                } else {
+                    let _ = cell.update(Segments::copied);
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+        let final_state = cell.load();
+        assert_eq!(final_state.closing(), None);
+        assert!(matches!(
+            final_state.state(final_state.current()),
+            Segment::Current { reads: 0 }
+        ));
     }
 }

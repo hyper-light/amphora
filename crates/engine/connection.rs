@@ -574,13 +574,22 @@ pub enum SyncRowStep {
     Upsert { stmt: Box<Statement> },
 }
 
-/// Bit packed into `Connection::statement_activity` while an explicit checkpoint is active,
-/// avoiding a per-statement mutex in `start_root_statement`.
-pub(crate) const EXPLICIT_CHECKPOINT_BIT: i32 = 1 << 30;
-pub(crate) const ROOT_STATEMENT_COUNT_MASK: i32 = EXPLICIT_CHECKPOINT_BIT - 1;
+/// Packed atomic layout of `Connection::statement_activity`:
+/// - bits `0..31`: active non-blob root statement count
+/// - bits `31..62`: active parked incremental-blob root statement count
+/// - bit `63`: `EXPLICIT_CHECKPOINT_BIT`
+///
+/// Packing both statement kinds with the checkpoint bit into one `AtomicU64` prevents the ABA race
+/// where a parked blob closes and a regular `SELECT` starts between loading the root count and
+/// acquiring `EXPLICIT_CHECKPOINT_BIT`.
+pub(crate) const EXPLICIT_CHECKPOINT_BIT: u64 = 1u64 << 63;
+pub(crate) const NON_BLOB_COUNT_MASK: u64 = (1u64 << 31) - 1;
+pub(crate) const BLOB_COUNT_SHIFT: u32 = 31;
+pub(crate) const BLOB_COUNT_ONE: u64 = 1u64 << BLOB_COUNT_SHIFT;
+pub(crate) const BLOB_COUNT_MASK: u64 = NON_BLOB_COUNT_MASK << BLOB_COUNT_SHIFT;
 
 pub(crate) struct ExplicitCheckpointGuard {
-    activity: Arc<AtomicI32>,
+    activity: Arc<AtomicU64>,
     pager: Arc<Pager>,
 }
 
@@ -921,16 +930,10 @@ pub struct Connection {
     /// This is currently only 0 or 1. We return Busy instead of allowing a
     /// second same-connection writer to start.
     pub(crate) n_active_writes: AtomicI32,
-    /// How many active root statements are parked incremental blob handles.
-    /// A blob handle keeps a Root statement open from `blob_open` until close,
-    /// but between blob operations it just sits on its row, so explicit
-    /// checkpoints subtract these instead of treating them as statements in
-    /// progress (SQLite checkpoints fine with open blob handles; a handle
-    /// re-positions on its next blob operation after the checkpoint's cache clear).
-    pub(crate) n_active_blob_statements: AtomicI32,
-    /// Active root statement count (bits `0..30`) packed with `EXPLICIT_CHECKPOINT_BIT` (bit 30),
-    /// preventing root statements and explicit checkpoints from overlapping without a mutex.
-    pub(crate) statement_activity: Arc<AtomicI32>,
+    /// Active non-blob root statements (bits `0..31`), parked incremental blob handles (bits
+    /// `31..62`), and `EXPLICIT_CHECKPOINT_BIT` (bit `63`) packed into one atomic word so root
+    /// statements and explicit checkpoints serialize without a mutex or blob-vs-SELECT ABA races.
+    pub(crate) statement_activity: Arc<AtomicU64>,
     /// Whether pragma ignore_check_constraints=ON for this connection
     pub(super) check_constraints_pragma: AtomicBool,
     /// Track when each virtual table instance is currently in transaction.
@@ -1274,8 +1277,8 @@ impl Connection {
             );
             let temp_db = guard.as_ref().expect("asserted above");
             match committed {
-                Some(snap) => *temp_db.db.schema.lock() = snap,
-                None => *temp_db.db.schema.lock() = self.empty_temp_schema(),
+                Some(snap) => temp_db.db.replace_schema(snap),
+                None => temp_db.db.replace_schema(self.empty_temp_schema()),
             }
         }
         self.temp.schema_did_change.store(false, Ordering::Release);
@@ -4369,6 +4372,7 @@ impl Connection {
                 let mut schema_guard = temp_db.db.schema.lock();
                 let schema = Schema::try_make_mut(&mut schema_guard)?;
                 let result = f(schema);
+                temp_db.db.bump_schema_epoch();
                 self.bump_prepare_context_generation();
                 Ok(result)
             }
@@ -5052,7 +5056,7 @@ impl Connection {
         if let Some(local_schema) = schemas.remove(&database_id) {
             let attached_dbs = self.attached_databases.read();
             if let Some(entry) = attached_dbs.index_to_data.get(&database_id) {
-                *entry.db.schema.lock() = local_schema;
+                entry.db.replace_schema(local_schema);
             }
             self.bump_prepare_context_generation();
         }
@@ -6170,16 +6174,25 @@ impl Connection {
         self.progress_handler.should_interrupt(prev_steps, vm_steps)
     }
 
-    /// Number of active root statements currently executing on this connection.
+    /// Number of active root statements (non-blob + parked blob handles) currently executing on
+    /// this connection.
     #[inline]
     pub(crate) fn active_root_statements(&self) -> i32 {
-        self.statement_activity.load(Ordering::Acquire) & ROOT_STATEMENT_COUNT_MASK
+        let word = self.statement_activity.load(Ordering::Acquire);
+        let non_blob = word & NON_BLOB_COUNT_MASK;
+        let blob = (word & BLOB_COUNT_MASK) >> BLOB_COUNT_SHIFT;
+        i32::try_from(non_blob.saturating_add(blob)).unwrap_or(i32::MAX)
     }
 
-    /// Decrements the active root statement count, returning the count before decrement.
+    /// Decrements the active root statement count for a non-blob or blob root statement, returning
+    /// the total active root statement count before decrement.
     #[inline]
-    pub(crate) fn finish_root_statement(&self) -> i32 {
-        self.statement_activity.fetch_sub(1, Ordering::AcqRel) & ROOT_STATEMENT_COUNT_MASK
+    pub(crate) fn finish_root_statement(&self, is_blob: bool) -> i32 {
+        let delta = if is_blob { BLOB_COUNT_ONE } else { 1 };
+        let prev = self.statement_activity.fetch_sub(delta, Ordering::AcqRel);
+        let non_blob = prev & NON_BLOB_COUNT_MASK;
+        let blob = (prev & BLOB_COUNT_MASK) >> BLOB_COUNT_SHIFT;
+        i32::try_from(non_blob.saturating_add(blob)).unwrap_or(i32::MAX)
     }
 
     /// Request interruption of currently running root statements on this connection.
@@ -6202,7 +6215,7 @@ impl Connection {
         }
     }
 
-    pub(crate) fn start_root_statement(&self) -> Result<()> {
+    pub(crate) fn start_root_statement(&self, is_blob: bool) -> Result<()> {
         let mut current = self.statement_activity.load(Ordering::Acquire);
         loop {
             if (current & EXPLICIT_CHECKPOINT_BIT) != 0 {
@@ -6210,15 +6223,18 @@ impl Connection {
                     "cannot start a statement while a checkpoint is active",
                 ));
             }
-            let count = current & ROOT_STATEMENT_COUNT_MASK;
-            let next = count
-                .checked_add(1)
-                .filter(|&n| n < EXPLICIT_CHECKPOINT_BIT);
-            let Some(next) = next else {
+            let field_count = if is_blob {
+                (current & BLOB_COUNT_MASK) >> BLOB_COUNT_SHIFT
+            } else {
+                current & NON_BLOB_COUNT_MASK
+            };
+            if field_count >= NON_BLOB_COUNT_MASK {
                 return Err(LimboError::InternalError(
                     "active root statement count overflow".to_string(),
                 ));
-            };
+            }
+            let delta = if is_blob { BLOB_COUNT_ONE } else { 1 };
+            let next = current.wrapping_add(delta);
             match self.statement_activity.compare_exchange_weak(
                 current,
                 next,
@@ -6240,17 +6256,14 @@ impl Connection {
         pager: Arc<Pager>,
         from_statement: bool,
     ) -> Result<ExplicitCheckpointGuard> {
-        let statements_expected = if from_statement { 1 } else { 0 };
+        let statements_expected: u64 = if from_statement { 1 } else { 0 };
         let mut current = self.statement_activity.load(Ordering::Acquire);
         loop {
-            // Parked incremental blob handles don't count: they hold a Root
-            // statement open for their whole lifetime, but between blob
-            // operations they just sit on their row and re-position on their
-            // next blob operation after the checkpoint's cache clear. Counting
-            // them would make one open blob handle block every explicit
-            // checkpoint until it is closed.
-            let active_non_blob = (current & ROOT_STATEMENT_COUNT_MASK)
-                - self.n_active_blob_statements.load(Ordering::SeqCst);
+            // Parked incremental blob handles (bits 31..62) do not block checkpoints: they sit on
+            // their row between blob operations and re-position after a cache clear. Checking the
+            // packed non-blob count (bits 0..31) in the same atomic word as EXPLICIT_CHECKPOINT_BIT
+            // prevents a blob close + SELECT start from matching via ABA.
+            let active_non_blob = current & NON_BLOB_COUNT_MASK;
             if (current & EXPLICIT_CHECKPOINT_BIT) != 0 || active_non_blob != statements_expected {
                 return Err(LimboError::StatementsInProgress(
                     "cannot checkpoint while another statement is active",
@@ -7306,5 +7319,96 @@ mod tests {
             "setval(13, false) committed: next nextval must return 13"
         );
         Ok(())
+    }
+
+    /// P1 regression: explicit checkpoint admission must validate the kind of active statement
+    /// (parked blob vs regular SELECT) in the same atomic word as the checkpoint bit, so closing a
+    /// blob and starting a SELECT with the same total root count (1) cannot bypass the guard.
+    #[test]
+    fn p1_explicit_checkpoint_distinguishes_blob_and_select_root_statements() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("ckpt_aba.db");
+        let conn = open_connection(&path);
+        let pager = conn.pager.load().clone();
+
+        // One parked blob handle: total root count is 1, non-blob count is 0 -> checkpoint allowed.
+        conn.start_root_statement(true).unwrap();
+        assert_eq!(conn.active_root_statements(), 1);
+        let blob_word = conn.statement_activity.load(Ordering::Acquire);
+        {
+            let _guard = conn
+                .begin_explicit_checkpoint(pager.clone(), false)
+                .expect("parked blob handle alone must allow explicit checkpoint");
+        }
+        assert_eq!(conn.finish_root_statement(true), 1);
+
+        // One live SELECT: total root count is again 1, but non-blob count is 1 -> refused, and
+        // its packed activity word differs from the blob-only word so ABA CAS cannot succeed.
+        conn.start_root_statement(false).unwrap();
+        assert_eq!(conn.active_root_statements(), 1);
+        let select_word = conn.statement_activity.load(Ordering::Acquire);
+        assert_ne!(
+            blob_word, select_word,
+            "blob-only and select-active words must differ to prevent ABA CAS"
+        );
+        assert!(matches!(
+            conn.begin_explicit_checkpoint(pager, false),
+            Err(LimboError::StatementsInProgress(_))
+        ));
+        assert_eq!(conn.finish_root_statement(false), 1);
+    }
+
+    /// P1 regression: committed DDL executed through an ATTACHed database must advance the
+    /// attached database's shared `schema_epoch` so another connection holding that file as its
+    /// main database immediately observes newly added columns instead of taking the epoch-equal
+    /// shortcut.
+    #[test]
+    fn p1_attached_ddl_commit_is_visible_to_other_main_connection() {
+        let temp_dir = TempDir::new().unwrap();
+        let target_path = temp_dir.path().join("target.db");
+        let host_path = temp_dir.path().join("host.db");
+        let io: Arc<dyn IO> = Arc::new(crate::PlatformIO::new().unwrap());
+
+        let host_db = Database::open_file_with_flags(
+            io,
+            host_path.to_str().unwrap(),
+            OpenFlags::default(),
+            DatabaseOpts::new().with_attach(true),
+            None,
+            Arc::new(crate::SqliteDialect),
+        )
+        .unwrap();
+
+        let attacher = host_db.connect(ConnectOpts::new()).unwrap();
+        attacher
+            .execute(format!(
+                "ATTACH DATABASE '{}' AS att",
+                target_path.display()
+            ))
+            .unwrap();
+        let target_db = attacher
+            .attached_databases()
+            .read()
+            .index_to_data
+            .values()
+            .next()
+            .expect("attached database must be registered")
+            .db
+            .clone();
+
+        let main_conn = target_db.connect(ConnectOpts::new()).unwrap();
+        main_conn.execute("CREATE TABLE items(a INTEGER)").unwrap();
+        main_conn.execute("INSERT INTO items VALUES (1)").unwrap();
+        assert_eq!(query_single_i64(&main_conn, "SELECT a FROM items"), 1);
+
+        attacher
+            .execute("ALTER TABLE att.items ADD COLUMN b INTEGER DEFAULT 42")
+            .unwrap();
+
+        assert_eq!(
+            query_single_i64(&main_conn, "SELECT b FROM items"),
+            42,
+            "main connection must observe column added via ATTACH commit"
+        );
     }
 }
