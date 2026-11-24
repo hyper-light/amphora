@@ -2181,6 +2181,22 @@ impl TableReferences {
             .find(|t| t.identifier == identifier && t.is_cte_name_in_scope())
     }
 
+    /// The entry that holds the syntax of the CTE `cte_ref` names, from which each use of it is
+    /// planned: a FROM clause's use of a CTE holds the plan it reads alone, and the entry its WITH
+    /// clause made, the syntax.
+    pub fn cte_definition<'a>(
+        &'a self,
+        cte_ref: &'a OuterQueryReference,
+    ) -> &'a OuterQueryReference {
+        if cte_ref.cte_select.is_some() || cte_ref.cte_id.is_none() {
+            return cte_ref;
+        }
+        self.outer_query_refs
+            .iter()
+            .find(|other| other.cte_id == cte_ref.cte_id && other.cte_select.is_some())
+            .unwrap_or(cte_ref)
+    }
+
     /// Marks the pre-planned [OuterQueryReference] with the given identifier as
     /// "CTE definition only". This prevents it from being used for column
     /// resolution while still allowing CTE definition lookup in subquery FROM

@@ -49,6 +49,10 @@ FOUND = [
     "WITH c AS (SELECT k, v FROM q) SELECT a.k, b.k FROM p AS a FULL JOIN p AS b ON b.k IN (SELECT c.k FROM c WHERE c.v = a.v)",
     "WITH RECURSIVE c(x) AS (SELECT 2 UNION ALL SELECT x + 1 FROM c WHERE x < 4) SELECT a.k, b.k FROM p AS a LEFT JOIN p AS b ON b.k IN (SELECT x FROM c)",
     "WITH c AS (SELECT k FROM q) SELECT x.value FROM json_each((SELECT json_group_array(k) FROM c)) AS x",
+    # A CTE read twice, once through another: the two shared the first's cursors.
+    "WITH c AS (SELECT k, v FROM q), d AS (SELECT k FROM c) SELECT c.k, a.k FROM c LEFT JOIN p AS a ON a.k = c.k AND (SELECT count(*) FROM d) = 5",
+    "WITH RECURSIVE c(x) AS (SELECT 0 UNION ALL SELECT x + 1 FROM c WHERE x < 3), d AS (SELECT x FROM c) SELECT a.k, c.x FROM p AS a LEFT JOIN c ON c.x IN (SELECT x FROM d WHERE x > a.k)",
+    "WITH RECURSIVE c(x) AS (SELECT 0 UNION ALL SELECT x + 1 FROM c WHERE x < 3), d AS (SELECT x FROM c) SELECT a.k, b.k FROM p AS a FULL JOIN q AS b ON (SELECT count(*) FROM c AS s WHERE (SELECT max(x) FROM d) = s.x) = a.k",
     "SELECT count(*) FROM p AS a0 FULL JOIN w AS a2 ON a0.k = a2.v",
     "SELECT a0.k, a2.v FROM p AS a0 RIGHT JOIN w AS a2 ON a0.k = a2.v AND a0.v = 2",
     "SELECT a0.k, a2.v, a2.k FROM p AS a0 FULL JOIN w AS a2 ON a0.k = a2.v WHERE a2.v >= 0",
@@ -143,8 +147,11 @@ class Draw:
             # A WITH of the subquery's own, which may take the name of one in reach.
             own = rng.choice(kept) if kept and rng.random() < 0.3 else f"d{self.made}"
             before = self.with_clause([own])
+        source = self.source()
+        if source in self.ctes and source not in scope and rng.random() < 0.25:
+            name = source
         inner = scope + [name]
-        text = f"{self.source()} AS {name}"
+        text = source if name == source else f"{source} AS {name}"
         if rng.random() < 0.18:
             other = self.alias()
             inner = scope + [name, other]
@@ -183,8 +190,10 @@ class Draw:
         return f"NOT ({self.on_subquery(scope, depth)})"
 
     def joined(self, alias, tables):
-        """A source of the FROM clause, and the text of it."""
+        """The text of a source of the FROM clause, named `alias`."""
         rng = self.rng
+        if alias in self.ctes:
+            return alias
         drawn = rng.random()
         if self.ctes and drawn < 0.18:
             return f"{rng.choice(self.ctes)} AS {alias}"
@@ -194,8 +203,13 @@ class Draw:
         return f"{rng.choice(tables)} AS {alias}"
 
     def from_clause(self, aliases, depth):
-        """The FROM clause over `aliases`, each join's ON clause holding a subquery most often."""
+        """The FROM clause over `aliases`, each join's ON clause holding a subquery most often. A CTE
+        may stand in it by its own name alone, which then takes the place of an alias."""
         rng = self.rng
+        for n in range(len(aliases)):
+            name = rng.choice(self.ctes)
+            if rng.random() < 0.2 and name not in aliases:
+                aliases[n] = name
         text = self.joined(aliases[0], SOURCES)
         for n in range(1, len(aliases)):
             join = rng.choice(JOINS)
@@ -221,11 +235,12 @@ class Draw:
         drawn = rng.random()
         if drawn < 0.08:
             # A parenthesized join, whose ON reads the CTEs, joined to one more table.
-            inner, outer = aliases[:2], ["a0", "a1", "a9"]
+            inner = aliases[:2]
             self.texts.add("a9")
+            group = self.from_clause(inner, depth)
+            aliases = inner + ["a9"]
             text = (f"{rng.choice(SOURCES)} AS a9 {rng.choice(['LEFT JOIN', 'JOIN', 'RIGHT JOIN', 'FULL JOIN'])} "
-                    f"({self.from_clause(inner, depth)}) ON {self.on_subquery(outer, depth)}")
-            aliases = outer
+                    f"({group}) ON {self.on_subquery(aliases, depth)}")
         elif drawn < 0.14:
             # A table function's argument reads a CTE.
             text = (f"json_each((SELECT json_group_array(k) FROM {rng.choice(self.ctes)})) AS j {rng.choice(['LEFT JOIN', 'JOIN'])} "
@@ -242,9 +257,10 @@ class Draw:
         drawn = rng.random()
         if drawn < 0.06:
             other = [f"a{n}" for n in range(2)]
-            arm = ", ".join(f"{other[n % 2]}.k" for n in range(select.count(',') + 1))
             self.texts = set()
-            sql += f" {rng.choice(['UNION ALL', 'UNION', 'EXCEPT'])} SELECT {arm} FROM {self.from_clause(other, depth)}"
+            source = self.from_clause(other, depth)
+            arm = ", ".join(f"{other[n % 2]}.k" for n in range(select.count(',') + 1))
+            sql += f" {rng.choice(['UNION ALL', 'UNION', 'EXCEPT'])} SELECT {arm} FROM {source}"
         elif drawn < 0.12:
             return f"{before}SELECT * FROM ({sql}) WHERE 1"
         elif drawn < 0.18:
