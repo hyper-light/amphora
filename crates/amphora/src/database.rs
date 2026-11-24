@@ -1087,6 +1087,12 @@ pub(crate) fn refused(error: &anyhow::Error) -> Refusal {
     if let Some(crate::sql::Error::Refusal(refusal)) = error.downcast_ref::<crate::sql::Error>() {
         return refusal.clone();
     }
+    if crate::db::too_old(error) {
+        return Refusal::Serialization {
+            what: "read".into(),
+            why: "its snapshot is too old: the database's log took back the segment it began on, for a write that needed the room; the same read asked again begins on a newer one".into(),
+        };
+    }
     unavailable(format!("{error:#}"))
 }
 /// A query's session on `db`, a reader or the writer between its commits: once, before its

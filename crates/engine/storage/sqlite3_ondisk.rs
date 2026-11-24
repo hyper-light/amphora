@@ -568,6 +568,7 @@ pub(crate) fn begin_read_page(
     io_ctx: &IOContext,
     group: Option<&mut CompletionGroup>,
     learned: Option<Arc<crate::translate::optimizer::learned_costs::LearnedCosts>>,
+    hold: Option<Arc<super::wal::ReadHold>>,
 ) -> Result<Completion> {
     tracing::trace!("begin_read_btree_page(page_idx = {})", page_idx);
     let timer = learned
@@ -581,6 +582,12 @@ pub(crate) fn begin_read_page(
             page.clear_locked();
             return None; // IO error already captured in completion
         };
+        // Amphora: the file may hold another generation's page of it since (decision 45): asked
+        // after the bytes.
+        if hold.as_ref().is_some_and(|hold| hold.is_ended()) {
+            page.clear_locked();
+            return Some(CompletionError::SnapshotTooOld);
+        }
         let buf_len = buf.len();
         // Handle truncated database files: if we read fewer bytes than expected
         // (and it's not an intentional empty read), return a ShortRead error.

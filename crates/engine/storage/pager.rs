@@ -4127,6 +4127,12 @@ impl Pager {
         let Some(read) = read else {
             return Ok(false);
         };
+        // The file may hold another generation's page since (decision 45): asked after the bytes.
+        if let Some(wal) = self.wal.as_ref() {
+            if wal.read_hold().is_some_and(|hold| hold.is_ended()) {
+                return Err(LimboError::SnapshotTooOld);
+            }
+        }
         let expected = buffer.len();
         if (read == 0 && !allow_empty) || (read != 0 && read != expected) {
             return Err(LimboError::CompletionError(CompletionError::ShortRead {
@@ -4401,6 +4407,7 @@ impl Pager {
             io_ctx,
             group,
             self.learned_costs.get().cloned(),
+            self.wal.as_ref().and_then(|wal| wal.read_hold()),
         )
     }
 

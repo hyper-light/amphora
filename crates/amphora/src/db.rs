@@ -117,6 +117,21 @@ fn fail(e: impl std::error::Error + Send + Sync + 'static) -> anyhow::Error {
     anyhow::Error::new(e)
 }
 
+/// Whether `error` says the engine ended this read: its snapshot's log segment was taken back for
+/// writes that needed the room ([`Db::end_closing_reads`]). It read nothing of another snapshot, so
+/// the read asked again is the same read on a newer one.
+pub(crate) fn too_old(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<LimboError>(),
+            Some(
+                LimboError::SnapshotTooOld
+                    | LimboError::CompletionError(CompletionError::SnapshotTooOld)
+            )
+        )
+    })
+}
+
 /// Wakes the thread that made it: what a statement stepped on this thread waits on while it is busy
 /// (the release of the lock it found held, [`step`]).
 struct Unpark(std::thread::Thread);
@@ -787,6 +802,18 @@ impl Db {
     /// past its room would refuse every submit after the restart that brought it back within.
     pub(crate) fn log_frames_in_use(&self) -> anyhow::Result<u64> {
         Ok(self.db.wal_backfill().0)
+    }
+
+    /// Ends the reads under way that count on the log's closing segment, and says how many: what
+    /// keeps that segment from the writes is then its copy alone (decision 45). Each finds it at
+    /// its next page ([`too_old`]).
+    pub(crate) fn end_closing_reads(&self) -> usize {
+        self.db.end_closing_reads()
+    }
+
+    /// The reads that count on the log's closing segment, none when no segment closes.
+    pub(crate) fn closing_reads(&self) -> u64 {
+        self.db.closing_reads()
     }
 
     /// The frames of log a restart keeps the log's file for: past them, it cuts the file to nothing

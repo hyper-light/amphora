@@ -1059,6 +1059,11 @@ struct Actor<F: BlockFile + 'static = LogDevice> {
     // (replication.md, "Decision (lane constants): the compaction's expansion learned where it
     // runs"; CT.1).
     compacting: super::compacting::Costs,
+    // The frames the log's current segment held as the flushing thread was last asked for a pass, and
+    // how many it grew by while that pass ran: what the next may grow it by, before the room is gone
+    // (`flush`; store.md, decision 45).
+    asked_frames: u64,
+    pass_grew: u64,
     // While the database's log is past its room: why, for the submits this member refuses.
     log_full: Option<String>,
     // The input queued as this step began, its own envelope among it: what a restart in the
@@ -2685,6 +2690,8 @@ fn open_on<F: BlockFile + 'static>(
         transferred: None,
         spacing: log_bound::Spacing::default(),
         compacting: super::compacting::Costs::default(),
+        asked_frames: 0,
+        pass_grew: 0,
         log_full: None,
         step_queued: 0,
         answers: patience::Answers::new(election, members),
@@ -3457,10 +3464,12 @@ impl<F: BlockFile + 'static> Actor<F> {
                 out,
                 pass,
             } => {
+                let mut passed = false;
                 match done.try_recv() {
                     Ok(Ok(flushed)) => {
                         self.replica.machine_mut().flushed_through(flushed.at);
                         *out = false;
+                        passed = flushed.pass.is_some();
                         if let Some(said) = flushed.pass {
                             self.replica.machine_mut().set_image_disk(said.image);
                             *pass = said;
@@ -3488,8 +3497,24 @@ impl<F: BlockFile + 'static> Actor<F> {
                 self.control
                     .meter
                     .log_limit_bytes(pass.room.saturating_mul(log_bound::FRAME_BYTES));
+                if passed {
+                    self.pass_grew = frames.saturating_sub(self.asked_frames);
+                }
                 let past = frames > pass.room;
                 let due = past || (frames > 0 && self.spacing.due()?);
+                // A local read keeps the segment it began on while there is room (store.md,
+                // decision 45). What the segment holds and what the last pass's time let it grow by
+                // are past the room: the next restart is needed, and the reads holding the segment
+                // the last one closed keep it from it, so they end (Ada, 2026-11-24: one slow read
+                // never holds up a write). Not while a pass that may free it is out, unless the room
+                // is gone already.
+                let needed = frames.saturating_add(self.pass_grew) > pass.room;
+                let machine = self.replica.machine();
+                let freed = needed
+                    && (past || !*out)
+                    && !lent
+                    && machine.closing_reads() > 0
+                    && machine.end_closing_reads() > 0;
                 let mut restarted = false;
                 if due && pass.ready && !*out && !lent {
                     // The queue as this step began, on the basis each later step reads it.
@@ -3528,7 +3553,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                 // nothing to flush: the next restart waits for the segment the last one closed to
                 // be copied. One is asked as a restart is made, so that segment is copied at once:
                 // a read that begins before it is counts on that segment too.
-                let copy = restarted || past || (frames > 0 && self.spacing.due()?);
+                let copy = restarted || freed || past || (frames > 0 && self.spacing.due()?);
                 let next = match self.replica.machine().unflushed() {
                     Some(at) => Some(at),
                     None if copy => Some(self.replica.machine().applied()),
@@ -3536,6 +3561,9 @@ impl<F: BlockFile + 'static> Actor<F> {
                 };
                 if !*out && let Some(at) = next {
                     let held = frames > 0;
+                    if copy {
+                        self.asked_frames = frames;
+                    }
                     ask.try_send(Ask { at, copy, held })
                         .map_err(|_| fenced("the replica's flushing thread took no flush"))?;
                     *out = true;

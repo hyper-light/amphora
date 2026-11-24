@@ -13,8 +13,9 @@ use std::num::NonZeroUsize;
 use strum::EnumString;
 use tracing::{instrument, Level};
 
-use crate::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use crate::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use crate::sync::RwLock;
+use crate::sync::Weak;
 use bitflags::bitflags;
 use std::fmt::{Debug, Formatter};
 use std::{fmt, sync::Arc};
@@ -23,7 +24,7 @@ use super::buffer_pool::BufferPool;
 use super::changes::{latest_by_page, ChangeLog};
 use super::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
 use super::log_index::{Lookup, ReadIndex};
-use super::log_segments::{ReadSpan, SegmentId, Segments, SegmentsCell};
+use super::log_segments::{ReadSpan, Segment, SegmentId, Segments, SegmentsCell};
 use super::packed::{self, LogFormat, Record, Records};
 use super::pager::{Logged, PageRef, Pager};
 use super::sqlite3_ondisk::{
@@ -1177,6 +1178,13 @@ pub trait Wal: Debug + Send + Sync {
     /// read. The shared pages key a frame's image by it, since frame numbers start again in each
     /// segment (decision 45).
     fn frame_generation(&self, frame: FrameRef) -> u32;
+
+    /// Amphora: what this connection's read under way holds of the log, which the log's owner can
+    /// end (decision 45): a page read from the file is used only while it isn't. None for a log that
+    /// can't be ended so.
+    fn read_hold(&self) -> Option<Arc<ReadHold>> {
+        None
+    }
 
     /// Read a frame from the WAL. The read is added to `group`, when
     /// given, before it is submitted.
@@ -3794,8 +3802,9 @@ pub struct WalFile {
     /// This is the index to the read_lock in WalFileShared that we are holding. This lock contains
     /// the max frame for this connection. It names the lock's segment too ([`ReadGuardKind`]).
     max_frame_read_lock_index: AtomicUsize,
-    /// The segments the read under way counts on (decision 45), given back at its end.
-    read_span: Mutex<Option<ReadSpan>>,
+    /// What the read under way holds of the log: its mark and the segments it counts on (decision
+    /// 45), given back at its end, or by the log's owner ([`SharedLog::end_closing_reads`]).
+    hold: Arc<ReadHold>,
     /// The last frame of the closing segment the read under way counts on, 0 when it counts on
     /// none: a page its own segment lacks is looked up there before the file (decision 45).
     closing_max_frame: AtomicU64,
@@ -4178,6 +4187,41 @@ pub struct SharedLog {
     /// Amphora (lane constants-22): each release of the locks above in this process, and each
     /// commit published, for the statements busy on them to wake on ([`LockRelease`]).
     pub released: Arc<LockRelease>,
+    /// The reads of this process's connections, one entry a connection, gone as it is dropped
+    /// ([`Self::end_closing_reads`]).
+    reads: Mutex<Vec<Weak<ReadHold>>>,
+}
+
+/// A connection's read under way, as the log's owner can end it (decision 45): its read mark and
+/// the segments it counts on, given back once, by the read's own end or by
+/// [`SharedLog::end_closing_reads`]. One to a connection, empty between its reads.
+#[derive(Debug, Default)]
+pub(crate) struct ReadHold {
+    held: Mutex<Option<(ReadGuardKind, ReadSpan)>>,
+    /// The read under way was ended here: set with its hold taken, before its marks and counts are
+    /// given back, and cleared as the next begins.
+    ended: AtomicBool,
+}
+
+impl ReadHold {
+    fn begin(&self, guard: ReadGuardKind, span: ReadSpan) {
+        let mut held = self.held.lock();
+        self.ended.store(false, Ordering::Release);
+        *held = Some((guard, span));
+    }
+
+    /// What the read holds, if nothing ended it first.
+    fn take(&self) -> Option<(ReadGuardKind, ReadSpan)> {
+        self.held.lock().take()
+    }
+
+    /// Whether the read under way was ended: what it reads of the log or the file from here on may
+    /// be another generation's. Asked after a page's bytes arrive, so a page it lets through was
+    /// read before its segment was given back.
+    pub(crate) fn is_ended(&self) -> bool {
+        fence(Ordering::SeqCst);
+        self.ended.load(Ordering::Acquire)
+    }
 }
 
 impl SharedLog {
@@ -4244,7 +4288,67 @@ impl SharedLog {
             write_lock: PaddedLock::new(TursoRwLock::new()),
             checkpoint_lock: PaddedLock::new(TursoRwLock::new()),
             released: Arc::default(),
+            reads: Mutex::default(),
         })
+    }
+
+    /// A connection's hold, kept here while the connection is.
+    fn register_read(&self) -> Arc<ReadHold> {
+        let hold = Arc::<ReadHold>::default();
+        let mut reads = self.reads.lock();
+        reads.retain(|read| read.strong_count() > 0);
+        reads.push(Arc::downgrade(&hold));
+        hold
+    }
+
+    /// Ends each read under way in this process that counts on the closing segment, and says how
+    /// many: nothing but that segment's copy and a backup then holds its reset. Its marks and
+    /// counts are given back for it here, so that the segment's copy may go past its snapshot and
+    /// the writer may write its file over; the read finds it at its next page ([`LimboError::
+    /// SnapshotTooOld`]) and its own end gives back nothing more. A read that counts on the current
+    /// segment alone is not ended. Asked by the log's owner, which holds no read itself, when the
+    /// writes need the room those reads keep (decision 45).
+    pub fn end_closing_reads(&self) -> usize {
+        let Some(closing) = self.segments.load().closing() else {
+            return 0;
+        };
+        let holds: Vec<Arc<ReadHold>> =
+            self.reads.lock().iter().filter_map(Weak::upgrade).collect();
+        let mut ended: usize = 0;
+        for hold in holds {
+            let mut held = hold.held.lock();
+            let on_closing = held
+                .as_ref()
+                .is_some_and(|(_, span)| span.lookup_order().any(|segment| segment == closing));
+            if !on_closing {
+                continue;
+            }
+            let Some((guard, span)) = held.take() else {
+                continue;
+            };
+            // Before anything is given back: whoever sees the segment free sees this.
+            hold.ended.store(true, Ordering::SeqCst);
+            if let Some((segment, slot)) = guard.read_mark() {
+                if let Some(mark) = self.segment(segment).read().runtime.read_locks.get(slot) {
+                    mark.unlock();
+                }
+            }
+            self.end_read(span);
+            ended = ended.saturating_add(1);
+        }
+        self.released.notify();
+        ended
+    }
+
+    /// The reads that count on the closing segment, none when no segment closes.
+    pub fn closing_reads(&self) -> u64 {
+        let segments = self.segments.load();
+        segments
+            .closing()
+            .map_or(0, |closing| match segments.state(closing) {
+                Segment::Closing(closing) => closing.reads,
+                Segment::Current { .. } | Segment::Free => 0,
+            })
     }
 
     pub fn segment(&self, id: SegmentId) -> &Arc<RwLock<WalFileShared>> {
@@ -5737,7 +5841,7 @@ impl WalFile {
         });
         self.closing_max_frame
             .store(closing_max_frame, Ordering::Release);
-        *self.read_span.lock() = Some(span);
+        self.hold.begin(read_guard, span);
         self.install_vacuum_lock_guard(vacuum_lock_guard);
         self.install_connection_state(WalConnectionState::new(shared_snapshot, read_guard));
         tracing::debug!(
@@ -5833,9 +5937,9 @@ impl Wal for WalFile {
         let slot = self.max_frame_read_lock_index.load(Ordering::Acquire);
         if slot != NO_LOCK_HELD {
             // A read guard is installed only with its span (`try_begin_read_tx`).
-            if let Some(span) = self.read_span.lock().take() {
-                self.coordination
-                    .end_read_tx(ReadGuardKind::from_lock_index(slot), span);
+            // A read the log's owner ended gave back its mark and its count then.
+            if let Some((guard, span)) = self.hold.take() {
+                self.coordination.end_read_tx(guard, span);
             }
             self.closing_max_frame.store(0, Ordering::Release);
             self.max_frame_read_lock_index
@@ -5995,6 +6099,9 @@ impl Wal for WalFile {
             "unexpected use of frame_watermark optional argument"
         );
 
+        if self.hold.is_ended() {
+            return Err(LimboError::SnapshotTooOld);
+        }
         let max_frame = self.max_frame.load(Ordering::Acquire);
         if frame_watermark.is_some_and(|watermark| watermark > max_frame) {
             return Err(LimboError::InvalidArgument(format!(
@@ -6071,6 +6178,10 @@ impl Wal for WalFile {
         Ok(self.find_closing_frame(segment, page_id))
     }
 
+    fn read_hold(&self) -> Option<Arc<ReadHold>> {
+        Some(self.hold.clone())
+    }
+
     fn frame_generation(&self, frame: FrameRef) -> u32 {
         let current = self.checkpoint_seq.load(Ordering::Acquire);
         // A switch writes the other segment's header with the current one's sequence plus one
@@ -6104,6 +6215,7 @@ impl Wal for WalFile {
             at.segment,
             label
         );
+        let hold = self.hold.clone();
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
             let Ok((buf, bytes_read)) = res else {
                 tracing::debug!(err = ?res.unwrap_err());
@@ -6111,6 +6223,12 @@ impl Wal for WalFile {
                 page.clear_wal_tag();
                 return None; // IO error already captured in completion
             };
+            // The segment may have been given to another generation since: asked after the bytes.
+            if hold.is_ended() {
+                page.clear_locked();
+                page.clear_wal_tag();
+                return Some(CompletionError::SnapshotTooOld);
+            }
             let buf_len = buf.len();
             if bytes_read != buf_len as i32 {
                 tracing::debug!(
@@ -7490,6 +7608,7 @@ impl WalFile {
         buffer_pool: Arc<BufferPool>,
     ) -> Self {
         let now = io.current_time_monotonic();
+        let hold = coordination.shared_wal_state().register_read();
         Self {
             io,
             coordination,
@@ -7517,7 +7636,7 @@ impl WalFile {
             min_frame: AtomicU64::new(0),
             transaction_count: AtomicU64::new(0),
             max_frame_read_lock_index: AtomicUsize::new(NO_LOCK_HELD),
-            read_span: Mutex::new(None),
+            hold,
             closing_max_frame: AtomicU64::new(0),
             last_checksum: AtomicU64::new(pack_checksum(last_checksum)),
             checkpoint_guard: RwLock::new(None),
