@@ -14,8 +14,9 @@ differently, pass 3 of 3 with one clean round and both cp_t1_13 tests, and the b
   harness's moving time charging the worker's real latency, or a loss a real-time run shows too. The real-time
   scenario (lane V13's 32 spread writers on real time, its r1814) was not run.
 - seed_and_delta is traced to the lost order: the leader queues its `MsgTimeoutNow` to member 2, and QB.2's shed
-  drops it from the outgoing queue as its oldest record, to fit a heartbeat. Not traced: why the leader's queue is past its bound at that
-  moment on the branch and not on main.
+  drops it from the outgoing queue as its oldest record, to fit a heartbeat. The bound it passes (2 messages) was
+  learned at t=20000, at the tick after a follower's slot ended by time (r78). Not traced: why the branch's closes
+  arrive after their slots end by time, and what moves the leader's clock there.
 - kiln restarted at 02:18Z and lost the first run (an earlier r72, macOS). adacachy2 had 1 to 14 idle cores; most runs asked 1
   core (CARGO_BUILD_JOBS=1) after a 4-core ask was refused.
 
@@ -67,24 +68,29 @@ The shed (QB.2, the owner's send loop) drops the oldest queued record when a new
 again, and with every clock standing still the transfer never runs out its election timeout, so the lead never
 moves.
 
-The earlier divergence in the same run: each follower's close for its call reaches the leader only after the slot
-ended by time (at t=5000, 10000 and 20000), where main's close releases the slot at t=0. Not traced: how the late
-closes, or the leader's clock moved 10 s at each, leave the outgoing queue past its bound at the hand-off.
+Why the queue is past its bound there (r78, both arms in one run, each tick's re-learned bound at the leader):
+
+| | branch (ef6b0990) | main (813eaf52) |
+|---|---|---|
+| follower closes for the calls | each after its slot ended by time: t=5000, 10000, 20000 | each ends its slot at t=0 (`Released` or `Forwarded`) |
+| the leader's outgoing bound | unbounded in messages until t=20000, then `Bound { bytes: 65953755136, messages: 2 }` | never re-learned before the hand-off |
+| at the hand-off | 3 records queued, past 2: `MsgTimeoutNow` shed | 3 records queued, no shed |
+
+So the first place the branch decides differently in this test is upstream of the shed: its followers' closes reach
+the leader after their slots ended by time, and the leader's clock and its learned drain move with them.
 
 ## Next, in order
 
-1. Log the outgoing queue's bound, count and bytes at each push from the first late close on, on both arms, and the
-   clock each was learned at. Find why the branch's queue is past its bound at the hand-off.
-2. Trace why each close arrives after its slot ended by time on the branch: log each owner's clock moves and what
+1. Trace why each close arrives after its slot ended by time on the branch: log each owner's clock moves and what
    moves them from the call's answer to the close's arrival, on both arms. `Driven::advance` moved none before the
    hand-off (r72 at 02:53Z), so the leader's 5 to 20 s jumps come from another clock setter. One
    candidate, unverified: on the branch `decide` answers the call and queues the close after the step's drive, and
    `end_slot` sets no `driving` where `propose_stamped` does.
-3. For V13, run lane V13's real-time bench (r1814) on the branch and on main. If the branch answers every write with
+2. For V13, run lane V13's real-time bench (r1814) on the branch and on main. If the branch answers every write with
    no stale base on real time, the failure is the harness's moving time. Then the harness would treat a session out
    on the worker as main's inline one ("Decision (lane P6)": the worker moves where a session runs, not when). That
    changes a test, so it is Ada's call under rule 0.
-4. Side finding, not acted on: QB.2's shed premise does not hold for `MsgTimeoutNow`, a one-shot order. Under a shed
+3. Side finding, not acted on: QB.2's shed premise does not hold for `MsgTimeoutNow`, a one-shot order. Under a shed
    on main too, a hand-off stalls until its election timeout.
 
 ## Runs
@@ -102,6 +108,7 @@ probe's SHA, each test alone with `--nocapture`. Logs on adacachy2: ~/.cache/amp
 | r62 | cpus=1,mem=6g | 8bb5582c (+ core decision, unreachable) | `MsgTimeoutNow` queued, then shed |
 | r66 | cpus=1,mem=6g | 34070c78 (main + the same) | the same three records, no shed; passes |
 | r72 (02:53Z) | cpus=1,mem=6g | aec4c1c6 (+ the shed record's kind, each `Driven::advance`) | shed `MsgTimeoutNow` for a heartbeat; no `advance` before the hand-off |
+| r78 | cpus=1,mem=6g | ef6b0990 and 813eaf52 (+ the leader's re-learned bound) | branch: bound 2 messages from t=20000; main: no change |
 
-Probe branches, never to merge: `perf/serve-p19-probe` (aec4c1c6, on the branch head) and
-`perf/serve-p19-probe-main` (34070c78, on main d88899f6). Its last commit puts `eprintln!` in vendored hyper-raft.
+Probe branches, never to merge: `perf/serve-p19-probe` (ef6b0990, on the branch head) and
+`perf/serve-p19-probe-main` (813eaf52, on main d88899f6). Its last commit puts `eprintln!` in vendored hyper-raft.
