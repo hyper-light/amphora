@@ -66,6 +66,16 @@ s3|select accountid, balance from accounts where accountid = 'checking'
 s3|select accountid, balance from accounts where accountid = 'cds'
 s1|update accounts set accountid = 'checking' where accountid = 'cds'
 s3|select accountid, balance from accounts where accountid = 'checking'
+# an index finds the row, whose key its holder changed and which still matches: the key stays the holder's
+s1|update accounts set balance = 600 where accountid = 'checking'
+s1|begin
+s1|update accounts set accountid = 'cds' where accountid = 'checking'
+s2>update accounts set balance = balance + 450 where accountid >= 'c' and accountid < 'd'
+s1|commit
+s2<
+s3|select accountid, balance from accounts where accountid = 'cds'
+s3|select accountid, balance from accounts where accountid = 'checking'
+s1|update accounts set accountid = 'checking' where accountid = 'cds'
 # eval-plan-qual: writep3a writep3b c1 c2 (one table for the spec's three)
 s1|create table p(id int not null, a int, b int, c int)
 s1|insert into p(id, a, b, c) values (1, 0, 1, 0)
@@ -330,6 +340,14 @@ s2>update q set v = v + 2 where id = 1
 s1|commit
 s2<
 s2|commit
+# timeouts: wrtbl lto update (an UPDATE for the spec's DELETE)
+s1|begin isolation level read committed
+s2|begin isolation level read committed
+s1|update accounts set balance = balance + 100 where balance >= 0
+s2|set lock_timeout = '10ms'
+s2~update accounts set balance = 0 where accountid = 'checking'
+s1|rollback
+s2|rollback
 # lock_timeout
 s1|begin
 s1|update q set v = v + 1 where id = 1
