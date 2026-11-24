@@ -1792,7 +1792,11 @@ rules:
 - *Read by a loop in the run.* Its NULL row is the loop's, as in a left-deep plan.
 
 An ON term holding a subquery keeps the table out of the run. A LEFT JOIN outside the pair is one of
-the outer loops, where the subsets the search builds already hold its ON's tables before it.
+the outer loops, which must hold its ON's tables before it. The sets of two tables and more the search
+builds do: each is grown one table at a time, holding every table each of its tables must follow. A
+set of one table was not held to that (lane C6): a LEFT JOIN's right table was planned alone, as if it
+were first, and a pair took it as its outer loops, so it was read before the tables its ON reads, and
+no NULL row was made for its unmatched rows. It is no set now (`compute_best_join_order`'s base case).
 
 A term above the outer join that reads its right table (a WHERE term, or an inner join's ON term) is
 not one of the ON's terms, so it stays above the join:
@@ -1885,7 +1889,16 @@ which the search weighs.
 - `bushy_search_tests::t_pl_8_13_a_left_join_inside_a_bushy_run_keeps_its_null_rows` now forces
   the LEFT JOIN into the run in every query: the LEFT JOIN's dimension keeps six rows and the other
   one, so the mirror plan, with the LEFT JOIN's side as the outer loops, scans the probe six times
-  where the plan with it in the run scans it once.
+  where the plan with it in the run scans it once. Lane C6: which of the two the search takes turns on
+  the hash probe's learned weight, which the test's own runs move, and no one set of weights puts the
+  LEFT JOIN in the run for all eight queries (record
+  `bench/records/2026-11-24-adacachy2-perf-planner-c6.md`). So the test states the weights, per query,
+  under which the search puts it there, and answers each query on the weights learned as well.
+- `bushy_search_tests::t_pl_8_13_outer_joins_answer_as_sqlite_*` (lane C6): 420 LEFT, RIGHT and FULL
+  joins among inner ones at three sizes, each as a row of aggregates, as its rows under an ORDER BY and
+  as groups in order, with and without statistics, serial and at 1, 2 and 8 stated workers, under
+  weights pinned to each side of the hash joins and as hand-built bushy trees, each with SQLite 3.54.0's
+  answer (`bench/sqlite_outer_joins.py`).
 
 **Falsified by.** An answer under the switch that differs from nested loops; a LEFT JOIN probe whose
 ON reads a table after it; a run's row NULL-extended for an outer row it doesn't join; a plan the
