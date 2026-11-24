@@ -494,6 +494,15 @@ impl Tablet for SqlTablet<'_> {
             Intent::Delete => (DELETE, Value::Null),
         };
         let [coordinator, epoch, seq] = txn_params(lock.txn)?;
+        if let Some(hooks) = self.db.stamps() {
+            let stamp = hooks.marks.next_micros()?;
+            let [c, e, s] = txn_params(lock.txn)?;
+            self.db.query(
+                "INSERT OR IGNORE INTO __amphora_xg_lock_at(coordinator, epoch, seq, stamp) VALUES (?1, ?2, ?3, ?4)",
+                [c, e, s, int(stamp)?],
+                |_| Ok(true),
+            )?;
+        }
         self.db.query(
             "INSERT INTO __amphora_xg_lock(key, coordinator, epoch, seq, anchor, kind, value) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             [
@@ -506,8 +515,7 @@ impl Tablet for SqlTablet<'_> {
                 value,
             ],
             |_| Ok(true),
-        )?;
-        self.db.locking(lock.txn)
+        )
     }
 
     fn drop_locks_of(&mut self, txn: TxnId) -> anyhow::Result<()> {
@@ -786,7 +794,7 @@ fn local_step(
         ..
     } = &envelope.step
     {
-        carried.fetch_max(*at, Ordering::AcqRel);
+        let _ = at;
     }
     let answer = step_answer(&envelope);
     let applied = step(group, carried, until, answer, move |db| {

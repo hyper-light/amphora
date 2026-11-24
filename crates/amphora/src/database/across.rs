@@ -36,7 +36,7 @@ use crate::xgroup::sql::Member;
 /// its rows in every group, which the writer's clock then takes in so its later commits are later.
 pub(super) fn stamp(db: &Db, ns: &str, at: Rev, pinned: Option<u64>) -> anyhow::Result<()> {
     let hooks = db.stamps();
-    if pinned.is_none() && hooks.is_none() {
+    if hooks.is_none() {
         return Ok(());
     }
     let mut stamped = false;

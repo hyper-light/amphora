@@ -681,9 +681,8 @@ impl Memory {
             && let (Some(txn), Some(at)) = (envelope.step.txn(), published)
             && let Some(stamp) = self.lock_at.get_mut(&txn)
         {
-            self.clock = self.clock.max(at);
-            *stamp = self.clock;
-            return Ok((reply, Some(*stamp)));
+            let _ = stamp;
+            return Ok((reply, Some(at)));
         }
         Ok((reply, None))
     }
