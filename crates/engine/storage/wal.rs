@@ -2029,7 +2029,9 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn restart_unmarked(&self, io: &dyn IO) -> Result<bool> {
-        if self.log.file_is_marked() {
+        let segments = self.log.segments.load();
+        let one_segment = segments.current() == SegmentId::First && segments.closing().is_none();
+        if !one_segment || self.log.file_is_marked() {
             return Ok(false);
         }
         let held = (1..READ_MARKS)

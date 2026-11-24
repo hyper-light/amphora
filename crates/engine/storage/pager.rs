@@ -6610,7 +6610,7 @@ impl Pager {
 
     /// Whether a commit of page 1 without the mark was made ([`Self::leave_to_sqlite`]).
     fn unmark(&self) -> Result<bool> {
-        let Some(wal) = self.wal.as_ref() else {
+        let Some(wal) = self.wal.as_ref().filter(|wal| !wal.mark_wanted()) else {
             return Ok(false);
         };
         self.begin_read_tx()?;

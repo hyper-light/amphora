@@ -2497,17 +2497,7 @@ impl Database {
                         second_segment,
                         Some(storage::wal::second_segment_path(&self.wal_path)),
                     )?;
-                    if !self.opts.enable_multiprocess_wal
-                        && !self.io.is_memory()
-                        && !is_memory_like(&self.path)
-                    {
-                        shared_log.set_mark(if *marked {
-                            storage::wal::Mark::InFile
-                        } else {
-                            storage::wal::Mark::Absent
-                        });
-                    }
-
+                    let marked = *marked;
                     let open_mv_store = *open_mv_store;
                     let HeaderValidationState::OpenWal { mut pager, .. } = std::mem::take(st)
                     else {
@@ -2530,6 +2520,18 @@ impl Database {
                     pager.clear_page_cache(true);
                     pager.set_schema_cookie(None);
 
+                    if !self.opts.enable_multiprocess_wal
+                        && !self.io.is_memory()
+                        && !is_memory_like(&self.path)
+                    {
+                        let marked = marked && (open_mv_store || self.log_is_marked(&pager)?);
+                        self.shared_wal.set_mark(if marked {
+                            storage::wal::Mark::InFile
+                        } else {
+                            storage::wal::Mark::Absent
+                        });
+                    }
+
                     if open_mv_store {
                         let canonical_path = self.get_database_canonical_path();
                         let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
@@ -2549,6 +2551,30 @@ impl Database {
                 }
             }
         }
+    }
+
+    /// Whether the log recovered keeps the mark the file's page 1 has (decision 45): a clean close cut
+    /// short leaves a later page 1 without it there, which the next copy would put in the file.
+    fn log_is_marked(&self, pager: &Pager) -> Result<bool> {
+        let frames = |id| {
+            self.shared_wal
+                .segment(id)
+                .read()
+                .last_checksum_and_max_frame()
+                .1
+        };
+        use storage::log_segments::SegmentId;
+        if frames(SegmentId::First) == 0 && frames(SegmentId::Second) == 0 {
+            return Ok(true);
+        }
+        pager.begin_read_tx()?;
+        let version = pager
+            .io
+            .block(|| pager.with_header(|header| header.read_version));
+        pager.end_read_tx();
+        pager.clear_page_cache(true);
+        pager.set_schema_cookie(None);
+        Ok(!version?.sqlite_reads())
     }
 
     /// The log's second segment (decision 45) as its file holds it. Frames left in it beside a
