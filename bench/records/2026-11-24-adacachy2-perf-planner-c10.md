@@ -5,7 +5,7 @@ simulator`); SQLite 3.54.0 is the reference (adacachy's and adacachy2's system l
 
 Losses first.
 
-- **Five defects the sweep found on the way are on main still** (each in plain SQL, none CH's, none fixed here; findings.md):
+- **Six defects the sweep found on the way are on main still** (none CH's by its trace, none fixed here; findings.md):
   - CM: a RIGHT or FULL JOIN whose right table is WITHOUT ROWID (experimental) with a secondary index errors, with a subquery or
     without: `SELECT count(*) FROM e AS a0 FULL JOIN w AS a2 ON a0.k = a2.v`: SQLite 3, Amphora "secondary index lacks primary key locator".
   - CN: with statistics, a LEFT JOIN run as a hash join on a materialized build does not test a WHERE term on a correlated subquery for
@@ -19,6 +19,8 @@ Losses first.
     (`FROM a FULL JOIN json_each((SELECT t.j FROM t WHERE t.k = a.k AND EXISTS (...))) AS je ON je.value = 7`: SQLite `1,7; 2,NULL`,
     Amphora `1,NULL; 2,7`), on main before this lane too. That argument is the one place a subquery is still coded twice, so
     one that holds an uncorrelated subquery which hash joins still loses rows under a left table with no row (SQLite 2, Amphora 0).
+  - CR, not traced: with every join a hash join (`JoinMethods::HashJoinsOnly`, a test's setting), one drawn LEFT JOIN over EXISTS and
+    json_each loses a row (SQLite 1, Amphora 0; seed z1, its query in findings.md). At every other setting it answers as SQLite.
 - The drawn sweep draws no WITHOUT ROWID table on the right of a RIGHT or FULL JOIN (CM) and no CTE in an ON clause (CO), and says so.
 - `crates/engine/tests/planner.rs:182` fails as on main before (lane C4's record: red since 18daab1e).
 - A read of the unmatched rows no longer seeks by a term that reads a correlated subquery (it read by the copy's value); it reads the table and the row
@@ -41,9 +43,17 @@ The panic's stack: `Option::expect` (btree.rs:3155) < `indexbtree_seek_unpacked`
 < `normal_step`; then on the statement's reset `Pager::rollback` (pager.rs:7106, "dirty pages should be empty for read txn").
 
 **It is worse than a panic.** `op_open_ephemeral` empties a cursor's B-tree when it finds the cursor open (`ClearExisting`), and the cursor was the outer
-table's. The same statement over a WITHOUT ROWID table (whose cursor is an index's, so nothing panics) emptied the table: in a drawn
-sweep on main every later query of it answered over no rows (3,346 of 20,000 answers, no panic). The "dirty pages" panic is that write, met in
-a read transaction.
+table's. On main f183dd75 a SELECT deletes a table's rows, with no panic and no error where nothing is put in the list nor looked up in it:
+
+```sql
+CREATE TABLE o(x INT);  INSERT INTO o VALUES (1), (2);   -- r and l empty
+SELECT a.x, b.x FROM o AS a FULL JOIN o AS b ON NULL WHERE (SELECT count(*) FROM r WHERE r.x IN (SELECT l.y FROM l WHERE b.x <= l.x)) = 0;
+-- SQLite 4 rows. Amphora 3 (1,NULL; 2,NULL; NULL,NULL).   Then SELECT count(*) FROM o: 0, and 0 after a later INSERT into another table commits.
+```
+
+A WITHOUT ROWID table lost its 3 rows under a right answer (`FROM w AS a FULL JOIN n AS b`). Whether a reopened database has lost them was not
+run. The "dirty pages" panic is that write, met in a read transaction. With the fix both tables hold their rows. In a drawn sweep (m4) on main 3,346
+answers were wrong with no panic, the rows they lack `w`'s (inferred from them; a replay of its 2,500 first statements kept `w`, so which one emptied it is not known).
 
 ## Traced (done when 2)
 
@@ -83,8 +93,9 @@ a read transaction.
 | drawn, seed m2, 4 settings | main f183dd75 | 20,000 | 538 | 24 | 12 | 502 |
 | drawn, seed m4, 4 settings | main f183dd75 | 20,000 | 3,358 | 0 | 12 | 3,346 |
 | drawn, seeds m1 to m4 | the copy counted as held, not removed | 80,000 | 56 | 6 | 44 | 6 |
-| drawn, seeds k1 and k2 (CTEs, json_each added) | ffd0ac6f, the fix's engine | 48,000 | 18 | 0 | 0 | 18 (16 CP, 2 CN) |
-| the landed sweep, 5 settings | d8adcbe2 (tests and fix) | 3,000 | 0 | 0 | 0 | 0 |
+| drawn, seeds k1 and k2 (CTEs, json_each added) | ffd0ac6f, the fix's engine | 48,000 | 18 | 0 | 0 | 18 (16 CP by their form, 2 CN) |
+| drawn, seeds z1 and z2, 5 settings, every table read after each query | main 6178f578 (landed) | 40,000 | 11 | 0 | 0 | 11 (10 CP by their form, 1 CR); no table changed |
+| the landed sweep, 5 settings | d8adcbe2 (tests and fix), and main 6178f578 | 3,000 | 0 | 0 | 0 | 0 |
 | the landed sweep, 5 settings | 238d54b0 (the tests, main's engine) | 3,000 | 50 | 33 | 0 | 17 |
 
 In the last row's run 22 of the 50 also left a table of the database empty (`n`, 5 rows, read after the query on the same connection: 0). Panics there: 17
