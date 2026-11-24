@@ -1,0 +1,8 @@
+CREATE TABLE o(x INT);
+INSERT INTO o VALUES (1), (2);
+CREATE TABLE e(x INT);
+CREATE TABLE z(x INT);
+SELECT a.x, b.x FROM o AS a FULL JOIN o AS b ON NULL WHERE (SELECT count(*) FROM e WHERE e.x IN (SELECT s.x FROM e AS s WHERE b.x <= s.x)) = 0;
+SELECT count(*) FROM o;
+INSERT INTO z VALUES (1);
+SELECT count(*) FROM o;
