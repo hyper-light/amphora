@@ -93,8 +93,17 @@ The landed code's tests were red before a fix each time in this hour:
 - Found by reading the validation's own doc while the runs went (no run showed it): READ COMMITTED and REPEATABLE READ
   are validated as `Snapshot`, which doesn't refuse an index built beside a commit that adds rows, so a transaction that
   changes the catalog is now validated in full (`Txn::validate_fully`); the test
-  `t_pg_14_1_an_index_built_beside_a_commit_is_refused_at_any_level` is its check. Not shown red on the code before the fix
-  in this hour (no run of that test on it).
+  `t_pg_14_1_an_index_built_beside_a_commit_is_refused_at_any_level` is its check, and it is red without the fix (M4).
+
+Each part taken out of the landed code, one at a time, and the isolation test run on it (r1595, 09:41Z, cpus=4, load 17.4
+24.6 36.2, tree 70f6712b with one change each; no run on a change's own tests beyond these):
+
+| Change | What failed |
+|---|---|
+| M1: a statement's snapshot not renewed (`Clock::renew` does nothing) | T-PG.14.1 at `s1\|select v from e where id = 1` (READ COMMITTED's statement snapshot); the other two passed |
+| M2: a transaction's end wakes no waiter (`Clock::forget` drops the wakers) | T-PG.14.1 at its first `<` step: the holder's end alone wakes the wait |
+| M3: a session's transaction doesn't wait (`Level::rules` with `waits: false`) | T-PG.14.1 at its first wait (`s2>update a set v = v + 100 where id = 1`); T-PG.14.2 |
+| M4: a catalog change not validated in full (`change_schema` without the level and `validate_fully`) | `t_pg_14_1_an_index_built_beside_a_commit_is_refused_at_any_level` |
 
 
 ## Runs
@@ -118,5 +127,6 @@ lane's, CARGO_TARGET_DIR ~/.cache/amphora-perf-target/postgres, CARGO_INCREMENTA
 | same | same | `bash scripts/check-production.sh` | exit 0. `engine-ratchet: 10617 left in the engine's production code across 17 lints, as the ratchet holds`. |
 | r1564, 09:28Z, cpus=4, load 40.4 48.9 50.5 | b734a56d, main 925c73fb merged | fmt, `scripts/test_requirements.py`, the clippy command; isolation, listener, protocol; `cargo test -p amphora-engine --lib -- storage::versioned dialect::` | clippy exit 0; 3, 8 and 13 passed; the engine 204 passed, 1 ignored, 3,056 filtered out, in 211 s; check-production exit 0, 10617 as the ratchet holds. |
 | r1585, 09:35Z, cpus=4, load 14.7 29.3 41.4 | 81727306, main af8ca01c merged (lane C9's and V22's engine changes) | fmt, clippy; isolation, listener, protocol; `cargo test -p amphora-engine --lib -- storage::versioned::version storage::versioned::switch dialect::` | clippy exit 0 (every crate above checked); 3, 8 and 13 passed; 56 passed, 3,208 filtered out; check-production exit 0, 10616 as the ratchet holds. |
+| a foreground run, 09:44Z, cpus=4, load 25.8 28.1 35.6 | d5086d18, main as landed (70f6712b and this record) | `cargo build -p amphora --bin amphora`; `scripts/postgres-clients.sh` | exit 0, every comparison the same: PG20's psql and pgbench matrix (pgbench `-c 1`, 100 transactions, and `-c 2`, 200, 0 failed on both). pgbench's clients write rows of their own there, so no statement of it waits. |
 | this machine | the branch | `cargo fmt --all --check`, `python3 scripts/test_requirements.py` | pass |
 

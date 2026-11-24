@@ -110,7 +110,7 @@ fn decode(name: &str) -> Option<(char, String)> {
 
 /// Flushes a directory's entries (the fsync(2) quote above). Windows has no portable way to open a
 /// directory for flushing from std; NTFS journals its directory changes itself.
-fn sync_dir(dir: &Path) -> Result<(), BlobRefusal> {
+pub(super) fn sync_dir(dir: &Path) -> Result<(), BlobRefusal> {
     #[cfg(unix)]
     {
         File::open(dir)
