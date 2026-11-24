@@ -922,6 +922,15 @@ enum Phase {
     },
 }
 #[cfg(test)]
+static P19_ON: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+fn p19_on() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    P19_ON
+        .fetch_update(Relaxed, Relaxed, |n| n.checked_sub(1))
+        .is_ok()
+}
+#[cfg(test)]
 fn p19_phase(phase: &Phase) -> &'static str {
     match phase {
         Phase::Barrier(Some(_)) => "barrier",
@@ -3766,6 +3775,12 @@ impl<F: BlockFile + 'static> Actor<F> {
                 } else {
                     self.step(from, &bytes, reservation)
                 };
+                #[cfg(test)]
+                if let Err(error) = &result
+                    && p19_on()
+                {
+                    eprintln!("P19 in-err m={} from={from} {error:?}", self.replica.id());
+                }
                 let fatal = matches!(&result, Err(Refusal::Fenced(_)));
                 let error = result.as_ref().err().cloned();
                 answer(response, result);
@@ -4172,6 +4187,17 @@ impl<F: BlockFile + 'static> Actor<F> {
         }
         let message = Message::decode(bytes)
             .map_err(|error| api::invalid("replica wire record", &error.to_string()))?;
+        #[cfg(test)]
+        if p19_on() {
+            eprintln!(
+                "P19 in m={} from={from} type={:?} term={} reject={} at={}",
+                self.replica.id(),
+                message.msg_type,
+                message.term,
+                message.reject,
+                super::slot::p19(self.at)
+            );
+        }
         if message.from != from || message.to != self.replica.id() || from == self.replica.id() {
             return Err(api::invalid(
                 "replica sender",
@@ -4826,6 +4852,16 @@ impl<F: BlockFile + 'static> Actor<F> {
                 }
             }
             outgoing.bytes = total;
+            #[cfg(test)]
+            if p19_on() {
+                eprintln!(
+                    "P19 out m={} to={} type={:?} term={}",
+                    self.replica.id(),
+                    message.to,
+                    message.msg_type,
+                    message.term
+                );
+            }
             outgoing.messages.push_back(Outbound {
                 to: message.to,
                 bytes,
@@ -6931,6 +6967,9 @@ mod tests {
             let id = u64::try_from(to + 1).unwrap();
             self.owner_mut(from).replica.transfer(id).unwrap();
             let mut seen = String::new();
+            if id == 2 {
+                P19_ON.store(160, std::sync::atomic::Ordering::Relaxed);
+            }
             for round in 0..ROUNDS {
                 self.round(pump);
                 let now: String = self
