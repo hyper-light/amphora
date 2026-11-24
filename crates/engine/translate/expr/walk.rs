@@ -219,22 +219,21 @@ pub fn expr_references_any_subquery(expr: &ast::Expr) -> bool {
     found
 }
 
-pub fn expr_references_outer_query(expr: &ast::Expr, table_references: &TableReferences) -> bool {
-    let mut has_outer_ref = false;
-    walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
-        if let ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } = expr {
-            has_outer_ref |= table_references
-                .find_outer_query_ref_by_internal_id(*table)
-                .is_some();
+/// Whether `expr` reads a column or the rowid of a table other than `table`, an outer query's
+/// among them.
+pub fn expr_reads_another_table(expr: &ast::Expr, table: TableInternalId) -> bool {
+    let mut found = false;
+    let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        if let ast::Expr::Column { table: read, .. } | ast::Expr::RowId { table: read, .. } = e {
+            found |= *read != table;
         }
-        Ok(if has_outer_ref {
+        Ok(if found {
             WalkControl::SkipChildren
         } else {
             WalkControl::Continue
         })
-    })
-    .expect("walking an expression cannot fail");
-    has_outer_ref
+    });
+    found
 }
 
 /// Return whether evaluating an expression may fail for a particular input.
