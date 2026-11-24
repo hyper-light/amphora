@@ -5707,6 +5707,60 @@ mod tests {
         drop(driven);
     }
 
+    /// QB.2 (CP-T1.13): the shed takes only a record raft sends again. A hand-off's order to
+    /// campaign is sent once, and the core takes no proposal until its hand-off ends. Do: a leader
+    /// of three, its outgoing queue held at its least bound (a record to each peer), releases the
+    /// order to one peer and a heartbeat to each peer at once, nothing drained between. Expect: one
+    /// record shed, and the order still queued for its peer.
+    #[test]
+    fn qb2_the_shed_never_takes_a_hand_offs_order_to_campaign() {
+        use hyper_raft::proto::MessageType;
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 0);
+        let handle = clients.get(leader).unwrap().handle();
+        handle.drain(usize::MAX).unwrap();
+        let owner = driven.owner_mut(leader);
+        let (id, term) = (owner.replica.id(), owner.replica.term());
+        let peers: Vec<u64> = (1..=3).filter(|&n| n != id).collect();
+        let heir = *peers.first().unwrap();
+        locked(&owner.control.outgoing).unwrap().bound.messages = 2;
+        let record = |to: u64, kind: MessageType| {
+            let mut message = hyper_raft::proto::message(to, kind);
+            message.from = id;
+            message.term = term;
+            message
+        };
+        let mut output = Output::default();
+        output
+            .messages
+            .push(record(heir, MessageType::MsgTimeoutNow));
+        for &peer in &peers {
+            output
+                .messages
+                .push(record(peer, MessageType::MsgHeartbeat));
+        }
+        owner.release(output).unwrap();
+        let shed = locked(&owner.control.outgoing).unwrap().shed;
+        let queued: Vec<(u64, MessageType)> = handle
+            .drain(usize::MAX)
+            .unwrap()
+            .iter()
+            .map(|record| (record.to, Message::decode(&record.bytes).unwrap().msg_type))
+            .collect();
+        assert_eq!(shed, 1, "{queued:?}");
+        assert!(
+            queued.contains(&(heir, MessageType::MsgTimeoutNow)),
+            "the order to campaign was shed: {queued:?}"
+        );
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
     /// A call waiting for a leader, as `ReplicaHandle::submit` queues it: charged its operation's
     /// real or declared size (`Admission::bytes_for`).
     fn waiting_call(
