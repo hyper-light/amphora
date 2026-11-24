@@ -45,7 +45,7 @@ use crate::{
             fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
         },
         upsert::{
-            collect_set_clauses_for_upsert, emit_upsert, resolve_upsert_target,
+            collect_set_clauses_for_upsert, emit_upsert, resolve_upsert_target, DoUpdateSubqueries,
             ResolvedUpsertTarget,
         },
     },
@@ -360,6 +360,13 @@ pub fn translate_insert(
             collect_subquery_table_refs_in_expr(expr, &mut returning_table_refs);
         }
     }
+    for (_, _, upsert) in &upsert_actions {
+        if let UpsertDo::Set { sets, where_clause } = &upsert.do_clause {
+            for expr in sets.iter().map(|set| &set.expr).chain(where_clause) {
+                collect_subquery_table_refs_in_expr(expr, &mut returning_table_refs);
+            }
+        }
+    }
     plan_ctes_as_outer_refs(
         with_for_returning,
         &returning_table_refs,
@@ -609,7 +616,6 @@ pub fn translate_insert(
                 start_reg: insertion.first_col_register(),
                 count: insertion.num_non_virtual_cols,
                 check_generated: false,
-                check_null_keys: false,
                 table_reference: BTreeTable::input_type_check_table_ref(
                     ctx.table,
                     resolver.schema(),
@@ -697,42 +703,6 @@ pub fn translate_insert(
     }
 
     program.preassign_label_to_next_insn(ctx.key_labels.key_ready_for_check);
-
-    //TODO building the type-check table is expensive, we should cache it somehow.
-    let maybe_type_check_table = ctx
-        .table
-        .is_strict
-        .then(|| BTreeTable::type_check_table_ref(ctx.table, resolver.schema()));
-    if let Some(type_check_table) = &maybe_type_check_table {
-        // Pre-encoding TypeCheck: validate input types match the custom type's declared value type
-        // to catch things like a TEXT value inserted into an INTEGER-based custom type.
-        program.emit_insn(Insn::TypeCheck {
-            start_reg: insertion.first_col_register(),
-            count: insertion.num_non_virtual_cols,
-            check_generated: false,
-            check_null_keys: true,
-            table_reference: BTreeTable::input_type_check_table_ref(
-                ctx.table,
-                resolver.schema(),
-                None,
-            )?,
-        });
-
-        // Encode values for columns with custom types.
-        emit_custom_type_encode(program, resolver, &insertion, &ctx.table.name)?;
-
-        // Post-encode TypeCheck: validate that encode produced the correct storage type (BASE).
-        // We don't check generated columns in this initial pass because their dependencies could
-        // still be REPLACEd.
-        program.emit_insn(Insn::TypeCheck {
-            start_reg: insertion.first_col_register(),
-            count: insertion.num_non_virtual_cols,
-            check_generated: false,
-            check_null_keys: true,
-            table_reference: Arc::clone(type_check_table),
-        });
-    }
-    // Non-STRICT tables: Affinity was already emitted earlier (before BEFORE triggers).
 
     // For AUTOINCREMENT tables with an explicit rowid, update sqlite_sequence
     // before CHECK constraints. SQLite updates sqlite_sequence even when
@@ -850,7 +820,52 @@ pub fn translate_insert(
     //    1. replace `a` with 5 (the NOT NULL REPLACE action)
     //    2. compute `b`
     //    3. check that `b` isn't null (the NOT NULL constraint)
-    emit_notnulls(program, &ctx, &insertion, resolver, false)?;
+    //
+    // Amphora: a STRICT table's types are checked after its NOT NULLs, as SQLite checks them
+    // (sqlite3GenerateConstraintChecks): OR IGNORE skips a row for its NULL whatever its other
+    // values' types, and the default put in for a NULL is converted as its column converts. A
+    // custom type's NOT NULL is asked of the decoded value, so its columns are encoded first.
+    let encodes_columns = ctx.table.is_strict
+        && super::without_rowid::has_encoded_columns(&btree_table, resolver, database_id);
+    //TODO building the type-check table is expensive, we should cache it somehow.
+    let maybe_type_check_table = ctx
+        .table
+        .is_strict
+        .then(|| BTreeTable::type_check_table_ref(ctx.table, resolver.schema()));
+    if !encodes_columns {
+        emit_notnulls(program, &ctx, &insertion, resolver, false)?;
+    }
+    if let Some(type_check_table) = &maybe_type_check_table {
+        // Pre-encoding TypeCheck: validate input types match the custom type's declared value type
+        // to catch things like a TEXT value inserted into an INTEGER-based custom type.
+        program.emit_insn(Insn::TypeCheck {
+            start_reg: insertion.first_col_register(),
+            count: insertion.num_non_virtual_cols,
+            check_generated: false,
+            table_reference: BTreeTable::input_type_check_table_ref(
+                ctx.table,
+                resolver.schema(),
+                None,
+            )?,
+        });
+
+        // Encode values for columns with custom types.
+        emit_custom_type_encode(program, resolver, &insertion, &ctx.table.name)?;
+
+        // Post-encode TypeCheck: validate that encode produced the correct storage type (BASE).
+        // We don't check generated columns in this initial pass because their dependencies could
+        // still be REPLACEd.
+        program.emit_insn(Insn::TypeCheck {
+            start_reg: insertion.first_col_register(),
+            count: insertion.num_non_virtual_cols,
+            check_generated: false,
+            table_reference: Arc::clone(type_check_table),
+        });
+    }
+    // Non-STRICT tables: Affinity was already emitted earlier (before BEFORE triggers).
+    if encodes_columns {
+        emit_notnulls(program, &ctx, &insertion, resolver, false)?;
+    }
 
     if insertion.has_virtual_columns() {
         //TODO only compute the necessary virtual columns for CHECK and NOT NULL evaluation
@@ -869,7 +884,6 @@ pub fn translate_insert(
                 //TODO here we could eventually type-check only virtual columns and the stored
                 // columns that have NOT NULL REPLACE.
                 check_generated: true,
-                check_null_keys: true,
                 table_reference: type_check_table,
             });
         }
@@ -1702,6 +1716,17 @@ fn resolve_upserts(
             ref mut where_clause,
         } = upsert.do_clause
         {
+            let mut subqueries = DoUpdateSubqueries::plan(
+                program,
+                resolver,
+                connection,
+                ctx,
+                insertion,
+                table_references,
+                table_alias,
+                sets,
+                where_clause,
+            )?;
             // Normalize SET pairs once
             let mut rewritten_sets = collect_set_clauses_for_upsert(table, sets)?;
 
@@ -1717,6 +1742,7 @@ fn resolve_upserts(
                 connection,
                 table_references,
                 table_alias,
+                &mut subqueries,
             )?;
         } else {
             // UpsertDo::Nothing case
@@ -2018,7 +2044,7 @@ struct BoundInsertResult {
 /// Check if an expression contains a subquery (Subquery, InSelect, or Exists).
 /// This is used to detect when single-row VALUES should be routed through the
 /// multi-row path which has proper subquery handling.
-fn expr_contains_subquery(expr: &Expr) -> bool {
+pub(crate) fn expr_contains_subquery(expr: &Expr) -> bool {
     let mut found_subquery = false;
     let _ = walk_expr(expr, &mut |e| {
         if matches!(

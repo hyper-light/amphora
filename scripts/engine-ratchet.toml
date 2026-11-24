@@ -14,7 +14,7 @@
 "clippy::arithmetic_side_effects" = 3273
 "clippy::string_slice" = 101
 "clippy::cast_possible_truncation" = 519
-"clippy::cast_sign_loss" = 233
+"clippy::cast_sign_loss" = 231
 "clippy::cast_possible_wrap" = 672
 "clippy::disallowed_macros" = 755
 "clippy::disallowed_methods" = 40

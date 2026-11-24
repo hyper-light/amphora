@@ -1112,7 +1112,10 @@ fn rewrite_expressions_in_select_for_when_clause(
 
 /// Rewrite all expressions in a SELECT tree, including CTEs, compounds, ORDER BY,
 /// LIMIT/OFFSET, FROM/JOIN subqueries, and window clauses.
-fn rewrite_select_expressions<F>(select: &mut ast::Select, rewrite_expr: &mut F) -> Result<()>
+pub(crate) fn rewrite_select_expressions<F>(
+    select: &mut ast::Select,
+    rewrite_expr: &mut F,
+) -> Result<()>
 where
     F: FnMut(&mut ast::Expr) -> Result<()>,
 {

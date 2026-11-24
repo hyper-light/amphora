@@ -2,8 +2,8 @@
 //! becomes a typed one, its names, operators, functions and casts resolved as 19's `parse_*.c` resolve
 //! them, over 19's own `pg_type`, `pg_operator`, `pg_proc` and `pg_cast` rows (amphora-pg-catalog). The
 //! values and functions are those of int4, int8, text, char(n), "char", timestamp, timestamptz and
-//! regclass; a statement that needs another refuses with `0A000` naming it. Pure: no I/O, no clock.
-//! Source lines are REL_19_0's.
+//! regclass, and name's input and output; a statement that needs another refuses with `0A000` naming
+//! it. Pure: no I/O, no clock. Source lines are REL_19_0's.
 #![cfg_attr(
     test,
     allow(
@@ -16,6 +16,7 @@
     )
 )]
 
+pub mod binary;
 pub mod coerce;
 pub mod datetime;
 pub mod expr;
@@ -28,7 +29,7 @@ pub mod utility;
 
 pub use expr::{Expr, ExprId, ExprKind, Exprs, Form};
 pub use func::{Value, call, eval, input, output};
-pub use lower::{Field, Lowered, lower};
+pub use lower::{Field, Lowered, fields, lower};
 pub use stmt::{Query, Target, analyze};
 pub use utility::{Utility, utility};
 
@@ -40,6 +41,9 @@ pub mod sqlstate {
     pub const NUMERIC_VALUE_OUT_OF_RANGE: &str = "22003";
     pub const INVALID_DATETIME_FORMAT: &str = "22007";
     pub const DATETIME_FIELD_OVERFLOW: &str = "22008";
+    pub const CHARACTER_NOT_IN_REPERTOIRE: &str = "22021";
+    pub const PROTOCOL_VIOLATION: &str = "08P01";
+    pub const NAME_TOO_LONG: &str = "42622";
     pub const INVALID_TIME_ZONE_DISPLACEMENT: &str = "22009";
     pub const DIVISION_BY_ZERO: &str = "22012";
     pub const STRING_DATA_RIGHT_TRUNCATION: &str = "22001";
@@ -70,6 +74,9 @@ pub struct Error {
     pub sqlstate: &'static str,
     pub message: String,
     pub location: i32,
+    /// Whether 19 raises it as the statement runs: the planner, which folds what is immutable, doesn't
+    /// compute what this is of.
+    pub runs: bool,
 }
 
 impl Error {
@@ -78,7 +85,13 @@ impl Error {
             sqlstate,
             message,
             location: -1,
+            runs: false,
         }
+    }
+
+    /// This refusal, raised as the statement runs.
+    fn of_its_run(self) -> Self {
+        Self { runs: true, ..self }
     }
 
     /// This refusal, pointing at `location` unless it points somewhere already.

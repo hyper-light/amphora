@@ -316,8 +316,8 @@ is the same text), and the engine's planner runs it.
   the PostgreSQL dialect runs by `amphora_pg_analysis::call` (`crates/engine/dialect/postgres.rs`); it is
   found by its name on each call, until `Func::Pg(ProcOid)` (above) replaces it. What reads the session's
   `TimeZone` or `search_path` over a column is refused `0A000`: the engine's dialect has no session.
-- An expression with no column in it is computed once, at lowering; `CURRENT_TIMESTAMP` is the
-  transaction's start.
+- An expression with no column in it is computed once, at lowering, a parameter with its Bind's value;
+  `CURRENT_TIMESTAMP` is the transaction's start.
 - The wire core (`crates/amphora/src/postgres/session.rs`) runs a session's Query through a `Statements`, which
   it opens once the role is authenticated, where PostgreSQL opens the session's database. `postgres/execute.rs`
   is one over an engine connection of the PostgreSQL dialect. Its transaction blocks are xact.c's: none, implicit
@@ -331,6 +331,32 @@ is the same text), and the engine's planner runs it.
   with their positions, several statements in one Query; and by `scripts/postgres-clients.sh`, where the
   postgres:19 image's own psql and pgbench run on both. `a_expr`'s `<`, `>`, `<=`, `>=`, `<>`, `=`, `+`, `-` and `/`
   are the ported operators (section 3's unit 6). An error's DETAIL and HINT aren't made.
+
+**What the extended protocol has so far** (unit 10, lane PG23): the wire core reads Parse, Bind, Describe,
+Execute, Close, Sync and Flush (`crates/amphora/src/postgres/extended.rs`), a session keeps its prepared statements and
+portals (`portal.rs`), and each message does what REL_19_0's `src/backend/tcop/postgres.c` does with it.
+
+- A prepared statement is the raw tree and its parameters' types, given or deduced by analysis
+  (`parse_analyze_varparams`); each Bind analyzes it again with those types, and is refused `0A000` ("cached plan must
+  not change result type") when its columns changed. Nothing of a plan is kept between Binds yet.
+- The messages since the last Sync are one transaction (xact.c's `TBLOCK_STARTED`, then from the first message after an
+  Execute `TBLOCK_IMPLICIT_INPROGRESS`): the engine's begins before the first of them that changes anything, commits at
+  Sync, and is the client's once a BEGIN is among them. An error ends it at once, every message until Sync is skipped,
+  and its portals go (in a client's block they fail, and go at its end).
+- A SELECT's portal has its Bind's snapshot (`PortalStart`, src/backend/tcop/pquery.c), so it runs at its Bind and keeps its
+  rows, charged to the session's budget, for the Executes that fetch them: between fetches it holds no reader and never
+  the writer. Section 11's unit 9b is to keep a snapshot and a place instead of the rows. An INSERT's or UPDATE's runs at its
+  Execute, on that statement's snapshot, and waits for a row as a Query's does.
+- 19's planner computes what is immutable (`eval_const_expressions`), so such an expression over constants and parameters is
+  refused at Bind; a stable function's refusal is the Execute's.
+- Text and binary formats, each by its type's `typreceive` and `typsend` (`crates/pg-analysis/src/binary.rs`): bool, `"char"`,
+  int4, int8, text, `char(n)`, `name`, oid, regclass, timestamp and timestamptz. A type 19 has no binary function for is refused
+  `42883` as there; one Amphora has no values of (numeric among them) `0A000`.
+- A prepared statement and a portal are charged to the process's budget, refused `53200` when it has no room for them.
+- Not built: FunctionCall, a plan kept between Binds, an ErrorResponse's CONTEXT but a Bind parameter's.
+- Checked against a 19.0 server: T-PG.10.1 (the wire core, 252 steps, every message of each), T-PG.10.2 and T-PG.10.3 (the
+  listener, over sockets), and `scripts/postgres-clients.sh`, where the postgres:19 image's own pgbench runs TPC-B at
+  `-M extended` and `-M prepared` and its psql runs `\bind`, `\parse`, `\bind_named` and pipelines on both.
 
 **Against the 10x bar.** Arithmetic and comparison on the hot path lower to the engine's own
 instructions (integer add with an overflow check that raises `22003`; comparisons of stored keys,

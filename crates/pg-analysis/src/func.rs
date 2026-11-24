@@ -9,6 +9,7 @@ use amphora_pg_catalog::data::type_oid;
 use amphora_pg_catalog::{Kind, Proc, type_by_oid};
 use amphora_pg_parser::tree::BoolOp;
 
+use crate::binary::NAMEDATALEN;
 use crate::expr::{ExprId, ExprKind, Exprs};
 use crate::{Error, Session, datetime, format_type, sqlstate};
 
@@ -22,7 +23,7 @@ pub enum Value {
     Int8(i64),
     /// `oid` and `regclass`.
     Oid(u32),
-    /// `text` and `bpchar`, a `char(n)` with its padding.
+    /// `text`, `name` and `bpchar`, a `char(n)` with its padding.
     Text(String),
     /// `timestamp` and `timestamptz`: microseconds from 2000-01-01, the extremes the infinities.
     Timestamp(i64),
@@ -54,6 +55,8 @@ pub fn has_body(function: &Proc) -> bool {
                 | "regclassout"
                 | "textin"
                 | "textout"
+                | "namein"
+                | "nameout"
                 | "bpcharin"
                 | "bpcharout"
                 | "timestamp_in"
@@ -392,7 +395,7 @@ fn bpchar(source: &str, typmod: i32, explicit: bool) -> Result<Value, Error> {
 }
 
 /// `charout` and `char_text` (char.c): nothing for the zero byte, `\ooo` for a byte past ASCII.
-fn char_text(c: u8) -> String {
+pub fn char_text(c: u8) -> String {
     match c {
         0 => String::new(),
         c if c.is_ascii() => char::from(c).to_string(),
@@ -400,8 +403,17 @@ fn char_text(c: u8) -> String {
     }
 }
 
+/// `namein` (name.c): what of a name there is room for, cut at a character's end (`pg_mbcliplen`).
+fn clipped(s: &str) -> &str {
+    let mut end = s.len().min(NAMEDATALEN.saturating_sub(1));
+    while !s.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    s.get(..end).unwrap_or_default()
+}
+
 /// `charin` and `text_char` (char.c): `\ooo`, else the first byte, else the zero byte.
-fn text_char(s: &str) -> u8 {
+pub fn text_char(s: &str) -> u8 {
     let octal = |b: u8| match b {
         b'0'..=b'7' => Some(b & 7),
         _ => None,
@@ -612,6 +624,7 @@ pub fn input(target: u32, s: &str, session: &Session<'_>) -> Result<Value, Error
             .map(Value::Int8)
             .map_err(|_| integer_range(s, "bigint")),
         "textin" | "bpcharin" => Ok(Value::Text(s.to_owned())),
+        "namein" => Ok(Value::Text(clipped(s).to_owned())),
         "charin" => Ok(Value::Char(text_char(s))),
         "boolin" => parse_bool(s).map(Value::Bool).ok_or_else(|| {
             Error::new(
