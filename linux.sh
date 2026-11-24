@@ -17,6 +17,7 @@ if [ "$SHA" != - ]; then
   git checkout -q -f --detach "$SHA" || exit 3
 fi
 for f in "$S"/probe/*.rs; do [ -f "$f" ] && { cmp -s "$f" crates/engine/tests/$(basename "$f") || cp "$f" crates/engine/tests/; }; done
+[ -n "${NOPROBE:-}" ] && rm -f crates/engine/tests/c26_probe.rs
 echo "== $(hostname) $(date -u +%T) tree $(git rev-parse --short=8 HEAD) load $(load)"
 D=$CARGO_TARGET_DIR/debug/deps
 bin() { ls -t "$D"/$1-* | grep -v '\.d$' | head -1; }

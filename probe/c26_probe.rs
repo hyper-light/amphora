@@ -23,7 +23,12 @@ fn open(parallel: bool) -> (Arc<MemoryIO>, Arc<Connection>) {
     (io, conn)
 }
 
-fn answer(io: &MemoryIO, conn: &Arc<Connection>, sql: &str, explain: bool) -> Result<String, String> {
+fn answer(
+    io: &MemoryIO,
+    conn: &Arc<Connection>,
+    sql: &str,
+    explain: bool,
+) -> Result<String, String> {
     let mut stmt = conn.prepare(sql).map_err(|error| error.to_string())?;
     let mut lines = Vec::new();
     loop {
@@ -93,7 +98,11 @@ fn probe() {
             let mut lines = Vec::new();
             for step in steps {
                 if step[0] == "x" {
-                    println!("EXPLAIN {}\n{}", step[1], outcome(&io, &conn, &format!("EXPLAIN {}", step[1]), true));
+                    println!(
+                        "EXPLAIN {}\n{}",
+                        step[1],
+                        outcome(&io, &conn, &format!("EXPLAIN {}", step[1]), true)
+                    );
                     continue;
                 }
                 let got = outcome(&io, &conn, &step[1], false);
@@ -106,7 +115,10 @@ fn probe() {
                 ran += 1;
                 let want = &step[2];
                 if verbose {
-                    println!("{name} parallel={parallel}: {}\n    SQLite  {want}\n    Amphora {got}", step[1]);
+                    println!(
+                        "{name} parallel={parallel}: {}\n    SQLite  {want}\n    Amphora {got}",
+                        step[1]
+                    );
                 }
                 if got.starts_with("PANIC") {
                     panics += 1;
@@ -116,22 +128,36 @@ fn probe() {
                 }
                 if want.starts_with("ERROR ") && got.starts_with("ERROR ") {
                     words += 1;
-                    lines.push(format!("  WORDS {}\n    SQLite  {want}\n    Amphora {got}", step[1]));
+                    lines.push(format!(
+                        "  WORDS {}\n    SQLite  {want}\n    Amphora {got}",
+                        step[1]
+                    ));
                     continue;
                 }
                 differ += 1;
-                lines.push(format!("  DIFFER {}\n    SQLite  {want}\n    Amphora {got}", step[1]));
+                lines.push(format!(
+                    "  DIFFER {}\n    SQLite  {want}\n    Amphora {got}",
+                    step[1]
+                ));
             }
             differs_by_setting.push(lines);
         }
         if differs_by_setting.iter().any(|lines| !lines.is_empty()) {
             let same = differs_by_setting[0] == differs_by_setting[1];
-            println!("##### {name} (parallel {})\n{}", if same { "the same" } else { "DIFFERENT" }, differs_by_setting[0].join("\n"));
+            println!(
+                "##### {name} (parallel {})\n{}",
+                if same { "the same" } else { "DIFFERENT" },
+                differs_by_setting[0].join("\n")
+            );
             if !same {
                 println!("  ---- parallel\n{}", differs_by_setting[1].join("\n"));
             }
             first.push(name.clone());
         }
     }
-    println!("ASKED {ran}, DIFFER {differ}, WORDS {words}, PANICS {panics}, DATABASES {}: {}", first.len(), first.join(" | "));
+    println!(
+        "ASKED {ran}, DIFFER {differ}, WORDS {words}, PANICS {panics}, DATABASES {}: {}",
+        first.len(),
+        first.join(" | ")
+    );
 }

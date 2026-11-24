@@ -9629,6 +9629,291 @@ q	SELECT * FROM p	3:1;2;3
 q	SELECT * FROM c	5:2;2;2;2;2
 q	ROLLBACK	ERROR
 q	PRAGMA integrity_check	1:ok
+db	recursive_triggers OFF: an INSERT that fires itself
+sql	CREATE TABLE lg(x, y)
+sql	CREATE TABLE t(k INTEGER PRIMARY KEY, n INT)
+sql	CREATE TRIGGER g AFTER INSERT ON t WHEN new.n < 4 BEGIN INSERT INTO lg VALUES ('g', new.n); INSERT INTO t(n) VALUES (new.n + 1); INSERT INTO lg VALUES ('z', new.n); END
+sql	PRAGMA recursive_triggers = OFF
+q	INSERT INTO t VALUES (100, 1)	0:
+q	SELECT * FROM t	2:100,1;101,2
+q	SELECT rowid, * FROM lg	2:1,g,1;2,z,1
+q	PRAGMA integrity_check	1:ok
+db	recursive_triggers OFF: UPDATE and DELETE that fire themselves
+sql	CREATE TABLE lg(x, y)
+sql	CREATE TABLE t(k INT PRIMARY KEY, n INT)
+sql	INSERT INTO t VALUES (1, 5), (2, 5), (3, 5), (4, 5)
+sql	CREATE TRIGGER g BEFORE UPDATE ON t WHEN new.n > 2 BEGIN INSERT INTO lg VALUES (old.k || 'b', new.n); UPDATE t SET n = new.n - 1 WHERE k = new.k + 1; END
+sql	CREATE TRIGGER h AFTER UPDATE ON t WHEN new.n > 1 BEGIN INSERT INTO lg VALUES (old.k || 'a', new.n); UPDATE t SET n = new.n - 2 WHERE k = new.k - 1; END
+sql	CREATE TRIGGER i AFTER DELETE ON t BEGIN INSERT INTO lg VALUES (old.k || 'd', old.n); DELETE FROM t WHERE k = old.k + 1; END
+sql	PRAGMA recursive_triggers = OFF
+q	UPDATE t SET n = 4 WHERE k = 2	0:
+q	SELECT * FROM t	4:1,2;2,4;3,3;4,5
+q	SELECT rowid, * FROM lg	3:1,2b,4;2,3a,3;3,2a,4
+q	UPDATE t SET n = n + 3	0:
+q	SELECT * FROM t	4:1,5;2,7;3,9;4,8
+q	SELECT rowid, * FROM lg	17:1,2b,4;10,1b,5;11,3b,9;12,4a,8;13,3a,9;14,2b,7;15,4b,11;16,4a,11;17,3b,9;2,3a,3;3,2a,4;4,1b,5;5,2a,4;6,1a,5;7,2b,7;8,3a,6;9,2a,7
+q	DELETE FROM t WHERE k = 2	0:
+q	SELECT * FROM t	2:1,5;4,8
+q	SELECT rowid, * FROM lg	18:1,2b,4;10,1b,5;11,3b,9;12,4a,8;13,3a,9;14,2b,7;15,4b,11;16,4a,11;17,3b,9;18,2d,7;2,3a,3;3,2a,4;4,1b,5;5,2a,4;6,1a,5;7,2b,7;8,3a,6;9,2a,7
+q	PRAGMA integrity_check	1:ok
+db	recursive_triggers OFF: what REPLACE removes
+sql	CREATE TABLE lg(x, y)
+sql	CREATE TABLE t(k INT PRIMARY KEY, n INT UNIQUE, m INT)
+sql	INSERT INTO t VALUES (1, 1, 1), (2, 2, 2), (3, 3, 3)
+sql	CREATE TRIGGER g BEFORE DELETE ON t BEGIN INSERT INTO lg VALUES (old.k || 'b', old.n); END
+sql	CREATE TRIGGER h AFTER DELETE ON t BEGIN INSERT INTO lg VALUES (old.k || 'a', (SELECT count(*) FROM t)); END
+sql	CREATE TRIGGER i AFTER INSERT ON t BEGIN INSERT INTO lg VALUES (new.k || 'i', new.n); END
+sql	CREATE TRIGGER j AFTER UPDATE ON t BEGIN INSERT INTO lg VALUES (new.k || 'u', new.n); END
+sql	PRAGMA recursive_triggers = OFF
+q	REPLACE INTO t VALUES (1, 9, 9)	0:
+q	SELECT * FROM t	3:1,9,9;2,2,2;3,3,3
+q	SELECT rowid, * FROM lg	1:1,1i,9
+q	REPLACE INTO t VALUES (2, 3, 8)	0:
+q	SELECT * FROM t	2:1,9,9;2,3,8
+q	SELECT rowid, * FROM lg	2:1,1i,9;2,2i,3
+q	INSERT INTO t VALUES (1, 4, 4)	ERROR UNIQUE constraint failed: t.k
+q	SELECT * FROM t	2:1,9,9;2,3,8
+q	SELECT rowid, * FROM lg	2:1,1i,9;2,2i,3
+q	UPDATE OR REPLACE t SET n = 9 WHERE k = 2	0:
+q	SELECT * FROM t	1:2,9,8
+q	SELECT rowid, * FROM lg	3:1,1i,9;2,2i,3;3,2u,9
+q	UPDATE t SET k = 7 WHERE k = 1	0:
+q	SELECT * FROM t	1:2,9,8
+q	SELECT rowid, * FROM lg	3:1,1i,9;2,2i,3;3,2u,9
+q	REPLACE INTO t VALUES (7, 7, 7), (7, 8, 8), (8, 8, 8)	0:
+q	SELECT * FROM t	2:2,9,8;8,8,8
+q	SELECT rowid, * FROM lg	6:1,1i,9;2,2i,3;3,2u,9;4,7i,7;5,7i,8;6,8i,8
+q	INSERT OR REPLACE INTO t VALUES (8, 1, 1) ON CONFLICT(k) DO UPDATE SET m = 5	0:
+q	SELECT * FROM t	2:2,9,8;8,8,5
+q	SELECT rowid, * FROM lg	7:1,1i,9;2,2i,3;3,2u,9;4,7i,7;5,7i,8;6,8i,8;7,8u,8
+q	PRAGMA integrity_check	1:ok
+db	recursive_triggers OFF: what REPLACE removes writes the row again
+sql	CREATE TABLE lg(x, y)
+sql	CREATE TABLE t(k INT PRIMARY KEY, n INT UNIQUE)
+sql	INSERT INTO t VALUES (1, 1), (2, 2), (3, 3)
+sql	CREATE TRIGGER h AFTER DELETE ON t WHEN old.k = 2 BEGIN INSERT INTO lg VALUES (old.k, old.n); INSERT INTO t VALUES (old.k, 77); END
+sql	CREATE TRIGGER i BEFORE DELETE ON t WHEN old.k = 3 BEGIN INSERT INTO lg VALUES (old.k, old.n); DELETE FROM t WHERE k = 3; END
+sql	PRAGMA recursive_triggers = OFF
+q	REPLACE INTO t VALUES (2, 9)	0:
+q	SELECT * FROM t	3:1,1;2,9;3,3
+q	SELECT rowid, * FROM lg	0:
+q	REPLACE INTO t VALUES (9, 3)	0:
+q	SELECT * FROM t	3:1,1;2,9;9,3
+q	SELECT rowid, * FROM lg	0:
+q	UPDATE OR REPLACE t SET k = 2 WHERE k = 1	0:
+q	SELECT * FROM t	2:2,1;9,3
+q	SELECT rowid, * FROM lg	0:
+q	PRAGMA integrity_check	1:ok
+db	recursive_triggers OFF: what REPLACE removes ON CONFLICT REPLACE
+sql	CREATE TABLE lg(x, y)
+sql	CREATE TABLE t(k INT PRIMARY KEY ON CONFLICT REPLACE, n INT UNIQUE ON CONFLICT REPLACE, m INT)
+sql	INSERT INTO t VALUES (1, 1, 1), (2, 2, 2), (3, 3, 3)
+sql	CREATE TRIGGER g BEFORE DELETE ON t BEGIN INSERT INTO lg VALUES (old.k || 'b', old.n); END
+sql	CREATE TRIGGER h AFTER DELETE ON t BEGIN INSERT INTO lg VALUES (old.k || 'a', (SELECT count(*) FROM t)); END
+sql	CREATE TRIGGER i AFTER INSERT ON t BEGIN INSERT INTO lg VALUES (new.k || 'i', new.n); END
+sql	CREATE TRIGGER j AFTER UPDATE ON t BEGIN INSERT INTO lg VALUES (new.k || 'u', new.n); END
+sql	PRAGMA recursive_triggers = OFF
+q	REPLACE INTO t VALUES (1, 9, 9)	0:
+q	SELECT * FROM t	3:1,9,9;2,2,2;3,3,3
+q	SELECT rowid, * FROM lg	1:1,1i,9
+q	REPLACE INTO t VALUES (2, 3, 8)	0:
+q	SELECT * FROM t	2:1,9,9;2,3,8
+q	SELECT rowid, * FROM lg	2:1,1i,9;2,2i,3
+q	INSERT INTO t VALUES (1, 4, 4)	0:
+q	SELECT * FROM t	2:1,4,4;2,3,8
+q	SELECT rowid, * FROM lg	3:1,1i,9;2,2i,3;3,1i,4
+q	UPDATE OR REPLACE t SET n = 9 WHERE k = 2	0:
+q	SELECT * FROM t	2:1,4,4;2,9,8
+q	SELECT rowid, * FROM lg	4:1,1i,9;2,2i,3;3,1i,4;4,2u,9
+q	UPDATE t SET k = 7 WHERE k = 1	0:
+q	SELECT * FROM t	2:2,9,8;7,4,4
+q	SELECT rowid, * FROM lg	5:1,1i,9;2,2i,3;3,1i,4;4,2u,9;5,7u,4
+q	REPLACE INTO t VALUES (7, 7, 7), (7, 8, 8), (8, 8, 8)	0:
+q	SELECT * FROM t	2:2,9,8;8,8,8
+q	SELECT rowid, * FROM lg	8:1,1i,9;2,2i,3;3,1i,4;4,2u,9;5,7u,4;6,7i,7;7,7i,8;8,8i,8
+q	INSERT OR REPLACE INTO t VALUES (8, 1, 1) ON CONFLICT(k) DO UPDATE SET m = 5	0:
+q	SELECT * FROM t	2:2,9,8;8,8,5
+q	SELECT rowid, * FROM lg	9:1,1i,9;2,2i,3;3,1i,4;4,2u,9;5,7u,4;6,7i,7;7,7i,8;8,8i,8;9,8u,8
+q	PRAGMA integrity_check	1:ok
+db	recursive_triggers OFF: what REPLACE removes writes the row again ON CONFLICT REPLACE
+sql	CREATE TABLE lg(x, y)
+sql	CREATE TABLE t(k INT PRIMARY KEY ON CONFLICT REPLACE, n INT UNIQUE ON CONFLICT REPLACE)
+sql	INSERT INTO t VALUES (1, 1), (2, 2), (3, 3)
+sql	CREATE TRIGGER h AFTER DELETE ON t WHEN old.k = 2 BEGIN INSERT INTO lg VALUES (old.k, old.n); INSERT INTO t VALUES (old.k, 77); END
+sql	CREATE TRIGGER i BEFORE DELETE ON t WHEN old.k = 3 BEGIN INSERT INTO lg VALUES (old.k, old.n); DELETE FROM t WHERE k = 3; END
+sql	PRAGMA recursive_triggers = OFF
+q	REPLACE INTO t VALUES (2, 9)	0:
+q	SELECT * FROM t	3:1,1;2,9;3,3
+q	SELECT rowid, * FROM lg	0:
+q	REPLACE INTO t VALUES (9, 3)	0:
+q	SELECT * FROM t	3:1,1;2,9;9,3
+q	SELECT rowid, * FROM lg	0:
+q	UPDATE OR REPLACE t SET k = 2 WHERE k = 1	0:
+q	SELECT * FROM t	2:2,1;9,3
+q	SELECT rowid, * FROM lg	0:
+q	PRAGMA integrity_check	1:ok
+db	recursive_triggers OFF: UPDATE and DELETE that fire themselves WITHOUT ROWID
+sql	CREATE TABLE lg(x, y)
+sql	CREATE TABLE t(k INT PRIMARY KEY, n INT) WITHOUT ROWID
+sql	INSERT INTO t VALUES (1, 5), (2, 5), (3, 5), (4, 5)
+sql	CREATE TRIGGER g BEFORE UPDATE ON t WHEN new.n > 2 BEGIN INSERT INTO lg VALUES (old.k || 'b', new.n); UPDATE t SET n = new.n - 1 WHERE k = new.k + 1; END
+sql	CREATE TRIGGER h AFTER UPDATE ON t WHEN new.n > 1 BEGIN INSERT INTO lg VALUES (old.k || 'a', new.n); UPDATE t SET n = new.n - 2 WHERE k = new.k - 1; END
+sql	CREATE TRIGGER i AFTER DELETE ON t BEGIN INSERT INTO lg VALUES (old.k || 'd', old.n); DELETE FROM t WHERE k = old.k + 1; END
+sql	PRAGMA recursive_triggers = OFF
+q	UPDATE t SET n = 4 WHERE k = 2	0:
+q	SELECT * FROM t	4:1,2;2,4;3,3;4,5
+q	SELECT rowid, * FROM lg	3:1,2b,4;2,3a,3;3,2a,4
+q	UPDATE t SET n = n + 3	0:
+q	SELECT * FROM t	4:1,5;2,7;3,9;4,8
+q	SELECT rowid, * FROM lg	17:1,2b,4;10,1b,5;11,3b,9;12,4a,8;13,3a,9;14,2b,7;15,4b,11;16,4a,11;17,3b,9;2,3a,3;3,2a,4;4,1b,5;5,2a,4;6,1a,5;7,2b,7;8,3a,6;9,2a,7
+q	DELETE FROM t WHERE k = 2	0:
+q	SELECT * FROM t	2:1,5;4,8
+q	SELECT rowid, * FROM lg	18:1,2b,4;10,1b,5;11,3b,9;12,4a,8;13,3a,9;14,2b,7;15,4b,11;16,4a,11;17,3b,9;18,2d,7;2,3a,3;3,2a,4;4,1b,5;5,2a,4;6,1a,5;7,2b,7;8,3a,6;9,2a,7
+q	PRAGMA integrity_check	1:ok
+db	recursive_triggers OFF: what REPLACE removes WITHOUT ROWID
+sql	CREATE TABLE lg(x, y)
+sql	CREATE TABLE t(k INT PRIMARY KEY, n INT UNIQUE, m INT) WITHOUT ROWID
+sql	INSERT INTO t VALUES (1, 1, 1), (2, 2, 2), (3, 3, 3)
+sql	CREATE TRIGGER g BEFORE DELETE ON t BEGIN INSERT INTO lg VALUES (old.k || 'b', old.n); END
+sql	CREATE TRIGGER h AFTER DELETE ON t BEGIN INSERT INTO lg VALUES (old.k || 'a', (SELECT count(*) FROM t)); END
+sql	CREATE TRIGGER i AFTER INSERT ON t BEGIN INSERT INTO lg VALUES (new.k || 'i', new.n); END
+sql	CREATE TRIGGER j AFTER UPDATE ON t BEGIN INSERT INTO lg VALUES (new.k || 'u', new.n); END
+sql	PRAGMA recursive_triggers = OFF
+q	REPLACE INTO t VALUES (1, 9, 9)	0:
+q	SELECT * FROM t	3:1,9,9;2,2,2;3,3,3
+q	SELECT rowid, * FROM lg	1:1,1i,9
+q	REPLACE INTO t VALUES (2, 3, 8)	0:
+q	SELECT * FROM t	2:1,9,9;2,3,8
+q	SELECT rowid, * FROM lg	2:1,1i,9;2,2i,3
+q	INSERT INTO t VALUES (1, 4, 4)	ERROR UNIQUE constraint failed: t.k
+q	SELECT * FROM t	2:1,9,9;2,3,8
+q	SELECT rowid, * FROM lg	2:1,1i,9;2,2i,3
+q	UPDATE OR REPLACE t SET n = 9 WHERE k = 2	0:
+q	SELECT * FROM t	1:2,9,8
+q	SELECT rowid, * FROM lg	3:1,1i,9;2,2i,3;3,2u,9
+q	UPDATE t SET k = 7 WHERE k = 1	0:
+q	SELECT * FROM t	1:2,9,8
+q	SELECT rowid, * FROM lg	3:1,1i,9;2,2i,3;3,2u,9
+q	REPLACE INTO t VALUES (7, 7, 7), (7, 8, 8), (8, 8, 8)	0:
+q	SELECT * FROM t	2:2,9,8;8,8,8
+q	SELECT rowid, * FROM lg	6:1,1i,9;2,2i,3;3,2u,9;4,7i,7;5,7i,8;6,8i,8
+q	INSERT OR REPLACE INTO t VALUES (8, 1, 1) ON CONFLICT(k) DO UPDATE SET m = 5	0:
+q	SELECT * FROM t	2:2,9,8;8,8,5
+q	SELECT rowid, * FROM lg	7:1,1i,9;2,2i,3;3,2u,9;4,7i,7;5,7i,8;6,8i,8;7,8u,8
+q	PRAGMA integrity_check	1:ok
+db	recursive_triggers OFF: what REPLACE removes writes the row again WITHOUT ROWID
+sql	CREATE TABLE lg(x, y)
+sql	CREATE TABLE t(k INT PRIMARY KEY, n INT UNIQUE) WITHOUT ROWID
+sql	INSERT INTO t VALUES (1, 1), (2, 2), (3, 3)
+sql	CREATE TRIGGER h AFTER DELETE ON t WHEN old.k = 2 BEGIN INSERT INTO lg VALUES (old.k, old.n); INSERT INTO t VALUES (old.k, 77); END
+sql	CREATE TRIGGER i BEFORE DELETE ON t WHEN old.k = 3 BEGIN INSERT INTO lg VALUES (old.k, old.n); DELETE FROM t WHERE k = 3; END
+sql	PRAGMA recursive_triggers = OFF
+q	REPLACE INTO t VALUES (2, 9)	0:
+q	SELECT * FROM t	3:1,1;2,9;3,3
+q	SELECT rowid, * FROM lg	0:
+q	REPLACE INTO t VALUES (9, 3)	0:
+q	SELECT * FROM t	3:1,1;2,9;9,3
+q	SELECT rowid, * FROM lg	0:
+q	UPDATE OR REPLACE t SET k = 2 WHERE k = 1	0:
+q	SELECT * FROM t	2:2,1;9,3
+q	SELECT rowid, * FROM lg	0:
+q	PRAGMA integrity_check	1:ok
+db	recursive_triggers OFF: what REPLACE removes WITHOUT ROWID ON CONFLICT REPLACE
+sql	CREATE TABLE lg(x, y)
+sql	CREATE TABLE t(k INT PRIMARY KEY ON CONFLICT REPLACE, n INT UNIQUE ON CONFLICT REPLACE, m INT) WITHOUT ROWID
+sql	INSERT INTO t VALUES (1, 1, 1), (2, 2, 2), (3, 3, 3)
+sql	CREATE TRIGGER g BEFORE DELETE ON t BEGIN INSERT INTO lg VALUES (old.k || 'b', old.n); END
+sql	CREATE TRIGGER h AFTER DELETE ON t BEGIN INSERT INTO lg VALUES (old.k || 'a', (SELECT count(*) FROM t)); END
+sql	CREATE TRIGGER i AFTER INSERT ON t BEGIN INSERT INTO lg VALUES (new.k || 'i', new.n); END
+sql	CREATE TRIGGER j AFTER UPDATE ON t BEGIN INSERT INTO lg VALUES (new.k || 'u', new.n); END
+sql	PRAGMA recursive_triggers = OFF
+q	REPLACE INTO t VALUES (1, 9, 9)	0:
+q	SELECT * FROM t	3:1,9,9;2,2,2;3,3,3
+q	SELECT rowid, * FROM lg	1:1,1i,9
+q	REPLACE INTO t VALUES (2, 3, 8)	0:
+q	SELECT * FROM t	2:1,9,9;2,3,8
+q	SELECT rowid, * FROM lg	2:1,1i,9;2,2i,3
+q	INSERT INTO t VALUES (1, 4, 4)	0:
+q	SELECT * FROM t	2:1,4,4;2,3,8
+q	SELECT rowid, * FROM lg	3:1,1i,9;2,2i,3;3,1i,4
+q	UPDATE OR REPLACE t SET n = 9 WHERE k = 2	0:
+q	SELECT * FROM t	2:1,4,4;2,9,8
+q	SELECT rowid, * FROM lg	4:1,1i,9;2,2i,3;3,1i,4;4,2u,9
+q	UPDATE t SET k = 7 WHERE k = 1	0:
+q	SELECT * FROM t	2:2,9,8;7,4,4
+q	SELECT rowid, * FROM lg	5:1,1i,9;2,2i,3;3,1i,4;4,2u,9;5,7u,4
+q	REPLACE INTO t VALUES (7, 7, 7), (7, 8, 8), (8, 8, 8)	0:
+q	SELECT * FROM t	2:2,9,8;8,8,8
+q	SELECT rowid, * FROM lg	8:1,1i,9;2,2i,3;3,1i,4;4,2u,9;5,7u,4;6,7i,7;7,7i,8;8,8i,8
+q	INSERT OR REPLACE INTO t VALUES (8, 1, 1) ON CONFLICT(k) DO UPDATE SET m = 5	0:
+q	SELECT * FROM t	2:2,9,8;8,8,5
+q	SELECT rowid, * FROM lg	9:1,1i,9;2,2i,3;3,1i,4;4,2u,9;5,7u,4;6,7i,7;7,7i,8;8,8i,8;9,8u,8
+q	PRAGMA integrity_check	1:ok
+db	recursive_triggers OFF: what REPLACE removes writes the row again WITHOUT ROWID ON CONFLICT REPLACE
+sql	CREATE TABLE lg(x, y)
+sql	CREATE TABLE t(k INT PRIMARY KEY ON CONFLICT REPLACE, n INT UNIQUE ON CONFLICT REPLACE) WITHOUT ROWID
+sql	INSERT INTO t VALUES (1, 1), (2, 2), (3, 3)
+sql	CREATE TRIGGER h AFTER DELETE ON t WHEN old.k = 2 BEGIN INSERT INTO lg VALUES (old.k, old.n); INSERT INTO t VALUES (old.k, 77); END
+sql	CREATE TRIGGER i BEFORE DELETE ON t WHEN old.k = 3 BEGIN INSERT INTO lg VALUES (old.k, old.n); DELETE FROM t WHERE k = 3; END
+sql	PRAGMA recursive_triggers = OFF
+q	REPLACE INTO t VALUES (2, 9)	0:
+q	SELECT * FROM t	3:1,1;2,9;3,3
+q	SELECT rowid, * FROM lg	0:
+q	REPLACE INTO t VALUES (9, 3)	0:
+q	SELECT * FROM t	3:1,1;2,9;9,3
+q	SELECT rowid, * FROM lg	0:
+q	UPDATE OR REPLACE t SET k = 2 WHERE k = 1	0:
+q	SELECT * FROM t	2:2,1;9,3
+q	SELECT rowid, * FROM lg	0:
+q	PRAGMA integrity_check	1:ok
+db	recursive_triggers OFF: two triggers that fire each other
+sql	CREATE TABLE lg(x, y)
+sql	CREATE TABLE t(n INT)
+sql	CREATE TABLE s(n INT)
+sql	CREATE TRIGGER g AFTER INSERT ON t WHEN new.n < 6 BEGIN INSERT INTO lg VALUES ('t', new.n); INSERT INTO s VALUES (new.n + 1); END
+sql	CREATE TRIGGER h AFTER INSERT ON s WHEN new.n < 6 BEGIN INSERT INTO lg VALUES ('s', new.n); INSERT INTO t VALUES (new.n + 1); END
+sql	PRAGMA recursive_triggers = OFF
+q	INSERT INTO t VALUES (1), (2)	0:
+q	SELECT * FROM t	4:1;2;3;4
+q	SELECT * FROM s	2:2;3
+q	SELECT rowid, * FROM lg	4:1,t,1;2,s,2;3,t,2;4,s,3
+q	INSERT INTO s VALUES (3)	0:
+q	SELECT rowid, * FROM lg	6:1,t,1;2,s,2;3,t,2;4,s,3;5,s,3;6,t,4
+q	PRAGMA integrity_check	1:ok
+db	recursive_triggers OFF: a foreign key's action fires what the trigger is in
+sql	PRAGMA foreign_keys = ON
+sql	CREATE TABLE lg(x, y)
+sql	CREATE TABLE p(k INT PRIMARY KEY)
+sql	CREATE TABLE c(k INT PRIMARY KEY, pk INT REFERENCES p(k) ON DELETE CASCADE)
+sql	INSERT INTO p VALUES (1), (2), (3)
+sql	INSERT INTO c VALUES (1, 1), (2, 2), (3, 3), (4, 3)
+sql	CREATE TRIGGER g AFTER DELETE ON c BEGIN INSERT INTO lg VALUES (old.k, old.pk); DELETE FROM p WHERE k = old.pk + 1; END
+sql	PRAGMA recursive_triggers = OFF
+q	DELETE FROM p WHERE k = 1	0:
+q	SELECT * FROM p	1:3
+q	SELECT * FROM c	2:3,3;4,3
+q	SELECT rowid, * FROM lg	1:1,1,1
+q	PRAGMA integrity_check	1:ok
+db	recursive_triggers OFF: 20 deep
+sql	CREATE TABLE t(n INT)
+sql	CREATE TRIGGER g AFTER INSERT ON t WHEN new.n < 20 BEGIN INSERT INTO t VALUES (new.n + 1); END
+sql	PRAGMA recursive_triggers = OFF
+q	INSERT INTO t VALUES (1)	0:
+q	SELECT count(*), max(n) FROM t	1:2,2
+q	DELETE FROM t	0:
+q	INSERT OR IGNORE INTO t VALUES (10)	0:
+q	SELECT count(*), max(n) FROM t	1:2,11
+q	PRAGMA integrity_check	1:ok
+db	recursive_triggers OFF: 1500 deep
+sql	CREATE TABLE t(n INT)
+sql	CREATE TRIGGER g AFTER INSERT ON t WHEN new.n < 1500 BEGIN INSERT INTO t VALUES (new.n + 1); END
+sql	PRAGMA recursive_triggers = OFF
+q	INSERT INTO t VALUES (1)	0:
+q	SELECT count(*), max(n) FROM t	1:2,2
+q	DELETE FROM t	0:
+q	INSERT OR IGNORE INTO t VALUES (1490)	0:
+q	SELECT count(*), max(n) FROM t	1:2,1491
+q	PRAGMA integrity_check	1:ok
 db	the order rows go in: k TEXT PRIMARY KEY; CREATE INDEX tb ON t(b)
 sql	CREATE TABLE lg(x, y)
 sql	CREATE TABLE t(k TEXT PRIMARY KEY, a INT, b INT)

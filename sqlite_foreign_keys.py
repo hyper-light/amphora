@@ -3,8 +3,8 @@ Foreign keys under every action (NO ACTION, RESTRICT, CASCADE, SET NULL, SET DEF
 UPDATE), immediate and deferred, of one column and of two, to a rowid, a primary key and a UNIQUE key, from
 and to WITHOUT ROWID tables, from a table to itself, two tables to each other, and three tables deep; defaults
 that are the key that goes, another and none; NULL keys; triggers of every time and event on all of them, under
-every conflict clause, that write each of them, themselves among them; PRAGMA foreign_keys and
-recursive_triggers on and off; alone, inside a transaction, and inside savepoints. Writes each statement with
+every conflict clause, that write each of them, themselves among them; PRAGMA foreign_keys on
+and off, recursive_triggers off (on: C26_RECURSIVE=1, which Amphora hasn't yet); alone, inside a transaction, and inside savepoints. Writes each statement with
 whether SQLite itself takes it (its words, when it doesn't) and what every table and the triggers' log hold after
 it (the sqlite3 library Python links, printed first) to crates/engine/tests/fixtures/foreign_keys.tsv, which
 tests/windows_and_triggers.rs holds Amphora to.
@@ -29,6 +29,7 @@ ORS = [""] + [f" OR {c}" for c in CONFLICTS]
 ACTIONS = ["NO ACTION", "RESTRICT", "CASCADE", "SET NULL", "SET DEFAULT"]
 DEFERRED = " DEFERRABLE INITIALLY DEFERRED"
 LOOK = "SELECT * FROM look"
+# PRAGMA recursive_triggers = ON, which Amphora doesn't have yet (lane C26's record): asked for by its environment.
 RECURSIVE = bool(os.environ.get("C26_RECURSIVE"))
 
 
@@ -89,10 +90,10 @@ def found():
                 asks += [s, "SELECT * FROM p", "SELECT * FROM c"]
             out.append((f"rows that mend each other{late} {action}", on + ["CREATE TABLE p(k INT PRIMARY KEY)", f"CREATE TABLE c(k INT DEFAULT 2 REFERENCES p(k) ON DELETE {action} ON UPDATE {action}{late})", "INSERT INTO p VALUES (1), (2), (3)", "INSERT INTO c VALUES (1), (2), (3), (3)"], asks + ["BEGIN"] + asks + ["COMMIT", "SELECT * FROM p", "SELECT * FROM c", "ROLLBACK"]))
     # C22: recursive_triggers
-    for recursive in ["ON", "OFF"] if RECURSIVE else []:
+    for recursive in ["ON", "OFF"] if RECURSIVE else ["OFF"]:
         pragma = [f"PRAGMA recursive_triggers = {recursive}"]
         log = "CREATE TABLE lg(x, y)"
-        out.append((f"recursive_triggers {recursive}: an INSERT that fires itself", [log, "CREATE TABLE t(k INTEGER PRIMARY KEY, n INT)", "CREATE TRIGGER g AFTER INSERT ON t WHEN new.n < 4 BEGIN INSERT INTO lg VALUES ('g', new.n); INSERT INTO t(n) VALUES (new.n + 1); INSERT INTO lg VALUES ('z', new.n); END"] + pragma, ["INSERT INTO t VALUES (100, 1)", "SELECT * FROM t", "SELECT rowid, * FROM lg", "PRAGMA recursive_triggers", "PRAGMA recursive_triggers = OFF", "INSERT INTO t VALUES (200, 1)", "SELECT * FROM t", "PRAGMA recursive_triggers = ON", "INSERT INTO t VALUES (300, 1)", "SELECT * FROM t", "SELECT rowid, * FROM lg", "PRAGMA recursive_triggers"]))
+        out.append((f"recursive_triggers {recursive}: an INSERT that fires itself", [log, "CREATE TABLE t(k INTEGER PRIMARY KEY, n INT)", "CREATE TRIGGER g AFTER INSERT ON t WHEN new.n < 4 BEGIN INSERT INTO lg VALUES ('g', new.n); INSERT INTO t(n) VALUES (new.n + 1); INSERT INTO lg VALUES ('z', new.n); END"] + pragma, ["INSERT INTO t VALUES (100, 1)", "SELECT * FROM t", "SELECT rowid, * FROM lg"] + ([] if not RECURSIVE else ["PRAGMA recursive_triggers", "PRAGMA recursive_triggers = OFF", "INSERT INTO t VALUES (200, 1)", "SELECT * FROM t", "PRAGMA recursive_triggers = ON", "INSERT INTO t VALUES (300, 1)", "SELECT * FROM t", "SELECT rowid, * FROM lg", "PRAGMA recursive_triggers"])))
         for keyed in ["", " WITHOUT ROWID"]:
             out.append((f"recursive_triggers {recursive}: UPDATE and DELETE that fire themselves{keyed}", [log, f"CREATE TABLE t(k INT PRIMARY KEY, n INT){keyed}", "INSERT INTO t VALUES (1, 5), (2, 5), (3, 5), (4, 5)", "CREATE TRIGGER g BEFORE UPDATE ON t WHEN new.n > 2 BEGIN INSERT INTO lg VALUES (old.k || 'b', new.n); UPDATE t SET n = new.n - 1 WHERE k = new.k + 1; END", "CREATE TRIGGER h AFTER UPDATE ON t WHEN new.n > 1 BEGIN INSERT INTO lg VALUES (old.k || 'a', new.n); UPDATE t SET n = new.n - 2 WHERE k = new.k - 1; END", "CREATE TRIGGER i AFTER DELETE ON t BEGIN INSERT INTO lg VALUES (old.k || 'd', old.n); DELETE FROM t WHERE k = old.k + 1; END"] + pragma, ["UPDATE t SET n = 4 WHERE k = 2", "SELECT * FROM t", "SELECT rowid, * FROM lg", "UPDATE t SET n = n + 3", "SELECT * FROM t", "SELECT rowid, * FROM lg", "DELETE FROM t WHERE k = 2", "SELECT * FROM t", "SELECT rowid, * FROM lg"]))
             for clause in ["", " ON CONFLICT REPLACE"]:
