@@ -594,6 +594,7 @@ pub fn translate_inner(
         ast::Stmt::Select(select) => {
             translate_select(
                 select,
+                &[],
                 resolver,
                 program,
                 plan::QueryDestination::ResultRows,
