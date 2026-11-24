@@ -5,7 +5,7 @@ compiled differs by platform): a count above its line fails, and one below it fa
 is lowered, so the file always says what is left. A host the file holds no counts for is counted,
 not checked.
 
-  cargo clippy -p amphora-engine ... --message-format=json -- -W clippy::unwrap_used ... |
+  cargo clippy -p amphora ... --message-format=json -- -W clippy::unwrap_used ... |
       python3 scripts/engine-ratchet.py scripts/engine-ratchet.toml <host> clippy::unwrap_used ...
 """
 
