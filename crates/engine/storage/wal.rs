@@ -11954,7 +11954,10 @@ pub mod test {
         assert_eq!(count_rows(&reader, "t where v = 'A'"), 1);
         run_checkpoint_until_done(&checkpointer.pager.load(), passive);
         assert_eq!(db.shared_wal.segments.load().closing(), None);
-        assert!(!db.switch_log(None).unwrap(), "no switch from an empty segment");
+        assert!(
+            !db.switch_log(None).unwrap(),
+            "no switch from an empty segment"
+        );
 
         writer.execute("update t set v = 'X' where id = 1").unwrap();
         assert!(db.switch_log(None).unwrap());
