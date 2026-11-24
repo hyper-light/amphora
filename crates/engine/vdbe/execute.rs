@@ -1228,6 +1228,15 @@ fn comparison_slow(
         (_, _) => {}
     }
 
+    // SQLite's OP_Eq converts under TEXT affinity only to compare with a text: two numbers compare as
+    // numbers. A FULL JOIN's merged column is the case: its first column's affinity, TEXT, and the
+    // value of the other, a number (the oracles' finding CZ).
+    let affinity = match (lhs_value, rhs_value) {
+        (Value::Text(_), _) | (_, Value::Text(_)) => affinity,
+        _ if affinity == Affinity::Text => Affinity::Blob,
+        _ => affinity,
+    };
+
     // If all else failed, do an affinity-aware comparison
     let (new_lhs, new_rhs) = (
         affinity.convert_for_compare(lhs_value, program.connection.fp_digits()),
