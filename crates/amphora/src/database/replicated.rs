@@ -4369,6 +4369,18 @@ impl<F: BlockFile + 'static> Actor<F> {
             match message.msg_type {
                 hyper_raft::proto::MessageType::MsgPropose => {
                     let forward = self.slots.forward(from, self.at, (message, reservation));
+                    #[cfg(test)]
+                    if forward.step.is_some()
+                        && self
+                            .pending
+                            .as_ref()
+                            .is_some_and(|p| matches!(p.phase, Phase::Running))
+                    {
+                        eprintln!(
+                            "P18 forward from {from} stepped while the leader's own session is out (turn {})",
+                            self.slots.turn()
+                        );
+                    }
                     if let Some(unmeasured) = forward.unmeasured {
                         tracing::warn!(target: "amphora.replication", event = "write_slot_unmeasured", error = %unmeasured, "a retry's gap was not learned for the write slot");
                     }
@@ -4824,6 +4836,15 @@ impl<F: BlockFile + 'static> Actor<F> {
                         Err(error) => Err(error),
                     },
                 };
+                #[cfg(test)]
+                if matches!(&result, Err(Refusal::Serialization { .. })) {
+                    eprintln!(
+                        "P18 stale answer at member {} leader {} owner-authored {}",
+                        self.replica.id(),
+                        self.replica.is_leader(),
+                        matches!(pending.author, Author::Owner)
+                    );
+                }
                 #[cfg(test)]
                 if self.turn_context.as_ref() == Some(&pending.context) {
                     self.turn_context = None;
