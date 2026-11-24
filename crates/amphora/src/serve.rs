@@ -2539,7 +2539,9 @@ mod tests {
             &postcard::to_allocvec(&SqlAnswer::Tables(vec![table(within.clone())])).unwrap(),
         )
         .unwrap();
-        let SqlAnswer::Tables(tables) = answer(&mut wire.as_slice(), 1, Duration::from_secs(30)).unwrap() else {
+        let SqlAnswer::Tables(tables) =
+            answer(&mut wire.as_slice(), 1, Duration::from_secs(30)).unwrap()
+        else {
             panic!("not tables");
         };
         assert_eq!(tables[0].rows, within);
@@ -2580,7 +2582,9 @@ mod tests {
         for frame in &frames {
             write_frame(&mut wire, &frame.bytes).unwrap();
         }
-        let SqlAnswer::Tables(tables) = answer(&mut wire.as_slice(), 2, Duration::from_secs(30)).unwrap() else {
+        let SqlAnswer::Tables(tables) =
+            answer(&mut wire.as_slice(), 2, Duration::from_secs(30)).unwrap()
+        else {
             panic!("not tables");
         };
         assert_eq!(tables[0].affected, 1);
