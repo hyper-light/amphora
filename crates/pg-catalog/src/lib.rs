@@ -113,19 +113,19 @@ impl SearchPath {
                 "pg_temp" => temp,
                 name => namespace(name),
             };
-            if let Some(oid) = oid {
-                if !namespaces.contains(&oid) {
-                    namespaces.push(oid);
-                }
+            if let Some(oid) = oid
+                && !namespaces.contains(&oid)
+            {
+                namespaces.push(oid);
             }
         }
         if !namespaces.contains(&PG_CATALOG_NAMESPACE) {
             namespaces.insert(0, PG_CATALOG_NAMESPACE);
         }
-        if let Some(temp) = temp {
-            if !namespaces.contains(&temp) {
-                namespaces.insert(0, temp);
-            }
+        if let Some(temp) = temp
+            && !namespaces.contains(&temp)
+        {
+            namespaces.insert(0, temp);
         }
         Self { namespaces, temp }
     }
