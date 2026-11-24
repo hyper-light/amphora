@@ -1,6 +1,6 @@
 # T1 reviewer landing (lane D4, 2026-11-24)
 
-This landing carries the T1 reviewer's fixes onto main. It takes `origin/t1/main-review` at `3b8620fa`, the branch's head when lane D4 started (02:57Z), and main at `9fbfdbaf`. The branch's two later commits are left for the next landing, except `f02b5e67`, a test fix this landing needs (below).
+This landing carries the T1 reviewer's fixes onto main. It takes `origin/t1/main-review` at `3b8620fa`, the branch's head when lane D4 started (02:57Z), and main at `fac69083`. The branch's two later commits are left for the next landing, except `f02b5e67`, a test fix this landing needs (below).
 
 ## Commits on top of lane D2's merged tree (`e966cfbe`)
 
@@ -13,6 +13,7 @@ This landing carries the T1 reviewer's fixes onto main. It takes `origin/t1/main
 | `8b798818` | Cherry-picks `f02b5e67`. `e966cfbe` kept main's Linux-only `Descriptors::waiting()` beside the reviewer's portable test, so the amphora lib tests did not compile on macOS (E0599). |
 | `689da68f` | Restores main's four lint allowances in `examples/admission.rs`. `e43ede95` dropped them while main's later code in that file still unwraps, which gave 22 clippy errors. |
 | `ac2c48c5` | Merges `origin/main` at `9fbfdbaf` (lane R9's bound parameter in the column copy's filter). No conflicts; `shape_chain` keeps the guard. |
+| `8cfb85a8` | Merges `origin/main` at `fac69083` (lanes PG12 and PG13: the Postgres dialect and pg_catalog vtabs). No conflicts. Rechecked with workspace clippy and the engine lib set (run r181). |
 
 ## Run r36 (adacachy2, `e966cfbe`)
 
@@ -41,8 +42,9 @@ Linux on adacachy2 with 4 cores, load 35 to 60 (run r155 on `ac2c48c5`):
 | `scripts/check-production.sh` | exit 0 in 80 s; checked `amphora`, `amphora-api`, `amphora-corpus` and `amphora-engine-parser`, compiled `amphora-engine`, `amphora-engine-ext` and `amphora-engine-macros`; "engine-ratchet: 10903 left in the engine's production code across 17 lints, as the ratchet holds" |
 | amphora lib: `memory::` (with `60cdd988`'s Linux-only test), `xgroup::`, `transport::`, `descriptors::` | 94 passed, 1 ignored |
 | `--test transport` | 9 passed |
+| engine lib `morsel_scan` | 40 passed, 1 failed (`t_qt_6_35`); main `9fbfdbaf` alone fails it with the same message |
 
 ## Reds that are main's own
 
-- `t_qt_6_35_joins_over_rowid_ranges_run_on_morsels_as_the_serial_loop` fails on main alone with the landing's message: "SELECT count(*), sum(d.b) FROM f JOIN d ON f.a = d.a WHERE f.id > 2000 on 1 cores: the hook built no link".
+- `t_qt_6_35_joins_over_rowid_ranges_run_on_morsels_as_the_serial_loop` fails on main alone, on macOS and on Linux, with the landing's message: "SELECT count(*), sum(d.b) FROM f JOIN d ON f.a = d.a WHERE f.id > 2000 on 1 cores: the hook built no link".
 - `t_qt_6_18_join_workers_run_a_copy_of_the_loop_body_as_the_serial_loop` did not finish in 24 minutes on main alone on Mac Studio 2. On the landing it did not finish in 20 minutes there, nor in 13 minutes on adacachy2 in r36.
