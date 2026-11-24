@@ -9,6 +9,7 @@ q	IS, count	SELECT count(*), sum((t0.r, t0.u, t0.i) IS ((t0.r || ''), CAST(t0.u 
 q	<>, left join	SELECT t0.id, t1.id FROM t t0 LEFT JOIN s t1 ON ('1.0', (SELECT m1.d FROM s m1 WHERE m1.id = t0.id), t0.x) <> (t1.u, t1.d, (t1.x COLLATE NOCASE)) AND t0.i = t1.i	41:53efbc5129d4996f
 q	<>, exists	SELECT t0.id FROM t t0 WHERE EXISTS (SELECT 1 FROM s t1 WHERE (t0.i, t0.x) <> (t1.i, CAST(t1.u AS INTEGER)))	20:a00d37499e3e8ef8
 q	<, where	SELECT t0.id FROM t t0 WHERE ((SELECT max(m1.i) FROM s m1), t0.u, t0.c) < (x'61', -1, '7')	24:8370b17183c81c8f
+q	NOT BETWEEN, not	SELECT t0.id FROM t t0 WHERE NOT (t0.c, t0.u, 7) NOT BETWEEN (NULL, t0.d, t0.i) AND (lower(t0.x), (t0.d + 0), t0.i)	0:cbf29ce484222325
 q	NOT IN (list), value	SELECT t0.id, (t0.x, t0.i, t0.c) NOT IN ((0, 0, 'b'), (NULL, 'a ', '2'), ('7', 1, 'A')) FROM s t0	14:29c551c9cefa5cc9
 q	<, join	SELECT t0.id, t1.id FROM s t0 JOIN t t1 ON (t0.i, t0.d) < (t1.i, t1.d)	80:11b47e2afd2cb0bf
 q	IN (SELECT), where	SELECT t0.id FROM s t0 WHERE ((SELECT m1.x FROM s m1 WHERE m1.id = t0.id), t0.i, t0.c) IN (SELECT q2.x, q2.i, q2.c FROM s q2 WHERE q2.d <> x'62' AND q2.d >= t0.d UNION ALL SELECT 'B ', 1, 'a ')	5:7a29a5bc1840846d
@@ -55,6 +56,7 @@ q	IN (SELECT), case	SELECT t0.id, CASE WHEN (NULL, t0.d, t0.u) IN (SELECT q1.x, 
 q	IS NOT, join	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON (t0.i, t0.x) IS NOT (t1.i, (SELECT max(m1.x) FROM s m1))	336:db828c071857a065
 q	IN (SELECT), count	SELECT count(*), sum((t0.d, t0.x) IN (SELECT q1.d, q1.x FROM s q1 WHERE q1.c <> '')) FROM t t0	1:f5f7890b223d0ef4
 q	NOT IN (SELECT), and	SELECT t0.id FROM t t0 WHERE (t0.u, t0.b) NOT IN (SELECT q1.u, q1.b FROM s q1 WHERE q1.c IS t0.c) AND t0.id > 5	15:8861d62b85e3bcd2
+q	BETWEEN, and	SELECT t0.id FROM t t0 WHERE (t0.i, (t0.n COLLATE NOCASE), t0.c) BETWEEN (NULL, 'a', lower(t0.c)) AND (t0.d, t0.b, '') AND t0.id > 2	0:cbf29ce484222325
 q	<>, and	SELECT t0.id FROM t t0 WHERE (t0.n, t0.r) <> ((t0.n || ''), CAST(t0.r AS TEXT)) AND t0.id > 5	2:d9a6fa33d9249490
 q	=, exists	SELECT t0.id FROM t t0 WHERE EXISTS (SELECT 1 FROM s t1 WHERE (t0.d, t0.b, (t0.r || '')) = (t1.d, (SELECT m2.b FROM s m2 WHERE m2.id = t1.id), t1.r))	0:cbf29ce484222325
 q	IN (SELECT), on and where	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON ('', (t0.d + 0), coalesce(t0.c, '1')) IN (SELECT q4.u, q4.u, q4.i FROM s q4 WHERE q4.b IS t0.b UNION ALL SELECT 1.0, 2.0, -1) WHERE (t0.u, NULL, t0.b) IN (SELECT NULL, q1.r, q1.b FROM s q1)	0:cbf29ce484222325
@@ -63,6 +65,7 @@ q	IS, value	SELECT t0.id, (t0.i, t0.x) IS (0, NULL) FROM s t0	14:8a8f8b2b7391ac0
 q	IN (SELECT), correlated	SELECT t0.id, (SELECT count(*) FROM s t1 WHERE ((SELECT max(m1.c) FROM s m1), t0.i) IN (SELECT q2.c, q2.i FROM t q2 WHERE q2.i = t0.i ORDER BY q2.id LIMIT 0)) FROM t t0	24:d363dc08c47dcb47
 q	NOT IN (list), not	SELECT t0.id FROM s t0 WHERE NOT (t0.d, t0.x) NOT IN (('A', NULL), ('2', 'B '))	1:af63ab4c86019949
 q	NOT IN (list), where	SELECT t0.id FROM t t0 WHERE (-0.5, 'b') NOT IN ((NULL, NULL), ('B ', 'a '), ('2', NULL))	0:cbf29ce484222325
+q	NOT BETWEEN, or	SELECT t0.id FROM t t0 WHERE (t0.i, t0.x) NOT BETWEEN (t0.i, +t0.c) AND ('7', t0.x) OR t0.id < 7	11:6052552c18c05180
 q	IS, count	SELECT count(*), sum(('b', 1.5, t0.x) IS ((t0.b + 0), CAST(t0.x AS TEXT), 'B ')) FROM s t0	1:eb7245f0e56dc744
 q	IN (SELECT), left join	SELECT t0.id, t1.id FROM t t0 LEFT JOIN s t1 ON ((SELECT max(m1.d) FROM s m1), (t0.b || '')) IN (SELECT q3.r, q3.b FROM s q3 WHERE q3.d <> 'a ' AND q3.r = t1.r ORDER BY q3.id LIMIT 0)	24:d9790ee11730f207
 q	BETWEEN, where	SELECT t0.id FROM t t0 WHERE (t0.c, t0.i) BETWEEN (t0.c, coalesce(t0.i, 7)) AND (t0.x, t0.i)	5:3e3dc144c6191024
@@ -80,6 +83,7 @@ q	>=, left join	SELECT t0.id, t1.id FROM t t0 LEFT JOIN s t1 ON (t0.n, t0.i, (SE
 q	NOT IN (SELECT), case	SELECT t0.id, CASE WHEN (t0.b, t0.b) NOT IN (SELECT q1.b, q1.b FROM s q1 ORDER BY q1.id LIMIT 0) THEN 1 WHEN t0.id > 4 THEN 2 END FROM t t0	24:04e3e57f608ad5a9
 q	IN (SELECT), where	SELECT t0.id FROM t t0 WHERE (t0.u, t0.b) IN (SELECT q1.u, q1.b FROM s q1 WHERE q1.c >= t0.c)	0:cbf29ce484222325
 q	>, left join	SELECT t0.id, t1.id FROM t t0 LEFT JOIN s t1 ON (t0.i, t0.x) > (-1, '2')	232:1e43cfeb569d3c91
+q	BETWEEN, exists	SELECT t0.id FROM t t0 WHERE NOT EXISTS (SELECT 1 FROM s t1 WHERE (t0.b, t0.i) BETWEEN (t1.b, t1.c) AND (t1.b, t1.i))	22:464471becd2a0907
 q	=, correlated	SELECT t0.id, (SELECT count(*) FROM s t1 WHERE (t0.c, t0.i) = ('A', 'a')) FROM t t0	24:d363dc08c47dcb47
 q	IN (SELECT), join	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON (t0.i, t0.n) IN (SELECT q1.i, q1.n FROM s q1 WHERE q1.c IS t1.c)	4:cc9cb7b76780a365
 q	IN (list), where	SELECT t0.id FROM s t0 WHERE (t0.i, t0.x) IN ((NULL, ''), (3, '2'), (-1, '1'))	0:cbf29ce484222325
@@ -101,6 +105,7 @@ q	IS NOT, left join	SELECT t0.id, t1.id FROM t t0 LEFT JOIN s t1 ON (t0.i, t0.i,
 q	BETWEEN, join	SELECT t0.id, t1.id FROM s t0 JOIN t t1 ON (t0.i, t0.x) BETWEEN (lower(t1.r), NULL) AND (t1.i, NULL)	20:567d0e7aca0eacf3
 q	IS (SELECT), count	SELECT count(*), sum((t0.r, t0.i) IS (SELECT q1.r, q1.i FROM s q1 WHERE q1.id = 14)) FROM t t0	1:f5f78a0b223d10a7
 q	IS NOT, not	SELECT t0.id FROM t t0 WHERE NOT (t0.c, t0.i) IS NOT (t0.d, t0.i)	1:af63a94c860195e3
+q	IS NOT, where	SELECT t0.id FROM t t0 WHERE (t0.r, '', t0.n) IS NOT (t0.c, t0.b, t0.n)	24:8370b17183c81c8f
 q	<=, where	SELECT t0.id FROM t t0 WHERE (t0.x, t0.d) <= ('a', NULL)	10:a8cc1bf025b99ebb
 q	IN (SELECT), case	SELECT t0.id, CASE WHEN (t0.n, t0.r) IN (SELECT q1.n, (q1.r || '') FROM s q1 WHERE q1.u > 2 UNION ALL SELECT NULL, -1) THEN 1 WHEN t0.id > 4 THEN 2 END FROM t t0	24:4759ac99a2f2fbfd
 q	NOT IN (SELECT), null	SELECT t0.id FROM s t0 WHERE (((t0.b || ''), CAST(t0.x AS TEXT), (SELECT m3.u FROM s m3 WHERE m3.id = t0.id)) NOT IN (SELECT q4.b, q4.x, q4.u FROM s q4 WHERE q4.x > '1.0' ORDER BY q4.id LIMIT 1)) IS NULL	0:cbf29ce484222325
@@ -234,6 +239,7 @@ q	IS, value	SELECT t0.id, ('b', +t0.b) IS (1.0, NULL) FROM t t0	24:d363dc08c47dc
 q	IN (SELECT), case	SELECT t0.id, CASE WHEN ('1', +t0.r, t0.b) IN (SELECT q2.c, q2.r, q2.b FROM s q2 WHERE q2.u > NULL AND q2.n IS t0.n) THEN 1 WHEN t0.id > 4 THEN 2 END FROM t t0	24:4759ac99a2f2fbfd
 q	IN (list), join	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON (t0.u, NULL) IN ((x'', '7'))	0:cbf29ce484222325
 q	BETWEEN, exists	SELECT t0.id FROM t t0 WHERE NOT EXISTS (SELECT 1 FROM s t1 WHERE (t0.u, t0.b) BETWEEN ('7', NULL) AND (NULL, '7'))	24:8370b17183c81c8f
+q	BETWEEN, not	SELECT t0.id FROM t t0 WHERE NOT (t0.u, t0.u, NULL) BETWEEN (1.0, t0.d, t0.x) AND (t0.u, t0.d, CAST(t0.x AS TEXT))	8:065913414d8724bb
 q	<>, value	SELECT t0.id, (t0.x, t0.i, t0.c) <> (t0.x, t0.i, CAST(t0.c AS INTEGER)) FROM s t0	14:57fd7d538978471d
 q	NOT BETWEEN, on and where	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON (t0.x, t0.i, t0.c) NOT IN (SELECT q2.x, q2.i, q2.c FROM s q2 WHERE q2.n >= t0.n) WHERE (t0.r, (t0.d COLLATE BINARY), x'') NOT BETWEEN ('2', NULL, '') AND (x'31', 'A', '7') AND t0.c = t1.c	11:b7e29813571f2cf7
 q	<>, where	SELECT t0.id FROM t t0 WHERE (t0.r, t0.i) <> ((t0.c COLLATE BINARY), x'')	20:860f151661ed42c3
@@ -304,6 +310,7 @@ q	NOT IN (SELECT), where	SELECT t0.id FROM t t0 WHERE ('B ', t0.i) NOT IN (SELEC
 q	IN (SELECT), value	SELECT t0.id, ((SELECT max(m1.x) FROM s m1), t0.i, t0.c) IN (SELECT 'b', q2.i, q2.c FROM t q2 WHERE q2.b <> '1.0' UNION ALL SELECT NULL, 7, 'a') FROM t t0	24:2250026b1e839a7b
 q	IN (list), or	SELECT t0.id FROM s t0 WHERE (t0.r, t0.x) IN ((1, '1'), (-0.5, 7)) OR t0.id < 4	3:dbd536d5af6ff2c7
 q	NOT IN (SELECT), null	SELECT t0.id FROM s t0 WHERE ((7.0, NULL) NOT IN (SELECT q1.n, q1.r FROM t q1 WHERE q1.r = 0 ORDER BY q1.id LIMIT 1)) IS NULL	0:cbf29ce484222325
+q	NOT BETWEEN, left join	SELECT t0.id, t1.id FROM s t0 LEFT JOIN t t1 ON (t0.r, t0.i) NOT BETWEEN ((SELECT max(m1.r) FROM s m1), t1.c) AND (t1.r, t1.i)	284:1cdab657109f1f11
 q	NOT BETWEEN, exists	SELECT t0.id FROM t t0 WHERE NOT EXISTS (SELECT 1 FROM s t1 WHERE (t0.i, t0.x) NOT BETWEEN (t1.i, (t1.x + 0)) AND (CAST(t1.i AS TEXT), t1.x))	8:2e79cd4035d02e85
 q	IS, value	SELECT t0.id, (lower(t0.x), lower(t0.n)) IS ('a ', (SELECT max(m3.n) FROM s m3)) FROM t t0	24:d363dc08c47dcb47
 q	IN (SELECT), pairs	SELECT t0.id, t1.id, (t0.u, (SELECT max(m1.u) FROM s m1), 'a') IN (SELECT q2.u, q2.i, q2.x FROM t q2 UNION ALL SELECT NULL, NULL, 'B ') FROM t t0, s t1	336:47f1cfc7d6b34bff
@@ -319,6 +326,7 @@ q	IN (list), case	SELECT t0.id, CASE WHEN ('7', x'31') IN (('1.0', 'B '), ('7', 
 q	NOT IN (SELECT), on and where	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON (t0.u, t0.b) < (t0.u, t0.b) WHERE (t0.x, t0.u, t0.u) NOT IN (SELECT q1.x, q1.u, q1.u FROM s q1 WHERE q1.n > 'a' AND q1.i = t1.i)	0:cbf29ce484222325
 q	IN (SELECT), left join	SELECT t0.id, t1.id FROM s t0 LEFT JOIN t t1 ON (t0.i, t0.x) IN (SELECT q1.i, q1.x FROM s q1 WHERE q1.c = t0.c ORDER BY q1.id LIMIT 1) AND t0.r = t1.r	14:cb04b64ed3be62d4
 q	IS NOT, join	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON (3, NULL) IS NOT (t1.r, t1.i)	336:db828c071857a065
+q	<=, or	SELECT t0.id FROM t t0 WHERE ('2', (t0.i || ''), t0.r) <= (NULL, t0.u, t0.d) OR t0.id < 4	3:dbd536d5af6ff2c7
 q	NOT IN (SELECT), left join	SELECT t0.id, t1.id FROM t t0 LEFT JOIN s t1 ON (t0.r, t0.i) NOT IN (SELECT q1.r, q1.i FROM s q1 WHERE q1.d > NULL ORDER BY q1.id LIMIT 1)	336:db828c071857a065
 q	IN (SELECT), correlated	SELECT t0.id, (SELECT count(*) FROM s t1 WHERE (t0.x, t0.i, t0.c) IN (SELECT q1.x, (q1.i COLLATE BINARY), q1.c FROM s q1)) FROM t t0	24:d26e0fe06e726206
 q	<, left join	SELECT t0.id, t1.id FROM t t0 LEFT JOIN s t1 ON ('', lower(t0.x)) < (t1.b, +t1.r) AND t0.d = t1.d	28:cd2809900a95e904
@@ -348,9 +356,12 @@ q	NOT IN (SELECT), or	SELECT t0.id FROM s t0 WHERE ('', t0.u, NULL) NOT IN (SELE
 q	IN (SELECT), on and where	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON (t0.d, t0.x) IN (SELECT q2.d, q2.x FROM s q2) WHERE (t0.d, t0.x) IN (SELECT q1.d, q1.x FROM t q1 WHERE q1.c IS t1.c)	0:cbf29ce484222325
 q	IN (SELECT), or	SELECT t0.id FROM s t0 WHERE (t0.c, CAST(t0.c AS TEXT)) IN (SELECT 'a', q2.c FROM t q2 WHERE q2.n < '1') OR t0.id < 4	3:dbd536d5af6ff2c7
 q	IS, value	SELECT t0.id, (t0.r, t0.i) IS (t0.r, +t0.i) FROM s t0	14:b74a6e5e70d42499
+q	BETWEEN, and	SELECT t0.id FROM s t0 WHERE (t0.x, t0.i, t0.i) BETWEEN (NULL, t0.i, 0) AND ('1.0', t0.i, t0.c) AND t0.id > 2	0:cbf29ce484222325
 q	IN (SELECT), case	SELECT t0.id, CASE WHEN (t0.x, t0.i, t0.c) IN (SELECT q1.x, 2, q1.c FROM s q1 WHERE q1.b = t0.b) THEN 1 WHEN t0.id > 4 THEN 2 END FROM s t0	14:b7a99742df7a59c4
 q	NOT IN (SELECT), case	SELECT t0.id, CASE WHEN (t0.n, t0.r) NOT IN (SELECT q1.n, q1.r FROM t q1 UNION ALL SELECT 'B ', 2.0) THEN 1 WHEN t0.id > 4 THEN 2 END FROM s t0	14:2763028f01bbc747
+q	BETWEEN, null	SELECT t0.id FROM s t0 WHERE (('7', t0.i, 3) BETWEEN (NULL, t0.d, (t0.n + 0)) AND (t0.n, t0.d, -1)) IS NULL	6:92477f8678d1a6f7
 q	=, where	SELECT t0.id FROM t t0 WHERE (t0.x, coalesce(t0.c, 'A')) = ('1.0', t0.c)	2:d9a6fd33d92499a9
+q	IN (SELECT), on and where	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON ('a ', t0.i) = (CAST(t0.x AS TEXT), t0.c) WHERE (t0.u, CAST(t0.n AS INTEGER)) IN (SELECT q2.u, q2.n FROM t q2)	0:cbf29ce484222325
 q	NOT BETWEEN, not	SELECT t0.id FROM t t0 WHERE NOT (t0.r, t0.i) NOT BETWEEN (NULL, 0) AND (x'', 1)	0:cbf29ce484222325
 q	IN (SELECT), and	SELECT t0.id FROM t t0 WHERE (-0.5, t0.c) IN (SELECT q1.u, q1.c FROM s q1 WHERE q1.i <> 1) AND t0.id > 2	0:cbf29ce484222325
 q	IN (list), where	SELECT t0.id FROM t t0 WHERE (3, t0.u, (t0.r COLLATE BINARY)) IN ((2, '1.0', 3), (7, '1.0', 7), (0, x'62', 7.0))	0:cbf29ce484222325
@@ -485,6 +496,7 @@ q	BETWEEN, where	SELECT t0.id FROM t t0 WHERE (t0.d, t0.x) BETWEEN (+t0.d, t0.x)
 q	NOT IN (list), left join	SELECT t0.id, t1.id FROM t t0 LEFT JOIN s t1 ON (t0.n, t0.r) NOT IN ((-0.5, NULL))	206:fd80bbf806208b79
 q	NOT IN (SELECT), left join	SELECT t0.id, t1.id FROM t t0 LEFT JOIN s t1 ON (t0.u, t0.b) NOT IN (SELECT q1.u, q1.b FROM s q1 WHERE q1.d IS t1.d) AND t0.r = t1.r	28:bb8fcd3df28b08b4
 q	NOT IN (SELECT), value	SELECT t0.id, (t0.c, t0.u) NOT IN (SELECT q1.c, q1.u FROM s q1) FROM t t0	24:e7a76c9d32442cc5
+q	NOT IN (list), join	SELECT t0.id, t1.id FROM s t0 JOIN t t1 ON (t0.n, t0.r) NOT IN ((CAST(t1.c AS TEXT), t1.r))	314:48fe6070ee0f4aa0
 q	BETWEEN, and	SELECT t0.id FROM t t0 WHERE (t0.x, t0.i, t0.c) BETWEEN ('', NULL, 'A') AND ('7', 1, 'A') AND t0.id > 1	8:fd1d74fce2bcce67
 q	IS NOT, and	SELECT t0.id FROM t t0 WHERE (t0.i, (SELECT max(m1.c) FROM s m1)) IS NOT (-1, '') AND t0.id > 7	17:21730b3fe5464b9b
 q	<>, null	SELECT t0.id FROM t t0 WHERE ((t0.x, t0.i, t0.c) <> (t0.x, t0.i, t0.c)) IS NULL	14:a33746b53efba652
@@ -492,18 +504,6 @@ q	<= (SELECT), case	SELECT t0.id, CASE WHEN (t0.u, t0.b) <= (SELECT q1.u, q1.b F
 q	IN (list), or	SELECT t0.id FROM t t0 WHERE (t0.n, t0.r) IN (('', 3)) OR t0.id < 2	1:af63ac4c86019afc
 q	NOT BETWEEN, not	SELECT t0.id FROM t t0 WHERE NOT (t0.r, (SELECT m1.n FROM s m1 WHERE m1.id = t0.id)) NOT BETWEEN (0, '1.0') AND (1.5, 2)	4:b6b4256b81724f89
 q	IN (SELECT), where	SELECT t0.id FROM s t0 WHERE (-1, '7') IN (SELECT q1.i, q1.x FROM s q1)	0:cbf29ce484222325
-q	BETWEEN, null	SELECT t0.id FROM t t0 WHERE ((t0.u, t0.r, t0.d) BETWEEN (t0.u, t0.i, (t0.d + 0)) AND (t0.u, (t0.r COLLATE BINARY), CAST(t0.d AS INTEGER))) IS NULL	15:8cc40759d0619e59
-q	IN (SELECT), on and where	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON (t0.r, (SELECT m3.n FROM s m3 WHERE m3.id = t0.id)) NOT IN (SELECT q4.r, q4.i FROM s q4) WHERE (t0.u, t0.b) IN (SELECT q1.u, CAST(q1.b AS INTEGER) FROM t q1 WHERE q1.n IS t1.n) AND t0.i = t1.i	0:cbf29ce484222325
-q	>=, null	SELECT t0.id FROM t t0 WHERE (((t0.c + 0), t0.i) >= ((t0.c COLLATE BINARY), t0.i)) IS NULL	6:355adc5d5f0a77fe
-q	>=, null	SELECT t0.id FROM t t0 WHERE ((NULL, t0.u) >= (lower(t0.r), 1)) IS NULL	24:8370b17183c81c8f
-q	BETWEEN, where	SELECT t0.id FROM t t0 WHERE (t0.c, (t0.i COLLATE BINARY)) BETWEEN (t0.c, t0.i) AND (t0.c, t0.i)	14:379f9f0e25f2bb0b
-q	NOT IN (SELECT), case	SELECT t0.id, CASE WHEN (t0.c, 1.5) NOT IN (SELECT q1.c, q1.c FROM s q1 WHERE q1.n < NULL) THEN 1 WHEN t0.id > 4 THEN 2 END FROM s t0	14:b74a6e5e70d42499
-q	IS NOT, value	SELECT t0.id, (NULL, 2.0) IS NOT (t0.n, 1.5) FROM t t0	24:04e3e57f608ad5a9
-q	BETWEEN, not	SELECT t0.id FROM t t0 WHERE NOT (0, t0.i, (SELECT m1.n FROM s m1 WHERE m1.id = t0.id)) BETWEEN (t0.i, (t0.n + 0), t0.n) AND (NULL, t0.i, t0.n)	12:f320559a36992b5c
-q	IS NOT, not	SELECT t0.id FROM t t0 WHERE NOT (t0.d, t0.r, t0.d) IS NOT (NULL, 0, (SELECT max(m1.d) FROM s m1))	0:cbf29ce484222325
-q	<>, where	SELECT t0.id FROM t t0 WHERE (t0.c, t0.i) <> (t0.c, (SELECT max(m1.i) FROM s m1))	13:a82a5e31c02544e3
-q	IS, pairs	SELECT t0.id, t1.id, (t1.r, t1.i) IS (7, t1.n) FROM t t0, s t1	336:a8c01c8905857b0d
-q	NOT IN (SELECT), value	SELECT t0.id, (t0.x, t0.i) NOT IN (SELECT '2', 7 FROM s q1) FROM s t0	14:71d775bc14dbff8f
 db	indexed
 sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INT, r REAL, x TEXT, n NUMERIC, b BLOB, u, c TEXT COLLATE NOCASE, d TEXT COLLATE RTRIM)
 sql	CREATE TABLE s(id INTEGER PRIMARY KEY, i INT, r REAL, x TEXT, n NUMERIC, b BLOB, u, c TEXT COLLATE NOCASE, d TEXT COLLATE RTRIM)
@@ -589,9 +589,11 @@ q	IS, and	SELECT t0.id FROM t t0 WHERE ('7', t0.n, 'a ') IS (t0.c, (t0.n || ''),
 q	NOT IN (SELECT), value	SELECT t0.id, ((t0.n || ''), 7) NOT IN (SELECT q2.i, q2.i FROM s q2) FROM t t0	24:615acef385d7697f
 q	NOT IN (SELECT), on and where	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON (7, 'b') NOT BETWEEN (3, '2') AND (1.5, NULL) WHERE (t0.i, t0.x) NOT IN (SELECT q1.i, q1.x FROM s q1)	0:cbf29ce484222325
 q	IN (SELECT), exists	SELECT t0.id FROM t t0 WHERE NOT EXISTS (SELECT 1 FROM s t1 WHERE (t0.d, 'a') IN (SELECT q1.d, q1.c FROM t q1 ORDER BY q1.id LIMIT 3))	22:77ded7ed8ee96a70
+q	<, exists	SELECT t0.id FROM t t0 WHERE NOT EXISTS (SELECT 1 FROM s t1 WHERE (t1.n, +t1.i) < (t1.u, t1.d))	0:cbf29ce484222325
 q	=, or	SELECT t0.id FROM s t0 WHERE (t0.n, t0.r) = (7, 1.5) OR t0.id < 3	2:45f7b11818964190
 q	NOT IN (SELECT), value	SELECT t0.id, (CAST(t0.x AS TEXT), t0.i) NOT IN (SELECT +q2.x, q2.i FROM s q2 ORDER BY q2.id LIMIT 1) FROM t t0	24:164ea4ec870d753d
 q	=, where	SELECT t0.id FROM t t0 WHERE (t0.x, t0.d) = (NULL, NULL)	0:cbf29ce484222325
+q	<=, where	SELECT t0.id FROM t t0 WHERE (t0.r, t0.i) <= (CAST(t0.r AS INTEGER), t0.d)	5:0881a5b6471dfb15
 q	IN (SELECT), on and where	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON (t0.u, t0.b) IN (SELECT q2.u, q2.b FROM s q2) WHERE (3, 1) IN (SELECT q1.n, q1.i FROM s q1) AND t0.u = t1.u	0:cbf29ce484222325
 q	IS, left join	SELECT t0.id, t1.id FROM t t0 LEFT JOIN s t1 ON (t0.r, t0.x, t0.u) IS (CAST(t1.x AS TEXT), +t1.x, t1.u)	25:4d1a48438d2e2170
 q	IS NOT, and	SELECT t0.id FROM t t0 WHERE ((t0.d + 0), 'a ') IS NOT (NULL, t0.r) AND t0.id > 6	18:0c1b3171ba5cb2b0
@@ -600,6 +602,7 @@ q	IN (SELECT), null	SELECT t0.id FROM t t0 WHERE ((t0.n, t0.r) IN (SELECT q1.n, 
 q	NOT IN (SELECT), value	SELECT t0.id, (t0.n, t0.i, t0.i) NOT IN (SELECT q1.n, 2, q1.b FROM s q1) FROM s t0	14:bc15099af43d9ef7
 q	IN (list), value	SELECT t0.id, (t0.d, lower(t0.r)) IN (('b', -1), ('a ', -1)) FROM s t0	14:b3c30e461e837c7a
 q	NOT IN (SELECT), where	SELECT t0.id FROM s t0 WHERE (t0.n, t0.r) NOT IN (SELECT q1.n, q1.r FROM s q1)	0:cbf29ce484222325
+q	>=, case	SELECT t0.id, CASE WHEN ('a', t0.i) >= (t0.u, t0.c) THEN 1 WHEN t0.id > 4 THEN 2 END FROM t t0	24:b5fd8c4c2378630c
 q	NOT IN (SELECT), case	SELECT t0.id, CASE WHEN (coalesce(t0.x, ''), t0.c) NOT IN (SELECT q2.x, q2.u FROM t q2) THEN 1 WHEN t0.id > 4 THEN 2 END FROM s t0	14:2763028f01bbc747
 q	IN (SELECT), case	SELECT t0.id, CASE WHEN (t0.i, '7', t0.d) IN (SELECT q1.i, q1.b, q1.d FROM s q1 WHERE q1.n < 2.0) THEN 1 WHEN t0.id > 4 THEN 2 END FROM s t0	14:2763028f01bbc747
 q	IN (SELECT), case	SELECT t0.id, CASE WHEN (0, NULL, t0.x) IN (SELECT q1.d, q1.x, q1.x FROM s q1) THEN 1 WHEN t0.id > 4 THEN 2 END FROM s t0	14:2763028f01bbc747
@@ -660,6 +663,7 @@ q	IS, on and where	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON (t0.r, t0.i) = (1.
 q	IS, value	SELECT t0.id, ('1', t0.i, t0.r) IS (t0.b, NULL, t0.u) FROM s t0	14:8a8f8b2b7391ac03
 q	=, on and where	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON (t0.x, t0.r, t0.c) NOT IN (SELECT q1.x, (q1.r COLLATE BINARY), q1.b FROM s q1) WHERE (NULL, 1.0) = (t1.i, t1.u)	0:cbf29ce484222325
 q	IN (SELECT), where	SELECT t0.id FROM t t0 WHERE (CAST(t0.c AS TEXT), t0.i) IN (SELECT q2.c, 3 FROM s q2 WHERE q2.u < '2' ORDER BY q2.id LIMIT 1)	1:af63a84c86019430
+q	IS NOT, value	SELECT t0.id, (CAST(t0.r AS TEXT), t0.b) IS NOT ((SELECT max(m2.r) FROM s m2), t0.d) FROM s t0	14:020511fe7dd2b551
 q	>, pairs	SELECT t0.id, t1.id, (t0.i, t0.x) > (t0.i, t1.x) FROM t t0, s t1	336:c32c943c7abb2961
 q	NOT IN (SELECT), case	SELECT t0.id, CASE WHEN (t0.d, (t0.u COLLATE BINARY)) NOT IN (SELECT q2.d, q2.u FROM s q2 WHERE q2.i < -1) THEN 1 WHEN t0.id > 4 THEN 2 END FROM s t0	14:b74a6e5e70d42499
 q	IN (list), pairs	SELECT t0.id, t1.id, ((t0.u + 0), 'a') IN ((coalesce(t1.u, '1.0'), t1.b)) FROM t t0, s t1	336:5d20436090295625
@@ -743,6 +747,7 @@ q	<>, on and where	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON (t0.d, CAST(t0.d A
 q	=, correlated	SELECT t0.id, (SELECT count(*) FROM s t1 WHERE (t0.c, t0.c) = (NULL, NULL)) FROM t t0	24:d363dc08c47dcb47
 q	IS, or	SELECT t0.id FROM t t0 WHERE ((SELECT max(m1.x) FROM s m1), (SELECT max(m2.u) FROM s m2)) IS ('b', x'31') OR t0.id < 7	6:2423f4459c7fd1a4
 q	IN (SELECT), pairs	SELECT t0.id, t1.id, (t1.n, t1.r) IN (SELECT q1.n, q1.r FROM s q1 WHERE q1.u <> 1 AND q1.r IS t1.r) FROM t t0, s t1	336:86b68d5b29e8456b
+q	BETWEEN, null	SELECT t0.id FROM t t0 WHERE ((t0.d, t0.x) BETWEEN ('b', t0.d) AND (t0.d, CAST(t0.x AS TEXT))) IS NULL	5:6213b8580e2fe40f
 q	IN (list), case	SELECT t0.id, CASE WHEN (t0.b, t0.c, t0.d) IN (('', 'a', NULL)) THEN 1 WHEN t0.id > 4 THEN 2 END FROM s t0	14:2763028f01bbc747
 q	IN (SELECT), not	SELECT t0.id FROM t t0 WHERE NOT (t0.i, coalesce(t0.i, NULL)) IN (SELECT q2.i, q2.i FROM s q2 WHERE q2.x >= t0.x)	6:736facf1ac8b7c29
 q	IS, value	SELECT t0.id, ('a ', t0.i) IS (t0.x, t0.i) FROM t t0	24:c9d92eab8a4a9f93
@@ -762,6 +767,7 @@ q	IS (SELECT), join	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON (t0.n, t0.r) IS (
 q	<>, case	SELECT t0.id, CASE WHEN (t0.r, t0.i) <> ((t0.r + 0), t0.i) THEN 1 WHEN t0.id > 4 THEN 2 END FROM t t0	24:cab34d6210435d7d
 q	BETWEEN, exists	SELECT t0.id FROM t t0 WHERE EXISTS (SELECT 1 FROM s t1 WHERE (t0.i, t0.x) BETWEEN (t1.x, +t1.b) AND (t1.i, NULL))	0:cbf29ce484222325
 q	>, case	SELECT t0.id, CASE WHEN (t0.i, t0.x) > (2, NULL) THEN 1 WHEN t0.id > 4 THEN 2 END FROM s t0	14:9c4bf9f028b01d3b
+q	IS NOT, case	SELECT t0.id, CASE WHEN (t0.x, t0.i, t0.r) IS NOT ('a ', t0.i, t0.c) THEN 1 WHEN t0.id > 4 THEN 2 END FROM t t0	24:04e3e57f608ad5a9
 q	<, where	SELECT t0.id FROM s t0 WHERE (t0.c, t0.i) < ('2', NULL)	5:16fbac4d24b6fb09
 q	NOT IN (SELECT), on and where	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON (t0.d, 0) < ('1', '2') WHERE ('2', 1.0) NOT IN (SELECT 7, q1.i FROM s q1 WHERE q1.n >= t1.n) AND t0.d = t1.d	4:44f9e271de12cb0b
 q	IN (SELECT), pairs	SELECT t0.id, t1.id, (t1.x, 2.0, t1.x) IN (SELECT q1.x, (q1.r COLLATE NOCASE), q1.x FROM s q1 ORDER BY q1.id LIMIT 0) FROM t t0, s t1	336:a8c01c8905857b0d
@@ -770,6 +776,7 @@ q	NOT IN (SELECT), or	SELECT t0.id FROM t t0 WHERE (NULL, (t0.r || '')) NOT IN (
 q	NOT IN (SELECT), value	SELECT t0.id, (t0.n, t0.u, 'b') NOT IN (SELECT q1.n, coalesce(q1.u, x''), q1.r FROM s q1) FROM s t0	14:e936452373b7c847
 q	IN (SELECT), exists	SELECT t0.id FROM t t0 WHERE NOT EXISTS (SELECT 1 FROM s t1 WHERE (x'61', t0.b) IN (SELECT q1.b, (q1.b COLLATE NOCASE) FROM s q1 WHERE q1.i = t0.i))	24:8370b17183c81c8f
 q	IS NOT, join	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON (t0.i, NULL, (t0.d || '')) IS NOT (7, 'a', t1.d)	336:db828c071857a065
+q	BETWEEN, where	SELECT t0.id FROM t t0 WHERE (t0.x, t0.b) BETWEEN (+t0.r, t0.b) AND (t0.c, t0.r)	3:fa1078319e5f6ef5
 q	NOT IN (list), and	SELECT t0.id FROM t t0 WHERE (t0.u, t0.b) NOT IN ((7.0, '7')) AND t0.id > 1	21:414ac462a95f066b
 q	NOT IN (SELECT), case	SELECT t0.id, CASE WHEN ((SELECT max(m1.x) FROM s m1), t0.i, t0.c) NOT IN (SELECT q2.x, q2.i, q2.c FROM s q2 UNION ALL SELECT '', NULL, '7') THEN 1 WHEN t0.id > 4 THEN 2 END FROM s t0	14:2763028f01bbc747
 q	NOT IN (SELECT), correlated	SELECT t0.id, (SELECT count(*) FROM s t1 WHERE ((t0.n COLLATE NOCASE), t0.x, NULL) NOT IN (SELECT q2.n, q2.x, '' FROM s q2 WHERE q2.c = 'a' ORDER BY q2.id LIMIT 1)) FROM t t0	24:46fd598b74e8f2c7
@@ -887,13 +894,16 @@ q	IN (SELECT), case	SELECT t0.id, CASE WHEN (t0.n, 'a ') IN (SELECT q1.n, q1.c F
 q	=, on and where	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON (+t0.d, t0.r) BETWEEN (t0.d, t0.x) AND (NULL, 1.0) WHERE ('a', -0.5) = (t1.x, 3) AND t0.c = t1.c	0:cbf29ce484222325
 q	BETWEEN, and	SELECT t0.id FROM s t0 WHERE (t0.u, t0.n) BETWEEN (CAST(t0.u AS INTEGER), 'A') AND (t0.u, '') AND t0.id > 5	1:07f89307b4ba0a57
 q	<, exists	SELECT t0.id FROM t t0 WHERE EXISTS (SELECT 1 FROM s t1 WHERE (t0.d, t0.x) < ('a ', t1.x))	17:6bcd60337991ce6f
+q	=, correlated	SELECT t0.id, (SELECT count(*) FROM s t1 WHERE (t1.d, t1.u, t1.u) = ('7', t1.d, t1.u)) FROM t t0	24:d363dc08c47dcb47
 q	>= (SELECT), join	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON (t0.u, t0.d) >= (SELECT q1.u, q1.d FROM s q1 WHERE q1.id = 2)	266:12877a8f7c19b5d3
 q	IS NOT, where	SELECT t0.id FROM t t0 WHERE (t0.c, (SELECT m1.x FROM s m1 WHERE m1.id = t0.id), CAST(t0.d AS TEXT)) IS NOT (t0.c, t0.x, t0.d)	20:26df33355174a828
 q	NOT BETWEEN, and	SELECT t0.id FROM t t0 WHERE (t0.i, t0.x) NOT BETWEEN (7, x'') AND (NULL, -1) AND t0.id > 2	15:414bcbd2d19dc3cf
+q	BETWEEN, exists	SELECT t0.id FROM t t0 WHERE NOT EXISTS (SELECT 1 FROM s t1 WHERE (t0.n, t0.r) BETWEEN (t1.u, t1.d) AND (t1.d, t1.r))	13:a01f628316fd8b5f
 q	<=, and	SELECT t0.id FROM t t0 WHERE (t0.d, t0.b, 'a ') <= ((SELECT max(m1.d) FROM s m1), x'', t0.x) AND t0.id > 2	15:fe88cce7cc1d6c86
 q	NOT IN (SELECT), value	SELECT t0.id, (t0.d, t0.x) NOT IN (SELECT q1.d, q1.x FROM s q1) FROM s t0	14:942c888c41d1f75d
 q	<=, null	SELECT t0.id FROM t t0 WHERE ((CAST(t0.n AS INTEGER), 1, '2') <= (t0.n, -1, t0.x)) IS NULL	0:cbf29ce484222325
 q	<>, correlated	SELECT t0.id, (SELECT count(*) FROM s t1 WHERE ((t1.d COLLATE BINARY), t0.d, coalesce(t1.r, 1.0)) <> ('a', '1.0', NULL)) FROM t t0	24:27cf89eabd000f65
+q	BETWEEN, null	SELECT t0.id FROM t t0 WHERE ((NULL, t0.u) BETWEEN (3, +t0.u) AND (t0.c, t0.c)) IS NULL	24:8370b17183c81c8f
 q	IN (SELECT), join	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON ('b', t1.c) IN (SELECT q1.x, q1.c FROM s q1 ORDER BY q1.id LIMIT 1)	0:cbf29ce484222325
 q	NOT BETWEEN, null	SELECT t0.id FROM s t0 WHERE ((t0.b, t0.r, 'B ') NOT BETWEEN (t0.b, t0.u, t0.n) AND (t0.b, t0.b, t0.n)) IS NULL	6:94ed7816f574e02a
 q	NOT IN (list), and	SELECT t0.id FROM s t0 WHERE (t0.n, t0.r) NOT IN ((NULL, 1.0), (1, 1), (NULL, NULL)) AND t0.id > 4	0:cbf29ce484222325
@@ -971,8 +981,10 @@ q	>=, exists	SELECT t0.id FROM t t0 WHERE NOT EXISTS (SELECT 1 FROM s t1 WHERE (
 q	IS, count	SELECT count(*), sum((+t0.u, t0.r, t0.d) IS (lower(t0.u), t0.r, '1.0')) FROM t t0	1:f5f7860b223d09db
 q	NOT IN (SELECT), count	SELECT count(*), sum((t0.i, '7', NULL) NOT IN (SELECT q1.i, q1.d, q1.i FROM s q1 WHERE q1.n = t0.n ORDER BY q1.id LIMIT 0)) FROM t t0	1:30b72feb2dc95cdb
 q	NOT IN (SELECT), where	SELECT t0.id FROM t t0 WHERE (t0.x, t0.i, t0.c) NOT IN (SELECT q1.x, q1.i, q1.c FROM s q1 WHERE q1.b IS t0.b)	20:54e70af38873f5cc
+q	=, join	SELECT t0.id, t1.id FROM s t0 JOIN t t1 ON (t1.c, 'A', t1.n) = (coalesce(t1.c, 'a '), 'a', t1.c)	0:cbf29ce484222325
 q	IS NOT, where	SELECT t0.id FROM t t0 WHERE (t0.n, t0.r) IS NOT (t0.n, 1)	20:3d8c432f493a762b
 q	IN (SELECT), value	SELECT t0.id, ((SELECT max(m1.i) FROM s m1), 2) IN (SELECT q2.i, q2.r FROM s q2 WHERE q2.i = t0.i) FROM t t0	24:d363dc08c47dcb47
+q	BETWEEN, on and where	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON (t0.x, t0.n) BETWEEN ('B ', t0.n) AND (t0.c, t0.n) WHERE (1.0, NULL, NULL) BETWEEN (t1.u, 7, t1.i) AND (2.0, (t1.r COLLATE BINARY), t1.r)	3:03aa5b0828e3822c
 q	NOT IN (SELECT), or	SELECT t0.id FROM t t0 WHERE (t0.d, t0.x) NOT IN (SELECT q1.d, q1.x FROM s q1 WHERE q1.d <> 'a ' ORDER BY q1.id LIMIT 3) OR t0.id < 3	17:9c808fddbc1fd5ae
 q	IN (SELECT), case	SELECT t0.id, CASE WHEN (t0.n, t0.i) IN (SELECT q1.n, q1.i FROM s q1) THEN 1 WHEN t0.id > 4 THEN 2 END FROM s t0	14:63c43b190bf12e3e
 q	IN (SELECT), join	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON (t0.x, t0.d, t0.b) IN (SELECT q1.x, q1.d, q1.b FROM s q1 UNION ALL SELECT NULL, 'B ', 1)	0:cbf29ce484222325
@@ -1004,25 +1016,13 @@ q	IN (SELECT), where	SELECT t0.id FROM t t0 WHERE (t0.u, t0.b) IN (SELECT q1.u, 
 q	BETWEEN, correlated	SELECT t0.id, (SELECT count(*) FROM s t1 WHERE (t0.u, x'62') BETWEEN (3, 'a') AND (NULL, '2')) FROM t t0	24:d363dc08c47dcb47
 q	=, pairs	SELECT t0.id, t1.id, (t1.n, t1.n) = (0, 'a') FROM t t0, s t1	336:a6fc5ae5903491a9
 q	> (SELECT), on and where	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON ('1.0', coalesce(t0.i, 3), 7.0) NOT IN (('A', 'a', NULL), (NULL, 'A', 1.5)) WHERE (t0.u, t0.b) > (SELECT q1.u, q1.b FROM s q1 WHERE q1.id = 9)	0:cbf29ce484222325
+q	IS NOT, correlated	SELECT t0.id, (SELECT count(*) FROM s t1 WHERE (t0.x, t0.b, (t0.u + 0)) IS NOT (t1.d, t1.b, (t1.u COLLATE NOCASE))) FROM t t0	24:46fd598b74e8f2c7
 q	NOT IN (SELECT), case	SELECT t0.id, CASE WHEN (t0.n, (t0.u + 0)) NOT IN (SELECT q2.n, q2.u FROM s q2 WHERE q2.c IS t0.c) THEN 1 WHEN t0.id > 4 THEN 2 END FROM t t0	24:d11d88a6a3a9dbd0
 q	NOT IN (SELECT), count	SELECT count(*), sum((t0.x, t0.i, t0.c) NOT IN (SELECT q1.x, lower(q1.i), q1.c FROM s q1 WHERE q1.i > 3)) FROM s t0	1:80f75155d98c2872
 q	=, case	SELECT t0.id, CASE WHEN (t0.x, t0.i, t0.c) = (t0.x, t0.i, t0.c) THEN 1 WHEN t0.id > 4 THEN 2 END FROM s t0	14:8a13193242c9fc74
 q	NOT IN (SELECT), or	SELECT t0.id FROM s t0 WHERE (t0.c, (t0.r COLLATE BINARY), (SELECT m2.d FROM s m2 WHERE m2.id = t0.id)) NOT IN (SELECT q3.c, q3.r, q3.d FROM s q3) OR t0.id < 3	2:45f7b11818964190
 q	NOT BETWEEN, where	SELECT t0.id FROM t t0 WHERE (t0.x, t0.i, t0.c) NOT BETWEEN ('2', lower(t0.i), (t0.c COLLATE NOCASE)) AND (t0.x, t0.r, coalesce(t0.c, 0))	12:614cd89e38d7834a
 q	IN (list), value	SELECT t0.id, (t0.x, t0.d) IN (('2', 2)) FROM t t0	24:c6a3cc1b8c3b6651
-q	<=, join	SELECT t0.id, t1.id FROM s t0 JOIN t t1 ON ((SELECT max(m1.u) FROM s m1), t0.b) <= (2.0, 'A') AND t0.x = t1.x	0:cbf29ce484222325
-q	NOT IN (SELECT), and	SELECT t0.id FROM s t0 WHERE ((t0.n + 0), t0.d) NOT IN (SELECT q2.n, q2.r FROM s q2 WHERE q2.r > -1) AND t0.id > 4	6:9cad6b82fc5f5a45
-q	NOT IN (SELECT), value	SELECT t0.id, (t0.u, t0.b) NOT IN (SELECT q1.u, q1.b FROM s q1 WHERE q1.x < t0.x) FROM s t0	14:3ab8f9026881bd21
-q	<=, pairs	SELECT t0.id, t1.id, (7.0, NULL) <= ('A', t0.r) FROM t t0, s t1	336:229c90d9d5a45787
-q	>, case	SELECT t0.id, CASE WHEN ((SELECT max(m1.i) FROM s m1), t0.x) > (NULL, 'B ') THEN 1 WHEN t0.id > 4 THEN 2 END FROM t t0	24:4759ac99a2f2fbfd
-q	NOT IN (SELECT), null	SELECT t0.id FROM t t0 WHERE (((t0.u || ''), 'a') NOT IN (SELECT q2.u, q2.b FROM s q2)) IS NULL	5:a58f769f2c39dbf8
-q	IN (SELECT), not	SELECT t0.id FROM t t0 WHERE NOT ((t0.c COLLATE BINARY), (SELECT m2.c FROM s m2 WHERE m2.id = t0.id), t0.u) IN (SELECT q3.b, q3.u, q3.u FROM t q3)	0:cbf29ce484222325
-q	=, where	SELECT t0.id FROM s t0 WHERE (NULL, t0.u) = ('1.0', t0.u)	0:cbf29ce484222325
-q	IN (SELECT), or	SELECT t0.id FROM t t0 WHERE (t0.i, t0.x) IN (SELECT q1.i, q1.x FROM s q1 ORDER BY q1.id LIMIT 1) OR t0.id < 7	6:2423f4459c7fd1a4
-q	NOT IN (SELECT), on and where	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON (t0.n, t0.r) < (CAST(t0.n AS INTEGER), t0.r) WHERE (t0.r, t0.d) NOT IN (SELECT (q1.r COLLATE NOCASE), q1.d FROM s q1 WHERE q1.i > 0)	14:b6a2e94a8976fe2b
-q	<=, left join	SELECT t0.id, t1.id FROM s t0 LEFT JOIN t t1 ON ((SELECT max(m1.x) FROM s m1), -1, t1.r) <= ('2', 3, 'B ') AND t0.x = t1.x	14:877bcdc307d6c3a9
-q	NOT IN (SELECT), value	SELECT t0.id, (t0.b, (t0.n COLLATE BINARY), t0.r) NOT IN (SELECT q2.b, q2.n, q2.r FROM s q2 WHERE q2.u IS t0.u) FROM t t0	24:fa96ca43a87b203b
-q	>=, exists	SELECT t0.id FROM t t0 WHERE NOT EXISTS (SELECT 1 FROM s t1 WHERE ((SELECT max(m1.d) FROM s m1), t0.u, 'a') >= (CAST(t1.d AS TEXT), t1.u, '2'))	0:cbf29ce484222325
 db	keyed
 sql	CREATE TABLE t(id INTEGER PRIMARY KEY, i INT, r REAL, x TEXT, n NUMERIC, b BLOB, u, c TEXT COLLATE NOCASE, d TEXT COLLATE RTRIM)
 sql	CREATE TABLE s(id INT, i INT, r REAL, x TEXT, n NUMERIC, b BLOB, u, c TEXT COLLATE NOCASE, d TEXT COLLATE RTRIM, PRIMARY KEY (x, i), UNIQUE (c, n)) WITHOUT ROWID
@@ -1040,6 +1040,7 @@ q	<=, left join	SELECT t0.id, t1.id FROM s t0 LEFT JOIN t t1 ON (t0.d, (SELECT m
 q	IN (list), join	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON (t1.x, t0.c, t1.r) IN ((1.5, 'B ', -0.5))	0:cbf29ce484222325
 q	IN (list), join	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON (NULL, 'b', 'a ') IN (('A', '7', 'a'), ('b', 1.0, '1.0'), ('b', 7, 'a'))	0:cbf29ce484222325
 q	NOT IN (SELECT), not	SELECT t0.id FROM t t0 WHERE NOT ('1', t0.i, lower(t0.d)) NOT IN (SELECT q2.d, q2.i, q2.u FROM s q2 UNION ALL SELECT 2.0, 3, NULL)	0:cbf29ce484222325
+q	BETWEEN, not	SELECT t0.id FROM t t0 WHERE NOT ((t0.i COLLATE NOCASE), t0.u, 0) BETWEEN (NULL, t0.d, t0.u) AND (CAST(t0.i AS TEXT), '7', t0.u)	3:07dd677e538c02ab
 q	NOT BETWEEN, where	SELECT t0.id FROM t t0 WHERE (t0.n, t0.r) NOT BETWEEN (7, 7) AND (-1, NULL)	21:53165d605f2ba5f1
 q	<>, or	SELECT t0.id FROM s t0 WHERE (t0.i, t0.x) <> (NULL, 'b') OR t0.id < 1	12:8a0c2fc4672b81e2
 q	NOT BETWEEN, where	SELECT t0.id FROM t t0 WHERE (t0.r, t0.i) NOT BETWEEN (-0.5, t0.i) AND (t0.r, t0.i)	1:07f88e07b4ba01d8
@@ -1091,6 +1092,7 @@ q	=, value	SELECT t0.id, (t0.c, t0.i) = (t0.c, (t0.i || '')) FROM s t0	12:9b6db0
 q	=, null	SELECT t0.id FROM t t0 WHERE ((t0.x, t0.i, t0.c) = (t0.x, t0.i, t0.r)) IS NULL	6:577e8ec067352275
 q	NOT IN (SELECT), count	SELECT count(*), sum(((t0.i COLLATE BINARY), 'B ') NOT IN (SELECT q2.i, lower(q2.b) FROM s q2 WHERE q2.n < t0.n ORDER BY q2.id LIMIT 1)) FROM s t0	1:40d75c87dece98f1
 q	NOT BETWEEN, where	SELECT t0.id FROM s t0 WHERE (t0.x, t0.i, t0.c) NOT BETWEEN (t0.x, t0.i, t0.c) AND (1, '2', t0.c)	8:f8bc752794c13fb2
+q	=, left join	SELECT t0.id, t1.id FROM t t0 LEFT JOIN s t1 ON (t0.d, t0.x) = (t1.d, t1.c)	24:a5b6afe1e058ed85
 q	<=, left join	SELECT t0.id, t1.id FROM t t0 LEFT JOIN s t1 ON (t0.n, t0.r) <= (t1.n, t1.r)	107:68e9810827369f76
 q	IN (SELECT), on and where	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON (NULL, t0.u) BETWEEN ((t0.x + 0), t0.u) AND (t0.x, t0.u) WHERE ('', 'B ', 7.0) IN (SELECT q1.n, q1.x, q1.r FROM t q1 WHERE q1.c = t1.c ORDER BY q1.id LIMIT 3)	0:cbf29ce484222325
 q	IS NOT, on and where	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON ('7', t0.n, t0.b) NOT IN (SELECT q1.c, q1.n, q1.b FROM t q1 WHERE q1.c < t0.c UNION ALL SELECT 'a', 'a ', NULL) WHERE (t0.u, t0.b) IS NOT ('2', 'A') AND t0.r = t1.r	19:cc1ae15c8cc98853
@@ -1187,6 +1189,7 @@ q	IN (list), where	SELECT t0.id FROM t t0 WHERE (t0.d, t0.x) IN ((x'61', 'a'))	0
 q	IS, left join	SELECT t0.id, t1.id FROM t t0 LEFT JOIN s t1 ON (t0.x, 0) IS (0, 0)	24:d9790ee11730f207
 q	NOT IN (SELECT), pairs	SELECT t0.id, t1.id, (CAST(t0.d AS TEXT), NULL) NOT IN (SELECT q2.d, q2.x FROM s q2 WHERE q2.b < t1.b UNION ALL SELECT 'b', NULL) FROM t t0, s t1	288:7eea34ff5b8f80f1
 q	BETWEEN, null	SELECT t0.id FROM s t0 WHERE ((t0.i, t0.u, NULL) BETWEEN (1, 'b', NULL) AND (NULL, 'a ', '7')) IS NULL	5:b616c351574a6cc8
+q	<>, where	SELECT t0.id FROM s t0 WHERE (t0.r, CAST(t0.i AS INTEGER), t0.n) <> ('A', t0.c, (t0.n COLLATE BINARY))	12:8a0c2fc4672b81e2
 q	IN (SELECT), exists	SELECT t0.id FROM t t0 WHERE NOT EXISTS (SELECT 1 FROM s t1 WHERE (t0.c, t0.i) IN (SELECT q1.c, q1.i FROM s q1 WHERE q1.u < 7.0 ORDER BY q1.id LIMIT 1))	24:8370b17183c81c8f
 q	NOT IN (SELECT), where	SELECT t0.id FROM t t0 WHERE (t0.c, t0.x) NOT IN (SELECT '', q1.x FROM s q1 WHERE q1.u = NULL AND q1.c IS t0.c)	24:8370b17183c81c8f
 q	NOT IN (SELECT), correlated	SELECT t0.id, (SELECT count(*) FROM s t1 WHERE (t0.n, NULL, (t0.c COLLATE NOCASE)) NOT IN (SELECT q2.n, (q2.b COLLATE BINARY), q2.x FROM t q2)) FROM t t0	24:c7e3e9b303cf2ad6
@@ -1208,6 +1211,7 @@ q	IN (SELECT), not	SELECT t0.id FROM t t0 WHERE NOT (t0.u, t0.b) IN (SELECT q1.u
 q	IN (SELECT), pairs	SELECT t0.id, t1.id, ((t0.r + 0), t0.i) IN (SELECT NULL, (q2.i COLLATE BINARY) FROM s q2 WHERE q2.n <> 1) FROM t t0, s t1	288:6924d27e8ad36d8b
 q	IN (SELECT), where	SELECT t0.id FROM t t0 WHERE (t0.n, t0.r) IN (SELECT q1.n, q1.r FROM s q1 WHERE q1.x <> 'a ' ORDER BY q1.id LIMIT 0)	0:cbf29ce484222325
 q	IS (SELECT), and	SELECT t0.id FROM t t0 WHERE (t0.c, t0.i) IS (SELECT q1.c, q1.i FROM s q1 WHERE q1.id = 10) AND t0.id > 1	0:cbf29ce484222325
+q	=, value	SELECT t0.id, (t0.u, t0.u) = (t0.c, t0.u) FROM t t0	24:63e2500a693b5dae
 q	IN (SELECT), count	SELECT count(*), sum(((t0.r || ''), t0.i) IN (SELECT q2.r, NULL FROM s q2 WHERE q2.n = t0.n)) FROM t t0	1:f5f78a0b223d10a7
 q	NOT IN (SELECT), value	SELECT t0.id, (NULL, 7) NOT IN (SELECT q1.u, q1.i FROM t q1 UNION ALL SELECT -1, NULL) FROM s t0	12:8e3a9cacf6fb7772
 q	=, join	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON (7, (t1.r || ''), t1.i) = (t1.c, t1.r, NULL)	0:cbf29ce484222325
@@ -1284,6 +1288,7 @@ q	NOT IN (list), on and where	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON (t0.c, 
 q	IS, exists	SELECT t0.id FROM t t0 WHERE EXISTS (SELECT 1 FROM s t1 WHERE (t0.n, 0) IS (NULL, 1.0))	0:cbf29ce484222325
 q	IN (list), case	SELECT t0.id, CASE WHEN (lower(t0.u), '2') IN ((NULL, x'62'), (NULL, NULL), (NULL, x'31')) THEN 1 WHEN t0.id > 4 THEN 2 END FROM t t0	24:4759ac99a2f2fbfd
 q	<=, where	SELECT t0.id FROM t t0 WHERE (x'61', CAST(t0.n AS INTEGER), lower(t0.c)) <= ('', 'A', NULL)	0:cbf29ce484222325
+q	<=, count	SELECT count(*), sum((t0.c, t0.n, t0.u) <= (t0.i, CAST(t0.c AS INTEGER), t0.u)) FROM s t0	1:1f6b28f102ddc0f9
 q	NOT IN (SELECT), left join	SELECT t0.id, t1.id FROM t t0 LEFT JOIN s t1 ON (t0.c, t0.i) NOT IN (SELECT q1.c, q1.i FROM t q1 ORDER BY q1.id LIMIT 1)	255:610c2b672543d7b5
 q	NOT IN (SELECT), count	SELECT count(*), sum((t0.d, t0.x) NOT IN (SELECT q1.d, q1.x FROM s q1)) FROM t t0	1:30aca0eb2dc01559
 q	>=, where	SELECT t0.id FROM t t0 WHERE (t0.r, 1) >= ('a', 2)	0:cbf29ce484222325
@@ -1295,12 +1300,14 @@ q	BETWEEN, not	SELECT t0.id FROM t t0 WHERE NOT (t0.r, t0.i) BETWEEN (t0.r, 2) A
 q	IN (SELECT), where	SELECT t0.id FROM t t0 WHERE (x'62', t0.x) IN (SELECT q1.i, q1.x FROM t q1)	0:cbf29ce484222325
 q	NOT IN (list), on and where	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON (t0.i, t0.x) <> (t0.i, lower(t0.x)) WHERE (t0.d, t0.x) NOT IN (('7', 'a'), (NULL, 1.0))	60:dce1a6f8c7927c52
 q	IN (SELECT), count	SELECT count(*), sum((+t0.d, lower(t0.n), CAST(t0.r AS TEXT)) IN (SELECT q4.d, q4.n, q4.r FROM s q4 WHERE q4.i <> 2 UNION ALL SELECT 'a', '7', -0.5)) FROM t t0	1:f5f78a0b223d10a7
+q	IS NOT, on and where	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON (t0.i, (t0.x COLLATE NOCASE), NULL) NOT IN ((NULL, 'A', 3), (NULL, '', 1.5), (NULL, NULL, NULL)) WHERE (t0.i, t0.c, t0.b) IS NOT (t1.c, t1.b, t1.x)	0:cbf29ce484222325
 q	IN (SELECT), where	SELECT t0.id FROM t t0 WHERE (t0.n, t0.i) IN (SELECT q1.n, q1.i FROM s q1 ORDER BY q1.id LIMIT 0)	0:cbf29ce484222325
 q	IN (SELECT), left join	SELECT t0.id, t1.id FROM t t0 LEFT JOIN s t1 ON (t0.d, t0.x) IN (SELECT q1.d, (q1.x COLLATE NOCASE) FROM s q1 ORDER BY q1.id LIMIT 0)	24:d9790ee11730f207
 q	=, value	SELECT t0.id, (x'', t0.x, t0.i) = (t0.b, +t0.x, 3) FROM t t0	24:f11b91e567da13bb
 q	IS, on and where	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON (t0.u, t0.b) NOT BETWEEN (t0.u, (t0.d COLLATE BINARY)) AND (t0.u, (t0.b COLLATE NOCASE)) WHERE (t0.i, t0.x) IS (7, 3)	0:cbf29ce484222325
 q	=, where	SELECT t0.id FROM t t0 WHERE (t0.i, t0.x) = (2, t0.x)	3:da8d4256efb25693
 q	NOT IN (list), join	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON (t0.c, t0.i) NOT IN ((x'', 1), ('', NULL))	216:8cda9cd694e1c0d9
+q	<>, value	SELECT t0.id, (t0.i, t0.i) <> (t0.c, t0.u) FROM s t0	12:5e8150ae5495d7d2
 q	IN (SELECT), where	SELECT t0.id FROM t t0 WHERE (t0.n, coalesce(t0.i, 2), (t0.u || '')) IN (SELECT q3.n, 7, q3.u FROM s q3)	0:cbf29ce484222325
 q	BETWEEN, null	SELECT t0.id FROM t t0 WHERE ((t0.i, t0.x) BETWEEN (NULL, '7') AND (3, '7')) IS NULL	20:a3dec5a776e65dfc
 q	IN (SELECT), value	SELECT t0.id, (1, x'62') IN (SELECT q1.x, q1.d FROM t q1) FROM s t0	12:27a6f8d4a80f2c32
@@ -1327,6 +1334,7 @@ q	IN (list), and	SELECT t0.id FROM t t0 WHERE (t0.i, t0.i) IN (('a', 1), (2, 7))
 q	NOT IN (SELECT), correlated	SELECT t0.id, (SELECT count(*) FROM s t1 WHERE (t0.c, t0.i) NOT IN (SELECT q1.c, q1.i FROM t q1 WHERE q1.u > x'62' ORDER BY q1.id LIMIT 3)) FROM t t0	24:56304c54e7f9d8d3
 q	NOT IN (SELECT), value	SELECT t0.id, (t0.i, CAST(t0.n AS INTEGER), (t0.i + 0)) NOT IN (SELECT q3.i, q3.n, q3.i FROM s q3 WHERE q3.c IS t0.c) FROM t t0	24:ff4638ace0ac1f4b
 q	NOT IN (SELECT), pairs	SELECT t0.id, t1.id, (NULL, t1.n) NOT IN (SELECT q1.u, q1.n FROM t q1 WHERE q1.b >= t0.b ORDER BY q1.id LIMIT 1) FROM t t0, s t1	288:cda0a844d8c1163d
+q	IS, exists	SELECT t0.id FROM t t0 WHERE NOT EXISTS (SELECT 1 FROM s t1 WHERE (t1.u, 'A', t0.n) IS (t1.u, CAST(t1.r AS TEXT), t1.c))	24:8370b17183c81c8f
 q	IN (SELECT), on and where	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON (t0.x, (t0.c || ''), t0.r) IN (SELECT q4.x, q4.c, q4.r FROM t q4 ORDER BY q4.id LIMIT 0) WHERE (t0.r, t0.i) IN (SELECT +q1.r, q1.i FROM s q1) AND t0.n = t1.n	0:cbf29ce484222325
 q	IN (SELECT), correlated	SELECT t0.id, (SELECT count(*) FROM s t1 WHERE (t0.r, t0.i) IN (SELECT q1.r, q1.i FROM s q1 WHERE q1.u > 7 UNION ALL SELECT -1, 2)) FROM t t0	24:d363dc08c47dcb47
 q	BETWEEN, exists	SELECT t0.id FROM t t0 WHERE EXISTS (SELECT 1 FROM s t1 WHERE (t1.i, t1.c, t1.i) BETWEEN (t1.b, t1.c, t1.i) AND (t1.b, t1.c, t1.r))	0:cbf29ce484222325
@@ -1408,6 +1416,7 @@ q	NOT IN (SELECT), value	SELECT t0.id, ((t0.d || ''), CAST(t0.x AS TEXT)) NOT IN
 q	IN (SELECT), and	SELECT t0.id FROM t t0 WHERE (t0.i, t0.x) IN (SELECT q1.i, q1.x FROM s q1) AND t0.id > 7	1:07f88e07b4ba01d8
 q	<=, null	SELECT t0.id FROM s t0 WHERE ((coalesce(t0.d, '1'), t0.x) <= ('', t0.x)) IS NULL	0:cbf29ce484222325
 q	IN (SELECT), on and where	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON (t0.x, t0.i, t0.c) BETWEEN (t0.x, t0.i, 'B ') AND (t0.x, (SELECT max(m3.i) FROM s m3), CAST(t0.c AS INTEGER)) WHERE (t0.d, (t0.x + 0)) IN (SELECT q2.d, q2.x FROM s q2 WHERE q2.b = 'b' AND q2.n IS t1.n)	0:cbf29ce484222325
+q	NOT BETWEEN, where	SELECT t0.id FROM s t0 WHERE (t0.i, t0.x) NOT BETWEEN (+t0.i, t0.x) AND (t0.d, t0.x)	2:27a0d8f107632925
 q	NOT IN (SELECT), case	SELECT t0.id, CASE WHEN (t0.r, '1.0') NOT IN (SELECT q1.d, q1.x FROM s q1) THEN 1 WHEN t0.id > 4 THEN 2 END FROM t t0	24:74e8abc73c1bf780
 q	NOT IN (list), pairs	SELECT t0.id, t1.id, (t0.x, t0.i, t0.c) NOT IN (('', -0.5, '7'), (NULL, -1, '7'), ('b', '2', '2')) FROM t t0, s t1	288:0ac26879a6944cbf
 q	IS NOT, or	SELECT t0.id FROM t t0 WHERE (t0.i, t0.r, t0.d) IS NOT (t0.i, NULL, '2') OR t0.id < 7	24:8370b17183c81c8f
@@ -1470,6 +1479,7 @@ q	NOT IN (list), value	SELECT t0.id, (t0.c, t0.i) NOT IN (('a', 3), ('1', 7), (N
 q	IN (list), count	SELECT count(*), sum(((t0.x + 0), t0.b) IN ((t0.x, '1'))) FROM t t0	1:f5f78a0b223d10a7
 q	=, correlated	SELECT t0.id, (SELECT count(*) FROM s t1 WHERE (t0.x, lower(t0.i)) = (CAST(t1.x AS TEXT), NULL)) FROM t t0	24:d363dc08c47dcb47
 q	IN (SELECT), and	SELECT t0.id FROM s t0 WHERE (NULL, (t0.i COLLATE BINARY)) IN (SELECT q2.x, q2.i FROM s q2 WHERE q2.n < 1) AND t0.id > 6	0:cbf29ce484222325
+q	IS NOT, left join	SELECT t0.id, t1.id FROM s t0 LEFT JOIN t t1 ON (t0.b, (t0.d COLLATE NOCASE)) IS NOT (t1.c, t1.i)	288:ae8d9fd63b8d77dd
 q	IN (SELECT), and	SELECT t0.id FROM t t0 WHERE (t0.x, t0.i, '2') IN (SELECT q1.x, q1.i, '1.0' FROM s q1 WHERE q1.c < t0.c) AND t0.id > 6	0:cbf29ce484222325
 q	IS NOT, exists	SELECT t0.id FROM t t0 WHERE EXISTS (SELECT 1 FROM s t1 WHERE (t0.x, t0.i, t0.c) IS NOT ('1', t1.r, t1.c))	24:8370b17183c81c8f
 q	IN (SELECT), or	SELECT t0.id FROM s t0 WHERE (t0.n, t0.r) IN (SELECT '1', q1.r FROM s q1 WHERE q1.u = t0.u) OR t0.id < 4	3:dbd536d5af6ff2c7
@@ -1518,15 +1528,5 @@ q	NOT IN (SELECT), and	SELECT t0.id FROM s t0 WHERE (t0.d, t0.x) NOT IN (SELECT 
 q	IS, join	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON (NULL, '') IS ((t1.d + 0), t1.n)	0:cbf29ce484222325
 q	BETWEEN, and	SELECT t0.id FROM t t0 WHERE (t0.r, t0.i) BETWEEN (t0.r, 0) AND (2.0, t0.i) AND t0.id > 4	13:0bbbb96deca3aba9
 q	IN (SELECT), case	SELECT t0.id, CASE WHEN (t0.x, t0.i, t0.c) IN (SELECT q1.x, q1.i, q1.c FROM s q1 UNION ALL SELECT 'a ', 0, '1.0') THEN 1 WHEN t0.id > 4 THEN 2 END FROM t t0	24:4759ac99a2f2fbfd
+q	IS, pairs	SELECT t0.id, t1.id, (t1.i, t1.x) IS (t0.c, CAST(t0.x AS INTEGER)) FROM t t0, s t1	288:7986b1f1f91734fc
 q	=, join	SELECT t0.id, t1.id FROM t t0 JOIN s t1 ON (t0.n, t0.r) = (t1.n, +t1.r)	1:eb7248f0e56dcc5d
-q	=, value	SELECT t0.id, (7, t0.x) = ((SELECT max(m1.d) FROM s m1), t0.x) FROM s t0	12:27a6f8d4a80f2c32
-q	IN (SELECT), join	SELECT t0.id, t1.id FROM s t0 JOIN t t1 ON (x'62', t0.r, t0.i) IN (SELECT q1.b, q1.r, q1.i FROM s q1 WHERE q1.u >= t0.u) AND t0.b = t1.b	1:eb723ef0e56dbb5f
-q	IS NOT, null	SELECT t0.id FROM t t0 WHERE (((t0.u COLLATE BINARY), t0.b) IS NOT (t0.u, t0.b)) IS NULL	0:cbf29ce484222325
-q	NOT IN (SELECT), null	SELECT t0.id FROM t t0 WHERE ((lower(t0.i), t0.n) NOT IN (SELECT q2.i, q2.c FROM s q2 ORDER BY q2.id LIMIT 1)) IS NULL	7:c5e99b7e9cedb930
-q	IN (list), where	SELECT t0.id FROM s t0 WHERE (t0.d, t0.x) IN (('b', '1.0'), ('A', x''), ('7', 'A'))	0:cbf29ce484222325
-q	<=, correlated	SELECT t0.id, (SELECT count(*) FROM s t1 WHERE (t0.n, t0.x, (SELECT m1.n FROM s m1 WHERE m1.id = t0.id)) <= (-1, CAST(t1.x AS TEXT), (SELECT m3.n FROM s m3 WHERE m3.id = t1.id))) FROM t t0	24:20a106d5850f25b3
-q	IN (SELECT), not	SELECT t0.id FROM t t0 WHERE NOT (7, CAST(t0.b AS TEXT)) IN (SELECT q2.u, q2.b FROM t q2 WHERE q2.u >= t0.u)	21:e1639462a8d79b8d
-q	NOT IN (SELECT), not	SELECT t0.id FROM t t0 WHERE NOT (CAST(t0.i AS TEXT), t0.x) NOT IN (SELECT q2.i, q2.x FROM s q2 UNION ALL SELECT -1, NULL)	3:46883ec51e1c6456
-q	IS, or	SELECT t0.id FROM s t0 WHERE (t0.x, x'31', t0.c) IS ('7', CAST(t0.i AS INTEGER), t0.c) OR t0.id < 5	4:25955ba942d3be39
-q	<=, correlated	SELECT t0.id, (SELECT count(*) FROM s t1 WHERE (t0.d, t0.n) <= ('a ', '7')) FROM t t0	24:e0a9c19ea6c7366a
-q	NOT IN (list), or	SELECT t0.id FROM t t0 WHERE (t0.u, t0.n, t0.b) NOT IN (('B ', -1, 'b'), ('A', '1.0', 7), ('7', 7.0, x'')) OR t0.id < 3	24:8370b17183c81c8f

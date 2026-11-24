@@ -29,17 +29,15 @@ INDEXES = ["i, x", "x, i, c", "c, i", "n, r", "u, b", "d, x", "r DESC, i"]
 # The forms Amphora doesn't answer as SQLite yet, each a cause of its own
 # (bench/records/2026-11-24-adacachy2-perf-expr-c15.md): none is in the fixture until it does.
 LEFT_OUT = {
-    "between as a value": "refused: insufficient registers (the oracles' finding CM)",
-    "collation": "a BINARY column before one of another collation, which compares by the other's",
+    "between as a value": "refused: insufficient registers (the oracles' finding CM, lane C11's)",
     "row subquery": "a field beside a row subquery's, which loses the subquery's affinity and collation",
     "list rows": "a list of rows, not all literals: SQLite compares each by the affinity of one of them",
     "list subquery": "a scalar subquery in an IN subquery's columns, which loses its affinity",
-    "two tables": "a range of a row of two tables' columns in a join (the oracles' finding DB)",
+    "two tables": "a range of a row of two tables' columns in a join (the oracles' finding DB, lane C11's)",
 }
 
-# A field of a row: its SQL, the column it is (under + or CAST too), whether it has its own COLLATE, and
-# whether it is a literal.
-Field = collections.namedtuple("Field", "sql column collate literal", defaults=(None, False, False))
+# A field of a row: its SQL, the column it is (under + or CAST too), and whether it is a literal.
+Field = collections.namedtuple("Field", "sql column literal", defaults=(None, False))
 
 
 def fill(rng, name, rows):
@@ -96,9 +94,8 @@ class Draw:
         self.n += 1
         m = f"m{self.n}"
         return rng.choice([
-            Field(f"+{at}", column), Field(f"({at} COLLATE NOCASE)", collate=True),
-            Field(f"({at} COLLATE BINARY)", collate=True), Field(f"CAST({at} AS TEXT)", column),
-            Field(f"CAST({at} AS INTEGER)", column), Field(f"lower({at})"),
+            Field(f"+{at}", column), Field(f"({at} COLLATE NOCASE)"), Field(f"({at} COLLATE BINARY)"),
+            Field(f"CAST({at} AS TEXT)", column), Field(f"CAST({at} AS INTEGER)", column), Field(f"lower({at})"),
             Field(f"coalesce({at}, {self.literal(column)})"), Field(f"({at} || '')"), Field(f"({at} + 0)"),
             Field(f"(SELECT max({m}.{column}) FROM s {m})"),
             Field(f"(SELECT {m}.{column} FROM s {m} WHERE {m}.id = {alias}.id)"),
@@ -119,12 +116,6 @@ class Draw:
         if len(aliases) > 1 and rng.random() < 0.6:
             aliases = [rng.choice(aliases)]
         return [self.field(column if rng.random() < 0.85 else rng.choice(list(COLUMNS)), aliases) for column in columns]
-
-    def collations(self, left, right):
-        """Notes a field of `left` that is a BINARY column beside one of `right` of another collation."""
-        for one, other in zip(left, right):
-            if one.column in set(COLUMNS) - {"c", "d"} and other.column in {"c", "d"} and not (one.collate or other.collate):
-                self.forms.add("collation")
 
     def listed(self, columns, aliases, not_):
         """`(...) [NOT] IN (SELECT ...)`: the list's rows of s or t, all or some, correlated or not."""
@@ -173,22 +164,16 @@ class Draw:
                                           f"WHERE {q}.id = {rng.randrange(1, 16)})")
             if spans and op in ("<", "<=", ">", ">="):
                 self.forms.add("two tables")
-            other = self.row(columns, right)
-            self.collations(left, other)
-            return op, f"({written(left)}) {op} ({written(other)})"
+            return op, f"({written(left)}) {op} ({written(self.row(columns, right))})"
         if kind < 0.50:
             not_ = rng.choice(["", "", "NOT "])
             low, high = self.row(columns, right), self.row(columns, right)
-            self.collations(left, low)
-            self.collations(left, high)
             if spans:
                 self.forms.add("two tables")
             return f"{not_}BETWEEN", f"({written(left)}) {not_}BETWEEN ({written(low)}) AND ({written(high)})"
         not_ = rng.choice(["", "NOT "])
         if kind < 0.64:
             rows = [self.row(columns, right if rng.random() < 0.4 else []) for _ in range(rng.choice([1, 2, 3]))]
-            for row in rows:
-                self.collations(left, row)
             if len(rows) > 1 and not all(field.literal for row in rows for field in row):
                 self.forms.add("list rows")
             return f"{not_}IN (list)", f"({written(left)}) {not_}IN ({', '.join(f'({written(row)})' for row in rows)})"
