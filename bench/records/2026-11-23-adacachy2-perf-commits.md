@@ -1851,3 +1851,94 @@ arm order alternated, load 24 to 37 on 32 cores):
     # macOS runs: kiln run with needs macos/arm64,cpus=8,mem=24g, sync true from the lane's clones
     bash bench/records/2026-11-23-adacachy2-perf-commits-v16/v16.sh <red> <fix> 0 <out> 8       # builds, focused tests
     bash bench/records/2026-11-23-adacachy2-perf-commits-v16/ladder16.sh <release amphora-bench> <out> 3
+
+# Lane V17 (commits) on adacachy2: lane V16's fix on main; its one-round failure is main's own; the ladder on main (2026-11-24, 03:52Z to 04:53Z)
+
+Ada's goal is replicated commits about 10x faster than rqlite and dqlite, with no write refused under load. This
+lane's deliverable: lane V16's fix (a follower's close driven at once, aedd6cef and b9dd342b) merged with main,
+checked and pushed; the test it failed once in three suite rounds (r73) run alone as many times on main as on the
+merge; V16's ladder at 32 and 128 spread writers, both classes, on the landed tree.
+
+## Losses first
+
+LADDER_LOSS
+1. **The one-round failure is main's own, and it is not traced.** `a_local_read_holds_off_the_logs_restart_and_one_after_waits_for_it`
+   fails alone 5 times in 16 on main fac69083 and 5 times in 16 on the merge 1e07a639 (r188), each at its outer
+   `read_local`'s `unwrap` with `Timeout` after the read's 60 s (`HANG_READ`). The brief said to trace and fix it
+   only if the fix alone failed it, so it was neither traced nor fixed. The only wait in `read_local` that ends in
+   `Timeout` is `Local::with`'s loop for a reader (read from the code), so the read waited there its whole 60 s;
+   whether for a log restart's hold (`ledger.restarting`) or for a charge is not traced.
+2. **The alone runs compared 1e07a639 with fac69083, not the landed tree with its main.** Main moved twice inside
+   crates/ before the push (lanes T19, R10 in crates/engine; lanes D4 and P20 in crates/amphora, replicated.rs
+   among them), and the alone runs were not repeated on c39adf56.
+3. **Two landings were checked, passed and not pushed:** 1e07a639 (with main fac69083, r188) and 73004633 (with main
+   c67455f6, r240). Main moved inside crates/ before each push; the third, c39adf56 (with main 9ed5b097, r263), is on
+   main since 04:19:57Z.
+4. **Most runs had less room than RULES 6 names:** adacachy2 had 1 to 7 of 32 cores idle, at load 44 to 78; cpus=8
+   was refused at 03:56Z, cpus=4 and cpus=2 at 04:10Z, cpus=4 at 04:16Z and 04:17Z. r263 and r268 ran at cpus=2.
+5. **I stopped r188 at 04:10:15Z**, after its alone section: its ladder section would have built 1e07a639, no longer
+   the tree to land. I stopped r237 (cpus=1) seconds after its start at 04:11:49Z, when 7 cores came idle, and asked again
+   at cpus=4 (r240).
+
+## Runs
+
+All on adacachy2 (00aad8daff2fa3c9daa65d53c425d450), sync false, from the GitHub clone ~/.cache/amphora-perf/commits-remote,
+CARGO_TARGET_DIR=~/.cache/amphora-perf-target/commits, CARGO_INCREMENTAL=0, CARGO_BUILD_JOBS = the needs' cpus.
+
+| run | needs, load, time | tree | result |
+|---|---|---|---|
+| r188 | cpus=4; load 45 to 67 on 32 cores, CPU pressure avg10 13 to 40, I/O 4 to 13; 03:56Z to 04:10Z | 1e07a639, V16's branch with main fac69083 | lib tests built in 71 s; focused: 18 passed; clippy exit 0; check-production exit 0, the engine's ratchet holds (10,903) |
+| r188 | | fac69083, main without the fix | lib tests built in 23 s |
+| r188 | | both, the test alone | 16 pairs from 03:59:39Z, the arm order alternated: fac69083 11 passed, 5 failed; 1e07a639 11 passed, 5 failed |
+| r240 | cpus=4; load 65 to 78; 04:12Z to 04:16Z | 73004633, with main c67455f6 (lane T19) | built in 102 s; focused: 18 passed; clippy 0; check-production 0 (10,903). Main then moved in crates/ |
+| r263 | cpus=2; load 44 to 52; 04:16:45Z to 04:19:45Z | c39adf56, with main 9ed5b097 (lanes D4, P20, R10) | built in 78 s; focused: 18 passed; clippy 0; check-production 0 (10,903); pushed to main at 04:19:57Z |
+| r268 | cpus=2; load 37 to 46, CPU pressure avg10 18, I/O 9 to 11; 04:17:12Z to 04:23:26Z | c39adf56 (main) | the release bench built in 237 s; V16's ladder, 3 rounds: no refusal in 12 runs; deadline misses in 3 of the 6 runs at 128 writers (below) |
+
+clippy re-checked amphora-engine in each run (its log shows "Compiling amphora-engine"), and `cargo fmt --all
+--check` passed on each merge before its run.
+
+## The test alone (r188)
+
+| pair | 2 | 4 | 5 | 10 | 13 | 14 | 15 | 16 |
+|---|---|---|---|---|---|---|---|---|
+| fac69083 (main) | | failed | failed | | failed | | failed | failed |
+| 1e07a639 (the merge) | failed | | | failed | failed | failed | | failed |
+
+Every other run passed. Passing runs took 1.0 to 2.0 s (pairs 1 and 2); each failure took 60.36 to 61.0 s, and
+each said the same (the merge's pair 2, from its saved log; main's at 16879:14, the same `unwrap`):
+
+    panicked at crates/amphora/src/database/replicated.rs:16884:14:
+    called `Result::unwrap()` on an `Err` value: Timeout
+
+## The ladder on main (r268)
+
+V16's `ladder16.sh` (V13's `cell13.py`): Amphora alone, V12's flags (`--batch 1 --text-bytes 600 --deadline-s 10
+--relay-records 128 --warmup-s 1 --seconds 5`, `--spanning 2` for the replicated class), 32 and 128 spread writers,
+both classes, 3 rounds, cell order reversed in round 2. Refusals are the driver's count by node; node 3 led every
+run but round 2's persisted 128 (node 2).
+
+| class | writers | refusals by node, r1; r2; r3 | commits/s per round | p50 ms per round | misses per round |
+|---|---|---|---|---|---|
+| persisted | 32 | 0 0 0; 0 0 0; 0 0 0 | 20.4, 17.4, 20.6 | 1,458, 1,901, 1,769 | 0, 0, 0 |
+| persisted | 128 | 0 0 0; 0 0 0; 0 0 0 | 23.0, 17.4, 10.8 | 6,095, 7,340, 7,733 | 0, 0, 9 |
+| replicated | 32 | 0 0 0; 0 0 0; 0 0 0 | 22.0, 12.4, 19.8 | 1,229, 1,376, 1,720 | 0, 0, 0 |
+| replicated | 128 | 0 0 0; 0 0 0; 0 0 0 | 19.2, 20.6, 5.2 | 4,456, 5,374, 9,699 | 0, 3, 16 |
+
+No write was refused in 12 runs, as in V14's r1987. But the rates are 5.2 to 23.0 commits a second against
+r1987's 37.2 to 60.8, the p50s at 128 writers 4,456 to 9,699 ms against its 1,589 to 3,146, and 28 writes missed
+their 10 s deadline where V14's and V13's ladders had none. The driver's last lines in round 2's replicated runs:
+`node 1 stop: node 1 closed the connection`. This run had cpus=2 of room at load 37 to 46; r1987 had cpus=4 at load
+39 to 77, on main as of 01:35Z.
+
+AB_SECTION
+
+## Commands
+
+    bash bench/records/2026-11-23-adacachy2-perf-commits-v17/v17.sh <merge> <main> <window s> <ladder rounds> <out> <threads> [parts]
+    # r188: 1e07a639 fac69083 600 3 <out> 4 (parts 1 and 2; stopped before part 3)
+    # r240: 73004633 c67455f6 0 3 <out> 4 1;  r263: c39adf56 9ed5b097 0 3 <out> 2 1;  r268: c39adf56 9ed5b097 0 3 <out> 2 3
+    # part 1: cargo test -p amphora --lib --locked --no-run; the binary with --test-threads=<threads> v15_a_write_its_deadline
+    #   database::slot:: v14_a_slow a_slot_holder_whose_write_fails; cargo clippy -p amphora --all-targets --locked -- -D warnings;
+    #   bash scripts/check-production.sh
+    # part 2: each arm's binary --exact database::replicated::tests::a_local_read_holds_off_the_logs_restart_and_one_after_waits_for_it
+    # part 3: (cd bench && cargo build --release); ladder16.sh <that amphora-bench> <out>/ladder <rounds>
