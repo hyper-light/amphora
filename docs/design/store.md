@@ -1897,7 +1897,7 @@ mixed log than on the page-a-frame log of the same binary (`AMPHORA_PAGE_LOG=1`)
 of 3; a profile of the writer still showing the registry's publishing or the commit's pages found
 per record; a row read back other than as committed (the tests above).
 
-## 40. A page read finds its frame and the log's header without the shared locks (prototype, behind a switch)
+## 40. A page read finds its frame and the log's header without the shared locks
 
 G3 step 2 (kiln plan "G3 Point reads", step 2; docs/research/read-path.md fix 1(b)). Every page read
 took the read side of the `RwLock` over the log's shared state, then the frame index's lock
@@ -1905,10 +1905,8 @@ took the read side of the `RwLock` over the log's shared state, then the frame i
 hottest leaves: `find_frame` 26.9%, `wal_header` 23.4%, `RwLock::lock_shared_slow` 13.2%
 (bench/records/2026-10-23-adacachy-read-path.md).
 
-The prototype is `crates/engine/storage/log_index.rs`. Its switch is `LogReadIndex`:
-`AMPHORA_LOG_READ_INDEX` = `locked` (today's path, the default), `filtered`, `published` or
-`optimistic`, or `LogReadIndex::set_process_default`. Each connection holds the log's `ReadIndex`.
-The `ReadIndex` is never replaced, so reaching it takes no lock.
+The code is `crates/engine/storage/log_index.rs`. Each connection holds the log's `ReadIndex`. The
+`ReadIndex` is never replaced, so reaching it takes no lock.
 
 - **The header** is copied, all eight words, under a sequence number (a seqlock) each time its
   guard lets the lock go. A reader reads the copy and checks that the sequence didn't move. Only
@@ -1918,10 +1916,7 @@ The `ReadIndex` is never replaced, so reaching it takes no lock.
   reports a page as held when no frame holds it, except frames cut since the bitmap was built. It
   has no false-positive rate to choose, unlike a Bloom filter. The empty log (`max_frame <
   min_frame`) already skipped the index.
-- **Way (a), `published`**: the whole index is copied and published through an `ArcSwap`. A reader
-  whose snapshot reaches past the copy publishes a new one. Each new copy costs O(pages in the log).
-  While another reader publishes, it reads under the lock. A read-only workload publishes once.
-- **Way (b), `optimistic`**: a table of each page's latest frame, in shards. Each shard has its own
+- **A page the log holds** is answered from a table of each page's latest frame, in shards. Each shard has its own
   version, after LeanStore's optimistic latches (Leis et al., ICDE 2018): read the version, read
   the slot, check the version. There is one shard for each thread that can run at once
   (`available_parallelism`, the reader count where the process runs). There are twice as many slots
@@ -1937,14 +1932,33 @@ The `ReadIndex` is never replaced, so reaching it takes no lock.
 - Not taken: the multi-process backend (`ShmWalCoordination`). Its local index is filled from other
   processes' frames, so its fallback reads under the locks.
 
-Tests: `storage::wal::tests::g3_2_*` (the model, and readers beside a writer) and
-`crates/engine/tests/log_read_index.rs` (a crash at every write of a checkpoint and of a log
-restart). The measurements are the coordinator's: the 32-client profiles, the suite at 10M rows
-and `bench/prof_parts.py`'s shares, with each way switched on. One way is kept and the others are
-removed, as the numbers favour. Falsified, as read-path.md has it, if with the log empty after the
-settle `point_pk`'s instructions per statement at one client fall by less than 15%, or if
-`table_count` at 32 clients rises less than 3x. The step's own bars: the log's and locks' share of
-point reads at 32 clients is at most 5%, and `point_pk` at 32 clients is at least 4x one client.
+**The way kept, by measurement.** Four ways were built behind a switch (`AMPHORA_LOG_READ_INDEX`) and
+measured on one binary each time, the ways alternated: the index read under its lock (`locked`, the
+old path); the bitmap in front of that (`filtered`); a read-only copy of the whole index, published
+per generation, which a reader whose snapshot passed it copied again under the lock while the
+others read under the lock (`published`); and the sharded table (`optimistic`). The table is kept.
+The switch and the other three are deleted.
+
+- The suite's point reads (lane Q4, bench/records/2026-11-23-adacachy2-perf-reads-q4.md): at 32
+  and 128 clients `find_frame`'s lock took 3.4-7.2% of the CPU samples under `locked`, 0.0% under the
+  other three, with no loss at 1 client. The three couldn't be told apart: the suite's settle
+  truncates the log, so the bitmap answers nearly every read.
+- K0's mixed phase (lane Q5, bench/records/2026-11-24-adacachy2-perf-reads-q5.md): N writers commit
+  events durably while N readers read sessions' latest pages, so the log holds the pages read and
+  every commit moves the snapshot on. `find_frame`'s share of the CPU samples, two rounds each:
+  1 client `locked` 8.8/9.4%, `filtered` 9.0/9.2%, `published` 7.7/10.9%, `optimistic` 5.8/5.5%;
+  32 clients 14.0/17.9%, 15.4/18.4%, 14.7/15.6%, 0.9/0.9%; 128 clients 16.3/24.2%, 20.7/28.7%,
+  33.6/29.6%, 1.9/1.9%. The lookup's lock alone took 12.5-24.4% under the first three at 32 and
+  128 clients, 0.1-0.2% under the table. `filtered` sends every page the log holds to the lock,
+  and a reader beside writers reads those. `published` copies the index once for each commit a
+  reader sees, under the lock: at 128 clients it cost the most of the four.
+
+Tests: `storage::wal::tests::g3_2_*` (the model against the index read under its lock, and readers
+beside a writer) and `crates/engine/tests/log_read_index.rs` (a crash at every write of a checkpoint
+and of a log restart). Falsified, as read-path.md has it, if with the log empty after the settle
+`point_pk`'s instructions per statement at one client fall by less than 15%, or if `table_count` at
+32 clients rises less than 3x. The step's own bars: the log's and locks' share of point reads at 32
+clients is at most 5%, and `point_pk` at 32 clients is at least 4x one client.
 
 ## 41. Skipping the descent: an adaptive hash against a learned leaf locator (prototypes, behind a switch)
 
