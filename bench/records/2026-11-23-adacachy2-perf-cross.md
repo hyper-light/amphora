@@ -974,3 +974,112 @@ flooded = `window_slow_flooded_fast_starved`, r5 = `session_reads::t_t1_10_r5_�
 
 Rounds 1-6 on 0f65a665 and main a64549cc; the last on 0ba7307d and main 3a58a13f. v13 passed in all 12 suite logs of rounds
 1-6 (grepped for its "ok"); r402's two suite runs list no v13 failure.
+
+## `t_t1_10_r5` is the old `t_t1_10_r1` renamed; its failure is the test's own race, on main too (perf-A24)
+
+**Lane times.** First command 05:50:25Z; the hour ends 06:50:25Z. Branch `perf/cross-a24`, from origin/main c205dd7d
+(A21's charge landed). Ada's benchmark window on adacachy2 began at about 05:56Z: r538 (a build) had ended, and nothing
+of this lane ran there after it. The other runs are on macOS (MacBook Pro 2, load 46-76 of other lanes).
+
+**Losses.**
+- **The count the brief asked for is not done.** The suite rounds that include r5, alternated, on Linux, wait for the
+  window's end. The evidence here is forced, not counted: a reader started late on purpose (below). To see a rate of 1
+  in 6 once takes 17 rounds a side with probability 95.5% (1-(5/6)^17; 26 rounds: 99.1%; A23's 6 had 66.5%).
+- **Not merged.** Linux clippy, check-production, and the a21_ and session_reads tests on Linux wait for the window's
+  end too. main has moved inside crates/ since c205dd7d (fab12d7e: B21, R12); perf/cross-a24 merges clean with it
+  (`git merge-tree`), unchecked.
+- **No natural failure was caught with stamps in it.** On macOS the follower comes back 19 to 303 ms after the reader's
+  spawn, so a reader doesn't start that late there; the natural failures were on Linux, whose /tmp is RAM. What a natural
+  failure's counters say is below, from the code.
+- r557 was stopped by this lane after its two builds and one test run (in the table). The first RAM-disk probe (r5 on a
+  macOS RAM disk) failed opening its files (`enforced Unix ownership` unavailable) and is not used, nor are two probes of
+  the plain a23 binaries.
+- Forced runs are 2 a cell, on one Mac, at load 46-76.
+
+**r5 is `t_t1_10_r1` renamed.** 358fbde2 (2026-11-24 02:10Z) renamed `t_t1_10_r1_a_session_reads_its_write_on_a_lagging_follower`
+to `t_t1_10_r5_...` (R1 and R2 stay with the cross-group tests it collided with) and changed nothing in its body. So r5 was in main's known
+flaky set under its first name. Failures on trees with no line of A21's charge, from the records (the suites' rounds
+that list r1 as failed, not a controlled count):
+
+| run | tree | failed rounds |
+|---|---|---|
+| r1619 (V11) | main 98bd0fa9; eb365f3d | 1 of 6; 0 of 6 |
+| r1660 (V11) | ad4c0922; eb365f3d | 0 of 6; 0 of 6 |
+| r1756 (A17) | 848a16c2; cf13e776 (`database::`, 8 threads) | 1 of 1; 0 of 1 |
+| r612, r628 (K) | 37008250 and its successor; main 1e874db1 | 1 of 3; 0 of 2 |
+| r1896 (V13) | c3ebea5d, main's product with its new test; 2332e2ae | 1 of 3; 0 of 3 |
+| r150 (A21) | main 7de5344d | 0 of 1 |
+| r312, r369, r402 (A23) | main a64549cc; main 3a58a13f | 0 of 6; 0 of 1 |
+| the same with A21's charge | d0f6a606 (r150); 0f65a665 (r312, r369); 0ba7307d (r402) | 1 of 1; 1 of 6; 0 of 1 |
+
+K's and A23's failures counted `at_once: 1, waited: 0`; A17's and r312's panicked at session_reads.rs:122, the assertion
+`counters.waited == 1`, the same line in 848a16c2, 0f65a665 and c205dd7d.
+
+**What the test promises.** A session that wrote 2 reads it on a follower that has not applied it: the read is never answered
+without 2, waits there (counted) while the follower is behind, and answers 1 and 2 once the follower rejoins; a read
+with no token answers at once. A client observes the answer [1, 2] and that a read with no token doesn't wait. In every
+failure whose panic line is known (r312's, A17's, all the forced ones) the answer was right: `assert_eq!(served, Here([1, 2]))`
+comes first and passed. The failing step is the third, `waited == 1`: the test's own proof that the read met a follower that was behind.
+
+**Where it goes wrong.** session_reads.rs:112-113, in the test: it spawns the reader and at once brings the follower back
+(`rejoin`); nothing orders the two. `at_once: 1, waited: 0` beside a `Here` answer needs the reader's first check
+(`wait_token`) to find the follower's published point at the token. The follower can't publish 2 before `rejoin`: until
+then its records are lost, and only the main thread steps it. So in those failures the reader's first check came after
+`rejoin` had begun. To show the order alone decides it, the test took stamps (the reader's first line, the follower back,
+the read answered) and the follower's published point at the reader's first line, and the reader was started late on
+request (`A24_READER_DELAY_US`), on main's tree and on the change's (macOS, branches diag/cross-a24-base,
+diag/cross-a24-change):
+
+| run | tree | reader started late by | each run: the reader's first line after its spawn, the follower back (µs), result |
+|---|---|---|---|
+| r557 | main ecdb013c + stamps (9a473313) | 0 | 84, 303363 pass |
+| r606 | the same | 0 | 78, 184110 pass; 38, 25130 pass |
+| r606 | the same | 150 ms | 223253, 161617 FAIL; 221298, 40866 FAIL |
+| r606 | the same | 1 s | 1070102, 251919 FAIL; 1015816, 54809 FAIL |
+| r606 | the same | 3 s | 3066390, 54869 FAIL; 3068208, 43603 FAIL |
+| r606 | c205dd7d, A21's charge + stamps (a4eb33f2) | 0 | 1458, 47274 pass; 165, 269555 pass |
+| r606 | the same | 150 ms | 220489, 213355 FAIL; 199644, 238921 pass |
+| r606 | the same | 1 s | 1074014, 135968 FAIL; 1075047, 19152 FAIL |
+| r606 | the same | 3 s | 3071428, 96320 FAIL; 3060578, 108990 FAIL |
+
+The test failed exactly when the reader's first line came after the follower was back, 11 of the 17 runs, on main without
+the change and on the change alike. In every failure the follower's point at that line was the write's own token (index 4),
+the counters were `at_once: 1, waited: 0`, and the answer was [1, 2]. A21's charge is not in the read's path (`read_session`
+calls no `enqueue`).
+
+**The fix (536f9730; test only, the product outside `#[cfg(test)]` unchanged).** The test brings the follower back
+only once the read waits there. `wait_token` counts a read that begins to wait and tells it under the closed time's lock
+(`#[cfg(test)]`, as the disk switch's `held` does), so no publication falls between the count and the wait; the test
+waits on that count (`Client::session_waits`), woken by the read. Its assertions are unchanged. The same stamps and
+delays on the fix (macOS, diag/cross-a24-fix):
+
+| run | tree | reader started late by | each run: the reader's first line after its spawn, the follower back (µs), result |
+|---|---|---|---|
+| r607 | the fix + the same stamps and delay (dde71900) | 0 | 49, 63380 pass; 45, 77806 pass |
+| r607 | the same | 150 ms | 223529, 285660 pass; 214822, 252192 pass |
+| r607 | the same | 1 s | 1074615, 1091835 pass; 1074679, 1101170 pass |
+| r607 | the same | 3 s | 3066163, 3096021 pass; 3072204, 3100007 pass |
+
+The follower came back after the reader's first line in all 8, its point there was still index 3, and the counters were
+`at_once: 0, waited: 1`. On macOS at the fix's test binary (dde71900), `a21_` 5 of 5 and `session_reads::` 4 of 4, three
+runs each (r638); `cargo fmt --all --check` clean; clippy -p amphora --all-targets clean on macOS (r635, 763 s, 60b50f0d: the fix's tree before
+it was squashed into 536f9730).
+
+| run | where | what |
+|---|---|---|
+| r538, 05:54Z | adacachy2, needs cpus=8 | built the stamps' lib tests on ecdb013c (fa44d54a, 59 s) and c205dd7d (e7a70c64, 24 s); kept as a24-tests-<sha> in ~/.cache/amphora-perf-bin/cross; ended before the window |
+| r557, 05:57Z | macOS, needs cpus=8 | the same with the late reader (9a473313 679 s, a4eb33f2 332 s); stopped |
+| r606, 06:16Z | macOS, needs cpus=6 | the forced runs on both trees |
+| r607, 06:16Z | macOS, needs cpus=4 | built dde71900 (597 s), the forced runs on the fix |
+| r635, 06:26Z | macOS, needs cpus=6 | clippy at 60b50f0d (the fix's tree): rc 0, 763 s |
+| r638, 06:27Z | macOS, needs cpus=4 | a21_ and session_reads:: |
+
+**For the next lane (Linux, once the window ends).** Scripts in bench/records/2026-11-23-adacachy2-perf-cross-a24/ (a24build.sh,
+a24suite.sh, a24gates.sh, and a24m2.sh for macOS), run with `on` 00aad8daff2fa3c9daa65d53c425d450, sync false, `git show` them
+out of `perf/cross-a24` in ~/.cache/amphora-perf/cross-remote:
+
+1. Gates on the fix merged with main: `JOBS=8 a24gates.sh perf/cross-a24:SHA OUT` (clippy -p amphora --all-targets, check-production,
+   `a21_` and `session_reads::` 3 times).
+2. The count: `JOBS=8 a24suite.sh 17 OUT fa44d54a84126cba36bbba1e9b64a78b2d45f187 e7a70c6441e137d5eb7d1737062d20a0fb83e8fc 1` (the
+   suites, main then A21's change, alternated; the binaries print each r5 run's stamps), START=2 beside it for a second stream; then
+   the same number of rounds on the fix (`a24build.sh perf/cross-a24:SHA`). A23's rounds took 40 to 147 s at 8 threads.
