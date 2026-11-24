@@ -67,6 +67,22 @@ const EVENTS_LAST: &str = "SELECT session, id, seq, at, parent, \"by\", kind, le
 
 const SEARCH: &str = "SELECT session, id FROM events WHERE text LIKE $1 ORDER BY at DESC LIMIT $2";
 
+/// A row of `EVENTS_LAST`, each column as the store reads it.
+type EventRow = (
+    String,
+    String,
+    i64,
+    i64,
+    Option<String>,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+);
+
 /// A client with the workload's statements prepared on it.
 struct Conn {
     client: Client,
@@ -233,20 +249,7 @@ impl Blocking for Pg {
                 .query(&c.last, &[&session, &i64::try_from(limit)?])?;
             // Every column taken, as a reader of the page would (the store builds its rows).
             for r in &rows {
-                let row: (
-                    String,
-                    String,
-                    i64,
-                    i64,
-                    Option<String>,
-                    Option<String>,
-                    String,
-                    Option<String>,
-                    Option<String>,
-                    Option<String>,
-                    String,
-                    String,
-                ) = (
+                let row: EventRow = (
                     r.try_get(0)?,
                     r.try_get(1)?,
                     r.try_get(2)?,

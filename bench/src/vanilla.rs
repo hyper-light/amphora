@@ -2,8 +2,8 @@
 //! as durable as it goes by default:
 //! - **Turso** (`turso_core` upstream, at 3e09a82, the revision Amphora's engine was taken from,
 //!   with none of Amphora's changes): its defaults (every commit
-//!   flushed, its own checkpoints), a connection for each thread, a write one transaction, tried
-//!   again while another writer holds the lock;
+//!   flushed, its own checkpoints), a connection for each thread, a write one transaction, and
+//!   SQLite's busy timeout, its own busy handler waiting out another writer's lock;
 //! - **SQLite** (rusqlite's bundled SQLite): its log (WAL) with every commit flushed
 //!   (`synchronous = FULL`), a connection for each thread, the same transactions.
 
@@ -12,6 +12,7 @@ use std::num::NonZero;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::schema as sql;
 use turso_core::{
@@ -41,6 +42,9 @@ fn like(word: &str) -> String {
 
 const SEARCH: &str = sql::SEARCH;
 
+/// How long a statement waits for another writer's lock before it fails, the same for both engines.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(60);
+
 pub struct Turso {
     io: Arc<dyn IO>,
     db: Arc<Database>,
@@ -48,9 +52,6 @@ pub struct Turso {
     rev: AtomicU64,
     seen: Mutex<HashSet<String>>,
 }
-
-/// A statement that found the database locked by another writer: the transaction goes again.
-struct Busy;
 
 impl Turso {
     pub fn open(dir: &str) -> anyhow::Result<Self> {
@@ -90,9 +91,12 @@ impl Turso {
         {
             return Ok(c);
         }
-        self.db
+        let c = self
+            .db
             .connect(ConnectOpts::new())
-            .map_err(|e| anyhow::anyhow!("{e}"))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        c.set_busy_timeout(BUSY_TIMEOUT);
+        Ok(c)
     }
 
     fn give(&self, c: Arc<Connection>) {
@@ -108,7 +112,7 @@ impl Turso {
         sql: &str,
         params: &[Value],
         mut each: impl FnMut(&turso_core::Row),
-    ) -> anyhow::Result<Result<(), Busy>> {
+    ) -> anyhow::Result<()> {
         let mut stmt = c.prepare(sql).map_err(|e| anyhow::anyhow!("{e}"))?;
         for (i, p) in params.iter().enumerate() {
             stmt.bind_at(
@@ -124,19 +128,13 @@ impl Turso {
                         each(r);
                     }
                 }
-                Ok(StepResult::Done) => return Ok(Ok(())),
-                Ok(StepResult::IO | StepResult::Yield) => {
+                Ok(StepResult::Done) => return Ok(()),
+                // Sleep is the busy handler's backoff: Turso's own SDK steps again through it
+                // (sdk-kit's `step_inner`), so its handler does the waiting.
+                Ok(StepResult::IO | StepResult::Yield | StepResult::Sleep { .. }) => {
                     self.io.step().map_err(|e| anyhow::anyhow!("{e}"))?
                 }
-                Ok(StepResult::Sleep { duration }) => {
-                    #[expect(
-                        clippy::disallowed_methods,
-                        reason = "vanilla Turso has no event for a lock's release: its busy handler asks the caller to wait out its own backoff"
-                    )]
-                    std::thread::sleep(duration);
-                    self.io.step().map_err(|e| anyhow::anyhow!("{e}"))?;
-                }
-                Ok(StepResult::Busy) | Err(turso_core::LimboError::Busy) => return Ok(Err(Busy)),
+                Ok(StepResult::Busy) => anyhow::bail!("busy past the busy timeout"),
                 Ok(StepResult::Interrupt) => anyhow::bail!("interrupted"),
                 Err(e) => return Err(anyhow::anyhow!("{e}")),
             }
@@ -148,10 +146,8 @@ impl Turso {
         c: &Arc<Connection>,
         events: &[Event],
         new: &[String],
-    ) -> anyhow::Result<Result<(), Busy>> {
-        if let Err(b) = self.run(c, "BEGIN IMMEDIATE", &[], |_| {})? {
-            return Ok(Err(b));
-        }
+    ) -> anyhow::Result<()> {
+        self.run(c, "BEGIN IMMEDIATE", &[], |_| {})?;
         let t = |s: &str| Value::from_text(s.to_owned());
         let i = |n: i64| Value::from_i64(n);
         for s in new {
@@ -167,9 +163,7 @@ impl Turso {
                 i(0),
                 rev,
             ];
-            if let Err(b) = self.run(c, sql::SESSION_UPSERT, &params, |_| {})? {
-                return Ok(Err(b));
-            }
+            self.run(c, sql::SESSION_UPSERT, &params, |_| {})?;
         }
         for e in events {
             let rev =
@@ -189,9 +183,7 @@ impl Turso {
                 t(&e.body),
                 rev,
             ];
-            if let Err(b) = self.run(c, sql::EVENT_UPSERT, &params, |_| {})? {
-                return Ok(Err(b));
-            }
+            self.run(c, sql::EVENT_UPSERT, &params, |_| {})?;
         }
         self.run(c, "COMMIT", &[], |_| {})
     }
@@ -208,23 +200,10 @@ impl Blocking for Turso {
                 .collect()
         };
         let c = self.connection()?;
-        let done = loop {
-            match self.try_write(&c, events, &new) {
-                Ok(Ok(())) => break Ok(()),
-                Ok(Err(Busy)) => {
-                    let _ = c.execute("ROLLBACK");
-                    #[expect(
-                        clippy::disallowed_methods,
-                        reason = "vanilla Turso says Busy with no event for the lock's release: no wait but a timed one (200 us, a picked number)"
-                    )]
-                    std::thread::sleep(std::time::Duration::from_micros(200));
-                }
-                Err(e) => {
-                    let _ = c.execute("ROLLBACK");
-                    break Err(e);
-                }
-            }
-        };
+        let done = self.try_write(&c, events, &new);
+        if done.is_err() {
+            let _ = c.execute("ROLLBACK");
+        }
         self.give(c);
         done
     }
@@ -235,25 +214,15 @@ impl Blocking for Turso {
             Value::from_text(session.to_owned()),
             Value::from_i64(i64::try_from(limit).unwrap_or(i64::MAX)),
         ];
-        let done = loop {
-            let mut n = 0;
-            // Every column taken, as a reader of the page would (the store builds its rows).
-            match self.run(&c, sql::EVENTS_LAST, &params, |r| {
+        let mut n = 0;
+        // Every column taken, as a reader of the page would (the store builds its rows).
+        let done = self
+            .run(&c, sql::EVENTS_LAST, &params, |r| {
                 let row: Vec<turso_core::Value> = (0..12).map(|i| r.get_value(i).clone()).collect();
                 std::hint::black_box(row);
                 n += 1;
-            }) {
-                Ok(Ok(())) => break Ok(n),
-                Ok(Err(Busy)) => {
-                    #[expect(
-                        clippy::disallowed_methods,
-                        reason = "vanilla Turso says Busy with no event for the lock's release: no wait but a timed one (200 us, a picked number)"
-                    )]
-                    std::thread::sleep(std::time::Duration::from_micros(200));
-                }
-                Err(e) => break Err(e),
-            }
-        };
+            })
+            .map(|()| n);
         self.give(c);
         done
     }
@@ -265,10 +234,7 @@ impl Blocking for Turso {
             Value::from_text(like(word)),
             Value::from_i64(i64::try_from(limit).unwrap_or(i64::MAX)),
         ];
-        let done = match self.run(&c, SEARCH, &params, |_| n += 1) {
-            Ok(_) => Ok(n),
-            Err(e) => Err(e),
-        };
+        let done = self.run(&c, SEARCH, &params, |_| n += 1).map(|()| n);
         self.give(c);
         done
     }
@@ -308,9 +274,8 @@ impl Sqlite {
             return Ok(c);
         }
         let c = rusqlite::Connection::open(&self.path)?;
-        c.execute_batch(
-            "PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA busy_timeout = 60000;",
-        )?;
+        c.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;")?;
+        c.busy_timeout(BUSY_TIMEOUT)?;
         Ok(c)
     }
 

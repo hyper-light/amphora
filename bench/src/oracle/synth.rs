@@ -513,7 +513,7 @@ pub fn database(r: &mut Rng) -> (Vec<String>, Schema) {
         for c in 0..ncols {
             let col = Col {
                 name: format!("c{c}"),
-                decl: *r.pick(DECLS),
+                decl: r.pick(DECLS),
                 collate: if r.chance(0.3) {
                     Some(*r.pick(COLLATIONS))
                 } else {
@@ -728,10 +728,10 @@ impl Scope<'_> {
         };
         let mut args: Vec<E> = (0..n).map(|_| self.expr(r, d)).collect();
         // likelihood's second argument is a REAL literal from 0.0 to 1.0, or SQLite refuses the call
-        if f.name == "likelihood" {
-            if let Some(p) = args.get_mut(1) {
-                *p = E::Lit(V::Real(*r.pick(&[0.0, 0.0625, 0.5, 0.9375, 1.0])));
-            }
+        if f.name == "likelihood"
+            && let Some(p) = args.get_mut(1)
+        {
+            *p = E::Lit(V::Real(*r.pick(&[0.0, 0.0625, 0.5, 0.9375, 1.0])));
         }
         E::Fn(f.name.clone(), args)
     }

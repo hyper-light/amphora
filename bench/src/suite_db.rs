@@ -167,6 +167,8 @@ fn suite_db(dir: &str, reuse: bool) -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
+/// How long a statement waits for another writer before it fails: each engine's deadline and the
+/// busy timeout of SQLite and Turso, whose own busy handlers do the waiting.
 const WAIT: Duration = Duration::from_secs(120);
 
 // ---------------------------------------------------------------------------------------------
@@ -850,16 +852,13 @@ mod mvcc_target {
                         io.step().map_err(|e| anyhow::anyhow!("{e}"))?;
                     }
                     Ok(StepResult::Busy) => return Ok(Err(Retry)),
-                    Err(e)
-                        if matches!(
-                            e,
-                            LimboError::Busy
-                                | LimboError::BusySnapshot
-                                | LimboError::WriteWriteConflict
-                                | LimboError::CommitDependencyAborted
-                                | LimboError::TxTerminated
-                        ) =>
-                    {
+                    Err(
+                        LimboError::Busy
+                        | LimboError::BusySnapshot
+                        | LimboError::WriteWriteConflict
+                        | LimboError::CommitDependencyAborted
+                        | LimboError::TxTerminated,
+                    ) => {
                         return Ok(Err(Retry));
                     }
                     Ok(StepResult::Interrupt) => anyhow::bail!("interrupted"),
@@ -984,6 +983,7 @@ impl Turso {
             .db
             .connect(turso_core::ConnectOpts::new())
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+        conn.set_busy_timeout(WAIT);
         Ok(TursoSession {
             io: self.io.clone(),
             conn,
@@ -1007,10 +1007,7 @@ impl Target for Turso {
     fn settle(&self) -> anyhow::Result<()> {
         let mut s = self.connect()?;
         let mut rows = 0;
-        if let Err(Busy) = s.step("PRAGMA wal_checkpoint(TRUNCATE)", &[], &mut rows)? {
-            anyhow::bail!("the checkpoint found the database busy");
-        }
-        Ok(())
+        s.step("PRAGMA wal_checkpoint(TRUNCATE)", &[], &mut rows)
     }
 
     fn session(&self) -> anyhow::Result<Box<dyn Session>> {
@@ -1024,9 +1021,6 @@ struct TursoSession {
     stmts: HashMap<String, turso_core::Statement>,
 }
 
-/// A statement found the database locked by another writer.
-struct Busy;
-
 fn turso_value(p: &P) -> turso_core::Value {
     match p {
         P::I(i) => turso_core::Value::from_i64(*i),
@@ -1039,12 +1033,7 @@ fn turso_value(p: &P) -> turso_core::Value {
 }
 
 impl TursoSession {
-    fn step(
-        &mut self,
-        sql: &str,
-        params: &[P],
-        rows: &mut usize,
-    ) -> anyhow::Result<Result<(), Busy>> {
+    fn step(&mut self, sql: &str, params: &[P], rows: &mut usize) -> anyhow::Result<()> {
         if !self.stmts.contains_key(sql) {
             let stmt = self.conn.prepare(sql).map_err(|e| anyhow::anyhow!("{e}"))?;
             self.stmts.insert(sql.to_owned(), stmt);
@@ -1072,62 +1061,35 @@ impl TursoSession {
                     }
                     *rows += 1;
                 }
-                Ok(turso_core::StepResult::Done) => return Ok(Ok(())),
-                Ok(turso_core::StepResult::IO | turso_core::StepResult::Yield) => {
-                    io.step().map_err(|e| anyhow::anyhow!("{e}"))?
-                }
-                Ok(turso_core::StepResult::Sleep { duration }) => {
-                    #[expect(
-                        clippy::disallowed_methods,
-                        reason = "vanilla Turso has no event for a lock's release: its busy handler asks the caller to wait out its own backoff"
-                    )]
-                    std::thread::sleep(duration);
-                    io.step().map_err(|e| anyhow::anyhow!("{e}"))?;
-                }
-                Ok(turso_core::StepResult::Busy) | Err(turso_core::LimboError::Busy) => {
-                    return Ok(Err(Busy));
-                }
+                Ok(turso_core::StepResult::Done) => return Ok(()),
+                // Sleep is the busy handler's backoff: Turso's own SDK steps again through it
+                // (sdk-kit's `step_inner`), so its handler does the waiting.
+                Ok(
+                    turso_core::StepResult::IO
+                    | turso_core::StepResult::Yield
+                    | turso_core::StepResult::Sleep { .. },
+                ) => io.step().map_err(|e| anyhow::anyhow!("{e}"))?,
+                Ok(turso_core::StepResult::Busy) => anyhow::bail!("busy past the busy timeout"),
                 Ok(turso_core::StepResult::Interrupt) => anyhow::bail!("interrupted"),
                 Err(e) => return Err(anyhow::anyhow!("{e}")),
             }
         }
     }
 
-    /// `stmts` in one transaction, tried again while another writer holds the database.
+    /// `stmts` in one transaction.
     fn transaction(&mut self, stmts: &[String], params: &[Vec<P>]) -> anyhow::Result<()> {
-        let began = Instant::now();
-        loop {
-            let mut rows = 0;
-            let attempt = (|| -> anyhow::Result<Result<(), Busy>> {
-                if let Err(b) = self.step("BEGIN IMMEDIATE", &[], &mut rows)? {
-                    return Ok(Err(b));
-                }
-                for (s, p) in stmts.iter().zip(params) {
-                    if let Err(b) = self.step(s, p, &mut rows)? {
-                        return Ok(Err(b));
-                    }
-                }
-                self.step("COMMIT", &[], &mut rows)
-            })();
-            match attempt {
-                Ok(Ok(())) => return Ok(()),
-                Ok(Err(Busy)) => {
-                    let _ = self.step("ROLLBACK", &[], &mut rows);
-                    if began.elapsed() > WAIT {
-                        anyhow::bail!("the database stayed busy");
-                    }
-                    #[expect(
-                        clippy::disallowed_methods,
-                        reason = "vanilla Turso says Busy with no event for the lock's release: no wait but a timed one (200 us, a picked number)"
-                    )]
-                    std::thread::sleep(Duration::from_micros(200));
-                }
-                Err(e) => {
-                    let _ = self.step("ROLLBACK", &[], &mut rows);
-                    return Err(e);
-                }
+        let mut rows = 0;
+        let done = (|| -> anyhow::Result<()> {
+            self.step("BEGIN IMMEDIATE", &[], &mut rows)?;
+            for (s, p) in stmts.iter().zip(params) {
+                self.step(s, p, &mut rows)?;
             }
+            self.step("COMMIT", &[], &mut rows)
+        })();
+        if done.is_err() {
+            let _ = self.step("ROLLBACK", &[], &mut rows);
         }
+        done
     }
 }
 
@@ -1214,28 +1176,11 @@ impl Session for TursoSession {
         match (kind, stmts) {
             (Kind::Write, [_, _, ..]) => self.transaction(stmts, params).map(|()| 0),
             _ => {
-                let began = Instant::now();
-                loop {
-                    let mut rows = 0;
-                    let mut busy = false;
-                    for (s, p) in stmts.iter().zip(params) {
-                        if self.step(s, p, &mut rows)?.is_err() {
-                            busy = true;
-                            break;
-                        }
-                    }
-                    if !busy {
-                        return Ok(rows);
-                    }
-                    if began.elapsed() > WAIT {
-                        anyhow::bail!("the database stayed busy");
-                    }
-                    #[expect(
-                        clippy::disallowed_methods,
-                        reason = "vanilla Turso says Busy with no event for the lock's release: no wait but a timed one (200 us, a picked number)"
-                    )]
-                    std::thread::sleep(Duration::from_micros(200));
+                let mut rows = 0;
+                for (s, p) in stmts.iter().zip(params) {
+                    self.step(s, p, &mut rows)?;
                 }
+                Ok(rows)
             }
         }
     }
@@ -1257,9 +1202,8 @@ impl Sqlite {
 
     fn connect(&self) -> anyhow::Result<rusqlite::Connection> {
         let c = rusqlite::Connection::open(&self.path)?;
-        c.execute_batch(
-            "PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA busy_timeout = 120000;",
-        )?;
+        c.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;")?;
+        c.busy_timeout(WAIT)?;
         Ok(c)
     }
 }
@@ -1567,11 +1511,12 @@ impl Target for Pg {
     fn setup(&self, stmts: &[(String, Vec<P>)]) -> anyhow::Result<()> {
         let mut c = self.client()?;
         // VACUUM runs outside a transaction.
-        if let [(s, p)] = stmts {
-            if p.is_empty() && s.starts_with("VACUUM") {
-                c.batch_execute(s)?;
-                return Ok(());
-            }
+        if let [(s, p)] = stmts
+            && p.is_empty()
+            && s.starts_with("VACUUM")
+        {
+            c.batch_execute(s)?;
+            return Ok(());
         }
         let mut tx = c.transaction()?;
         for (s, p) in stmts {

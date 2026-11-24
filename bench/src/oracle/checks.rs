@@ -1120,7 +1120,7 @@ fn estimate(a: &mut Amphora, sql: &str, aliases: &[String]) -> Result<Option<f64
                         .is_some_and(|al| aliases.iter().any(|x| x == al))
             })
             .filter_map(|n| n["op"]["estimate"]["output_rows"].as_f64())
-            .last()
+            .next_back()
     }))
 }
 
@@ -1169,7 +1169,7 @@ fn having_pred(r: &mut Rng, s: &Scope, group: &[E], depth: u32) -> E {
         ),
         2 => E::Null(Box::new(term(r)), r.chance(0.5)),
         _ => E::Bin(
-            *r.pick(&["=", "<", ">", "<=", ">=", "<>", "IS", "IS NOT"]),
+            r.pick(&["=", "<", ">", "<=", ">=", "<>", "IS", "IS NOT"]),
             Box::new(term(r)),
             Box::new(term(r)),
         ),
@@ -1457,7 +1457,7 @@ pub fn transform(q: &Sel, r: &mut Rng, schema: &Schema, funcs: &[Func]) -> Sel {
                 k = usize::MAX;
                 let old = e.clone();
                 *e = if is {
-                    if rule % 2 == 0 {
+                    if rule.is_multiple_of(2) {
                         E::Bin("OR", Box::new(false_expr(&q1)), Box::new(old))
                     } else {
                         E::Bin("AND", Box::new(true_expr(&q1)), Box::new(old))

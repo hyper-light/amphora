@@ -11,6 +11,9 @@ use std::time::Instant;
 
 use crate::suite::P;
 
+/// One statement with its parameters, run on the target: its rows as text.
+type Run = Box<dyn FnMut(&str, &[P]) -> anyhow::Result<Vec<String>>>;
+
 struct Opts {
     target: String,
     dir: String,
@@ -74,8 +77,7 @@ pub fn main() -> anyhow::Result<()> {
     let o = opts()?;
     let path = Path::new(&o.dir).join("suite.db");
     anyhow::ensure!(path.exists(), "no database at {}", path.display());
-    let mut run: Box<dyn FnMut(&str, &[P]) -> anyhow::Result<Vec<String>>> = match o.target.as_str()
-    {
+    let mut run: Run = match o.target.as_str() {
         "amphora" => {
             // The suite's readers read on connections of their own beside the writer's: so does this.
             let writer =

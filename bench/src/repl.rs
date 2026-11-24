@@ -1801,6 +1801,9 @@ mod procs {
         Ok(())
     }
 
+    /// A program and its arguments.
+    type Program = (String, Vec<String>);
+
     /// The three members over TCP, each request on a connection of the member's pool: a writer
     /// takes one, or opens one, and gives it back, so writers never queue behind each other here.
     pub struct Procs {
@@ -1809,7 +1812,7 @@ mod procs {
         cut: [AtomicBool; NODES],
         deadline: Duration,
         /// Each killed member's program and arguments, for `start`.
-        relaunch: [Mutex<Option<(String, Vec<String>)>>; NODES],
+        relaunch: [Mutex<Option<Program>>; NODES],
         /// The members `start` ran, waited for as the driver ends.
         started: Mutex<Vec<std::process::Child>>,
     }

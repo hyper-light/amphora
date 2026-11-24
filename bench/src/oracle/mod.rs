@@ -296,50 +296,46 @@ fn replay_check(path: &str) -> anyhow::Result<()> {
         .file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|n| n.starts_with("cert-"))
+        && let [q, more] = queries.as_slice()
     {
-        if let [q, more] = queries.as_slice() {
-            let (Some(eq), Some(er)) = (
-                checks::estimate_any(&mut a, q),
-                checks::estimate_any(&mut a, more),
-            ) else {
-                println!("no estimate: {q}");
-                std::process::exit(1);
-            };
-            if !checks::no_more(er, eq) {
-                println!(
-                    "estimates {er} rows for the more restrictive query, {eq} for the query: {more}"
-                );
-                std::process::exit(1);
-            }
-            return Ok(());
+        let (Some(eq), Some(er)) = (
+            checks::estimate_any(&mut a, q),
+            checks::estimate_any(&mut a, more),
+        ) else {
+            println!("no estimate: {q}");
+            std::process::exit(1);
+        };
+        if !checks::no_more(er, eq) {
+            println!(
+                "estimates {er} rows for the more restrictive query, {eq} for the query: {more}"
+            );
+            std::process::exit(1);
         }
+        return Ok(());
     }
     // An order finding's two queries: the same join written in two orders, estimated alike.
     if std::path::Path::new(path)
         .file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|n| n.starts_with("order-"))
+        && let [q, other] = queries.as_slice()
     {
-        if let [q, other] = queries.as_slice() {
-            let strip = |s: &str| {
-                s.trim_start_matches("EXPLAIN QUERY PLAN FORMAT=JSON ")
-                    .to_owned()
-            };
-            let (Some(eq), Some(eo)) = (
-                checks::estimate_any(&mut a, &strip(q)),
-                checks::estimate_any(&mut a, &strip(other)),
-            ) else {
-                println!("no estimate: {other}");
-                std::process::exit(1);
-            };
-            if !checks::same_estimate(eq, eo) {
-                println!(
-                    "estimates {eo} rows for one order, {eq} for the query as written: {other}"
-                );
-                std::process::exit(1);
-            }
-            return Ok(());
+        let strip = |s: &str| {
+            s.trim_start_matches("EXPLAIN QUERY PLAN FORMAT=JSON ")
+                .to_owned()
+        };
+        let (Some(eq), Some(eo)) = (
+            checks::estimate_any(&mut a, &strip(q)),
+            checks::estimate_any(&mut a, &strip(other)),
+        ) else {
+            println!("no estimate: {other}");
+            std::process::exit(1);
+        };
+        if !checks::same_estimate(eq, eo) {
+            println!("estimates {eo} rows for one order, {eq} for the query as written: {other}");
+            std::process::exit(1);
         }
+        return Ok(());
     }
     for q in &queries {
         let same = match (a.run(q), s.run(q)) {

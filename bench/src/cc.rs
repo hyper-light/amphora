@@ -213,12 +213,17 @@ fn until_committed(
     }
 }
 
+/// Writer `w` of `o.writers`, with its own random draws.
+struct Writer<'a> {
+    w: usize,
+    rng: &'a mut Rng,
+}
+
 /// One write class's transaction by writer `w` of `n`, ids `next` handing out new rows' ids.
 fn class_txn(
     class: &str,
     o: &Opts,
-    w: usize,
-    rng: &mut Rng,
+    Writer { w, rng }: Writer<'_>,
     next: &AtomicU64,
     v: &Versioned,
     d: &mut Descender,
@@ -457,7 +462,15 @@ pub fn main() -> anyhow::Result<()> {
                         let room = match (k0, reader) {
                             (true, true) => k0_read(session, &v, &mut d, &mut c)?,
                             (true, false) => k0_write(&o, session, &v, &mut d, &mut c)?,
-                            _ => class_txn(&class, &o, w, &mut rng, &next, &v, &mut d, &mut c)?,
+                            _ => class_txn(
+                                &class,
+                                &o,
+                                Writer { w, rng: &mut rng },
+                                &next,
+                                &v,
+                                &mut d,
+                                &mut c,
+                            )?,
                         };
                         if !room {
                             let _ = full.compare_exchange(

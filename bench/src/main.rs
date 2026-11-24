@@ -1176,7 +1176,7 @@ pub fn write_profile(prefix: &str, guard: &Profiler) -> anyhow::Result<()> {
     }
     let top = |m: Counts, total: usize, n: usize| {
         let mut v: Vec<(String, usize)> = m.into_iter().collect();
-        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
         v.into_iter()
             .take(n)
             .map(|(k, c)| format!("{:6.2}% {k}", c as f64 * 100.0 / total.max(1) as f64))
