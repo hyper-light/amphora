@@ -75,6 +75,14 @@ weighed (by the hook's shape or a skip), so it is not a routing choice. Not trac
 ## The A/B, not run
 
 It was refused at 00:35Z and 00:36Z: adacachy2 had 0 of 32 cores idle, at cpus=16 and again at 4.
+r1921 started at cpus=4 at 00:38Z. Its build stopped at once: the bench workspace has no
+`Cargo.lock` in git, so `--locked` refuses to make one. The script now builds without `--locked`,
+and the second arm builds on the lock the first arm resolved. The relaunch at 00:42Z was refused
+(2 cores idle). Two commands are ready in `~/.cache/amphora-perf/reals-r6-scripts/` on adacachy:
+- `ab_build_cmd.txt` builds both arms, loads the data and prints each statement's path counts,
+  with ROUNDS=0 at cpus=4.
+- `ab_cmd.txt` runs the whole A/B: 5 alternated rounds at cpus=16.
+The `vdbe::morsel` suites at cb44211b (r1845's second half) were still running at 00:43Z.
 
 `~/.cache/amphora-perf/reals-r6-scripts/ab_linux.sh` (lane R6's scripts, adacachy) runs S8's five
 analytics statements (`table_count`, `table_group_by`, `filter_no_index`, `aggregates_range`,
