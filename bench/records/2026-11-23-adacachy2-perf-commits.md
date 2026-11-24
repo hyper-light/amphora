@@ -2114,3 +2114,121 @@ is lane F6's crates/engine change; the landed arm is b9e45555, which has three m
     cargo clippy -p amphora --all-targets --locked -- -D warnings
     # owed, not run: three rounds of v18-tests-<sha> --test-threads=2 database::replicated:: replication:: on main 3a58a13f and on the landed change,
     # and (cd bench && cargo build --release); ladder16.sh <that amphora-bench> <out> 3 (V16's script, 32 and 128 spread writers, both classes)
+
+# Lane V19 (commits) on macOS (MacBook Pro 2): the stage behind the two restart-wait tests' hang is a frame count a log restart leaves stale (fixed on main by lane B19's e44b8868); a deterministic test of it; T1 and T2 not reproduced on macOS; Linux checks owed (2026-11-24, 05:50Z to 06:57Z)
+
+Ada's goal is replicated commits about 10x faster than rqlite and dqlite, with no write refused under load, and
+correct first: every replicated write commits or gets a typed refusal, and no read breaks a promise. This lane's
+deliverable: `a_restart_due_waits_for_a_reads_deadline_and_no_longer` (T2) and
+`a_local_read_holds_off_the_logs_restart_and_one_after_waits_for_it` (T1) each settled: what they promise and by which design
+decision, their rate on main and on the merge, the cause traced in the failing run and fixed, suites and the ladder with
+nothing new.
+
+## Losses first
+
+1. **No rate on main or on the merge was measured on Linux, and the suites' 3 rounds a side, the ladder at 32 and 128,
+   check-production and clippy on Linux did not run.** Ada's benchmark window on adacachy2 opened at 05:55Z, 4 minutes into
+   the hour; I stopped my run there (r544, the build of both arms not finished) and it stayed closed to the end.
+   macOS was all I had: r568 (needs `macos/arm64,cpus=8,mem=24g`) never left the queue from 06:01Z to 06:57Z, and the first
+   build on MacBook Pro 2 (r563, load 46 to 60, 4 jobs) took 921 s and ran into its own 1,500 s limit before any test.
+2. **Nobody has traced a failing run of T1 or T2 themselves.** On MacBook Pro 2 the pre-landing main (c205dd7d, trace binary,
+   r643 and r677) passed T1 and T2 in every run that got CPU (below); V17's and V18's failures were on adacachy2, where I could
+   not look. What is traced is the stage, in a run of those tests that passed, and a deterministic test that fails at
+   the same stage (T3, below). I did not prove that each of V17's and V18's failures was this.
+3. The merge arm's results and T3's green arrived at the end of the hour or not at all: the table says which.
+4. **Nothing is merged.** The branch adds one test to `replicated.rs` (perf/commits-v19, 4215bf64). It needs clippy, T3, T1 and T2, the
+   suites and check-production on Linux before it lands.
+
+## What each test promises, and by which decision
+
+T1, as a user would say it: a local read that is open on a replica is never cut short by the replica's log starting
+again. While it runs the log may grow past its room, the read keeps the one state it began with, and nothing restarts the
+log under it; a read that comes while the restart waits for it waits too, and is refused at its own deadline; when the open read ends the
+log starts again and the next read sees every row. T2: a restart that has come due waits for a read that is out, and no longer than that read's deadline: the read is refused at its
+deadline and the restart follows.
+
+- The decision is replication.md, "A replica's database log bounded by what it measures" (2026-11-11), B ("It is ready when
+  it is due, no flush and no read is out, and the last pass caught up"), D (the log holds at most min(H, what the group commits
+  between restarts due by share + what it commits while the local reads out at the due point finish); "Each of those reads is bounded by its
+  caller's deadline ... and no new one begins") and its "Falsified by": "a log restart while a local read was out, or a
+  local read that began while a restart was due". `Local::hold_reads` and `restart_unread` are point 7.
+- Decision 45 (store.md, main a5ae048c, B18) does not supersede it. Its text decides the engine's switch:
+  `Db::restart_log` switches the writer to the free segment and waits for no read, with B19's paragraph in "A local read on a replica" saying so for
+  the image-install test (64e77079, whose call is on a reader's `Db`, not the owner's). It says nothing of when a replica's
+  owner asks for its restart. D was restated for it by lane B20 (c50e0709, Ada's decision on B19's question), with the same words: "what
+  it commits while the local reads out at the due point finish". So neither test's text changes, and none was changed.
+  Whether the owner should still wait is a question for Ada (the report): the switch no longer takes a read's frames away.
+
+## The cause
+
+T1 and T2's own failing runs (V17, V18) were not traced: this stage is inferred for them from the code, the passing trace below and
+T3's failure at the same `read_local`.
+
+`Db::log_frames_in_use` (main before 2b0d5e7c) was the machine connection's own `max_frame`, which a switch
+(`Db::restart_log` through `Database::switch_log`) does not move: the connection sees the new segment only at its next transaction. The learner's
+machine runs no transaction between entries. The owner's `flush` takes `past = frames > pass.room` from that count, and
+`hold_due` holds reads whenever `past`. So after a switch, with nothing written, a learner whose stale count is past its room
+(a room near the file's is what T1 and T2 set after `voter_and_learner`, `free_for(16, 2)`) holds reads at every step, and only its next
+applied entry ends it; in the driven harness nothing steps it while the test thread waits inside `read_local`, so the read waits out its deadline.
+
+The stage, traced in T1 on pre-landing main (c205dd7d + the trace, r643 round 1; stderr of the passing run, microseconds
+from the process's first line; owner 1 is the learner; the trace is `v19()` in the trace branch, below):
+
+    2650067  restart_unread id=1 restart_log -> true                                    (the learner's first, free restart, in the setup)
+    2807096  owner id=1 flush frames=77 room=4251516 past=false due=false out=false ... segs current: Second ... backfill=(0, 0) end=(1, 0)
+    3872885  owner id=1 flush frames=5  room=4251516 past=false ...                      (the next entry it applied refreshed the count)
+
+The learner's count said 77 frames for a segment that held 0, for 1.07 s, until its next entry. Here the room was 4,251,516 frames, so past
+was false and no read was held; T1 and T2 then set a room of 18 frames (limit 74,160 B), where 77 would be past. Whether the
+first restart falls before or after the room shrinks is the flushing thread's timing: T1 passes when it falls before
+(this run), and reads are held for good when it falls after, which is what the two tests' 60 s `read_local` timeout and
+the first assertion's `local_readers_in_use` of 0 say.
+
+**The deterministic test (T3, the brief's bug fix starts with a failing test).**
+`a_read_after_the_logs_restart_is_not_held_though_nothing_is_written_after_it` (perf/commits-v19, 4215bf64): a learner told it has no
+bytes free past one image, written until its log restarted, its flushing thread's flushes held, rounds, then a local read.
+On main before lane B21's landing (c205dd7d + the test, 620305f8, r657): failed, `left: Err(Timeout) right: Ok([1])`, at
+replicated.rs:17798, after 81.1 s at load 76. On main with B19's e44b8868 (fab12d7e + the test, 4215bf64): passed (r703, 27.2 s at load 73).
+
+**The fix is already on main.** B19's e44b8868 (`log_frames_in_use` reads the shared current segment's count), on main since
+2b0d5e7c (B21's landing, 06:00Z). This lane changed no production code. The test is its guard.
+
+## Rates
+
+V17's and V18's, on adacachy2, before e44b8868 was on main: T1 alone 5 of 16 on main fac69083 and 5 of 16 on the merge; T2 alone 2 of 4 on main 1f4a8e88 and 3 of 4 on the landed arm,
+and in the suites 0 of 3 and 3 of 3 (V18, r427). The trees with e44b8868 that lanes B20 and B21 ran passed both tests:
+`database::replicated::` 152 of 152 (r307, 999fa608), 154 of 155 and 155 of 155 (r401, r428), each with T1 and T2 in it.
+
+On MacBook Pro 2, pre-landing main (c205dd7d with the trace, binary `v19-tests-trace`):
+
+| run | load | what | result |
+|---|---|---|---|
+| r643 | 57 to 79 | T1 and T2 side by side, 4 rounds | 8 of 8 passed (22 to 49 s each) |
+| r677 | 65 to 78 | four of T1 and four of T2 at once, 3 rounds | 20 passed (13 to 98 s), and four runs of round 1 ended at the 100 s limit with no verdict: three of their logs hold no trace line at all and the fourth 11 (0.34 s of trace), so they did not get the CPU |
+| r703, both binaries (pre-landing main + T3, 4215bf64) | 68 to 76 | T1 and T2 once each on each binary, two rounds, the five runs of a round at once | 4 of 4 passed on 620305f8 and 4 of 4 on 4215bf64 (28 to 46 s) |
+
+Both rates are 0 on macOS, before and after, so macOS shows no difference: the rates need adacachy2's faster flusher and were not measured there.
+
+## Runs
+
+| run | where, needs, load, time | tree | result |
+|---|---|---|---|
+| r544 | adacachy2, cpus=4, 05:54Z to 05:55Z | c205dd7d and its trace | stopped by me: Ada's benchmark window |
+| r548, r568 | macOS, cpus=8, mem=24g, `sync` | trace and main c205dd7d; trace and main fab12d7e | queued, never placed (r548 withdrawn by me to change the arms) |
+| r563 | MacBook Pro 2, cpus=4, 06:04Z | trace 7de0ab73 | built in 921 s; ended by its own 1,500 s limit before the second build finished |
+| r611 | MacBook Pro 2, cpus=4, 06:18Z | 620305f8 (pre-landing main + T3) and 4215bf64 (fab12d7e + T3) | 620305f8 built in 780 s; 4215bf64 built in 985 s (75 to 77 load); its test loop did not run: the run ended at its own 1,800 s limit, after both builds. The binary was used by r703 |
+| r643, r677 | MacBook Pro 2, cpus=2 and 8 | 7de0ab73's binary | T1 and T2, above |
+| r657 | MacBook Pro 2, cpus=2, 06:33Z, load 76 | 620305f8's binary | T3 failed in 81.1 s (Timeout) |
+| r703 | MacBook Pro 2, cpus=2, 06:48Z, load 68 to 76 | 620305f8's and 4215bf64's binaries | T3 on 4215bf64: 2 of 2 passed (27.2 and 35.6 s); T1 and T2, above |
+
+My own r662 (a clippy run, cwd `commits-v19-mac3`) synced that clone's HEAD (620305f8) over r611's folder while it built 4215bf64, at about
+06:35Z. I stopped r662 and put the folder back to 4215bf64 (`git checkout -f`), 06:38Z, before the amphora crate was compiled, and
+the engine's rustc had read its sources by then. The merge binary is valid only as said at its row; its T3 result is what says it.
+
+## Commands
+
+    # the trace: bench/records/../trace.py's `v19()` lines, applied to a clone (branch diag/commits-v19-trace, never for main)
+    # the test alone: v19-tests-<label> --exact database::replicated::tests::a_read_after_the_logs_restart_is_not_held_though_nothing_is_written_after_it --test-threads=1 --nocapture
+    # owed (Linux, adacachy2): bench/records/2026-11-23-adacachy2-perf-commits-v19/v19.sh <out> 4 5 3 main=fab12d7e merge=<the landed tree>
+    #   for T1 and T2 alone and the suites; cargo clippy -p amphora --all-targets --locked -- -D warnings; bash scripts/check-production.sh;
+    #   ladder16.sh at 32 and 128 spread writers, both classes
