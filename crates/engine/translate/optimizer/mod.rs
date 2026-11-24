@@ -5010,22 +5010,30 @@ pub(crate) mod bushy_search_tests {
         /// Lane pl8-20: the LEFT JOIN's dimension keeps six rows (`cat < 3`), the other one
         /// (`id = 7` or `id = 3`). Lane pl8-22: each side reaches its fact through an index made
         /// for the join, so the plan with the LEFT JOIN in the run and its mirror differ only by
-        /// which side is built and which probes (kiln run r124 planned both for one query, the
-        /// mirror as it ran and the LEFT JOIN in the run at the EXPLAIN after). On calibration's
-        /// weights alone the search picks the mirror (kiln run r298: an EXPLAIN before the first
-        /// run plans `d2`'s side as the run); once the query's first run has timed the seeks and
-        /// the hash joins, the learned weights make the LEFT JOIN's side the run (three runs of
-        /// three, r288). So each query runs once by cost first, its answer checked too, and the
-        /// plan's shape is checked on the run after, before the answers.
+        /// which side is built and which probes.
+        ///
+        /// Lane C6: the search takes the one or the other by the hash probe's weight, which each
+        /// query's run moves, so no weights learned here put the LEFT JOIN in the run for all
+        /// eight. Priced with the others at 8.2, 25 and 0.005736 (adacachy2's, pinned), the six
+        /// queries without `AND s.id IS NULL` alone take it at a probe of 20 rows' visits and more
+        /// (the seventh below 104 only: past that its left-deep plan is cheaper), the pair with it
+        /// at 92 and more; see the record of lane C6. The design promises the answer, and that the
+        /// shape is what is tested (T-PL.8.13), not which shape the weights learned choose
+        /// (docs/design/planner.md, the decision of lane pl8-19, "Falsified by"). So each query is
+        /// answered on the weights learned, twice, by cost; then the weights are stated and its
+        /// LEFT JOIN is in a run of a bushy plan, its answer the nested loops'.
         #[test]
         fn t_pl_8_13_a_left_join_inside_a_bushy_run_keeps_its_null_rows() {
+            use crate::translate::optimizer::learned_costs::LearnedWeights;
             let (_db, conn) = facts();
             let select = "SELECT count(*), sum(f1.id), sum(f2.id), count(s.id), sum(s.cat)";
-            for (on_extra, above) in [
-                ("", ""),
-                (" AND s.cat <> 11 AND s.cat <> 17", ""),
-                ("", " AND s.id IS NULL"),
-                ("", " AND (s.id IS NULL OR s.cat + f2.k = 11)"),
+            // The hash probe's weight that puts the LEFT JOIN in the run: past which the mirror
+            // plan, with the LEFT JOIN an outer loop, costs more.
+            for (on_extra, above, hash_probe) in [
+                ("", "", 40.0),
+                (" AND s.cat <> 11 AND s.cat <> 17", "", 40.0),
+                ("", " AND s.id IS NULL", 312.9),
+                ("", " AND (s.id IS NULL OR s.cat + f2.k = 11)", 40.0),
             ] {
                 for (from, filter) in [
                     (
@@ -5046,22 +5054,39 @@ pub(crate) mod bushy_search_tests {
                     ),
                 ] {
                     let sql = format!("{select} {from} {filter}{above}");
+                    conn.set_join_methods(JoinMethods::NestedLoopsOnly);
+                    let nested_loops = rows(&conn, &sql);
+                    assert!(!nested_loops.is_empty(), "{sql}");
                     conn.set_join_methods(JoinMethods::ByCost);
-                    let first = rows(&conn, &sql);
+                    for run in ["first", "second"] {
+                        let plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+                        assert_eq!(
+                            rows(&conn, &sql),
+                            nested_loops,
+                            "{sql}: the {run} run on the weights learned: {plan:?}"
+                        );
+                    }
+                    conn.pin_cost_weights(Some(LearnedWeights {
+                        row_in_pages: Some(0.005736),
+                        seek: 8.2,
+                        hash_build: 25.0,
+                        hash_probe,
+                        sort: 3.0,
+                        bloom_probe: 10.0,
+                        where_step: 1.0,
+                        page_miss: None,
+                    }));
                     BUSHY_PLANS.with(|plans| plans.set(0));
                     LEFT_JOINS_IN_RUNS.with(|runs| runs.set(0));
                     let searched = rows(&conn, &sql);
                     let made_bushy = BUSHY_PLANS.with(Cell::get);
                     let in_runs = LEFT_JOINS_IN_RUNS.with(Cell::get);
                     let plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+                    conn.pin_cost_weights(None);
                     eprintln!("bushy={made_bushy} in_runs={in_runs}: {sql}: {plan:?}");
+                    assert_eq!(searched, nested_loops, "{sql}: {plan:?}");
                     assert!(made_bushy > 0, "not planned bushy: {sql}: {plan:?}");
                     assert!(in_runs > 0, "no LEFT JOIN inside a run: {sql}: {plan:?}");
-                    conn.set_join_methods(JoinMethods::NestedLoopsOnly);
-                    let nested_loops = rows(&conn, &sql);
-                    assert!(!nested_loops.is_empty(), "{sql}");
-                    assert_eq!(searched, nested_loops, "{sql}: {plan:?}");
-                    assert_eq!(first, nested_loops, "{sql}: the first run's plan");
                 }
             }
         }
