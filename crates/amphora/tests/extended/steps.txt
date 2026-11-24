@@ -177,6 +177,8 @@ s1: P||SET lock_timeout = '3s'| ~ DS| ~ B||||| ~ DP| ~ E||0 ~ S
 s1: P||SHOW lock_timeout| ~ B||||| ~ E||0 ~ S
 s1: P||SET lock_timeout = '4s'| ~ B||||| ~ E||0 ~ P||SHOW lock_timeout| ~ B||||| ~ E||0 ~ P||SELECT 1/0| ~ B||||| ~ E||0 ~ S
 s1: Q|SHOW lock_timeout
+s1: P||SET LOCAL lock_timeout = '9s'| ~ B||||| ~ E||0 ~ P||SET LOCAL lock_timeout = '8s'| ~ B||||| ~ E||0 ~ P||SHOW lock_timeout| ~ B||||| ~ E||0 ~ S
+s1: Q|SHOW lock_timeout
 s1: P||RESET lock_timeout| ~ B||||| ~ E||0 ~ S
 s1: Q|SHOW lock_timeout
 # Messages until Sync are one transaction.

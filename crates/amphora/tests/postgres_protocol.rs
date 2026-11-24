@@ -1315,3 +1315,67 @@ fn t_pg_10_1_extended_messages_answer_as_a_19_server_does() {
         assert!(compared.values().sum::<i32>() > 1000, "{compared:?}");
     }
 }
+
+/// T-PG.10.4: each message of T-PG.10.1's steps cut at each byte, a byte longer, and (but for a Parse's, whose
+/// text is the parser's own hostile input) with each byte at three others, a Sync behind it, is answered to
+/// its ReadyForQuery with at most one ErrorResponse, and the session goes on.
+#[test]
+fn t_pg_10_4_hostile_extended_messages_are_answered_to_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("postgres.db");
+    let database = execute::Database::open(
+        path.to_str().unwrap(),
+        amphora_engine::storage::versioned::memory::machine(),
+    )
+    .unwrap();
+    let role = execute::SessionRole {
+        name: "ada",
+        superuser: true,
+    };
+    let executor = database.session(role, "UTC", 1).unwrap();
+    let mut session = log_in(Box::new(executor));
+    let mut given = BTreeSet::new();
+    for (_, _, answer) in tpcb::answers(include_str!("extended/answers.txt")) {
+        for message in messages(&answer[0].1) {
+            if b"PBDEC".contains(&message.0) {
+                given.insert(message);
+            }
+        }
+    }
+    let mut send = |bytes: &[u8]| {
+        let (out, next) = drive(&mut session, roles(), bytes, Pace::Frames);
+        assert_eq!(next, None, "{bytes:02x?}");
+        messages(&out)
+    };
+    for (tag, body) in given
+        .iter()
+        .filter(|(tag, body)| *tag == b'P' && body[0] != 0)
+    {
+        send(&frontend(*tag, body));
+        send(&frontend(b'S', b""));
+    }
+    let mut sent = 0;
+    for (tag, body) in &given {
+        let mut hostile: Vec<Vec<u8>> = (0..body.len()).map(|at| body[..at].to_vec()).collect();
+        hostile.push([body.as_slice(), &[0xff]].concat());
+        for at in (0..body.len()).filter(|_| *tag != b'P') {
+            for byte in [0x00, 0x7f, 0xff] {
+                let mut other = body.clone();
+                other[at] = byte;
+                hostile.push(other);
+            }
+        }
+        for body in hostile {
+            let mut bytes = frontend(*tag, &body);
+            bytes.extend(frontend(b'S', b""));
+            let answer = send(&bytes);
+            assert_eq!(answer.last().map(|m| m.0), Some(b'Z'), "{bytes:02x?}");
+            let refusals = answer.iter().filter(|m| m.0 == b'E').count();
+            assert!(refusals <= 1, "{bytes:02x?}");
+            sent += 1;
+        }
+    }
+    assert!(sent > 10_000, "{sent} hostile messages");
+    let answer = send(&query(b"SELECT 1"));
+    assert_eq!(answer[2], (b'C', b"SELECT 1\0".to_vec()));
+}
