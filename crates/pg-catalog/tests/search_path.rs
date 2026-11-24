@@ -1,7 +1,11 @@
 //! T-PG.7.2: an unqualified table, type or function name resolves as PostgreSQL 19 resolves it.
 //! Each expectation cites 19's documentation (doc/src/sgml/config.sgml, `search_path`) or its
 //! source (src/backend/catalog/namespace.c) at REL_19_0.
-#![allow(clippy::unwrap_used, clippy::disallowed_macros)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::disallowed_macros
+)]
 
 use amphora_pg_catalog::data::{PG_CLASS, PG_NAMESPACE, PG_PROC, PG_TYPE};
 use amphora_pg_catalog::{Catalog, Datum, Kind, PG_CATALOG_NAMESPACE, Proc, SearchPath};
@@ -84,8 +88,13 @@ fn relation(path: &SearchPath, name: &str) -> Option<u32> {
 
 fn type_(path: &SearchPath, name: &str) -> Option<u32> {
     path.resolve(Kind::Type, |ns| {
-        builtin(&PG_TYPE, "typname", name, Some(("typnamespace", ns)))
-            .or((ns == S && name == "int4").then_some(S_INT4))
+        builtin(&PG_TYPE, "typname", name, Some(("typnamespace", ns))).or(
+            if ns == S && name == "int4" {
+                Some(S_INT4)
+            } else {
+                None
+            },
+        )
     })
 }
 
