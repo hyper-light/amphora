@@ -263,6 +263,33 @@ mod page_inner {
             self.buffer.take()
         }
 
+        /// Amphora: resets an exclusively owned plain page in place with `buffer` from the shared
+        /// page pool (`PageCache::insert_shared_plain`): zero heap allocation, zero atomic RMWs.
+        pub fn reset_plain_shared(
+            &mut self,
+            id: usize,
+            buffer: Arc<Buffer>,
+        ) -> std::result::Result<(), Arc<Buffer>> {
+            let Some(ptr) = std::ptr::NonNull::new(buffer.as_mut_ptr()) else {
+                return Err(buffer);
+            };
+            self.id = id;
+            self.header_offset = Self::header_offset_of(id);
+            *self.flags.get_mut() = PAGE_PLAIN | PAGE_LOADED | PAGE_SHARED;
+            *self.pin_count.get_mut() = 0;
+            *self.wal_tag.get_mut() = TAG_UNSET;
+            *self.logged_frame.get_mut() = 0;
+            *self.logged_as.get_mut() = super::LOGGED_NONE;
+            self.log_base = None;
+            self.publish = None;
+            self.overflow_cells.clear();
+            self.key_heads.reset();
+            self.data_ptr = ptr;
+            self.data_len = buffer.len();
+            self.buffer = Some(buffer);
+            Ok(())
+        }
+
         /// Returns the page data as a mutable slice.
         #[inline(always)]
         #[allow(clippy::mut_from_ref)]
@@ -1021,6 +1048,17 @@ pub fn unpack_tag_pair(tag: u64) -> (u64, u32) {
     (frame, epoch)
 }
 
+/// Amphora: outcome of [`Pager::read_shared`].
+enum SharedRead {
+    /// Already inserted into the connection's page cache in place (zero allocations on plain path).
+    Cached(PageRef),
+    /// Test-only yield injected before cache insert.
+    #[cfg(test)]
+    Yield(Completion),
+    /// Loaded (or read in flight), still needs `cache_insert`.
+    Loaded(PageRef, Option<Completion>),
+}
+
 /// Amphora: a version of a page in a packed log (`storage/packed.rs`): the frame of the record
 /// that holds it, the log's generation (its header's checkpoint sequence), its depth (deltas
 /// since the page's last whole image there) and those deltas' bytes (their runs).
@@ -1156,6 +1194,30 @@ impl Page {
             buffer
         };
         Some((page, buffer))
+    }
+
+    /// Amphora: a new plain page already loaded with `buffer` from the shared pool.
+    pub fn new_plain_shared(id: usize, buffer: Arc<Buffer>) -> Self {
+        let mut inner = PageInner::unloaded(id);
+        if inner.reset_plain_shared(id, buffer).is_err() {
+            *inner.flags.get_mut() = PAGE_PLAIN;
+        }
+        Self {
+            inner: UnsafeCell::new(inner),
+        }
+    }
+
+    /// Amphora: recycles an exclusively owned plain page in place with `buffer` from the shared
+    /// pool; returns `Err(buffer)` when another holder remains.
+    pub fn recycle_shared(
+        page: &mut PageRef,
+        id: usize,
+        buffer: Arc<Buffer>,
+    ) -> std::result::Result<(), Arc<Buffer>> {
+        let Some(inner) = Arc::get_mut(page).map(|p| p.inner.get_mut()) else {
+            return Err(buffer);
+        };
+        inner.reset_plain_shared(id, buffer)
     }
 
     /// Amphora: whether the page's pins are plain counts (decision 42).
@@ -4291,7 +4353,17 @@ impl Pager {
             // Amphora: a version another connection read in is shared, and one read now is
             // shared once read (decision 20).
             let (page, c) = match self.read_shared(page_idx, group.as_deref_mut())? {
-                Some(read) => read,
+                Some(SharedRead::Cached(resident)) => {
+                    if !resident.is_loaded() {
+                        io_yield_one!(crate::Completion::new_yield());
+                    }
+                    return Ok(IOResult::Done((resident, None)));
+                }
+                #[cfg(test)]
+                Some(SharedRead::Yield(yield_c)) => {
+                    io_yield_one!(yield_c);
+                }
+                Some(SharedRead::Loaded(page, c)) => (page, c),
                 None => self.read_page_uncached(page_idx, group)?,
             };
             // Amphora (QT.5): a fetch the shared pages served read no file; one with a read in
@@ -4789,15 +4861,15 @@ impl Pager {
     }
 
     /// Amphora: reads `page_idx` through the pages the database's connections share (decision
-    /// 20): the version this connection sees, as another connection read it in (`(page, None)`:
-    /// no read), or read now (`(page, Some(read))`), shared once read unless this connection
-    /// writes (decision 27). None when this connection doesn't share now: no shared pages,
-    /// outside a read transaction, or a frame its own write transaction wrote.
+    /// 20): the version this connection sees, already inserted in place into the connection's
+    /// cache (`Cached`, zero allocations on the plain path), loaded to insert (`Loaded`), or None
+    /// when this connection doesn't share now: no shared pages, outside a read transaction, or a
+    /// frame its own write transaction wrote.
     fn read_shared(
         &self,
         page_idx: i64,
         group: Option<&mut CompletionGroup>,
-    ) -> Result<Option<(PageRef, Option<Completion>)>> {
+    ) -> Result<Option<SharedRead>> {
         let (Some(shared), Some(wal)) = (self.db_file.shared_pages(), self.wal.as_ref()) else {
             return Ok(None);
         };
@@ -4826,23 +4898,36 @@ impl Pager {
             None => Version::File,
         };
         let key = shared.key(page_no, version);
+        // Amphora (decision 42): on the plain path the pool's own buffer, its count taken once as
+        // the page enters this connection's cache; the pins after are this connection's
+        // (PostgreSQL's private refcounts). Recycle the evicted cache entry and its `Page` in
+        // place under a single cache write lock (zero `Arc<Page>` / `Box<PageCacheEntry>` allocs).
+        let plain = self.page_path() == PagePath::Plain;
+        if plain {
+            if let Some(buffer) = shared.pages().take_count(&key) {
+                let id = usize::try_from(page_idx).map_err(|_| LimboError::IntegerOverflow)?;
+                #[cfg(test)]
+                if self.insert_yield.should_yield_for(page_idx) {
+                    return Ok(Some(SharedRead::Yield(crate::Completion::new_yield())));
+                }
+                let inserted = self
+                    .page_cache
+                    .write()
+                    .insert_shared_plain(PageCacheKey::new(id), id, buffer);
+                match inserted {
+                    Ok(page) => return Ok(Some(SharedRead::Cached(page))),
+                    Err((CacheError::Full, buffer)) => {
+                        let page = Arc::new(Page::new_plain_shared(id, buffer));
+                        return Ok(Some(SharedRead::Loaded(page, None)));
+                    }
+                    Err((e, _)) => return Err(e.into()),
+                }
+            }
+        }
         let (page, spare) = match self.page_path() {
             PagePath::Plain => self.plain_page(page_idx)?,
             PagePath::Today => (Arc::new(Page::new(page_idx)), None),
         };
-        // Amphora (decision 42): on the plain path the pool's own buffer, its count taken once as
-        // the page enters this connection's cache; the pins after are this connection's
-        // (PostgreSQL's private refcounts). The image was checked as it entered the process and is
-        // trusted while the pool keeps it; a write copies it first (`Pager::add_dirty`).
-        let plain = self.page_path() == PagePath::Plain;
-        if plain {
-            if let Some(buffer) = shared.pages().take_count(&key) {
-                page.get().set_buffer(buffer);
-                page.set_loaded();
-                page.set_shared();
-                return Ok(Some((page, None)));
-            }
-        }
         // A copy of its own: no count on a buffer every reader of the page shares (decision 29).
         // Amphora (AUDIT 2.3): on the plain path `take_count` has just missed the shards, so only
         // the frames read without a lock in front of them are left to look in, and only when the
@@ -4859,7 +4944,7 @@ impl Pager {
                 #[allow(clippy::arc_with_non_send_sync)]
                 page.get().set_buffer(Arc::new(copy));
                 page.set_loaded();
-                return Ok(Some((page, None)));
+                return Ok(Some(SharedRead::Loaded(page, None)));
             }
         }
         // Amphora: what a writer reads isn't kept: it reads the pages it is about to change, whose
@@ -4875,14 +4960,14 @@ impl Pager {
                 if self.page_path() == PagePath::Plain
                     && self.read_disk_inline(at, &page, false, spare)?
                 {
-                    return Ok(Some((page, None)));
+                    return Ok(Some(SharedRead::Loaded(page, None)));
                 }
                 page.set_locked();
                 let io_ctx = self.io_ctx.read();
                 self.begin_read_disk_page(at, page.clone(), false, &io_ctx, group)?
             }
         };
-        Ok(Some((page, Some(read))))
+        Ok(Some(SharedRead::Loaded(page, Some(read))))
     }
 
     pub fn wal_state(&self) -> Result<WalState> {

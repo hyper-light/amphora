@@ -393,13 +393,23 @@ impl PageCache {
         }
 
         // Key doesn't exist, proceed with new entry
-        self.make_room_for(1, bypass_capacity)?;
+        let evicted = self.make_room_for_reusing(1, bypass_capacity)?;
 
         // Track evictable count for the new page
         let is_evictable = Self::counted_as_evictable(&value);
 
         let slot_page = Arc::downgrade(&value);
-        let entry = PageCacheEntry::new(key, value);
+        let entry = match evicted {
+            Some(mut reused) => {
+                let old_page = std::mem::replace(&mut reused.page, value);
+                if old_page.is_plain() {
+                    self.spare = Some(old_page);
+                }
+                reused.key = key;
+                reused
+            }
+            None => PageCacheEntry::new(key, value),
+        };
 
         // Amphora (decision 19, lane Q2): a new page joins just behind the hand, where the sweep
         // looks last, so the hand reaches it after every page already cached. Inserted just after
@@ -435,6 +445,102 @@ impl PageCache {
         }
 
         Ok(())
+    }
+
+    /// Amphora: inserts a shared page on the plain path under one cache write lock, recycling an
+    /// evicted `Box<PageCacheEntry>` and its `Arc<Page>` in place when the cache is at capacity
+    /// (zero heap allocations per miss that hits `SharedPages`).
+    pub fn insert_shared_plain(
+        &mut self,
+        key: PageCacheKey,
+        page_idx: usize,
+        buffer: Arc<crate::io::Buffer>,
+    ) -> std::result::Result<PageRef, (CacheError, Arc<crate::io::Buffer>)> {
+        if let Some(slot) = self.map.get(&key) {
+            let entry = unsafe { &*slot.entry };
+            let p = &entry.page;
+            if !p.is_loaded() && !p.is_locked() {
+                if let Err(e) = self._delete(key, true) {
+                    return Err((e, buffer));
+                }
+            } else {
+                slot.bump_ref();
+                return Ok(p.clone());
+            }
+        }
+
+        let evicted = match self.make_room_for_reusing(1, false) {
+            Ok(evicted) => evicted,
+            Err(e) => return Err((e, buffer)),
+        };
+
+        let entry = match evicted {
+            Some(mut reused) => {
+                if reused.page.is_plain() {
+                    match Page::recycle_shared(&mut reused.page, page_idx, buffer) {
+                        Ok(()) => {
+                            self.recycled = self.recycled.saturating_add(1);
+                        }
+                        Err(buffer) => {
+                            reused.page = Arc::new(Page::new_plain_shared(page_idx, buffer));
+                        }
+                    }
+                } else {
+                    reused.page = Arc::new(Page::new_plain_shared(page_idx, buffer));
+                }
+                reused.key = key;
+                reused
+            }
+            None => {
+                let page = match self.spare.take() {
+                    Some(mut spare) => match Page::recycle_shared(&mut spare, page_idx, buffer) {
+                        Ok(()) => {
+                            self.recycled = self.recycled.saturating_add(1);
+                            spare
+                        }
+                        Err(buffer) => Arc::new(Page::new_plain_shared(page_idx, buffer)),
+                    },
+                    None => Arc::new(Page::new_plain_shared(page_idx, buffer)),
+                };
+                PageCacheEntry::new(key, page)
+            }
+        };
+
+        let is_evictable = Self::counted_as_evictable(&entry.page);
+        let result = entry.page.clone();
+        let slot_page = Arc::downgrade(&entry.page);
+
+        let entry_ptr = if self.clock_hand.is_null() {
+            self.queue.push_back(entry);
+            self.queue.back().get().map(std::ptr::from_ref)
+        } else {
+            // SAFETY: the hand points into `queue` whenever it is not null.
+            let mut hand = unsafe { self.queue.cursor_mut_from_ptr(self.clock_hand) };
+            hand.insert_before(entry);
+            hand.peek_prev().get().map(std::ptr::from_ref)
+        };
+        let Some(entry_ptr) = entry_ptr else {
+            return Err((
+                CacheError::InternalError("Failed to get inserted entry pointer".into()),
+                Arc::new(crate::io::Buffer::new_temporary(0)),
+            ));
+        };
+        let entry_ptr = entry_ptr.cast_mut();
+        self.map.insert(
+            key,
+            Slot {
+                entry: entry_ptr,
+                page: slot_page,
+                ref_bit: AtomicU8::new(CLEAR),
+            },
+        );
+        if self.clock_hand.is_null() {
+            self.clock_hand = entry_ptr;
+        }
+        if is_evictable {
+            self.evictable_count = self.evictable_count.saturating_add(1);
+        }
+        Ok(result)
     }
 
     fn _delete(&mut self, key: PageCacheKey, clean_page: bool) -> Result<(), CacheError> {
@@ -767,23 +873,40 @@ impl PageCache {
     /// can drive the real SIEVE eviction sweep directly (aretta-books accessor A-29).
     /// This exposes an existing internal eviction primitive; it adds no new
     /// behaviour. NEVER use in production.
-    #[cfg_attr(
-        feature = "aristo-instr",
-        aristo::instrument::expose_pub(as = "inspect_make_room_for")
-    )]
+    #[cfg(feature = "aristo-instr")]
+    #[aristo::instrument::expose_pub(as = "inspect_make_room_for")]
     fn make_room_for(&mut self, n: usize, bypass_capacity: bool) -> Result<(), CacheError> {
+        if let Some(evicted) = self.make_room_for_reusing(n, bypass_capacity)? {
+            if evicted.page.is_plain() {
+                self.spare = Some(evicted.page);
+            }
+        }
+        Ok(())
+    }
+
+    fn make_room_for_reusing(
+        &mut self,
+        n: usize,
+        bypass_capacity: bool,
+    ) -> Result<Option<Box<PageCacheEntry>>, CacheError> {
         if bypass_capacity {
-            return Ok(());
+            return Ok(None);
         }
         if n > self.capacity {
             return Err(CacheError::Full);
         }
 
-        let target_len = self.capacity - n;
+        let target_len = self.capacity.saturating_sub(n);
+        let mut last_evicted: Option<Box<PageCacheEntry>> = None;
         while self.len() > target_len {
-            self.evict_one()?;
+            if let Some(prev) = last_evicted.take() {
+                if prev.page.is_plain() {
+                    self.spare = Some(prev.page);
+                }
+            }
+            last_evicted = self.evict_one_entry()?;
         }
-        Ok(())
+        Ok(last_evicted)
     }
 
     #[inline]
@@ -797,6 +920,17 @@ impl PageCache {
 
     /// Evicts a single page using the SIEVE algorithm
     fn evict_one(&mut self) -> Result<(), CacheError> {
+        if let Some(removed) = self.evict_one_entry()? {
+            if removed.page.is_plain() {
+                self.spare = Some(removed.page);
+            }
+        }
+        Ok(())
+    }
+
+    /// Evicts a single page using the SIEVE algorithm and returns its unlinked entry node so the
+    /// caller can reuse the `Box<PageCacheEntry>` and plain `Page` without heap allocation.
+    fn evict_one_entry(&mut self) -> Result<Option<Box<PageCacheEntry>>, CacheError> {
         if self.len() == 0 {
             return Err(CacheError::InternalError(
                 "Cannot evict from empty cache".into(),
@@ -840,8 +974,7 @@ impl PageCache {
                 page.clear_loaded();
                 // Amphora (decision 42): a plain page no one else holds keeps its buffer, to be
                 // the next miss's (`take_spare`); a shared page's buffer is the pool's.
-                let spare = page.is_plain() && !page.is_shared();
-                if !spare {
+                if !page.is_plain() || page.is_shared() {
                     let _ = page.get().take_buffer();
                 }
 
@@ -850,14 +983,11 @@ impl PageCache {
                     let mut cursor = self.queue.cursor_mut_from_ptr(entry_ptr);
                     cursor.remove()
                 };
-                if spare {
-                    self.spare = removed.map(|entry| entry.page);
-                }
 
                 // Update evictable count after successful eviction
                 self.evictable_count = self.evictable_count.saturating_sub(1);
 
-                return Ok(());
+                return Ok(removed);
             } else if evictable {
                 // Decrement ref bit and continue
                 if let Some(slot) = self.map.get(&key) {

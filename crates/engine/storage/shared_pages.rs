@@ -24,9 +24,10 @@ use crate::sync::{Arc, RwLock};
 use rustc_hash::FxHashMap;
 use std::sync::OnceLock;
 
-/// Shards: a lock each, so readers of different pages seldom meet.
+/// Shards: a lock each, so readers of different pages seldom meet. Power of two for bitmasking.
 const SHARDS: usize = 64;
 const SHARDS_U64: u64 = 64;
+const SHARD_MASK: u64 = SHARDS_U64 - 1;
 
 /// Which version of a page an image is.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -67,17 +68,39 @@ struct Shard {
     added: u64,
 }
 
-/// A shard, and its lookups counted beside its lock (a lookup holds the lock to read, so it can't
-/// count under it): one count a shard, where one for the pool, written by every reader's every
-/// lookup, would move its line between their cores each time (decision 22). Alone on its
-/// cache-line pair (AUDIT 2.3): neighbouring shards' locks and counts shared lines, so readers of
-/// different shards still moved them between cores; 128 bytes as `optimistic_pages`' frames.
+/// A shard lock, alone on its cache-line pair so lookups' hit/miss counters never dirty the
+/// lock's cache line across cores (128 bytes: adjacent-line prefetcher pulls pairs).
 #[derive(Default)]
 #[repr(align(128))]
 struct ShardCell {
     shard: RwLock<Shard>,
+}
+
+/// Striped per-thread hit/miss counters, alone on their own cache-line pair so concurrent readers
+/// hitting the same shard do not bounce a single hit counter line between cores.
+#[derive(Default)]
+#[repr(align(128))]
+struct CountStripe {
     hits: AtomicU64,
     misses: AtomicU64,
+}
+
+fn count_stripe_index(mask: usize) -> usize {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    std::thread_local! {
+        static STRIPE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    }
+    STRIPE.with(|s| {
+        let id = match s.get() {
+            Some(v) => v,
+            None => {
+                let v = NEXT.fetch_add(1, Ordering::Relaxed);
+                s.set(Some(v));
+                v
+            }
+        };
+        id & mask
+    })
 }
 
 /// Lookups that found an image, lookups that didn't, and images added: for tests and meters.
@@ -91,6 +114,9 @@ pub struct Counts {
 /// The pages a database's connections share.
 pub struct SharedPages {
     shards: Box<[ShardCell]>,
+    /// Striped hit/miss counters (power-of-two length derived from hardware parallelism).
+    counts: Box<[CountStripe]>,
+    count_mask: usize,
     /// Pages each shard keeps at most.
     per_shard: usize,
     /// The number the next file to join gets.
@@ -125,12 +151,28 @@ impl SharedPages {
     /// `new`, its lookups taken as `reads` says.
     pub fn with_reads(pages: usize, reads: SharedPageReads) -> Self {
         let per_shard = pages.checked_div(SHARDS).unwrap_or(0).max(1);
+        let stripes = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1)
+            .checked_next_power_of_two()
+            .unwrap_or(1)
+            .max(1);
         Self {
             shards: (0..SHARDS).map(|_| ShardCell::default()).collect(),
+            counts: (0..stripes).map(|_| CountStripe::default()).collect(),
+            count_mask: stripes.saturating_sub(1),
             per_shard,
             files: AtomicU64::new(0),
             charged: AtomicUsize::new(0),
             front: (reads == SharedPageReads::Optimistic).then(OnceLock::new),
+        }
+    }
+
+    #[inline]
+    fn record_lookup(&self, found: bool) {
+        if let Some(stripe) = self.counts.get(count_stripe_index(self.count_mask)) {
+            let count = if found { &stripe.hits } else { &stripe.misses };
+            count.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -193,7 +235,7 @@ impl SharedPages {
     /// in turn) the first pages of 64 files fall on 64 shards, while one file's run of pages still
     /// fills every shard evenly, as a hash wouldn't.
     fn shard(&self, file: u64, page: u64) -> Option<&ShardCell> {
-        let at = page.wrapping_add(file).checked_rem(SHARDS_U64).unwrap_or(0);
+        let at = page.wrapping_add(file) & SHARD_MASK;
         self.shards.get(usize::try_from(at).ok()?)
     }
 
@@ -223,8 +265,7 @@ impl SharedPages {
                 _ => false,
             }
         };
-        let count = if found { &cell.hits } else { &cell.misses };
-        count.fetch_add(1, Ordering::Relaxed);
+        self.record_lookup(found);
         found
     }
 
@@ -243,12 +284,7 @@ impl SharedPages {
                 entry.buffer.clone()
             })
         };
-        let count = if found.is_some() {
-            &cell.hits
-        } else {
-            &cell.misses
-        };
-        count.fetch_add(1, Ordering::Relaxed);
+        self.record_lookup(found.is_some());
         found
     }
 
@@ -409,15 +445,20 @@ impl SharedPages {
 
     /// Lookups and additions so far, the shards' summed.
     pub fn counts(&self) -> Counts {
-        let front = Counts {
+        let mut sum = Counts {
             hits: self.front_made().map_or(0, Frames::hits),
             ..Counts::default()
         };
-        self.shards.iter().fold(front, |sum, cell| Counts {
-            hits: sum.hits.wrapping_add(cell.hits.load(Ordering::Relaxed)),
-            misses: sum.misses.wrapping_add(cell.misses.load(Ordering::Relaxed)),
-            added: sum.added.wrapping_add(cell.shard.read().added),
-        })
+        for stripe in self.counts.iter() {
+            sum.hits = sum.hits.wrapping_add(stripe.hits.load(Ordering::Relaxed));
+            sum.misses = sum
+                .misses
+                .wrapping_add(stripe.misses.load(Ordering::Relaxed));
+        }
+        for cell in self.shards.iter() {
+            sum.added = sum.added.wrapping_add(cell.shard.read().added);
+        }
+        sum
     }
 }
 
