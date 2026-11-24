@@ -1110,7 +1110,26 @@ mod stored {
 
     /// The calibration kept for `key`, None if there is none or what's there is anything else.
     pub(super) fn load(key: &Key) -> Option<Calibration> {
-        let text = std::fs::read_to_string(key.file()).ok()?;
+        load_from(key, std::fs::File::open(key.file()).ok()?)
+    }
+
+    pub(super) fn load_from(key: &Key, reader: impl std::io::Read) -> Option<Calibration> {
+        use std::io::Read;
+        // render uses fixed-width hexadecimal fields. Only the header varies with the key.
+        let size = render(
+            key,
+            &Calibration {
+                timing_nanos: 0.0,
+                kinds: [(0.0, 0.0); CALIBRATED.len()],
+            },
+        )
+        .len();
+        let bound = u64::try_from(size).ok()?.checked_add(1)?;
+        let mut text = String::new();
+        reader.take(bound).read_to_string(&mut text).ok()?;
+        if text.len() != size {
+            return None;
+        }
         parse(key, &text)
     }
 
@@ -1119,35 +1138,27 @@ mod stored {
         // not read as another number.
         let body = text.strip_prefix(&key.header())?.strip_suffix('\n')?;
         let mut lines = body.split('\n');
-        let bits = |line: Option<&str>, name: &str| -> Option<Vec<f64>> {
-            let mut words = line?.split(' ');
-            if words.next()? != name {
+        let number = |word: &str| -> Option<f64> {
+            if word.len() != 16 || !word.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return None;
             }
-            words
-                .map(|w| {
-                    let digits = w.len() == 16 && w.bytes().all(|b| b.is_ascii_hexdigit());
-                    digits.then(|| u64::from_str_radix(w, 16).ok().map(f64::from_bits))?
-                })
-                .collect()
+            u64::from_str_radix(word, 16).ok().map(f64::from_bits)
         };
-        let timing = bits(lines.next(), "timing")?;
-        let [timing_nanos] = timing.as_slice() else {
-            return None;
-        };
+        let timing_nanos = number(lines.next()?.strip_prefix("timing ")?)?;
         let mut kinds = [(0.0, 0.0); 7];
         for (slot, kind) in kinds.iter_mut().zip(CALIBRATED) {
-            let pair = bits(lines.next(), &format!("{kind:?}"))?;
-            let [units, nanos] = pair.as_slice() else {
+            let (name, pair) = lines.next()?.split_once(' ')?;
+            if name != format!("{kind:?}") {
                 return None;
-            };
-            *slot = (*units, *nanos);
+            }
+            let (units, nanos) = pair.split_once(' ')?;
+            *slot = (number(units)?, number(nanos)?);
         }
         if lines.next().is_some() {
             return None;
         }
         let kept = Calibration {
-            timing_nanos: *timing_nanos,
+            timing_nanos,
             kinds,
         };
         if kept.timed() {
@@ -1232,7 +1243,7 @@ mod stored {
     }
 
     /// The first record of a `/proc/cpuinfo`, its fields that don't move, one a line; None without
-    /// a whole record. Linux's alone: no other platform has the file.
+    /// a whole record.
     #[cfg(any(target_os = "linux", test))]
     pub(super) fn cpu_record(text: &str) -> Option<String> {
         let (record, _) = text.split_once("\n\n")?;
@@ -1521,7 +1532,8 @@ fn page_read_place(db_path: &str, io: &dyn crate::io::IO) -> Option<PageReadPlac
 /// the place (`PageReadPlace`): (reads, nanoseconds), as `time_page_read` gives them. Bounded by
 /// the IO backends compiled in times the devices the process opens databases on (the mounted
 /// filesystems); an entry is never evicted, as a device's read cost is the same all process long.
-type PageReads = FxHashMap<(&'static str, PageReadPlace), (f64, f64)>;
+type PageReads =
+    FxHashMap<(&'static str, PageReadPlace), std::sync::Arc<Mutex<Option<(f64, f64)>>>>;
 
 fn page_reads() -> &'static Mutex<PageReads> {
     static PAGE_READS: OnceLock<Mutex<PageReads>> = OnceLock::new();
@@ -1541,22 +1553,22 @@ pub(crate) fn page_read_anchor(
     most_reads: usize,
     writable: bool,
 ) -> Option<(f64, f64)> {
-    let key = io
-        .page_read_backend()
-        .zip(page_read_place(db_path, io.as_ref()));
     if !writable {
         return None;
     }
-    if let Some(key) = &key {
-        if let Some(timed) = page_reads().lock().get(key) {
-            return Some(*timed);
-        }
+    let Some(key) = io
+        .page_read_backend()
+        .and_then(|backend| page_read_place(db_path, io.as_ref()).map(|place| (backend, place)))
+    else {
+        return time_page_read(db_path, io, page_size, most_reads);
+    };
+    // Scratch IO on another device can proceed while the first open on this device measures.
+    let slot = page_reads().lock().entry(key).or_default().clone();
+    let mut sample = slot.lock();
+    if sample.is_none() {
+        *sample = time_page_read(db_path, io, page_size, most_reads);
     }
-    let timed = time_page_read(db_path, io, page_size, most_reads)?;
-    if let Some(key) = key {
-        page_reads().lock().entry(key).or_insert(timed);
-    }
-    Some(timed)
+    *sample
 }
 
 /// Times page reads at a database's open, before it has read a page of its own (QT.5): a scratch
@@ -1713,6 +1725,23 @@ mod tests {
                 (512.0, 650.0),
             ],
         }
+    }
+
+    /// T-QT.5.5. A cache entry of the wrong size is discarded after reading at most the size
+    /// of this key's record and one trailing byte.
+    #[test]
+    fn review_calibration_reads_only_one_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = audit_7_1_key(dir.path());
+        let record = stored::render(&key, &audit_7_1_calibration());
+        let mut input = std::io::Cursor::new(record.repeat(2));
+        assert_eq!(stored::load_from(&key, &mut input), None);
+        assert!(
+            input.position() <= record.len() as u64 + 1,
+            "read {} bytes for a {} byte record",
+            input.position(),
+            record.len()
+        );
     }
 
     /// Do: keep a calibration for a key, then read it back (AUDIT §7.1). Expect: the very same
@@ -2278,6 +2307,32 @@ mod tests {
         let again = page_read_anchor(":memory:", &second_io, 4096, 8, true).unwrap();
         assert_eq!(second.opened.load(Ordering::SeqCst), 0);
         assert_eq!(again, timed);
+    }
+
+    /// T-QT.5.5. Simultaneous first opens on one backend and device all share one measurement.
+    #[test]
+    fn review_concurrent_first_opens_share_one_page_read() {
+        let workers = 8;
+        let io = counting(Some("review-concurrent-first-open"));
+        let ready = std::sync::Barrier::new(workers);
+        let times = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..workers)
+                .map(|_| {
+                    let dyn_io: crate::sync::Arc<dyn crate::io::IO> = io.clone();
+                    let ready = &ready;
+                    scope.spawn(move || {
+                        ready.wait();
+                        page_read_anchor(":memory:", &dyn_io, 4096, 8, true).unwrap()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(io.opened.load(Ordering::SeqCst), 1);
+        assert!(times.windows(2).all(|pair| pair[0] == pair[1]));
     }
 
     /// Do: take the open's page read twice through an IO that names no backend. Expect: each

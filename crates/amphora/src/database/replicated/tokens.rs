@@ -92,9 +92,8 @@ impl Client {
     pub(in crate::database) fn closed_micros(&self) -> Result<u64, Refusal> {
         Ok(locked(&self.handle.shared.closed)?.time.unwrap_or(0))
     }
-    /// This replica's closed point as a token (tests across groups, lane xgroup-sql): at or past
-    /// every write it has answered, as `Database::session_token` gave before ryw-6 made each write's
-    /// answer carry its own.
+    /// The applied point this replica can serve now. A follower can already have acknowledged
+    /// a later write on its leader's commit; its own write token identifies that entry.
     #[cfg(test)]
     pub(in crate::database) fn closed_token(&self) -> Result<Token, Refusal> {
         let point = locked(&self.handle.shared.closed)?;

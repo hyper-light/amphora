@@ -626,15 +626,18 @@ pub fn merge(found: Vec<Found>, lanes: usize, t: u64) -> Result<Replay> {
     })
 }
 
-/// Cuts each redo file after the last record recovery replayed (`ends`, as [`merge`] found them),
-/// durably: an append there must not leave a torn record's leftovers, or a record past a gap, after
-/// it, to be read back as records.
+/// Makes each recovered prefix durable and cuts off records past it. After a process restart
+/// even a complete record may only be in the OS cache. Its file must be synced before the
+/// reopened log can report the recovered timestamp durable (T-T1.3.1).
 pub fn trim(disk: &dyn Disk, ends: &[[u64; 2]]) -> Result<()> {
     for (lane, turns) in ends.iter().enumerate() {
         for (turn, end) in turns.iter().enumerate() {
             let file = File::Redo { lane, turn };
-            if disk.len(file)? > *end {
+            let cut = disk.len(file)? > *end;
+            if cut {
                 disk.truncate(file, *end)?;
+            }
+            if cut || *end > 0 {
                 disk.sync(file)?;
             }
         }

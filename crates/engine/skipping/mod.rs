@@ -38,7 +38,7 @@ mod zone_map;
 pub(crate) use build::{build_inline, start_build};
 pub use choose::{Chooser, ChooserStats, Lead, MethodStats, SkipMethod, Upkeep};
 pub use cracking::{CrackerColumn, CrackerStats};
-pub(crate) use leaves::{cracker_of_table, nanos_since};
+pub(crate) use leaves::nanos_since;
 pub use leaves::{
     set_list_probe, set_skipping, set_skipping_until, set_skipping_with, set_skipping_with_until,
     skipping_candidates, skipping_counts, zone_map_of_table, LeafBuildError, SkipKind,

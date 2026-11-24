@@ -111,6 +111,7 @@ pub struct CopyCounts {
     pub skipped_body: u64,
     pub skipped_join: u64,
     pub skipped_transaction: u64,
+    pub skipped_defaults: u64,
     /// Statements on a table with a copy, at a snapshot no generation of it answers exactly (none
     /// made yet, made after it, or behind there): the rows answered (lane colcopy-10, AC-CB.4.7).
     pub unserved: u64,
@@ -123,6 +124,7 @@ impl CopyCounts {
             .saturating_add(self.skipped_body)
             .saturating_add(self.skipped_join)
             .saturating_add(self.skipped_transaction)
+            .saturating_add(self.skipped_defaults)
     }
 
     /// Whether the statements between `before` and `self` were all handed over and none was
@@ -146,6 +148,8 @@ pub enum Skip {
     /// In a transaction that changed rows: the copy holds commits alone. (A transaction that
     /// only reads reads the copy at its own snapshot, lane colcopy-10.)
     Transaction,
+    /// Short records need the added columns' defaults from the row loop.
+    Defaults,
 }
 
 impl Skip {
@@ -156,6 +160,7 @@ impl Skip {
             Skip::Body => "body",
             Skip::Join => "join",
             Skip::Transaction => "transaction",
+            Skip::Defaults => "defaults",
         }
     }
 }
@@ -497,6 +502,7 @@ impl Copies {
                 Some(Skip::Body) => &mut c.skipped_body,
                 Some(Skip::Join) => &mut c.skipped_join,
                 Some(Skip::Transaction) => &mut c.skipped_transaction,
+                Some(Skip::Defaults) => &mut c.skipped_defaults,
             };
             *n = n.saturating_add(1);
         }
@@ -913,16 +919,12 @@ pub(crate) fn aggregate(
     connection: &crate::Connection,
     statement_memory: usize,
 ) -> Result<Handed> {
-    // A column with a default a short row reads: the copy decodes the records as written, so the
-    // serial loop reads the rows (lane qs6-17; the copy's own padding is open, executor.md 8).
-    if !data.defaults.is_empty() {
-        return Ok(Handed::Rows(None));
-    }
     let storage = switch.storage();
     let copies = &storage.copies;
     // A statement no copy can answer reads the rows, counted with its reason (lane colcopy-9,
     // AC-CB.4.6) so an A/B can leave it out: it reads the rows under either rebuy policy.
     let skip = match &data.body {
+        _ if !data.defaults.is_empty() => Some(Skip::Defaults),
         Some(body) if !body.simple && body.rows => Some(Skip::Rows),
         Some(body) if !body.simple => Some(Skip::Body),
         _ if !data.joins.is_empty() => Some(Skip::Join),
@@ -1269,6 +1271,26 @@ mod tests {
     }
 
     use crate::storage::versioned::columns_ab::QUERIES;
+
+    /// AC-CB.4.6, T-QT.6.29: a short row reads its added column's default and the
+    /// statement counts as one handing to the copies that only the rows could answer.
+    #[test]
+    fn a_default_read_is_counted_when_the_copy_defers_to_the_rows() {
+        let (_db, conn) = connect();
+        create(&conn, "CREATE TABLE t(id INTEGER PRIMARY KEY)", true);
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("ALTER TABLE t ADD COLUMN v INTEGER DEFAULT 7")
+            .unwrap();
+        let before = copies(&conn).counts();
+        assert_eq!(
+            rows(&conn, "SELECT sum(v) FROM t"),
+            vec![vec![Value::from_i64(7)]]
+        );
+        let after = copies(&conn).counts();
+        assert_eq!(after.handed - before.handed, 1);
+        assert_eq!(after.skipped() - before.skipped(), 1);
+        assert_eq!(after.skipped_defaults - before.skipped_defaults, 1);
+    }
 
     /// Do: the same table on two versioned storages, one with the column copies' switch on; the
     /// analytic statements (filters, aggregates, GROUP BY) on both, with inserts, updates and
@@ -1999,6 +2021,15 @@ mod tests {
     #[test]
     fn cb4_a_read_only_transaction_reads_the_copy_at_its_snapshot() {
         let (_db, reader, writer) = reader_and_writer(None);
+        // This test exercises three reads on the copy. Give the planner a stated slow
+        // row path, so machine calibration cannot route the snapshot checks around it.
+        use crate::translate::optimizer::learned_costs::{WeightRule, Work};
+        reader.db.learned_costs.set_rule(WeightRule::Blend);
+        let samples = f64::from(u32::MAX);
+        reader
+            .db
+            .learned_costs
+            .observe(Work::Row, samples, samples * 1_000_000.0);
         reader.execute("BEGIN").unwrap();
         let first = copies(&reader).counts();
         let then = rows(&reader, SNAPSHOT_Q);
@@ -2416,7 +2447,9 @@ mod tests {
     /// `AMPHORA_AB_SCALE=200 AMPHORA_AB_OUT=bench/records/<date>-<host>-colcopy-ab.jsonl cargo test -p amphora-engine --release --lib storage::versioned::columns_sql::tests::ab -- --nocapture`
     mod ab {
         use super::*;
-        use crate::storage::versioned::columns_ab::{scenarios, schema, Press, Scenario, Traces};
+        use crate::storage::versioned::columns_ab::{
+            scenarios, schema, Handoffs, Press, Scenario, Traces,
+        };
         use std::time::Instant;
 
         fn scale() -> i64 {
@@ -2461,6 +2494,7 @@ mod tests {
             let mut latencies = Vec::with_capacity(s.statements);
             let mut reached = Vec::with_capacity(s.statements);
             let mut skipped_queries = std::collections::BTreeSet::new();
+            let mut handoffs = Handoffs::default();
             let (mut held_sum, mut held_peak, mut equal, mut waited_most) =
                 (0u64, 0u64, true, 0u64);
             let (mut writes_refused, mut write_refusal) = (0u64, None::<String>);
@@ -2473,15 +2507,21 @@ mod tests {
                 if s.grow > 0 {
                     let from = next.get(i).copied().unwrap_or(s.rows + 1);
                     let w = fill_sql(i, from, from + s.grow - 1);
-                    // The scenario's room is the copies' (lane colcopy-8): the other use gives its
-                    // bytes back while the rows grow, so the table's growth is never what the cap
-                    // refuses, and the press after it puts the copies back at their room. A copy
-                    // that must grow with its table then meets the cap first, as the scenario
-                    // says. A write still refused is counted, and left out of the row loop's
-                    // table too, so the answers still compare.
+                    // Grow the row tree first. The commit offers its changes to the copies'
+                    // feeds, so restore this round's pressure before publishing the transaction.
                     room.give(other);
                     other = 0;
-                    match on.execute(&w) {
+                    on.execute("BEGIN").unwrap();
+                    let written = on.execute(&w).and_then(|()| {
+                        if let Some(free) = s.free_at(k, need) {
+                            press(&room, &mut other, free, &on);
+                        }
+                        on.execute("COMMIT")
+                    });
+                    if written.is_err() && !on.get_auto_commit() {
+                        on.execute("ROLLBACK").unwrap();
+                    }
+                    match written {
                         Ok(()) => {
                             off.execute(&w).unwrap();
                             if let Some(n) = next.get_mut(i) {
@@ -2504,7 +2544,9 @@ mod tests {
                 let got = rows(&on, &q);
                 let took = u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 latencies.push(took);
-                if copies(&on).counts().reached_since(&before, 1) {
+                let after = copies(&on).counts();
+                handoffs.record(&before, &after);
+                if after.reached_since(&before, 1) {
                     reached.push(took);
                 } else {
                     skipped_queries.insert(k % QUERIES.len());
@@ -2571,9 +2613,9 @@ mod tests {
                 "reached_statements": reached.len(),
                 "reached_statements_per_s": reached.len() as f64 / (reached_ns as f64 / 1e9).max(f64::MIN_POSITIVE),
                 "skipped_queries": skipped_queries,
-                "skipped": {"rows": c.skipped_rows, "body": c.skipped_body, "join": c.skipped_join, "transaction": c.skipped_transaction},
+                "skipped": handoffs.skipped,
                 "unserved": c.unserved,
-                "handed": c.handed,
+                "handed": handoffs.handed,
                 "all_p50_ns": at(&latencies, 0.5),
                 "all_p99_ns": at(&latencies, 0.99),
                 "all_p999_ns": at(&latencies, 0.999),
@@ -2631,6 +2673,10 @@ mod tests {
                         o.insert("traces_compiled".into(), Traces::compiled().into());
                     }
                     assert_eq!(line["equal"], true, "{line}");
+                    assert!(
+                        line["handed"].as_u64().unwrap() <= s.statements as u64,
+                        "{line}"
+                    );
                     // Lane colcopy-9 (T-CB.4.4): the A/B counts only statements a copy could
                     // answer, so there must be some, and each statement handed over is either
                     // one of them or counted with its reason.
