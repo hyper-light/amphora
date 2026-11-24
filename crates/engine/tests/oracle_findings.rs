@@ -3727,3 +3727,275 @@ fn a_hash_joins_rows_are_tested_by_where_terms_on_correlated_subqueries() {
         }
     }
 }
+
+/// The settings a user meets a statement under, and hash joins wherever a join can take one.
+const FIVE_SETTINGS: [(&str, bool, bool, JoinMethods); 5] = [
+    ("default", false, false, JoinMethods::ByCost),
+    ("parallel", true, false, JoinMethods::ByCost),
+    ("statistics", false, true, JoinMethods::ByCost),
+    ("parallel, statistics", true, true, JoinMethods::ByCost),
+    ("hash joins", false, false, JoinMethods::HashJoinsOnly),
+];
+
+/// Do: fill a database and run each statement under each of FIVE_SETTINGS. Expect: its rows, sorted.
+fn answers_under_five_settings(fill: &[&str], statements: &[(&str, &[&str])]) {
+    for (setting, parallel, statistics, joins) in FIVE_SETTINGS {
+        let (io, conn) = open();
+        for statement in fill {
+            conn.execute(*statement).unwrap();
+        }
+        if parallel {
+            conn.set_parallel_mode(amphora_engine::morsel::ParallelMode::On);
+        }
+        if statistics {
+            conn.execute("ANALYZE").unwrap();
+        }
+        conn.set_join_methods(joins);
+        for (sql, expected) in statements {
+            let mut got = rows(&io, &conn, sql);
+            got.sort();
+            assert_eq!(got, *expected, "{setting}: {sql}");
+        }
+    }
+}
+
+/// Do: RIGHT and FULL JOINs to a table function whose argument holds a subquery correlated with the
+/// tables before it: alone, beside a join it hash joins, under an aggregate, over a left table with no
+/// row, and between two joins that keep their right rows. Expect: SQLite's rows (finding CQ).
+/// Amphora ran the subquery after the function's argument was read, so the argument was the row
+/// before's, and coded it a second time for the unmatched rows, whose hash join nothing had built.
+#[test]
+fn a_table_functions_correlated_argument_is_the_row_in_hands() {
+    answers_under_five_settings(
+        &[
+            "CREATE TABLE a(k INT)",
+            "INSERT INTO a VALUES (1), (2)",
+            "CREATE TABLE t(k INT, j TEXT)",
+            "INSERT INTO t VALUES (1, '[7]'), (2, '[8]'), (NULL, '[7, 9]')",
+            "CREATE TABLE r(x INT)",
+            "INSERT INTO r VALUES (5)",
+            "CREATE TABLE l(y INT)",
+            "INSERT INTO l VALUES (5)",
+            "CREATE TABLE z(k INT)",
+            "CREATE TABLE b(k INT)",
+            "INSERT INTO b VALUES (7), (3)",
+        ],
+        &[
+            (
+                "SELECT a.k, je.value FROM a FULL JOIN json_each((SELECT t.j FROM t WHERE t.k = a.k AND EXISTS (SELECT 1 FROM r JOIN l ON r.x = l.y))) AS je ON je.value = 7",
+                &["1|7", "2|NULL"],
+            ),
+            (
+                "SELECT a.k, je.value FROM a RIGHT JOIN json_each((SELECT t.j FROM t WHERE t.k = a.k)) AS je ON je.value = 7",
+                &["1|7"],
+            ),
+            (
+                "SELECT a.k, je.value FROM a FULL JOIN json_each((SELECT t.j FROM t WHERE t.k IS a.k)) AS je ON je.value = 7",
+                &["1|7", "2|NULL", "NULL|9"],
+            ),
+            (
+                "SELECT count(*), sum(je.value), count(a.k) FROM a FULL JOIN json_each((SELECT t.j FROM t WHERE t.k IS a.k)) AS je ON je.value = 7",
+                &["3|16|2"],
+            ),
+            (
+                "SELECT z.k, je.value FROM z FULL JOIN json_each((SELECT json_array(count(*), 4) FROM t WHERE t.k IS z.k AND 5 IN (SELECT r.x FROM r JOIN l ON r.x = l.y))) AS je",
+                &["NULL|1", "NULL|4"],
+            ),
+            (
+                "SELECT a.k, je.value, b.k FROM a JOIN json_each((SELECT t.j FROM t WHERE t.k = a.k)) AS je RIGHT JOIN b ON b.k = je.value",
+                &["1|7|7", "NULL|NULL|3"],
+            ),
+            (
+                "SELECT a.k, b.k, je.value FROM a RIGHT JOIN b ON a.k = b.k LEFT JOIN json_each((SELECT t.j FROM t WHERE t.k IS a.k)) AS je",
+                &["NULL|3|7", "NULL|3|9", "NULL|7|7", "NULL|7|9"],
+            ),
+        ],
+    );
+}
+
+/// Do: compare json_each's key and value, which declare no type, with columns of every affinity and
+/// with a text: by =, IN, NOT IN, in an ON clause, through a derived table. Expect: SQLite's rows: a
+/// column with no type has BLOB affinity (datatype3.html 3.1), so a TEXT column and it compare as
+/// they are (finding CP). Amphora declared them ANY, NUMERIC affinity, and found 1 = '1'.
+#[test]
+fn a_table_functions_untyped_column_compares_as_it_is() {
+    answers_under_five_settings(
+        &[
+            "CREATE TABLE p(s TEXT, i INTEGER, n NUMERIC, b BLOB, u, nc TEXT COLLATE NOCASE)",
+            "INSERT INTO p VALUES ('1', 1, '1', '1', '1', '1'), ('2', 2, 2, 2, 2, 'A'), ('a', 0, 'a', x'61', 'a', 'a')",
+        ],
+        &[
+            (
+                "SELECT p.s, j.key FROM p, json_each('[5,6,7]') AS j WHERE p.s = j.key",
+                &[],
+            ),
+            (
+                "SELECT p.s FROM p WHERE p.s NOT IN (SELECT key FROM json_each('[5,6,7]'))",
+                &["'1'", "'2'", "'a'"],
+            ),
+            (
+                "SELECT j.key FROM json_each('[5,6,7]') AS j WHERE j.key = '1'",
+                &[],
+            ),
+            (
+                "SELECT p.i, j.value FROM p, json_each('[1,\"1\",\"2\",2.5,\"a\"]') AS j WHERE p.i = j.value",
+                &["1|'1'", "1|1", "2|'2'"],
+            ),
+            (
+                "SELECT p.b, j.value FROM p, json_each('[1,\"1\",\"2\",2.5,\"a\"]') AS j WHERE j.value = p.b",
+                &["'1'|'1'"],
+            ),
+            (
+                "SELECT p.s, j.value FROM p LEFT JOIN json_each('[1,\"a\",2]') AS j ON j.value = p.s",
+                &["'1'|NULL", "'2'|NULL", "'a'|'a'"],
+            ),
+            (
+                "SELECT p.s, v FROM p JOIN (SELECT value AS v FROM json_each('[1,\"1\",2]') LIMIT 10) ON v = p.s",
+                &["'1'|'1'"],
+            ),
+            (
+                "SELECT p.nc, j.atom FROM p, json_tree('[1,\"a\"]') AS j WHERE p.nc = j.atom",
+                &["'A'|'a'", "'a'|'a'"],
+            ),
+        ],
+    );
+}
+
+/// Do: fire triggers whose WHEN and body compare new.c and old.c of a NOCASE and an RTRIM column, in
+/// an operator, an IN, a row value, a function and a subquery, and new.id with a text. Expect: what
+/// SQLite writes: a column's collation (datatype3.html 7.1), no affinity but the rowid's INTEGER
+/// (finding CX). Amphora compared them by BINARY, so the WHEN never fired, and a body's new.id had no
+/// affinity.
+#[test]
+fn a_triggers_new_and_old_keep_their_columns_collations() {
+    let (io, conn) = open();
+    for statement in [
+        "CREATE TABLE u(id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE, r TEXT COLLATE RTRIM, b TEXT, n INTEGER)",
+        "CREATE TABLE m(b TEXT, nc TEXT COLLATE NOCASE)",
+        "INSERT INTO m VALUES ('admin', 'x'), ('other', 'Y')",
+        "CREATE INDEX mb ON m(b)",
+        "CREATE TABLE lg(g, a, b, c, d, e, f)",
+        "CREATE TRIGGER w AFTER INSERT ON u WHEN new.name = 'admin' BEGIN INSERT INTO lg VALUES ('when', new.name = 'admin', new.name IN ('admin'), new.r = 'x', new.id = '1', new.n = '1', nullif(new.name, 'admin')); END",
+        "CREATE TRIGGER e AFTER INSERT ON u WHEN EXISTS (SELECT 1 FROM m WHERE new.name = m.b) BEGIN INSERT INTO lg VALUES ('exists', (SELECT m.b FROM m WHERE new.name = m.b), (SELECT m.b FROM m WHERE m.b = new.name), new.name IN (SELECT m.b FROM m), CASE new.name WHEN 'admin' THEN 1 ELSE 0 END, new.name BETWEEN 'admin' AND 'admin', max(new.name, 'b')); END",
+        "CREATE TRIGGER i AFTER INSERT ON u WHEN new.name IN (SELECT b FROM m) AND (new.name, new.r) = ('admin', 'x') BEGIN INSERT INTO lg VALUES ('in', new.name || '' = 'admin', new.name COLLATE BINARY = 'admin', new.b = 'admin', new.b = (SELECT nc FROM m LIMIT 1), +new.name = 'admin', CAST(new.name AS TEXT) = 'admin'); END",
+        "CREATE TRIGGER o AFTER UPDATE ON u WHEN old.name = new.b COLLATE BINARY OR old.name = new.name BEGIN INSERT INTO lg VALUES ('old', old.name = new.name, old.name = new.b, new.b = old.name, old.r = new.r, old.id = '1', old.name < 'B'); END",
+        "INSERT INTO u VALUES (1, 'ADMIN', 'x  ', 'Admin', 1)",
+        "UPDATE u SET name = 'admin', r = 'x'",
+    ] {
+        conn.execute(statement).unwrap();
+    }
+    assert_eq!(
+        rows(&io, &conn, "SELECT * FROM lg ORDER BY g"),
+        [
+            "'exists'|'admin'|NULL|1|1|1|'b'",
+            "'in'|0|0|0|0|1|1",
+            "'old'|1|1|0|1|1|1",
+            "'when'|1|1|1|1|0|NULL",
+        ]
+    );
+}
+
+/// Do: a NOT EXISTS (an EXISTS, a NOT IN) whose subquery holds an IN, its left side a column of the
+/// subquery's table and its own subquery correlated with the outer table: over few rows, where every
+/// join is a hash join, and over hundreds, at defaults too. Expect: SQLite's rows (finding CR). The
+/// outer subquery became an anti join, and the IN a semi join beside it, where a row the anti join
+/// keeps must match it too: no row came out.
+#[test]
+fn an_in_beside_an_anti_joined_table_stays_in_its_subquery() {
+    answers_under_five_settings(
+        &[
+            "CREATE TABLE o(k INT, v INT)",
+            "INSERT INTO o VALUES (1, 1), (2, 0), (6, NULL)",
+            "CREATE TABLE p(k INT, v INT, s TEXT)",
+            "INSERT INTO p VALUES (1, 2, '11'), (2, 1, '2'), (NULL, 1, '13'), (1, 0, '4'), (3, 0, '1')",
+            "CREATE TABLE e(k INT)",
+            "CREATE TABLE f(k INT)",
+            "INSERT INTO f VALUES (5), (2), (1)",
+        ],
+        &[
+            (
+                "SELECT o.k FROM o WHERE NOT EXISTS (SELECT 1 FROM e WHERE e.k IN (SELECT p.s FROM p WHERE o.v = p.v))",
+                &["1", "2", "6"],
+            ),
+            (
+                "SELECT o.k FROM o WHERE NOT EXISTS (SELECT 1 FROM f WHERE f.k IN (SELECT p.k FROM p WHERE o.v = p.v AND p.k > 1))",
+                &["2", "6"],
+            ),
+            (
+                "SELECT o.k FROM o WHERE EXISTS (SELECT 1 FROM f WHERE f.k IN (SELECT p.k FROM p WHERE o.v = p.v))",
+                &["1", "2"],
+            ),
+            (
+                "SELECT o.k, p.s FROM o LEFT JOIN p ON o.k = p.v WHERE NOT EXISTS (SELECT 1 FROM e WHERE e.k IN (SELECT q.s FROM p AS q WHERE o.v = q.v))",
+                &["1|'13'", "1|'2'", "2|'11'", "6|NULL"],
+            ),
+            (
+                "SELECT o.k FROM o WHERE o.k NOT IN (SELECT f.k FROM f WHERE f.k IN (SELECT p.k FROM p WHERE o.v = p.v))",
+                &["1", "2", "6"],
+            ),
+        ],
+    );
+    answers_under_five_settings(
+        &[
+            "CREATE TABLE o(k INT, v INT)",
+            "CREATE TABLE e(k INT, v INT)",
+            "CREATE TABLE p(k INT, v INT)",
+            "INSERT INTO o WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 300) SELECT i, i % 100 FROM c",
+            "INSERT INTO e WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 60) SELECT i * 7, i % 90 FROM c",
+            "INSERT INTO p WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 400) SELECT i * 3, i % 170 FROM c",
+        ],
+        &[
+            (
+                "SELECT count(*) FROM o WHERE NOT EXISTS (SELECT 1 FROM e WHERE e.v = o.v AND e.k IN (SELECT p.k FROM p WHERE o.v = p.v))",
+                &["300"],
+            ),
+            (
+                "SELECT count(*) FROM o WHERE NOT EXISTS (SELECT 1 FROM e WHERE e.k IN (SELECT p.k FROM p WHERE o.v = p.v))",
+                &["258"],
+            ),
+            (
+                "SELECT count(*) FROM o WHERE EXISTS (SELECT 1 FROM e WHERE e.k IN (SELECT p.k FROM p WHERE o.v = p.v))",
+                &["42"],
+            ),
+            (
+                "SELECT count(*) FROM o WHERE o.k NOT IN (SELECT e.k FROM e WHERE e.v IN (SELECT p.k FROM p WHERE o.v = p.v))",
+                &["298"],
+            ),
+        ],
+    );
+}
+
+/// Do: aggregates over comparisons of NOCASE and RTRIM columns, in a query grouped by a subquery's
+/// answer, with a FILTER and in a window function. Expect: each comparison by its column's collation
+/// (finding DE). The rows a sort groups gave the aggregates their columns without it.
+#[test]
+fn an_aggregates_argument_compares_by_its_columns_collation() {
+    answers_under_five_settings(
+        &[
+            "CREATE TABLE t0(c0, c1 TEXT COLLATE NOCASE, c2, c3 TEXT COLLATE RTRIM)",
+            "INSERT INTO t0 VALUES (1, 'ABC', 3.0, 'x '), (2, 'x', 3.0, 'x'), (3, 'abc', 1, 'y'), ('abc', 'Abc', 2, 'x  ')",
+        ],
+        &[
+            (
+                "SELECT b.c0 IN (SELECT s.c0 FROM t0 AS s WHERE s.c1 == b.c0), max(quote((b.c1 IS 'abc'))) FROM t0 AS b GROUP BY 1",
+                &["0|'1'", "1|'1'"],
+            ),
+            (
+                "SELECT EXISTS (SELECT 1 FROM t0 AS s WHERE s.c0 = b.c0), sum(b.c1 = 'abc'), sum(b.c3 = 'x'), count(DISTINCT b.c1) FROM t0 AS b GROUP BY 1",
+                &["1|3|3|2"],
+            ),
+            (
+                "SELECT b.c0 IN (SELECT s.c0 FROM t0 AS s WHERE s.c1 == b.c0), sum(b.c1 = 'abc') FILTER (WHERE b.c1 = 'abc'), max(CASE b.c1 WHEN 'abc' THEN 1 ELSE 0 END), max(b.c1 IN ('abc', 'q')) FROM t0 AS b GROUP BY 1",
+                &["0|2|1|1", "1|1|1|1"],
+            ),
+            (
+                "SELECT (SELECT max(s.c0) FROM t0 AS s WHERE s.c0 = b.c0), max(b.c1 = 'abc') FROM t0 AS b GROUP BY 1 HAVING max(b.c1 = 'abc')",
+                &["'abc'|1", "1|1", "3|1"],
+            ),
+            (
+                "SELECT b.c2, sum(b.c1 = 'abc') OVER (PARTITION BY b.c2 ORDER BY b.c0 ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM (SELECT * FROM t0) AS b",
+                &["1|1", "2|1", "3.0|1", "3.0|1"],
+            ),
+        ],
+    );
+}

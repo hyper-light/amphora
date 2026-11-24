@@ -167,10 +167,10 @@ impl InternalVirtualTable for JsonVirtualTable {
 
     fn sql(&self) -> String {
         "CREATE TABLE x(
-            key ANY,             -- key for current element relative to its parent
-            value ANY,           -- value for the current element
+            key,                 -- key for current element relative to its parent
+            value,               -- value for the current element
             type TEXT,           -- 'object','array','string','integer', etc.
-            atom ANY,            -- value for primitive types, null for array & object
+            atom,                -- value for primitive types, null for array & object
             id INTEGER,          -- integer ID for this element
             parent INTEGER,      -- integer ID for the parent of this element
             fullkey TEXT,        -- full path describing the current element

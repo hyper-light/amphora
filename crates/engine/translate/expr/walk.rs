@@ -171,6 +171,7 @@ where
                     | ast::Expr::Qualified(..)
                     | ast::Expr::Variable(_)
                     | ast::Expr::Register(_)
+                    | ast::Expr::TriggerRegister(..)
                     | ast::Expr::Default => {}
                     ast::Expr::FieldAccess { base, .. } => {
                         stack.push(WalkItem::Expr(base));
@@ -505,6 +506,7 @@ where
                     | ast::Expr::Qualified(..)
                     | ast::Expr::Variable(_)
                     | ast::Expr::Register(_)
+                    | ast::Expr::TriggerRegister(..)
                     | ast::Expr::Default => {}
                     ast::Expr::FieldAccess { base, .. } => {
                         stack.push(WalkItem::Expr(base));
