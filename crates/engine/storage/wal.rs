@@ -7533,6 +7533,13 @@ impl WalFile {
                     }
                     // acquire the appropriate exclusive locks depending on the checkpoint mode
                     self.acquire_proper_checkpoint_guard(mode, lock_source, segment)?;
+                    // The closing segment may have been reset, and the current one copied by
+                    // another pass, while this one waited for its locks: a pass copies the
+                    // segment rule 1 names with them held, or none.
+                    let held = self.coordination.segments();
+                    if held.to_copy() != segment || held.closing().is_some() != closing {
+                        return Err(LimboError::Busy.into());
+                    }
                     let mut max_frame = self.determine_max_safe_checkpoint_frame(segment);
                     let nbackfills = self.coordination.segment_snapshot(segment).nbackfills;
 
