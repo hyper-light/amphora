@@ -12,7 +12,9 @@ use crate::sync::RwLock;
 use crate::vtab::{InternalVirtualTable, InternalVirtualTableCursor};
 use crate::{Connection, LimboError, Result, Value};
 use amphora_engine_ext::{ConstraintInfo, ConstraintUsage, IndexInfo, OrderByInfo, ResultCode};
-use amphora_pg_catalog::data::{PG_ATTRIBUTE, PG_CLASS, PG_NAMESPACE, PG_TYPE};
+use amphora_pg_catalog::data::{
+    PG_ATTRIBUTE, PG_CLASS, PG_INHERITS, PG_NAMESPACE, PG_PARTITIONED_TABLE, PG_TYPE,
+};
 use amphora_pg_catalog::{Catalog, Datum};
 
 /// The `pg_catalog` relations served so far.
@@ -22,10 +24,20 @@ pub enum PgCatalog {
     Type,
     Class,
     Attribute,
+    /// Empty: there are no partitions yet, nor inheritance.
+    PartitionedTable,
+    Inherits,
 }
 
 impl PgCatalog {
-    pub const ALL: [Self; 4] = [Self::Namespace, Self::Type, Self::Class, Self::Attribute];
+    pub const ALL: [Self; 6] = [
+        Self::Namespace,
+        Self::Type,
+        Self::Class,
+        Self::Attribute,
+        Self::PartitionedTable,
+        Self::Inherits,
+    ];
 
     fn catalog(self) -> &'static Catalog {
         match self {
@@ -33,6 +45,8 @@ impl PgCatalog {
             Self::Type => &PG_TYPE,
             Self::Class => &PG_CLASS,
             Self::Attribute => &PG_ATTRIBUTE,
+            Self::PartitionedTable => &PG_PARTITIONED_TABLE,
+            Self::Inherits => &PG_INHERITS,
         }
     }
 }
@@ -174,7 +188,10 @@ fn rows(catalog: PgCatalog, conn: &Arc<Connection>) -> Result<Vec<Vec<Value>>> {
         .map(|row| row.iter().map(value).collect())
         .collect();
     match catalog {
-        PgCatalog::Namespace | PgCatalog::Type => {}
+        PgCatalog::Namespace
+        | PgCatalog::Type
+        | PgCatalog::PartitionedTable
+        | PgCatalog::Inherits => {}
         PgCatalog::Class => {
             for table in user_tables(conn)? {
                 rows.push(class_row(&table)?);

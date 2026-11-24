@@ -677,6 +677,8 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         1923 => (0x9113_5026_c13a_e4a7, top),
         // Typename: SimpleTypename opt_array_bounds
         1964 => (0xc58b_b6eb_3ec8_28bf, typename),
+        // opt_array_bounds: opt_array_bounds '[' ']'
+        1970 => (0x3fc9_fa1e_7faf_0612, unbounded),
         // opt_array_bounds: /* EMPTY */
         1972 => (0x5be7_5729_4b12_8d74, nil),
         // SimpleTypename: GenericType
@@ -787,6 +789,8 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         2373 => (0x9b92_967c_258a_d5db, qualified_columnref),
         // indirection_el: '.' attr_name
         2374 => (0x7baf_b980_ab5f_c89c, field),
+        // indirection: indirection indirection_el
+        2381 => (0x23a9_e08f_dcd7_6a60, append_second),
         // indirection: indirection_el
         2380 => (0x0fda_94aa_d7e7_3ffc, list1),
         // opt_indirection: /* EMPTY */
@@ -835,6 +839,8 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         2504 => (0xa007_892c_3e21_a49b, top),
         // type_function_name: IDENT
         2507 => (0x2c4d_653c_2123_81fb, top),
+        // type_function_name: unreserved_keyword
+        2508 => (0x1d4d_f16c_54a7_2564, top),
         // NonReservedWord: IDENT
         2510 => (0x2c4d_653c_2123_81fb, top),
         // NonReservedWord: unreserved_keyword
@@ -1780,6 +1786,13 @@ fn typename(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
     Ok(Value::Node(Some(id)))
 }
 
+/// `opt_array_bounds '[' ']'`: `lappend($1, makeInteger(-1))`.
+fn unbounded(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let mut bounds = r.list(1)?;
+    bounds.push(r.push(Node::Integer(-1))?);
+    Ok(Value::List(bounds))
+}
+
 /// `columnDef`. SplitColQualList keeps the Constraints and takes out a COLLATE clause; only
 /// ColConstraintElem's ported rules reach ColQualList, so every element is a Constraint.
 fn column_def(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
@@ -2438,7 +2451,7 @@ mod tests {
                 n += 1;
             }
         }
-        assert_eq!(n, 293);
+        assert_eq!(n, 296);
     }
 
     /// T-PG.5.1: a syntax error is 42601 at the token 19 names (1-based characters), the end of
