@@ -2354,7 +2354,10 @@ before any frame of the current one.
   checkpointer's pass that copies its last frame and flushes the file, or, for a backed-up database, the backup's
   word that it shipped the segment. Each already happens, so the reset needs no timer and no poll. It writes nothing.
   The segment's frames stay until the next switch writes a new header over them (decision 13). Decision 31's cut of
-  a log past twice its bound applies to a segment at its reset.
+  a segment file past its bound comes when the writer next switches into that segment, never at the restart that
+  closed it or at its reset, because reads may still be reading it then; so the log's peak on disk is two segment
+  files (Ada, 2026-11-24, on lane B18's question). The writer never switches from a segment that holds no frame:
+  its header is written by its first commit, so a switch from it would leave two headers recovery refuses (lane B19).
 - **Bounded.** A read holds a segment for at most its request's deadline D. Reads begun before the switch end by D
   after it. Reads begun before the closing segment's copy finished end by D after that, and no read begun after
   it counts on the segment (The shape). So a closing segment is free
