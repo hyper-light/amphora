@@ -60,9 +60,45 @@ The preflight's test is red too with its two lines put back (r957): `TwoPhase: O
 gone out to the version-8 owner. The three tests that pin bytes pass either way, as they should. Green (r956, the same
 machine): all of them, in 156 passed, 0 failed.
 
-## Checks on the landing tree `aca5cef3` (main `b53a29b1` merged)
+## Checks on the merged tree
 
-RUNS
+Main moved inside `crates/` three times in the hour, so each merge was checked. The last, `9529b50c` (main `6c54b2cb`), has
+the production code of `aa99c841`: lane A25 changed only a test and its `#[cfg(test)]` hook between them. All macOS runs
+are on Mac Studio 2 (32 cores, load 3 to 32, the named cores), all Linux ones on adacachy2 (load 44 to 78, jobs 1 or 2).
+
+| Tree | Check | Result |
+|---|---|---|
+| `aa99c841` | Linux `cargo clippy --workspace --all-targets -D warnings` (r1037) | exit 0; engine, amphora and the pg crates checked |
+| `aa99c841` | Linux `scripts/check-production.sh` (r1037) | exit 0: "10617 left in the engine's production code across 17 lints, as the ratchet holds" |
+| `9529b50c` | macOS workspace clippy (r1046) | exit 0 |
+| `9529b50c` | amphora lib `xgroup::`, `database::across::`, `transport::`, `replication::`, `session_reads` (r1046, 8 threads) | 123 passed, 0 failed, 2 ignored |
+| `aa99c841` | amphora lib `xgroup::`, `database::across::`, `transport::`, `replication::`, `backup::`, `db::` (r1035) | 168 passed, 0 failed, 2 ignored |
+| `aa99c841` | `--test serve`, `transport` (r1035) | 11 and 9 passed |
+| `aa99c841` | amphora lib `database::replicated::` (r1034) | 161 passed, 3 failed, 5 ignored; below |
+| `aca5cef3` | the same lib sets and `database::replicated::` in one run (r984) | 329 passed, 2 failed, 7 ignored; below |
+| `aca5cef3` | `--test serve`, `transport`, `groups`, `replication` (r984) | 11, 9, 12 passed; 2 passed and 1 failed; below |
+| `aca5cef3` | Linux clippy and check-production (r985) | exit 0, exit 0 |
+| `04aee7c9`, main alone | the lib sets with `database::replicated::` (r964) | 305 passed, 1 failed (`v13_...`), 7 ignored |
+| each | `cargo fmt --all --check`, `python3 scripts/test_requirements.py` (the duplicate-ID test; already on main) | pass |
+
+Reds, each main's own unless it says otherwise:
+
+- `v13_thirty_two_spread_writers_on_moving_time_...`: "Persisted: row 0 at member 1: Timeout" on every macOS run of the suite,
+  main alone included (r964, the same line and message).
+- `a_checkpoint_pass_copies_no_frame_past_...` (r975, `ece9982b`): "left: 77, right: 17", main's own in lanes B20's, B21's and
+  V20's records. Lane V20 has since changed the test by its design, and it passes on `aa99c841`.
+- `local_readers_are_bounded_by_the_transport_not_four`: `Err(Timeout)` at replicated.rs:17174, failed at `aca5cef3`; main `b53a29b1`
+  alone fails it 1 of 3, the same line (r1028). Lane B23 landed before both.
+- `--test replication`, `stale_preparations_are_refused_and_snapshots_...`: "snapshot must read the current catalog page", on main
+  `04aee7c9` alone too (r1029).
+- `serve` failed two at `ece9982b` under load 31 (`os error 35`, a read's deadline) and passes 11 of 11 since, as on main.
+- `a_group_upgrading_to_the_floor_tracks_joins_...` failed once in r1034 ("owner 1 differs at applied index 3") and passed 3 of 3 alone
+  on `aa99c841` (r1052) and 3 of 3 alone on main `1ceb12fd` (r1051). No lock entry is in it. Whether main's suite shows it is in the
+  post-merge runs below, if they ended in the hour.
+- `a_local_read_open_across_an_image_install_...` failed in r1034 and 3 of 3 alone on `aa99c841` (r1052): "the state machine failed".
+  It passed at `aca5cef3`, before lane V20's `32ba72e3` came in. Main `1ceb12fd` alone fails it 3 of 3, the same line and message
+  (r1051): main's own since that landing, on macOS. It passed on Linux in V20's runs. A replica's state machine failed, so its owner
+  should see it.
 
 ## Found on the way, one line each
 
