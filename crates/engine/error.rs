@@ -18,6 +18,13 @@ pub enum LimboError {
     /// so `abort()` does not apply ON CONFLICT resolution to it.
     #[error("{0}")]
     SqlError(String),
+    /// A refusal of the PostgreSQL dialect's: its SQLSTATE (src/backend/utils/errcodes.txt) and
+    /// its message, for the session that asked to answer with.
+    #[error("{message}")]
+    Postgres {
+        sqlstate: &'static str,
+        message: String,
+    },
     #[error(transparent)]
     CacheError(#[from] CacheError),
     #[error("database or disk is full")]

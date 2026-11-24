@@ -15,10 +15,13 @@
 )]
 
 use std::collections::BTreeSet;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
+use amphora::postgres::execute::{self, Executor};
 use amphora::postgres::scram::{self, Binding, ScramSecret, ScramServer};
-use amphora::postgres::session::{Config, Next, Role, Roles, Seed, Session, direct_tls_alpn};
+use amphora::postgres::session::{
+    Config, Next, Role, Roles, Seed, Session, Statements, direct_tls_alpn,
+};
 use amphora::postgres::wire::{self, PgError, SqlState};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -1134,4 +1137,224 @@ fn t_pg_2_2_a_refused_session_is_answered_after_its_startup_packet_as_postgresql
     assert!(fields.contains(&(b'S', "FATAL".to_owned())));
     assert!(fields.contains(&(b'C', "53300".to_owned())));
     assert!(fields.contains(&(b'M', "sorry, too many clients already".to_owned())));
+}
+
+/// pgbench's tables as pgbench.c's createTables makes them, with 19's names for the types.
+const TPCB_SCHEMA: [&str; 7] = [
+    "CREATE TABLE pgbench_history(tid integer, bid integer, aid integer, delta integer, mtime timestamp, filler character(22))",
+    "CREATE TABLE pgbench_tellers(tid integer NOT NULL, bid integer, tbalance integer, filler character(84))",
+    "CREATE TABLE pgbench_accounts(aid integer NOT NULL, bid integer, abalance integer, filler character(84))",
+    "CREATE TABLE pgbench_branches(bid integer NOT NULL, bbalance integer, filler character(88))",
+    "CREATE UNIQUE INDEX pgbench_tellers_pkey ON pgbench_tellers(tid)",
+    "CREATE UNIQUE INDEX pgbench_accounts_pkey ON pgbench_accounts(aid)",
+    "CREATE UNIQUE INDEX pgbench_branches_pkey ON pgbench_branches(bid)",
+];
+
+const TPCB_STATEMENTS: &str = include_str!("tpcb/statements.txt");
+const TPCB_ANSWERS: &str = include_str!("tpcb/answers.txt");
+
+/// A role's session past its start-up and SCRAM, its statements run on `statements`.
+fn log_in(statements: Box<dyn Statements>) -> Session {
+    let mut session = Session::new(config(false), seed()).with_statements(statements);
+    let roles = roles();
+    let user = [("user", "ada"), ("database", "ada")];
+    let packet = startup_packet(wire::PROTOCOL_3_0, &user);
+    drive(&mut session, roles, &packet, Pace::Frames);
+    let bare = "n=,r=clientnonce123";
+    let first = format!("n,,{bare}");
+    let (out, _) = drive(
+        &mut session,
+        roles,
+        &sasl_initial(scram::MECHANISM, first.as_bytes()),
+        Pace::Frames,
+    );
+    let answered = messages(&out);
+    let server_first = String::from_utf8(answered[0].1[4..].to_vec()).unwrap();
+    let (last, _) = client_final(PASSWORD, bare, &server_first, b"n,,");
+    let (out, _) = drive(
+        &mut session,
+        roles,
+        &frontend(b'p', last.as_bytes()),
+        Pace::Frames,
+    );
+    assert_eq!(messages(&out).last().unwrap(), &(b'Z', b"I".to_vec()));
+    session
+}
+
+fn tpcb_statements(conn: &Arc<amphora_engine::Connection>) -> Box<dyn Statements> {
+    let zone = amphora_pg_analysis::tz::time_zone("UTC").unwrap();
+    Box::new(Executor::new(
+        Arc::clone(conn),
+        "ada",
+        zone,
+        Box::new(execute::system_clock),
+    ))
+}
+
+/// A timestamp's text as 19 writes it: to the microsecond, less its trailing zeros.
+fn is_timestamp(text: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(text) else {
+        return false;
+    };
+    let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
+    let shape: String = whole
+        .chars()
+        .map(|c| if c.is_ascii_digit() { '0' } else { c })
+        .collect();
+    shape == "0000-00-00 00:00:00"
+        && fraction.len() <= 6
+        && fraction.bytes().all(|b| b.is_ascii_digit())
+        && !text.ends_with('.')
+        && !fraction.ends_with('0')
+}
+
+fn be16(body: &[u8], at: usize) -> u16 {
+    u16::from_be_bytes(body[at..at + 2].try_into().unwrap())
+}
+
+fn be32(body: &[u8], at: usize) -> u32 {
+    u32::from_be_bytes(body[at..at + 4].try_into().unwrap())
+}
+
+/// What a client can tell of a message: RowDescription without the table's OID but whether it has
+/// one, a refusal's severity and SQLSTATE, a NoticeResponse's SQLSTATE, everything else as it is.
+fn told(kind: u8, body: &[u8], timestamps: &[usize]) -> String {
+    match kind {
+        b'T' => {
+            let mut fields = Vec::new();
+            let mut at = 2;
+            for _ in 0..be16(body, 0) {
+                let end = at + body[at..].iter().position(|b| *b == 0).unwrap();
+                let name = String::from_utf8(body[at..end].to_vec()).unwrap();
+                at = end + 1;
+                let (table, attnum) = (be32(body, at) != 0, be16(body, at + 4));
+                let (type_oid, typlen) = (be32(body, at + 6), be16(body, at + 10).cast_signed());
+                let (typmod, format) = (be32(body, at + 12).cast_signed(), be16(body, at + 16));
+                fields.push(format!(
+                    "{name}: table {table} column {attnum}, type {type_oid}, {typlen}, {typmod}, format {format}"
+                ));
+                at += 18;
+            }
+            format!("T {fields:?}")
+        }
+        b'D' => {
+            let mut values = Vec::new();
+            let mut at = 2;
+            for column in 0..usize::from(be16(body, 0)) {
+                let length = be32(body, at).cast_signed();
+                at += 4;
+                let Ok(length) = usize::try_from(length) else {
+                    values.push("NULL".to_owned());
+                    continue;
+                };
+                let value = &body[at..at + length];
+                at += length;
+                values.push(if timestamps.contains(&column) && is_timestamp(value) {
+                    "a timestamp".to_owned()
+                } else {
+                    String::from_utf8_lossy(value).into_owned()
+                });
+            }
+            format!("D {values:?}")
+        }
+        b'C' => format!("C {}", String::from_utf8_lossy(body)),
+        b'E' | b'N' => {
+            let field = |tag: u8| {
+                body.split(|b| *b == 0)
+                    .find(|f| f.first() == Some(&tag))
+                    .map(|f| String::from_utf8_lossy(&f[1..]).into_owned())
+            };
+            format!("{} {:?} {:?}", char::from(kind), field(b'V'), field(b'C'))
+        }
+        b'Z' => format!("Z {}", String::from_utf8_lossy(body)),
+        _ => format!("{} {body:02x?}", char::from(kind)),
+    }
+}
+
+/// `@ session sql`, then each message's type and hex body (scripts/postgres-tpcb-answers.py).
+/// A session's name, its statement, and what a 19 server answered it.
+type Step = (String, String, Vec<(u8, Vec<u8>)>);
+
+fn tpcb_answers() -> Vec<Step> {
+    let mut steps: Vec<Step> = Vec::new();
+    for line in TPCB_ANSWERS.lines() {
+        if let Some(step) = line.strip_prefix("@ ") {
+            let (session, sql) = step.split_once(' ').unwrap();
+            steps.push((session.to_owned(), sql.to_owned(), Vec::new()));
+            continue;
+        }
+        let (kind, hex) = line.split_once(' ').unwrap_or((line, ""));
+        let body = hex
+            .as_bytes()
+            .chunks(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect();
+        let kind = kind.bytes().next().unwrap();
+        steps.last_mut().unwrap().2.push((kind, body));
+    }
+    steps
+}
+
+/// T-PG.9.1: pgbench's TPC-B statements, through two sessions on the wire core, answer as a
+/// PostgreSQL 19.0 server answered the same statements (scripts/postgres-tpcb-answers.py): the same
+/// RowDescription types, the same DataRow text, the same command tags, refusals and transaction
+/// states. Only a table's OID and a CURRENT_TIMESTAMP's value differ, and only its shape is held.
+#[test]
+fn t_pg_9_1_tpcb_statements_answer_as_a_19_server_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tpcb.db");
+    let io: Arc<dyn amphora_engine::IO> = Arc::new(amphora_engine::PlatformIO::new().unwrap());
+    let db = amphora_engine::Database::open_file(
+        io,
+        path.to_str().unwrap(),
+        Arc::new(amphora_engine::PostgresDialect::new()),
+    )
+    .unwrap();
+    let connect = || db.connect(amphora_engine::ConnectOpts::new()).unwrap();
+    let setup = connect();
+    for ddl in TPCB_SCHEMA {
+        setup.execute(ddl).unwrap();
+    }
+    let mut sessions = std::collections::BTreeMap::new();
+    for name in ["s1", "s2"] {
+        sessions.insert(name.to_owned(), log_in(tpcb_statements(&connect())));
+    }
+    let answers = tpcb_answers();
+    let expected: Vec<&str> = TPCB_STATEMENTS.lines().collect();
+    assert_eq!(answers.len(), expected.len());
+    let mut wrong = Vec::new();
+    let mut compared = 0;
+    for ((session, sql, theirs), line) in answers.iter().zip(expected) {
+        assert_eq!(line, format!("{session}|{sql}"));
+        let (out, next) = drive(
+            sessions.get_mut(session).unwrap(),
+            roles(),
+            &query(sql.as_bytes()),
+            Pace::Frames,
+        );
+        assert_eq!(next, None);
+        let timestamps: &[usize] = if sql.contains("mtime FROM") {
+            &[4]
+        } else {
+            &[]
+        };
+        let told_all = |messages: &[(u8, Vec<u8>)]| -> Vec<String> {
+            messages
+                .iter()
+                .map(|(kind, body)| told(*kind, body, timestamps))
+                .collect()
+        };
+        let (got, want) = (told_all(&messages(&out)), told_all(theirs));
+        compared += want.len();
+        if got != want {
+            wrong.push(format!(
+                "{session}|{sql}:\n  here: {got:#?}\n  19:   {want:#?}"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    assert!(
+        compared > 100,
+        "every message of every statement is compared"
+    );
 }
