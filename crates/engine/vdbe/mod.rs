@@ -967,6 +967,9 @@ pub struct ProgramState {
     /// Lane T18 (PL.13): with `amphora::seek_time` on at DEBUG, each cursor's seeks and their
     /// nanoseconds this run, by cursor id (`execute::seek_trace_end`); empty otherwise.
     pub(crate) seek_times: Vec<(u64, u64)>,
+    /// Lane T19: the statement's star-filter probes and rejects when `execute::star_trace_write`
+    /// last wrote them, so it writes each run's alone.
+    pub(crate) star_trace_base: (u64, u64),
     /// Amphora (QT.7): this run's column batches (`leaf_batch.rs`).
     pub(crate) leaf_batches: leaf_batch::LeafBatches,
     /// Amphora (G5 step 4, T-G5.4.3): the scans skipping rows by a summary, a walk a cursor.
@@ -1139,6 +1142,7 @@ impl ProgramState {
             metrics: StatementMetrics::new(),
             row_counts: Vec::new(),
             seek_times: Vec::new(),
+            star_trace_base: (0, 0),
             leaf_batches: leaf_batch::LeafBatches::default(),
             skip_walks: crate::skipping::SkipWalks::default(),
             distinct_key_values: Vec::new(),
