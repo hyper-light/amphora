@@ -1145,7 +1145,7 @@ criteria = [
 ]
 tests = [
   { id = "T-G3.2.1", text = "storage::wal::tests::g3_2_* — passes when every page read through each lock-free way (filtered, published, optimistic), at random snapshots while frames are appended, rewound, rolled back, checkpointed and the log restarted, and beside a writer thread, finds the frame the index read under its lock finds, or none" },
-  { id = "T-G3.2.2", text = "crates/engine/tests/log_read_index.rs — passes when, after a crash at every write of a checkpoint and of a log restart, every read through each way returns its page's last committed version" },
+  { id = "T-G3.2.2", text = "crates/engine/tests/log_read_index.rs — passes when, after a crash at every write of a checkpoint and of a log restart, every read through the lock-free lookup returns its page's last committed version" },
 ]
 
 # lane g3s5: G3 step 5 (kiln plan 01a16b0f464172dc80c7a3b9a14acbce), skipping the descent.
