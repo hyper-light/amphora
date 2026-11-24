@@ -3505,6 +3505,13 @@ impl Connection {
             .store(WalAutoActions::empty().bits(), Ordering::SeqCst);
     }
 
+    /// Amphora: turns off this connection's own restart of the log before a write, its other
+    /// actions kept, for a log whose owner decides when it starts again (decision 45).
+    pub fn wal_auto_restart_disable(&self) {
+        self.wal_auto_actions
+            .fetch_and(!WalAutoActions::Restart.bits(), Ordering::SeqCst);
+    }
+
     /// Returns the set of automatic WAL maintenance actions this connection
     /// permits. MVCC connections always return an empty set because the
     /// MVCC checkpoint state machine drives WAL maintenance explicitly.

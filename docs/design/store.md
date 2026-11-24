@@ -2486,6 +2486,43 @@ passes, so that the segment is copied whole, reset and switched to. No write wai
 room to spare no read ends. Each ended read gets the error a replica's does (`snapshot_too_old`, database.rs). Test:
 `d45_a_slow_read_gives_way_when_the_logs_room_is_full` (crates/amphora/tests/store.rs).
 
+**Every restart switches (2026-11-24, lane B27).** RESTART, TRUNCATE and the writer's own restart before a write switch
+as the store's does, in a log of one process; nothing restarts a segment in place there. What SQLite documents for each
+(wal_checkpoint_v2, pragma.html's wal_checkpoint) is kept, over two files:
+- *The writer's restart.* "This ensures that the next writer will restart the log file from the beginning": a writer
+  that finds every frame of the current segment in the file switches before its first frame (`switch_before_write`). Its
+  own read, of the log's last commit, goes on from the file and counts on the segment it writes. It waits for no read and
+  no read waits for it: a read in the log keeps the segment it began on, where SQLite's writer appends past it. While the
+  other segment closes, the writer appends on.
+- *FULL, and what RESTART and TRUNCATE share with it.* "It then checkpoints all frames in the log file and syncs the
+  database file": the closing segment is copied, the file synced and the copy published, and then the current one, under
+  the same locks, so that no writer comes between (`after_closing`). A read that counts on the closing segment still holds
+  back the current one's copy (the order above).
+- *RESTART.* "After checkpointing the log file it blocks (calls the busy-handler callback) until all readers are reading
+  from the database file only": with the file synced and no read in the log (every read mark but 0 free), it switches, so
+  the next writer starts a segment from its first frame whatever its own restart is set to. A read of the file alone
+  blocks it no more than in SQLite.
+- *TRUNCATE.* "It also truncates the log file to zero bytes just prior to a successful return", and answers 0, 0: both
+  files are cut. The file with the older header goes first and its cut is synced before the other is asked, since
+  recovery takes a lone valid header for the log and the older one's frames are older than the file's pages. The log is
+  then a new database's, as recovery takes two empty files: its first segment is current. A clean close is this.
+- *Busy* (the pragma's first column 1) means what it does in SQLite: a writer is at work, another checkpoint is, a read of
+  an older snapshot holds frames back, or, for RESTART and TRUNCATE, a read is in the log (either segment). "The checkpoint
+  operation proceeds from that point in the same way as SQLITE_CHECKPOINT_PASSIVE", and the row counts the log's frames and
+  those in the file. It no longer means that the log goes on growing: the next writer starts it again beside a read of
+  the newest snapshot. So a call after one that was busy can count fewer frames than SQLite's would.
+- *Where it differs, counted only.* A RESTART that answered 0 leaves the log with no frame, so the next call counts none;
+  SQLite's counts the old ones until a writer comes. A second RESTART or TRUNCATE beside one read of the file alone is
+  busy: that read keeps the segment the first one closed.
+- *An owner's log.* A replica's owner alone starts its log again, when what it measures says so (replication.md, B): a
+  switch before the room is needed would end a local read sooner. So each of the replica's two connections that write
+  turns its own restart off (`Db::own_restarts`): the owner's, and its session worker's
+  (`Machine::session_connection`), whose sessions are write transactions too, rolled back. Its local reads'
+  connections are refused every write (`Db::query_transaction`), and its copier only copies.
+- *A multi-process log* is its one segment, restarted in place as before: its shared memory publishes no switch
+  (`ShmWalCoordination::switch_unread`). Not built.
+Tests: crates/engine/tests/log_restart.rs, its steps run in sqlite3 3.54.0 as they are.
+
 **A replica's owner (the coordinator, 2026-11-24; lane V20).** The restart a replica's owner makes is this switch and
 waits for no local read (replication.md, "A replica's database log bounded by what it measures", B and D, which had it
 wait until no read was out and held reads for it). It calls the switch alone (`Db::switch_log`), never
@@ -2549,11 +2586,12 @@ the checkpointer copies the closing segment and then the current one. A crash at
 
 **Where it lands in the engine.** Today there is one log in every structure that keys on a frame number. These are
 the places a segment is added (`crates/engine/storage/`):
-- `wal.rs` `restart_wal_header` (8142-8183) becomes the switch. `begin_restart` and `end_restart` (1731-1757) take
-  every read mark exclusively and refuse a restart while any is held: that is the rule the switch drops, and both are
+- `wal.rs` `restart_wal_header` (8142-8183) becomes the switch. `begin_restart` and `end_restart` (1731-1757) took
+  every read mark exclusively and refused a restart while any was held: that is the rule the switch drops, and both are
   deleted with the rest of the one-segment restart (the rewrite of the log from its first frame, `Readers::
-  restart_if_asked`'s gate taken for writing and `Slots::take_all` in `store.rs` 1164-1183). No path starts a log
-  again from its first frame while a read can look into it, so none is kept beside the switch.
+  restart_if_asked`'s gate taken for writing and `Slots::take_all` in `store.rs` 1164-1183; lanes B18 and B27). No path
+  of a log of one process starts it again from its first frame while a read can look into it, so none is kept beside the
+  switch.
 - `WalSharedMetadata` and `WalSharedRuntime` (3703-3787) hold one header, one file, one frame cache, one `nbackfills`
   and five read marks. Each becomes one per segment.
 - `try_begin_read_tx`'s read marks (1528-1604) and `WalSnapshot` (196-211): a snapshot names its segments.
