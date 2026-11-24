@@ -851,6 +851,8 @@ pub struct Connection {
     pub(super) is_mvcc_bootstrap_connection: AtomicBool,
     /// Whether pragma foreign_keys=ON for this connection
     pub(super) fk_pragma: AtomicBool,
+    /// Whether pragma recursive_triggers=ON for this connection
+    pub(super) recursive_triggers: AtomicBool,
     pub(crate) fk_deferred_violations: AtomicIsize,
     /// Number of active top-level write statements on this connection.
     ///
@@ -2985,6 +2987,17 @@ impl Connection {
 
     pub fn foreign_keys_enabled(&self) -> bool {
         self.fk_pragma.load(Ordering::Acquire)
+    }
+
+    /// `PRAGMA recursive_triggers`: whether a trigger may fire itself, and REPLACE the DELETE triggers
+    /// of the rows it removes.
+    pub fn set_recursive_triggers(&self, enable: bool) {
+        self.recursive_triggers.store(enable, Ordering::Release);
+        self.bump_prepare_context_generation();
+    }
+
+    pub fn recursive_triggers(&self) -> bool {
+        self.recursive_triggers.load(Ordering::Acquire)
     }
 
     pub fn set_check_constraints_ignored(&self, ignore: bool) {

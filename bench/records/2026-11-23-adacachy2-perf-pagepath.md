@@ -1846,3 +1846,75 @@ main's pass set: the branch's `storage` and `vdbe` hold main's tests and one mor
 
 **For the next lane.** B27's list above. `every_falsifier_...`: its `calm` waits with time standing still, where its `caught_up` moves the clocks; the dump and the ticks are in `~/.cache/amphora-perf/pagepath-b28/dump.py`
 and r2082's command. `perf/pagepath-b27` (WIP history) and `perf/pagepath-b28-land` hold nothing main doesn't.
+
+## perf-B29 (2026-11-24, 12:03:47Z-13:03:47Z; what plain SQLite sees of a database that needs `-wal2`)
+
+**Losses first.**
+- `Db` makes no clean close as it is dropped (it never did), so the files an Amphora server leaves stay marked: sqlite3 refuses them until something opens them and closes them
+  cleanly. `Db::close` is there; no command of the binary calls it. Before, sqlite3 read such a file when its log happened to be empty, and wrote it (below).
+- The reset is not the version 2 and 2 the design had. SQLite keeps no page checksum (decision 12), so after any write by sqlite3 Amphora refuses the database: seen on main, after a
+  clean close and after a kill (`ChecksumMismatch { page_id: 2 }` at the open). A clean close says write version 3, read version 2: sqlite3 reads it and is refused writes. VACUUM INTO's
+  file keeps 2 and 2, as main has it: a write to that one was not run.
+- A first generation of pages (an engine database's, never `Db`'s) keeps SQLite's format, which two unit tests assert: sqlite3 refuses it (26), yet folds `-wal` into the file and deletes it as
+  it closes. Nothing is lost (the drill's rows), but a process that had lost its file lock (POSIX locks go with any close of the file in the process) would be writing a deleted
+  log. Not run.
+- Costs, not measured: a file opened with version 2 has page 1 in the first commit of each open; a clean close makes one commit of page 1 and one checkpoint more.
+- Not as SQLite: RESTART on a log SQLite left is Busy until Amphora's first commit there is copied. A multi-process log keeps no mark. An attached database that was written stays marked.
+- Noted, not run: a switch cuts the free file with no sync (`cut_past`); a TRUNCATE that comes before the next commit skips a file of 0 bytes (`LogCut::Truncate`), so a power cut could
+  bring that older segment back alone. `Database::wal_format` sets the current segment's format only (read, not run).
+
+**Shown real** (sqlite3 3.54.0, 2026-10-09; main 8be208d6; `premise.py`, `premise2.py` and r2106, r2160, r2165 below).
+| the files | sqlite3 on main | Amphora after it, on main | with the change |
+|---|---|---|---|
+| a kill, the first segment current again, pages (9 rows committed, 3 in the second segment, 3 in the first) | reads 9, takes a row, folds `-wal` and deletes it | 6 rows, integrity ok: 3 committed rows lost | 14, nothing touched; 9 rows |
+| a kill, the first segment cut to 0 bytes (records or pages; 6 committed) | reads 3, takes a row | 6 rows, the row sqlite3 was told it wrote is gone | 26; 6 rows |
+| a kill, the second segment current, pages (6 committed) | reads 3, takes a row | 6 rows, sqlite3's row gone | 26; 6 rows |
+| the same, records, without `-wal` | reads 3, takes a row | | 26 |
+| a clean close | reads all, takes a row | refuses to open: `ChecksumMismatch` | reads all, "attempt to write a readonly database"; every row |
+| a kill, one segment, pages | reads all, takes a row | refuses to open: `ChecksumMismatch` | 26; every row |
+| a database sqlite3 left with its log, then two of Amphora's restarts and a kill | `-wal2` held frames (4,152 bytes) with nothing keeping SQLite out | | 26 |
+
+**Decided by what ran.** The header's versions are not enough. A WAL database with 3 in bytes 18 and 19 of the file and of the log's page 1 (checksums recomputed): the query answers "file is
+not a database (26)", and as the shell closes `-wal` is folded into the file and deleted; with 3 in the file alone and 2 in the log's frame the query is answered. With a log header whose format
+isn't 3007000: "unable to open database file (14)", and nothing is touched but a 32 KiB `-shm`. With `-wal` empty, absent or torn and 3 in the file: 26, nothing touched. With write version 3 and read
+version 2: reads, "attempt to write a readonly database". So: the versions where `-wal` holds no frames, the log's format where it does (SQLite's wal2 has its own too, `WAL_VERSION2` 3021000,
+branch wal2's wal.c). store.md, decision 45, "What plain SQLite sees".
+- Set: in a new file's first page as it is made, and in the first commit of an open of a file that says 2 (`Pager::begin_write_tx`); every later frame of page 1 carries it.
+- A switch waits for the mark's copy in the synced file (`SharedLog::file_is_marked`).
+- Reset: a clean close, once both segments are folded, cut and synced; by a commit of page 1 and a checkpoint, not in place (a torn page 1 would fail its checksum with no log to restore it).
+- Found on the way, in my own change: the open took the file's word for the mark, so a clean close cut between that commit and its fold was written on with the mark set and page 1 unmarked in the
+  log. Mutant m1 is it, red (below).
+
+**Landed** (a fast-forward from ed7007d4 at 12:54:30Z): 643555bc (crates/engine/tests/plain_sqlite.rs, red) and cebeb95c (the change); then, on 6683e18d, b3dafe48 (the clean close's test, which had passed with m1's rule taken out). Branches perf/pagepath-b29-wip and -wip2 hold its history (WIP)
+and nothing main doesn't.
+
+**Red on main** a7d4af72 (r2216). plain_sqlite.rs: 5 of 6 fail (VACUUM INTO's passes, before and after). crash.rs on main's engine, `Db::close` alone taken: both its tests. The 200-seed power cut: seeds of pages,
+"SQLite would read the file and `-wal` (65952 bytes) without `-wal2`'s 24752" and "SQLite would fold `-wal`, the newer segment, and delete it". The clean close's: a database of records, reopened and
+written on, "SQLite would read the file and `-wal` (107152 bytes) without `-wal2`'s 173072". That its reopened first segment was in SQLite's format (the commit message says so) is read from the code and that
+message, not from its header. The first red (r2160) had asserted the rule before asking sqlite3; it was turned round to show the loss first.
+
+**Mutants** (f42a9728, each rule taken out alone; plain_sqlite.rs, and of crash.rs the 200 seeds and the clean close; r2246).
+| rule taken out | what failed |
+|---|---|
+| m1, the open reads the mark in the log too | at the landing nothing did: the first clean-close test's second life inserted rows, whose commits write page 1 and set the mark right. Its rows change in place since: "Pages, back false, cut at 14 of 21 [...] written on, its log started again: SQLite would read the file and `-wal` (8272 bytes) without `-wal2`'s 4152" (r2258), green on the change |
+| m2, the log header's own format | plain_sqlite.rs failed (exit 101, r2246; which of its tests was not read) |
+| m3 no mark, m4 the switch's wait for the file, m5 no reset, m6 the reset's write version | not run: stopped for the landings. m3's is main (the reds above); m6's shape is r2165's red |
+
+**Runs** (adacachy2, `on` it; clone `pagepath-remote`, target `pagepath`; CARGO_INCREMENTAL=0; logs in `~/.cache/amphora-perf/pagepath-b29/` there, the premise's scripts on adacachy in the same folder).
+| run | tree | result |
+|---|---|---|
+| r2106 (cpus=8) | main 8be208d6 | the pass set: engine lib `storage:: vdbe:: mvcc::database::tests multiprocess_tests` 1,623 passed, 0 failed, 28 ignored (210 s); log_restart 4, read_ended 2, log_read_index 1; backup 50 (1 ignored), crash 10 (3), files 3 (1), store 18 |
+| r2160, r2165 (cpus=4) | main 8be208d6 with the tests; f8db4321 | red 5 of 6; on the change 5 of 6 passed: the sixth asked SQLite to write a closed database, and Amphora refused it (`ChecksumMismatch`): the reset became read version 2, write version 3 |
+| r2172 (cpus=8) | c374b22d | plain_sqlite 6, log_restart 4, read_ended 2, log_read_index 1; backup 50, crash 11, files 3, store 18; engine lib 1,623 passed, 0 failed, 28 ignored (210 s) |
+| r2190 (stopped) | c7954fd0 | log_restart 3 passed, 1 failed: the open's reading of the log's page 1 in a read transaction left the schema's read without the closing segment; it is read without one, as the schema is |
+| r2193 (cpus=8) | ba5a90f7 (main a7d4af72 merged) | fmt 0; plain_sqlite 6, log_restart 4, read_ended 2, log_read_index 1; amplification 2, backup 50, crash 11, files 3, groups 12, restore 4, store 18; amphora lib `database::replicated:: backup:: d45_ log_bound` 236 passed, 0 failed, 5 ignored; clippy 101 (one expression of mine) |
+| r2205 (cpus=8) | a75b75dc | fmt 0; clippy `-p amphora -p amphora-engine --all-targets --locked -D warnings` 0 ("Checking amphora-engine"); check-production 0 ("10567 left ... as the ratchet holds") |
+| r2216 (cpus=8, stopped for the landing's check) | a75b75dc; main a7d4af72 | engine lib 1,623 passed, 0 failed, 28 ignored (217 s); 200 seeds: cut midway in 188, 3,112 checkpoints, 875 restarts, 118 cuts of the log's file, 13,873 batches acknowledged, plain SQLite refuses 200 of the 200 images; the reds above |
+| r2234 (cpus=6) | f42a9728 (main ed7007d4 merged; the landed tree) | fmt 0; clippy 0 ("Checking amphora-engine"); check-production 0 ("10515 left"); plain_sqlite 6, log_restart 4, read_ended 2, log_read_index 1; backup 50, crash 11, files 3, store 18 |
+| r2246, r2258 (cpus=6, both stopped) | f42a9728; 9205e36c | the mutants above; the changed clean-close test green on the change |
+| r2266 (cpus=6) | 22465858 (b3dafe48's tree, main 6683e18d) | fmt 0; crash 11 passed (3 ignored); clippy `-p amphora --tests --locked -D warnings` 0 (amphora-engine not rebuilt by it) |
+
+The engine lib was not run again on the landed tree: main moved by C26's and C27's engine changes (vdbe) between a75b75dc and it. Refused for room: 8 cpus at 12:24Z (4 idle) and 12:50Z (7); r2187 (macOS, the mutants) never
+started in eight minutes and was stopped.
+
+**For the next lane.** The notes above, the first two first: what a stopped server's files should be (a decision), and a command that closes one cleanly.
