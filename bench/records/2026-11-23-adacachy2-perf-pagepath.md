@@ -999,9 +999,10 @@ with an error (its shared memory doesn't publish a switch). No A/B ran (rule 0).
 - r32 on b4662671 (this branch with main merged, lane Q5's read path in wal.rs among it; load 45-57): the store test
   passed 17; `d45_a_backup_after_a_switch_holds_the_writes_made_after_it` passed; the files test passed 3, ignored 1;
   the workspace clippy exit 0 in 42 s; `d45_` passed 20. Main then moved only outside crates/ (lane V15's records),
-  merged as 929355dd and pushed to main without a new run. The engine's `storage:: vdbe::vacuum` and
-  `scripts/check-production.sh` were still running on b4662671 at the push (rule 5b): their numbers are the
-  successor's first read (`~/.cache/amphora-perf/pagepath-b18-engine.log` and `-prod.log` on adacachy2).
+  merged as 929355dd and pushed to main as a5ae048c without a new run. After the push (rule 5b), on the same
+  b4662671: `storage:: vdbe::vacuum` passed 738, failed 1 (`cb4_ab_both_rebuy_policies_at_the_extremes`, main's own, as
+  in r5) and ignored 14, in 261 s; `scripts/check-production.sh` exit 0 in 60 s ("10903 left in the engine's
+  production code across 17 lints, as the ratchet holds").
 
 **Notes, one line each.**
 - The switch carries the epoch over unbumped, and a pass that finds the closing segment copied at its start resets it
