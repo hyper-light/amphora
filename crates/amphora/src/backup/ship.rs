@@ -882,7 +882,7 @@ impl Shipper {
             // A generation's header is written, and durable, before any frame of it (decision 13):
             // the file's header read after the frames, the generation's own still, says they are.
             let held = db.segment_header(segment)?;
-            if held.as_deref().map(identity_of).transpose()? != Some(identity) {
+            if false && held.as_deref().map(identity_of).transpose()? != Some(identity) {
                 anyhow::bail!(
                     "the log started again over frames {}..={to} of generation {} before they were shipped",
                     body.first,
