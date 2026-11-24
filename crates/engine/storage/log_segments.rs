@@ -13,6 +13,9 @@ const SHIPPED: u64 = 0x1000_0000_0000_0000;
 const COPIED: u64 = 0x2000_0000_0000_0000;
 const CLOSING: u64 = 0x4000_0000_0000_0000;
 const SECOND_CURRENT: u64 = 0x8000_0000_0000_0000;
+/// The multi-process shared word's bits 0-59 ([`Segments::shared_word`]): how many times its
+/// segments and flags changed.
+const CHANGES: u64 = 0x0FFF_FFFF_FFFF_FFFF;
 /// [`SegmentsCell`]'s word holds the reads as well: bits 0-29 count those on the current segment
 /// and bits 30-59 those on the closing one.
 const READS: u64 = 0x3FFF_FFFF;
@@ -254,6 +257,18 @@ impl Segments {
             }
         }
         word
+    }
+
+    /// The multi-process shared word that follows `word` with this state: [`Self::pack`]'s flags,
+    /// and in bits 0-59 a count raised by each change of them (it wraps at 60 bits). A read checks
+    /// the whole word once it is counted, so flags brought back by later changes (a reset and a
+    /// switch, twice) can't pass for no change (decision 45, lane B15's note).
+    pub fn shared_word(&self, word: u64) -> u64 {
+        let flags = self.pack();
+        if flags == word & !CHANGES {
+            return word;
+        }
+        flags | (word.wrapping_add(1) & CHANGES)
     }
 
     /// The state [`Self::pack`] stored in `word`, with no read counted.
@@ -659,6 +674,30 @@ mod tests {
 
     /// Do: pack each kind of state into the shared memory's word, with reads under way. Expect:
     /// each unpacks to itself with no read counted, and the reads the slots count fill it back.
+    /// Do: from a switch, reset and switch twice more, so the flags are as they were, and write
+    /// the shared word at each step. Expect: the word differs from the one a read took its span
+    /// from at the start, though it unpacks to the same state; a step that changes nothing leaves
+    /// the word as it was (decision 45, lane B15's note).
+    #[test]
+    fn d45_two_switches_never_bring_the_shared_word_back() {
+        let mut log = Segments::new(SegmentId::First);
+        assert_eq!(log.switch(false), Some(SegmentId::Second));
+        let spanned = log.shared_word(0);
+        let mut word = spanned;
+        for _ in 0..2 {
+            assert!(log.copied().is_some());
+            word = log.shared_word(word);
+            assert!(log.switch(false).is_some());
+            word = log.shared_word(word);
+        }
+        assert_eq!(Segments::unpack(word), Segments::unpack(spanned));
+        assert_ne!(word, spanned, "a read's re-check sees the four changes");
+        assert_eq!(log.shared_word(word), word);
+        let at_most = log.pack() | CHANGES;
+        assert!(log.copied().is_some());
+        assert_eq!(log.shared_word(at_most), log.pack(), "the count wraps, the flags kept");
+    }
+
     #[test]
     fn d45_the_shared_word_holds_every_state() {
         let mut log = Segments::new(SegmentId::Second);
