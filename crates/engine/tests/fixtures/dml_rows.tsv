@@ -2141,7 +2141,7 @@ sql	CREATE TRIGGER g0 AFTER UPDATE ON t WHEN new.id IS NOT NULL BEGIN INSERT INT
 sql	CREATE TRIGGER g1 BEFORE UPDATE ON t BEGIN INSERT INTO lg VALUES ('BEFORE UPDATE', new.id, typeof(new.id), new.c0, typeof(new.c0), new.u, typeof(new.u), new.rowid, typeof(new.rowid), quote(old.id), quote(old.c0), quote(old.u), quote(old.rowid)); END
 do	INSERT INTO t VALUES ('1', x'41', 1)	ok
 do	INSERT INTO t VALUES ('a', x'', NULL)	ok
-do	INSERT INTO t VALUES (1, x'41', 1) ON CONFLICT(u) DO UPDATE SET c0 = (SELECT typeof(excluded.id) || typeof(u))	refused: cannot store TEXT value in BLOB column t.c0
+do	INSERT INTO t VALUES (1, x'41', 1) ON CONFLICT(u) DO UPDATE SET c0 = (SELECT typeof(excluded.id) || typeof(t.u))	refused: cannot store TEXT value in BLOB column t.c0
 do	INSERT INTO t(id, u) VALUES ('a', NULL), (NULL, NULL), ('b', NULL)	refused: UNIQUE constraint failed: t.id
 rows	SELECT rowid, id, c0, u FROM t	1,'1',x'41',r3ff0000000000000 / 2,'a',x'',NULL
 rows	SELECT rowid, * FROM lg	
@@ -2394,7 +2394,7 @@ sql	CREATE TABLE lg(e, v0, w0, v1, w1, v2, w2, v3, w3, v4, w4, o0, o1, o2, o3, o
 sql	CREATE TRIGGER g0 BEFORE DELETE ON t BEGIN INSERT INTO lg VALUES ('BEFORE DELETE', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, quote(old.c0), quote(old.Key), quote(old.c1), quote(old.c2), quote(old.u)); END
 sql	CREATE TRIGGER g1 AFTER UPDATE OF u ON t BEGIN INSERT INTO lg VALUES ('AFTER UPDATE OF', new.c0, typeof(new.c0), new.Key, typeof(new.Key), new.c1, typeof(new.c1), new.c2, typeof(new.c2), new.u, typeof(new.u), quote(old.c0), quote(old.Key), quote(old.c1), quote(old.c2), quote(old.u)); INSERT OR IGNORE INTO t(Key, c0) VALUES ('b', '1.0'); END
 do	INSERT INTO t VALUES (x'41', 1, 1.5, NULL, 2)	ok
-do	INSERT INTO t(Key, c1, u, c0) VALUES (1, '2.5', 1, 3.0) ON CONFLICT(u) DO UPDATE SET c1 = excluded.Key = 10, c2 = Key NOT IN (SELECT excluded.c0), c0 = excluded.Key	refused: UNIQUE constraint failed: t.Key
+do	INSERT INTO t(Key, c1, u, c0) VALUES (1, '2.5', 1, 3.0) ON CONFLICT(u) DO UPDATE SET c1 = excluded.Key = 10, c2 = t.Key NOT IN (SELECT excluded.c0), c0 = excluded.Key	refused: UNIQUE constraint failed: t.Key
 do	INSERT INTO t SELECT 1.5, 1, '2.5', 1.5, 2 UNION ALL SELECT 3.0, 'a', 0, 0, NULL WHERE true ON CONFLICT(Key) DO UPDATE SET c1 = excluded.Key, c0 = length(excluded.u) WHERE excluded.Key = 2	ok
 do	INSERT OR IGNORE INTO t SELECT '7', '1', 7, 100.0, NULL UNION ALL SELECT '7', 'a', NULL, -3, '1' UNION ALL SELECT '7', 'b', 7, 0, 1 WHERE true	ok
 rows	SELECT c0, Key, c1, c2, u FROM t	'7','b',r401c000000000000,r0000000000000000,r3ff0000000000000 / r4008000000000000,'a',r0000000000000000,r0000000000000000,NULL / x'41','1',r3ff8000000000000,NULL,r4000000000000000
@@ -3155,7 +3155,7 @@ case
 sql	CREATE TABLE t(id INT PRIMARY KEY, c0 BLOB DEFAULT x'3700', u INT UNIQUE) STRICT, WITHOUT ROWID
 do	INSERT INTO t VALUES (3, x'3700', 2)	ok
 do	INSERT INTO t VALUES (3.0, x'3700', 1.0)	refused: UNIQUE constraint failed: t.id
-do	INSERT INTO t VALUES (3, x'41', 1.0) ON CONFLICT(u) DO UPDATE SET c0 = id NOT IN (SELECT excluded.c0) WHERE excluded.id = 2	refused: UNIQUE constraint failed: t.id
+do	INSERT INTO t VALUES (3, x'41', 1.0) ON CONFLICT(u) DO UPDATE SET c0 = t.id NOT IN (SELECT excluded.c0) WHERE excluded.id = 2	refused: UNIQUE constraint failed: t.id
 do	INSERT OR IGNORE INTO t(id, c0, u) VALUES (2, NULL, 1.0) ON CONFLICT(id) DO UPDATE SET c0 = excluded.id	ok
 do	INSERT OR REPLACE INTO t VALUES (1, 'ABC', 1.0)	refused: cannot store TEXT value in BLOB column t.c0
 rows	SELECT id, c0, u FROM t	2,NULL,1 / 3,x'3700',2
@@ -4439,7 +4439,7 @@ case
 sql	CREATE TABLE t(id INTEGER PRIMARY KEY, c0 NUMERIC NOT NULL, c1 NUMERIC DEFAULT 'abc', g INT AS (typeof(c0)) VIRTUAL)
 do	INSERT INTO t VALUES (NULL, 9007199254740993, x'37')	ok
 do	DELETE FROM t	ok
-do	INSERT INTO t(id, c0, c1) SELECT 10, x'37', -1 UNION ALL SELECT '10', 0.0, '1e2' UNION ALL SELECT 2, -1, '7' WHERE true ON CONFLICT(id) DO UPDATE SET c1 = id NOT IN (SELECT excluded.id) WHERE excluded.id IS t.rowid	ok
+do	INSERT INTO t(id, c0, c1) SELECT 10, x'37', -1 UNION ALL SELECT '10', 0.0, '1e2' UNION ALL SELECT 2, -1, '7' WHERE true ON CONFLICT(id) DO UPDATE SET c1 = t.id NOT IN (SELECT excluded.id) WHERE excluded.id IS t.rowid	ok
 rows	SELECT rowid, id, c0, c1, g FROM t	10,10,x'37',0,'blob' / 2,2,-1,7,'integer'
 rows	PRAGMA integrity_check	'ok'
 case
@@ -5002,7 +5002,7 @@ sql	CREATE TABLE t(id INTEGER PRIMARY KEY, c0 ANY, g ANY AS (c1) VIRTUAL, c1 INT
 sql	CREATE TABLE lg(e, v0, w0, v1, w1, v2, w2, v3, w3, v4, w4, o0, o1, o2, o3, o4)
 sql	CREATE TRIGGER g0 AFTER UPDATE ON t BEGIN INSERT INTO lg VALUES ('AFTER UPDATE', new.id, typeof(new.id), new.c0, typeof(new.c0), new.g, typeof(new.g), new.c1, typeof(new.c1), new.rowid, typeof(new.rowid), quote(old.id), quote(old.c0), quote(old.g), quote(old.c1), quote(old.rowid)); END
 do	INSERT INTO t VALUES (' 5 ', NULL, 3.0)	ok
-do	INSERT INTO t VALUES (' 5 ', 9007199254740993, '1e2') ON CONFLICT(id) DO UPDATE SET c1 = _rowid_ NOT IN (SELECT excluded.c1), c0 = (SELECT count(*) FROM t AS x WHERE x.c0 IS t.c0)	ok
+do	INSERT INTO t VALUES (' 5 ', 9007199254740993, '1e2') ON CONFLICT(id) DO UPDATE SET c1 = t._rowid_ NOT IN (SELECT excluded.c1), c0 = (SELECT count(*) FROM t AS x WHERE x.c0 IS t.c0)	ok
 do	INSERT INTO t(id, c0) VALUES (10, 7), (' 5 ', 'a'), (3, 100) ON CONFLICT(id) DO UPDATE SET c1 = 1, c0 = excluded._rowid_	ok
 rows	SELECT rowid, id, c0, g, c1 FROM t	10,10,7,NULL,NULL / 3,3,100,NULL,NULL / 5,5,5,1,1
 rows	SELECT rowid, * FROM lg	1,'AFTER UPDATE',5,'integer',1,'integer',1,'integer',1,'integer',5,'integer','5','NULL','3','3','5' / 2,'AFTER UPDATE',5,'integer',5,'integer',1,'integer',1,'integer',5,'integer','5','1','1','1','5'
@@ -6155,7 +6155,7 @@ sql	CREATE TRIGGER g0 AFTER UPDATE OF u ON t BEGIN INSERT INTO lg VALUES ('AFTER
 sql	CREATE TRIGGER g1 BEFORE DELETE ON t BEGIN INSERT INTO lg VALUES ('BEFORE DELETE', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, quote(old.id), quote(old.c0), quote(old.c1), quote(old.c2), quote(old.u)); SELECT RAISE(IGNORE) WHERE old.c0 > 2; END
 sql	CREATE TRIGGER g2 BEFORE UPDATE ON t BEGIN INSERT INTO lg VALUES ('BEFORE UPDATE', new.id, typeof(new.id), new.c0, typeof(new.c0), new.c1, typeof(new.c1), new.c2, typeof(new.c2), new.u, typeof(new.u), quote(old.id), quote(old.c0), quote(old.c1), quote(old.c2), quote(old.u)); SELECT RAISE(IGNORE) WHERE old.c2 > 2; END
 do	INSERT INTO t VALUES (3, '12', 7, NULL, 1)	ok
-do	INSERT OR REPLACE INTO t VALUES (3, 3.0, 0, '7', 1) ON CONFLICT(id) DO UPDATE SET c0 = c0 NOT IN (SELECT excluded.c0), c2 = id = excluded.id, c1 = c2 = excluded.u	refused: NOT NULL constraint failed: t.c1
+do	INSERT OR REPLACE INTO t VALUES (3, 3.0, 0, '7', 1) ON CONFLICT(id) DO UPDATE SET c0 = t.c0 NOT IN (SELECT excluded.c0), c2 = id = excluded.id, c1 = c2 = excluded.u	refused: NOT NULL constraint failed: t.c1
 rows	SELECT id, c0, c1, c2, u FROM t	3,12,7,NULL,r3ff0000000000000
 rows	SELECT rowid, * FROM lg	
 rows	PRAGMA integrity_check	'ok'

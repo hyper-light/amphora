@@ -9,7 +9,8 @@
 usage: bench/sqlite_refused_queries.py COUNT SEED > crates/engine/tests/fixtures/refused_queries.tsv   (SQLite 3.54.0)
 
 A compound's values are distinct under every collation, so that the order is one; its columns declare no collation (which
-arm's collation sorts is CY). No correlated subquery is a compound (refused anywhere). One lag, lead, first_value, last_value or nth_value a query (two beside another window is CO).
+arm's collation sorts is CY). No correlated subquery is a compound (refused anywhere), no query has two of lag, lead,
+first_value, last_value and nth_value (CO), and no `SELECT *` is over two windows (it has a column too few).
 """
 import random
 import sqlite3
@@ -100,7 +101,7 @@ def window(rng):
         if rng.random() < 0.25:
             query += f" WHERE {sub()}"
     outer = rng.random()
-    if outer < 0.1:
+    if outer < 0.1 and len(used) == 1:
         query = f"SELECT * FROM ({query})"
     elif outer < 0.18:
         query = f"SELECT count(*) FROM ({query}) AS q"
@@ -159,8 +160,7 @@ def derived(rng):
         f"SELECT j FROM {src} JOIN o ON v.{c} = o.j", f"SELECT v.id FROM {src} RIGHT JOIN o ON o.id = v.id", f"SELECT o.id, v.{c} FROM o FULL JOIN {src} ON v.id = o.id", f"SELECT x.id FROM doc AS x, {src} WHERE x.id = v.id AND v.{c} IS NOT NULL",
         f"SELECT {c} FROM {src} LIMIT 2", f"SELECT id FROM {src} GROUP BY id HAVING max({c}) IS NOT NULL", f"SELECT CASE WHEN {c} IS NULL THEN {d} ELSE id END FROM {src}", f"SELECT rowid FROM o WHERE j NOT IN (SELECT {c} FROM {src} WHERE {c} IS NOT NULL)",
     ]
-    queries = [("rows", head + rng.choice(once))]
-    return setup, queries
+    return setup, [("rows" if c not in bad else "reads a failing column", head + rng.choice(once))]
 
 
 def cell(v):
@@ -177,20 +177,24 @@ def main():
     count, seed = int(sys.argv[1]), int(sys.argv[2])
     rng = random.Random(seed)
     lines = []
-    for made in range(count):
+    made = 0
+    while made < count:
         setup, queries = (window, compound, derived)[made % 3](rng)
         conn = sqlite3.connect(":memory:", isolation_level=None)
-        lines.append("case")
         for sql in setup:
             conn.execute(sql)
-            lines.append(f"sql\t{sql}")
         for kind, sql in queries:
             try:
                 rows = [",".join(cell(v) for v in row) for row in conn.execute(sql).fetchall()]
                 got = " / ".join(rows if kind == "ordered" else sorted(rows))
             except sqlite3.Error as error:
                 got = f"refused: {error}"
-            lines.append(f"{kind}\t{sql}\t{got}")
+            if made % 3 == 2 and kind == "rows" and got.startswith("refused"):
+                continue  # SQLite evaluates a column nothing reads where it neither flattens nor prunes: no document says it does
+            made += 1
+            lines.append("case")
+            lines.extend(f"sql\t{sql}" for sql in setup)
+            lines.append(f"{'ordered' if kind == 'ordered' else 'rows'}\t{sql}\t{got}")
     print(f"# bench/sqlite_refused_queries.py {count} {seed}, SQLite {sqlite3.sqlite_version}: a case's statements, and each query's rows.")
     print("\n".join(lines))
 

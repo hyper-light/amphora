@@ -2066,18 +2066,12 @@ fn leave_out_unread_columns(
     Ok(())
 }
 
-/// Amphora: takes back the marks of a SELECT's reads of its derived tables' columns that a column
-/// left out alone made, so that theirs are left out in turn. A subquery may read any.
+/// Amphora: drops a SELECT's subqueries that nothing reads once a column is left out, and takes back
+/// the marks of its reads of derived tables' columns, so that theirs are left out in turn. A subquery
+/// left may read any.
 fn unmark_unread_columns(plan: &mut SelectPlan) -> Result<()> {
-    let lateral = |table: &JoinedTable| {
-        matches!(&table.table, Table::FromClauseSubquery(subquery)
-            if crate::translate::plan::plan_is_correlated(&subquery.plan))
-    };
-    let tables = plan.table_references.joined_tables();
-    if !plan.non_from_clause_subqueries.is_empty() || tables.iter().any(lateral) {
-        return Ok(());
-    }
     let mut read: rustc_hash::FxHashSet<(TableInternalId, usize)> = Default::default();
+    let mut subqueries: rustc_hash::FxHashSet<TableInternalId> = Default::default();
     let exprs = plan
         .result_columns
         .iter()
@@ -2088,11 +2082,34 @@ fn unmark_unread_columns(plan: &mut SelectPlan) -> Result<()> {
         .chain(plan.offset.as_deref());
     for expr in exprs {
         walk_expr(expr, &mut |expr| {
-            if let Expr::Column { table, column, .. } = expr {
-                read.insert((*table, *column));
+            match expr {
+                Expr::Column { table, column, .. } => {
+                    read.insert((*table, *column));
+                }
+                Expr::SubqueryResult { subquery_id, .. } => {
+                    subqueries.insert(*subquery_id);
+                }
+                _ => {}
             }
             Ok(WalkControl::Continue)
         })?;
+    }
+    let shared: Vec<TableInternalId> = plan
+        .non_from_clause_subqueries
+        .iter()
+        .filter(|subquery| subqueries.contains(&subquery.internal_id))
+        .filter_map(|subquery| subquery.same_query)
+        .collect();
+    subqueries.extend(shared);
+    plan.non_from_clause_subqueries
+        .retain(|subquery| subqueries.contains(&subquery.internal_id));
+    let lateral = |table: &JoinedTable| {
+        matches!(&table.table, Table::FromClauseSubquery(subquery)
+            if crate::translate::plan::plan_is_correlated(&subquery.plan))
+    };
+    let tables = plan.table_references.joined_tables();
+    if !plan.non_from_clause_subqueries.is_empty() || tables.iter().any(lateral) {
+        return Ok(());
     }
     for table in plan.table_references.joined_tables_mut() {
         if !matches!(table.table, Table::FromClauseSubquery(_)) {

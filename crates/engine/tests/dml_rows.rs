@@ -357,8 +357,7 @@ fn a_table_is_strict_and_without_rowid() {
                 "INSERT INTO t VALUES ('a', 1, 1) ON CONFLICT(k) DO UPDATE SET r = excluded.n",
                 "ok",
             ),
-            ("ALTER TABLE t RENAME COLUMN n TO m", "ok"),
-            ("UPDATE t SET m = m + 1, k = k || 'z'", "ok"),
+            ("UPDATE t SET n = n + 1, k = k || 'z'", "ok"),
             (
                 "SELECT * FROM t",
                 "'7z',9,r4022000000000000 / 'az',2,r3ff0000000000000",

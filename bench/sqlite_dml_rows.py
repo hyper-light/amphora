@@ -229,6 +229,7 @@ class Case:
         lit = rng.choice(["1", "'7'", "'a'", "1.5", "NULL", "10", "'A'"])
         if rng.random() < 0.2:
             x = f"x.{rng.choice(self.written)}"
+            own = f"t.{c}"  # the rowid's bare name is no column of a query around (refused anywhere)
             return rng.choice([
                 f"(SELECT {e})", f"(SELECT typeof({e}) || typeof({own}))", f"(SELECT y FROM (SELECT {e} AS y))",
                 f"(SELECT count(*) FROM t AS x WHERE {x} IS {e})", f"(SELECT max({x}) FROM t AS x)", f"(SELECT count(*) FROM t AS x WHERE {x} IS {x.replace('x.', 't.')})",
