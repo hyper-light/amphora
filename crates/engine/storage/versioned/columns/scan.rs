@@ -645,13 +645,16 @@ pub enum Agg {
     Sum(usize),
     Min(usize),
     Max(usize),
+    /// AVG(col) over its numbers (lane R11): their sum, as SUM's, over how many there are, a
+    /// real; NULL when it has none. Text and blobs are not summed.
+    Avg(usize),
 }
 
 impl Agg {
     fn col(self) -> Option<usize> {
         match self {
             Agg::Count => None,
-            Agg::CountOf(c) | Agg::Sum(c) | Agg::Min(c) | Agg::Max(c) => Some(c),
+            Agg::CountOf(c) | Agg::Sum(c) | Agg::Min(c) | Agg::Max(c) | Agg::Avg(c) => Some(c),
         }
     }
 }
@@ -670,6 +673,12 @@ enum Acc {
     /// partials merge in.
     Min(Option<(Cell, u64)>),
     Max(Option<(Cell, u64)>),
+    /// AVG: the numbers' sum as [`Acc::Sum`] keeps it, and the sum of the integers' magnitudes,
+    /// the bound of every partial sum of them in any order (lane R11).
+    Avg {
+        sum: Box<Acc>,
+        magnitude: u128,
+    },
 }
 
 fn overflow() -> LimboError {
@@ -695,7 +704,18 @@ impl Acc {
             },
             Agg::Min(_) => Acc::Min(None),
             Agg::Max(_) => Acc::Max(None),
+            Agg::Avg(c) => Acc::Avg {
+                sum: Box::new(Acc::new(Agg::Sum(c))),
+                magnitude: 0,
+            },
         }
+    }
+
+    /// Whether an AVG's integers reach a double's exact integers (2^53, IEEE 754 binary64's
+    /// 53-bit significand): past it the serial loop's compensated double sum rounds its own way,
+    /// so it answers (as the morsels' AVG, lane qs6-17).
+    fn past_exact(&self) -> bool {
+        matches!(self, Acc::Avg { magnitude, .. } if *magnitude >= crate::vdbe::morsel::DOUBLE_EXACT)
     }
 
     /// Folds one value, of the row at position `pos` (for COUNT(*), any non-null cell).
@@ -736,6 +756,14 @@ impl Acc {
                     *m = Some((c.clone(), pos));
                 }
             }
+            Acc::Avg { sum, magnitude } => {
+                if let Cell::Int(x) = c {
+                    *magnitude = magnitude
+                        .checked_add(u128::from(x.unsigned_abs()))
+                        .ok_or_else(overflow)?;
+                }
+                sum.fold(c, pos)?;
+            }
         }
         Ok(())
     }
@@ -773,6 +801,16 @@ impl Acc {
                 if let Some((c, pos)) = later {
                     me.fold(c, *pos)?;
                 }
+            }
+            (
+                Acc::Avg { sum, magnitude },
+                Acc::Avg {
+                    sum: s2,
+                    magnitude: m2,
+                },
+            ) => {
+                sum.merge(s2)?;
+                *magnitude = magnitude.checked_add(*m2).ok_or_else(overflow)?;
             }
             _ => {
                 return Err(LimboError::InternalError(
@@ -813,6 +851,17 @@ impl Acc {
                 }
             }
             Acc::Min(m) | Acc::Max(m) => m.as_ref().map_or(Cell::Null, |(c, _)| c.clone()),
+            // SQLite's avgFinalize: the sum as a double over the count as one (func.c); below
+            // 2^53 in magnitude the integers' sum is exact as SQLite's 64-bit one is.
+            Acc::Avg { sum, .. } => match (sum.finish()?, &**sum) {
+                (Cell::Int(total), Acc::Sum { numbers, .. }) => {
+                    Cell::Real(total as f64 / *numbers as f64)
+                }
+                (Cell::Real(total), Acc::Sum { numbers, .. }) => {
+                    Cell::Real(total / *numbers as f64)
+                }
+                _ => Cell::Null,
+            },
         })
     }
 }
@@ -1098,6 +1147,14 @@ impl Plan<'_> {
         budget: &MemoryBudget,
     ) -> std::result::Result<(Vec<Vec<Cell>>, Counts, RunStats), MorselError> {
         let (p, stats) = morsel::execute(self, mode, costs, budget)?;
+        if p.groups
+            .values()
+            .any(|(_, accs)| accs.iter().any(Acc::past_exact))
+        {
+            return Err(MorselError::Unsupported {
+                kind: "an average past a double's exact integers",
+            });
+        }
         let counts = p.counts;
         let rows = self.finish(p).map_err(morsel_error)?;
         Ok((rows, counts, stats))

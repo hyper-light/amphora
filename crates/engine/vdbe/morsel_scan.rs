@@ -400,6 +400,11 @@ impl Pipeline for TableAggregate<'_> {
         budget: &MemoryBudget,
     ) -> Result<(), MorselError> {
         self.table.scan(leaves, |rowid, row| {
+            if self.sums_a_real(row)? {
+                return Err(MorselError::Unsupported {
+                    kind: "a REAL to sum under RealSums::Serial",
+                });
+            }
             self.shape.fold(row, position(rowid)?, partial, budget)
         })
     }
@@ -415,6 +420,31 @@ impl Pipeline for TableAggregate<'_> {
 }
 
 impl TableAggregate<'_> {
+    /// Whether `row` passes the filter with a REAL for a SUM under [`crate::RealSums::Serial`]
+    /// (lane R11): SQLite's compensated sum in row order is the serial loop's to give, so the
+    /// statement goes back to it, as the body's workers send it (`no_real_outputs`). AVG and TOTAL
+    /// decline their REALs themselves outside `RealSums::Exact`; under `RowOrder` a SUM replays
+    /// the serial loop's steps.
+    fn sums_a_real(&self, row: &[Value]) -> Result<bool, MorselError> {
+        use super::morsel::Aggregate;
+        if self.shape.sums != crate::RealSums::Serial {
+            return Ok(false);
+        }
+        let real = self.shape.aggregates.iter().any(|aggregate| {
+            matches!(aggregate, Aggregate::Sum(at)
+                if matches!(row.get(*at), Some(Value::Numeric(crate::numeric::Numeric::Float(_)))))
+        });
+        if !real {
+            return Ok(false);
+        }
+        for term in self.shape.filter {
+            if !term.holds(row)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// The answer as the switch and the measured costs pick the degree.
     pub fn run_mode(
         &self,
