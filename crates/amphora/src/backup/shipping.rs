@@ -870,11 +870,11 @@ mod tests {
         assert_eq!(ids(&Db::open(&target).unwrap()), ids(&db));
     }
 
-    /// Decision 45, AC-T1.12.3 (lane B24): a round between the writer's switch and the fence's word
-    /// of it ends the base under way. Do: begin a first base; write 5 rows and ship them; start the log again,
-    /// and in the writer's restart, the switch made and the fence not told of it yet, run the round
-    /// that copies the base's last chunk, as the shipping thread may; restore the last commit's
-    /// second. Expect: the base ended, so the second restores with every row.
+    /// Decision 45, AC-T1.12.3 (lane B24): a round within the writer's restart, its switch made and
+    /// the restart not ended, ends the base under way. Do: begin a first base; write 5 rows and ship
+    /// them; start the log again, and within the restart run the round that copies the base's last
+    /// chunk, as the shipping thread may; restore the last commit's second. Expect: the base ended,
+    /// so the second restores with every row.
     #[test]
     fn d45_a_round_within_the_writers_switch_ends_the_base_under_way() {
         let dir = tempfile::tempdir().unwrap();
@@ -1025,5 +1025,60 @@ mod tests {
             "the log grew by {grew} bytes, the check leaves it {}",
             budget.log_headroom
         );
+    }
+
+    /// Lane B24's scenario on a real small disk (a tmpfs the run mounts at AMPHORA_SMALL_DISK).
+    #[test]
+    #[ignore]
+    fn small_disk() {
+        let disk = PathBuf::from(std::env::var("AMPHORA_SMALL_DISK").unwrap());
+        let path = disk.join("source.db");
+        let blobs = Arc::new(SimBlobs::new(64 * 1024, 1_000_000, 1 << 30));
+        let (mut db, mut prepared, now) =
+            backed_up(&path, &blobs, Some(400), CheckPolicy::Continuous);
+        write(&db, &now, 0, 10);
+        let mut copy = None;
+        while !prepared.round(&mut copy).unwrap().1 {}
+        assert!(db.restart_log().unwrap(), "shipped, so it starts again");
+        write(&db, &now, 10, 300);
+        now.fetch_add(SECOND_NS, Ordering::SeqCst);
+        prepared.round(&mut copy).unwrap();
+        let checker = prepared.checker.as_ref().unwrap();
+        let budget = checker.budget().unwrap();
+        let admitted = checker.admitted().unwrap();
+        eprintln!(
+            "free {}, the restore counted {}, the log's growth {}: the check begins: {admitted}",
+            budget.free, budget.restore, budget.log_headroom
+        );
+        if admitted {
+            let at = now.load(Ordering::SeqCst) / SECOND_NS - 1;
+            let mut peak = Peak {
+                dir: disk.clone(),
+                bytes: 0,
+            };
+            let restored = restore_paced(
+                blobs.as_ref(),
+                "db",
+                at,
+                &disk.join("source.db.check"),
+                &mut peak,
+                until(),
+            );
+            eprintln!(
+                "its restore: {:?}; free after it {}",
+                restored.map(|r| r.cut).map_err(|e| format!("{e:#}")),
+                fs4::available_space(&disk).unwrap()
+            );
+        }
+        for id in 1000..1100 {
+            now.fetch_add(SECOND_NS, Ordering::SeqCst);
+            if let Err(e) = db.exec(&format!(
+                "INSERT INTO t (id, v) VALUES ({id}, '{}')",
+                "z".repeat(500)
+            )) {
+                panic!("the database's commit {} after the check failed: {e:#}", id - 999);
+            }
+        }
+        eprintln!("the database's next 100 commits held");
     }
 }

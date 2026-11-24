@@ -1377,11 +1377,11 @@ fn restarts_forced_mid_send(restarts: i64) -> (Option<String>, Vec<u64>) {
 }
 
 /// Decision 45, AC-T1.12.4 (lane B24): a log started again past what it keeps while a send of its
-/// frames is under way leaves them in the segment that closed, and the send ships them from there. Do: commit
-/// 60 rows with no round, ship them in parts, and as the first is stored have the writer switch,
-/// those commits unshipped, and commit 80 rows more; end a base after the break; restore every
-/// second. Expect: the send ends, every second of its commits restores with its rows, and no second
-/// restores with others.
+/// frames is under way leaves them in the segment that closed, and the send ships them from there.
+/// Do: commit 60 rows with no round, ship them in parts, and as the first is stored have the writer
+/// switch, those commits unshipped, and commit 80 rows more; end a base after the break; restore
+/// every second. Expect: the send ends, every second of its commits restores with its rows, and no
+/// second restores with others.
 #[test]
 fn d45_a_send_ships_its_own_generation_when_the_log_starts_again_under_it() {
     let (sent, refused) = restarts_forced_mid_send(1);
