@@ -68,7 +68,8 @@ struct Holding {
 /// One member's retries as the leader measured them: the longest gap from a slot's start to its
 /// next forward in this generation and in the one before, and the start of the slot it is
 /// waiting on, if any. A slot that expired keeps waiting, so a late retry still teaches the next,
-/// unless the host's detector suspected the member while it waited (`suspected`).
+/// unless the host's detector suspected the member while it waited (`suspected`), and a late
+/// second barrier is still its close (`Slots::ask`).
 struct Gap {
     member: u64,
     current: Option<Duration>,
@@ -190,12 +191,14 @@ impl<T> Slots<T> {
     }
 
     /// `member`'s barrier asks for a slot before its first try (CP-T1.8, lane V8): it joins the
-    /// queue's tail unless it holds the slot, whose second barrier ends it (`Slots::read`).
+    /// queue's tail unless a slot begun for it still waits for its close (`Gap::from`), held or
+    /// ended first (its length passed, or a release). That barrier is the close (`Slots::read`):
+    /// a slot no work would end never begins for it (replication.md, "the write slot"; lane P14).
     pub(super) fn ask(&mut self, member: u64) {
         if self
-            .holding
-            .as_ref()
-            .is_some_and(|holding| holding.member == member)
+            .gaps
+            .iter()
+            .any(|gap| gap.member == member && gap.from.is_some())
         {
             return;
         }
@@ -203,10 +206,10 @@ impl<T> Slots<T> {
     }
 
     /// `member`'s barrier (its ReadIndex) at `at`, its write ending `stated` after it, if the
-    /// barrier says (CP-T1.8, lane V14). A queued member's waits for its slot. The holder's second
-    /// barrier before any forward means its slot's work was no write (a read, or a write that
-    /// prepared nothing), so its slot ends released and the barrier steps. Anything else steps
-    /// now.
+    /// barrier says (CP-T1.8, lane V14). A queued member's waits for its slot. A second barrier
+    /// before any forward means its slot's work was no write (a read, or a write that prepared
+    /// nothing): it ends the slot released if still held, ends nothing if the slot ended first,
+    /// since a slot ends once, and steps. Anything else steps now.
     pub(super) fn read(
         &mut self,
         member: u64,
@@ -511,17 +514,19 @@ impl<T> Slots<T> {
         Ok(())
     }
 
-    /// Ends `member`'s slot released at `at`, if it holds it: its work was no write.
+    /// `member`'s barrier, marked a read's or not, closes a slot begun for it, held or ended
+    /// first (lane P14), so its next write's barrier asks for a slot again (lane P16); a slot it
+    /// still holds ends released at `at`: its work was no write.
     fn released(&mut self, member: u64, at: Instant) -> Option<Ended> {
+        if let Some(gap) = self.gaps.iter_mut().find(|gap| gap.member == member) {
+            gap.from = None;
+        }
         if !self
             .holding
             .as_ref()
             .is_some_and(|holding| holding.member == member)
         {
             return None;
-        }
-        if let Some(gap) = self.gaps.iter_mut().find(|gap| gap.member == member) {
-            gap.from = None;
         }
         self.end(at, SlotEnd::Released)
     }
@@ -899,6 +904,67 @@ mod tests {
             "held through the leader's turn after the slot"
         );
         assert_eq!(slots.length(2), 300 * MS);
+    }
+
+    /// T-T1.8.W4 (CP-T1.13, lane P14): do let member 2's slot pass its length while member 3's
+    /// barrier waits, then take 2's late second barrier as the owner takes every barrier (`ask`,
+    /// then `read`); expect it stepped, ending nothing, 3's slot begun next and none for 2, and
+    /// once 3's ends, no slot held and none begun: a slot ends once, and its close asks nothing.
+    #[test]
+    fn a_late_second_barrier_after_its_slot_expired_begins_no_slot() {
+        let t = Instant::now();
+        let mut slots = leading(t);
+        slots.ask(2);
+        waits(&mut slots, 2, t);
+        assert_eq!(slots.start(t, 1, 1, false).map(|(m, _)| m), Some(2));
+        drained(&mut slots);
+        slots.ask(3);
+        waits(&mut slots, 3, t + MS);
+        let expired = slots.expire(t + BOUNDS.election + MS).unwrap();
+        assert_eq!((expired.member, expired.how), (2, SlotEnd::Expired));
+        let late = t + 300 * MS;
+        slots.ask(2);
+        let close = slots.read(2, late, "close", None);
+        assert_eq!(close.step, Some("close"));
+        assert_eq!(close.ended, None, "its slot ended already");
+        assert_eq!(slots.start(late, 1, 1, false).map(|(m, _)| m), Some(3));
+        drained(&mut slots);
+        slots.forward(3, late + MS, "three");
+        assert_eq!(
+            slots.start(late + MS, 2, 2, false),
+            None,
+            "none for the late close"
+        );
+        assert!(!slots.holds());
+        assert_eq!(slots.length(2), BOUNDS.election, "a close teaches no gap");
+    }
+
+    /// T-T1.8.W4 (CP-T1.13, lane P16): do let member 2's slot pass its length, then take its late
+    /// close marked a read's (`pass`: its write forwarded nothing, lane V11), then its next
+    /// write's barrier as the owner takes it (`ask`, then `read`); expect the close stepped,
+    /// ending nothing, and the next write's barrier waiting for a slot of its own, which begins:
+    /// a marked close closes the slot as an unmarked one does.
+    #[test]
+    fn a_late_marked_close_after_its_slot_expired_leaves_the_next_write_its_slot() {
+        let t = Instant::now();
+        let mut slots = leading(t);
+        slots.ask(2);
+        waits(&mut slots, 2, t);
+        assert_eq!(slots.start(t, 1, 1, false).map(|(m, _)| m), Some(2));
+        drained(&mut slots);
+        let expired = slots.expire(t + BOUNDS.election + MS).unwrap();
+        assert_eq!((expired.member, expired.how), (2, SlotEnd::Expired));
+        let late = t + 300 * MS;
+        let close = slots.pass(2, late, "close");
+        assert_eq!(close.step, Some("close"));
+        assert_eq!(close.ended, None, "its slot ended already");
+        slots.ask(2);
+        assert_eq!(
+            slots.read(2, late + MS, "next", None).step,
+            None,
+            "the next write stepped without a slot"
+        );
+        assert_eq!(slots.start(late + MS, 1, 1, false).map(|(m, _)| m), Some(2));
     }
 
     /// T-T1.8.W4 (Q3): do let the host's detector suspect a member while its retry is awaited,
