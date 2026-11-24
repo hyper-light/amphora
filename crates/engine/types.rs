@@ -1105,19 +1105,103 @@ impl Default for SumAggState {
 /// to share code between register-based and hash-based aggregation (future enhancement).
 #[derive(Debug, PartialEq)]
 pub enum AggContext {
-    /// Built-in aggregates store state as a flat `Vec<Value>` payload.
-    /// The layout depends on the aggregate function (see init_agg_payload).
+    /// Built-in aggregates with variable or exact-decimal state (e.g. group_concat, json,
+    /// array_agg, exact real sums, window frame inversion, or overflowed/float SUM).
     Builtin(Vec<Value>),
+    /// Inline COUNT / COUNT(*) accumulator (zero heap allocation).
+    Count(i64),
+    /// Inline integer SUM / TOTAL accumulator (zero heap allocation; promotes to `Builtin` on
+    /// float/text input, i64 overflow, or window frame inversion).
+    SumInt {
+        sum: i64,
+        count: i64,
+        is_total: bool,
+    },
+    /// Inline finite KBN-compensated AVG accumulator (zero heap allocation; promotes to `Builtin`
+    /// on non-finite input, exact-real mode, or window frame inversion).
+    Avg {
+        sum: f64,
+        err: f64,
+        count: i64,
+    },
+    /// Inline MIN / MAX accumulator (zero heap allocation).
+    MinMax(Value),
     /// External (extension) aggregates need FFI state that can't be serialized.
     External(ExternalAggState),
     Native(crate::native_ext::AggregateState),
 }
 
 impl AggContext {
+    /// Materializes any inline aggregate variant into its canonical `Builtin(Vec<Value>)`
+    /// representation so slow paths (float/text affinity, overflow, window `AggInverse`) can
+    /// operate uniformly on the payload slice without duplicating edge-case logic.
+    pub(crate) fn materialize_builtin(
+        &mut self,
+        spare: &mut Vec<crate::alloc::Vec<Value>>,
+    ) -> crate::Result<&mut Vec<Value>> {
+        if let Self::Builtin(payload) = self {
+            return Ok(payload);
+        }
+        let mut payload = spare.pop().unwrap_or_default();
+        payload.clear();
+        match std::mem::replace(self, Self::Count(0)) {
+            Self::Count(c) => {
+                payload.try_reserve_exact(1)?;
+                payload.push(Value::from_i64(c));
+            }
+            Self::SumInt {
+                sum,
+                count,
+                is_total,
+            } => {
+                payload.try_reserve_exact(5)?;
+                let acc = if count == 0 {
+                    if is_total {
+                        Value::from_f64(0.0)
+                    } else {
+                        Value::Null
+                    }
+                } else {
+                    Value::from_i64(sum)
+                };
+                payload.push(acc);
+                payload.push(Value::from_f64(0.0));
+                payload.push(Value::from_i64(0));
+                payload.push(Value::from_i64(0));
+                payload.push(Value::from_i64(count));
+            }
+            Self::Avg { sum, err, count } => {
+                payload.try_reserve_exact(3)?;
+                payload.push(Value::from_f64(sum));
+                payload.push(Value::from_f64(err));
+                payload.push(Value::from_i64(count));
+            }
+            Self::MinMax(val) => {
+                payload.try_reserve_exact(1)?;
+                payload.push(val);
+            }
+            Self::Builtin(_) => unreachable!(),
+            other @ (Self::External(_) | Self::Native(_)) => {
+                *self = other;
+                return Err(crate::LimboError::InternalError(
+                    "materialize_builtin called on extension aggregate".to_string(),
+                ));
+            }
+        }
+        *self = Self::Builtin(payload);
+        match self {
+            Self::Builtin(payload) => Ok(payload),
+            _ => unreachable!(),
+        }
+    }
+
     /// Get a mutable reference to the builtin payload as a slice
     pub fn payload_mut(&mut self) -> &mut [Value] {
         match self {
             Self::Builtin(payload) => payload,
+            Self::Count(_) | Self::SumInt { .. } | Self::Avg { .. } | Self::MinMax(_) => {
+                panic!("payload_mut() called on unmaterialized inline aggregate")
+            }
             Self::External(_) | Self::Native(_) => {
                 panic!("payload_mut() called on extension aggregate")
             }
@@ -1129,6 +1213,9 @@ impl AggContext {
     pub fn payload_vec_mut(&mut self) -> &mut Vec<Value> {
         match self {
             Self::Builtin(payload) => payload,
+            Self::Count(_) | Self::SumInt { .. } | Self::Avg { .. } | Self::MinMax(_) => {
+                panic!("payload_vec_mut() called on unmaterialized inline aggregate")
+            }
             Self::External(_) | Self::Native(_) => {
                 panic!("payload_vec_mut() called on extension aggregate")
             }
@@ -1139,6 +1226,9 @@ impl AggContext {
     pub fn payload(&self) -> &[Value] {
         match self {
             Self::Builtin(payload) => payload,
+            Self::Count(_) | Self::SumInt { .. } | Self::Avg { .. } | Self::MinMax(_) => {
+                panic!("payload() called on unmaterialized inline aggregate")
+            }
             Self::External(_) | Self::Native(_) => {
                 panic!("payload() called on extension aggregate")
             }
@@ -1169,6 +1259,8 @@ impl PartialOrd<AggContext> for AggContext {
                     _ => None,
                 }
             }
+            (Self::Count(a), Self::Count(b)) => a.partial_cmp(b),
+            (Self::MinMax(a), Self::MinMax(b)) => a.partial_cmp(b),
             _ => None,
         }
     }

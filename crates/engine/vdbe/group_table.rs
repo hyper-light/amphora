@@ -17,21 +17,17 @@
 use crate::alloc::TryClone;
 use crate::translate::collate::CollationSeq;
 use crate::types::{compare_immutable, KeyInfo, Value, ValueRef};
-use crate::vdbe::hash_table::{hash_join_key, keys_equal_distinct};
+use crate::vdbe::hash_table::{hash_join_key, keys_equal_distinct, values_equal_distinct};
 use crate::vdbe::Register;
 use crate::{LimboError, Result};
-use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::cmp::Ordering;
 
-/// Bytes a group costs beyond its values: the group, its vectors and its place in the index.
+/// Bytes a group costs beyond its values: its metadata and open-addressed hash slot.
 const GROUP_OVERHEAD: usize = 96;
 
-/// A group: what its first row gave the non-aggregate expressions, and its accumulators.
-struct Group {
-    values: Vec<Value>,
-    accs: Vec<Register>,
-}
+/// Sentinel marking an empty slot in the open-addressed index table.
+const EMPTY_SLOT: u32 = u32::MAX;
 
 fn value_bytes(v: &Value) -> usize {
     let held = match v.as_ref() {
@@ -57,13 +53,27 @@ fn missing(what: &str) -> LimboError {
     LimboError::InternalError(format!("group table: {what}"))
 }
 
-/// One GROUP BY's groups.
+/// One GROUP BY's groups stored in flat contiguous slabs (`all_values`, `all_accs`) with a direct
+/// power-of-two open-addressed index (`slots`) to avoid per-group `Vec` allocations and nested
+/// hash maps.
 pub struct GroupTable {
     /// Leading values that are the group's keys.
     num_keys: usize,
+    /// Fixed number of non-aggregate values stored per group (set on first insert).
+    num_values: usize,
+    /// Fixed number of accumulators stored per group (set on first insert).
+    num_accs: usize,
+    /// Number of groups currently stored.
+    num_groups: usize,
     collations: Vec<CollationSeq>,
-    groups: Vec<Group>,
-    by_hash: FxHashMap<u64, SmallVec<[u32; 2]>>,
+    /// Flat slab of group values: group `g` owns `g * num_values .. (g + 1) * num_values`.
+    all_values: Vec<Value>,
+    /// Flat slab of group accumulators: group `g` owns `g * num_accs .. (g + 1) * num_accs`.
+    all_accs: Vec<Register>,
+    /// Precomputed 64-bit key hash per group, parallel to `0..num_groups`.
+    hashes: Vec<u64>,
+    /// Power-of-two open-addressed linear-probing table mapping `hash & mask -> group id`.
+    slots: Vec<u32>,
     bytes: usize,
     budget: usize,
     /// The group the last find loaded, for its save.
@@ -77,9 +87,14 @@ impl GroupTable {
     pub fn new(num_keys: usize, collations: Vec<CollationSeq>, budget: usize) -> Self {
         Self {
             num_keys,
+            num_values: 0,
+            num_accs: 0,
+            num_groups: 0,
             collations,
-            groups: Vec::new(),
-            by_hash: FxHashMap::default(),
+            all_values: Vec::new(),
+            all_accs: Vec::new(),
+            hashes: Vec::new(),
+            slots: Vec::new(),
             bytes: 0,
             budget,
             current: None,
@@ -88,32 +103,229 @@ impl GroupTable {
         }
     }
 
-    /// The group whose keys are the first `num_keys` of `values`, made from copies of them with
-    /// `num_accs` empty accumulators if there is none; None if there is none and making it would
-    /// pass the budget. The group found becomes the current one.
-    pub fn find_or_insert(&mut self, values: &[&Value], num_accs: usize) -> Result<Option<u32>> {
-        let keys: SmallVec<[ValueRef; 4]> = values
-            .get(..self.num_keys)
-            .ok_or_else(|| missing("fewer values than keys"))?
-            .iter()
-            .map(|v| v.as_ref())
-            .collect();
-        let hash = hash_join_key(&keys, &self.collations);
-        if let Some(candidates) = self.by_hash.get(&hash) {
-            for &g in candidates {
-                let group = usize::try_from(g)
-                    .ok()
-                    .and_then(|i| self.groups.get(i))
-                    .ok_or_else(|| missing("an indexed group is gone"))?;
-                let held = group
-                    .values
-                    .get(..self.num_keys)
+    #[inline(always)]
+    fn slot_index(hash: u64, len: usize) -> usize {
+        let mask = len.wrapping_sub(1);
+        usize::try_from(hash & u64::try_from(mask).unwrap_or(u64::MAX)).unwrap_or(mask)
+    }
+
+    fn ensure_slot_capacity(&mut self) -> Result<()> {
+        // Maintain <= 70% load factor (Knuth TAOCP vol. 3, §6.4 Algorithm L).
+        let needed = self.num_groups.saturating_add(1);
+        if !self.slots.is_empty() && needed.saturating_mul(10) <= self.slots.len().saturating_mul(7)
+        {
+            return Ok(());
+        }
+        let new_len = if self.slots.is_empty() {
+            16usize
+        } else {
+            self.slots
+                .len()
+                .checked_mul(2)
+                .ok_or(LimboError::IntegerOverflow)?
+        };
+        let mut new_slots = Vec::new();
+        new_slots.try_reserve_exact(new_len)?;
+        new_slots.resize(new_len, EMPTY_SLOT);
+        let mask = new_len.wrapping_sub(1);
+        for (idx, &h) in self.hashes.iter().enumerate() {
+            let g = u32::try_from(idx).map_err(|_| LimboError::IntegerOverflow)?;
+            let mut pos = Self::slot_index(h, new_len);
+            loop {
+                let slot = new_slots
+                    .get_mut(pos)
+                    .ok_or_else(|| missing("slot index out of range"))?;
+                if *slot == EMPTY_SLOT {
+                    *slot = g;
+                    break;
+                }
+                pos = pos.wrapping_add(1) & mask;
+            }
+        }
+        self.slots = new_slots;
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn group_keys(&self, g: usize) -> Option<&[Value]> {
+        let start = g.checked_mul(self.num_values)?;
+        let end = start.checked_add(self.num_keys)?;
+        self.all_values.get(start..end)
+    }
+
+    /// Looks up the group for `keys` (pre-hashed as `hash`), or returns the empty slot index
+    /// where a new group should be inserted.
+    #[inline]
+    fn probe_single_key(&self, key0: ValueRef<'_>, hash: u64) -> Result<Option<u32>> {
+        let len = self.slots.len();
+        if len == 0 {
+            return Ok(None);
+        }
+        let mask = len.wrapping_sub(1);
+        let collation = self
+            .collations
+            .first()
+            .copied()
+            .unwrap_or(CollationSeq::Binary);
+        let mut pos = Self::slot_index(hash, len);
+        for _ in 0..len {
+            let g = *self
+                .slots
+                .get(pos)
+                .ok_or_else(|| missing("slot index out of range"))?;
+            if g == EMPTY_SLOT {
+                return Ok(None);
+            }
+            let gi = usize::try_from(g).map_err(|_| missing("group index overflow"))?;
+            if self.hashes.get(gi).copied() == Some(hash) {
+                let start = gi
+                    .checked_mul(self.num_values)
+                    .ok_or_else(|| missing("group value offset overflow"))?;
+                let held0 = self
+                    .all_values
+                    .get(start)
                     .ok_or_else(|| missing("a group with fewer values than keys"))?;
-                if keys_equal_distinct(held, &keys, &self.collations) {
-                    self.current = Some(g);
+                if values_equal_distinct(held0.as_ref(), key0, collation) {
                     return Ok(Some(g));
                 }
             }
+            pos = pos.wrapping_add(1) & mask;
+        }
+        Ok(None)
+    }
+
+    fn probe_multi_keys(&self, keys: &[ValueRef<'_>], hash: u64) -> Result<Option<u32>> {
+        let len = self.slots.len();
+        if len == 0 {
+            return Ok(None);
+        }
+        let mask = len.wrapping_sub(1);
+        let mut pos = Self::slot_index(hash, len);
+        for _ in 0..len {
+            let g = *self
+                .slots
+                .get(pos)
+                .ok_or_else(|| missing("slot index out of range"))?;
+            if g == EMPTY_SLOT {
+                return Ok(None);
+            }
+            let gi = usize::try_from(g).map_err(|_| missing("group index overflow"))?;
+            if self.hashes.get(gi).copied() == Some(hash) {
+                let held = self
+                    .group_keys(gi)
+                    .ok_or_else(|| missing("a group with fewer values than keys"))?;
+                if keys_equal_distinct(held, keys, &self.collations) {
+                    return Ok(Some(g));
+                }
+            }
+            pos = pos.wrapping_add(1) & mask;
+        }
+        Ok(None)
+    }
+
+    #[inline]
+    fn insert_slot(&mut self, hash: u64, g: u32) -> Result<()> {
+        self.ensure_slot_capacity()?;
+        let len = self.slots.len();
+        let mask = len.wrapping_sub(1);
+        let mut pos = Self::slot_index(hash, len);
+        for _ in 0..len {
+            let slot = self
+                .slots
+                .get_mut(pos)
+                .ok_or_else(|| missing("slot index out of range"))?;
+            if *slot == EMPTY_SLOT {
+                *slot = g;
+                return Ok(());
+            }
+            pos = pos.wrapping_add(1) & mask;
+        }
+        Err(missing("open-addressed group table is full"))
+    }
+
+    /// Hot VDBE path: find or insert a group directly from a contiguous slice of `Register`s,
+    /// avoiding temporary `SmallVec<[&Value; 8]>` construction per row.
+    pub fn find_or_insert_regs(&mut self, regs: &[Register], num_accs: usize) -> Result<Option<u32>> {
+        let (hash, found) = if self.num_keys == 1 {
+            let key0 = regs
+                .first()
+                .ok_or_else(|| missing("fewer values than keys"))?
+                .get_value()
+                .as_ref();
+            let hash = hash_join_key(&[key0], &self.collations);
+            (hash, self.probe_single_key(key0, hash)?)
+        } else {
+            let keys: SmallVec<[ValueRef; 4]> = regs
+                .get(..self.num_keys)
+                .ok_or_else(|| missing("fewer values than keys"))?
+                .iter()
+                .map(|r| r.get_value().as_ref())
+                .collect();
+            let hash = hash_join_key(&keys, &self.collations);
+            (hash, self.probe_multi_keys(&keys, hash)?)
+        };
+        if let Some(g) = found {
+            self.current = Some(g);
+            return Ok(Some(g));
+        }
+        let size = regs
+            .iter()
+            .map(|r| value_bytes(r.get_value()))
+            .fold(GROUP_OVERHEAD, usize::saturating_add)
+            .saturating_add(num_accs.saturating_mul(std::mem::size_of::<Register>()));
+        if self.bytes.saturating_add(size) > self.budget {
+            self.current = None;
+            return Ok(None);
+        }
+        if self.num_groups == 0 {
+            self.num_values = regs.len();
+            self.num_accs = num_accs;
+        } else if self.num_values != regs.len() || self.num_accs != num_accs {
+            return Err(missing("group width changed mid-query"));
+        }
+        let g = u32::try_from(self.num_groups).map_err(|_| LimboError::IntegerOverflow)?;
+        self.all_values.try_reserve(regs.len())?;
+        self.all_accs.try_reserve(num_accs)?;
+        self.hashes.try_reserve(1)?;
+        for r in regs {
+            self.all_values.push(r.get_value().try_clone()?);
+        }
+        for _ in 0..num_accs {
+            self.all_accs.push(Register::Value(Value::Null));
+        }
+        self.hashes.push(hash);
+        self.insert_slot(hash, g)?;
+        self.num_groups = self.num_groups.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(size);
+        self.current = Some(g);
+        Ok(Some(g))
+    }
+
+    /// The group whose keys are the first `num_keys` of `values`, made from copies of them with
+    /// `num_accs` empty accumulators if there is none; None if there is none and making it would
+    /// pass the budget. The group found becomes the current one.
+    #[cfg(test)]
+    pub fn find_or_insert(&mut self, values: &[&Value], num_accs: usize) -> Result<Option<u32>> {
+        let (hash, found) = if self.num_keys == 1 {
+            let key0 = values
+                .first()
+                .ok_or_else(|| missing("fewer values than keys"))?
+                .as_ref();
+            let hash = hash_join_key(&[key0], &self.collations);
+            (hash, self.probe_single_key(key0, hash)?)
+        } else {
+            let keys: SmallVec<[ValueRef; 4]> = values
+                .get(..self.num_keys)
+                .ok_or_else(|| missing("fewer values than keys"))?
+                .iter()
+                .map(|v| v.as_ref())
+                .collect();
+            let hash = hash_join_key(&keys, &self.collations);
+            (hash, self.probe_multi_keys(&keys, hash)?)
+        };
+        if let Some(g) = found {
+            self.current = Some(g);
+            return Ok(Some(g));
         }
         let size = values
             .iter()
@@ -124,48 +336,59 @@ impl GroupTable {
             self.current = None;
             return Ok(None);
         }
-        let g = u32::try_from(self.groups.len()).map_err(|_| LimboError::IntegerOverflow)?;
-        let mut copied = Vec::new();
-        copied.try_reserve_exact(values.len())?;
-        for v in values {
-            copied.push(v.try_clone()?);
+        if self.num_groups == 0 {
+            self.num_values = values.len();
+            self.num_accs = num_accs;
+        } else if self.num_values != values.len() || self.num_accs != num_accs {
+            return Err(missing("group width changed mid-query"));
         }
-        let mut accs = Vec::new();
-        accs.try_reserve_exact(num_accs)?;
-        accs.resize_with(num_accs, || Register::Value(Value::Null));
-        self.groups.try_reserve(1)?;
-        self.groups.push(Group {
-            values: copied,
-            accs,
-        });
-        self.by_hash.entry(hash).or_default().push(g);
+        let g = u32::try_from(self.num_groups).map_err(|_| LimboError::IntegerOverflow)?;
+        self.all_values.try_reserve(values.len())?;
+        self.all_accs.try_reserve(num_accs)?;
+        self.hashes.try_reserve(1)?;
+        for v in values {
+            self.all_values.push(v.try_clone()?);
+        }
+        for _ in 0..num_accs {
+            self.all_accs.push(Register::Value(Value::Null));
+        }
+        self.hashes.push(hash);
+        self.insert_slot(hash, g)?;
+        self.num_groups = self.num_groups.saturating_add(1);
         self.bytes = self.bytes.saturating_add(size);
         self.current = Some(g);
         Ok(Some(g))
     }
 
     /// The current group's accumulators.
+    #[inline]
     pub fn current_accumulators(&mut self) -> Result<&mut [Register]> {
         let g = self.current.ok_or_else(|| missing("no current group"))?;
-        let group = usize::try_from(g)
-            .ok()
-            .and_then(|i| self.groups.get_mut(i))
-            .ok_or_else(|| missing("the current group is gone"))?;
-        Ok(&mut group.accs)
+        let gi = usize::try_from(g).map_err(|_| missing("the current group is gone"))?;
+        let start = gi
+            .checked_mul(self.num_accs)
+            .ok_or_else(|| missing("accumulator offset overflow"))?;
+        let end = start
+            .checked_add(self.num_accs)
+            .ok_or_else(|| missing("accumulator end overflow"))?;
+        self.all_accs
+            .get_mut(start..end)
+            .ok_or_else(|| missing("the current group is gone"))
     }
 
     /// Puts the groups in the order `key_info` gives their keys, a sorter's order, to be drained.
     pub fn sort(&mut self, key_info: &[KeyInfo]) -> Result<()> {
-        let n = u32::try_from(self.groups.len()).map_err(|_| LimboError::IntegerOverflow)?;
+        let n = u32::try_from(self.num_groups).map_err(|_| LimboError::IntegerOverflow)?;
         self.order.clear();
-        self.order.try_reserve_exact(self.groups.len())?;
+        self.order.try_reserve_exact(self.num_groups)?;
         self.order.extend(0..n);
-        let (groups, num_keys) = (&self.groups, self.num_keys);
+        let (all_values, num_values, num_keys) = (&self.all_values, self.num_values, self.num_keys);
         let keys = |g: u32| {
             usize::try_from(g)
                 .ok()
-                .and_then(|i| groups.get(i))
-                .and_then(|group| group.values.get(..num_keys))
+                .and_then(|i| i.checked_mul(num_values))
+                .and_then(|start| start.checked_add(num_keys).map(|end| (start, end)))
+                .and_then(|(start, end)| all_values.get(start..end))
                 .unwrap_or_default()
         };
         self.order.sort_by(|&a, &b| {
@@ -179,25 +402,30 @@ impl GroupTable {
         Ok(())
     }
 
-    /// The next group in sorted order whose keys order before `bound` (any, with no bound): its
-    /// values, the result columns among them in `result_mask`'s places, and its accumulators,
-    /// moved out of the table (each group is drained once). None once no such group is left.
-    pub fn drain_next(
+    /// Zero-allocation drain helper: yields mutable slices to the next sorted group's values and
+    /// accumulators so the caller can move them directly into VDBE registers.
+    pub fn drain_next_slices(
         &mut self,
         bound: Option<&[ValueRef]>,
         key_info: &[KeyInfo],
-    ) -> Result<Option<(Vec<Value>, Vec<Register>)>> {
+    ) -> Result<Option<(&mut [Value], &mut [Register])>> {
         let Some(&g) = self.order.get(self.next) else {
             return Ok(None);
         };
-        let group = usize::try_from(g)
-            .ok()
-            .and_then(|i| self.groups.get_mut(i))
-            .ok_or_else(|| missing("a sorted group is gone"))?;
+        let gi = usize::try_from(g).map_err(|_| missing("a sorted group is gone"))?;
+        let val_start = gi
+            .checked_mul(self.num_values)
+            .ok_or_else(|| missing("group value offset overflow"))?;
+        let val_end = val_start
+            .checked_add(self.num_values)
+            .ok_or_else(|| missing("group value end overflow"))?;
         if let Some(bound) = bound {
-            let keys = group
-                .values
-                .get(..self.num_keys)
+            let key_end = val_start
+                .checked_add(self.num_keys)
+                .ok_or_else(|| missing("group key end overflow"))?;
+            let keys = self
+                .all_values
+                .get(val_start..key_end)
                 .ok_or_else(|| missing("a group with fewer values than keys"))?;
             if keys.len() < key_info.len() || bound.len() < key_info.len() {
                 return Err(missing("fewer keys than the order compares"));
@@ -206,11 +434,44 @@ impl GroupTable {
                 return Ok(None);
             }
         }
+        let acc_start = gi
+            .checked_mul(self.num_accs)
+            .ok_or_else(|| missing("group acc offset overflow"))?;
+        let acc_end = acc_start
+            .checked_add(self.num_accs)
+            .ok_or_else(|| missing("group acc end overflow"))?;
         self.next = self.next.saturating_add(1);
-        Ok(Some((
-            std::mem::take(&mut group.values),
-            std::mem::take(&mut group.accs),
-        )))
+        let values = self
+            .all_values
+            .get_mut(val_start..val_end)
+            .ok_or_else(|| missing("a sorted group is gone"))?;
+        let accs = self
+            .all_accs
+            .get_mut(acc_start..acc_end)
+            .ok_or_else(|| missing("a sorted group's accumulators are gone"))?;
+        Ok(Some((values, accs)))
+    }
+
+    /// The next group in sorted order whose keys order before `bound` (any, with no bound): its
+    /// values and its accumulators, moved out of the table (each group is drained once).
+    #[cfg(test)]
+    pub fn drain_next(
+        &mut self,
+        bound: Option<&[ValueRef]>,
+        key_info: &[KeyInfo],
+    ) -> Result<Option<(Vec<Value>, Vec<Register>)>> {
+        let Some((values, accs)) = self.drain_next_slices(bound, key_info)? else {
+            return Ok(None);
+        };
+        let out_vals: Vec<Value> = values
+            .iter_mut()
+            .map(|v| std::mem::replace(v, Value::Null))
+            .collect();
+        let out_accs: Vec<Register> = accs
+            .iter_mut()
+            .map(|r| std::mem::replace(r, Register::Value(Value::Null)))
+            .collect();
+        Ok(Some((out_vals, out_accs)))
     }
 }
 
@@ -261,7 +522,7 @@ mod tests {
             .map(|k| t.find_or_insert(&[k], 1).unwrap().unwrap())
             .collect();
         assert_eq!(found, vec![0, 1, 0, 2, 1, 3, 3]);
-        assert_eq!(t.groups.len(), 4);
+        assert_eq!(t.num_groups, 4);
         t.sort(&asc()).unwrap();
         assert_eq!(drain_keys(&mut t, Some(&int(2))), vec![Value::Null, int(1)]);
         assert_eq!(drain_keys(&mut t, None), vec![int(2), int(3)]);

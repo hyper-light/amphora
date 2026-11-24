@@ -383,7 +383,11 @@ impl ShardedRwLock {
     #[inline]
     pub fn read_sharded(&self) -> Option<usize> {
         let idx = thread_shard() & self.mask;
-        self.read_on(idx).then(|| idx)
+        if self.read_on(idx) {
+            Some(idx)
+        } else {
+            None
+        }
     }
 
     #[inline]
@@ -1889,9 +1893,7 @@ impl InProcessWalCoordination {
         let Ok(slot_idx) = usize::try_from(best_idx) else {
             return None;
         };
-        let Some(chosen) = read_locks.get(slot_idx) else {
-            return None;
-        };
+        let chosen = read_locks.get(slot_idx)?;
         if !chosen.read_on(shard) {
             return None;
         }
@@ -2654,9 +2656,7 @@ impl ShmWalCoordination {
         let Ok(slot_idx) = usize::try_from(best_idx) else {
             return None;
         };
-        let Some(chosen) = read_locks.get(slot_idx) else {
-            return None;
-        };
+        let chosen = read_locks.get(slot_idx)?;
         if !chosen.read_on(shard) {
             return None;
         }

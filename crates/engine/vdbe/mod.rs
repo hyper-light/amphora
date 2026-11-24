@@ -597,9 +597,9 @@ impl ProgramExecutionState {
 /// Allows HashBuild to resume cleanly after async I/O without re-reading the row.
 #[derive(Debug)]
 pub struct OpHashBuildState {
-    pub key_values: crate::alloc::Vec<Value>,
+    pub key_values: crate::vdbe::hash_table::HashKeyValues,
     pub key_idx: usize,
-    pub payload_values: crate::alloc::Vec<Value>,
+    pub payload_values: crate::vdbe::hash_table::HashPayloadValues,
     pub payload_idx: usize,
     pub rowid: Option<i64>,
     pub cursor_id: CursorID,

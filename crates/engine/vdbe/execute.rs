@@ -9473,7 +9473,7 @@ pub fn op_agg_inverse(
         ))
         .into());
     };
-    let payload = agg.payload_mut();
+    let payload = agg.materialize_builtin(&mut state.spare_agg_payloads)?;
     inverse_agg_payload(func, arg, payload)?;
 
     state.pc += 1;
@@ -9804,52 +9804,66 @@ pub(crate) fn agg_step_fast(data: &AggStepData, arg: Option<Numeric>, acc: &mut 
         match agg {
             AggFunc::Sum | AggFunc::Total => {
                 if let Some(arg) = arg {
-                    if let Register::Aggregate(AggContext::Builtin(payload)) = &mut *acc {
-                        // payload[2] is the approx flag and payload[3] the overflow flag.
-                        match (arg, payload.as_mut_slice()) {
-                            (
-                                Numeric::Integer(arg),
-                                [Value::Numeric(Numeric::Integer(acc)), _, Value::Numeric(Numeric::Integer(0)), _, Value::Numeric(Numeric::Integer(count)), ..],
-                            ) => {
-                                if let (Some(sum), Some(rows)) =
-                                    (acc.checked_add(arg), count.checked_add(1))
+                    match &mut *acc {
+                        Register::Aggregate(AggContext::SumInt { sum, count, .. }) => {
+                            if let Numeric::Integer(i) = arg {
+                                if let (Some(next_sum), Some(next_count)) =
+                                    (sum.checked_add(i), count.checked_add(1))
                                 {
-                                    *acc = sum;
-                                    *count = rows;
+                                    *sum = next_sum;
+                                    *count = next_count;
                                     return true;
                                 }
                             }
-                            (
-                                Numeric::Float(arg),
-                                [Value::Numeric(Numeric::Float(acc)), Value::Numeric(Numeric::Float(r_err)), Value::Numeric(Numeric::Integer(1)), Value::Numeric(Numeric::Integer(ovrfl)), Value::Numeric(Numeric::Integer(count)), ..],
-                            ) => {
-                                if let (Some((sum, err)), Some(rows)) = (
-                                    kbn_step_finite(*acc, *r_err, f64::from(arg)),
-                                    count.checked_add(1),
-                                ) {
-                                    *acc = sum;
-                                    *r_err = err;
-                                    *ovrfl = 0;
-                                    *count = rows;
-                                    return true;
-                                }
-                            }
-                            (
-                                Numeric::Integer(arg),
-                                [Value::Numeric(Numeric::Float(acc)), Value::Numeric(Numeric::Float(r_err)), _, _, Value::Numeric(Numeric::Integer(count)), ..],
-                            ) if arg.unsigned_abs() < KBN_EXACT_INTEGER_LIMIT => {
-                                if let (Some((sum, err)), Some(rows)) = (
-                                    kbn_step_finite(*acc, *r_err, arg as f64),
-                                    count.checked_add(1),
-                                ) {
-                                    *acc = sum;
-                                    *r_err = err;
-                                    *count = rows;
-                                    return true;
-                                }
-                            }
-                            _ => {}
                         }
+                        Register::Aggregate(AggContext::Builtin(payload)) => {
+                            // payload[2] is the approx flag and payload[3] the overflow flag.
+                            match (arg, payload.as_mut_slice()) {
+                                (
+                                    Numeric::Integer(arg),
+                                    [Value::Numeric(Numeric::Integer(acc)), _, Value::Numeric(Numeric::Integer(0)), _, Value::Numeric(Numeric::Integer(count)), ..],
+                                ) => {
+                                    if let (Some(sum), Some(rows)) =
+                                        (acc.checked_add(arg), count.checked_add(1))
+                                    {
+                                        *acc = sum;
+                                        *count = rows;
+                                        return true;
+                                    }
+                                }
+                                (
+                                    Numeric::Float(arg),
+                                    [Value::Numeric(Numeric::Float(acc)), Value::Numeric(Numeric::Float(r_err)), Value::Numeric(Numeric::Integer(1)), Value::Numeric(Numeric::Integer(ovrfl)), Value::Numeric(Numeric::Integer(count)), ..],
+                                ) => {
+                                    if let (Some((sum, err)), Some(rows)) = (
+                                        kbn_step_finite(*acc, *r_err, f64::from(arg)),
+                                        count.checked_add(1),
+                                    ) {
+                                        *acc = sum;
+                                        *r_err = err;
+                                        *ovrfl = 0;
+                                        *count = rows;
+                                        return true;
+                                    }
+                                }
+                                (
+                                    Numeric::Integer(arg),
+                                    [Value::Numeric(Numeric::Float(acc)), Value::Numeric(Numeric::Float(r_err)), _, _, Value::Numeric(Numeric::Integer(count)), ..],
+                                ) if arg.unsigned_abs() < KBN_EXACT_INTEGER_LIMIT => {
+                                    if let (Some((sum, err)), Some(rows)) = (
+                                        kbn_step_finite(*acc, *r_err, arg as f64),
+                                        count.checked_add(1),
+                                    ) {
+                                        *acc = sum;
+                                        *r_err = err;
+                                        *count = rows;
+                                        return true;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -9862,34 +9876,62 @@ pub(crate) fn agg_step_fast(data: &AggStepData, arg: Option<Numeric>, acc: &mut 
                         }
                         Numeric::Integer(_) => None,
                     };
-                    if let (Some(arg), Register::Aggregate(AggContext::Builtin(payload))) =
-                        (arg, &mut *acc)
-                    {
-                        if let [Value::Numeric(Numeric::Float(acc)), Value::Numeric(Numeric::Float(r_err)), Value::Numeric(Numeric::Integer(count)), ..] =
-                            payload.as_mut_slice()
-                        {
-                            if let (Some((sum, err)), Some(rows)) =
-                                (kbn_step_finite(*acc, *r_err, arg), count.checked_add(1))
-                            {
-                                *acc = sum;
-                                *r_err = err;
-                                *count = rows;
-                                return true;
+                    if let Some(arg) = arg {
+                        match &mut *acc {
+                            Register::Aggregate(AggContext::Avg { sum, err, count }) => {
+                                let t = *sum + arg;
+                                if t.is_finite() {
+                                    if let Some(rows) = count.checked_add(1) {
+                                        let next_err = *err + kbn_correction(*sum, arg, t);
+                                        if next_err.is_finite() {
+                                            *sum = t;
+                                            *err = next_err;
+                                            *count = rows;
+                                            return true;
+                                        }
+                                    }
+                                }
                             }
+                            Register::Aggregate(AggContext::Builtin(payload)) => {
+                                if let [Value::Numeric(Numeric::Float(acc)), Value::Numeric(Numeric::Float(r_err)), Value::Numeric(Numeric::Integer(count)), ..] =
+                                    payload.as_mut_slice()
+                                {
+                                    if let (Some((sum, err)), Some(rows)) =
+                                        (kbn_step_finite(*acc, *r_err, arg), count.checked_add(1))
+                                    {
+                                        *acc = sum;
+                                        *r_err = err;
+                                        *count = rows;
+                                        return true;
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
             }
             AggFunc::Count | AggFunc::Count0 => {
                 let counts = matches!(agg, AggFunc::Count0) || arg.is_some();
-                if let (true, Register::Aggregate(AggContext::Builtin(payload))) =
-                    (counts, &mut *acc)
-                {
-                    if let [Value::Numeric(Numeric::Integer(count))] = payload.as_mut_slice() {
-                        if let Some(rows) = count.checked_add(1) {
-                            *count = rows;
-                            return true;
+                if counts {
+                    match &mut *acc {
+                        Register::Aggregate(AggContext::Count(count)) => {
+                            if let Some(rows) = count.checked_add(1) {
+                                *count = rows;
+                                return true;
+                            }
                         }
+                        Register::Aggregate(AggContext::Builtin(payload)) => {
+                            if let [Value::Numeric(Numeric::Integer(count))] =
+                                payload.as_mut_slice()
+                            {
+                                if let Some(rows) = count.checked_add(1) {
+                                    *count = rows;
+                                    return true;
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -9897,8 +9939,10 @@ pub(crate) fn agg_step_fast(data: &AggStepData, arg: Option<Numeric>, acc: &mut 
                 if data.comparator.is_none() && data.collation.is_none_or(|c| !c.is_custom()) =>
             {
                 if let Some(Numeric::Integer(arg)) = arg {
-                    if let Register::Aggregate(AggContext::Builtin(payload)) = &mut *acc {
-                        if let Some(Value::Numeric(Numeric::Integer(best))) = payload.first_mut() {
+                    match &mut *acc {
+                        Register::Aggregate(AggContext::MinMax(Value::Numeric(
+                            Numeric::Integer(best),
+                        ))) => {
                             let better = match agg {
                                 AggFunc::Max => arg > *best,
                                 _ => arg < *best,
@@ -9908,6 +9952,21 @@ pub(crate) fn agg_step_fast(data: &AggStepData, arg: Option<Numeric>, acc: &mut 
                             }
                             return true;
                         }
+                        Register::Aggregate(AggContext::Builtin(payload)) => {
+                            if let Some(Value::Numeric(Numeric::Integer(best))) =
+                                payload.first_mut()
+                            {
+                                let better = match agg {
+                                    AggFunc::Max => arg > *best,
+                                    _ => arg < *best,
+                                };
+                                if better {
+                                    *best = arg;
+                                }
+                                return true;
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -9946,39 +10005,135 @@ pub(crate) fn op_agg_step_slow(
         return Ok(InsnFunctionStepResult::Step);
     }
 
-    // Initialize aggregate state if not already done
+    // Initialize aggregate state if not already done (inline zero-alloc variants for common scalar
+    // aggregates when exact real sums are not enabled).
     if let Register::Value(Value::Null) = state.registers[*acc_reg] {
-        // Fast path for the first row of a COUNT group
-        if let AggFunc::Count | AggFunc::Count0 = func {
-            let counts = match (func, &state.registers[*col]) {
-                (AggFunc::Count0, _) => Some(true),
-                (_, Register::Value(Value::Null)) => Some(false),
-                (_, Register::Value(_) | Register::Record(_)) => Some(true),
-                (_, Register::Aggregate(_)) => None,
-            };
-            if let Some(counts) = counts {
-                let mut payload = state
-                    .spare_agg_payloads
-                    .pop()
-                    .unwrap_or_else(|| crate::alloc::vec![]);
-                init_agg_payload(func, &mut payload)?;
-                if counts {
-                    payload[0] = Value::from_i64(1);
+        let exact_reals = program.connection.real_sums() == crate::RealSums::Exact;
+        match func {
+            AggFunc::Count | AggFunc::Count0 => {
+                let counts = match (func, &state.registers[*col]) {
+                    (AggFunc::Count0, _) => Some(true),
+                    (_, Register::Value(Value::Null)) => Some(false),
+                    (_, Register::Value(_) | Register::Record(_)) => Some(true),
+                    (_, Register::Aggregate(_)) => None,
+                };
+                if let Some(counts) = counts {
+                    state.registers[*acc_reg] =
+                        Register::Aggregate(AggContext::Count(i64::from(counts)));
+                    state.pc = state.pc.checked_add(1).or_overflow()?;
+                    return Ok(InsnFunctionStepResult::Step);
                 }
-                state.registers[*acc_reg] = Register::Aggregate(AggContext::Builtin(payload));
-                state.pc += 1;
-                return Ok(InsnFunctionStepResult::Step);
             }
+            AggFunc::Sum | AggFunc::Total if !exact_reals => {
+                let is_total = matches!(func, AggFunc::Total);
+                match &state.registers[*col] {
+                    Register::Value(Value::Null) => {
+                        state.registers[*acc_reg] = Register::Aggregate(AggContext::SumInt {
+                            sum: 0,
+                            count: 0,
+                            is_total,
+                        });
+                        state.pc = state.pc.checked_add(1).or_overflow()?;
+                        return Ok(InsnFunctionStepResult::Step);
+                    }
+                    Register::Value(Value::Numeric(Numeric::Integer(i))) => {
+                        state.registers[*acc_reg] = Register::Aggregate(AggContext::SumInt {
+                            sum: *i,
+                            count: 1,
+                            is_total,
+                        });
+                        state.pc = state.pc.checked_add(1).or_overflow()?;
+                        return Ok(InsnFunctionStepResult::Step);
+                    }
+                    _ => {}
+                }
+            }
+            AggFunc::Avg if !exact_reals => match &state.registers[*col] {
+                Register::Value(Value::Null) => {
+                    state.registers[*acc_reg] = Register::Aggregate(AggContext::Avg {
+                        sum: 0.0,
+                        err: 0.0,
+                        count: 0,
+                    });
+                    state.pc = state.pc.checked_add(1).or_overflow()?;
+                    return Ok(InsnFunctionStepResult::Step);
+                }
+                Register::Value(Value::Numeric(Numeric::Float(f))) if f64::from(*f).is_finite() => {
+                    state.registers[*acc_reg] = Register::Aggregate(AggContext::Avg {
+                        sum: f64::from(*f),
+                        err: 0.0,
+                        count: 1,
+                    });
+                    state.pc = state.pc.checked_add(1).or_overflow()?;
+                    return Ok(InsnFunctionStepResult::Step);
+                }
+                Register::Value(Value::Numeric(Numeric::Integer(i)))
+                    if i.unsigned_abs() < KBN_EXACT_INTEGER_LIMIT =>
+                {
+                    state.registers[*acc_reg] = Register::Aggregate(AggContext::Avg {
+                        sum: *i as f64,
+                        err: 0.0,
+                        count: 1,
+                    });
+                    state.pc = state.pc.checked_add(1).or_overflow()?;
+                    return Ok(InsnFunctionStepResult::Step);
+                }
+                _ => {}
+            },
+            AggFunc::Min | AggFunc::Max
+                if comparator.is_none() && collation.is_none_or(|c| !c.is_custom()) =>
+            {
+                if let Register::Value(v) = &state.registers[*col] {
+                    state.registers[*acc_reg] =
+                        Register::Aggregate(AggContext::MinMax(v.try_clone()?));
+                    state.pc = state.pc.checked_add(1).or_overflow()?;
+                    return Ok(InsnFunctionStepResult::Step);
+                }
+            }
+            _ => {}
         }
         let mut payload = state
             .spare_agg_payloads
             .pop()
             .unwrap_or_else(|| crate::alloc::vec![]);
         init_agg_payload(func, &mut payload)?;
-        if program.connection.real_sums() == crate::RealSums::Exact {
+        if exact_reals {
             exact_agg_payload(func, &mut payload)?;
         }
         state.registers[*acc_reg] = Register::Aggregate(AggContext::Builtin(payload));
+    } else if matches!(
+        (&state.registers[*acc_reg], func),
+        (
+            Register::Aggregate(
+                AggContext::Count(_)
+                    | AggContext::SumInt { .. }
+                    | AggContext::Avg { .. }
+                    | AggContext::MinMax(_)
+            ),
+            AggFunc::Count
+                | AggFunc::Count0
+                | AggFunc::Sum
+                | AggFunc::Total
+                | AggFunc::Avg
+                | AggFunc::Min
+                | AggFunc::Max
+        )
+    ) {
+        // Inline fast checks for NULL inputs (and non-NULL text/blob COUNT or MinMax without heap).
+        match (&state.registers[*col], func) {
+            (Register::Value(Value::Null), AggFunc::Count | AggFunc::Sum | AggFunc::Total | AggFunc::Avg | AggFunc::Min | AggFunc::Max) => {
+                state.pc = state.pc.checked_add(1).or_overflow()?;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+            (Register::Value(_), AggFunc::Count | AggFunc::Count0) => {
+                if let Register::Aggregate(AggContext::Count(c)) = &mut state.registers[*acc_reg] {
+                    *c = c.checked_add(1).or_overflow()?;
+                    state.pc = state.pc.checked_add(1).or_overflow()?;
+                    return Ok(InsnFunctionStepResult::Step);
+                }
+            }
+            _ => {}
+        }
     }
 
     let current_collation = collation.unwrap_or(CollationSeq::Binary);
@@ -10032,7 +10187,7 @@ pub(crate) fn op_agg_step_slow(
                 ))
                 .into());
             };
-            let payload = agg.payload_vec_mut();
+            let payload = agg.materialize_builtin(&mut state.spare_agg_payloads)?;
             update_agg_payload(
                 func,
                 arg,
@@ -10102,6 +10257,32 @@ pub fn op_agg_final(
                 AggContext::External(_) | AggContext::Native(_) => {
                     unreachable!("external aggregates are finalized above")
                 }
+                AggContext::Count(count) => Value::from_i64(*count),
+                AggContext::SumInt {
+                    sum,
+                    count,
+                    is_total,
+                } => {
+                    if *count == 0 {
+                        if *is_total {
+                            Value::from_f64(0.0)
+                        } else {
+                            Value::Null
+                        }
+                    } else if *is_total {
+                        Value::from_f64(*sum as f64)
+                    } else {
+                        Value::from_i64(*sum)
+                    }
+                }
+                AggContext::Avg { sum, err, count } => {
+                    if *count == 0 {
+                        Value::Null
+                    } else {
+                        Value::from_f64((*sum + *err) / (*count as f64))
+                    }
+                }
+                AggContext::MinMax(v) => v.clone(),
                 AggContext::Builtin(payload) => match func {
                     AggFunc::Count | AggFunc::Count0 => {
                         let [Value::Numeric(Numeric::Integer(count))] = payload.as_slice() else {
@@ -19123,9 +19304,9 @@ fn hash_build_run(
     }) {
         Some(op_state) => op_state,
         None => OpHashBuildState {
-            key_values: crate::alloc::Vec::try_with_capacity_ext(data.num_keys)?,
+            key_values: crate::vdbe::hash_table::HashKeyValues::new(),
             key_idx: 0,
-            payload_values: crate::alloc::Vec::try_with_capacity_ext(data.num_payload)?,
+            payload_values: crate::vdbe::hash_table::HashPayloadValues::new(),
             payload_idx: 0,
             rowid: None,
             cursor_id: data.cursor_id,
@@ -19212,9 +19393,9 @@ fn hash_build_run(
     if let Some(ht) = state.hash_tables.get_mut(&data.hash_table_id) {
         let rowid = op_state.rowid.expect("rowid set");
         let pending = PendingHashInsert {
-            key_values: std::mem::replace(&mut op_state.key_values, crate::alloc::vec![]),
+            key_values: std::mem::take(&mut op_state.key_values),
             rowid,
-            payload_values: std::mem::replace(&mut op_state.payload_values, crate::alloc::vec![]),
+            payload_values: std::mem::take(&mut op_state.payload_values),
         };
         match ht.insert_pending(pending, Some(&mut state.metrics.hash_join))? {
             HashInsertResult::Done => {
@@ -19357,15 +19538,11 @@ pub fn op_group_find(
         .values_start
         .checked_add(data.num_values)
         .ok_or(LimboError::IntegerOverflow)?;
-    let values: SmallVec<[&Value; 8]> = state
+    let val_regs = state
         .registers
         .get(data.values_start..end)
-        .ok_or_else(|| group_error("value registers out of range"))?
-        .iter()
-        .map(Register::get_value)
-        .collect();
-    let found = table.find_or_insert(&values, data.num_accs)?;
-    drop(values);
+        .ok_or_else(|| group_error("value registers out of range"))?;
+    let found = table.find_or_insert_regs(val_regs, data.num_accs)?;
     if found.is_none() {
         state.pc = data.target_pc_full.as_offset_int();
         return Ok(InsnFunctionStepResult::Step);
@@ -19467,22 +19644,22 @@ pub fn op_group_drain(
                 .iter()
                 .map(|r| r.get_value().as_ref())
                 .collect();
-            table.drain_next(Some(&bound), &data.key_info)?
+            table.drain_next_slices(Some(&bound), &data.key_info)?
         }
-        None => table.drain_next(None, &data.key_info)?,
+        None => table.drain_next_slices(None, &data.key_info)?,
     };
     let Some((values, accs)) = drained else {
         state.pc = data.target_pc_done.as_offset_int();
         return Ok(InsnFunctionStepResult::Step);
     };
     let mut dest = data.dest_start;
-    for (value, &in_result) in values.into_iter().zip(data.result_mask.iter()) {
+    for (value, &in_result) in values.iter_mut().zip(data.result_mask.iter()) {
         if in_result {
             let reg = state
                 .registers
                 .get_mut(dest)
                 .ok_or_else(|| group_error("result registers out of range"))?;
-            *reg = Register::Value(value);
+            *reg = Register::Value(std::mem::replace(value, Value::Null));
             dest = dest.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
         }
     }
@@ -19497,8 +19674,8 @@ pub fn op_group_drain(
     if regs.len() != accs.len() {
         return Err(group_error("accumulator count differs from the group's").into());
     }
-    for (r, a) in regs.iter_mut().zip(accs) {
-        *r = a;
+    for (r, a) in regs.iter_mut().zip(accs.iter_mut()) {
+        *r = std::mem::replace(a, Register::Value(Value::Null));
     }
     state.pc = next_pc(state)?;
     Ok(InsnFunctionStepResult::Step)

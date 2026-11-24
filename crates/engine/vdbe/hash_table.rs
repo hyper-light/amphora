@@ -19,7 +19,16 @@ use crate::{
 use amphora_engine_macros::{turso_assert_eq, AtomicEnum};
 use branches::{mark_unlikely, unlikely};
 use rapidhash::fast::RapidHasher;
+use smallvec::SmallVec;
 use std::{cell::RefCell, cmp::Ordering, hash::Hasher};
+
+/// Inline storage for hash join key values (1 key inline avoids heap allocs for single-key joins).
+pub(crate) type HashKeyValues = SmallVec<[Value; 1]>;
+/// Inline storage for hash join payload values (2 values inline avoids heap allocs for common joins).
+pub(crate) type HashPayloadValues = SmallVec<[Value; 2]>;
+
+/// Sentinel index for the end of an intrusive hash bucket chain in `HashTable::heads` / `next`.
+const EMPTY_ENTRY: u32 = u32::MAX;
 
 const DEFAULT_SEED: u64 = 1337;
 
@@ -237,7 +246,7 @@ fn merge_keys_cmp<'a>(
 }
 
 /// DISTINCT equality: NULLs compare equal to NULL.
-fn values_equal_distinct(v1: ValueRef, v2: ValueRef, collation: CollationSeq) -> bool {
+pub(crate) fn values_equal_distinct(v1: ValueRef, v2: ValueRef, collation: CollationSeq) -> bool {
     match (v1, v2) {
         (ValueRef::Null, ValueRef::Null) => true,
         (ValueRef::Null, _) | (_, ValueRef::Null) => false,
@@ -280,13 +289,13 @@ pub struct GraceProbeEntry {
     pub probe_rowid: i64,
 }
 
-/// A single entry in a hash table bucket.
+/// A single entry in a hash table.
 #[derive(Debug, Clone)]
 pub struct HashEntry {
     /// Hash value of the join keys.
     pub hash: u64,
-    /// The join key values.
-    pub key_values: Vec<Value>,
+    /// The join key values (inline for single-key joins to eliminate per-row heap allocs).
+    pub key_values: HashKeyValues,
     /// The rowid of the row in the build table.
     /// During probe phase, we'll use SeekRowid to fetch the full row
     /// (unless payload_values contains all needed columns).
@@ -295,14 +304,14 @@ pub struct HashEntry {
     /// directly in the hash entry to avoid SeekRowid during probe phase.
     /// When populated, these are the result columns needed from the build table,
     /// stored in column index order as specified during hash table construction.
-    pub payload_values: Vec<Value>,
+    pub payload_values: HashPayloadValues,
 }
 
 #[derive(Debug)]
 pub(crate) struct PendingHashInsert {
-    pub(crate) key_values: Vec<Value>,
+    pub(crate) key_values: HashKeyValues,
     pub(crate) rowid: i64,
-    pub(crate) payload_values: Vec<Value>,
+    pub(crate) payload_values: HashPayloadValues,
 }
 
 #[derive(Debug)]
@@ -315,31 +324,31 @@ pub(crate) enum HashInsertResult {
 }
 
 impl HashEntry {
-    fn new(hash: u64, key_values: Vec<Value>, rowid: i64) -> Self {
+    fn new(hash: u64, key_values: impl Into<HashKeyValues>, rowid: i64) -> Self {
         Self {
             hash,
-            key_values,
+            key_values: key_values.into(),
             rowid,
-            payload_values: vec![],
+            payload_values: HashPayloadValues::new(),
         }
     }
 
-    const fn new_with_payload(
+    fn new_with_payload(
         hash: u64,
-        key_values: Vec<Value>,
+        key_values: impl Into<HashKeyValues>,
         rowid: i64,
-        payload_values: Vec<Value>,
+        payload_values: impl Into<HashPayloadValues>,
     ) -> Self {
         Self {
             hash,
-            key_values,
+            key_values: key_values.into(),
             rowid,
-            payload_values,
+            payload_values: payload_values.into(),
         }
     }
 
     /// Returns true if this entry has payload values stored.
-    pub const fn has_payload(&self) -> bool {
+    pub fn has_payload(&self) -> bool {
         !self.payload_values.is_empty()
     }
 
@@ -531,12 +540,16 @@ impl HashEntry {
         let (num_keys, varint_len) = read_varint(&buf[offset..])?;
         offset += varint_len;
 
-        let mut key_values = Vec::try_with_capacity_ext(num_keys as usize)?;
-        for _ in 0..num_keys {
-            let (value, consumed) = Self::deserialize_value(&buf[offset..])?;
+        let mut key_values = HashKeyValues::new();
+        let num_keys_usize = usize::try_from(num_keys).map_err(|_| LimboError::IntegerOverflow)?;
+        if num_keys_usize > key_values.inline_size() {
             key_values
-                .push_within_capacity(value)
-                .expect("key values vector was preallocated");
+                .try_reserve_exact(num_keys_usize)
+                .map_err(|_| LimboError::OutOfMemory)?;
+        }
+        for _ in 0..num_keys_usize {
+            let (value, consumed) = Self::deserialize_value(&buf[offset..])?;
+            key_values.push(value);
             offset += consumed;
         }
 
@@ -544,12 +557,17 @@ impl HashEntry {
         let (num_payload, varint_len) = read_varint(&buf[offset..])?;
         offset += varint_len;
 
-        let mut payload_values = Vec::try_with_capacity_ext(num_payload as usize)?;
-        for _ in 0..num_payload {
-            let (value, consumed) = Self::deserialize_value(&buf[offset..])?;
+        let mut payload_values = HashPayloadValues::new();
+        let num_payload_usize =
+            usize::try_from(num_payload).map_err(|_| LimboError::IntegerOverflow)?;
+        if num_payload_usize > payload_values.inline_size() {
             payload_values
-                .push_within_capacity(value)
-                .expect("payload values vector was preallocated");
+                .try_reserve_exact(num_payload_usize)
+                .map_err(|_| LimboError::OutOfMemory)?;
+        }
+        for _ in 0..num_payload_usize {
+            let (value, consumed) = Self::deserialize_value(&buf[offset..])?;
+            payload_values.push(value);
             offset += consumed;
         }
 
@@ -1031,10 +1049,15 @@ enum GracePartitionLoadState {
 pub struct HashTable {
     /// Initial bucket count used to reinitialize after spills.
     initial_buckets: usize,
-    /// The hash buckets (used when not spilled). Their count is a power of two that doubles as
-    /// entries arrive (AUDIT 3.1, `grow_buckets`), indexed by the hash's low bits.
-    buckets: Vec<HashBucket>,
-    /// Bytes of the bucket array past its initial size, counted against `mem_budget` with
+    /// Power-of-two bucket head indices into `entries` (`EMPTY_ENTRY` when empty), doubled as
+    /// entries arrive (AUDIT 3.1, `grow_buckets`). Uses 4 bytes per bucket and zero per-bucket
+    /// heap allocations.
+    heads: Vec<u32>,
+    /// Flat contiguous slab of in-memory entries (used when not spilled).
+    entries: Vec<HashEntry>,
+    /// Intrusive singly-linked chain pointers parallel to `entries` (`EMPTY_ENTRY` at chain end).
+    next: Vec<u32>,
+    /// Bytes of the bucket head array past its initial size, counted against `mem_budget` with
     /// `mem_used` so growing never passes the table's memory bound (AUDIT 3.1).
     bucket_mem: usize,
     /// Number of entries in the table.
@@ -1051,10 +1074,14 @@ pub struct HashTable {
     state: HashTableState,
     /// IO object for disk operations.
     io: Arc<dyn IO>,
-    /// Current probe position bucket index.
+    /// Current probe position bucket index (spilled partitions).
     probe_bucket_idx: usize,
-    /// Current probe entry index within bucket.
+    /// Current probe entry index within bucket (spilled partitions).
     probe_entry_idx: usize,
+    /// Last matched entry index in `entries` (non-spilled mode, for `mark_current_matched`).
+    probe_current_entry: Option<u32>,
+    /// Next entry index in `entries` chain to inspect on `next_match` (non-spilled mode).
+    probe_next_entry: u32,
     /// Cached hash of current probe keys (to avoid recomputing)
     current_probe_hash: Option<u64>,
     /// Current probe key values being searched.
@@ -1062,7 +1089,7 @@ pub struct HashTable {
     spill_state: Option<SpillState>,
     /// Index of current spilled partition being probed
     current_spill_partition_idx: usize,
-    /// Track non-empty buckets for fast clear in distinct/group-by usage.
+    /// Track non-empty bucket indices in `heads` for fast clear in distinct/group-by usage.
     non_empty_buckets: Vec<usize>,
     /// LRU of resident spilled partitions to cap memory for DISTINCT, grace,
     /// and unmatched-scan partition loads.
@@ -1073,11 +1100,11 @@ pub struct HashTable {
     temp_store: crate::TempStore,
     /// Whether to track matched entries (for FULL OUTER JOIN).
     track_matched: bool,
-    /// Parallel to `buckets`: one `Vec<bool>` per bucket tracking which entries were matched.
-    matched_bits: Vec<Vec<bool>>,
-    /// Bucket index for iterating unmatched entries.
+    /// Parallel to `entries`: tracks which entries were matched in non-spilled mode.
+    matched_bits: Vec<bool>,
+    /// Bucket index for iterating unmatched entries (spilled partitions).
     unmatched_scan_bucket: usize,
-    /// Entry index within bucket for iterating unmatched entries.
+    /// Entry index within bucket / `entries` for iterating unmatched entries.
     unmatched_scan_entry: usize,
     /// Partition index for iterating unmatched entries in spilled mode.
     unmatched_scan_partition: usize,
@@ -1089,10 +1116,9 @@ pub struct HashTable {
     grace_state: Option<GraceState>,
     /// Amphora (QT.5 step 4, lane qs5-21): a sort-merge join's table (`set_merge`).
     merge: bool,
-    /// A merge's order: the entries' (bucket, entry) positions sorted by key once the build is
-    /// done. Empty when the table isn't a merge's, or spilled or past its budget (then probed by
-    /// hash).
-    merge_order: Vec<(usize, usize)>,
+    /// A merge's order: indices into `entries` sorted by key once the build is done. Empty when
+    /// the table isn't a merge's, or spilled or past its budget (then probed by hash).
+    merge_order: Vec<u32>,
     /// Where the last probe's run starts in `merge_order`: a probe key at or past the last merges
     /// forward from here, and a repeated key replays its run.
     merge_run: usize,
@@ -1157,15 +1183,14 @@ impl HashTable {
         }
         // A power of two, so a bucket is the hash's low bits and doubling splits each chain in two.
         let num_buckets = config.initial_buckets.max(1).next_power_of_two();
-        let buckets = (0..num_buckets).map(|_| HashBucket::new()).try_collect()?;
-        let matched_bits = if config.track_matched {
-            (0..num_buckets).map(|_| vec![]).try_collect()?
-        } else {
-            vec![]
-        };
+        let mut heads = Vec::new();
+        heads.try_reserve_exact(num_buckets)?;
+        heads.resize(num_buckets, EMPTY_ENTRY);
         Ok(Self {
             initial_buckets: num_buckets,
-            buckets,
+            heads,
+            entries: vec![],
+            next: vec![],
             bucket_mem: 0,
             num_entries: 0,
             mem_used: 0,
@@ -1176,6 +1201,8 @@ impl HashTable {
             io,
             probe_bucket_idx: 0,
             probe_entry_idx: 0,
+            probe_current_entry: None,
+            probe_next_entry: EMPTY_ENTRY,
             current_probe_keys: None,
             current_probe_hash: None,
             spill_state: None,
@@ -1185,7 +1212,7 @@ impl HashTable {
             non_empty_buckets: vec![],
             temp_store: config.temp_store,
             track_matched: config.track_matched,
-            matched_bits,
+            matched_bits: vec![],
             unmatched_scan_bucket: 0,
             unmatched_scan_entry: 0,
             unmatched_scan_partition: 0,
@@ -1210,12 +1237,12 @@ impl HashTable {
         self.merge = merge;
     }
 
-    /// Sorts the entries' positions by key into `merge_order`, within the table's budget: false,
+    /// Sorts the entries' indices by key into `merge_order`, within the table's budget: false,
     /// and nothing held, when the positions would pass it.
     fn build_merge_order(&mut self) -> Result<bool> {
         let bytes = self
             .num_entries
-            .saturating_mul(std::mem::size_of::<(usize, usize)>());
+            .saturating_mul(std::mem::size_of::<u32>());
         if self
             .mem_used
             .saturating_add(self.bucket_mem)
@@ -1224,19 +1251,13 @@ impl HashTable {
         {
             return Ok(false);
         }
-        let mut order: Vec<(usize, usize)> = vec![];
-        for (bucket_idx, bucket) in self.buckets.iter().enumerate() {
-            for entry_idx in 0..bucket.entries.len() {
-                order.try_push((bucket_idx, entry_idx))?;
-            }
-        }
-        let buckets = &self.buckets;
+        let n = u32::try_from(self.entries.len()).map_err(|_| LimboError::IntegerOverflow)?;
+        let mut order: Vec<u32> = Vec::new();
+        order.try_reserve_exact(self.entries.len())?;
+        order.extend(0..n);
+        let entries = &self.entries;
         let collations = &self.collations;
-        let entry_at = |(bucket, entry): (usize, usize)| {
-            buckets
-                .get(bucket)
-                .and_then(|bucket| bucket.entries.get(entry))
-        };
+        let entry_at = |idx: u32| usize::try_from(idx).ok().and_then(|i| entries.get(i));
         // In place, with no buffer: the order is all the merge holds beyond the hash table's.
         order.sort_unstable_by(|a, b| match (entry_at(*a), entry_at(*b)) {
             (Some(a), Some(b)) => merge_keys_cmp(
@@ -1258,13 +1279,13 @@ impl HashTable {
             let Some(probe_keys) = self.current_probe_keys.as_ref() else {
                 return Ok(None);
             };
-            let buckets = &self.buckets;
+            let entries = &self.entries;
             let collations = &self.collations;
             let order = &self.merge_order;
-            let below_probe = |position: &(usize, usize)| {
-                buckets
-                    .get(position.0)
-                    .and_then(|bucket| bucket.entries.get(position.1))
+            let below_probe = |&entry_idx: &u32| {
+                usize::try_from(entry_idx)
+                    .ok()
+                    .and_then(|i| entries.get(i))
                     .is_some_and(|entry| {
                         merge_keys_cmp(
                             entry.key_values.iter().map(|v| v.as_ref()),
@@ -1309,16 +1330,13 @@ impl HashTable {
         let Some(probe_keys) = self.current_probe_keys.as_deref() else {
             return Ok(None);
         };
-        let Some(&(bucket_idx, entry_idx)) = self.merge_order.get(self.merge_next) else {
+        let Some(&entry_idx) = self.merge_order.get(self.merge_next) else {
             return Ok(None);
         };
-        let matches = self
-            .buckets
-            .get(bucket_idx)
-            .and_then(|bucket| bucket.entries.get(entry_idx))
-            .is_some_and(|entry| {
-                keys_equal_values(&entry.key_values, probe_keys, &self.collations)
-            });
+        let entry_pos = usize::try_from(entry_idx).map_err(|_| LimboError::IntegerOverflow)?;
+        let matches = self.entries.get(entry_pos).is_some_and(|entry| {
+            keys_equal_values(&entry.key_values, probe_keys, &self.collations)
+        });
         if !matches {
             return Ok(None);
         }
@@ -1326,14 +1344,8 @@ impl HashTable {
             .merge_next
             .checked_add(1)
             .ok_or(LimboError::IntegerOverflow)?;
-        self.probe_bucket_idx = bucket_idx;
-        self.probe_entry_idx = entry_idx
-            .checked_add(1)
-            .ok_or(LimboError::IntegerOverflow)?;
-        Ok(self
-            .buckets
-            .get(bucket_idx)
-            .and_then(|bucket| bucket.entries.get(entry_idx)))
+        self.probe_current_entry = Some(entry_idx);
+        Ok(self.entries.get(entry_pos))
     }
 
     /// Get the current state of the hash table.
@@ -1389,14 +1401,36 @@ impl HashTable {
         metrics: Option<&mut HashJoinMetrics>,
     ) -> IOResultOr<()> {
         let pending = PendingHashInsert {
-            key_values,
+            key_values: key_values.into(),
             rowid,
-            payload_values,
+            payload_values: payload_values.into(),
         };
         match self.insert_pending(pending, metrics)? {
             HashInsertResult::Done => Ok(IOResult::Done(())),
             HashInsertResult::IO { io, .. } => Ok(IOResult::IO(io)),
         }
+    }
+
+    /// Push `entry` into the flat slab and prepend it to bucket `bucket_idx`'s intrusive chain.
+    #[inline]
+    fn push_slab_entry(&mut self, bucket_idx: usize, entry: HashEntry) -> Result<()> {
+        let entry_idx = u32::try_from(self.entries.len()).map_err(|_| LimboError::IntegerOverflow)?;
+        let Some(head) = self.heads.get_mut(bucket_idx) else {
+            return Err(LimboError::InternalError("hash bucket out of range".into()));
+        };
+        let prev_head = *head;
+        if prev_head == EMPTY_ENTRY {
+            self.non_empty_buckets.try_push(bucket_idx)?;
+        }
+        self.entries.try_push(entry)?;
+        self.next.try_push(prev_head)?;
+        if self.track_matched {
+            self.matched_bits.try_push(false)?;
+        }
+        if let Some(slot) = self.heads.get_mut(bucket_idx) {
+            *slot = entry_idx;
+        }
+        Ok(())
     }
 
     pub(crate) fn insert_pending(
@@ -1420,13 +1454,8 @@ impl HashTable {
             return Ok(HashInsertResult::Done);
         }
 
-        // Compute hash of the join keys using collations
-        let key_refs: Vec<ValueRef> = pending
-            .key_values
-            .iter()
-            .map(|value| value.as_ref())
-            .try_collect()?;
-        let hash = hash_join_key(&key_refs, &self.collations);
+        // Compute hash of the join keys directly without allocating a temporary `Vec<ValueRef>`.
+        let hash = hash_join_values(&pending.key_values, &self.collations);
         let entry_size = HashEntry::size_from_values(&pending.key_values, &pending.payload_values);
 
         // Check if we would exceed memory budget
@@ -1438,7 +1467,7 @@ impl HashTable {
                     self.mem_budget
                 );
                 // First time exceeding budget, trigger spill
-                // Move all existing bucket entries into partition buffers
+                // Move all existing slab entries into partition buffers
                 let partition_count = self.choose_partition_count(entry_size);
                 let partitioning = Partitioning::new(partition_count);
                 self.spill_state = Some(SpillState::new(&self.io, self.temp_store, partitioning)?);
@@ -1474,16 +1503,10 @@ impl HashTable {
             // In spilled mode, insert into partition buffer
             spill_state.partition_buffers[partition_idx].insert(entry)?;
         } else {
-            // Normal mode, insert into hash bucket
+            // Normal mode, insert into flat slab and bucket chain
             self.grow_buckets(entry_size)?;
-            let bucket_idx = Self::bucket_of(hash, self.buckets.len());
-            if self.buckets[bucket_idx].entries.is_empty() {
-                self.non_empty_buckets.try_push(bucket_idx)?;
-            }
-            self.buckets[bucket_idx].insert(entry)?;
-            if self.track_matched {
-                self.matched_bits[bucket_idx].try_push(false)?;
-            }
+            let bucket_idx = Self::bucket_of(hash, self.heads.len());
+            self.push_slab_entry(bucket_idx, entry)?;
         }
 
         self.num_entries += 1;
@@ -1562,9 +1585,14 @@ impl HashTable {
 
             {
                 let spill_state = self.spill_state.as_mut().expect("spill state exists");
+                let owned_keys: HashKeyValues = if let [only] = key_values {
+                    HashKeyValues::from([only.clone()])
+                } else {
+                    HashKeyValues::from(key_values.iter().cloned().try_collect::<Vec<Value>>()?)
+                };
                 spill_state.partition_buffers[partition_idx].insert(HashEntry::new(
                     hash,
-                    key_values.iter().cloned().try_collect()?,
+                    owned_keys,
                     0,
                 ))?;
             }
@@ -1573,15 +1601,22 @@ impl HashTable {
             return Ok(IOResult::Done(true));
         }
 
-        // Non-spilled mode: check main buckets
-        let bucket_idx = Self::bucket_of(hash, self.buckets.len());
-        let bucket = &self.buckets[bucket_idx];
-        for entry in &bucket.entries {
+        // Non-spilled mode: walk bucket chain in flat slab
+        let bucket_idx = Self::bucket_of(hash, self.heads.len());
+        let mut cur = self.heads.get(bucket_idx).copied().unwrap_or(EMPTY_ENTRY);
+        while cur != EMPTY_ENTRY {
+            let Some(i) = usize::try_from(cur).ok() else {
+                break;
+            };
+            let Some(entry) = self.entries.get(i) else {
+                break;
+            };
             if entry.hash == hash
                 && keys_equal_distinct(&entry.key_values, key_refs, &self.collations)
             {
                 return Ok(IOResult::Done(false));
             }
+            cur = self.next.get(i).copied().unwrap_or(EMPTY_ENTRY);
         }
 
         let entry_size = HashEntry::size_from_values(key_values, &[]);
@@ -1597,18 +1632,20 @@ impl HashTable {
         }
 
         let bucket_idx = if self.grow_buckets(entry_size)? {
-            Self::bucket_of(hash, self.buckets.len())
+            Self::bucket_of(hash, self.heads.len())
         } else {
             bucket_idx
         };
-        if self.buckets[bucket_idx].entries.is_empty() {
-            self.non_empty_buckets.try_push(bucket_idx)?;
+        let mut owned_keys = HashKeyValues::new();
+        if key_values.len() > owned_keys.inline_size() {
+            owned_keys
+                .try_reserve_exact(key_values.len())
+                .map_err(|_| LimboError::OutOfMemory)?;
         }
-        self.buckets[bucket_idx].insert(HashEntry::new(
-            hash,
-            key_values.iter().cloned().try_collect()?,
-            0,
-        ))?;
+        for v in key_values {
+            owned_keys.push(v.try_clone()?);
+        }
+        self.push_slab_entry(bucket_idx, HashEntry::new(hash, owned_keys, 0))?;
         self.num_entries += 1;
         self.mem_used += entry_size;
         Ok(IOResult::Done(true))
@@ -1633,24 +1670,19 @@ impl HashTable {
             .is_none_or(|used| used > self.mem_budget)
     }
 
-    /// AUDIT 3.1: doubles the in-memory bucket array once the table holds as many entries as it
-    /// has buckets, so chains stay short however many rows arrive (the array was fixed at its
-    /// initial 1,024, and 1M rows made 1,000-entry chains). The load factor of 1 is Knuth's
-    /// separate chaining bound (TAOCP vol. 3, 6.4, Algorithm C analysis): at load factor a a
-    /// successful search visits 1 + a/2 entries and an unsuccessful one a + e^-a on average, so
-    /// at a <= 1 a probe visits at most 1.5 entries on a hit and 1.37 on a miss, while the array
-    /// costs at most two bucket headers an entry. The added array counts against the budget
-    /// (`bucket_mem`): a table whose growth wouldn't fit keeps its size and spills as before.
-    /// Returns whether the array grew (the caller's bucket index is then stale).
+    /// AUDIT 3.1: doubles the in-memory bucket head array once the table holds as many entries as
+    /// it has buckets, so chains stay short however many rows arrive (Knuth TAOCP vol. 3, 6.4).
+    /// Entries stay in place in `self.entries`; only `heads` and `next` links are rebuilt with
+    /// zero per-bucket allocations and zero entry moves.
     fn grow_buckets(&mut self, entry_size: usize) -> Result<bool> {
-        let len = self.buckets.len();
+        let len = self.heads.len();
         if self.num_entries < len || self.spill_state.is_some() || len == 0 {
             return Ok(false);
         }
         let Some(new_len) = len.checked_mul(2) else {
             return Ok(false);
         };
-        let added = len.saturating_mul(std::mem::size_of::<HashBucket>());
+        let added = len.saturating_mul(std::mem::size_of::<u32>());
         if self
             .mem_used
             .saturating_add(self.bucket_mem)
@@ -1660,35 +1692,26 @@ impl HashTable {
         {
             return Ok(false);
         }
-        let mut buckets: Vec<HashBucket> = Vec::new();
-        buckets.try_reserve_exact(new_len)?;
-        buckets.resize_with(new_len, HashBucket::new);
-        let mut matched_bits: Vec<Vec<bool>> = Vec::new();
-        if self.track_matched {
-            matched_bits.try_reserve_exact(new_len)?;
-            matched_bits.resize_with(new_len, Vec::new);
-        }
-        let old_bits = std::mem::take(&mut self.matched_bits);
-        let mut old_bits = old_bits.into_iter();
+        let mut heads: Vec<u32> = Vec::new();
+        heads.try_reserve_exact(new_len)?;
+        heads.resize(new_len, EMPTY_ENTRY);
         self.non_empty_buckets.clear();
-        for bucket in std::mem::take(&mut self.buckets) {
-            let bits = old_bits.next().unwrap_or_default();
-            for (i, entry) in bucket.entries.into_iter().enumerate() {
-                let idx = Self::bucket_of(entry.hash, new_len);
-                let Some(bucket) = buckets.get_mut(idx) else {
-                    return Err(LimboError::InternalError("hash bucket out of range".into()));
-                };
-                if bucket.is_empty() {
-                    self.non_empty_buckets.try_push(idx)?;
-                }
-                bucket.insert(entry)?;
-                if let Some(slot) = matched_bits.get_mut(idx) {
-                    slot.try_push(bits.get(i).copied().unwrap_or(false))?;
-                }
+        for (i, entry) in self.entries.iter().enumerate() {
+            let entry_idx = u32::try_from(i).map_err(|_| LimboError::IntegerOverflow)?;
+            let bucket_idx = Self::bucket_of(entry.hash, new_len);
+            let Some(head) = heads.get_mut(bucket_idx) else {
+                return Err(LimboError::InternalError("hash bucket out of range".into()));
+            };
+            let prev_head = *head;
+            if prev_head == EMPTY_ENTRY {
+                self.non_empty_buckets.try_push(bucket_idx)?;
             }
+            if let Some(next_slot) = self.next.get_mut(i) {
+                *next_slot = prev_head;
+            }
+            *head = entry_idx;
         }
-        self.buckets = buckets;
-        self.matched_bits = matched_bits;
+        self.heads = heads;
         self.bucket_mem = self.bucket_mem.saturating_add(added);
         Ok(true)
     }
@@ -1698,6 +1721,8 @@ impl HashTable {
         self.merge_order.clear();
         self.merge_run = 0;
         self.merge_next = 0;
+        self.probe_current_entry = None;
+        self.probe_next_entry = EMPTY_ENTRY;
         if self.num_entries == 0 && self.spill_state.is_none() {
             self.state = HashTableState::Building;
             self.current_probe_keys = None;
@@ -1714,18 +1739,26 @@ impl HashTable {
         }
 
         if self.spill_state.is_some() {
-            // Drop spilled partitions and reset buckets.
+            // Drop spilled partitions and reset bucket heads.
             self.spill_state = None;
             let bucket_count = self.initial_buckets.max(1);
-            self.buckets = (0..bucket_count).map(|_| HashBucket::new()).try_collect()?;
+            let mut heads = Vec::new();
+            heads.try_reserve_exact(bucket_count)?;
+            heads.resize(bucket_count, EMPTY_ENTRY);
+            self.heads = heads;
             self.bucket_mem = 0;
             self.non_empty_buckets.clear();
         } else {
             for &idx in &self.non_empty_buckets {
-                self.buckets[idx].entries.clear();
+                if let Some(head) = self.heads.get_mut(idx) {
+                    *head = EMPTY_ENTRY;
+                }
             }
             self.non_empty_buckets.clear();
         }
+        self.entries.clear();
+        self.next.clear();
+        self.matched_bits.clear();
 
         self.num_entries = 0;
         self.mem_used = 0;
@@ -1740,23 +1773,23 @@ impl HashTable {
         Ok(())
     }
 
-    /// Redistribute existing bucket entries into partition buffers for grace hash join.
+    /// Redistribute existing slab entries into partition buffers for grace hash join.
     fn redistribute_to_partitions(&mut self) -> Result<()> {
         let partitioning = {
             let spill_state = self.spill_state.as_ref().expect("spill state must exist");
             spill_state.partitioning
         };
-        for bucket in self.buckets.drain(..) {
-            for entry in bucket.entries {
-                let partition_idx = partitioning.index(entry.hash);
-                self.spill_state
-                    .as_mut()
-                    .expect("spill state must exist")
-                    .partition_buffers[partition_idx]
-                    .insert(entry)?;
-            }
+        for entry in self.entries.drain(..) {
+            let partition_idx = partitioning.index(entry.hash);
+            self.spill_state
+                .as_mut()
+                .expect("spill state must exist")
+                .partition_buffers[partition_idx]
+                .insert(entry)?;
         }
-        // Clear in-memory matched bits; spilled partitions will have their own.
+        // Clear in-memory slab metadata; spilled partitions will have their own.
+        self.heads.clear();
+        self.next.clear();
         self.matched_bits.clear();
         self.non_empty_buckets.clear();
         self.bucket_mem = 0;
@@ -2179,6 +2212,27 @@ impl HashTable {
             for partition_idx in materialize_targets {
                 self.materialize_partition_in_memory(partition_idx)?;
             }
+        } else if self.entries.len() > self.non_empty_buckets.len() {
+            // Restore FIFO insertion order for duplicate keys / colliding buckets in one
+            // cache-sequential reverse pass over `entries` (skipped in O(1) when every non-empty
+            // bucket holds a single entry).
+            for &b in &self.non_empty_buckets {
+                if let Some(h) = self.heads.get_mut(b) {
+                    *h = EMPTY_ENTRY;
+                }
+            }
+            let num_buckets = self.heads.len();
+            for (idx, entry) in self.entries.iter().enumerate().rev() {
+                let bucket_idx = Self::bucket_of(entry.hash, num_buckets);
+                if let (Ok(entry_u32), Some(head), Some(next_slot)) = (
+                    u32::try_from(idx),
+                    self.heads.get_mut(bucket_idx),
+                    self.next.get_mut(idx),
+                ) {
+                    *next_slot = *head;
+                    *head = entry_u32;
+                }
+            }
         }
         self.current_spill_partition_idx = 0;
         // Amphora (QT.5 step 4, lane qs5-21): a merge's rows sorted by key, in memory, or probed
@@ -2290,28 +2344,35 @@ impl HashTable {
             }
             Ok(None)
         } else {
-            // Normal mode - search in hash buckets
+            // Normal mode - walk flat slab bucket chain
             self.record_probe_call(metrics);
-            let bucket_idx = Self::bucket_of(hash, self.buckets.len());
-            self.probe_bucket_idx = bucket_idx;
-            let match_idx = {
-                let key = self.current_probe_keys.as_deref().unwrap_or_default();
-                let bucket = &self.buckets[bucket_idx];
-                let mut found = None;
-                for (idx, entry) in bucket.entries.iter().enumerate() {
-                    if entry.hash == hash
-                        && keys_equal_values(&entry.key_values, key, &self.collations)
-                    {
-                        found = Some(idx);
-                        break;
-                    }
+            let bucket_idx = Self::bucket_of(hash, self.heads.len());
+            self.probe_current_entry = None;
+            self.probe_next_entry = EMPTY_ENTRY;
+            let mut cur = self.heads.get(bucket_idx).copied().unwrap_or(EMPTY_ENTRY);
+            let key = self.current_probe_keys.as_deref().unwrap_or_default();
+            let mut match_idx: Option<(u32, usize, u32)> = None;
+            while cur != EMPTY_ENTRY {
+                let Some(i) = usize::try_from(cur).ok() else {
+                    break;
+                };
+                let Some(entry) = self.entries.get(i) else {
+                    break;
+                };
+                let next_idx = self.next.get(i).copied().unwrap_or(EMPTY_ENTRY);
+                if entry.hash == hash
+                    && keys_equal_values(&entry.key_values, key, &self.collations)
+                {
+                    match_idx = Some((cur, i, next_idx));
+                    break;
                 }
-                found
-            };
+                cur = next_idx;
+            }
 
-            if let Some(idx) = match_idx {
-                self.probe_entry_idx = idx + 1;
-                return Ok(self.buckets[bucket_idx].entries.get(idx));
+            if let Some((cur_u32, idx, next_idx)) = match_idx {
+                self.probe_current_entry = Some(cur_u32);
+                self.probe_next_entry = next_idx;
+                return Ok(self.entries.get(idx));
             }
             Ok(None)
         }
@@ -2377,18 +2438,26 @@ impl HashTable {
             }
             Ok(None)
         } else {
-            // non-spilled case, seach in main buckets
-            let bucket = &self.buckets[self.probe_bucket_idx];
-            for idx in self.probe_entry_idx..bucket.entries.len() {
-                let entry = &bucket.entries[idx];
+            // Non-spilled case: continue walking flat slab bucket chain
+            let mut cur = self.probe_next_entry;
+            while cur != EMPTY_ENTRY {
+                let Some(i) = usize::try_from(cur).ok() else {
+                    break;
+                };
+                let Some(entry) = self.entries.get(i) else {
+                    break;
+                };
+                let next_idx = self.next.get(i).copied().unwrap_or(EMPTY_ENTRY);
                 if entry.hash == hash
                     && keys_equal_values(&entry.key_values, probe_keys, &self.collations)
                 {
-                    // update probe entry index for next call
-                    self.probe_entry_idx = idx + 1;
-                    return Ok(Some(entry));
+                    self.probe_current_entry = Some(cur);
+                    self.probe_next_entry = next_idx;
+                    return Ok(self.entries.get(i));
                 }
+                cur = next_idx;
             }
+            self.probe_next_entry = EMPTY_ENTRY;
             Ok(None)
         }
     }
@@ -2399,19 +2468,23 @@ impl HashTable {
         if !self.track_matched {
             return;
         }
-        let entry_idx = self
-            .probe_entry_idx
-            .checked_sub(1)
-            .expect("mark_current_matched called without prior probe match");
-        let bucket_idx = self.probe_bucket_idx;
         if let Some(spill_state) = &mut self.spill_state {
+            let entry_idx = self
+                .probe_entry_idx
+                .checked_sub(1)
+                .expect("mark_current_matched called without prior probe match");
+            let bucket_idx = self.probe_bucket_idx;
             let partition_idx = self.current_spill_partition_idx;
             let partition = spill_state
                 .find_partition_mut(partition_idx)
                 .expect("spilled partition missing during mark_current_matched");
             partition.matched_bits[bucket_idx][entry_idx] = true;
-        } else {
-            self.matched_bits[bucket_idx][entry_idx] = true;
+        } else if let Some(entry_u32) = self.probe_current_entry {
+            if let Ok(idx) = usize::try_from(entry_u32) {
+                if let Some(bit) = self.matched_bits.get_mut(idx) {
+                    *bit = true;
+                }
+            }
         }
     }
 
@@ -2424,11 +2497,11 @@ impl HashTable {
                 "semi join's hash table does not track matches".to_string(),
             ));
         }
-        let entry_idx = self.probe_entry_idx.checked_sub(1).ok_or_else(|| {
-            LimboError::InternalError("hash first-match test without a probe match".to_string())
-        })?;
-        let bucket_idx = self.probe_bucket_idx;
-        let bits = if let Some(spill_state) = &mut self.spill_state {
+        if let Some(spill_state) = &mut self.spill_state {
+            let entry_idx = self.probe_entry_idx.checked_sub(1).ok_or_else(|| {
+                LimboError::InternalError("hash first-match test without a probe match".to_string())
+            })?;
+            let bucket_idx = self.probe_bucket_idx;
             let partition_idx = self.current_spill_partition_idx;
             let partition = spill_state
                 .find_partition_mut(partition_idx)
@@ -2437,18 +2510,26 @@ impl HashTable {
                         "spilled partition {partition_idx} missing at a hash first-match test"
                     ))
                 })?;
-            &mut partition.matched_bits
-        } else {
-            &mut self.matched_bits
-        };
-        let bit = bits
-            .get_mut(bucket_idx)
-            .and_then(|bucket| bucket.get_mut(entry_idx))
-            .ok_or_else(|| {
-                LimboError::InternalError(format!(
-                    "hash first-match test past its bucket ({bucket_idx}, {entry_idx})"
-                ))
-            })?;
+            let bit = partition
+                .matched_bits
+                .get_mut(bucket_idx)
+                .and_then(|bucket| bucket.get_mut(entry_idx))
+                .ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "hash first-match test past its bucket ({bucket_idx}, {entry_idx})"
+                    ))
+                })?;
+            let first = !*bit;
+            *bit = true;
+            return Ok(first);
+        }
+        let entry_u32 = self.probe_current_entry.ok_or_else(|| {
+            LimboError::InternalError("hash first-match test without a probe match".to_string())
+        })?;
+        let idx = usize::try_from(entry_u32).map_err(|_| LimboError::IntegerOverflow)?;
+        let bit = self.matched_bits.get_mut(idx).ok_or_else(|| {
+            LimboError::InternalError(format!("hash first-match test past slab ({idx})"))
+        })?;
         let first = !*bit;
         *bit = true;
         Ok(first)
@@ -2465,9 +2546,7 @@ impl HashTable {
                 }
             }
         }
-        for bits in &mut self.matched_bits {
-            bits.fill(false);
-        }
+        self.matched_bits.fill(false);
     }
 
     /// Reset the unmatched scan state to the beginning.
@@ -2502,18 +2581,12 @@ impl HashTable {
     }
 
     fn next_unmatched_main_buckets(&mut self) -> Option<&HashEntry> {
-        while self.unmatched_scan_bucket < self.buckets.len() {
-            let bucket = &self.buckets[self.unmatched_scan_bucket];
-            let matched = &self.matched_bits[self.unmatched_scan_bucket];
-            while self.unmatched_scan_entry < bucket.entries.len() {
-                let idx = self.unmatched_scan_entry;
-                self.unmatched_scan_entry += 1;
-                if !matched[idx] {
-                    return Some(&bucket.entries[idx]);
-                }
+        while self.unmatched_scan_entry < self.entries.len() {
+            let idx = self.unmatched_scan_entry;
+            self.unmatched_scan_entry = self.unmatched_scan_entry.saturating_add(1);
+            if !self.matched_bits.get(idx).copied().unwrap_or(false) {
+                return self.entries.get(idx);
             }
-            self.unmatched_scan_bucket += 1;
-            self.unmatched_scan_entry = 0;
         }
         None
     }
@@ -3102,8 +3175,7 @@ impl HashTable {
             )?);
         }
 
-        let key_refs: Vec<ValueRef> = key_values.iter().map(|v| v.as_ref()).try_collect()?;
-        let hash = hash_join_key(&key_refs, &self.collations);
+        let hash = hash_join_values(&key_values, &self.collations);
         let partition_idx = partitioning.index(hash);
 
         let entry = HashEntry::new(hash, key_values, probe_rowid);
@@ -3377,7 +3449,7 @@ impl HashTable {
             if grace.probe_entry_cursor < grace.probe_entries.len() {
                 let entry = &grace.probe_entries[grace.probe_entry_cursor];
                 let result = GraceProbeEntry {
-                    key_values: entry.key_values.clone(),
+                    key_values: entry.key_values.iter().cloned().try_collect()?,
                     probe_rowid: entry.rowid,
                 };
                 let grace = self.grace_state.as_mut().expect("grace state");
@@ -3445,8 +3517,12 @@ impl HashTable {
                 }
             }
         }
-        // Also free the main buckets
-        self.buckets.clear();
+        // Also free the main slab
+        self.heads.clear();
+        self.entries.clear();
+        self.next.clear();
+        self.matched_bits.clear();
+        self.non_empty_buckets.clear();
         self.loaded_partitions_lru.borrow_mut().clear();
         self.loaded_partitions_mem = 0;
     }
@@ -3659,7 +3735,11 @@ impl HashTable {
     /// Close the hash table and free resources.
     pub fn close(&mut self) {
         self.state = HashTableState::Closed;
-        self.buckets.clear();
+        self.heads.clear();
+        self.entries.clear();
+        self.next.clear();
+        self.matched_bits.clear();
+        self.non_empty_buckets.clear();
         self.num_entries = 0;
         self.mem_used = 0;
         self.loaded_partitions_lru.borrow_mut().clear();
@@ -3884,14 +3964,11 @@ mod hashtests {
                     .unwrap();
             }
             assert!(!ht.has_spilled());
-            assert!(ht.buckets.len() >= n as usize, "{}", ht.buckets.len());
-            assert!(ht.buckets.len().is_power_of_two());
+            assert!(ht.heads.len() >= n as usize, "{}", ht.heads.len());
+            assert!(ht.heads.len().is_power_of_two());
             assert!(ht.bucket_mem > 0);
             if track_matched {
-                assert_eq!(ht.matched_bits.len(), ht.buckets.len());
-                for (b, bits) in ht.buckets.iter().zip(&ht.matched_bits) {
-                    assert_eq!(b.entries.len(), bits.len());
-                }
+                assert_eq!(ht.matched_bits.len(), ht.entries.len());
             }
             let _ = ht.finalize_build(None);
             for i in (0..n).step_by(97) {
@@ -3929,7 +4006,7 @@ mod hashtests {
             assert_eq!(inserted, 2_000, "round {round}");
             assert!(ht.mem_used + ht.bucket_mem <= ht.mem_budget);
         }
-        assert!(ht.buckets.len() >= 2_000);
+        assert!(ht.heads.len() >= 2_000);
         let small = HashTableConfig {
             initial_buckets: 4,
             mem_budget: 4 * 1024,
