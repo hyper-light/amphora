@@ -11,7 +11,8 @@ usage: bench/sqlite_dml_rows.py COUNT SEED > crates/engine/tests/fixtures/dml_ro
 Left out, each a difference of another cause (bench/records/2026-11-24-adacachy2-oracle-c11.md): a comparison in a
 trigger of a column with a collation (CX), STRICT beside WITHOUT ROWID (refused), triggers on WITHOUT ROWID tables
 (refused), which of two unique constraints an UPSERT with no target meets first (no document says), an INSERT OR IGNORE
-of NULL into a STRICT key that is no rowid alias, and the text of a REAL past 15 digits (CK).
+of NULL into a STRICT key that is no rowid alias, a subquery in DO UPDATE (refused), and the text of a REAL past 15
+digits (CK).
 """
 import random
 import sqlite3
@@ -151,7 +152,8 @@ class Case:
         rng = self.rng
         if rng.random() < 0.6:
             return None
-        cols = [c for c in self.written if rng.random() < 0.8] or self.written[:]
+        named = {self.pk} if self.strict and not self.alias else set()
+        cols = [c for c in self.written if c in named or rng.random() < 0.8] or self.written[:]
         if rng.random() < 0.3:
             rng.shuffle(cols)
         if not self.without_rowid and not (self.alias in cols) and "rowid" not in cols and rng.random() < 0.25:
@@ -183,7 +185,7 @@ class Case:
 
     def expr(self):
         rng = self.rng
-        e, c, d = "excluded." + self.ref(), self.ref(), rng.choice(self.all)
+        e, c = "excluded." + self.ref(), self.ref()
         own = rng.choice([f"t.{c}", c])
         lit = rng.choice(["1", "'7'", "'a'", "1.5", "NULL", "10", "'A'"])
         return rng.choice([
@@ -191,7 +193,7 @@ class Case:
             f"typeof({e})", f"quote({e})", f"coalesce({e}, {own})", f"coalesce({own}, {e})", f"{e} + 1", f"{own} + {e}", f"-{e}",
             f"{e} = {own}", f"{e} IS {own}", f"{e} = {lit}", f"{own} = {e}", f"{e} < {lit}", f"{e} > {own}",
             f"CASE WHEN {e} > 2 THEN {e} ELSE {own} END", f"iif({e} IS NULL, {own}, {e})", f"CAST({e} AS TEXT)", f"hex({e})", f"{e} IN (1, 2, '2', 10)",
-            f"max({e}, coalesce({own}, 0))", f"(SELECT {e})", f"(SELECT count(*) FROM t AS z WHERE z.{d} IS {e})", f"length({e})", lit, own,
+            f"max({e}, coalesce({own}, 0))", f"length({e})", lit, own,
         ])
 
     def sets(self):
