@@ -302,6 +302,9 @@ def main():
         except sqlite3.Error as error:
             refused += 1
             continue
+        if draw.enforced and db.execute("PRAGMA foreign_key_check").fetchall():
+            refused += 1
+            continue
         out.append(f"db\tdrawn {made}")
         out += lines
         made += 1
