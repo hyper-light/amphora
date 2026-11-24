@@ -1682,11 +1682,12 @@ AC-T1.8.D1 and AC-T1.8.D2, tests T-T1.8.D1 and T-T1.8.D2 (docs/requirements.toml
    25 ms, the store's measured period (store.md, decision 4). Past the bound, as the writer counts its frames, a pass
    follows every flush. A pass that copied nothing new waits for the next flush, which on this thread is automatic
    (store.md, decision 25).
-3. **The owner starts the log again**, on the machine's own connection between steps, as the store's writer does
-   (`Db::restart_log`: Restart, or Truncate past `keep_log`, store.md decision 31). It is the owner's because a
-   restart takes the engine's write lock: on another connection it would make the owner's next `wal_insert_begin`
-   busy, and a failed apply fences. The owner never waits for a reader: with a flush or a local read out, it tries
-   again at its next step. When a restart is due, when reads are held for it, and how far the log may grow are
+3. **The owner starts the log again**, on the machine's own connection between steps, as the store's writer does, by
+   the engine's switch to the log's free segment (`Db::switch_log`, which copies nothing; store.md, decisions 45 and
+   31). It is the owner's because a restart takes the engine's write lock: on another connection it would make the
+   owner's next `wal_insert_begin` busy, and a failed apply fences. The owner never waits for a reader, and no reader
+   for it (2026-11-24, lane V20): with a flush out, or the segment the last restart closed not yet free, it tries again
+   at its next step. When a restart is due, and how far the log may grow are
    "A replica's database log bounded by what it measures" (2026-11-11), below, which replaces this point's picked
    bound (`LOG_FRAMES`, 131,072 frames, and a 64th of it) and points 4 and 5. A leader's log is also started again
    by the engine itself: a preparation is a write transaction, and the engine restarts the log at a write's begin
@@ -1699,13 +1700,12 @@ AC-T1.8.D1 and AC-T1.8.D2, tests T-T1.8.D1 and T-T1.8.D2 (docs/requirements.toml
 5. *(Replaced, 2026-11-11: the disk a log takes is that section's C.)*
 6. **Busy is a skip; only I/O fences.** A checkpoint pass that finds the log busy copies nothing and reports nothing:
    its `Checkpointed` is the default, and the owner keeps what the last real pass said. A restart that finds the log
-   busy (`Db::restart_log`'s `Ok(false)`) is tried again at the next step. A pass or a restart that fails for any
+   busy (`Db::switch_log`'s `Ok(false)`) is tried again at the next step. A pass or a restart that fails for any
    other reason fences the owner, as a failed flush does: the file's state is unknown after it (store.md, decision 9's
    argument), so the failure is typed and reported, never silent.
-7. **The local reads' pool.** The restart reaches the readers through two calls on `Local`: `hold_reads` (no read
-   begins on this replica until the restart) and `restart_unread` (the restart, run only while no read of this replica
-   is out). Whatever the pool becomes (amphora-class-and-readers' goal 314d704a, one account across replicas), it
-   keeps those two per replica.
+7. *(Superseded, 2026-11-24, lane V20, by store.md's decision 45: a restart reaches no reader. The pool's two calls for
+   it, `hold_reads` (no read begins on this replica until the restart) and `restart_unread` (the restart, run only while
+   no read of this replica is out), are deleted, and with them `unhold_reads`.)*
 
 ### Evidence
 
@@ -1717,7 +1717,8 @@ lowered bounds with a lowered room.
   bound after every write, restarts and passes counted, every row read back locally and after a restart.
 - T-T1.8.D1 `a_local_read_holds_off_the_logs_restart_and_one_after_waits_for_it`: a local read open across 39 writes
   on a learner with a 16-frame bound. No restart under it, and its view stays whole. A read that came while the
-  restart was due was refused `Timeout` (red on main: it answered at once). A restart once it ended.
+  restart was due was refused `Timeout` (red on main: it answered at once). A restart once it ended. *(Its promise is
+  superseded by decision 45, and the test rewritten: the next section.)*
 - T-T1.8.D2 `a_held_database_flush_stalls_no_persisted_owner_step`: three persisted voters, the leader's flushes held,
   rounds for four election timeouts at least. Red on main: the leader's owner reached the held flush on its own
   thread. With the change it never did. The write was answered with its flush held, and the term and the leader
@@ -1726,7 +1727,7 @@ lowered bounds with a lowered room.
   2 to 5 applied unflushed. A pass copies through the frame the flush covered, and no further (store.md, decision 15).
 - T-T1.8.D1 `a_restart_due_waits_for_a_reads_deadline_and_no_longer`: a local read with no end, under a deadline on a
   clock the test moves, out while the learner's log passes twice its bound. No restart while it runs. It is refused
-  at its deadline, and the restart follows.
+  at its deadline, and the restart follows. *(Superseded and rewritten the same way.)*
 - T-T1.8.D2 `a_member_power_cut_loses_no_acknowledged_persisted_write`: the power-cut nemesis on three persisted
   voters, 12 seeds: 92 writes acknowledged, 36 cuts, 16 of them of a leader holding writes unflushed, none lost. And
   `a_persisted_local_read_after_a_power_cut_is_no_older_than_its_last_flush` (T-T1.10.L6 in the persisted class).
@@ -1759,7 +1760,7 @@ log, a replica having two logs):
 
 - (the bound's falsifiers are the next section's);
 - a checkpoint pass that changed what an open local read sees;
-- a log restart while a local read was out, or a local read that began while a restart was due;
+- a log restart that waits for a local read, or a local read that waits for a restart (store.md, decision 45);
 - a persisted owner that flushes an ordinary entry's database log on its own thread, or an acknowledged write lost
   after a power cut in the persisted class (the power-cut nemesis);
 - terms that move as often under the same load after the change as before.
@@ -1826,16 +1827,31 @@ construction. With h of the tail held, the p99.9 becomes the base's quantile at 
 can't see (quorum, network) can move that by more than AC-T1.4.3's 1 ms. That 1 ms is held by the batch's
 benchmark, restarts on against off, not by this rule.
 
-**B. A restart waits for a pass that copied every durable frame.** It is ready when it is due, no flush and no read
-is out, and the last pass caught up: it copied through the frame the flush before it made durable (its cap, store.md
-decision 15; the flushing thread reports `backfilled >= durable`, or nothing left). What the restart then copies on
-the owner is only what the owner applied since that flush was asked, at most one flush's growth, the least any rule
-can leave. This replaces "a 64th left". Reads are held (`hold_due`) when a restart is due and the last pass either
-caught up (the restart waits only for the reads out) or found the log busy: a read that began on a log wholly copied
-holds read-mark 0, and a passive pass is busy beside it (wal.c, `walCheckpoint` takes `WAL_READ_LOCK(0)`). The
-flushing thread now reports a busy pass instead of dropping it, and a busy pass is the fact that "twice the bound
-however much is left" guessed at. While a restart is due, every flush is followed by a pass, and one is asked even
-with nothing to flush.
+**B. A restart waits for a pass, and for no read** (store.md, decision 45; revised 2026-11-24, lane V20). It is ready
+when it is due, no flush is out, and a pass has followed a flush of what the current segment holds (`Pass::ready`).
+The pass copied every durable frame the reads under way let it (its cap, store.md decision 15); how far it got is no
+part of the rule. The restart is the engine's switch alone (`Db::switch_log`): it copies nothing. It flushes what the
+current segment holds unflushed, what the owner applied since that flush was asked, at most one flush's growth, the
+least any rule can leave, and that segment closes. The flushing thread copies it: a pass is asked as the restart is
+made, so it is copied at once, and one follows the flushes after. A local read holds off no restart, and a restart no
+read:
+- **What an open read keeps.** The segment it began on, to its end: the switch leaves every frame where it was, so the
+  read's view is whole. A read that begins before the pass asked at the restart has copied the closed segment counts on
+  that one too, since not all of it is in the file; one that begins after counts on the current one alone. A read that
+  begins while a restart is due waits for nothing.
+- **How long the closed segment lives.** Until it is copied whole and no read counts on it: each read ends by its
+  caller's deadline D (`run_query`'s progress handler), and none begun after the copy counts on it, so at most 2D plus
+  one copy after the restart (decision 45, "Bounded"). Until then the other segment isn't free: the owner appends on in
+  the current one and tries again at each step.
+- **What was removed.** Until then a restart waited until no read was out, and reads were held (`hold_due`) once one
+  was due: a read that came waited for the restart and was refused at its own deadline. Both were there because a
+  restart wrote the log again from its first frame, under a read whose snapshot ended inside it. They cost what decision
+  45 names: one slow reader had every write past the room refused (C) until it ended. With them go T1's promises that no
+  restart is made under an open read and that a read that comes meanwhile waits for it, and T2's that a restart due
+  waits for a read's deadline (below, "Evidence").
+While a restart is due, every flush is followed by a pass, and one is asked even with nothing to flush. A pass that
+finds the log busy copies nothing, and the restart follows it as any other: a read that began on a log wholly copied
+holds read-mark 0, and a passive pass is busy beside it (wal.c, `walCheckpoint` takes `WAL_READ_LOCK(0)`).
 
 **C. The log's room, from the filesystem, at each pass.** After each pass the flushing thread (never the owner)
 reads:
@@ -1861,7 +1877,7 @@ does.
 
 Past H, on every member, a restart is due whatever the share says, and it counts as held: disk before latency.
 Without that, an owner whose own base tail has spent the share would never restart, its log would stay past H, and
-its submits would be refused for good. Reads are held. New submits are refused `Refusal::Unavailable("the
+its submits would be refused for good. No read is held (B). New submits are refused `Refusal::Unavailable("the
 database's log holds {frames} frames, past the {H} it may hold: ...")`, typed and retryable. No new variant: none
 until kiln shows a caller that must branch on it, and `Refusal` is a wire enum. A follower can't refuse what its
 group committed, and the leader can't see a follower's disk without a wire change, so a follower past H applies on.
@@ -1888,14 +1904,20 @@ installing at once (a node rejoining behind on all its groups) can still meet a 
 typed. `SNAPSHOT_BYTES` (256 MiB, "until streaming snapshots") is itself picked, noted to amphora-constants.
 
 **D. The bound, stated.** A replica's database log is two segment files (store.md, decision 45), each within the
-room: each holds at most min(H, what its group commits between restarts due by their share + what it commits while
-the local reads out at the due point finish). The room counts the current segment's frames, read from the log's shared
+room: each holds at most min(H, what its group commits between restarts due by their share, and, while a read counts
+on the other segment, until that one ends). The room counts the current segment's frames, read from the log's shared
 state (`Db::log_frames_in_use`), not the writer connection's own view, which a switch leaves on the closed segment
 until its next transaction. The closing segment holds what it held when the writer switched from it, within the room
 then, and grows no more. So the log's peak disk is two segment files, each within the room (Ada, 2026-11-24, on lane
-B19's question; lane B20). Each of those reads is
-bounded by its caller's deadline (`run_query`'s progress handler), and no new one begins. Past H no new submit is
-taken on that member. Restarts spend at most 1 - q of the entries, net of the owner's base tail.
+B19's question; lane B20). A slow local read takes no room from the writes: it keeps the segment it began on, and
+they go on in the other, up to that one's own room (lane V20). One thing a slow read can still cost is the disk's: where
+the writes fill that segment's whole room too while the read still holds the first, the member refuses new submits,
+typed (C), until the read ends, at most its caller's deadline. The room is read from the free bytes as each pass finds them: the
+pages a closed segment's copy may still add to the database's file, up to one a frame while a read holds the copy
+back, were in that segment's room while it was current, and are counted free again in the current one's, so they draw
+on the image kept back (C). Kept back too, they would leave the second segment no room while a read held the first,
+whose room, at 8,216 bytes a frame, is the log's whole share: a slow read would have a write refused again. Past H no
+new submit is taken on that member. Restarts spend at most 1 - q of the entries, net of the owner's base tail.
 
 How often each value is computed: A, F and N after every checkpoint pass, at most one a flush (one statvfs a pass);
 the counts at each owner step and tick; the restart's held at each step until idle.
@@ -1920,9 +1942,10 @@ On adas-mac-studio.local-2 (macOS aarch64), 2026-11-11; the core's tests in `dat
   (on b151af0 none, its bound being 131,072 frames). Told of a restart that held one entry, it makes none while 20
   more apply, and makes one once its generation covered its spend.
 - T-T1.8.D3 `past_its_room_a_replica_refuses_submits_and_restarts_whatever_its_share`: a voter whose share is spent
-  (a million held) and whose filesystem has nothing free past one image. With a local read held open, a write is
-  refused `Unavailable` naming the frames past the room, and no restart is made. Once the read ends a restart
-  follows, and the next write is taken.
+  (a million held) and whose filesystem has nothing free past one image. With a local read held open, a restart is
+  made under it and, the second segment past its room too, a write is refused `Unavailable` naming the frames past the
+  room (2026-11-24, lane V20: no restart was made until then). Once the read ends a restart follows, and the next write
+  is taken.
 - T-T1.8.D3 `a_follower_past_its_room_applies_on_and_fences_when_its_disk_fills`: a learner past its room refusing
   submits applies 6 to 10. Its flushes then fail as a full disk's do (`StorageFull`), it fences ("failed a flush"),
   and reopened on its files it holds 1 to 10.
@@ -1931,12 +1954,19 @@ On adas-mac-studio.local-2 (macOS aarch64), 2026-11-11; the core's tests in `dat
 - T-T1.8.D1, rewritten on the room:
   - `a_replicas_database_log_stays_within_its_room`: 300 writes, both logs at room for 64 frames each; each within
     its room plus what two writes grow it;
-  - `a_local_read_holds_off_the_logs_restart_and_one_after_waits_for_it` and
-    `a_restart_due_waits_for_a_reads_deadline_and_no_longer`: past a room of 16, no restart under a read, one after
-    it;
-  - `a_read_on_a_wholly_copied_log_holds_passes_off_and_a_busy_pass_holds_reads`: a restart due by its share, a busy
-    pass, reads held, the log within its room;
-  - `the_owner_holds_reads_past_the_room_or_once_a_due_restart_can_go`: the rule at each state.
+  - `a_local_read_holds_off_no_restart_of_the_log_and_one_after_waits_for_nothing` (T1, until 2026-11-24
+    `a_local_read_holds_off_the_logs_restart_and_one_after_waits_for_it`): past a room of 16, a restart under an open
+    read whose two views are both its own, a read beside it answered, and a restart once it ended (its segment free);
+  - `a_restart_due_waits_for_no_read_and_the_next_for_its_deadline_at_most` (T2, until 2026-11-24
+    `a_restart_due_waits_for_a_reads_deadline_and_no_longer`): a restart under a read with no end, and the next once
+    its deadline ended it;
+  - `a_slow_local_read_has_no_write_refused_past_the_logs_room`: on the voter, past its room under an open read, every
+    write taken;
+  - `a_read_after_the_logs_restart_is_not_held_though_nothing_is_written_after_it` (lane V19): a restart that went
+    through holds no read;
+  - `a_read_on_a_wholly_copied_log_holds_passes_off_and_no_restart_or_read` (until 2026-11-24 `..._and_a_busy_pass_holds_reads`):
+    a restart due by its share, a busy pass, a restart under the read and a read answered, the log within its room;
+  - `the_owner_holds_reads_past_the_room_or_once_a_due_restart_can_go`: deleted with the rule it stated, 2026-11-24.
 
 ### Metrics
 
@@ -1954,12 +1984,13 @@ beside
   restart that held no more than the worst before it (the share test);
 - a commit p99.9 that rises with restarts on against off, at a load where restarts are due by their share (the
   batch's benchmark: AC-T1.4.3's 1 ms is its to hold);
-- a submit taken on a member whose log was past its room; a restart not made past the room once no read was out
-  and a pass had caught up;
+- a submit taken on a member whose log was past its room; a restart not made past the room though the other segment
+  was free and a pass had run; a write refused past the room while the other segment was free;
 - a disk filled by replica logs while each was within its room. statvfs's `f_bavail` is an estimate on btrfs
   (compression, and space its allocator still holds) and on APFS (purgeable space counted free, and containers
   sharing one pool), so a filesystem may hold less than it said;
-- a restart that copied more than what was applied after the last caught-up pass's flush;
+- a restart that copied a frame on the owner, or flushed there more than what was applied after the last flush was
+  asked; a restart or a read that waited for the other;
 - a snapshot install that met a full disk mid-image while its filesystem was within every log's room (several
   installs at once on one filesystem are the stated exception);
 - a reopen too slow at a log near its room: a reopen reads the whole log to rebuild its index (wal.c,

@@ -1279,10 +1279,11 @@ impl Machine {
         self.db.keep_log(frames);
     }
 
-    /// Starts the database's log again on the machine's own connection, with no reader reading
-    /// (its owner holds them back): whether it did (`Db::restart_log`).
+    /// Starts the database's log again on the machine's own connection: its writer's switch to the
+    /// free segment, which copies nothing and waits for no read (`Db::switch_log`; store.md,
+    /// decision 45): whether it did.
     pub(crate) fn restart_log(&mut self) -> anyhow::Result<bool> {
-        self.db.restart_log()
+        self.db.switch_log()
     }
 
     /// A flush of the database's log, to run on the owner's flushing thread: what was committed
