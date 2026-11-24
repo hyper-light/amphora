@@ -6,7 +6,9 @@ for case in text.split("----\n"):
     for sql in [s.strip() for s in case.split(";\n") if s.strip()]:
         if sql.startswith("EXPLAIN"): continue
         try:
-            rows = c.execute(sql).fetchall()
+            cur = c.execute(sql)
+            if "-n" in sys.argv and sql.startswith("SELECT"): print("      names:", " | ".join(d[0] for d in cur.description))
+            rows = cur.fetchall()
             if sql.startswith(("SELECT",)) or rows: print("  ", sql, "\n     ", " / ".join(", ".join("NULL" if v is None else repr(v) for v in r) for r in rows))
             elif not sql.startswith("CREATE"): print("   ok", sql)
         except Exception as e: print("  ", sql, "\n      ERROR", e)

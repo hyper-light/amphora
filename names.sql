@@ -1,0 +1,24 @@
+CREATE TABLE t(a INTEGER PRIMARY KEY, g INT, v);
+CREATE TABLE s(a INT, b INT);
+INSERT INTO t VALUES (1, 1, 2.5), (2, 1, NULL), (3, 2, 2);
+INSERT INTO s VALUES (3, 1), (5, 2);
+SELECT * FROM (SELECT g, count(*), sum(count(*)) OVER () FROM t GROUP BY g);
+SELECT * FROM (SELECT a, (SELECT max(b) FROM s), sum(a) OVER () FROM t);
+SELECT * FROM (SELECT a, EXISTS (SELECT 1 FROM s), sum(a) OVER () FROM t);
+SELECT * FROM (SELECT a, a IN (SELECT a FROM s), sum(a) OVER () FROM t);
+SELECT * FROM (SELECT rowid, sum(a) OVER () FROM t);
+SELECT * FROM (SELECT t.a, s.a, sum(t.a) OVER () FROM t, s);
+SELECT t.a, s.a, sum(t.a) OVER () FROM t, s;
+SELECT a, avg(g) OVER (ORDER BY a), min(a) OVER (ORDER BY a DESC) FROM t;
+SELECT g, count(*), sum(count(*)) OVER () FROM t GROUP BY g;
+SELECT a, (SELECT max(b) FROM s), sum(a) OVER () FROM t;
+SELECT a, (SELECT max(b) FROM s WHERE s.a = t.a) FROM t;
+SELECT * FROM (SELECT a, (SELECT max(b) FROM s WHERE s.a = t.a) FROM t);
+SELECT * FROM (SELECT a, (SELECT max(b) FROM s WHERE s.a = t.a), sum(a) OVER () FROM t);
+SELECT * FROM (SELECT a, a + 1, (a), -a, sum(a) OVER (), max(a) OVER (ORDER BY g) FROM t);
+SELECT * FROM (SELECT a, sum(a) OVER w1, max(a) OVER w2 FROM t WINDOW w1 AS (ORDER BY a), w2 AS (PARTITION BY g));
+SELECT * FROM (SELECT DISTINCT g, sum(a) OVER (PARTITION BY g), count(*) OVER () FROM t);
+SELECT * FROM (SELECT g, sum(a) OVER (PARTITION BY g), count(*) OVER () FROM t UNION SELECT 1, 2, 3);
+SELECT * FROM (SELECT 1, 2, 3 UNION ALL SELECT g, sum(a) OVER (PARTITION BY g), count(*) OVER () FROM t);
+SELECT * FROM (SELECT (max(a) OVER (ORDER BY g)), (min(a) OVER (ORDER BY a)) COLLATE nocase FROM t);
+SELECT * FROM (SELECT max(a) OVER (ORDER BY g), max(a) OVER (ORDER BY g), min(a) OVER (ORDER BY a), min(a) OVER (ORDER BY a) FROM t)

@@ -5,6 +5,9 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 fn run(conn: &Arc<Connection>, sql: &str) -> Result<Vec<String>, String> {
     let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    if std::env::var("C25_NAMES").is_ok() && sql.starts_with("SELECT") {
+        println!("      names: {}", (0..stmt.num_columns()).map(|i| stmt.get_column_name(i).to_string()).collect::<Vec<_>>().join(" | "));
+    }
     let rows = stmt.run_collect_rows().map_err(|e| e.to_string())?;
     Ok(rows.iter().map(|row| row.iter().map(|v| match v {
         Value::Null => "NULL".to_owned(),
