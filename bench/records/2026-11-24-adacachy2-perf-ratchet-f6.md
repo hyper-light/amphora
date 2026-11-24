@@ -61,10 +61,10 @@ build only, and 1 in the engine-alone pass only, net 12.
 
 - All 13 compile only with `conn_raw_api` (connection.rs's two also with `fs`); crates/amphora turns it on
   (crates/amphora/Cargo.toml:24), so they ship. All 13 are fixed in code below; none is left.
-- Doesn't ship: storage/wal.rs:5947, `#[cfg(not(feature = "conn_raw_api"))]`, compiled only in builds of the
-  engine alone (its tests' builds).
+- Doesn't ship: storage/wal.rs:5947, `#[cfg(not(feature = "conn_raw_api"))]`, compiled only where
+  `conn_raw_api` is off (the engine by itself, amphora-corpus by itself); neither ships.
 - Evidence that each was one of the 13 and is gone: the shipping build at main (a64549cc) has 10630 sites and at
-  this commit (F, the tree of 5237f16e) 10617; the multiset difference by (lint, file, source line) is exactly
+  F (50a488dc; 5237f16e adds only docs) 10617; the multiset difference by (lint, file, source line) is exactly
   the 13, with none added. After the fixes the workspace build has no site the engine-alone pass lacks (0).
 
 ## Changed
@@ -78,7 +78,7 @@ build only, and 1 in the engine-alone pass only, net 12.
 - crates/engine/mvcc/portable_logical.rs: a repeated object-map id is `InternalError`.
 - scripts/check-production.sh: the engine pass is `cargo clippy -p amphora` without `--no-deps`; the engine is
   linted as a dependency of what ships, with the features it resolves. CLAUDE.md and engine-ratchet.py say so.
-- scripts/engine-ratchet.toml: every ceiling is the shipping build's count at this commit; none raised (table).
+- scripts/engine-ratchet.toml: every ceiling is the count of the shipping build's features, dev profile, at F; none raised (table).
 
 | Lint | Main's ceiling | Ceiling now | The old gate's count at this commit |
 |---|---|---|---|
@@ -112,8 +112,9 @@ left and the 13 this lane fixed). The old gate compiled none of those 13 (`conn_
   66 s with the engine's lib.rs files touched, so clippy re-linted the engine ("Compiling amphora-engine" in
   its log). Then a negative control: an `unwrap()` put in the shipping `conn_raw_api` function
   `write_schema_version` and reverted afterwards. check-production exit 1:
-  "clippy::unwrap_used: 434, above the 433". The old gate compiles the engine without `conn_raw_api` and
-  could not see it.
+  "clippy::unwrap_used: 434, above the 433". The old gate compiles the engine without `conn_raw_api`,
+  so it could not see it: inferred from its pass's JSON, which holds none of the 13 `conn_raw_api` sites; the
+  control was not run against the old gate.
 - r377 at 5237f16e: the engine's portable-logical tests,
   `cargo test -p amphora-engine --locked --features conn_raw_api --lib -- portable`: 28 passed, 0 failed.
 - r388 at 5237f16e: the engine's whole `mvcc::` module, the same features: 558 passed, 0 failed, 12 ignored.
@@ -125,8 +126,8 @@ left and the 13 this lane fixed). The old gate compiled none of those 13 (`conn_
   `write_schema_version` path, `restage_schema`): 10 passed, 0 failed.
 - r416 at the second merge, e0947c86 (main moved inside crates/engine: dialect/postgres.rs, database.rs,
   translate, vdbe and others, 4 lines of mvcc/database/mod.rs, none of them this lane's edits): check-production
-  exit 0 in 59 s, "Compiling amphora-engine" in both passes, 10617 as the ratchet holds (main's new engine code
-  added no counted site to the shipping build); workspace clippy `--all-targets -D warnings` exit 0 in 45 s;
+  exit 0 in 59 s, "Compiling amphora-engine" in both passes, 10617 as the ratchet holds (no lint's count
+  changed with main's new engine code); workspace clippy `--all-targets -D warnings` exit 0 in 45 s;
   `cargo test -p amphora-engine --locked --features conn_raw_api --lib -- mvcc::`: 558 passed, 0 failed, 12 ignored.
 - `cargo fmt --all --check`: exit 0 (this machine, 5237f16e and the merge).
 @@LIB@@
