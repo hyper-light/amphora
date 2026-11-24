@@ -88,4 +88,27 @@ removable share is the lookup's 15-18% (bound 1.22x), and the median ratio is 1.
 
 ## Answers
 
-PENDING
+Each way's answers after K0's mixed phase held to SQLite's on the same rows (`q5_answers.sh`,
+02:18Z to 02:20Z, binary 105d8482: b6e2e72f with `AMPHORA_ANSWERS` saying how many events each
+session was written): one run a way at 1, 32 and 128 clients. After the mixed phase the bench reads
+each of the 1,000 sessions' latest 50 events through Amphora's readers, with the log still holding
+the pages (no checkpoint ran); SQLite gets exactly the rows the bench wrote (every write answered,
+ids `e-0` to `e-<written - 1>`) and answers the same query. 12 runs, 12,000 pages, 50,744-94,936
+events a run: 0 differ, in all four ways. Failures 0, unanswered writes 0 in every run.
+
+## Commands
+
+All on adacachy2 (runner 00aad8daff2fa3c9daa65d53c425d450, sync false), scripts in
+`2026-11-24-adacachy2-perf-reads-q5/` and lane Q4's `q4_shares.py`, the lane's folder
+`~/.cache/analytics-q5`:
+- r2: the release bench at 6229da95 and `store::tests::q5_k0_amphora_opens_and_reads_what_it_wrote`
+  (cpus=8,mem=24g): the fix, its test passing.
+- r14: the bench at b6e2e72f, its test, then `q5_mixed.sh` (cpus=4,mem=12g, after a refusal at 16):
+  the profiles and the timed rounds above. Its answer step failed in every run (SQLite can't open
+  Amphora's files); that step's numbers are not used.
+- r75: the bench at 105d8482 and `WAYS="locked filtered published optimistic" q5_answers.sh`
+  (cpus=4,mem=12g), in a second target dir (deleted after, RULES 5c) so it didn't wait behind the
+  engine checks' build lock.
+- The engine checks of the merged tree, below the deletion: clippy on amphora-engine
+  (`--all-targets -D warnings`), `storage::wal`'s tests, `--test log_read_index` and
+  scripts/check-production.sh.
