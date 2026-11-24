@@ -224,9 +224,6 @@ impl<T> Slots<T> {
                 unmeasured: None,
             };
         }
-        if let Some(gap) = self.gaps.iter_mut().find(|gap| gap.member == member) {
-            gap.from = None;
-        }
         let ended = self.released(member, at);
         Taken {
             step: Some(message),
@@ -478,17 +475,19 @@ impl<T> Slots<T> {
         Ok(())
     }
 
-    /// Ends `member`'s slot released at `at`, if it holds it: its work was no write.
+    /// `member`'s barrier, marked a read's or not, closes a slot begun for it, held or ended
+    /// first (lane P14), so its next write's barrier asks for a slot again (lane P16); a slot it
+    /// still holds ends released at `at`: its work was no write.
     fn released(&mut self, member: u64, at: Instant) -> Option<Ended> {
+        if let Some(gap) = self.gaps.iter_mut().find(|gap| gap.member == member) {
+            gap.from = None;
+        }
         if !self
             .holding
             .as_ref()
             .is_some_and(|holding| holding.member == member)
         {
             return None;
-        }
-        if let Some(gap) = self.gaps.iter_mut().find(|gap| gap.member == member) {
-            gap.from = None;
         }
         self.end(at, SlotEnd::Released)
     }

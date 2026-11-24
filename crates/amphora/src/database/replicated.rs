@@ -702,6 +702,20 @@ impl Local {
         locked(&self.account.ledger)?.restarting.insert(self.id);
         Ok(())
     }
+    /// Reads begin again with no restart run: none runs while a session holds the write lock
+    /// (`Actor::hand_off`), so none is held for one meanwhile.
+    fn unhold_reads(&self) -> Result<(), Refusal> {
+        if locked(&self.account.ledger)?.restarting.remove(&self.id) {
+            self.account.free();
+        }
+        Ok(())
+    }
+    /// Whether this replica's reads are held for a restart that waits for a pass alone: no read
+    /// of it is out.
+    fn held_unread(&self) -> Result<bool, Refusal> {
+        let ledger = locked(&self.account.ledger)?;
+        Ok(ledger.restarting.contains(&self.id) && !ledger.out.contains_key(&self.id))
+    }
     /// `restart`, once no read of this replica is out, its reads held back while it runs: none
     /// while one is out. Reads begin again once it started the log (`Ok(true)`).
     fn restart_unread(
@@ -1131,9 +1145,9 @@ impl Sessions {
                 // the owner, woken, finds the worker gone and fences, as its own unwinding does.
                 let _ring = Ring(Arc::clone(&bell));
                 for session in asked {
-                    let Ok(ran) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        session(&mut db)
-                    })) else {
+                    let Ok(ran) =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session(&mut db)))
+                    else {
                         return;
                     };
                     if finished.send(ran).is_err() {
@@ -5611,7 +5625,14 @@ impl<F: BlockFile + 'static> Actor<F> {
         } else {
             let clock = Arc::clone(&self.clock);
             self.replica.machine_mut().prepare_db(|db| {
-                run_session(db, &operation, &pending.namespace, claim.as_ref(), pending.until, clock)
+                run_session(
+                    db,
+                    &operation,
+                    &pending.namespace,
+                    claim.as_ref(),
+                    pending.until,
+                    clock,
+                )
             })
         };
         // The preparation ran the caller's work, which takes time of its own: its deadline is
@@ -5634,6 +5655,11 @@ impl<F: BlockFile + 'static> Actor<F> {
         operation: Operation,
         claim: Option<Option<crate::database::Application>>,
     ) -> Result<(), Refusal> {
+        // A restart due and ready runs before the write lock is lent, as after a session run
+        // inline; none runs while the session is out, so no read is held for one meanwhile, and
+        // one due then runs as it comes back (`decide`; CP-T1.13, lane P15's trace).
+        self.flush()?;
+        self.control.local.unhold_reads()?;
         let base = match self.replica.machine().session_base() {
             Ok(base) => base,
             Err(refusal) => {
@@ -5666,6 +5692,12 @@ impl<F: BlockFile + 'static> Actor<F> {
     /// write whose lead moved before its preparation does (`requeue`), and a call, its closure
     /// spent, is refused `NotLeader`, a known outcome, never run again (CP-T1.13).
     fn decide(&mut self) -> Result<(), Refusal> {
+        // A restart that came due while the session was out runs before its answer goes out, or
+        // a read the answer lets begin would wait on it (lane P15's trace). It waits only for a
+        // pass while no read is out (`Local::restart_unread`).
+        if self.ran.is_some() && self.control.local.held_unread()? {
+            return Ok(());
+        }
         let Some((ran, operation)) = self.ran.take() else {
             return Ok(());
         };
@@ -16195,7 +16227,11 @@ mod tests {
             assert_eq!(values.first().unwrap(), &vec![3]);
         }
         if matches!(answered, Err(Refusal::NotLeader { .. })) {
-            assert_eq!(values.first().unwrap(), &vec![2], "a NotLeader delta wrote nothing");
+            assert_eq!(
+                values.first().unwrap(),
+                &vec![2],
+                "a NotLeader delta wrote nothing"
+            );
         }
         // The lead moves again while a replica reads the seed's original image.
         let image = submit(clients.get(1).unwrap(), driven.until(), unchanged);
@@ -17489,12 +17525,18 @@ mod tests {
         settle_log(&mut driven, &mut pump, &clients);
         driven.flushed(&mut pump, 0);
         for _ in 0..ROUNDS {
-            if matches!(&driven.owner(0).flushing, Flushing::Thread { out: false, .. }) {
+            if matches!(
+                &driven.owner(0).flushing,
+                Flushing::Thread { out: false, .. }
+            ) {
                 break;
             }
             driven.round(&mut pump);
         }
-        let whole = driven.owner(0).replica.machine().reader()().unwrap().checkpoint().unwrap();
+        let whole = driven.owner(0).replica.machine().reader()()
+            .unwrap()
+            .checkpoint()
+            .unwrap();
         assert_eq!(whole.left, 0, "{whole:?}");
         let handle = voter.handle();
         let restarts = handle.counters().database_log_restarts;
@@ -17512,7 +17554,11 @@ mod tests {
             db.exec("INSERT INTO member_items VALUES(2)")?;
             Ok(restarted.to_le_bytes().to_vec())
         });
-        let ran: [u8; 8] = driven.settle(&mut pump, &answer).unwrap().try_into().unwrap();
+        let ran: [u8; 8] = driven
+            .settle(&mut pump, &answer)
+            .unwrap()
+            .try_into()
+            .unwrap();
         assert!(
             u64::from_le_bytes(ran) > restarts,
             "the session ran lent the write lock with a restart due and ready not run"
@@ -17966,7 +18012,10 @@ mod tests {
                 }
                 driven.step();
             }
-            assert!(driven.owner(0).sessions.out, "the capture was handed to the worker");
+            assert!(
+                driven.owner(0).sessions.out,
+                "the capture was handed to the worker"
+            );
             let (mut receipts, finishing, processed) = taken.recv().unwrap();
             assert_eq!(driven.settle(&mut pump, &capture), Ok(Vec::new()));
             for receipt in &mut receipts {
@@ -18794,7 +18843,8 @@ mod tests {
                         acknowledged += 1;
                         if crashes < CRASHES {
                             row[id] += WRITERS;
-                            *slot = Some((via, submit(&clients[via], driven.until(), write(row[id]))));
+                            *slot =
+                                Some((via, submit(&clients[via], driven.until(), write(row[id]))));
                         }
                         false
                     }
@@ -19013,7 +19063,10 @@ mod tests {
                             *slot = Some(submit(&clients[id % 3], driven.until(), write(id)));
                         }
                         Ok(Err(refusal)) => {
-                            panic!("{durability:?}: writer {id} at member {}: {refusal:?}", id % 3 + 1)
+                            panic!(
+                                "{durability:?}: writer {id} at member {}: {refusal:?}",
+                                id % 3 + 1
+                            )
                         }
                     }
                 }
@@ -19037,7 +19090,11 @@ mod tests {
                         Ok(ids)
                     })
                     .unwrap();
-                assert_eq!(ids, (0..WRITERS).collect::<Vec<_>>(), "{durability:?}: owner {owner}");
+                assert_eq!(
+                    ids,
+                    (0..WRITERS).collect::<Vec<_>>(),
+                    "{durability:?}: owner {owner}"
+                );
             }
             driven.drain(&mut pump);
             pump.finish();
@@ -19048,7 +19105,10 @@ mod tests {
                 format!("{durability:?}: over {writes} writes, at most {most} for one, in {rounds} rounds"),
             ));
         }
-        assert!(stale.iter().all(|(n, _)| *n == 0), "stale-base refusals: {stale:?}");
+        assert!(
+            stale.iter().all(|(n, _)| *n == 0),
+            "stale-base refusals: {stale:?}"
+        );
     }
 
     /// T-T1.8.W1, the stale-base refusal's type (PostgreSQL's 40001): a write refused because
@@ -19691,7 +19751,10 @@ mod tests {
             driven.round(&mut pump);
         }
         assert!(pump.captures_ready(), "member 3's write never forwarded");
-        assert!(driven.owner(0).slots.holds(), "member 3's write held no slot");
+        assert!(
+            driven.owner(0).slots.holds(),
+            "member 3's write held no slot"
+        );
         let head = enqueue(&clients[1], driven.until(), "ns", Operation::Head);
         let query = enqueue(
             &clients[1],

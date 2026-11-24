@@ -94,7 +94,13 @@ fn cp_t1_13_a_leader_keeps_its_lead_and_answers_local_reads_while_a_session_runs
     } = hold_a_session(&mut driven, &mut pump, &clients);
     let id = u64::try_from(leader + 1).unwrap();
     let term = driven.owner(leader).replica.term();
-    let election = driven.owner(leader).replica.core().raft.config().election_tick;
+    let election = driven
+        .owner(leader)
+        .replica
+        .core()
+        .raft
+        .config()
+        .election_tick;
     for _ in 0..3 * election {
         for owner in 0..clients.len() {
             driven.advance_tick(owner);
@@ -124,7 +130,10 @@ fn cp_t1_13_a_leader_keeps_its_lead_and_answers_local_reads_while_a_session_runs
         "a local read answered while the session runs"
     );
     go.send(()).unwrap();
-    assert!(driven.answer(&mut pump, &answer).is_ok(), "the write commits");
+    assert!(
+        driven.answer(&mut pump, &answer).is_ok(),
+        "the write commits"
+    );
     assert_eq!(ran.load(Ordering::Relaxed), 1, "the session ran once");
     assert_eq!(
         clients

@@ -2010,8 +2010,8 @@ pure core is `database/slot.rs`, driven by the owner (`Actor::keep_slots`, `star
   ended (its length passed while the work ran, or a release) asked for a new slot that no work ends, holding the
   leader and every member queued behind it for its length (lane P13's trace, CP-T1.13). A slot begun for a member
   waits for its close until one comes (`Gap::from`), so a barrier from a member whose slot ended before its close came
-  is that close: it ends nothing and asks for nothing, and it steps. A slot ends once (lane P14). A member sends its
-  close only to the leader that gave the slot, in that term (`Actor::end_slot`): a slot dies with its term, and a new
+  is that close, marked a read's or not (`Slots::released`; lane P16): it ends nothing and asks for nothing, and it
+  steps. A slot ends once (lane P14). A member sends its close only to the leader that gave the slot, in that term (`Actor::end_slot`): a slot dies with its term, and a new
   leader, which gave none, would take the close as an ask (lane P14's trace, the same stuck state).
 - *Which barriers ask* (CP-T1.8, lanes V8 and V11). Since lane V8 a follower's write asks for its slot from its
   first try: the leader queues every write's barrier (`Slots::ask`), not only a refused member's, so the base it
@@ -3053,7 +3053,13 @@ length, and the owner takes none until it has the result back.
    behind its durability fence, core step R-6, under which `Ready`s go on), with a hold of Amphora's own beside the
    fence's so the fence's `resume_apply` cannot lift it. Applied state stays still, so the owner neither refreshes
    nor runs a `read_db`. Everything else goes on: ticks, heartbeats, votes (a vote is the raft log's hard state, not
-   the database's), appends and their flushes, ReadIndex, a member's forward appended.
+   the database's), appends and their flushes, ReadIndex, a member's forward appended. The database's log is not
+   restarted while the lock is lent, so a restart due and ready at the hand-off runs first (`Actor::hand_off` steps
+   the flushing), as it ran after a session run inline, and no read is held for one while the session is out; one
+   due as the result comes back runs before the write is decided, while it waits only for a pass (`Actor::decide`).
+   Lane P15's trace: the step that lent the lock skipped a due and ready restart, the passes then found the log busy
+   under the session's reader, and the write was answered with the replica's reads held for a restart still to come
+   (CP-T1.13, lane P16).
 4. **The result handed back, on an event.** The worker sends its result on a done channel and wakes the owner's bell,
    as the flushing thread does (`Flushing::Thread`). The owner's next step takes it with `try_recv`: it woke on the
    bell, so nothing polls. The owner lifts its hold, lets the step's drive apply what committed meanwhile, then
