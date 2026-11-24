@@ -6021,9 +6021,10 @@ mod tests {
         });
         handle.drain(usize::MAX).unwrap();
         assert!(matches!(asked.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        // The driven `submit` charges `REQUEST_MAX` for its call, beside its envelope.
         assert_eq!(
             budget.held(crate::memory::Use::Queues),
-            written(api::REQUEST_MAX)
+            u64::try_from(api::REQUEST_MAX + ENVELOPE_BYTES).unwrap()
         );
         let others: Vec<usize> = (0..3).filter(|owner| *owner != leader).collect();
         let answered = (0..ROUNDS)
