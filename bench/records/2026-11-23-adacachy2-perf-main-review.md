@@ -110,4 +110,21 @@ On arm64 macOS, the exact landing passed the descriptor, busy-writer and W9/W10/
 
 The Linux production gate in r125 passed with Rust 1.99.1 and 10,903 diagnostics across 17 lints. Arithmetic side effects, possible truncation, sign loss, possible wrap and disallowed methods counted 3,345, 547, 249, 685 and 40 respectively. Compared with `62687f5d`, ten ceilings fell and seven stayed level. [Linux ratchet at the landing](https://github.com/hyper-light/amphora/blob/2571f8418abbe912a4004724007d60614befdb59/scripts/engine-ratchet.toml)
 
+The earlier five counts came from Kiln r69 on November 23, in the review snapshot with the changes committed as `f6ea38fdc3f0d62a2023b43360516fd84ac4b0c3`. That snapshot started from a Git archive of `e4fd7876` with the review changes applied and their contents checked by SHA-256. R69 applied and checked the quantile fix’s three files before running the gate. On adacachy2 the shell ran the gate with the following environment.
+
+```bash
+cd /tmp/amphora-verifier-cargo-proof.pn7oIRWU/final
+export PATH="$HOME/.cargo/bin:$PATH"
+export CARGO_HOME="$HOME/.cache/cargo-home-verifier" CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=8
+export CARGO_TARGET_DIR="$HOME/.cache/amphora-target/verifier"
+export CARGO_BUILD_BUILD_DIR=/tmp/amphora-verifier-cargo-proof.pn7oIRWU/cargo-build
+export CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu CARGO_INCREMENTAL=0
+export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+nice -n 10 bash scripts/check-production.sh > ../production-policy.log 2>&1
+```
+
+The script used its default production targets and features. Its engine pass selected the four engine crates with `--locked --no-deps --message-format=json`, the workspace Clippy configuration and all 17 warning lints. The preceding two-crate `--all-targets` Clippy check wrote to a separate log. The toolchain was rustc 1.99.1 (`58cf8f9c3`), Cargo 1.99.1 (`5f94df478`) and Clippy 0.1.99 (`58cf8f9c35`).
+
+Kiln r133 ran the same script on a clean Git archive of `f6ea38fd`, using the normal host build settings. The gate exited 1 and reproduced the five counts of 3,492 / 568 / 266 / 696 / 69, with 11,143 diagnostics in total. R134 recovered the original gate log and checked the archived manifests, gate scripts, lint configuration and toolchain pin. F4 and r125 agree on the later landing’s five counts. [Historical gate](https://github.com/hyper-light/amphora/blob/f6ea38fdc3f0d62a2023b43360516fd84ac4b0c3/scripts/check-production.sh) · [F4’s comparison](https://github.com/hyper-light/amphora/blob/5bd0f46eb3e1954a8a161b05d942d6b599221ed1/bench/records/2026-11-24-adacachy2-perf-ratchet.md)
+
 The separate T-QT.6.35 run in r125 failed in 2.75 seconds on `2571f841`. Kiln r127 reproduced the same missing-link assertion on the immediately preceding main, `c67455f6`. For the seeded inner join, both normal costing and `HashJoinsOnly` chose a primary-key range on `f` and a statement-built covering index on `d`. The serial and parallel settings both returned a count of 11,691 and a sum of −11,155. The parallel setting emitted no `MorselAggregate` and built zero links. The executor accepts the ephemeral index while inspecting the tables, then declines the inner join when it finds no hash build or qualifying searched link. The design requires a hash join for this chain. The test requires a link for each of its range queries. The coordinator has the trace for that decision. [Executor eligibility](https://github.com/hyper-light/amphora/blob/2571f8418abbe912a4004724007d60614befdb59/crates/engine/translate/parallel.rs#L1382) · [Join design](https://github.com/hyper-light/amphora/blob/2571f8418abbe912a4004724007d60614befdb59/docs/design/executor.md#L519) · [T-QT.6.35](https://github.com/hyper-light/amphora/blob/2571f8418abbe912a4004724007d60614befdb59/docs/requirements.toml#L1130)
