@@ -109,6 +109,13 @@ impl Weights {
         self.at.is_empty()
     }
 
+    /// Adds every entry from `other` into `self`, folding to at most `most` entries.
+    pub fn merge(&mut self, other: Self, most: usize) {
+        for (pos, weight) in other.at {
+            self.add(pos, weight, most);
+        }
+    }
+
     /// The [`cut`] of what was added.
     #[must_use]
     pub fn cut(&self) -> Option<Cut> {

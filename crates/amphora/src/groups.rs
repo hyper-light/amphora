@@ -13,9 +13,11 @@
 //! is acted on, and a group started again answers from what it kept, whatever directory it is
 //! started by: never from a router's memory.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use crate::meter::Counters;
@@ -26,21 +28,96 @@ use crate::reshard::plan::{GroupLoad, NodeRoom, Weights};
 use crate::reshard::{self, GroupId, NodeId, Pos, Span, position};
 use crate::store::{Config, Engine, Refused, Store, Ticket};
 
+/// Power-of-two shard count derived from hardware parallelism so concurrent readers and writers
+/// never bounce a single shared `RwLock` or window `Mutex` cache line across cores.
+fn shard_count() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .next_power_of_two()
+        .max(1)
+}
+
+/// Stable per-thread shard index assigned once per thread (zero shared writes on the hot path).
+fn shard_thread_id() -> usize {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    thread_local! {
+        static ID: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+    ID.with(|cell| match cell.get() {
+        Some(v) => v,
+        None => {
+            let v = NEXT.fetch_add(1, Ordering::Relaxed);
+            cell.set(Some(v));
+            v
+        }
+    })
+}
+
+/// Cache-line-isolated shard of a group's written-position histogram (`Weights`), merged only on
+/// rare [`Groups::measure`] calls so concurrent writers never serialize on one window mutex.
+#[repr(align(128))]
+struct PaddedWeights(Mutex<Weights>);
+
+struct ShardedWindow {
+    apply_us: Mutex<u64>,
+    first: PaddedWeights,
+    rest: Box<[PaddedWeights]>,
+    mask: usize,
+}
+
+impl ShardedWindow {
+    fn new() -> Self {
+        let count = shard_count();
+        let rest_len = count.saturating_sub(1);
+        Self {
+            apply_us: Mutex::new(0),
+            first: PaddedWeights(Mutex::new(Weights::default())),
+            rest: (0..rest_len)
+                .map(|_| PaddedWeights(Mutex::new(Weights::default())))
+                .collect(),
+            mask: count.saturating_sub(1),
+        }
+    }
+
+    fn shard_len(&self) -> usize {
+        self.rest.len().saturating_add(1)
+    }
+
+    fn record(&self, positions: &[Pos], total_most: usize) {
+        let per_shard = total_most.checked_div(self.shard_len()).unwrap_or(2).max(2);
+        let idx = shard_thread_id() & self.mask;
+        let shard = match idx.checked_sub(1).and_then(|i| self.rest.get(i)) {
+            Some(s) => s,
+            None => &self.first,
+        };
+        let mut weights = shard.0.lock().unwrap_or_else(PoisonError::into_inner);
+        for pos in positions {
+            weights.add(*pos, 1, per_shard);
+        }
+    }
+
+    fn take_merged(&self, most: usize) -> Weights {
+        let mut merged = Weights::default();
+        for shard in std::iter::once(&self.first).chain(self.rest.iter()) {
+            let taken = {
+                let mut w = shard.0.lock().unwrap_or_else(PoisonError::into_inner);
+                std::mem::take(&mut *w)
+            };
+            if !taken.is_empty() {
+                merged.merge(taken, most);
+            }
+        }
+        merged
+    }
+}
+
 /// A group: its store, what it holds, what the copy path's work has cost its writer, and what was
 /// measured of it since [`Groups::measure`] last asked.
 struct Group<E: Engine> {
     store: Store<E>,
     holding: Holding,
     costs: Arc<Mutex<Costs>>,
-    window: Arc<Mutex<Window>>,
-}
-
-/// What a group's load is measured from between two [`Groups::measure`] calls: its meter's commit
-/// time when last asked, and the positions written since, each weighted one a key.
-#[derive(Debug, Default)]
-struct Window {
-    apply_us: u64,
-    written: Weights,
+    window: Arc<ShardedWindow>,
 }
 
 impl<E: Engine> Clone for Group<E> {
@@ -60,7 +137,7 @@ impl<E: Engine> Group<E> {
             store,
             holding,
             costs: Arc::default(),
-            window: Arc::default(),
+            window: Arc::new(ShardedWindow::new()),
         }
     }
 }
@@ -159,6 +236,76 @@ struct Route<E: Engine> {
     /// than the directory lags this node by.
     retired: BTreeSet<GroupId>,
     book: PathBuf,
+}
+
+impl<E: Engine> Clone for Route<E> {
+    fn clone(&self) -> Self {
+        Self {
+            directory: self.directory.clone(),
+            groups: self.groups.clone(),
+            retired: self.retired.clone(),
+            book: self.book.clone(),
+        }
+    }
+}
+
+/// One 128B cache-line-isolated shard of [`ShardedRoute`].
+#[repr(align(128))]
+struct RouteShard<E: Engine>(RwLock<Route<E>>);
+
+/// Sharded reader-writer route table: reads and writes acquire only their thread's own shard's
+/// read lock (eliminating cross-core cache-line bouncing on a single global `RwLock`), while rare
+/// directory/holding mutations (`route`, `create`, `hold`, `fence`, `retire`) serialize on
+/// `write_lock` and acquire every shard's write lock in index order simultaneously, preserving the
+/// exact fence linearization invariant.
+struct ShardedRoute<E: Engine> {
+    write_lock: Mutex<()>,
+    first: RouteShard<E>,
+    rest: Box<[RouteShard<E>]>,
+    mask: usize,
+}
+
+impl<E: Engine> ShardedRoute<E> {
+    fn new(route: Route<E>) -> Self {
+        let count = shard_count();
+        let rest_len = count.saturating_sub(1);
+        let rest = (0..rest_len)
+            .map(|_| RouteShard(RwLock::new(route.clone())))
+            .collect();
+        Self {
+            write_lock: Mutex::new(()),
+            first: RouteShard(RwLock::new(route)),
+            rest,
+            mask: count.saturating_sub(1),
+        }
+    }
+
+    #[inline]
+    fn read(&self) -> RwLockReadGuard<'_, Route<E>> {
+        let idx = shard_thread_id() & self.mask;
+        let shard = match idx.checked_sub(1).and_then(|i| self.rest.get(i)) {
+            Some(s) => s,
+            None => &self.first,
+        };
+        shard.0.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write_all<R>(&self, f: impl FnOnce(&mut Route<E>) -> R) -> R {
+        let _serial = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut first = self.first.0.write().unwrap_or_else(PoisonError::into_inner);
+        let mut rest: Vec<RwLockWriteGuard<'_, Route<E>>> = Vec::with_capacity(self.rest.len());
+        for shard in &self.rest {
+            rest.push(shard.0.write().unwrap_or_else(PoisonError::into_inner));
+        }
+        let result = f(&mut first);
+        for guard in &mut rest {
+            **guard = first.clone();
+        }
+        result
+    }
 }
 
 impl<E: Engine> Route<E> {
@@ -281,7 +428,7 @@ impl Peers for Alone {
 
 /// A store in groups: cheap to clone, usable from any thread; clones share one route.
 pub struct Groups<E: Engine> {
-    route: Arc<RwLock<Route<E>>>,
+    route: Arc<ShardedRoute<E>>,
     config: Config,
     /// The bytes a copy-path batch may hold in memory ([`batch_memory`]).
     memory: u64,
@@ -312,9 +459,49 @@ impl GroupTicket {
     }
 }
 
+/// Stack-inline positions for the common 1–4 routing-key batches, spilling to a heap `Vec` only
+/// when a batch spans more keys.
+enum SmallPositions {
+    Inline { buf: [Pos; 4], len: usize },
+    Heap(Vec<Pos>),
+}
+
+impl SmallPositions {
+    fn new() -> Self {
+        Self::Inline {
+            buf: [0; 4],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, pos: Pos) {
+        match self {
+            Self::Inline { buf, len } => {
+                if let Some(slot) = buf.get_mut(*len) {
+                    *slot = pos;
+                    *len = len.saturating_add(1);
+                } else {
+                    let mut v = Vec::with_capacity(8);
+                    v.extend_from_slice(buf);
+                    v.push(pos);
+                    *self = Self::Heap(v);
+                }
+            }
+            Self::Heap(v) => v.push(pos),
+        }
+    }
+
+    fn as_slice(&self) -> &[Pos] {
+        match self {
+            Self::Inline { buf, len } => buf.get(..*len).unwrap_or_default(),
+            Self::Heap(v) => v.as_slice(),
+        }
+    }
+}
+
 /// The positions of the keys `rows` route by ([`Engine::routes`]), in bytes.
-fn routes<E: Engine>(rows: &[E::Row]) -> Vec<Pos> {
-    let mut positions = Vec::with_capacity(rows.len());
+fn routes<E: Engine>(rows: &[E::Row]) -> SmallPositions {
+    let mut positions = SmallPositions::new();
     for row in rows {
         E::routes(row, &mut |key| positions.push(reshard::position_of(key)));
     }
@@ -474,7 +661,7 @@ impl<E: Engine> Groups<E> {
             book,
         };
         Ok(Self {
-            route: Arc::new(RwLock::new(route)),
+            route: Arc::new(ShardedRoute::new(route)),
             config,
             memory: batch_memory(crate::memory::limit()),
         })
@@ -484,28 +671,25 @@ impl<E: Engine> Groups<E> {
     /// group's, as this member has applied it.
     pub fn route(&self, directory: &Directory) -> Result<(), reshard::Refused> {
         directory.check()?;
-        let mut route = self.route.write().unwrap_or_else(PoisonError::into_inner);
-        if directory.generation() > route.directory.generation() {
-            route.directory = directory.clone();
-            // The groups the directory now shows retired leave the book, kept with it. If it
-            // can't be kept, the book keeps the older directory with them all, which is as true:
-            // they leave at the next directory.
-            let shown = route.retired.iter().any(|g| shows_retired(directory, *g));
-            if shown && let Ok(left) = keep_book(&route.book, directory, &route.retired) {
-                route.retired = left;
+        self.route.write_all(|route| {
+            if directory.generation() > route.directory.generation() {
+                route.directory = directory.clone();
+                // The groups the directory now shows retired leave the book, kept with it. If it
+                // can't be kept, the book keeps the older directory with them all, which is as true:
+                // they leave at the next directory.
+                let shown = route.retired.iter().any(|g| shows_retired(directory, *g));
+                if shown && let Ok(left) = keep_book(&route.book, directory, &route.retired) {
+                    route.retired = left;
+                }
             }
-        }
+        });
         Ok(())
     }
 
     /// The generation of the directory routed by.
     #[must_use]
     pub fn generation(&self) -> u64 {
-        self.route
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .directory
-            .generation()
+        self.route.read().directory.generation()
     }
 
     /// A new group (the driver's `Do::Create`), holding nothing until an operation hands it a
@@ -516,15 +700,16 @@ impl<E: Engine> Groups<E> {
         group: GroupId,
         engine: impl FnOnce() -> anyhow::Result<E>,
     ) -> anyhow::Result<()> {
-        let mut route = self.route.write().unwrap_or_else(PoisonError::into_inner);
-        if route.groups.contains_key(&group) {
-            return Ok(());
-        }
-        let mut engine = engine()?;
-        let holding = kept(&mut engine, None)?;
-        let store = Store::start(engine, self.config)?;
-        route.groups.insert(group, Group::new(store, holding));
-        Ok(())
+        self.route.write_all(|route| {
+            if route.groups.contains_key(&group) {
+                return Ok(());
+            }
+            let mut engine = engine()?;
+            let holding = kept(&mut engine, None)?;
+            let store = Store::start(engine, self.config)?;
+            route.groups.insert(group, Group::new(store, holding));
+            Ok(())
+        })
     }
 
     /// `f` on `group`'s holding: how the shell carries out a driver's action at the group (its
@@ -540,24 +725,25 @@ impl<E: Engine> Groups<E> {
         until: Instant,
         f: impl FnOnce(&mut Holding) -> Result<T, reshard::Refused>,
     ) -> anyhow::Result<T> {
-        let mut route = self.route.write().unwrap_or_else(PoisonError::into_inner);
-        let held = route
-            .groups
-            .get_mut(&group)
-            .ok_or(reshard::Refused::NoGroup(group))?;
-        let mut next = held.holding;
-        let out = f(&mut next)?;
-        if next != held.holding {
-            let bytes = encode(&next)?;
-            held.store.run(until, move |e| e.keep_holding(&bytes))?;
-            held.holding = next;
-        }
-        Ok(out)
+        self.route.write_all(|route| {
+            let held = route
+                .groups
+                .get_mut(&group)
+                .ok_or(reshard::Refused::NoGroup(group))?;
+            let mut next = held.holding;
+            let out = f(&mut next)?;
+            if next != held.holding {
+                let bytes = encode(&next)?;
+                held.store.run(until, move |e| e.keep_holding(&bytes))?;
+                held.holding = next;
+            }
+            Ok(out)
+        })
     }
 
     /// The store of `group`, if it is on this node.
     fn store_of(&self, group: GroupId) -> Option<Store<E>> {
-        let route = self.route.read().unwrap_or_else(PoisonError::into_inner);
+        let route = self.route.read();
         route.groups.get(&group).map(|g| g.store.clone())
     }
 
@@ -569,7 +755,7 @@ impl<E: Engine> Groups<E> {
     /// held here, being made, or never given out isn't named.
     #[must_use]
     pub fn retired_of(&self, found: impl IntoIterator<Item = GroupId>) -> Vec<GroupId> {
-        let route = self.route.read().unwrap_or_else(PoisonError::into_inner);
+        let route = self.route.read();
         found
             .into_iter()
             .filter(|g| !route.groups.contains_key(g) && route.was_retired(*g))
@@ -579,7 +765,7 @@ impl<E: Engine> Groups<E> {
     /// The holding `group` answers from now, if it is on this node.
     #[must_use]
     pub fn holding_of(&self, group: GroupId) -> Option<Holding> {
-        let route = self.route.read().unwrap_or_else(PoisonError::into_inner);
+        let route = self.route.read();
         route.groups.get(&group).map(|g| g.holding)
     }
 
@@ -613,11 +799,7 @@ impl<E: Engine> Groups<E> {
         };
         match action.what {
             Do::Create { group, .. } => {
-                let retired = self
-                    .route
-                    .read()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .was_retired(group);
+                let retired = self.route.read().was_retired(group);
                 if retired {
                     return Ok(Reply::Failed(Failure::Refused(reshard::Refused::Ended(op))));
                 }
@@ -740,7 +922,7 @@ impl<E: Engine> Groups<E> {
                     // A retired group held nothing when it was retired: a release asked of it
                     // again is done. A group never made has nothing to discard.
                     let retired = {
-                        let route = self.route.read().unwrap_or_else(PoisonError::into_inner);
+                        let route = self.route.read();
                         route.retired.contains(&group) || route.directory.given_out(group)
                     };
                     return Ok(match (release, retired) {
@@ -777,8 +959,7 @@ impl<E: Engine> Groups<E> {
                     Reply::Discarded { done }
                 })
             }
-            Do::Retire { group } => {
-                let mut route = self.route.write().unwrap_or_else(PoisonError::into_inner);
+            Do::Retire { group } => self.route.write_all(|route| {
                 if let Some(held) = route.groups.get(&group) {
                     let h = held.holding;
                     if h.owned().is_some() || h.incoming().is_some() || h.fenced().is_some() {
@@ -795,7 +976,7 @@ impl<E: Engine> Groups<E> {
                 next.insert(group);
                 route.retired = keep_book(&route.book, &route.directory, &next)?;
                 Ok(Reply::Retired)
-            }
+            }),
         }
     }
 
@@ -879,12 +1060,7 @@ impl<E: Engine> Groups<E> {
         if self.store_of(from).is_some() {
             return self.serve(pull, until);
         }
-        let node = self
-            .route
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .directory
-            .node_of(from);
+        let node = self.route.read().directory.node_of(from);
         match node {
             Some(node) => peers.pull(node, pull, until),
             None => Ok(Pulled::NoGroup),
@@ -901,30 +1077,31 @@ impl<E: Engine> Groups<E> {
         span: Span,
         until: Instant,
     ) -> anyhow::Result<reshard::Seq> {
-        let mut route = self.route.write().unwrap_or_else(PoisonError::into_inner);
-        let held = route
-            .groups
-            .get_mut(&group)
-            .ok_or(reshard::Refused::NoGroup(group))?;
-        let holding = held.holding;
-        let (at, kept) = held.store.run(until, move |e| {
-            let mut next = holding;
-            let next_entry = e
-                .head()?
-                .checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("the log's entries ran out"))?;
-            match next.fence(op, span, next_entry)? {
-                Fenced::Already(at) => Ok((at, None)),
-                Fenced::New(at) => {
-                    e.keep_holding(&encode(&next)?)?;
-                    Ok((at, Some(next)))
+        self.route.write_all(|route| {
+            let held = route
+                .groups
+                .get_mut(&group)
+                .ok_or(reshard::Refused::NoGroup(group))?;
+            let holding = held.holding;
+            let (at, kept) = held.store.run(until, move |e| {
+                let mut next = holding;
+                let next_entry = e
+                    .head()?
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("the log's entries ran out"))?;
+                match next.fence(op, span, next_entry)? {
+                    Fenced::Already(at) => Ok((at, None)),
+                    Fenced::New(at) => {
+                        e.keep_holding(&encode(&next)?)?;
+                        Ok((at, Some(next)))
+                    }
                 }
+            })?;
+            if let Some(kept) = kept {
+                held.holding = kept;
             }
-        })?;
-        if let Some(kept) = kept {
-            held.holding = kept;
-        }
-        Ok(at)
+            Ok(at)
+        })
     }
 
     /// The units of `work` a batch on `group`'s writer takes ([`Cost::within`]): to hold it
@@ -936,7 +1113,7 @@ impl<E: Engine> Groups<E> {
 
     /// [`Groups::batch`], held to `bytes` as well as to the process's memory.
     fn batch_within(&self, group: GroupId, work: Work, bytes: u64) -> u64 {
-        let route = self.route.read().unwrap_or_else(PoisonError::into_inner);
+        let route = self.route.read();
         let mean = |c: &Counters| {
             u128::from(c.apply_us)
                 .saturating_mul(1000)
@@ -972,7 +1149,7 @@ impl<E: Engine> Groups<E> {
 
     /// `units` of `work`, holding `bytes` in memory, held `group`'s writer for `took`.
     fn ran(&self, group: GroupId, work: Work, units: u64, took: Duration, bytes: u64) {
-        let route = self.route.read().unwrap_or_else(PoisonError::into_inner);
+        let route = self.route.read();
         if let Some(held) = route.groups.get(&group) {
             let mut costs = held.costs.lock().unwrap_or_else(PoisonError::into_inner);
             costs.of(work).ran(units, took, bytes);
@@ -982,11 +1159,7 @@ impl<E: Engine> Groups<E> {
     /// How many groups are on this node.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.route
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .groups
-            .len()
+        self.route.read().groups.len()
     }
 
     /// Whether no group is on this node (every group's span has moved to other nodes).
@@ -1005,8 +1178,18 @@ impl<E: Engine> Groups<E> {
     /// [`Groups::group`] of a key in bytes, as [`Engine::routes`] gives them.
     #[must_use]
     pub fn group_of(&self, key: &[u8]) -> Option<GroupId> {
-        let route = self.route.read().unwrap_or_else(PoisonError::into_inner);
+        let route = self.route.read();
         route.directory.owner(reshard::position_of(key))
+    }
+
+    fn window_most(&self, group_count: usize) -> usize {
+        let entry = u64::try_from(std::mem::size_of::<(Pos, u64)>()).unwrap_or(u64::MAX);
+        let shares = u64::try_from(group_count).unwrap_or(u64::MAX).max(1);
+        let most = self
+            .memory
+            .checked_div(entry.saturating_mul(shares))
+            .unwrap_or(0);
+        usize::try_from(most).unwrap_or(usize::MAX)
     }
 
     /// The store of the group `positions` all route to, once its holding answers every one of
@@ -1016,7 +1199,7 @@ impl<E: Engine> Groups<E> {
         mut positions: impl Iterator<Item = Pos>,
         then: impl FnOnce(GroupId, &Store<E>) -> Result<T, Refused>,
     ) -> Result<T, Refused> {
-        let route = self.route.read().unwrap_or_else(PoisonError::into_inner);
+        let route = self.route.read();
         let first = positions.next().unwrap_or(0);
         let group = route.directory.owner(first).ok_or(Refused::Groups)?;
         // A group the directory places on another node doesn't answer here.
@@ -1034,31 +1217,40 @@ impl<E: Engine> Groups<E> {
         then(group, &held.store)
     }
 
-    fn at<T>(&self, group: GroupId, then: impl FnOnce(&Store<E>) -> T) -> Result<T, Refused> {
-        let route = self.route.read().unwrap_or_else(PoisonError::into_inner);
-        let held = route.groups.get(&group).ok_or(Refused::Groups)?;
-        Ok(then(&held.store))
+    /// Routes a write batch under one sharded read guard and records its positions into the
+    /// group's sharded window on success without a second route lock or `BTreeMap` lookup.
+    fn routed_write(
+        &self,
+        positions: &[Pos],
+        then: impl FnOnce(&Store<E>) -> Result<Ticket, Refused>,
+    ) -> Result<GroupTicket, Refused> {
+        let route = self.route.read();
+        let mut iter = positions.iter().copied();
+        let first = iter.next().unwrap_or(0);
+        let group = route.directory.owner(first).ok_or(Refused::Groups)?;
+        let held = route
+            .groups
+            .get(&group)
+            .ok_or(Refused::Away(Away::Elsewhere))?;
+        held.holding.answers(first).map_err(Refused::Away)?;
+        for pos in iter {
+            if route.directory.owner(pos) != Some(group) {
+                return Err(Refused::Groups);
+            }
+            held.holding.answers(pos).map_err(Refused::Away)?;
+        }
+        let ticket = then(&held.store)?;
+        if !positions.is_empty() {
+            let most = self.window_most(route.groups.len());
+            held.window.record(positions, most);
+        }
+        Ok(GroupTicket { group, ticket })
     }
 
-    /// `positions`, handed to `group`'s writer, kept in its window for the load's cut: at most as
-    /// many entries as the process's memory for batches ([`batch_memory`]) holds, shared among
-    /// this node's groups (decision "Load from the store's meter").
-    fn wrote(&self, group: GroupId, positions: &[Pos]) {
-        let route = self.route.read().unwrap_or_else(PoisonError::into_inner);
-        let Some(held) = route.groups.get(&group) else {
-            return;
-        };
-        let entry = u64::try_from(std::mem::size_of::<(Pos, u64)>()).unwrap_or(u64::MAX);
-        let shares = u64::try_from(route.groups.len()).unwrap_or(u64::MAX).max(1);
-        let most = self
-            .memory
-            .checked_div(entry.saturating_mul(shares))
-            .unwrap_or(0);
-        let most = usize::try_from(most).unwrap_or(usize::MAX);
-        let mut window = held.window.lock().unwrap_or_else(PoisonError::into_inner);
-        for pos in positions {
-            window.written.add(*pos, 1, most);
-        }
+    fn at<T>(&self, group: GroupId, then: impl FnOnce(&Store<E>) -> T) -> Result<T, Refused> {
+        let route = self.route.read();
+        let held = route.groups.get(&group).ok_or(Refused::Groups)?;
+        Ok(then(&held.store))
     }
 
     /// What each group on this node was measured doing since the last call, for
@@ -1071,24 +1263,32 @@ impl<E: Engine> Groups<E> {
     /// half each side ([`Engine::size_cut`], asked on its writer with its size; decision "The size
     /// cut from the B-tree's middle key").
     pub fn measure(&self, until: Instant) -> anyhow::Result<Vec<GroupLoad>> {
-        type Measured<E> = (GroupId, Store<E>, Arc<Mutex<Window>>);
-        let held: Vec<Measured<E>> = {
-            let route = self.route.read().unwrap_or_else(PoisonError::into_inner);
-            route
+        type Measured<E> = (GroupId, Store<E>, Arc<ShardedWindow>);
+        let (held, most): (Vec<Measured<E>>, usize) = {
+            let route = self.route.read();
+            let most = self.window_most(route.groups.len());
+            let held = route
                 .groups
                 .iter()
                 .map(|(g, h)| (*g, h.store.clone(), Arc::clone(&h.window)))
-                .collect()
+                .collect();
+            (held, most)
         };
         let mut out = Vec::with_capacity(held.len());
         for (group, store, window) in held {
             let (bytes, by_size) = store.run(until, |e| Ok((e.bytes()?, e.size_cut()?)))?;
             let bytes = bytes.unwrap_or(0);
             let now = store.counters().apply_us;
-            let mut window = window.lock().unwrap_or_else(PoisonError::into_inner);
-            let load = now.saturating_sub(window.apply_us);
-            window.apply_us = now;
-            let written = std::mem::take(&mut window.written);
+            let load = {
+                let mut prev = window
+                    .apply_us
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let load = now.saturating_sub(*prev);
+                *prev = now;
+                load
+            };
+            let written = window.take_merged(most);
             out.push(GroupLoad {
                 group,
                 bytes,
@@ -1103,24 +1303,14 @@ impl<E: Engine> Groups<E> {
     /// [`Store::put`] to the rows' group.
     pub fn put(&self, rows: Vec<E::Row>) -> Result<GroupTicket, Refused> {
         let positions = routes::<E>(&rows);
-        let ticket = self.routed(positions.iter().copied(), |group, store| {
-            let ticket = store.put(rows)?;
-            Ok(GroupTicket { group, ticket })
-        })?;
-        self.wrote(ticket.group, &positions);
-        Ok(ticket)
+        self.routed_write(positions.as_slice(), |store| store.put(rows))
     }
 
     /// [`Store::put_wait`] to the rows' group. It waits for room under the route's read lock, so a
     /// fence waits for it too, no longer than `until`.
     pub fn put_wait(&self, rows: Vec<E::Row>, until: Instant) -> Result<GroupTicket, Refused> {
         let positions = routes::<E>(&rows);
-        let ticket = self.routed(positions.iter().copied(), |group, store| {
-            let ticket = store.put_wait(rows, until)?;
-            Ok(GroupTicket { group, ticket })
-        })?;
-        self.wrote(ticket.group, &positions);
-        Ok(ticket)
+        self.routed_write(positions.as_slice(), |store| store.put_wait(rows, until))
     }
 
     /// [`Store::put_then`] to the rows' group.
@@ -1131,12 +1321,9 @@ impl<E: Engine> Groups<E> {
         then: impl FnOnce(Result<(), Refused>) + Send + 'static,
     ) -> Result<GroupTicket, Refused> {
         let positions = routes::<E>(&rows);
-        let ticket = self.routed(positions.iter().copied(), |group, store| {
-            let ticket = store.put_then(rows, until, then)?;
-            Ok(GroupTicket { group, ticket })
-        })?;
-        self.wrote(ticket.group, &positions);
-        Ok(ticket)
+        self.routed_write(positions.as_slice(), |store| {
+            store.put_then(rows, until, then)
+        })
     }
 
     /// [`Store::durable`] in the ticket's group.
@@ -1194,7 +1381,7 @@ impl<E: Engine> Groups<E> {
 
     /// Every group's store on this node, in group order.
     fn stores(&self) -> Vec<Store<E>> {
-        let route = self.route.read().unwrap_or_else(PoisonError::into_inner);
+        let route = self.route.read();
         route.groups.values().map(|g| g.store.clone()).collect()
     }
 

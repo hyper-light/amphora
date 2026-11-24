@@ -12,7 +12,42 @@
 
 use amphora_engine::Statement;
 use std::collections::HashMap;
+use std::hash::{BuildHasher, Hasher};
 use std::sync::{Arc, Mutex, MutexGuard};
+
+/// Fast non-cryptographic FNV-1a 64-bit hasher for per-connection statement text lookups
+/// (matches the FNV-1a hash used in `store.rs` and `groups.rs`; avoids SipHash overhead on
+/// single-connection SQL caches).
+#[derive(Clone, Copy, Default)]
+struct FnvBuildHasher;
+
+struct FnvHasher(u64);
+
+impl Hasher for FnvHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = self.0;
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        self.0 = h;
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+impl BuildHasher for FnvBuildHasher {
+    type Hasher = FnvHasher;
+
+    #[inline]
+    fn build_hasher(&self) -> Self::Hasher {
+        FnvHasher(0xcbf2_9ce4_8422_2325)
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum Error {
@@ -43,10 +78,12 @@ impl Default for Limits {
 
 /// A kept statement, whether the session's validation accepted its text, and its neighbours in
 /// the recency order, linked by flat slab indices (no `Arc<str>` cloning or extra hash lookups on
-/// unlink/link).
+/// unlink/link). When the MRU entry is checked out on the fast path, `statement` is temporarily
+/// `None` and the slot stays in place so returning the same statement needs zero hashing, zero
+/// `Arc<str>` refcount ops, and zero list relinking.
 struct Slot {
     key: Arc<str>,
-    statement: Statement,
+    statement: Option<Statement>,
     validated: bool,
     older: Option<usize>,
     newer: Option<usize>,
@@ -54,16 +91,20 @@ struct Slot {
 
 #[derive(Default)]
 struct State {
-    index: HashMap<Arc<str>, usize>,
+    index: HashMap<Arc<str>, usize, FnvBuildHasher>,
     slots: Vec<Option<Slot>>,
     free: Vec<usize>,
     oldest: Option<usize>,
     newest: Option<usize>,
+    /// Slot currently checked out in-place via the MRU fast path (`statement == None`).
+    checked_out: Option<usize>,
+    /// Stored statements currently available in the cache (excludes `checked_out`).
+    live_entries: usize,
     sql_bytes: usize,
     schema: Option<u64>,
 }
 impl State {
-    fn unlink(&mut self, idx: usize) -> Result<Slot> {
+    fn unlink_raw(&mut self, idx: usize) -> Result<Slot> {
         let slot = self
             .slots
             .get_mut(idx)
@@ -90,11 +131,56 @@ impl State {
             None => self.newest = slot.older,
         }
         self.free.push(idx);
+        Ok(slot)
+    }
+
+    fn unlink(&mut self, idx: usize) -> Result<Slot> {
+        let slot = self.unlink_raw(idx)?;
+        self.live_entries = self.live_entries.checked_sub(1).ok_or(Error::Accounting)?;
         self.sql_bytes = self
             .sql_bytes
             .checked_sub(slot.key.len())
             .ok_or(Error::Accounting)?;
         Ok(slot)
+    }
+
+    /// Removes any MRU slot left checked out in-place (e.g., if a caller errored, ran a nested
+    /// query, or switched to a different statement) so `index.len() == live_entries` always holds.
+    fn flush_checked_out(&mut self) -> Result<()> {
+        let Some(idx) = self.checked_out.take() else {
+            return Ok(());
+        };
+        let slot = self.unlink_raw(idx)?;
+        if self.index.remove(slot.key.as_ref()) != Some(idx) {
+            return Err(Error::Accounting);
+        }
+        Ok(())
+    }
+
+    /// Fast-path checkout of the MRU slot in-place when `sql` matches `self.newest`, avoiding
+    /// hash calculation, `HashMap` mutation, list unlink, and `Arc<str>` refcount ops.
+    fn take_fast(&mut self, sql: &str) -> Result<Option<Taken>> {
+        if self.checked_out.is_none()
+            && let Some(idx) = self.newest
+            && let Some(slot) = self.slots.get_mut(idx).and_then(Option::as_mut)
+            && slot.key.as_ref() == sql
+            && let Some(statement) = slot.statement.take()
+        {
+            self.checked_out = Some(idx);
+            self.live_entries = self.live_entries.checked_sub(1).ok_or(Error::Accounting)?;
+            self.sql_bytes = self
+                .sql_bytes
+                .checked_sub(slot.key.len())
+                .ok_or(Error::Accounting)?;
+            return Ok(Some(Taken {
+                slot_idx: Some(idx),
+                text: None,
+                statement,
+                validated: slot.validated,
+            }));
+        }
+        self.flush_checked_out()?;
+        self.remove(sql)
     }
 
     /// Takes `sql`'s statement out with its kept text and mark, its neighbours joined where it was.
@@ -103,9 +189,11 @@ impl State {
             return Ok(None);
         };
         let slot = self.unlink(idx)?;
+        let statement = slot.statement.ok_or(Error::Accounting)?;
         Ok(Some(Taken {
-            text: slot.key,
-            statement: slot.statement,
+            slot_idx: None,
+            text: Some(slot.key),
+            statement,
             validated: slot.validated,
         }))
     }
@@ -117,7 +205,7 @@ impl State {
         if self.index.remove(slot.key.as_ref()) != Some(oldest_idx) {
             return Err(Error::Accounting);
         }
-        Ok(slot.statement)
+        slot.statement.ok_or(Error::Accounting)
     }
 
     /// Makes `current` the schema identity entries are kept under. A change of schema hands back
@@ -161,7 +249,7 @@ impl State {
         self.newest = Some(idx);
         let slot = Slot {
             key: Arc::clone(&key),
-            statement,
+            statement: Some(statement),
             validated,
             older: prev_newest,
             newer: None,
@@ -170,16 +258,18 @@ impl State {
         if self.index.insert(key, idx).is_some() {
             return Err(Error::Accounting);
         }
+        self.live_entries = self.live_entries.checked_add(1).ok_or(Error::Accounting)?;
         self.sql_bytes = sql_bytes;
         Ok(())
     }
 }
 
-/// A statement taken out of the cache: the text it was kept under (handed back to
-/// [`Cache::put`] so a return keys it without copying the text again), the statement, and its
-/// validation mark.
+/// A statement taken out of the cache: its fast-path MRU slot index (when checked out in-place),
+/// the text it was kept under (handed back to [`Cache::put`] so a slow-path return keys it
+/// without copying the text again), the statement, and its validation mark.
 pub(super) struct Taken {
-    pub(super) text: Arc<str>,
+    pub(super) slot_idx: Option<usize>,
+    pub(super) text: Option<Arc<str>>,
     pub(super) statement: Statement,
     pub(super) validated: bool,
 }
@@ -208,7 +298,7 @@ impl Cache {
         let (previous, taken) = {
             let mut state = self.locked()?;
             let previous = state.align(schema);
-            (previous, state.remove(sql))
+            (previous, state.take_fast(sql))
         };
         drop(previous);
         taken
@@ -218,11 +308,13 @@ impl Cache {
     /// the lock, and clear parameters so cached statements retain no request values or blobs.
     /// `validated` says the session's validation accepted the text; nothing else may set it.
     /// `current` becomes the schema entries are kept under ([`Cache::schema`]), and the statement
-    /// is kept only if it was `prepared` under that same schema. `text` is the text the statement
-    /// was taken out under ([`Taken`]), if it came from the cache.
+    /// is kept only if it was `prepared` under that same schema. `slot_idx` and `text` come from
+    /// [`Taken`] when the statement originated from the cache.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn put(
         &self,
         sql: &str,
+        slot_idx: Option<usize>,
         text: Option<Arc<str>>,
         mut statement: Statement,
         validated: bool,
@@ -244,6 +336,26 @@ impl Cache {
         {
             let mut state = self.locked()?;
             previous = state.align(current);
+            if let Some(idx) = slot_idx
+                && state.checked_out == Some(idx)
+                && state.newest == Some(idx)
+                && let Some(bytes) = state.sql_bytes.checked_add(sql.len())
+                && state.live_entries < self.limits.entries
+                && bytes <= self.limits.sql_bytes
+                && let Some(slot) = state.slots.get_mut(idx).and_then(Option::as_mut)
+                && slot.statement.is_none()
+                && slot.key.as_ref() == sql
+            {
+                slot.statement = Some(statement);
+                slot.validated = validated;
+                state.checked_out = None;
+                state.live_entries = state.live_entries.checked_add(1).ok_or(Error::Accounting)?;
+                state.sql_bytes = bytes;
+                drop(state);
+                drop(previous);
+                return Ok(());
+            }
+            state.flush_checked_out()?;
             if let Some(prior) = state.remove(sql)? {
                 retired.push(prior.statement);
             }
@@ -260,7 +372,7 @@ impl Cache {
                     .sql_bytes
                     .checked_add(sql.len())
                     .ok_or(Error::Accounting)?;
-                if state.index.len() < self.limits.entries && bytes <= self.limits.sql_bytes {
+                if state.live_entries < self.limits.entries && bytes <= self.limits.sql_bytes {
                     let key = text.unwrap_or_else(|| Arc::from(sql));
                     state.push(key, statement, validated, bytes)?;
                     admitted = true;
@@ -297,7 +409,7 @@ mod tests {
 
     fn put(cache: &Cache, db: &crate::db::Db, sql: &str, statement: Statement) -> Result<()> {
         let schema = db.conn.schema_identity();
-        cache.put(sql, None, statement, false, schema, schema)
+        cache.put(sql, None, None, statement, false, schema, schema)
     }
 
     fn take(cache: &Cache, db: &crate::db::Db, sql: &str) -> Result<Option<(Statement, bool)>> {

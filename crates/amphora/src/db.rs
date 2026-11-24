@@ -966,16 +966,16 @@ impl Db {
     ) -> anyhow::Result<()> {
         self.ensure_unfenced()?;
         let schema = self.conn.schema_identity();
-        let (text, mut stmt, marked) = match self.statements.take(sql, schema)? {
-            Some(taken) => (Some(taken.text), taken.statement, taken.validated),
-            None => (None, self.conn.prepare(sql).map_err(fail)?, false),
+        let (slot_idx, text, mut stmt, marked) = match self.statements.take(sql, schema)? {
+            Some(taken) => (taken.slot_idx, taken.text, taken.statement, taken.validated),
+            None => (None, None, self.conn.prepare(sql).map_err(fail)?, false),
         };
         step(self.io.as_ref(), &mut stmt, params, each)?;
         // A callback can change schema and run another query. The cache never keeps this
         // checked-out statement under that later schema's cache identity.
         let current = self.conn.schema_identity();
         self.statements
-            .put(sql, text, stmt, marked, schema, current)?;
+            .put(sql, slot_idx, text, stmt, marked, schema, current)?;
         self.marked()
     }
 
@@ -987,13 +987,13 @@ impl Db {
     pub fn column_count(&self, sql: &str) -> anyhow::Result<usize> {
         self.ensure_unfenced()?;
         let schema = self.conn.schema_identity();
-        let (text, stmt, marked) = match self.statements.take(sql, schema)? {
-            Some(taken) => (Some(taken.text), taken.statement, taken.validated),
-            None => (None, self.conn.prepare(sql).map_err(fail)?, false),
+        let (slot_idx, text, stmt, marked) = match self.statements.take(sql, schema)? {
+            Some(taken) => (taken.slot_idx, taken.text, taken.statement, taken.validated),
+            None => (None, None, self.conn.prepare(sql).map_err(fail)?, false),
         };
         let columns = stmt.num_columns();
         self.statements
-            .put(sql, text, stmt, marked, schema, schema)?;
+            .put(sql, slot_idx, text, stmt, marked, schema, schema)?;
         Ok(columns)
     }
 
@@ -1049,6 +1049,7 @@ impl Db {
         let current = self.conn.schema_identity();
         self.statements.put(
             &held.sql,
+            None,
             None,
             held.statement,
             held.validated,

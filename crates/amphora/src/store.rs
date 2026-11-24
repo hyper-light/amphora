@@ -23,6 +23,7 @@
 //!
 //! What it counts is in [`Meter`].
 
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -415,9 +416,9 @@ impl std::error::Error for Refused {}
 type Job<E> = Box<dyn FnOnce(&mut E) + Send>;
 
 enum Msg<E: Engine> {
-    /// Rows, the keys they are of, what becomes of them, and their charge (none: they charge
-    /// nothing, [`Engine::row_bytes`]).
-    Rows(Vec<E::Row>, Vec<String>, Arc<Fate>, Option<Charge>),
+    /// Rows, the non-empty keys they are of, whether any row carried an empty key `""`, what
+    /// becomes of them, and their charge (none: they charge nothing, [`Engine::row_bytes`]).
+    Rows(Vec<E::Row>, Vec<String>, bool, Arc<Fate>, Option<Charge>),
     /// Run on the engine, between commits (what was sent before it is committed first).
     Run(Job<E>),
 }
@@ -475,6 +476,45 @@ struct Progress {
     commits: u64,
 }
 
+/// Cache-line-isolated shard of per-ticket blocking waiters parked in [`Sends::wait_ticket`],
+/// sized to hardware parallelism so 1k–10k concurrent writers never serialize on one wait queue.
+#[repr(align(128))]
+struct PaddedTicketShard {
+    count: AtomicUsize,
+    waiters: Mutex<Vec<(u64, std::thread::Thread)>>,
+}
+
+impl Default for PaddedTicketShard {
+    fn default() -> Self {
+        Self {
+            count: AtomicUsize::new(0),
+            waiters: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+fn ticket_shard_count() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .next_power_of_two()
+        .max(1)
+}
+
+fn ticket_thread_id() -> usize {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    thread_local! {
+        static ID: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+    ID.with(|cell| match cell.get() {
+        Some(v) => v,
+        None => {
+            let v = NEXT.fetch_add(1, Ordering::Relaxed);
+            cell.set(Some(v));
+            v
+        }
+    })
+}
+
 /// What was handed to the writer, and how much of it is committed and durable, counted rather
 /// than numbered in order (that took one lock with every batch queued and every read):
 /// - a read of a key waits until as many of the key's batches are committed as had been handed
@@ -486,6 +526,10 @@ struct Sends {
     keys: Vec<Mutex<HashMap<String, Counts>>>,
     /// Where a key would go if a shard were missing (none is: the index is taken modulo their number).
     spare: Mutex<HashMap<String, Counts>>,
+    /// Lock-free handed/committed counters for the empty key `""` (used by SQL engines without
+    /// per-row routing keys), avoiding `Vec<String>` allocations and single-shard mutex convoys.
+    empty_handed: AtomicU64,
+    empty_committed: AtomicU64,
     /// Gives each key's entry its own number: a reader that finds another entry (or none) where it
     /// read one knows everything its entry was handed is committed.
     epochs: AtomicU64,
@@ -499,10 +543,12 @@ struct Sends {
     durable_batches: AtomicU64,
     durable_commits: AtomicU64,
     flushed: Condvar,
-    /// Per-ticket waiters parked in [`Self::wait_ticket`], woken directly by `Thread::unpark` so
-    /// ready writers verify `durable_commits` lock-free without serializing on `self.durable`.
-    ticket_waiter_count: AtomicUsize,
-    ticket_waiters: Mutex<Vec<(u64, std::thread::Thread)>>,
+    /// Sharded per-ticket waiters parked in [`Self::wait_ticket`], woken directly by
+    /// `Thread::unpark` so ready writers verify `durable_commits` lock-free without serializing.
+    ticket_waiter_total: AtomicUsize,
+    ticket_shards_first: PaddedTicketShard,
+    ticket_shards_rest: Box<[PaddedTicketShard]>,
+    ticket_shard_mask: usize,
     /// Its engine's commits are durable as they end: no flusher.
     durable_as_committed: AtomicBool,
     /// The writer has stopped: the flusher flushes what is left, then stops.
@@ -564,9 +610,12 @@ const SHARDS: u64 = 64;
 
 impl Default for Sends {
     fn default() -> Self {
+        let shard_count = ticket_shard_count();
         Self {
             keys: (0..SHARDS).map(|_| Mutex::default()).collect(),
             spare: Mutex::default(),
+            empty_handed: AtomicU64::new(0),
+            empty_committed: AtomicU64::new(0),
             epochs: AtomicU64::new(1),
             handed: AtomicU64::new(0),
             committed: Mutex::new(Progress::default()),
@@ -576,8 +625,12 @@ impl Default for Sends {
             durable_batches: AtomicU64::new(0),
             durable_commits: AtomicU64::new(0),
             flushed: Condvar::new(),
-            ticket_waiter_count: AtomicUsize::new(0),
-            ticket_waiters: Mutex::new(Vec::new()),
+            ticket_waiter_total: AtomicUsize::new(0),
+            ticket_shards_first: PaddedTicketShard::default(),
+            ticket_shards_rest: (0..shard_count.saturating_sub(1))
+                .map(|_| PaddedTicketShard::default())
+                .collect(),
+            ticket_shard_mask: shard_count.saturating_sub(1),
             durable_as_committed: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             disk_failed: AtomicBool::new(false),
@@ -594,6 +647,17 @@ fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Sends {
+    fn ticket_shard(&self) -> &PaddedTicketShard {
+        let idx = ticket_thread_id() & self.ticket_shard_mask;
+        match idx
+            .checked_sub(1)
+            .and_then(|i| self.ticket_shards_rest.get(i))
+        {
+            Some(s) => s,
+            None => &self.ticket_shards_first,
+        }
+    }
+
     fn shard(&self, key: &str) -> MutexGuard<'_, HashMap<String, Counts>> {
         let h = key.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
             (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
@@ -602,8 +666,11 @@ impl Sends {
         locked(self.keys.get(i).unwrap_or(&self.spare))
     }
 
-    /// A batch with rows of `keys` handed over (before it is queued).
-    fn handing(&self, keys: &[String]) {
+    /// A batch with rows of `keys` (and optional empty key `""`) handed over (before it is queued).
+    fn handing(&self, keys: &[String], has_empty: bool) {
+        if has_empty {
+            self.empty_handed.fetch_add(1, Ordering::Release);
+        }
         for k in keys {
             let mut shard = self.shard(k);
             if let Some(c) = shard.get_mut(k.as_str()) {
@@ -624,7 +691,10 @@ impl Sends {
 
     /// A batch of `keys` committed, or let go (a send that failed, a commit that failed): nothing
     /// waits on it any longer once [`Sends::wake`] counts it.
-    fn settled(&self, keys: &[String]) {
+    fn settled(&self, keys: &[String], has_empty: bool) {
+        if has_empty {
+            self.empty_committed.fetch_add(1, Ordering::Release);
+        }
         for k in keys {
             let mut shard = self.shard(k);
             if let Some(c) = shard.get_mut(k) {
@@ -633,6 +703,14 @@ impl Sends {
                     shard.remove(k);
                 }
             }
+        }
+    }
+
+    /// Coalesced settlement for `count` empty-key batches in a group commit (one atomic add instead
+    /// of one mutex acquisition per batch).
+    fn settled_empty(&self, count: u64) {
+        if count > 0 {
+            self.empty_committed.fetch_add(count, Ordering::Release);
         }
     }
 
@@ -668,6 +746,17 @@ impl Sends {
                     return true;
                 }
                 self.wait_until(until, |_| true, target)
+            }
+            Some("") => {
+                let target = self.empty_handed.load(Ordering::Acquire);
+                if self.empty_committed.load(Ordering::Acquire) >= target {
+                    return true;
+                }
+                self.wait_until(
+                    until,
+                    |this| this.empty_committed.load(Ordering::Acquire) >= target,
+                    0,
+                )
             }
             Some(k) => {
                 let Some((epoch, target)) = self.shard(k).get(k).map(|c| (c.epoch, c.handed))
@@ -799,12 +888,18 @@ impl Sends {
     }
 
     fn unpark_ready_ticket_waiters(&self, durable_commits: u64) {
-        if self.ticket_waiter_count.load(Ordering::SeqCst) == 0 {
+        if self.ticket_waiter_total.load(Ordering::SeqCst) == 0 {
             return;
         }
         let mut wake = Vec::new();
+        for shard in
+            std::iter::once(&self.ticket_shards_first).chain(self.ticket_shards_rest.iter())
         {
-            let mut waiters = locked(&self.ticket_waiters);
+            if shard.count.load(Ordering::SeqCst) == 0 {
+                continue;
+            }
+            let mut waiters = locked(&shard.waiters);
+            let mut removed = 0usize;
             let mut i = 0;
             while i < waiters.len() {
                 let ready = waiters
@@ -812,12 +907,16 @@ impl Sends {
                     .is_some_and(|(commit, _)| *commit <= durable_commits);
                 if ready {
                     wake.push(waiters.swap_remove(i).1);
+                    removed = removed.saturating_add(1);
                 } else {
                     i = i.saturating_add(1);
                 }
             }
-            self.ticket_waiter_count
-                .store(waiters.len(), Ordering::SeqCst);
+            if removed > 0 {
+                shard.count.store(waiters.len(), Ordering::SeqCst);
+                self.ticket_waiter_total
+                    .fetch_sub(removed, Ordering::SeqCst);
+            }
         }
         for thread in wake {
             thread.unpark();
@@ -825,24 +924,35 @@ impl Sends {
     }
 
     fn unpark_all_ticket_waiters(&self) {
-        if self.ticket_waiter_count.load(Ordering::SeqCst) == 0 {
+        if self.ticket_waiter_total.load(Ordering::SeqCst) == 0 {
             return;
         }
-        let wake = {
-            let mut waiters = locked(&self.ticket_waiters);
-            let wake = std::mem::take(&mut *waiters);
-            self.ticket_waiter_count.store(0, Ordering::SeqCst);
-            wake
-        };
-        for (_, thread) in wake {
+        let mut wake = Vec::new();
+        for shard in
+            std::iter::once(&self.ticket_shards_first).chain(self.ticket_shards_rest.iter())
+        {
+            if shard.count.load(Ordering::SeqCst) == 0 {
+                continue;
+            }
+            let mut waiters = locked(&shard.waiters);
+            let removed = waiters.len();
+            if removed > 0 {
+                wake.extend(waiters.drain(..).map(|(_, thread)| thread));
+                shard.count.store(0, Ordering::SeqCst);
+                self.ticket_waiter_total
+                    .fetch_sub(removed, Ordering::SeqCst);
+            }
+        }
+        for thread in wake {
             thread.unpark();
         }
     }
 
     /// Waits until the batch whose fate is `fate` is committed and then flushed, up to `until`; see
-    /// [`Store::durable`]. Uses per-thread `park`/`unpark` with lock-free post-wakeup checks so
-    /// high-concurrency writers do not contend on a shared mutex as a group commit flushes.
+    /// [`Store::durable`]. Uses sharded per-thread `park`/`unpark` with lock-free post-wakeup
+    /// checks so 1k–10k concurrent writers never contend on a shared mutex as a group commit flushes.
     fn wait_ticket(&self, fate: &Fate, until: Instant) -> Result<(), Refused> {
+        let shard = self.ticket_shard();
         loop {
             match fate.state.load(Ordering::Acquire) {
                 FAILED => return Err(Refused::Failed),
@@ -868,37 +978,40 @@ impl Sends {
                 return Err(Refused::Timeout);
             }
             {
-                let mut waiters = locked(&self.ticket_waiters);
-                let next_count = waiters.len().saturating_add(1);
-                self.ticket_waiter_count.store(next_count, Ordering::SeqCst);
+                let mut waiters = locked(&shard.waiters);
+                let prev_len = waiters.len();
+                shard
+                    .count
+                    .store(prev_len.saturating_add(1), Ordering::SeqCst);
+                self.ticket_waiter_total.fetch_add(1, Ordering::SeqCst);
                 let commit = match fate.state.load(Ordering::SeqCst) {
                     FAILED => {
-                        self.ticket_waiter_count
-                            .store(waiters.len(), Ordering::SeqCst);
+                        shard.count.store(prev_len, Ordering::SeqCst);
+                        self.ticket_waiter_total.fetch_sub(1, Ordering::SeqCst);
                         return Err(Refused::Failed);
                     }
                     UNSETTLED => {
                         if self.disk_failed.load(Ordering::SeqCst) {
-                            self.ticket_waiter_count
-                                .store(waiters.len(), Ordering::SeqCst);
+                            shard.count.store(prev_len, Ordering::SeqCst);
+                            self.ticket_waiter_total.fetch_sub(1, Ordering::SeqCst);
                             return Err(Refused::Disk);
                         }
                         if self.stopping.load(Ordering::SeqCst) {
-                            self.ticket_waiter_count
-                                .store(waiters.len(), Ordering::SeqCst);
+                            shard.count.store(prev_len, Ordering::SeqCst);
+                            self.ticket_waiter_total.fetch_sub(1, Ordering::SeqCst);
                             return Err(Refused::Stopped);
                         }
                         UNSETTLED
                     }
                     commit => {
                         if self.durable_commits.load(Ordering::SeqCst) >= commit {
-                            self.ticket_waiter_count
-                                .store(waiters.len(), Ordering::SeqCst);
+                            shard.count.store(prev_len, Ordering::SeqCst);
+                            self.ticket_waiter_total.fetch_sub(1, Ordering::SeqCst);
                             return Ok(());
                         }
                         if self.disk_failed.load(Ordering::SeqCst) {
-                            self.ticket_waiter_count
-                                .store(waiters.len(), Ordering::SeqCst);
+                            shard.count.store(prev_len, Ordering::SeqCst);
+                            self.ticket_waiter_total.fetch_sub(1, Ordering::SeqCst);
                             return Err(Refused::Disk);
                         }
                         commit
@@ -1473,25 +1586,28 @@ impl<E: Engine> Store<E> {
             self.meter.dropped();
         })?;
         let mut keys: Vec<String> = Vec::new();
+        let mut has_empty = false;
         for r in &rows {
             let k = E::key(r);
-            if !keys.iter().any(|have| have == k) {
+            if k.is_empty() {
+                has_empty = true;
+            } else if !keys.iter().any(|have| have == k) {
                 keys.push(k.to_owned());
             }
         }
         // Counted before it is queued: a read that begins once it is queued waits for it.
-        self.sends.handing(&keys);
+        self.sends.handing(&keys, has_empty);
         let fate = Arc::new(Fate {
             state: AtomicU64::new(UNSETTLED),
             has_then: then.is_some(),
             then: Mutex::new(then),
         });
         self.tx
-            .send(Msg::Rows(rows, keys, fate.clone(), queued))
+            .send(Msg::Rows(rows, keys, has_empty, fate.clone(), queued))
             .map_err(|mpsc::SendError(back)| {
                 // Never committed: nothing waits on it.
-                if let Msg::Rows(_, keys, ..) = back {
-                    self.sends.settled(&keys);
+                if let Msg::Rows(_, keys, has_empty, ..) = back {
+                    self.sends.settled(&keys, has_empty);
                     self.sends.wake(1, 0, false);
                 }
                 Refused::Stopped
@@ -1675,6 +1791,7 @@ fn notify(watchers: &Mutex<Vec<Watcher>>) {
 struct Batch {
     end: usize,
     keys: Vec<String>,
+    has_empty: bool,
     fate: Arc<Fate>,
     _queued: Option<Charge>,
 }
@@ -1783,9 +1900,16 @@ fn writer<E: Engine>(
         }
         // Committed or failed: either way no read waits on it any longer.
         let n = u64::try_from(batches.len()).unwrap_or(u64::MAX);
+        let mut empty_settled = 0u64;
         for b in batches.drain(..) {
-            sends.settled(&b.keys);
+            if b.has_empty {
+                empty_settled = empty_settled.saturating_add(1);
+            }
+            if !b.keys.is_empty() {
+                sends.settled(&b.keys, false);
+            }
         }
+        sends.settled_empty(empty_settled);
         sends.wake(n, *commits, any_failed);
     };
     loop {
@@ -1799,11 +1923,12 @@ fn writer<E: Engine>(
         let began = Instant::now();
         let quiet = matches!(got, Err(mpsc::RecvTimeoutError::Timeout)) && pending.is_empty();
         match got {
-            Ok(Msg::Rows(rows, keys, fate, queued)) => {
+            Ok(Msg::Rows(rows, keys, has_empty, fate, queued)) => {
                 pending.extend(rows);
                 batches.push(Batch {
                     end: pending.len(),
                     keys,
+                    has_empty,
                     fate,
                     _queued: queued,
                 });
