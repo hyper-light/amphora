@@ -746,6 +746,20 @@ mod tests {
         Instant::now() + Duration::from_secs(60)
     }
 
+    /// The archive a test's database is backed up to, its clock `now`.
+    fn archive(blobs: &Arc<SimBlobs>, now: &Arc<AtomicU64>, check: CheckPolicy) -> Archive {
+        let read = Arc::clone(now);
+        Archive {
+            blobs: Arc::clone(blobs) as Arc<dyn Blobs>,
+            prefix: "db".into(),
+            clock: Arc::new(move || read.load(Ordering::SeqCst)),
+            memory: 32 * 1024,
+            patience: Duration::from_secs(60),
+            chunks: ChunkGrowth::Keep,
+            check,
+        }
+    }
+
     /// A database at `path` backed up round by round, its table made, with its clock.
     fn backed_up(
         path: &Path,
@@ -754,20 +768,11 @@ mod tests {
         check: CheckPolicy,
     ) -> (Db, Prepared, Arc<AtomicU64>) {
         let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS));
-        let read = Arc::clone(&now);
-        let archive = Archive {
-            blobs: Arc::clone(blobs) as Arc<dyn Blobs>,
-            prefix: "db".into(),
-            clock: Arc::new(move || read.load(Ordering::SeqCst)),
-            memory: 32 * 1024,
-            patience: Duration::from_secs(60),
-            chunks: ChunkGrowth::Keep,
-            check,
-        };
         let mut db = Db::open(path).unwrap();
         if let Some(kept) = kept {
             db.keep_log(kept);
         }
+        let archive = archive(blobs, &now, check);
         let prepared = Prepared::on(&mut db, path, archive, until()).unwrap();
         db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
             .unwrap();
@@ -918,6 +923,124 @@ mod tests {
             )
         });
         assert_eq!(ids(&Db::open(&target).unwrap()), ids(&db));
+    }
+
+    /// Runs the thread's rounds while a base is under way: whether one ended.
+    fn rounds(prepared: &mut Prepared, copy: &mut Option<BaseCopy>) -> bool {
+        let mut ended = false;
+        loop {
+            ended |= prepared.round(copy).unwrap().1;
+            if copy.is_none() {
+                return ended;
+            }
+        }
+    }
+
+    /// The rows of the last whole second the clock has passed, restored.
+    fn restored_now(dir: &Path, blobs: &SimBlobs, now: &AtomicU64) -> anyhow::Result<Vec<i64>> {
+        let second = now.load(Ordering::SeqCst) / SECOND_NS - 1;
+        let target = dir.join(format!("at-{second}.db"));
+        restore(blobs, "db", second, &target, until())?;
+        Ok(ids(&Db::open(&target)?))
+    }
+
+    /// AC-T1.12.3 (lane B25): a base begun before the log broke mends nothing: no restore takes it.
+    /// Do: begin the first base; with its copy under way and no round run, write past what a restart
+    /// keeps and start the log again, unshipped (the log breaks); commit, and run the thread's
+    /// rounds until the base under way ends; commit again, as wakes the thread, and run its rounds;
+    /// restore the last commit's second. Expect: it restores with every row.
+    #[test]
+    fn a_base_begun_before_the_log_broke_is_begun_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = Arc::new(SimBlobs::new(64 * 1024, 1_000_000, 1 << 30));
+        let (mut db, mut prepared, now) = backed_up(
+            &dir.path().join("source.db"),
+            &blobs,
+            Some(20),
+            CheckPolicy::Off,
+        );
+        write(&db, &now, 0, 10);
+        let mut copy = None;
+        prepared.round(&mut copy).unwrap();
+        assert!(copy.is_some(), "the first base begins");
+        write(&db, &now, 10, 60);
+        assert!(
+            db.restart_log().unwrap(),
+            "past what a restart keeps, it starts again unshipped"
+        );
+        write(&db, &now, 70, 1);
+        assert!(rounds(&mut prepared, &mut copy), "a base ended");
+        write(&db, &now, 71, 1);
+        rounds(&mut prepared, &mut copy);
+        now.fetch_add(SECOND_NS, Ordering::SeqCst);
+        prepared.round(&mut copy).unwrap();
+
+        match restored_now(dir.path(), &blobs, &now) {
+            Ok(restored) => assert_eq!(restored, ids(&db)),
+            Err(e) => panic!(
+                "the last commit's second is refused, bases ended and none due ({}): {e:#}",
+                prepared.shipper.base_due(None)
+            ),
+        }
+    }
+
+    /// AC-T1.12.3 (lane B25): an archive whose latest base was begun before its log broke, as a
+    /// shipper before this lane ended one, has no base a restore takes after the break: a shipper
+    /// opened on it begins one. Do: end a base; write past what a restart keeps and start the log
+    /// again unshipped; ship the generation after and put there a base begun in the one before and
+    /// ended in it; open the backup again, commit, and run the thread's rounds; restore the last
+    /// commit's second. Expect: it restores with every row.
+    #[test]
+    fn a_shipper_opened_on_a_base_begun_before_a_break_begins_another() {
+        use crate::backup::object;
+        use crate::backup::plan::BaseKey;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.db");
+        let blobs = Arc::new(SimBlobs::new(64 * 1024, 1_000_000, 1 << 30));
+        let (mut db, mut prepared, now) = backed_up(&path, &blobs, Some(20), CheckPolicy::Off);
+        write(&db, &now, 0, 10);
+        let mut copy = None;
+        assert!(rounds(&mut prepared, &mut copy), "the first base ends");
+        write(&db, &now, 10, 60);
+        assert!(
+            db.restart_log().unwrap(),
+            "past what a restart keeps, it starts again unshipped"
+        );
+        write(&db, &now, 70, 1);
+        prepared.ship().unwrap();
+        let listed = blobs.list("db/base/", None, 10, until()).unwrap().objects;
+        let (key, _) = listed.first().unwrap();
+        let first = object::manifest(key, &blobs.get(key, until()).unwrap()).unwrap();
+        let useless = object::Manifest {
+            id: first.id + 1,
+            end: (2, prepared.shipper.frames_in_generation()),
+            from: object::runs(&first.chunk_bases().unwrap()),
+            ..first
+        };
+        let key = BaseKey {
+            end: useless.end,
+            start_gen: useless.start_gen,
+            id: useless.id,
+        };
+        blobs
+            .create(&key.key("db"), &object::encode(&useless).unwrap(), until())
+            .unwrap();
+        drop(prepared);
+
+        let reopened = archive(&blobs, &now, CheckPolicy::Off);
+        let mut prepared = Prepared::on(&mut db, &path, reopened, until()).unwrap();
+        now.fetch_add(SECOND_NS, Ordering::SeqCst);
+        write(&db, &now, 71, 1);
+        rounds(&mut prepared, &mut copy);
+        now.fetch_add(SECOND_NS, Ordering::SeqCst);
+        prepared.round(&mut copy).unwrap();
+        match restored_now(dir.path(), &blobs, &now) {
+            Ok(restored) => assert_eq!(restored, ids(&db)),
+            Err(e) => panic!(
+                "the last commit's second is refused, and no base is due ({}): {e:#}",
+                prepared.shipper.base_due(None)
+            ),
+        }
     }
 
     /// The most bytes the files in a restore's folder held together, seen at each of its steps.

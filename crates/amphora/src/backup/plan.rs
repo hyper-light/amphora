@@ -38,6 +38,17 @@ pub enum Unrestorable {
     Gap(u64),
     #[error("no base precedes second {0} on an unbroken log")]
     NoBase(u64),
+    #[error(
+        "frames {first} to {archived} of generation {generation} of the log, which the archive says it holds, don't replay: its frames end at {replayed}",
+        first = .replayed.saturating_add(1)
+    )]
+    Short {
+        generation: u64,
+        /// The last of its frames the archive's segments hold, up to the restore's cut.
+        archived: u64,
+        /// The last the replay recovered.
+        replayed: u64,
+    },
     #[error("archive object {key}: {why}")]
     Malformed { key: String, why: String },
     #[error(

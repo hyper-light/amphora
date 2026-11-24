@@ -1260,10 +1260,10 @@ impl Blobs for MidSend<'_> {
 
 /// Writes a backlog, then, while a send of it is under way (its first part stored), has the writer
 /// start the log again `restarts` times past what a restart keeps, the send's frames not shipped,
-/// and commit on. Then ships, ends a base after the break, and compares every second from the first
-/// base's on with the rows as of it: whether the send was refused, and the seconds of the backlog
-/// refused.
-fn restarts_forced_mid_send(restarts: i64) -> (Option<String>, Vec<u64>) {
+/// and commit on. Then ships, ends a base after that where `based_after`, and compares every second
+/// from the first base's on with the rows as of it: whether the send was refused, and the seconds
+/// refused (of the backlog's alone, where a base ends after it).
+fn restarts_forced_mid_send(restarts: i64, based_after: bool) -> (Option<String>, Vec<u64>) {
     let mut s = Source::new();
     // The frames a restart keeps: far fewer than the backlog's, so it is past them.
     s.db.keep_log(20);
@@ -1321,17 +1321,20 @@ fn restarts_forced_mid_send(restarts: i64) -> (Option<String>, Vec<u64>) {
     // The generation now is shipped, and a base ends after the break.
     now.fetch_add(SECOND_NS, Ordering::SeqCst);
     shipper.ship(&reader, &blobs, until()).unwrap();
-    // The base begins once the file holds the segment the last switch closed.
-    let _copied = db.checkpoint().unwrap();
-    let mut base = shipper
-        .begin_base(&reader, &blobs, &amphora::memory::process(), 32 * 1024)
-        .unwrap();
-    while shipper
-        .copy_base(&reader, &blobs, &mut base, until())
-        .unwrap()
-    {}
-    shipper.end_base(&reader, &blobs, base, until()).unwrap();
-    let mended = now.load(Ordering::SeqCst).div_ceil(SECOND_NS);
+    let mut mended = u64::MAX;
+    if based_after {
+        // The base begins once the file holds the segment the last switch closed.
+        let _copied = db.checkpoint().unwrap();
+        let mut base = shipper
+            .begin_base(&reader, &blobs, &amphora::memory::process(), 32 * 1024)
+            .unwrap();
+        while shipper
+            .copy_base(&reader, &blobs, &mut base, until())
+            .unwrap()
+        {}
+        shipper.end_base(&reader, &blobs, base, until()).unwrap();
+        mended = now.load(Ordering::SeqCst).div_ceil(SECOND_NS);
+    }
     put(&mut db, &now, 9000..9005, "f", &mut model, &mut history);
     now.fetch_add(SECOND_NS, Ordering::SeqCst);
     shipper.ship(&reader, &blobs, until()).unwrap();
@@ -1367,7 +1370,7 @@ fn restarts_forced_mid_send(restarts: i64) -> (Option<String>, Vec<u64>) {
                     ) && second <= mended,
                     "second {second} refused for another reason than the break: {e:#}"
                 );
-                if second <= backlog {
+                if second <= backlog || !based_after {
                     refused.push(second);
                 }
             }
@@ -1384,7 +1387,7 @@ fn restarts_forced_mid_send(restarts: i64) -> (Option<String>, Vec<u64>) {
 /// second restores with others.
 #[test]
 fn d45_a_send_ships_its_own_generation_when_the_log_starts_again_under_it() {
-    let (sent, refused) = restarts_forced_mid_send(1);
+    let (sent, refused) = restarts_forced_mid_send(1, true);
     assert_eq!(sent, None, "its frames are in the closing segment");
     assert_eq!(refused, Vec::<u64>::new(), "its commits are in the archive");
 }
@@ -1395,8 +1398,359 @@ fn d45_a_send_ships_its_own_generation_when_the_log_starts_again_under_it() {
 /// rows than its own.
 #[test]
 fn d45_a_send_whose_segment_is_written_over_is_refused() {
-    let (sent, _) = restarts_forced_mid_send(2);
+    let (sent, _) = restarts_forced_mid_send(2, true);
     assert!(sent.is_some(), "its frames are gone, and it says so");
+}
+
+/// Decision 45, AC-T1.12.4 (lane B25): a generation the writer ended by force while a send of it was
+/// under way is in the archive whole once that send has shipped its last frame. Do: as above, the
+/// log started again once under the send, 80 rows committed after it, and no base ended since.
+/// Expect: the send ends, and every second restores with its rows, those of the 80 too.
+#[test]
+fn d45_a_generation_ended_by_force_is_whole_once_its_send_ships_it() {
+    let (sent, refused) = restarts_forced_mid_send(1, false);
+    assert_eq!(sent, None, "its frames are in the closing segment");
+    assert_eq!(
+        refused,
+        Vec::<u64>::new(),
+        "every frame of it is in the archive, so nothing breaks there"
+    );
+}
+
+/// The generations of an archive written by a shipper, each one's segments and their bodies.
+fn generation_segments(
+    blobs: &dyn Blobs,
+    generation: u64,
+) -> Vec<(backup::plan::SegmentKey, String, SegmentBody)> {
+    segment_keys(blobs)
+        .into_iter()
+        .filter(|(key, _)| key.generation == generation)
+        .map(|(key, name)| {
+            let body = segment_body(blobs, &name);
+            (key, name, body)
+        })
+        .collect()
+}
+
+/// Puts `body` in the place of the segment at `name`, sealed with its own sum.
+fn replace_segment(blobs: &dyn Blobs, name: &str, body: &SegmentBody) {
+    blobs.delete(name, until()).unwrap();
+    blobs.create(name, &sealed_segment(body), until()).unwrap();
+}
+
+/// How an archive came to hold a generation whose frames end before its keys say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wrong {
+    /// As a shipper before lane B24 sent a generation the log started again under (its suspect 2):
+    /// each part after the first is the next generation's frames, read from its segment.
+    NextGenerations,
+    /// The frames of its last part's end, gone (zeroes).
+    Truncated,
+}
+
+/// Archives a base, then a generation in several parts and one after it, makes the first of the two
+/// `wrong`, sealed as a shipper seals it, and restores every second from the base on: the seconds
+/// restored, whose rows are all compared, and those refused, each with the gap it names.
+fn restored_from_a_wrong_generation(wrong: Wrong) {
+    let mut s = Source::new();
+    s.put(0..10, "a");
+    s.ship().unwrap();
+    let mut base = s.begin_base().unwrap();
+    s.copy_base(&mut base);
+    s.end_base(base).unwrap();
+    let based = s.second();
+    assert!(s.db.restart_log().unwrap(), "shipped, so it starts again");
+    s.put(10..70, "b");
+    s.ship().unwrap();
+    let sent = generation_segments(&s.blobs, 2);
+    assert!(sent.len() > 2, "non-vacuous: {} parts", sent.len());
+    assert!(s.db.restart_log().unwrap(), "shipped, so it starts again");
+    s.put(1000..1080, "c");
+    s.ship().unwrap();
+    s.now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    s.ship().unwrap();
+
+    let frame = sent[0].2.frames.len() / usize::try_from(sent[0].0.last).unwrap();
+    // The last frame of the generation that is its own still.
+    let own = match wrong {
+        Wrong::NextGenerations => {
+            let next: Vec<u8> = generation_segments(&s.blobs, 3)
+                .into_iter()
+                .flat_map(|(_, _, body)| body.frames)
+                .collect();
+            for (key, name, body) in &sent[1..] {
+                let from = usize::try_from(key.first - 1).unwrap() * frame;
+                let mut body = body.clone();
+                let to = from + body.frames.len();
+                body.frames.copy_from_slice(&next[from..to]);
+                replace_segment(&s.blobs, name, &body);
+            }
+            sent[0].0.last
+        }
+        Wrong::Truncated => {
+            let (key, name, body) = sent.last().unwrap();
+            let mut body = body.clone();
+            let kept = body.frames.len() - 2 * frame;
+            body.frames[kept..].fill(0);
+            replace_segment(&s.blobs, name, &body);
+            key.last - 2
+        }
+    };
+    // The generation's commits, by second, with the frame each ends at.
+    let marks: Vec<SegmentMark> = sent.iter().flat_map(|(_, _, b)| b.marks.clone()).collect();
+
+    let last = s.history.last().unwrap().0.div_ceil(SECOND_NS);
+    let mut refused = Vec::new();
+    for second in based..=last {
+        let mark = marks
+            .iter()
+            .rfind(|m| m.ns.div_ceil(SECOND_NS) <= second)
+            .cloned();
+        // Past the generation's last commit, the whole of it is replayed under the next.
+        let cut = mark.map_or(0, |m| m.frame);
+        match s.restored(second) {
+            Ok(restored) => {
+                let expected = at(&s.history, second).cloned().unwrap_or_default();
+                let lost = expected
+                    .iter()
+                    .filter(|(id, v)| restored.get(id) != Some(v))
+                    .count();
+                assert_eq!(
+                    (lost, restored.len()),
+                    (0, expected.len()),
+                    "{wrong:?}: second {second} restored with no error, {lost} of its {} rows \
+                     lost, {} rows in all; generation 2 is its own through frame {own}, this second \
+                     ends at its frame {cut}",
+                    expected.len(),
+                    restored.len()
+                );
+                assert!(cut <= own, "{wrong:?}: second {second} is past frame {own}");
+            }
+            Err(e) => {
+                let named = e.downcast_ref::<Unrestorable>();
+                assert!(
+                    matches!(
+                        named,
+                        Some(Unrestorable::Short { generation: 2, archived, replayed })
+                            if *archived == cut && *replayed <= own && cut > own
+                    ),
+                    "{wrong:?}: second {second}, which ends at frame {cut} of generation 2 (its own \
+                     through {own}), refused otherwise: {e:#}"
+                );
+                refused.push(second);
+            }
+        }
+    }
+    let first = refused.first().copied().unwrap_or(0);
+    assert_eq!(
+        refused,
+        (first..=last).collect::<Vec<u64>>(),
+        "{wrong:?}: every second from the first past frame {own} is refused, none before"
+    );
+    assert!(first > based, "{wrong:?}: the seconds before restore");
+}
+
+/// AC-T1.12.4 (lane B25): a restore never answers with fewer rows than its archive says it holds. Do:
+/// an archive written before lane B24's fix, where a log started again under a send left the next
+/// generation's frames under the send's keys, sealed with their own sums; restore every second.
+/// Expect: each second up to the last of the generation's own frames restores with its rows, and each
+/// after it is refused, typed, naming the generation and the frames that don't replay.
+#[test]
+fn a_restore_of_an_archive_short_of_its_frames_is_refused() {
+    restored_from_a_wrong_generation(Wrong::NextGenerations);
+}
+
+/// AC-T1.12.4 (lane B25): the same, the last frames of a generation gone.
+#[test]
+fn a_restore_of_a_truncated_generation_is_refused() {
+    restored_from_a_wrong_generation(Wrong::Truncated);
+}
+
+/// AC-T1.12.4 (lane B25): a restore that is refused for a short archive leaves nothing at its path
+/// that opens as a whole database. Do: zero the end of a generation's last frame, sealed again;
+/// restore its last second; then restore the base's own second at the same path. Expect: the first
+/// is refused, typed, and no file stands at its path; the second holds its rows.
+#[test]
+fn a_short_restore_leaves_no_database() {
+    let mut s = Source::new();
+    s.put(0..10, "a");
+    s.ship().unwrap();
+    let mut base = s.begin_base().unwrap();
+    s.copy_base(&mut base);
+    s.end_base(base).unwrap();
+    let based = s.second();
+    let rows_then = s.model.clone();
+    s.now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    s.put(10..20, "b");
+    s.ship().unwrap();
+    let last = s.second();
+    s.now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    s.ship().unwrap();
+    let (_, name, mut body) = generation_segments(&s.blobs, 1).pop().unwrap();
+    let tail = body.frames.len() - 100;
+    body.frames[tail..].fill(0);
+    replace_segment(&s.blobs, &name, &body);
+    let target = s.dir.path().join("short.db");
+    let refused = backup::restore(&s.blobs, "db", last, &target, until()).map(|_| ());
+    let left: Vec<String> = std::fs::read_dir(s.dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("short.db"))
+        .collect();
+    let stands = if target.exists() {
+        Some(rows(&Db::open(&target).unwrap()).len())
+    } else {
+        None
+    };
+    assert!(
+        matches!(
+            refused
+                .as_ref()
+                .err()
+                .and_then(|e| e.downcast_ref::<Unrestorable>()),
+            Some(Unrestorable::Short { .. })
+        ),
+        "the restore: {refused:?}; at its path: {left:?}, {stands:?} rows of {}",
+        s.model.len()
+    );
+    assert_eq!(left, Vec::<String>::new(), "{stands:?} rows stand there");
+    backup::restore(&s.blobs, "db", based, &target, until()).unwrap();
+    assert_eq!(rows(&Db::open(&target).unwrap()), rows_then);
+}
+
+/// AC-T1.12.3, decision 45 (lane B25): a shipper opened after a switch carries on from the segment the
+/// switch closed, which the archive holds whole. Do: end a base; write 20 rows and ship them; start
+/// the log again (the writer switches) and commit 5 rows no round ships; end the process there (its
+/// files as they stand), open them backed up to the same archive, and commit 10 rows more, shipped;
+/// restore every second from the opening on. Expect: each one restores with its rows, no base
+/// ended since.
+#[test]
+fn d45_a_shipper_opened_after_a_switch_carries_on_from_the_closed_segment() {
+    let mut s = Source::new();
+    s.put(0..20, "a");
+    s.ship().unwrap();
+    let mut base = s.begin_base().unwrap();
+    s.copy_base(&mut base);
+    s.end_base(base).unwrap();
+    s.put(20..40, "b");
+    s.ship().unwrap();
+    s.put(40..45, "c");
+    s.ship().unwrap();
+    assert!(s.db.restart_log().unwrap(), "shipped, so it starts again");
+    s.put(45..50, "d");
+    let state = log_files(&s.path);
+    let ended = s.dir.path().join("ended.db");
+    for suffix in ["", "-wal", "-wal2"] {
+        let beside = |path: &std::path::Path| {
+            let mut file = path.as_os_str().to_owned();
+            file.push(suffix);
+            std::path::PathBuf::from(file)
+        };
+        std::fs::copy(beside(&s.path), beside(&ended)).unwrap();
+    }
+
+    s.now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    let now = Arc::clone(&s.now);
+    s.hooks = Hooks::new(Arc::new(move || now.load(Ordering::SeqCst)), 1 << 16);
+    s.db = Db::open(&ended).unwrap();
+    assert_eq!(rows(&s.db), s.model, "the process ended with its commits");
+    s.db.back_up(Arc::clone(&s.hooks));
+    s.path = ended;
+    s.shipper = Shipper::open("db", Arc::clone(&s.hooks), &s.blobs, &s.db, until()).unwrap();
+    let opened = s.second();
+    let due = s.shipper.base_needed();
+    s.history
+        .push((s.now.load(Ordering::SeqCst), s.model.clone()));
+    s.put(50..60, "e");
+    s.ship().unwrap();
+    s.now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    s.ship().unwrap();
+    let last = s.history.last().unwrap().0.div_ceil(SECOND_NS);
+    let mut refused = Vec::new();
+    for second in opened..=last {
+        match s.restored(second) {
+            Ok(restored) => {
+                let expected = at(&s.history, second).cloned().unwrap_or_default();
+                assert_eq!(restored, expected, "the rows of second {second}");
+            }
+            Err(e) => refused.push((second, format!("{e:#}"))),
+        }
+    }
+    assert!(
+        refused.is_empty(),
+        "{} of {} seconds refused, the first {:?}; a base was needed at the opening: {due}; the log \
+         as the process ended: {state}",
+        refused.len(),
+        last - opened + 1,
+        refused.first()
+    );
+}
+
+/// Decision 45 (lane B25): a new database takes nothing from a log segment left at its path, `-wal2` as
+/// `-wal`. Do: write 20 rows, start the log again (the writer switches to `-wal2`) and write 5 rows
+/// more; end, and remove the database's file and its `-wal`, the ones SQLite names, its `-wal2` left;
+/// open a database at that path, make a table and write 3 rows, and open it again. Expect: it begins
+/// empty, and holds the 3 rows alone, its file whole.
+#[test]
+fn d45_a_new_database_takes_no_log_segment_left_at_its_path() {
+    let mut s = Source::new();
+    s.put(0..20, "a");
+    s.ship().unwrap();
+    assert!(s.db.restart_log().unwrap(), "shipped, so it starts again");
+    s.put(20..25, "b");
+    let state = log_files(&s.path);
+    let Source { path, db, dir, .. } = s;
+    drop(db);
+    let beside = |suffix: &str| {
+        let mut file = path.clone().into_os_string();
+        file.push(suffix);
+        std::path::PathBuf::from(file)
+    };
+    std::fs::remove_file(&path).unwrap();
+    std::fs::remove_file(beside("-wal")).unwrap();
+    assert!(
+        std::fs::metadata(beside("-wal2")).unwrap().len() > 32,
+        "non-vacuous: a segment with frames is left; {state}"
+    );
+
+    let tables = |db: &Db| -> anyhow::Result<Vec<String>> {
+        let mut names = Vec::new();
+        db.query("SELECT name FROM sqlite_schema ORDER BY name", [], |r| {
+            names.push(r.get::<String>(0).map_err(|e| anyhow::anyhow!("{e}"))?);
+            Ok(true)
+        })?;
+        Ok(names)
+    };
+    let opened = Db::open(&path).and_then(|db| tables(&db).map(|names| (db, names)));
+    let (db, names) = match opened {
+        Ok(opened) => opened,
+        Err(e) => panic!("a new database where `-wal2` is left doesn't open: {e:#}; {state}"),
+    };
+    assert_eq!(
+        names,
+        Vec::<String>::new(),
+        "a new database holds tables of the one removed; {state}"
+    );
+    let mut expected = Rows::new();
+    db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+        .unwrap();
+    for id in 0..3 {
+        db.exec(&format!("INSERT INTO t (id, v) VALUES ({id}, 'new')"))
+            .unwrap();
+        expected.insert(id, "new".into());
+    }
+    assert_eq!(rows(&db), expected);
+    drop(db);
+    let db = Db::open(&path).unwrap();
+    assert_eq!(rows(&db), expected, "opened again");
+    let mut whole = Vec::new();
+    db.query("PRAGMA integrity_check", [], |r| {
+        whole.push(r.get::<String>(0).map_err(|e| anyhow::anyhow!("{e}"))?);
+        Ok(true)
+    })
+    .unwrap();
+    assert_eq!(whole, ["ok"]);
+    drop(dir);
 }
 
 /// T-T1.12.I1 (AC-T1.12.3, AC-T1.12.4): an incremental base. Do: write 400 rows, start the log
