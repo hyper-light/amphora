@@ -1746,6 +1746,11 @@ answer was lost; found by a trace, fixed, robust over the suites and the ladder,
 
 ## Losses first
 
+0. **Not on main.** The branch `perf/commits-v16` (6140be06, with main 9fbfdbaf merged and re-checked) was green
+   at 03:50Z, past the hour's end (03:48Z); main had moved again to fac69083 in crates/engine (lane PG13), which
+   needs one more re-check before the push (RULES 6, landing while main moves). The lander's steps: merge
+   origin/main, `cargo test -p amphora --lib --locked -- v15_a_write_its_deadline database::slot:: v14_a_slow
+   a_slot_holder_whose_write_fails`, `cargo clippy -p amphora --all-targets --locked -- -D warnings`, push.
 1. **The ladder and the suites against main's product were not run on the landed tree.** adacachy2 was the verifier's
    quiet window from 03:00Z to 03:45Z, and the macOS runs (r121's ladder) had not finished its cold release build at
    load 64 to 140 on 18 cores when the hour ended; it was stopped. So the deliverable's robust
