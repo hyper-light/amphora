@@ -2,7 +2,7 @@
 //! perf-A27; replication.md, QB.1's amendment of that lane), on every interleaving of the events
 //! that move them: a call's arrival, a place or bytes given back, a wire record's arrival, a
 //! deadline, the bounds learned again, the owner's end, and the memory budget's room going after a
-//! place was granted. And the wait for the memory budget's room (T-MB.1.7, lane perf-A28; store.md),
+//! place was granted. And the wait for the memory budget's room (T-MB.1.5, lane perf-A28; store.md),
 //! on every interleaving of a holder's wait, bytes given back and an owner's end. The code under test
 //! is the owner's own file, `line.rs`, and the budget's, `memory/wait.rs`, compiled here over loom's
 //! types; the stand-ins below are what they take from around them.

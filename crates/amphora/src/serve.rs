@@ -2352,7 +2352,7 @@ mod tests {
         })
     }
 
-    /// MB.1 (T-MB.1.9, lane perf-A28): what waits for the memory budget's room for a member's work
+    /// MB.1 (T-MB.1.7, lane perf-A28): what waits for the memory budget's room for a member's work
     /// hears its replica end, as a disk cut off ends it, and holds nothing. Do: on a member of one,
     /// another use holding the budget, a `Q` request whose frame finds no room, one whose decoded
     /// values find none, or a call on the member's replica, waits for room; its log's disk is cut and

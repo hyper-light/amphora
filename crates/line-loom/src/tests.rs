@@ -454,13 +454,13 @@ fn t_qb_1_19_the_owners_end_reaches_a_call_that_waits_for_the_budget() {
     });
 }
 
-/// T-MB.1.7: the budget's wait alone (the five below). Do: a holder that finds no room waits for an
+/// T-MB.1.5: the budget's wait alone (the five below). Do: a holder that finds no room waits for an
 /// owner's work; what it waits for is given back, or the owner ends, or both, or its deadline passes,
 /// as it looks. Expect: the holder charged where the bytes came and the owner stood, refused with the
 /// owner's reason where it ended, `Full` at its deadline, answered on every interleaving, nothing
 /// charged where refused; none counted waiting after.
 #[test]
-fn t_mb_1_7_bytes_given_back_reach_a_holder_that_waits() {
+fn t_mb_1_5_bytes_given_back_reach_a_holder_that_waits() {
     every(None, || {
         let budget = memory::Budget::of(5);
         let other = budget.take(memory::Use::Queues, 5).unwrap();
@@ -471,7 +471,7 @@ fn t_mb_1_7_bytes_given_back_reach_a_holder_that_waits() {
     });
 }
 #[test]
-fn t_mb_1_7_an_owners_end_reaches_a_holder_that_waits() {
+fn t_mb_1_5_an_owners_end_reaches_a_holder_that_waits() {
     every(None, || {
         let budget = memory::Budget::of(5);
         let other = budget.take(memory::Use::Queues, 5).unwrap();
@@ -485,7 +485,7 @@ fn t_mb_1_7_an_owners_end_reaches_a_holder_that_waits() {
     });
 }
 #[test]
-fn t_mb_1_7_bytes_given_back_beside_the_end_are_charged_or_not_never_held_by_a_refusal() {
+fn t_mb_1_5_bytes_given_back_beside_the_end_are_charged_or_not_never_held_by_a_refusal() {
     every(None, || {
         let budget = memory::Budget::of(5);
         let other = budget.take(memory::Use::Queues, 5).unwrap();
@@ -508,7 +508,7 @@ fn t_mb_1_7_bytes_given_back_beside_the_end_are_charged_or_not_never_held_by_a_r
 /// Two owners' holders on one budget: one owner's end takes no other's wait, and a give-back wakes the
 /// other.
 #[test]
-fn t_mb_1_7_an_owners_end_ends_no_other_owners_wait() {
+fn t_mb_1_5_an_owners_end_ends_no_other_owners_wait() {
     every(None, || {
         let budget = memory::Budget::of(5);
         let other = budget.take(memory::Use::Queues, 5).unwrap();
@@ -529,7 +529,7 @@ fn t_mb_1_7_an_owners_end_ends_no_other_owners_wait() {
 /// A deadline beside the end: the holder is answered one way, `Full` or the reason; a wait that begins
 /// after the end is refused at once.
 #[test]
-fn t_mb_1_7_a_deadline_beside_the_end_is_answered_and_a_wait_after_it_is_refused_at_once() {
+fn t_mb_1_5_a_deadline_beside_the_end_is_answered_and_a_wait_after_it_is_refused_at_once() {
     every(None, || {
         let budget = memory::Budget::of(5);
         let other = budget.take(memory::Use::Queues, 5).unwrap();

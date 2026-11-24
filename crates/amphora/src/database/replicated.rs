@@ -7297,6 +7297,74 @@ mod tests {
         holds_nothing(&handle, &budget);
     }
 
+    /// QB.1 (T-QB.1.24, lane perf-A28): a record that has no room beside a call the queue holds, as an
+    /// image has none beside the largest, is refused at once and sent again, and what it waits for is
+    /// that call's end, which its deadline is at the latest. Do: on a leaderless member, queue the
+    /// largest call it holds alone, then a second in line; send a record that fits the queue but not
+    /// beside the call; move the clock past the first call's deadline, then past the second's. Expect:
+    /// the record refused `Full` while either is held, admitted once both ended, at their deadlines.
+    #[test]
+    fn a28_a_record_with_no_room_beside_a_held_call_enters_once_the_call_ended() {
+        let dir = tempfile::tempdir().unwrap();
+        let budget = budget_of(128 << 20);
+        let mut driven = Driven::new();
+        let client = on_budget(&budget, || driven.open(dir.path(), 1, vec![1, 2, 3], None));
+        let handle = client.handle().clone();
+        let evaluated = Arc::new(AtomicUsize::new(0));
+        let whole = usize::try_from(written(0)).unwrap();
+        let alone = handle.alone_bound();
+        let until = driven.until();
+        let held = on_budget(&budget, || {
+            waiting_call(&handle, alone - whole, until, &evaluated)
+        });
+        let held = held.unwrap();
+        on_budget(&budget, || driven.step());
+        assert_eq!(driven.owner(0).waiting.len(), 1);
+        // Waits past the first, on the first's room, its deadline a second after the first's.
+        let later = until + Duration::from_secs(1);
+        let second = {
+            let (handle, budget) = (handle.clone(), Arc::clone(&budget));
+            let evaluated = Arc::clone(&evaluated);
+            std::thread::spawn(move || {
+                on_budget(&budget, || {
+                    waiting_call(&handle, alone - whole, later, &evaluated)
+                })
+            })
+        };
+        in_line(&handle, 1, || second.is_finished());
+        // It fits the queue's bytes, not those beside the call.
+        let record = vec![0xff; handle.queue_bound() - alone];
+        let refused = |what: &str| {
+            let refused = handle
+                .admit_receive(2, record.clone(), driven.until())
+                .err();
+            assert!(
+                matches!(refused, Some(Refusal::Full { .. })),
+                "{what}: {refused:?}"
+            );
+        };
+        refused("the first held");
+        on_budget(&budget, || {
+            driven.advance(0, Duration::from_secs(6));
+            driven.step();
+        });
+        assert!(matches!(held.try_recv(), Ok(Err(Refusal::Timeout))));
+        let second = finished(second).unwrap();
+        refused("the second in its place");
+        on_budget(&budget, || {
+            driven.advance(0, Duration::from_secs(2));
+            driven.step();
+            driven.step();
+        });
+        assert!(matches!(second.try_recv(), Ok(Err(Refusal::Timeout))));
+        let admitted = handle.admit_receive(2, record.clone(), driven.until());
+        assert!(admitted.is_ok(), "{:?}", admitted.err());
+        drop(admitted);
+        drop(driven);
+        holds_nothing(&handle, &budget);
+        assert_eq!(evaluated.load(Ordering::Relaxed), 0);
+    }
+
     /// QB.1 (T-QB.1.22, lane perf-A27; run under ThreadSanitizer too): calls from every thread, with
     /// deadlines near and far, sizes from a few bytes to one alone, wire records and learned bounds
     /// moving beside them. Expect: every call whose deadline is far admitted; every one near it

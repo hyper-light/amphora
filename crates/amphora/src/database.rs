@@ -4730,7 +4730,7 @@ mod admission_charge {
         ));
     }
 
-    /// AUDIT 2026-11-23 §1, MB.1 (T-MB.1.8, lane perf-A28): a request waiting for the memory
+    /// AUDIT 2026-11-23 §1, MB.1 (T-MB.1.6, lane perf-A28): a request waiting for the memory
     /// budget's room hears its database's writer end. Do: on a local database, another use holding the
     /// whole budget, a call waits for room on a thread; its disk fails. Expect: the call refused
     /// `Fenced` as a call after a failed disk is, none waiting, nothing held.

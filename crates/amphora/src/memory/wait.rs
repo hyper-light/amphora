@@ -2,7 +2,7 @@
 //! docs/design/store.md): bytes given back anywhere in the budget, the end of the owner the room is for
 //! (lane perf-A28), or its deadline, whichever is first. What it shares between threads comes from
 //! `super::sync`: `crates/line-loom` compiles this file over loom's, and runs every interleaving of a
-//! holder's wait, a give-back and an owner's end (T-MB.1.7).
+//! holder's wait, a give-back and an owner's end (T-MB.1.5).
 
 use super::Refusal;
 use super::sync::{Arc, AtomicU64, Condvar, Instant, Mutex, fence};

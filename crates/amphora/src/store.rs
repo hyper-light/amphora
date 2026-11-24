@@ -1863,7 +1863,7 @@ mod tests {
         }
     }
 
-    /// AUDIT 2026-11-23 §1, MB.1 (T-MB.1.8, lane perf-A28): a sender waiting for the memory budget's
+    /// AUDIT 2026-11-23 §1, MB.1 (T-MB.1.6, lane perf-A28): a sender waiting for the memory budget's
     /// room hears its store's end and holds nothing, and one that comes after is refused the same. Do:
     /// another use holding the whole budget, a batch and an admission wait for room on threads; the
     /// writer stops, its upkeep failed, or the disk's flush fails. Expect: both refused `Stopped`, or
