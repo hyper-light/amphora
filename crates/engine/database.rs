@@ -2974,6 +2974,7 @@ impl Database {
             vectorized_scans: AtomicBool::new(false),
             enable_load_extension: AtomicBool::new(self.can_load_extensions()),
             fk_pragma: AtomicBool::new(false),
+            recursive_triggers: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),
             n_active_writes: AtomicI32::new(0),
             n_active_root_statements: AtomicI32::new(0),
