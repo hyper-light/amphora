@@ -22,7 +22,7 @@ fn c14_sql() {
         println!("=====");
         for (name, parallel, statistics) in [("default", false, false), ("parallel", true, false), ("statistics", false, true)] {
             n += 1;
-            let db = Database::open(Arc::new(MemoryIO::new()), &format!("c14_{n}.db"), OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new().with_without_rowid(true))).unwrap();
+            let db = Database::open(Arc::new(MemoryIO::new()), &format!("c14_{n}.db"), OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new().with_without_rowid(true).with_generated_columns(true))).unwrap();
             let conn = db.connect(ConnectOpts::new()).unwrap();
             if parallel { conn.set_parallel_mode(ParallelMode::On); }
             let mut analyzed = false;

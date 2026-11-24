@@ -160,8 +160,9 @@ fn a_before_trigger_sees_the_rowid_as_an_integer() {
         ("INSERT INTO p(id, c) VALUES ('10', 1), (3.0, 2), (NULL, 3)", "ok"),
         ("INSERT INTO p(c) VALUES (4)", "ok"),
         ("INSERT INTO p(id, c) VALUES ('x', 5)", "datatype mismatch"),
-        ("SELECT * FROM audit", "-1,'integer',0,-1 / -1,'integer',0,-1 / 10,'integer',11,10 / 3,'integer',4,3"),
-        ("SELECT * FROM p", "10,11,1 / 11,12,3 / 12,13,4 / 3,4,2"),
+        ("INSERT INTO p(id, c) VALUES (' 20 ', 6)", "ok"),
+        ("SELECT * FROM audit", "-1,'integer',0,-1 / -1,'integer',0,-1 / 10,'integer',11,10 / 20,'integer',21,20 / 3,'integer',4,3"),
+        ("SELECT * FROM p", "10,11,1 / 11,12,3 / 12,13,4 / 20,21,6 / 3,4,2"),
     ]);
 }
 
