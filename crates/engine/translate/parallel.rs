@@ -76,6 +76,7 @@ pub(crate) fn emit_morsel_hook(
                 root_page: looped.table.root_page,
                 columns: looped.table.columns().len(),
                 rowid_alias: rowid_alias(looped.table),
+                reals: Vec::new(),
                 defaults: defaults(looped.table),
                 rowid_range: looped.rowid_range,
                 filter: Vec::new(),
@@ -981,12 +982,34 @@ fn shape(plan: &SelectPlan) -> Option<MorselAggregateData> {
             None
         }
     };
+    // A column a bound parameter is compared with: INTEGER or REAL (lane R10), which the copy and
+    // the morsels read as the serial loop does (`MorselAggregateData::reals`), compared bytewise.
+    let compared = |expr: &Expr| -> Option<usize> {
+        let Expr::Column {
+            table: t, column, ..
+        } = expr
+        else {
+            return None;
+        };
+        let col = columns.get(*column)?;
+        if *t == id
+            && matches!(col.affinity(), Affinity::Integer | Affinity::Real)
+            && matches!(col.collation(), CollationSeq::Binary | CollationSeq::Unset)
+        {
+            Some(*column)
+        } else {
+            None
+        }
+    };
     let mut filter = Vec::new();
     for term in &plan.where_clause {
         if term.consumed {
             continue;
         }
-        filter.push(predicate(&term.expr, &column, table)?);
+        filter.push(
+            predicate(&term.expr, &column, table)
+                .or_else(|| parameter(&term.expr, &compared, &plan.table_references))?,
+        );
     }
     let integer = |at: usize| {
         columns
@@ -998,6 +1021,7 @@ fn shape(plan: &SelectPlan) -> Option<MorselAggregateData> {
         root_page: table.root_page,
         columns: columns.len(),
         rowid_alias: rowid_alias(table),
+        reals: reals(table),
         defaults: defaults(table),
         rowid_range: (None, None),
         filter,
@@ -1014,6 +1038,17 @@ fn shape(plan: &SelectPlan) -> Option<MorselAggregateData> {
 
 fn rowid_alias(table: &BTreeTable) -> Option<usize> {
     table.get_rowid_alias_column().map(|(at, _)| at)
+}
+
+/// The table's columns of REAL affinity ([`MorselAggregateData::reals`]).
+fn reals(table: &BTreeTable) -> Vec<usize> {
+    table
+        .columns()
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.affinity() == Affinity::Real)
+        .map(|(at, _)| at)
+        .collect()
 }
 
 fn predicate(
@@ -1079,6 +1114,51 @@ fn predicate(
         }
         _ => None,
     }
+}
+
+/// `column op ?` (lane R9), or `? op column`, against an INTEGER or REAL column (lane R10): the
+/// parameter's value is read when the statement runs and converted as the serial loop's comparison
+/// converts it, by the comparison's affinity (SQLite's datatype3 section 4.2: NUMERIC applied to
+/// the parameter, which has no affinity), so a row passes exactly where the serial loop's term
+/// holds.
+fn parameter(
+    expr: &Expr,
+    column: &impl Fn(&Expr) -> Option<usize>,
+    refs: &crate::translate::plan::TableReferences,
+) -> Option<Predicate> {
+    let Expr::Binary(left, op, right) = expr else {
+        return None;
+    };
+    let (at, op, variable) = match (column(left), column(right), left.as_ref(), right.as_ref()) {
+        (Some(at), None, _, Expr::Variable(v)) => (at, *op, v),
+        (None, Some(at), Expr::Variable(v), _) => (at, flip(*op)?, v),
+        _ => return None,
+    };
+    let op = match op {
+        Operator::Less => CmpOp::Lt,
+        Operator::LessEquals => CmpOp::Le,
+        Operator::Equals => CmpOp::Eq,
+        Operator::NotEquals => CmpOp::Ne,
+        Operator::Greater => CmpOp::Gt,
+        Operator::GreaterEquals => CmpOp::Ge,
+        _ => return None,
+    };
+    let affinity = crate::translate::expr::comparison_affinity(
+        left.as_ref(),
+        right.as_ref(),
+        Some(refs),
+        None,
+    );
+    if affinity != Affinity::Numeric {
+        return None;
+    }
+    let index = std::num::NonZeroUsize::new(usize::try_from(variable.index.get()).ok()?)?;
+    Some(Predicate::Parameter {
+        column: at,
+        op,
+        index,
+        affinity,
+    })
 }
 
 fn flip(op: Operator) -> Option<Operator> {
@@ -1568,6 +1648,7 @@ fn shape_join(
         root_page: probe_table.root_page,
         columns: probe_table.columns().len(),
         rowid_alias: rowid_alias(probe_table),
+        reals: Vec::new(),
         defaults: defaults(probe_table),
         rowid_range: *ranges.get(probe_at)?,
         filter: std::mem::take(filters.get_mut(probe_at)?),
@@ -1777,7 +1858,9 @@ fn shape_chain(
             return None;
         }
         match &table.op {
-            Operation::Scan(Scan::BTreeTable { index: None, .. }) | Operation::HashJoin(_) => {}
+            Operation::Scan(Scan::BTreeTable { index: None, .. }) => {}
+            Operation::HashJoin(op)
+                if op.method == crate::translate::plan::HashJoinMethod::Hash => {}
             // As in `shape_join` (lane qs6-17).
             op if scanned_rowids(op).is_some() => {}
             Operation::Search(Search::Seek {
@@ -1945,6 +2028,7 @@ fn shape_chain(
         root_page: probe_table.root_page,
         columns: probe_table.columns().len(),
         rowid_alias: rowid_alias(probe_table),
+        reals: Vec::new(),
         defaults: defaults(probe_table),
         rowid_range: *ranges.first()?,
         filter: std::mem::take(filters.first_mut()?),

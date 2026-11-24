@@ -933,6 +933,12 @@ impl Drop for Connection {
             // This prevents deadlocks if a connection is dropped (e.g., due to a panic)
             // while holding a read or write lock.
             let pager = self.pager.load();
+            if self.versioned.is_some() && self.get_tx_state() != TransactionState::None {
+                // AC-NS.2.1. A writer abandoned by its connection must release its versions
+                // and wake table waiters before another connection acquires its WAL locks.
+                pager.rollback_tx(self);
+                self.rollback_attached_wal_txns();
+            }
             if let Some(wal) = &pager.wal {
                 if wal.holds_write_lock() {
                     wal.end_write_tx();

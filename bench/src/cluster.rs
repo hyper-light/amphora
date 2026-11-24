@@ -268,12 +268,8 @@ fn relay(
         let mut moved = 0u64;
         for group in &handles {
             for (from, handle) in MEMBERS.iter().zip(group) {
-                // The member's whole queue each pass: its own bound, no count picked here.
-                for record in handle
-                    .outgoing_bound()
-                    .and_then(|bound| handle.drain(bound))
-                    .unwrap_or_default()
-                {
+                // Take the queue under one lock, even if its learned limit just shrank.
+                for record in handle.drain_all().unwrap_or_default() {
                     let to = usize::try_from(record.to).unwrap_or(0).saturating_sub(1);
                     if let Some(target) = group.get(to) {
                         let _ = target.receive(*from, record.bytes, Instant::now() + WAIT);

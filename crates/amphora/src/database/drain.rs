@@ -261,7 +261,7 @@ mod tests {
     }
 
     /// T-QB.1.1: nothing measured, then an interval with nothing queued and nothing read: passes
-    /// when the bound is one record (`least`), the room no matter how large.
+    /// when memory room bounds bytes and the rate imposes no count limit.
     #[test]
     fn drain_nothing_measured_bounds_the_room() {
         let mut drain = Drain::default();

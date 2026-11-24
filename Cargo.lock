@@ -149,6 +149,7 @@ dependencies = [
  "amphora-engine-ext",
  "amphora-engine-macros",
  "amphora-engine-parser",
+ "amphora-pg-catalog",
  "antithesis_sdk",
  "arc-swap",
  "aristo",

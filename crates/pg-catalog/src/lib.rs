@@ -179,3 +179,260 @@ impl SearchPath {
         visible
     }
 }
+
+/// A column's type as `pg_attribute` records it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ColumnType {
+    /// `atttypid`.
+    pub oid: u32,
+    /// `atttypmod`: -1 when the column has no modifier.
+    pub typmod: i32,
+}
+
+/// Why a declared type is no PostgreSQL 19 column type, with 19's message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TypeError {
+    /// `42704`: no type of that name (`typenameType`, src/backend/parser/parse_type.c).
+    Undefined(String),
+    /// `22023` or `42601`: modifiers the type refuses (its `typmodin`).
+    Modifier(String),
+}
+
+impl std::fmt::Display for TypeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Undefined(m) | Self::Modifier(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for TypeError {}
+
+/// `VARHDRSZ` (src/include/varatt.h): the length word counted in bpchar's, varchar's and numeric's typmods.
+const VARHDRSZ: i32 = 4;
+
+/// The type a column declared as `name(modifiers)` has. `name` is the type's words as written: a
+/// double-quoted name is a type name matched exactly; otherwise the words are folded to lower case,
+/// the SQL-standard spellings of gram.y's `Numeric`, `Bit`, `Character` and `ConstDatetime`
+/// productions become the system type they name, and any other single word is a `GenericType`
+/// looked up in `pg_catalog`. The modifiers go through the type's `typmodin`.
+pub fn column_type(name: &str, modifiers: &[i64]) -> Result<ColumnType, TypeError> {
+    let quoted = name.strip_prefix('"').and_then(|n| n.strip_suffix('"'));
+    let words = match quoted {
+        Some(exact) => exact.to_owned(),
+        None => name
+            .split_whitespace()
+            .map(str::to_ascii_lowercase)
+            .collect::<Vec<_>>()
+            .join(" "),
+    };
+    let (typname, modifiers) = match quoted {
+        Some(_) => (words.as_str(), modifiers.to_vec()),
+        None => standard_spelling(&words, modifiers)?,
+    };
+    let row = data::PG_TYPE
+        .rows
+        .iter()
+        .find(|row| {
+            data::PG_TYPE.column("typname").and_then(|i| row.get(i)) == Some(&Datum::Name(typname))
+                && data::PG_TYPE
+                    .column("typnamespace")
+                    .and_then(|i| row.get(i))
+                    == Some(&Datum::Oid(PG_CATALOG_NAMESPACE))
+        })
+        .ok_or_else(|| TypeError::Undefined(format!("type \"{words}\" does not exist")))?;
+    let field = |name: &str| data::PG_TYPE.column(name).and_then(|i| row.get(i));
+    let (Some(Datum::Oid(oid)), Some(Datum::Oid(typmodin))) = (field("oid"), field("typmodin"))
+    else {
+        return Err(TypeError::Undefined(format!(
+            "type \"{words}\" does not exist"
+        )));
+    };
+    let typmodin = data::PG_PROC
+        .iter()
+        .find(|p| p.oid == *typmodin)
+        .map(|p| p.name);
+    Ok(ColumnType {
+        oid: *oid,
+        typmod: typmod(typname, typmodin, &modifiers)?,
+    })
+}
+
+/// gram.y's SQL-standard type spellings and the system type each names, with the modifiers it
+/// passes on: `float(p)` picks float4 or float8 by its bits (`Numeric`'s `opt_float`), `char` and
+/// `bit` without a length are length 1 (`CharacterWithoutLength`, `BitWithoutLength`). Any other
+/// name is a `GenericType`, looked up as written.
+fn standard_spelling<'a>(
+    words: &'a str,
+    modifiers: &[i64],
+) -> Result<(&'a str, Vec<i64>), TypeError> {
+    let length_one = || {
+        if modifiers.is_empty() {
+            vec![1]
+        } else {
+            modifiers.to_vec()
+        }
+    };
+    let system = match words {
+        "int" | "integer" => "int4",
+        "smallint" => "int2",
+        "bigint" => "int8",
+        "real" => "float4",
+        "double precision" => "float8",
+        "boolean" => "bool",
+        "decimal" | "dec" | "numeric" => "numeric",
+        "float" => {
+            return match modifiers {
+                [] => Ok(("float8", Vec::new())),
+                [1..=24] => Ok(("float4", Vec::new())),
+                [25..=53] => Ok(("float8", Vec::new())),
+                [bits] if *bits < 1 => Err(TypeError::Modifier(
+                    "precision for type float must be at least 1 bit".to_owned(),
+                )),
+                [_] => Err(TypeError::Modifier(
+                    "precision for type float must be less than 54 bits".to_owned(),
+                )),
+                _ => Err(TypeError::Modifier(
+                    "syntax error at or near \",\"".to_owned(),
+                )),
+            };
+        }
+        "character varying"
+        | "char varying"
+        | "varchar"
+        | "national character varying"
+        | "national char varying"
+        | "nchar varying" => "varchar",
+        "character" | "char" | "national character" | "national char" | "nchar" => {
+            return Ok(("bpchar", length_one()));
+        }
+        "bit varying" => "varbit",
+        "bit" => return Ok(("bit", length_one())),
+        "timestamp" | "timestamp without time zone" => "timestamp",
+        "timestamp with time zone" => "timestamptz",
+        "time" | "time without time zone" => "time",
+        "time with time zone" => "timetz",
+        generic if !generic.contains(' ') => generic,
+        _ => {
+            return Err(TypeError::Undefined(format!(
+                "type \"{words}\" does not exist"
+            )));
+        }
+    };
+    Ok((system, modifiers.to_vec()))
+}
+
+/// The typmod the type's `typmodin` makes of `modifiers`, as 19 computes it.
+fn typmod(typname: &str, typmodin: Option<&str>, modifiers: &[i64]) -> Result<i32, TypeError> {
+    // MaxAttrSize, (10 * 1024 * 1024) (src/include/access/htup_details.h:780).
+    const MAX_ATTR_SIZE: i64 = 10_485_760;
+    // VARBITMAXLEN, (INT_MAX - BITS_PER_BYTE + 1) (src/include/utils/varbit.h:83).
+    const VARBIT_MAX_LEN: i64 = 2_147_483_640;
+    // NUMERIC_MAX_PRECISION, NUMERIC_MIN_SCALE, NUMERIC_MAX_SCALE (src/include/utils/numeric.h:35-38).
+    const NUMERIC_MAX_PRECISION: i64 = 1000;
+    const NUMERIC_MIN_SCALE: i64 = -1000;
+    const NUMERIC_MAX_SCALE: i64 = 1000;
+    // MAX_TIME_PRECISION (src/include/utils/date.h:51), MAX_TIMESTAMP_PRECISION and
+    // MAX_INTERVAL_PRECISION (src/include/datatype/timestamp.h:92-93).
+    const MAX_PRECISION: i64 = 6;
+    // INTERVAL_FULL_RANGE << 16, (0x7FFF) (src/include/utils/timestamp.h:76).
+    const INTERVAL_FULL_RANGE_HIGH: i32 = 0x7FFF_0000;
+    let invalid = || TypeError::Modifier("invalid type modifier".to_owned());
+    let fits = |v: i64| i32::try_from(v).map_err(|_| invalid());
+    if modifiers.is_empty() {
+        return Ok(-1);
+    }
+    match (typmodin, modifiers) {
+        // anychar_typmodin (src/backend/utils/adt/varchar.c:50-58).
+        (Some("bpchartypmodin" | "varchartypmodin"), [n]) => {
+            if *n < 1 {
+                return Err(TypeError::Modifier(format!(
+                    "length for type {typname} must be at least 1"
+                )));
+            }
+            if *n > MAX_ATTR_SIZE {
+                return Err(TypeError::Modifier(format!(
+                    "length for type {typname} cannot exceed {MAX_ATTR_SIZE}"
+                )));
+            }
+            fits(*n)?.checked_add(VARHDRSZ).ok_or_else(invalid)
+        }
+        // bittypmodin and varbittypmodin (src/backend/utils/adt/varbit.c).
+        (Some("bittypmodin" | "varbittypmodin"), [n]) => {
+            if *n < 1 {
+                return Err(TypeError::Modifier(format!(
+                    "length for type {typname} must be at least 1"
+                )));
+            }
+            if *n > VARBIT_MAX_LEN {
+                return Err(TypeError::Modifier(format!(
+                    "length for type {typname} cannot exceed {VARBIT_MAX_LEN}"
+                )));
+            }
+            fits(*n)
+        }
+        // numerictypmodin and make_numeric_typmod, ((precision << 16) | (scale & 0x7ff)) + VARHDRSZ
+        // (src/backend/utils/adt/numeric.c:890-893).
+        (Some("numerictypmodin"), [precision] | [precision, _]) => {
+            let scale = modifiers.get(1).copied().unwrap_or(0);
+            if !(1..=NUMERIC_MAX_PRECISION).contains(precision) {
+                return Err(TypeError::Modifier(format!(
+                    "NUMERIC precision {precision} must be between 1 and {NUMERIC_MAX_PRECISION}"
+                )));
+            }
+            if !(NUMERIC_MIN_SCALE..=NUMERIC_MAX_SCALE).contains(&scale) {
+                return Err(TypeError::Modifier(format!(
+                    "NUMERIC scale {scale} must be between {NUMERIC_MIN_SCALE} and {NUMERIC_MAX_SCALE}"
+                )));
+            }
+            let (precision, scale) = (fits(*precision)?, fits(scale)?);
+            precision
+                .checked_mul(0x1_0000)
+                .map(|high| high | (scale & 0x7ff))
+                .and_then(|packed| packed.checked_add(VARHDRSZ))
+                .ok_or_else(invalid)
+        }
+        // anytime_typmod_check (src/backend/utils/adt/date.c:65-82) and anytimestamp_typmod_check
+        // (timestamp.c): a negative precision is refused, a larger one reduced to the maximum.
+        (
+            Some(
+                f @ ("timetypmodin"
+                | "timetztypmodin"
+                | "timestamptypmodin"
+                | "timestamptztypmodin"),
+            ),
+            [p],
+        ) => {
+            if *p < 0 {
+                let base = if f.starts_with("timestamp") {
+                    "TIMESTAMP"
+                } else {
+                    "TIME"
+                };
+                let tz = if f.contains("tz") {
+                    " WITH TIME ZONE"
+                } else {
+                    ""
+                };
+                return Err(TypeError::Modifier(format!(
+                    "{base}({p}){tz} precision must not be negative"
+                )));
+            }
+            fits((*p).min(MAX_PRECISION))
+        }
+        // intervaltypmodin with gram.y's full range: INTERVAL_TYPMOD(p, r), ((r & 0x7FFF) << 16) |
+        // (p & 0xFFFF) (src/include/utils/timestamp.h:80).
+        (Some("intervaltypmodin"), [p]) => {
+            if *p < 0 {
+                return Err(TypeError::Modifier(format!(
+                    "INTERVAL({p}) precision must not be negative"
+                )));
+            }
+            Ok(INTERVAL_FULL_RANGE_HIGH | fits((*p).min(MAX_PRECISION))?)
+        }
+        (Some(_), _) => Err(invalid()),
+        (None, _) => Err(TypeError::Modifier(format!(
+            "type modifier is not allowed for type \"{typname}\""
+        ))),
+    }
+}

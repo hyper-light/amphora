@@ -29,6 +29,47 @@ fn sql_rows(conn: &Arc<Connection>, sql: &str) -> Vec<Vec<Value>> {
     conn.prepare(sql).unwrap().run_collect_rows().unwrap()
 }
 
+/// T-QT.5.18, T-QT.6.19: the kept-side outer join uses morsels for a hash plan.
+/// Forcing merge must execute the planned merge under the same parallel setting.
+#[test]
+fn a_kept_side_merge_join_stays_serial() {
+    let conn = open(":memory:merge-chain");
+    let mut rng = ChaCha8Rng::seed_from_u64(518);
+    fill(&conn, &mut rng, "t", 64);
+    fill(&conn, &mut rng, "u", 48);
+    let sql = "SELECT count(*) FROM t LEFT JOIN u ON u.a = t.a";
+    conn.set_parallel_mode(ParallelMode::Off);
+    let serial = sql_rows(&conn, sql);
+    conn.set_parallel_mode(ParallelMode::On);
+    conn.set_parallel_outer_probe(crate::OuterJoinProbe::Kept);
+    for (method, morsels) in [
+        (crate::JoinMethods::HashJoinsOnly, true),
+        (crate::JoinMethods::MergeJoinsOnly, false),
+    ] {
+        conn.set_join_methods(method);
+        let plan = sql_rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+        assert!(
+            plan.iter()
+                .flatten()
+                .any(|v| v
+                    .to_string()
+                    .contains(if morsels { "HASH JOIN" } else { "MERGE JOIN" })),
+            "{plan:?}"
+        );
+        let bytecode = sql_rows(&conn, &format!("EXPLAIN {sql}"));
+        let hooked = bytecode.iter().any(|r| {
+            r.get(1)
+                .is_some_and(|v| v.to_string().contains("MorselAggregate"))
+        });
+        assert_eq!(
+            sql_rows(&conn, sql),
+            serial,
+            "{method:?}: the serial answer"
+        );
+        assert_eq!(hooked, morsels, "{method:?}");
+    }
+}
+
 fn literal(value: &Value) -> String {
     match value {
         Value::Null => "NULL".to_string(),
@@ -179,6 +220,7 @@ fn to_sql(
                 };
                 format!("{} {op} {}", COLUMNS[*column], literal(value))
             }
+            Predicate::Parameter { .. } => panic!("the fuzz shapes bind no parameter"),
         })
         .collect();
     let mut sql = format!("SELECT {} FROM {name}", select.join(", "));
@@ -2755,6 +2797,8 @@ fn t_qt_6_27_joins_through_seeks_run_on_morsels_as_the_serial_loop() {
 #[test]
 fn t_qt_6_29_short_rows_read_their_columns_defaults_as_the_serial_loop() {
     let conn = open(":memory:qt-6-29");
+    // The join cases exercise the hash morsel worker. A chosen merge join stays serial.
+    conn.set_join_methods(crate::JoinMethods::HashJoinsOnly);
     let mut rng = ChaCha8Rng::seed_from_u64(629);
     let pad = "x".repeat(64);
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, p TEXT)")
@@ -2893,6 +2937,7 @@ fn t_qt_6_29_short_rows_read_their_columns_defaults_as_the_serial_loop() {
 #[test]
 fn t_qt_6_30_avg_and_total_run_on_morsels_as_the_serial_loop() {
     let conn = open(":memory:qt-6-30");
+    conn.set_join_methods(crate::JoinMethods::HashJoinsOnly);
     let mut rng = ChaCha8Rng::seed_from_u64(630);
     let pad = "x".repeat(64);
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT, p TEXT)")
@@ -2978,6 +3023,20 @@ fn t_qt_6_30_avg_and_total_run_on_morsels_as_the_serial_loop() {
     conn.set_parallel_mode(ParallelMode::Off);
 }
 
+#[test]
+fn an_aggregate_filter_can_read_a_column_absent_from_its_input() {
+    let conn = open(":memory:qt-filter-column");
+    conn.execute("CREATE TABLE t(v INTEGER, keep INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 0), (4, 1), (8, NULL)")
+        .unwrap();
+    let sql = "SELECT sum(v) FILTER (WHERE keep > 0) FROM t";
+    for mode in [ParallelMode::Off, ParallelMode::On] {
+        conn.set_parallel_mode(mode);
+        assert_eq!(sql_rows(&conn, sql), vec![vec![Value::from_i64(4)]]);
+    }
+}
+
 /// T-QT.6.31 (lane qs6-17): aggregates with a FILTER run on morsels: a row that fails an
 /// aggregate's FILTER gives its input NULL in the copied body, which every aggregate the pipeline
 /// folds skips. COUNT(*), COUNT, SUM, MIN, MAX, AVG and TOTAL with a FILTER, beside unfiltered
@@ -2986,6 +3045,7 @@ fn t_qt_6_30_avg_and_total_run_on_morsels_as_the_serial_loop() {
 #[test]
 fn t_qt_6_31_filtered_aggregates_run_on_morsels_as_the_serial_loop() {
     let conn = open(":memory:qt-6-31");
+    conn.set_join_methods(crate::JoinMethods::HashJoinsOnly);
     let mut rng = ChaCha8Rng::seed_from_u64(631);
     let pad = "x".repeat(64);
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT, p TEXT)")
@@ -3065,6 +3125,7 @@ fn t_qt_6_31_filtered_aggregates_run_on_morsels_as_the_serial_loop() {
 #[test]
 fn t_qt_6_32_having_over_aggregates_runs_on_morsels_as_the_serial_loop() {
     let conn = open(":memory:qt-6-32");
+    conn.set_join_methods(crate::JoinMethods::HashJoinsOnly);
     let mut rng = ChaCha8Rng::seed_from_u64(632);
     let pad = "x".repeat(64);
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT, p TEXT)")
