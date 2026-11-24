@@ -14289,6 +14289,9 @@ mod tests {
         // Learner 5 never runs: every record to it is lost.
         pump.lost.push(5);
         let leader = tracked_group(&mut driven, &mut pump, &clients);
+        // Neither entry commits before both are in the leader's log: the raise's session runs on
+        // the session worker, so the change could otherwise commit and apply before it is back.
+        pump.hold_durable();
         let until = driven.until();
         let added = change(&clients[leader], until, MemberChange::AddLearner(5));
         let operation = Operation::Call(
@@ -14356,6 +14359,7 @@ mod tests {
             .unwrap()
             .index;
         let raised_first = raise_index < change_index;
+        pump.let_durable();
         let led = driven.hand_off(&mut pump, &clients[..3], leader, (leader + 1) % 3);
         let first = driven.answer(&mut pump, &raised);
         let _ = driven.answer(&mut pump, &added);
