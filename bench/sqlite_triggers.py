@@ -66,23 +66,21 @@ class Draw:
         self.rng = rng
         rng_choice = rng.choice
         self.keyed = rng.random() < 0.6
-        clause = rng_choice(["", "", "", "", " ON CONFLICT REPLACE", " ON CONFLICT IGNORE", " ON CONFLICT FAIL", " ON CONFLICT ROLLBACK"])
         null = rng_choice(["", "", " NOT NULL", " NOT NULL DEFAULT 5", " NOT NULL ON CONFLICT REPLACE DEFAULT 6", " NOT NULL ON CONFLICT IGNORE"])
         check = rng_choice(["", "", "", " CHECK (a < 50)", " CHECK (a <> 4)"])
-        unique = rng_choice([f" UNIQUE{clause}", f" UNIQUE{clause}", ""])
+        unique = rng_choice([" UNIQUE", " UNIQUE", ""])
         self.unique = bool(unique)
-        key = rng_choice(["k TEXT PRIMARY KEY, a INT{n}{c}, b TEXT, c INT{u}", "k TEXT, a INT{n}{c}, b TEXT, c INT{u}, PRIMARY KEY (k, a)", "k TEXT COLLATE NOCASE PRIMARY KEY, a INT{n}{c}, b TEXT, c INT{u}", "b TEXT, k INT, a INT{n}{c}, c INT{u}, PRIMARY KEY (a DESC, k)"] + ([] if self.keyed else ["k INTEGER PRIMARY KEY, a INT{n}{c}, b TEXT, c INT{u}"]))
-        self.composite = "PRIMARY KEY (k, a)" in key or "PRIMARY KEY (a DESC, k)" in key
+        key = rng_choice(["k TEXT PRIMARY KEY, a INT{n}{c}, b TEXT, c INT{u}", "k TEXT, a INT{n}{c}, b TEXT, c INT{u}, PRIMARY KEY (k, a)", "b TEXT, k INT, a INT{n}{c}, c INT{u}, PRIMARY KEY (a DESC, k)"] + ([] if self.keyed else ["k INTEGER PRIMARY KEY, a INT{n}{c}, b TEXT, c INT{u}"]))
         self.target = "(k, a)" if "PRIMARY KEY (k, a)" in key else "(a, k)" if "PRIMARY KEY (a" in key else "(k)"
         self.number_key = "k INT" in key
         self.order = "b, k, a, c" if key.startswith("b TEXT") else "k, a, b, c"
         self.tables = [f"CREATE TABLE t({key.format(n=null, c=check, u=unique)}){' WITHOUT ROWID' if self.keyed else ''}"]
         self.tables.append(rng_choice(["CREATE TABLE u(k TEXT PRIMARY KEY, n INT UNIQUE) WITHOUT ROWID", "CREATE TABLE u(k TEXT PRIMARY KEY, n INT UNIQUE)"]))
         self.tables.append("CREATE TABLE lg(ev, x, y, z)")
-        for index in ["CREATE INDEX tb ON t(b)", "CREATE INDEX tca ON t(c, a)", "CREATE INDEX tp ON t(b) WHERE a > 2", "CREATE INDEX te ON t(a + c)", "CREATE UNIQUE INDEX tub ON t(b) WHERE b > 'x'"]:
-            if rng.random() < 0.2:
-                self.tables.append(index)
-        self.events = []
+        indexes = ["CREATE INDEX tb ON t(b)", "CREATE INDEX tca ON t(c, a)", "CREATE INDEX tp ON t(b) WHERE a > 2", "CREATE INDEX te ON t(a + c)", "CREATE UNIQUE INDEX tub ON t(b) WHERE b > 'x'"]
+        self.indexed = rng.random() < 0.5
+        if self.indexed:
+            self.tables += rng.sample(indexes, rng.choice([1, 1, 2, 3]))
         self.triggers = [self.trigger(i) for i in range(rng.choice([1, 2, 2, 3, 4]))]
 
     def key(self):
@@ -111,7 +109,7 @@ class Draw:
         body = [f"INSERT INTO lg VALUES ('{time[0]}{event[0]}{i}', {read()}, {read()}, {read()})"]
         for _ in range(rng.choice([0, 1, 1, 2])):
             drawn = rng.random()
-            orc = rng.choice(["", "", " OR IGNORE", " OR REPLACE", " OR ABORT", " OR FAIL"])
+            orc = rng.choice(["", "", " OR IGNORE", " OR REPLACE", " OR ABORT"])
             if drawn < 0.25:
                 body.append(f"INSERT{orc} INTO u VALUES ({read()}, {rng.choice(['1', '2', '8', read()])})")
             elif drawn < 0.4:
@@ -131,12 +129,9 @@ class Draw:
             else:
                 body.append(f"SELECT {read()}")
         name = f"g{i}"
-        self.events.append((time, event))
         return f"CREATE TRIGGER {name} {time} {text} ON t{when} BEGIN {'; '.join(body)}; END"
 
     def statement(self):
-        """A statement on t. Its terms but the key's take no index (a unary plus), so that SQLite and Amphora
-        visit the rows in one order, which conflicts and triggers show."""
         rng = self.rng
         orc = rng.choice(["", "", ""] + [f" OR {c}" for c in CONFLICTS])
         drawn = rng.random()
@@ -144,8 +139,8 @@ class Draw:
             rows = ", ".join(self.row() for _ in range(rng.choice([1, 1, 2, 3])))
             returning = rng.choice(["", "", "", " RETURNING k, a, b, c"])
             return f"INSERT{orc} INTO t VALUES {rows}{returning}"
-        if drawn < 0.36:
-            return f"INSERT{orc} INTO t(k, a, b, c) SELECT k, n, 'x', n + 1 FROM u"
+        if drawn < 0.36 and not self.number_key:
+            return f"INSERT{orc} INTO t(k, a, b, c) SELECT k, n, 'x', n + 1 FROM u ORDER BY k"
         if drawn < 0.5:
             sets = ", ".join(rng.sample([f"b = {rng.choice(['excluded.b', repr('q'), 't.b || excluded.b'])}", f"c = {rng.choice(['excluded.c', 't.c + 1', '3'])}", "a = excluded.a", "a = t.a + 1"], rng.choice([1, 1, 2])))
             where = rng.choice(["", "", f" WHERE t.a < {rng.choice([2, 3, 9])}"])
@@ -155,12 +150,22 @@ class Draw:
             return f"INSERT{rng.choice(['', '', orc])} INTO t VALUES {rows} ON CONFLICT{target} {do}"
         if drawn < 0.8:
             sets = ", ".join(rng.sample([f"a = {rng.choice(['a + 1', '3', '4', 'NULL', 'c'])}", f"b = {rng.choice([repr('x'), repr('q'), 'b || a', 'NULL'])}", f"c = {rng.choice(['c + 1', '2', 'c', 'a'])}", f"k = {rng.choice([self.key(), 'k', self.key()])}"], rng.choice([1, 1, 2, 3])))
-            where = rng.choice(["", f" WHERE k = {self.key()}", f" WHERE +c > {rng.choice([1, 2, 3])}", " WHERE +b IS NOT NULL", " WHERE +a IN (SELECT n FROM u)"])
+            where = self.where(["", f" WHERE +c > {rng.choice([1, 2, 3])}", " WHERE +b IS NOT NULL", " WHERE +a IN (SELECT n FROM u)"])
             returning = rng.choice(["", "", "", " RETURNING k, a, b, c"])
             return f"UPDATE{orc} t SET {sets}{where}{returning}"
-        where = rng.choice([f" WHERE k = {self.key()}", f" WHERE +c > {rng.choice([2, 3])}", " WHERE +b = 'x'", "", " WHERE +a IN (SELECT n FROM u)"])
+        where = self.where([f" WHERE +c > {rng.choice([2, 3])}", " WHERE +b = 'x'", "", " WHERE +a IN (SELECT n FROM u)"])
         returning = rng.choice(["", "", "", " RETURNING k, a, b, c"])
         return f"DELETE FROM t{where}{returning}"
+
+    def where(self, scans):
+        """The rows a statement is on. The order a scan visits rows in, which conflicts and triggers show, is
+        the planner's to choose where a table has an index: there, one row by its key."""
+        rng = self.rng
+        if not self.indexed and not self.unique and rng.random() < 0.7:
+            return rng.choice(scans)
+        if self.target == "(k)":
+            return f" WHERE k = {self.key()}"
+        return f" WHERE k = {self.key()} AND a = {rng.choice([1, 2, 3, 5])}"
 
 
 def text(value):

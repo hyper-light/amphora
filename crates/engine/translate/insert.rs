@@ -607,9 +607,9 @@ pub fn translate_insert(
             .collect();
         // Determine the conflict resolution to propagate to triggers:
         // 1. If there's already an override from UPSERT DO UPDATE context, use it (forces ABORT)
-        // 2. If the INSERT uses an explicit ON CONFLICT clause (not default ABORT),
-        //    propagate it to trigger statements (per SQLite semantics, the outer
-        //    statement's conflict resolution overrides the trigger body's)
+        // 2. If the INSERT has an OR clause of its own, ABORT among them, propagate it
+        //    to trigger statements (per SQLite semantics, the outer statement's
+        //    conflict resolution overrides the trigger body's)
         // 3. Otherwise, don't override (use statement's own conflict resolution)
         let trigger_ctx = if let Some(override_conflict) = program.trigger_conflict_override {
             TriggerContext::new_with_override_conflict(
@@ -618,7 +618,7 @@ pub fn translate_insert(
                 None, // No OLD for INSERT
                 override_conflict,
             )
-        } else if !matches!(ctx.on_conflict, ResolveType::Abort) {
+        } else if program.flags.has_statement_conflict() {
             TriggerContext::new_with_override_conflict(
                 btree_table.clone(),
                 Some(new_registers),
@@ -1050,7 +1050,7 @@ pub fn translate_insert(
                 None,
                 override_conflict,
             )
-        } else if !matches!(ctx.on_conflict, ResolveType::Abort) {
+        } else if program.flags.has_statement_conflict() {
             TriggerContext::new_after_with_override_conflict(
                 btree_table.clone(),
                 Some(new_registers_after),

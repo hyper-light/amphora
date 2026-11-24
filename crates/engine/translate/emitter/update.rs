@@ -611,10 +611,10 @@ fn emit_notnull_constraint_check(
 /// UPDATE. Carries the NEW and OLD register snapshots the trigger body will
 /// read, and propagates a conflict-resolution override when one is in effect:
 /// a `trigger_conflict_override` pushed by an enclosing UPSERT `DO UPDATE`
-/// wins, otherwise the outer UPDATE's explicit `OR <conflict>` overrides the
-/// trigger's own conflict resolution (except for the default `ABORT`, which
-/// is left unset so the trigger's own resolution applies). `after` selects
-/// between the BEFORE and AFTER constructors.
+/// wins, otherwise the outer UPDATE's explicit `OR <conflict>`, ABORT among
+/// them, overrides the trigger's own conflict resolution, and an UPDATE
+/// without one leaves the trigger's own. `after` selects between the BEFORE
+/// and AFTER constructors.
 pub(crate) fn update_trigger_context(
     program: &ProgramBuilder,
     btree_table: &Arc<BTreeTable>,
@@ -625,7 +625,7 @@ pub(crate) fn update_trigger_context(
 ) -> TriggerContext {
     let override_conflict = program
         .trigger_conflict_override
-        .or_else(|| (!matches!(or_conflict, ResolveType::Abort)).then_some(or_conflict));
+        .or_else(|| program.flags.has_statement_conflict().then_some(or_conflict));
 
     let after = matches!(timing, TriggerTime::After);
     match (after, override_conflict) {
