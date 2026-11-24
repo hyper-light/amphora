@@ -164,19 +164,22 @@ fn opts() -> anyhow::Result<Opts> {
     Ok(o)
 }
 
-/// `--pin-weights <file>`: a JSON object of `LearnedWeights`' eight fields, each a number;
+fn pinned_weights(path: &Path) -> anyhow::Result<amphora_engine::LearnedWeights> {
+    let text = std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("--pin-weights {}: {e}", path.display()))?;
+    weights_json(&text).map_err(|e| anyhow::anyhow!("--pin-weights {}: {e}", path.display()))
+}
+
+/// `--pin-weights`' file: a JSON object of `LearnedWeights`' eight fields, each a number;
 /// `row_in_pages` and `page_miss` may be null, as a process that has read no page from its file
 /// has them. The trace's "the weights this plan is made on" prints the same fields.
-fn pinned_weights(path: &Path) -> anyhow::Result<amphora_engine::LearnedWeights> {
+fn weights_json(text: &str) -> anyhow::Result<amphora_engine::LearnedWeights> {
     const FIELDS: [&str; 8] = ["row_in_pages", "seek", "hash_build", "hash_probe", "sort", "bloom_probe", "where_step", "page_miss"];
-    let at = |e: &dyn std::fmt::Display| anyhow::anyhow!("--pin-weights {}: {e}", path.display());
-    let text = std::fs::read_to_string(path).map_err(|e| at(&e))?;
-    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| at(&e))?;
-    let fields = v.as_object().ok_or_else(|| at(&"not a JSON object"))?;
+    let v: serde_json::Value = serde_json::from_str(text)?;
+    let fields = v.as_object().ok_or_else(|| anyhow::anyhow!("not a JSON object"))?;
     if let Some(other) = fields.keys().find(|k| !FIELDS.contains(&k.as_str())) {
-        return Err(at(&format!("{other} is not one of {}", FIELDS.join(", "))));
+        anyhow::bail!("{other} is not one of {}", FIELDS.join(", "));
     }
-    let number = |k: &str| fields.get(k).and_then(serde_json::Value::as_f64).filter(|x| x.is_finite()).ok_or_else(|| at(&format!("{k} is a finite number")));
+    let number = |k: &str| fields.get(k).and_then(serde_json::Value::as_f64).filter(|x| x.is_finite()).ok_or_else(|| anyhow::anyhow!("{k} is a finite number"));
     let maybe = |k: &str| match fields.get(k) {
         Some(serde_json::Value::Null) => Ok(None),
         _ => number(k).map(Some),
@@ -719,5 +722,23 @@ mod tests {
         let meminfo = "MemTotal:       65536000 kB\nSwapCached:          12 kB\nCached:          4096 kB\nActive:  1 kB\n";
         assert_eq!(cached_kib(meminfo), Some(4096));
         assert_eq!(cached_kib("MemTotal: 1 kB\nSwapCached: 12 kB\n"), None);
+    }
+
+    /// Do: read `--pin-weights`' JSON (lane T17): T16's r1894 A-1 run 2 set, a set with
+    /// `row_in_pages` and `page_miss` null, one with a field misspelt, one without `seek`.
+    /// Expect: the eight fields as written, None for the nulls, and a refusal naming the field.
+    #[test]
+    fn pinned_weights_are_the_files_fields() -> anyhow::Result<()> {
+        let w = weights_json(r#"{"row_in_pages": 0.000224, "seek": 16.88, "hash_build": 657.9, "hash_probe": 161.0, "sort": 0.717, "bloom_probe": 6.37, "where_step": 11.05, "page_miss": 0.294}"#)?;
+        let want = amphora_engine::LearnedWeights { row_in_pages: Some(0.000224), seek: 16.88, hash_build: 657.9, hash_probe: 161.0, sort: 0.717, bloom_probe: 6.37, where_step: 11.05, page_miss: Some(0.294) };
+        assert_eq!(w, want);
+        let w = weights_json(r#"{"row_in_pages": null, "seek": 1, "hash_build": 2, "hash_probe": 3, "sort": 4, "bloom_probe": 5, "where_step": 6, "page_miss": null}"#)?;
+        assert_eq!((w.row_in_pages, w.seek, w.page_miss), (None, 1.0, None));
+        let refused = |text: &str| weights_json(text).err().map(|e| e.to_string()).unwrap_or_default();
+        let misspelt = refused(r#"{"row_in_pages": null, "seeks": 1, "hash_build": 2, "hash_probe": 3, "sort": 4, "bloom_probe": 5, "where_step": 6, "page_miss": null}"#);
+        assert!(misspelt.starts_with("seeks is not one of"), "{misspelt}");
+        let missing = refused(r#"{"row_in_pages": null, "hash_build": 2, "hash_probe": 3, "sort": 4, "bloom_probe": 5, "where_step": 6, "page_miss": null}"#);
+        assert_eq!(missing, "seek is a finite number");
+        Ok(())
     }
 }
