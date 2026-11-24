@@ -17492,17 +17492,16 @@ mod tests {
         pump.finish();
     }
 
-    /// CP-T1.13, AC-T1.8.D1 (replication.md, "Decision (lane P6)" and "A replica's database log
-    /// bounded by what it measures"; lane P16): a restart due and ready as a caller's session is
-    /// handed to the session worker runs before the write lock is lent, as it does after a
-    /// session run inline, and no read waits on it once the write is answered. Do: a voter and
-    /// its learner; 1 written and the logs settled; the voter's log wholly copied, its restarts
-    /// forgotten (a restart due by its share), its last pass caught up and no flush out; then a
-    /// call that reads the voter's restart count as it runs and writes 2, and a local read on the
-    /// voter once the call is answered. Expect: the count the call read past the one before it;
-    /// the read served, 1 and 2.
+    /// CP-T1.13 (replication.md, "Decision (lane P6)" and "A replica's database log bounded by
+    /// what it measures"; lanes P15 to P17): a read made once a write's answer is out is served
+    /// when the write's session ran on the session worker. Reads held for a restart that is no
+    /// longer due (the engine starts a wholly copied log again by itself at its next write) begin
+    /// again as the session is lent the write lock, since no restart runs while it is out. Do: a
+    /// voter and its learner; 1 written and the logs settled; the voter's reads held for a
+    /// restart, none due; then a call that writes 2, and a local read on the voter once it is
+    /// answered. Expect: the call answered; the read served, 1 and 2.
     #[test]
-    fn t_t1_13_a_restart_due_and_ready_runs_before_a_session_is_lent() {
+    fn t_t1_13_a_read_after_a_writes_answer_is_served_across_a_session_hand_off() {
         own_account();
         let dir = tempfile::tempdir().unwrap();
         let mut driven = Driven::new();
@@ -17511,46 +17510,12 @@ mod tests {
         let voter = &clients[0];
         write(&mut driven, &mut pump, voter, 1);
         settle_log(&mut driven, &mut pump, &clients);
-        driven.flushed(&mut pump, 0);
-        for _ in 0..ROUNDS {
-            if matches!(
-                &driven.owner(0).flushing,
-                Flushing::Thread { out: false, .. }
-            ) {
-                break;
-            }
-            driven.round(&mut pump);
-        }
-        let whole = driven.owner(0).replica.machine().reader()()
-            .unwrap()
-            .checkpoint()
-            .unwrap();
-        assert_eq!(whole.left, 0, "{whole:?}");
-        let handle = voter.handle();
-        let restarts = handle.counters().database_log_restarts;
-        let owner = driven.owner_mut(0);
-        owner.spacing = log_bound::Spacing::default();
-        owner.spacing.stepped(1, Duration::ZERO, 0).unwrap();
-        let Flushing::Thread { out, pass, .. } = &mut owner.flushing else {
-            panic!("the voter's log flushes on its own thread");
-        };
-        assert!(!*out, "a flush is out on the voter");
-        pass.caught_up = true;
-        pass.busy = false;
-        let answer = submit(voter, driven.until(), move |db| {
-            let restarted = handle.counters().database_log_restarts;
+        driven.owner(0).control.local.hold_reads().unwrap();
+        let answer = submit(voter, driven.until(), |db| {
             db.exec("INSERT INTO member_items VALUES(2)")?;
-            Ok(restarted.to_le_bytes().to_vec())
+            Ok(Vec::new())
         });
-        let ran: [u8; 8] = driven
-            .settle(&mut pump, &answer)
-            .unwrap()
-            .try_into()
-            .unwrap();
-        assert!(
-            u64::from_le_bytes(ran) > restarts,
-            "the session ran lent the write lock with a restart due and ready not run"
-        );
+        assert_eq!(driven.settle(&mut pump, &answer), Ok(Vec::new()));
         assert_eq!(
             voter.read_local(Instant::now() + HANG_READ, values),
             Ok(vec![1, 2])
