@@ -16,7 +16,8 @@ amphora = { path = "../crates/amphora" }
 amphora-api = { path = "../crates/api" }
 # What the session's validate does to a statement on every execute (`--sql-api --shapes parse`).
 amphora-engine-parser = { path = "../crates/engine-parser" }
-amphora-engine = { path = "../crates/engine", default-features = false, features = ["fs", "json", "pure-rust-crypto", "checksum"] }
+# `bench`: `Connection::pin_cost_weights` for `--planner --pin-weights` (lane T17).
+amphora-engine = { path = "../crates/engine", default-features = false, features = ["fs", "json", "pure-rust-crypto", "checksum", "bench"] }
 # Vanilla Turso: upstream at the revision Amphora's engine was taken from, none of Amphora's changes.
 turso_core = { git = "https://github.com/tursodatabase/turso", rev = "3e09a82750d8290ef96e3830896e7205b7c0b9e6", default-features = false, features = ["fs", "json", "pure-rust-crypto"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
@@ -39,7 +40,7 @@ serde_json = { version = "1", features = ["float_roundtrip"] }
 # perf), written as a flamegraph and the hottest frames.
 # The versioned storage's log through io_uring (`--vlog --uring`): Linux's.
 [target.'cfg(target_os = "linux")'.dependencies]
-amphora-engine = { path = "../crates/engine", default-features = false, features = ["fs", "json", "pure-rust-crypto", "checksum", "io_uring"] }
+amphora-engine = { path = "../crates/engine", default-features = false, features = ["fs", "json", "pure-rust-crypto", "checksum", "bench", "io_uring"] }
 
 [target.'cfg(unix)'.dependencies]
 pprof = { version = "0.14", default-features = false, features = ["flamegraph"] }

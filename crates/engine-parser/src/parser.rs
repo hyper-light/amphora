@@ -3593,6 +3593,10 @@ impl<'a> Parser<'a> {
                             options.strict_text = Some(from_bytes(tok.as_bytes()));
                             Ok(())
                         }
+                        b"COLUMNAR" => {
+                            options.columnar_text = Some(from_bytes(tok.as_bytes()));
+                            Ok(())
+                        }
                         _ => Err(Error::Custom(format!(
                             "unknown table option: {}",
                             from_bytes(tok.as_bytes())
@@ -11978,7 +11982,7 @@ mod tests {
                                 }
                             },
                         ],
-                        options: TableOptions { without_rowid_text: None, strict_text: Some("STRICT".to_string()) },
+                        options: TableOptions { without_rowid_text: None, strict_text: Some("STRICT".to_string()), columnar_text: None },
                     },
                 })],
             ),
@@ -12037,7 +12041,7 @@ mod tests {
                                 }
                             },
                         ],
-                        options: TableOptions { without_rowid_text: Some("WITHOUT ROWID".to_string()), strict_text: None },
+                        options: TableOptions { without_rowid_text: Some("WITHOUT ROWID".to_string()), strict_text: None, columnar_text: None },
                     },
                 })],
             ),

@@ -1675,6 +1675,9 @@ pub struct TableOptions {
     pub without_rowid_text: Option<String>,
     /// Original text for STRICT option (e.g., "STRICT", "strict", "StRiCt")
     pub strict_text: Option<String>,
+    /// Amphora: original text for the COLUMNAR option, the table's declared column copy
+    /// (`docs/design/columnar.md`, decision 1, item 1)
+    pub columnar_text: Option<String>,
 }
 
 impl TableOptions {
@@ -1683,6 +1686,7 @@ impl TableOptions {
         Self {
             without_rowid_text: None,
             strict_text: None,
+            columnar_text: None,
         }
     }
 
@@ -1694,6 +1698,11 @@ impl TableOptions {
     /// Check if table has STRICT option
     pub fn contains_strict(&self) -> bool {
         self.strict_text.is_some()
+    }
+
+    /// Amphora: whether the table declares a column copy (COLUMNAR)
+    pub fn contains_columnar(&self) -> bool {
+        self.columnar_text.is_some()
     }
 
     /// For backward compatibility with bitflags interface

@@ -189,6 +189,13 @@ impl Amphora {
         Ok(a)
     }
 
+    /// Lane T17 (`--pin-weights`): both connections plan every statement on `weights` in place of
+    /// the learned ones, the page-miss share included (`Connection::pin_cost_weights`).
+    pub fn pin_cost_weights(&self, weights: amphora_engine::LearnedWeights) {
+        self.conn.pin_cost_weights(Some(weights));
+        self.counted.pin_cost_weights(Some(weights));
+    }
+
     fn exec_on(&mut self, conn: &Arc<amphora_engine::Connection>, sql: &str) -> anyhow::Result<()> {
         for one in sql.split(';').map(str::trim).filter(|s| !s.is_empty()) {
             let mut stmt = conn.prepare(one).map_err(|e| anyhow::anyhow!("{e} (in: {one})"))?;

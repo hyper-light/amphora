@@ -1316,7 +1316,7 @@ measure and each record's `waits` says so (lane scaleout-harness-11, AC-SH.11).
   ranges, with writes between scans, serially and on the morsel executor's workers (`Plan` is a
   `vdbe/morsel.rs` pipeline, granules its unit) (T-CS.4.1 to T-CS.4.3). Open: the planner's use
   (step 5), and the benches against CedarDB and ClickHouse (AC-CS.4.1, AC-CS.4.2).
-  Step 5's choice is built, behind `AMPHORA_COLUMN_PATH=on` (CS.5, lane g11s5): the planner prices
+  Step 5's choice is built, for the tables declared `COLUMNAR` (CS.5, lane g11s5; lane R8): the planner prices
   "scan the column copy" from the copy's measured nanoseconds per row at its block size plus each
   queued key read from the rows and merged (`translate/optimizer/column_path.rs`), against the
   row path's learned rates for a row's visit and a seek; a copy that can't answer the snapshot

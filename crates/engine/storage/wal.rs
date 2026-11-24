@@ -1457,7 +1457,14 @@ impl InProcessWalCoordination {
 
     /// Unlock `slot` on `segment`: a read's guard is released on the segment it was locked on.
     fn unlock_segment_read_mark(&self, segment: SegmentId, slot: usize) {
-        if let Some(read_lock) = self.log.segment(segment).read().runtime.read_locks.get(slot) {
+        if let Some(read_lock) = self
+            .log
+            .segment(segment)
+            .read()
+            .runtime
+            .read_locks
+            .get(slot)
+        {
             read_lock.unlock();
         }
         self.log.released.notify();
@@ -1862,7 +1869,9 @@ impl WalCoordination for InProcessWalCoordination {
         );
         let shared = self.log.segment(segment).read();
         let mut max_safe_frame = max_frame;
-        for (read_lock_idx, read_lock) in shared.runtime.read_locks.iter().enumerate().take(5).skip(1) {
+        for (read_lock_idx, read_lock) in
+            shared.runtime.read_locks.iter().enumerate().take(5).skip(1)
+        {
             let this_mark = read_lock.get_value();
             if this_mark < max_safe_frame as u32 {
                 let busy = !read_lock.write();
@@ -2948,9 +2957,13 @@ impl WalCoordination for ShmWalCoordination {
         // closing segment is answered from this process's scan of its file, complete because no
         // process appends to it (decision 45).
         if self.authority.frame_index_overflowed() || segment != self.current_segment() {
-            return self
-                .fallback
-                .find_frame(segment, page_id, min_frame, max_frame, frame_watermark);
+            return self.fallback.find_frame(
+                segment,
+                page_id,
+                min_frame,
+                max_frame,
+                frame_watermark,
+            );
         }
         self.authority
             .find_frame(page_id, min_frame, max_frame, frame_watermark)
@@ -2976,7 +2989,8 @@ impl WalCoordination for ShmWalCoordination {
         if segment == self.current_segment() {
             return self.iter_latest_frames(min_frame, max_frame);
         }
-        self.fallback.iter_segment_frames(segment, min_frame, max_frame)
+        self.fallback
+            .iter_segment_frames(segment, min_frame, max_frame)
     }
 
     fn segments(&self) -> Segments {
@@ -5912,9 +5926,9 @@ impl Wal for WalFile {
             min_frame,
             max_frame
         );
-        let frame = self
-            .coordination
-            .find_frame(segment, page_id, min_frame, max_frame, frame_watermark);
+        let frame =
+            self.coordination
+                .find_frame(segment, page_id, min_frame, max_frame, frame_watermark);
         if let Some(frame) = frame {
             tracing::debug!(
                 "find_frame(page_id={}, frame_watermark={:?}): found frame={}",
@@ -6463,7 +6477,8 @@ impl Wal for WalFile {
                 "current_max_frame": snapshot.max_frame
             }
         );
-        self.coordination.publish_segment_backfill(segment, max_frame);
+        self.coordination
+            .publish_segment_backfill(segment, max_frame);
         if closing.is_some() && max_frame == snapshot.max_frame {
             self.coordination.closing_copied();
         }
@@ -7544,7 +7559,9 @@ impl WalFile {
                         // only after the file's sync), or it holds none.
                         self.coordination.closing_copied();
                     }
-                    if matches!(lock_source, CheckpointLockSource::HeldByCaller) && closing.is_none() {
+                    if matches!(lock_source, CheckpointLockSource::HeldByCaller)
+                        && closing.is_none()
+                    {
                         turso_assert!(
                             needs_backfill,
                             "held checkpoint-lock path requires WAL frames to backfill",
@@ -7868,7 +7885,8 @@ impl WalFile {
                     // This ensures data durability: if a crash occurs after WAL truncation
                     // but before DB sync, the data would be lost. By truncating the WAL
                     // only after the DB is safely synced, we guarantee recoverability.
-                    if mode.should_restart_log() && self.ongoing_checkpoint.read().closing.is_none() {
+                    if mode.should_restart_log() && self.ongoing_checkpoint.read().closing.is_none()
+                    {
                         Self::unlock_after_restart(&self.coordination, None);
                     }
                     let mut checkpoint_result = {
@@ -10792,15 +10810,28 @@ pub mod test {
                             Lookup::Ask => {}
                             Lookup::Absent => {
                                 answered += 1;
-                                assert_eq!(locked, None, "seed {seed} page {page} {min_frame}..={max_frame}");
+                                assert_eq!(
+                                    locked, None,
+                                    "seed {seed} page {page} {min_frame}..={max_frame}"
+                                );
                             }
                             Lookup::Frame(frame) => {
                                 answered += 1;
-                                assert_eq!(locked, Some(frame), "seed {seed} page {page} {min_frame}..={max_frame}");
+                                assert_eq!(
+                                    locked,
+                                    Some(frame),
+                                    "seed {seed} page {page} {min_frame}..={max_frame}"
+                                );
                             }
                         }
                         assert_eq!(
-                            coordination.find_frame(SegmentId::First, page, min_frame, max_frame, None),
+                            coordination.find_frame(
+                                SegmentId::First,
+                                page,
+                                min_frame,
+                                max_frame,
+                                None
+                            ),
                             locked,
                             "seed {seed} page {page} {min_frame}..={max_frame}"
                         );
@@ -10810,10 +10841,7 @@ pub mod test {
         }
         // Non-vacuity: the way answers most reads itself (the filter alone answers the pages
         // the log doesn't hold, 8 of every 48 at least).
-        assert!(
-            answered * 6 > reads,
-            "answered {answered} of {reads}"
-        );
+        assert!(answered * 6 > reads, "answered {answered} of {reads}");
     }
 
     /// AUDIT 2.1 (perf-B4): a page past every page the log holds, past the bitmap's words, is
@@ -10845,10 +10873,7 @@ pub mod test {
             );
         }
         let held = read_index.find(100, 1, 100, &index);
-        assert!(
-            matches!(held, Lookup::Frame(100) | Lookup::Ask),
-            "{held:?}"
-        );
+        assert!(matches!(held, Lookup::Frame(100) | Lookup::Ask), "{held:?}");
         assert_eq!(
             coordination.find_frame(SegmentId::First, 100, 1, 100, None),
             Some(100)
@@ -10881,8 +10906,13 @@ pub mod test {
                         let max_frame = rng.next_u64() % (upto + 1);
                         let min_frame = 1 + rng.next_u64() % (max_frame + 1);
                         for page in 0..48u64 {
-                            let fast =
-                                coordination.find_frame(SegmentId::First, page, min_frame, max_frame, None);
+                            let fast = coordination.find_frame(
+                                SegmentId::First,
+                                page,
+                                min_frame,
+                                max_frame,
+                                None,
+                            );
                             let locked = coordination.find_frame_locked(
                                 coordination.log.current_id(),
                                 page,
@@ -10890,10 +10920,7 @@ pub mod test {
                                 max_frame,
                                 None,
                             );
-                            assert_eq!(
-                                fast, locked,
-                                "page {page} {min_frame}..={max_frame}"
-                            );
+                            assert_eq!(fast, locked, "page {page} {min_frame}..={max_frame}");
                         }
                     }
                 });
@@ -10994,7 +11021,8 @@ pub mod test {
                         let mut rng = ChaCha8Rng::seed_from_u64(reader as u64);
                         for _ in 0..lookups {
                             let page = 1 + rng.next_u64() % (2 * pages);
-                            let found = coordination.find_frame(SegmentId::First, page, 1, max_frame, None);
+                            let found =
+                                coordination.find_frame(SegmentId::First, page, 1, max_frame, None);
                             let expected = (page <= pages).then_some(page + pages);
                             assert_eq!(found, expected, "page {page}");
                         }
@@ -11035,8 +11063,14 @@ pub mod test {
 
         assert_eq!(coordination.load_snapshot(), snapshot);
         assert_eq!(coordination.checkpoint_epoch(), 5);
-        assert_eq!(coordination.find_frame(SegmentId::First, 1, 4, 9, None), Some(8));
-        assert_eq!(coordination.find_frame(SegmentId::First, 2, 4, 9, Some(5)), Some(2));
+        assert_eq!(
+            coordination.find_frame(SegmentId::First, 1, 4, 9, None),
+            Some(8)
+        );
+        assert_eq!(
+            coordination.find_frame(SegmentId::First, 2, 4, 9, Some(5)),
+            Some(2)
+        );
         assert_eq!(coordination.iter_latest_frames(4, 9), vec![(1, 8), (2, 6)]);
 
         coordination.publish_commit(WalCommitState {
@@ -11117,12 +11151,18 @@ pub mod test {
         coordination.cache_frame(9, 4);
         coordination.cache_frame(7, 5);
 
-        assert_eq!(coordination.find_frame(SegmentId::First, 7, 0, 5, None), Some(5));
+        assert_eq!(
+            coordination.find_frame(SegmentId::First, 7, 0, 5, None),
+            Some(5)
+        );
         assert_eq!(coordination.iter_latest_frames(0, 5), vec![(7, 5), (9, 4)]);
 
         coordination.rollback_cache(4);
 
-        assert_eq!(coordination.find_frame(SegmentId::First, 7, 0, 5, None), Some(2));
+        assert_eq!(
+            coordination.find_frame(SegmentId::First, 7, 0, 5, None),
+            Some(2)
+        );
         assert_eq!(coordination.iter_latest_frames(0, 5), vec![(7, 2), (9, 4)]);
         assert_eq!(
             shared.current().read().runtime.frame_cache.lock().get(&7),
@@ -11147,7 +11187,10 @@ pub mod test {
         coordination.cache_frame(7, 3);
         coordination.cache_frame(9, 4);
         coordination.cache_frame(7, 5);
-        assert_eq!(coordination.find_frame(SegmentId::First, 9, 0, 10, None), Some(4));
+        assert_eq!(
+            coordination.find_frame(SegmentId::First, 9, 0, 10, None),
+            Some(4)
+        );
 
         // The append position rewinds and frame slots 4 and 5 are overwritten,
         // now belonging to page 11 (@4) and page 13 (@5). The earlier owners of
@@ -11171,7 +11214,10 @@ pub mod test {
             "page 13 now owns frame slot 5"
         );
         // Page 7's still-valid lower frame (3) survives; its stale 5 is gone.
-        assert_eq!(coordination.find_frame(SegmentId::First, 7, 0, 10, None), Some(3));
+        assert_eq!(
+            coordination.find_frame(SegmentId::First, 7, 0, 10, None),
+            Some(3)
+        );
     }
 
     #[test]
@@ -11205,9 +11251,18 @@ pub mod test {
 
         // Mappings at or below the rollback point survive, later ones are
         // discarded; frames 26..=27 remain as unpublished spills.
-        assert_eq!(coordination.find_frame(SegmentId::First, 7, 0, 30, None), Some(10));
-        assert_eq!(coordination.find_frame(SegmentId::First, 9, 0, 30, None), Some(26));
-        assert_eq!(coordination.find_frame(SegmentId::First, 11, 0, 30, None), None);
+        assert_eq!(
+            coordination.find_frame(SegmentId::First, 7, 0, 30, None),
+            Some(10)
+        );
+        assert_eq!(
+            coordination.find_frame(SegmentId::First, 9, 0, 30, None),
+            Some(26)
+        );
+        assert_eq!(
+            coordination.find_frame(SegmentId::First, 11, 0, 30, None),
+            None
+        );
         assert_eq!(wal.get_max_frame(), 27);
         assert_eq!(wal.last_checksum(), (13, 21));
 
@@ -11218,7 +11273,10 @@ pub mod test {
             checksum: (55, 89),
             checkpoint_seq: 1,
         }));
-        assert_eq!(coordination.find_frame(SegmentId::First, 9, 0, 30, None), None);
+        assert_eq!(
+            coordination.find_frame(SegmentId::First, 9, 0, 30, None),
+            None
+        );
         assert_eq!(wal.get_max_frame(), 25);
     }
 
@@ -11335,8 +11393,7 @@ pub mod test {
         assert!(closing_frames > 0 && current_frames > 0);
         std::fs::copy(format!("{source_path}-wal"), format!("{copy_path}-wal2")).unwrap();
 
-        let reopened =
-            Database::open_file(io.clone(), copy_path, Arc::new(SqliteDialect)).unwrap();
+        let reopened = Database::open_file(io.clone(), copy_path, Arc::new(SqliteDialect)).unwrap();
         let log = &reopened.shared_wal;
         assert_eq!(log.current_id(), SegmentId::Second);
         let segments = log.segments.load();
@@ -11361,7 +11418,9 @@ pub mod test {
     }
 
     fn count_rows(conn: &Arc<Connection>, table: &str) -> i64 {
-        let mut stmt = conn.prepare(format!("select count(*) from {table}")).unwrap();
+        let mut stmt = conn
+            .prepare(format!("select count(*) from {table}"))
+            .unwrap();
         let mut count: i64 = 0;
         stmt.run_with_row_callback(|row| {
             count = row.get(0).unwrap();
@@ -11823,7 +11882,10 @@ pub mod test {
         assert_eq!(coordination_b.wal_header().page_size, 4096);
         assert_eq!(coordination_b.wal_header().salt_1, 17);
         assert_eq!(coordination_b.wal_header().salt_2, 23);
-        assert_eq!(coordination_b.find_frame(SegmentId::First, 7, 0, 5, None), Some(5));
+        assert_eq!(
+            coordination_b.find_frame(SegmentId::First, 7, 0, 5, None),
+            Some(5)
+        );
         assert_eq!(
             coordination_b.iter_latest_frames(0, 5),
             vec![(7, 5), (9, 4)]
@@ -11861,7 +11923,10 @@ pub mod test {
         );
 
         coordination_b.rollback_cache(4);
-        assert_eq!(coordination_a.find_frame(SegmentId::First, 7, 0, 5, None), Some(2));
+        assert_eq!(
+            coordination_a.find_frame(SegmentId::First, 7, 0, 5, None),
+            Some(2)
+        );
         assert_eq!(
             coordination_a.iter_latest_frames(0, 5),
             vec![(7, 2), (9, 4)]
@@ -12059,7 +12124,13 @@ pub mod test {
             Some(OLD_FIXED_LIMIT + 2)
         );
         assert_eq!(
-            coordination_b.find_frame(SegmentId::First, 7, 0, OLD_FIXED_LIMIT + 2, Some(OLD_FIXED_LIMIT + 1)),
+            coordination_b.find_frame(
+                SegmentId::First,
+                7,
+                0,
+                OLD_FIXED_LIMIT + 2,
+                Some(OLD_FIXED_LIMIT + 1)
+            ),
             Some(2)
         );
         assert!(coordination_b
@@ -12217,7 +12288,10 @@ pub mod test {
                 SharedWalCoordinationOpenMode::Exclusive
             );
             assert_eq!(coordination.load_snapshot(), snapshot);
-            assert_eq!(coordination.find_frame(SegmentId::First, 7, 0, 5, None), Some(5));
+            assert_eq!(
+                coordination.find_frame(SegmentId::First, 7, 0, 5, None),
+                Some(5)
+            );
         }
 
         let reopened_file = io
@@ -12546,7 +12620,10 @@ pub mod test {
         let exclusive_coordination =
             ShmWalCoordination::new(SharedLog::new(exclusive), authority.clone());
         assert_eq!(authority.iter_latest_frames(0, u64::MAX), vec![(7, 1)]);
-        assert_eq!(exclusive_coordination.find_frame(SegmentId::First, 7, 0, 1, None), Some(1));
+        assert_eq!(
+            exclusive_coordination.find_frame(SegmentId::First, 7, 0, 1, None),
+            Some(1)
+        );
 
         drop(exclusive_coordination);
         drop(authority);
@@ -12574,7 +12651,10 @@ pub mod test {
             .loaded_from_disk_scan
             .load(Ordering::Acquire));
         let reopened_coordination = ShmWalCoordination::new(reopened_shared, reopened_authority);
-        assert_eq!(reopened_coordination.find_frame(SegmentId::First, 7, 0, 1, None), Some(1));
+        assert_eq!(
+            reopened_coordination.find_frame(SegmentId::First, 7, 0, 1, None),
+            Some(1)
+        );
     }
 
     #[cfg(host_shared_wal)]
@@ -13074,7 +13154,10 @@ pub mod test {
             authority.snapshot().transaction_count,
             authoritative.transaction_count
         );
-        assert_eq!(coordination_b.find_frame(SegmentId::First, 7, 0, 5, None), Some(5));
+        assert_eq!(
+            coordination_b.find_frame(SegmentId::First, 7, 0, 5, None),
+            Some(5)
+        );
         authority.release_writer(authority.owner_record());
     }
 
@@ -13788,12 +13871,11 @@ pub mod test {
         vacuum_wal.end_write_tx();
         assert!(!vacuum_wal.holds_write_lock());
 
-        let guard =
-            CheckpointLocks::from_held_vacuum_checkpoint_lock(
-                vacuum_wal.coordination.clone(),
-                SegmentId::First,
-            )
-            .unwrap();
+        let guard = CheckpointLocks::from_held_vacuum_checkpoint_lock(
+            vacuum_wal.coordination.clone(),
+            SegmentId::First,
+        )
+        .unwrap();
         assert!(
             matches!(contender_wal.try_begin_read_tx(0), TryBeginReadResult::Busy),
             "VACUUM lock should continue blocking readers during final checkpoint"

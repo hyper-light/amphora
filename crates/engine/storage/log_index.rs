@@ -420,9 +420,9 @@ impl ReadIndex {
         // doubling a shard (every page in one shard), so the loop ends.
         for _ in 0..=previous.shards.len().max(1).ilog2().saturating_add(1) {
             let latest = Latest::sized(generation, pages);
-            let whole = index.iter().all(|(&page, frames)| {
-                frames.last().is_none_or(|&frame| latest.put(page, frame))
-            });
+            let whole = index
+                .iter()
+                .all(|(&page, frames)| frames.last().is_none_or(|&frame| latest.put(page, frame)));
             if whole {
                 self.latest.store(Arc::new(latest));
                 break;
