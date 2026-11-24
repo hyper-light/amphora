@@ -14,8 +14,9 @@ Left out: which of two UNIQUE constraints a row meets first (no document says; a
 expression that raises (SQLite evaluates a constant one before the statement's first row), what Amphora has no table
 function for (pragma_foreign_key_check, pragma_integrity_check('t')) or lists otherwise (pragma_index_list of a WITHOUT
 ROWID table), a STRICT table's CHECK that compares TEXT with a number (Amphora refuses the table), a generated column
-(production doesn't make one), and two foreign key causes of plain INSERTs: a row with no parent (refused at once, SQLite
-at the statement's end) and OR REPLACE of a parent's row on a WITHOUT ROWID table (refused, SQLite takes the new row).
+(production doesn't make one), and two foreign key causes: a row with no parent in a statement of several rows (refused at
+once, SQLite at the statement's end) and OR REPLACE of a parent's row on a WITHOUT ROWID table (refused, SQLite takes the
+new row).
 
 usage: bench/sqlite_upsert_checks.py COUNT SEED > crates/engine/tests/fixtures/upsert_checks.tsv   (SQLite 3.54.0 in Python)
 """
@@ -37,6 +38,7 @@ class Case:
         self.without_rowid = rng.random() < 0.35
         self.fk = rng.random() < 0.3
         self.unchecked = False
+        self.many = 1
         self.ddl = []
         if self.fk:
             self.ddl.append("CREATE TABLE p(x INT PRIMARY KEY)")
@@ -104,7 +106,7 @@ class Case:
         if col == "id":
             return rng.choice(["1", "2", "3", "'2'", "9", "95"] + ["NULL"] * (rng.random() < 0.2)) if "TEXT" not in self.key else rng.choice(["'a'", "'b'", "'c'", "'long'"])
         if col == "f":
-            return rng.choice(["1", "1", "2", "NULL"] + ["8"] * (not inserted))
+            return rng.choice(["1", "1", "2", "NULL"] + ["8"] * (not inserted and self.many == 1))
         if col == "u":
             return rng.choice(["1", "2", "3", "4", "5", "NULL"])
         if rng.random() < bad:
@@ -131,7 +133,8 @@ class Case:
 
     def upsert(self):
         rng = self.rng
-        rows = ", ".join("(" + ", ".join(self.value(x, 0.08, True) for x in self.cols) + ")" for _ in range(rng.choice([1, 1, 2, 3])))
+        self.many = rng.choice([1, 1, 2, 3])
+        rows = ", ".join("(" + ", ".join(self.value(x, 0.08, True) for x in self.cols) + ")" for _ in range(self.many))
         head = rng.choice(["INSERT"] * 5 + ["INSERT OR ABORT", "INSERT OR FAIL", "INSERT OR IGNORE", "INSERT OR ROLLBACK"] + ["INSERT OR REPLACE"] * (not (self.fk and self.without_rowid)))
         where = lambda: rng.choice([""] * 4 + [f" WHERE {rng.choice(['t.', 'excluded.'])}{rng.choice(self.cols)} {rng.choice(['IS NOT NULL', '> 1', '< 5'])}"])
         arms = [f" ON CONFLICT(id) DO UPDATE SET {self.sets()}{where()}", f" ON CONFLICT(u) DO UPDATE SET {self.sets()}{where()}"]
@@ -147,6 +150,7 @@ class Case:
         drawn = rng.random()
         if drawn < 0.75:
             return self.upsert()
+        self.many = 1
         where = f" WHERE id = {self.value('id')}" if rng.random() < 0.5 or self.without_rowid else ""
         if drawn < 0.9:
             cols = rng.sample(self.cols[1:], rng.choice([1, 2]))
