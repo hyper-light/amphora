@@ -29,6 +29,12 @@ pub const AUTH_TOKEN_LIMIT: usize = 65_535;
 pub struct SqlState(&'static str);
 
 impl SqlState {
+    /// Any SQLSTATE of `src/backend/utils/errcodes.txt`.
+    #[must_use]
+    pub const fn new(code: &'static str) -> Self {
+        Self(code)
+    }
+
     pub const FEATURE_NOT_SUPPORTED: Self = Self("0A000");
     pub const PROTOCOL_VIOLATION: Self = Self("08P01");
     pub const INVALID_AUTHORIZATION_SPECIFICATION: Self = Self("28000");
@@ -308,6 +314,27 @@ pub fn error_response(out: &mut Vec<u8>, error: &PgError) -> Result<(), PgError>
         if let Some(detail) = &error.detail {
             out.push(b'D');
             put_cstr(out, detail.as_bytes());
+        }
+        out.push(0);
+    })
+}
+
+/// NoticeResponse with the severity, SQLSTATE and message fields (`doc/src/sgml/protocol.sgml`).
+pub fn notice_response(
+    out: &mut Vec<u8>,
+    severity: &str,
+    code: &str,
+    text: &str,
+) -> Result<(), PgError> {
+    message(out, b'N', |out| {
+        for (field, value) in [
+            (b'S', severity),
+            (b'V', severity),
+            (b'C', code),
+            (b'M', text),
+        ] {
+            out.push(field);
+            put_cstr(out, value.as_bytes());
         }
         out.push(0);
     })

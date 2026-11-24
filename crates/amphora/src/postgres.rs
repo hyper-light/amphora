@@ -6,11 +6,13 @@
 //!   and backend messages written.
 //! - [`scram`]: SCRAM-SHA-256 and SCRAM-SHA-256-PLUS on the server's side (RFC 5802, RFC 7677).
 //! - [`session`]: one connection's state machine, from its first byte to Terminate.
+//! - [`execute`]: a session's statements run on an engine connection (unit 9).
 //! - [`listener`]: the shell that drives sessions over hyper-rt's sockets (unit 2), each charged to
 //!   the process's memory budget.
 //!
 //! PostgreSQL's source is cited as `path:line` at tag `REL_19_0`.
 
+pub mod execute;
 pub mod listener;
 pub mod scram;
 pub mod session;

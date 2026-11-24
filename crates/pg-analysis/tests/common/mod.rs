@@ -158,6 +158,7 @@ pub fn session<T>(zone: &TimeZone, f: impl FnOnce(&Session<'_>) -> T) -> T {
         path: &path,
         relations: &Schema,
         time_zone: zone,
+        now: None,
     })
 }
 
