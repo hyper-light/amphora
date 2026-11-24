@@ -1360,6 +1360,7 @@ fn join_lhs_and_rhs<'a>(
                     );
                     let forced = pinned_hash_here
                         || (!pinned && planning_context.join_methods.hash_shaped_only());
+                    tracing::debug!(target: "amphora::join_search", rhs_table = rhs_table_reference.table.get_name(), build_table = build_table.table.get_name(), lhs_mask = ?lhs_mask, input_cardinality, lhs_cost = lhs_cost.0, best_cost = best_access_method.cost.0, best = ?best_access_method.params, best_rows_per_outer_row = best_access_method.estimated_rows_per_outer_row, hash_join_cost = hash_join_method.cost.0, hash_join_allowed, forced, "T18: a read weighed against a hash join");
                     if hash_join_allowed
                         && (forced
                             || hash_join_method.cost < best_access_method.cost
