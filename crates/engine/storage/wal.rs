@@ -82,13 +82,30 @@ pub struct CheckpointResult {
     maybe_guard: Option<CheckpointLocks>,
     pub db_truncate_sent: bool,
     pub db_sync_sent: bool,
-    /// Whether WAL truncation I/O has been submitted (for TRUNCATE checkpoint mode)
-    pub wal_truncate_sent: bool,
-    /// Whether WAL sync I/O has been submitted after truncation
-    pub wal_sync_sent: bool,
-    /// The closing segment this pass copied (decision 45): its backfill is published and its
-    /// copy reported, and a Restart or Truncate restarts nothing, the current segment not copied.
+    /// How far a TRUNCATE has cut the log's two files.
+    cut: LogCut,
+    /// The closing segment this passive pass copied (decision 45): its backfill is published and
+    /// its copy reported. Every other mode copies the whole log.
     pub closing: Option<SegmentId>,
+}
+
+/// A TRUNCATE's cut of the log's two segment files (decision 45), each step's I/O done before the
+/// next is asked. The file with the older header goes first, and its cut is synced before the other
+/// file's is asked: recovery takes a lone valid header for the log, and the older one's frames are
+/// older than the file's pages.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum LogCut {
+    #[default]
+    Asked,
+    Truncate {
+        segment: SegmentId,
+        last: bool,
+    },
+    Sync {
+        segment: SegmentId,
+        last: bool,
+    },
+    Done,
 }
 
 impl Drop for CheckpointResult {
@@ -110,8 +127,7 @@ impl CheckpointResult {
             maybe_guard: None,
             db_sync_sent: false,
             db_truncate_sent: false,
-            wal_truncate_sent: false,
-            wal_sync_sent: false,
+            cut: LogCut::Asked,
             closing: None,
         }
     }
@@ -123,6 +139,10 @@ impl CheckpointResult {
         // TRUNCATE should also clear any stale WAL bytes when the log was restarted
         // (wal_max_frame=0) but the file still contains old frames.
         self.everything_backfilled()
+    }
+    /// Whether a TRUNCATE has cut both of the log's files to nothing.
+    pub fn log_is_cut(&self) -> bool {
+        self.cut == LogCut::Done
     }
     pub fn release_guard(&mut self) {
         let _ = self.maybe_guard.take();
@@ -159,7 +179,7 @@ bitflags! {
         /// Run an auto-checkpoint after commit when `should_checkpoint()`
         /// is true, and the truncate-checkpoint on connection shutdown.
         const Checkpoint = 0b01;
-        /// Restart the WAL header in `try_restart_log_before_write` when
+        /// Switch the log to its free segment in `switch_before_write` when
         /// every frame has been backfilled, before starting a write tx.
         const Restart    = 0b10;
     }
@@ -333,6 +353,9 @@ pub struct TursoRwLock(AtomicU64);
 pub type PaddedLock = crossbeam_utils::CachePadded<TursoRwLock>;
 
 pub const READMARK_NOT_USED: u32 = 0xffffffff;
+/// A segment's read marks ([`WalSharedRuntime::read_locks`]): mark 0 guards a read of the file
+/// alone, the others a read of the log.
+const READ_MARKS: usize = 5;
 const NO_LOCK_HELD: usize = usize::MAX;
 
 impl TursoRwLock {
@@ -1047,16 +1070,21 @@ trait WalCoordination: Debug + Send + Sync {
     /// Lowest read-mark frame any reader is currently pinned at, or `None` if none. Read-only.
     fn min_pinned_read_frame(&self) -> Option<u64>;
 
-    /// Begin a restart while the caller holds the required external checkpoint/write guards.
-    fn begin_restart(&self, io: &dyn IO) -> Result<WalSnapshot>;
+    /// Move a checkpoint's read mark 0 from the segment its last pass copied to the one its next
+    /// pass copies, its other locks kept (decision 45). On error the mark stays where it was.
+    fn move_checkpoint_guard(&self, from: SegmentId, to: SegmentId) -> Result<()>;
 
-    /// Release any restart-only coordination state held by `begin_restart`.
-    fn end_restart(&self);
+    /// The writer's switch to the log's free segment, every frame of the current one in the file
+    /// (decision 45): the segment now current. None, with nothing changed, while the other one
+    /// closes or where the current one holds no frame. The caller holds the write lock.
+    /// `held` is its own read's mark.
+    fn switch(&self, io: &dyn IO, held: ReadGuardKind) -> Result<Option<SegmentId>>;
 
-    /// Attempt the restart path used by a writer holding read-mark 0.
-    fn try_restart_log_for_write(&self, io: &dyn IO) -> Result<Option<WalSnapshot>>;
+    /// [`Self::switch`] with no read in the log, as RESTART and TRUNCATE promise: Busy while a read
+    /// mark of the current segment guards one. The caller holds a checkpoint's locks and the writer's.
+    fn switch_unread(&self, io: &dyn IO) -> Result<Option<SegmentId>>;
 
-    /// Mark the WAL uninitialized before truncation and return the WAL file handle.
+    /// Mark the current segment's header unwritten before its file is cut, and return that file.
     fn prepare_truncate(&self) -> Result<Arc<dyn File>>;
 
     /// Amphora: whether a new header cuts the log's file back to it, its frames from before the
@@ -1169,7 +1197,7 @@ pub trait Wal: Debug + Send + Sync {
     /// `allowed_auto_actions` controls which automatic WAL maintenance
     /// actions are permitted within this call — currently only
     /// `WalAutoActions::Restart` is consulted (it gates
-    /// `try_restart_log_before_write`). Callers that own WAL state
+    /// `switch_before_write`). Callers that own WAL state
     /// externally (e.g. the sync engine) pass an empty set to opt out.
     fn begin_write_tx(&self, allowed_auto_actions: WalAutoActions) -> Result<()>;
 
@@ -1362,9 +1390,13 @@ pub trait Wal: Debug + Send + Sync {
     /// This should't be used with regular WAL mode.
     fn update_max_frame(&self);
 
-    /// Truncate WAL file to zero and sync it. This is called AFTER the DB file has been
-    /// synced during TRUNCATE checkpoint mode, ensuring data durability.
-    /// The result parameter is used to track I/O progress (wal_truncate_sent, wal_sync_sent).
+    /// Start the log again in its free segment, after a RESTART's copy and the DB file's sync
+    /// (decision 45). Busy while a read is in the log.
+    fn restart_wal(&self, result: &CheckpointResult) -> Result<()>;
+
+    /// Start the log again and truncate its files to zero, each cut synced. This is called AFTER the
+    /// DB file has been synced during TRUNCATE checkpoint mode, ensuring data durability. Busy while
+    /// a read is in the log. The result parameter tracks the I/O's progress.
     fn truncate_wal(
         &self,
         result: &mut CheckpointResult,
@@ -1931,47 +1963,32 @@ impl WalCoordination for InProcessWalCoordination {
         self.min_pinned_read_frame_inner()
     }
 
-    fn begin_restart(&self, io: &dyn IO) -> Result<WalSnapshot> {
-        for idx in 1..5 {
-            if !self.try_read_mark_exclusive(idx) {
-                for j in 1..idx {
-                    self.unlock_read_mark(j);
-                }
-                return Err(LimboError::Busy);
-            }
-            self.set_read_mark_value_exclusive(idx, READMARK_NOT_USED);
+    fn move_checkpoint_guard(&self, from: SegmentId, to: SegmentId) -> Result<()> {
+        if !self.try_segment_read_mark_exclusive(to, 0) {
+            return Err(LimboError::Busy);
         }
-        let mut shared = self.log.current().write();
-        shared.restart_wal_header(io);
-        let checkpoint_seq = shared.metadata.wal_header.lock().checkpoint_seq;
-        Ok(WalSnapshot {
-            max_frame: shared.metadata.max_frame.load(Ordering::Acquire),
-            nbackfills: shared.metadata.nbackfills.load(Ordering::Acquire),
-            last_checksum: shared.metadata.last_checksum,
-            checkpoint_seq,
-            transaction_count: shared.metadata.transaction_count.load(Ordering::Acquire),
-        })
+        self.unlock_segment_read_mark(from, 0);
+        Ok(())
     }
 
-    fn end_restart(&self) {
-        for idx in 1..5 {
-            self.unlock_read_mark(idx);
-        }
+    fn switch(&self, io: &dyn IO, _held: ReadGuardKind) -> Result<Option<SegmentId>> {
+        let switched = self.log.switch(io, None);
+        self.log.released.notify();
+        switched
     }
 
-    fn try_restart_log_for_write(&self, io: &dyn IO) -> Result<Option<WalSnapshot>> {
-        if !self.try_upgrade_read_mark(0) {
-            return Ok(None);
-        }
-        let result = self.begin_restart(io);
-        self.downgrade_read_mark(0);
-        match result {
-            Ok(snapshot) => {
-                self.end_restart();
-                Ok(Some(snapshot))
-            }
-            Err(err) => Err(err),
-        }
+    fn switch_unread(&self, io: &dyn IO) -> Result<Option<SegmentId>> {
+        let segment = self.log.current_id();
+        let held = (1..READ_MARKS)
+            .take_while(|&slot| self.try_segment_read_mark_exclusive(segment, slot))
+            .count();
+        let switched = if held == READ_MARKS.saturating_sub(1) {
+            self.log.switch(io, None)
+        } else {
+            Err(LimboError::Busy)
+        };
+        (1..=held).for_each(|slot| self.unlock_segment_read_mark(segment, slot));
+        switched
     }
 
     fn truncates_orphans(&self) -> bool {
@@ -3270,8 +3287,21 @@ impl WalCoordination for ShmWalCoordination {
         id = "restart_ignores_db_file_readers",
         parent = "wal_protocol_correctness"
     )]
-    fn begin_restart(&self, io: &dyn IO) -> Result<WalSnapshot> {
-        for idx in 1..5 {
+    fn switch_unread(&self, io: &dyn IO) -> Result<Option<SegmentId>> {
+        let current = self.current_segment();
+        // The pair rule of a log left in two segments by a process that switched it: a restart of
+        // one segment would take its sequence two past the other's.
+        if self
+            .log
+            .segment(current.other())
+            .read()
+            .runtime
+            .file
+            .is_some()
+        {
+            return Err(LimboError::Busy);
+        }
+        for idx in 1..READ_MARKS {
             if !self.fallback.try_read_mark_exclusive(idx) {
                 for held_idx in 1..idx {
                     self.fallback.unlock_read_mark(held_idx);
@@ -3284,32 +3314,33 @@ impl WalCoordination for ShmWalCoordination {
         // active cross-process readers before proceeding with the WAL restart,
         // otherwise we reset the shared WAL state while another process still has
         // an active read transaction that reads from the WAL, leading to data loss.
-        if self.authority.min_active_reader_frame().is_some() {
-            for idx in 1..5 {
-                self.fallback.unlock_read_mark(idx);
-            }
+        let read = self.authority.min_active_reader_frame().is_some();
+        if !read {
+            self.restart_snapshot_from_authority(self.authority.snapshot(), io);
+        }
+        for idx in 1..READ_MARKS {
+            self.fallback.unlock_read_mark(idx);
+        }
+        if read {
             return Err(LimboError::Busy);
         }
-        Ok(self.restart_snapshot_from_authority(self.authority.snapshot(), io))
+        Ok(Some(current))
     }
 
-    fn end_restart(&self) {
-        self.fallback.end_restart();
-    }
-
-    fn try_restart_log_for_write(&self, io: &dyn IO) -> Result<Option<WalSnapshot>> {
-        if !self.fallback.try_upgrade_read_mark(0) {
+    fn switch(&self, io: &dyn IO, held: ReadGuardKind) -> Result<Option<SegmentId>> {
+        if !matches!(held, ReadGuardKind::DbFile(_)) || !self.fallback.try_upgrade_read_mark(0) {
             return Ok(None);
         }
-        let result = self.begin_restart(io);
+        let switched = self.switch_unread(io);
         self.fallback.downgrade_read_mark(0);
-        match result {
-            Ok(snapshot) => {
-                self.end_restart();
-                Ok(Some(snapshot))
-            }
-            Err(err) => Err(err),
+        match switched {
+            Err(LimboError::Busy) => Ok(None),
+            switched => switched,
         }
+    }
+
+    fn move_checkpoint_guard(&self, from: SegmentId, to: SegmentId) -> Result<()> {
+        self.fallback.move_checkpoint_guard(from, to)
     }
 
     fn prepare_truncate(&self) -> Result<Arc<dyn File>> {
@@ -3547,8 +3578,14 @@ pub enum CheckpointState {
     /// leaving a torn database that matches no committed prefix.
     SyncWal,
     Processing,
-    /// Determine the checkpoint result: update nBackfills, restart log if needed.
+    /// Determine the checkpoint result: the closing segment's, or the whole log's.
     DetermineResult,
+    /// The closing segment is copied, in a checkpoint of the whole log: the file is synced, the copy
+    /// published, and the current segment's pass begins (decision 45's rule 1).
+    ClosingCopied {
+        backfilled: u64,
+        synced: bool,
+    },
     /// Final cleanup: release locks, clear internal state, return result.
     /// WAL truncation (if needed) is handled by pager.rs via truncate_wal() AFTER the DB is synced.
     Finalize {
@@ -4088,7 +4125,7 @@ pub struct WalSharedRuntime {
     /// from a partially checkpointed db file.
     /// Slots 1‑4 carry a frame‑number in value and may be shared by many readers. Slot 1 is the
     /// default read lock and is to contain the max_frame in WAL.
-    pub read_locks: [PaddedLock; 5],
+    pub read_locks: [PaddedLock; READ_MARKS],
     /// Increments on each checkpoint, used to prevent stale cached pages being used for
     /// backfilling.
     pub epoch: AtomicU32,
@@ -4241,6 +4278,15 @@ impl ReadHold {
         self.begun.store(number, Ordering::Release);
         self.under_way.store(number, Ordering::Release);
         *held = Some((guard, span));
+    }
+
+    /// The read under way goes on with `guard` and `span`: what it held until now, to give back.
+    fn move_to(
+        &self,
+        guard: ReadGuardKind,
+        span: ReadSpan,
+    ) -> Option<(ReadGuardKind, ReadSpan)> {
+        self.held.lock().replace((guard, span))
     }
 
     /// The read's own end, its hold given back already or not.
@@ -4512,9 +4558,10 @@ impl SharedLog {
         }
         let from = segments.current();
         let to = from.other();
-        let (header, epoch, transaction_count) = {
+        let (header, epoch, transaction_count, copied) = {
             let closing = self.segment(from).read();
-            if closing.metadata.max_frame.load(Ordering::Acquire) == 0 {
+            let frames = closing.metadata.max_frame.load(Ordering::Acquire);
+            if frames == 0 {
                 return Ok(None);
             }
             let header = *closing.metadata.wal_header.lock();
@@ -4522,6 +4569,7 @@ impl SharedLog {
                 header,
                 closing.runtime.epoch.load(Ordering::Acquire),
                 closing.metadata.transaction_count.load(Ordering::Acquire),
+                closing.metadata.nbackfills.load(Ordering::Acquire) == frames,
             )
         };
         {
@@ -4565,7 +4613,15 @@ impl SharedLog {
                 .iter()
                 .for_each(|lock| lock.unlock());
         }
-        let switched = self.segments.update(|segments| segments.switch(false));
+        // A segment copied whole before the switch is closed so, and is free as the last read on it
+        // ends: with none, in this same change.
+        let switched = self.segments.update(|segments| {
+            let switched = segments.switch(false);
+            if copied {
+                let _ = segments.copied();
+            }
+            switched
+        });
         if switched != Some(Some(to)) {
             return Err(LimboError::InternalError(format!(
                 "the log's switch to {to:?} found {switched:?}: only the writer switches"
@@ -4754,6 +4810,25 @@ impl CheckpointLocks {
         match self {
             Self::Writer { segment, .. } | Self::Read0 { segment, .. } => *segment,
         }
+    }
+
+    /// This guard's read mark 0 moved to `to`, the segment the checkpoint's next pass copies, its
+    /// other locks kept: no writer and no other checkpoint comes between the two passes.
+    fn move_to(&mut self, to: SegmentId) -> Result<()> {
+        match self {
+            Self::Writer {
+                coordination,
+                segment,
+            }
+            | Self::Read0 {
+                coordination,
+                segment,
+            } => {
+                coordination.move_checkpoint_guard(*segment, to)?;
+                *segment = to;
+            }
+        }
+        Ok(())
     }
 
     /// Build checkpoint ownership from a checkpoint_lock that VACUUM already
@@ -6126,10 +6201,10 @@ impl Wal for WalFile {
             return Ok(());
         }
 
-        let result = self.try_restart_log_before_write();
+        let result = self.switch_before_write();
         if let Err(LimboError::Busy) | Ok(()) = &result {
-            // it's fine if we were unable to restart WAL file due to Busy errors
-            // Amphora: taken after a restart, which starts the log again from frame 0.
+            // it's fine if we were unable to switch the log due to Busy errors
+            // Amphora: taken after a switch, whose segment starts from frame 0.
             self.write_base
                 .store(self.max_frame.load(Ordering::Acquire), Ordering::Release);
             return Ok(());
@@ -7019,6 +7094,12 @@ impl Wal for WalFile {
         // Install connection state with a fresh snapshot.
         let snapshot = self.load_coordination_snapshot();
         self.install_connection_state(WalConnectionState::new(snapshot, ReadGuardKind::None));
+        // What the closing segment holds is in no file until its copy (decision 45).
+        let closing_max_frame = self.coordination.segments().closing().map_or(0, |closing| {
+            self.coordination.segment_snapshot(closing).max_frame
+        });
+        self.closing_max_frame
+            .store(closing_max_frame, Ordering::Release);
         turso_assert!(
             self.coordination.shared_wal_state().write_lock.write(),
             "begin_vacuum_blocking_tx: write lock held after VACUUM lock acquired"
@@ -7103,7 +7184,7 @@ impl Wal for WalFile {
         let _header_c =
             sqlite3_ondisk::begin_write_wal_header(file.as_ref(), &header, Some(&mut group))?;
 
-        // After a RESTART or try_restart_log_before_write the WAL file may
+        // After a RESTART or switch_before_write the WAL file may
         // still contain orphaned frames from the previous epoch. Truncate
         // them so that classify_authority_snapshot_against_wal does not see a
         // length mismatch and unnecessarily fall back to a full disk scan
@@ -7655,6 +7736,10 @@ impl Wal for WalFile {
         self.max_frame.store(new_max_frame, Ordering::Release);
     }
 
+    fn restart_wal(&self, result: &CheckpointResult) -> Result<()> {
+        self.start_log_again(result)
+    }
+
     fn truncate_wal(
         &self,
         result: &mut CheckpointResult,
@@ -7916,6 +8001,12 @@ impl WalFile {
                         // Every frame of it is in a flushed file already (a backfill is published
                         // only after the file's sync), or it holds none.
                         self.coordination.closing_copied();
+                        if mode.require_all_backfilled() {
+                            match self.after_closing(mode)? {
+                                Some(result) => return Ok(IOResult::Done(result)),
+                                None => continue,
+                            }
+                        }
                     }
                     if matches!(lock_source, CheckpointLockSource::HeldByCaller)
                         && closing.is_none()
@@ -7949,7 +8040,7 @@ impl WalFile {
                         upper_bound_inclusive: Some(upper_bound),
                     } = mode
                     {
-                        if max_frame > upper_bound {
+                        if closing.is_none() && max_frame > upper_bound {
                             tracing::debug!(
                                 "abort checkpoint because latest frame in WAL is greater than upper_bound in TRUNCATE mode: {max_frame} != {upper_bound}"
                             );
@@ -8196,7 +8287,7 @@ impl WalFile {
                     }
                 }
                 // All eligible frames copied to the db file.
-                // Compute checkpoint result, update nBackfills, restart log if needed.
+                // Compute checkpoint result.
                 CheckpointState::DetermineResult => {
                     let mut ongoing_chkpt = self.ongoing_checkpoint.write();
                     turso_assert!(
@@ -8223,9 +8314,17 @@ impl WalFile {
                     if mode.require_all_backfilled() && !checkpoint_result.everything_backfilled() {
                         return Err(LimboError::Busy.into());
                     }
-                    // A pass over the closing segment restarts nothing: the current segment isn't
-                    // copied yet (decision 45).
-                    if mode.should_restart_log() && closing.is_none() {
+                    // The closing segment's frames are a part of the log, the older one: the rest
+                    // is the current segment's, copied once the file that holds these is synced
+                    // (decision 45's rule 1).
+                    if closing.is_some() && mode.require_all_backfilled() {
+                        ongoing_chkpt.state = CheckpointState::ClosingCopied {
+                            backfilled: wal_total_backfilled,
+                            synced: wal_checkpoint_backfilled == 0 || sync_mode == SyncMode::Off,
+                        };
+                        continue;
+                    }
+                    if mode.should_restart_log() {
                         turso_assert!(
                             matches!(
                                 *self.checkpoint_guard.read(),
@@ -8234,11 +8333,29 @@ impl WalFile {
                             "We must hold writer and checkpoint locks to restart the log",
                             { "checkpoint_guard": *self.checkpoint_guard.read() }
                         );
-                        self.restart_log()?;
+                        self.read_from_file();
                     }
                     ongoing_chkpt.state = CheckpointState::Finalize {
                         checkpoint_result: Some(checkpoint_result),
                     };
+                }
+                CheckpointState::ClosingCopied { backfilled, synced } => {
+                    if !synced {
+                        let c = pager
+                            .db_file
+                            .sync(Completion::new_sync(|_| {}), pager.get_sync_type())?;
+                        self.ongoing_checkpoint.write().state = CheckpointState::ClosingCopied {
+                            backfilled,
+                            synced: true,
+                        };
+                        io_yield_one!(c);
+                    }
+                    self.publish_backfill(backfilled);
+                    self.increment_checkpoint_epoch();
+                    self.ongoing_checkpoint.write().reset();
+                    if let Some(result) = self.after_closing(mode)? {
+                        return Ok(IOResult::Done(result));
+                    }
                 }
                 CheckpointState::Finalize { .. } => {
                     // NOTE: For TRUNCATE mode, WAL truncation is NOT done here.
@@ -8247,10 +8364,6 @@ impl WalFile {
                     // This ensures data durability: if a crash occurs after WAL truncation
                     // but before DB sync, the data would be lost. By truncating the WAL
                     // only after the DB is safely synced, we guarantee recoverability.
-                    if mode.should_restart_log() && self.ongoing_checkpoint.read().closing.is_none()
-                    {
-                        Self::unlock_after_restart(&self.coordination, None);
-                    }
                     let mut checkpoint_result = {
                         let mut oc = self.ongoing_checkpoint.write();
                         let CheckpointState::Finalize {
@@ -8304,6 +8417,29 @@ impl WalFile {
         }
     }
 
+    /// The closing segment is copied, in a checkpoint of the whole log: None when it is reset and
+    /// the current one's pass is next. A read that counts on it yet looked into the log before the
+    /// switch, so no frame after it may reach the file ([`Segments::to_copy`]): Busy where one waits
+    /// there, or where the log can't start again for that read. A FULL with none after it has the
+    /// whole log in the file.
+    fn after_closing(&self, mode: CheckpointMode) -> Result<Option<CheckpointResult>> {
+        let segments = self.coordination.segments();
+        if segments.closing().is_none() {
+            return Ok(None);
+        }
+        let current = self.coordination.segment_snapshot(segments.current());
+        let copied = current.max_frame == current.nbackfills;
+        if !copied || mode.should_restart_log() {
+            return Err(LimboError::Busy);
+        }
+        let _ = self.checkpoint_guard.write().take();
+        Ok(Some(CheckpointResult::new(
+            current.max_frame,
+            current.nbackfills,
+            0,
+        )))
+    }
+
     /// Coordinate what the maximum safe frame is for us to backfill when checkpointing.
     /// We can never backfill a frame with a higher number than any reader's read mark,
     /// because we might overwrite content the reader is reading from the database file.
@@ -8340,138 +8476,149 @@ impl WalFile {
         )
     }
 
-    /// attempt to restart WAL header before write in order to keep WAL file size under the control
-    /// The conditions for WAL restart are following:
-    /// 1. we can do that only under write transaction
-    /// 2. max_frame_read_lock_index == 0 - this means that transaction was initiated to read data from DB file
-    /// 3. nbackfills > 0 - otherwise nothing was backfilled and there is no reason to truncate header
-    /// 4. max_frame == nbackfills - otherwise there are some non-checkpointed frames in the WAL and we can't truncate the log
-    pub fn try_restart_log_before_write(&self) -> Result<()> {
-        if self.restarts_by_switch() {
-            return Ok(());
-        }
-        let max_frame_read_lock_index = self.max_frame_read_lock_index.load(Ordering::Acquire);
-        if !matches!(
-            ReadGuardKind::from_lock_index(max_frame_read_lock_index),
-            ReadGuardKind::DbFile(_)
-        ) {
-            tracing::debug!(
-                "try_restart_log_before_write: max_frame_read_lock_index={max_frame_read_lock_index}, writer use WAL - can't restart the log"
-            );
-            return Ok(());
-        }
+    /// The writer's switch before its first frame (decision 45), where SQLite's writer restarts the
+    /// log ("the next writer will restart the log file from the beginning"): once every frame of the
+    /// current segment is in the file, the writer appends to the free one, and no read waits or is
+    /// waited for. The caller holds the write lock and reads the log's last commit, all of it in the
+    /// file, so its read goes on from the file and counts on the segment it writes. Nothing while the
+    /// other segment closes: the writer appends on.
+    fn switch_before_write(&self) -> Result<()> {
         let snapshot = self.load_coordination_snapshot();
-        let max_frame = snapshot.max_frame;
-        let nbackfills = snapshot.nbackfills;
-        if nbackfills == 0 {
-            tracing::debug!(
-                "try_restart_log_before_write: nbackfills={nbackfills}, nothing were backfilled - can't restart the log"
-            );
+        if snapshot.nbackfills == 0 || snapshot.max_frame != snapshot.nbackfills {
             return Ok(());
         }
-        turso_assert!(
-            max_frame >= nbackfills,
-            "backfills can't be more than max_frame"
-        );
-        if max_frame != nbackfills {
-            tracing::debug!(
-                "try_restart_log_before_write: max_frame={max_frame}, nbackfills={nbackfills}, not everything is backfilled to the DB file - can't restart the log"
-            );
-            return Ok(());
-        }
-        let Some(snapshot) = self
-            .coordination
-            .try_restart_log_for_write(self.io.as_ref())?
-        else {
+        let held = self.connection_state().read_guard;
+        let Some(segment) = self.coordination.switch(self.io.as_ref(), held)? else {
             return Ok(());
         };
-        self.apply_restart_snapshot(snapshot);
-        self.increment_checkpoint_epoch();
-        let result = Ok(());
-        tracing::debug!("try_restart_log_before_write: result={:?}", result);
-        result
-    }
-
-    /// Whether the log's other segment has a file (decision 45): once it has, the log starts again
-    /// only by the writer's switch. A restart in place would take the current segment's sequence
-    /// two past the other's header, a pair recovery refuses, and a truncate would leave the other
-    /// segment's copied frames to be read as the log.
-    fn restarts_by_switch(&self) -> bool {
-        let log = self.coordination.shared_wal_state();
-        let other = log.segment(log.current_id().other());
-        let segment = other.read();
-        segment.runtime.file.is_some()
-    }
-
-    fn restart_log(&self) -> Result<()> {
-        tracing::debug!("restart_log");
-        if self.restarts_by_switch() {
-            return Err(LimboError::Busy);
+        let snapshot = self.load_coordination_snapshot();
+        if held.read_mark().is_some_and(|(read, _)| read == segment) {
+            // A multi-process log is its one segment: the read's mark is on it already.
+            self.install_connection_state(WalConnectionState::new(snapshot, held));
+            self.increment_checkpoint_epoch();
+            return Ok(());
         }
-        let snapshot = self.coordination.begin_restart(self.io.as_ref())?;
-        self.apply_restart_snapshot(snapshot);
+        let Some((guard, span)) = self.coordination.try_begin_read_tx(snapshot) else {
+            return Err(LimboError::BusySnapshot);
+        };
+        let left = self.hold.move_to(guard, span);
+        self.closing_max_frame.store(0, Ordering::Release);
+        self.install_connection_state(WalConnectionState::new(snapshot, guard));
+        if let Some((guard, span)) = left {
+            self.coordination.end_read_tx(guard, span);
+        }
         Ok(())
     }
 
-    /// Truncate WAL file to zero and sync it. Called by pager AFTER DB file is synced.
+    /// Every frame of the log is in the file, where this connection now reads (a checkpoint's, with
+    /// no read of its own under way, or VACUUM's): a view of its own from before would read pages
+    /// older than the file's.
+    fn read_from_file(&self) {
+        let snapshot = self.load_coordination_snapshot();
+        self.set_last_checksum(snapshot.last_checksum);
+        self.max_frame.store(snapshot.max_frame, Ordering::Release);
+        self.min_frame
+            .store(snapshot.max_frame.saturating_add(1), Ordering::Release);
+        self.closing_max_frame.store(0, Ordering::Release);
+        self.checkpoint_seq
+            .store(snapshot.checkpoint_seq, Ordering::Release);
+    }
+
+    /// The end of a RESTART's or TRUNCATE's copy, the file synced: its backfill is published, and
+    /// the log switches to its free segment (decision 45), so that the next writer starts a segment
+    /// from its first frame. Busy while a read is in the log, as SQLite answers one ("blocks (calls
+    /// the busy-handler callback) until all readers are reading from the database file only",
+    /// sqlite.org/c3ref/wal_checkpoint_v2.html); what was copied stays copied.
+    fn start_log_again(&self, result: &CheckpointResult) -> Result<()> {
+        if result.wal_max_frame == 0 {
+            return Ok(());
+        }
+        self.coordination
+            .publish_backfill(result.wal_total_backfilled);
+        let _ = self.coordination.switch_unread(self.io.as_ref())?;
+        self.read_from_file();
+        Ok(())
+    }
+
+    /// TRUNCATE's end, after the DB file's sync: the log starts again, then both its files are cut to
+    /// nothing ("it also truncates the log file to zero bytes just prior to a successful return"),
+    /// each cut synced, the file with the older header first ([`LogCut`]).
     #[aristo::intent("WAL truncate is atomic: no committed frame can be observed lost across the truncate operation\n", id = "aristos:wal_truncate_atomic_under_concurrent_writers", verify = "full", parent = "wal_protocol_correctness")]
     fn truncate_log(
         &self,
         result: &mut CheckpointResult,
         sync_type: FileSyncType,
     ) -> IOResultOr<()> {
-        let file = self.coordination.prepare_truncate()?;
-
-        if !result.wal_truncate_sent {
-            let c = Completion::new_trunc({
-                move |res| {
-                    if let Err(err) = res {
-                        tracing::debug!("WAL truncate failed: {err}")
+        loop {
+            match result.cut {
+                LogCut::Asked => {
+                    self.start_log_again(result)?;
+                    // A segment switched to has its header written by its first commit: until then
+                    // its file holds the older one, of its life before.
+                    let current = self.coordination.current_segment();
+                    let older = if self.coordination.wal_is_initialized() {
+                        current.other()
                     } else {
-                        tracing::trace!("WAL file truncated to 0 B");
-                    }
+                        current
+                    };
+                    let _current_file = self.coordination.prepare_truncate()?;
+                    // after truncation - there will be nothing in the WAL
+                    result.wal_max_frame = 0;
+                    result.wal_total_backfilled = 0;
+                    result.cut = LogCut::Truncate {
+                        segment: older,
+                        last: false,
+                    };
                 }
-            });
-            let c = file.truncate(0, c)?;
-            result.wal_truncate_sent = true;
-            // after truncation - there will be nothing in the WAL
-            result.wal_max_frame = 0;
-            result.wal_total_backfilled = 0;
-            io_yield_one!(c);
-        } else if !result.wal_sync_sent {
-            let c = file.sync(
-                Completion::new_sync(move |res| {
-                    if let Err(err) = res {
-                        tracing::debug!("WAL sync failed: {err}")
-                    } else {
-                        tracing::trace!("WAL file synced after truncation");
-                    }
-                }),
-                sync_type,
-            )?;
-            result.wal_sync_sent = true;
-            io_yield_one!(c);
+                LogCut::Truncate { segment, last } => {
+                    let file = self
+                        .coordination
+                        .shared_wal_state()
+                        .segment(segment)
+                        .read()
+                        .runtime
+                        .file
+                        .clone();
+                    // Nothing to cut in a segment never switched to, nor in one cut already.
+                    let file = file.filter(|file| last || file.size().map_or(true, |size| size > 0));
+                    let Some(file) = file else {
+                        result.cut = Self::after_cut(segment, last);
+                        continue;
+                    };
+                    let c = file.truncate(
+                        0,
+                        Completion::new_trunc(move |res| match res {
+                            Err(err) => tracing::debug!("WAL truncate failed: {err}"),
+                            Ok(_) => tracing::trace!("WAL file truncated to 0 B"),
+                        }),
+                    )?;
+                    result.cut = LogCut::Sync { segment, last };
+                    io_yield_one!(c);
+                }
+                LogCut::Sync { segment, last } => {
+                    let c = self.coordination.segment_file(segment)?.sync(
+                        Completion::new_sync(move |res| match res {
+                            Err(err) => tracing::debug!("WAL sync failed: {err}"),
+                            Ok(_) => tracing::trace!("WAL file synced after truncation"),
+                        }),
+                        sync_type,
+                    )?;
+                    result.cut = Self::after_cut(segment, last);
+                    io_yield_one!(c);
+                }
+                LogCut::Done => return Ok(IOResult::Done(())),
+            }
         }
-        Ok(IOResult::Done(()))
     }
 
-    fn apply_restart_snapshot(&self, snapshot: WalSnapshot) {
-        self.set_last_checksum(snapshot.last_checksum);
-        self.max_frame.store(snapshot.max_frame, Ordering::Release);
-        self.min_frame.store(0, Ordering::Release);
-        self.checkpoint_seq
-            .store(snapshot.checkpoint_seq, Ordering::Release);
-    }
-
-    // unlock shared read locks taken by RESTART/TRUNCATE checkpoint modes
-    fn unlock_after_restart(coordination: &Arc<dyn WalCoordination>, e: Option<&LimboError>) {
-        coordination.end_restart();
-        if let Some(e) = e {
-            mark_unlikely();
-            tracing::debug!(
-                "Failed to restart WAL header: {:?}, releasing read locks",
-                e
-            );
+    fn after_cut(segment: SegmentId, last: bool) -> LogCut {
+        if last {
+            LogCut::Done
+        } else {
+            LogCut::Truncate {
+                segment: segment.other(),
+                last: true,
+            }
         }
     }
 
@@ -8482,19 +8629,26 @@ impl WalFile {
         segment: SegmentId,
     ) -> Result<()> {
         let needs_new_guard = {
-            let guard = self.checkpoint_guard.read();
-            let same_segment = guard.as_ref().is_some_and(|held| held.segment() == segment);
-            !same_segment
-                || !matches!(
-                    (&*guard, mode),
-                    (
-                        Some(CheckpointLocks::Read0 { .. }),
-                        CheckpointMode::Passive { .. },
-                    ) | (
-                        Some(CheckpointLocks::Writer { .. }),
-                        CheckpointMode::Restart | CheckpointMode::Truncate { .. },
-                    ),
-                )
+            let mut guard = self.checkpoint_guard.write();
+            let fits = matches!(
+                (&*guard, mode),
+                (
+                    Some(CheckpointLocks::Read0 { .. }),
+                    CheckpointMode::Passive { .. },
+                ) | (
+                    Some(CheckpointLocks::Writer { .. }),
+                    CheckpointMode::Full
+                        | CheckpointMode::Restart
+                        | CheckpointMode::Truncate { .. },
+                ),
+            );
+            match &mut *guard {
+                Some(held) if fits && held.segment() != segment => {
+                    held.move_to(segment)?;
+                    false
+                }
+                _ => !fits,
+            }
         };
         if needs_new_guard {
             // Drop any existing guard
@@ -11551,8 +11705,15 @@ pub mod test {
     }
 
     #[test]
-    fn test_in_process_coordination_publishes_checkpoint_and_restart_state() {
-        let (shared, _wal) = make_test_wal();
+    fn test_in_process_coordination_publishes_checkpoint_and_switch_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let second = dir.path().join("test.db-wal2");
+        let shared = SharedLog::with_segments(
+            WalFileShared::new_noop(),
+            WalFileShared::new_noop(),
+            Segments::new(SegmentId::First),
+            Some(second.to_str().unwrap().to_owned()),
+        );
         let coordination = make_test_coordination(&shared);
         let io = PlatformIO::new().unwrap();
         let snapshot = WalSnapshot {
@@ -11583,10 +11744,19 @@ pub mod test {
         assert_eq!(coordination.bump_checkpoint_epoch(), 5);
         assert_eq!(coordination.checkpoint_epoch(), 6);
 
-        assert!(coordination.try_read_mark_exclusive(0));
-        let restarted = coordination.begin_restart(&io).unwrap();
-        coordination.end_restart();
-        coordination.unlock_read_mark(0);
+        // A read on a mark of the current segment keeps the log from starting again, and no more
+        // once it ends.
+        assert!(coordination.try_read_mark_shared(1));
+        assert!(matches!(
+            coordination.switch_unread(&io),
+            Err(LimboError::Busy)
+        ));
+        coordination.unlock_read_mark(1);
+        assert_eq!(
+            coordination.switch_unread(&io).unwrap(),
+            Some(SegmentId::Second)
+        );
+        let restarted = coordination.load_snapshot();
 
         assert_eq!(restarted.max_frame, 0);
         assert_eq!(restarted.nbackfills, 0);
@@ -13022,12 +13192,12 @@ pub mod test {
         }
 
         assert!(coordination_b.fallback.try_read_mark_exclusive(0));
-        let restarted = coordination_b.begin_restart(&io).unwrap();
-        coordination_b.end_restart();
+        let started = coordination_b.switch_unread(&io).unwrap();
         coordination_b.fallback.unlock_read_mark(0);
+        assert_eq!(started, Some(SegmentId::First));
 
         assert_eq!(
-            restarted,
+            coordination_b.load_snapshot(),
             WalSnapshot {
                 max_frame: 0,
                 nbackfills: 0,
