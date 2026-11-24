@@ -616,6 +616,13 @@ impl Analysis<'_> {
         };
         let target = self.target_of(*node, &mut select.targets, Place::OrderBy)?;
         self.ordered(&mut select.targets, target)?;
+        // A "char" is stored as charout prints it (section 5), whose `\ooo` for a byte past ASCII isn't in the byte's order.
+        if let Some(target) = select.targets.get(target) {
+            let e = self.exprs.get(target.expr)?;
+            if coerce::base_type(e.type_oid) == type_oid::CHAR {
+                return Err(Error::unsupported("the order of type \"char\"").at(e.location));
+            }
+        }
         if select.sort.iter().all(|sort| sort.target != target) {
             select.sort.push(Sort {
                 target,

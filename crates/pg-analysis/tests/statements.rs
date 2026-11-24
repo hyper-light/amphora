@@ -161,3 +161,19 @@ fn t_pg_8_6_a_deep_expression_takes_no_stack() {
         assert_eq!(value(&query, "", session), Ok("1501".to_owned()));
     });
 }
+
+/// T-PG.12.3: ORDER BY of a "char" refuses `0A000`, since the engine's order of what it is stored as isn't 19's order of
+/// its byte; GROUP BY of one, which compares it for equality alone, doesn't.
+#[test]
+fn t_pg_12_3_the_order_of_a_char_is_refused_and_its_groups_are_not() {
+    let utc = tz::time_zone("UTC").unwrap();
+    common::session(&utc, |session| {
+        let refused = "select relkind from pg_class order by relkind asc limit 1";
+        let e = common::prepare(refused, &[], session).unwrap_err();
+        assert_eq!(e.sqlstate, sqlstate::FEATURE_NOT_SUPPORTED);
+        assert!(e.message.contains("\"char\""), "{}", e.message);
+        let grouped = "select relkind, count(*) from pg_class group by relkind";
+        let query = common::prepare(grouped, &[], session).unwrap();
+        assert_eq!(query.group, [0]);
+    });
+}
