@@ -121,6 +121,7 @@ impl Relations for Schema {
             name: name.to_owned(),
             type_oid,
             typmod,
+            not_null: false,
         };
         if let Some(t) = TABLES.iter().find(|t| t.0 == oid) {
             return t.2.iter().map(|(n, t, m)| column(n, *t, *m)).collect();

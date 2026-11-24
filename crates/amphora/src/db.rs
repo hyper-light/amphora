@@ -1234,25 +1234,21 @@ impl Db {
 
     /// The bytes an image of this database would hold now, as `image_pages` counts them.
     pub(crate) fn image_bytes(&mut self) -> anyhow::Result<usize> {
-        self.exec("BEGIN")?;
-        let result = self.image_extent().map(|(_, size)| size);
-        self.exec("ROLLBACK")?;
-        result
+        self.on_snapshot(|db| db.image_extent().map(|(_, size)| size))
     }
 
     pub(crate) fn image_pages(&mut self, max_bytes: usize) -> anyhow::Result<Pages> {
-        self.exec("BEGIN")?;
-        let result = (|| {
-            let (count, size) = self.image_extent()?;
+        self.on_snapshot(|db| {
+            let (count, size) = db.image_extent()?;
             if size > max_bytes {
                 anyhow::bail!("snapshot exceeds its byte budget");
             }
-            let pager = self.conn.get_pager();
+            let pager = db.conn.get_pager();
             let mut pages = Vec::with_capacity(usize::try_from(count)?);
             for id in 1..=count {
-                let (page, completion) = self.io.block(|| pager.read_page(i64::from(id)))?;
+                let (page, completion) = db.io.block(|| pager.read_page(i64::from(id)))?;
                 if let Some(completion) = completion {
-                    self.io.wait_for_completion(completion).map_err(fail)?;
+                    db.io.wait_for_completion(completion).map_err(fail)?;
                 }
                 if !page.is_loaded() {
                     anyhow::bail!("snapshot page was not loaded");
@@ -1260,7 +1256,22 @@ impl Db {
                 pages.push((id, page.get_contents().as_ptr().to_vec()));
             }
             Ok(pages)
-        })();
+        })
+    }
+
+    /// `f` in a read transaction on one snapshot of what was committed when it began. `BEGIN` is
+    /// deferred: it takes no snapshot until a statement reads, and a raw page read is no statement.
+    /// Without one the connection looks a page up in the log as its last transaction left it, and
+    /// that view knows no segment a switch has closed since (store.md, decision 45): its pages
+    /// would be read from the file, stale or not there yet.
+    fn on_snapshot<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        self.exec("BEGIN")?;
+        let result = self
+            .query("SELECT 1 FROM sqlite_schema LIMIT 1", [], |_| Ok(false))
+            .and_then(|()| f(self));
         self.exec("ROLLBACK")?;
         result
     }
@@ -1907,6 +1918,50 @@ mod tests {
             matches!(&refusal, amphora_api::Refusal::Fenced(reason) if reason == "a floor not proven by this group's members; raise it again once joins are tracked"),
             "{refusal:?}"
         );
+    }
+
+    /// AC-T1.8.D1, T-T1.10.L4 (store.md, decision 45): an image is the database as of when it is
+    /// taken, whichever segment of the log holds its pages. Do: a database whose file holds one
+    /// table; a second table, of more pages than the file holds, committed and not copied; the log
+    /// switched, so that the segment holding it closes uncopied; an image taken on the writer's own
+    /// connection, after a write to it, and applied to a new database. Expect: its bytes are its
+    /// pages', and every row of both tables is there.
+    #[test]
+    fn an_image_holds_the_pages_of_a_closing_segment_not_yet_copied() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut source = Db::open(&dir.path().join("source.db")).unwrap();
+        source.exec("CREATE TABLE kept(value)").unwrap();
+        source.flusher()().unwrap();
+        source.checkpoint().unwrap();
+        source.exec("CREATE TABLE spread(data)").unwrap();
+        source
+            .exec("INSERT INTO spread SELECT zeroblob(3000) FROM (WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<200) SELECT x FROM n)")
+            .unwrap();
+        assert!(source.switch_log().unwrap(), "the log didn't switch");
+        assert!(!source.closing_copied(), "the closing segment was copied");
+        source.exec("INSERT INTO kept VALUES (7)").unwrap();
+        let bytes = source.image_bytes().unwrap();
+        let image = source.image_pages(1 << 30).unwrap();
+        assert_eq!(
+            bytes,
+            image.iter().map(|(_, page)| page.len()).sum::<usize>()
+        );
+        let mut target = Db::open(&dir.path().join("target.db")).unwrap();
+        target
+            .apply_pages(&image, |db| db.exec("CREATE TABLE applied(n)"))
+            .unwrap();
+        let count = |sql: &'static str| {
+            let mut count = 0;
+            target
+                .query(sql, [], |row| {
+                    count = row.get::<i64>(0).unwrap();
+                    Ok(false)
+                })
+                .unwrap();
+            count
+        };
+        assert_eq!(count("SELECT count(*) FROM spread"), 200);
+        assert_eq!(count("SELECT value FROM kept"), 7);
     }
 
     /// U05/U15, bug 68a308b7: Db::exec of a statement its deadline interrupts reports the

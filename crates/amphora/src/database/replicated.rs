@@ -945,12 +945,20 @@ impl Drop for Turn<'_> {
         }
     }
 }
-/// What a counter of the queue's bytes holds with `bytes` more, within `limit`; one that holds
-/// none takes a call however large, as a window that holds nothing sends one entry (hyper-raft's
+/// What the calls' bytes hold with `bytes` more, within their `limit`; holding none, they take one
+/// call of up to `alone`, as a window that holds nothing sends one entry however large (hyper-raft's
 /// `Inflights::full`): what the memory budget has room for never waits for room no one can make.
-fn within(held: usize, bytes: usize, limit: usize) -> Option<usize> {
-    held.checked_add(bytes)
-        .filter(|next| held == 0 || *next <= limit)
+fn within(held: usize, bytes: usize, limit: usize, alone: usize) -> Option<usize> {
+    let limit = if held == 0 { limit.max(alone) } else { limit };
+    held.checked_add(bytes).filter(|next| *next <= limit)
+}
+/// The most bytes one call may hold of a command queue of `queued` bytes: all but a record without
+/// entries (`RECORD_BYTES`) and its envelope, so that a vote or a heartbeat, the record that finds
+/// a leader, enters beside it (QB.1).
+fn alone(queued: usize) -> usize {
+    queued
+        .saturating_sub(RECORD_BYTES)
+        .saturating_sub(ENVELOPE_BYTES)
 }
 struct Envelope {
     command: Input,
@@ -1784,8 +1792,9 @@ impl ReplicaHandle {
     }
 
     /// A call's place in the command queue, waited for in line (`Line`) until `until`, holding
-    /// nothing meanwhile: refused `Full` at the bound it is past once `until` has passed, and with
-    /// the owner's reason once it ended.
+    /// nothing meanwhile: refused `Full` at the bound it is past once `until` has passed, with the
+    /// owner's reason once it ended, and `TooLarge` at once past what one call may hold (`alone`),
+    /// which no bytes given back make room for.
     fn place_by(&self, bytes: usize, until: Instant) -> Result<Reservation, Refusal> {
         let line = &self.shared.line;
         if line.waiting.load(Ordering::Acquire) == 0
@@ -1795,6 +1804,8 @@ impl ReplicaHandle {
         }
         let turn = line.join()?;
         loop {
+            let queued = self.shared.queued.load(Ordering::Acquire);
+            api::bound("replica command queue bytes", bytes, alone(queued))?;
             // Looked at before it is taken: a place taken in part and given back would ring this
             // call again, and it would look without end.
             let past = self.past(bytes);
@@ -1821,14 +1832,19 @@ impl ReplicaHandle {
         if control.commands.load(Ordering::Acquire) >= commands.saturating_sub(1) {
             return Some(Refusal::Full { limit: commands });
         }
-        [
-            (&control.called, &control.applications),
-            (&control.admitted, &control.queued),
-        ]
-        .into_iter()
-        .map(|(held, limit)| (held, limit.load(Ordering::Acquire)))
-        .find(|(held, limit)| within(held.load(Ordering::Acquire), bytes, *limit).is_none())
-        .map(|(_, limit)| Refusal::Full { limit })
+        let queued = control.queued.load(Ordering::Acquire);
+        let applications = control.applications.load(Ordering::Acquire);
+        let called = control.called.load(Ordering::Acquire);
+        if within(called, bytes, applications, alone(queued)).is_none() {
+            return Some(Refusal::Full {
+                limit: applications,
+            });
+        }
+        let admitted = control.admitted.load(Ordering::Acquire);
+        if admitted.saturating_add(bytes) > queued {
+            return Some(Refusal::Full { limit: queued });
+        }
+        None
     }
 
     /// A place in the command queue for an input of `bytes`, a call's (`call`) or another's, or the
@@ -1868,7 +1884,7 @@ impl ReplicaHandle {
             self.shared
                 .called
                 .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
-                    within(held, bytes, application_limit)
+                    within(held, bytes, application_limit, alone(limit))
                 })
                 .map_err(|_| Refusal::Full {
                     limit: application_limit,
@@ -1878,11 +1894,7 @@ impl ReplicaHandle {
         self.shared
             .admitted
             .try_update(Ordering::AcqRel, Ordering::Acquire, |charged| {
-                if call {
-                    within(charged, bytes, limit)
-                } else {
-                    charged.checked_add(bytes).filter(|next| *next <= limit)
-                }
+                charged.checked_add(bytes).filter(|next| *next <= limit)
             })
             .map_err(|charged| match charged.checked_add(bytes) {
                 Some(next) => api::bound("replica command queue bytes", next, limit)
@@ -6997,6 +7009,53 @@ mod tests {
         assert!(record.is_ok(), "{:?}", record.err());
         drop(driven);
         holds_nothing(&handle, &budget);
+        assert_eq!(evaluated.load(Ordering::Relaxed), 0);
+    }
+
+    /// QB.1 (T-QB.1.18, lane perf-A26): however large the call a queue holds alone, the record that
+    /// finds a leader enters beside it, and a call that would leave it no room is refused `TooLarge`
+    /// at once. Do: on a leaderless member, queue a call holding all the queue does but a record
+    /// without entries, then a heartbeat; on another, a call one byte larger. Expect: the call
+    /// admitted and the heartbeat processed; the larger call refused, holding nothing.
+    #[test]
+    fn a26_the_record_that_finds_a_leader_enters_beside_the_largest_call() {
+        let budget = budget_of(1 << 50);
+        let evaluated = Arc::new(AtomicUsize::new(0));
+        for past in [0, 1] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut driven = Driven::new();
+            let client = driven.open(dir.path(), 1, vec![1, 2, 3], None);
+            let handle = client.handle().clone();
+            let until = driven.until();
+            let declared = alone(handle.queue_bound()) - usize::try_from(written(0)).unwrap();
+            let call = on_budget(&budget, || {
+                waiting_call(&handle, declared + past, until, &evaluated)
+            });
+            if past > 0 {
+                let refused = call.err();
+                assert!(
+                    matches!(refused, Some(Refusal::TooLarge { .. })),
+                    "{refused:?}"
+                );
+                holds_nothing(&handle, &budget);
+                continue;
+            }
+            assert!(call.is_ok(), "{:?}", call.err());
+            let mut bytes = Vec::new();
+            Message {
+                msg_type: hyper_raft::proto::MessageType::MsgHeartbeat,
+                from: 2,
+                to: 1,
+                term: 1,
+                ..Message::default()
+            }
+            .encode(&mut bytes);
+            let mut heartbeat = handle.admit_receive(2, bytes, until).unwrap();
+            driven.step();
+            assert!(matches!(heartbeat.try_result(), Ok(Some(()))));
+            drop(driven);
+            holds_nothing(&handle, &budget);
+        }
         assert_eq!(evaluated.load(Ordering::Relaxed), 0);
     }
 
