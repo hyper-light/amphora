@@ -3,8 +3,10 @@
 //! statements to the copy, point reads to the rows, by measured cost [c95]).
 //!
 //! Every cost here is nanoseconds, measured where the engine runs, never a picked weight:
-//! - the row path's: a row's visit and a seek, the database's learned rates
-//!   (`learned_costs::LearnedCosts::nanos_per`, calibrated at start and moved by its operators);
+//! - the row path's: a row's visit and a seek. For SQL's aggregates the row's visit is the
+//!   table's own, measured as the copy's is: the time the engine's serial loop took per row of the
+//!   table for the statements the copies handed it (`storage::versioned::columns_sql`, lane R6).
+//!   The seek is the database's learned rate (`learned_costs::LearnedCosts::nanos_per`);
 //! - the copy's: its own measured scan time per row at the block size it is cut at
 //!   (`storage::versioned::columns::Columns::plan_view`), which already carries what its deltas
 //!   cost, and the keys its queue holds at the statement's snapshot, each read from the rows (a

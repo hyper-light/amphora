@@ -2041,7 +2041,11 @@ pure core is `database/slot.rs`, driven by the owner (`Actor::keep_slots`, `star
   entry and the forwards stepped at the slot's end. Other members' forwards stay held through the turn, until the
   leader's own write is appended, or until the next start finds it has none to make. A second forward from a member
   held in the turn ends the turn. So the turn's write follows those entries and nothing else, and none was refused
-  in any W2 run. Outside a turn the leader's writes keep today's rule. A general tail rule at the leader is a
+  in any W2 run. A turn the leader has no write for passes only to a slot that begins: with no barrier waiting it
+  stays owed, and only the forwards it held go, so the leader's next write still prepares behind the holder's entry
+  (CP-T1.8, lane V13: given up at once, the leader's next write prepared on its applied state behind the holder's
+  uncommitted entry, and was refused stale, 1 to 4 a run at 32 spread writers in trace r1814). Outside a turn the
+  leader's writes keep today's rule. A general tail rule at the leader is a
   separate question: in the driven runs it refused the leader at most once in a row, against up to 8 without it.
   But two floor tests, `a_raise_beside_a_change_holds_through_a_lost_lead` and
   `a_raise_whose_base_is_joint_is_refused`, rest on a leader write prepared beside an entry in flight, and the
@@ -2065,7 +2069,12 @@ that member's slot to its next forward, and keeps the longest gap of this genera
 (each generation as long as the member's last two learned gaps were apart: "Decision (lane constants): generations
 learned where they run"). A member's slot is the larger of those two. A retry that arrives after its slot expired
 is still measured, so an expiry teaches the next slot rather than censoring it. Before a member's first measured gap,
-its slot is the core's election timeout in the owner's ticks (`election_tick × TICK`), the derived first value. No
+its slot is the core's election timeout in the owner's ticks (`election_tick × TICK`), the derived first value.
+The election timeout is also every slot's shortest (CP-T1.8, lane V13): a learned gap is an estimate, and a live
+holder's next retry outruns it, after which the leader appends first and refuses the retry. Lane V13's trace
+(r1814, 32 spread writers, both classes, two rounds) found 148 of 155 stale forwards were such a slot, ended at its
+learned length (37 to 47 a run) while its holder's forward was on its way. So a slot ends by time only once its
+holder is as late as the core takes a member for gone, and a gap longer than that still lengthens the next slot. No
 number bounds a gap: a gap over which the host's detector suspected its member is refused, typed
 (`slot::Unmeasured::Suspected`), logged (`write_slot_unmeasured`) and not learned: that member was gone, not slow. The
 detector's verdict is learned where it runs; the slot no longer borrows `patience::QUORUM_CEILING`, a tail measured

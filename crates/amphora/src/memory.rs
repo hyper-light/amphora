@@ -9,8 +9,9 @@
 //! The parsers are pure, so tests give them each file's text; [`limit`] reads the files.
 
 use amphora_api::Refusal;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering, fence};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+use std::time::Instant;
 
 /// A cgroup v1 limit at or past this is "no limit" (the kernel reports its page-rounded
 /// `LONG_MAX`, 9,223,372,036,854,771,712 on 4 KiB pages).
@@ -416,6 +417,12 @@ pub struct Budget {
     held: [AtomicU64; 5],
     /// The streams of each use open now, each of which may hold a charge at once ([`Stream`]).
     streams: [AtomicU64; 5],
+    /// The holders waiting for room now ([`Budget::take_until`]): a charge given back with none
+    /// waiting takes no lock.
+    waiting: AtomicU64,
+    /// The charges given back while a holder waited, counted under this lock: a holder that found
+    /// no room waits on it until the count moves or its deadline passes.
+    given: (Mutex<u64>, Condvar),
 }
 
 /// One stream of a use's that may hold a charge at any moment while it lives (a backup's base copy,
@@ -503,6 +510,8 @@ impl Budget {
             readings,
             held: Default::default(),
             streams: Default::default(),
+            waiting: AtomicU64::new(0),
+            given: (Mutex::new(0), Condvar::new()),
         })
     }
 
@@ -601,13 +610,70 @@ impl Budget {
             })
     }
 
-    /// `bytes` held by `used` ([`Budget::hold`]) given back.
+    /// `bytes` more held by `used`, as [`Budget::take`], waiting for room until `until`: woken by
+    /// each charge given back anywhere in the budget ([`Budget::give`]), never by a timer, and
+    /// `waits` told (under the budget's lock) each time it waits. Refused as [`Budget::hold`]
+    /// refuses once `until` has passed, and at once for a refusal other than no room.
+    pub fn take_until(
+        self: &Arc<Self>,
+        used: Use,
+        bytes: u64,
+        until: Instant,
+        mut waits: impl FnMut(),
+    ) -> Result<Charge, Refusal> {
+        let mut given = self.given.0.lock().unwrap_or_else(PoisonError::into_inner);
+        self.waiting.fetch_add(1, Ordering::Relaxed);
+        // Pairs with `give`'s sequentially consistent give-back and read of `waiting` (C++
+        // [atomics.order], the single total order; Linux's include/linux/wait.h, `waitqueue_active`):
+        // either this look for room sees bytes given back, or their giver sees this holder waiting.
+        fence(Ordering::SeqCst);
+        let held = 'look: loop {
+            let seen = *given;
+            let refused = match self.hold(used, bytes) {
+                Err(refused @ Refusal::TooLarge { .. }) => refused,
+                other => break other,
+            };
+            let mut left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break Err(refused);
+            }
+            waits();
+            while *given == seen {
+                if left.is_zero() {
+                    break 'look Err(refused);
+                }
+                given = self
+                    .given
+                    .1
+                    .wait_timeout(given, left)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+                left = until.saturating_duration_since(Instant::now());
+            }
+        };
+        self.waiting.fetch_sub(1, Ordering::Relaxed);
+        drop(given);
+        held.map(|()| Charge {
+            budget: Arc::clone(self),
+            used,
+            bytes,
+        })
+    }
+
+    /// `bytes` held by `used` ([`Budget::hold`]) given back, and the holders waiting for room
+    /// ([`Budget::take_until`]) woken to look again.
     pub fn give(&self, used: Use, bytes: u64) {
         let _ = self
             .slot(used)
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
                 Some(held.saturating_sub(bytes))
             });
+        if self.waiting.load(Ordering::SeqCst) > 0 {
+            let mut given = self.given.0.lock().unwrap_or_else(PoisonError::into_inner);
+            *given = given.wrapping_add(1);
+            drop(given);
+            self.given.1.notify_all();
+        }
     }
 
     /// The room for one image: [`Use::Images`]' room, in the `usize` an image's bytes are

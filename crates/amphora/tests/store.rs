@@ -46,6 +46,12 @@ impl Engine for Events {
         &row.key
     }
 
+    fn row_bytes(row: &Row) -> usize {
+        std::mem::size_of::<Row>()
+            .saturating_add(row.key.capacity())
+            .saturating_add(row.text.capacity())
+    }
+
     fn apply(&mut self, rows: &[Row]) -> anyhow::Result<usize> {
         self.db.transaction(|db| insert(db, rows))?;
         Ok(rows.len())
@@ -509,41 +515,6 @@ fn a_transaction_holding_a_failed_statement_is_never_committed() {
     })
     .unwrap();
     assert_eq!(rows, vec![3]);
-}
-
-/// A full queue refuses what it can't take, typed and counted; a sender that waits for room is
-/// taken once the writer frees some.
-#[test]
-fn a_full_queue_refuses_typed_and_counted_and_a_wait_for_room_is_taken() {
-    let config = Config {
-        queue: Some(1),
-        ..Config::default()
-    };
-    let lab = lab(config, None);
-    // The writer held by a job, the queue filled behind it.
-    let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
-    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
-    let busy = lab.store.clone();
-    let job = std::thread::spawn(move || {
-        busy.run(soon(), move |_| {
-            held_tx.send(()).unwrap();
-            go_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-            Ok(())
-        })
-    });
-    held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-    lab.store.put(vec![row("a", 1)]).unwrap();
-    assert_eq!(lab.store.put(vec![row("a", 2)]).err(), Some(Refused::Full));
-    assert_eq!(lab.store.counters().dropped, 1);
-    // A wait for room is taken once the writer goes on.
-    let waiting = lab.store.clone();
-    let waiter = std::thread::spawn(move || waiting.put_wait(vec![row("a", 3)], soon()));
-    go_tx.send(()).unwrap();
-    waiter.join().unwrap().unwrap();
-    job.join().unwrap().unwrap();
-    lab.store.sync(soon()).unwrap();
-    // The refused row isn't there; the others are.
-    assert_eq!(count(&lab.store, "a"), 2);
 }
 
 /// Under writes and reads that never pause, the log stays bounded: the checkpointer copies it and

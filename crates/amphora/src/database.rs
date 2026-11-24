@@ -2129,18 +2129,11 @@ impl Database {
             shared: Arc::new(Shared {
                 transport: Mutex::new(None),
                 path: OnceLock::new(),
-                // No count bounds the writer's queue: every request is admitted by its charge to
-                // the memory budget's room for queues (MB.1), so a call waits on that room alone,
-                // never on a count picked apart from it (lane perf-A8).
+                // Every request is admitted by its charge to the memory budget's room for queues
+                // (MB.1), so its store charges its commands nothing more (`Local::row_bytes`).
                 writer: Writer::Local(
-                    Store::start(
-                        Local { db, restoring },
-                        store::Config {
-                            queue: None,
-                            ..store::Config::default()
-                        },
-                    )
-                    .map_err(unavailable)?,
+                    Store::start(Local { db, restoring }, store::Config::default())
+                        .map_err(unavailable)?,
                 ),
                 changed: Arc::new(changed),
                 restoring: AtomicBool::new(restoring),
@@ -2452,12 +2445,23 @@ impl Database {
                     .map(|(value, _)| value);
             }
         };
-        database.query_reader(store, until, move |c| Ok(within(f(c)?, answer)?))
+        database.query_reader(store, until, Some(answer.get()), move |c| {
+            Ok(within(f(c)?, answer)?)
+        })
     }
 
-    /// [`Database::query`] on a local store: on a reader, or on the writer while it has none to
-    /// lend; admission charges it nothing.
-    fn query_reader<R, F>(&self, store: &Store<Local>, until: Instant, f: F) -> Result<R, Refusal>
+    /// [`Database::query`] on a local store: on a reader, on this thread, charged nothing; or, while
+    /// the store has no reader to lend, queued on the writer and so charged at admission as a
+    /// queued request is (MB.1): its job, its session, and `answer`, the bytes its answer declared
+    /// ([`AnswerMax`]; none from [`Database::query_local`] and [`Database::query_closed`], which
+    /// declare none).
+    fn query_reader<R, F>(
+        &self,
+        store: &Store<Local>,
+        until: Instant,
+        answer: Option<usize>,
+        f: F,
+    ) -> Result<R, Refusal>
     where
         R: Send + 'static,
         F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + 'static,
@@ -2467,20 +2471,22 @@ impl Database {
             .foreground
             .get()
             .map(crate::backup::Foreground::call);
-        // The store runs the session on a reader, or on the writer while it has none to lend.
         let session = Arc::new(Mutex::new(Some(f)));
-        let on_writer = Arc::clone(&session);
         let claim = self.application.clone();
-        let on_writer_claim = claim.clone();
-        store
-            .read_committed(
-                until,
-                |reader| run_query(reader, until, claim.as_ref(), &session),
-                move |engine| {
-                    run_query(&mut engine.db, until, on_writer_claim.as_ref(), &on_writer)
-                },
-            )
-            .map_err(|e| refused(&e))
+        if let Some(read) =
+            store.on_reader(until, |reader| run_query(reader, until, claim.as_ref(), &session))
+        {
+            return read.map_err(|e| refused(&e));
+        }
+        let job =
+            move |engine: &mut Local| run_query(&mut engine.db, until, claim.as_ref(), &session);
+        let _admission = Admission::charge(
+            &self.shared.admitted,
+            std::mem::size_of_val(&job)
+                .saturating_add(std::mem::size_of::<Mutex<Option<F>>>())
+                .saturating_add(answer.unwrap_or(0)),
+        )?;
+        store.run(until, job).map_err(|e| refused(&e))
     }
 
     /// [`Database::query`] for a session whose Records reads wait on a held cross-group lock
@@ -2582,7 +2588,7 @@ impl Database {
                 .for_application(database.application.clone())
                 .query_local(until, f)
                 .map_err(Refusal::from),
-            Writer::Local(store) => database.query_reader(store, until, f),
+            Writer::Local(store) => database.query_reader(store, until, None, f),
         }
     }
 
@@ -2620,7 +2626,7 @@ impl Database {
             Writer::Local(store) => {
                 let micros = replicated::wall_micros()?;
                 database
-                    .query_reader(store, until, f)
+                    .query_reader(store, until, None, f)
                     .map(|value| ClosedRead { value, micros })
             }
         }
@@ -3569,6 +3575,11 @@ impl Engine for Local {
     type Reader = Db;
     fn key(_: &Command) -> &str {
         "database"
+    }
+    /// None of its own: a command is charged at its admission ([`Admission`]), what it carries
+    /// and what its answer can hold, until it is answered, its time in the writer's queue within.
+    fn row_bytes(_: &Command) -> usize {
+        0
     }
     /// A Records transaction routes by every key its conditions and writes name, and a get by
     /// its key, each as its row key ([`reshard::row_key`] of the namespace, family and key), so a

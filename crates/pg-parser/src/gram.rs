@@ -287,25 +287,57 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         // opt_drop_behavior: /* EMPTY */
         148 => (0x784d_d6d1_0e75_e150, |_| Ok(Value::Int(0))),
         // VariableSetStmt: SET set_rest
-        215 => (0x7e32_ef61_7adc_84a9, set_stmt),
+        215 => (0x7e32_ef61_7adc_84a9, |r| set_stmt(r, 2, false)),
+        // VariableSetStmt: SET LOCAL set_rest
+        216 => (0xe59c_d0d1_bdbb_fdc4, |r| set_stmt(r, 3, true)),
+        // VariableSetStmt: SET SESSION set_rest
+        217 => (0x7e32_ef61_7adc_84a9, |r| set_stmt(r, 3, false)),
         // generic_set: var_name TO var_list
         221 => (0x3133_3e60_3a82_cdfb, generic_set),
+        // generic_set: var_name '=' var_list
+        222 => (0x3133_3e60_3a82_cdfb, generic_set),
+        // generic_set: var_name TO DEFAULT
+        225 => (0x292d_21e5_3b9c_b86e, |r| named_set_kind(r, 1)),
+        // generic_set: var_name '=' DEFAULT
+        226 => (0x292d_21e5_3b9c_b86e, |r| named_set_kind(r, 1)),
         // set_rest_more: generic_set
         227 => (0xb63c_8f94_4218_f133, top),
         // var_name: ColId
         238 => (0x2c4d_653c_2123_81fb, top),
+        // var_name: var_name '.' ColId
+        239 => (0x13e3_87cb_b06c_5602, dotted_name),
         // var_list: var_value
         240 => (0x0fda_94aa_d7e7_3ffc, list1),
+        // var_list: var_list ',' var_value
+        241 => (0x6976_767c_5e07_8201, append),
         // var_value: opt_boolean_or_string
         242 => (0x1721_9ff3_34b4_a393, string_const),
+        // var_value: NumericOnly
+        243 => (0x3860_77ae_8732_c4e2, numeric_const),
+        // opt_boolean_or_string: TRUE_P
+        248 => (0xb22a_f767_a16c_1ad4, |_| Ok(word("true"))),
+        // opt_boolean_or_string: FALSE_P
+        249 => (0x015b_a288_ef4e_5f5b, |_| Ok(word("false"))),
         // opt_boolean_or_string: ON
         250 => (0xbe4d_bf1d_d140_a8e1, |_| Ok(word("on"))),
         // opt_boolean_or_string: NonReservedWord_or_Sconst
         251 => (0x2c4d_653c_2123_81fb, top),
+        // NonReservedWord_or_Sconst: NonReservedWord
+        262 => (0xa007_892c_3e21_a49b, top),
         // NonReservedWord_or_Sconst: Sconst
         263 => (0x6314_522d_4765_c4bb, top),
+        // VariableResetStmt: RESET reset_rest
+        264 => (0xc42a_11c7_a7f1_a966, |r| Ok(r.take(2))),
+        // reset_rest: generic_reset
+        265 => (0x9197_a3d2_c91c_9897, top),
+        // generic_reset: var_name
+        269 => (0xfdf5_dca3_63d1_242a, |r| named_set_kind(r, 4)),
+        // generic_reset: ALL
+        270 => (0x03eb_20f3_52f6_bd28, |r| set_kind(r, 5, None)),
         // VariableShowStmt: SHOW var_name
         275 => (0xc00b_e3b1_de12_3e7b, show_stmt),
+        // VariableShowStmt: SHOW ALL
+        279 => (0xc23e_8a83_7ffd_4aab, show_all),
         // AlterTableStmt: ALTER TABLE relation_expr alter_table_cmds
         291 => (0xdc8a_b7d1_3e26_151c, alter_table),
         // alter_table_cmds: alter_table_cmd
@@ -412,6 +444,12 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         625 => (0x8ee1_1e76_ad01_e0db, null),
         // OptConsTableSpace: /* EMPTY */
         627 => (0x8ee1_1e76_ad01_e0db, null),
+        // NumericOnly: FCONST
+        678 => (0x12df_1e0d_616c_3850, |r| float_value(r, 1, false)),
+        // NumericOnly: '+' FCONST
+        679 => (0xe112_18d7_b2ec_bcb0, |r| float_value(r, 2, false)),
+        // NumericOnly: '-' FCONST
+        680 => (0xd322_50a9_608f_c449, |r| float_value(r, 2, true)),
         // NumericOnly: SignedIconst
         681 => (0x699b_98a9_71ef_9ef1, integer),
         // create_generic_options: /* EMPTY */
@@ -430,6 +468,10 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         980 => (0x721c_8e26_0e62_7609, any_name_append),
         // any_name: ColId
         981 => (0xad62_ca6c_ccde_7143, any_name),
+        // attrs: '.' attr_name
+        983 => (0x2eeb_eadd_6516_86e3, attrs_first),
+        // attrs: attrs '.' attr_name
+        984 => (0x4e4b_623b_606d_cb78, attrs_append),
         // TruncateStmt: TRUNCATE opt_table relation_expr_list opt_restart_seqs opt_drop_behavior
         987 => (0x1fdb_3a96_2e09_cf75, truncate_stmt),
         // opt_restart_seqs: /* EMPTY */
@@ -592,12 +634,20 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         1964 => (0xc58b_b6eb_3ec8_28bf, typename),
         // opt_array_bounds: /* EMPTY */
         1972 => (0x5be7_5729_4b12_8d74, nil),
+        // SimpleTypename: GenericType
+        1973 => (0x0cb0_b34c_e5bd_f9f3, top),
         // SimpleTypename: Numeric
         1974 => (0x0cb0_b34c_e5bd_f9f3, top),
         // SimpleTypename: Character
         1976 => (0x0cb0_b34c_e5bd_f9f3, top),
         // SimpleTypename: ConstDatetime
         1977 => (0x54ea_3776_f177_7e53, top),
+        // GenericType: type_function_name opt_type_modifiers
+        1986 => (0xa0fc_f20c_7374_334f, |r| generic_type(r, false)),
+        // GenericType: type_function_name attrs opt_type_modifiers
+        1987 => (0x9241_9142_11fe_2eae, |r| generic_type(r, true)),
+        // opt_type_modifiers: /* EMPTY */
+        1989 => (0x5195_4352_6e6c_0588, nil),
         // Numeric: INT_P
         1990 => (0x7ebf_d128_317b_820d, |r| system_type_at(r, "int4")),
         // Numeric: BIGINT
@@ -616,6 +666,8 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         2030 => (0xf9a7_c703_e0b2_bd02, |_| Ok(Value::Bool(false))),
         // a_expr: c_expr
         2048 => (0x9113_5026_c13a_e4a7, top),
+        // a_expr: a_expr TYPECAST Typename
+        2049 => (0xf291_a789_1854_d33d, type_cast),
         // a_expr: '-' a_expr
         2054 => (0x50eb_9947_0f67_cd77, negate),
         // a_expr: a_expr '+' a_expr
@@ -640,6 +692,8 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         2143 => (0x9592_5b42_d849_02b0, parenthesized),
         // c_expr: func_expr
         2145 => (0xcc48_388e_3a70_ab47, top),
+        // func_application: func_name '(' ')'
+        2154 => (0x299c_3568_049b_5c90, func_no_args),
         // func_application: func_name '(' func_arg_list opt_sort_clause ')'
         2155 => (0x568c_7c1f_de3b_fc0f, func_call),
         // func_application: func_name '(' '*' ')'
@@ -718,10 +772,22 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         2487 => (0xa007_892c_3e21_a49b, top),
         // SignedIconst: Iconst
         2488 => (0xd710_1847_a287_d2cb, top),
+        // SignedIconst: '+' Iconst
+        2489 => (0x7192_1f1f_75bd_9188, |r| Ok(Value::Int(r.int(2)?))),
+        // SignedIconst: '-' Iconst
+        2490 => (0x39c0_f4c2_5e5c_17aa, negative_iconst),
         // ColId: IDENT
         2504 => (0xa007_892c_3e21_a49b, top),
         // type_function_name: IDENT
         2507 => (0x2c4d_653c_2123_81fb, top),
+        // NonReservedWord: IDENT
+        2510 => (0x2c4d_653c_2123_81fb, top),
+        // NonReservedWord: unreserved_keyword
+        2511 => (0x1d4d_f16c_54a7_2564, top),
+        // NonReservedWord: col_name_keyword
+        2512 => (0x0f87_a177_22a9_8584, top),
+        // NonReservedWord: type_func_name_keyword
+        2513 => (0x1d4d_f16c_54a7_2564, top),
         // ColLabel: IDENT
         2514 => (0xa007_892c_3e21_a49b, top),
         // ColLabel: type_func_name_keyword
@@ -1806,7 +1872,7 @@ fn copy_stmt(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
     })
 }
 
-/// `generic_set: var_name TO var_list`; VAR_SET_VALUE is 0.
+/// `generic_set: var_name TO var_list` and `var_name '=' var_list`; VAR_SET_VALUE is 0.
 fn generic_set(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
     let name = r.string(1)?;
     let args = r.list(3)?;
@@ -1821,14 +1887,137 @@ fn generic_set(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
     })
 }
 
-/// `VariableSetStmt: SET set_rest`.
-fn set_stmt(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
-    let stmt = r.node(2)?.ok_or_else(fault)?;
+/// `VariableSetStmt: SET set_rest`, `SET LOCAL set_rest` and `SET SESSION set_rest`: set_rest's
+/// statement, `$n`, with is_local as the keyword says.
+fn set_stmt(r: &mut Reduce<'_>, n: usize, local: bool) -> Result<Value, Refusal> {
+    let stmt = r.node(n)?.ok_or_else(fault)?;
     let Node::VariableSetStmt { is_local, .. } = r.tree.get_mut(stmt)? else {
         return Err(fault());
     };
-    *is_local = false;
+    *is_local = local;
     Ok(Value::Node(Some(stmt)))
+}
+
+/// A VariableSetStmt of VariableSetKind `kind` with no arguments, its location -1: generic_set's
+/// DEFAULT (VAR_SET_DEFAULT, 1), generic_reset's var_name (VAR_RESET, 4) and ALL (VAR_RESET_ALL, 5).
+fn set_kind(r: &mut Reduce<'_>, kind: i32, name: Option<String>) -> Result<Value, Refusal> {
+    r.make(Node::VariableSetStmt {
+        kind,
+        name,
+        args: Vec::new(),
+        jumble_args: false,
+        is_local: false,
+        location: -1,
+    })
+}
+
+/// `generic_set: var_name TO DEFAULT` and `var_name '=' DEFAULT`, or `generic_reset: var_name`.
+fn named_set_kind(r: &mut Reduce<'_>, kind: i32) -> Result<Value, Refusal> {
+    let name = r.string(1)?;
+    set_kind(r, kind, Some(name))
+}
+
+/// `var_name: var_name '.' ColId`: psprintf("%s.%s", $1, $3).
+fn dotted_name(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let head = r.string(1)?;
+    let tail = r.string(3)?;
+    Ok(Value::Token(lex::Value::Str(
+        format!("{head}.{tail}").into_bytes(),
+    )))
+}
+
+/// `NumericOnly: FCONST`, `'+' FCONST` and `'-' FCONST`: makeFloat($n), negated as doNegateFloat
+/// negates it (a leading '+' dropped, then a leading '-' stripped or one put in front).
+fn float_value(r: &mut Reduce<'_>, n: usize, negate: bool) -> Result<Value, Refusal> {
+    let text = r.string(n)?;
+    let text = if negate {
+        let v = text.strip_prefix('+').unwrap_or(&text);
+        v.strip_prefix('-')
+            .map_or_else(|| format!("-{v}"), str::to_owned)
+    } else {
+        text
+    };
+    r.make(Node::Float(text))
+}
+
+/// `SignedIconst: '-' Iconst`: `- $2` (ICONST is at most INT_MAX, so its negation is an int).
+fn negative_iconst(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let v = r.int(2)?;
+    Ok(Value::Int(v.checked_neg().ok_or_else(fault)?))
+}
+
+/// `var_value: NumericOnly`: makeAConst($1, @1), the Integer's or the Float's A_Const.
+fn numeric_const(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let id = r.node(1)?.ok_or_else(fault)?;
+    let location = r.at(1)?;
+    let val = match r.tree.get(id)? {
+        Node::Integer(v) => Val::Integer(*v),
+        Node::Float(s) => Val::Float(s.clone()),
+        _ => return Err(fault()),
+    };
+    r.make(Node::AConst { val, location })
+}
+
+/// `a_expr: a_expr TYPECAST Typename`: makeTypeCast($1, $3, @2).
+fn type_cast(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let arg = r.node(1)?;
+    let type_name = r.node(3)?;
+    let location = r.at(2)?;
+    r.make(Node::TypeCast {
+        arg,
+        type_name,
+        location,
+    })
+}
+
+/// `GenericType: type_function_name opt_type_modifiers` (makeTypeName) and `type_function_name
+/// attrs opt_type_modifiers` (makeTypeNameFromNameList of `lcons(makeString($1), $2)`), typmods
+/// and location @1 set.
+fn generic_type(r: &mut Reduce<'_>, attrs: bool) -> Result<Value, Refusal> {
+    let first = r.string(1)?;
+    let mut names = vec![r.push(Node::String(first))?];
+    let typmods = if attrs {
+        names.extend(r.list(2)?);
+        r.list(3)?
+    } else {
+        r.list(2)?
+    };
+    let location = r.at(1)?;
+    r.make(Node::TypeName {
+        names,
+        type_oid: 0,
+        setof: false,
+        pct_type: false,
+        typmods,
+        typemod: -1,
+        array_bounds: Vec::new(),
+        location,
+    })
+}
+
+/// `attrs: '.' attr_name`: list_make1(makeString($2)).
+fn attrs_first(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let name = r.string(2)?;
+    Ok(Value::List(vec![r.push(Node::String(name))?]))
+}
+
+/// `attrs: attrs '.' attr_name`: lappend($1, makeString($3)).
+fn attrs_append(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let mut list = r.list(1)?;
+    let name = r.string(3)?;
+    list.push(r.push(Node::String(name))?);
+    Ok(Value::List(list))
+}
+
+/// `func_application: func_name '(' ')'`: makeFuncCall($1, NIL, COERCE_EXPLICIT_CALL, @1).
+fn func_no_args(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let funcname = r.list(1)?;
+    let location = r.at(1)?;
+    r.make(Node::FuncCall(Box::new(FuncCall {
+        funcname,
+        location,
+        ..FuncCall::default()
+    })))
 }
 
 /// `PartitionSpec: PARTITION BY ColId '(' part_params ')'`: parsePartitionStrategy, which refuses
@@ -1874,6 +2063,13 @@ fn part_elem(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
 fn show_stmt(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
     let name = r.string(2)?;
     r.make(Node::VariableShowStmt { name: Some(name) })
+}
+
+/// `VariableShowStmt: SHOW ALL`: the name "all".
+fn show_all(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    r.make(Node::VariableShowStmt {
+        name: Some("all".to_owned()),
+    })
 }
 
 /// The rule's `$$`: bison's default (`$$ = $1`, before any action) for a rule with no action, the
@@ -2105,7 +2301,7 @@ mod tests {
                 n += 1;
             }
         }
-        assert_eq!(n, 232);
+        assert_eq!(n, 265);
     }
 
     /// T-PG.5.1: a syntax error is 42601 at the token 19 names (1-based characters), the end of
