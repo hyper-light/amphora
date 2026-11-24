@@ -563,9 +563,8 @@ pub struct PreparedFrames {
 pub(crate) fn page1_version(page: &[u8]) -> RawVersion {
     const READ_VERSION: usize = 19;
     page.get(READ_VERSION)
-        .map_or(RawVersion::from(Version::Wal), |&version| {
-            RawVersion(version)
-        })
+        .copied()
+        .map_or_else(|| Version::Wal.into(), RawVersion)
 }
 
 /// Amphora: what a page's delta is made against: the log's generation, the last frame the writer
