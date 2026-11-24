@@ -31,7 +31,9 @@
 342 add_constraint
 390 |r| Ok(r.take(2))
 393 list1
+394 append
 395 |r| def_elem(r, 3)
+396 |r| def_elem_named(r, None, None)
 425 copy_stmt
 427 |_| Ok(Value::Bool(true))
 428 |_| Ok(Value::Bool(false))
@@ -44,8 +46,11 @@
 455 null
 457 null
 460 list1
+461 append
 462 |r| def_elem(r, 2)
+463 |r| { let arg = r.node(2)?; def_elem_named(r, Some("format"), arg) }
 464 make_string
+469 null
 473 create_stmt
 486 |_| Ok(Value::Char('p'))
 487 top
@@ -63,8 +68,10 @@
 560 primary_key
 569 |_| Ok(Value::Bool(false))
 571 |_| Ok(Value::Bool(false))
+572 |r| Ok(Value::List(r.list(2)?))
 573 nil
 574 list1
+575 append
 580 make_string
 582 nil
 606 nil
@@ -102,6 +109,7 @@
 1491 end
 1590 vacuum_stmt
 1596 |_| Ok(Value::Bool(true))
+1597 |_| Ok(Value::Bool(false))
 1599 |_| Ok(Value::Bool(false))
 1601 |_| Ok(Value::Bool(false))
 1603 |_| Ok(Value::Bool(false))
@@ -252,4 +260,7 @@
 2512 top
 2513 top
 2514 top
+2515 top
+2516 top
 2517 top
+2518 top

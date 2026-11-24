@@ -555,12 +555,15 @@ impl Executor {
             self.began
         };
         let lowered = {
-            let session = self.analysis(Some(now));
-            if let Some(utility) = utility(tree, id, &session).map_err(|e| refusal(e, sql))? {
-                drop(session);
+            let utility = {
+                let session = self.analysis(Some(now));
+                utility(tree, id, &session).map_err(|e| refusal(e, sql))?
+            };
+            if let Some(utility) = utility {
                 self.ensure_transaction()?;
                 return Ok(self.run_utility(&utility, out)?);
             }
+            let session = self.analysis(Some(now));
             let query = analyze(tree, id, &session, &[]).map_err(|e| refusal(e, sql))?;
             if !query.params.is_empty() {
                 return Err(
