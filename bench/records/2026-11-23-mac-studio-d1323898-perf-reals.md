@@ -474,3 +474,90 @@ max + 2^970 (the tie: +inf), max + 2^970 - 2^-1074 (the tiny term breaks the tie
 - Any label placed by `preassign_label_to_next_insn` right after an instruction that gets hoisted
   follows it to the constant section. Only `keep` was found doing this in `parallel.rs`; the rest of
   the translator was not searched.
+
+# Lane R5 (reals), 2026-11-23 22:51Z to 23:51Z: one ExactSum; constant result columns answer as SQLite in every shape; t_qt_6_18 runs past 240 s alone
+
+On main as 41422da9 (lane branch `perf/reals-r5`). Runs on adacachy2 (r1729, r1735, r1746, cpus=3:
+the Macs' queue started nothing in the hour, and adacachy2 refused 8 and 4 cores), load 27 to 47 on
+32 cores. No timings: nothing here is a speed change.
+
+## Verdict, losses first
+
+- **t_qt_6_18 runs past 240 s alone at both 6a3e8ebb and 55513d95** (r1746), so it predates R4
+  (J2's 13:29Z LANES note already skipped it as one of "main's hangs"). Hang or only slow is not
+  known: no stacks (gdb printed no engine frames), and the Mac runs with samples and a 600 s cap
+  (r1692, r1693) never left kiln's queue; stopped at the hour's end.
+- **The column copy never answered SUM over a REAL column** in the SQL test, under `Exact`, at 14
+  rows and at 3,014 (r1729, r1735: no copy bought). Not traced (rule 0). The copy's sum is held
+  by a unit test on the scan's aggregate instead (below).
+- `cb4_a_read_only_transaction_reads_the_copy_at_its_snapshot` and
+  `cb4_ab_both_rebuy_policies_at_the_extremes` fail on main 969cbbc6 too (r1735, same run, same
+  machine): not this lane's.
+- **Done: one ExactSum** (a5607e5f, d5111aee, 20c1a565). **Done: the sweep** (1d76d93e): no lost or
+  extra row in any shape, serial or parallel, against SQLite 3.54.0; no fix was needed past R4's.
+
+## One ExactSum
+
+`storage/versioned/columns/scan.rs`'s own `ExactSum` is deleted; the scan's `Acc::Sum` uses
+`vdbe::morsel::ExactSum` (R4's), its errors mapped (out of memory as `OutOfMemory`).
+
+`ExactSum::value` now returns the non-finite inputs' sum when there are any. It returned
+`finite + special`, so +inf beside finite values whose exact sum rounds to -inf gave NaN, which
+SQL shows as NULL. The finite inputs' exact sum is a real number however far past the range, so
+the answer is the infinity; SQLite 3.54.0 answers +inf there too (its KBN sum stays at inf). The
+deleted copy had this right (it returned `special`), so taking R4's unchanged would have lost it.
+
+| test (20c1a565, r1746) | cases | answer |
+|---|---|---|
+| `r5_the_copys_sum_stays_exact_past_the_range` (the scan's `Acc`, cut at every place, merged) | bigpairs; 1e308 1e308 -1e308 -1e308 1.5; inf -1e308 -1e308 | +inf, 1.5, +inf: pass |
+| `r5_versioned_exact_sums_stay_exact_past_the_range` (SQL, versioned storage, copies on and off) | the same, per group | +inf, 1.5, +inf: pass |
+| `r4_exact_sum_stays_exact_past_the_range` (morsel) | R4's six and the infinity case | pass |
+
+SQLite 3.54.0 on the same rows (sqlite3 shell on adacachy2, 23:46Z): Inf, Inf, Inf. Exact agrees on
+bigpairs and on the infinity case, and differs on overflow and back (Exact 1.5, the exact sum;
+SQLite Inf, its KBN sum stuck at inf): a data point for the RowOrder or Exact choice.
+
+Not run red: the old copy's answers are traced from its code, not run. In row order bigpairs and
+overflow-and-back both put +inf, then -inf, into `special` (each overflowing step's sum went there),
+so both were NaN, which SQL shows as NULL. R4's guess held.
+
+## Constant result columns against SQLite 3.54.0
+
+`r5-scripts/sweep_sqlite.py` (not in the repo; on adacachy2, SQLite 3.54.0) builds `t` (5,000 rows),
+`u` (300) and `w`, runs each statement and prints its rows' count and FNV-1a 64 hash, listed as the
+shell lists them and sorted unless ordered. The eight `r5_constant_columns_*` tests
+(`vdbe/morsel_scan_tests.rs`) run each statement with `ParallelMode::Off`, then `On` on a machine
+stated as 1, 2, 4 and 8 cores (hash joins only), and compare each answer with SQLite's.
+
+| shape | statements (constant first, middle, last) | rows | serial | parallel 1/2/4/8 |
+|---|---|---|---|---|
+| scan | `SELECT 7, a, s FROM t` ... `a, s, 2.5` | 5000 | = SQLite | = SQLite, workers ran the body |
+| filtered scan | `... WHERE b < 300` | 1500 | = | =, body ran |
+| join | `SELECT 7, t.id, u.c FROM t JOIN u ON t.a = u.a` ... | 15466 | = | =, body ran |
+| GROUP BY | `SELECT 7, a, count(*) ... GROUP BY a`, `'x', sum(b)`, `count(*), 2.5 ... WHERE` | 97 | = | = |
+| ORDER BY + LIMIT | `ORDER BY b, id LIMIT 1000` and two more, in order | 1000 | = | = |
+| compound | three UNION ALL (a constant in each arm), one UNION | 800, 1367 | = | = |
+| subquery in FROM | constant inside (flattened), and outside a GROUP BY subquery | 2500, 97 | = | = |
+| INSERT ... SELECT | `INSERT INTO w SELECT 7, a, s FROM t WHERE b < 600` ..., `w` read back | 3000 | = | = |
+
+Every one of 28 statements matched at all five settings (r1729 on 1d76d93e; again r1746 on 20c1a565).
+
+## t_qt_6_18 alone (r1746, adacachy2, 3 cores asked, load 30 to 45)
+
+`r5-scripts/qt618_linux.sh`: the test binary built at each SHA in the lane's one target dir, the
+test run alone (`--exact --test-threads=1`), stopped at 240 s.
+
+| SHA | result |
+|---|---|
+| 55513d95 (R4 merged) | still running at 240 s, stopped |
+| 6a3e8ebb (main before R4) | still running at 240 s, stopped |
+
+Both arms alike: not R4's. One line for the coordinator: t_qt_6_18 runs past 240 s alone on main before and after R4 (r1746).
+
+## Side findings (not chased, rule 0)
+
+- The column copy declines SUM over a REAL column under `Exact` (r1729, r1735: no copy bought at
+  3,014 rows); why is not traced. If it ever answers one under `Serial`, its exact sum would differ
+  from SQLite's KBN (q09); not run.
+- The sweep's SQLite probe lives in the lane clone (`~/.cache/amphora-perf/reals/r5-scripts`), not
+  the repo; the tests cite it.

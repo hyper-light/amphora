@@ -11,7 +11,9 @@ use crate::gram_tables::{
     R1, R2, TABLE, TABLE_ERROR, TRANSLATE,
 };
 use crate::lex::{self, Lexer, ScanError, cursor};
-use crate::tree::{FuncCall, Node, NodeId, SelectStmt, TransactionStmtKind, Tree, TreeFault, Val};
+use crate::tree::{
+    BoolOp, FuncCall, Node, NodeId, SelectStmt, TransactionStmtKind, Tree, TreeFault, Val,
+};
 
 /// yacc.c's YYMAXDEPTH, 10000 when the grammar doesn't define it (gram.y doesn't): a parse whose
 /// stack would hold that many states is refused "memory exhausted", as 19 refuses it.
@@ -116,6 +118,12 @@ pub enum Value {
     FuncAlias {
         alias: Option<NodeId>,
         coldeflist: Vec<NodeId>,
+    },
+    /// gram.y's SelectLimit, as far as insertSelectOptions stores it.
+    Limit {
+        offset: Option<NodeId>,
+        count: Option<NodeId>,
+        option: i32,
     },
     /// gram.y's GroupClause: GROUP BY's list and whether it said DISTINCT.
     Group {
@@ -235,6 +243,10 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         1516 => (0xcafd_31ef_0f34_4799, |_| Ok(Value::Bool(true))),
         // opt_transaction_chain: AND NO CHAIN | /* EMPTY */
         1517 | 1518 => (0xc7dd_6751_cbba_2e22, |_| Ok(Value::Bool(false))),
+        // opt_asc_desc: ASC
+        1140 => (0xe77c_326d_e6dc_6368, |_| Ok(Value::Int(1))),
+        // opt_nulls_order: /* EMPTY */
+        1145 => (0x0b11_90e3_6dba_5283, |_| Ok(Value::Int(0))),
         // InsertStmt: opt_with_clause INSERT INTO insert_target insert_rest
         1642 => (0x2105_41e7_4a78_96e0, insert_stmt),
         // insert_target: qualified_name
@@ -259,8 +271,14 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         1693 => (0x4bef_6d70_91a3_86ad, set_clause),
         // set_target: ColId opt_indirection
         1695 => (0x5914_3a79_afda_e407, column_target),
+        // select_with_parens: '(' select_no_parens ')'
+        1733 => (0x35f8_c5c0_6c96_56bb, |r| Ok(r.take(2))),
         // select_no_parens: simple_select
         1735 => (0xfd2f_9ec2_19c8_d787, top),
+        // select_no_parens: select_clause opt_sort_clause select_limit opt_for_locking_clause
+        1738 => (0xeafc_1cea_3dce_5bd8, select_options),
+        // select_clause: simple_select
+        1743 => (0x9113_5026_c13a_e4a7, top),
         // simple_select: SELECT opt_all_clause opt_target_list
         1745 => (0x5a6d_b6e1_b8fa_52e2, simple_select),
         // simple_select: values_clause
@@ -269,12 +287,38 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         1768 => (0xf8ee_ad8a_b545_1b54, null),
         // into_clause: /* EMPTY */
         1770 => (0xb6f0_5cf7_ff18_9c86, null),
+        // set_quantifier: /* EMPTY */
+        1784 => (0xb02b_6c1e_060b_daa0, |_| Ok(Value::Int(0))),
+        // opt_sort_clause: sort_clause
+        1791 => (0x728e_0d00_0e99_dcf3, top),
         // opt_sort_clause: /* EMPTY */
         1792 => (0x1e2a_fd0a_a524_9ce8, nil),
+        // sort_clause: ORDER BY sortby_list
+        1793 => (0xd863_0378_0bf9_2833, top),
+        // sortby_list: sortby
+        1794 => (0x6d50_77ee_7de0_e14f, list1),
+        // sortby: a_expr opt_asc_desc opt_nulls_order
+        1797 => (0x9a8c_51b5_784b_e329, sort_by),
+        // select_limit: limit_clause
+        1800 => (0x54a2_d13b_0eee_a2ce, top),
+        // limit_clause: LIMIT select_limit_value
+        1804 => (0x6bde_211d_e6c9_c953, limit),
+        // select_limit_value: a_expr
+        1812 => (0xe963_95cd_c2fd_e247, top),
+        // group_clause: GROUP_P BY set_quantifier group_by_list
+        1824 => (0x9266_6d88_fbf4_19a3, group_by),
         // group_clause: /* EMPTY */
         1825 => (0x0321_6edd_97cb_a203, no_group),
+        // group_by_list: group_by_item
+        1826 => (0x0fda_94aa_d7e7_3ffc, list1),
+        // group_by_list: group_by_list ',' group_by_item
+        1827 => (0xb1dd_ab8e_1708_cd31, append),
+        // group_by_item: a_expr
+        1828 => (0xe963_95cd_c2fd_e247, top),
         // having_clause: /* EMPTY */
         1838 => (0x2ef6_8e2d_5a42_4abc, null),
+        // opt_for_locking_clause: /* EMPTY */
+        1842 => (0x5195_4352_6e6c_0588, nil),
         // values_clause: VALUES '(' expr_list ')'
         1854 => (0x3037_617e_9420_4e91, values_clause),
         // from_clause: FROM from_list
@@ -287,12 +331,30 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         1860 => (0x35dd_dca3_624f_7135, aliased_relation),
         // table_ref: func_table func_alias_clause
         1862 => (0x86e4_091c_e124_8a20, function_table),
+        // table_ref: LATERAL_P select_with_parens opt_alias_clause
+        1867 => (0xa2b8_3f93_88bc_e040, lateral_subselect),
+        // table_ref: joined_table
+        1868 => (0x14fd_3bb9_6f1d_61e0, top),
+        // joined_table: table_ref CROSS JOIN table_ref
+        1873 => (0xc074_2d9d_5b67_fbca, cross_join),
+        // joined_table: table_ref join_type JOIN table_ref join_qual
+        1874 => (0x26e2_ab46_39e5_0dab, typed_join),
+        // joined_table: table_ref JOIN table_ref join_qual
+        1875 => (0xe461_6ad1_6cd3_fe21, inner_join),
+        // alias_clause: AS ColId '(' name_list ')'
+        1878 => (0xe7be_9fd2_ff3e_ffb5, alias_columns),
         // alias_clause: AS ColId
         1879 => (0x59f2_2c8a_f16a_a2ef, alias),
+        // opt_alias_clause: alias_clause
+        1882 => (0x9e57_90c4_a176_5385, top),
         // opt_alias_clause: /* EMPTY */
         1883 => (0xd843_f1a2_034c_c3a2, null),
         // func_alias_clause: alias_clause
         1886 => (0x5fd2_8df3_dcf9_cac1, func_alias),
+        // join_type: LEFT opt_outer
+        1892 => (0xa884_3c48_4bcd_af3d, |_| Ok(Value::Int(1))),
+        // join_qual: ON a_expr
+        1898 => (0x0daa_dfab_dabf_50ca, top),
         // relation_expr: qualified_name
         1899 => (0x0f6f_0ebf_dca7_954d, relation_expr),
         // relation_expr_opt_alias: relation_expr
@@ -319,6 +381,10 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         2058 => (0x25dc_16de_5219_d95c, |r| a_expr_op(r, "/")),
         // a_expr: a_expr '=' a_expr
         2063 => (0x8a20_32d0_a75b_2e2e, |r| a_expr_op(r, "=")),
+        // a_expr: a_expr AND a_expr
+        2069 => (0x9b8b_3cb2_7846_ac2b, and_expr),
+        // a_expr: a_expr IS NOT NULL_P
+        2087 => (0x2ce6_900c_856e_049e, is_not_null),
         // c_expr: columnref
         2140 => (0x9113_5026_c13a_e4a7, top),
         // c_expr: AexprConst
@@ -363,6 +429,12 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         2328 => (0x0daa_dfab_dabf_50ca, top),
         // columnref: ColId
         2372 => (0xe7f0_4492_1ba8_ebf2, columnref),
+        // columnref: ColId indirection
+        2373 => (0x9b92_967c_258a_d5db, qualified_columnref),
+        // indirection_el: '.' attr_name
+        2374 => (0x7baf_b980_ab5f_c89c, field),
+        // indirection: indirection_el
+        2380 => (0x0fda_94aa_d7e7_3ffc, list1),
         // opt_indirection: /* EMPTY */
         2382 => (0x1e2a_fd0a_a524_9ce8, nil),
         // opt_target_list: target_list
@@ -375,14 +447,26 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         2460 => (0xfe9d_afba_fed1_0593, target_el),
         // qualified_name: ColId
         2464 => (0x74ff_14c1_e4b9_74b6, qualified_name),
+        // qualified_name: ColId indirection
+        2465 => (0x1609_9d21_21a1_3cbe, dotted_relation),
+        // name_list: name
+        2466 => (0x2eeb_eadd_6516_86e3, func_name),
+        // name: ColId
+        2468 => (0xa007_892c_3e21_a49b, top),
+        // attr_name: ColLabel
+        2469 => (0xa007_892c_3e21_a49b, top),
         // func_name: type_function_name
         2471 => (0x2eeb_eadd_6516_86e3, func_name),
+        // func_name: ColId indirection
+        2472 => (0x2898_bc6a_e871_63c8, qualified_func_name),
         // AexprConst: Iconst
         2473 => (0xedd7_3fba_5686_550f, int_const),
         // AexprConst: FCONST
         2474 => (0x38e4_cd19_2237_3ce1, float_const),
         // AexprConst: Sconst
         2475 => (0xeb6d_7390_faf1_1cfe, string_const),
+        // AexprConst: TRUE_P
+        2483 => (0x8819_5c83_6cd1_1185, true_const),
         // Iconst: ICONST
         2486 => (0x35a8_92e8_20e5_a06b, top),
         // Sconst: SCONST
@@ -391,6 +475,8 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         2504 => (0xa007_892c_3e21_a49b, top),
         // type_function_name: IDENT
         2507 => (0x2c4d_653c_2123_81fb, top),
+        // ColLabel: IDENT
+        2514 => (0xa007_892c_3e21_a49b, top),
         _ => return None,
     })
 }
@@ -599,7 +685,7 @@ fn negate(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
                 *text = negated;
                 return Ok(Value::Node(Some(n)));
             }
-            Val::String(_) => {}
+            Val::Boolean(_) | Val::String(_) => {}
         }
     }
     simple_a_expr(r, "-", None, Some(n), location)
@@ -883,6 +969,245 @@ fn float_const(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
     })
 }
 
+/// `select_no_parens: select_clause opt_sort_clause select_limit opt_for_locking_clause`:
+/// insertSelectOptions. Its refusals need a clause the statement already has, which only unported
+/// rules make, so such a statement declines as unported.
+fn select_options(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let stmt = r.node(1)?.ok_or_else(fault)?;
+    let sort = r.list(2)?;
+    let Value::Limit {
+        offset,
+        count,
+        option,
+    } = r.take(3)
+    else {
+        return Err(fault());
+    };
+    let locking = r.list(4)?;
+    let Node::SelectStmt(n) = r.tree.get_mut(stmt)? else {
+        return Err(fault());
+    };
+    let conflict = (!sort.is_empty() && !n.sort_clause.is_empty())
+        || (offset.is_some() && n.limit_offset.is_some())
+        || (count.is_some() && n.limit_count.is_some())
+        || option != 0;
+    if conflict {
+        return Ok(Value::Unported);
+    }
+    if !sort.is_empty() {
+        n.sort_clause = sort;
+    }
+    n.locking_clause.extend(locking);
+    if offset.is_some() {
+        n.limit_offset = offset;
+    }
+    if count.is_some() {
+        n.limit_count = count;
+    }
+    n.limit_option = option;
+    Ok(Value::Node(Some(stmt)))
+}
+
+/// `sortby: a_expr opt_asc_desc opt_nulls_order`.
+fn sort_by(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let node = r.node(1)?;
+    let sortby_dir = r.int(2)?;
+    let sortby_nulls = r.int(3)?;
+    r.make(Node::SortBy {
+        node,
+        sortby_dir,
+        sortby_nulls,
+        use_op: Vec::new(),
+        location: -1,
+    })
+}
+
+/// `limit_clause: LIMIT select_limit_value`: LIMIT_OPTION_COUNT, 0.
+fn limit(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    Ok(Value::Limit {
+        offset: None,
+        count: r.node(2)?,
+        option: 0,
+    })
+}
+
+/// `group_clause: GROUP_P BY set_quantifier group_by_list`; SET_QUANTIFIER_DISTINCT is 2.
+fn group_by(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let quantifier = r.int(3)?;
+    let list = r.list(4)?;
+    Ok(Value::Group {
+        distinct: quantifier == 2,
+        list,
+    })
+}
+
+/// `table_ref: LATERAL_P select_with_parens opt_alias_clause`.
+fn lateral_subselect(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let subquery = r.node(2)?;
+    let alias = r.node(3)?;
+    r.make(Node::RangeSubselect {
+        lateral: true,
+        subquery,
+        alias,
+    })
+}
+
+/// A JoinExpr with no USING (join_qual's USING form isn't ported).
+fn join(
+    r: &mut Reduce<'_>,
+    jointype: i32,
+    larg: Option<NodeId>,
+    rarg: Option<NodeId>,
+    quals: Option<NodeId>,
+) -> Result<Value, Refusal> {
+    r.make(Node::JoinExpr {
+        jointype,
+        is_natural: false,
+        larg,
+        rarg,
+        using_clause: Vec::new(),
+        join_using_alias: None,
+        quals,
+        alias: None,
+        rtindex: 0,
+    })
+}
+
+/// `table_ref CROSS JOIN table_ref`: JOIN_INNER, 0.
+fn cross_join(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let larg = r.node(1)?;
+    let rarg = r.node(4)?;
+    join(r, 0, larg, rarg, None)
+}
+
+/// `table_ref join_type JOIN table_ref join_qual`.
+fn typed_join(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let larg = r.node(1)?;
+    let jointype = r.int(2)?;
+    let rarg = r.node(4)?;
+    let quals = r.node(5)?;
+    join(r, jointype, larg, rarg, quals)
+}
+
+/// `table_ref JOIN table_ref join_qual`: JOIN_INNER.
+fn inner_join(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let larg = r.node(1)?;
+    let rarg = r.node(3)?;
+    let quals = r.node(4)?;
+    join(r, 0, larg, rarg, quals)
+}
+
+/// `alias_clause: AS ColId '(' name_list ')'`.
+fn alias_columns(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let aliasname = r.string(2)?;
+    let colnames = r.list(4)?;
+    r.make(Node::Alias {
+        aliasname,
+        colnames,
+    })
+}
+
+/// makeAndExpr: an AND joins the BoolExpr of an AND on its left.
+fn and_expr(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let left = r.node(1)?.ok_or_else(fault)?;
+    let right = r.node(3)?.ok_or_else(fault)?;
+    let location = r.at(2)?;
+    if let Node::BoolExpr {
+        boolop: BoolOp::And,
+        args,
+        ..
+    } = r.tree.get_mut(left)?
+    {
+        args.push(right);
+        return Ok(Value::Node(Some(left)));
+    }
+    r.make(Node::BoolExpr {
+        boolop: BoolOp::And,
+        args: vec![left, right],
+        location,
+    })
+}
+
+/// `a_expr IS NOT NULL_P`: IS_NOT_NULL, 1.
+fn is_not_null(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let arg = r.node(1)?;
+    let location = r.at(2)?;
+    r.make(Node::NullTest {
+        arg,
+        nulltesttype: 1,
+        argisrow: false,
+        location,
+    })
+}
+
+/// `ColId indirection` as a name list: the name, then the indirection's names (only
+/// `'.' attr_name` is ported, so each is a String, as check_func_name and makeColumnRef require).
+fn dotted(r: &mut Reduce<'_>) -> Result<Vec<NodeId>, Refusal> {
+    let name = r.string(1)?;
+    let rest = r.list(2)?;
+    let mut names = vec![r.push(Node::String(name))?];
+    names.extend(rest);
+    Ok(names)
+}
+
+/// `columnref: ColId indirection`: makeColumnRef with field selection only.
+fn qualified_columnref(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let location = r.at(1)?;
+    let fields = dotted(r)?;
+    r.make(Node::ColumnRef { fields, location })
+}
+
+/// `func_name: ColId indirection`: check_func_name(lcons(makeString($1), $2)).
+fn qualified_func_name(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    Ok(Value::List(dotted(r)?))
+}
+
+/// `indirection_el: '.' attr_name`: makeString($2).
+fn field(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let name = r.string(2)?;
+    r.make(Node::String(name))
+}
+
+/// `qualified_name: ColId indirection`: makeRangeVarFromQualifiedName. Its refusal of more than
+/// three names isn't ported: such a name declines as unported.
+fn dotted_relation(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let name = r.string(1)?;
+    let rest = r.list(2)?;
+    let location = r.at(1)?;
+    let mut names = Vec::with_capacity(rest.len());
+    for id in rest {
+        match r.tree.get(id)? {
+            Node::String(s) => names.push(s.clone()),
+            _ => return Err(fault()),
+        }
+    }
+    let (catalogname, schemaname, relname) = match <[String; 1]>::try_from(names) {
+        Ok([relname]) => (None, name, relname),
+        Err(names) => match <[String; 2]>::try_from(names) {
+            Ok([schema, relname]) => (Some(name), schema, relname),
+            Err(_) => return Ok(Value::Unported),
+        },
+    };
+    r.make(Node::RangeVar {
+        catalogname,
+        schemaname: Some(schemaname),
+        relname,
+        inh: true,
+        relpersistence: 'p',
+        alias: None,
+        location,
+    })
+}
+
+/// makeBoolAConst(true, @1).
+fn true_const(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let location = r.at(1)?;
+    r.make(Node::AConst {
+        val: Val::Boolean(true),
+        location,
+    })
+}
+
 /// makeIntConst.
 fn int_const(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
     let v = r.int(1)?;
@@ -1121,7 +1446,7 @@ mod tests {
                 n += 1;
             }
         }
-        assert_eq!(n, 88);
+        assert_eq!(n, 127);
     }
 
     /// T-PG.5.1: a syntax error is 42601 at the token 19 names (1-based characters), the end of
