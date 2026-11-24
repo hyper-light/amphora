@@ -1835,14 +1835,29 @@ current segment holds unflushed, what the owner applied since that flush was ask
 least any rule can leave, and that segment closes. The flushing thread copies it: a pass is asked as the restart is
 made, so it is copied at once, and one follows the flushes after. A local read holds off no restart, and a restart no
 read:
-- **What an open read keeps.** The segment it began on, to its end: the switch leaves every frame where it was, so the
-  read's view is whole. A read that begins before the pass asked at the restart has copied the closed segment counts on
+- **What an open read keeps.** The segment it began on, to its end while there is room (below, "A read gives way"): the
+  switch leaves every frame where it was, so the read's view is whole. A read that begins before the pass asked at the restart has copied the closed segment counts on
   that one too, since not all of it is in the file; one that begins after counts on the current one alone. A read that
   begins while a restart is due waits for nothing.
 - **How long the closed segment lives.** Until it is copied whole and no read counts on it: each read ends by its
   caller's deadline D (`run_query`'s progress handler), and none begun after the copy counts on it, so at most 2D plus
-  one copy after the restart (decision 45, "Bounded"). Until then the other segment isn't free: the owner appends on in
-  the current one and tries again at each step.
+  one copy after the restart (decision 45, "Bounded"), or until the owner ends that read. Until then the other segment
+  isn't free: the owner appends on in the current one and tries again at each step.
+- **A read gives way to a write that needs the room** (Ada, 2026-11-24: "one slow reader never holds up a write";
+  lane V21). When the current segment's frames and what the last pass's time let it grow by (the frames appended
+  between that pass's asking and its answer, as measured) pass the room, the next restart is needed, and the reads that
+  count on the segment the last one closed keep it from it. The owner ends them, all at once: a read is told it is
+  over, then its read mark and its counts are given back for it, so that nothing but the segment's copy holds its
+  reset, and a pass is asked for at once. A read counting on the current segment alone is not ended. No timer, no
+  grace, no fixed share: the event is the room, and what it ends is exactly the reads that hold what it needs. It ends
+  none while a pass that may free the segment is out, unless the room is gone already (two or more passes may ask
+  before the room is). The read finds it at its next step: a page it reads after (from the log or the file, checked
+  once the bytes have arrived, so none of another generation is used), the next statement of its transaction, or, for
+  one that works in memory alone, its next 1,024 instructions (the deadline's check, `Db::deadline`). A page it read
+  before is its snapshot's, and stays so. It is answered `Refusal::Serialization` ("snapshot too old: the database's
+  log took back the segment it began on, for a write that needed the room"): the repository's typed retry, so no wire
+  variant is added; asked again, it begins on a newer snapshot. Its reader's end gives back nothing more. In one
+  process; a multi-process log switches no segment, so none is ended there.
 - **What was removed.** Until then a restart waited until no read was out, and reads were held (`hold_due`) once one
   was due: a read that came waited for the restart and was refused at its own deadline. Both were there because a
   restart wrote the log again from its first frame, under a read whose snapshot ended inside it. They cost what decision
@@ -1877,7 +1892,8 @@ does.
 
 Past H, on every member, a restart is due whatever the share says, and it counts as held: disk before latency.
 Without that, an owner whose own base tail has spent the share would never restart, its log would stay past H, and
-its submits would be refused for good. No read is held (B). New submits are refused `Refusal::Unavailable("the
+its submits would be refused for good. No read is held (B); the reads that keep the segment a restart needs are ended
+before the log reaches it (B). New submits are refused `Refusal::Unavailable("the
 database's log holds {frames} frames, past the {H} it may hold: ...")`, typed and retryable. No new variant: none
 until kiln shows a caller that must branch on it, and `Refusal` is a wire enum. A follower can't refuse what its
 group committed, and the leader can't see a follower's disk without a wire change, so a follower past H applies on.
@@ -1910,9 +1926,9 @@ state (`Db::log_frames_in_use`), not the writer connection's own view, which a s
 until its next transaction. The closing segment holds what it held when the writer switched from it, within the room
 then, and grows no more. So the log's peak disk is two segment files, each within the room (Ada, 2026-11-24, on lane
 B19's question; lane B20). A slow local read takes no room from the writes: it keeps the segment it began on, and
-they go on in the other, up to that one's own room (lane V20). One thing a slow read can still cost is the disk's: where
-the writes fill that segment's whole room too while the read still holds the first, the member refuses new submits,
-typed (C), until the read ends, at most its caller's deadline. The room is read from the free bytes as each pass finds them: the
+they go on in the other, up to that one's own room (lane V20). It costs the read: where the writes need that segment's whole room too
+while it still holds the first, the owner ends it, and it is refused, typed (B); the member refuses none for it (C).
+A pass in flight when the room ends may leave the log past it by what that pass's time let it grow by. The room is read from the free bytes as each pass finds them: the
 pages a closed segment's copy may still add to the database's file, up to one a frame while a read holds the copy
 back, were in that segment's room while it was current, and are counted free again in the current one's, so they draw
 on the image kept back (C). Kept back too, they would leave the second segment no room while a read held the first,

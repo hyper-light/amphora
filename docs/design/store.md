@@ -2433,6 +2433,14 @@ before any frame of the current one.
   Each segment then holds at most its bound plus what the writer appends in 2D plus one copy. The A/B below measures
   that against today's twice-the-bound.
 
+- **A read ended for a write that needs the room (Ada, 2026-11-24; lane V21).** A read holds a segment for at most
+  its request's deadline D, or until a writer needs the room: the owner of the log ends the reads that count on the
+  closing segment, at once and all of them, when the room's end is near (replication.md, B). Each is told it is over
+  before its mark and its counts are given back, so a read that finds its bytes later than that uses none of them:
+  every page it reads, from the log or the file, is checked once the bytes have arrived (seqlock order: the flag first,
+  then the release; the read's check after its read). `Segments` and the multi-process word are unchanged: the read is
+  counted until it is given back, whoever gives it. Multi-process logs, which switch nothing, end none.
+
 **A replica's owner (the coordinator, 2026-11-24; lane V20).** The restart a replica's owner makes is this switch and
 waits for no local read (replication.md, "A replica's database log bounded by what it measures", B and D, which had it
 wait until no read was out and held reads for it). It calls the switch alone (`Db::switch_log`), never

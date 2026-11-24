@@ -17861,6 +17861,10 @@ mod tests {
             .set_free_bytes(free_for(16, 2));
         let restarts = handle.counters().database_log_restarts;
         let files = ["state-1.db-wal", "state-1.db-wal2"].map(|name| dir.path().join(name));
+        let bytes = |file: &PathBuf| std::fs::metadata(file).map_or(0, |file| file.len());
+        // What the files took before the room stood: past it already, they are cut at the switch
+        // into each, not before (store.md, decision 31).
+        let began = files.each_ref().map(bytes);
         let (mut refused, mut last, mut slow) = (None, 1u8, Vec::new());
         let (mut sizes, mut frames, mut wrong) = (Vec::new(), Vec::new(), Vec::new());
         let read = voter.read_local(Instant::now() + HANG_READ, |db| {
@@ -17883,11 +17887,7 @@ mod tests {
                         driven.owner(0).replica.machine().log_frames().unwrap(),
                         room(&clients, 0),
                     ));
-                    sizes.push(
-                        files
-                            .clone()
-                            .map(|file| std::fs::metadata(file).map_or(0, |file| file.len())),
-                    );
+                    sizes.push(files.each_ref().map(bytes));
                     let fast = voter.read_local(Instant::now() + HANG_READ, values);
                     if fast != Ok((1..=value).collect::<Vec<u8>>()) {
                         wrong.push((value, fast));
@@ -17919,7 +17919,8 @@ mod tests {
             .unwrap();
         for (write, (held, (_, room))) in sizes.iter().zip(&frames).enumerate() {
             let most = log_bound::FRAME_BYTES * (room + 2 * grew) + 32;
-            for (file, bytes) in files.iter().zip(held) {
+            for ((file, began), bytes) in files.iter().zip(&began).zip(held) {
+                let most = most.max(*began);
                 assert!(
                     *bytes <= most,
                     "{} holds {bytes} bytes after write {write}, over {most}: room {room}, a write {grew}",
