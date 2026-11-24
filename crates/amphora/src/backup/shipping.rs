@@ -579,11 +579,13 @@ impl Checker {
             _ => Path::new("."),
         };
         let pages = self.reader.pages()?.saturating_mul(PAGE_BYTES);
-        let mut restore = file_len(&self.source)?.max(pages);
+        let _ = pages;
+        let mut restore = file_len(&self.source)?;
         let mut log_headroom = 0u64;
         for segment in log_paths(&self.source) {
             restore = restore.saturating_add(file_len(&segment)?);
-            log_headroom = self.reader.log_kept_frames().saturating_mul(FRAME_BYTES);
+            log_headroom = log_headroom
+                .saturating_add(self.reader.log_kept_frames().saturating_mul(FRAME_BYTES));
         }
         Ok(Budget {
             free: fs4::available_space(disk)?,
