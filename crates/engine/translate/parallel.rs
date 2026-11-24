@@ -669,16 +669,23 @@ fn scanned_rowids(op: &Operation) -> Option<(Option<i64>, Option<i64>)> {
     }
 }
 
-/// A forward search of the table b-tree by a rowid range (lane R11), as the terms on the rowid's
-/// alias column the serial loop reads its rows by: `alias >= x` or `alias > x` from its start,
-/// `alias <= y` or `alias < y` from its end (an end `GT` stops past `y`), each bound an integer
-/// literal or a bound parameter. SQLite seeks the start with OP_SeekGE or OP_SeekGT on the table
-/// b-tree and stops at the end by comparing each rowid with it under NUMERIC affinity (wherecode.c,
-/// `sqlite3WhereCodeOneLoopStart`, case 3; here `seek_internal` and `main_loop/seek.rs`), the
-/// comparison [`Predicate::bind`] and [`Predicate::holds`] make: a NULL bound leaves no row, and
-/// a text or a blob no number reads as is above every rowid. The pipelines test the terms on each
-/// row and read only the rowids they admit (`op_morsel_aggregate`). None: another search, the
-/// serial loop's.
+/// A forward search of the table b-tree by a rowid range (lane R11), as terms on the rowid's
+/// alias column, which the serial loop reads its rows by: `alias >= x` or `alias > x` from its
+/// start, `alias <= y` or `alias < y` from its end (an end `GT` stops past `y`), each bound an
+/// integer literal or a bound parameter. The pipelines test each row's rowid by them, and read
+/// only the rowids they admit (`morsel::rowid_range`). None: another search, the serial loop's.
+///
+/// [`Predicate::bind`] converts a bound value as SQLite converts it, and [`Predicate::holds`]
+/// compares it, so each type answers as in SQLite 3.54.0 (its source, `vdbe.c` and
+/// `wherecode.c`):
+/// - The start, `OP_SeekGE` or `OP_SeekGT` on the table cursor: an integer seeks itself; a real,
+///   the rowids at or past it (`sqlite3IntFloatCompare` moves the seek past the integer it
+///   truncates to); text that reads as a number, that number (`applyNumericAffinity`); other text,
+///   a blob and NULL, no row (`jump_to_p2`).
+/// - The end, `OP_Gt` or `OP_Ge` of the rowid with it under NUMERIC affinity, `SQLITE_JUMPIFNULL`
+///   (`sqlite3WhereCodeOneLoopStart`, case 3): an integer, a real and text that reads as a number
+///   compare by value; other text and a blob are above every rowid, so none is past them; NULL,
+///   no row.
 fn rowid_bounds(seek_def: &SeekDef, alias: usize) -> Option<Vec<Predicate>> {
     if !seek_def.prefix.is_empty()
         || seek_def.skip != 0
