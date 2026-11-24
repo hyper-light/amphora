@@ -15,7 +15,7 @@ def load(path):
             if not line.startswith("P23 "):
                 continue
             p = line.split()
-            if len(p) < 9:
+            if len(p) < 8:
                 continue
             try:
                 ev.append((int(p[1]), p[2], int(p[3]), int(p[4]), int(p[5]), int(p[6]), int(p[7])))
