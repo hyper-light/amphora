@@ -17,7 +17,7 @@ use crate::translate::subquery::{
 use crate::translate::trigger_exec::has_triggers_including_temp;
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
-use crate::Result;
+use crate::{Connection, Result};
 use amphora_engine_parser::ast::{Expr, QualifiedName, RefAct, ResultColumn, TriggerEvent, With};
 use smallvec::SmallVec;
 
@@ -148,6 +148,7 @@ pub fn translate_delete(
         // Re-check after optimization: chosen access paths can make "delete while scanning"
         // unsafe, so we may need to collect rowids first.
         record_delete_optimizer_safety(delete_plan_inner);
+        record_delete_fk_safety(delete_plan_inner, resolver, connection, database_id);
         if delete_plan_inner.safety.requires_stable_write_set() {
             ensure_delete_uses_rowset(program, delete_plan_inner);
         }
@@ -378,6 +379,32 @@ fn table_has_fk_cascade_triggers(
         }
     }
     Ok(false)
+}
+
+/// A foreign key's action may write the table it is of, and RESTRICT judges each row as it goes: a
+/// DELETE of several rows of a table that has a foreign key, or that one references, reads the rows
+/// first and goes in the order of their rowids (SQLite's `bComplex`, delete.c).
+fn record_delete_fk_safety(
+    plan: &mut DeletePlan,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    database_id: usize,
+) {
+    let Some(target) = plan.table_references.joined_tables().first() else {
+        return;
+    };
+    if !connection.foreign_keys_enabled() || target.op.affects_max_1_row() {
+        return;
+    }
+    let Some(table) = target.btree() else {
+        return;
+    };
+    let has_fks = resolver.with_schema(database_id, |s| {
+        s.has_child_fks(&table.name) || s.any_resolved_fks_referencing(&table.name)
+    });
+    if has_fks {
+        plan.safety.require(DmlSafetyReason::FkCascade);
+    }
 }
 
 /// Check if any WHERE predicate contains a subquery (Subquery, InSelect, or Exists).
