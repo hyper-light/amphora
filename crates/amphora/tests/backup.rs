@@ -1446,6 +1446,8 @@ enum Wrong {
     NextGenerations,
     /// The frames of its last part's end, gone (zeroes).
     Truncated,
+    /// Its last part two frames shorter than its key says.
+    Fewer,
 }
 
 /// Archives a base, then a generation in several parts and one after it, makes the first of the two
@@ -1492,6 +1494,13 @@ fn restored_from_a_wrong_generation(wrong: Wrong) {
             let mut body = body.clone();
             let kept = body.frames.len() - 2 * frame;
             body.frames[kept..].fill(0);
+            replace_segment(&s.blobs, name, &body);
+            key.last - 2
+        }
+        Wrong::Fewer => {
+            let (key, name, body) = sent.last().unwrap();
+            let mut body = body.clone();
+            body.frames.truncate(body.frames.len() - 2 * frame);
             replace_segment(&s.blobs, name, &body);
             key.last - 2
         }
@@ -1564,6 +1573,12 @@ fn a_restore_of_an_archive_short_of_its_frames_is_refused() {
 #[test]
 fn a_restore_of_a_truncated_generation_is_refused() {
     restored_from_a_wrong_generation(Wrong::Truncated);
+}
+
+/// AC-T1.12.4 (lane B25): the same, a part holding fewer frames than its key says.
+#[test]
+fn a_restore_of_a_part_shorter_than_its_key_is_refused() {
+    restored_from_a_wrong_generation(Wrong::Fewer);
 }
 
 /// AC-T1.12.4 (lane B25): a restore that is refused for a short archive leaves nothing at its path
