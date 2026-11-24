@@ -5,7 +5,7 @@ simulator`); SQLite 3.54.0 is the reference (adacachy's and adacachy2's system l
 
 Losses first.
 
-- **Five defects the sweep found on the way are on main still** (each in plain SQL, none CH's, none fixed here; findings.md):
+- **Six defects the sweep found on the way are on main still** (none CH's by its trace, none fixed here; findings.md):
   - CM: a RIGHT or FULL JOIN whose right table is WITHOUT ROWID (experimental) with a secondary index errors, with a subquery or
     without: `SELECT count(*) FROM e AS a0 FULL JOIN w AS a2 ON a0.k = a2.v`: SQLite 3, Amphora "secondary index lacks primary key locator".
   - CN: with statistics, a LEFT JOIN run as a hash join on a materialized build does not test a WHERE term on a correlated subquery for
@@ -19,6 +19,8 @@ Losses first.
     (`FROM a FULL JOIN json_each((SELECT t.j FROM t WHERE t.k = a.k AND EXISTS (...))) AS je ON je.value = 7`: SQLite `1,7; 2,NULL`,
     Amphora `1,NULL; 2,7`), on main before this lane too. That argument is the one place a subquery is still coded twice, so
     one that holds an uncorrelated subquery which hash joins still loses rows under a left table with no row (SQLite 2, Amphora 0).
+  - CR, not traced: with every join a hash join (`JoinMethods::HashJoinsOnly`, a test's setting), one drawn LEFT JOIN over EXISTS and
+    json_each loses a row (SQLite 1, Amphora 0; seed z1, its query in findings.md). At every other setting it answers as SQLite.
 - The drawn sweep draws no WITHOUT ROWID table on the right of a RIGHT or FULL JOIN (CM) and no CTE in an ON clause (CO), and says so.
 - `crates/engine/tests/planner.rs:182` fails as on main before (lane C4's record: red since 18daab1e).
 - A read of the unmatched rows no longer seeks by a term that reads a correlated subquery (it read by the copy's value); it reads the table and the row
@@ -92,7 +94,8 @@ answers were wrong with no panic, the rows they lack `w`'s (inferred from them; 
 | drawn, seed m4, 4 settings | main f183dd75 | 20,000 | 3,358 | 0 | 12 | 3,346 |
 | drawn, seeds m1 to m4 | the copy counted as held, not removed | 80,000 | 56 | 6 | 44 | 6 |
 | drawn, seeds k1 and k2 (CTEs, json_each added) | ffd0ac6f, the fix's engine | 48,000 | 18 | 0 | 0 | 18 (16 CP by their form, 2 CN) |
-| the landed sweep, 5 settings | d8adcbe2 (tests and fix) | 3,000 | 0 | 0 | 0 | 0 |
+| drawn, seeds z1 and z2, 5 settings, every table read after each query | main 6178f578 (landed) | 40,000 | 11 | 0 | 0 | 11 (10 CP by their form, 1 CR); no table changed |
+| the landed sweep, 5 settings | d8adcbe2 (tests and fix), and main 6178f578 | 3,000 | 0 | 0 | 0 | 0 |
 | the landed sweep, 5 settings | 238d54b0 (the tests, main's engine) | 3,000 | 50 | 33 | 0 | 17 |
 
 In the last row's run 22 of the 50 also left a table of the database empty (`n`, 5 rows, read after the query on the same connection: 0). Panics there: 17
