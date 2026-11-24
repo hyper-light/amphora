@@ -186,5 +186,5 @@ s1: Q|select a from fresh2
 s1: P||copy fresh2 from stdin| ~ B||||| ~ DP| ~ E||0 ~ d|4\n ~ c ~ S
 s1: P||copy fresh2 from stdin| ~ B||||| ~ E||0 ~ d|x\n ~ c ~ S
 s1: P||copy fresh2 from stdin| ~ B||||| ~ E||0 ~ f|halted ~ S
-s1: P||copy fresh2 from stdin| ~ B||||| ~ E||0 ~ d|5\n ~ H ~ S ~ d|6\n ~ c ~ S
+s1: P||copy fresh2 from stdin| ~ B||||| ~ E||0 ~ d|5\n ~ H ~ SI ~ d|6\n ~ c ~ S
 s1: Q|select a from fresh2

@@ -36,8 +36,8 @@ pub(super) struct CopyIn {
 /// What goes on once a COPY has ended.
 pub(super) enum Then {
     Query(super::execute::Query),
-    /// An Execute of the portal of that name.
-    Execute(String),
+    /// An Execute, whose answer no ReadyForQuery ends.
+    Execute,
 }
 
 impl Executor {
@@ -154,7 +154,7 @@ impl Executor {
                 query.at = query.at.saturating_add(1);
                 self.run_query(query, None, out)
             }
-            (Ok(()), Then::Execute(_)) => {
+            (Ok(()), Then::Execute) => {
                 self.pipelining = true;
                 Ok(Flow::Done)
             }
@@ -167,7 +167,7 @@ impl Executor {
                 self.refused(&error, out)?;
                 Ok(match then {
                     Then::Query(_) => Flow::Done,
-                    Then::Execute(_) => Flow::Refused,
+                    Then::Execute => Flow::Refused,
                 })
             }
         }

@@ -1144,7 +1144,7 @@ impl Executor {
                 Ok(Flow::Waiting)
             }
             Err(Stop::Copy(copy)) => {
-                self.copying = Some((copy, Then::Execute(name.to_owned())));
+                self.copying = Some((copy, Then::Execute));
                 Ok(Flow::CopyIn)
             }
             Err(Stop::Refused(error)) => {
