@@ -2949,13 +2949,14 @@ impl WalCoordination for ShmWalCoordination {
     ) -> Option<u64> {
         // Exhausting the reserved shared index space leaves the authority
         // incomplete. Fall back to the local scanned cache rather than trusting
-        // a truncated shared index.
-        if self.authority.frame_index_overflowed() {
+        // a truncated shared index. The authority holds the current segment's frames only: a
+        // closing segment is answered from this process's scan of its file, complete because no
+        // process appends to it (decision 45).
+        if self.authority.frame_index_overflowed() || segment != self.current_segment() {
             return self
                 .fallback
                 .find_frame(segment, page_id, min_frame, max_frame, frame_watermark);
         }
-        // The authority holds one segment's frames until it carries both (decision 45).
         self.authority
             .find_frame(page_id, min_frame, max_frame, frame_watermark)
     }
@@ -3766,6 +3767,9 @@ pub struct WalFile {
     max_frame_read_lock_index: AtomicUsize,
     /// The segments the read under way counts on (decision 45), given back at its end.
     read_span: Mutex<Option<ReadSpan>>,
+    /// The last frame of the closing segment the read under way counts on, 0 when it counts on
+    /// none: a page its own segment lacks is looked up there before the file (decision 45).
+    closing_max_frame: AtomicU64,
     /// Max frame allowed to lookup range=(minframe..max_frame)
     max_frame: AtomicU64,
     /// Start of range to look for frames range=(minframe..max_frame)
@@ -5416,6 +5420,23 @@ impl WalFile {
         )
     }
 
+    /// A page the read's own segment lacks, in the closing segment the read counts on (decision
+    /// 45): the file lacks that segment's frames until its copy. Every frame of it was committed
+    /// before any of the read's own segment, so the newest there is the read's version.
+    fn find_closing_frame(&self, segment: SegmentId, page_id: u64) -> Option<FrameRef> {
+        let max_frame = self.closing_max_frame.load(Ordering::Acquire);
+        if max_frame == 0 {
+            return None;
+        }
+        let closing = segment.other();
+        self.coordination
+            .find_frame(closing, page_id, 1, max_frame, None)
+            .map(|frame| FrameRef {
+                segment: closing,
+                frame,
+            })
+    }
+
     /// The segment this connection's read looks its pages up in: the one current when the read
     /// began, whose read mark guards it (decision 45). With no read mark held (VACUUM's exclusive
     /// transaction), the current one.
@@ -5571,6 +5592,12 @@ impl WalFile {
         let Some((read_guard, span)) = self.coordination.try_begin_read_tx(shared_snapshot) else {
             return TryBeginReadResult::Retry;
         };
+        // A closing segment takes no frame after the switch, so its last frame holds for the read.
+        let closing_max_frame = span.closing().map_or(0, |closing| {
+            self.coordination.segment_snapshot(closing).max_frame
+        });
+        self.closing_max_frame
+            .store(closing_max_frame, Ordering::Release);
         *self.read_span.lock() = Some(span);
         self.install_vacuum_lock_guard(vacuum_lock_guard);
         self.install_connection_state(WalConnectionState::new(shared_snapshot, read_guard));
@@ -5671,6 +5698,7 @@ impl Wal for WalFile {
                 self.coordination
                     .end_read_tx(ReadGuardKind::from_lock_index(slot), span);
             }
+            self.closing_max_frame.store(0, Ordering::Release);
             self.max_frame_read_lock_index
                 .store(NO_LOCK_HELD, Ordering::Release);
             self.release_vacuum_read_lock_guard();
@@ -5859,13 +5887,14 @@ impl Wal for WalFile {
         // snapshot.
         //
         // by default, SQLite tries to restart log file in this case - but for now let's keep it simple in the turso-db
+        let segment = self.read_segment();
         if self.max_frame.load(Ordering::Acquire) < self.min_frame.load(Ordering::Acquire) {
             tracing::debug!(
                 "find_frame(page_id={}, frame_watermark={:?}): fully backfilled - read from DB file",
                 page_id,
                 frame_watermark,
             );
-            return Ok(None);
+            return Ok(self.find_closing_frame(segment, page_id));
         }
         let min_frame = self.min_frame.load(Ordering::Acquire);
         let max_frame = self.max_frame.load(Ordering::Acquire);
@@ -5888,7 +5917,6 @@ impl Wal for WalFile {
             min_frame,
             max_frame
         );
-        let segment = self.read_segment();
         let frame = self
             .coordination
             .find_frame(segment, page_id, min_frame, max_frame, frame_watermark);
@@ -5899,8 +5927,9 @@ impl Wal for WalFile {
                 frame_watermark,
                 frame
             );
+            return Ok(Some(FrameRef { segment, frame }));
         }
-        Ok(frame.map(|frame| FrameRef { segment, frame }))
+        Ok(self.find_closing_frame(segment, page_id))
     }
 
     fn frame_generation(&self, frame: FrameRef) -> u32 {
@@ -7335,6 +7364,7 @@ impl WalFile {
             transaction_count: AtomicU64::new(0),
             max_frame_read_lock_index: AtomicUsize::new(NO_LOCK_HELD),
             read_span: Mutex::new(None),
+            closing_max_frame: AtomicU64::new(0),
             last_checksum: AtomicU64::new(pack_checksum(last_checksum)),
             checkpoint_guard: RwLock::new(None),
             io_ctx: RwLock::new(IOContext::default()),
@@ -11535,6 +11565,27 @@ pub mod test {
             .unwrap();
         assert_eq!(count_rows(&during, "other"), 11);
         during.execute("commit").unwrap();
+    }
+
+    /// Do: open a log in two segments and, before any checkpoint, read the table whose page only
+    /// the closing segment holds, and the one the current segment changed. Expect: every row of
+    /// each, the closing segment's page found there and not in the file, which lacks it until
+    /// the closing segment's copy (decision 45, unit 5).
+    #[test]
+    fn d45_a_read_finds_a_page_only_the_closing_segment_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = two_segment_database(dir.path());
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("begin").unwrap();
+        assert_eq!(count_rows(&conn, "other"), 11);
+        assert_eq!(count_test_table(&conn), 30);
+        conn.execute("commit").unwrap();
+        let closing = db.shared_wal.segment(SegmentId::First).read();
+        assert_eq!(
+            closing.metadata.nbackfills.load(Ordering::Acquire),
+            0,
+            "nothing of the closing segment was copied"
+        );
     }
 
     #[test]
