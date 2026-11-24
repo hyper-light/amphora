@@ -106,19 +106,29 @@ fn stale_preparations_are_refused_and_snapshots_restore_rows_and_membership_toge
     assert_eq!(value(&mut source), vec![1]);
     let mut image = Vec::new();
     let (at, membership) = source.image(&mut image).unwrap();
-    let pages: Vec<(u32, Vec<u8>)> = postcard::from_bytes(&image).unwrap();
-    assert!(
-        pages[0].1.windows(b"items".len()).any(|w| w == b"items"),
-        "snapshot must read the current catalog page"
-    );
+    let catalog = |machine: &mut Machine| {
+        machine
+            .read(|c| {
+                let mut tables = c.prepare(
+                    "SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN ('items', 'discarded') ORDER BY name",
+                )?;
+                let names = tables
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(names)
+            })
+            .unwrap()
+    };
     let path = dir.path().join("restored.db");
     let mut restored = Machine::open(&path, configuration()).unwrap();
     restored.install(&image, at, &membership).unwrap();
+    assert_eq!(catalog(&mut restored), ["items"], "installed catalog");
     assert_eq!(value(&mut restored), vec![1], "installed image");
     drop(restored);
     let mut reopened = Machine::open(&path, ConfState::default()).unwrap();
     assert_eq!(reopened.durable(), at);
     assert_eq!(reopened.configuration(), &membership);
+    assert_eq!(catalog(&mut reopened), ["items"], "reopened catalog");
     assert_eq!(value(&mut reopened), vec![1], "reopened image");
 }
 
