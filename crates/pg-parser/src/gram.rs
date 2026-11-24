@@ -2301,7 +2301,7 @@ mod tests {
                 n += 1;
             }
         }
-        assert_eq!(n, 232);
+        assert_eq!(n, 265);
     }
 
     /// T-PG.5.1: a syntax error is 42601 at the token 19 names (1-based characters), the end of
