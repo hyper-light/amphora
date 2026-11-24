@@ -451,7 +451,7 @@ impl Shipper {
             )?;
             shipper.generation = last.generation;
             shipper.archived_through = last.through;
-            if let Some(head) = db.read_log(0, usize::try_from(LOG_HEADER_BYTES)?)?
+            if let Some(head) = db.log_header()?
                 && identity_of(&head)? == body.identity
             {
                 shipper.identity = Some(body.identity);
@@ -622,12 +622,13 @@ impl Shipper {
     ) -> anyhow::Result<(Shipped, bool)> {
         let (seq, end) = db.log_end();
         let durable = db.durable_frame().unwrap_or(0).min(end);
-        let Some(head) = db.read_log(0, usize::try_from(LOG_HEADER_BYTES)?)? else {
+        // A generation's first commit writes its header (decision 45): until then its segment's
+        // file holds none, or the one of the generation it held before, and nothing to ship.
+        let Some(head) = db.log_header()? else {
             return Ok((Shipped::default(), false));
         };
         let identity = identity_of(&head)?;
         if identity.seq != seq {
-            // The log was started again and its header isn't written yet.
             return Ok((Shipped::default(), false));
         }
         if self.identity != Some(identity) {
