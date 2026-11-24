@@ -3,8 +3,8 @@
 
 Runs PostgreSQL's own genbki.pl (vendored, REL_19_0) on the vendored catalog headers and .dat files,
 as PostgreSQL's build does, and lifts the rows its postgres.bki inserts into pg_type, pg_namespace,
-pg_class and pg_attribute, and the names and argument types of pg_proc, into
-crates/pg-catalog/src/data.rs. Nothing in that file is written by hand.
+pg_class and pg_attribute, and what analysis reads of pg_type, pg_proc, pg_operator, pg_cast and
+pg_range (section 11's unit 8), into crates/pg-catalog/src/data.rs. Nothing in that file is written by hand.
 
 usage: scripts/postgres-catalog.py <work dir under ~/.cache>
 """
@@ -161,6 +161,110 @@ def datum(kind: str, ty: str, value: str | None, syms: dict[str, str]) -> str:
     sys.exit(f"type {ty} holds {value!r}; data.rs carries it only as NULL")
 
 
+def by_name(rel: dict) -> list[dict[str, str | None]]:
+    """A catalog's rows as column name to value."""
+    names = [c for c, _ in rel["columns"]]
+    return [dict(zip(names, row)) for row in rel["rows"]]
+
+
+def oid(value: str | None) -> int:
+    """An oid or regproc value: `-` (and NULL) is InvalidOid."""
+    return 0 if value in (None, "-") else int(value)
+
+
+def flag(value: str | None) -> str:
+    if value not in ("t", "f"):
+        sys.exit(f"bool {value!r}")
+    return "true" if value == "t" else "false"
+
+
+def char(value: str | None) -> str:
+    if value is None or len(value) != 1 or not value.isascii():
+        sys.exit(f"char {value!r}")
+    return f"b'{value}'"
+
+
+def argument_defaults(row: dict[str, str | None]) -> int:
+    """pronargdefaults: genbki.pl leaves it 0, and bootstrap sets it to how many entries proargdefaults has
+    (`InsertOneProargdefaultsValue`, src/backend/bootstrap/bootstrap.c at REL_19_0)."""
+    value = row["proargdefaults"]
+    if value is None:
+        return int(row["pronargdefaults"] or 0)
+    entry = r'(?:"[^"\\]*"|[^"\\,{}\s]+)'
+    if not re.fullmatch(rf"\{{{entry}(?:,{entry})*\}}", value):
+        sys.exit(f"proargdefaults {value!r}")
+    return len(re.findall(entry, value))
+
+
+def types_table(rel: dict) -> list[str]:
+    """What analysis reads of pg_type, by OID (its syscache key TYPEOID)."""
+    out = ["", "pub static TYPES: &[Type] = &["]
+    for r in sorted(by_name(rel), key=lambda r: int(r["oid"] or 0)):
+        out.append(
+            f"    Type {{ oid: {oid(r['oid'])}, name: {rust_str(r['typname'] or '')}, namespace: {oid(r['typnamespace'])}, "
+            f"kind: {char(r['typtype'])}, category: {char(r['typcategory'])}, preferred: {flag(r['typispreferred'])}, "
+            f"relid: {oid(r['typrelid'])}, subscript: {oid(r['typsubscript'])}, elem: {oid(r['typelem'])}, "
+            f"array: {oid(r['typarray'])}, base: {oid(r['typbasetype'])}, typtypmod: {int(r['typtypmod'] or -1)}, "
+            f"input: {oid(r['typinput'])}, output: {oid(r['typoutput'])}, modin: {oid(r['typmodin'])}, collation: {oid(r['typcollation'])} }},"
+        )
+    out += ["];", "", "/// Each built-in type's OID by its name (arrays aside), as pg_type_d.h's symbols name them.", "pub mod type_oid {"]
+    for r in sorted(by_name(rel), key=lambda r: int(r["oid"] or 0)):
+        if not (r["typname"] or "_").startswith("_"):
+            out.append(f"    pub const {(r['typname'] or '').upper()}: u32 = {oid(r['oid'])};")
+    return out + ["}"]
+
+
+def ranges(rel: dict) -> list[str]:
+    """What analysis reads of pg_range, by range type."""
+    out = ["", "pub static PG_RANGE: &[Range] = &["]
+    for r in sorted(by_name(rel), key=lambda r: oid(r["rngtypid"])):
+        out.append(f"    Range {{ oid: {oid(r['rngtypid'])}, subtype: {oid(r['rngsubtype'])}, multirange: {oid(r['rngmultitypid'])} }},")
+    return out + ["];"]
+
+
+def procs(rel: dict, types: dict[str, int]) -> list[str]:
+    """What analysis reads of pg_proc, by OID, and the same rows' places in order of name."""
+    rows = sorted(by_name(rel), key=lambda r: int(r["oid"] or 0))
+    out = ["", "pub static PG_PROC: &[Proc] = &["]
+    for r in rows:
+        args = ", ".join(str(types.get(a, a)) for a in (r["proargtypes"] or "").split())
+        out.append(
+            f"    Proc {{ oid: {oid(r['oid'])}, name: {rust_str(r['proname'] or '')}, namespace: {oid(r['pronamespace'])}, "
+            f"kind: {char(r['prokind'])}, strict: {flag(r['proisstrict'])}, retset: {flag(r['proretset'])}, "
+            f"volatile: {char(r['provolatile'])}, variadic: {oid(r['provariadic'])}, defaults: {argument_defaults(r)}, "
+            f"result: {oid(r['prorettype'])}, args: &[{args}], src: {rust_str(r['prosrc'] or '')} }},"
+        )
+    out += ["];", "", "pub static PG_PROC_BY_NAME: &[u16] = &["]
+    order = sorted(range(len(rows)), key=lambda i: ((rows[i]["proname"] or "").encode(), i))
+    for i in range(0, len(order), 16):
+        out.append("    " + " ".join(f"{n}," for n in order[i : i + 16]))
+    return out + ["];"]
+
+
+def operators(rel: dict) -> list[str]:
+    """What analysis reads of pg_operator, in order of name, kind, left and right operand."""
+    key = lambda r: ((r["oprname"] or "").encode(), r["oprkind"], oid(r["oprleft"]), oid(r["oprright"]))
+    out = ["", "pub static PG_OPERATOR: &[Operator] = &["]
+    for r in sorted(by_name(rel), key=key):
+        out.append(
+            f"    Operator {{ oid: {oid(r['oid'])}, name: {rust_str(r['oprname'] or '')}, namespace: {oid(r['oprnamespace'])}, "
+            f"kind: {char(r['oprkind'])}, left: {oid(r['oprleft'])}, right: {oid(r['oprright'])}, "
+            f"result: {oid(r['oprresult'])}, code: {oid(r['oprcode'])} }},"
+        )
+    return out + ["];"]
+
+
+def casts(rel: dict) -> list[str]:
+    """pg_cast, in order of source and target (its syscache key CASTSOURCETARGET)."""
+    out = ["", "pub static PG_CAST: &[Cast] = &["]
+    for r in sorted(by_name(rel), key=lambda r: (oid(r["castsource"]), oid(r["casttarget"]))):
+        out.append(
+            f"    Cast {{ source: {oid(r['castsource'])}, target: {oid(r['casttarget'])}, func: {oid(r['castfunc'])}, "
+            f"context: {char(r['castcontext'])}, method: {char(r['castmethod'])} }},"
+        )
+    return out + ["];"]
+
+
 def main() -> None:
     if len(sys.argv) != 2:
         sys.exit(__doc__)
@@ -176,13 +280,13 @@ def main() -> None:
     syms = symbols()
     types = {r[1]: int(r[0]) for r in rels["pg_type"]["rows"]}
     out = [
-        "//! PostgreSQL 19's built-in rows of pg_namespace, pg_type, pg_class and pg_attribute, and pg_proc's",
-        "//! names and argument types: PostgreSQL's own genbki.pl run on the vendored catalog headers and",
-        "//! .dat files (vendor/postgres, REL_19_0), its postgres.bki lifted by scripts/postgres-catalog.py.",
-        "//! Generated; do not edit.",
+        "//! PostgreSQL 19's built-in rows of pg_namespace, pg_type, pg_class and pg_attribute, and what analysis",
+        "//! reads of pg_type, pg_proc, pg_operator, pg_cast and pg_range: PostgreSQL's own genbki.pl run on the vendored",
+        "//! catalog headers and .dat files (vendor/postgres, REL_19_0), its postgres.bki lifted by",
+        "//! scripts/postgres-catalog.py. Generated; do not edit.",
         "",
         "use crate::Datum::{USED};",
-        "use crate::{Catalog, Column, Proc};",
+        "use crate::{Cast, Catalog, Column, Operator, Proc, Range, Type};",
         "",
         "/// sha256 over the files genbki.pl read (scripts/postgres-catalog.py `inputs`).",
         f"pub const INPUTS_SHA256: &str = \"{inputs_sha256()}\";",
@@ -203,17 +307,7 @@ def main() -> None:
             vals = ", ".join(datum(k, ty, v, syms) for k, (_, ty), v in zip(kinds, r["columns"], row))
             out.append(f"        &[{vals}],")
         out += ["    ],", "};"]
-    proc = rels["pg_proc"]
-    names = [c for c, _ in proc["columns"]]
-    oid_i, name_i, ns_i, args_i = (names.index(c) for c in ("oid", "proname", "pronamespace", "proargtypes"))
-    out += ["", "pub static PG_PROC: &[Proc] = &["]
-    for row in proc["rows"]:
-        args = (row[args_i] or "").split()
-        out.append(
-            f"    Proc {{ oid: {int(row[oid_i])}, name: {rust_str(row[name_i] or '')}, namespace: {int(row[ns_i])}, "
-            f"args: &[{', '.join(str(types.get(a, a)) for a in args)}] }},"
-        )
-    out.append("];")
+    out += types_table(rels["pg_type"]) + procs(rels["pg_proc"], types) + operators(rels["pg_operator"]) + casts(rels["pg_cast"]) + ranges(rels["pg_range"])
     text = "\n".join(out) + "\n"
     used = sorted(v for v in ("Bool", "Char", "Float4", "Int2", "Int4", "Name", "Null", "Oid", "Text", "Xid") if re.search(rf"\b{v}\b", text.split("{USED}", 1)[1]))
     OUT.write_text(text.replace("{USED}", "{" + ", ".join(used) + "}", 1))
