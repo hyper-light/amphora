@@ -1015,11 +1015,6 @@ impl Shipper {
         if self.identity.is_none_or(|i| i.seq != seq) {
             anyhow::bail!("ship the log's generation before copying a base in it");
         }
-        if !db.closing_copied() {
-            anyhow::bail!(
-                "a base begins once the log's closing segment is copied into the file: a read under way holds it"
-            );
-        }
         let stream = memory.stream(Use::Chunks);
         let share = memory.stream_room(Use::Chunks)?;
         let by_memory = share.saturating_sub(SUM).checked_div(2).unwrap_or(0);
