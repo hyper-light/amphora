@@ -2,9 +2,10 @@
 //!
 //! - **One writer.** A thread owns the engine. Rows reach it by channel, never by lock, and are
 //!   committed as soon as it takes them, with whatever else came while it committed the last: a
-//!   group commit, no row waiting for a timer. A full queue refuses rows ([`Refused::Full`]) rather
-//!   than growing without bound; [`Store::put_wait`] waits for room instead. A queue with no count
-//!   ([`Config::queue`] None) is bounded by what its senders admit.
+//!   group commit, no row waiting for a timer. A batch is charged its rows' bytes
+//!   ([`Engine::row_bytes`]) to the memory budget's room for queues (MB.1) until its commit ends:
+//!   past that room it is refused ([`Refused::Full`]) rather than queued; [`Store::put_wait`] waits
+//!   for room instead, until its deadline, woken by each charge given back anywhere in the budget.
 //! - **Durable beside the writer.** A commit doesn't wait for the disk: a flusher thread flushes
 //!   what was committed, over and over, and a write is durable once a flush that began after its
 //!   commit ends ([`Store::durable`] waits for that, by the [`Ticket`] its batch was handed with).
@@ -27,6 +28,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
+use crate::memory::Charge;
 use crate::meter::{Counters, Meter};
 use crate::reshard::{Pos, Seq, Span};
 
@@ -48,6 +50,12 @@ pub trait Engine: Send + 'static {
 
     /// The key a row is of: a read of a key waits for its writes handed over before it.
     fn key(row: &Self::Row) -> &str;
+
+    /// The bytes `row` holds from its hand-over until its commit ends, its own and what it owns:
+    /// what the store charges it to the memory budget's room for queues (MB.1) for that long. 0 for
+    /// a row its sender charged where it admitted it (a [`crate::database::Database`]'s command,
+    /// charged at its admission until it is answered).
+    fn row_bytes(row: &Self::Row) -> usize;
 
     /// The keys, in bytes, a store in groups routes `row` by, each given to `each` (CP-T1.9;
     /// docs/design/reshard.md, decision "The routing key is bytes"): every key it reads or writes,
@@ -273,10 +281,6 @@ pub enum ForReaders {
 /// A store's bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
-    /// Batches of rows waiting for the writer, at most. None: no count bounds the queue, and
-    /// what its senders admit bounds what waits (a [`crate::database::Database`] charges every
-    /// request to the memory budget's room for queues, MB.1).
-    pub queue: Option<usize>,
     /// Rows that make a commit at once, however many more wait. A commit of fewer rows still ends
     /// where its engine's commit is full (decision 23).
     pub commit_rows: usize,
@@ -299,10 +303,6 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            // A channel of this bound takes its slots at once: a full queue refuses (`put`) or
-            // waits for room (`put_wait`), so it needn't be deep. A database's store has none
-            // (lane perf-A8): the memory budget bounds its queue in bytes.
-            queue: Some(4096),
             // A commit's pages fit its writer's cache: at 10,000 writers a commit of 512 rows wrote
             // 35,000-41,000 rows a second, of 2,048 rows 22,000-24,000 (fedora, 2026-10-20).
             commit_rows: 512,
@@ -359,7 +359,7 @@ fn machine_readers() -> usize {
 /// Why a store didn't take or answer something.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refused {
-    /// Its writer's queue is full.
+    /// The memory budget's room for queues has no room for its batch (MB.1).
     Full,
     /// Its writer has stopped.
     Stopped,
@@ -404,8 +404,9 @@ impl std::error::Error for Refused {}
 type Job<E> = Box<dyn FnOnce(&mut E) + Send>;
 
 enum Msg<E: Engine> {
-    /// Rows, the keys they are of, and what becomes of them.
-    Rows(Vec<E::Row>, Vec<String>, Arc<Fate>),
+    /// Rows, the keys they are of, what becomes of them, and their charge (none: they charge
+    /// nothing, [`Engine::row_bytes`]).
+    Rows(Vec<E::Row>, Vec<String>, Arc<Fate>, Option<Charge>),
     /// Run on the engine, between commits (what was sent before it is committed first).
     Run(Job<E>),
 }
@@ -487,8 +488,6 @@ struct Sends {
     stopping: AtomicBool,
     /// A flush failed: the store takes nothing more, and acknowledges nothing more durable.
     disk_failed: AtomicBool,
-    /// The writer took batches off its queue: a sender waiting for room looks again.
-    room: (Mutex<()>, Condvar),
     claims: Mutex<Claims>,
     notices: Mutex<Notices>,
     noticed: Condvar,
@@ -540,10 +539,6 @@ struct Counts {
 /// Shards of the keys' counts.
 const SHARDS: u64 = 64;
 
-/// A sender waiting for room looks again at least this often (a wakeup lost between its try and
-/// its wait costs no more).
-const ROOM_LOOK: Duration = Duration::from_millis(5);
-
 impl Default for Sends {
     fn default() -> Self {
         Self {
@@ -558,7 +553,6 @@ impl Default for Sends {
             durable_as_committed: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             disk_failed: AtomicBool::new(false),
-            room: (Mutex::new(()), Condvar::new()),
             claims: Mutex::default(),
             notices: Mutex::default(),
             noticed: Condvar::new(),
@@ -1227,35 +1221,11 @@ impl<R: Send + 'static> Readers<R> {
     }
 }
 
-/// The writer's queue: bounded by a count ([`Config::queue`]), or by what its senders admit.
-enum Queue<T> {
-    Bounded(mpsc::SyncSender<T>),
-    Unbounded(mpsc::Sender<T>),
-}
-
-impl<T> Clone for Queue<T> {
-    fn clone(&self) -> Self {
-        match self {
-            Self::Bounded(tx) => Self::Bounded(tx.clone()),
-            Self::Unbounded(tx) => Self::Unbounded(tx.clone()),
-        }
-    }
-}
-
-impl<T> Queue<T> {
-    fn try_send(&self, m: T) -> Result<(), mpsc::TrySendError<T>> {
-        match self {
-            Self::Bounded(tx) => tx.try_send(m),
-            Self::Unbounded(tx) => tx
-                .send(m)
-                .map_err(|mpsc::SendError(m)| mpsc::TrySendError::Disconnected(m)),
-        }
-    }
-}
-
-/// A handle to a store: cheap to clone, usable from any thread.
+/// A handle to a store: cheap to clone, usable from any thread. Its writer's queue counts nothing:
+/// its batches are bounded by their charge ([`Engine::row_bytes`]), its jobs by their callers, each
+/// waiting for its own.
 pub struct Store<E: Engine> {
-    tx: Queue<Msg<E>>,
+    tx: mpsc::Sender<Msg<E>>,
     meter: Arc<Meter>,
     watchers: Arc<Mutex<Vec<Watcher>>>,
     sends: Arc<Sends>,
@@ -1282,16 +1252,7 @@ impl<E: Engine> Store<E> {
 
     /// [`Store::start`], its engine's flusher replaced by `flush` when given (tests).
     pub fn start_with(engine: E, config: Config, flush: Option<Flush>) -> anyhow::Result<Self> {
-        let (tx, rx) = match config.queue {
-            Some(bound) => {
-                let (tx, rx) = mpsc::sync_channel::<Msg<E>>(bound.max(1));
-                (Queue::Bounded(tx), rx)
-            }
-            None => {
-                let (tx, rx) = mpsc::channel::<Msg<E>>();
-                (Queue::Unbounded(tx), rx)
-            }
-        };
+        let (tx, rx) = mpsc::channel::<Msg<E>>();
         let meter: Arc<Meter> = Arc::default();
         let watchers: Arc<Mutex<Vec<Watcher>>> = Arc::default();
         let sends: Arc<Sends> = Arc::default();
@@ -1340,12 +1301,13 @@ impl<E: Engine> Store<E> {
         self.meter.counters()
     }
 
-    /// Rows to be committed with the next batch. Never blocks: a full queue refuses them, counted.
+    /// Rows to be committed with the next batch. Never waits: with no room for their charge they
+    /// are refused, counted.
     pub fn put(&self, rows: Vec<E::Row>) -> Result<Ticket, Refused> {
         self.hand(rows, None, None)
     }
 
-    /// Rows to be committed with the next batch, waiting for room until `until`.
+    /// Rows to be committed with the next batch, waiting for room until `until` ([`Store::put`]).
     pub fn put_wait(&self, rows: Vec<E::Row>, until: Instant) -> Result<Ticket, Refused> {
         self.hand(rows, Some(until), None)
     }
@@ -1377,6 +1339,9 @@ impl<E: Engine> Store<E> {
             }
             return Ok(Ticket(None));
         }
+        let queued = self.charge(&rows, until).inspect_err(|_| {
+            self.meter.dropped();
+        })?;
         let mut keys: Vec<String> = Vec::new();
         for r in &rows {
             let k = E::key(r);
@@ -1390,35 +1355,38 @@ impl<E: Engine> Store<E> {
             state: AtomicU64::new(UNSETTLED),
             then: Mutex::new(then),
         });
-        let mut m = Msg::Rows(rows, keys, fate.clone());
-        loop {
-            match self.tx.try_send(m) {
-                Ok(()) => return Ok(Ticket(Some(fate))),
-                Err(mpsc::TrySendError::Disconnected(back)) => {
-                    self.let_go(&back);
-                    return Err(Refused::Stopped);
+        self.tx
+            .send(Msg::Rows(rows, keys, fate.clone(), queued))
+            .map_err(|mpsc::SendError(back)| {
+                // Never committed: nothing waits on it.
+                if let Msg::Rows(_, keys, ..) = back {
+                    self.sends.settled(&keys);
+                    self.sends.wake(1, 0);
                 }
-                Err(mpsc::TrySendError::Full(back)) => m = back,
-            }
-            let left = until.map_or(Duration::ZERO, |u| {
-                u.saturating_duration_since(Instant::now())
-            });
-            if left.is_zero() {
-                self.let_go(&m);
-                self.meter.dropped();
-                return Err(Refused::Full);
-            }
-            let room = locked(&self.sends.room.0);
-            let _looked = self.sends.room.1.wait_timeout(room, left.min(ROOM_LOOK));
-        }
+                Refused::Stopped
+            })?;
+        Ok(Ticket(Some(fate)))
     }
 
-    /// A batch that will never be committed: nothing waits on it.
-    fn let_go(&self, m: &Msg<E>) {
-        if let Msg::Rows(_, keys, _) = m {
-            self.sends.settled(keys);
-            self.sends.wake(1, 0);
+    /// Charges `rows`' bytes ([`Engine::row_bytes`]) to the memory budget's room for queues
+    /// (MB.1) until their commit ends, waiting until `until` (none: not at all) for room given back
+    /// anywhere in the budget ([`crate::memory::Budget::take_until`]). Refused [`Refused::Full`]
+    /// past `until`.
+    fn charge(&self, rows: &[E::Row], until: Option<Instant>) -> Result<Option<Charge>, Refused> {
+        let bytes = rows.iter().fold(0u64, |n, row| {
+            n.saturating_add(u64::try_from(E::row_bytes(row)).unwrap_or(u64::MAX))
+        });
+        if bytes == 0 {
+            return Ok(None);
         }
+        let budget = crate::memory::process();
+        let queues = crate::memory::Use::Queues;
+        match until {
+            None => budget.take(queues, bytes),
+            Some(until) => budget.take_until(queues, bytes, until, || self.meter.waited_for_room()),
+        }
+        .map(Some)
+        .map_err(|_| Refused::Full)
     }
 
     /// Run `f` on a reader, on this thread, once the writes of `key` (of every key: None) handed
@@ -1472,14 +1440,24 @@ impl<E: Engine> Store<E> {
         f: impl FnOnce(&mut E::Reader) -> anyhow::Result<T>,
         on_writer: impl FnOnce(&mut E) -> anyhow::Result<T> + Send + 'static,
     ) -> anyhow::Result<T> {
-        let asked = Instant::now();
-        match self.readers.with(until, f) {
-            Some(answer) => {
-                self.meter.waited(asked.elapsed());
-                answer
-            }
+        match self.on_reader(until, f) {
+            Some(answer) => answer,
             None => self.run(until, on_writer),
         }
+    }
+
+    /// Run `f` on a reader, on this thread, on what is committed now, as
+    /// [`Store::read_committed`] does: None when the store has no reader now, its caller to run it
+    /// on the writer ([`Store::run`]) as it admits it there. Blocking, until `until` at most.
+    pub fn on_reader<T>(
+        &self,
+        until: Instant,
+        f: impl FnOnce(&mut E::Reader) -> anyhow::Result<T>,
+    ) -> Option<anyhow::Result<T>> {
+        let asked = Instant::now();
+        let answer = self.readers.with(until, f)?;
+        self.meter.waited(asked.elapsed());
+        Some(answer)
     }
 
     /// Run `f` on the engine once what was sent before is committed. Blocking, until `until` at
@@ -1491,23 +1469,11 @@ impl<E: Engine> Store<E> {
     ) -> anyhow::Result<T> {
         let (rtx, rrx) = mpsc::channel();
         let asked = Instant::now();
-        let mut m: Msg<E> = Msg::Run(Box::new(move |e| {
-            let _ = rtx.send(f(e));
-        }));
-        loop {
-            match self.tx.try_send(m) {
-                Ok(()) => break,
-                Err(mpsc::TrySendError::Disconnected(_)) => return Err(Refused::Stopped.into()),
-                Err(mpsc::TrySendError::Full(back)) => m = back,
-            }
-            let left = until.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                self.meter.timed_out();
-                return Err(Refused::Timeout.into());
-            }
-            let room = locked(&self.sends.room.0);
-            let _looked = self.sends.room.1.wait_timeout(room, left.min(ROOM_LOOK));
-        }
+        self.tx
+            .send(Msg::Run(Box::new(move |e| {
+                let _ = rtx.send(f(e));
+            })))
+            .map_err(|_| Refused::Stopped)?;
         match rrx.recv_timeout(until.saturating_duration_since(Instant::now())) {
             Ok(answer) => {
                 self.meter.waited(asked.elapsed());
@@ -1559,11 +1525,12 @@ fn notify(watchers: &Mutex<Vec<Watcher>>) {
 }
 
 /// A batch taken off the queue and not yet committed: where its rows end among those pending, the
-/// keys they are of, and what becomes of them.
+/// keys they are of, what becomes of them, and their charge, given back once their commit ends.
 struct Batch {
     end: usize,
     keys: Vec<String>,
     fate: Arc<Fate>,
+    _queued: Option<Charge>,
 }
 
 /// The writer: rows are committed as soon as nothing else waits in the queue (or at the commit's
@@ -1682,13 +1649,13 @@ fn writer<E: Engine>(
         let began = Instant::now();
         let quiet = matches!(got, Err(mpsc::RecvTimeoutError::Timeout)) && pending.is_empty();
         match got {
-            Ok(Msg::Rows(rows, keys, fate)) => {
-                sends.room.1.notify_all();
+            Ok(Msg::Rows(rows, keys, fate, queued)) => {
                 pending.extend(rows);
                 batches.push(Batch {
                     end: pending.len(),
                     keys,
                     fate,
+                    _queued: queued,
                 });
                 if pending.len() >= config.commit_rows {
                     commit(&mut engine, &mut pending, &mut batches, &mut commits);
@@ -1696,7 +1663,6 @@ fn writer<E: Engine>(
                 }
             }
             Ok(Msg::Run(job)) => {
-                sends.room.1.notify_all();
                 commit(&mut engine, &mut pending, &mut batches, &mut commits);
                 job(&mut engine);
                 meter.ran();
@@ -1734,5 +1700,127 @@ fn writer<E: Engine>(
             }
         }
         meter.held(began.elapsed());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::tests::{BUDGET, Fed, budget};
+
+    /// Rows kept in memory, in commit order.
+    struct Kept(Arc<Mutex<Vec<String>>>);
+
+    impl Engine for Kept {
+        type Row = String;
+        type Reader = ();
+
+        fn key(row: &String) -> &str {
+            row
+        }
+
+        fn row_bytes(row: &String) -> usize {
+            std::mem::size_of::<String>() + row.capacity()
+        }
+
+        fn apply(&mut self, rows: &[String]) -> anyhow::Result<usize> {
+            self.0.lock().unwrap().extend(rows.iter().cloned());
+            Ok(rows.len())
+        }
+    }
+
+    /// AUDIT 2026-11-23 §1, MB.1: a batch past the memory budget's room for queues is refused
+    /// typed and counted, and a sender waiting for room is woken by the commit that gives a batch's
+    /// bytes back, no timer. Do: with room for one row, hold the writer in a job, queue a row, put a
+    /// second, wait with a third until a deadline an hour off, then let the writer go. Expect: the
+    /// second refused Full and counted; the third taken once the first commits; all given back.
+    #[test]
+    fn mb1_a_wait_for_room_is_woken_by_the_commit_that_gives_room_back() {
+        let one = std::mem::size_of::<String>() + 1;
+        let fed = Fed::new(Some(u64::try_from(one).unwrap()), Some(0));
+        let (budget, _unset) = budget(&fed);
+        let kept = Arc::new(Mutex::new(Vec::new()));
+        let store = Store::start(Kept(Arc::clone(&kept)), Config::default()).unwrap();
+        let far = Instant::now() + Duration::from_secs(3600);
+        let (held_tx, held_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let busy = store.clone();
+        let job = std::thread::spawn(move || {
+            busy.run(far, move |_| {
+                held_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+                Ok(())
+            })
+        });
+        held_rx.recv().unwrap();
+        let first = store.put(vec!["a".to_owned()]).unwrap();
+        assert_eq!(store.put(vec!["b".to_owned()]).err(), Some(Refused::Full));
+        assert_eq!(store.counters().dropped, 1);
+        let (waiting, on_waiter) = (store.clone(), Arc::clone(&budget));
+        let waiter = std::thread::spawn(move || {
+            BUDGET.with(|slot| *slot.borrow_mut() = Some(on_waiter));
+            waiting.put_wait(vec!["c".to_owned()], far)
+        });
+        while store.counters().room_waits == 0 {
+            std::thread::yield_now();
+        }
+        go_tx.send(()).unwrap();
+        let third = waiter.join().unwrap().unwrap();
+        job.join().unwrap().unwrap();
+        store.durable(&first, far).unwrap();
+        store.durable(&third, far).unwrap();
+        store.sync(far).unwrap();
+        assert_eq!(*kept.lock().unwrap(), vec!["a".to_owned(), "c".to_owned()]);
+        assert!(store.counters().room_waits >= 1);
+        assert_eq!(budget.held(crate::memory::Use::Queues), 0);
+    }
+
+    /// AUDIT 2026-11-23 §1, MB.1: a sender waiting for room is woken by a charge given back
+    /// anywhere in the memory budget, not only by its own store's commits. Do: with room for one
+    /// row, hold store A's writer in a job and queue a row on A; on store B, which holds no charge,
+    /// wait with a row until a deadline an hour off; then let A's writer go. Expect: B's wait
+    /// counted, B's row taken once A's commit gives its charge back, none refused, all given back.
+    #[test]
+    fn mb1_a_wait_for_room_is_woken_by_another_stores_charge_given_back() {
+        let one = std::mem::size_of::<String>() + 1;
+        let fed = Fed::new(Some(u64::try_from(one).unwrap()), Some(0));
+        let (budget, _unset) = budget(&fed);
+        let (kept_a, kept_b) = (
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let a = Store::start(Kept(Arc::clone(&kept_a)), Config::default()).unwrap();
+        let b = Store::start(Kept(Arc::clone(&kept_b)), Config::default()).unwrap();
+        let far = Instant::now() + Duration::from_secs(3600);
+        let (held_tx, held_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let busy = a.clone();
+        let job = std::thread::spawn(move || {
+            busy.run(far, move |_| {
+                held_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+                Ok(())
+            })
+        });
+        held_rx.recv().unwrap();
+        let first = a.put(vec!["a".to_owned()]).unwrap();
+        let (waiting, on_waiter) = (b.clone(), Arc::clone(&budget));
+        let waiter = std::thread::spawn(move || {
+            BUDGET.with(|slot| *slot.borrow_mut() = Some(on_waiter));
+            waiting.put_wait(vec!["b".to_owned()], far)
+        });
+        while b.counters().room_waits == 0 && !waiter.is_finished() {
+            std::thread::yield_now();
+        }
+        go_tx.send(()).unwrap();
+        let second = waiter.join().unwrap().unwrap();
+        job.join().unwrap().unwrap();
+        a.durable(&first, far).unwrap();
+        b.durable(&second, far).unwrap();
+        assert_eq!(*kept_a.lock().unwrap(), vec!["a".to_owned()]);
+        assert_eq!(*kept_b.lock().unwrap(), vec!["b".to_owned()]);
+        assert_eq!(b.counters().room_waits, 1);
+        assert_eq!(a.counters().dropped + b.counters().dropped, 0);
+        assert_eq!(budget.held(crate::memory::Use::Queues), 0);
     }
 }

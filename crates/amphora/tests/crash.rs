@@ -471,6 +471,10 @@ impl Engine for Events {
         &row.key
     }
 
+    fn row_bytes(row: &Row) -> usize {
+        std::mem::size_of::<Row>().saturating_add(row.key.capacity())
+    }
+
     fn apply(&mut self, rows: &[Row]) -> anyhow::Result<usize> {
         self.db.transaction(|db| {
             for r in rows {
@@ -1230,6 +1234,10 @@ impl Engine for Mixed {
 
     fn key(_: &Option<i64>) -> &str {
         "t"
+    }
+
+    fn row_bytes(_: &Option<i64>) -> usize {
+        std::mem::size_of::<Option<i64>>()
     }
 
     fn apply(&mut self, rows: &[Option<i64>]) -> anyhow::Result<usize> {

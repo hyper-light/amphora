@@ -2131,6 +2131,37 @@ list: `QUEUED_BYTES`, `OUTGOING_BYTES`, `OUTGOING_MESSAGES`).
 `mb1_unread_resident_bytes_fall_to_the_charges_counted` (T-MB.1.3), `mb1_this_process_reads_its_limit_and_resident_bytes`
 (T-MB.1.4, on Linux, macOS and Windows); the engine's `io::system_memory::tests::the_platform_says_its_physical_memory`.
 
+## Decision (lane perf-A18): a wait for room is woken by any charge given back (2026-11-24)
+
+A store's batch is charged its rows' bytes (`Engine::row_bytes`) to the budget's room for queues until its commit
+ends, and `Store::put_wait` waits for room until its deadline. That wait was woken only by its own store's commits, so
+a sender whose store held no charge was refused `Full` at once, though another store, an admitted request or the
+caches could give room back a moment later.
+
+**The decision.** The budget wakes its waiters. `Budget::take_until` looks for room and, finding none, waits until its
+holder's deadline, woken only by charges given back anywhere in the budget (`Budget::give`, which every `Charge`'s drop
+and the caches' give-back call), never by a timer. A refusal other than no room (`Unavailable`: the limit unread) is
+returned at once.
+- No wakeup is lost. A waiter reads the count of gives under the budget's lock in the same hold as its look for room,
+  and a giver that sees it waiting bumps that count under the same lock before it wakes it.
+- A give with no holder waiting takes no lock. Holders waiting are counted, and a giver locks and wakes only when the
+  count is above zero. The waiter counts itself, then puts a sequentially consistent fence before its look; the giver's
+  give-back and its read of the count are sequentially consistent operations. The single total order of those
+  operations and fences (C++ [atomics.order], which Rust's atomics follow) then lets either the look see the bytes
+  given back or the giver see the waiter, never neither. This is the pattern Linux documents for `waitqueue_active`
+  (include/linux/wait.h). On x86-64 the giver's sequentially consistent compare-and-swap and load are the same
+  instructions as before (a locked `cmpxchg` and a plain `mov`): a give with no waiter pays no fence.
+
+**What is left.** A batch past the whole limit waits out its deadline: no give can make room for it. Resident bytes
+that fall without a charge given back wake no one. A give wakes every waiter, and each looks again.
+
+**Tests.** `store::tests::mb1_a_wait_for_room_is_woken_by_another_stores_charge_given_back` (store B, holding no
+charge, waits with a deadline an hour off and is woken when store A's commit gives its charge back) and
+`store::tests::mb1_a_wait_for_room_is_woken_by_the_commit_that_gives_room_back`.
+
+**Falsified if** a waiter sleeps to its deadline after a give made room for it: the tests above then hang to their
+hour-off deadlines.
+
 ## Decision (lane perf-A9): a call is charged the answer bound its caller declares (2026-11-23)
 
 A request admitted to a database's writer is charged what it and its answer can hold (MB.1, `Admission::bytes_for`).
