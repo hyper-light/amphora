@@ -3,7 +3,7 @@
 set -uo pipefail
 SHA=$1; shift
 export CARGO_HOME=$HOME/.cache/cargo-home-perf-oracle-c27 CARGO_NET_OFFLINE=true CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=${JOBS:-8}
-export CARGO_TARGET_DIR=$HOME/.cache/amphora-perf-target/oracle-c27
+export CARGO_TARGET_DIR=${TGT:-$HOME/.cache/amphora-perf-target/oracle-c27}
 O=$HOME/.cache/amphora-perf/oracle-c27-out; R=$HOME/.cache/amphora-perf/${CLONE:-oracle-c27-remote}; S=$HOME/.cache/amphora-perf/oracle-c27-scripts
 LIB=$HOME/.cache/sqlite-oracle/libsqlite3-oracle-3540000.so
 mkdir -p "$O" "$CARGO_HOME" "$CARGO_TARGET_DIR" "$HOME/.cache/amphora-perf-bin/oracle-c27"
@@ -53,6 +53,8 @@ for step in "$@"; do
     red:*)  # red:REF:FILE[,FILE..]: these files as REF has them
       IFS=: read -r _ ref files <<< "$step"; git checkout -q -f "$ref" -- ${files//,/ }; echo "== red: $files as $(git rev-parse --short=8 $ref)"; git status --short | head -5 ;;
     green) git checkout -q -f "$TREE" -- . && git status --short | head -5; echo "== green" ;;
+    seedall:*)  # a private copy of a finished build folder
+      if [ ! -d "$CARGO_TARGET_DIR/debug" ]; then mkdir -p "$CARGO_TARGET_DIR"; cp -a --reflink=always "$HOME/.cache/amphora-perf-target/${step#seedall:}/." "$CARGO_TARGET_DIR/"; echo "== seeded rc=$? $(( $(date +%s) - s ))s"; fi ;;
     fmt) cargo fmt --all --check > "$O/fmt.log" 2>&1; echo "== fmt rc=$?"; head -40 "$O/fmt.log" ;;
     clippy)
       timeout 1500 nice -n 10 cargo clippy -p amphora-engine --all-targets --locked -- -D warnings > "$O/clippy.log" 2>&1; rc=$?
