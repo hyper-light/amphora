@@ -5477,7 +5477,6 @@ impl WalFile {
         header: &WalHeader,
         buffer_pool: &Arc<BufferPool>,
         group: Option<&mut CompletionGroup>,
-        asked: Asked,
     ) -> Result<Completion> {
         let page_size =
             usize::try_from(header.page_size).map_err(|_| LimboError::IntegerOverflow)?;
@@ -5513,7 +5512,7 @@ impl WalFile {
             frame_len,
             file: self.coordination.segment_file(segment)?,
             records: self.segment_records(segment),
-            asked,
+            asked: Asked::now(&self.hold),
             readers,
             state: SpinLock::new(ReadState::default()),
             done: SpinLock::new(None),
@@ -5703,7 +5702,6 @@ impl WalFile {
             header,
             &self.buffer_pool,
             Some(group),
-            Asked::now(&self.hold),
         )?;
         Ok(slots
             .into_iter()
@@ -6312,7 +6310,6 @@ impl Wal for WalFile {
             label
         );
         let asked = Asked::now(&self.hold);
-        let admitted = asked.clone();
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
             let Ok((buf, bytes_read)) = res else {
                 tracing::debug!(err = ?res.unwrap_err());
@@ -6327,14 +6324,14 @@ impl Wal for WalFile {
                 );
                 page.clear_locked();
                 page.clear_wal_tag();
-                return Some(admitted.or_ended(CompletionError::ShortReadWalFrame {
+                return Some(asked.or_ended(CompletionError::ShortReadWalFrame {
                     offset,
                     expected: buf_len,
                     actual: bytes_read as usize,
                 }));
             }
             // The segment may have been given to another generation since (decision 45).
-            let taken = admitted.admit(|| {
+            let taken = asked.admit(|| {
                 finish_read_page(page.get().id(), buf, frame.clone());
                 match label {
                     Some(epoch) => frame.set_wal_tag(frame_id, epoch),
@@ -6371,7 +6368,6 @@ impl Wal for WalFile {
                 &header,
                 &buffer_pool,
                 group,
-                asked,
             );
         }
         // important not to hold shared state locks beyond this point to avoid deadlock with

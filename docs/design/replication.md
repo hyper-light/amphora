@@ -1960,26 +1960,32 @@ On adas-mac-studio.local-2 (macOS aarch64), 2026-11-11; the core's tests in `dat
   (on b151af0 none, its bound being 131,072 frames). Told of a restart that held one entry, it makes none while 20
   more apply, and makes one once its generation covered its spend.
 - T-T1.8.D3 `past_its_room_a_replica_refuses_submits_and_restarts_whatever_its_share`: a voter whose share is spent
-  (a million held) and whose filesystem has nothing free past one image. With a local read held open, a restart is
-  made under it and, the second segment past its room too, a write is refused `Unavailable` naming the frames past the
-  room (2026-11-24, lane V20: no restart was made until then). Once the read ends a restart follows, and the next write
-  is taken.
-- T-T1.8.D3 `a_follower_past_its_room_applies_on_and_fences_when_its_disk_fills`: a learner past its room refusing
-  submits applies 6 to 10. Its flushes then fail as a full disk's do (`StorageFull`), it fences ("failed a flush"),
-  and reopened on its files it holds 1 to 10.
+  (a million held) and whose filesystem has nothing free past one image, as it learned, its flushes held so that no pass
+  copies its log: a write is refused `Unavailable` naming the frames past the room. Once a pass has copied it a restart
+  follows, and the next write is taken. (Until 2026-11-24, lane V21, a local read held open was what took it past its
+  room; it ends now.)
+- T-T1.8.D3 `a_follower_past_its_room_applies_on_and_fences_when_its_disk_fills`: a learner whose filesystem has nothing
+  free past one image makes two restarts under an open local read, which is refused, typed, as a snapshot too old; its
+  flushes held, it is past its room, refuses submits and applies 4 more entries. Its flushes then fail as a full disk's
+  do (`StorageFull`), it fences ("failed a flush"), and reopened on its files it holds every value.
 - T-T1.8.D3 `a_dropped_replica_leaves_its_filesystems_room_to_the_others`: two logs counted on a tempdir's
   filesystem, then one once an owner dropped and its flushing thread ended.
 - T-T1.8.D1, rewritten on the room:
   - `a_replicas_database_log_stays_within_its_room`: 300 writes, both logs at room for 64 frames each; each within
     its room plus what two writes grow it;
   - `a_local_read_holds_off_no_restart_of_the_log_and_one_after_waits_for_nothing` (T1, until 2026-11-24
-    `a_local_read_holds_off_the_logs_restart_and_one_after_waits_for_it`): past a room of 16, a restart under an open
-    read whose two views are both its own, a read beside it answered, and a restart once it ended (its segment free);
-  - `a_restart_due_waits_for_no_read_and_the_next_for_its_deadline_at_most` (T2, until 2026-11-24
-    `a_restart_due_waits_for_a_reads_deadline_and_no_longer`): a restart under a read with no end, and the next once
-    its deadline ended it;
+    `a_local_read_holds_off_the_logs_restart_and_one_after_waits_for_it`): in a room the writes fit in, a restart under
+    an open read whose two views are both its own, one due by its share alone ending no read, and a read beside it
+    answered; then, the disk told it has room for 16, a restart while it is open, its third view refused as a snapshot
+    too old;
+  - `a_restart_due_waits_for_no_read_and_the_next_ends_the_one_that_holds_its_segment` (T2, until 2026-11-24
+    `a_restart_due_waits_for_a_reads_deadline_and_no_longer`): a restart under a read with no end, and the next, which
+    needs its segment, ending it, not its deadline;
   - `a_slow_local_read_has_no_write_refused_past_the_logs_room`: on the voter, past its room under an open read, every
     write taken;
+  - `a_slow_local_read_past_the_logs_room_ends_typed_and_no_write_is_refused`: on the voter, four restarts under an open
+    read, every write taken and every read beside it answered, each of the log's two files within its room, and the
+    read's second view refused as a snapshot too old;
   - `a_read_after_the_logs_restart_is_not_held_though_nothing_is_written_after_it` (lane V19): a restart that went
     through holds no read;
   - `a_read_on_a_wholly_copied_log_holds_passes_off_and_no_restart_or_read` (until 2026-11-24 `..._and_a_busy_pass_holds_reads`):
