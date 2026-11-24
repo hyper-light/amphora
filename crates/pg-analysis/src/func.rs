@@ -394,6 +394,14 @@ fn bpchar(source: &str, typmod: i32, explicit: bool) -> Result<Value, Error> {
     Ok(Value::Text(padded))
 }
 
+/// A value under its column's type modifier (`bpchar_input`, varchar.c; a `char(n)`'s n characters).
+pub fn fitted(type_oid: u32, typmod: i32, value: Value) -> Result<Value, Error> {
+    match value {
+        Value::Text(text) if type_oid == type_oid::BPCHAR => bpchar(&text, typmod, false),
+        value => Ok(value),
+    }
+}
+
 /// `charout` and `char_text` (char.c): nothing for the zero byte, `\ooo` for a byte past ASCII.
 pub fn char_text(c: u8) -> String {
     match c {

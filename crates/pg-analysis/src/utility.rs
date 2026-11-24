@@ -97,7 +97,7 @@ pub fn utility(
 }
 
 /// The name a RangeVar gives a table, in no schema: the parser's ported rules read no other.
-fn table_name(tree: &Tree, relation: Option<NodeId>) -> Result<&str, Error> {
+pub(crate) fn table_name(tree: &Tree, relation: Option<NodeId>) -> Result<&str, Error> {
     match relation.map(|id| tree.get(id)).transpose()? {
         Some(Node::RangeVar {
             catalogname: None,
@@ -361,7 +361,7 @@ fn add_primary_key(
 
 /// A relation a statement names: the OID it resolves to, none where there is none. A catalog's refuses as 19's
 /// (`RangeVarCallbackForTruncate`, tablecmds.c; `CheckDropPermissions`).
-fn user_table(
+pub(crate) fn user_table(
     session: &Session<'_>,
     schema: Option<&str>,
     name: &str,
@@ -387,7 +387,7 @@ fn user_table(
     Ok(found)
 }
 
-fn undefined_relation(name: &str) -> Error {
+pub(crate) fn undefined_relation(name: &str) -> Error {
     Error::new(
         sqlstate::UNDEFINED_TABLE,
         format!("relation \"{name}\" does not exist"),
@@ -579,17 +579,19 @@ mod tests {
     fn t_pg_9_3_pgbench_tables_and_keys_lower_to_the_engines() {
         assert_eq!(
             lowered("create table pgbench_tellers(tid int not null,bid int,mtime timestamp,filler char(84)) with (fillfactor=100)").unwrap(),
-            Some(Utility {
-                sql: "CREATE TABLE \"pgbench_tellers\"(\"tid\" int4 NOT NULL, \"bid\" int4, \"mtime\" timestamp, \"filler\" bpchar(84))".to_owned(),
-                tag: "CREATE TABLE",
-            })
+            Some(Utility::of(
+                "CREATE TABLE \"pgbench_tellers\"(\"tid\" int4 NOT NULL, \"bid\" int4, \"mtime\" timestamp, \"filler\" bpchar(84))".to_owned(),
+                "CREATE TABLE",
+                Effect::Created("pgbench_tellers".to_owned()),
+            ))
         );
         assert_eq!(
             lowered("alter table t add primary key (aid)").unwrap(),
-            Some(Utility {
-                sql: "CREATE UNIQUE INDEX \"t_pkey\" ON \"t\"(\"aid\")".to_owned(),
-                tag: "ALTER TABLE",
-            })
+            Some(Utility::of(
+                "CREATE UNIQUE INDEX \"t_pkey\" ON \"t\"(\"aid\")".to_owned(),
+                "ALTER TABLE",
+                Effect::Keyed("t_pkey".to_owned()),
+            ))
         );
         assert_eq!(lowered("SELECT 1").unwrap(), None);
     }
@@ -609,12 +611,22 @@ mod tests {
             ("create table u(a uuid)", sqlstate::FEATURE_NOT_SUPPORTED),
             (
                 "create table u(a int) with (fillfactor=5)",
-                sqlstate::FEATURE_NOT_SUPPORTED,
+                sqlstate::INVALID_PARAMETER_VALUE,
             ),
             (
-                "create table u(a int) with (autovacuum_enabled=1)",
+                "create table u(a int) with (fillfactor=100, fillfactor=90)",
+                sqlstate::INVALID_PARAMETER_VALUE,
+            ),
+            (
+                "create table u(a int) with (nosuch=1)",
+                sqlstate::INVALID_PARAMETER_VALUE,
+            ),
+            (
+                "create table u(a int) with (toast.autovacuum_enabled=1)",
                 sqlstate::FEATURE_NOT_SUPPORTED,
             ),
+            ("vacuum analyze u", sqlstate::UNDEFINED_TABLE),
+            ("truncate table t, u", sqlstate::UNDEFINED_TABLE),
             (
                 "alter table u add primary key (aid)",
                 sqlstate::UNDEFINED_TABLE,

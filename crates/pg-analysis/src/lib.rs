@@ -18,6 +18,7 @@
 
 pub mod binary;
 pub mod coerce;
+pub mod copy;
 pub mod datetime;
 pub mod expr;
 pub mod func;

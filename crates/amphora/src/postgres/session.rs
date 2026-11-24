@@ -173,6 +173,11 @@ pub trait Statements {
     /// Runs a message of the extended protocol and appends what answers it; [`Flow::Refused`] when that
     /// is an ErrorResponse, after which every message until Sync is skipped.
     fn extended(&mut self, message: Message<'_>, out: &mut Vec<u8>) -> Result<Flow, PgError>;
+    /// A message of the COPY that [`Flow::CopyIn`] began: that again while it goes on, [`Flow::Done`] once it has
+    /// ended, or (of an Execute's) [`Flow::Refused`] once it is refused.
+    fn copy(&mut self, _message: Copy<'_>, _out: &mut Vec<u8>) -> Result<Flow, PgError> {
+        Ok(Flow::Done)
+    }
     /// Sync: ends the transaction of the messages before it that no BEGIN made the client's.
     fn sync(&mut self, out: &mut Vec<u8>) -> Result<(), PgError>;
     /// Answers with `error` a message that can't be read, and ends what a statement's refusal ends.
@@ -196,6 +201,16 @@ pub enum Flow {
     Waiting,
     /// The message of the extended protocol was refused.
     Refused,
+    /// A COPY FROM STDIN began or goes on: the client's data comes next.
+    CopyIn,
+}
+
+/// A message of a COPY FROM STDIN under way (doc/src/sgml/protocol.sgml, "COPY Operations").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Copy<'a> {
+    Data(&'a [u8]),
+    Done,
+    Fail(&'a str),
 }
 
 /// What opens a session's database once its role is authenticated, as PostgreSQL's InitPostgres opens
@@ -214,6 +229,8 @@ pub struct Session {
     statements: Option<Box<dyn Statements>>,
     /// Whether the message a wait stopped is an Execute, whose end no ReadyForQuery follows.
     executing: bool,
+    /// Whether a COPY FROM STDIN goes on, and whether an Execute began it.
+    copying: Option<bool>,
 }
 
 fn fatal(out: &mut Vec<u8>, consumed: usize, error: &PgError) -> Result<Step, PgError> {
@@ -458,6 +475,7 @@ impl Session {
             open: None,
             statements: None,
             executing: false,
+            copying: None,
         }
     }
 
@@ -860,6 +878,9 @@ impl Session {
         input: &[u8],
         out: &mut Vec<u8>,
     ) -> Result<Step, PgError> {
+        if let Some(extended) = self.copying {
+            return self.copy_frame(startup, extended, input, out);
+        }
         let (tag, body, len) = match wire::message_frame(input, ready_limit) {
             Ok(Frame::Whole { tag, body, len }) => (tag.unwrap_or_default(), body, len),
             Ok(Frame::Need(total)) => {
@@ -893,9 +914,12 @@ impl Session {
                     Err(error) => return fatal(out, len, &error),
                 };
                 let mut waiting = false;
+                let mut copying = false;
                 match (text(sql), &mut self.statements) {
                     (Ok(sql), Some(statements)) => {
-                        waiting = statements.simple_query(sql, out)? == Flow::Waiting;
+                        let flow = statements.simple_query(sql, out)?;
+                        waiting = flow == Flow::Waiting;
+                        copying = flow == Flow::CopyIn;
                     }
                     (Err(error), Some(statements)) => statements.refuse(&error, out)?,
                     (Ok(sql), None) => match empty_query(sql.as_bytes()) {
@@ -904,6 +928,17 @@ impl Session {
                         Err(error) => wire::error_response(out, &error)?,
                     },
                     (Err(error), None) => wire::error_response(out, &error)?,
+                }
+                if copying {
+                    self.copying = Some(false);
+                    self.phase = Phase::Ready {
+                        startup,
+                        skip_to_sync: skip,
+                    };
+                    return Ok(Step {
+                        consumed: len,
+                        next: Next::Continue,
+                    });
                 }
                 if waiting {
                     self.executing = false;
@@ -938,6 +973,9 @@ impl Session {
                 if flow == Flow::Waiting {
                     self.executing = true;
                     next = Next::Wait;
+                }
+                if flow == Flow::CopyIn {
+                    self.copying = Some(true);
                 }
             }
             b'S' => {
@@ -978,6 +1016,100 @@ impl Session {
 }
 
 impl Session {
+    /// A frame while a COPY FROM STDIN goes on (`CopyGetData`, src/backend/commands/copyfromparse.c:246): CopyData,
+    /// CopyDone and CopyFail are its data's, Flush and Sync are ignored, and another type loses the protocol's sync.
+    fn copy_frame(
+        &mut self,
+        startup: Startup,
+        extended: bool,
+        input: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<Step, PgError> {
+        if let Some(tag) = input.first().filter(|tag| !b"dcfHS".contains(*tag)) {
+            let error = PgError::error(
+                SqlState::PROTOCOL_VIOLATION,
+                format!("unexpected message type 0x{tag:02X} during COPY from stdin"),
+            );
+            wire::error_response(out, &error)?;
+            return fatal(
+                out,
+                input.len(),
+                &PgError::fatal(
+                    SqlState::PROTOCOL_VIOLATION,
+                    "terminating connection because protocol synchronization was lost",
+                ),
+            );
+        }
+        let (tag, body, len) = match wire::message_frame(input, ready_limit) {
+            Ok(Frame::Whole { tag, body, len }) => (tag.unwrap_or_default(), body, len),
+            Ok(Frame::Need(total)) => {
+                self.phase = Phase::Ready {
+                    startup,
+                    skip_to_sync: false,
+                };
+                return Ok(Step {
+                    consumed: 0,
+                    next: Next::Need(total),
+                });
+            }
+            Err(error) => return fatal(out, 0, &error),
+        };
+        let mut skip = false;
+        let mut next = Next::Continue;
+        let reason;
+        let message = match tag {
+            b'd' => Some(Copy::Data(body)),
+            b'c' => Some(Copy::Done),
+            b'f' => {
+                reason = Reader::new(body).cstr().and_then(text);
+                match &reason {
+                    Ok(reason) => Some(Copy::Fail(reason)),
+                    Err(error) => return fatal(out, len, error),
+                }
+            }
+            _ => None,
+        };
+        let Some(message) = message else {
+            self.phase = Phase::Ready {
+                startup,
+                skip_to_sync: false,
+            };
+            return Ok(Step {
+                consumed: len,
+                next: Next::Continue,
+            });
+        };
+        let flow = match &mut self.statements {
+            Some(statements) => statements.copy(message, out)?,
+            None => Flow::Done,
+        };
+        match flow {
+            Flow::CopyIn => {}
+            Flow::Waiting => {
+                // The rest of the Query waits for another session.
+                self.copying = None;
+                self.executing = false;
+                next = Next::Wait;
+            }
+            Flow::Done | Flow::Refused => {
+                self.copying = None;
+                if extended {
+                    skip = flow == Flow::Refused;
+                } else {
+                    ready_for_query(out, self.tx_status())?;
+                }
+            }
+        }
+        self.phase = Phase::Ready {
+            startup,
+            skip_to_sync: skip,
+        };
+        Ok(Step {
+            consumed: len,
+            next,
+        })
+    }
+
     /// Ready once the statement the Query or the Execute stopped at ([`Next::Wait`]) can run again.
     pub fn poll_wait(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         match &mut self.statements {

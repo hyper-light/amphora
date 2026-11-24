@@ -91,6 +91,11 @@ impl Portal {
         }
     }
 
+    /// Whether it waits to be run, or to go on (`PORTAL_READY`).
+    pub(super) fn is_ready(&self) -> bool {
+        !matches!(self.run, Run::Done)
+    }
+
     /// Its transaction failed (`AtAbort_Portals`): its rows go, its columns stay.
     pub(super) fn fail(&mut self) {
         self.run = Run::Done;
