@@ -933,9 +933,11 @@ store` passed 14 (main's store test has 14 since lane A18's change).
 Run r1989 (needs `linux/amd64,cpus=4,mem=12g`, load 45-78) on 22173583: check exit 0; `d45_` passed 20; `q3_` passed 3;
 `storage::shared_wal_coordination` passed 50 and `storage::log_segments` 14; the workspace clippy exit 0 in 45 s;
 `scripts/check-production.sh` exit 0 ("10903 left in the engine's production code across 17 lints, as the ratchet
-holds"). Main then moved in `crates/pg-parser` (lane PG10) and records only; `cargo tree -e all -p amphora-engine` and
-`-p amphora` with `-i amphora-pg-parser` find no such package in their trees, so the merge was pushed without a re-run
-(RULES 6, rev 00:00Z). The engine suite on main after the merge is the successor's first run.
+holds"). Main then moved in `crates/pg-parser` (lane PG10; not in amphora-engine's or amphora's trees by `cargo tree -e
+all -i`) and in `crates/amphora` (lane W6's store.rs and store test, files this lane didn't touch). The re-merge a1f6337b
+(load 12-20, cpus=4): the workspace clippy exit 0 in 30 s; `d45_` passed 20. Pushed to main as a1f6337b. Not run on the
+merged tree: the engine's `storage:: vdbe::vacuum` and the store test (r1979 ran them on 554b248e); they are the
+successor's first run on main.
 
 **Notes, one line each.** `Db::read_log` reads `-wal` by path, so the backup will need the current segment's file once
 the switch exists (above). Main's `store` test has 14 tests since lane A18 (15 at B16's merge).
