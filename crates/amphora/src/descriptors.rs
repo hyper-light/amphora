@@ -24,6 +24,8 @@ pub(crate) struct Descriptors {
     held: AtomicUsize,
     /// Give-backs so far: what a waiter for a release compares against (AUDIT 6).
     released: AtomicU64,
+    /// Threads currently registered in `waiters`: checked lock-free on every `Held::drop`.
+    waiting: AtomicUsize,
     /// The threads waiting for a give-back ([`Self::wait_release`]), each woken by the next one.
     waiters: Mutex<Vec<Thread>>,
 }
@@ -43,6 +45,7 @@ impl Descriptors {
             outside: AtomicUsize::new(0),
             held: AtomicUsize::new(0),
             released: AtomicU64::new(0),
+            waiting: AtomicUsize::new(0),
             waiters: Mutex::new(Vec::new()),
         });
         budget.recount()?;
@@ -58,6 +61,7 @@ impl Descriptors {
             outside: AtomicUsize::new(0),
             held: AtomicUsize::new(0),
             released: AtomicU64::new(0),
+            waiting: AtomicUsize::new(0),
             waiters: Mutex::new(Vec::new()),
         })
     }
@@ -147,19 +151,28 @@ impl Descriptors {
     /// descriptor this budget charged.
     pub(crate) fn wait_release(&self, seen: u64, stopping: &AtomicBool) {
         let me = std::thread::current();
-        self.waiters
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(me.clone());
-        // Registered before the check: a give-back after it finds this thread among the waiters
-        // and unparks it, and a park after an unpark returns at once.
+        {
+            let mut waiters = self.waiters.lock().unwrap_or_else(PoisonError::into_inner);
+            waiters.push(me.clone());
+            self.waiting.fetch_add(1, Ordering::SeqCst);
+        }
+        // Registered and counted before the check: a give-back after it sees `waiting > 0`
+        // (SeqCst total order with `released.fetch_add(1, SeqCst)` in `Held::drop`), finds
+        // this thread among the waiters and unparks it, and a park after an unpark returns at once.
         while self.released.load(Ordering::SeqCst) == seen && !stopping.load(Ordering::Acquire) {
             std::thread::park();
         }
-        self.waiters
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .retain(|waiter| waiter.id() != me.id());
+        let mut waiters = self.waiters.lock().unwrap_or_else(PoisonError::into_inner);
+        let before = waiters.len();
+        waiters.retain(|waiter| waiter.id() != me.id());
+        let removed = before.saturating_sub(waiters.len());
+        if removed > 0 {
+            let _ = self
+                .waiting
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |w| {
+                    Some(w.saturating_sub(removed))
+                });
+        }
     }
 
     fn wake_waiters(&self) {
@@ -206,7 +219,9 @@ impl Drop for Held {
                 Some(held.saturating_sub(self.count))
             });
         self.budget.released.fetch_add(1, Ordering::SeqCst);
-        self.budget.wake_waiters();
+        if self.budget.waiting.load(Ordering::SeqCst) > 0 {
+            self.budget.wake_waiters();
+        }
     }
 }
 

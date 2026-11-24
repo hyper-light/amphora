@@ -9,7 +9,7 @@
 //! The parsers are pure, so tests give them each file's text; [`limit`] reads the files.
 
 use amphora_api::Refusal;
-use std::sync::atomic::{AtomicU64, Ordering, fence};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering, fence};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::Instant;
 
@@ -86,22 +86,28 @@ pub fn ancestors(path: &str) -> Vec<String> {
     out
 }
 
+fn min_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    }
+}
+
 /// The memory this process may use, in bytes: the smallest of what the platform says (the module's
 /// head lists the readings). None where nothing can be read.
 #[must_use]
 pub fn limit() -> Option<u64> {
-    let mut limits = platform_limits();
-    limits.extend(process_limits());
-    limits.into_iter().min()
+    min_opt(platform_limit(), process_limit())
 }
 
 /// Linux: the limits of every control group above this process (v2 and v1) and the machine's
 /// memory (`/proc/meminfo`).
 #[cfg(target_os = "linux")]
-fn platform_limits() -> Vec<u64> {
+fn platform_limit() -> Option<u64> {
     let read = |path: &str| std::fs::read_to_string(path).ok();
     let cgroup = read("/proc/self/cgroup").unwrap_or_default();
-    let mut limits: Vec<u64> = Vec::new();
+    let mut best: Option<u64> = None;
     if let Some(group) = v2_group(&cgroup) {
         for at in ancestors(group) {
             let dir = format!("/sys/fs/cgroup{}", if at == "/" { "" } else { at.as_str() });
@@ -109,7 +115,7 @@ fn platform_limits() -> Vec<u64> {
                 .as_deref()
                 .and_then(group_limit)
             {
-                limits.push(n);
+                best = min_opt(best, Some(n));
             }
         }
     }
@@ -123,41 +129,42 @@ fn platform_limits() -> Vec<u64> {
                 .as_deref()
                 .and_then(group_limit)
             {
-                limits.push(n);
+                best = min_opt(best, Some(n));
             }
         }
     }
     if let Some(n) = read("/proc/meminfo").as_deref().and_then(mem_total) {
-        limits.push(n);
+        best = min_opt(best, Some(n));
     }
-    limits
+    best
 }
 
 /// macOS and Windows: the machine's physical memory as the platform reports it (the engine makes
-/// the call: this crate denies `unsafe`). A Windows job object's memory limit isn't read (it needs
-/// `QueryInformationJobObject`): the machine's memory bounds such a process from above.
+/// the call: this crate denies `unsafe`). Physical RAM does not change during a process's life,
+/// so read it once instead of invoking `sysctl`/`GlobalMemoryStatusEx` on every budget check. A
+/// Windows job object's memory limit isn't read (it needs `QueryInformationJobObject`): the
+/// machine's memory bounds such a process from above.
 #[cfg(not(target_os = "linux"))]
-fn platform_limits() -> Vec<u64> {
-    amphora_engine::io::system_memory::physical_memory()
-        .into_iter()
-        .collect()
+fn platform_limit() -> Option<u64> {
+    static PHYSICAL: OnceLock<Option<u64>> = OnceLock::new();
+    *PHYSICAL.get_or_init(amphora_engine::io::system_memory::physical_memory)
 }
 
 /// The process's own soft limits on what it may map (POSIX `getrlimit`: `RLIMIT_AS`,
 /// `RLIMIT_DATA`, and `RLIMIT_RSS` where the system enforces it), each where one is set.
 #[cfg(unix)]
-fn process_limits() -> Vec<u64> {
+fn process_limit() -> Option<u64> {
     use rustix::process::{Resource, getrlimit};
     [Resource::As, Resource::Data, Resource::Rss]
         .into_iter()
         .filter_map(|resource| getrlimit(resource).current)
-        .collect()
+        .min()
 }
 
 /// Windows has no per-process soft limit of this kind (its job objects aside, above).
 #[cfg(windows)]
-fn process_limits() -> Vec<u64> {
-    Vec::new()
+fn process_limit() -> Option<u64> {
+    None
 }
 
 /// The bytes this process holds resident now (Linux `/proc/self/statm`, macOS `task_info`,
@@ -213,12 +220,59 @@ pub trait Readings: Send + Sync {
     fn read(&self) -> Reading;
 }
 
+/// One slot of the double-buffered single-flight reading: holds the last completed kernel reading
+/// in atomics so concurrent callers arriving while another thread is already inside kernel syscalls
+/// read it lock-free without piling duplicate syscalls onto the OS, while every sequential call
+/// still reads the kernel afresh (MB.1; no time constant or TTL).
+struct ReadingSlot {
+    limit: AtomicU64,
+    resident: AtomicU64,
+    /// Bit 0: `limit` is `Some`; bit 1: `resident` is `Some`.
+    flags: AtomicU8,
+}
+
+impl ReadingSlot {
+    fn new() -> Self {
+        Self {
+            limit: AtomicU64::new(0),
+            resident: AtomicU64::new(0),
+            flags: AtomicU8::new(0),
+        }
+    }
+
+    fn store(&self, reading: Reading) {
+        let mut flags = 0u8;
+        if let Some(limit) = reading.limit {
+            self.limit.store(limit, Ordering::Relaxed);
+            flags |= 1;
+        }
+        if let Some(resident) = reading.resident {
+            self.resident.store(resident, Ordering::Relaxed);
+            flags |= 2;
+        }
+        self.flags.store(flags, Ordering::Relaxed);
+    }
+
+    fn load(&self) -> Reading {
+        let flags = self.flags.load(Ordering::Relaxed);
+        let limit = (flags & 1 != 0).then(|| self.limit.load(Ordering::Relaxed));
+        let resident = (flags & 2 != 0).then(|| self.resident.load(Ordering::Relaxed));
+        Reading { limit, resident }
+    }
+}
+
 /// The system's readings, taken again at every ask: a host may change a limit while the process runs.
 /// On Linux each file is opened once and read again in place at every ask ([`Opened`]): the same
 /// readings, exact at each ask, without the opens, path walks and `/proc/meminfo` they cost.
+/// Under concurrency, overlapping asks coalesce via a lock-free double-buffered single-flight so
+/// only one thread executes the kernel syscalls at a time; sequential asks always query the kernel.
 struct System {
     #[cfg(target_os = "linux")]
     opened: std::sync::RwLock<Option<Arc<Opened>>>,
+    /// Even `2 * gen`: idle, last completed reading is in `slots[(gen - 1) & 1]` when `gen > 0`.
+    /// Odd `2 * gen + 1`: one thread is querying the kernel and will write `slots[gen & 1]`.
+    flight: AtomicU64,
+    slots: [ReadingSlot; 2],
 }
 
 impl System {
@@ -226,16 +280,91 @@ impl System {
         Self {
             #[cfg(target_os = "linux")]
             opened: std::sync::RwLock::new(None),
+            flight: AtomicU64::new(0),
+            slots: [ReadingSlot::new(), ReadingSlot::new()],
         }
     }
-}
 
-#[cfg(not(target_os = "linux"))]
-impl Readings for System {
-    fn read(&self) -> Reading {
+    fn slot(&self, index: u64) -> &ReadingSlot {
+        let [even, odd] = &self.slots;
+        if index & 1 == 0 { even } else { odd }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn read_fresh(&self) -> Reading {
         Reading {
             limit: limit(),
             resident: resident(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_fresh(&self) -> Reading {
+        let held = self.opened.read().ok().and_then(|o| o.clone());
+        if let Some(reading) = held.as_deref().and_then(Opened::reading) {
+            return reading;
+        }
+        let fresh = Opened::open().map(Arc::new);
+        let reading = fresh.as_deref().and_then(Opened::reading);
+        if let Ok(mut slot) = self.opened.write() {
+            *slot = fresh.filter(|_| reading.is_some());
+        }
+        reading.unwrap_or_else(|| Reading {
+            limit: limit(),
+            resident: resident(),
+        })
+    }
+}
+
+impl Readings for System {
+    fn read(&self) -> Reading {
+        loop {
+            let state = self.flight.load(Ordering::Acquire);
+            if state & 1 == 1 {
+                let generation = state >> 1;
+                if let Some(prev) = generation.checked_sub(1) {
+                    let reading = self.slot(prev).load();
+                    // Pairs with the writer's Release store and AcqRel CAS: `prev` is untouched
+                    // until `flight` advances to `state + 2`.
+                    fence(Ordering::Acquire);
+                    let after = self.flight.load(Ordering::Relaxed);
+                    if after == state || after == state.wrapping_add(1) {
+                        return reading;
+                    }
+                    continue;
+                }
+                return self.read_fresh();
+            }
+            let in_flight = state.wrapping_add(1);
+            if self
+                .flight
+                .compare_exchange(state, in_flight, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                struct Guard<'a> {
+                    flight: &'a AtomicU64,
+                    restore: u64,
+                    done: bool,
+                }
+                impl Drop for Guard<'_> {
+                    fn drop(&mut self) {
+                        if !self.done {
+                            self.flight.store(self.restore, Ordering::Release);
+                        }
+                    }
+                }
+                let mut guard = Guard {
+                    flight: &self.flight,
+                    restore: state,
+                    done: false,
+                };
+                let reading = self.read_fresh();
+                self.slot(state >> 1).store(reading);
+                guard.done = true;
+                self.flight
+                    .store(state.wrapping_add(2), Ordering::Release);
+                return reading;
+            }
         }
     }
 }
@@ -371,7 +500,7 @@ impl Opened {
         let mut buf = [0u8; IN_PLACE];
         let machine = rustix::system::sysinfo();
         let machine = u64::from(machine.mem_unit.max(1)).checked_mul(machine.totalram);
-        let mut limit = machine.into_iter().chain(process_limits()).min();
+        let mut limit = min_opt(machine, process_limit());
         for file in &self.limits {
             let n = read_at(file, &mut buf)?;
             let text = std::str::from_utf8(buf.get(..n)?).ok()?;
@@ -402,25 +531,6 @@ impl Opened {
         Some(Reading {
             limit: Some(self.limit()?),
             resident: self.resident().or_else(resident),
-        })
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Readings for System {
-    fn read(&self) -> Reading {
-        let held = self.opened.read().ok().and_then(|o| o.clone());
-        if let Some(reading) = held.as_deref().and_then(Opened::reading) {
-            return reading;
-        }
-        let fresh = Opened::open().map(Arc::new);
-        let reading = fresh.as_deref().and_then(Opened::reading);
-        if let Ok(mut slot) = self.opened.write() {
-            *slot = fresh.filter(|_| reading.is_some());
-        }
-        reading.unwrap_or_else(|| Reading {
-            limit: limit(),
-            resident: resident(),
         })
     }
 }
@@ -586,10 +696,8 @@ impl Budget {
         self.slot(used).load(Ordering::Acquire)
     }
 
-    /// The bytes `used` may hold at most now: the limit less what the rest of the process holds
-    /// (the larger of its resident bytes and every charge counted, `used`'s own given back).
-    /// Refused, typed and naming the platform, when the limit can't be read.
-    pub fn room(&self, used: Use) -> Result<u64, Refusal> {
+    /// The bytes `used` may hold at most now, alongside the whole process limit read.
+    fn room_and_limit(&self, used: Use) -> Result<(u64, u64), Refusal> {
         let reading = self.readings.read();
         let limit = reading.limit.ok_or_else(|| unread("memory limit"))?;
         let charged = Use::ALL
@@ -597,7 +705,14 @@ impl Budget {
             .fold(0u64, |sum, each| sum.saturating_add(self.held(*each)));
         let resident = reading.resident.unwrap_or(charged);
         let others = resident.max(charged).saturating_sub(self.held(used));
-        Ok(limit.saturating_sub(others))
+        Ok((limit.saturating_sub(others), limit))
+    }
+
+    /// The bytes `used` may hold at most now: the limit less what the rest of the process holds
+    /// (the larger of its resident bytes and every charge counted, `used`'s own given back).
+    /// Refused, typed and naming the platform, when the limit can't be read.
+    pub fn room(&self, used: Use) -> Result<u64, Refusal> {
+        self.room_and_limit(used).map(|(room, _)| room)
     }
 
     /// `bytes` more held by `used`, refused typed (past its room, [`Refusal::TooLarge`] naming the
@@ -611,21 +726,33 @@ impl Budget {
         })
     }
 
-    /// `bytes` more held by `used`, as [`Budget::take`], for a holder that counts its own and
-    /// gives them back with [`Budget::give`] (the engine's versioned storage, which takes a run of
-    /// frames or a step of its versions' reservation at a time).
-    pub fn hold(&self, used: Use, bytes: u64) -> Result<(), Refusal> {
-        let room = self.room(used)?;
+    fn hold_with_limit(&self, used: Use, bytes: u64) -> Result<(), (Refusal, Option<u64>)> {
+        let (room, whole_limit) = self
+            .room_and_limit(used)
+            .map_err(|refusal| (refusal, None))?;
         self.slot(used)
             .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
                 held.checked_add(bytes).filter(|after| *after <= room)
             })
             .map(|_| ())
-            .map_err(|held| Refusal::TooLarge {
-                what: format!("memory for {}", used.name()),
-                size: usize::try_from(held.saturating_add(bytes)).unwrap_or(usize::MAX),
-                limit: usize::try_from(room).unwrap_or(usize::MAX),
+            .map_err(|held| {
+                (
+                    Refusal::TooLarge {
+                        what: format!("memory for {}", used.name()),
+                        size: usize::try_from(held.saturating_add(bytes)).unwrap_or(usize::MAX),
+                        limit: usize::try_from(room).unwrap_or(usize::MAX),
+                    },
+                    Some(whole_limit),
+                )
             })
+    }
+
+    /// `bytes` more held by `used`, as [`Budget::take`], for a holder that counts its own and
+    /// gives them back with [`Budget::give`] (the engine's versioned storage, which takes a run of
+    /// frames or a step of its versions' reservation at a time).
+    pub fn hold(&self, used: Use, bytes: u64) -> Result<(), Refusal> {
+        self.hold_with_limit(used, bytes)
+            .map_err(|(refusal, _)| refusal)
     }
 
     /// `bytes` more held by `used`, as [`Budget::take`], waiting for room until `until`: woken by
@@ -643,8 +770,23 @@ impl Budget {
     ) -> Result<Charge, Refusal> {
         // Room found takes no lock, as Linux's `wait_event` looks before it joins the queue
         // (include/linux/wait.h); the look under the lock below is the one a give can't slip past.
-        if let Ok(charge) = self.take(used, bytes) {
-            return Ok(charge);
+        match self.hold_with_limit(used, bytes) {
+            Ok(()) => {
+                return Ok(Charge {
+                    budget: Arc::clone(self),
+                    used,
+                    bytes,
+                });
+            }
+            Err((_, Some(limit))) if bytes > limit => {
+                return Err(Refusal::TooLarge {
+                    what: format!("memory for {}", used.name()),
+                    size: usize::try_from(bytes).unwrap_or(usize::MAX),
+                    limit: usize::try_from(limit).unwrap_or(usize::MAX),
+                });
+            }
+            Err((Refusal::TooLarge { .. }, _)) => {}
+            Err((other, _)) => return Err(other),
         }
         let mut given = self.given.0.lock().unwrap_or_else(PoisonError::into_inner);
         self.waiting.fetch_add(1, Ordering::Relaxed);
@@ -654,11 +796,12 @@ impl Budget {
         fence(Ordering::SeqCst);
         let held = 'look: loop {
             let seen = *given;
-            let room = match self.hold(used, bytes) {
-                Err(Refusal::TooLarge { limit, .. }) => limit,
-                other => break other,
+            let (room, whole_limit) = match self.hold_with_limit(used, bytes) {
+                Ok(()) => break Ok(()),
+                Err((Refusal::TooLarge { limit, .. }, whole_limit)) => (limit, whole_limit),
+                Err((other, _)) => break Err(other),
             };
-            if let Some(limit) = self.readings.read().limit.filter(|limit| bytes > *limit) {
+            if let Some(limit) = whole_limit.filter(|limit| bytes > *limit) {
                 break Err(Refusal::TooLarge {
                     what: format!("memory for {}", used.name()),
                     size: usize::try_from(bytes).unwrap_or(usize::MAX),

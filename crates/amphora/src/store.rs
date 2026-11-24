@@ -24,7 +24,7 @@
 //! What it counts is in [`Meter`].
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -436,6 +436,9 @@ pub type Then = Box<dyn FnOnce(Result<(), Refused>) + Send>;
 struct Fate {
     /// [`UNSETTLED`], [`FAILED`], or the number of the commit its batch is in (numbered from 1).
     state: AtomicU64,
+    /// Whether this batch carries a [`Then`] callback (`put_then`): immutable once constructed so
+    /// the writer skips locking `then` for every `put`/`put_wait` batch.
+    has_then: bool,
     then: Mutex<Option<Then>>,
 }
 
@@ -489,9 +492,12 @@ struct Sends {
     handed: AtomicU64,
     /// Batches settled in all (committed, failed or let go), and commits made: readers see them.
     committed: Mutex<Progress>,
+    committed_batches: AtomicU64,
     done: Condvar,
     /// Batches settled and commits made, durable: a flush that began after them ended.
     durable: Mutex<Progress>,
+    durable_batches: AtomicU64,
+    durable_commits: AtomicU64,
     flushed: Condvar,
     /// Its engine's commits are durable as they end: no flusher.
     durable_as_committed: AtomicBool,
@@ -500,6 +506,8 @@ struct Sends {
     /// A flush failed: the store takes nothing more, and acknowledges nothing more durable.
     disk_failed: AtomicBool,
     claims: Mutex<Claims>,
+    /// Entries waiting in `notices.awaiting`: when 0, `made_durable` skips locking `notices`.
+    notices_awaiting: AtomicUsize,
     notices: Mutex<Notices>,
     noticed: Condvar,
 }
@@ -558,13 +566,17 @@ impl Default for Sends {
             epochs: AtomicU64::new(1),
             handed: AtomicU64::new(0),
             committed: Mutex::new(Progress::default()),
+            committed_batches: AtomicU64::new(0),
             done: Condvar::new(),
             durable: Mutex::new(Progress::default()),
+            durable_batches: AtomicU64::new(0),
+            durable_commits: AtomicU64::new(0),
             flushed: Condvar::new(),
             durable_as_committed: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             disk_failed: AtomicBool::new(false),
             claims: Mutex::default(),
+            notices_awaiting: AtomicUsize::new(0),
             notices: Mutex::default(),
             noticed: Condvar::new(),
         }
@@ -588,12 +600,18 @@ impl Sends {
     fn handing(&self, keys: &[String]) {
         for k in keys {
             let mut shard = self.shard(k);
-            let c = shard.entry(k.clone()).or_insert_with(|| Counts {
-                epoch: self.epochs.fetch_add(1, Ordering::Relaxed),
-                handed: 0,
-                committed: 0,
-            });
-            c.handed = c.handed.saturating_add(1);
+            if let Some(c) = shard.get_mut(k.as_str()) {
+                c.handed = c.handed.saturating_add(1);
+            } else {
+                shard.insert(
+                    k.clone(),
+                    Counts {
+                        epoch: self.epochs.fetch_add(1, Ordering::Relaxed),
+                        handed: 1,
+                        committed: 0,
+                    },
+                );
+            }
         }
         self.handed.fetch_add(1, Ordering::Relaxed);
     }
@@ -612,18 +630,25 @@ impl Sends {
         }
     }
 
-    /// `batches` more are settled, and `commits` made in all: readers and senders waiting on them
-    /// look again.
-    fn wake(&self, batches: u64, commits: u64) {
+    /// `batches` more are settled, and `commits` made in all: readers and the flusher waiting on
+    /// them look again. If any batch failed (`any_failed`), senders waiting in [`Self::wait_ticket`]
+    /// are woken immediately instead of waiting for a flush.
+    fn wake(&self, batches: u64, commits: u64, any_failed: bool) {
         let now = {
             let mut committed = locked(&self.committed);
             committed.batches = committed.batches.saturating_add(batches);
             committed.commits = committed.commits.max(commits);
-            self.done.notify_all();
             *committed
         };
+        self.committed_batches.store(now.batches, Ordering::Release);
+        self.done.notify_all();
         if self.durable_as_committed.load(Ordering::Relaxed) {
             self.made_durable(now);
+        } else if any_failed {
+            // Synchronize with `wait_ticket`'s `self.durable` lock before notifying `self.flushed`
+            // so a concurrent waiter cannot miss `FAILED`.
+            drop(locked(&self.durable));
+            self.flushed.notify_all();
         }
     }
 
@@ -633,6 +658,9 @@ impl Sends {
         match key {
             None => {
                 let target = self.handed.load(Ordering::Relaxed);
+                if self.committed_batches.load(Ordering::Acquire) >= target {
+                    return true;
+                }
                 self.wait_until(until, |_| true, target)
             }
             Some(k) => {
@@ -671,18 +699,29 @@ impl Sends {
     }
 
     fn made_durable(&self, through: Progress) {
-        {
+        let advanced = {
             let mut durable = locked(&self.durable);
             if through.batches <= durable.batches && through.commits <= durable.commits {
                 return;
             }
             durable.batches = durable.batches.max(through.batches);
             durable.commits = durable.commits.max(through.commits);
-            self.flushed.notify_all();
+            *durable
+        };
+        self.durable_batches
+            .fetch_max(advanced.batches, Ordering::Release);
+        self.durable_commits
+            .fetch_max(advanced.commits, Ordering::SeqCst);
+        self.flushed.notify_all();
+        // Pairs with `to_tell`'s SeqCst store to `notices_awaiting` and load of `durable_commits`:
+        // when no `put_then` notices await durability, skip locking `notices` and waking notifier.
+        if self.notices_awaiting.load(Ordering::SeqCst) > 0 {
+            {
+                let mut notices = locked(&self.notices);
+                notices.durable = notices.durable.max(advanced.commits);
+            }
+            self.noticed.notify_all();
         }
-        let mut notices = locked(&self.notices);
-        notices.durable = notices.durable.max(through.commits);
-        self.noticed.notify_all();
     }
 
     /// The commits durable so far, once more than `seen` are, or `most` has passed, or the store
@@ -710,12 +749,19 @@ impl Sends {
 
     /// The batches of a commit (numbered `commit`, or none: it failed) that have a sender to tell.
     fn to_tell(&self, fates: impl Iterator<Item = (Arc<Fate>, Option<u64>)>) {
-        let mut notices = locked(&self.notices);
-        for (fate, commit) in fates {
-            match commit {
-                Some(c) => notices.awaiting.push_back((c, fate)),
-                None => notices.refused.push((fate, Refused::Failed)),
+        {
+            let mut notices = locked(&self.notices);
+            for (fate, commit) in fates {
+                match commit {
+                    Some(c) => notices.awaiting.push_back((c, fate)),
+                    None => notices.refused.push((fate, Refused::Failed)),
+                }
             }
+            self.notices_awaiting
+                .store(notices.awaiting.len(), Ordering::SeqCst);
+            notices.durable = notices
+                .durable
+                .max(self.durable_commits.load(Ordering::SeqCst));
         }
         self.noticed.notify_all();
     }
@@ -724,6 +770,9 @@ impl Sends {
     /// `until`.
     fn wait_durable(&self, until: Instant) -> Result<(), Refused> {
         let target = self.handed.load(Ordering::Relaxed);
+        if self.durable_batches.load(Ordering::Acquire) >= target {
+            return Ok(());
+        }
         let mut durable = locked(&self.durable);
         while durable.batches < target {
             if self.disk_failed.load(Ordering::SeqCst) {
@@ -743,37 +792,39 @@ impl Sends {
     }
 
     /// Waits until the batch whose fate is `fate` is committed and then flushed, up to `until`; see
-    /// [`Store::durable`].
+    /// [`Store::durable`]. Waits directly on `self.flushed` rather than waking on `self.done` at
+    /// commit time: a committed batch is only ready once flushed, so skipping the intermediate
+    /// commit wakeup avoids waking every writer thread twice per group commit.
     fn wait_ticket(&self, fate: &Fate, until: Instant) -> Result<(), Refused> {
-        let commit = {
-            let mut committed = locked(&self.committed);
-            loop {
-                match fate.state.load(Ordering::Acquire) {
-                    FAILED => return Err(Refused::Failed),
-                    UNSETTLED if self.disk_failed.load(Ordering::SeqCst) => {
+        match fate.state.load(Ordering::Acquire) {
+            FAILED => return Err(Refused::Failed),
+            UNSETTLED => {}
+            commit => {
+                if self.durable_commits.load(Ordering::Acquire) >= commit {
+                    return Ok(());
+                }
+            }
+        }
+        let mut durable = locked(&self.durable);
+        loop {
+            match fate.state.load(Ordering::Acquire) {
+                FAILED => return Err(Refused::Failed),
+                UNSETTLED => {
+                    if self.disk_failed.load(Ordering::SeqCst) {
                         return Err(Refused::Disk);
                     }
-                    UNSETTLED if self.stopping.load(Ordering::Relaxed) => {
+                    if self.stopping.load(Ordering::SeqCst) {
                         return Err(Refused::Stopped);
                     }
-                    UNSETTLED => {}
-                    commit => break commit,
                 }
-                let left = until.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    return Err(Refused::Timeout);
+                commit => {
+                    if durable.commits >= commit {
+                        return Ok(());
+                    }
+                    if self.disk_failed.load(Ordering::SeqCst) {
+                        return Err(Refused::Disk);
+                    }
                 }
-                committed = self
-                    .done
-                    .wait_timeout(committed, left)
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .0;
-            }
-        };
-        let mut durable = locked(&self.durable);
-        while durable.commits < commit {
-            if self.disk_failed.load(Ordering::SeqCst) {
-                return Err(Refused::Disk);
             }
             let left = until.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -785,28 +836,29 @@ impl Sends {
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
         }
-        Ok(())
     }
 
     fn stop(&self) {
-        self.stopping.store(true, Ordering::Relaxed);
-        let _committed = locked(&self.committed);
+        self.stopping.store(true, Ordering::SeqCst);
+        drop(locked(&self.committed));
         self.done.notify_all();
+        drop(locked(&self.durable));
+        self.flushed.notify_all();
+        drop(locked(&self.notices));
+        self.noticed.notify_all();
     }
 
     /// A flush failed: whoever waits for a commit or a flush is told.
     fn disk_failed(&self) {
         self.disk_failed.store(true, Ordering::SeqCst);
+        drop(locked(&self.committed));
+        self.done.notify_all();
+        drop(locked(&self.durable));
+        self.flushed.notify_all();
         {
-            let _committed = locked(&self.committed);
-            self.done.notify_all();
+            let mut notices = locked(&self.notices);
+            notices.disk_failed = true;
         }
-        {
-            let _durable = locked(&self.durable);
-            self.flushed.notify_all();
-        }
-        let mut notices = locked(&self.notices);
-        notices.disk_failed = true;
         self.noticed.notify_all();
     }
 }
@@ -836,7 +888,10 @@ fn notifier(sends: &Sends) {
                     .unwrap_or_else(PoisonError::into_inner)
                     .0;
             }
-            let durable = notices.durable;
+            let durable = notices
+                .durable
+                .max(sends.durable_commits.load(Ordering::SeqCst));
+            notices.durable = durable;
             let mut ready = Vec::new();
             while notices.awaiting.front().is_some_and(|(c, _)| *c <= durable) {
                 if let Some((_, fate)) = notices.awaiting.pop_front() {
@@ -853,6 +908,9 @@ fn notifier(sends: &Sends) {
                         .map(|(_, fate)| (fate, Refused::Disk)),
                 );
             }
+            sends
+                .notices_awaiting
+                .store(notices.awaiting.len(), Ordering::SeqCst);
             (ready, refused)
         };
         let tell = |fate: &Fate, answer: Result<(), Refused>| {
@@ -1350,6 +1408,7 @@ impl<E: Engine> Store<E> {
         self.sends.handing(&keys);
         let fate = Arc::new(Fate {
             state: AtomicU64::new(UNSETTLED),
+            has_then: then.is_some(),
             then: Mutex::new(then),
         });
         self.tx
@@ -1358,7 +1417,7 @@ impl<E: Engine> Store<E> {
                 // Never committed: nothing waits on it.
                 if let Msg::Rows(_, keys, ..) = back {
                     self.sends.settled(&keys);
-                    self.sends.wake(1, 0);
+                    self.sends.wake(1, 0, false);
                 }
                 Refused::Stopped
             })?;
@@ -1580,6 +1639,7 @@ fn writer<E: Engine>(
         // The batches in as few commits as the engine takes them in (decision 23): `from` the
         // first batch not committed yet, `start` its first row.
         let (mut from, mut start) = (0usize, 0usize);
+        let mut any_failed = false;
         while let Some(rest) = batches.get(from..).filter(|rest| !rest.is_empty()) {
             let ends: Vec<usize> = rest.iter().map(|b| b.end.saturating_sub(start)).collect();
             let began = Instant::now();
@@ -1618,6 +1678,7 @@ fn writer<E: Engine>(
                     }
                     Err(e) => {
                         b.fate.state.store(FAILED, Ordering::Release);
+                        any_failed = true;
                         let failed = meter.failed();
                         if failed.is_power_of_two() {
                             tracing::warn!(target: "amphora.store", event = "batch_failed", error = %format!("{e:#}"), failed, "a batch couldn't be committed; its sender is told");
@@ -1629,26 +1690,28 @@ fn writer<E: Engine>(
         }
         pending.clear();
         // Senders to tell once their batches are durable, or that they failed.
-        let telling: Vec<(Arc<Fate>, Option<u64>)> = batches
-            .iter()
-            .filter(|b| locked(&b.fate.then).is_some())
-            .map(|b| {
-                let state = b.fate.state.load(Ordering::Acquire);
-                (
-                    b.fate.clone(),
-                    if state == FAILED { None } else { Some(state) },
-                )
-            })
-            .collect();
-        if !telling.is_empty() {
-            sends.to_tell(telling.into_iter());
+        if batches.iter().any(|b| b.fate.has_then) {
+            let telling: Vec<(Arc<Fate>, Option<u64>)> = batches
+                .iter()
+                .filter(|b| b.fate.has_then)
+                .map(|b| {
+                    let state = b.fate.state.load(Ordering::Acquire);
+                    (
+                        b.fate.clone(),
+                        if state == FAILED { None } else { Some(state) },
+                    )
+                })
+                .collect();
+            if !telling.is_empty() {
+                sends.to_tell(telling.into_iter());
+            }
         }
         // Committed or failed: either way no read waits on it any longer.
         let n = u64::try_from(batches.len()).unwrap_or(u64::MAX);
         for b in batches.drain(..) {
             sends.settled(&b.keys);
         }
-        sends.wake(n, *commits);
+        sends.wake(n, *commits, any_failed);
     };
     loop {
         // Rows pending are committed once the queue has nothing more for them at once.
