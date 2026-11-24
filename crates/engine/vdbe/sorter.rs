@@ -195,9 +195,47 @@ struct Kept {
     heap: BinaryHeap<KeptRecord>,
     arrived: u64,
     sorted: Vec<KeptRecord>,
+    /// Recycled `ImmutableRecord` buffers reclaimed across runs of the same statement so `offer`
+    /// avoids reallocating record buffers on the first `limit` rows of each execution.
+    reusable: Vec<ImmutableRecord>,
 }
 
 impl Kept {
+    fn reclaim_record(&mut self, record: ImmutableRecord) {
+        if self.reusable.len() < self.limit {
+            self.reusable.push(record);
+        }
+    }
+
+    fn reset_for_reuse(&mut self, new_limit: usize) {
+        let keep_cap = new_limit.max(self.limit);
+        for item in self.sorted.drain(..) {
+            if self.reusable.len() < keep_cap {
+                self.reusable.push(item.record.record);
+            }
+        }
+        let mut heap_vec = std::mem::take(&mut self.heap).into_vec();
+        for item in heap_vec.drain(..) {
+            if self.reusable.len() < keep_cap {
+                self.reusable.push(item.record.record);
+            }
+        }
+        // Return whichever `Vec<KeptRecord>` holds the larger backing capacity to `self.heap`
+        // so repeated executions do not grow `heap` from capacity 0 on every run.
+        let sorted_vec = std::mem::take(&mut self.sorted);
+        let kept_vec = if sorted_vec.capacity() >= heap_vec.capacity() {
+            sorted_vec
+        } else {
+            heap_vec
+        };
+        self.heap = BinaryHeap::from(kept_vec);
+        self.limit = new_limit;
+        self.arrived = 0;
+        if new_limit > 0 && self.reusable.len() > new_limit {
+            self.reusable.truncate(new_limit);
+        }
+    }
+
     /// Offers `record`: kept if fewer than `limit` are, or if it orders before the worst kept one,
     /// which then goes. A row that can't be kept is dropped with no copy; a row that evicts the
     /// worst reuses its `ImmutableRecord` buffer in place (zero heap allocations on replacement).
@@ -228,6 +266,10 @@ impl Kept {
                 copy.start_serialization(payload)?;
                 copy
             }
+        } else if let Some(mut reused) = self.reusable.pop() {
+            reused.invalidate();
+            reused.start_serialization(payload)?;
+            reused
         } else {
             let mut copy = ImmutableRecord::new(payload.len())?;
             copy.start_serialization(payload)?;
@@ -395,17 +437,17 @@ impl Sorter {
     pub fn clear_for_reuse(&mut self) {
         self.records.clear();
         self.arena.reset();
-        self.current = None;
+        let prev_current = self.current.take();
         self.current_buffer_size = 0;
         self.max_payload_size_in_buffer = 0;
         self.sort_state = SortState::Start;
         self.insert_state = InsertState::Start;
         self.init_chunk_heap_state = InitChunkHeapState::Start;
         if let Some(kept) = self.kept.as_mut() {
-            kept.limit = 0;
-            kept.heap.clear();
-            kept.sorted.clear();
-            kept.arrived = 0;
+            if let Some(rec) = prev_current {
+                kept.reclaim_record(rec);
+            }
+            kept.reset_for_reuse(0);
         }
         self.limit_decided = false;
         self.inserted = 0;
@@ -468,16 +510,14 @@ impl Sorter {
         if let Some(limit) = limit.filter(|&l| l > 0 && l <= MAX_KEPT) {
             if self.records.is_empty() && self.chunks.is_empty() {
                 if let Some(kept) = self.kept.as_mut() {
-                    kept.limit = limit;
-                    kept.heap.clear();
-                    kept.sorted.clear();
-                    kept.arrived = 0;
+                    kept.reset_for_reuse(limit);
                 } else {
                     self.kept = Some(Kept {
                         limit,
                         heap: BinaryHeap::new(),
                         arrived: 0,
                         sorted: Vec::new(),
+                        reusable: Vec::new(),
                     });
                 }
             }
@@ -564,6 +604,9 @@ impl Sorter {
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> IOResultOr<()> {
         if let Some(kept) = self.kept.as_mut().filter(|k| k.limit > 0) {
+            if let Some(prev) = self.current.take() {
+                kept.reclaim_record(prev);
+            }
             self.current = kept.sorted.pop().map(|kept| kept.record.record);
             return Ok(IOResult::Done(()));
         }

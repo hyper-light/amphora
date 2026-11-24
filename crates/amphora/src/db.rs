@@ -125,18 +125,105 @@ pub fn default_pages(memory: Option<u64>) -> usize {
         .max(MIN_PROCESS_PAGES)
 }
 
+/// PostgreSQL's documented default `maintenance_work_mem` (64 MiB), expressed in 4 KiB pages:
+/// caps a single writer's private page cache so large-RAM hosts do not accumulate unbounded
+/// flushed append pages instead of recycling page buffers through the buffer pool.
+const MAX_WRITER_PAGES: usize = (64 * 1024 * 1024) / 4096;
+
+/// Hardware-derived per-reader local page-cache size when `SharedPages` backs the database: sized
+/// to half a core's measured L1 data cache (leaving the other half for query registers and row
+/// payloads) divided by `PageCache::ESTIMATED_ENTRY_BYTES`, floored at the engine's
+/// `MINIMUM_PAGE_CACHE_SIZE_IN_PAGES` and capped at `READER_PAGES`.
+#[must_use]
+fn shared_reader_pages() -> i64 {
+    static PAGES: OnceLock<i64> = OnceLock::new();
+    *PAGES.get_or_init(|| {
+        let min_pages = amphora_engine::storage::MINIMUM_PAGE_CACHE_SIZE_IN_PAGES;
+        let max_pages = usize::try_from(READER_PAGES).unwrap_or(min_pages);
+        let entry_bytes = amphora_engine::storage::PAGE_CACHE_ENTRY_BYTES
+            .saturating_mul(2)
+            .max(1);
+        let pages = l1_data_cache_bytes()
+            .and_then(|l1| l1.checked_div(entry_bytes))
+            .map_or(min_pages, |n| n.clamp(min_pages, max_pages));
+        i64::try_from(pages).unwrap_or(READER_PAGES)
+    })
+}
+
+/// The core's L1 data cache size in bytes, read once per process from the OS (sysfs on Linux,
+/// sysctl on macOS).
+fn l1_data_cache_bytes() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        for entry in std::fs::read_dir("/sys/devices/system/cpu/cpu0/cache")
+            .ok()?
+            .flatten()
+        {
+            let path = entry.path();
+            let level = std::fs::read_to_string(path.join("level")).ok();
+            let kind = std::fs::read_to_string(path.join("type")).ok();
+            if level.as_deref().map(str::trim) != Some("1")
+                || kind.as_deref().map(str::trim) != Some("Data")
+            {
+                continue;
+            }
+            let raw = std::fs::read_to_string(path.join("size")).ok()?;
+            let text = raw.trim();
+            let (digits, unit) = match text.strip_suffix(['K', 'k']) {
+                Some(d) => (d, 1024usize),
+                None => match text.strip_suffix(['M', 'm']) {
+                    Some(d) => (d, 1024usize * 1024),
+                    None => (text, 1),
+                },
+            };
+            if let Some(bytes) = digits
+                .parse::<usize>()
+                .ok()
+                .and_then(|n| n.checked_mul(unit))
+                .filter(|b| *b > 0)
+            {
+                return Some(bytes);
+            }
+        }
+        None
+    }
+    #[cfg(target_os = "macos")]
+    {
+        for name in ["hw.perflevel0.l1dcachesize", "hw.l1dcachesize"] {
+            let Ok(out) = std::process::Command::new("/usr/sbin/sysctl")
+                .args(["-n", name])
+                .output()
+            else {
+                continue;
+            };
+            if let Some(bytes) = std::str::from_utf8(&out.stdout)
+                .ok()
+                .and_then(|t| t.trim().parse::<usize>().ok())
+                .filter(|b| *b > 0)
+            {
+                return Some(bytes);
+            }
+        }
+        None
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
 /// The pages a database's single writer keeps at most, derived from the process's memory budget:
-/// one [`MEMORY_SHARE_DIVISOR`]th of [`default_pages`] (1/16th of memory, matching PostgreSQL's
-/// `maintenance_work_mem` guidance), at least [`MIN_PROCESS_PAGES`]. The writer's page cache
-/// allocates pages lazily as touched, so small databases consume only their working set while
-/// write-heavy workloads avoid evicting hot index and leaf pages into WAL record reads.
+/// one [`MEMORY_SHARE_DIVISOR`]th of [`default_pages`] (1/16th of memory), bounded between
+/// [`MIN_PROCESS_PAGES`] (16 MiB) and PostgreSQL's `maintenance_work_mem` default (64 MiB) so
+/// sustained append workloads recycle clean flushed pages instead of growing the writer heap
+/// without bound.
 #[must_use]
 pub fn writer_pages(memory: Option<u64>) -> i64 {
     let divisor = usize::try_from(MEMORY_SHARE_DIVISOR).unwrap_or(4);
     let pages = default_pages(memory)
         .checked_div(divisor)
         .unwrap_or(0)
-        .max(MIN_PROCESS_PAGES);
+        .clamp(MIN_PROCESS_PAGES, MAX_WRITER_PAGES);
     i64::try_from(pages).unwrap_or(i64::MAX)
 }
 
@@ -456,7 +543,12 @@ impl Db {
             log_kept: self.log_kept,
             backup: None,
         };
-        r.keep_pages(READER_PAGES)?;
+        let reader_pages = if self.db.shared_page_counts().is_some() {
+            shared_reader_pages()
+        } else {
+            READER_PAGES
+        };
+        r.keep_pages(reader_pages)?;
         Ok(r)
     }
 
@@ -486,7 +578,12 @@ impl Db {
                 log_kept,
                 backup: None,
             };
-            r.keep_pages(READER_PAGES)?;
+            let reader_pages = if held.db.shared_page_counts().is_some() {
+                shared_reader_pages()
+            } else {
+                READER_PAGES
+            };
+            r.keep_pages(reader_pages)?;
             Ok(r)
         })
     }
@@ -1957,7 +2054,7 @@ mod tests {
         assert!(default_pages(Some(u64::MAX)) >= MIN_PROCESS_PAGES);
         assert_eq!(
             writer_pages(Some(32 << 30)),
-            i64::try_from((2u64 << 30) / 4096).unwrap()
+            i64::try_from(MAX_WRITER_PAGES).unwrap()
         );
         assert_eq!(
             writer_pages(Some(16 << 20)),
@@ -1965,7 +2062,7 @@ mod tests {
         );
         assert_eq!(
             writer_pages(None),
-            i64::try_from(UNKNOWN_MEMORY_PAGES / 4).unwrap()
+            i64::try_from((UNKNOWN_MEMORY_PAGES / 4).min(MAX_WRITER_PAGES)).unwrap()
         );
     }
 }

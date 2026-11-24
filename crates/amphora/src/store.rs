@@ -499,6 +499,10 @@ struct Sends {
     durable_batches: AtomicU64,
     durable_commits: AtomicU64,
     flushed: Condvar,
+    /// Per-ticket waiters parked in [`Self::wait_ticket`], woken directly by `Thread::unpark` so
+    /// ready writers verify `durable_commits` lock-free without serializing on `self.durable`.
+    ticket_waiter_count: AtomicUsize,
+    ticket_waiters: Mutex<Vec<(u64, std::thread::Thread)>>,
     /// Its engine's commits are durable as they end: no flusher.
     durable_as_committed: AtomicBool,
     /// The writer has stopped: the flusher flushes what is left, then stops.
@@ -572,6 +576,8 @@ impl Default for Sends {
             durable_batches: AtomicU64::new(0),
             durable_commits: AtomicU64::new(0),
             flushed: Condvar::new(),
+            ticket_waiter_count: AtomicUsize::new(0),
+            ticket_waiters: Mutex::new(Vec::new()),
             durable_as_committed: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             disk_failed: AtomicBool::new(false),
@@ -645,10 +651,10 @@ impl Sends {
         if self.durable_as_committed.load(Ordering::Relaxed) {
             self.made_durable(now);
         } else if any_failed {
-            // Synchronize with `wait_ticket`'s `self.durable` lock before notifying `self.flushed`
-            // so a concurrent waiter cannot miss `FAILED`.
+            // Synchronize with `wait_ticket` before waking so a concurrent waiter cannot miss `FAILED`.
             drop(locked(&self.durable));
             self.flushed.notify_all();
+            self.unpark_all_ticket_waiters();
         }
     }
 
@@ -713,6 +719,7 @@ impl Sends {
         self.durable_commits
             .fetch_max(advanced.commits, Ordering::SeqCst);
         self.flushed.notify_all();
+        self.unpark_ready_ticket_waiters(advanced.commits);
         // Pairs with `to_tell`'s SeqCst store to `notices_awaiting` and load of `durable_commits`:
         // when no `put_then` notices await durability, skip locking `notices` and waking notifier.
         if self.notices_awaiting.load(Ordering::SeqCst) > 0 {
@@ -791,21 +798,51 @@ impl Sends {
         Ok(())
     }
 
-    /// Waits until the batch whose fate is `fate` is committed and then flushed, up to `until`; see
-    /// [`Store::durable`]. Waits directly on `self.flushed` rather than waking on `self.done` at
-    /// commit time: a committed batch is only ready once flushed, so skipping the intermediate
-    /// commit wakeup avoids waking every writer thread twice per group commit.
-    fn wait_ticket(&self, fate: &Fate, until: Instant) -> Result<(), Refused> {
-        match fate.state.load(Ordering::Acquire) {
-            FAILED => return Err(Refused::Failed),
-            UNSETTLED => {}
-            commit => {
-                if self.durable_commits.load(Ordering::Acquire) >= commit {
-                    return Ok(());
+    fn unpark_ready_ticket_waiters(&self, durable_commits: u64) {
+        if self.ticket_waiter_count.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        let mut wake = Vec::new();
+        {
+            let mut waiters = locked(&self.ticket_waiters);
+            let mut i = 0;
+            while i < waiters.len() {
+                let ready = waiters
+                    .get(i)
+                    .is_some_and(|(commit, _)| *commit <= durable_commits);
+                if ready {
+                    wake.push(waiters.swap_remove(i).1);
+                } else {
+                    i = i.saturating_add(1);
                 }
             }
+            self.ticket_waiter_count
+                .store(waiters.len(), Ordering::SeqCst);
         }
-        let mut durable = locked(&self.durable);
+        for thread in wake {
+            thread.unpark();
+        }
+    }
+
+    fn unpark_all_ticket_waiters(&self) {
+        if self.ticket_waiter_count.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        let wake = {
+            let mut waiters = locked(&self.ticket_waiters);
+            let wake = std::mem::take(&mut *waiters);
+            self.ticket_waiter_count.store(0, Ordering::SeqCst);
+            wake
+        };
+        for (_, thread) in wake {
+            thread.unpark();
+        }
+    }
+
+    /// Waits until the batch whose fate is `fate` is committed and then flushed, up to `until`; see
+    /// [`Store::durable`]. Uses per-thread `park`/`unpark` with lock-free post-wakeup checks so
+    /// high-concurrency writers do not contend on a shared mutex as a group commit flushes.
+    fn wait_ticket(&self, fate: &Fate, until: Instant) -> Result<(), Refused> {
         loop {
             match fate.state.load(Ordering::Acquire) {
                 FAILED => return Err(Refused::Failed),
@@ -818,7 +855,7 @@ impl Sends {
                     }
                 }
                 commit => {
-                    if durable.commits >= commit {
+                    if self.durable_commits.load(Ordering::Acquire) >= commit {
                         return Ok(());
                     }
                     if self.disk_failed.load(Ordering::SeqCst) {
@@ -830,11 +867,46 @@ impl Sends {
             if left.is_zero() {
                 return Err(Refused::Timeout);
             }
-            durable = self
-                .flushed
-                .wait_timeout(durable, left)
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
+            {
+                let mut waiters = locked(&self.ticket_waiters);
+                let next_count = waiters.len().saturating_add(1);
+                self.ticket_waiter_count.store(next_count, Ordering::SeqCst);
+                let commit = match fate.state.load(Ordering::SeqCst) {
+                    FAILED => {
+                        self.ticket_waiter_count
+                            .store(waiters.len(), Ordering::SeqCst);
+                        return Err(Refused::Failed);
+                    }
+                    UNSETTLED => {
+                        if self.disk_failed.load(Ordering::SeqCst) {
+                            self.ticket_waiter_count
+                                .store(waiters.len(), Ordering::SeqCst);
+                            return Err(Refused::Disk);
+                        }
+                        if self.stopping.load(Ordering::SeqCst) {
+                            self.ticket_waiter_count
+                                .store(waiters.len(), Ordering::SeqCst);
+                            return Err(Refused::Stopped);
+                        }
+                        UNSETTLED
+                    }
+                    commit => {
+                        if self.durable_commits.load(Ordering::SeqCst) >= commit {
+                            self.ticket_waiter_count
+                                .store(waiters.len(), Ordering::SeqCst);
+                            return Ok(());
+                        }
+                        if self.disk_failed.load(Ordering::SeqCst) {
+                            self.ticket_waiter_count
+                                .store(waiters.len(), Ordering::SeqCst);
+                            return Err(Refused::Disk);
+                        }
+                        commit
+                    }
+                };
+                waiters.push((commit, std::thread::current()));
+            }
+            std::thread::park_timeout(left);
         }
     }
 
@@ -844,6 +916,7 @@ impl Sends {
         self.done.notify_all();
         drop(locked(&self.durable));
         self.flushed.notify_all();
+        self.unpark_all_ticket_waiters();
         drop(locked(&self.notices));
         self.noticed.notify_all();
     }
@@ -855,6 +928,7 @@ impl Sends {
         self.done.notify_all();
         drop(locked(&self.durable));
         self.flushed.notify_all();
+        self.unpark_all_ticket_waiters();
         {
             let mut notices = locked(&self.notices);
             notices.disk_failed = true;
