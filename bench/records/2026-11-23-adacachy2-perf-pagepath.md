@@ -1260,3 +1260,98 @@ On the branch only, once (round 1): `every_falsifier_of_the_floor_holds_under_a_
 **Commands.** `~/.cache/amphora-perf/pagepath-b21/` on this machine holds `check.sh` and the run commands (`cmd-r1.sh` r307,
 `cmd-r3.sh` r364, `cmd-r4.sh` r401) and runs on adacachy2 in the lane's clone `~/.cache/amphora-perf/pagepath-remote`, target
 `~/.cache/amphora-perf-target/pagepath`, CARGO_INCREMENTAL=0, nice 10, `JOBS` = the needs' cpus.
+
+## perf-B22 (2026-11-24, 05:55-06:55Z; a backup across decision 45's switch)
+
+**Losses first.**
+- Not on main. The lead held the merge for check-production on Linux, which waits for the benchmark window's end; the branch
+  `perf/pagepath-b22` holds the work, its tree equal to main 8fc85651 merged with this lane (f12728d2).
+- Main answers wrong, silently, since lane B18's switch (a5ae048c), and this was not in the brief. The brief's defect refused
+  a base; this one loses rows. Red on main 0101aa38 plus the tests (r579, below): a base begun after a switch, while a read
+  under way kept the closing segment's later frames out of the file, restored 20 of 41 committed rows with no error.
+- Clippy was red once and not re-run: at f12728d2 it checked amphora-engine and amphora and stopped at one error, in this
+  lane's test (`chunks_exact` with a constant size, tests/backup.rs `log_files`), fixed in the branch's last test commit
+  (`as_chunks`) with no run after it. Targets it hadn't reached when it stopped are unchecked.
+- Not run in the hour: the engine's `storage::` and `vdbe::` suites, its `d45_` tests, tests/store.rs, the 200-seed power cut,
+  and check-production. macOS gave one machine (MacBook Pro 2, load 40 to 86 of 18 cores): the first build took 10 min, and
+  the runs queued with needs only (r550, r564, r575, r608) never started ("others ahead of it").
+- The shipping thread's own test of a base that waits (dcd6769b) was not run. It is out of the branch's tip.
+- A base that waits for a read begins in the first round after a commit that follows the read's end: an idle database with a
+  waiting base gets none until it commits. No restore answers wrong meanwhile; seconds with no base are refused.
+
+**1. Reproduced.** r579 (MacBook Pro 2, needs `macos/arm64,cpus=8,mem=16g`, ba250493 = main 0101aa38 plus this lane's tests,
+load 66 of 18 cores, 06:05Z to 06:18Z). The drill's message now says which base and what the log's two files hold (its
+expectation is unchanged):
+```
+seed 0x123456789abcdef1, step 55: BaseCopy { id: 1022862395980, start_gen: 1, chunk_bytes: 32768, file_bytes: 73728, next: 3, .. }
+refused its end: source.db-wal2 held 0 bytes at 0, not 32; shipped through frame 106 of the archive's generation 1;
+-wal: 436752 bytes, generation 0, 106 frames of it; -wal2: 0 bytes, no header
+```
+B21's inference holds. The base began in the generation `-wal` holds, every chunk was copied, all 106 frames were shipped,
+and the writer had switched to `-wal2`, which no commit had reached: 0 bytes. Seeds 1 and 2 pass; the third fails at step
+55.
+
+**2. Wrong for a user.** Yes, three ways (the tests, red on main in r579; the table says what the restored database answered):
+- *A base can't end while the current segment has no frame* (`d45_a_base_ended_while_the_current_segment_holds_no_frame_
+  restores_every_commit`): "the base refused its end". No committed row is lost by it: every commit is in the archive's
+  log. But the shipping thread throws the base away and starts it over (a round that fails), and with no base the archive
+  restores nothing (read in the code: no restore is made on that arm). It lasts as long as the writer is idle: the store
+  switches after a batch commits (`store.rs` 1674, 1684).
+- *A restored database can't be backed up to its archive again* (`a_restored_database_is_backed_up_to_its_archive_again`):
+  "the shipper refused to open: restored.db-wal held 0 bytes at 0, not 32". A restore's replay empties the log and keeps
+  its file. `Shipper::open` reads the header the same way (ship.rs 454; the same line is in a5ae048c's parent, so it predates
+  the switch: read in the code, not run there).
+- *A base begun after a switch loses commits* (`d45_a_base_begun_while_a_read_holds_the_closing_segment_restores_every_commit`):
+  "21 rows committed before the base began are lost in its restore: [20, ... 40]" of 41.
+So the "32 bytes" isn't the drill's: it's `Db::read_at`'s, read by the shipper. Decision 45 says a segment's header is
+written by its first commit (store.md, "The reset, on an event", its last bullet), so a file with no header is one of the
+log's states, and the drill's expectation (a base ends at any step) is right. It stands as written.
+
+**What the restored database answered, on both arms** (the same machine, MacBook Pro 2; main 0101aa38 plus the tests is
+ba250493, r579; fixed is 38e42411, r621):
+
+| test | main plus the tests | fixed |
+|---|---|---|
+| drill, seeds 1 and 2 (12 random seconds each) | no restored second differed by a row | no restored second differed by a row |
+| drill, seed 3 (12 random seconds) | the base refused its end at step 55, so no restore was made | no restored second differed by a row |
+| base ended on an empty current segment | refused its end, no restore made | 25 of 25 rows at the last commit's second, 25 at a second with no commit, then every second to 35 rows |
+| restored database backed up again | its shipper refused to open | every second restores, to 50 of 50 rows |
+| base begun while a read holds the closing segment | **20 of 41 rows, no error** (ids 20 to 40 gone) | 41 of 41 |
+
+**3. The cause, and the fix.**
+- *The header* (4c84dcb0). `ship_durable` and `Shipper::open` read the current segment's first 32 bytes and failed the
+  round where the file holds fewer. `Db::log_header` answers None there, and the shipper ships nothing of that generation,
+  as it already did where the file still held the header of the generation before.
+- *The base's start* (38e42411; its thread test, unrun, at dcd6769b). A restore replays the log from the first frame of the generation its base began
+  in, and backup.md rested on "a log only starts again once every frame is in the file". Decision 45's switch waits for no
+  read, so a read keeps the closing segment's frames past its mark out of the file, and a base begun in the next generation
+  copied the file without them. `Shipper::begin_base` refuses until the file holds every frame before the current segment
+  (`Database::wal_closing_copied`: no segment closing, or the closing one's frames all backfilled, which is published after
+  the file's flush). The shipping thread asks for a pass first; where a read still holds the segment the base waits
+  (`base_waits`) and begins in a later round.
+- backup.md restated: the header's state, a base's start, and what an incremental base's kept chunk rests on.
+
+**Checks.**
+- r579 (MacBook Pro 2, ba250493): the drill red, the three scenario tests red, `d45_a_backup_after_a_switch...` green (above).
+- r621 (MacBook Pro 2, 38e42411, needs `macos/arm64,cpus=4,mem=12g`, load 41 to 81, 06:21Z to 06:33Z):
+  tests/backup.rs 24 passed, 0 failed, 1 ignored (the benchmark) in 254 s. The drill passes as written, all three seeds; the
+  three scenario tests pass; `t_t1_12_*` as before.
+- r685 (MacBook Pro 2, f12728d2, the branch's tree, needs `macos/arm64,cpus=7,mem=14g`): clippy exit 101 in 645 s
+  (load 54 to 86), "Checking amphora-engine" and "Checking amphora" in its log, the one error above. The steps after it
+  (tests/backup.rs, `d45_`, tests/store.rs, the power cut, `storage:: vdbe::`, all at f12728d2) were still to run at the hour's
+  end: the successor reads r685 (logs in `~/.cache/amphora-perf/pagepath-b22/*-land.log` on that machine).
+- Local: `cargo fmt --all --check` exit 0.
+
+**Found on the way, left (read in the code, no scenario run).**
+- A restore is refused where a `-wal` is left at its path, not where a `-wal2` is (restore.rs 162): the open after it would
+  take a leftover segment whose sequence is one from the restored log's as its own.
+- `Shipper::send` reads frames from the current segment's file (`Db::read_log`), not the segment its generation is in
+  (decision 45's "Where it lands"). A log restarted past its bound while a send of unshipped frames is under way makes it
+  read the other segment's bytes.
+- A round between `Db::switch_log` and the fence's word of it (`restart_log`) fails `end_base` ("ship the log's generation
+  before ending a base in it"), and the base under way starts over.
+- `Checker::admitted` counts `-wal` and not `-wal2` in the disk a restore needs.
+
+**Commands.** `~/.cache/amphora-perf/pagepath-b22/` on this machine holds the red run's output and the check script (`mac.sh`);
+on MacBook Pro 2 the same folder holds the logs, target `~/.cache/amphora-perf-target/pagepath`, CARGO_INCREMENTAL=0, nice 10.
+
