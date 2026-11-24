@@ -5347,6 +5347,159 @@ pub(crate) mod bushy_search_tests {
             }
         }
 
+        /// Lane C7's probe, not for main: one slice of the sweep by environment, one line a run.
+        /// C7_DB, C7_ANALYZED (0 or 1), C7_PLANS (indices 0 to 5), C7_WORKERS (indices 0 to 4),
+        /// C7_SLICE ("i/n": statements whose index mod n is i), C7_ONLY (statement indices, all).
+        #[test]
+        #[ignore = "lane C7's probe: run by environment"]
+        fn c7_probe_slice() {
+            use super::super::bushy_test_hook::{APPLIED, PIN, SPLIT};
+            use crate::translate::optimizer::learned_costs::LearnedWeights;
+            use crate::vdbe::morsel::{MachineCosts, ParallelMode};
+            use std::io::Write;
+            use std::sync::atomic::Ordering;
+            let var = |name: &str| std::env::var(name).unwrap();
+            let list = |name: &str| -> Vec<usize> {
+                var(name)
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.parse().unwrap())
+                    .collect()
+            };
+            let name = var("C7_DB");
+            let analyzed = var("C7_ANALYZED") == "1";
+            let chosen_plans = list("C7_PLANS");
+            let chosen_workers = list("C7_WORKERS");
+            let only: Vec<usize> = std::env::var("C7_ONLY")
+                .map(|s| {
+                    s.split(',')
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.parse().unwrap())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let slice = var("C7_SLICE");
+            let (at, of) = slice.split_once('/').unwrap();
+            let (at, of): (usize, usize) = (at.parse().unwrap(), of.parse().unwrap());
+            let db = outer_joins(&name);
+            let io = Arc::new(MemoryIO::new());
+            let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            let conn = database.connect(ConnectOpts::new()).unwrap();
+            for sql in &db.fill {
+                conn.execute(*sql).unwrap();
+            }
+            if analyzed {
+                conn.execute("ANALYZE").unwrap();
+            }
+            let padded = crate::OuterJoinProbe::Padded;
+            let workers = [
+                None,
+                Some((1, padded)),
+                Some((2, padded)),
+                Some((8, padded)),
+                Some((8, crate::OuterJoinProbe::Kept)),
+            ];
+            let plans = [
+                OuterJoinPlans::ByCost,
+                OuterJoinPlans::Weights(2.0, 0.5, 0.5),
+                OuterJoinPlans::Weights(2000.0, 0.5, 0.5),
+                OuterJoinPlans::Weights(2000.0, 50.0, 0.5),
+                OuterJoinPlans::HandBuilt(1),
+                OuterJoinPlans::HandBuilt(2),
+            ];
+            let mut done = 0usize;
+            let mut wrong = 0usize;
+            for &plan_index in &chosen_plans {
+                let plan = plans[plan_index];
+                match plan {
+                    OuterJoinPlans::ByCost => {}
+                    OuterJoinPlans::Weights(seek, hash_build, hash_probe) => {
+                        conn.set_bushy_left_join_probes(BushyLeftJoinProbes::ByCost);
+                        conn.pin_cost_weights(Some(LearnedWeights {
+                            row_in_pages: Some(0.003),
+                            seek,
+                            hash_build,
+                            hash_probe,
+                            sort: 3.0,
+                            bloom_probe: 10.0,
+                            where_step: 1.0,
+                            page_miss: None,
+                        }));
+                    }
+                    OuterJoinPlans::HandBuilt(split) => {
+                        conn.pin_cost_weights(None);
+                        conn.set_bushy_left_join_probes(BushyLeftJoinProbes::Off);
+                        PIN.with(|pin| pin.set(true));
+                        SPLIT.with(|first| first.set(Some(split)));
+                    }
+                }
+                for &worker_index in &chosen_workers {
+                    let stated = workers[worker_index];
+                    conn.set_parallel_mode(ParallelMode::Off);
+                    conn.set_parallel_outer_probe(padded);
+                    if let Some((count, probe)) = stated {
+                        conn.set_parallel_mode(ParallelMode::On);
+                        conn.set_parallel_outer_probe(probe);
+                        *conn.morsel_costs.lock() = Some(MachineCosts::stated(
+                            std::num::NonZeroUsize::new(count).unwrap(),
+                            1.0,
+                            1.0,
+                        ));
+                    }
+                    for (index, (keys, sql, want)) in db.queries.iter().enumerate() {
+                        if index % of != at || (!only.is_empty() && !only.contains(&index)) {
+                            continue;
+                        }
+                        let id = format!(
+                            "{name}\t{}\t{plan_index}\t{worker_index}\t{index}",
+                            u8::from(analyzed)
+                        );
+                        println!("C7BEGIN\t{id}");
+                        std::io::stdout().flush().unwrap();
+                        BUSHY_PLANS.with(|plans| plans.set(0));
+                        LEFT_JOINS_IN_RUNS.with(|runs| runs.set(0));
+                        LEFT_JOIN_PROBES.with(|probes| probes.set(0));
+                        APPLIED.with(|applied| applied.set(0));
+                        let links = conn.morsel_join_links.load(Ordering::Relaxed);
+                        let began = std::time::Instant::now();
+                        let (got, first) = outer_join_outcome(&conn, sql, *keys);
+                        let millis = began.elapsed().as_millis();
+                        let bushy = BUSHY_PLANS.with(Cell::get) + APPLIED.with(Cell::get);
+                        let hooked = conn.morsel_join_links.load(Ordering::Relaxed) > links;
+                        let runs = LEFT_JOINS_IN_RUNS.with(Cell::get);
+                        let probes = LEFT_JOIN_PROBES.with(Cell::get);
+                        done += 1;
+                        let status = if got == *want { "ok" } else { "WRONG" };
+                        println!("C7RUN\t{id}\t{millis}\t{status}\tbushy={bushy} runs={runs} probes={probes} hooked={hooked}");
+                        std::io::stdout().flush().unwrap();
+                        if got != *want {
+                            wrong += 1;
+                            let plan_rows = conn
+                                .prepare(format!("EXPLAIN QUERY PLAN {sql}"))
+                                .and_then(|mut stmt| stmt.run_collect_rows())
+                                .map(|rows| {
+                                    rows.iter()
+                                        .filter_map(|row| row.last().map(ToString::to_string))
+                                        .collect::<Vec<_>>()
+                                });
+                            println!(
+                                "C7WRONG\t{id}\t{plan:?}\t{stated:?}\tgot {got}\tSQLite {want}\t{sql}\tfirst {first:?}\t{plan_rows:?}"
+                            );
+                            std::io::stdout().flush().unwrap();
+                        }
+                    }
+                }
+                conn.set_parallel_mode(ParallelMode::Off);
+                conn.set_parallel_outer_probe(padded);
+                conn.pin_cost_weights(None);
+                conn.set_bushy_left_join_probes(BushyLeftJoinProbes::Off);
+                PIN.with(|pin| pin.set(false));
+                SPLIT.with(|first| first.set(None));
+            }
+            println!("C7DONE\t{name}\t{}\t{chosen_plans:?}\t{chosen_workers:?}\t{slice}\t{done} runs\t{wrong} wrong", u8::from(analyzed));
+            assert_eq!(wrong, 0);
+        }
+
         #[test]
         fn t_pl_8_13_outer_joins_answer_as_sqlite_small_analyzed() {
             outer_joins_answer_as_sqlite("small", true);
