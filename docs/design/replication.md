@@ -2031,19 +2031,25 @@ pure core is `database/slot.rs`, driven by the owner (`Actor::keep_slots`, `star
   with that drive's `Ready` (lane V16). Before lane V16 it waited in the core (`Raft::msgs`) for the owner's next
   wake: on a real clock its next tick, unless an input came first (read from `run_loop`'s wait, not measured),
   and never in the driven harness, whose clocks stand still (`replicated::v15_a_write_its_deadline_ends_at_its_barrier_closes_its_slot`).
-- *What bounds a lost forward* (CP-T1.8, lane V15, measured; not yet an event). A holder's forward lost on the way
-  is bounded only by its stated end: the holder sends no barrier or forward after it (its write waits, proposed,
-  for its entry), and a live holder is not suspected. Lane V15's run on real time (three members in one process,
-  relayed by the test pump, which lost member 3's forward; the persisted class; 10 ms ticks; member 3's write with
-  the bench driver's 10 s deadline) timed each stage from member 3's call: its slot began at 0.7 ms, its forward was
-  lost at 2.7 ms, and the leader's own write and member 2's were called at 2.8 ms; member 3 was answered
-  `UnknownOutcome` at 10,000.2 ms, the slot ended `expired` at 10,006.7 ms, and the leader's write was answered at
-  10,030.6 ms and member 2's at 10,064.8 ms: each waited the holder's whole deadline. A bound by an event the
-  leader can see needs a message from the holder that follows its forward on the same ordered link, so that its
-  arrival with no forward before it shows the forward lost: a close sent right behind every forward (one more message per follower write,
-  and a ReadIndex round at the leader unless it consumes the close unstepped), or the holder's forward sent again
-  when its transport reports the link reset or the record refused (with the leader dropping, typed, a copy it
-  already appended). Neither is built; each is a design for the next lane, with its cost to be measured.
+- *What bounds a lost forward* (CP-T1.8, lanes V15 and V18; an event since V18). A holder's forward lost on the way
+  leaves the slot without its event: nothing after the forward reaches the leader for it, and the holder is live, so
+  nobody suspects it. Lane V15 measured that wait on real time (three members in one process, relayed by the test
+  pump, which lost member 3's forward): the leader's other writes waited the holder's whole 10 s deadline (10,027.9 ms
+  and more). Since lane V18 a follower's forward is followed, in the same drive and so on the same ordered link, by a
+  close: a barrier marked a read's (`Actor::close_behind`, the second barrier a write that forwarded nothing already
+  sent). The leader steps a marked barrier at once and ends a slot its member holds `released` (`Slots::pass`), so a
+  forward lost on the way holds the slot only until that close arrives; a forward that did arrive ended the slot
+  `forwarded` before it, and the close is then only a read's round. The wire is unchanged: a leader of any version
+  steps a marked barrier at once, and the close's own read state matches nothing at the member and is dropped. Lane
+  V18's red test (`replicated::v18_a_lost_forward_is_bounded_by_the_close_behind_it`, the forward lost, no clock moved)
+  fails without the close: the leader's write never answers while the slot holds. Lane V15's stages, run again with
+  the close (both classes, real clock, the same 10 ms tick): the leader's other write answered in 12.3 and 17.9 ms, with
+  the slot ended `released` at 2.8 and 2.9 ms; before, its wait was 10,021 and 10,017 ms. What the close costs a
+  follower's write on the normal path (message counts, both arms): bench/records, lane V18. The bound is the
+  close's arrival, so a loss that takes both (a link reset between the two) is still the deadline's, or the
+  detector's: the close leaves with its forward in one drive, so a whole `Ready` lost takes both. Lane V15 named a
+  second design (the forward sent again when the transport reports the link reset or the record refused), not
+  built: it needs a report from the host's transport and a typed drop of a copy at the leader.
 - *What a slot holds* (Q1). Everything the leader would append between the holder's base and its retry: its own
   writes and floor sessions (`prepare` defers them, `slot_deferred`), its class entry (`propose_class`), and other
   members' forwarded proposals, held after the sender and origin checks. A change of members or a hand-off ends the
