@@ -114,7 +114,7 @@ impl Analysis<'_> {
         }
         self.table = match s.from_clause.as_slice() {
             [] => None,
-            [item] => Some(self.from_item(*item)?),
+            [item] => Some(self.item_read(*item)?),
             _ => return Err(Error::unsupported("a FROM of several items")),
         };
         let mut targets = Vec::with_capacity(s.target_list.len());
@@ -193,7 +193,7 @@ impl Analysis<'_> {
     }
 
     /// `transformFromClauseItem` (parse_clause.c): a relation, or a function's rows.
-    fn from_item(&mut self, id: NodeId) -> Result<Table, Error> {
+    fn item_read(&mut self, id: NodeId) -> Result<Table, Error> {
         match self.tree.get(id)? {
             Node::RangeFunction { .. } => self.function_table(id),
             _ => self.table(id),

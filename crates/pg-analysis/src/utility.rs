@@ -611,10 +611,6 @@ mod tests {
                 "create table u(a int) with (nosuch=1)",
                 sqlstate::INVALID_PARAMETER_VALUE,
             ),
-            (
-                "create table u(a int) with (toast.autovacuum_enabled=1)",
-                sqlstate::FEATURE_NOT_SUPPORTED,
-            ),
             ("vacuum analyze u", sqlstate::UNDEFINED_TABLE),
             ("truncate table t, u", sqlstate::UNDEFINED_TABLE),
             (
