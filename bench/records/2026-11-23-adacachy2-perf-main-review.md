@@ -70,8 +70,18 @@ The Linux engine gate failed before T1 and on audited main. Runs r75–r77 used 
 | Possible wrap | 687 | 696 | 696 | 696 | 696 |
 | Disallowed methods | 40 | 56 | 65 | 68 | 66 |
 
-## Coordinator decisions
+## Follow-up durability checks
 
-- **Descriptor exhaustion** — An external close or a raised process limit has no notification in the descriptor budget. A lifetime listener lease can keep the listener waiting for an internal return even after external capacity becomes available. The zero-held fallback still uses a fixed timer. The host needs a wake or refusal contract.
-- **Mixed-version cross-group recovery** — A v8 participant can durably acquire a Lock. A later v9-only ResolveAt or RecoverAt can be refused after the transaction has progressed. Preflight and recovery must agree about how an already-recorded transaction finishes. Converting the timestamp units alone leaves this case open.
-- **Calibration on a shared home directory** — Two machines can present the same CPU record and executable metadata to the same cache directory. The per-machine claim needs a host identity or an explicit host-local cache contract.
+After a process dies, its replacement can read complete writes that the OS still holds in cache. The next power cut can lose those writes. Two Linux regressions exercise that sequence.
+
+- At seed 3 the original redo writer stopped between its write and its flush. A replacement read its row, completed the read-only transaction, and durably committed another row on a second lane. Linux r78 recovered neither row after power loss. Commit `09f3c209` syncs nonempty retained redo files and any truncations before recovery reports the prefix durable. In r79 all 25 durability and six redo tests passed.
+- At checkpoint operation 7 of 21, seed 3, the replacement process adopted a complete journal from cache and wrote its header. All acknowledged rows were readable. After power loss, the second reopen reported a corrupt database because the named journal was gone. Commit `477da701` syncs the selected journal before recovery can rely on it, including when an older recovery has already written a matching header. This adds one journal sync per reopen. Linux r85 passed both crash sweeps, all 26 durability and six redo tests, and all-target engine Clippy.
+
+Both fixes are on `origin/t1/main-review`. The earlier C3 read-only commit fix `67d1bab5` from the same branch is present on main as `b6cb6aa8`. The stable patch IDs match.
+
+## Coordinator decisions, November 24 UTC
+
+- **Descriptor exhaustion** — The queued contract tries the syscall on every acquire and returns a typed refusal immediately on EMFILE or ENFILE. The budget counts descriptors for reporting. On exhaustion the listener uses its reserve descriptor to accept, refuse and close the pending connection, replenishes the reserve, and resumes waiting on the listening socket. The listener is the only production caller of the old release wait on the checked main.
+- **Cross-group recovery** — Before taking the first lock, every participant must have negotiated the version needed to finish the transaction, currently v9 for ResolveAt and RecoverAt. Amphora is unreleased and the current contract excludes recovery of transactions started on v8 under v9. Timestamp recovery across versions is a design item before any release supporting mixed-version fleets.
+- **Calibration on a shared home directory** — The queued key includes a hash of Linux's machine ID, macOS's IOPlatformUUID, or Windows's MachineGuid alongside the CPU record and executable path, length and mtime. Failure to read the identity triggers a fresh measurement.
+- **Engine production gate** — The cleanup lane will fix violations in code, starting at the T1 merge's sites, and lower the ceilings where the diagnostic counts fell. Its landing will be checked at its exact SHA.
