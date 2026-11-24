@@ -1991,16 +1991,13 @@ fn update_from_set_result_columns(set_clauses: &[UpdateSetClause]) -> Vec<Result
 /// Amphora: the columns of a view or a derived table that its query doesn't read are NULL, which
 /// nothing evaluates, as SQLite leaves them (disableUnusedSubqueryResultColumns, select.c; one it
 /// flattens has none): an expression that fails on a row fails no query that doesn't read it
-/// (finding CW). Every column counts where rows are made distinct, grouped or windowed, or stored
-/// for several readers (a CTE), and a parameter in one stays, to be bound.
+/// (finding CW). Every column counts where rows are made distinct, grouped or windowed, and a CTE's,
+/// whose rows one of its uses may store for the others. A parameter in one stays, to be bound.
 fn leave_out_unread_columns(
     subquery: &mut crate::schema::FromClauseSubquery,
     read: &crate::translate::plan::ColumnUsedMask,
 ) -> Result<()> {
-    if subquery.shared_materialization()
-        || subquery.materialize_hint()
-        || subquery.parenthesized_join_columns.is_some()
-    {
+    if subquery.cte_id().is_some() || subquery.parenthesized_join_columns.is_some() {
         return Ok(());
     }
     let mut arms: Vec<&mut SelectPlan> = match subquery.plan.as_mut() {
