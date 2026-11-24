@@ -110,7 +110,15 @@ fn t_t1_10_r5_a_session_reads_its_write_on_a_lagging_follower() {
     assert!(local == vec![1] || local == vec![1, 2], "{local:?}");
     let reader = clients.get(follower).unwrap().clone();
     let spawned = Instant::now();
+    // Diag (A24): the reader thread starts this late, as a loaded machine would start it.
+    let late = std::env::var("A24_READER_DELAY_US")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
     let waiting = std::thread::spawn(move || {
+        if late > 0 {
+            std::thread::sleep(Duration::from_micros(late));
+        }
         let started = Instant::now();
         let at_start = reader.closed_token();
         let served = read_token(&reader, second);
