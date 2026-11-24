@@ -47,6 +47,23 @@ const READ_BARRIER: u8 = 1;
 fn reads(context: &[u8]) -> bool {
     context.get(CONTEXT_BYTES..) == Some([READ_BARRIER].as_slice())
 }
+/// Whether `close` is the context of the close a follower sent right behind its forward, whose
+/// request identity is `forward` (`Actor::close_behind`; CP-T1.8, lane V18): the same member, term
+/// and incarnation, the serial after the forward's, and a read's mark. No other context of that
+/// member, in that term and incarnation, has that serial: each names one request once, and the
+/// forward's owner makes none between the forward and its close.
+fn follows(forward: &[u8], close: &[u8]) -> bool {
+    let head = CONTEXT_BYTES.saturating_sub(std::mem::size_of::<u64>());
+    let serial = |context: &[u8]| {
+        let bytes: [u8; 8] = context.get(head..CONTEXT_BYTES)?.try_into().ok()?;
+        Some(u64::from_le_bytes(bytes))
+    };
+    reads(close)
+        && forward.get(..head).is_some()
+        && forward.get(..head) == close.get(..head)
+        && serial(forward).and_then(|serial| serial.checked_add(1)) == serial(close)
+        && serial(close).is_some()
+}
 /// Format: the byte a write's barrier context carries past the request identity, then the time
 /// left to its write's deadline as it was sent, in nanoseconds, a little-endian `u64` (CP-T1.8,
 /// lane V14). Its leader ends the write's slot by time at that end, which bounds a lost forward;
@@ -1033,6 +1050,9 @@ struct Actor<F: BlockFile + 'static = LogDevice> {
     // A close sent behind a forward (`close_behind`) since the step's drive: the next step
     // drives again at once.
     behind: bool,
+    // At the leader: the request identity of the last forward each member's arrived with, so that
+    // the close behind it is consumed, its read round unneeded (`follows`).
+    forwarded: std::collections::BTreeMap<u64, Vec<u8>>,
     serial: u64,
     // Every time this owner reads comes from this clock (replication.md, "The owner's time").
     clock: Clock,
@@ -2685,6 +2705,7 @@ fn open_on<F: BlockFile + 'static>(
         slot_deferred: false,
         closing: None,
         behind: false,
+        forwarded: std::collections::BTreeMap::new(),
         serial: 0,
         transferred: None,
         spacing: log_bound::Spacing::default(),
@@ -4450,6 +4471,11 @@ impl<F: BlockFile + 'static> Actor<F> {
         if self.replica.is_leader() && !self.slot_off() {
             match message.msg_type {
                 hyper_raft::proto::MessageType::MsgPropose => {
+                    if let [entry] = message.entries.as_slice()
+                        && let Some(identity) = entry.context.get(..CONTEXT_BYTES)
+                    {
+                        self.forwarded.insert(from, identity.to_vec());
+                    }
                     let forward = self.slots.forward(from, self.at, (message, reservation));
                     if let Some(unmeasured) = forward.unmeasured {
                         tracing::warn!(target: "amphora.replication", event = "write_slot_unmeasured", error = %unmeasured, "a retry's gap was not learned for the write slot");
@@ -4471,7 +4497,18 @@ impl<F: BlockFile + 'static> Actor<F> {
                         .first()
                         .is_some_and(|entry| reads(&entry.data));
                     let read = if marked {
-                        self.slots.pass(from, self.at, (message, reservation))
+                        // The close behind a forward this leader stepped has nothing left to do:
+                        // its forward ended its slot, and nothing here reads its answer (lane V18).
+                        let behind = message.entries.first().is_some_and(|entry| {
+                            self.forwarded
+                                .get(&from)
+                                .is_some_and(|forward| follows(forward, &entry.data))
+                        });
+                        let mut taken = self.slots.pass(from, self.at, (message, reservation));
+                        if behind {
+                            taken.step = None;
+                        }
+                        taken
                     } else {
                         let stated = message
                             .entries
@@ -4688,6 +4725,9 @@ impl<F: BlockFile + 'static> Actor<F> {
         let leading = (self.replica.is_leader() && !self.slot_off()).then(|| self.replica.term());
         let ended = self.slots.lead(leading, at);
         self.slot_ended(ended);
+        if leading.is_none() {
+            self.forwarded.clear();
+        }
         if leading.is_some() {
             let configuration = self.replica.core().raft.configuration();
             let detected = &self.detected;
@@ -19800,6 +19840,109 @@ mod tests {
             );
             pump.losing = None;
             drop(late);
+            driven.quiet(&mut pump);
+            driven.drain(&mut pump);
+            pump.finish();
+        }
+    }
+
+    /// T-T1.8.W1 (CP-T1.8, lane V18): a close is the one behind a member's forward exactly when it
+    /// names the member, term and incarnation the forward did, the next serial, and a read's mark.
+    #[test]
+    fn v18_a_close_follows_its_own_forward_only() {
+        let identity = |member: u64, term: u64, incarnation: u64, serial: u64| -> Vec<u8> {
+            [member, term, incarnation, serial]
+                .iter()
+                .flat_map(|part| part.to_le_bytes())
+                .collect()
+        };
+        let close = |member, term, incarnation, serial| {
+            let mut context = identity(member, term, incarnation, serial);
+            context.push(READ_BARRIER);
+            context
+        };
+        let forward = identity(3, 2, 7, 5);
+        assert!(follows(&forward, &close(3, 2, 7, 6)));
+        for other in [
+            close(3, 2, 7, 5),
+            close(3, 2, 7, 7),
+            close(2, 2, 7, 6),
+            close(3, 3, 7, 6),
+            close(3, 2, 8, 6),
+            identity(3, 2, 7, 6),
+            vec![READ_BARRIER],
+            Vec::new(),
+        ] {
+            assert!(!follows(&forward, &other), "{other:?}");
+        }
+        assert!(!follows(&[0; 8], &close(3, 2, 7, 6)));
+    }
+
+    /// T-T1.8.W1 (CP-T1.8, lane V18): the close behind a forward the leader stepped costs no read
+    /// round. Do, in each class: owner 0 leads; member 3 makes four writes one at a time, none lost.
+    /// Expect: one answer to a read per write (the barrier's), and one close sent per write.
+    #[test]
+    fn v18_a_close_behind_a_stepped_forward_costs_no_read_round() {
+        for durability in [Durability::Persisted, three_fates()] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut driven = Driven::new();
+            let clients: Vec<Client> = (1..=3)
+                .map(|n| driven.open_with(dir.path(), n, vec![1, 2, 3], None, durability.clone()))
+                .collect();
+            let mut pump = Pump::new(&clients);
+            let leader = driven.elect(&mut pump, &clients, 0, 1);
+            assert_eq!(leader, 0, "{durability:?}: owner 0 did not lead");
+            driven
+                .call(&mut pump, &clients[leader], |db| {
+                    db.exec("CREATE TABLE events(id INTEGER NOT NULL)")?;
+                    Ok(Vec::new())
+                })
+                .unwrap();
+            for _ in 0..ROUNDS {
+                driven.quiet(&mut pump);
+                if driven.owner(2).pending.is_none() {
+                    break;
+                }
+            }
+            let answers = Arc::new(AtomicUsize::new(0));
+            let closes = Arc::new(AtomicUsize::new(0));
+            let (answered, closed) = (Arc::clone(&answers), Arc::clone(&closes));
+            pump.losing = Some(Box::new(move |from, message: &Message| {
+                use hyper_raft::proto::MessageType;
+                if from == 1 && message.to == 3 && message.msg_type == MessageType::MsgReadIndexResp
+                {
+                    answered.fetch_add(1, Ordering::AcqRel);
+                }
+                if from == 3
+                    && message.to == 1
+                    && message.msg_type == MessageType::MsgReadIndex
+                    && message
+                        .entries
+                        .first()
+                        .is_some_and(|entry| reads(&entry.data))
+                {
+                    closed.fetch_add(1, Ordering::AcqRel);
+                }
+                false
+            }));
+            let writes: usize = 4;
+            for n in 0..writes {
+                driven
+                    .call(&mut pump, &clients[2], move |db| {
+                        db.exec(&format!("INSERT INTO events VALUES ({n})"))?;
+                        Ok(Vec::new())
+                    })
+                    .unwrap();
+            }
+            pump.losing = None;
+            assert_eq!(
+                (
+                    answers.load(Ordering::Acquire),
+                    closes.load(Ordering::Acquire)
+                ),
+                (writes, writes),
+                "{durability:?}: read answers to member 3 (one a write, its barrier's) and closes sent"
+            );
             driven.quiet(&mut pump);
             driven.drain(&mut pump);
             pump.finish();
