@@ -72,7 +72,8 @@ def encode(step):
         return message("Q", text(parts[0])), ["q"]
     if kind == "R":
         tag, body = parts
-        return message(tag, bytes.fromhex(body)), {"S": ["Z"], "Q": ["q"], "H": []}.get(tag, ["?"])
+        ends = {"S": ["Z"], "Q": ["q"], "H": [], "P": ["1"], "B": ["2"], "C": ["3"], "D": ["Tn"], "E": ["CsI"]}
+        return message(tag, bytes.fromhex(body)), ends[tag]
     raise SystemExit("no such message: %s" % step)
 
 
