@@ -233,12 +233,22 @@ pub fn refresh_analyze_stats_on_connect_nonblock(
             .load(crate::sync::atomic::Ordering::Acquire)
             == u64::from(schema_version)
         {
-            let shared = conn.db.schema.lock().clone();
+            let (shared, epoch) = {
+                let guard = conn.db.schema.lock();
+                (
+                    guard.clone(),
+                    conn.db
+                        .schema_epoch
+                        .load(crate::sync::atomic::Ordering::Acquire),
+                )
+            };
             if shared.schema_version == schema_version {
                 let mut current = conn.schema.write();
                 if !Arc::ptr_eq(&current, &shared) {
                     *current = shared;
                 }
+                conn.local_schema_epoch
+                    .store(epoch, crate::sync::atomic::Ordering::Relaxed);
                 return Ok(IOResult::Done(()));
             }
         }
@@ -343,17 +353,20 @@ fn install_analyze_stats(conn: &Arc<Connection>, stats: AnalyzeStats) -> Result<
             if let Some(stats) = pending.take() {
                 Schema::try_make_mut(&mut shared)?.analyze_stats = stats;
             }
+            let epoch = conn.db.bump_schema_epoch();
             conn.db.analyze_stats_version.store(
                 u64::from(local_version),
                 crate::sync::atomic::Ordering::Release,
             );
-            Some(Arc::clone(&shared))
+            Some((Arc::clone(&shared), epoch))
         } else {
             None
         }
     };
-    if let Some(updated) = updated_shared {
+    if let Some((updated, epoch)) = updated_shared {
         *conn.schema.write() = updated;
+        conn.local_schema_epoch
+            .store(epoch, crate::sync::atomic::Ordering::Relaxed);
     } else if let Some(stats) = pending {
         conn.with_schema_mut(|schema| {
             schema.analyze_stats = stats;

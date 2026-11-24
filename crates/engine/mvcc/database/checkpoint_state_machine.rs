@@ -2118,10 +2118,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         schema
             .dropped_root_pages
             .extend(std::mem::take(&mut self.ended_created_roots));
+        self.database.bump_schema_epoch();
         drop(schema_ref);
         let schema = self.database.clone_schema();
         if self.database_id == crate::MAIN_DB_ID {
             *self.connection.schema.write() = schema;
+            self.connection.invalidate_local_schema_epoch();
         } else {
             self.connection
                 .database_schemas()

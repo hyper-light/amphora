@@ -225,10 +225,15 @@ struct EngineHandles {
 
 pub(crate) struct Deadline {
     connection: Arc<Connection>,
+    custom_handler: bool,
 }
 impl Drop for Deadline {
     fn drop(&mut self) {
-        self.connection.set_progress_handler(0, None);
+        if self.custom_handler {
+            self.connection.set_progress_handler(0, None);
+        } else {
+            self.connection.set_deadline(0, None);
+        }
     }
 }
 
@@ -279,7 +284,13 @@ impl Db {
     /// Bound SQL VM work by the request's absolute deadline. The owning caller drops this guard
     /// before COMMIT/ROLLBACK cleanup, so cancellation cannot interrupt recovery of its session.
     pub(crate) fn deadline(&self, until: Instant) -> Deadline {
-        self.deadline_on(until, Instant::now)
+        // An administrative cancellation quantum, not a throughput tuning claim. A SQL VM can
+        // execute at most 1024 further instructions between deadline checks.
+        self.conn.set_deadline(1024, Some(until));
+        Deadline {
+            connection: Arc::clone(&self.conn),
+            custom_handler: false,
+        }
     }
 
     /// [`Db::deadline`] on `clock`: a replicated owner's, which its shell gives it
@@ -295,6 +306,7 @@ impl Db {
             .set_progress_handler(1024, Some(Box::new(move || clock() >= until)));
         Deadline {
             connection: Arc::clone(&self.conn),
+            custom_handler: true,
         }
     }
 
@@ -305,7 +317,7 @@ impl Db {
     /// journal: a transaction ([`Db::transaction`]) is committed whole or rolled back whole, so one
     /// that fails is never undone alone (docs/design/store.md, decision 7).
     pub fn open(path: &Path) -> anyhow::Result<Self> {
-        Self::open_sharing(path, &Sharing::Off)
+        Self::open_sharing(path, &Sharing::Process)
     }
 
     /// [`Db::open`], its connections reading through `sharing`'s pages.
@@ -325,7 +337,7 @@ impl Db {
 
     /// [`Db::open`] on `io`: the system's files, or a simulator's disk.
     pub fn open_with(path: &Path, io: Arc<dyn IO>) -> anyhow::Result<Self> {
-        Self::open_with_sharing(path, io, &Sharing::Off)
+        Self::open_with_sharing(path, io, &Sharing::Process)
     }
 
     /// [`Db::open_with`], its connections reading through `sharing`'s pages. A pool the caller

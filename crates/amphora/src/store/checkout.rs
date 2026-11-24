@@ -36,14 +36,14 @@ const UNSET: u8 = u8::MAX;
 
 impl ReadCheckout {
     /// The way stores started from now on take: `set_process_default`'s if called, else
-    /// `AMPHORA_READ_CHECKOUT` (read once), else `Pool`.
+    /// `AMPHORA_READ_CHECKOUT` (read once), else `Slots`.
     pub fn process_default() -> Self {
         static FROM_ENV: std::sync::OnceLock<ReadCheckout> = std::sync::OnceLock::new();
         match PROCESS_DEFAULT.load(Ordering::Relaxed) {
             UNSET => {
                 *FROM_ENV.get_or_init(|| match std::env::var("AMPHORA_READ_CHECKOUT").as_deref() {
-                    Ok("slots") => Self::Slots,
-                    _ => Self::Pool,
+                    Ok("pool") => Self::Pool,
+                    _ => Self::Slots,
                 })
             }
             1 => Self::Slots,
@@ -173,10 +173,19 @@ impl<R> Slots<R> {
         })
     }
 
-    /// Wakes the waiters, if any. Called as a slot is given back: the waiter counts itself before
+    /// Wakes one waiter, if any. Called as one slot is given back: the waiter counts itself before
     /// it tries the slots under `wait`, and this reads the count after the slot's unlock (the
     /// fence), so a waiter whose try failed is either seen here or tries again after.
     fn wake(&self) {
+        fence(Ordering::SeqCst);
+        if self.waiting.load(Ordering::SeqCst) > 0 {
+            drop(self.wait.lock().unwrap_or_else(PoisonError::into_inner));
+            self.freed.notify_one();
+        }
+    }
+
+    /// Wakes every waiter, if any. Called when every slot is given back at once (`All::drop`).
+    fn wake_all(&self) {
         fence(Ordering::SeqCst);
         if self.waiting.load(Ordering::SeqCst) > 0 {
             drop(self.wait.lock().unwrap_or_else(PoisonError::into_inner));
@@ -213,7 +222,7 @@ impl<R> Drop for All<'_, R> {
     fn drop(&mut self) {
         // Every slot unlocked first, then the waiters woken, so they find them free.
         self.held.clear();
-        self.slots.wake();
+        self.slots.wake_all();
     }
 }
 

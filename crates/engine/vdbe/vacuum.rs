@@ -1662,6 +1662,7 @@ fn install_committed_vacuum_image(
     let source_db = connection.get_source_database(db);
     let schema = committed_image.schema.clone();
     *connection.schema.write() = schema.clone();
+    connection.invalidate_local_schema_epoch();
 
     if source_db.mvcc_enabled() {
         let mv_store = source_db
@@ -1731,7 +1732,7 @@ fn vacuum_in_place_step(
                     .into());
                 }
                 // 2. No other active root statements on this connection.
-                if connection.n_active_root_statements.load(Ordering::SeqCst) != 1 {
+                if connection.active_root_statements() != 1 {
                     return Err(LimboError::TxError(
                         "cannot VACUUM - SQL statements in progress".to_string(),
                     )

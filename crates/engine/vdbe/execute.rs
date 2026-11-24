@@ -5568,10 +5568,7 @@ pub fn op_transaction_inner(
                     && auto_commit
                     && state.auto_txn_cleanup == TxnCleanup::None
                 {
-                    let active_root_statements = program
-                        .connection
-                        .n_active_root_statements
-                        .load(Ordering::SeqCst);
+                    let active_root_statements = program.connection.active_root_statements();
                     if active_root_statements > 1 {
                         // A sibling statement opened the implicit transaction
                         // before this statement joined it. Mark this statement
@@ -6077,6 +6074,7 @@ pub fn op_savepoint(
             // I/O.
             if let Some(info) = frame_info {
                 *conn.schema.write() = info.main_schema_snapshot;
+                conn.invalidate_local_schema_epoch();
                 if let Some(temp_db) = conn.temp.database.read().as_ref() {
                     match info.temp_schema_snapshot {
                         Some(snap) => *temp_db.db.schema.lock() = snap,
@@ -16621,6 +16619,7 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                     conn.database_schemas().write().insert(db, schema_arc);
                 } else {
                     *conn.schema.write() = schema_arc;
+                    conn.invalidate_local_schema_epoch();
                 }
                 drop(stmt);
                 conn.auto_commit
@@ -19967,11 +19966,7 @@ fn replan_on_built_rows(
 /// statement on the connection under way in it, `ProgramState::can_autocommit_now`'s siblings).
 fn hand_off_now(program: &Program, state: &mut ProgramState, replanned: bool) -> bool {
     let txn_its_own = !program.connection.get_auto_commit()
-        || program
-            .connection
-            .n_active_root_statements
-            .load(crate::sync::atomic::Ordering::SeqCst)
-            == 1;
+        || program.connection.active_root_statements() == 1;
     if replanned && state.handoff_open && txn_its_own {
         state.handoff_asked = true;
         return true;
@@ -21614,12 +21609,7 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                 // This VACUUM INTO statement itself is the one active root
                 // statement. Any count other than 1 means some other
                 // top-level statement on the same connection is still active.
-                if program
-                    .connection
-                    .n_active_root_statements
-                    .load(Ordering::SeqCst)
-                    != 1
-                {
+                if program.connection.active_root_statements() != 1 {
                     return Err(LimboError::TxError(
                         "cannot VACUUM - SQL statements in progress".to_string(),
                     )

@@ -754,11 +754,7 @@ impl Statement {
                     .n_active_blob_statements
                     .fetch_sub(1, Ordering::SeqCst);
             }
-            let previous = self
-                .program
-                .connection
-                .n_active_root_statements
-                .fetch_sub(1, Ordering::SeqCst);
+            let previous = self.program.connection.finish_root_statement();
             if previous == 1 {
                 self.program.connection.clear_interrupt_if_idle();
                 // Amphora (PL.8, lane pl8-17): the connection went idle between statements.

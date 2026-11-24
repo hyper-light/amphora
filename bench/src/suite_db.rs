@@ -664,8 +664,8 @@ pub fn amphora_sharing() -> anyhow::Result<amphora::db::Sharing> {
     }
     Ok(
         match std::env::var("AMPHORA_SHARED_PAGES").ok().as_deref() {
-            None | Some("0") => Sharing::Off,
-            Some("process") => Sharing::Process,
+            Some("0") => Sharing::Off,
+            None | Some("process") => Sharing::Process,
             Some(pages) => {
                 let pages = pages.parse::<usize>().map_err(|e| {
                     anyhow::anyhow!(

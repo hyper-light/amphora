@@ -1078,7 +1078,7 @@ pub(crate) fn open_db(path: &Path, owner: &Owned) -> Result<Db, Refusal> {
         return Db::open(path).map_err(unavailable);
     }
     let path = existing_path(path)?;
-    Db::open_made(&path, &crate::db::Sharing::Off).map_err(unavailable)
+    Db::open_made(&path, &crate::db::Sharing::Process).map_err(unavailable)
 }
 pub(crate) fn refused(error: &anyhow::Error) -> Refusal {
     if let Some(refusal) = error.downcast_ref::<Refusal>() {

@@ -574,13 +574,13 @@ pub enum SyncRowStep {
     Upsert { stmt: Box<Statement> },
 }
 
-#[derive(Default)]
-pub(crate) struct StatementActivity {
-    explicit_checkpoint_active: bool,
-}
+/// Bit packed into `Connection::statement_activity` while an explicit checkpoint is active,
+/// avoiding a per-statement mutex in `start_root_statement`.
+pub(crate) const EXPLICIT_CHECKPOINT_BIT: i32 = 1 << 30;
+pub(crate) const ROOT_STATEMENT_COUNT_MASK: i32 = EXPLICIT_CHECKPOINT_BIT - 1;
 
 pub(crate) struct ExplicitCheckpointGuard {
-    activity: Arc<Mutex<StatementActivity>>,
+    activity: Arc<AtomicI32>,
     pager: Arc<Pager>,
 }
 
@@ -589,12 +589,13 @@ impl Drop for ExplicitCheckpointGuard {
         if self.pager.is_checkpointing() {
             self.pager.cleanup_after_checkpoint_failure();
         }
-        let mut activity = self.activity.lock();
+        let prev = self
+            .activity
+            .fetch_and(!EXPLICIT_CHECKPOINT_BIT, Ordering::AcqRel);
         turso_assert!(
-            activity.explicit_checkpoint_active,
+            (prev & EXPLICIT_CHECKPOINT_BIT) != 0,
             "dropping an inactive explicit checkpoint guard"
         );
-        activity.explicit_checkpoint_active = false;
     }
 }
 
@@ -619,6 +620,9 @@ pub struct Connection {
     pub(super) context: Option<Arc<dyn Any + Send + Sync>>,
     pub(crate) pager: ArcSwap<Pager>,
     pub(crate) schema: RwLock<Arc<Schema>>,
+    /// Epoch of `db.schema_epoch` last synchronized into `self.schema` (`u64::MAX` when mutated
+    /// locally): allows `maybe_update_schema()` to skip locking `db.schema` when unchanged.
+    pub(crate) local_schema_epoch: AtomicU64,
     /// Per-database schema cache (database_index -> schema)
     /// Loaded lazily to avoid copying all schemas on connection open
     pub(super) database_schemas: RwLock<HashMap<usize, Arc<Schema>>>,
@@ -854,21 +858,16 @@ pub struct Connection {
     /// This is currently only 0 or 1. We return Busy instead of allowing a
     /// second same-connection writer to start.
     pub(crate) n_active_writes: AtomicI32,
-    /// Number of active root statements currently executing on this connection.
-    /// This is Turso's equivalent of SQLite's top-level active-VDBE count
-    /// (`db->nVdbeActive`) for user statements, excluding internal helpers and
-    /// subprogram execution.
-    pub(crate) n_active_root_statements: AtomicI32,
-    /// How many of `n_active_root_statements` are parked incremental blob
-    /// handles. A blob handle keeps a Root statement open from `blob_open`
-    /// until close, but between blob operations it just sits on its row, so
-    /// explicit checkpoints subtract these instead of treating them as
-    /// statements in progress (SQLite checkpoints fine with open blob
-    /// handles; a handle re-positions on its next blob operation after the
-    /// checkpoint's cache clear).
+    /// How many active root statements are parked incremental blob handles.
+    /// A blob handle keeps a Root statement open from `blob_open` until close,
+    /// but between blob operations it just sits on its row, so explicit
+    /// checkpoints subtract these instead of treating them as statements in
+    /// progress (SQLite checkpoints fine with open blob handles; a handle
+    /// re-positions on its next blob operation after the checkpoint's cache clear).
     pub(crate) n_active_blob_statements: AtomicI32,
-    /// Prevents root statements and explicit checkpoints from overlapping on this connection.
-    pub(crate) statement_activity: Arc<Mutex<StatementActivity>>,
+    /// Active root statement count (bits `0..30`) packed with `EXPLICIT_CHECKPOINT_BIT` (bit 30),
+    /// preventing root statements and explicit checkpoints from overlapping without a mutex.
+    pub(crate) statement_activity: Arc<AtomicI32>,
     /// Whether pragma ignore_check_constraints=ON for this connection
     pub(super) check_constraints_pragma: AtomicBool,
     /// Track when each virtual table instance is currently in transaction.
@@ -3030,6 +3029,11 @@ impl Connection {
         Ok(type_rows)
     }
 
+    #[inline]
+    pub(crate) fn invalidate_local_schema_epoch(&self) {
+        self.local_schema_epoch.store(u64::MAX, Ordering::Relaxed);
+    }
+
     pub fn maybe_update_schema(&self) {
         if self.schema_reparse_in_progress() {
             return;
@@ -3042,8 +3046,13 @@ impl Connection {
         if !self.has_no_open_transaction_state() {
             return;
         }
+        let db_epoch = self.db.schema_epoch.load(Ordering::Acquire);
+        if self.local_schema_epoch.load(Ordering::Relaxed) == db_epoch {
+            return;
+        }
         let current_schema = self.schema.read().clone();
         let schema = self.db.schema.lock();
+        let locked_epoch = self.db.schema_epoch.load(Ordering::Acquire);
         // MVCC checkpoint can publish physical btree roots into the shared
         // schema without changing SQLite's schema cookie. If this connection
         // still has the older schema snapshot, prepared statements must be
@@ -3063,6 +3072,8 @@ impl Connection {
             *self.schema.write() = adopted;
             self.bump_prepare_context_generation();
         }
+        self.local_schema_epoch
+            .store(locked_epoch, Ordering::Relaxed);
     }
 
     fn has_no_open_transaction_state(&self) -> bool {
@@ -3121,13 +3132,17 @@ impl Connection {
 
     pub(crate) fn refresh_schema_from_shared_for_reprepare(&self) {
         let current_schema = self.schema.read().clone();
-        let schema = self.db.schema.lock().clone();
+        let (schema, epoch) = {
+            let guard = self.db.schema.lock();
+            (guard.clone(), self.db.schema_epoch.load(Ordering::Acquire))
+        };
         if current_schema.schema_version < schema.schema_version
             || (self.has_no_open_transaction_state()
                 && self
                     .has_mvcc_schema_snapshot_changed_with_same_version(&current_schema, &schema))
         {
             *self.schema.write() = schema;
+            self.local_schema_epoch.store(epoch, Ordering::Relaxed);
             self.bump_prepare_context_generation();
         }
     }
@@ -4041,6 +4056,7 @@ impl Connection {
     {
         let name = self.db.register_internal_vtab(table)?;
         *self.schema.write() = self.db.clone_schema();
+        self.invalidate_local_schema_epoch();
         self.bump_prepare_context_generation();
         Ok(name)
     }
@@ -4048,6 +4064,7 @@ impl Connection {
     pub fn register_virtual_table(&self, table: Arc<crate::VirtualTable>) -> Result<String> {
         let name = self.db.register_virtual_table(table)?;
         *self.schema.write() = self.db.clone_schema();
+        self.invalidate_local_schema_epoch();
         self.bump_prepare_context_generation();
         Ok(name)
     }
@@ -4259,6 +4276,7 @@ impl Connection {
     pub fn with_schema_mut<T>(&self, f: impl FnOnce(&mut Schema) -> T) -> Result<T> {
         let mut schema_ref = self.schema.write();
         let schema = Schema::try_make_mut(&mut schema_ref)?;
+        self.invalidate_local_schema_epoch();
         Ok(f(schema))
     }
 
@@ -6066,6 +6084,11 @@ impl Connection {
         self.progress_handler.set(ops, handler);
     }
 
+    /// Sets or clears a lock-free wall-clock deadline checked approximately every `ops` VM steps.
+    pub fn set_deadline(&self, ops: u64, until: Option<std::time::Instant>) {
+        self.progress_handler.set_deadline(ops, until);
+    }
+
     /// Configured progress-handler interval in VM steps; 0 when disabled.
     pub fn progress_ops(&self) -> u64 {
         self.progress_handler.ops()
@@ -6077,10 +6100,22 @@ impl Connection {
         self.progress_handler.should_interrupt(prev_steps, vm_steps)
     }
 
+    /// Number of active root statements currently executing on this connection.
+    #[inline]
+    pub(crate) fn active_root_statements(&self) -> i32 {
+        self.statement_activity.load(Ordering::Acquire) & ROOT_STATEMENT_COUNT_MASK
+    }
+
+    /// Decrements the active root statement count, returning the count before decrement.
+    #[inline]
+    pub(crate) fn finish_root_statement(&self) -> i32 {
+        self.statement_activity.fetch_sub(1, Ordering::AcqRel) & ROOT_STATEMENT_COUNT_MASK
+    }
+
     /// Request interruption of currently running root statements on this connection.
     /// If no root statement is active, the request is ignored to match SQLite semantics.
     pub fn interrupt(&self) {
-        if self.n_active_root_statements.load(Ordering::SeqCst) > 0 {
+        if self.active_root_statements() > 0 {
             self.interrupt_requested.store(true, Ordering::SeqCst);
         }
     }
@@ -6092,20 +6127,36 @@ impl Connection {
 
     /// Clear the connection interrupt once no root statements remain active.
     pub(crate) fn clear_interrupt_if_idle(&self) {
-        if self.n_active_root_statements.load(Ordering::SeqCst) == 0 {
+        if self.active_root_statements() == 0 {
             self.interrupt_requested.store(false, Ordering::SeqCst);
         }
     }
 
     pub(crate) fn start_root_statement(&self) -> Result<()> {
-        let activity = self.statement_activity.lock();
-        if activity.explicit_checkpoint_active {
-            return Err(LimboError::StatementsInProgress(
-                "cannot start a statement while a checkpoint is active",
-            ));
+        let mut current = self.statement_activity.load(Ordering::Acquire);
+        loop {
+            if (current & EXPLICIT_CHECKPOINT_BIT) != 0 {
+                return Err(LimboError::StatementsInProgress(
+                    "cannot start a statement while a checkpoint is active",
+                ));
+            }
+            let count = current & ROOT_STATEMENT_COUNT_MASK;
+            let next = count.checked_add(1).filter(|&n| n < EXPLICIT_CHECKPOINT_BIT);
+            let Some(next) = next else {
+                return Err(LimboError::InternalError(
+                    "active root statement count overflow".to_string(),
+                ));
+            };
+            match self.statement_activity.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(observed) => current = observed,
+            }
         }
-        self.n_active_root_statements.fetch_add(1, Ordering::SeqCst);
-        Ok(())
     }
 
     /// `from_statement` is true when the checkpoint runs inside a root
@@ -6118,25 +6169,36 @@ impl Connection {
         from_statement: bool,
     ) -> Result<ExplicitCheckpointGuard> {
         let statements_expected = if from_statement { 1 } else { 0 };
-        let mut activity = self.statement_activity.lock();
-        // Parked incremental blob handles don't count: they hold a Root
-        // statement open for their whole lifetime, but between blob
-        // operations they just sit on their row and re-position on their
-        // next blob operation after the checkpoint's cache clear. Counting
-        // them would make one open blob handle block every explicit
-        // checkpoint until it is closed.
-        let active_non_blob = self.n_active_root_statements.load(Ordering::SeqCst)
-            - self.n_active_blob_statements.load(Ordering::SeqCst);
-        if activity.explicit_checkpoint_active || active_non_blob != statements_expected {
-            return Err(LimboError::StatementsInProgress(
-                "cannot checkpoint while another statement is active",
-            ));
+        let mut current = self.statement_activity.load(Ordering::Acquire);
+        loop {
+            // Parked incremental blob handles don't count: they hold a Root
+            // statement open for their whole lifetime, but between blob
+            // operations they just sit on their row and re-position on their
+            // next blob operation after the checkpoint's cache clear. Counting
+            // them would make one open blob handle block every explicit
+            // checkpoint until it is closed.
+            let active_non_blob = (current & ROOT_STATEMENT_COUNT_MASK)
+                - self.n_active_blob_statements.load(Ordering::SeqCst);
+            if (current & EXPLICIT_CHECKPOINT_BIT) != 0 || active_non_blob != statements_expected {
+                return Err(LimboError::StatementsInProgress(
+                    "cannot checkpoint while another statement is active",
+                ));
+            }
+            match self.statement_activity.compare_exchange_weak(
+                current,
+                current | EXPLICIT_CHECKPOINT_BIT,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(ExplicitCheckpointGuard {
+                        activity: self.statement_activity.clone(),
+                        pager,
+                    });
+                }
+                Err(observed) => current = observed,
+            }
         }
-        activity.explicit_checkpoint_active = true;
-        Ok(ExplicitCheckpointGuard {
-            activity: self.statement_activity.clone(),
-            pager,
-        })
     }
 
     pub(crate) fn set_tx_state(&self, state: TransactionState) {

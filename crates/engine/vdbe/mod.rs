@@ -1437,8 +1437,7 @@ impl ProgramState {
             // MVCC keeps one tx id on the connection. A writer waits for
             // sibling readers, and a reader waits for sibling readers/writers.
             return self.auto_txn_cleanup == TxnCleanup::RollbackTxn
-                && connection.n_active_root_statements.load(Ordering::SeqCst)
-                    == i32::from(self_counted)
+                && connection.active_root_statements() == i32::from(self_counted)
                 && (self.is_active_write || active_writers == 0);
         }
         if self.auto_txn_cleanup == TxnCleanup::RollbackTxn && self.is_active_write {
@@ -1458,7 +1457,7 @@ impl ProgramState {
                     .any(|(_, pager)| pager.holds_read_lock() || pager.holds_write_lock())
             })
         };
-        if connection.n_active_root_statements.load(Ordering::SeqCst) > i32::from(self_counted) {
+        if connection.active_root_statements() > i32::from(self_counted) {
             // Readers can finish while sibling readers remain active, but a
             // shared attached transaction may only be finished by the last
             // active statement, like SQLite's btreeEndTransaction keeps the

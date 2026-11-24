@@ -4642,7 +4642,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         connection.with_schema_mut(|schema| {
             Self::rehydrate_table_valued_functions(schema, table_valued_functions);
         })?;
-        *connection.db.schema.lock() = connection.schema.read().clone();
+        connection.db.replace_schema(connection.schema.read().clone());
         Ok(())
     }
 
@@ -5312,7 +5312,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     // already on disk, so it propagates as a bootstrap failure.
                     return_if_io!(bootstrap_conn
                         .sync_autoincrement_backing_tables_from_sqlite_sequence_nonblock(sync_st));
-                    *bootstrap_conn.db.schema.lock() = bootstrap_conn.schema.read().clone();
+                    bootstrap_conn
+                        .db
+                        .replace_schema(bootstrap_conn.schema.read().clone());
                     *st = BootstrapState::AwaitingGlobalHeader;
                 }
                 BootstrapState::AwaitingGlobalHeader => {
@@ -7209,6 +7211,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             {
                 // Connection made schema changes during tx and rolled back -> revert connection-local schema.
                 *connection.schema.write() = connection.db.clone_schema();
+                connection.invalidate_local_schema_epoch();
             }
         }
 
@@ -9737,7 +9740,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             .dialect()
                             .load_next_oid(header.pg_next_oid.get());
                     }
-                    *connection.db.schema.lock() = connection.schema.read().clone();
+                    connection.db.replace_schema(connection.schema.read().clone());
                     self.clock.reset(max_commit_ts_seen + 1);
                     self.last_committed_tx_ts
                         .store(max_commit_ts_seen, Ordering::SeqCst);
@@ -9778,7 +9781,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
         let install_schema = |schema: Arc<Schema>| {
             *connection.schema.write() = schema.clone();
-            *connection.db.schema.lock() = schema;
+            connection.invalidate_local_schema_epoch();
+            connection.db.replace_schema(schema);
         };
 
         let root_page_for_index = |index_id: MVTableId| -> i64 {

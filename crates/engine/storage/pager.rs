@@ -1129,13 +1129,14 @@ impl PagePath {
         }
     }
 
-    /// The process's switch, read once: `AMPHORA_PAGE_PATH=plain`.
+    /// The process's switch, read once: defaults to `Plain`, with `AMPHORA_PAGE_PATH=today`
+    /// opting back into the legacy completion/copy path for A/B comparison.
     pub fn switched() -> Self {
         static PATH: crate::sync::LazyLock<PagePath> = crate::sync::LazyLock::new(|| {
-            if std::env::var_os("AMPHORA_PAGE_PATH").is_some_and(|value| value == "plain") {
-                PagePath::Plain
-            } else {
+            if std::env::var_os("AMPHORA_PAGE_PATH").is_some_and(|value| value == "today") {
                 PagePath::Today
+            } else {
+                PagePath::Plain
             }
         });
         *PATH
@@ -7198,6 +7199,7 @@ impl Pager {
         self.set_schema_cookie(None);
         if schema_did_change {
             *connection.schema.write() = connection.db.clone_schema();
+            connection.invalidate_local_schema_epoch();
         }
         if is_write {
             if let Some(wal) = self.wal.as_ref() {

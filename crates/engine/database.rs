@@ -728,6 +728,10 @@ pub struct Database<
     pub(crate) skipping: crate::skipping::SkipRegistry,
     pub(crate) allocators: DatabaseAllocators<A, F>,
     pub(crate) schema: Arc<Mutex<Arc<Schema>>>,
+    /// Monotonic epoch bumped whenever `schema` is mutated: lets `Connection::maybe_update_schema`
+    /// verify its local snapshot is current with a single `Acquire` load instead of contending on
+    /// `schema.lock()` on every statement.
+    pub(crate) schema_epoch: AtomicU64,
     /// Schema version for which `ANALYZE` statistics were already loaded into `schema`
     /// (`u64::MAX` until loaded): prevents every new connection from re-scanning `sqlite_stat1`
     /// and deep-cloning `Schema` + column samples.
@@ -935,6 +939,7 @@ impl Database {
                 s.generated_columns_enabled = opts.enable_generated_columns;
                 s
             }))),
+            schema_epoch: AtomicU64::new(0),
             analyze_stats_version: AtomicU64::new(u64::MAX),
             cost_run_seed: AtomicU64::new(0),
             _shared_page_cache: shared_page_cache,
@@ -2824,6 +2829,10 @@ impl Database {
                 None,
             )?
             .map(|s| Arc::new(crate::storage::versioned::switch::Switch::new(s)));
+        let (initial_schema, initial_schema_epoch) = {
+            let shared = self.schema.lock();
+            (shared.clone(), self.schema_epoch.load(Ordering::Acquire))
+        };
         let conn = Arc::new(Connection {
             cost_runs: crate::translate::optimizer::learned_costs::RunCounts::staggered(
                 self.cost_run_seed.fetch_add(1, Ordering::Relaxed),
@@ -2833,7 +2842,8 @@ impl Database {
             db: self.clone(),
             context,
             pager: ArcSwap::new(pager),
-            schema: RwLock::new(self.schema.lock().clone()),
+            schema: RwLock::new(initial_schema),
+            local_schema_epoch: AtomicU64::new(initial_schema_epoch),
             database_schemas: RwLock::new(HashMap::default()),
             auto_commit: AtomicBool::new(true),
             transaction_state: AtomicTransactionState::new(TransactionState::None),
@@ -2959,11 +2969,8 @@ impl Database {
             fk_pragma: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),
             n_active_writes: AtomicI32::new(0),
-            n_active_root_statements: AtomicI32::new(0),
             n_active_blob_statements: AtomicI32::new(0),
-            statement_activity: Arc::new(Mutex::new(
-                crate::connection::StatementActivity::default(),
-            )),
+            statement_activity: Arc::new(AtomicI32::new(0)),
             check_constraints_pragma: AtomicBool::new(false),
             vtab_txn_states: RwLock::new(HashSet::default()),
             index_method_tx_cursors: crate::sync::Mutex::new(Vec::new()),
@@ -3967,14 +3974,25 @@ impl Database {
     }
 
     #[inline]
+    pub(crate) fn bump_schema_epoch(&self) -> u64 {
+        self.schema_epoch
+            .fetch_add(1, Ordering::Release)
+            .wrapping_add(1)
+    }
+
+    #[inline]
     pub(crate) fn with_schema_mut<T>(&self, f: impl FnOnce(&mut Schema) -> Result<T>) -> Result<T> {
         let mut schema_ref = self.schema.lock();
         let schema = Schema::try_make_mut(&mut schema_ref)?;
-        f(schema)
+        let out = f(schema);
+        self.bump_schema_epoch();
+        out
     }
 
     pub(crate) fn replace_schema(&self, schema: Arc<Schema>) {
-        *self.schema.lock() = schema;
+        let mut guard = self.schema.lock();
+        *guard = schema;
+        self.bump_schema_epoch();
     }
 
     /// Register an `InternalVirtualTable` into this database's catalog. The
@@ -4020,6 +4038,7 @@ impl Database {
                 another.schema_version
             );
             *schema = another;
+            self.bump_schema_epoch();
         } else {
             tracing::debug!(
                 "DB schema is up to date: {} >= {}",
