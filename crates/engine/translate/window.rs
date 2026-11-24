@@ -16,6 +16,7 @@ use crate::translate::plan::{
 };
 use crate::translate::planner::resolve_window_and_aggregate_functions;
 use crate::translate::result_row::emit_select_result;
+use crate::translate::select::validate_expr_correct_column_counts;
 use crate::translate::subquery::plan_subqueries_from_select_plan;
 use crate::types::KeyInfo;
 use crate::util::exprs_are_equivalent;
@@ -132,6 +133,7 @@ fn prepare_window_subquery(
         // Plan them now so they become SubqueryResult nodes with entries in
         // non_from_clause_subqueries.
         plan_subqueries_from_select_plan(program, outer_plan, resolver, connection)?;
+        validate_expr_correct_column_counts(outer_plan)?;
         return Ok(());
     }
 

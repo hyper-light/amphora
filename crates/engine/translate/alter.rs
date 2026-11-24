@@ -2767,7 +2767,6 @@ fn emit_strict_column_conversion(
         start_reg,
         count: layout.num_non_virtual_cols(),
         check_generated: false,
-        check_null_keys: true,
         table_reference: BTreeTable::input_type_check_table_ref(
             &rewritten_table,
             resolver.schema(),
@@ -2787,7 +2786,6 @@ fn emit_strict_column_conversion(
         start_reg,
         count: layout.num_non_virtual_cols(),
         check_generated: false,
-        check_null_keys: true,
         table_reference: BTreeTable::type_check_table_ref(&rewritten_table, resolver.schema()),
     });
     Ok(())

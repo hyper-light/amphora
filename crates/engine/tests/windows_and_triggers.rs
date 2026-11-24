@@ -1,7 +1,8 @@
 //! Oracle findings CO, CP and DC (lane C17): window functions over each other, triggers on rowid and
 //! WITHOUT ROWID tables, and the cursors a grouped outer join's subqueries and an automatic index read,
 //! answer as SQLite 3.54.0 does, with no panic (CLAUDE.md 1; AC-T1.1.1: reads as committed; AC-T1.8.6:
-//! the differential suite).
+//! the differential suite). A conflict in a trigger's statement is judged by that statement's clause
+//! (lane C22).
 
 use amphora_engine::{
     ConnectOpts, Connection, Database, DatabaseOpts, MemoryIO, Numeric, OpenOptions, SqliteDialect,
@@ -12,8 +13,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// A line of a fixture (`bench/sqlite_windows.py`, `bench/sqlite_triggers.py`,
-/// `bench/sqlite_unread_cursors.py`): a statement that fills the database, or a query or a statement
-/// with what SQLite answered.
+/// `bench/sqlite_unread_cursors.py`, `bench/sqlite_trigger_conflicts.py`): a statement that fills the
+/// database, or a query or a statement with what SQLite answered.
 enum Step {
     Fill(&'static str),
     Ask(&'static str, &'static str),
@@ -113,7 +114,8 @@ fn answer(io: &MemoryIO, conn: &Arc<Connection>, sql: &str) -> Result<String, St
 }
 
 /// What `sql` answers, or the panic it ended in. SQLite's refusal of a statement is held as a refusal
-/// alone: `ERROR` and no words.
+/// alone, `ERROR` and no words, but for a constraint's in `trigger_conflicts.tsv`: which one refused a
+/// statement says whose clause judged it.
 fn outcome(io: &MemoryIO, conn: &Arc<Connection>, sql: &str) -> String {
     match catch_unwind(AssertUnwindSafe(|| answer(io, conn, sql))) {
         Ok(Ok(rows)) => rows,
@@ -206,6 +208,15 @@ fn windows_over_windows_answer_as_sqlite() {
 #[test]
 fn triggers_fire_as_sqlite_fires_them() {
     answers_as_sqlite(include_str!("fixtures/triggers.tsv"));
+}
+
+/// Lane C22: every clause on a statement, on a trigger's, and on a statement of a trigger that one fires;
+/// DO UPDATE, DELETE and foreign keys' actions, which have a clause of their own; constraints declared
+/// with one; in transactions and savepoints. Expect what the tables and the triggers' log hold, whether
+/// the transaction stands, and which constraint refused.
+#[test]
+fn a_conflict_is_judged_by_the_clause_of_the_statement_that_meets_it() {
+    answers_as_sqlite(include_str!("fixtures/trigger_conflicts.tsv"));
 }
 
 /// Finding DC: subqueries of grouped and aggregate outer joins, and row-value ranges across a join.

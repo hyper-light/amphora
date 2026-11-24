@@ -187,6 +187,7 @@ impl Listener {
         let (database, time_zone) = (Rc::clone(&self.database), self.config.time_zone.clone());
         let process_id = seed.process_id;
         let superusers = Rc::clone(&self.roles);
+        let budget = Arc::clone(&self.budget);
         let mut session =
             Session::new(self.config.clone(), seed).with_database(Box::new(move |startup| {
                 let role = SessionRole {
@@ -195,7 +196,8 @@ impl Listener {
                         .role(&startup.user)
                         .is_some_and(|role| role.superuser),
                 };
-                Ok(Box::new(database.session(role, &time_zone, process_id)?))
+                let executor = database.session(role, &time_zone, process_id)?;
+                Ok(Box::new(executor.charged_to(budget)))
             }));
         let live = self.live.get();
         let admitted = if live < self.max_connections {
@@ -233,6 +235,11 @@ impl Listener {
             input.drain(..step.consumed.min(input.len()));
             match step.next {
                 Next::Continue => {}
+                Next::Flush => {
+                    if let Err(error) = flush(stream, &mut out).await {
+                        return Ended::Socket(error);
+                    }
+                }
                 // The end of the transaction it waits for wakes this task (docs/design/postgres.md
                 // section 8); nothing it held is another's, so its other sessions go on meanwhile.
                 Next::Wait => {

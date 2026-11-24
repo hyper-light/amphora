@@ -45,7 +45,7 @@ use crate::{
             fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
         },
         upsert::{
-            collect_set_clauses_for_upsert, emit_upsert, resolve_upsert_target,
+            collect_set_clauses_for_upsert, emit_upsert, resolve_upsert_target, DoUpdateSubqueries,
             ResolvedUpsertTarget,
         },
     },
@@ -53,7 +53,9 @@ use crate::{
     vdbe::{
         affinity::Affinity,
         builder::{CursorKey, CursorType, DmlColumnContext, ProgramBuilder, ProgramBuilderOpts},
-        insn::{to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral},
+        insn::{
+            to_u32, CmpInsFlags, HaltAction, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral,
+        },
         BranchOffset,
     },
     CaptureDataChangesExt, Connection, LimboError, Result, VirtualTable,
@@ -360,6 +362,13 @@ pub fn translate_insert(
             collect_subquery_table_refs_in_expr(expr, &mut returning_table_refs);
         }
     }
+    for (_, _, upsert) in &upsert_actions {
+        if let UpsertDo::Set { sets, where_clause } = &upsert.do_clause {
+            for expr in sets.iter().map(|set| &set.expr).chain(where_clause) {
+                collect_subquery_table_refs_in_expr(expr, &mut returning_table_refs);
+            }
+        }
+    }
     plan_ctes_as_outer_refs(
         with_for_returning,
         &returning_table_refs,
@@ -609,7 +618,6 @@ pub fn translate_insert(
                 start_reg: insertion.first_col_register(),
                 count: insertion.num_non_virtual_cols,
                 check_generated: false,
-                check_null_keys: false,
                 table_reference: BTreeTable::input_type_check_table_ref(
                     ctx.table,
                     resolver.schema(),
@@ -697,42 +705,6 @@ pub fn translate_insert(
     }
 
     program.preassign_label_to_next_insn(ctx.key_labels.key_ready_for_check);
-
-    //TODO building the type-check table is expensive, we should cache it somehow.
-    let maybe_type_check_table = ctx
-        .table
-        .is_strict
-        .then(|| BTreeTable::type_check_table_ref(ctx.table, resolver.schema()));
-    if let Some(type_check_table) = &maybe_type_check_table {
-        // Pre-encoding TypeCheck: validate input types match the custom type's declared value type
-        // to catch things like a TEXT value inserted into an INTEGER-based custom type.
-        program.emit_insn(Insn::TypeCheck {
-            start_reg: insertion.first_col_register(),
-            count: insertion.num_non_virtual_cols,
-            check_generated: false,
-            check_null_keys: true,
-            table_reference: BTreeTable::input_type_check_table_ref(
-                ctx.table,
-                resolver.schema(),
-                None,
-            )?,
-        });
-
-        // Encode values for columns with custom types.
-        emit_custom_type_encode(program, resolver, &insertion, &ctx.table.name)?;
-
-        // Post-encode TypeCheck: validate that encode produced the correct storage type (BASE).
-        // We don't check generated columns in this initial pass because their dependencies could
-        // still be REPLACEd.
-        program.emit_insn(Insn::TypeCheck {
-            start_reg: insertion.first_col_register(),
-            count: insertion.num_non_virtual_cols,
-            check_generated: false,
-            check_null_keys: true,
-            table_reference: Arc::clone(type_check_table),
-        });
-    }
-    // Non-STRICT tables: Affinity was already emitted earlier (before BEFORE triggers).
 
     // For AUTOINCREMENT tables with an explicit rowid, update sqlite_sequence
     // before CHECK constraints. SQLite updates sqlite_sequence even when
@@ -850,7 +822,52 @@ pub fn translate_insert(
     //    1. replace `a` with 5 (the NOT NULL REPLACE action)
     //    2. compute `b`
     //    3. check that `b` isn't null (the NOT NULL constraint)
-    emit_notnulls(program, &ctx, &insertion, resolver, false)?;
+    //
+    // Amphora: a STRICT table's types are checked after its NOT NULLs, as SQLite checks them
+    // (sqlite3GenerateConstraintChecks): OR IGNORE skips a row for its NULL whatever its other
+    // values' types, and the default put in for a NULL is converted as its column converts. A
+    // custom type's NOT NULL is asked of the decoded value, so its columns are encoded first.
+    let encodes_columns = ctx.table.is_strict
+        && super::without_rowid::has_encoded_columns(&btree_table, resolver, database_id);
+    //TODO building the type-check table is expensive, we should cache it somehow.
+    let maybe_type_check_table = ctx
+        .table
+        .is_strict
+        .then(|| BTreeTable::type_check_table_ref(ctx.table, resolver.schema()));
+    if !encodes_columns {
+        emit_notnulls(program, &ctx, &insertion, resolver, false)?;
+    }
+    if let Some(type_check_table) = &maybe_type_check_table {
+        // Pre-encoding TypeCheck: validate input types match the custom type's declared value type
+        // to catch things like a TEXT value inserted into an INTEGER-based custom type.
+        program.emit_insn(Insn::TypeCheck {
+            start_reg: insertion.first_col_register(),
+            count: insertion.num_non_virtual_cols,
+            check_generated: false,
+            table_reference: BTreeTable::input_type_check_table_ref(
+                ctx.table,
+                resolver.schema(),
+                None,
+            )?,
+        });
+
+        // Encode values for columns with custom types.
+        emit_custom_type_encode(program, resolver, &insertion, &ctx.table.name)?;
+
+        // Post-encode TypeCheck: validate that encode produced the correct storage type (BASE).
+        // We don't check generated columns in this initial pass because their dependencies could
+        // still be REPLACEd.
+        program.emit_insn(Insn::TypeCheck {
+            start_reg: insertion.first_col_register(),
+            count: insertion.num_non_virtual_cols,
+            check_generated: false,
+            table_reference: Arc::clone(type_check_table),
+        });
+    }
+    // Non-STRICT tables: Affinity was already emitted earlier (before BEFORE triggers).
+    if encodes_columns {
+        emit_notnulls(program, &ctx, &insertion, resolver, false)?;
+    }
 
     if insertion.has_virtual_columns() {
         //TODO only compute the necessary virtual columns for CHECK and NOT NULL evaluation
@@ -869,7 +886,6 @@ pub fn translate_insert(
                 //TODO here we could eventually type-check only virtual columns and the stored
                 // columns that have NOT NULL REPLACE.
                 check_generated: true,
-                check_null_keys: true,
                 table_reference: type_check_table,
             });
         }
@@ -905,13 +921,11 @@ pub fn translate_insert(
     // Build a list of upsert constraints/indexes we need to run preflight
     // checks against, in the proper order of evaluation,
     let constraints = build_constraints_to_check(
-        table_name.as_str(),
+        ctx.table,
         &upsert_actions,
-        ctx.table.has_rowid,
         has_user_provided_rowid,
         resolver,
         ctx.database_id,
-        ctx.table.rowid_alias_conflict_clause,
         ctx.statement_on_conflict.is_some(),
     );
 
@@ -1702,6 +1716,17 @@ fn resolve_upserts(
             ref mut where_clause,
         } = upsert.do_clause
         {
+            let mut subqueries = DoUpdateSubqueries::plan(
+                program,
+                resolver,
+                connection,
+                ctx,
+                insertion,
+                table_references,
+                table_alias,
+                sets,
+                where_clause,
+            )?;
             // Normalize SET pairs once
             let mut rewritten_sets = collect_set_clauses_for_upsert(table, sets)?;
 
@@ -1717,6 +1742,7 @@ fn resolve_upserts(
                 connection,
                 table_references,
                 table_alias,
+                &mut subqueries,
             )?;
         } else {
             // UpsertDo::Nothing case
@@ -1980,6 +2006,7 @@ fn emit_notnulls(
             program.emit_insn(Insn::HaltIfNull {
                 target_reg: check_reg,
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
+                on_error: HaltAction::of_constraint(effective),
                 description: {
                     let mut description = String::with_capacity(
                         ctx.table.name.as_str().len()
@@ -2018,7 +2045,7 @@ struct BoundInsertResult {
 /// Check if an expression contains a subquery (Subquery, InSelect, or Exists).
 /// This is used to detect when single-row VALUES should be routed through the
 /// multi-row path which has proper subquery handling.
-fn expr_contains_subquery(expr: &Expr) -> bool {
+pub(crate) fn expr_contains_subquery(expr: &Expr) -> bool {
     let mut found_subquery = false;
     let _ = walk_expr(expr, &mut |e| {
         if matches!(
@@ -3049,15 +3076,10 @@ fn emit_pk_uniqueness_check(
                 .map(|(name, _)| format!("{}.{}", ctx.table.name, name))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let (description, on_error) = halt_desc_and_on_error(
-                &raw_desc,
-                preflight.effective_on_conflict,
-                program.flags.has_statement_conflict(),
-            );
             program.emit_insn(Insn::Halt {
                 err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-                description,
-                on_error,
+                description: raw_desc,
+                on_error: HaltAction::of_constraint(preflight.effective_on_conflict),
                 description_reg: None,
             });
         }
@@ -3115,16 +3137,10 @@ fn emit_pk_uniqueness_check(
             });
             break 'emit_halt;
         }
-        let raw_desc = format!("{}.{}", ctx.table.name, rowid_column_name);
-        let (description, on_error) = halt_desc_and_on_error(
-            &raw_desc,
-            preflight.effective_on_conflict,
-            program.flags.has_statement_conflict(),
-        );
         program.emit_insn(Insn::Halt {
             err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-            description,
-            on_error,
+            description: format!("{}.{}", ctx.table.name, rowid_column_name),
+            on_error: HaltAction::of_constraint(preflight.effective_on_conflict),
             description_reg: None,
         });
     }
@@ -3297,19 +3313,18 @@ fn emit_unique_index_check(
                 ctx,
                 preflight.table_references,
             )?;
+        } else if matches!(preflight.effective_on_conflict, ResolveType::Ignore) {
+            // No upsert covers this constraint and IGNORE settles it: skip this row.
+            program.emit_insn(Insn::Goto {
+                target_pc: ctx.loop_labels.row_done,
+            });
         } else {
             // No matching UPSERT handler so we emit constraint error
             // (if conflict clause matched - VM will jump to later instructions and skip halt)
-            let raw_desc = format_unique_violation_desc(ctx.table.name.as_str(), index);
-            let (description, on_error) = halt_desc_and_on_error(
-                &raw_desc,
-                preflight.effective_on_conflict,
-                program.flags.has_statement_conflict(),
-            );
             program.emit_insn(Insn::Halt {
                 err_code: SQLITE_CONSTRAINT_UNIQUE,
-                description,
-                on_error,
+                description: format_unique_violation_desc(ctx.table.name.as_str(), index),
+                on_error: HaltAction::of_constraint(preflight.effective_on_conflict),
                 description_reg: None,
             });
         }
@@ -3346,16 +3361,10 @@ fn emit_unique_index_check(
             });
         } else {
             // ABORT/FAIL/ROLLBACK: halt on conflict.
-            let raw_desc = format_unique_violation_desc(ctx.table.name.as_str(), index);
-            let (description, on_error) = halt_desc_and_on_error(
-                &raw_desc,
-                preflight.effective_on_conflict,
-                program.flags.has_statement_conflict(),
-            );
             program.emit_insn(Insn::Halt {
                 err_code: SQLITE_CONSTRAINT_UNIQUE,
-                description,
-                on_error,
+                description: format_unique_violation_desc(ctx.table.name.as_str(), index),
+                on_error: HaltAction::of_constraint(preflight.effective_on_conflict),
                 description_reg: None,
             });
         }
@@ -3665,50 +3674,14 @@ fn ensure_sequence_initialized(
 #[inline]
 /// Build the UNIQUE constraint error description to match sqlite
 /// single column: `t.c1`
-/// multi-column:  `t.(k, c1)`
-/// For constraint-level FAIL/ROLLBACK ON CONFLICT, pre-format the description
-/// and set on_error so the VM's halt() produces Raise(rt, msg) with correct semantics.
-/// `has_statement_conflict` should be true when the statement has its own OR clause
-/// (e.g. INSERT OR FAIL), in which case program.resolve_type already handles it.
-pub(crate) fn halt_desc_and_on_error(
-    raw_desc: &str,
-    effective: ResolveType,
-    has_statement_conflict: bool,
-) -> (String, Option<ResolveType>) {
-    if has_statement_conflict {
-        return (raw_desc.to_string(), None);
-    }
-    match effective {
-        ResolveType::Fail | ResolveType::Rollback => (
-            format!("UNIQUE constraint failed: {raw_desc}"),
-            Some(effective),
-        ),
-        _ => (raw_desc.to_string(), None),
-    }
-}
-
+/// multi-column:  `t.k, t.c1`
 pub fn format_unique_violation_desc(table_name: &str, index: &Index) -> String {
-    if index.columns.len() == 1 {
-        let mut s = String::with_capacity(table_name.len() + 1 + index.columns[0].name.len());
-        s.push_str(table_name);
-        s.push('.');
-        s.push_str(&index.columns[0].name);
-        s
-    } else {
-        let mut s = String::with_capacity(table_name.len() + 3 + 4 * index.columns.len());
-        s.push_str(table_name);
-        s.push_str(".(");
-        s.push_str(
-            &index
-                .columns
-                .iter()
-                .map(|c| c.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
-        s.push(')');
-        s
-    }
+    index
+        .columns
+        .iter()
+        .map(|column| format!("{table_name}.{}", column.name))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn emit_index_column_value_for_insert(
@@ -3798,34 +3771,40 @@ struct PreflightCtx<'a, 'b> {
     table_references: &'b mut TableReferences,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_constraints_to_check(
-    table_name: &str,
+    table: &BTreeTable,
     upsert_actions: &[(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)],
-    has_rowid: bool,
     has_user_provided_rowid: bool,
     resolver: &Resolver,
     database_id: usize,
-    rowid_alias_conflict_clause: Option<ResolveType>,
     has_statement_conflict: bool,
 ) -> ConstraintsToCheck {
+    let rowid_alias_conflict_clause = table.rowid_alias_conflict_clause;
     let mut constraints_to_check = Vec::new();
-    if !has_rowid || has_user_provided_rowid {
-        // Check uniqueness constraint for rowid if it was provided by user.
-        // When the DB allocates it there are no need for separate uniqueness checks.
-        let position = upsert_actions
-            .iter()
-            .position(|(target, ..)| matches!(target, ResolvedUpsertTarget::PrimaryKey));
-        constraints_to_check.push((ResolvedUpsertTarget::PrimaryKey, position));
-    }
     let indices: Vec<_> = resolver.with_schema(database_id, |s| {
-        s.get_indices(table_name).cloned().collect()
+        s.get_indices(&table.name).cloned().collect()
     });
     for index in &indices {
         let position = upsert_actions
             .iter()
             .position(|(target, ..)| matches!(target, ResolvedUpsertTarget::Index(x) if Arc::ptr_eq(x, index)));
         constraints_to_check.push((ResolvedUpsertTarget::Index(index.clone()), position));
+    }
+    if !table.has_rowid || has_user_provided_rowid {
+        // Check uniqueness constraint for rowid if it was provided by user.
+        // When the DB allocates it there are no need for separate uniqueness checks.
+        let position = upsert_actions
+            .iter()
+            .position(|(target, ..)| matches!(target, ResolvedUpsertTarget::PrimaryKey));
+        let place = if table.has_rowid {
+            0
+        } else {
+            indices
+                .iter()
+                .take_while(|index| table.checked_before_primary_key(index))
+                .count()
+        };
+        constraints_to_check.insert(place, (ResolvedUpsertTarget::PrimaryKey, position));
     }
 
     constraints_to_check.sort_by(|(_, p1), (_, p2)| match (p1, p2) {
@@ -3840,6 +3819,7 @@ fn build_constraints_to_check(
     // constraints exist with potentially different modes, the IPK check
     // runs last to avoid premature row deletion before FAIL/IGNORE fires.
     let defer_ipk_replace_after_other_checks = !has_statement_conflict
+        && table.has_rowid
         && rowid_alias_conflict_clause == Some(ResolveType::Replace)
         && constraints_to_check.len() > 1
         && !upsert_actions
@@ -4653,13 +4633,7 @@ fn without_rowid_preflight(
                     ctx.cursor_id,
                     replace_flag,
                 )?),
-                _ => wr::halt_constraint(
-                    program,
-                    ctx.table,
-                    index.map(|i| i.as_ref()),
-                    effective,
-                    false,
-                ),
+                _ => wr::halt_constraint(program, ctx.table, index.map(|i| i.as_ref()), effective),
             }
         }
         program.preassign_label_to_next_insn(ok);

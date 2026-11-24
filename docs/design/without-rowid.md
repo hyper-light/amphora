@@ -66,11 +66,19 @@ it has no rowid to name, so `new.rowid` is \"no such column\".
 - **REPLACE** deletes rows without firing DELETE triggers, as recursive triggers are off
   ([conflict clauses](https://www.sqlite.org/lang_conflict.html)).
 - **Conflict clauses.** A statement's own clause overrides its triggers'; a DO UPDATE's triggers run
-  under ABORT; a DELETE's keep theirs.
+  under ABORT; a DELETE's keep theirs. A foreign key's action is an UPDATE under ABORT, and so is
+  what it fires (fkey.c, `sqlite3FkActions`). What a refused constraint does is its own Halt's
+  (`HaltAction`), so each statement of a trigger's program has its own, and an error no clause is
+  for (a rowid that is no integer, a function's) is under ABORT.
+- **The key's place.** A conflict with the key is met in its place among the table's UNIQUE
+  constraints, the newest first and those under REPLACE last (build.c, `sqlite3CreateIndex`): of two
+  constraints in conflict, the first met is the one whose clause says what happens.
 
-Evidence: `triggers_fire_as_sqlite_fires_them` (`crates/engine/tests/windows_and_triggers.rs`), a
-generated sweep of every event, time and clause on rowid and WITHOUT ROWID tables against SQLite
-3.54.0 (`bench/sqlite_triggers.py`). Falsified by any statement of it whose answer, refusal or rows
+Evidence: `triggers_fire_as_sqlite_fires_them` and
+`a_conflict_is_judged_by_the_clause_of_the_statement_that_meets_it`
+(`crates/engine/tests/windows_and_triggers.rs`), generated sweeps of every event, time and clause on
+rowid and WITHOUT ROWID tables against SQLite 3.54.0 (`bench/sqlite_triggers.py`,
+`bench/sqlite_trigger_conflicts.py`). Falsified by any statement of it whose answer, refusal or rows
 left behind differ, or by a failed `PRAGMA integrity_check` after one.
 
 ## Native primary-root query access

@@ -1,9 +1,10 @@
 //! One PostgreSQL connection as a state machine: the opening (direct TLS, SSLRequest,
-//! GSSENCRequest, CancelRequest, StartupMessage), SCRAM, the session's parameters, and the simple
-//! query loop. [`Session::step`] reads at most one frame from the bytes the caller holds and
+//! GSSENCRequest, CancelRequest, StartupMessage), SCRAM, the session's parameters, and the loop of the
+//! simple and the extended query protocols. [`Session::step`] reads at most one frame from the bytes the caller holds and
 //! appends its answer to the caller's buffer; it allocates nothing the frame's length didn't
 //! bound, and the caller charges a frame's length before holding it ([`Next::Need`]).
 
+use super::extended::{Message, text};
 use super::scram::{self, Binding, ScramSecret, ScramServer};
 use super::wire::{self, Frame, PROTOCOL_3_2, PgError, Reader, SqlState};
 use std::task::{Context, Poll};
@@ -62,8 +63,10 @@ pub enum Next {
     StartDirectTls,
     /// A CancelRequest for another session; this connection then ends with no reply.
     Cancel { process_id: i32, key: Vec<u8> },
+    /// Send what was written, then step again with the rest of the input.
+    Flush,
     /// A statement waits for another session's transaction ([`Session::poll_wait`]): when it has
-    /// ended, [`Session::resume`] the Query.
+    /// ended, [`Session::resume`] the Query or the Execute.
     Wait,
     /// Send what was written, then close.
     Close,
@@ -165,8 +168,15 @@ pub trait Statements {
     /// `lock_timeout` has passed since the wait began: its statement is refused (`55P03`) when it is
     /// resumed.
     fn lock_timed_out(&mut self);
-    /// Runs the rest of the Query a wait stopped.
+    /// Runs the rest of the Query or the Execute a wait stopped.
     fn resume(&mut self, out: &mut Vec<u8>) -> Result<Flow, PgError>;
+    /// Runs a message of the extended protocol and appends what answers it; [`Flow::Refused`] when that
+    /// is an ErrorResponse, after which every message until Sync is skipped.
+    fn extended(&mut self, message: Message<'_>, out: &mut Vec<u8>) -> Result<Flow, PgError>;
+    /// Sync: ends the transaction of the messages before it that no BEGIN made the client's.
+    fn sync(&mut self, out: &mut Vec<u8>) -> Result<(), PgError>;
+    /// Answers with `error` a message that can't be read, and ends what a statement's refusal ends.
+    fn refuse(&mut self, error: &PgError, out: &mut Vec<u8>) -> Result<(), PgError>;
 }
 
 /// PostgreSQL's deadlines of one wait for a lock, from when it began (`ProcSleep`, REL_19_0
@@ -179,11 +189,13 @@ pub struct WaitLimits {
     pub lock: Option<Duration>,
 }
 
-/// How far a Query's statements got.
+/// How far a Query's statements, or a message of the extended protocol, got.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Flow {
     Done,
     Waiting,
+    /// The message of the extended protocol was refused.
+    Refused,
 }
 
 /// What opens a session's database once its role is authenticated, as PostgreSQL's InitPostgres opens
@@ -200,6 +212,8 @@ pub struct Session {
     open: Option<Open>,
     /// What runs its statements: none refuses each with `0A000`.
     statements: Option<Box<dyn Statements>>,
+    /// Whether the message a wait stopped is an Execute, whose end no ReadyForQuery follows.
+    executing: bool,
 }
 
 fn fatal(out: &mut Vec<u8>, consumed: usize, error: &PgError) -> Result<Step, PgError> {
@@ -443,6 +457,7 @@ impl Session {
             refused: None,
             open: None,
             statements: None,
+            executing: false,
         }
     }
 
@@ -860,6 +875,7 @@ impl Session {
             Err(error) => return fatal(out, 0, &error),
         };
         let mut skip = skip_to_sync;
+        let mut next = Next::Continue;
         match tag {
             // Terminate and Sync end a skip to Sync; everything else waits it out
             // (`postgres.c:420-443`, `:4839`).
@@ -876,21 +892,21 @@ impl Session {
                     Ok(sql) => sql,
                     Err(error) => return fatal(out, len, &error),
                 };
-                let answer = utf8(sql)
-                    .map_err(|e| PgError::error(e.code, e.message))
-                    .and_then(|text| empty_query(sql).map(|empty| (text, empty)));
                 let mut waiting = false;
-                match answer {
-                    Ok((_, true)) => wire::message(out, b'I', |_| {})?,
-                    Ok((text, false)) => match &mut self.statements {
-                        Some(statements) => {
-                            waiting = statements.simple_query(text, out)? == Flow::Waiting;
-                        }
-                        None => wire::error_response(out, &not_yet())?,
+                match (text(sql), &mut self.statements) {
+                    (Ok(sql), Some(statements)) => {
+                        waiting = statements.simple_query(sql, out)? == Flow::Waiting;
+                    }
+                    (Err(error), Some(statements)) => statements.refuse(&error, out)?,
+                    (Ok(sql), None) => match empty_query(sql.as_bytes()) {
+                        Ok(true) => wire::message(out, b'I', |_| {})?,
+                        Ok(false) => wire::error_response(out, &not_yet())?,
+                        Err(error) => wire::error_response(out, &error)?,
                     },
-                    Err(error) => wire::error_response(out, &error)?,
+                    (Err(error), None) => wire::error_response(out, &error)?,
                 }
                 if waiting {
+                    self.executing = false;
                     self.phase = Phase::Ready {
                         startup,
                         skip_to_sync: skip,
@@ -907,15 +923,47 @@ impl Session {
                 ready_for_query(out, self.tx_status())?;
             }
             b'P' | b'B' | b'D' | b'E' | b'C' => {
-                wire::error_response(out, &not_yet())?;
-                skip = true;
+                let flow = match (Message::read(tag, body), &mut self.statements) {
+                    (Ok(message), Some(statements)) => statements.extended(message, out)?,
+                    (Err(error), Some(statements)) => {
+                        statements.refuse(&error, out)?;
+                        Flow::Refused
+                    }
+                    (_, None) => {
+                        wire::error_response(out, &not_yet())?;
+                        Flow::Refused
+                    }
+                };
+                skip = flow == Flow::Refused;
+                if flow == Flow::Waiting {
+                    self.executing = true;
+                    next = Next::Wait;
+                }
             }
             b'S' => {
+                match (Reader::new(body).end(), &mut self.statements) {
+                    (Ok(()), Some(statements)) => statements.sync(out)?,
+                    (Err(error), Some(statements)) => {
+                        statements.refuse(&error.of_statement(), out)?;
+                    }
+                    (Ok(()), None) => {}
+                    (Err(error), None) => wire::error_response(out, &error.of_statement())?,
+                }
                 ready_for_query(out, self.tx_status())?;
                 skip = false;
             }
-            // Flush, and copy messages outside a COPY, which PostgreSQL also ignores
-            // (`postgres.c:5098-5108`).
+            b'H' => match Reader::new(body).end() {
+                Ok(()) => next = Next::Flush,
+                Err(error) => {
+                    let error = error.of_statement();
+                    match &mut self.statements {
+                        Some(statements) => statements.refuse(&error, out)?,
+                        None => wire::error_response(out, &error)?,
+                    }
+                    skip = true;
+                }
+            },
+            // Copy messages outside a COPY, which PostgreSQL also ignores (`postgres.c:5098-5108`).
             _ => {}
         }
         self.phase = Phase::Ready {
@@ -924,13 +972,13 @@ impl Session {
         };
         Ok(Step {
             consumed: len,
-            next: Next::Continue,
+            next,
         })
     }
 }
 
 impl Session {
-    /// Ready once the statement the Query stopped at ([`Next::Wait`]) can run again.
+    /// Ready once the statement the Query or the Execute stopped at ([`Next::Wait`]) can run again.
     pub fn poll_wait(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         match &mut self.statements {
             Some(statements) => statements.poll_wait(cx),
@@ -955,8 +1003,8 @@ impl Session {
         }
     }
 
-    /// Goes on with the Query a wait stopped: its messages, and [`Next::Wait`] again if another
-    /// statement of it waits.
+    /// Goes on with the Query or the Execute a wait stopped: its messages, and [`Next::Wait`] again if
+    /// another statement of it, or another row, waits.
     pub fn resume(&mut self, out: &mut Vec<u8>) -> Result<Step, PgError> {
         let flow = match &mut self.statements {
             Some(statements) => statements.resume(out)?,
@@ -968,7 +1016,13 @@ impl Session {
                 next: Next::Wait,
             });
         }
-        ready_for_query(out, self.tx_status())?;
+        if !self.executing {
+            ready_for_query(out, self.tx_status())?;
+        } else if flow == Flow::Refused
+            && let Phase::Ready { skip_to_sync, .. } = &mut self.phase
+        {
+            *skip_to_sync = true;
+        }
         Ok(Step {
             consumed: 0,
             next: Next::Continue,

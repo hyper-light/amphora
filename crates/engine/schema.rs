@@ -3886,8 +3886,7 @@ impl BTreeTable {
                 }
             }
 
-            if column.notnull()
-                && (column.explicit_notnull() || !self.is_without_rowid_inline_pk(column))
+            if column.notnull() && (column.explicit_notnull() || !self.key_implies_notnull(column))
             {
                 sql.push_str(" NOT NULL");
                 push_on_conflict_clause(&mut sql, column.notnull_conflict_clause);
@@ -4084,6 +4083,49 @@ impl BTreeTable {
             .and_then(|unique_set| unique_set.conflict_clause)
     }
 
+    /// Whether a WITHOUT ROWID table's `index` meets a conflict before its primary key does. SQLite
+    /// lists the key with the table's indexes, the newest first and those under REPLACE last
+    /// (`sqlite3CreateIndex`), and makes an INTEGER PRIMARY KEY one of them when it has read the whole
+    /// table (`convertToWithoutRowidTable`).
+    pub(crate) fn checked_before_primary_key(&self, index: &Index) -> bool {
+        let Some(key_at) = self.unique_sets.iter().position(|set| set.is_primary_key) else {
+            return false;
+        };
+        let Some((key, newer)) = self
+            .unique_sets
+            .get(key_at..)
+            .and_then(|sets| sets.split_first())
+        else {
+            return false;
+        };
+        let key_replaces = key.conflict_clause == Some(ResolveType::Replace);
+        if key_replaces != (index.on_conflict == Some(ResolveType::Replace)) {
+            return key_replaces;
+        }
+        if !index
+            .name
+            .starts_with(crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX)
+        {
+            return true;
+        }
+        let integer_key = matches!(
+            key.columns.as_slice(),
+            [only] if only.sort_order == SortOrder::Asc
+                && self
+                    .get_column(&only.name)
+                    .is_some_and(|(_, column)| column.ty_str.eq_ignore_ascii_case("INTEGER"))
+        );
+        !integer_key
+            && newer.iter().any(|set| {
+                set.columns.len() == index.columns.len()
+                    && set
+                        .columns
+                        .iter()
+                        .zip(&index.columns)
+                        .all(|(a, b)| a.name.eq_ignore_ascii_case(&b.name))
+            })
+    }
+
     fn primary_key_conflict_clause(&self) -> Option<ResolveType> {
         self.unique_sets
             .iter()
@@ -4109,8 +4151,10 @@ impl BTreeTable {
             .and_then(|column| column.collation)
     }
 
-    fn is_without_rowid_inline_pk(&self, column: &Column) -> bool {
-        !self.has_rowid && self.primary_key_columns.len() == 1 && column.primary_key()
+    /// Whether the column's NOT NULL is its key's, which a STRICT or a WITHOUT ROWID table's is.
+    fn key_implies_notnull(&self, column: &Column) -> bool {
+        let keyed = self.is_strict || (!self.has_rowid && self.primary_key_columns.len() == 1);
+        keyed && column.primary_key()
     }
 
     pub fn column_collations(&self) -> Result<Vec<CollationSeq>> {
@@ -5483,6 +5527,17 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     unreachable!("PRIMARY KEY column should exist");
                 };
                 table.columns[idx].set_notnull(true);
+            }
+        }
+    } else if table.is_strict {
+        // Amphora: a STRICT table's PRIMARY KEY columns are NOT NULL, but for an INTEGER PRIMARY
+        // KEY, whose NULL is the next rowid (stricttables.html, section 2).
+        let keys = &table.primary_key_columns;
+        for column in table.columns.iter_mut() {
+            let name = column.name.as_deref().unwrap_or_default();
+            let keyed = keys.iter().any(|(key, _)| key.eq_ignore_ascii_case(name));
+            if keyed && !column.is_rowid_alias() {
+                column.set_notnull(true);
             }
         }
     }

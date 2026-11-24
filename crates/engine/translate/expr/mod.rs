@@ -28,7 +28,7 @@ use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::{CursorKey, DmlColumnContext, SelfTableContext};
 use crate::vdbe::{
     builder::ProgramBuilder,
-    insn::{CmpInsFlags, InsertFlags, Insn},
+    insn::{CmpInsFlags, HaltAction, InsertFlags, Insn},
     BranchOffset, CursorID,
 };
 use crate::{LimboError, Numeric, Result, Value};

@@ -14,12 +14,17 @@ use crate::translate::fkeys::{
     affected_parent_fks_for_update, emit_fk_child_update_counters, emit_fk_update_parent_actions,
     fire_fk_update_actions, ParentKeyNewProbeMode,
 };
-use crate::translate::insert::{format_unique_violation_desc, InsertEmitCtx};
-use crate::translate::plan::ColumnMask;
-use crate::translate::planner::ROWID_STRS;
-use crate::translate::trigger_exec::{
-    fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
+use crate::translate::insert::{
+    expr_contains_subquery, format_unique_violation_desc, InsertEmitCtx,
 };
+use crate::translate::plan::{ColumnMask, NonFromClauseSubquery};
+use crate::translate::planner::ROWID_STRS;
+use crate::translate::subquery::plan_subqueries_from_row_writes;
+use crate::translate::trigger_exec::{
+    fire_trigger, get_triggers_including_temp, has_triggers_including_temp,
+    rewrite_select_expressions, TriggerContext,
+};
+use crate::translate::update::split_update_set_values;
 use crate::vdbe::insn::{to_u32, CmpInsFlags};
 use crate::{
     bail_parse_error,
@@ -39,7 +44,7 @@ use crate::{
     util::{exprs_are_equivalent, normalize_ident},
     vdbe::{
         affinity::Affinity,
-        builder::{DmlColumnContext, ProgramBuilder},
+        builder::{CursorKey, DmlColumnContext, ProgramBuilder},
         insn::{IdxInsertFlags, InsertFlags, Insn},
     },
 };
@@ -465,6 +470,249 @@ pub fn resolve_upsert_target(
     );
 }
 
+/// Amphora: the subqueries of a DO UPDATE's WHERE and SET (lang_upsert.html). They read the
+/// conflicting row as the target table, outside their own FROM, and `excluded.*` from the registers
+/// of the row to insert.
+#[derive(Default)]
+pub(crate) struct DoUpdateSubqueries {
+    target: Option<ast::TableInternalId>,
+    predicate: RowSubqueries,
+    sets: RowSubqueries,
+}
+
+/// Each subquery beside whether it reads the row to insert, which is another at each conflict: what
+/// ran once within it then runs again.
+#[derive(Default)]
+struct RowSubqueries {
+    planned: Vec<(NonFromClauseSubquery, bool)>,
+}
+
+impl DoUpdateSubqueries {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn plan(
+        program: &mut ProgramBuilder,
+        resolver: &Resolver,
+        connection: &Arc<Connection>,
+        ctx: &InsertEmitCtx,
+        insertion: &Insertion,
+        scope: &TableReferences,
+        alias: Option<&str>,
+        sets: &mut [ast::Set],
+        predicate: &mut Option<Box<ast::Expr>>,
+    ) -> crate::Result<Self> {
+        let mut subqueries = Self::default();
+        let exprs = sets.iter().map(|set| &set.expr).chain(predicate.iter());
+        // A custom type's excluded values are stored ones here, which no subquery can read yet: its
+        // subqueries stay unplanned, and are refused where they are translated.
+        let encoded = ctx.table.is_strict
+            && super::without_rowid::has_encoded_columns(ctx.table, resolver, ctx.database_id);
+        if encoded || !exprs.into_iter().any(|expr| expr_contains_subquery(expr)) {
+            return Ok(subqueries);
+        }
+        let mut target = scope.joined_tables().first().cloned().ok_or_else(|| {
+            crate::LimboError::InternalError("an UPSERT without its target table".into())
+        })?;
+        target.internal_id = program.table_reference_counter.next();
+        target.identifier = normalize_ident(alias.unwrap_or(&ctx.table.name));
+        target.col_used_mask = Default::default();
+        subqueries.target = Some(target.internal_id);
+        let excluded = |name: &str| -> crate::Result<ast::Expr> {
+            let name = normalize_ident(name);
+            let register = match insertion.get_col_mapping_by_name(&name) {
+                Some(mapping) if !mapping.column.is_rowid_alias() => mapping.register,
+                None if !(ctx.table.has_rowid
+                    && ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&name))) =>
+                {
+                    bail_parse_error!("no such column: excluded.{}", name)
+                }
+                _ => insertion.key_register(),
+            };
+            Ok(ast::Expr::Register(register))
+        };
+        // The target's alias takes its name's place, and the name `excluded` if it is that.
+        let shadowed = target.identifier == EXCLUDED;
+        let mut tables = TableReferences::new(vec![target], scope.outer_query_refs().to_vec());
+        for (exprs, RowSubqueries { planned }) in [
+            (
+                predicate.iter_mut().collect::<Vec<_>>(),
+                &mut subqueries.predicate,
+            ),
+            (
+                sets.iter_mut().map(|set| &mut set.expr).collect(),
+                &mut subqueries.sets,
+            ),
+        ] {
+            for expr in exprs {
+                walk_expr_mut(expr, &mut |node| {
+                    if subquery_of(node).is_none() {
+                        return Ok(WalkControl::Continue);
+                    }
+                    let mut reads_excluded = false;
+                    if !shadowed {
+                        walk_expr_mut(node, &mut |node| {
+                            if let Some(select) = subquery_of(node) {
+                                rewrite_excluded(select, &excluded, &mut reads_excluded)?;
+                            }
+                            Ok(WalkControl::Continue)
+                        })?;
+                    }
+                    let mut found = Vec::new();
+                    plan_subqueries_from_row_writes(
+                        program,
+                        &mut found,
+                        &mut tables,
+                        &mut [node],
+                        resolver,
+                        connection,
+                    )?;
+                    // What reads the row to insert runs for each, as what reads the conflicting row.
+                    planned.extend(found.into_iter().map(|mut subquery| {
+                        subquery.correlated |= reads_excluded;
+                        (subquery, reads_excluded)
+                    }));
+                    Ok(WalkControl::SkipChildren)
+                })?;
+            }
+        }
+        for set in sets.iter_mut() {
+            let mut value = set.expr.as_ref();
+            while let ast::Expr::Parenthesized(inner) = value {
+                let [one] = inner.as_slice() else {
+                    break;
+                };
+                value = one;
+            }
+            if matches!(
+                value,
+                ast::Expr::SubqueryResult {
+                    query_type: ast::SubqueryType::RowValue { .. },
+                    ..
+                }
+            ) {
+                let values = split_update_set_values(value.clone(), set.col_names.len())?;
+                *set.expr = ast::Expr::Parenthesized(values.into_iter().map(Box::new).collect());
+            }
+        }
+        Ok(subqueries)
+    }
+
+    /// Emits `read`, which reads the WHERE's subqueries.
+    pub(crate) fn read_predicate<T>(
+        &mut self,
+        program: &mut ProgramBuilder,
+        resolver: &Resolver,
+        ctx: &InsertEmitCtx,
+        read: impl FnOnce(&mut ProgramBuilder) -> crate::Result<T>,
+    ) -> crate::Result<T> {
+        self.predicate
+            .read(self.target, program, resolver, ctx, read)
+    }
+
+    /// Emits `read`, which reads the SET's subqueries.
+    pub(crate) fn read_sets<T>(
+        &mut self,
+        program: &mut ProgramBuilder,
+        resolver: &Resolver,
+        ctx: &InsertEmitCtx,
+        read: impl FnOnce(&mut ProgramBuilder) -> crate::Result<T>,
+    ) -> crate::Result<T> {
+        self.sets.read(self.target, program, resolver, ctx, read)
+    }
+}
+
+impl RowSubqueries {
+    fn read<T>(
+        &mut self,
+        target: Option<ast::TableInternalId>,
+        program: &mut ProgramBuilder,
+        resolver: &Resolver,
+        ctx: &InsertEmitCtx,
+        read: impl FnOnce(&mut ProgramBuilder) -> crate::Result<T>,
+    ) -> crate::Result<T> {
+        let (Some(target), false) = (target, self.planned.is_empty()) else {
+            return read(program);
+        };
+        // The cursor stands on the conflicting row.
+        let row = [(CursorKey::table(target), ctx.cursor_id)];
+        program.with_cursor_overrides(&row, |program| {
+            for (subquery, reads_excluded) in &mut self.planned {
+                let end = program.allocate_label();
+                if *reads_excluded {
+                    program.emit_insn(Insn::ResetOnce { region_end: end });
+                }
+                super::without_rowid::emit_write_subqueries(
+                    program,
+                    resolver,
+                    std::slice::from_mut(subquery),
+                    false,
+                    ctx.database_id,
+                    &ctx.table.name,
+                )?;
+                program.preassign_label_to_next_insn(end);
+            }
+            read(program)
+        })
+    }
+}
+
+/// The name by which a DO UPDATE reads the row that was to be inserted.
+const EXCLUDED: &str = "excluded";
+
+fn subquery_of(expr: &mut ast::Expr) -> Option<&mut ast::Select> {
+    match expr {
+        ast::Expr::Exists(select)
+        | ast::Expr::Subquery(select)
+        | ast::Expr::InSelect { rhs: select, .. } => Some(select),
+        _ => None,
+    }
+}
+
+/// Puts `excluded`'s registers in the place of `excluded.*` in a DO UPDATE's subquery, but where
+/// its own FROM names a table so.
+fn rewrite_excluded(
+    select: &mut ast::Select,
+    excluded: &impl Fn(&str) -> crate::Result<ast::Expr>,
+    found: &mut bool,
+) -> crate::Result<()> {
+    let arms = std::iter::once(&select.body.select)
+        .chain(select.body.compounds.iter().map(|arm| &arm.select));
+    for arm in arms {
+        let ast::OneSelect::Select {
+            from: Some(from), ..
+        } = arm
+        else {
+            continue;
+        };
+        let tables = std::iter::once(&*from.select).chain(from.joins.iter().map(|j| &*j.table));
+        for table in tables {
+            let name = match table {
+                ast::SelectTable::Table(name, alias, _)
+                | ast::SelectTable::TableCall(name, _, alias) => {
+                    Some(alias.as_ref().map_or(&name.name, |alias| alias.name()))
+                }
+                ast::SelectTable::Select { alias, .. } | ast::SelectTable::Sub(_, alias) => {
+                    alias.as_ref().map(|alias| alias.name())
+                }
+            };
+            if name.is_some_and(|name| name.as_str().eq_ignore_ascii_case(EXCLUDED)) {
+                return Ok(());
+            }
+        }
+    }
+    rewrite_select_expressions(select, &mut |expr| {
+        if let Some(inner) = subquery_of(expr) {
+            return rewrite_excluded(inner, excluded, found);
+        }
+        if let ast::Expr::Qualified(table, column) = expr {
+            if table.as_str().eq_ignore_ascii_case(EXCLUDED) {
+                *expr = excluded(column.as_str())?;
+                *found = true;
+            }
+        }
+        Ok(())
+    })
+}
+
 /// Emit the bytecode to implement the `DO UPDATE` arm of an UPSERT.
 ///
 /// This routine is entered after the caller has determined that an INSERT
@@ -500,6 +748,7 @@ pub fn emit_upsert(
     connection: &Arc<Connection>,
     table_references: &mut TableReferences,
     table_alias: Option<&str>,
+    subqueries: &mut DoUpdateSubqueries,
 ) -> crate::Result<()> {
     if !ctx.table.has_rowid {
         return super::without_rowid::emit_upsert(
@@ -514,6 +763,7 @@ pub fn emit_upsert(
             connection,
             table_references,
             table_alias,
+            subqueries,
         );
     }
     // Seek & snapshot CURRENT
@@ -666,7 +916,9 @@ pub fn emit_upsert(
             &layout,
         )?;
         let pr = program.alloc_register();
-        translate_expr(program, None, pred, pr, resolver)?;
+        subqueries.read_predicate(program, resolver, ctx, |program| {
+            translate_expr(program, None, pred, pr, resolver)
+        })?;
         program.emit_insn(Insn::IfNot {
             reg: pr,
             target_pc: ctx.loop_labels.row_done,
@@ -676,61 +928,65 @@ pub fn emit_upsert(
 
     // Apply SET; capture rowid change if any
     let mut new_rowid_reg: Option<usize> = None;
-    for (col_idx, expr) in set_pairs.iter_mut() {
-        rewrite_expr_to_registers(
-            expr,
-            table,
-            expr_current_start,
-            ctx.conflict_rowid_reg,
-            Some(table.get_name()),
-            table_alias,
-            Some(insertion),
-            true,
-            excluded_decoded_start,
-            &layout,
-        )?;
-        // Save/restore target_union_type so union_value() resolves tags
-        // against this column's union type. See ProgramBuilder::target_union_type.
-        let col = &table.columns()[*col_idx];
-        let union_td = resolver
-            .schema()
-            .get_type_def_unchecked(&col.ty_str)
-            .filter(|td| td.is_union())
-            .cloned();
-        let prev_union = program.target_union_type.take();
-        program.target_union_type = union_td;
-        let translate_result = translate_expr_no_constant_opt(
-            program,
-            None,
-            expr,
-            layout.to_register(new_start, *col_idx),
-            resolver,
-            NoConstantOptReason::RegisterReuse,
-        );
-        program.target_union_type = prev_union;
-        translate_result?;
-        if col.notnull() && !col.is_rowid_alias() {
-            program.emit_insn(Insn::HaltIfNull {
-                target_reg: layout.to_register(new_start, *col_idx),
-                err_code: SQLITE_CONSTRAINT_NOTNULL,
-                description: String::from(table.get_name()) + "." + col.name.as_ref().unwrap(),
-            });
+    subqueries.read_sets(program, resolver, ctx, |program| {
+        for (col_idx, expr) in set_pairs.iter_mut() {
+            rewrite_expr_to_registers(
+                expr,
+                table,
+                expr_current_start,
+                ctx.conflict_rowid_reg,
+                Some(table.get_name()),
+                table_alias,
+                Some(insertion),
+                true,
+                excluded_decoded_start,
+                &layout,
+            )?;
+            // Save/restore target_union_type so union_value() resolves tags
+            // against this column's union type. See ProgramBuilder::target_union_type.
+            let col = &table.columns()[*col_idx];
+            let union_td = resolver
+                .schema()
+                .get_type_def_unchecked(&col.ty_str)
+                .filter(|td| td.is_union())
+                .cloned();
+            let prev_union = program.target_union_type.take();
+            program.target_union_type = union_td;
+            let translate_result = translate_expr_no_constant_opt(
+                program,
+                None,
+                expr,
+                layout.to_register(new_start, *col_idx),
+                resolver,
+                NoConstantOptReason::RegisterReuse,
+            );
+            program.target_union_type = prev_union;
+            translate_result?;
+            if col.notnull() && !col.is_rowid_alias() {
+                program.emit_insn(Insn::HaltIfNull {
+                    target_reg: layout.to_register(new_start, *col_idx),
+                    err_code: SQLITE_CONSTRAINT_NOTNULL,
+                    on_error: None,
+                    description: String::from(table.get_name()) + "." + col.name.as_ref().unwrap(),
+                });
+            }
+            if col.is_rowid_alias() {
+                // Must be integer; remember the NEW rowid value
+                let r = program.alloc_register();
+                program.emit_insn(Insn::Copy {
+                    src_reg: layout.to_register(new_start, *col_idx),
+                    dst_reg: r,
+                    extra_amount: 0,
+                });
+                program.emit_insn(Insn::MustBeInt {
+                    reg: r,
+                    target_pc: None,
+                });
+                new_rowid_reg = Some(r);
+            }
         }
-        if col.is_rowid_alias() {
-            // Must be integer; remember the NEW rowid value
-            let r = program.alloc_register();
-            program.emit_insn(Insn::Copy {
-                src_reg: layout.to_register(new_start, *col_idx),
-                dst_reg: r,
-                extra_amount: 0,
-            });
-            program.emit_insn(Insn::MustBeInt {
-                reg: r,
-                target_pc: None,
-            });
-            new_rowid_reg = Some(r);
-        }
-    }
+        Ok(())
+    })?;
 
     if let Some(bt) = table.btree() {
         if bt.is_strict {
@@ -741,7 +997,6 @@ pub fn emit_upsert(
                 start_reg: new_start,
                 count: layout.num_non_virtual_cols(),
                 check_generated: false,
-                check_null_keys: true,
                 table_reference: BTreeTable::input_type_check_table_ref(
                     &bt,
                     resolver.schema(),
@@ -801,7 +1056,6 @@ pub fn emit_upsert(
                 start_reg: new_start,
                 count: bt.columns().len(),
                 check_generated: true,
-                check_null_keys: true,
                 table_reference: BTreeTable::type_check_table_ref(&bt, resolver.schema()),
             });
         }
