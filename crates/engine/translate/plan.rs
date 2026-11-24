@@ -15,7 +15,7 @@ use crate::{
         },
         expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
-        planner::determine_where_to_eval_term,
+        planner::{determine_where_to_eval_term, CteDefinition},
     },
     types::SeekOp,
     util::exprs_are_equivalent,
@@ -1821,7 +1821,7 @@ pub struct TablePlanEstimate {
 /// A WITH clause and the names that the queries around it let its CTEs' bodies read.
 #[derive(Debug)]
 pub struct CteWith {
-    pub(super) definitions: Arc<Vec<CteDefinition>>,
+    pub(super) definitions: crate::sync::Arc<Vec<CteDefinition>>,
     pub(super) outer_query_refs: Vec<OuterQueryReference>,
 }
 
@@ -1830,7 +1830,7 @@ pub struct CteWith {
 /// of its own.
 #[derive(Debug, Clone)]
 pub struct CteScope {
-    pub(super) with: Arc<CteWith>,
+    pub(super) with: crate::sync::Arc<CteWith>,
     /// The CTE's place in its WITH clause.
     pub(super) index: usize,
     /// The CTE is read by another of its WITH clause, whose own uses of it share the entry's plan:
