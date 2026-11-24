@@ -1478,6 +1478,8 @@ fixes), 8c4f29fa (the fence's own test and comments), and the merges of main 67c
 | r1145 | 8c4f29fa (eb0c360d plus the fence's test) | `cpus=4,mem=12g`, 49 to 58, 08:05Z to 08:09Z | all exit 0: `backup::` 41 passed; tests/backup.rs 29 passed, 0 failed, 1 ignored in 36 s; store 17; power cut 1; `d45_` 23; clippy 41 s; check-production 62 s, 10617 |
 | r1199 | ecaee231, landed (main b4ad7122 merged) | `cpus=2,mem=8g`, 64 to 79, 08:11Z to 08:18Z | all exit 0: fmt; `backup::` 41 passed; tests/backup.rs 29 passed, 0 failed, 1 ignored in 45 s; store 17; power cut 1; `d45_` 23; clippy `-p amphora -p amphora-engine --all-targets --locked -D warnings` 81 s ("Checking amphora-engine"); check-production 76 s ("Compiling amphora-engine" twice, 10617) |
 
+| after | 4931c0b1, main itself with lanes A26 and C7 landed on top | `cpus=4,mem=12g`, 46 to 57, 08:28Z to 08:30Z | fmt 0; `backup::` 41 passed; tests/backup.rs 29 passed, 0 failed, 1 ignored in 36 s; store 17; power cut 1 (clippy and check-production not run again) |
+
 Refused for room: `cpus=8` at 08:05Z and 08:10Z, then 4, 3 and 2 until 08:11Z (0 to 3 of 32 cores idle).
 
 **Each assertion is red without its part of the fix** (r1265, adacachy2, `cpus=2,mem=8g`, load 52 to 67, 08:21Z to 08:27Z, on the landed
