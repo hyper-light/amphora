@@ -1665,7 +1665,10 @@ and the rule in replication.md. Then the replicated suites three rounds and the 
    taking the barrier-phase branch (deadline passed, term 1 and leader 1 unchanged, not leading) and `Actor::close`
    past its checks (term 1/1, leader 1/1), and no error from its replica's `read`; yet the pump saw no read-marked
    ReadIndex from member 3. hyper-raft's follower forwards a ReadIndex as it comes (`step_follower`, `forward`), so
-   the stop is between the replica's accepted read and the wire; not found in this hour.
+   the stop is between the replica's accepted read and the wire. r37 (79fd65c8, cpus=2, 02:41Z) printed every
+   message member 3 sent through the pump and the close's result: `Actor::close`'s read returned Ok, and member 3
+   sent nothing at all in the rounds after it, so the close is held inside member 3 (its replica's drive or its
+   owner's release), not lost on the way. Not found further in this hour.
 3. **Time lost to the platform.** The coordinator's kiln restarted twice and stopped this session (about 02:01Z and
    02:18Z), kiln's server was unreachable for 5 of this lane's run requests, and adacachy2 refused cpus=8 once and
    cpus=4 once (3 of 32 cores idle), so runs went at cpus=4 and cpus=2.
@@ -1696,6 +1699,7 @@ leader's write Ok, one slot ended `released` and none `expired`, `Driven::lapses
 | r3, 02:33Z, cpus=4, load 19 to 44 | 6adfa5f8 on main (floor session first) | Timeout as expected; member 3 closed false, slot still member 3's |
 | r3 | ba2b2351 red | the same |
 | r19, 02:37Z, cpus=2, load 66 | 193ff5dc (6adfa5f8 with `eprintln` in `expire`, `close`, `prepare_barrier`) | `expire id=3 phase_barrier=true expired=true changed_term=false leader=1 is_leader=false`; `close id=3 term=1/1 leader=1/1 is_leader=false`; no close counted |
+| r37, 02:41Z, cpus=2, load 63 | 79fd65c8 (r19's, and every message member 3 sends, and the close's read) | `close read Ok(())`; no message from member 3 reached the pump after it |
 
 The other slot tests ran beside it in r3: `database::slot::`, `v14_a_slow_live_holder_keeps_its_slot_past_the_election_timeout`
 and `a_slot_holder_whose_write_fails_ends_its_slot_without_waiting_its_length` passed on main's arm (17 passed, the
@@ -1732,4 +1736,4 @@ designs for a bound are in replication.md ("What bounds a lost forward"); neithe
     cargo test -p amphora --lib --locked --no-run    # each arm in turn, the binary kept as ~/.cache/amphora-perf-bin/commits/v15-tests-<sha>
     v15-tests-<sha> --test-threads=4 v15_a_write database::slot:: v14_a_slow a_slot_holder_whose_write_fails
     v15-tests-d64cff0b --ignored --nocapture --test-threads=1 v15_stages    # r65, gap 2's stages
-    v15-tests-193ff5dc --test-threads=1 --nocapture v15_a_write             # r19, gap 1's trace
+    v15-tests-193ff5dc --test-threads=1 --nocapture v15_a_write             # r19, gap 1's trace (r37: 79fd65c8)
