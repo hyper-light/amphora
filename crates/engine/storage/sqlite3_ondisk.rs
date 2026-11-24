@@ -1610,7 +1610,7 @@ impl BuildSharedWal {
                 durable: SpinLock::new(None),
                 legacy_durable_allowed: true,
                 format: AtomicU32::new(packed::PAGE_FORMAT),
-                records: Arc::new(SpinLock::new(Records::default())),
+                records: Arc::new(RwLock::new(Records::default())),
                 changes: SpinLock::new(ChangeLog::default()),
                 #[cfg(test)]
                 frames_compared: AtomicU64::new(0),
@@ -2113,7 +2113,7 @@ impl StreamingWalReader {
         wfs.runtime.read_index.invalidate();
         // Amphora: a packed generation's records, known before their pages map to them.
         if !state.pending_records.is_empty() {
-            let mut records = wfs.runtime.records.lock();
+            let mut records = wfs.runtime.records.write();
             for (head, slots) in state.pending_records.drain(..) {
                 records.publish(head, slots);
             }
@@ -2155,7 +2155,7 @@ impl StreamingWalReader {
                 frames.retain(|&f| f <= max_frame);
             }
             frame_cache.retain(|_, frames| !frames.is_empty());
-            wfs.runtime.records.lock().drop_after(max_frame);
+            wfs.runtime.records.write().drop_after(max_frame);
             let header = wfs.metadata.wal_header.lock();
             wfs.runtime.overflow_fallback_coverage.lock().record(
                 header.checkpoint_seq,
