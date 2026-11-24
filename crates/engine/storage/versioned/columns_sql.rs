@@ -111,6 +111,7 @@ pub struct CopyCounts {
     pub skipped_body: u64,
     pub skipped_join: u64,
     pub skipped_transaction: u64,
+    pub skipped_defaults: u64,
     /// Statements on a table with a copy, at a snapshot no generation of it answers exactly (none
     /// made yet, made after it, or behind there): the rows answered (lane colcopy-10, AC-CB.4.7).
     pub unserved: u64,
@@ -123,6 +124,7 @@ impl CopyCounts {
             .saturating_add(self.skipped_body)
             .saturating_add(self.skipped_join)
             .saturating_add(self.skipped_transaction)
+            .saturating_add(self.skipped_defaults)
     }
 
     /// Whether the statements between `before` and `self` were all handed over and none was
@@ -146,6 +148,8 @@ pub enum Skip {
     /// In a transaction that changed rows: the copy holds commits alone. (A transaction that
     /// only reads reads the copy at its own snapshot, lane colcopy-10.)
     Transaction,
+    /// Short records need the added columns' defaults from the row loop.
+    Defaults,
 }
 
 impl Skip {
@@ -156,6 +160,7 @@ impl Skip {
             Skip::Body => "body",
             Skip::Join => "join",
             Skip::Transaction => "transaction",
+            Skip::Defaults => "defaults",
         }
     }
 }
@@ -497,6 +502,7 @@ impl Copies {
                 Some(Skip::Body) => &mut c.skipped_body,
                 Some(Skip::Join) => &mut c.skipped_join,
                 Some(Skip::Transaction) => &mut c.skipped_transaction,
+                Some(Skip::Defaults) => &mut c.skipped_defaults,
             };
             *n = n.saturating_add(1);
         }
@@ -689,17 +695,27 @@ impl Rows for At<'_> {
 }
 
 /// A SQL table's rows: record payloads, an INTEGER PRIMARY KEY's column (stored as NULL) read
-/// from the row's key, as the executor's scan hook reads it.
-struct SqlRows {
+/// from the row's key, as the executor's scan hook reads it; an INTEGER in a column of REAL
+/// affinity read as a REAL, as the serial loop's `RealAffinity` makes it (lane R10). Both come
+/// from the table's schema, so the blocks a copy caches decode alike for every statement.
+struct SqlRows<'a> {
     rowid_alias: Option<usize>,
+    reals: &'a [usize],
 }
 
-impl Decode for SqlRows {
+impl Decode for SqlRows<'_> {
     fn decode(&self, key: &[u8], row: &[u8], out: &mut Vec<Cell>) -> Result<()> {
         Records.decode(key, row, out)?;
         if let Some(at) = self.rowid_alias {
             if let Some(cell) = out.get_mut(at) {
                 *cell = Cell::Int(key_rowid(key)?);
+            }
+        }
+        for at in self.reals {
+            if let Some(cell) = out.get_mut(*at) {
+                if let Cell::Int(i) = *cell {
+                    *cell = Cell::Real(i as f64);
+                }
             }
         }
         Ok(())
@@ -712,6 +728,7 @@ impl Decode for SqlRows {
 struct OnCores<'a> {
     cache: &'a Cache,
     mode: ParallelMode,
+    sums: crate::RealSums,
     costs: &'a Mutex<Option<MachineCosts>>,
     budget: &'a MemoryBudget,
     declined: std::cell::Cell<bool>,
@@ -736,6 +753,15 @@ impl<B: Block> CopyScan<B> for OnCores<'_> {
         if let Some(kind) = sums_text(q, &granules) {
             self.declined.set(true);
             return Err(morsel(MorselError::Unsupported { kind }));
+        }
+        // A REAL to sum (lane R10): the copy's sum is exact and rounded once, `RealSums::Exact`'s
+        // answer. Under the others the sum is SQLite's compensated one in row order, which the
+        // serial loop takes, as the morsels' workers hand it back (`no_real_outputs`).
+        if self.sums != crate::RealSums::Exact && sums_real(q, &granules) {
+            self.declined.set(true);
+            return Err(morsel(MorselError::Unsupported {
+                kind: "a REAL to sum outside RealSums::Exact",
+            }));
         }
         let built = granules
             .iter()
@@ -785,6 +811,25 @@ fn sums_text(q: &Query, granules: &[Placed]) -> Option<&'static str> {
                         Cell::Blob(_) => Some("BLOB"),
                         _ => None,
                     }),
+                })
+        })
+}
+
+/// Whether a column `q` sums holds a REAL in any granule.
+fn sums_real(q: &Query, granules: &[Placed]) -> bool {
+    q.aggs
+        .iter()
+        .filter_map(|a| match a {
+            Agg::Sum(c) => Some(*c),
+            _ => None,
+        })
+        .any(|c| {
+            granules
+                .iter()
+                .any(|p| match p.granule.columns.get(c).map(|v| &v.data) {
+                    Some(Data::Real(_)) => true,
+                    Some(Data::Mixed(cells)) => cells.iter().any(|v| matches!(v, Cell::Real(_))),
+                    _ => false,
                 })
         })
 }
@@ -874,16 +919,12 @@ pub(crate) fn aggregate(
     connection: &crate::Connection,
     statement_memory: usize,
 ) -> Result<Handed> {
-    // A column with a default a short row reads: the copy decodes the records as written, so the
-    // serial loop reads the rows (lane qs6-17; the copy's own padding is open, executor.md 8).
-    if !data.defaults.is_empty() {
-        return Ok(Handed::Rows(None));
-    }
     let storage = switch.storage();
     let copies = &storage.copies;
     // A statement no copy can answer reads the rows, counted with its reason (lane colcopy-9,
     // AC-CB.4.6) so an A/B can leave it out: it reads the rows under either rebuy policy.
     let skip = match &data.body {
+        _ if !data.defaults.is_empty() => Some(Skip::Defaults),
         Some(body) if !body.simple && body.rows => Some(Skip::Rows),
         Some(body) if !body.simple => Some(Skip::Body),
         _ if !data.joins.is_empty() => Some(Skip::Join),
@@ -997,12 +1038,14 @@ fn read(
             let scan = OnCores {
                 cache: &copy.cache,
                 mode: connection.parallel_mode(),
+                sums: connection.real_sums(),
                 costs: &connection.morsel_costs,
                 budget: &budget,
                 declined: std::cell::Cell::new(false),
             };
             let dec = SqlRows {
                 rowid_alias: data.rowid_alias,
+                reals: &data.reals,
             };
             match columns_path::aggregate_on_copy(
                 &copy.columns,
@@ -1228,6 +1271,26 @@ mod tests {
     }
 
     use crate::storage::versioned::columns_ab::QUERIES;
+
+    /// AC-CB.4.6, T-QT.6.29: a short row reads its added column's default and the
+    /// statement counts as one handing to the copies that only the rows could answer.
+    #[test]
+    fn a_default_read_is_counted_when_the_copy_defers_to_the_rows() {
+        let (_db, conn) = connect();
+        create(&conn, "CREATE TABLE t(id INTEGER PRIMARY KEY)", true);
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("ALTER TABLE t ADD COLUMN v INTEGER DEFAULT 7")
+            .unwrap();
+        let before = copies(&conn).counts();
+        assert_eq!(
+            rows(&conn, "SELECT sum(v) FROM t"),
+            vec![vec![Value::from_i64(7)]]
+        );
+        let after = copies(&conn).counts();
+        assert_eq!(after.handed - before.handed, 1);
+        assert_eq!(after.skipped() - before.skipped(), 1);
+        assert_eq!(after.skipped_defaults - before.skipped_defaults, 1);
+    }
 
     /// Do: the same table on two versioned storages, one with the column copies' switch on; the
     /// analytic statements (filters, aggregates, GROUP BY) on both, with inserts, updates and
@@ -1499,6 +1562,371 @@ mod tests {
         );
     }
 
+    /// Lane R10: REAL columns through the copies, with SQLite's answers. Do: a table with an
+    /// INTEGER column `q` holding stray REALs (2.5, f64::MAX twice, -0.0) and a REAL column `p`
+    /// holding whole-number REALs (stored as integers), halves, -0.0, both f64::MAX, the least
+    /// subnormal, 2^53 + 1 and i64's ends as integers (read as their nearest doubles), a text and
+    /// NULL; declared `COLUMNAR` and not, and on the pager's storage; each statement bound as
+    /// `bench/sqlite_answers_r10.py` binds it, one worker and then the
+    /// workers the switch picks, three runs each, under `RealSums::Serial`. Expect: every answer
+    /// bit for bit the one that script printed from SQLite 3.54.0, on both tables; the statements
+    /// handed to the copies, none skipped as `body`, and the copy reading some.
+    #[test]
+    fn r10_real_columns_reach_the_copies_with_sqlites_answers() {
+        trace();
+        let (_a, on) = connect();
+        let (_b, off) = connect();
+        // The pager's storage, whose scan hook reads the rows on morsels (`TableSource`).
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let paged_db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let paged = paged_db.connect(ConnectOpts::new()).unwrap();
+        for (c, declared) in [(&on, true), (&off, false), (&paged, false)] {
+            create(
+                c,
+                "CREATE TABLE r (id INTEGER PRIMARY KEY, q INTEGER, p REAL)",
+                declared,
+            );
+            c.execute("INSERT INTO r SELECT value, value % 10, (value % 50) * 0.5 - 5.0 FROM generate_series(1, 600)")
+                .unwrap();
+            c.execute("INSERT INTO r VALUES (601, 7, -0.0), (602, 7, 1.7976931348623157e308), (603, 7, -1.7976931348623157e308), \
+                 (604, 7, 4.9406564584124654e-324), (605, 7, 9007199254740993), (606, 7, 9223372036854775807), \
+                 (607, 2.5, 1.0), (608, 1.7976931348623157e308, 2.0), (609, 1.7976931348623157e308, 3.0), \
+                 (610, NULL, NULL), (611, -9223372036854775808, -9223372036854775808), (612, 7, 'abc'), (613, -0.0, 4.0)")
+                .unwrap();
+        }
+        let sql = [
+            "SELECT COUNT(*) FROM r WHERE p < ?",
+            "SELECT COUNT(*) FROM r WHERE p >= ?",
+            "SELECT COUNT(*) FROM r WHERE p = ?",
+            "SELECT COUNT(*) FROM r WHERE ? <> p",
+            "SELECT COUNT(*) FROM r WHERE q = ? AND p < ?",
+            "SELECT SUM(q), COUNT(q), MIN(q), MAX(q) FROM r WHERE p > ?",
+            "SELECT SUM(q), COUNT(*) FROM r WHERE p < ?",
+        ];
+        let sqlite: Vec<(usize, Vec<Value>, &str)> = vec![
+            (0, vec![Value::from_i64(500)], "i608"),
+            (
+                0,
+                vec![Value::from_f64(f64::from_bits(0x407f400000000000))],
+                "i608",
+            ),
+            (0, vec![Value::from_i64(0)], "i122"),
+            (
+                0,
+                vec![Value::from_f64(f64::from_bits(0x8000000000000000))],
+                "i122",
+            ),
+            (
+                0,
+                vec![Value::from_f64(f64::from_bits(0x0000000000000000))],
+                "i122",
+            ),
+            (0, vec![Value::from_i64(-5)], "i2"),
+            (
+                0,
+                vec![Value::from_f64(f64::from_bits(0x7fefffffffffffff))],
+                "i610",
+            ),
+            (
+                0,
+                vec![Value::from_f64(f64::from_bits(0xffefffffffffffff))],
+                "i0",
+            ),
+            (0, vec![Value::from_i64(9007199254740992)], "i608"),
+            (0, vec![Value::from_i64(9007199254740993)], "i609"),
+            (0, vec![Value::from_i64(9223372036854775807)], "i609"),
+            (0, vec![Value::from_i64(i64::MIN)], "i1"),
+            (0, vec![Value::build_text("500")], "i608"),
+            (0, vec![Value::build_text("1e400")], "i611"),
+            (0, vec![Value::build_text("-0.0")], "i122"),
+            (0, vec![Value::build_text("abc")], "i611"),
+            (0, vec![Value::Null], "i0"),
+            (0, vec![Value::from_blob(vec![1])], "i612"),
+            (
+                0,
+                vec![Value::from_f64(f64::from_bits(0x0000000000000001))],
+                "i135",
+            ),
+            (1, vec![Value::from_i64(500)], "i4"),
+            (
+                1,
+                vec![Value::from_f64(f64::from_bits(0x407f400000000000))],
+                "i4",
+            ),
+            (1, vec![Value::from_i64(0)], "i490"),
+            (
+                1,
+                vec![Value::from_f64(f64::from_bits(0x8000000000000000))],
+                "i490",
+            ),
+            (
+                1,
+                vec![Value::from_f64(f64::from_bits(0x0000000000000000))],
+                "i490",
+            ),
+            (1, vec![Value::from_i64(-5)], "i610"),
+            (
+                1,
+                vec![Value::from_f64(f64::from_bits(0x7fefffffffffffff))],
+                "i2",
+            ),
+            (
+                1,
+                vec![Value::from_f64(f64::from_bits(0xffefffffffffffff))],
+                "i612",
+            ),
+            (1, vec![Value::from_i64(9007199254740992)], "i4"),
+            (1, vec![Value::from_i64(9007199254740993)], "i3"),
+            (1, vec![Value::from_i64(9223372036854775807)], "i3"),
+            (1, vec![Value::from_i64(i64::MIN)], "i611"),
+            (1, vec![Value::build_text("500")], "i4"),
+            (1, vec![Value::build_text("1e400")], "i1"),
+            (1, vec![Value::build_text("-0.0")], "i490"),
+            (1, vec![Value::build_text("abc")], "i1"),
+            (1, vec![Value::Null], "i0"),
+            (1, vec![Value::from_blob(vec![1])], "i0"),
+            (
+                1,
+                vec![Value::from_f64(f64::from_bits(0x0000000000000001))],
+                "i477",
+            ),
+            (2, vec![Value::from_i64(500)], "i0"),
+            (
+                2,
+                vec![Value::from_f64(f64::from_bits(0x407f400000000000))],
+                "i0",
+            ),
+            (2, vec![Value::from_i64(0)], "i13"),
+            (
+                2,
+                vec![Value::from_f64(f64::from_bits(0x8000000000000000))],
+                "i13",
+            ),
+            (
+                2,
+                vec![Value::from_f64(f64::from_bits(0x0000000000000000))],
+                "i13",
+            ),
+            (2, vec![Value::from_i64(-5)], "i12"),
+            (
+                2,
+                vec![Value::from_f64(f64::from_bits(0x7fefffffffffffff))],
+                "i1",
+            ),
+            (
+                2,
+                vec![Value::from_f64(f64::from_bits(0xffefffffffffffff))],
+                "i1",
+            ),
+            (2, vec![Value::from_i64(9007199254740992)], "i1"),
+            (2, vec![Value::from_i64(9007199254740993)], "i0"),
+            (2, vec![Value::from_i64(9223372036854775807)], "i0"),
+            (2, vec![Value::from_i64(i64::MIN)], "i1"),
+            (2, vec![Value::build_text("500")], "i0"),
+            (2, vec![Value::build_text("1e400")], "i0"),
+            (2, vec![Value::build_text("-0.0")], "i13"),
+            (2, vec![Value::build_text("abc")], "i1"),
+            (2, vec![Value::Null], "i0"),
+            (2, vec![Value::from_blob(vec![1])], "i0"),
+            (
+                2,
+                vec![Value::from_f64(f64::from_bits(0x0000000000000001))],
+                "i1",
+            ),
+            (3, vec![Value::from_i64(500)], "i612"),
+            (
+                3,
+                vec![Value::from_f64(f64::from_bits(0x407f400000000000))],
+                "i612",
+            ),
+            (3, vec![Value::from_i64(0)], "i599"),
+            (
+                3,
+                vec![Value::from_f64(f64::from_bits(0x8000000000000000))],
+                "i599",
+            ),
+            (
+                3,
+                vec![Value::from_f64(f64::from_bits(0x0000000000000000))],
+                "i599",
+            ),
+            (3, vec![Value::from_i64(-5)], "i600"),
+            (
+                3,
+                vec![Value::from_f64(f64::from_bits(0x7fefffffffffffff))],
+                "i611",
+            ),
+            (
+                3,
+                vec![Value::from_f64(f64::from_bits(0xffefffffffffffff))],
+                "i611",
+            ),
+            (3, vec![Value::from_i64(9007199254740992)], "i611"),
+            (3, vec![Value::from_i64(9007199254740993)], "i612"),
+            (3, vec![Value::from_i64(9223372036854775807)], "i612"),
+            (3, vec![Value::from_i64(i64::MIN)], "i611"),
+            (3, vec![Value::build_text("500")], "i612"),
+            (3, vec![Value::build_text("1e400")], "i612"),
+            (3, vec![Value::build_text("-0.0")], "i599"),
+            (3, vec![Value::build_text("abc")], "i611"),
+            (3, vec![Value::Null], "i0"),
+            (3, vec![Value::from_blob(vec![1])], "i612"),
+            (
+                3,
+                vec![Value::from_f64(f64::from_bits(0x0000000000000001))],
+                "i611",
+            ),
+            (
+                4,
+                vec![
+                    Value::from_i64(7),
+                    Value::from_f64(f64::from_bits(0x407f400000000000)),
+                ],
+                "i63",
+            ),
+            (4, vec![Value::from_i64(7), Value::from_i64(0)], "i13"),
+            (
+                4,
+                vec![
+                    Value::from_f64(f64::from_bits(0x4004000000000000)),
+                    Value::from_i64(2),
+                ],
+                "i1",
+            ),
+            (
+                4,
+                vec![Value::from_i64(7), Value::build_text("1e400")],
+                "i66",
+            ),
+            (
+                4,
+                vec![
+                    Value::from_i64(0),
+                    Value::from_f64(f64::from_bits(0x8000000000000000)),
+                ],
+                "i12",
+            ),
+            (
+                5,
+                vec![Value::from_f64(f64::from_bits(0xc000000000000000))],
+                "r7ff0000000000000,i526,i0,r7fefffffffffffff",
+            ),
+            (
+                5,
+                vec![Value::from_f64(f64::from_bits(0x3fe0000000000000))],
+                "r7ff0000000000000,i464,i0,r7fefffffffffffff",
+            ),
+            (
+                5,
+                vec![Value::from_f64(f64::from_bits(0x3ff8000000000000))],
+                "r7ff0000000000000,i439,i0,r7fefffffffffffff",
+            ),
+            (
+                5,
+                vec![Value::from_f64(f64::from_bits(0x4004000000000000))],
+                "r7fefffffffffffff,i414,i0,r7fefffffffffffff",
+            ),
+            (
+                5,
+                vec![Value::from_f64(f64::from_bits(0x4008000000000000))],
+                "i1936,i401,i0,i9",
+            ),
+            (5, vec![Value::Null], "n,i0,n,n"),
+            (
+                6,
+                vec![Value::from_f64(f64::from_bits(0x3ff0000000000000))],
+                "i-9223372036854775235,i148",
+            ),
+            (
+                6,
+                vec![Value::from_f64(f64::from_bits(0x3ff8000000000000))],
+                "rc3dfffffffffffff,i161",
+            ),
+            (
+                6,
+                vec![Value::from_f64(f64::from_bits(0xc010000000000000))],
+                "i-9223372036854775789,i26",
+            ),
+        ];
+        let cell = |v: &Value| match v {
+            Value::Null => "n".to_string(),
+            Value::Numeric(Numeric::Integer(i)) => format!("i{i}"),
+            Value::Numeric(Numeric::Float(f)) => format!("r{:016x}", f64::from(*f).to_bits()),
+            Value::Text(t) => format!("t{}", t.as_str()),
+            Value::Blob(b) => format!("b{b:?}"),
+        };
+        let bound = |conn: &Arc<crate::Connection>, sql: &str, params: &[Value]| {
+            let mut stmt = conn.prepare(sql).unwrap();
+            for (i, v) in params.iter().enumerate() {
+                stmt.bind_at(std::num::NonZero::new(i + 1).unwrap(), v.clone())
+                    .unwrap();
+            }
+            let mut out: Vec<String> = Vec::new();
+            stmt.run_with_row_callback(|row| {
+                out.push(row.get_values().map(cell).collect::<Vec<_>>().join(","));
+                Ok(())
+            })
+            .unwrap();
+            out.join(";")
+        };
+        for text in sql {
+            let hooked = rows(&on, &format!("EXPLAIN {text}")).iter().any(|r| {
+                r.iter()
+                    .any(|v| matches!(v, Value::Text(t) if t.as_str() == "MorselAggregate"))
+            });
+            assert!(
+                hooked,
+                "{text}: the statement's program holds the copies' hook"
+            );
+        }
+        let before = copies(&on).counts();
+        for mode in [ParallelMode::Off, ParallelMode::On] {
+            on.set_parallel_mode(mode);
+            off.set_parallel_mode(mode);
+            paged.set_parallel_mode(mode);
+            for (at, params, answer) in &sqlite {
+                let text = sql[*at];
+                assert_eq!(
+                    bound(&paged, text, params),
+                    *answer,
+                    "the pager's storage, {mode:?}: {text} {params:?}"
+                );
+                for _ in 0..3 {
+                    assert_eq!(
+                        bound(&on, text, params),
+                        *answer,
+                        "declared, {mode:?}: {text} {params:?}"
+                    );
+                    assert_eq!(
+                        bound(&off, text, params),
+                        *answer,
+                        "not declared, {mode:?}: {text} {params:?}"
+                    );
+                }
+            }
+        }
+        let after = copies(&on).counts();
+        let runs = u64::try_from(sqlite.len() * 3 * 2).unwrap();
+        assert_eq!(
+            after.handed - before.handed,
+            runs,
+            "every run handed to the copies"
+        );
+        assert_eq!(
+            after.skipped_body, before.skipped_body,
+            "none skipped as body"
+        );
+        assert!(after.copy > before.copy, "the copy read some");
+        eprintln!(
+            "== r10: handed {}, read by the copy {}, sent to the rows {}, no copy yet {}, copies kept {}",
+            after.handed - before.handed,
+            after.copy - before.copy,
+            after.rows - before.rows,
+            after.absent - before.absent,
+            after.kept,
+        );
+    }
+
     /// T-CB.4.4 (lane colcopy-9, AC-CB.4.6): an analytic statement in autocommit, then the same
     /// statement in a transaction that wrote and in one that only reads, then each of the A/B's
     /// queries in autocommit. Expect: the first is handed over and reaches the copies; the one in
@@ -1593,6 +2021,15 @@ mod tests {
     #[test]
     fn cb4_a_read_only_transaction_reads_the_copy_at_its_snapshot() {
         let (_db, reader, writer) = reader_and_writer(None);
+        // This test exercises three reads on the copy. Give the planner a stated slow
+        // row path, so machine calibration cannot route the snapshot checks around it.
+        use crate::translate::optimizer::learned_costs::{WeightRule, Work};
+        reader.db.learned_costs.set_rule(WeightRule::Blend);
+        let samples = f64::from(u32::MAX);
+        reader
+            .db
+            .learned_costs
+            .observe(Work::Row, samples, samples * 1_000_000.0);
         reader.execute("BEGIN").unwrap();
         let first = copies(&reader).counts();
         let then = rows(&reader, SNAPSHOT_Q);
@@ -2010,7 +2447,9 @@ mod tests {
     /// `AMPHORA_AB_SCALE=200 AMPHORA_AB_OUT=bench/records/<date>-<host>-colcopy-ab.jsonl cargo test -p amphora-engine --release --lib storage::versioned::columns_sql::tests::ab -- --nocapture`
     mod ab {
         use super::*;
-        use crate::storage::versioned::columns_ab::{scenarios, schema, Press, Scenario, Traces};
+        use crate::storage::versioned::columns_ab::{
+            scenarios, schema, Handoffs, Press, Scenario, Traces,
+        };
         use std::time::Instant;
 
         fn scale() -> i64 {
@@ -2055,6 +2494,7 @@ mod tests {
             let mut latencies = Vec::with_capacity(s.statements);
             let mut reached = Vec::with_capacity(s.statements);
             let mut skipped_queries = std::collections::BTreeSet::new();
+            let mut handoffs = Handoffs::default();
             let (mut held_sum, mut held_peak, mut equal, mut waited_most) =
                 (0u64, 0u64, true, 0u64);
             let (mut writes_refused, mut write_refusal) = (0u64, None::<String>);
@@ -2067,15 +2507,21 @@ mod tests {
                 if s.grow > 0 {
                     let from = next.get(i).copied().unwrap_or(s.rows + 1);
                     let w = fill_sql(i, from, from + s.grow - 1);
-                    // The scenario's room is the copies' (lane colcopy-8): the other use gives its
-                    // bytes back while the rows grow, so the table's growth is never what the cap
-                    // refuses, and the press after it puts the copies back at their room. A copy
-                    // that must grow with its table then meets the cap first, as the scenario
-                    // says. A write still refused is counted, and left out of the row loop's
-                    // table too, so the answers still compare.
+                    // Grow the row tree first. The commit offers its changes to the copies'
+                    // feeds, so restore this round's pressure before publishing the transaction.
                     room.give(other);
                     other = 0;
-                    match on.execute(&w) {
+                    on.execute("BEGIN").unwrap();
+                    let written = on.execute(&w).and_then(|()| {
+                        if let Some(free) = s.free_at(k, need) {
+                            press(&room, &mut other, free, &on);
+                        }
+                        on.execute("COMMIT")
+                    });
+                    if written.is_err() && !on.get_auto_commit() {
+                        on.execute("ROLLBACK").unwrap();
+                    }
+                    match written {
                         Ok(()) => {
                             off.execute(&w).unwrap();
                             if let Some(n) = next.get_mut(i) {
@@ -2098,7 +2544,9 @@ mod tests {
                 let got = rows(&on, &q);
                 let took = u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 latencies.push(took);
-                if copies(&on).counts().reached_since(&before, 1) {
+                let after = copies(&on).counts();
+                handoffs.record(&before, &after);
+                if after.reached_since(&before, 1) {
                     reached.push(took);
                 } else {
                     skipped_queries.insert(k % QUERIES.len());
@@ -2165,9 +2613,9 @@ mod tests {
                 "reached_statements": reached.len(),
                 "reached_statements_per_s": reached.len() as f64 / (reached_ns as f64 / 1e9).max(f64::MIN_POSITIVE),
                 "skipped_queries": skipped_queries,
-                "skipped": {"rows": c.skipped_rows, "body": c.skipped_body, "join": c.skipped_join, "transaction": c.skipped_transaction},
+                "skipped": handoffs.skipped,
                 "unserved": c.unserved,
-                "handed": c.handed,
+                "handed": handoffs.handed,
                 "all_p50_ns": at(&latencies, 0.5),
                 "all_p99_ns": at(&latencies, 0.99),
                 "all_p999_ns": at(&latencies, 0.999),
@@ -2225,6 +2673,10 @@ mod tests {
                         o.insert("traces_compiled".into(), Traces::compiled().into());
                     }
                     assert_eq!(line["equal"], true, "{line}");
+                    assert!(
+                        line["handed"].as_u64().unwrap() <= s.statements as u64,
+                        "{line}"
+                    );
                     // Lane colcopy-9 (T-CB.4.4): the A/B counts only statements a copy could
                     // answer, so there must be some, and each statement handed over is either
                     // one of them or counted with its reason.

@@ -182,9 +182,9 @@ the candidate that removes it as a third setting, `LockedReads::WaitOnLock`, `Wa
   then reads once more, so a resolution between its first try and joining isn't missed; it waits on
   that list's own bell, and the list's ring count, read before each try, says whether a resolution
   landed since.
-- A resolution step that drops a transaction's locks notes their Records rows; once the step has
-  answered, the process that ran it rings those rows' lists (`Database::ring_locks`), so a woken get
-  reads the resolution. A row nobody waits on rings no one, and a list lives only while a get waits.
+- A standalone writer records the Records keys a resolution unlocks. Its durable callback rings
+  those rows' lists even if the coordinator missed its answer. A retry sees the done row and has
+  no locks left to drop. A row nobody waits on rings no one, and a list lives only while a get waits.
 - Each wake is counted (`Database::locked_wakes`), under both settings.
 - What it costs: one more read for each get that meets a lock (the read after joining), and a list
   entry per row waited on.

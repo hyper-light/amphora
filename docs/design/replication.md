@@ -2655,7 +2655,12 @@ wire records queued beside them (`Control::called`).
 - `CHECKPOINT_EVERY` (25 ms, measured once on fedora): learned from this host's checkpoint costs, as `compacting`
   learns compaction's.
 - The log device's alignment (4096): the device's logical block size, read at open.
-- `serve::OUTGOING_MESSAGES` (4096, CP-T1.13's peer senders): the outgoing queue's learned bound in messages.
+- CP-T1.13 peer senders (QB.1, MB.1). Replace `serve::OUTGOING_MESSAGES` and its count-bounded
+  `sync_channel` with a charge for each record's bytes against the process queue budget. The
+  owner keeps each queued record until its peer's sender takes it. A producer whose record
+  does not fit waits for a budget release until its own deadline. On expiry it receives a
+  typed refusal and retains the record. QB counts throughput at the handoff to the peer's sender.
+  An unreachable peer leaves records queued and producers can observe the refusals.
 - `compaction::ENVELOPE` (81): stated as a format value; it could be worked out from the encoding as
   `COMMAND_ENVELOPE` is.
 Format and requirement values, not picked: `PAGE_BYTES`, `FRAME_BYTES`, `U64_MOST`, `U32_MOST`, `LAG_SAMPLES` (the
@@ -2666,7 +2671,7 @@ are to be removed, with that work driven from events, not given better intervals
 timeouts stay learned, since they are truly about time. Lane repl-measure-8 owns the commit path's timer waits
 (`run_loop`, `deadline`, `Bell`).
 
-**Tests.** `drain::tests::drain_nothing_measured_bounds_one_record` (T-QB.1.1),
+**Tests.** `drain::tests::drain_nothing_measured_bounds_the_room` (T-QB.1.1),
 `drain_bound_is_rate_times_election_timeout_within_room` (T-QB.1.2), `drain_bound_follows_the_reader_and_ignores_no_time`
 (T-QB.1.3), `replicated::tests::queue_bound_a_burst_at_start_grows_before_it_fences` (T-QB.1.4),
 `replicated::tests::t_qb_1_6_command_queue_inputs_counted_by_rate_within_the_room` (T-QB.1.6) and
@@ -2892,7 +2897,7 @@ ends, not on a flush of the owner's own.
 ## Decision (lane ryw-1): read-your-writes by session tokens (2026-11-22, kiln goal 8119f25d)
 
 Ada's order (2026-11-22): read-your-writes on any replica, built behind a switch with today's read as the control,
-decided from live runs. Requirements AC-T1.10.R1 to R4, tests T-T1.10.R1 to R4 (docs/requirements.toml, lanes ryw-1
+decided from live runs. Requirements AC-T1.10.R1 to R4, tests T-T1.10.R5 to R8 (docs/requirements.toml, lanes ryw-1
 and ryw-3).
 
 ### What was already there
@@ -2970,9 +2975,9 @@ its outgoing queue, as it already rings `drain_wait`'s condition, and when it en
 member that went. The bench gives every member the same bell, and `stop` rings it too. Lane scaleout-harness-9 wrote
 the same hook for `scale.rs`'s relay; lane ryw-5 made the two one (`listen`, which `on_sent` had been). The bell
 keeps a ring given while the relay is moving records, so no record waits for a later ring. A member's records have
-one host to take them, so a waker given again replaces the one before. Each pass drains a member's whole queue:
-`drain` at `ReplicaHandle::outgoing_bound`, the most records the queue holds before its owner fences, where the relay
-drained a picked 4096 before (lane ryw-6, tested by `a_drain_at_the_queues_bound_takes_the_whole_queue`).
+one host to take them, so a waker given again replaces the one before. Each pass takes every record already in a member's queue
+with `ReplicaHandle::drain_all`. The learned bound can shrink below the backlog between passes
+(QB.1, tested by `a_whole_queue_drain_survives_a_shrinking_learned_bound`).
 `amphora_ryw`'s records now carry `relay`: its kind (`Bell` or `Park`), its passes, records moved, waits and the
 wakes that found nothing to move.
 
@@ -3004,15 +3009,15 @@ differs from the one published only in its fence wakes the waiters; one that dif
 
 ### Evidence
 
-- T-T1.10.R1 `t_t1_10_r1_a_session_reads_its_write_on_a_lagging_follower`: records to one follower are lost while 2 is
+- T-T1.10.R5 `t_t1_10_r5_a_session_reads_its_write_on_a_lagging_follower`: records to one follower are lost while 2 is
   written. Its token read waits (counted, non-vacuity asserted: the follower was behind), and once the follower
   rejoins it answers 1 and 2, never 1 alone. A read with no token answers at once.
-- T-T1.10.R2 `t_t1_10_r2_a_behind_replica_with_no_lag_learned_redirects`: a follower that has applied nothing stamped
+- T-T1.10.R6 `t_t1_10_r6_a_behind_replica_with_no_lag_learned_redirects`: a follower that has applied nothing stamped
   redirects at once, counted. Once caught up, every member serves the same token with the write.
-- T-T1.10.R3 `t_t1_10_r3_a_session_reads_its_writes_across_leader_changes`: clocks an hour apart and the lead passed
+- T-T1.10.R7 `t_t1_10_r7_a_session_reads_its_writes_across_leader_changes`: clocks an hour apart and the lead passed
   1, 2, 3, 1. Each new write's token orders after the last, every token read served sees all of the session's writes,
   and once caught up every member's answer equals the leader's state (the control's answer).
-- T-T1.10.R4 `t_t1_10_r4_each_session_waits_only_for_its_own_writes`: sessions A and B write at once through the
+- T-T1.10.R8 `t_t1_10_r8_each_session_waits_only_for_its_own_writes`: sessions A and B write at once through the
   leader, and each answer names its own write (A's before B's). With a follower cut off after it holds A's write, B
   writes again. A's read on that follower is served at once, with no wait or redirect, though B wrote since. B's read
   is answered with its newer write once the follower rejoins.

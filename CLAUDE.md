@@ -129,6 +129,7 @@ end-to-end runs, and the benchmarks belong to the batch, run by whoever merges i
 order and stops at the first failure; kiln CI runs it on every push and pull request (`.kiln/ci.yaml`).
 
 ```
+python3 scripts/test_requirements.py
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo clippy --workspace --all-targets --locked --target aarch64-apple-darwin -- -D warnings

@@ -1568,6 +1568,11 @@ impl Versioned {
         })
     }
 
+    /// Root-directory slots, including dropped trees whose IDs cannot be reused.
+    pub(super) fn root_slots(&self) -> usize {
+        self.trees.read().len()
+    }
+
     /// Each tree's root page, by tree; 0 for a tree dropped (`AC-NS.2.5`).
     pub fn roots(&self) -> Vec<u64> {
         self.trees
@@ -1752,15 +1757,14 @@ impl Versioned {
         Ok(ts)
     }
 
-    /// Ends `txn` with no commit if it changed nothing and its validation would keep nothing of
-    /// it (AUDIT 2.4, `AC-NS.2.1`): a transaction that only read is serialized at its snapshot
-    /// under every validation but SSI with reads kept ([`Versioned::validate`] and
-    /// [`Versioned::kept`] pass it untouched), so its commit only took a timestamp and published
-    /// nothing. Its snapshot, state and read charge are let go, as a commit's are. `txn` back,
-    /// untouched, when it must commit.
+    /// Finishes an unchanged transaction at its snapshot when validation needs no read history
+    /// (AUDIT 2.4, `AC-NS.2.1`). SSI must retain tracked reads and reject a transaction that
+    /// lost its read evidence (`T-G8.4.3`). Returns the transaction intact when it needs the
+    /// full commit path. Otherwise it releases the snapshot, transaction state and read charge.
     pub fn end_unwritten(&self, mut txn: Txn) -> Result<Option<Txn>> {
-        let kept_reads = self.validation == Validation::Ssi && !txn.reads.is_empty();
-        if !txn.ops.is_empty() || !txn.changed.is_empty() || kept_reads {
+        let validate_reads =
+            self.validation == Validation::Ssi && (txn.reads.lost || !txn.reads.is_empty());
+        if !txn.ops.is_empty() || !txn.changed.is_empty() || validate_reads {
             return Ok(Some(txn));
         }
         txn.reads = Reads::default();
@@ -2817,6 +2821,30 @@ mod tests {
             v.commit(txn, &mut d),
             Err(LimboError::SerializationFailure)
         ));
+    }
+
+    /// T-G8.4.3. An SSI reader whose budget refused even a whole-tree read has an empty
+    /// read set but has lost its validation evidence. A read-only finish must refuse it.
+    #[test]
+    fn review_unwritten_ssi_reader_keeps_a_lost_read_for_validation() {
+        let v = db().with_budget(64 * 1024).with_validation(Validation::Ssi);
+        let mut txn = v.clock.begin().unwrap();
+        let room = v.clock.budget().limit() - v.clock.budget().held();
+        let filler = v.clock.budget.reserve("test", room as usize).unwrap();
+        assert!(matches!(
+            v.keep_read(&mut txn, 0, Some(b"a"), Some(b"z")),
+            Err(LimboError::MemoryBudget { .. })
+        ));
+        v.clock.budget.release(filler);
+        assert!(txn.reads.lost && txn.reads.is_empty());
+        let result = v.end_unwritten(txn).and_then(|remaining| match remaining {
+            Some(txn) => v.commit(txn, &mut Descender::new()).map(drop),
+            None => Ok(()),
+        });
+        assert!(
+            matches!(result, Err(LimboError::SerializationFailure)),
+            "{result:?}"
+        );
     }
 
     /// T-G8.2.1, the soak (AC-G8.2.1): a reader holds one snapshot open while 32 writers change

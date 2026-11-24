@@ -986,7 +986,7 @@ coordinator) are now one branch, and three pieces of split-merge-21's "Left" are
   whose groups keep no clock.
 - **Held reads wake for their own row.** A read across groups held by a lock (get, scan, the
   change feed) waits on the waiter list of the row it met (`xgroup::sql::held_at` answers the
-  first held row), rung only by the step that drops that row's locks (`Database::ring_locks`),
+  first held row), rung when the writer publishes the resolution that drops that row's locks,
   as a Records get under `LockedReads::WaitOnLock` does; a replicated group's reads wait on its
   change event. The group's resolution counter is gone, and with it the wake every resolving step
   sent to every held read.
