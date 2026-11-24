@@ -21,6 +21,10 @@
 //! each count of calls in flight through `Database::call_nowait`, each call's answer taken by its
 //! waker as it is woken; a call's latency runs from its submission to its answer.
 #![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
     clippy::arithmetic_side_effects,
     clippy::disallowed_macros,
     clippy::disallowed_methods,
