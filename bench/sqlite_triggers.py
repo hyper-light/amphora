@@ -7,6 +7,12 @@ SQLite itself takes it and what the tables hold after it (the sqlite3 library Py
 first) to crates/engine/tests/fixtures/triggers.tsv, which tests/windows_and_triggers.rs holds Amphora
 to.
 
+Not drawn, each a difference of another cause this sweep found or the oracles had (lane C17's record): FAIL
+and ROLLBACK in a trigger's own statements, and an OR clause before DO UPDATE (a constraint that fails in a
+trigger's statement is taken by the clause of the statement that fired it, not by its own); UNIQUE ON
+CONFLICT (which of two constraints is met first); NOCASE columns (the oracles' CX); text inserted in an
+INTEGER PRIMARY KEY under OR ROLLBACK.
+
 Each line is `db <name>`, `sql <statement>` (the database's tables, rows and triggers) or `q <statement>
 <answer>`: the answer's rows sorted, each row's values joined by commas, a NULL written NULL, the rows
 joined by semicolons, or ERROR for a statement SQLite refuses.
@@ -147,7 +153,7 @@ class Draw:
             target = rng.choice([self.target, self.target, "(c)" if self.unique else self.target])
             do = rng.choice([f"DO UPDATE SET {sets}{where}", f"DO UPDATE SET {sets}{where}", "DO NOTHING"])
             rows = ", ".join(self.row() for _ in range(rng.choice([1, 2])))
-            return f"INSERT{rng.choice(['', '', orc])} INTO t VALUES {rows} ON CONFLICT{target} {do}"
+            return f"INSERT{orc if do == 'DO NOTHING' else ''} INTO t VALUES {rows} ON CONFLICT{target} {do}"
         if drawn < 0.8:
             sets = ", ".join(rng.sample([f"a = {rng.choice(['a + 1', '3', '4', 'NULL', 'c'])}", f"b = {rng.choice([repr('x'), repr('q'), 'b || a', 'NULL'])}", f"c = {rng.choice(['c + 1', '2', 'c', 'a'])}", f"k = {rng.choice([self.key(), 'k', self.key()])}"], rng.choice([1, 1, 2, 3])))
             where = self.where(["", f" WHERE +c > {rng.choice([1, 2, 3])}", " WHERE +b IS NOT NULL", " WHERE +a IN (SELECT n FROM u)"])
