@@ -5026,6 +5026,15 @@ impl<F: BlockFile + 'static> Actor<F> {
                     let Some(oldest) = outgoing.messages.pop_front() else {
                         break;
                     };
+                    #[cfg(test)]
+                    eprintln!(
+                        "P19 shed m={} oldest_to={} oldest={:?} new={:?} held={held} count={count} queued={}",
+                        self.replica.id(),
+                        oldest.to,
+                        Message::decode(&oldest.bytes).map(|m| m.msg_type).ok(),
+                        message.msg_type,
+                        outgoing.messages.len()
+                    );
                     outgoing.bytes = outgoing
                         .bytes
                         .checked_sub(oldest.bytes.len())
@@ -7148,6 +7157,7 @@ mod tests {
                 + Duration::from_secs(5)
         }
         fn advance(&mut self, owner: usize, by: Duration) {
+            eprintln!("P19 advance owner={owner} by={by:?}");
             let clock = self.clocks.get(owner).unwrap();
             set(clock, self.base, self.base + offset(clock) + by);
         }
