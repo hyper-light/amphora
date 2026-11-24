@@ -1737,3 +1737,111 @@ designs for a bound are in replication.md ("What bounds a lost forward"); neithe
     v15-tests-<sha> --test-threads=4 v15_a_write database::slot:: v14_a_slow a_slot_holder_whose_write_fails
     v15-tests-d64cff0b --ignored --nocapture --test-threads=1 v15_stages    # r65, gap 2's stages
     v15-tests-193ff5dc --test-threads=1 --nocapture v15_a_write             # r19, gap 1's trace (r37: 79fd65c8)
+
+# Lane V16 (commits) on adacachy2 and macOS: lane V15's gap 1 traced to its line and fixed; the close reaches the leader (2026-11-24, 02:43Z to 03:48Z)
+
+Ada's goal is replicated commits about 10x faster than rqlite and dqlite, with no write refused under load. This
+lane's deliverable: lane V15's gap 1 closed, so that a follower's close reaches the leader when its write's barrier
+answer was lost; found by a trace, fixed, robust over the suites and the ladder, merged to main.
+
+## Losses first
+
+1. **The ladder and the suites against main's product were not run on the landed tree.** adacachy2 was the verifier's
+   quiet window from 03:00Z to 03:45Z, and the macOS runs (r121's ladder) had not finished its cold release build at
+   load 64 to 140 on 18 cores when the hour ended; it was stopped. So the deliverable's robust
+   half is shown only by the three suite rounds on b9dd342b (r73), not by the ladder.
+2. **The suites' comparison arm on Linux was the harness change alone (aedd6cef), not main's product.** Main's own
+   product was run only on the four tests both arms failed (r80, r81), not the whole suite; the fix's one failure
+   that neither of those runs covers (`a_local_read_holds_off_the_logs_restart_and_one_after_waits_for_it`, once in
+   three rounds, in the slowest round) is not shown to fail on main.
+3. **Four replicated tests fail on main itself** (lane B18's decision 45 is the only change in crates/ between a
+   main that passes them and one that fails them): listed under Runs. Not this lane's; not traced.
+4. **r73 likely ran past 03:00Z into the verifier's quiet window on adacachy2**, by about 20 to 45 s: its six
+   suite runs took 377 s in all from about 02:54:10Z, and its 300 s timeout did not stop it (inferred from its
+   rounds' times; kiln's end time not read).
+5. **kiln's sync to the MacBook Pro timed out twice** (r102, r107), and the Mac Studios were queued behind other
+   lanes, so the merged tree's checks ran from a GitHub clone on adas-macbook-pro-2 at load 64 to 83 on 18 cores.
+6. **The fix changes the driven harness every driven test runs on** (`Driven::quiet`): an owner left driving is
+   now stepped before the group counts as quiet. The suites above are its only check.
+7. **Where else the same fault may be.** `run_step` makes other work for the core after its one drive (a waiting
+   write's dispatch, `bootstrap`, `keep_floor`, `propose_class`, `prepare`); each waits likewise for the next wake
+   unless its drive left more. Read from the code, not measured; not changed (not this lane's deliverable).
+
+## Where the close stopped (r57, branch `diag/commits-v16-close` cd720fde, never for main)
+
+The diagnostic traced member 3 from its close on: `Actor::close` printed the core's queue after its read, and
+from then on each of member 3's steps (paused or not, and each drive's messages) and each of its replica's drives
+(`has_ready`, the core's queue, the writes out, `ready_due`'s parts, the `Ready` taken and the messages a durable
+write gives out). r57 on adacachy2 (cpus=2, load 47 to 50 on 32 cores, 02:48Z), lane V15's test, persisted class:
+
+    V16 close id=3 read=Ok(()) has_ready=true msgs=[(MsgReadIndex, 1)] in_flight=0 at=10ms
+    panicked at crates/amphora/src/database/replicated.rs:19046:13: Persisted: member 3 closed, and the slot's holder after
+      left: (false, Some(3))
+
+No other V16 line follows the close: member 3 never stepped again. The close's ReadIndex to the leader (member 1)
+sat in member 3's core (`Raft::msgs`), with no write out and a `Ready` due. The line is `run_step`'s
+`self.close()?` (replicated.rs, after the step's one `self.replica.drive`): the close is asked of the core after
+the step's only drive, and `self.driving` was set from that drive (`driven.more`) before it, so nothing drives the
+close out until the owner's next wake. On a real clock that is its next tick or input (read from `run_loop`'s wait,
+not measured); in the driven harness, whose clocks stand still, it never comes: `Driven::quiet` stops at a round
+with nothing to relay and no write out on any disk, and member 3's queued close is neither.
+
+## The fix (aedd6cef, b9dd342b; merged tree d7df6b30)
+
+- **`Actor::close`** (b9dd342b): once its read is queued, the owner is marked driving, so `run_loop` steps again at
+  once and that step's drive takes the `Ready` the close is in. One drive a step stays the rule.
+- **`Driven::quiet`** (aedd6cef): an owner whose last step left more to drive (`Actor::driving`) is not quiet, as
+  its thread steps again at once (`run_loop`); lane QB2's test already waited for it by hand. Alone, this is the red
+  arm: lane V15's test fails on it as on main.
+- replication.md's write-slot rule says so, in place of lane V15's open defect.
+
+## Runs
+
+Linux runs on adacachy2 ended by 03:00Z but r73 (below); macOS runs on adas-macbook-pro-2 (e30189ea), after two
+kiln syncs to it timed out (r102, r107: "did not answer the sync in 60s"), from a GitHub clone there (sync false).
+
+| run | where, needs, load | tree | result |
+|---|---|---|---|
+| r57 | adacachy2, cpus=2, 47 to 50, 02:48Z | cd720fde, the diagnostic | the trace above; lane V15's test fails `(false, Some(3))` |
+| r68 | adacachy2, cpus=4, 31 to 43, 02:52Z | b9dd342b, the fix | focused: 18 passed (`v15_a_write_its_deadline`, `database::slot::`, `v14_a_slow`, `a_slot_holder_whose_write_fails`) |
+| r68 | | aedd6cef, the harness alone | 17 passed, 1 failed: lane V15's test, `(false, Some(3))` at replicated.rs:19037 |
+| r76 | adacachy2, cpus=4, 34 to 42 | b9dd342b | `cargo clippy -p amphora --all-targets --locked -- -D warnings` exit 0 (29 s) |
+| r79 | adacachy2, cpus=4, 34 to 41 | f76ebe98 | `scripts/check-production.sh` exit 0; the engine's ratchet holds (10,903 left) |
+| r113 | adas-macbook-pro-2, cpus=8, load 65 to 80 on 18 cores, 03:13Z to 03:41Z (cold build 1,510 s) | d7df6b30, the merged tree | focused: 18 passed |
+| r113 | | 6f3eafa1, the merged tree with the fix reverted | 17 passed, 1 failed: lane V15's test, `(false, Some(3))` at replicated.rs:19038 |
+| r121 | the same, cpus=4, from 03:23Z | d7df6b30, the release bench and the ladder | the cold release build had not finished at 03:45Z; stopped |
+| r124 | adacachy2, cpus=8, load 16, 03:45Z to 03:47Z | d7df6b30 | `cargo clippy -p amphora --all-targets --locked -- -D warnings` exit 0; `scripts/check-production.sh` exit 0, the ratchet holds (10,903) |
+**The replicated suites, 3 rounds** (r73, adacachy2, cpus=4, `--test-threads=4 database::replicated:: replication::`,
+arm order alternated, load 24 to 37 on 32 cores):
+
+| round | b9dd342b (the fix) | aedd6cef (the harness alone) |
+|---|---|---|
+| 1 | 170 passed, 4 failed (53 s) | 168 passed, 6 failed (50 s) |
+| 2 | 169 passed, 5 failed (88 s) | 168 passed, 6 failed (52 s) |
+| 3 | 170 passed, 4 failed (48 s) | 168 passed, 6 failed (86 s) |
+
+- On both arms nearly every round: `a_local_read_open_across_an_image_install_sees_one_side_whole`,
+  `a_replicas_database_log_stays_within_its_room`, `past_its_room_a_replica_refuses_submits_and_restarts_whatever_its_share`,
+  `a_checkpoint_pass_copies_no_frame_past_the_last_finished_flush`. Main's own product fails them too: r80 (02:58Z)
+  ran the four on cd720fde (main a5ae048c and lane V15's test, with the diagnostic's prints and neither change of
+  this lane): 2 failed (`past_its_room`, `a_local_read_open`); r81 ran the other two on all three trees: each
+  failed both, with the same values (`left: 77, right: 17` at the checkpoint test). On lane V15's 6adfa5f8 (main
+  46773985) all four passed (r80). The only commits in crates/ between those mains are lane B18's (decision 45).
+- On the fix only, once (round 2, its slowest): `a_local_read_holds_off_the_logs_restart_and_one_after_waits_for_it`;
+  and `a_restart_due_waits_for_a_reads_deadline_and_no_longer`, which the harness alone failed in round 3 too.
+  Neither was run on main's product here.
+- On the harness alone only: lane V15's test (each round), `a_group_upgrading_to_the_floor_tracks_joins_only_once_every_member_attests`
+  (rounds 2 and 3), `window_slow_flooded_fast_starved` (round 1).
+
+## Commands
+
+    # Linux runs: kiln run on 00aad8daff2fa3c9daa65d53c425d450, sync false, cwd ~/.cache/amphora-perf/commits-remote,
+    # CARGO_TARGET_DIR=~/.cache/amphora-perf-target/commits, CARGO_INCREMENTAL=0, CARGO_BUILD_JOBS = the needs' cpus
+    cargo test -p amphora --lib --locked --no-run    # each arm in turn, kept as ~/.cache/amphora-perf-bin/commits/v16-tests-<sha>
+    v16-tests-cd720fde --test-threads=1 --nocapture v15_a_write_its_deadline                         # r57, the trace
+    v16-tests-<sha> --test-threads=4 v15_a_write_its_deadline database::slot:: v14_a_slow a_slot_holder_whose_write_fails
+    v16-tests-<sha> --test-threads=4 database::replicated:: replication::                            # r73, 3 rounds, arms alternated
+    cargo clippy -p amphora --all-targets --locked -- -D warnings; bash scripts/check-production.sh
+    # macOS runs: kiln run with needs macos/arm64,cpus=8,mem=24g, sync true from the lane's clones
+    bash bench/records/2026-11-23-adacachy2-perf-commits-v16/v16.sh <red> <fix> 0 <out> 8       # builds, focused tests
+    bash bench/records/2026-11-23-adacachy2-perf-commits-v16/ladder16.sh <release amphora-bench> <out> 3
