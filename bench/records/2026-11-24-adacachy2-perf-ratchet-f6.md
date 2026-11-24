@@ -107,9 +107,16 @@ and `pager.rs:3334`).
   `cargo test -p amphora-engine --locked --features conn_raw_api --lib -- portable`: 28 passed, 0 failed.
 - r388 at 5237f16e: the engine's whole `mvcc::` module, the same features: 558 passed, 0 failed, 12 ignored.
 - r389 at 5237f16e: `cargo clippy --workspace --all-targets --locked -- -D warnings` (Linux): exit 0.
-- r395 at the merge 2009772f (main moved in crates/amphora, crates/api and vendored hyper-raft, not in
-  crates/engine): check-production exit 0 in 179 s, "Compiling amphora-engine" in both passes with the
+- r395 at the first merge of main, 2009772f (main moved in crates/amphora, crates/api and vendored hyper-raft,
+  not in crates/engine): check-production exit 0 in 179 s, "Compiling amphora-engine" in both passes with the
   engine's lib.rs files touched again, 10617 as the ratchet holds; the same workspace clippy: exit 0 in 61 s.
+  r397, same tree: `cargo test -p amphora --locked --test online_schema` (the caller of the shipping
+  `write_schema_version` path, `restage_schema`): 10 passed, 0 failed.
+- r416 at the second merge, e0947c86 (main moved inside crates/engine: dialect/postgres.rs, database.rs,
+  translate, vdbe and others, 4 lines of mvcc/database/mod.rs, none of them this lane's edits): check-production
+  exit 0 in 59 s, "Compiling amphora-engine" in both passes, 10617 as the ratchet holds (main's new engine code
+  added no counted site to the shipping build); workspace clippy `--all-targets -D warnings` exit 0 in 45 s;
+  `cargo test -p amphora-engine --locked --features conn_raw_api --lib -- mvcc::`: 558 passed, 0 failed, 12 ignored.
 - `cargo fmt --all --check`: exit 0 (this machine, 5237f16e and the merge).
 - macOS run r351 (portable checks) queued behind others and never started; nothing here relies on it. The
   engine suites were run on Linux with `conn_raw_api` instead.
