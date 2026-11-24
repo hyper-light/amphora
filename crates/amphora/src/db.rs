@@ -703,6 +703,12 @@ impl Db {
         self.conn.wal_auto_actions_disable();
     }
 
+    /// Leaves this database's log to its owner: no write on this connection starts it again by
+    /// itself, only [`Db::switch_log`] and [`Db::restart_log`] do.
+    pub(crate) fn own_restarts(&self) {
+        self.conn.wal_auto_restart_disable();
+    }
+
     /// The frames of log a restart keeps the log's file for ([`Db::keep_log`]): the most a log
     /// holds between restarts.
     pub(crate) fn log_kept_frames(&self) -> u64 {
