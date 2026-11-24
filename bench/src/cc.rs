@@ -20,7 +20,7 @@
 //! usage: amphora-bench --cc [--validation precision,ssi,occ] [--classes all|name,...]
 //!        [--writers 32] [--seconds 10] [--items 200000] [--row-bytes 600] [--text-bytes 600]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -347,7 +347,7 @@ pub fn main() -> anyhow::Result<()> {
                 load_items(&v, &o)?;
             }
             let v = Arc::new(v);
-            let stop = Arc::new(AtomicBool::new(false));
+            let stop = Arc::new(crate::Stop::default());
             // When the pool filled, in microseconds from the start (0: it didn't).
             let full = Arc::new(AtomicU64::new(0));
             let next = Arc::new(AtomicU64::new(o.items));
@@ -358,7 +358,7 @@ pub fn main() -> anyhow::Result<()> {
                     let mut d = Descender::new();
                     let mut rng = Rng(0x9e37_79b9_7f4a_7c15 ^ (w as u64 + 1).wrapping_mul(0xbf58_476d_1ce4_e5b9) | 1);
                     let (mut c, mut h) = (Counts::default(), Hist::new());
-                    while !stop.load(Ordering::Relaxed) {
+                    while !stop.stopped() {
                         let at = Instant::now();
                         let session = rng.next() % SESSIONS;
                         let room = match (k0, reader) {
@@ -368,7 +368,7 @@ pub fn main() -> anyhow::Result<()> {
                         };
                         if !room {
                             let _ = full.compare_exchange(0, u64::try_from(began.elapsed().as_micros()).unwrap_or(u64::MAX).max(1), Ordering::AcqRel, Ordering::Acquire);
-                            stop.store(true, Ordering::Relaxed);
+                            stop.stop();
                             break;
                         }
                         h.record(u64::try_from(at.elapsed().as_micros()).unwrap_or(u64::MAX));
@@ -378,8 +378,8 @@ pub fn main() -> anyhow::Result<()> {
             };
             let writers: Vec<_> = (0..o.writers).map(|w| spawn(w, false)).collect();
             let readers: Vec<_> = if k0 { (0..READERS).map(|r| spawn(o.writers + r, true)).collect() } else { Vec::new() };
-            std::thread::sleep(Duration::from_secs_f64(o.seconds));
-            stop.store(true, Ordering::Relaxed);
+            stop.wait_until(Instant::now() + Duration::from_secs_f64(o.seconds));
+            stop.stop();
             let filled = full.load(Ordering::Acquire);
             let window = if filled == 0 { began.elapsed().as_secs_f64() } else { filled as f64 / 1e6 };
             let gather = |handles: Vec<std::thread::JoinHandle<anyhow::Result<(Counts, Hist)>>>| -> anyhow::Result<(Counts, Hist)> {

@@ -93,6 +93,7 @@ impl Turso {
                 Ok(StepResult::Done) => return Ok(Ok(())),
                 Ok(StepResult::IO | StepResult::Yield) => self.io.step().map_err(|e| anyhow::anyhow!("{e}"))?,
                 Ok(StepResult::Sleep { duration }) => {
+                    #[expect(clippy::disallowed_methods, reason = "vanilla Turso has no event for a lock's release: its busy handler asks the caller to wait out its own backoff")]
                     std::thread::sleep(duration);
                     self.io.step().map_err(|e| anyhow::anyhow!("{e}"))?;
                 }
@@ -139,6 +140,7 @@ impl Blocking for Turso {
                 Ok(Ok(())) => break Ok(()),
                 Ok(Err(Busy)) => {
                     let _ = c.execute("ROLLBACK");
+                    #[expect(clippy::disallowed_methods, reason = "vanilla Turso says Busy with no event for the lock's release: no wait but a timed one (200 us, a picked number)")]
                     std::thread::sleep(std::time::Duration::from_micros(200));
                 }
                 Err(e) => {
@@ -163,7 +165,10 @@ impl Blocking for Turso {
                 n += 1;
             }) {
                 Ok(Ok(())) => break Ok(n),
-                Ok(Err(Busy)) => std::thread::sleep(std::time::Duration::from_micros(200)),
+                Ok(Err(Busy)) => {
+                    #[expect(clippy::disallowed_methods, reason = "vanilla Turso says Busy with no event for the lock's release: no wait but a timed one (200 us, a picked number)")]
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                }
                 Err(e) => break Err(e),
             }
         };

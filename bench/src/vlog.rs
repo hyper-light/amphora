@@ -11,7 +11,7 @@
 //! usage: amphora-bench --vlog --dir <empty dir> [--writers 32] [--lanes 1,<cores>] [--seconds 10]
 //!        [--keys 200000] [--value 200] [--uring]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -108,14 +108,14 @@ fn quantiles(ns: &mut [u64]) -> serde_json::Value {
 /// One run: `o.writers` writers committing for `o.seconds`, checkpoints back to back if
 /// `checkpoints`; each commit's time, and whether a checkpoint ran during it.
 fn run(o: &Opts, db: &Arc<Database>, checkpoints: bool) -> anyhow::Result<(Vec<u64>, Vec<u64>, u64, f64)> {
-    let stop = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(crate::Stop::default());
     // Odd while a checkpoint runs; moved on as each begins and ends.
     let phase = Arc::new(AtomicU64::new(0));
     let checkpointer = checkpoints.then(|| {
         let (db, stop, phase) = (db.clone(), stop.clone(), phase.clone());
         std::thread::spawn(move || -> anyhow::Result<u64> {
             let mut n = 0;
-            while !stop.load(Ordering::Acquire) {
+            while !stop.stopped() {
                 phase.fetch_add(1, Ordering::AcqRel);
                 let done = db.checkpoint();
                 phase.fetch_add(1, Ordering::AcqRel);
@@ -131,7 +131,7 @@ fn run(o: &Opts, db: &Arc<Database>, checkpoints: bool) -> anyhow::Result<(Vec<u
         let (db, stop) = (db.clone(), stop.clone());
         std::thread::spawn(move || -> anyhow::Result<()> {
             let mut d = Descender::new();
-            while !stop.load(Ordering::Acquire) {
+            while !stop.stopped() {
                 db.collect(&mut d).map_err(e)?;
             }
             Ok(())
@@ -148,7 +148,7 @@ fn run(o: &Opts, db: &Arc<Database>, checkpoints: bool) -> anyhow::Result<(Vec<u
                 let lane = db.lane();
                 let (mut quiet, mut during) = (Vec::new(), Vec::new());
                 let mut i = 0u64;
-                while !stop.load(Ordering::Acquire) {
+                while !stop.stopped() {
                     i += 1;
                     let key = mix(w * each + mix(i) % each).to_be_bytes();
                     let start = Instant::now();
@@ -164,8 +164,8 @@ fn run(o: &Opts, db: &Arc<Database>, checkpoints: bool) -> anyhow::Result<(Vec<u
             })
         })
         .collect();
-    std::thread::sleep(Duration::from_secs(o.seconds));
-    stop.store(true, Ordering::Release);
+    stop.wait_until(Instant::now() + Duration::from_secs(o.seconds));
+    stop.stop();
     let (mut quiet, mut during) = (Vec::new(), Vec::new());
     for w in writers {
         let (q, d) = w.join().map_err(|_| anyhow::anyhow!("a writer panicked"))??;

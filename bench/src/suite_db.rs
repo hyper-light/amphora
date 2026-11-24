@@ -527,6 +527,16 @@ mod mvcc_target {
     pub struct Mvcc {
         io: Arc<dyn IO>,
         db: Arc<Database>,
+        /// The checkpointing thread's stop (AMPHORA_MVCC_CHECKPOINT_MS), set when the target goes.
+        checkpointer: Option<Arc<crate::Stop>>,
+    }
+
+    impl Drop for Mvcc {
+        fn drop(&mut self) {
+            if let Some(stop) = &self.checkpointer {
+                stop.stop();
+            }
+        }
     }
 
     impl Mvcc {
@@ -538,7 +548,7 @@ mod mvcc_target {
             // AMPHORA_MVCC_CHECKPOINT_MS: commits never checkpoint; a thread of its own does, this
             // often (unset: each commit past the log's threshold checkpoints, as the engine ships).
             let background = std::env::var("AMPHORA_MVCC_CHECKPOINT_MS").ok().and_then(|v| v.parse().ok()).map(Duration::from_millis);
-            let m = Self { io, db };
+            let mut m = Self { io, db, checkpointer: None };
             let mut s = m.connect()?;
             let mut rows = 0;
             if let Err(Retry) = s.step("PRAGMA journal_mode = 'mvcc'", &[], &mut rows)? {
@@ -549,9 +559,12 @@ mod mvcc_target {
                     anyhow::bail!("couldn't turn inline checkpoints off");
                 }
                 let mut c = m.connect()?;
+                let stop = Arc::new(crate::Stop::default());
+                m.checkpointer = Some(stop.clone());
+                // Every `every`, until the target goes: the period is the setting's, a timed wait on
+                // the stop.
                 std::thread::Builder::new().name("mvcc-checkpoint".into()).spawn(move || {
-                    loop {
-                        std::thread::sleep(every);
+                    while !stop.wait_until(Instant::now() + every) {
                         let mut rows = 0;
                         if let Err(e) = c.step("PRAGMA wal_checkpoint(TRUNCATE)", &[], &mut rows) {
                             eprintln!("mvcc checkpoint: {e:#}");
@@ -611,8 +624,9 @@ mod mvcc_target {
             for (i, p) in params.iter().enumerate() {
                 stmt.bind_at(NonZero::new(i + 1).ok_or_else(|| anyhow::anyhow!("parameter 0"))?, value(p)).map_err(|e| anyhow::anyhow!("{e}"))?;
             }
+            let waker = crate::unpark_waker();
             loop {
-                match stmt.step() {
+                match stmt.step_with_waker(&waker) {
                     Ok(StepResult::Row) => {
                         if let Some(r) = stmt.row() {
                             for v in r.get_values() {
@@ -624,7 +638,9 @@ mod mvcc_target {
                     Ok(StepResult::Done) => return Ok(Ok(())),
                     Ok(StepResult::IO | StepResult::Yield) => io.step().map_err(|e| anyhow::anyhow!("{e}"))?,
                     Ok(StepResult::Sleep { duration }) => {
-                        std::thread::sleep(duration);
+                        // Busy: until the engine wakes this thread (the lock released) or its deadline; a wake for
+                        // no reason only steps again.
+                        std::thread::park_timeout(duration);
                         io.step().map_err(|e| anyhow::anyhow!("{e}"))?;
                     }
                     Ok(StepResult::Busy) => return Ok(Err(Retry)),
@@ -804,6 +820,7 @@ impl TursoSession {
                 Ok(turso_core::StepResult::Done) => return Ok(Ok(())),
                 Ok(turso_core::StepResult::IO | turso_core::StepResult::Yield) => io.step().map_err(|e| anyhow::anyhow!("{e}"))?,
                 Ok(turso_core::StepResult::Sleep { duration }) => {
+                    #[expect(clippy::disallowed_methods, reason = "vanilla Turso has no event for a lock's release: its busy handler asks the caller to wait out its own backoff")]
                     std::thread::sleep(duration);
                     io.step().map_err(|e| anyhow::anyhow!("{e}"))?;
                 }
@@ -837,6 +854,7 @@ impl TursoSession {
                     if began.elapsed() > WAIT {
                         anyhow::bail!("the database stayed busy");
                     }
+                    #[expect(clippy::disallowed_methods, reason = "vanilla Turso says Busy with no event for the lock's release: no wait but a timed one (200 us, a picked number)")]
                     std::thread::sleep(Duration::from_micros(200));
                 }
                 Err(e) => {
@@ -923,6 +941,7 @@ impl Session for TursoSession {
                     if began.elapsed() > WAIT {
                         anyhow::bail!("the database stayed busy");
                     }
+                    #[expect(clippy::disallowed_methods, reason = "vanilla Turso says Busy with no event for the lock's release: no wait but a timed one (200 us, a picked number)")]
                     std::thread::sleep(Duration::from_micros(200));
                 }
             }

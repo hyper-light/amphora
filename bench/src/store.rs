@@ -328,8 +328,8 @@ mod tests {
     // `Groups::start` asked every engine for its group's holding and this one kept none.
     #[test]
     fn q5_k0_amphora_opens_and_reads_what_it_wrote() {
-        let dir = std::env::temp_dir().join(format!("amphora-q5-k0-{}", std::process::id()));
-        let amphora = Amphora::open(dir.to_str().unwrap()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let amphora = Amphora::open(dir.path().join("k0").to_str().unwrap()).unwrap();
         let events: Vec<Event> = (0..3)
             .map(|seq| Event { session: "s-000001".into(), id: format!("e-{seq}"), seq, at: 0, kind: "user", text: "quorum".into(), body: "{}".into() })
             .collect();
@@ -340,6 +340,5 @@ mod tests {
         assert_eq!(amphora.history("s-000002", 50).unwrap(), 0);
         assert_eq!(amphora.page("s-000001", 50).unwrap(), ["e-2", "e-1", "e-0"]);
         drop(amphora);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

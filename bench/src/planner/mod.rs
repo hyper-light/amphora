@@ -294,6 +294,7 @@ fn quiet(max: f64, wait: Duration) -> Option<f64> {
         if load.is_none_or(|l| l < max) || Instant::now() >= until {
             return load;
         }
+        #[expect(clippy::disallowed_methods, reason = "the load average has no event: the kernel recomputes it on a period of its own")]
         std::thread::sleep(Duration::from_secs(1));
     }
 }

@@ -397,7 +397,7 @@ pub fn database(r: &mut Rng) -> (Vec<String>, Schema) {
             let n = 1 + r.below(3);
             // the rowid's alias (an INTEGER PRIMARY KEY) never takes the largest rowid: a NULL after it
             // gets a rowid chosen at random, a different one in each engine
-            let alias = (pk < ncols && cols[pk].decl == "INTEGER").then_some(pk);
+            let alias = if pk < ncols && cols[pk].decl == "INTEGER" { Some(pk) } else { None };
             let rows: Vec<String> = (0..n)
                 .map(|_| format!("({})", (0..ncols).map(|c| match literal(r) {
                     V::Int(i64::MAX) if Some(c) == alias => V::Int(5).sql(),

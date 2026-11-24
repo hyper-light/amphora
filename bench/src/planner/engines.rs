@@ -212,8 +212,9 @@ impl Amphora {
         mut each: impl FnMut(&amphora_engine::Row),
     ) -> anyhow::Result<bool> {
         use amphora_engine::StepResult;
+        let waker = crate::unpark_waker();
         loop {
-            let step = stmt.step();
+            let step = stmt.step_with_waker(&waker);
             let late = deadline.is_some_and(|d| Instant::now() >= d);
             match step {
                 Ok(StepResult::Row) => {
@@ -224,7 +225,9 @@ impl Amphora {
                 Ok(StepResult::Done) => return Ok(true),
                 Ok(StepResult::IO | StepResult::Yield) => self.io.step().map_err(|e| anyhow::anyhow!("{e}"))?,
                 Ok(StepResult::Sleep { duration }) => {
-                    std::thread::sleep(duration);
+                    // Busy: until the engine wakes this thread (the lock released) or its deadline; a wake for
+                    // no reason only steps again.
+                    std::thread::park_timeout(deadline.map_or(duration, |d| duration.min(d.saturating_duration_since(Instant::now()))));
                     self.io.step().map_err(|e| anyhow::anyhow!("{e}"))?;
                 }
                 Ok(StepResult::Interrupt) if late => return Ok(false),

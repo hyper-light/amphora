@@ -31,7 +31,7 @@
 //! left in `--dir` instead of loading again, and AMPHORA_PERF_CTL turns perf's counting on and off
 //! around each measured window (`perf_ctl`), so a profile holds that window alone.
 
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -736,7 +736,7 @@ fn answers(target: &Arc<dyn Target>, only: Option<&str>, shape: &Shape, clients:
 }
 
 fn run_op(target: &Arc<dyn Target>, op: &Op, stmts: &Arc<Vec<String>>, shape: &Arc<Shape>, clients: usize, warmup: f64, seconds: f64) -> Outcome {
-    let stop = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(crate::Stop::default());
     let began = Instant::now();
     let count_from = began + Duration::from_secs_f64(warmup);
     let until = count_from + Duration::from_secs_f64(seconds);
@@ -745,15 +745,16 @@ fn run_op(target: &Arc<dyn Target>, op: &Op, stmts: &Arc<Vec<String>>, shape: &A
     let cpu = std::thread::scope(|s| {
         // The measured window's own thread: the process's CPU time in it, and perf on and off
         // around it (perf_ctl).
+        let window_stop = stop.clone();
         let window = s.spawn(move || {
-            std::thread::sleep(count_from.saturating_duration_since(Instant::now()));
+            window_stop.wait_until(count_from);
             let before = cpu_times();
             // An empty window turns nothing on, so perf counts nothing for it.
             let counted = until > count_from;
             if counted {
                 perf_ctl("enable");
             }
-            std::thread::sleep(until.saturating_duration_since(Instant::now()));
+            window_stop.wait_until(until);
             if counted {
                 perf_ctl("disable");
             }
@@ -771,10 +772,10 @@ fn run_op(target: &Arc<dyn Target>, op: &Op, stmts: &Arc<Vec<String>>, shape: &A
                     }
                     Ok(mut session) => {
                         let mut failing = 0u32;
-                        while !stop.load(Ordering::Relaxed) {
+                        while !stop.stopped() {
                             let now = Instant::now();
                             if now >= until {
-                                stop.store(true, Ordering::Relaxed);
+                                stop.stop();
                                 break;
                             }
                             let p = params(op.name, &mut rng, &shape, (c, clients), d);

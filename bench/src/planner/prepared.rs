@@ -124,12 +124,12 @@ pub fn query(amphora: &mut Amphora, name: &str, sql: &str, params: &Params, mode
     for m in &each {
         let finished = m.best_ms.iter().all(Option::is_some);
         let total: f64 = m.best_ms.iter().flatten().sum();
-        totals.push((m.name.clone(), finished.then_some(total)));
+        totals.push((m.name.clone(), if finished { Some(total) } else { None }));
         modes_json.insert(
             m.name.clone(),
             serde_json::json!({
                 "best_ms": m.best_ms,
-                "total_ms": finished.then_some(total),
+                "total_ms": if finished { Some(total) } else { None },
                 "custom_plans": m.stmt.metrics().custom_plans,
                 "stopped": m.stopped,
             }),

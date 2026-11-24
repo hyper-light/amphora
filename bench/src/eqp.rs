@@ -98,8 +98,9 @@ fn steps(text: &str) -> anyhow::Result<Vec<Step>> {
 /// Steps `stmt` to its end, each row's values printed unless `quiet`.
 fn drive(io: &Arc<dyn amphora_engine::IO>, stmt: &mut amphora_engine::Statement, quiet: bool) -> anyhow::Result<u64> {
     let mut rows = 0u64;
+    let waker = crate::unpark_waker();
     loop {
-        match stmt.step().map_err(|e| anyhow::anyhow!("{e}"))? {
+        match stmt.step_with_waker(&waker).map_err(|e| anyhow::anyhow!("{e}"))? {
             StepResult::Row => {
                 rows += 1;
                 if quiet {
@@ -117,7 +118,9 @@ fn drive(io: &Arc<dyn amphora_engine::IO>, stmt: &mut amphora_engine::Statement,
             StepResult::Done => return Ok(rows),
             StepResult::IO | StepResult::Yield => io.step().map_err(|e| anyhow::anyhow!("{e}"))?,
             StepResult::Sleep { duration } => {
-                std::thread::sleep(duration);
+                // Busy: until the engine wakes this thread (the lock released) or its deadline; a wake for
+                // no reason only steps again.
+                std::thread::park_timeout(duration);
                 io.step().map_err(|e| anyhow::anyhow!("{e}"))?;
             }
             StepResult::Interrupt => anyhow::bail!("interrupted"),

@@ -2894,6 +2894,7 @@ pub mod sql {
                                 Instant::now() < until,
                                 "TiDB's placement wasn't scheduled within --deadline-s: {states:?}"
                             );
+                            #[expect(clippy::disallowed_methods, reason = "PD has no watch for this state (Self::pd_patrol): read at PD's own patrol period")]
                             std::thread::sleep(patrol);
                         }
                     }
@@ -3200,6 +3201,7 @@ pub mod sql {
                     Instant::now() < until,
                     "Region {region}'s {what:?} operation didn't take effect within --deadline-s"
                 );
+                #[expect(clippy::disallowed_methods, reason = "PD has no watch for this state (Self::pd_patrol): read at PD's own patrol period")]
                 std::thread::sleep(patrol);
             }
         }

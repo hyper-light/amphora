@@ -12,7 +12,7 @@
 //!
 //! Each run prints one JSON line: throughput and latency percentiles of each part.
 
-// Tests may unwrap, assert and index (CLAUDE.md §1): clippy reads the workspace's clippy.toml here.
+// Tests may unwrap, assert and index (CLAUDE.md §1): clippy reads bench/clippy.toml here.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::arithmetic_side_effects, clippy::disallowed_macros))]
 
 mod blink;
@@ -474,10 +474,10 @@ impl Ready {
     }
 
     /// The earliest writer due, once it is (none: stop came first).
-    fn pop(&self, stop: &AtomicBool) -> Option<(Instant, usize)> {
+    fn pop(&self, stop: &Stop) -> Option<(Instant, usize)> {
         let mut heap = self.heap.lock().ok()?;
         loop {
-            if stop.load(Ordering::Relaxed) {
+            if stop.stopped() {
                 return None;
             }
             let wait = match heap.peek() {
@@ -490,6 +490,59 @@ impl Ready {
             heap = self.wake.wait_timeout(heap, wait).ok()?.0;
         }
     }
+}
+
+/// A run's stop, set once: when its time is up, or by a worker that can't go on. Workers read it
+/// with one load; whoever times the run waits on it with that time as the timeout, so a stop that
+/// comes sooner ends the wait at once (Ada's rule: wake on the event, time only as a timeout).
+#[derive(Default)]
+pub struct Stop {
+    stopped: AtomicBool,
+    lock: Mutex<()>,
+    told: Condvar,
+}
+
+impl Stop {
+    pub fn stop(&self) {
+        // Under the lock: a waiter between its look and its wait can't miss the stop.
+        let _held = self.lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.stopped.store(true, Ordering::SeqCst);
+        self.told.notify_all();
+    }
+
+    pub fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+    }
+
+    /// Waits for the stop, no later than `due`: whether it came.
+    pub fn wait_until(&self, due: Instant) -> bool {
+        let held = self.lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(self.told.wait_timeout_while(held, due.saturating_duration_since(Instant::now()), |_| !self.stopped()));
+        self.stopped()
+    }
+}
+
+/// Unparks the thread that made it: the engine wakes it when a lock a statement found held is
+/// released (`amphora_engine::BusyWake::Release`, lane constants-22), as amphora's `db::step` does.
+struct Unpark(std::thread::Thread);
+
+impl std::task::Wake for Unpark {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+thread_local! {
+    static UNPARK: std::task::Waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+}
+
+/// The waker for the statements this thread steps: a busy one sleeps until the lock it found held
+/// is released (`park_timeout` with the engine's deadline), not on a schedule of its own.
+pub fn unpark_waker() -> std::task::Waker {
+    UNPARK.try_with(std::task::Waker::clone).unwrap_or_else(|_| std::task::Waker::from(Arc::new(Unpark(std::thread::current()))))
 }
 
 /// Percentiles of latencies in ms.
@@ -641,7 +694,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     // Mixed: writers append, readers read, for a while.
-    let stop = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(Stop::default());
     let until = Duration::from_secs(o.seconds);
     // Each second's writes finished, and the longest of them (µs), by the second it finished in.
     let slots = usize::try_from(o.seconds).unwrap_or(0) + 2;
@@ -654,17 +707,18 @@ fn main() -> anyhow::Result<()> {
     let sampler = {
         let (stop, anon_peak) = (stop.clone(), anon_peak.clone());
         std::thread::spawn(move || {
-            while !stop.load(Ordering::Relaxed) {
+            while !stop.stopped() {
                 if let Some(mb) = rss_anon_mb() {
                     anon_peak.fetch_max((mb * 10.0) as u64, Ordering::Relaxed);
                 }
-                std::thread::sleep(Duration::from_millis(100));
+                stop.wait_until(Instant::now() + Duration::from_millis(100));
             }
         })
     };
     let written = Arc::new(Shared::new());
     let ready = Arc::new(Ready { heap: Mutex::new((0..o.writers).map(|w| Reverse((mixed, w))).collect()), wake: Condvar::new() });
     let inflight = Arc::new(AtomicU64::new(0));
+    let drained = Arc::new((Mutex::new(()), Condvar::new()));
     let failures = Arc::new(AtomicU64::new(0));
     // Paced: each writer a write every writers/rate seconds, from when it was due (not when the last
     // was answered), so a slow answer can't hide its own wait.
@@ -672,14 +726,14 @@ fn main() -> anyhow::Result<()> {
     let reads = std::thread::scope(|s| -> anyhow::Result<Hist> {
         let mut subs = Vec::new();
         for t in 0..o.submitters.max(1) {
-            let (driver, seqs, stop, o, per_second, ready, written, inflight, failures) =
-                (driver.clone(), seqs.clone(), stop.clone(), &o, per_second.clone(), ready.clone(), written.clone(), inflight.clone(), failures.clone());
+            let (driver, seqs, stop, o, per_second, ready, written, inflight, drained, failures) =
+                (driver.clone(), seqs.clone(), stop.clone(), &o, per_second.clone(), ready.clone(), written.clone(), inflight.clone(), drained.clone(), failures.clone());
             subs.push(s.spawn(move || -> anyhow::Result<()> {
                 let mut rng = Rng(0xd1b5_4a32_d192_ed03 ^ (t as u64 + 1));
                 while let Some((due, w)) = ready.pop(&stop) {
                     let session = rng.below(if o.disjoint { o.sessions / 2 } else { o.sessions });
                     let batch: Vec<Event> = (0..o.batch.max(1)).map(|_| event(&mut rng, session, seqs[session].fetch_add(1, Ordering::Relaxed), o.text_bytes)).collect();
-                    let (ready, written, per_second, stop, inflight, failures) = (ready.clone(), written.clone(), per_second.clone(), stop.clone(), inflight.clone(), failures.clone());
+                    let (ready, written, per_second, stop, inflight, drained, failures) = (ready.clone(), written.clone(), per_second.clone(), stop.clone(), inflight.clone(), drained.clone(), failures.clone());
                     inflight.fetch_add(1, Ordering::Relaxed);
                     driver.write(
                         batch,
@@ -698,9 +752,15 @@ fn main() -> anyhow::Result<()> {
                                 n.fetch_add(1, Ordering::Relaxed);
                                 most.fetch_max(us, Ordering::Relaxed);
                             }
-                            inflight.fetch_sub(1, Ordering::Relaxed);
-                            if !stop.load(Ordering::Relaxed) {
+                            // The last answer after the stop wakes the drain below. SeqCst here and on the
+                            // stop: either this sees the stop, or the drain sees this answer.
+                            let last = inflight.fetch_sub(1, Ordering::SeqCst) == 1;
+                            if !stop.stopped() {
                                 ready.push(interval.map_or(now, |i| (due + i).max(now)), w);
+                            } else if last {
+                                let (lock, answered) = &*drained;
+                                let _held = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                                answered.notify_all();
                             }
                         }),
                     )?;
@@ -714,7 +774,7 @@ fn main() -> anyhow::Result<()> {
             rs.push(s.spawn(move || -> anyhow::Result<Hist> {
                 let mut rng = Rng(0x2545_f491_4f6c_dd1d ^ (r as u64 + 1));
                 let mut lat = Hist::new();
-                while !stop.load(Ordering::Relaxed) {
+                while !stop.stopped() {
                     let session = format!("s-{:06}", if o.disjoint { o.sessions / 2 + rng.below(o.sessions - o.sessions / 2) } else { rng.below(o.sessions) });
                     let t = Instant::now();
                     driver.history(&session, 50)?;
@@ -723,8 +783,8 @@ fn main() -> anyhow::Result<()> {
                 Ok(lat)
             }));
         }
-        std::thread::sleep(until);
-        stop.store(true, Ordering::Relaxed);
+        stop.wait_until(Instant::now() + until);
+        stop.stop();
         ready.wake.notify_all();
         for h in subs {
             h.join().map_err(|_| anyhow::anyhow!("a submitter panicked"))??;
@@ -735,12 +795,14 @@ fn main() -> anyhow::Result<()> {
         }
         Ok(reads)
     })?;
-    // What was handed over and not yet answered is waited for (a minute at most): it counts.
-    let drain = Instant::now() + Duration::from_secs(60);
-    while inflight.load(Ordering::Relaxed) > 0 && Instant::now() < drain {
-        std::thread::sleep(Duration::from_millis(10));
+    // What was handed over and not yet answered is waited for (a minute at most): it counts. The
+    // last answer wakes this wait.
+    {
+        let (lock, answered) = &*drained;
+        let held = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(answered.wait_timeout_while(held, Duration::from_secs(60), |_| inflight.load(Ordering::SeqCst) > 0));
     }
-    let unanswered = inflight.load(Ordering::Relaxed);
+    let unanswered = inflight.load(Ordering::SeqCst);
     let _ = sampler.join();
     let writes = written.hist();
     let stats_after_mixed = driver.stats();
