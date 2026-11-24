@@ -898,7 +898,9 @@ impl Predicate {
             .cloned()
             .unwrap_or(Value::Null);
         let value = match affinity.convert_for_compare(&bound, digits) {
-            Some(either::Either::Left(converted)) => converted.to_owned()?,
+            Some(either::Either::Left(converted)) => {
+                converted.to_owned().map_err(|_| MorselError::Alloc)?
+            }
             Some(either::Either::Right(converted)) => converted,
             None => bound,
         };
