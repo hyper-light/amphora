@@ -1,6 +1,6 @@
 # Lane C3 (planner), 2026-11-24 05:55:48Z to 06:55:48Z: t_pl_8_13, a left join inside a bushy run
 
-Machine: MacBook Pro 2 (runner e30189ea), the only Mac that took a run this hour: load 50 to 86 on 18 cores, each of my
+Machine: MacBook Pro 2 (runner e30189ea), the only Mac that took a run this hour: load 50 to 95 on 18 cores, each of my
 processes at nice 20 on 10 to 16% of a core (CPU time against elapsed, r660). adacachy2 was closed to lanes (Ada's
 benchmark window). perf/planner-c3 is main 0101aa38 with this record and no code. Not green, so on branches of their own:
 perf/planner-c3-candidate d564a2f0 (the candidate price, the sweep's test, its fixture and generator) and
@@ -13,12 +13,14 @@ perf/planner-c3-ab 69dc0668 (main's engine with the probes, and the candidate as
 - **The candidate fix has never been run.** Its build (r647) did not end either.
 - The sweep was not run. Its test has not been compiled.
 - The forced shapes (r636's second half) met my 10 minute limit inside the first shape: no time for either plan.
-- r554, r565, r596 and r609, without `on`, were still queued behind other lanes at 06:44Z; r592's sync timed out (60 s).
+- r554, r565, r596 and r609, without `on`, were still queued behind other lanes at 06:46Z (I then stopped r565 and r609, which repeat
+  r596); r592's sync timed out (60 s).
 
 ## 2. Is it wrong for a user? Not where it ran
 
-Earlier lanes' failures are all at the test's plan-shape asserts (`made_bushy > 0`, `in_runs > 0`;
-2026-11-23-adacachy2-perf-tpch.md T3 to T10), which stand before its answer checks. None shows a row lost or changed.
+Every earlier record that names the failing assert names a plan-shape one (`made_bushy > 0`, `in_runs > 0`:
+2026-11-23-adacachy2-perf-tpch.md, lanes T3, T4, T6, T9, T10), which stands before the test's answer checks. T7's r1185 and
+F6's r446 do not name theirs. No record shows a row lost or changed.
 
 Query 0 (`d1 LEFT JOIN d2 s`, no extra ON term), ANALYZEd, main's engine, debug, through SQL; SQLite 3.54.0 answers
 `172800,1038240000,1033516800,57600,691200` (115,200 of its 172,800 rows are NULL-extended):
@@ -31,15 +33,16 @@ Query 0 (`d1 LEFT JOIN d2 s`, no extra ON term), ANALYZEd, main's engine, debug,
 | adaptive joins | yes | yes | SQLite's |
 | parallel mode, 1 core | yes | yes | SQLite's |
 | parallel mode, 2 cores | yes | yes | SQLite's |
+| parallel mode, 8 cores | yes | yes | SQLite's |
 
 Query 1 (its mirror FROM), by cost (r636): bushy with the LEFT JOIN in the run, `172800,1032825600,1038240000,57600,345600`, SQLite's.
 Whether the parallel hook ran, or the serial loop answered, was not read. Not run: the other six queries, without statistics,
-8 workers, the other join methods.
+the other join methods.
 
 ## 3. The trace: why the search does not put the LEFT JOIN in the run (r636, `c3_probe_weighed`)
 
 Query 0 at the weights the test starts with: seek 12.79 rows' visits, hash build 20.77, hash probe 5.87, a row's visit
-0.005736 page reads. Every whole plan the search weighed, estimated cost and estimated rows after each table:
+0.005736 page reads. The whole plans in the search's trace, with their estimated cost and estimated rows after each table:
 
 | plan | cost | rows |
 |---|---|---|
@@ -50,10 +53,10 @@ Query 0 at the weights the test starts with: seek 12.79 rows' visits, hash build
 - The run (d1, s, f1) reads f1 by an automatic index (EXPLAIN: `SEARCH f1 USING COVERING INDEX ephemeral_f1_t3 (d1=?)`).
 - By the formula (`estimate_ephemeral_index_build_cost`, `n * log2(n) * cpu_cost_per_seek`) that index is priced at
   12,000 x 13.55 x 12.79 x 0.005736 = 11,930, which is 85% of the plan's 14,095. I computed it; the trace does not log it.
-- The formula is the Turso import's (f2e07044), where a seek's price stood for a comparison's. Since 2996f99c
-  `cpu_cost_per_seek` is the learned price of a whole search (calibration times a binary search of a page's 512 keys), so each
-  insert is priced at 13.55 searches. **Inferred, not measured: that an insert really takes about one.**
-- With an insert at one search and one visit of its row, the index is 949 and the plan 3,114, under the mirror's 5,300.
+- The formula is the Turso import's (f2e07044); its comment counts comparisons ("about log2(rows) comparisons per insert").
+  Since 2996f99c `cpu_cost_per_seek` is the learned price of a whole search (calibration times a binary search of a page's 512
+  keys), so each insert is priced at 13.55 searches. **Inferred from the code, not measured: that an insert takes about one.**
+- Computed: with an insert at one search and one visit of its row, the index is 949 and the plan 3,114, under the mirror's 5,300.
 - The query's first run moved the hash probe's weight from 5.87 to 88.0 (then 312.9 after query 1). At 88.0 the mirror costs
   51,705 and the test's plan 19,749, so the second run has the LEFT JOIN in the run. The test passes where that weight moves
   far enough and fails where it does not. Why one run moves it 15 times is not traced.
