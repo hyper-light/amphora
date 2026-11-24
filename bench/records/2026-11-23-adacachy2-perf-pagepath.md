@@ -1615,3 +1615,105 @@ Note 5's fix has its red arm above (c1e73c06, 3e028a02: the checkpoint's test an
 **Commands.** `~/.cache/amphora-perf/pagepath-b25/` on this machine holds the scripts and this record's draft; on adacachy2 the same folder holds
 `check.sh`, `focus.sh`, `evidence.sh`, `mutants.{py,sh}`, `old_write.py`, `old_read.py`, the two old archives, and one folder of logs a run
 (`red`, `red2`, `green1` to `green3`, `red3`, `red4`, `merged-aedd4bb6`, `landing-84cfb3d6`) and the evidence's and mutants' logs beside them.
+
+## perf-B26 (2026-11-24, 09:24:29Z-10:24:29Z; lane B25's three backup notes: a short base, a failed restore's files, a failed check)
+
+**Losses first.**
+- Bases made before this lane restore nothing. A manifest of format 1 or 2 doesn't say what its file held, so every second whose base is
+  one is refused until a new, whole base ends (the lead's decision; Amphora is unreleased). The first opening after an upgrade begins one.
+- A killed restore's files stay until someone removes them. Its path is refused meanwhile, by an open and by a restore, naming them: they may be
+  another process's restore under way, and nothing tells the two apart.
+- What is left is refused by its name (`<database>.restoring`), by Amphora's opens. Its bytes are a database's: renamed by hand, or opened by another
+  program, it opens as an older one. No database can take a name that ends so.
+- A failed check begins a base only where its restore was refused for frames of a generation (`Short`, `Gap`) or for a base's proof (`Unproven`).
+  A sum that fails, an object that is gone, `NoBase`, a failed integrity check and rows that differ begin none, as before.
+- The bound on those bases is one for the same log's end. A store that spoils every copy, under a database that commits, gets a whole base for each
+  check that fails.
+- The log shipped again costs its bytes again (at most what the log keeps) beside the whole base. The second the check failed at, and those
+  before it in the short generation, stay refused.
+- A cut across groups that fails after its groups are at their paths (the coordinator's finishing) leaves them: each is whole at the second, and the next
+  coordinator finishes it. A kill between two of the cut's last renames leaves the first group's alone; the others' paths are refused.
+- The first landing (507ba0f6) had no test that the base a failed check begins is whole, and none that told the check's wake from a
+  commit's: with either taken out (m14, m9) every test passed. bc008095 (main at 10:10:41Z, test code only) has both, each red on its mutant. Its
+  message says the first "passed vacuously as landed"; that one was on the branch (04087dab), never on main.
+- The two 60 s waits of the red arms end at the test's deadline: that is what "no base began" looks like there.
+- The file system with no hard links (a rename then) was not run. Windows was not run or linted. macOS ran the suite once (r1664), no clippy.
+- No benchmark was run (rule 0). An opening reads nothing more; a restore reads no object more; a database's open looks one name up, two where a restore's file is there.
+- perf/pagepath-b26's history holds WIP messages; main's doesn't: 507ba0f6 is f46a2d7f's tree. perf/pagepath-b26-red holds the red arm and the scripts (`b26/`), never for main.
+
+**What each note was.** Red is main's code (07d95147) with the lane's tests and the types they name (0429fe9c); green is f46a2d7f, whose tree is
+507ba0f6's, or 04087dab, its tests alone changed. Logs on adacachy2 in `~/.cache/amphora-perf/pagepath-b26/`.
+
+| note | the scenario | red: what the user got | green |
+|---|---|---|---|
+| 1, a base made before lane B22's fix | the drill: the archive and files that tree wrote (ba250493: 41 rows, a read keeping the closing segment back; `old_write.py`), each second restored, then opened again backed up to it, a base ended, 3 rows more (`old_read.py`) | **20 of 41 rows, no error** (seconds 1041, 1042); opened again, no base needed | refused, typed: "base 1041000000002 can't be shown to restore: its manifest, of an earlier format, doesn't say its file holds the log before generation 2, the one it began in"; a base needed, 0 chunks kept, seconds 1047 to 1050 whole |
+| 1, the same made by the test | `a_base_that_does_not_say_what_its_file_holds_is_refused` | 20 of 41 rows, no error | refused `Unproven`, `Unsaid`; a whole base restores every second; `expire` lets the old one go |
+| 1, a manifest and its log that disagree (no such manifest on main) | `a_base_whose_manifest_and_log_disagree_is_refused`: all but 5 of the closing segment's frames in the file; 5 fewer in it; none; another generation | with the comparison taken out (m1, m2): 30 of 30 rows, no error | each refused, typed, naming it (`Uncopied`, `Before` twice, `Own`), no file left |
+| 1, a shipper that begins a base too early | `d45_a_base_begun_while_a_read_holds_...` with the shipper's checks taken out (m3) | main before B22: 21 of 41 rows lost | refused by the restore: "its file held 25 of the 48 frames of -wal, the segment closing as it began (the log's generation 0): frames 26 to 48 are missing" |
+| 2, an error mid-restore | a restore of a base and four generations failing at each of its 38 steps | **35 left a database** of 10 to 49 of its 50 rows | 0 |
+| 2, a read of the store refused | each of its 14 reads | **11 left a database** of 5 to 49 rows | 0 |
+| 2, a kill between two writes | a process killed at each of the 38 steps (`a_killed_restore_leaves_no_database`, and the survey) | **35 left a database** of 10 to 49 rows | 0: the files left are refused by name, the path too; removed, the restore is whole |
+| 2, a full disk | a tmpfs of 2 MiB, so much of it left free | 10 amounts, 8,192 to 118,784 bytes free ("No space left on device"; at the last, the engine's own write): **9 left a database** of 1 to 20 rows | 0 of 10, no file left; 131,072 free: restored, 50 of 50 rows (both arms) |
+| 2, the same in the suite | `a_restore_a_full_disk_cuts_short_leaves_no_database`: a file that can't grow (`ulimit -f`) | files left at the first limit ("File too large") | no file left at any limit |
+| 2, a missing frame | in `a_restore_that_fails_leaves_no_database`, and lane B25's `a_short_restore_leaves_no_database` | refused, no file (lane B25's) | refused, no file |
+| 2, a cut across groups | `a_cut_one_group_fails_leaves_no_database` | the first group's database, 50 rows | no file |
+| 3, a failed check | `a_failed_check_of_a_short_archive_begins_a_base`: its last frame zeroed, sealed again, under a database that then commits nothing | none in 60 s, 112 rounds run | a base begun in the next generation ends |
+| 3, the check's own wake | `a_check_that_fails_wakes_the_round_that_begins_a_base`: the threads' wakes are the test's, one made before the check, none after | (no such code) with the wake taken out (m9): the check failed, no base in 60 s, 3 rounds run | ends |
+
+**The causes, and the fixes** (507ba0f6; its message says each in full; docs/design/backup.md restated).
+- *Note 1* (`object.rs` `Held`, `ship.rs` `begin_base`, `restore.rs`, engine `Database::wal_before`): the manifest's format 3 says the generation the base
+  began in and the closing segment (file, generation, frames, frames copied); the restore compares it with the archive's link and header first.
+  The shipper refuses to begin a base it would refuse. A generation that isn't the base's own asks for the log shipped again, as which of the two is wrong isn't known.
+- *Note 2* (`restore.rs` `Making`, `db.rs` `Unrestored`): the file is made aside, linked at its path last. `Db::open` made an empty file at the path before it
+  looked (`in_place`), so the path's own refusal stands before it (found by the kill test, r1608).
+- *Note 3* (`shipping.rs` `Mends`, `ship.rs` `mend`): a base begun in the short generation would replay it, so that generation is shipped again, whole,
+  as one of the archive's own; taken out (m10) the thread begins and drops bases without end (1,927,592 rounds in the 60 s wait).
+
+**What landed.** Main 507ba0f6 at 09:55:22Z, a fast-forward from 07d95147 (main had moved from 925c73fb, where the lane began; merged at 09:46Z); then bc008095
+at 10:10:41Z, a fast-forward from b0e68ba7 (lane A28 landed between the two; the tests were put on it and run there).
+
+**Checks** (adacachy2, `on` it, needs as named; the clone is `~/.cache/amphora-perf/pagepath-remote`, target
+`~/.cache/amphora-perf-target/pagepath`, CARGO_INCREMENTAL=0, nice 10; the scripts are `b26/` on perf/pagepath-b26-red).
+
+| run | tree | needs, load | result |
+|---|---|---|---|
+| r1598 | 3e08f36d (main 925c73fb plus the change, before its tests) | `cpus=4,mem=12g`, 30 to 41, 09:42Z to 09:44Z | tests/backup.rs 41 passed, 0 failed, 1 ignored; `backup::` 46 |
+| r1608 | d5092835 (with the tests) | `cpus=6,mem=16g`, 31 to 32, 09:45Z | 8 passed, 1 failed (`a_killed_restore_...`: the path opened; fixed in 55f5c333) |
+| r1611 | 9d56159e (main 07d95147 merged) | `cpus=8,mem=20g`, 28 to 35, 09:47Z to 09:50Z | all eleven steps exit 0 |
+| r1629 | f46a2d7f, whose tree is 507ba0f6's, landed | `cpus=8,mem=20g`, 27 to 72, 09:51Z to 09:55Z | all eleven steps exit 0: fmt; requirements; `backup::` 47 passed; tests/backup.rs 50 passed, 0 failed, 1 ignored (the benchmark) in 21.9 s, the drill among them; tests/store.rs 17; the power cut 1 (its 200 seeds); engine `d45_` 26; clippy `-p amphora -p amphora-engine --all-targets --locked -D warnings` 47 s ("Checking amphora-engine"); check-production 64 s ("Compiling amphora-engine" twice, "10616 left ... as the ratchet holds") |
+| r1660 | ba250493, 0429fe9c, 04087dab | `cpus=8,mem=20g`, 51 to 81, 09:55Z to 09:59Z | the drill and the red arm, as above: on main's code 8 of the 9 tests fail (two of them, `a_base_whose_...` and `d45_a_base_begun_after_...`, as no manifest of format 3 is there to read); the ninth (`d45_a_check_clears_...`, a killed check's files) is red on m12 |
+| r1683 | 0429fe9c, 04087dab | `cpus=4,mem=12g`, 53 to 84, 10:01Z to 10:07Z | the disk and the survey, as above (the disk drill at 3 amounts of room: 2 of 3 left a database, then 0 of 3; its own "more than 3 amounts" failed on both arms, so it was run again at finer steps, r1758); the mutants, below |
+| r1721 | bc008095, main itself (main b0e68ba7 plus the two tests) | `cpus=4,mem=12g`, 44 to 51, 10:07Z to 10:12Z | fmt 0; `backup::` 48 passed; tests/backup.rs 50 passed, 0 failed, 1 ignored in 50.3 s; clippy `-p amphora --all-targets --locked -D warnings` 0 ("Checking amphora"; the engine was not touched); m9 and m14 red (check-production, tests/store.rs, the power cut and `d45_` not run again: test code only) |
+| r1758 | bc008095, 0429fe9c | `cpus=2,mem=8g`, 48 to 115, 10:13Z to 10:15Z | the disk drill at 10 amounts of room, and the survey again, as above |
+| r1664 | 04087dab | MacBook Pro 2 (macOS, `cpus=5,mem=12g`), 31 to 46, 09:59Z to 10:11Z | tests/backup.rs 50 passed, 0 failed, 1 ignored in 157.9 s; `backup::` 47 passed in 32.9 s |
+
+Refused for room: `cpus=8` at 10:00Z (2 of 32 cores idle), `cpus=6` at 10:07Z (5), `cpus=4` at 10:12Z (2). r1678 was stopped by this lane within a minute of its start (its mutants ran one by one; r1683 runs them in sets).
+
+**Each part of the fix is red when taken out** (r1683 on 04087dab in three sets, parts whose tests are apart; m9 and m14 again in r1721 on bc008095; `mutants.py`).
+
+| arm | what is taken out | red |
+|---|---|---|
+| m1 | a restore's comparison of what the manifest says | `a_base_whose_manifest_and_log_disagree_is_refused` |
+| m2 | its own generation's comparison | the same |
+| m3 | the shipper's checks at a base's beginning | `d45_a_base_begun_while_a_read_holds_...` (refused by the restore), `d45_a_base_begun_after_an_opening_...` |
+| m4 | a failed restore's files removed | `a_restore_that_fails_...`, `a_restore_a_full_disk_...`, `a_short_restore_...` |
+| m5 | the database made aside | `a_killed_restore_leaves_no_database` |
+| m6 | its path refused | the same |
+| m7 | its name refused | the same ("restored.db.restoring opens, 10 rows", killed at step 3) |
+| m8 | the check's ask | `a_failed_check_of_a_short_archive_begins_a_base` |
+| m9 | the ask's wake | 507ba0f6's tests: none (a commit's wake came after the check); bc008095's: `a_check_that_fails_wakes_...` |
+| m10 | the log shipped again | `a_failed_check_of_a_short_archive_begins_a_base` |
+| m11 | a cut's groups made before any is put at its path | `a_cut_one_group_fails_leaves_no_database` |
+| m12 | a killed check's files cleared | `d45_a_check_clears_the_segments_left_at_its_scratch_path` |
+| m13 | one base for the same log's end | `a_check_that_finds_the_archive_lacking_...` |
+| m14 | the base for it whole | 04087dab's tests: none; bc008095's: the same test (7 chunks, 6 of another base's) |
+
+**Found on the way, left (read in the code, no scenario run).**
+- A shipper opened on an archive marks the pages an incremental base must copy from its segments' frames without checking they are the generation's own.
+  Where one is short (sealed, so a shipper's fault; those known were followed by a gap, which makes the base whole), the next incremental base would
+  keep a chunk those frames changed, and its manifest's proof wouldn't say so.
+- A check that fails for a sum, a missing object, its integrity or its rows begins no base (above).
+- Still gapped, refused typed, as lane B25 left it: commits between a send's drain and a forced switch, and an opening on a closed segment the archive holds short.
+
+**Commands.** `~/.cache/amphora-perf/pagepath-b26/` on this machine holds the scripts and this record's draft; on adacachy2 the same folder holds them, the old base (`old-base`)
+and one folder of logs a run (`wip1`, `wip2`, `merged-9d56159e`, `final-f46a2d7f`, `mutants`, `last-land`) beside the evidence's logs.
