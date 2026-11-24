@@ -722,9 +722,9 @@ fn put(
 }
 
 /// Decision 45 (lane B18): the backup ships from the segment the writer appends to. Do: write
-/// 20 rows and ship them, start the log again (the writer switches to `-wal2`), write 20 more and
-/// ship, then restore the last second. Expect: the switch made `-wal2`, and the restore holds the
-/// 20 rows written after it as well as the 20 before.
+/// 20 rows, ship them and copy a base, start the log again (the writer switches to `-wal2`), write
+/// 20 more and ship, then restore the last second. Expect: the switch made `-wal2`, and the
+/// restore holds the 20 rows written after it as well as the 20 before.
 #[test]
 fn d45_a_backup_after_a_switch_holds_the_writes_made_after_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -742,6 +742,11 @@ fn d45_a_backup_after_a_switch_holds_the_writes_made_after_it() {
     let mut shipper = Shipper::open("db", Arc::clone(&hooks), &blobs, &db, until()).unwrap();
     put(&mut db, &now, 0..20, "a", &mut model, &mut history);
     shipper.ship(&db, &blobs, until()).unwrap();
+    let mut base = shipper
+        .begin_base(&db, &blobs, &amphora::memory::process(), 32 * 1024)
+        .unwrap();
+    while shipper.copy_base(&db, &blobs, &mut base, until()).unwrap() {}
+    shipper.end_base(&db, &blobs, base, until()).unwrap();
     assert!(
         db.restart_log().unwrap(),
         "the log starts again once shipped"
