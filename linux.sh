@@ -47,6 +47,9 @@ for step in "$@"; do
       echo "panics: $(grep -ac '^    Amphora PANIC' "$O/wide-$seed.log")"
       grep -a "^    Amphora PANIC" "$O/wide-$seed.log" | sort | uniq -c | sort -rn | head -5
       python3 "$HOME/.cache/amphora-perf/dml-c14-diag-remote/classify.py" "$O/wide-$seed.log" ${CLASS_MAX:-14} ;;
+    libtest:*)  # libtest:FILTER,FILTER
+      timeout 900 nice -n 10 "$(ls -t "$D"/amphora_engine-* | grep -v '\.d$' | grep -v rlib | grep -v rmeta | head -1)" $(echo "${step#libtest:}" | tr , ' ') --test-threads=${JOBS:-8} > "$O/libtest.log" 2>&1; rc=$?
+      echo "== libtest ${step#libtest:} rc=$rc $(( $(date +%s) - s ))s"; grep -E "test result|FAILED|failed$|panicked" "$O/libtest.log" | head -20 ;;
     red:*)  # red:COUNT:SEED   every test of c14_dml by name, on this tree
       IFS=: read -r _ count seed <<< "$step"
       python3 "$HOME/.cache/amphora-perf/dml-c14-diag-remote/sqlite_dml_rows.py" "$count" "$seed" > "$O/red-$seed.tsv" || exit 9
@@ -56,7 +59,7 @@ for step in "$@"; do
       grep -aE "SQLite .*|^[0-9]+ runs" "$O/red-$seed.log" | grep -aE "^(default|parallel|statistics):|runs" | cut -c1-260 | head -20 ;;
     clippy)
       timeout 1500 nice -n 10 cargo clippy -p amphora-engine --all-targets --locked -- -D warnings > "$O/clippy.log" 2>&1; rc=$?
-      echo "== clippy rc=$rc $(( $(date +%s) - s ))s"; grep -E "Checking amphora-engine|^(error|warning)" -A 12 "$O/clippy.log" | head -80 ;;
+      echo "== clippy rc=$rc $(( $(date +%s) - s ))s"; grep -E "Checking amphora-engine v" "$O/clippy.log"; grep -E "^(error|warning)" -A 12 "$O/clippy.log" | head -80 ;;
     production)
       timeout 1500 nice -n 10 bash scripts/check-production.sh > "$O/production.log" 2>&1; rc=$?
       echo "== check-production rc=$rc $(( $(date +%s) - s ))s"; tail -6 "$O/production.log" ;;
