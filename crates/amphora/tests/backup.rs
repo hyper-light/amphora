@@ -73,8 +73,9 @@ fn log_files(path: &std::path::Path) -> String {
                 return format!("{suffix}: {} bytes, no header", bytes.len());
             };
             let generation = u32::from_be_bytes(header[12..16].try_into().unwrap());
-            let frames = bytes[32..]
-                .chunks_exact(4096 + 24)
+            let (frames, _) = bytes[32..].as_chunks::<{ 4096 + 24 }>();
+            let frames = frames
+                .iter()
                 .take_while(|frame| frame[8..16] == header[16..24])
                 .count();
             format!(
