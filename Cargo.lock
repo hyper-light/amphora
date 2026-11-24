@@ -258,6 +258,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "amphora-pg-catalog"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
 name = "amphora-pg-oracle"
 version = "0.1.0"
 
