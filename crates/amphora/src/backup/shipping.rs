@@ -1102,23 +1102,23 @@ mod tests {
 
     /// AC-T1.12.4 (lane B26): a check that finds the archive lacking gets one base for it, and another
     /// only where that one lacks too and a commit moved the log since: a check that fails again and
-    /// again never keeps a base copying for nothing. Do: end a first base; ask for one for frames of
-    /// the generation shipped now and run rounds; ask again for the same frames, for frames of the
-    /// generation after, which the base begun began in, and for that base's proof; commit, ask for its proof
-    /// again, and run rounds; restore the last second. Expect: a base ends at the first ask, in a
-    /// generation of its own with the log shipped again, and at the last; none in between; the second
-    /// restores with every row.
+    /// again never keeps a base copying for nothing. Do: end a first base of 400 rows; ask for one
+    /// for frames of the generation shipped now and run rounds; ask again for the same frames, for
+    /// frames of the generation after, which the base begun began in, and for that base's proof; change a
+    /// row over two generations, ask for its proof again, and run rounds; restore the last second.
+    /// Expect: a base ends at the first ask, in a generation of its own with the log shipped again,
+    /// and at the last, keeping no chunk; none in between; the second restores with every row.
     #[test]
     fn a_check_that_finds_the_archive_lacking_gets_one_base_until_a_commit() {
         let dir = tempfile::tempdir().unwrap();
         let blobs = Arc::new(SimBlobs::new(64 * 1024, 1_000_000, 1 << 30));
-        let (db, mut prepared, now) = backed_up(
+        let (mut db, mut prepared, now) = backed_up(
             &dir.path().join("source.db"),
             &blobs,
             None,
             CheckPolicy::Off,
         );
-        write(&db, &now, 0, 10);
+        write(&db, &now, 0, 400);
         let mut copy = None;
         assert!(rounds(&mut prepared, &mut copy), "the first base ends");
         let generation = prepared.shipper.generation();
@@ -1136,13 +1136,105 @@ mod tests {
             prepared.mends.ask(lacks);
             assert!(!rounds(&mut prepared, &mut copy), "{lacks:?}, no commit");
         }
-        write(&db, &now, 10, 1);
-        prepared.mends.ask(Lacks::Base { id });
-        assert!(rounds(&mut prepared, &mut copy), "a base for the proof");
-        assert_ne!(prepared.shipper.latest_base(), Some(id));
+        let change = |db: &Db, v: &str| {
+            now.fetch_add(SECOND_NS, Ordering::SeqCst);
+            db.exec(&format!("UPDATE t SET v = '{v}' WHERE id = 5"))
+                .unwrap();
+        };
+        // Twice: the second's base could keep the first's chunks, whose generation wrote few pages.
+        let mut whole = id;
+        for (before, after) in [("a", "b"), ("c", "d")] {
+            change(&db, before);
+            prepared.ship().unwrap();
+            assert!(db.restart_log().unwrap(), "shipped, so it starts again");
+            change(&db, after);
+            prepared.mends.ask(Lacks::Base { id: whole });
+            assert!(rounds(&mut prepared, &mut copy), "a base for the proof");
+            let ended = prepared.shipper.latest_base().unwrap();
+            assert_ne!(ended, whole);
+            whole = ended;
+        }
+        let listed = blobs.list("db/base/", None, 10, until()).unwrap().objects;
+        let (key, _) = listed.last().unwrap();
+        let manifest = crate::backup::object::manifest(key, &blobs.get(key, until()).unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(
+            manifest.chunks > 4,
+            "non-vacuous: {} chunks",
+            manifest.chunks
+        );
+        assert_eq!(
+            manifest.from,
+            vec![(whole, manifest.chunks)],
+            "no chunk of another base's"
+        );
         now.fetch_add(SECOND_NS, Ordering::SeqCst);
         prepared.round(&mut copy).unwrap();
         assert_eq!(restored_now(dir.path(), &blobs, &now).unwrap(), ids(&db));
+    }
+
+    /// AC-T1.12.4 (lane B26): a check that fails wakes the shipping thread for the base it asks for: no
+    /// commit does. Do: end a first base, commit and ship; zero the last frame of the log's
+    /// generation in the archive, sealed again; start the threads, whose wakes are the test's to make; once
+    /// the check thread took its snapshot, make one, so the round after it checks that second; make no
+    /// other.
+    /// Expect: the check fails, and a base begun after the short generation ends.
+    #[test]
+    fn a_check_that_fails_wakes_the_round_that_begins_a_base() {
+        use crate::backup::object;
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = Arc::new(SimBlobs::new(64 * 1024, 1_000_000, 1 << 30));
+        let (db, mut prepared, now) = backed_up(
+            &dir.path().join("source.db"),
+            &blobs,
+            None,
+            CheckPolicy::Scratch(None),
+        );
+        write(&db, &now, 0, 10);
+        let mut copy = None;
+        assert!(rounds(&mut prepared, &mut copy), "the first base ends");
+        write(&db, &now, 10, 1);
+        prepared.ship().unwrap();
+        let generation = prepared.shipper.generation();
+        let listed = blobs.list("db/log/", None, 100, until()).unwrap().objects;
+        let (key, _) = listed.last().unwrap();
+        let sealed = blobs.get(key, until()).unwrap();
+        let mut segment: object::Segment =
+            postcard::from_bytes(object::opened(key, &sealed).unwrap()).unwrap();
+        let tail = segment.frames.len() - usize::try_from(FRAME_BYTES).unwrap();
+        segment.frames[tail..].fill(0);
+        blobs.delete(key, until()).unwrap();
+        blobs
+            .create(key, &object::encode(&segment).unwrap(), until())
+            .unwrap();
+        now.fetch_add(2 * SECOND_NS, Ordering::SeqCst);
+
+        let hooks = prepared.hooks();
+        let mut wake = None;
+        let shipping = prepared.start(|watcher| wake = Some(watcher)).unwrap();
+        let deadline = until();
+        while hooks.marks.state().unwrap().watch.is_none() {
+            assert!(Instant::now() < deadline, "no snapshot was taken");
+            std::thread::yield_now();
+        }
+        assert!(wake.as_ref().unwrap()(), "the thread runs");
+        let failed = |s: &Status| match &s.last_check {
+            Some(Check::Failed {
+                why: CheckFailure::Lacking { lacks, .. },
+                ..
+            }) => *lacks == Lacks::Frames { generation },
+            _ => false,
+        };
+        shipping
+            .wait(until(), |s| s.bases > 0 && failed(s))
+            .unwrap_or_else(|e| panic!("no base ended: {e:#}; {:?}", shipping.status()));
+        let bases = blobs.list("db/base/", None, 10, until()).unwrap().objects;
+        let (newest, _) = bases.last().unwrap();
+        let newest = plan::BaseKey::parse("db", newest).unwrap();
+        assert_eq!(newest.start_gen, generation + 1);
+        drop(wake);
+        shipping.wait(until(), |s| s.ended).unwrap();
     }
 
     /// The most bytes the files in a restore's folder held together, seen at each of its steps.
