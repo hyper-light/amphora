@@ -664,6 +664,22 @@ mod tests {
         );
     }
 
+    /// Decision 45, AC-T1.12.4 (lane B25): a generation ended by force is whole once all of it is
+    /// shipped, and no sooner. Do: start 6 again at frame 5 with 3 shipped; ship it to 4, then 5. Expect:
+    /// 6 reaches 7 whole only at 5, asked from 5.
+    #[test]
+    fn d45_a_generation_ended_by_force_is_whole_once_shipped() {
+        let fence = Fence::default();
+        fence.shipped(6, 3).unwrap();
+        fence.restart(6, 5, true, || Ok(true)).unwrap();
+        for frame in 3..=5 {
+            fence.shipped(6, frame).unwrap();
+            let whole = fence.ended_whole(6, frame, 7).unwrap();
+            assert_eq!(whole, frame == 5, "shipped through {frame} of 5");
+        }
+        assert!(!fence.ended_whole(6, 4, 7).unwrap(), "it ended at 5");
+    }
+
     /// T-T1.12.P11: a log started again twice with no write between keeps its link whole; a
     /// restart forced before its frames were shipped, or one the fence wasn't told of, breaks it.
     #[test]

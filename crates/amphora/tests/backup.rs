@@ -1446,6 +1446,8 @@ enum Wrong {
     NextGenerations,
     /// The frames of its last part's end, gone (zeroes).
     Truncated,
+    /// Its last part two frames shorter than its key says.
+    Fewer,
 }
 
 /// Archives a base, then a generation in several parts and one after it, makes the first of the two
@@ -1492,6 +1494,13 @@ fn restored_from_a_wrong_generation(wrong: Wrong) {
             let mut body = body.clone();
             let kept = body.frames.len() - 2 * frame;
             body.frames[kept..].fill(0);
+            replace_segment(&s.blobs, name, &body);
+            key.last - 2
+        }
+        Wrong::Fewer => {
+            let (key, name, body) = sent.last().unwrap();
+            let mut body = body.clone();
+            body.frames.truncate(body.frames.len() - 2 * frame);
             replace_segment(&s.blobs, name, &body);
             key.last - 2
         }
@@ -1564,6 +1573,12 @@ fn a_restore_of_an_archive_short_of_its_frames_is_refused() {
 #[test]
 fn a_restore_of_a_truncated_generation_is_refused() {
     restored_from_a_wrong_generation(Wrong::Truncated);
+}
+
+/// AC-T1.12.4 (lane B25): the same, a part holding fewer frames than its key says.
+#[test]
+fn a_restore_of_a_part_shorter_than_its_key_is_refused() {
+    restored_from_a_wrong_generation(Wrong::Fewer);
 }
 
 /// AC-T1.12.4 (lane B25): a restore that is refused for a short archive leaves nothing at its path
@@ -1685,6 +1700,44 @@ fn d45_a_shipper_opened_after_a_switch_carries_on_from_the_closed_segment() {
         last - opened + 1,
         refused.first()
     );
+}
+
+/// AC-T1.12.3 (lane B25): a base begun before the log broke is refused its end, so the archive never
+/// counts as mended by a base no restore takes. Do: begin a base and copy it; commit past what a restart
+/// keeps with no round, start the log again unshipped, commit and ship; end the base; then end one
+/// begun since, commit and ship; restore every second from its end. Expect: the first is refused, a
+/// base needed still; after the second none is, and every second restores with its rows.
+#[test]
+fn a_base_begun_before_a_break_is_refused_its_end() {
+    let mut s = Source::new();
+    s.db.keep_log(20);
+    s.put(0..10, "a");
+    s.ship().unwrap();
+    let mut base = s.begin_base().unwrap();
+    s.copy_base(&mut base);
+    s.put(10..70, "b");
+    assert!(
+        s.db.restart_log().unwrap(),
+        "past what a restart keeps, it starts again unshipped"
+    );
+    s.put(70..75, "c");
+    s.ship().unwrap();
+    let ended = s.end_base(base);
+    assert!(
+        ended.is_err() && s.shipper.base_needed(),
+        "a base begun before the break: its end {ended:?}, a base needed after it: {}",
+        s.shipper.base_needed()
+    );
+    let _copied = s.db.checkpoint().unwrap();
+    let mut base = s.begin_base().unwrap();
+    s.copy_base(&mut base);
+    s.end_base(base).unwrap();
+    assert!(!s.shipper.base_needed());
+    let based = s.second();
+    s.put(75..80, "d");
+    s.now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    s.ship().unwrap();
+    s.restores_every_second_from(based);
 }
 
 /// A folder where a database was removed and its `-wal2` left: 20 rows, the log started again (the
