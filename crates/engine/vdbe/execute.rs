@@ -2007,12 +2007,13 @@ fn skip_walk_for(
     };
     let span = [(bounds.lo, bounds.hi)];
     let spans: &[(i64, i64)] = values.as_deref().unwrap_or(&span);
-    let (reader_pos, committed) = conn.skipping_positions()?;
     // Lane skip-3 (T-SKU.2): a measured summary's scan is timed from here to its end (lane
     // skip-11: every probe of an IN list's values included).
     let mut started = std::time::Instant::now();
     let (candidates, method) = registry
-        .candidates_spans(root, conn.skipping_id(), reader_pos, committed, spans)
+        .probe(root, conn.skipping_id(), Some(column), spans, || {
+            conn.skipping_positions()
+        })
         .ok()?;
     // Lane skip-8 (T-SKU.10): a method dropped for its upkeep whose trial is due is built again
     // off this scan's path, one build per summary at a time; this scan goes on with the leader.
@@ -2025,14 +2026,14 @@ fn skip_walk_for(
         match registry.build_mode(root) {
             Some(crate::skipping::BuildMode::Inline) => {
                 let building = std::time::Instant::now();
-                if crate::skipping::build_inline(conn, root, column, columns).is_some() {
+                if crate::skipping::build_inline(conn, root, columns).is_some() {
                     started = started
                         .checked_add(building.elapsed())
                         .unwrap_or_else(std::time::Instant::now);
                 }
             }
             Some(_) => {
-                let _detached = crate::skipping::start_build(conn, root, column, columns);
+                let _detached = crate::skipping::start_build(conn, root, columns);
             }
             None => {}
         }
@@ -4625,6 +4626,7 @@ pub fn op_halt(
         description.to_string()
     };
     seek_trace_write(program, state);
+    star_trace_write(program, state);
     halt(program, state, pager, *err_code, &desc, *on_error)
 }
 
@@ -6997,6 +6999,40 @@ fn seek_trace_write(program: &Program, state: &mut ProgramState) {
         };
         tracing::debug!(target: "amphora::seek_time", cursor_id, name, seeks, nanos, row_nanos = ?row_nanos, "T18: a cursor's seeks this run");
     }
+}
+
+/// Lane T19: with `amphora::seek_time` on at DEBUG, the fact rows the star filters checked this
+/// run (`probes`) and dropped (`rejects`), beside the tables read into the run's Bloom filters.
+fn star_trace_write(program: &Program, state: &mut ProgramState) {
+    if !tracing::enabled!(target: "amphora::seek_time", tracing::Level::DEBUG) {
+        return;
+    }
+    let now = (
+        state.metrics.star_filter_probes,
+        state.metrics.star_filter_rejects,
+    );
+    let before = if now.0 >= state.star_trace_base.0 {
+        state.star_trace_base
+    } else {
+        (0, 0)
+    };
+    state.star_trace_base = now;
+    let probes = now.0.saturating_sub(before.0);
+    let rejects = now.1.saturating_sub(before.1);
+    if probes == 0 {
+        return;
+    }
+    let filters: Vec<&str> = program
+        .cursor_ref
+        .iter()
+        .enumerate()
+        .filter(|(cursor_id, _)| state.bloom_filters.contains_key(cursor_id))
+        .filter_map(|(_, (_, kind))| match kind {
+            CursorType::BTreeTable(table) => Some(table.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    tracing::debug!(target: "amphora::seek_time", probes, rejects, passed = probes.saturating_sub(rejects), filters = ?filters, "T19: the star filters' rows this run");
 }
 
 /// Amphora (QT.5, step 3a): runs `run`, one run of `work`, timing it when the database's
@@ -12666,7 +12702,7 @@ pub fn op_function(
                                         program
                                             .connection
                                             .dialect()
-                                            .format_rewritten_table_sql(&new_stmt)?,
+                                            .format_rewritten_table_sql(sql.as_str(), &new_stmt)?,
                                     )
                                 } else {
                                     // Other tables: only emit if we actually changed their FK targets.
@@ -12687,7 +12723,7 @@ pub fn op_function(
                                         program
                                             .connection
                                             .dialect()
-                                            .format_rewritten_table_sql(&new_stmt)?,
+                                            .format_rewritten_table_sql(sql.as_str(), &new_stmt)?,
                                     )
                                 }
                             }
@@ -13049,7 +13085,7 @@ pub fn op_function(
                                     program
                                         .connection
                                         .dialect()
-                                        .format_rewritten_table_sql(&new_stmt)?,
+                                        .format_rewritten_table_sql(sql.as_str(), &new_stmt)?,
                                 )
                             }
                             // Trigger SQL is rewritten by separate UPDATE statements
@@ -13397,22 +13433,17 @@ fn skipping_integer(value: Option<&Value>) -> Option<i64> {
 
 /// Hands the write hook the summarized column's value of the written row and, if it overwrote one,
 /// of the old row (captured before the write).
-fn skipping_hand(program: &Program, root: i64, write: crate::skipping::RowWrite) {
+fn skipping_hand(program: &Program, root: i64, column: usize, write: crate::skipping::RowWrite) {
     let registry = &program.connection.db.skipping;
-    match program.connection.skipping_write_base() {
-        Some((committed, told)) => {
-            // Lane skip-5 (T-SKU.5): each measured summary's write upkeep is timed.
-            let origin = std::time::Instant::now();
-            let mut now = || crate::skipping::nanos_since(origin);
-            let writer = program.connection.skipping_id();
-            if told {
-                registry.on_write_told(root, writer, committed, write, &mut now)
-            } else {
-                registry.on_write(root, writer, committed, write, &mut now)
-            }
-        }
-        None => registry.mark_stale(root),
-    }
+    let origin = std::time::Instant::now();
+    registry.write_checked(
+        root,
+        program.connection.skipping_id(),
+        Some(column),
+        write,
+        &mut || crate::skipping::nanos_since(origin),
+        || program.connection.skipping_write_base(),
+    );
 }
 
 fn skipping_on_insert(
@@ -13451,7 +13482,7 @@ fn skipping_on_insert(
         Some(old) => crate::skipping::RowWrite::Update { rowid, old, new },
         None => crate::skipping::RowWrite::Insert { rowid, value: new },
     };
-    skipping_hand(program, root, write);
+    skipping_hand(program, root, column, write);
 }
 
 /// Amphora (G7 step 2, `AC-NS.2.1`): a write that found no summary of its table before its row
@@ -13496,7 +13527,7 @@ fn skipping_on_delete(
             return;
         }
     };
-    skipping_hand(program, root, write);
+    skipping_hand(program, root, column, write);
 }
 
 pub fn op_insert(

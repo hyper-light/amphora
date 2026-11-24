@@ -455,10 +455,7 @@ fn wide_notes(conn: &Arc<Connection>) {
 /// within 1.1 of its count (1,000 and 2,000), the NULLs ANALYZE counted, where a fixed tenth
 /// (300 rows) and nine tenths (2,700) were estimated (AUDIT 5.1).
 ///
-/// Not the postfix forms: `note ISNULL` / `note NOTNULL` make no constraint at all
-/// (`as_binary_components` takes no `Expr::IsNull`), so with no sample they are estimated as
-/// cutting nothing (3,000 rows, kiln run on adacachy2); that gap is the wide-table sample's
-/// (AUDIT 5.1 item 1) and the constraint builder's, not the NULL share's.
+/// AC-PL.1.2. The postfix spellings have the same selectivity and return the same rows.
 #[test]
 fn audit_5_1_is_null_takes_the_nulls_analyze_counted() {
     let dir = tempfile::tempdir().unwrap();
@@ -468,6 +465,8 @@ fn audit_5_1_is_null_takes_the_nulls_analyze_counted() {
     for sql in [
         "SELECT id FROM notes WHERE note IS NULL",
         "SELECT id FROM notes WHERE note IS NOT NULL",
+        "SELECT id FROM notes WHERE note ISNULL",
+        "SELECT id FROM notes WHERE note NOTNULL",
     ] {
         let (e, c) = (estimate(&conn, sql), count(&conn, sql));
         assert!(q_error(e, c) <= 1.1, "{sql}: estimated {e}, counted {c}");

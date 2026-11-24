@@ -127,7 +127,7 @@ impl Descriptors {
         self.released.load(Ordering::SeqCst)
     }
 
-    /// The threads waiting for a give-back now (read only by the Linux accept-loop test).
+    /// The threads waiting for a give-back in the Linux accept-loop test.
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn waiting(&self) -> usize {
         self.waiters
@@ -160,6 +160,15 @@ impl Descriptors {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|waiter| waiter.id() != me.id());
+    }
+
+    fn wake_waiters(&self) {
+        // A waiter can already have observed this release before it registered. It owns its
+        // registration until its predicate is satisfied, including across an older notification.
+        let waiters = self.waiters.lock().unwrap_or_else(PoisonError::into_inner);
+        for waiter in waiters.iter() {
+            waiter.unpark();
+        }
     }
 
     /// `count` more held if within the bound; else what the held would come to.
@@ -196,19 +205,8 @@ impl Drop for Held {
             .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
                 Some(held.saturating_sub(self.count))
             });
-        // Counted before the waiters are taken: a waiter that registered after this count
-        // sees it moved and doesn't park; one registered before is unparked here.
         self.budget.released.fetch_add(1, Ordering::SeqCst);
-        let waiters = std::mem::take(
-            &mut *self
-                .budget
-                .waiters
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner),
-        );
-        for waiter in waiters {
-            waiter.unpark();
-        }
+        self.budget.wake_waiters();
     }
 }
 
@@ -383,6 +381,43 @@ pub(crate) mod tests {
         let older = budget.releases();
         drop(budget.take("a connection", 1).unwrap());
         budget.wait_release(older, &stopping);
+    }
+
+    /// AC-FD.1.2. An earlier release finishes notifying after a waiter saw its generation.
+    /// The waiter must still be registered for the next release.
+    #[test]
+    fn review_a_late_notification_preserves_the_next_descriptor_wake() {
+        let budget = Descriptors::fixed(1);
+        let held = budget.take("a connection", 1).unwrap();
+        let seen = budget.releases();
+        let waiter = {
+            let budget = Arc::clone(&budget);
+            std::thread::spawn(move || budget.wait_release(seen, &AtomicBool::new(false)))
+        };
+        let id = waiter.thread().id();
+        let registrations = || {
+            budget
+                .waiters
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|thread| thread.id() == id)
+                .count()
+        };
+        while registrations() == 0 {
+            std::thread::yield_now();
+        }
+        // Deliver just the notification for a generation the waiter has already seen.
+        budget.wake_waiters();
+        let registered_for_next = registrations();
+        drop(held);
+        // Let the thread exit even if the registration was lost, so the assertion can report it.
+        if registered_for_next == 0 {
+            waiter.thread().unpark();
+        }
+        waiter.join().unwrap();
+        assert_eq!(registered_for_next, 1);
+        assert!(budget.waiters.lock().unwrap().is_empty());
     }
 
     /// AUDIT 6: a waiter for a give-back ends when its listener stops. Do: hold the only

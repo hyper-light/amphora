@@ -28,9 +28,13 @@ Command: `REPS=3 CLIENTS="1 64" READS=4000 STORAGES="versioned default" BASE_SHA
 | default, 1 (control) | 1,165,197, 816,010, 860,102 | 977,236, 1,091,892, 1,122,122 | unchanged (noise) |
 | default, 64 (control) | 1,472,108, 1,474,473, 1,436,985 | 1,837,853, 2,251,200, 1,585,398 | unchanged (noise; other lanes' main changes) |
 
-Before, each versioned SELECT waited on a lane flush (3-10 ms at this load); after, none does. The
-versioned storage's point reads remain 2.3-4x below the default storage's at 64 clients: items 2
-and 3 below.
+The single-reader counter test establishes the redo work removed from this workload. The timed
+harness released its workers before the reporter started its clock. Any reads completed in that
+interval contributed to throughput with their elapsed time omitted. The after arm also included
+the CopyId change. These rates cannot establish an isolated speedup for the unwritten transaction.
+A reader finishing after another writer publishes may still need to flush that writer (T-T1.3.1).
+The revised harness starts the clock before releasing the prepared workers. Each SELECT must
+return its bound key's expected value exactly once, and the reported count sums those answers.
 
 ## Item 2, part: a leaf copy's id per thread (perf-C2, branch perf/versioned e7259743, not merged)
 
@@ -101,6 +105,14 @@ Verdict: faster. Every after median sits below every before minimum. The machine
 (roughly 12x-125x by median) is not a stable number. The limiter of "before" is inferred, not
 profiled: an fsync of the rewritten pages on a contended NVMe. Every reopen on both sides read
 back all 20,000 rows. To repeat on a quiet machine: the command above.
+
+The original example printed the number of rows it scanned. It accepted any count or contents.
+In verifier run r30 on adacachy2, requesting 16 rows after a 32-row run on the same path
+succeeded with `rows_read=[32, 32]`. With zero reopens it succeeded with three NaNs.
+The corrected example uses a fresh directory on the same device. It checks each expected key
+and its 100-byte value after timing each open and rejects an empty workload. The five pairs
+above remain the original measurements. The retained `before.log` and `after.log` in the
+named directory contain compiler output. Neither contains the per-reopen measurements.
 
 ## Not done, for the successor (verified against the code)
 
