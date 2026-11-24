@@ -6086,9 +6086,15 @@ impl Wal for WalFile {
             frame.set_wal_tag(frame_id, epoch_at_issue);
             None
         });
-        // Amphora: a page a record holds is read from the record.
-        let header = self.coordination.wal_header();
-        if self.holds_record(&header, frame_id) {
+        // Amphora: a page a record holds is read from the record, in the frame's own segment
+        // (decision 45). The current segment's header is read without a lock (decision 40), a
+        // closing one's under its segment's.
+        let header = if at.segment == self.coordination.current_segment() {
+            self.coordination.wal_header()
+        } else {
+            self.coordination.segment_header(at.segment)
+        };
+        if self.holds_segment_record(at.segment, &header, frame_id) {
             let number = u32::try_from(page_idx).map_err(|_| LimboError::IntegerOverflow)?;
             let complete = sqlite3_ondisk::wal_page_reader(
                 complete,
@@ -6097,7 +6103,7 @@ impl Wal for WalFile {
                 &self.io_ctx.read(),
             )?;
             return self.begin_read_record(
-                self.coordination.current_segment(),
+                at.segment,
                 frame_id,
                 vec![(number, complete)],
                 &header,
