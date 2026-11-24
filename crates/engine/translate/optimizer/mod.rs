@@ -5368,21 +5368,25 @@ pub(crate) mod bushy_search_tests {
         }
 
         #[test]
+        #[ignore = "minutes in a debug build: --ignored runs it"]
         fn t_pl_8_13_outer_joins_answer_as_sqlite_middle_analyzed() {
             outer_joins_answer_as_sqlite("middle", true);
         }
 
         #[test]
+        #[ignore = "minutes in a debug build: --ignored runs it"]
         fn t_pl_8_13_outer_joins_answer_as_sqlite_middle() {
             outer_joins_answer_as_sqlite("middle", false);
         }
 
         #[test]
+        #[ignore = "minutes in a debug build: --ignored runs it"]
         fn t_pl_8_13_outer_joins_answer_as_sqlite_facts_analyzed() {
             outer_joins_answer_as_sqlite("facts", true);
         }
 
         #[test]
+        #[ignore = "minutes in a debug build: --ignored runs it"]
         fn t_pl_8_13_outer_joins_answer_as_sqlite_facts() {
             outer_joins_answer_as_sqlite("facts", false);
         }
