@@ -263,6 +263,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "amphora-line-loom"
+version = "0.1.0"
+dependencies = [
+ "amphora-api",
+ "loom",
+]
+
+[[package]]
 name = "amphora-pg-analysis"
 version = "0.1.0"
 dependencies = [

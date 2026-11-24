@@ -1,0 +1,19 @@
+[package]
+name = "amphora-line-loom"
+description = "The replicated owner's command queue and its line, on every interleaving (T-QB.1.19)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Built only under RUSTFLAGS="--cfg loom" (src/lib.rs says how it is run); empty otherwise.
+[target.'cfg(loom)'.dependencies]
+amphora-api = { path = "../api" }
+loom = { workspace = true }
+
+[lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+unexpected_cfgs = { level = "deny", check-cfg = ["cfg(loom)"] }
