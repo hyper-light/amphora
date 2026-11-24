@@ -2,10 +2,11 @@
 
 ## Losses
 
-- **No morsel run is green.** `t_qt_6_35` fails in all nine ("the hook built no link"). It fails with the
+- **No morsel run of this lane is green.** `t_qt_6_35` fails in all nine ("the hook built no link"). It fails with the
   same words on main's own binary (219603df, run here at 07:23Z) and in lane C1's record. It belongs to the
   planner's lane and was not touched. Nothing else fails. Lane C4 has since changed that test's setup on
-  main (`171e902c`, its assertions as they were). The suite was not run on that tree.
+  main (`171e902c`, its assertions as they were), and its record has the whole suite on `1eaff6c8`, which has
+  `60993be4` in it: 51 passed, 0 failed, 4 ignored, 95.9 s (its r950). This lane did not run that tree.
 - **`translate::parallel` checked nothing.** The filter matches 0 of the lib's 3,231 tests, so its "ok" is
   empty. `crates/engine/translate/parallel.rs` (2,169 lines) has no test module. Lanes R4, R10, R12, durable and
   C2 list the filter beside others, whose tests gave the counts. No test was added.
