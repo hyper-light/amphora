@@ -857,13 +857,15 @@ the budget admits; `unknown_leader_application_pressure_keeps_wire_admission_ava
 | r138 | MacBook Pro 2, 8a2c25bd's test binary | `v13_thirty_two…` alone, 3 runs: 3 failed, `Persisted: row N at member 1: UnknownOutcome` (twice) and `Timeout` (once). main on macOS not yet run (r140 was building it) |
 | r150 | adacachy2, needs cpus=8, d0f6a606 and main 7de5344d | clippy clean (37 s); check-production rc 0 (engine ratchet holds, 10903); `a21_` 4/5 (term change: `reach` timed out); suite r1 (`database::replicated:: replication::`): d0f6a606 172 passed, 6 failed (checkpoint-pass, the a21 term change, image-install-read, past_its_room, `session_reads::t_t1_10_r1…`, `every_falsifier_of_the_floor_holds_under_a_nemesis`); main 168 passed, 5 failed (image-install-read, past_its_room, `v3_two_replicated_writes…`, `a_local_read_holds_off…`, `a_restart_due_waits…`); load 52-59. `v13_thirty_two…` passed on d0f6a606. Stopped after round 1 to re-gate f2cb8681 |
 
-**Why the term-change test failed twice.** At 8a2c25bd it dropped the leader's records one step after queueing
+| r180 | adacachy2, needs cpus=2 (cpus=8 and 4 refused), f2cb8681, load 50-61 | clippy clean (49 s); check-production rc 0 (ratchet 10903); `a21_` 4/5: the term-change test reached the write's proposal, the write unanswered, then expected `bytes_for`'s fixed bytes, which the driven `enqueue` helper doesn't charge (it charges `REQUEST_MAX` and the envelope). 7c753719 expects that; unverified. The run goes on to the suites (both arms) and the ladder, logs in `~/.cache/amphora-perf/cross-a21-out/` on adacachy2 |
+
+**Why the term-change test failed three times.** At 8a2c25bd it dropped the leader's records one step after queueing
 the write, before its barrier had sent any; at d0f6a606 it waited for the write's proposal, but its call wrote
 nothing, so it passed a read barrier (`READ_BARRIER`) and never proposed. f2cb8681's write creates a table
 through the driven `submit` helper, so it proposes, as 11873's change does.
 
 **Open for the successor.**
-1. f2cb8681: `cargo clippy -p amphora --all-targets` and the five `a21_` tests.
+1. 7c753719 (or the merge bb957f87's successor): `cargo clippy -p amphora --all-targets` and the five `a21_` tests, on the tree merged with main (main moved in crates/engine and crates/pg-catalog).
 2. `v13_thirty_two…` on macOS against main 7de5344d (it passes on Linux with the change).
 3. The replicated suites, rounds 2 and 3, both arms (`check21l.sh` in `cross-a21-scripts`), then V13's ladder
    at 32 and 128 writers, both classes (`ladder13.sh`), for zero refusals.
