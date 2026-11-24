@@ -10,7 +10,7 @@
 "clippy::unreachable" = 457
 "clippy::todo" = 11
 "clippy::unimplemented" = 0
-"clippy::indexing_slicing" = 3040
+"clippy::indexing_slicing" = 3038
 "clippy::arithmetic_side_effects" = 3273
 "clippy::string_slice" = 101
 "clippy::cast_possible_truncation" = 519
