@@ -850,6 +850,25 @@ pub(crate) mod tests {
         assert_eq!(opened.limit(), None);
     }
 
+    /// AC-MB.1.1. Do: cache this process's opened files with a limit file that then fails every
+    /// read, and take the system's reading. Expect: the limit a fresh read gives, from a newly
+    /// opened set that replaces the failing one, not the machine's limit from the rest.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn review_a_cached_limit_that_stops_reading_is_rediscovered() {
+        let mut cached = Opened::open().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        cached.limits = vec![std::fs::File::open(dir.path()).unwrap()];
+        let cached = Arc::new(cached);
+        let system = System::new();
+        *system.opened.write().unwrap() = Some(cached.clone());
+        assert_eq!(system.read().limit, limit());
+        assert!(!Arc::ptr_eq(
+            system.opened.read().unwrap().as_ref().unwrap(),
+            &cached
+        ));
+    }
+
     /// Do: parse a cgroup v2 process's `/proc/self/cgroup`, a v1 process's, and a hybrid's. Expect:
     /// each memory group's path, none where there is none (AC-T1.13.4: reads at their latency).
     #[test]
