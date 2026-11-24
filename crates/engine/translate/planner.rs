@@ -2523,7 +2523,7 @@ pub fn parse_from(
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     let mut cte_definitions = Arc::new(Vec::new());
-    let mut shadowed_outer_ctes = Vec::new();
+    let mut ctes_being_defined_around = None;
 
     if let Some(with) = with {
         cte_definitions = Arc::new(collect_cte_definitions(with, program)?);
@@ -2535,7 +2535,8 @@ pub fn parse_from(
             .iter()
             .map(|definition| definition.name.clone())
             .collect::<Vec<_>>();
-        shadowed_outer_ctes = program.mask_shadowed_ctes_being_defined(&shadowing_names);
+        ctes_being_defined_around =
+            Some(program.mask_shadowed_ctes_being_defined(&shadowing_names));
 
         // The subqueries in the FROM clause's own expressions read the CTEs too.
         let mut subquery_table_refs = table_refs_outside_from.to_vec();
@@ -2592,7 +2593,9 @@ pub fn parse_from(
         }
     }
 
-    program.unmask_shadowed_ctes_being_defined(shadowed_outer_ctes);
+    if let Some(around) = ctes_being_defined_around {
+        program.unmask_shadowed_ctes_being_defined(around);
+    }
     Ok(())
 }
 
