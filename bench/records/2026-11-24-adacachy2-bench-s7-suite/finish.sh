@@ -22,7 +22,9 @@ W=$L/commit-wt
 for i in 1 2 3 4 5; do
   git -C "$W" fetch -q origin && git -C "$W" checkout -q -f --detach origin/main || continue
   mkdir -p "$W/$S"
-  for f in rounds.txt phases.log procs.txt TABLES.md smoke-answers.txt smoke.err sha.txt; do [ -f "$O/$f" ] && cp "$O/$f" "$W/$S/"; done
+  for f in rounds.txt phases.log TABLES.md smoke-answers.txt smoke.err sha.txt; do [ -f "$O/$f" ] && cp "$O/$f" "$W/$S/"; done
+  # Process command lines as ps printed them, with anything that looks like a secret cut out.
+  sed -E 's/(token|secret|password|passwd|api[_-]?key|bearer)[^ ]*/[redacted]/Ig' "$O/procs.txt" >"$W/$S/procs.txt"
   cp "$O"/round*-answers.txt "$O"/round*.err "$W/$S/" 2>/dev/null
   # The raw rounds and the smoke pass, without the answers (compared untimed, value for value, by suite_answers.py).
   python3 -I - "$O" "$W/$S" <<'PY'
