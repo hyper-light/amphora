@@ -1,0 +1,16 @@
+CREATE TABLE p(id INTEGER PRIMARY KEY, k INT, v INT, s TEXT);
+CREATE TABLE q(id INTEGER PRIMARY KEY, k INT, v INT, s TEXT COLLATE NOCASE);
+CREATE TABLE e(k INT, v INT, s TEXT);
+INSERT INTO p VALUES (1, 1, 2, '1'), (2, 2, 3, 'b'), (3, NULL, 1, 'B'), (4, 4, NULL, NULL), (5, 1, 0, '2');
+INSERT INTO q VALUES (1, 2, 2, 'B'), (2, 2, 0, 'a'), (3, 5, 1, '1'), (4, NULL, 4, NULL);
+CREATE INDEX p_k ON p(k);
+CREATE INDEX q_k ON q(k, v);
+CREATE INDEX e_k ON e(k);
+ANALYZE;
+SELECT a0.k, a1.k, a2.k FROM p AS a0 CROSS JOIN q AS a1 ON a0.k = a1.k LEFT JOIN e AS a2 ON a1.k = a2.v WHERE (SELECT min(s1.k) FROM p AS s1 WHERE a0.k < NULL) IS NOT (a2.k - a2.k);
+SELECT a0.k, a1.k, a2.k FROM p AS a0 JOIN q AS a1 ON a0.k = a1.k LEFT JOIN e AS a2 ON a1.k = a2.v WHERE (SELECT min(s1.k) FROM p AS s1 WHERE a0.k < NULL) IS NOT (a2.k - a2.k);
+SELECT a0.k, a2.k FROM p AS a0 LEFT JOIN e AS a2 ON a0.k = a2.v WHERE (SELECT min(s1.k) FROM p AS s1 WHERE a0.k < NULL) IS NOT (a2.k - a2.k);
+SELECT a0.k, a2.k FROM p AS a0 LEFT JOIN e AS a2 ON a0.k = a2.v WHERE (SELECT min(s1.k) FROM p AS s1 WHERE s1.v > a0.v + 100) IS NOT a2.k;
+SELECT a0.k, a2.k, (SELECT min(s1.k) FROM p AS s1 WHERE s1.v > a0.v + 100) IS NOT a2.k FROM p AS a0 LEFT JOIN e AS a2 ON a0.k = a2.v;
+EXPLAIN QUERY PLAN SELECT a0.k, a1.k, a2.k FROM p AS a0 CROSS JOIN q AS a1 ON a0.k = a1.k LEFT JOIN e AS a2 ON a1.k = a2.v WHERE (SELECT min(s1.k) FROM p AS s1 WHERE a0.k < NULL) IS NOT (a2.k - a2.k);
+EXPLAIN SELECT a0.k, a1.k, a2.k FROM p AS a0 CROSS JOIN q AS a1 ON a0.k = a1.k LEFT JOIN e AS a2 ON a1.k = a2.v WHERE (SELECT min(s1.k) FROM p AS s1 WHERE a0.k < NULL) IS NOT (a2.k - a2.k);
