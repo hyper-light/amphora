@@ -19280,7 +19280,7 @@ mod tests {
                 .map(|w| Some((0, submit(&clients[w % 3], driven.until(), write(w)))))
                 .collect();
             let mut refused = 0u64;
-            let mut rounds = 0;
+            let (mut rounds, mut moved) = (0, 0);
             while inflight.iter().any(Option::is_some) {
                 assert!(
                     rounds < ROUNDS,
@@ -19320,9 +19320,11 @@ mod tests {
                     for owner in 0..3 {
                         driven.advance_tick(owner);
                     }
+                    moved += 1;
                 }
                 rounds += 1;
             }
+            eprintln!("{durability:?}: {moved} of {rounds} rounds moved the clocks");
             driven.quiet(&mut pump);
             driven.tick(&mut pump, leader);
             driven.tick(&mut pump, leader);
