@@ -521,11 +521,31 @@ the engine's schema and the tables' stored PostgreSQL definitions, never copied:
 - **`information_schema`** is PostgreSQL's own `information_schema.sql`, vendored and run through the
   front end: its views are SQL over `pg_catalog`, so running it is also a coverage test.
 
+**Where a table's OID lives** (decided by lane PG12). In the table's stored definition, after
+`POSTGRES_TABLE_SQL_PREFIX`: `/* pg_class.oid 16384 */ CREATE TABLE ...`. That text is the table's
+one durable copy (section 5), so the OID is written, renamed and dropped in the same `sqlite_schema`
+row as the table, with no second structure to keep in step, and is the same after a reopen. The
+dialect's counter is section 7's, outside the caller's transaction (a rolled-back CREATE TABLE
+spends its OID, as in PostgreSQL); it starts at `FirstNormalObjectId` and passes every OID a loaded
+definition holds, so a reopened database never gives a live table's OID to a new table. A dropped
+table's OID can come back after a reopen; PostgreSQL promises unique OIDs among live objects only
+(its counter wraps). Every engine path that rewrites a table's text goes through the dialect:
+`Dialect::format_rewritten_table_sql` receives the stored text and carries the OID (RENAME TABLE,
+RENAME COLUMN, ALTER's rewrites); ADD COLUMN and DROP COLUMN (`Dialect::format_altered_table_sql`)
+and VACUUM's replay (`Dialect::table_sql_for_replay`) refuse a PostgreSQL table with a typed error
+until they carry it.
+
+Served so far (`crates/engine/pg_catalog_vtab.rs`): `pg_namespace`, `pg_type`, `pg_class` and
+`pg_attribute`, each scan reading `sqlite_schema` through the connection's transaction. A user
+table's rows are 19's own rows for a plain heap table with the table's facts in place; not yet: its
+row type (`reltype` is 0), its TOAST table (`reltoastrelid` is 0), temporary tables and user schemas.
+
 **Against the 10x bar.** psql's describe queries and pgbench's start-up query are joins over the
 catalog; served from the in-memory schema, they cost what reading memory costs.
 
 **Falsified by.** A describe or start-up query whose rows differ from PostgreSQL 19's for the same
-objects.
+objects; or a table whose `pg_class.oid` changes across a rename, an ALTER, a VACUUM
+or a reopen, or two live tables sharing one.
 
 ## 10. Done when: PostgreSQL's own suites pass, the drivers' suites pass, and 10x PostgreSQL at every scale
 
