@@ -67,7 +67,7 @@ def spread(v, f="{:.3f}"):
     return f"{f.format(statistics.median(v))} ({f.format(min(v))} to {f.format(max(v))})"
 
 
-PAIRS = [("M", "D2"), ("T", "D2"), ("M", "D1"), ("T", "M")]
+PAIRS = [("M", "D2"), ("T", "D2"), ("M", "D1"), ("T", "D1"), ("T", "M")]
 
 
 def main(folder, arms):

@@ -205,3 +205,203 @@ evidence for the next lane, not a merge gate. Median (range), writes a second:
 Rows a flush in the kept runs: D1 32.0, 127.2, 31.4, 123.5; M 14.6, 60.1, 15.6, 63.5; T 31.9, 98.6,
 30.9, 123.0 (insert_one 32, 128, update_plain 32, 128). p50 at 32 clients: D1 5.28 and 5.12 ms, M
 8.83 and 8.45, T 6.34 and 6.18. Mean flush 4.28 to 5.07 ms in every arm. 0 errors, 0 retries.
+
+# Lane W6 (oltp), 2026-11-24 00:42Z to 01:42Z: D1 landed, and its A/B on a quiet Mac Studio 2
+
+Ada's goal: Amphora about 10x faster than every competitor, with no loss of durability. Lane W6
+lands lane W5's gather (D1, decision 14 of docs/design/store.md) on main, and measures it against
+main before it and the old timer, 5 rounds, every run kept.
+
+## Verdict, losses first
+
+- **The A/B measured W5's D1 binary (716ede4d), not main's merged code.** The merged tree adds
+  0e83fc98 (the flusher's 1-second re-look removed) and main's memory-budget charge (A16's
+  5e5ae655, A18's bdfb19ff) in the same file. Neither is in the timed binaries.
+- **D1 against the timer, update_plain at 32 and 128 clients: no measurable difference.** Medians
+  +20.4% and +8.8%, p 0.151 each. Two D1 runs sit low: r2 at 32 clients (4,384 writes a second,
+  beside other processes' CPU at 873 to 945%) and r1 at 128 (15,090, cause not found).
+- **The design index fails 3 of 9 on this tree, every fault main's own** (below).
+- **D1 against main: faster at 32 and 128 clients, the same at 1.** Writes a second +77.3% and
+  +75.3% at 32 clients, +25.4% and +50.5% at 128 (p 0.008 each); +0.5% and +0.9% at 1 (p 0.81 and
+  0.86). p50 at 32 clients 5.18 and 5.06 ms against 8.45.
+- **D1 against the timer: faster at 1 client and for insert_one at 32 and 128.** +29.1% and +27.3%
+  at 1 client, +23.3% and +12.5% for insert_one at 32 and 128, p 0.008 each.
+- **Rows a flush: every client in every flush.** D1 32.0 and 31.6 at 32 clients, 128.0 and 125.6
+  at 128; main 14.5, 15.6, 60.1 and 62.7; the timer 31.2, 31.6, 116.9 and 123.8.
+
+## The checks
+
+r1902 (MacBook Pro 2, W5's `w5-checks.sh` on W5's merge ac068dd1): clippy finished with no error;
+`--test store` 17 passed, both new tests among them; `--test crash` 10 passed, 3 ignored by design;
+`--lib store` 8 and 1 passed. Red run on main's store.rs (f363d688), 3 of 3:
+`a_batch_handed_before_a_flush_begins_is_made_durable_by_it` fails with "x and y were made durable
+by one flush after the first, left 3, right 2": main takes a third flush where D1 takes two. Its
+filter hid the script's own `==` lines, so pass and fail are read from cargo's lines.
+
+Main moved in crates/amphora (store.rs: A16's and A18's memory budget), crates/engine and records,
+so the merge a47b071d (main 7d6cd7f0) got its own run. Read on paper first: a batch refused for
+room is refused before `Sends::handing`, so it never counts in the flusher's note; a failed send
+settles and wakes; the writer wakes for every batch it drains. r1957 (`w6-checks.sh`, the same
+checks reordered so each build is reused, `RED` = main 7d6cd7f0): `--test store` 16 passed, both
+new tests among them; `--test crash` 10 passed, 3 ignored; `--lib store` 10 and 1 passed, A18's two
+wake tests among them; clippy finished with no error (the script's rc 0 over these four, 01:20Z).
+Red runs on main's store.rs (7d6cd7f0), 3 of 3: the first new test fails, left 3, right 2; the
+second passes, as it does on any design that never waits for a told sender to send again (it fails
+only on one that does, which decision 14 refuses on paper).
+
+The design index fails the same 3 tests on W5's tree (r1902) and on this one (r1957). Each fault
+names a decision with no index line, or a quote, from other lanes: local-owner-transport version
+10, planner T13, replication P6, store perf-A9, perf-A18 and 45, and the client protocol's "Answers
+past one frame". None is decision 14, which has its line (docs/design.md:221). On origin/main no
+index line names any of them.
+
+## The A/B (r1959, Mac Studio 2, 01:07Z to 01:13Z)
+
+`ab-w6.sh`: W5's `ab-w5.sh` with three arms, T the timer (98bd0fa9), M main before D1 (f363d688),
+D1 (716ede4d), binaries as W5 built them; insert_one and update_plain at 1, 32 and 128 clients, 5
+rounds, the arms' order reversed every other round, each run a fresh process on a fresh database;
+the first arm's calibration under every arm's key (RULES 5e). `ab_w6_runs.py` puts each run's mean
+flush and the load beside it; `ab_w5_stats.py` now also tests D1 against T.
+
+The machine. At 00:56Z Mac Studio 2 was not quiet: another lane's four `mantle-a148` at 50 to 231%
+CPU each, load 9.0, the disk at 25,600 transfers a second (105 MB/s of 4 KB writes). The other
+Studios have 14 cores and 0.3 and 6 GB free, short of the run's cpus=16; 2768d0d5 is excluded.
+W5's flush bound (5.40 ms) was named before the run as the fallback. At 01:07Z, when r1959 began,
+the `mantle-a148` were gone: load 2.1 on 32 cores, the disk at 160 to 355 transfers a second (2.5 to
+3.8 MB/s), one other process (`slates`, a release build of another lane's) at about one core
+throughout. Through the runs: load 2.28 to 5.24, CPU of all processes 13 to 945% (100 a core),
+every run's mean flush 4.14 to 5.34 ms. No run passed the bound, so the bounded table equals the
+one below. 0 errors, 0 retries in all 90 runs.
+
+Writes a second, median (range) of 5 runs; D1's change against M and T with the exact two-sided
+rank-sum p (5 against 5); rows a flush and mean flush ms, T, M, D1:
+
+| statement | clients | T | M | D1 | D1 against M | D1 against T | rows/flush | flush ms |
+|---|---|---|---|---|---|---|---|---|
+| insert_one | 1 | 172 (171 to 177) | 221 (215 to 226) | 222 (185 to 226) | +0.5%, p 0.810 | +29.1%, p 0.008 | 1.0, 1.0, 1.0 | 4.51, 4.47, 4.42 |
+| insert_one | 32 | 4,751 (4,576 to 4,961) | 3,303 (3,233 to 3,447) | 5,856 (5,663 to 5,920) | +77.3%, p 0.008 | +23.3%, p 0.008 | 31.2, 14.5, 32.0 | 4.40, 4.35, 4.28 |
+| insert_one | 128 | 13,315 (11,891 to 13,445) | 11,938 (11,288 to 12,592) | 14,976 (14,592 to 15,488) | +25.4%, p 0.008 | +12.5%, p 0.008 | 116.9, 60.1, 128.0 | 4.90, 4.41, 4.90 |
+| update_plain | 1 | 176 (165 to 184) | 222 (209 to 227) | 224 (204 to 227) | +0.9%, p 0.857 | +27.3%, p 0.008 | 1.0, 1.0, 1.0 | 4.44, 4.43, 4.42 |
+| update_plain | 32 | 5,250 (5,120 to 5,504) | 3,606 (3,433 to 3,655) | 6,321 (4,384 to 6,747) | +75.3%, p 0.008 | +20.4%, p 0.151 | 31.6, 15.6, 31.6 | 4.29, 4.31, 4.24 |
+| update_plain | 128 | 18,419 (17,571 to 18,975) | 13,306 (13,044 to 13,604) | 20,032 (15,090 to 21,319) | +50.5%, p 0.008 | +8.8%, p 0.151 | 123.8, 62.7, 125.6 | 4.37, 4.30, 4.33 |
+
+p50 ms, median of 5:
+
+| statement | clients | T | M | D1 | D1 against M | D1 against T |
+|---|---|---|---|---|---|---|
+| insert_one | 1 | 5.248 | 4.224 | 4.224 | +0.0%, p 1.000 | -19.5%, p 0.016 |
+| insert_one | 32 | 6.208 | 8.448 | 5.184 | -38.6%, p 0.008 | -16.5%, p 0.008 |
+| insert_one | 128 | 9.344 | 9.600 | 8.320 | -13.3%, p 0.008 | -11.0%, p 0.008 |
+| update_plain | 1 | 5.248 | 4.160 | 4.224 | +1.5%, p 0.119 | -19.5%, p 0.008 |
+| update_plain | 32 | 6.208 | 8.448 | 5.056 | -40.2%, p 0.008 | -18.6%, p 0.151 |
+| update_plain | 128 | 6.464 | 9.344 | 6.208 | -33.6%, p 0.016 | -4.0%, p 0.111 |
+
+Main against the timer, the same runs: +28.5% and +26.1% at 1 client, -30.5% and -31.3% at 32,
+-10.3% (p 0.056) and -27.8% at 128: W4's finding again.
+
+**The limiter is the flush.** In every cell, writes a second match rows a flush times flushes a
+second (the flusher's flushing share of the 1.5 s window over the mean flush) within 3% (0.0 to
+2.8% in the 18 cells): D1 at 32
+clients 32.0 x 0.79 / 4.28 ms = 5,907 against 5,856 measured; main 14.5 x 0.98 / 4.35 ms = 3,266
+against 3,303. At 1 client a write waits for its own flush: D1 and main at 222 to 224 a second,
+flushing 98% of the window, at most 2% under one 4.4 ms flush at a time; the timer flushes 78% of
+it (its wait, p50 +1.02 ms). At 32 clients D1 already flushes all 32 writers each time; the
+flusher's other 21% is the wait for the 2.0 commits a flush of the batches it counted (inferred
+from the store's counters; no per-stage trace on macOS). The CPU of all processes stayed near one
+core of 32 in most runs, so the work waits on the disk. Doubling needs more writers a flush or
+flushes that overlap on this disk (decision 6).
+
+Every run, in order:
+
+| run | arm | statement | clients | writes/s | mean flush ms | rows/flush | load before, after | CPU % before, after |
+|---|---|---|---|---|---|---|---|---|
+| r1 | T | insert_one | 1 | 171.0 | 4.60 | 1.0 | 2.40, 2.44 | 120, 125 |
+| r1 | T | insert_one | 32 | 4751.0 | 4.40 | 31.2 | 2.44, 2.73 | 125, 135 |
+| r1 | T | insert_one | 128 | 13445.0 | 4.69 | 105.9 | 2.73, 2.59 | 136, 125 |
+| r1 | T | update_plain | 1 | 165.0 | 4.68 | 1.0 | 2.59, 2.59 | 123, 123 |
+| r1 | T | update_plain | 32 | 5120.0 | 4.55 | 31.6 | 2.59, 2.54 | 135, 121 |
+| r1 | T | update_plain | 128 | 17571.0 | 4.37 | 123.8 | 2.54, 2.42 | 122, 109 |
+| r1 | M | insert_one | 1 | 218.0 | 4.53 | 1.0 | 2.42, 2.39 | 110, 135 |
+| r1 | M | insert_one | 32 | 3447.0 | 4.41 | 15.3 | 2.39, 2.67 | 137, 127 |
+| r1 | M | insert_one | 128 | 11288.0 | 4.61 | 60.5 | 2.67, 2.67 | 127, 65 |
+| r1 | M | update_plain | 1 | 209.0 | 4.60 | 1.0 | 2.67, 2.94 | 367, 120 |
+| r1 | M | update_plain | 32 | 3641.0 | 4.31 | 15.6 | 2.94, 2.86 | 121, 113 |
+| r1 | M | update_plain | 128 | 13467.0 | 4.20 | 64.1 | 2.86, 2.72 | 116, 122 |
+| r1 | D1 | insert_one | 1 | 222.0 | 4.43 | 1.0 | 2.72, 2.72 | 123, 147 |
+| r1 | D1 | insert_one | 32 | 5920.0 | 4.29 | 32.0 | 2.72, 2.74 | 138, 121 |
+| r1 | D1 | insert_one | 128 | 15104.0 | 4.96 | 128.0 | 2.74, 2.76 | 126, 13 |
+| r1 | D1 | update_plain | 1 | 204.0 | 4.70 | 1.0 | 2.76, 2.94 | 13, 40 |
+| r1 | D1 | update_plain | 32 | 6111.0 | 4.25 | 29.9 | 2.94, 2.94 | 40, 122 |
+| r1 | D1 | update_plain | 128 | 15090.0 | 4.56 | 125.6 | 2.94, 3.02 | 122, 99 |
+| r2 | D1 | insert_one | 1 | 185.0 | 4.92 | 1.0 | 3.02, 2.78 | 123, 112 |
+| r2 | D1 | insert_one | 32 | 5856.0 | 4.28 | 32.0 | 2.78, 2.88 | 146, 57 |
+| r2 | D1 | insert_one | 128 | 14870.0 | 4.90 | 126.0 | 2.88, 2.88 | 98, 367 |
+| r2 | D1 | update_plain | 1 | 224.0 | 4.42 | 1.0 | 2.88, 3.13 | 362, 873 |
+| r2 | D1 | update_plain | 32 | 4384.0 | 4.83 | 31.7 | 3.13, 3.92 | 945, 106 |
+| r2 | D1 | update_plain | 128 | 19981.0 | 4.50 | 126.1 | 3.92, 3.68 | 119, 121 |
+| r2 | M | insert_one | 1 | 221.0 | 4.45 | 1.0 | 3.68, 3.47 | 121, 129 |
+| r2 | M | insert_one | 32 | 3258.0 | 4.42 | 14.9 | 3.47, 3.47 | 132, 134 |
+| r2 | M | insert_one | 128 | 12592.0 | 4.38 | 60.1 | 3.47, 3.35 | 134, 134 |
+| r2 | M | update_plain | 1 | 227.0 | 4.39 | 1.0 | 3.35, 3.56 | 134, 123 |
+| r2 | M | update_plain | 32 | 3655.0 | 4.20 | 15.6 | 3.56, 3.36 | 123, 132 |
+| r2 | M | update_plain | 128 | 13604.0 | 4.28 | 63.5 | 3.36, 3.36 | 131, 117 |
+| r2 | T | insert_one | 1 | 171.0 | 4.53 | 1.0 | 3.36, 3.33 | 122, 130 |
+| r2 | T | insert_one | 32 | 4675.0 | 4.47 | 31.3 | 3.33, 3.22 | 127, 134 |
+| r2 | T | insert_one | 128 | 13315.0 | 5.06 | 117.5 | 3.22, 3.04 | 132, 119 |
+| r2 | T | update_plain | 1 | 176.0 | 4.54 | 1.0 | 3.04, 3.04 | 124, 132 |
+| r2 | T | update_plain | 32 | 5216.0 | 4.40 | 31.8 | 3.04, 3.04 | 136, 114 |
+| r2 | T | update_plain | 128 | 18014.0 | 4.47 | 123.8 | 3.04, 2.88 | 128, 111 |
+| r3 | T | insert_one | 1 | 177.0 | 4.45 | 1.0 | 2.88, 2.81 | 120, 115 |
+| r3 | T | insert_one | 32 | 4576.0 | 4.54 | 31.7 | 2.81, 2.81 | 116, 99 |
+| r3 | T | insert_one | 128 | 12928.0 | 4.90 | 116.9 | 2.81, 2.74 | 99, 111 |
+| r3 | T | update_plain | 1 | 184.0 | 4.38 | 1.0 | 2.74, 2.84 | 102, 84 |
+| r3 | T | update_plain | 32 | 5250.0 | 4.29 | 30.9 | 2.84, 2.77 | 81, 91 |
+| r3 | T | update_plain | 128 | 18869.0 | 4.26 | 123.8 | 2.77, 2.77 | 91, 72 |
+| r3 | M | insert_one | 1 | 222.0 | 4.47 | 1.0 | 2.77, 2.71 | 76, 90 |
+| r3 | M | insert_one | 32 | 3303.0 | 4.29 | 14.4 | 2.71, 2.90 | 87, 74 |
+| r3 | M | insert_one | 128 | 11513.0 | 4.57 | 58.9 | 2.90, 2.74 | 68, 93 |
+| r3 | M | update_plain | 1 | 220.0 | 4.49 | 1.0 | 2.74, 2.74 | 95, 86 |
+| r3 | M | update_plain | 32 | 3511.0 | 4.35 | 15.6 | 2.74, 2.68 | 84, 74 |
+| r3 | M | update_plain | 128 | 13044.0 | 4.39 | 61.3 | 2.68, 2.55 | 75, 75 |
+| r3 | D1 | insert_one | 1 | 225.0 | 4.34 | 1.0 | 2.55, 2.50 | 75, 72 |
+| r3 | D1 | insert_one | 32 | 5663.0 | 4.28 | 31.9 | 2.50, 2.50 | 79, 89 |
+| r3 | D1 | insert_one | 128 | 14976.0 | 4.89 | 128.0 | 2.50, 2.54 | 97, 110 |
+| r3 | D1 | update_plain | 1 | 219.0 | 4.43 | 1.0 | 2.54, 2.42 | 110, 124 |
+| r3 | D1 | update_plain | 32 | 6747.0 | 4.14 | 31.6 | 2.42, 2.31 | 122, 118 |
+| r3 | D1 | update_plain | 128 | 20032.0 | 4.29 | 121.6 | 2.31, 2.31 | 121, 109 |
+| r4 | D1 | insert_one | 1 | 226.0 | 4.33 | 1.0 | 2.31, 2.28 | 114, 130 |
+| r4 | D1 | insert_one | 32 | 5824.0 | 4.33 | 32.0 | 2.28, 2.58 | 133, 135 |
+| r4 | D1 | insert_one | 128 | 15488.0 | 4.86 | 128.0 | 2.58, 2.45 | 129, 114 |
+| r4 | D1 | update_plain | 1 | 227.0 | 4.35 | 1.0 | 2.45, 2.45 | 112, 123 |
+| r4 | D1 | update_plain | 32 | 6321.0 | 4.24 | 31.4 | 2.45, 2.50 | 127, 123 |
+| r4 | D1 | update_plain | 128 | 20400.0 | 4.27 | 125.1 | 2.50, 2.54 | 131, 114 |
+| r4 | M | insert_one | 1 | 226.0 | 4.35 | 1.0 | 2.54, 2.57 | 123, 152 |
+| r4 | M | insert_one | 32 | 3233.0 | 4.27 | 13.9 | 2.57, 2.57 | 152, 127 |
+| r4 | M | insert_one | 128 | 11938.0 | 4.41 | 59.6 | 2.57, 2.53 | 125, 112 |
+| r4 | M | update_plain | 1 | 222.0 | 4.43 | 1.0 | 2.53, 2.48 | 112, 121 |
+| r4 | M | update_plain | 32 | 3606.0 | 4.31 | 15.8 | 2.48, 2.69 | 119, 61 |
+| r4 | M | update_plain | 128 | 13305.0 | 4.38 | 62.7 | 2.69, 2.69 | 86, 109 |
+| r4 | T | insert_one | 1 | 172.0 | 4.50 | 1.0 | 2.69, 2.79 | 122, 140 |
+| r4 | T | insert_one | 32 | 4782.0 | 4.33 | 30.3 | 2.79, 2.73 | 151, 134 |
+| r4 | T | insert_one | 128 | 11891.0 | 4.71 | 77.0 | 2.73, 4.83 | 137, 88 |
+| r4 | T | update_plain | 1 | 175.0 | 4.44 | 1.0 | 4.83, 4.83 | 118, 517 |
+| r4 | T | update_plain | 32 | 5504.0 | 4.18 | 31.7 | 4.83, 5.24 | 495, 119 |
+| r4 | T | update_plain | 128 | 18419.0 | 4.37 | 109.1 | 5.24, 5.06 | 119, 118 |
+| r5 | T | insert_one | 1 | 172.0 | 4.51 | 1.0 | 5.06, 4.90 | 118, 125 |
+| r5 | T | insert_one | 32 | 4961.0 | 4.21 | 31.2 | 4.90, 4.90 | 122, 117 |
+| r5 | T | insert_one | 128 | 13440.0 | 4.91 | 124.8 | 4.90, 4.67 | 118, 125 |
+| r5 | T | update_plain | 1 | 176.0 | 4.43 | 1.0 | 4.67, 4.53 | 249, 148 |
+| r5 | T | update_plain | 32 | 5411.0 | 4.17 | 31.1 | 4.53, 4.25 | 140, 136 |
+| r5 | T | update_plain | 128 | 18975.0 | 4.24 | 120.4 | 4.25, 4.25 | 136, 96 |
+| r5 | M | insert_one | 1 | 215.0 | 4.55 | 1.0 | 4.25, 4.07 | 97, 114 |
+| r5 | M | insert_one | 32 | 3386.0 | 4.35 | 14.5 | 4.07, 3.90 | 114, 107 |
+| r5 | M | insert_one | 128 | 12132.0 | 4.35 | 60.3 | 3.90, 3.67 | 111, 114 |
+| r5 | M | update_plain | 1 | 222.0 | 4.43 | 1.0 | 3.67, 3.67 | 118, 119 |
+| r5 | M | update_plain | 32 | 3433.0 | 4.20 | 14.9 | 3.78, 3.78 | 131, 113 |
+| r5 | M | update_plain | 128 | 13306.0 | 4.30 | 60.9 | 3.78, 3.63 | 116, 113 |
+| r5 | D1 | insert_one | 1 | 219.0 | 4.42 | 1.0 | 3.63, 3.42 | 114, 124 |
+| r5 | D1 | insert_one | 32 | 5888.0 | 4.26 | 31.9 | 3.42, 3.23 | 125, 114 |
+| r5 | D1 | insert_one | 128 | 14592.0 | 5.34 | 126.2 | 3.23, 3.23 | 118, 141 |
+| r5 | D1 | update_plain | 1 | 225.0 | 4.38 | 1.0 | 3.23, 3.13 | 132, 126 |
+| r5 | D1 | update_plain | 32 | 6663.0 | 4.18 | 31.8 | 3.13, 3.04 | 127, 128 |
+| r5 | D1 | update_plain | 128 | 21319.0 | 4.33 | 126.6 | 3.04, 2.96 | 127, 109 |

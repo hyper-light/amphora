@@ -397,12 +397,11 @@ flush covers them all (rows a flush, below).
 
 **Designs weighed.** Lane W5, 2026-11-23, each a flush begun on events alone:
 
-- D1, this decision. Lane W5's clean runs on Mac Studio 2 (r1815, two rounds): rows a flush
-  31.0 to 32.0 at 32 clients and 123.5 to 128.0 at 128, against main's 14.0 to 15.6 and 59.1 to
-  64.3. The five-round A/B is not yet done (below).
+- D1, this decision. Lane W6's A/B on Mac Studio 2 (r1959, five rounds, below): rows a flush 32.0
+  and 31.6 at 32 clients and 128.0 and 125.6 at 128, against main's 14.5, 15.6, 60.1 and 62.7.
 - D2: D1, and after a flush the flusher also waits for the senders it told to leave their wait in
   `Store::durable`, counted by the commit each waits for. Each leaves on its own thread, so the
-  wait ends. Measured no better than D1 in the same runs, so not taken: its registry is code with
+  wait ends. Measured no better than D1 in lane W5's runs (r1815), so not taken: its registry is code with
   nothing measured to show for it.
 - Waiting for the told senders to send again, by count: refused on paper. A sender that stops never
   sends, and nothing else ends the wait.
@@ -414,10 +413,18 @@ flush covers them all (rows a flush, below).
 **Sources.** Helland et al. (HPTS 1987; decision 1): a timer adds latency without adding throughput
 once commits arrive faster than they complete. DeWitt et al. (SIGMOD 1984): group commit.
 
-**Evidence.** Not yet complete. Lane W5's A/B on Mac Studio 2 (r1815,
-`bench/records/2026-11-23-macstudio2-perf-oltp.md`) was disturbed from its second round by other
-work on the machine; its clean runs are recorded there, without p values. The five-round A/B
-against main and the timer (98bd0fa9) at 1, 32 and 128 clients is still to run.
+**Evidence.** Mac Studio 2, 2026-11-24, lane W6's A/B (r1959,
+`bench/records/2026-11-23-macstudio2-perf-oltp.md`): D1 (716ede4d) against main before it
+(f363d688) and the timer (98bd0fa9), insert_one and update_plain at 1, 32 and 128 clients, 5
+rounds alternated, each run a fresh process on a fresh database. Load 2.3 to 5.2 on 32 cores, every
+run's mean flush 4.14 to 5.34 ms, 0 errors, no run left out. Writes a second, median of 5, D1
+against main: +77.3% and +75.3% at 32 clients, +25.4% and +50.5% at 128 (exact rank-sum p 0.008
+each), +0.5% and +0.9% at 1 (p 0.81 and 0.86, no measurable difference). Against the timer: +29.1%
+and +27.3% at 1 client, +23.3% and +12.5% for insert_one at 32 and 128 (p 0.008 each);
+update_plain at 32 and 128 +20.4% and +8.8%, p 0.151, no measurable difference in 5 runs. p50 at
+32 clients 5.18 and 5.06 ms, against main's 8.45 and the timer's 6.21. The flush bounds every arm:
+writes a second are rows a flush times flushes a second within 3%. The binaries predate the
+flusher's one-second re-look's removal and main's memory-budget charge.
 
 adacachy2, 2026-11-23, insert_one at 1 client, traced with an `LD_PRELOAD` shim on the log's write,
 open, flush and close and on the threads' futex hand-offs (lane W2,
