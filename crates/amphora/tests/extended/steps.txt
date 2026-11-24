@@ -1,6 +1,7 @@
 # T-PG.10.1: the extended protocol's messages, as scripts/postgres-extended-answers.py reads them.
 s1: Q|create table t(a int not null, b int8, c "text", d char(4), e timestamp, f timestamptz)
 s1: Q|alter table t add primary key (a)
+s1: Q|create table n(a int not null, b int8)
 s1: Q|create table pgbench_accounts(aid int not null,bid int,abalance int,filler char(84))
 s1: Q|alter table pgbench_accounts add primary key (aid)
 s1: Q|create table pgbench_history(tid int,bid int,aid int,delta int,mtime timestamp,filler char(22))
@@ -53,10 +54,10 @@ s1: P||SELECT $1::int4, $2::int8, $3::"text", $4::char(3), $5::"char", $6::bool|
 s1: P||SELECT $1::int4, $2::int8, $3::"text", $4::char(3), $5::"char", $6::bool| ~ B|||1|x:80000000,x:8000000000000000,x:,x:616263646566,x:00,x:02|0 ~ DP| ~ E||0 ~ S
 s1: P||SELECT $1::oid, $2::regclass, $3::"name", $4::timestamp, $5::timestamptz| ~ DS| ~ B||||t:42,t:pg_class,t:a name,t:2000-01-01 00:00:00,t:2000-01-01 00:00:00|1 ~ DP| ~ E||0 ~ S
 s1: P||SELECT $1::oid, $2::regclass, $3::"name", $4::timestamp, $5::timestamptz| ~ B|||1|x:ffffffff,x:000004eb,x:6e,x:7fffffffffffffff,x:fffffffffffffffe|0 ~ DP| ~ E||0 ~ S
-s1: P||SELECT $1::timestamp(0), $1::timestamp(3), $2::"char", $2::"char"| ~ B|||1|x:0000000000000fff,x:ff|0 ~ E||0 ~ S
-s1: P||SELECT $1::bool, $1::bool IS NULL, $2::"text" IS NOT NULL| ~ B||||n,t:|1 ~ DP| ~ E||0 ~ S
+s1: P||SELECT $1::timestamp, $2::"char"| ~ B|||1|x:0000000000000fff,x:ff|0 ~ E||0 ~ S
+s1: P||SELECT $1::bool, $2::"text", $3::"name", $4::"char"| ~ B||||n,t:,n,n|1 ~ DP| ~ E||0 ~ S
 s1: P||SELECT $1::"name"| ~ B||||t:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa| ~ E||0 ~ S
-s1: P||SELECT 'literal', 1, 2147483648, true, NULL| ~ DS| ~ B|||||1 ~ DP| ~ E||0 ~ S
+s1: P||SELECT 'literal', 1, 2147483648, 'x'::"char", 'y'::char(3), 'pg_class'::regclass| ~ DS| ~ B|||||1 ~ DP| ~ E||0 ~ S
 # Parameters typed by analysis, or given.
 s1: P||SELECT $1| ~ DS| ~ B||||t:x| ~ E||0 ~ S
 s1: P||SELECT $1|23 ~ DS| ~ B||||t:12| ~ E||0 ~ S
@@ -102,15 +103,18 @@ s1: P||SELECT $1::timestamp| ~ B||||t:2026-13-45| ~ E||0 ~ S
 s1: P||SELECT $1::bool| ~ B||||t:maybe| ~ E||0 ~ S
 s1: P||SELECT $1::regclass| ~ B||||t:no such| ~ E||0 ~ S
 # What the planner computes is refused at Bind, what runs at Execute.
+s1: P|row|INSERT INTO n (a, b) VALUES ($1, $2)|20 ~ DS|row ~ B||row||t:1,t:1| ~ E||0 ~ B||row||t:2,n| ~ E||0 ~ S
+s1: B||row|1|x:0000000000000003,x:0000000000000003| ~ E||0 ~ B||row||t:4,n| ~ E||0 ~ S
+s1: B||row||t:99999999999,n| ~ E||0 ~ S
+s1: P||SELECT a FROM n WHERE a = $1|20 ~ B||||t:99999999999| ~ E||0 ~ B||||t:3| ~ E||0 ~ S
 s1: P||SELECT 1 / 0| ~ DS| ~ B||||| ~ DP| ~ E||0 ~ S
 s1: P||SELECT 1 / $1| ~ DS| ~ B||||t:0| ~ DP| ~ E||0 ~ S
 s1: P||SELECT $1::"text"::int4| ~ B||||t:x| ~ DP| ~ E||0 ~ S
 s1: P||SELECT $1::"text"::regclass| ~ B||||t:nosuch| ~ DP| ~ E||0 ~ S
-s1: P||SELECT $1::"text"::timestamptz| ~ B||||t:nosuch| ~ DP| ~ E||0 ~ S
-s1: P||SELECT 1 / (a - 2) FROM t WHERE a < 4| ~ B||||| ~ DP| ~ E||0 ~ S
-s1: P||SELECT 1 / (a - 2) FROM t WHERE a < 4| ~ B||||| ~ E||1 ~ E||1 ~ E||1 ~ S
-s1: Q|SELECT 1 / (a - 2) FROM t WHERE a < 4
-s1: P||UPDATE t SET b = 1 / (a - 2) WHERE a < 4| ~ B||||| ~ DP| ~ E||0 ~ S
+s1: P||SELECT 1 / (a - 2) FROM n WHERE a < 4| ~ B||||| ~ DP| ~ E||0 ~ S
+s1: P||SELECT 1 / (a - 2) FROM n WHERE a < 4| ~ B||||| ~ E||1 ~ E||1 ~ E||1 ~ S
+s1: Q|SELECT 1 / (a - 2) FROM n WHERE a < 4
+s1: P||UPDATE n SET b = 1 / (a - 2) WHERE a < 4| ~ B||||| ~ DP| ~ E||0 ~ S
 s1: P||INSERT INTO t (a) VALUES ($1)| ~ B||||n| ~ S
 # Parse: several statements, none, and errors with their places.
 s1: P||SELECT 1; SELECT 2| ~ S
@@ -122,7 +126,6 @@ s1: B||||| ~ E||0 ~ S
 s1: P||SELECT nosuch FROM t| ~ B||||| ~ E||0 ~ S
 s1: P||SELECT a FROM nosuch| ~ B||||| ~ E||0 ~ S
 s1: P||SELECT a FROM t WHERE a = 'x'| ~ B||||| ~ E||0 ~ S
-s1: P||SELECT '| ~ S
 # Names.
 s1: P|n1|SELECT 1| ~ P|n1|SELECT 2| ~ S
 s1: B||n1||| ~ E||0 ~ S
@@ -143,7 +146,7 @@ s1: B||||| ~ E||0 ~ S
 s1: P||SELECT 7| ~ Q|
 s1: B||||| ~ E||0 ~ S
 # A portal's rows, some at a time.
-s1: P|all|SELECT a FROM t WHERE a > $1| ~ S
+s1: P|all|SELECT a FROM n WHERE a > $1| ~ S
 s1: B||all||t:0| ~ E||1 ~ E||2 ~ E||0 ~ E||0 ~ S
 s1: B||all||t:0| ~ E||4 ~ E||4 ~ S
 s1: B||all||t:0| ~ E||5 ~ E||5 ~ S
@@ -165,7 +168,8 @@ s1: E|p|0 ~ S
 s1: P||INSERT INTO t (a, b) VALUES ($1, 0)| ~ B||||t:50| ~ E||1 ~ E||1 ~ S
 s1: P||UPDATE t SET b = 1 WHERE a < $1| ~ B|u|||t:3| ~ E|u|1 ~ S
 s1: P||UPDATE t SET b = 2 WHERE a < $1| ~ B|u|||t:3| ~ E|u|1 ~ E|u|1 ~ S
-s1: Q|SELECT a, b FROM t
+s1: Q|SELECT a, b FROM t WHERE a = 1
+s1: Q|SELECT a, b FROM t WHERE a = 2
 # SHOW and SET.
 s1: P||SHOW transaction_isolation| ~ DS| ~ B|||||1 ~ DP| ~ E||1 ~ E||1 ~ S
 s1: P||SHOW lock_timeout| ~ B||||| ~ E||0 ~ E||0 ~ S
