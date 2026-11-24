@@ -7239,7 +7239,7 @@ mod tests {
         let term = handle.status().unwrap().term;
         let budget = budget_of(64 << 20);
         let other = budget.take(crate::memory::Use::Images, 64 << 20).unwrap();
-        let until = Instant::now() + crate::transport::HANG;
+        let until = driven.until();
         pump.appends_lost = true;
         let write = {
             let (handle, budget) = (handle.clone(), Arc::clone(&budget));

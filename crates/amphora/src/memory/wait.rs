@@ -68,7 +68,7 @@ impl Waiters {
         mut look: impl FnMut() -> Result<T, NoRoom>,
         mut waits: impl FnMut(),
     ) -> Result<T, Refusal> {
-        let _watched = owner.watched_by(waiters)?;
+        let _watched = owner.watched_by(waiters);
         let mut told = waiters.told.lock().unwrap_or_else(PoisonError::into_inner);
         waiters.holders.fetch_add(1, Ordering::Relaxed);
         // Pairs with the sequentially consistent give-back and read of `holders` of `given`'s caller
@@ -78,7 +78,7 @@ impl Waiters {
         fence(Ordering::SeqCst);
         let found = 'look: loop {
             let seen = *told;
-            // The end is told under this lock after its reason is set, so this look sees the reason
+            // The end is told under this lock once its reason is set, so this look sees the reason
             // or the wait below hears the end.
             if let Some(reason) = owner.reason() {
                 break Err(reason);
@@ -153,18 +153,13 @@ impl Ending {
         }
     }
 
-    /// Told to `waiters` as it ends, until the guard drops; its reason if it has ended.
-    fn watched_by(&self, waiters: &Arc<Waiters>) -> Result<Watched<'_>, Refusal> {
-        let mut state = self.locked();
-        if let Some(reason) = &state.reason {
-            return Err(reason.clone());
-        }
-        state.watched.push(Arc::clone(waiters));
-        drop(state);
-        Ok(Watched {
+    /// Told to `waiters` as it ends, until the guard drops.
+    fn watched_by(&self, waiters: &Arc<Waiters>) -> Watched<'_> {
+        self.locked().watched.push(Arc::clone(waiters));
+        Watched {
             ending: self,
             waiters: Arc::clone(waiters),
-        })
+        }
     }
 
     /// The waits told as it ends.

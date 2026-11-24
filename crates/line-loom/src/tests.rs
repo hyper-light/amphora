@@ -509,7 +509,7 @@ fn t_mb_1_7_bytes_given_back_beside_the_end_are_charged_or_not_never_held_by_a_r
 /// other.
 #[test]
 fn t_mb_1_7_an_owners_end_ends_no_other_owners_wait() {
-    every(Some(3), || {
+    every(None, || {
         let budget = memory::Budget::of(5);
         let other = budget.take(memory::Use::Queues, 5).unwrap();
         let (ended, stands) = (
@@ -530,7 +530,7 @@ fn t_mb_1_7_an_owners_end_ends_no_other_owners_wait() {
 /// after the end is refused at once.
 #[test]
 fn t_mb_1_7_a_deadline_beside_the_end_is_answered_and_a_wait_after_it_is_refused_at_once() {
-    every(Some(3), || {
+    every(None, || {
         let budget = memory::Budget::of(5);
         let other = budget.take(memory::Use::Queues, 5).unwrap();
         let owner = Arc::new(memory::Ending::new());
