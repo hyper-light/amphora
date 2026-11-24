@@ -2636,8 +2636,8 @@ pub(crate) fn is_movable_left_join(table: &JoinedTable) -> bool {
 /// ON's test, where it would turn a NULL row into none. The right table is never the probe (an
 /// inner hash join's probe makes no NULL row), and an ON term holding a subquery keeps it out of
 /// the run (the emitter can't place the subquery's tables there). A LEFT JOIN outside the pair is
-/// one of the outer loops, where the subsets the search builds already hold its ON's tables before
-/// it.
+/// one of the outer loops, where the subsets the search builds hold its ON's tables before it: those
+/// grown past one table, and those of one table only where it must follow none (lane C6).
 ///
 /// Lane pl8-20 (T-PL.8.14), with `left_join_probes` (`Connection::set_bushy_left_join_probes`):
 /// the right table may be the probe, read by an outer hash join (`HashJoinType::LeftOuter`) whose

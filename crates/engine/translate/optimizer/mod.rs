@@ -5205,7 +5205,7 @@ pub(crate) mod bushy_search_tests {
         /// probes allowed, and as the hand-built bushy trees of its FROM order; each with the
         /// parallel mode off and at 1, 2 and 8 stated workers. Expect: SQLite's answer every time,
         /// its rows, their NULLs and their order.
-        fn outer_joins_answer_as_sqlite(name: &str, analyzed: bool) -> OuterJoinRuns {
+        fn outer_joins_answer_as_sqlite(name: &str, analyzed: bool) {
             use super::super::bushy_test_hook::{APPLIED, PIN, SPLIT};
             use crate::translate::optimizer::learned_costs::LearnedWeights;
             use crate::vdbe::morsel::{MachineCosts, ParallelMode};
@@ -5267,7 +5267,16 @@ pub(crate) mod bushy_search_tests {
                         SPLIT.with(|first| first.set(Some(split)));
                     }
                 }
+                // The parallel loops run where the plans differ: by cost, and on the weights that
+                // make every join a hash join. The other plans answer once, serially.
+                let parallel = matches!(
+                    plan,
+                    OuterJoinPlans::ByCost | OuterJoinPlans::Weights(2000.0, 0.5, 0.5)
+                );
                 for stated in workers {
+                    if stated.is_some() && !parallel {
+                        continue;
+                    }
                     conn.set_parallel_mode(ParallelMode::Off);
                     if let Some((count, probe)) = stated {
                         conn.set_parallel_mode(ParallelMode::On);
@@ -5328,7 +5337,10 @@ pub(crate) mod bushy_search_tests {
                 eprintln!("WRONG {line}");
             }
             assert!(wrong.is_empty(), "{} of {} wrong", wrong.len(), ran.runs);
-            ran
+            // Non-vacuity: bushy plans were run, and workers built the hash tables of some joins.
+            if name != "facts" {
+                assert!(ran.bushy > 0 && !ran.hooked.is_empty(), "{ran:?}");
+            }
         }
 
         #[test]
