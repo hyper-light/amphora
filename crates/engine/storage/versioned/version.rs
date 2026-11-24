@@ -2843,6 +2843,24 @@ mod tests {
         );
     }
 
+    /// T-G8.4.3, AUDIT 2.4. If SSI cannot keep even the first read, finishing the transaction
+    /// must still validate its incomplete read set and refuse it.
+    #[test]
+    fn audit_review_ssi_refuses_an_unwritten_transaction_that_lost_its_reads() {
+        let v = db().with_budget(64 * 1024).with_validation(Validation::Ssi);
+        let mut txn = v.clock.begin().unwrap();
+        let budget = v.clock.budget();
+        let room = usize::try_from(budget.limit() - budget.held()).unwrap();
+        let filler = budget.reserve("test filler", room).unwrap();
+        let mut d = Descender::new();
+        let read = v.tree(0).unwrap().read(&v.pool, &mut d, &v.clock, &mut txn, b"key");
+        budget.release(filler);
+        assert!(matches!(read, Err(LimboError::MemoryBudget { .. })));
+        assert!(txn.reads.is_empty() && txn.reads.lost);
+        let txn = v.end_unwritten(txn).unwrap().expect("SSI must validate the lost read");
+        assert!(matches!(v.commit(txn, &mut d), Err(LimboError::SerializationFailure)));
+    }
+
     /// T-G8.2.1, the soak (AC-G8.2.1): a reader holds one snapshot open while 32 writers change
     /// its rows (read two, write two, retry when refused) and a collector runs, for each
     /// validation that keeps commits; then one transaction changes every row. Expect: the budget
