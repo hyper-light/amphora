@@ -2007,6 +2007,13 @@ pure core is `database/slot.rs`, driven by the owner (`Actor::keep_slots`, `star
   learned slot expired). A leader of any version reads the second barrier so, so this adds nothing to the wire; the
   barrier's own read state matches nothing at the member and is dropped. Agreed there
   (amphora-owner-t1-g-slot-878285a-20261111), as better than the ruling it departs from.
+  Since lane V8 every follower barrier asks for a slot (`Slots::ask`), so a second barrier that comes after its slot
+  ended (its length passed while the work ran, or a release) asked for a new slot that no work ends, holding the
+  leader and every member queued behind it for its length (lane P13's trace, CP-T1.13). A slot begun for a member
+  waits for its close until one comes (`Gap::from`), so a barrier from a member whose slot ended before its close came
+  is that close, marked a read's or not (`Slots::released`; lane P16): it ends nothing and asks for nothing, and it
+  steps. A slot ends once (lane P14). A member sends its close only to the leader that gave the slot, in that term (`Actor::end_slot`): a slot dies with its term, and a new
+  leader, which gave none, would take the close as an ask (lane P14's trace, the same stuck state).
 - *Which barriers ask* (CP-T1.8, lanes V8 and V11). Since lane V8 a follower's write asks for its slot from its
   first try: the leader queues every write's barrier (`Slots::ask`), not only a refused member's, so the base it
   prepares on is current when its write appends. A read never asks (lane V11): work that writes nothing (a
@@ -3094,16 +3101,22 @@ length, and the owner takes none until it has the result back.
    behind its durability fence, core step R-6, under which `Ready`s go on), with a hold of Amphora's own beside the
    fence's so the fence's `resume_apply` cannot lift it. Applied state stays still, so the owner neither refreshes
    nor runs a `read_db`. Everything else goes on: ticks, heartbeats, votes (a vote is the raft log's hard state, not
-   the database's), appends and their flushes, ReadIndex, a member's forward appended.
+   the database's), appends and their flushes, ReadIndex, a member's forward appended. The database's log is not
+   restarted while the lock is lent, so a restart due and ready at the hand-off runs first (`Actor::hand_off` steps
+   the flushing), as it ran after a session run inline, and no read is held for one while the session is out.
+   Lane P15's trace: the step that lent the lock skipped a due and ready restart, the passes then found the log busy
+   under the session's reader, and the write was answered with the replica's reads held for a restart still to come
+   (CP-T1.13, lane P16).
 4. **The result handed back, on an event.** The worker sends its result on a done channel and wakes the owner's bell,
    as the flushing thread does (`Flushing::Thread`). The owner's next step takes it with `try_recv`: it woke on the
    bell, so nothing polls. The owner lifts its hold, lets the step's drive apply what committed meanwhile, then
    decides the pending write, which waited in a phase of its own (running, between `Barrier` and `Proposed`):
    - still leader, in the pending write's term, with the same leader: proposed as today (`Actor::propose`, which moves
      a base made stale by entries appended since by its read set, `rebase`), then `Proposed`;
-   - lead lost or term moved: refused `NotLeader` with the leader it knows. Nothing was proposed, so nothing was
-     written: a known outcome. Its session is spent (a call is `FnOnce`), so it is never run again, unlike a pending
-     write requeued before its preparation;
+   - lead lost or term moved: nothing was proposed, so nothing was written. Data (a mutation, an import: anything
+     but a caller's closure) comes back from the worker with its result and is requeued for the next lead, as a
+     pending write requeued before its preparation is (lane P8). A call is refused `NotLeader` with the leader it
+     knows, a known outcome: its session is spent (a call is `FnOnce`), so it is never run again;
    - past its deadline: `Timeout`, as today (the deadline guard ends the SQL inside the worker too);
    - the session's error: that error, as today.
 5. **Ordering.** Unchanged: one pending write per owner; later submits wait in `waiting` in arrival order and are
@@ -3168,3 +3181,100 @@ already, so the session's base is the applied point the owner hands over.
 - an apply whose write lock overlaps a session's transaction (the hold leaking);
 - commit latency at 1 or 32 writers on the replicated rung worse than before beyond run-to-run noise: the hand-off
   adds a thread's wake each way, and no saving at small writes pays for it.
+
+## Decision (lane P9): heartbeats and votes never wait behind a large entry (2026-11-23, CP-T1.13; part 1 built, parts 2 and 3 designed)
+
+### What was wrong
+
+Lane P8's trace of a 20 MiB replicated write (bench/records/2026-11-23-adacachy2-perf-serve-p8.md, measured, debug
+build): the leader spent 264.6 ms in one owner step proposing the entry; each follower stepped one record of
+21,082,349 bytes (12.6 ms) ahead of the heartbeats queued behind it; a follower's messages, heartbeat answers
+included, left only once its log write was durable; then every member spent 915-962 ms applying the entry in one
+step. Against a learned election timeout of about 21 ms (`election_tick` 20, tick period 0.6-1.3 ms) the leader lost
+its quorum check and stepped down on its own: 1 of 6 such writes answered Ok, the rest UnknownOutcome. With lane V4's
+hyper-raft change (a member whose term and vote are durable answers a heartbeat at once, `answer_beat_now`) it was 6
+of 8: needed, not enough. Four costs grow with the write's size, and each holds a heartbeat or its answer:
+
+1. one FIFO per peer: one TCP stream and one sender thread carry every record, and the reader blocks in `receive`
+   until the owner has stepped the whole record, so a heartbeat behind a 21 MB append is not even read until the
+   append is stepped (serve.rs `serve`, `to_peer`, `connection`);
+2. one entry per command, however large (`max_size_per_msg` is a whole command, `MESSAGE_BYTES`): each member steps
+   it in one step, and the leader's window sends it whole (`Inflights::full` lets one entry out past the window);
+3. the proposal's copies on the owner thread: the encoding, the leader's own log append and the sends, 264.6 ms;
+4. the apply on the owner thread: 915-962 ms, every member at once.
+
+### The decision (the coordinator's, 2026-11-23 16:44Z)
+
+Heartbeats, votes and their answers never wait behind a large entry. Built in this order, each A/B'd on the 20 MiB
+commit rate and on small-write commit latency at 1 and 32 writers before the next:
+
+1. **A path of its own per peer for control records (built, lane P9).** The owner tags each outgoing record with
+   its route as it releases it (`Outbound::route`, `api::replication::Route`): `Log` for the records that carry the
+   log (`MsgAppend`, `MsgSnapshot`), `Control` for every other record (heartbeats, votes, pre-votes, their answers,
+   appends' answers, read confirmations, a hand-over's `MsgTimeoutNow`), each bounded by its fields and never by an
+   entry. `serve` keeps one sender thread, one queue and one connection per peer and route; the control connection
+   is a new kind (`H`), framed as `R`, so the protocol grows by a kind and changes none. Each route keeps the order
+   its member sent; one route's records may overtake the other's, which Raft allows of any network (every message
+   carries its term, and a heartbeat's commit is the follower's matched index at most, so one that overtakes an
+   append commits nothing the follower lacks). An append's answer goes on the control path: the leader's window and
+   its match index move as soon as the follower answers, not after the next append behind it. The route is the
+   owner's, decided where the message is made: a host never parses a record to place it.
+2. **Large entries in parts sized by the path (designed).** A command whose encoded entry is larger than one
+   heartbeat interval's carriage goes into the log as parts: consecutive entries of one term, each at most
+   `min over the voters' paths of Path::carried(heartbeat interval)`, the bytes the host drained to that member in
+   a heartbeat interval at its measured rate (`carry`, `Drain::carried`), never under one record's framing
+   (`RECORD_BYTES`), so a part always moves. No size is picked: a fast path takes large parts, a slow one small. The
+   apply stages each part (as the seed's chunks are staged) and applies the write once, at its last part, in one
+   transaction. Parts must be contiguous and of one term: an entry of another term (a new leader's empty entry) or
+   of another write between them discards what is staged, deterministically on every member, so the write is
+   refused, not lost: the member that took it answers it typed (`NotLeader`, nothing applied) once its apply passes
+   the discard, a known outcome where today's is UnknownOutcome. Each step then handles one part at most per
+   record, so a member's step is bounded by what its path carries in a heartbeat interval, and the heartbeats stepped
+   between parts reach the core within one interval.
+3. **The proposal's copies and the apply off the owner thread (designed).** The session worker (lane P6's) already
+   holds the prepared write; it also encodes its parts, so the owner's step takes ready parts and proposes them as
+   the window opens, a part a step at most past the first. The apply moves to the same worker under the same lent
+   write lock and hold (`hold_apply`): the owner hands it the committed range, keeps ticking, beating, voting and
+   appending, and takes the result on the bell, as it takes a session's; the applied point is published when the
+   worker hands the range back. One writer still: a session and an apply never overlap, because the worker runs one
+   job at a time.
+
+### The data shapes
+
+- `Route { Log, Control }` on each `Outbound` (part 1), decided by the owner from the message's type.
+- Part 2: a command variant appended to the replicated command (`Part { write: context, index, of, bytes }`, the
+  wire growing by a variant), the staging keyed by the write's context, cleared by a discard or the last part's
+  apply, bounded by `COMMAND_BYTES` as the whole command is today.
+- Part 3: the worker's job grows a variant (`Apply { range }`) beside `Session`; the hand-back carries the applied
+  point.
+
+### The candidates weighed
+
+- **One connection with frames interleaved** (records cut into frames, control frames sent between a large
+  record's frames, as HTTP/2 streams share a connection, RFC 9113 section 5): the same effect on the wire, but the
+  reader still steps a whole record in one owner step and the sender's framing state is new code on every host.
+  Two connections need neither, and the kernel already schedules them.
+- **A priority queue in the owner** (control inputs stepped before queued appends): helps only once the record is
+  read, and part 1's reader already reads control records beside a large one; the step of a 21 MB record still
+  holds everything behind it, which only parts bound.
+- **Longer election timeouts for large writes**: rejected. Failover would slow for every write to save the large
+  ones, and the timeout would follow a size someone picked.
+- **Entries by reference** (the write's pages streamed out of band and the log carrying their digest): moves the
+  durability of the pages outside the log's rules (its fsync, its truncation on a new term); parts keep them inside.
+
+### Tests it is built with
+
+- Part 1: `--test serve` as it is (every member's records cross the two paths), the replicated suite, and P5's
+  probe at 20 MiB: the commit rate (Ok of N) and every member's leader lost within a term (`P8PROBE`), arms built
+  from fixed SHAs on one machine.
+- Part 2: a write of many parts commits whole; a leader lost between parts discards the staged parts on every
+  member and the write is refused `NotLeader` with nothing applied; a part's size follows the path's carriage.
+- Part 3: a vote request stepped into a member while its worker applies is answered; reads are answered at the
+  applied point meanwhile.
+
+### Falsified by
+
+- a heartbeat or vote answer that waits, at any member, for an append's bytes to be written, read or stepped;
+- a 20 MiB write's leader stepping down with no other fault once parts 1 to 3 are in;
+- commit latency at 1 or 32 writers worse than before beyond run-to-run noise (part 1 adds a connection and a
+  thread per peer and nothing to a small write's path).
