@@ -1,0 +1,265 @@
+# T-PG.10.1: the extended protocol's messages, as scripts/postgres-extended-answers.py reads them.
+s1: Q|create table t(a int not null, b int8, c "text", d char(4), e timestamp, f timestamptz)
+s1: Q|alter table t add primary key (a)
+s1: Q|create table pgbench_accounts(aid int not null,bid int,abalance int,filler char(84))
+s1: Q|alter table pgbench_accounts add primary key (aid)
+s1: Q|create table pgbench_history(tid int,bid int,aid int,delta int,mtime timestamp,filler char(22))
+s1: Q|insert into pgbench_accounts(aid,bid,abalance,filler) values (1, 1, 0, '')
+# pgbench -M extended: PQsendQueryParams, its parameters text and untyped.
+s1: P||BEGIN| ~ B||||| ~ DP| ~ E||0 ~ S
+s1: P||UPDATE pgbench_accounts SET abalance = abalance + $1 WHERE aid = $2;| ~ B||||t:-25,t:1|0 ~ DP| ~ E||0 ~ S
+s1: P||SELECT abalance FROM pgbench_accounts WHERE aid = $1;| ~ B||||t:1|0 ~ DP| ~ E||0 ~ S
+s1: P||INSERT INTO pgbench_history (tid, bid, aid, delta, mtime) VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP);| ~ B||||t:1,t:1,t:1,t:-25|0 ~ DP| ~ E||0 ~ S
+s1: P||END;| ~ B||||| ~ DP| ~ E||0 ~ S
+# pgbench -M prepared: PQprepare, then PQsendQueryPrepared.
+s1: P|P0_1|BEGIN;| ~ S
+s1: P|P0_2|UPDATE pgbench_accounts SET abalance = abalance + $1 WHERE aid = $2;| ~ S
+s1: P|P0_3|SELECT abalance FROM pgbench_accounts WHERE aid = $1;| ~ S
+s1: P|P0_4|INSERT INTO pgbench_history (tid, bid, aid, delta, mtime) VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP);| ~ S
+s1: P|P0_5|END;| ~ S
+s1: B||P0_1|||0 ~ DP| ~ E||0 ~ S
+s1: B||P0_2||t:100,t:1|0 ~ DP| ~ E||0 ~ S
+s1: B||P0_3||t:1|0 ~ DP| ~ E||0 ~ S
+s1: B||P0_4||t:1,t:1,t:1,t:100|0 ~ DP| ~ E||0 ~ S
+s1: B||P0_5|||0 ~ DP| ~ E||0 ~ S
+s1: B||P0_2||t:1,t:2|0 ~ DP| ~ E||0 ~ S
+s1: Q|SELECT abalance FROM pgbench_accounts WHERE aid = 1
+# Step g's PQexecParams relkind query (pgbench.c:868).
+s1: P||SELECT relkind FROM pg_catalog.pg_class WHERE oid=$1::pg_catalog.regclass| ~ B||||t:pgbench_accounts|0 ~ DP| ~ E||0 ~ S
+s1: P||SELECT relkind FROM pg_catalog.pg_class WHERE oid=$1::pg_catalog.regclass| ~ B||||t:pgbench_accounts|1 ~ DP| ~ E||0 ~ S
+s1: P||SELECT relkind FROM pg_catalog.pg_class WHERE oid=$1::pg_catalog.regclass| ~ DS| ~ B|||1|x:000004eb| ~ DP| ~ E||0 ~ S
+s1: P||SELECT relkind FROM pg_catalog.pg_class WHERE oid=$1::pg_catalog.regclass| ~ B||||n| ~ E||0 ~ S
+s1: P||SELECT relkind FROM pg_catalog.pg_class WHERE oid=$1::pg_catalog.regclass| ~ B||||t:nosuch| ~ DP| ~ E||0 ~ S
+s1: P||SELECT relname, oid, relkind FROM pg_catalog.pg_class WHERE oid = $1| ~ DS| ~ B||||t:1259|0 ~ DP| ~ E||0 ~ S
+s1: P||SELECT relname, oid, relkind FROM pg_catalog.pg_class WHERE oid = $1| ~ B|||1|x:000004eb|1 ~ DP| ~ E||0 ~ S
+# INSERT's parameters typed by assignment, in text, in binary and NULL; a row's columns in text, in binary and in both.
+s1: P|ins|INSERT INTO t (a, b, c, d, e, f) VALUES ($1, $2, $3, $4, $5, $6)| ~ DS|ins ~ S
+s1: B||ins||t:1,t:2,x:612ce282ac7e,t:ab,t:2026-11-23 10:11:12.5,t:2026-11-23 10:11:12+02| ~ DP| ~ E||0 ~ S
+s1: B||ins|1|x:00000002,x:fffffffffffffffd,x:c3a9,x:78,x:0002e3cf3e2a7800,x:0002e3cf3e2a7801| ~ DP| ~ E||0 ~ S
+s1: B||ins|1,0,1,0,1,0|x:00000003,n,n,n,n,n| ~ E||0 ~ S
+s1: B||ins|0,1,0,1,0,1|t:4,x:7fffffffffffffff,t:,x:61626364,t:infinity,x:8000000000000000| ~ E||0 ~ S
+s1: P|sel|SELECT a, b, c, d, e, f FROM t WHERE a = $1| ~ DS|sel ~ S
+s1: B||sel||t:1| ~ DP| ~ E||0 ~ S
+s1: B||sel||t:1|0 ~ DP| ~ E||0 ~ S
+s1: B||sel|1|x:00000002|1 ~ DP| ~ E||0 ~ S
+s1: B||sel|1|x:00000001|1,0,1,0,1,0 ~ DP| ~ E||0 ~ S
+s1: B||sel|0|t:4|0,1,0,1,0,1 ~ DP| ~ E||0 ~ S
+s1: B||sel||t:3|1 ~ DP| ~ E||0 ~ S
+s1: B||sel||t:9|1 ~ DP| ~ E||0 ~ S
+s1: B||sel||n| ~ E||0 ~ S
+s1: Q|SELECT a, b, c, d, e, f FROM t
+# Each type's value both ways.
+s1: P||SELECT $1::int4, $2::int8, $3::"text", $4::char(3), $5::"char", $6::bool| ~ DS| ~ B||||t:-7,t:-8,t:x y,t:ab,t:z,t:yes|1 ~ DP| ~ E||0 ~ S
+s1: P||SELECT $1::int4, $2::int8, $3::"text", $4::char(3), $5::"char", $6::bool| ~ B|||1|x:80000000,x:8000000000000000,x:,x:616263646566,x:00,x:02|0 ~ DP| ~ E||0 ~ S
+s1: P||SELECT $1::oid, $2::regclass, $3::"name", $4::timestamp, $5::timestamptz| ~ DS| ~ B||||t:42,t:pg_class,t:a name,t:2000-01-01 00:00:00,t:2000-01-01 00:00:00|1 ~ DP| ~ E||0 ~ S
+s1: P||SELECT $1::oid, $2::regclass, $3::"name", $4::timestamp, $5::timestamptz| ~ B|||1|x:ffffffff,x:000004eb,x:6e,x:7fffffffffffffff,x:fffffffffffffffe|0 ~ DP| ~ E||0 ~ S
+s1: P||SELECT $1::timestamp(0), $1::timestamp(3), $2::"char", $2::"char"| ~ B|||1|x:0000000000000fff,x:ff|0 ~ E||0 ~ S
+s1: P||SELECT $1::bool, $1::bool IS NULL, $2::"text" IS NOT NULL| ~ B||||n,t:|1 ~ DP| ~ E||0 ~ S
+s1: P||SELECT $1::"name"| ~ B||||t:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa| ~ E||0 ~ S
+s1: P||SELECT 'literal', 1, 2147483648, true, NULL| ~ DS| ~ B|||||1 ~ DP| ~ E||0 ~ S
+# Parameters typed by analysis, or given.
+s1: P||SELECT $1| ~ DS| ~ B||||t:x| ~ E||0 ~ S
+s1: P||SELECT $1|23 ~ DS| ~ B||||t:12| ~ E||0 ~ S
+s1: P||SELECT $1|705 ~ DS| ~ B||||t:12| ~ E||0 ~ S
+s1: P||SELECT $1 + $2|20,0 ~ DS| ~ B||||t:12,t:13| ~ E||0 ~ S
+s1: P||SELECT $2, $1|23 ~ DS| ~ B||||t:12,t:13| ~ E||0 ~ S
+s1: P||SELECT 1|23,25 ~ DS| ~ B||||t:12,t:13| ~ E||0 ~ S
+s1: P||SELECT 1|0 ~ DS| ~ S
+s1: P||SELECT $2| ~ DS| ~ S
+s1: P||SELECT $1 + 1|25 ~ DS| ~ S
+s1: P||SELECT $1, $1 + 1| ~ DS| ~ S
+s1: P||SELECT $1 + 1, $1| ~ DS| ~ B||||t:2147483646| ~ E||0 ~ S
+s1: P||SELECT a FROM t WHERE a = $1 AND b = $2 AND c = $3 AND e = $4| ~ DS| ~ S
+s1: P||UPDATE t SET b = $1 WHERE a = $2|23 ~ DS| ~ B||||t:5,t:1| ~ DP| ~ E||0 ~ S
+s1: P||UPDATE t SET d = $1 WHERE a = $2| ~ DS| ~ B||||t:abcde,t:1| ~ DP| ~ E||0 ~ S
+s1: P||UPDATE t SET d = $1 WHERE a = $2| ~ B||||t:abc  ,t:1| ~ DP| ~ E||0 ~ S
+# What Bind refuses.
+s1: P|two|SELECT $1::int4, $2::"text"| ~ S
+s1: B||two||t:1| ~ E||0 ~ S
+s1: B||two||t:1,t:2,t:3| ~ E||0 ~ S
+s1: B||two|0,0,0|t:1,t:2| ~ E||0 ~ S
+s1: B||two|0,1|t:1,t:2|0,0,0 ~ E||0 ~ S
+s1: B||two|2|t:1,t:2| ~ E||0 ~ S
+s1: B||two|-1|n,n| ~ E||0 ~ S
+s1: B||two||t:1,t:2|2 ~ DP| ~ E||0 ~ S
+s1: B||two||t:1,t:2|0,-5 ~ DP| ~ E||0 ~ S
+s1: B||two||t:one,t:2| ~ E||0 ~ S
+s1: B|named|two||t:99999999999,t:2| ~ E|named|0 ~ S
+s1: B||two||t:,t:2| ~ E||0 ~ S
+s1: B||two|1|x:000001,t:2| ~ E||0 ~ S
+s1: B||two|1|x:0000000001,t:2| ~ E||0 ~ S
+s1: B||two||t:1,x:ff| ~ E||0 ~ S
+s1: B||two||t:1,x:6100| ~ E||0 ~ S
+s1: B||two|1|x:00000001,x:c328| ~ E||0 ~ S
+s1: B||two|1|x:00000001,x:e282| ~ E||0 ~ S
+s1: B||two|0,1|t:1,x:61e2| ~ E||0 ~ S
+s1: B||nosuch||| ~ E||0 ~ S
+s1: B|||||| ~ E||0 ~ S
+s1: CS| ~ B||||| ~ E||0 ~ S
+s1: P||SELECT $1::timestamp, $2::"name"| ~ B|||1|x:8000000000000001,x:61| ~ E||0 ~ S
+s1: P||SELECT $1::"name"| ~ B|||1|x:61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161| ~ E||0 ~ S
+s1: P||SELECT $1::aclitem| ~ B|||1|x:61| ~ E||0 ~ S
+s1: P||SELECT $1::timestamp| ~ B||||t:2026-13-45| ~ E||0 ~ S
+s1: P||SELECT $1::bool| ~ B||||t:maybe| ~ E||0 ~ S
+s1: P||SELECT $1::regclass| ~ B||||t:no such| ~ E||0 ~ S
+# What the planner computes is refused at Bind, what runs at Execute.
+s1: P||SELECT 1 / 0| ~ DS| ~ B||||| ~ DP| ~ E||0 ~ S
+s1: P||SELECT 1 / $1| ~ DS| ~ B||||t:0| ~ DP| ~ E||0 ~ S
+s1: P||SELECT $1::"text"::int4| ~ B||||t:x| ~ DP| ~ E||0 ~ S
+s1: P||SELECT $1::"text"::regclass| ~ B||||t:nosuch| ~ DP| ~ E||0 ~ S
+s1: P||SELECT $1::"text"::timestamptz| ~ B||||t:nosuch| ~ DP| ~ E||0 ~ S
+s1: P||SELECT 1 / (a - 2) FROM t WHERE a < 4| ~ B||||| ~ DP| ~ E||0 ~ S
+s1: P||SELECT 1 / (a - 2) FROM t WHERE a < 4| ~ B||||| ~ E||1 ~ E||1 ~ E||1 ~ S
+s1: Q|SELECT 1 / (a - 2) FROM t WHERE a < 4
+s1: P||UPDATE t SET b = 1 / (a - 2) WHERE a < 4| ~ B||||| ~ DP| ~ E||0 ~ S
+s1: P||INSERT INTO t (a) VALUES ($1)| ~ B||||n| ~ S
+# Parse: several statements, none, and errors with their places.
+s1: P||SELECT 1; SELECT 2| ~ S
+s1: P||| ~ DS| ~ B||||| ~ DP| ~ E||0 ~ E||0 ~ S
+s1: P|empty| ; -- nothing| ~ DS|empty ~ B|empty|empty||| ~ DP|empty ~ E|empty|0 ~ S
+s1: P||SELECT 1;| ~ B||||| ~ E||0 ~ S
+s1: P||SELEC 1| ~ B||||| ~ E||0 ~ S
+s1: B||||| ~ E||0 ~ S
+s1: P||SELECT nosuch FROM t| ~ B||||| ~ E||0 ~ S
+s1: P||SELECT a FROM nosuch| ~ B||||| ~ E||0 ~ S
+s1: P||SELECT a FROM t WHERE a = 'x'| ~ B||||| ~ E||0 ~ S
+s1: P||SELECT '| ~ S
+# Names.
+s1: P|n1|SELECT 1| ~ P|n1|SELECT 2| ~ S
+s1: B||n1||| ~ E||0 ~ S
+s1: CS|n1 ~ P|n1|SELECT 2| ~ B||n1||| ~ E||0 ~ S
+s1: CS|nosuch ~ CP|nosuch ~ CS| ~ CP| ~ S
+s1: DS|nosuch ~ S
+s1: DP|nosuch ~ S
+s1: E|nosuch|0 ~ S
+s1: B|p|n1||| ~ B|p|n1||| ~ S
+s1: B|p|n1||| ~ CP|p ~ B|p|n1||| ~ E|p|0 ~ S
+s1: B||n1||| ~ B||n1||| ~ E||0 ~ S
+s1: B|p|n1||| ~ CS|n1 ~ DP|p ~ E|p|0 ~ S
+s1: B|p|two||t:1,t:2| ~ S ~ DP|p ~ S ~ E|p|0 ~ S
+s1: P||SELECT 5| ~ S
+s1: B||||| ~ E||0 ~ S
+s1: Q|SELECT 6
+s1: B||||| ~ E||0 ~ S
+s1: P||SELECT 7| ~ Q|
+s1: B||||| ~ E||0 ~ S
+# A portal's rows, some at a time.
+s1: P|all|SELECT a FROM t WHERE a > $1| ~ S
+s1: B||all||t:0| ~ E||1 ~ E||2 ~ E||0 ~ E||0 ~ S
+s1: B||all||t:0| ~ E||4 ~ E||4 ~ S
+s1: B||all||t:0| ~ E||5 ~ E||5 ~ S
+s1: B||all||t:0| ~ E||-1 ~ S
+s1: B|p|all||t:0|1 ~ DP|p ~ E|p|3 ~ B|q|all||t:2| ~ E|q|1 ~ E|p|3 ~ E|q|3 ~ CP|p ~ E|p|1 ~ S
+s1: B|p|all||t:0| ~ E|p|1 ~ S
+s1: E|p|1 ~ S
+s1: Q|BEGIN
+s1: B|p|all||t:0| ~ E|p|1 ~ S
+s1: B||all||t:1| ~ E||1 ~ S
+s1: E|p|1 ~ S
+s1: E||1 ~ S
+s1: Q|SELECT 8
+s1: E||1 ~ S
+s1: Q|SELECT 9
+s1: E|p|0 ~ S
+s1: Q|COMMIT
+s1: E|p|0 ~ S
+s1: P||INSERT INTO t (a, b) VALUES ($1, 0)| ~ B||||t:50| ~ E||1 ~ E||1 ~ S
+s1: P||UPDATE t SET b = 1 WHERE a < $1| ~ B|u|||t:3| ~ E|u|1 ~ S
+s1: P||UPDATE t SET b = 2 WHERE a < $1| ~ B|u|||t:3| ~ E|u|1 ~ E|u|1 ~ S
+s1: Q|SELECT a, b FROM t
+# SHOW and SET.
+s1: P||SHOW transaction_isolation| ~ DS| ~ B|||||1 ~ DP| ~ E||1 ~ E||1 ~ S
+s1: P||SHOW lock_timeout| ~ B||||| ~ E||0 ~ E||0 ~ S
+s1: P||SET lock_timeout = '3s'| ~ DS| ~ B||||| ~ DP| ~ E||0 ~ S
+s1: P||SHOW lock_timeout| ~ B||||| ~ E||0 ~ S
+s1: P||SET lock_timeout = '4s'| ~ B||||| ~ E||0 ~ P||SHOW lock_timeout| ~ B||||| ~ E||0 ~ P||SELECT 1/0| ~ B||||| ~ E||0 ~ S
+s1: Q|SHOW lock_timeout
+s1: P||RESET lock_timeout| ~ B||||| ~ E||0 ~ S
+s1: Q|SHOW lock_timeout
+# Messages until Sync are one transaction.
+s1: P|put|INSERT INTO t (a, b) VALUES ($1, 0)| ~ P|has|SELECT a FROM t WHERE a = $1| ~ S
+s1: B||put||t:60| ~ E||0 ~ B||has||t:60| ~ E||0 ~ P||SELECT 1/0| ~ B||||| ~ E||0 ~ B||put||t:61| ~ E||0 ~ S
+s1: B||has||t:60| ~ E||0 ~ B||has||t:61| ~ E||0 ~ S
+s1: B||put||t:62| ~ E||0 ~ B||put||t:63| ~ E||0 ~ S
+s1: B||has||t:62| ~ E||0 ~ B||has||t:63| ~ E||0 ~ S
+s1: B||put||t:64| ~ E||0 ~ P||BEGIN| ~ B||||| ~ E||0 ~ B||put||t:65| ~ E||0 ~ S
+s1: B||has||t:64| ~ E||0 ~ B||has||t:65| ~ E||0 ~ S
+s1: P||ROLLBACK| ~ B||||| ~ E||0 ~ S
+s1: B||has||t:64| ~ E||0 ~ B||has||t:65| ~ E||0 ~ S
+s1: B||put||t:66| ~ E||0 ~ P||COMMIT| ~ B||||| ~ E||0 ~ B||put||t:67| ~ E||0 ~ P||SELECT 1/0| ~ B||||| ~ E||0 ~ S
+s1: B||has||t:66| ~ E||0 ~ B||has||t:67| ~ E||0 ~ S
+s1: B||put||t:68| ~ E||0 ~ P||ROLLBACK| ~ B||||| ~ E||0 ~ B||put||t:69| ~ E||0 ~ S
+s1: B||has||t:68| ~ E||0 ~ B||has||t:69| ~ E||0 ~ S
+s1: P||COMMIT| ~ B||||| ~ E||0 ~ S
+s1: P||ROLLBACK| ~ B||||| ~ E||0 ~ S
+s1: P||BEGIN| ~ B||||| ~ E||0 ~ P||BEGIN| ~ B||||| ~ E||0 ~ P||COMMIT| ~ B||||| ~ E||0 ~ S
+s1: P||create table made(a int)| ~ DS| ~ B||||| ~ DP| ~ E||0 ~ P||SELECT a FROM made| ~ DS| ~ B||||| ~ E||0 ~ S
+s1: P||create table unmade(a int)| ~ B||||| ~ E||0 ~ P||SELECT 1/0| ~ B||||| ~ E||0 ~ S
+s1: Q|SELECT a FROM unmade
+s1: Q|SELECT a FROM made
+# A failed block takes COMMIT and ROLLBACK.
+s1: Q|BEGIN
+s1: B|p|all||t:0| ~ E|p|1 ~ B|i|put||t:70| ~ E|i|0 ~ P|end|ROLLBACK| ~ S
+s1: B||two||t:one,t:2| ~ E||0 ~ S
+s1: E|p|1 ~ S
+s1: DP|p ~ S
+s1: DP|i ~ S
+s1: E|i|1 ~ S
+s1: DP| ~ S
+s1: DS|all ~ S
+s1: DS|put ~ S
+s1: P||SELECT 1| ~ S
+s1: P||| ~ B||||| ~ S
+s1: B||put||t:71| ~ S
+s1: P||COMMIT|23 ~ B||||t:1| ~ S
+s1: CP|p ~ CS|two ~ S
+s1: Q|SELECT 1
+s1: B||end||| ~ DP| ~ E||0 ~ S
+s1: B||has||t:70| ~ E||0 ~ S
+s1: Q|BEGIN
+s1: P||SELECT 1/0| ~ B||||| ~ E||0 ~ S
+s1: P||COMMIT| ~ DS| ~ B||||| ~ DP| ~ E||0 ~ S
+# A SELECT's portal reads what its Bind saw.
+s2: P|up|UPDATE t SET b = $1 WHERE a = $2| ~ S
+s1: Q|BEGIN
+s1: P|b1|SELECT b FROM t WHERE a = 1| ~ B|p|b1||| ~ S
+s2: B||up||t:77,t:1| ~ E||0 ~ S
+s1: E|p|0 ~ S
+s1: B|q|b1||| ~ P||UPDATE t SET b = 78 WHERE a = 1| ~ B||||| ~ E||0 ~ B|r|b1||| ~ S
+s1: E|q|0 ~ E|r|0 ~ S
+s1: Q|ROLLBACK
+# Sync after an error; several Syncs; Flush.
+s1: P||SELECT 1/0| ~ B||||| ~ E||0 ~ P||SELECT 1| ~ B||||| ~ E||0 ~ S ~ S ~ P||SELECT 2| ~ B||||| ~ E||0 ~ S
+s1: S
+s1: S ~ S
+s1: P||SELECT 3| ~ DS| ~ B||||| ~ DP| ~ E||0 ~ H
+s1: B||||| ~ E||0 ~ H
+s1: S
+s1: P||SELECT 1/0| ~ B||||| ~ E||0 ~ H
+s1: P||SELECT 4| ~ H ~ S
+s1: P||SELEC| ~ Q|SELECT 5 ~ S
+s1: P||SELECT 4| ~ B||||| ~ E||0 ~ B||||| ~ E||0 ~ DP| ~ CP| ~ CS| ~ S
+# Messages malformed inside.
+s1: R|P|00 ~ S
+s1: R|P|0053454c4543542031000001 ~ S
+s1: R|P|0053454c45435420310000000000 ~ S
+s1: R|P|0053454c4543542027ff270000 ~ S
+s1: R|B|0000 ~ S
+s1: R|B|0000000100 ~ S
+s1: R|D| ~ S
+s1: R|D|5800 ~ S
+s1: R|D|53 ~ S
+s1: R|C|5800 ~ S
+s1: R|C|530000 ~ S
+s1: R|E|0000 ~ S
+s1: R|E|000000000000 ~ S
+s1: R|H|00 ~ P||SELECT 1| ~ S
+s1: R|S|00
+s1: Q|BEGIN
+s1: R|D|5800 ~ S
+s1: Q|ROLLBACK
+s1: P||SELECT $1::int4| ~ R|B|000000000001ffffff ~ S
+s1: P||SELECT $1::int4| ~ R|B|000000000001fffffffe0000 ~ S
+s1: P||SELECT $1::int4| ~ R|B|0000000000010000000531 ~ S
+s1: P||SELECT $1::int4| ~ R|B|00000000000100000001310000ff ~ S
+s1: P||SELECT $1::int4| ~ R|B|000000000001000000013100010001 ~ E||0 ~ S
