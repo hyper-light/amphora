@@ -3605,6 +3605,22 @@ fn each_use_of_a_cte_has_the_rows_and_the_names_of_its_definition() {
                 "WITH t AS (SELECT k, v FROM q) SELECT k FROM t ORDER BY k LIMIT (SELECT count(*) FROM t)",
                 &["2", "2", "3"],
             ),
+            (
+                "WITH RECURSIVE d AS (SELECT a.k FROM (SELECT k FROM g) AS a WHERE (SELECT min(k) FROM g) IN (SELECT k FROM g)), g(k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM g WHERE k < 3) SELECT k FROM d",
+                &["1", "2", "3"],
+            ),
+            (
+                "WITH d AS (SELECT a.k FROM (SELECT k FROM g) AS a JOIN (SELECT k FROM g) AS b ON a.k = b.k), g AS (SELECT k FROM q) SELECT k FROM d",
+                &["2", "2", "2", "2", "3"],
+            ),
+            (
+                "WITH RECURSIVE g(k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM g WHERE k < 3), d AS (SELECT k FROM g UNION ALL SELECT k + 10 FROM g) SELECT k FROM d",
+                &["1", "11", "12", "13", "2", "3"],
+            ),
+            (
+                "WITH d AS (WITH g AS (WITH d AS (SELECT k FROM t) SELECT d.k FROM d) SELECT a.k FROM g AS a WHERE a.k IN (SELECT k FROM g)) SELECT k FROM d",
+                &["1", "2"],
+            ),
         ],
     );
 }
