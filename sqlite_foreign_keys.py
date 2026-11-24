@@ -18,6 +18,7 @@ Each line is `db <name>`, `sql <statement>` (the database's tables, rows and tri
 <answer>`: the answer's rows sorted, each row's values joined by commas, a NULL written NULL, the rows joined by
 semicolons, or ERROR for a statement SQLite refuses, with its words when a constraint refused it.
 usage: python3 bench/sqlite_foreign_keys.py [databases [seed]] > crates/engine/tests/fixtures/foreign_keys.tsv"""
+import os
 import random
 import re
 import sqlite3
@@ -28,7 +29,7 @@ ORS = [""] + [f" OR {c}" for c in CONFLICTS]
 ACTIONS = ["NO ACTION", "RESTRICT", "CASCADE", "SET NULL", "SET DEFAULT"]
 DEFERRED = " DEFERRABLE INITIALLY DEFERRED"
 LOOK = "SELECT * FROM look"
-RECURSIVE = False
+RECURSIVE = bool(os.environ.get("C26_RECURSIVE"))
 
 
 def look(tables):
@@ -170,7 +171,8 @@ class Draw:
         # no trigger writes its own table without a guard that ends: a level's log is a row
         body = [f"INSERT INTO lg VALUES ('{name}{time[0]}{event[0]}', {read()}, {read()})"]
         for _ in range(pick([0, 1, 1, 2])):
-            other = pick("pcgt")
+            # what becomes of a row a BEFORE trigger changes is undefined (lang_createtrigger.html)
+            other = pick("pcgt" if time == "AFTER" or event == "INSERT" else "pcgt".replace(table, ""))
             there = self.columns[other]
             orc = pick(["", "", "", pick(ORS)])
             drawn = rng.random()
@@ -204,6 +206,8 @@ class Draw:
         if drawn < 0.3:
             return f"INSERT{orc} INTO {table} VALUES {', '.join(self.row(table) for _ in range(pick([1, 1, 2, 3])))}"
         if drawn < 0.55:
+            if not self.enforced:
+                where = f" WHERE {'k' if table == 'p' else 'id'} = {self.key()}" + (f" AND m = {self.key()}" if table == "p" and self.pair else "")
             sets = ", ".join(f"{c} = {pick([self.value(c), self.value(c), pick(columns)])}" for c in rng.sample(columns, pick([1, 1, 2])))
             return f"UPDATE{orc} {table} SET {sets}{where}"
         if drawn < 0.85:
@@ -251,7 +255,7 @@ def ask(db, sql, out):
     got = answer(db, sql)
     if db.execute("PRAGMA foreign_keys").fetchone()[0]:
         broken = db.execute("PRAGMA foreign_key_check").fetchall()
-        if sql == "COMMIT" and got == "ERROR FOREIGN KEY constraint failed" and not broken:
+        if sql.split()[0] in ("COMMIT", "RELEASE") and got == "ERROR FOREIGN KEY constraint failed" and not broken:
             raise Wrong(sql)
         if any(not db.in_transaction or not deferred(db, row[0], row[3]) for row in broken):
             raise Wrong(sql)
@@ -296,13 +300,12 @@ def main():
                 except sqlite3.IntegrityError:
                     continue
                 lines.append(f"sql\t{statement}")
+                if draw.enforced and db.execute("PRAGMA foreign_key_check").fetchall():
+                    raise sqlite3.Error(statement)
             for statement in draw.triggers + ([f"PRAGMA recursive_triggers = {'ON' if draw.recursive else 'OFF'}"]):
                 db.execute(statement)
                 lines.append(f"sql\t{statement}")
         except sqlite3.Error as error:
-            refused += 1
-            continue
-        if draw.enforced and db.execute("PRAGMA foreign_key_check").fetchall():
             refused += 1
             continue
         out.append(f"db\tdrawn {made}")
