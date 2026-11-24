@@ -1,6 +1,6 @@
 # Lane C12 (planner): oracle finding CN, a hash join's null-extended rows and WHERE terms on subqueries (2026-11-24)
 
-Hour: 09:29:01Z to 10:29:01Z. Machine: adacachy2 (Linux x86_64, 32 cores, shared: 1-minute load 16 to 89), debug builds (`--features
+Hour: 09:29:01Z to 10:29:01Z. Machine: adacachy2 (Linux x86_64, 32 cores, shared: 1-minute load 16 to 149), debug builds (`--features
 simulator`); SQLite 3.54.0 is the reference (adacachy's and adacachy2's system library). No timing is in this record.
 
 Losses first.
@@ -71,16 +71,23 @@ statistics, an inner join loses rows: `... JOIN f AS a2 ON a1.k = a2.v WHERE (SE
 | drawn, seeds w1 to w4 (row value NOT IN drawn then) | main 7173ca16 (5c55f2e6: the tests) | 132,000 | 560 | 196 | 364 |
 | the same | 57f266cd: causes 1 and 2 fixed | 132,000 | 413 | 275 | 138 (2 queries but for DJ's) |
 | drawn, seeds x1 to x3 | 7779647f: cause 3 left | 99,000 | 7 | 0 | 7 (one query: cause 3) |
-| drawn, seeds x2 and x5 | e9ffdc42, the fix | 66,000 | @X@ | @XE@ | @XW@ |
+| drawn, seeds x2 and x5 | e9ffdc42, the fix | 66,000 | 0 | 0 | 0 |
 | C10's generator, seed y1, 5 settings | 7779647f | 15,000 | 5 | 0 | 5 (CP, by its form) |
-| the landed sweep (its first drawing) | main 7173ca16 (5c55f2e6: the tests) | 5,500 | 49 | @E@ | @W@ |
+| the landed sweep (its first drawing) | main 7173ca16 (5c55f2e6: the tests) | 5,500 | 49 | not split | not split |
 | the landed sweep, as landed | e9ffdc42, the fix | 5,500 | 0 | 0 | 0 |
 
 No panic in any of these runs, and every table held its rows after each query. CN's 29 forms at 10 settings on d671229e, cause 2 alone fixed: 283 of 290 right.
 
-## Checks (Linux, adacachy2; e9ffdc42, whose tree is 7e9e52b1's)
+## Checks (Linux, adacachy2)
 
-@CHECKS@
+- On the merged tree (869a4f62, main b549489e; the landing merge dea76613 has its code): `cargo fmt --all --check` 0; clippy `-p amphora-engine --all-targets`
+  0 ("Checking amphora-engine"); outer_join_subqueries 3 passed (13,500 answers), oracle_findings 92; check-production @PROD@; @REST@.
+- On e9ffdc42 (the fix before lane C13's landing, the tree of 7e9e52b1): clippy 0, outer_join_subqueries 2, oracle_findings 87, C6's four small shards 4
+  passed (26,880 runs), lib `optimizer::` 185 of 208 passed and none failed when I stopped it for the merged tree's run (the machine's load was 149).
+- On 7779647f (causes 1, 2 and 4): in_subquery 4, join_methods 4 (1 ignored), adaptive_joins 23, unnesting 2 (simulator), hash_semi_join 1; planner 13 of 14
+  (`planner.rs:182`, main's own then).
+- Not run: the new test of oracle_findings on main without the fix (the sweep's red run is in the table; CN's forms were run by hand on main: 3 of 29 wrong
+  with statistics, parallel or not; 1 of 12 in the second set).
 
 ## Reproduce
 
