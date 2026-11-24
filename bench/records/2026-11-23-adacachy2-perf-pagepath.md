@@ -854,4 +854,8 @@ exit 1: `clippy::disallowed_methods` 42 against 40 (this unit's two `then_some`)
 check-production exit 0 ("10903 left in the engine's production code across 17 lints, as the ratchet holds"); the
 workspace clippy exit 0 in 62 s; `d45_` passed 18. Main then moved in `crates/engine` (lane R6's column copy choice,
 none of this lane's files): run r1919 on 7698a061, the re-merge with origin/main 50ab86c6 (load 70-111): check-production
-exit 0, the ratchet holding; the workspace clippy exit 0 in 42 s; `d45_` passed 18.
+exit 0, the ratchet holding; the workspace clippy exit 0 in 42 s; `d45_` passed 18. Merged to main as c044b33b (main had
+moved in bench records only). After the merge, run r1928 on main c044b33b (needs refused at cpus=4, run at cpus=2 with
+`--test-threads=2`; load 27-90): `storage:: vdbe::vacuum` passed 731, failed 1 and ignored 14 in 315 s, the one
+`cb4_ab_both_rebuy_policies_at_the_extremes` (main's own; `cb4_a_read_only_transaction_reads_the_copy_at_its_snapshot`
+passes on this main, after lane R6's columns_sql.rs change); `cargo test -p amphora --locked --test store` passed 15.

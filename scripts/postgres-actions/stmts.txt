@@ -39,3 +39,25 @@ alter table pgbench_tellers add primary key (tid)
 alter table pgbench_accounts add primary key (aid)
 set client_encoding to 'UTF8'
 show password_encryption
+SELECT relkind FROM pg_catalog.pg_class WHERE oid=$1::pg_catalog.regclass
+SET application_name = 'PostgreSQL JDBC Driver'
+SET extra_float_digits = 3
+SET extra_float_digits = 3;SET application_name = 'PostgreSQL JDBC Driver'
+show transaction_read_only
+SHOW transaction_read_only
+select pg_is_in_recovery()
+SELECT pg_catalog.pg_is_in_recovery()
+BEGIN
+SET SESSION search_path TO 'public'
+SET SESSION search_path TO DEFAULT
+SET search_path TO "$user", public
+SET LOCAL statement_timeout = 0
+SET client_min_messages TO warning
+SET extra_float_digits = -1
+SET cursor_tuple_fraction = 0.5
+SET enable_seqscan = off
+SET standard_conforming_strings = on
+SET myapp.user_id = '42'
+RESET statement_timeout
+RESET ALL
+SHOW ALL

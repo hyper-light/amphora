@@ -15,8 +15,9 @@ use std::time::{Duration, Instant};
 use crate::meter::SlotEnd;
 
 /// What a slot's length is learned against: the core's election timeout, a member's slot before
-/// any of its retries is measured. A learned gap is believed for one to two of its member's
-/// generations, each as long as the member went between its last two learned gaps, the first
+/// any of its retries is measured and its shortest after (lane V13). A learned gap is believed
+/// for one to two of its member's generations, each as long as the member went between its last
+/// two learned gaps, the first
 /// counted from its first slot (replication.md, "Decision (lane constants): generations learned
 /// where they run"). No ceiling bounds a gap by a number: a member is gone, not slow, when the
 /// host's detector suspects it while its retry is awaited (`keep`), a verdict learned where it
@@ -252,7 +253,10 @@ impl<T> Slots<T> {
     /// being `last` and its commit `commit`, unless a slot is held, or the leader's own turn is
     /// owed and `own` (it has a write to prepare). The barrier steps once the commit reaches
     /// `last`, so the member's retry prepares on every entry before the slot (amphora-seam-owner-
-    /// 2's ruling, Q2 b). Returns whose slot began and its length.
+    /// 2's ruling, Q2 b). A turn the leader has no write for passes only to a slot that begins:
+    /// with no barrier waiting it stays owed, so the leader's next write still prepares behind
+    /// the holder's entry, and only the forwards it held go (CP-T1.8, lane V13). Returns whose
+    /// slot began and its length.
     pub(super) fn start(
         &mut self,
         at: Instant,
@@ -265,6 +269,10 @@ impl<T> Slots<T> {
         }
         if self.turn {
             if own {
+                return None;
+            }
+            if self.waiting.is_empty() {
+                self.ready.extend(self.forwards.drain(..));
                 return None;
             }
             self.took_turn();
@@ -305,8 +313,12 @@ impl<T> Slots<T> {
         Some((member, length))
     }
 
-    /// The length of `member`'s next slot: the longest gap it took to retry in this generation
-    /// and the one before, or the election timeout while none is measured.
+    /// The length of `member`'s next slot: the core's election timeout, or the longest gap it
+    /// took to retry in this generation and the one before when that is longer. A slot ends by
+    /// time only once its holder is as late as the core takes a member for gone: a learned gap
+    /// is an estimate a live holder's next retry outruns, and the leader then appends first and
+    /// refuses it. At 32 spread writers that ended 37 to 47 slots a run, a stale refusal each
+    /// (CP-T1.8, lane V13's trace, r1814).
     pub(super) fn length(&self, member: u64) -> Duration {
         self.gaps
             .iter()
@@ -317,7 +329,9 @@ impl<T> Slots<T> {
                     Some(current.unwrap_or_default().max(before.unwrap_or_default()))
                 }
             })
-            .unwrap_or(self.bounds.election)
+            .map_or(self.bounds.election, |learned| {
+                learned.max(self.bounds.election)
+            })
     }
 
     /// Whether the leader appends nothing of its own now.
@@ -552,7 +566,44 @@ mod tests {
         );
         assert!(!slots.holds());
         assert_eq!(drained(&mut slots), vec![(3, "three")]);
-        assert_eq!(slots.length(2), 5 * MS);
+        assert_eq!(
+            slots.length(2),
+            BOUNDS.election,
+            "a gap shorter than the election timeout shortened the slot"
+        );
+    }
+
+    /// T-T1.8.W4 (CP-T1.8, lane V13): a slot ends by time only past the core's election timeout,
+    /// never at a learned gap shorter than it. Lane V13's trace (r1814, 32 spread writers, both
+    /// classes) found 148 of 155 stale forwards were a live holder's whose slot ended at its
+    /// learned length (the longest of its last one or two gaps) while its forward was on its way;
+    /// the leader then appended first. Do: member 2 retries 5 ms into its first slot, then takes
+    /// its next, and 6 ms pass. Expect: the slot still held, and the holder's forward stepped,
+    /// ending it forwarded.
+    #[test]
+    fn a_slot_outlasts_a_learned_gap_shorter_than_the_election_timeout() {
+        let t = Instant::now();
+        let mut slots = leading(t);
+        slots.ask(2);
+        waits(&mut slots, 2, t);
+        slots.start(t, 1, 1, false);
+        drained(&mut slots);
+        slots.forward(2, t + 5 * MS, "first");
+        slots.took_turn();
+        let next = t + 10 * MS;
+        slots.ask(2);
+        waits(&mut slots, 2, next);
+        assert_eq!(slots.start(next, 2, 2, false).map(|(m, _)| m), Some(2));
+        drained(&mut slots);
+        assert_eq!(
+            slots.expire(next + 6 * MS),
+            None,
+            "the live holder's slot ended at its learned 5 ms"
+        );
+        assert!(slots.holds());
+        let retry = slots.forward(2, next + 30 * MS, "second");
+        assert_eq!(retry.step, Some("second"));
+        assert_eq!(retry.ended.map(|e| e.how), Some(SlotEnd::Forwarded));
     }
 
     /// T-T1.8.W4: do refuse a member that never comes back; expect no slot, and another member's
@@ -642,7 +693,9 @@ mod tests {
     /// T-T1.8.W4 (amphora-owner-t1-g-slot-878285a-20261111): do end member 2's slot, then forward
     /// from member 3 in the leader's turn; expect 3's forward held through the turn, ready once
     /// the leader's own write is appended, and held again only by a slot; and a turn the leader
-    /// has no write for given up at the next start, its holds ready.
+    /// has no write for, with no barrier waiting, still owed at the next start, its holds ready
+    /// (CP-T1.8, lane V13: a turn given up while the holder's entry was uncommitted let the
+    /// leader's next write prepare behind it, refused stale at apply in r1814's trace).
     #[test]
     fn forwards_wait_through_the_leaders_turn() {
         let t = Instant::now();
@@ -669,8 +722,19 @@ mod tests {
         slots.forward(2, t, "two");
         slots.forward(3, t, "three");
         assert_eq!(slots.start(t, 3, 3, false), None, "nothing waits");
-        assert!(!slots.turn(), "a turn with no write is given up");
+        assert!(
+            slots.turn(),
+            "a turn with no write was given up with nothing waiting"
+        );
         assert_eq!(drained(&mut slots), vec![(3, "three")]);
+        slots.ask(4);
+        waits(&mut slots, 4, t);
+        assert_eq!(
+            slots.start(t, 4, 4, false).map(|(m, _)| m),
+            Some(4),
+            "a waiting barrier takes the turn the leader has no write for"
+        );
+        assert!(!slots.turn());
     }
 
     /// T-T1.8.W4 (amphora-seam-owner-2, Q1 a): do forward twice from member 3 during member 2's
@@ -777,9 +841,10 @@ mod tests {
         assert_eq!(slots.length(2), 5 * BOUNDS.election);
     }
 
-    /// T-T1.8.W4 (Q3), T-GN.1.2: do learn a gap 40 ms after the member's first slot began, then
-    /// let time pass with none; expect it believed through the next generation, as long as the
-    /// member took to its first gap (40 ms), and forgotten after it, back to the election timeout.
+    /// T-T1.8.W4 (Q3), T-GN.1.2: do learn a gap 400 ms after the member's first slot began (past
+    /// the election timeout, which a slot never ends before), then let time pass with none;
+    /// expect it believed through the next generation, as long as the member took to its first
+    /// gap (400 ms), and forgotten after it, back to the election timeout.
     #[test]
     fn a_learned_gap_is_believed_for_one_to_two_of_its_members_generations() {
         let t = Instant::now();
@@ -788,13 +853,13 @@ mod tests {
         slots.refused(2);
         waits(&mut slots, 2, t);
         slots.start(t, 1, 1, false);
-        slots.forward(2, t + 40 * MS, "two");
-        assert_eq!(slots.length(2), 40 * MS);
-        slots.expire(t + 40 * MS);
-        assert_eq!(slots.length(2), 40 * MS, "believed in the next generation");
-        slots.expire(t + 79 * MS);
-        assert_eq!(slots.length(2), 40 * MS, "believed through it");
-        slots.expire(t + 80 * MS);
+        slots.forward(2, t + 400 * MS, "two");
+        assert_eq!(slots.length(2), 400 * MS);
+        slots.expire(t + 400 * MS);
+        assert_eq!(slots.length(2), 400 * MS, "believed in the next generation");
+        slots.expire(t + 799 * MS);
+        assert_eq!(slots.length(2), 400 * MS, "believed through it");
+        slots.expire(t + 800 * MS);
         assert_eq!(slots.length(2), BOUNDS.election, "forgotten after it");
     }
 

@@ -154,6 +154,8 @@ pub enum Node {
     },
     /// value.h's Integer.
     Integer(i32),
+    /// value.h's Float: a numeric literal's text, printed as it is (`_outFloat`).
+    Float(String),
     DropStmt {
         objects: Vec<NodeId>,
         remove_type: i32,
@@ -244,6 +246,11 @@ pub enum Node {
         expr: Option<NodeId>,
         collation: Vec<NodeId>,
         opclass: Vec<NodeId>,
+        location: i32,
+    },
+    TypeCast {
+        arg: Option<NodeId>,
+        type_name: Option<NodeId>,
         location: i32,
     },
 }
@@ -885,6 +892,7 @@ impl Tree {
                 p.push(Text("}"));
             }
             Node::Integer(n) => p.push(Int(i64::from(*n))),
+            Node::Float(s) => p.push(Raw(s)),
             Node::DropStmt {
                 objects,
                 remove_type,
@@ -1267,6 +1275,20 @@ impl Tree {
                     List(collation),
                     Text(" :opclass "),
                     List(opclass),
+                ]);
+                location(p, " :location ", *at);
+                p.push(Text("}"));
+            }
+            Node::TypeCast {
+                arg,
+                type_name,
+                location: at,
+            } => {
+                p.extend([
+                    Text("{TYPECAST :arg "),
+                    N(*arg),
+                    Text(" :typeName "),
+                    N(*type_name),
                 ]);
                 location(p, " :location ", *at);
                 p.push(Text("}"));
