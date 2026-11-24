@@ -11,8 +11,8 @@ usage: bench/sqlite_dml_rows.py COUNT SEED > crates/engine/tests/fixtures/dml_ro
 Left out, each a difference of another cause (bench/records/2026-11-24-adacachy2-oracle-c11.md): a comparison in a
 trigger of a column with a collation (CX), STRICT beside WITHOUT ROWID (refused), triggers on WITHOUT ROWID tables
 (refused), which of two unique constraints an UPSERT with no target meets first (no document says), an INSERT OR IGNORE
-of NULL into a STRICT key that is no rowid alias, a subquery in DO UPDATE (refused), and the text of a REAL past 15
-digits (CK).
+of NULL into a STRICT key that is no rowid alias, a subquery in DO UPDATE (refused), the text of a REAL past 15 digits
+(CK), and an UPDATE of the rowid where a generated column reads it (NEW holds the old one's).
 
 At a conflict on the rowid SQLite's `excluded.c` is the value as given, not as c converts it ('7' in an INT column is
 '7'), unless the table has a generated column or an earlier ON CONFLICT names another constraint. By lang_upsert.html it
@@ -63,8 +63,9 @@ class Case:
                 extra += " COLLATE " + pick(["NOCASE", "RTRIM"])
             if rng.random() < 0.1:
                 extra += " NOT NULL"
-            self.cols.append((f"c{i}", ty))
-            defs.append(f"c{i} {ty}{extra}".replace("  ", " "))
+            name = rng.choice(["oid", "rowid"]) if i == 1 and rng.random() < 0.08 else f"c{i}"
+            self.cols.append((name, ty))
+            defs.append(f"{name} {ty}{extra}".replace("  ", " "))
         self.unique = []
         if key in ("alias", "alias table", "alias auto", "desc"):
             id_type = "INTEGER"
@@ -119,7 +120,7 @@ class Case:
         options = "STRICT" if self.strict else "WITHOUT ROWID" if self.without_rowid else ""
         self.ddl = [f"CREATE TABLE t({', '.join(defs + tail)}) {options}".strip()]
         if rng.random() < 0.15 and not self.without_rowid:
-            self.ddl.append(f"CREATE INDEX i ON t({pick(self.written)})")
+            self.ddl.append(f"CREATE INDEX i ON t({pick(self.all)})")
         self.triggers = 0
         if not self.without_rowid and rng.random() < 0.6:
             cells = [f"{w}.{c}" for c in self.all for w in ("X",)]
@@ -228,7 +229,8 @@ class Case:
         rng = self.rng
         kind = rng.choice(["insert"] * 2 + ["upsert"] * 6 + ["replace", "or ignore", "or replace", "update"])
         if kind == "update":
-            cols = rng.sample(self.written, min(len(self.written), rng.choice([1, 1, 2])))
+            open_to = [c for c in self.written if not (self.gen and c == self.alias)] or self.written
+            cols = rng.sample(open_to, min(len(open_to), rng.choice([1, 1, 2])))
             where = rng.choice(["", f" WHERE {self.written[0]} IS NOT NULL", f" WHERE {rng.choice(self.written)} = {rng.choice(['1', '2', '10'])}"])
             return "UPDATE t SET " + ", ".join(f"{c} = {self.value(c)}" for c in cols) + where
         cols = self.listed()
@@ -250,6 +252,7 @@ class Case:
         out.append(("rows", f"SELECT {'' if self.without_rowid else 'rowid, '}{', '.join(self.all)} FROM t"))
         if self.triggers:
             out.append(("rows", "SELECT rowid, * FROM lg"))
+        out.append(("rows", "PRAGMA integrity_check"))
         return out
 
 
