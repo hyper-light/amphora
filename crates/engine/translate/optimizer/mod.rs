@@ -732,6 +732,12 @@ fn subquery_resources(plan: &Plan) -> SubqueryResources {
             if let Table::FromClauseSubquery(subquery) = &table.table {
                 add_plan(&subquery.plan, resources);
             }
+            // A RIGHT or FULL JOIN's unmatched-row read runs its own copies of the WHERE clause's
+            // subqueries, taken before they were planned: a copy still holds, and writes, what
+            // unnesting removed from the subquery the loops run.
+            if let Some(unmatched) = &table.unmatched_right_rows_plan {
+                add_subqueries(&unmatched.subqueries, resources);
+            }
         }
     }
 
