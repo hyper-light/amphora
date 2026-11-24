@@ -180,8 +180,8 @@ fn returning_does_not_stand_in_for_a_trigger() {
 }
 
 /// lang_update.html: "Columns that do not appear in the list of assignments are unmodified when the
-/// row is updated." sqlite3 3.54.0 has them NULL in old and new where an UPDATE FROM is of a view of a
-/// compound it does not flatten.
+/// row is updated." sqlite3 3.54.0 has them NULL in old and new where an UPDATE FROM is of a view over
+/// a compound.
 #[test]
 fn an_update_from_keeps_the_columns_it_does_not_set() {
     let dir = tempfile::tempdir().unwrap();
