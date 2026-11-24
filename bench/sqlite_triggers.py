@@ -7,11 +7,9 @@ SQLite itself takes it and what the tables hold after it (the sqlite3 library Py
 first) to crates/engine/tests/fixtures/triggers.tsv, which tests/windows_and_triggers.rs holds Amphora
 to.
 
-Not drawn, each a difference of another cause this sweep found or the oracles had (lane C17's record): FAIL
-and ROLLBACK in a trigger's own statements, and an OR clause before DO UPDATE (a constraint that fails in a
-trigger's statement is taken by the clause of the statement that fired it, not by its own); UNIQUE ON
-CONFLICT (which of two constraints is met first); NOCASE columns (the oracles' CX); text inserted in an
-INTEGER PRIMARY KEY under OR ROLLBACK.
+Not drawn: NOCASE columns (the oracles' CX, a difference of another cause). Drawn by
+sqlite_trigger_conflicts.py: FAIL and ROLLBACK in a trigger's own statements, an OR clause before DO UPDATE,
+constraints declared ON CONFLICT, and text inserted in an INTEGER PRIMARY KEY.
 
 Each line is `db <name>`, `sql <statement>` (the database's tables, rows and triggers) or `q <statement>
 <answer>`: the answer's rows sorted, each row's values joined by commas, a NULL written NULL, the rows

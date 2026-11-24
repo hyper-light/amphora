@@ -18477,9 +18477,9 @@ mod tests {
         }
         panic!("owner 1 did not flush in {ROUNDS} driven rounds");
     }
-    /// A voter, and a learner of it, which applies what the voter commits and prepares nothing:
-    /// only a log restart of its owner's starts its database's log again (a leader's preparation
-    /// is a write transaction, which the engine starts on a log it finds wholly copied).
+    /// A voter, and a learner of it, which applies what the voter commits and prepares nothing.
+    /// Only a restart its owner makes starts either's database log again (store.md, decision 45,
+    /// "An owner's log").
     fn voter_and_learner(driven: &mut Driven, dir: &Path) -> Vec<Client> {
         let clients = vec![
             driven.open(dir, 1, vec![1], None),

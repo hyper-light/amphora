@@ -33,7 +33,7 @@ use crate::translate::plan::{Aggregate, ColumnMask};
 use crate::vdbe::{
     affinity::Affinity,
     builder::{CursorKey, CursorType, DmlColumnContext, ProgramBuilder, SelfTableContext},
-    insn::{to_u32, InsertFlags, Insn},
+    insn::{to_u32, HaltAction, InsertFlags, Insn},
     BranchOffset, CursorID,
 };
 use crate::{
@@ -2729,7 +2729,7 @@ fn emit_check_constraint_bytecode(
                 program.emit_insn(Insn::Halt {
                     err_code: SQLITE_CONSTRAINT_CHECK,
                     description: constraint_name.to_string(),
-                    on_error: None,
+                    on_error: HaltAction::of_constraint(or_conflict),
                     description_reg: None,
                 });
             }

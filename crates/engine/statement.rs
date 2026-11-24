@@ -1263,6 +1263,11 @@ impl Statement {
             .map_err(|err| *err)
     }
 
+    /// What the constraint this subprogram failed on does to the statement that runs it.
+    pub(crate) const fn constraint_action(&self) -> amphora_engine_parser::ast::ResolveType {
+        self.state.constraint_action
+    }
+
     pub(crate) fn abort_subprogram(&mut self, err: Option<&LimboError>) -> Result<()> {
         let result = self.program.abort(&self.pager, err, &mut self.state, false);
         self.state.execution_state = vdbe::ProgramExecutionState::Failed;

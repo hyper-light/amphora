@@ -1886,6 +1886,7 @@ fn emit_set_not_null_checks(
         program.emit_insn(Insn::HaltIfNull {
             target_reg: layout.to_register(new_start, idx),
             err_code: SQLITE_CONSTRAINT_NOTNULL,
+            on_error: None,
             description: format!(
                 "{}.{}",
                 table.get_name(),
