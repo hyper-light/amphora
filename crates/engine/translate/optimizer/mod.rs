@@ -5176,7 +5176,12 @@ pub(crate) mod bushy_search_tests {
                 }
             }
             eprintln!("bushy={bushy} in_runs={in_runs} probing={probing}");
-            assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+            assert!(
+                wrong.is_empty(),
+                "{} wrong:\n{}",
+                wrong.len(),
+                wrong.join("\n")
+            );
             assert!(bushy > 0 && in_runs > 0 && probing > 0);
         }
 
