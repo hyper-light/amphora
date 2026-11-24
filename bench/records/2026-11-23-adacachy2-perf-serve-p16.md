@@ -95,18 +95,21 @@ session_worker.rs: clean at 970b4386, after formatting P14's ten hunks and the m
 
 ## Not done (losses first)
 
-- perf/serve-p7 is NOT merged to main: 970b4386 fails 6 to 8 tests main passes in every round (7, 8, 6), the new
-  restart test besides.
-- The restart fix is unproven: its test fails with the fix in place.
-- The second part (a restart due while the session is out runs before the answer) is in 970b4386, and is the
-  likely cause of the regressions (inferred above).
-- 0f592fbb (main c6f915b1 merged in) is unbuilt. Clippy on 970b4386 did not finish.
+- perf/serve-p7 is NOT merged to main. 970b4386 failed 6 to 8 tests main passes in every round (7, 8, 6).
+- No fix is proven. The new restart test's premise fails on a leader (probe above), so it is red with or without
+  the fix; it must be rewritten before it can show anything.
+- The second part (a restart due while the session is out runs before the answer) is not done: its form (the
+  deferral in `decide`) caused the regressions and is removed (1276d43b, not rebuilt).
+- 0f592fbb and 1276d43b are unbuilt; clippy has not passed at any of this lane's trees.
 
 ## Next, in order
 
-1. Run r7.cmd (V1: 970b4386 without the slot change; V2: without the deferral; the probe on the restart test).
-2. Keep the slot change if V1 shows it isn't the cause. Fix the restart test or the hand-off by what the probe
-   shows. Drop or rework the deferral by V2.
+1. Build the branch head (1276d43b) and run the suite and serve cp_t1_13 against main a7568034's kept binaries
+   (r3.sh's rounds); clippy.
+2. Rewrite the restart test so its log can't be restarted by the engine (a reader on it, as in P15's trace), or
+   assert the read the write's answer lets begin is served; see it fail on 47c95d85.
+3. The case of a restart due while the session is out, by a form that does not hold the leader's write in `Running`
+   (P12's f5d1208b holds every member's slot behind it).
 
 ## Commands
 
