@@ -481,9 +481,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                     }
                     bail_parse_error!("no such column: {}.{}", ns, col);
                 } else {
-                    bail_parse_error!(
-                        "NEW references are only valid in INSERT and UPDATE triggers"
-                    );
+                    bail_parse_error!("no such column: {}.{}", ns, col);
                 }
             }
 
@@ -526,9 +524,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                     }
                     bail_parse_error!("no such column: {}.{}", ns, col);
                 } else {
-                    bail_parse_error!(
-                        "OLD references are only valid in UPDATE and DELETE triggers"
-                    );
+                    bail_parse_error!("no such column: {}.{}", ns, col);
                 }
             }
 
@@ -1416,11 +1412,9 @@ fn rewrite_trigger_expr_single_for_when_clause(
                             return Ok(());
                         }
                     }
-                    bail_parse_error!("no such column in NEW: {}", col);
+                    bail_parse_error!("no such column: {}.{}", ns, col);
                 } else {
-                    bail_parse_error!(
-                        "NEW references are only valid in INSERT and UPDATE triggers"
-                    );
+                    bail_parse_error!("no such column: {}.{}", ns, col);
                 }
             }
 
@@ -1440,11 +1434,9 @@ fn rewrite_trigger_expr_single_for_when_clause(
                             return Ok(());
                         }
                     }
-                    bail_parse_error!("no such column in OLD: {}", col);
+                    bail_parse_error!("no such column: {}.{}", ns, col);
                 } else {
-                    bail_parse_error!(
-                        "OLD references are only valid in UPDATE and DELETE triggers"
-                    );
+                    bail_parse_error!("no such column: {}.{}", ns, col);
                 }
             }
 

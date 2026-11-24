@@ -1887,17 +1887,10 @@ pub(crate) fn emit_delete_trigger_rows(
         root_page: 1i64.into(),
         db: database_id,
     });
-    // Hoist the literal trigger names + `"trigger"` type
-    // string into constant registers before the loop.
     let trigger_type_reg = program.emit_string8_new_reg("trigger".to_string());
-    program.mark_last_insn_constant();
     let name_regs: Vec<usize> = names
         .iter()
-        .map(|name| {
-            let reg = program.emit_string8_new_reg(name.clone());
-            program.mark_last_insn_constant();
-            reg
-        })
+        .map(|name| program.emit_string8_new_reg(name.clone()))
         .collect();
 
     let end_label = program.allocate_label();
