@@ -4099,4 +4099,28 @@ fn a_semi_joins_condition_is_read_in_its_own_loop() {
             ),
         ],
     );
+    answers_under_five_settings(
+        &[
+            "CREATE TABLE m(k INT, v INT)",
+            "INSERT INTO m VALUES (2, 1)",
+            "CREATE TABLE q(k INT, v INT)",
+            "INSERT INTO q VALUES (1, 2), (3, 2)",
+            "CREATE TABLE w(k INT)",
+            "INSERT INTO w VALUES (3)",
+        ],
+        &[
+            (
+                "SELECT a0.k, a1.v FROM m AS a0 LEFT JOIN m AS a1 ON a0.v = a1.v WHERE EXISTS (SELECT 1 FROM q AS s1 WHERE EXISTS (SELECT 1 FROM w AS s2 WHERE s2.k = s1.k) AND s1.v = a0.k) AND NOT EXISTS (SELECT 1 FROM m AS s9 WHERE s9.v = a1.k)",
+                &["2|1"],
+            ),
+            (
+                "SELECT a0.k, a1.v FROM m AS a0 LEFT JOIN m AS a1 ON a0.v = a1.v WHERE a0.k IN (SELECT s1.v FROM q AS s1 WHERE EXISTS (SELECT 1 FROM w AS s2 WHERE s2.k = s1.k)) AND NOT EXISTS (SELECT 1 FROM m AS s9 WHERE s9.v = a1.k)",
+                &["2|1"],
+            ),
+            (
+                "SELECT a0.k, a1.v FROM m AS a0 LEFT JOIN m AS a1 ON a0.v = a1.v WHERE EXISTS (SELECT 1 FROM q AS s1 WHERE (s1.k > 5 OR EXISTS (SELECT 1 FROM w AS s2 WHERE s2.k = s1.k)) AND s1.v = a0.k) AND NOT EXISTS (SELECT 1 FROM m AS s9 WHERE s9.v = a1.k)",
+                &["2|1"],
+            ),
+        ],
+    );
 }
