@@ -172,7 +172,10 @@ class Draw:
             elif drawn < 0.75:
                 on = f"{aliases[rng.randrange(n)]}.k = {aliases[n]}.{rng.choice('kv')}"
             else:
+                # Amphora finds no CTE from a subquery in an ON clause (finding CO, open).
+                ctes, self.ctes = self.ctes, False
                 on = self.condition(scope, depth)
+                self.ctes = ctes
             text += f" {join} {self.joined(join)} AS {aliases[n]} ON {on}"
         columns = [f"{a}.{c}" for a in aliases for c in ("k", "v")]
         if rng.random() < 0.12:
