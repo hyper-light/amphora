@@ -538,6 +538,11 @@ pub struct MorselAggregateData {
     /// The table's stored columns, and the one its rowid stands in for (an INTEGER PRIMARY KEY).
     pub columns: usize,
     pub rowid_alias: Option<usize>,
+    /// The table's columns of REAL affinity (lane R10), from its schema, so every statement on a
+    /// table reads its rows alike: an INTEGER stored in one (SQLite stores a whole REAL so) reads
+    /// as a REAL, as the serial loop's `RealAffinity` makes it. Empty for a body or a join, whose
+    /// workers convert their own (`MorselBody::reals`).
+    pub reals: Vec<usize>,
     /// Each column's value in a row written before the column was added (ALTER TABLE ADD COLUMN),
     /// as the serial loop's Column reads it; empty when every one is NULL (lane qs6-17).
     pub defaults: Vec<crate::types::Value>,
