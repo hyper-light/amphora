@@ -879,3 +879,87 @@ through the driven `submit` helper, so it proposes, as 11873's change does.
     # r150 (and its successor): kiln run on 00aad8daff2fa3c9daa65d53c425d450, needs linux/amd64,cpus=8,mem=24g,
     # sync false; ~/.cache/amphora-perf/cross-a21-scripts/check21l.sh BASE FIX ROUNDS LROUNDS OUT
     bash check21l.sh 7de5344d41dc850c022e829bdc285440c89c2095 f2cb8681fd80cfb95e82edfd83eb62e29485bc03 3 1 OUT
+
+## A21's replicated-write charge, checked on the merged tree; v13's macOS failure is main's too (perf-A23)
+
+**Lane times.** First command 04:58:43Z; the hour ends 05:58:43Z. Branch `perf/cross-a21`. The code in crates/ is
+A21's (8a2c25bd, 7c753719); this lane's one code change is 63017ae8 (the term-change test, below). Merges of main:
+0f65a665 (a64549cc: V17's close fix), 0ba7307d (3a58a13f: P20's and P22's serve landing, crates/amphora), a12bea22
+(1f4a8e88: PG14's OID counter, crates/engine), cdcdef9f (731240ed: V18's close behind a follower's forward in
+replicated.rs, V18's mvcc, F6's engine ratchet) and e53b671b (ac2c429a: T21's optimizer/lip.rs, crates/engine). `cargo
+fmt --all --check` clean on each. main moved inside crates/ each time, so each was re-run on clippy and the touched
+tests, at smaller `needs` when adacachy2 was busy.
+
+**Losses.**
+- v13 (`v13_thirty_two_spread_writers_on_moving_time_are_each_answered_with_no_stale_base`) fails on macOS on both
+  sides, so the change is not what fails it. MacBook Pro 2 (r346, load 70-105), 3 runs a side, the order alternated:
+  0f65a665 failed 3 of 3 (row 3 at member 1: UnknownOutcome; row 9 at member 1: Timeout, 142 s; row 15 at member 1:
+  UnknownOutcome) and main a64549cc failed 3 of 3 (row 3 at member 1: UnknownOutcome, twice; row 9 at member 1:
+  Timeout). Not traced here. On Linux it passed on both sides in every run (9 a side on the first merge and main
+  a64549cc, 4 a side on 0ba7307d and main 3a58a13f's). Not run on macOS on main 3a58a13f, whose V13 test changed
+  (P20's 8e0eced3).
+- The replicated suites fail tests on both sides at this load (41-61). Every failure on the change's side also fails on
+  main's side in the same rounds, but two. `a21_a_replicated_writes_charge_is_given_back_on_a_term_change` failed on
+  0ba7307d (r402, fixed below). `session_reads::t_t1_10_r5_…` failed once, in r312's round 3 on 0f65a665 (its read
+  counted `at_once: 1, waited: 0`), in none of main a64549cc's 6 rounds. Alone (r365, r392) it failed in none of 70
+  runs a side: 10 under the suites' load, 40 beside six busy loops, 20 without. The assertion fits its read's thread
+  running after the main thread had caught the follower up; inferred from the counters, not traced.
+- The release bench and the ladder ran under load 41-66 of other lanes: it shows refusals, not throughput.
+- Stopped by this lane before any result was read: r316 and r331 (the bench script had copied f2cb8681's binary after
+  its own build failed on the untracked `bench/Cargo.lock`; fixed by building offline without --locked); their cells are
+  not in this record.
+
+**The term-change test and main 3a58a13f (63017ae8).** On 0ba7307d it failed, the write answered Ok though its term
+moved. A proposal's append now goes out in the step that proposes it (`Actor::propose_stamped` sets `driving`, so the
+owner steps again at once to send and write it; CP-T1.13, replication.md "Decision (lane P9)", part 3), so `handle.drain`
+after the proposal no longer lost the append and the write committed. The appends are lost from the write's queueing
+instead (`Pump::appends_lost`); the assertions are unchanged. On 63017ae8: `a21_` 5 of 5, 10 rounds (r432).
+
+**Runs.** adacachy2 unless the row says macOS; each `kiln run` named its cores and memory in `needs` (refused ones
+re-asked smaller). Scripts: `~/.cache/amphora-perf/cross-a23-scripts/` (`check23l.sh MERGE MAIN NV ROUNDS OUT`,
+`bench23.sh MERGE LROUNDS OUT`, `check23m.sh` for macOS), outputs `~/.cache/amphora-perf/cross-a23-out/` there.
+
+| run | what | result |
+|---|---|---|
+| r312, 05:03Z | 0f65a665 and main a64549cc, needs cpus=8 | clippy -p amphora --all-targets clean (31.7 s); check-production rc 0 (engine ratchet 10903); `a21_` 5 of 5; v13 alone 3 of 3 a side (0f65a665 7.1, 7.4, 8.4 s; a64549cc 7.8, 10.3, 5.7 s; load 57-60) |
+| r365, 05:14Z | both, needs cpus=4 | `session_reads::` 10 rounds a side, the order alternated: 4 of 4 tests each on both sides |
+| r369, 05:16Z | both, needs cpus=8 | replicated suites rounds 4-6 (below) |
+| r392, 05:24Z | both, needs cpus=8 | t_t1_10_r5 alone beside six busy loops, 40 a side: 0 failures on either side; then 20 a side without: 0 |
+| r335, 05:07Z | 0f65a665, needs cpus=2 | release bench built (271 s), V13's ladder, one round: every cell rc 0, no refusal, no deadline miss (below) |
+| r346, 05:11Z | macOS, MacBook Pro 2 (needs cpus=8) | `a21_` 5 of 5; v13 alone, 3 rounds a side: failed 3 of 3 on 0f65a665 and 3 of 3 on a64549cc (above) |
+| r402, 05:24Z | 0ba7307d and main 3a58a13f, needs cpus=2 | clippy clean (50 s); check-production rc 0 (10903); `a21_` 4 of 5 (the term change); v13 alone 3 of 3 a side (0ba7307d 6.2, 7.7, 6.8 s; 3a58a13f 8.3, 9.3, 6.9 s; load 47-57); suites, one round (below) |
+| r410, 05:29Z | 0ba7307d, needs cpus=2 | release bench built (118 s), ladder, one round: every cell rc 0, no refusal, no deadline miss (below) |
+| r432, 05:33Z | 63017ae8, needs cpus=2 | clippy clean (45 s); `a21_` 5 of 5, 10 rounds |
+| r439, 05:35Z | a12bea22 (main 1f4a8e88), needs cpus=4 | clippy clean (36 s, engine re-checked); check-production rc 0 (10903); built 68 s; `a21_` 5 of 5, 3 rounds; v13 alone passes once (load 49) |
+| r457, 05:39Z | cdcdef9f (main 731240ed), needs cpus=2 (cpus=4 refused: 3 of 32 cores idle) | clippy clean (41 s); check-production rc 0 (F6's new ratchet, 10617); built 71 s; `a21_` 5 of 5, 3 rounds; v13 alone passes |
+| r478, 05:44Z | e53b671b (main ac2c429a: T21's optimizer/lip.rs), needs cpus=2 | clippy clean (29 s); built 61 s (engine compiled); `a21_` 5 of 5, 3 rounds; v13 alone passes |
+
+Ladder (`ladder13.sh`, Amphora alone, spread writers, one round each; commits/s, p50/p99 ms, refused by node, misses),
+0f65a665 (r335, load 41-44) and 0ba7307d (r410, load 62-66, two cells' drivers also printed "node N closed the
+connection" after the run):
+
+| cell | 0f65a665 commits/s | p50/p99 | refused | misses | 0ba7307d commits/s | p50/p99 | refused | misses |
+|---|---|---|---|---|---|---|---|---|
+| persisted 32 | 37.2 | 754/1409 | 0, 0, 0 | 0 | 14.2 | 1737/3113 | 0, 0, 0 | 0 |
+| replicated 32 | 36.8 | 688/1376 | 0, 0, 0 | 0 | 16.0 | 1409/3015 | 0, 0, 0 | 0 |
+| persisted 128 | 31.8 | 3867/5308 | 0, 0, 0 | 0 | 19.8 | 6095/8258 | 0, 0, 0 | 0 |
+| replicated 128 | 38.4 | 2327/4456 | 0, 0, 0 | 0 | 19.6 | 4588/9044 | 0, 0, 0 | 0 |
+
+**The replicated suites** (FAILED only; `--test-threads=8`, 2 on r402). ckpt = `a_checkpoint_pass_copies_no_frame_past_the_last_finished_flush`,
+image = `a_local_read_open_across_an_image_install_sees_one_side_whole`, room = `past_its_room_a_replica_refuses_submits_and_restarts_whatever_its_share`,
+dblog = `a_replicas_database_log_stays_within_its_room`, holds = `a_local_read_holds_off_the_logs_restart_and_one_after_waits_for_it`,
+due = `a_restart_due_waits_for_a_reads_deadline_and_no_longer`, nemesis = `every_falsifier_of_the_floor_holds_under_a_nemesis`,
+flooded = `window_slow_flooded_fast_starved`, r5 = `session_reads::t_t1_10_r5_…`, term = `a21_…_term_change`:
+
+| round (load) | the change | main |
+|---|---|---|
+| 1 (r312) | ckpt, image, dblog, nemesis, room | ckpt, image, room, holds |
+| 2 (r312) | image, room, holds, due | ckpt, image, dblog, room, holds |
+| 3 (r312) | image, dblog, room, r5 | ckpt, image, room, dblog, flooded, nemesis |
+| 4 (r369) | ckpt, image, dblog, room | ckpt, holds, image, dblog, due, room |
+| 5 (r369) | ckpt, holds, image, dblog, room | ckpt, image, dblog, room |
+| 6 (r369) | ckpt, image, due, room | ckpt, image, dblog, room |
+| r402 round 1 (0ba7307d, main 3a58a13f) | term, ckpt, image, dblog, room | ckpt, image, dblog, holds, room, flooded |
+
+Rounds 1-6 on 0f65a665 and main a64549cc; the last on 0ba7307d and main 3a58a13f. v13 passed in every one of those suite
+runs (12 logs checked) and the suites' other failures on the change's side all fail on main's side too, except as above.
