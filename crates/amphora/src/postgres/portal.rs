@@ -98,6 +98,29 @@ impl Portal {
     }
 }
 
+/// A result's columns' bytes as they are held.
+fn field_bytes(fields: &[Field]) -> usize {
+    fields
+        .iter()
+        .map(|field| std::mem::size_of::<Field>().saturating_add(field.name.len()))
+        .fold(0, usize::saturating_add)
+}
+
+/// A lowered INSERT's or UPDATE's bytes as they are held.
+fn change_bytes(lowered: &Lowered) -> usize {
+    lowered
+        .binds
+        .iter()
+        .map(|(_, value)| {
+            let text = match value {
+                Some(Value::Text(text) | Value::Numeric(text) | Value::Unknown(text)) => text.len(),
+                _ => 0,
+            };
+            std::mem::size_of::<(u32, Option<Value>)>().saturating_add(text)
+        })
+        .fold(lowered.sql.len(), usize::saturating_add)
+}
+
 /// A row's bytes as they are held.
 fn row_bytes(row: &[Stored]) -> usize {
     row.iter()
@@ -197,7 +220,7 @@ impl Executor {
                 ));
             }
         };
-        let prepared = Rc::new(self.analyzed(sql, tree, statement, types)?);
+        let prepared = Rc::new(self.analyzed(name, sql, tree, statement, types)?);
         if name.is_empty() {
             self.unnamed = Some(prepared);
         } else if self.named.contains_key(name) {
@@ -213,6 +236,7 @@ impl Executor {
 
     fn analyzed(
         &mut self,
+        name: &str,
         sql: &str,
         tree: Tree,
         statement: Option<NodeId>,
@@ -261,8 +285,16 @@ impl Executor {
                 ));
             }
         }
-        // The text, the tree, and the strings in the tree, which are the text's.
-        let held = self.charge(tree.bytes().saturating_add(sql.len().saturating_mul(2)))?;
+        // The statement under its name, its text, its tree, and the strings in that, which are the text's.
+        let held = [
+            std::mem::size_of::<Prepared>(),
+            name.len(),
+            sql.len().saturating_mul(2),
+            tree.bytes(),
+            std::mem::size_of_val(params.as_slice()),
+            columns.as_deref().map_or(0, field_bytes),
+        ];
+        let held = self.charge(held.into_iter().fold(0, usize::saturating_add))?;
         Ok(Prepared {
             sql: sql.to_owned(),
             tree,
@@ -337,7 +369,7 @@ impl Executor {
         }
         let result_formats = values.formats()?;
         values.end()?;
-        let mut defined = self.define(&prepared, &params)?;
+        let mut defined = self.define(portal, &prepared, &params)?;
         if let Some(columns) = &defined.fields {
             if result_formats.given() > 1 && result_formats.given() != columns.len() {
                 return Err(violation(format!(
@@ -390,7 +422,12 @@ impl Executor {
     }
 
     /// The portal of a statement over its parameters' values (`GetCachedPlan`, `PortalStart`).
-    fn define(&self, prepared: &Rc<Prepared>, params: &[Option<Value>]) -> Result<Portal, PgError> {
+    fn define(
+        &self,
+        name: &str,
+        prepared: &Rc<Prepared>,
+        params: &[Option<Value>],
+    ) -> Result<Portal, PgError> {
         let mut held = 0usize;
         let run = match (prepared.what, prepared.statement) {
             (What::Empty, _) | (_, None) => Run::Empty,
@@ -431,17 +468,24 @@ impl Executor {
                         }
                     }
                     Ok(lowered) => {
-                        held = lowered.sql.len();
+                        held = change_bytes(&lowered);
                         Run::Change(query.command, lowered)
                     }
                 }
             }
         };
+        // The portal under its name, its columns, and what it runs or sends.
+        let held = [
+            std::mem::size_of::<Portal>(),
+            name.len(),
+            prepared.fields.as_deref().map_or(0, field_bytes),
+            held,
+        ];
         Ok(Portal {
             fields: prepared.fields.clone(),
             formats: Formats::default(),
             run,
-            _held: self.charge(held)?,
+            _held: self.charge(held.into_iter().fold(0, usize::saturating_add))?,
         })
     }
 
