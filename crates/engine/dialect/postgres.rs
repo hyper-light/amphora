@@ -18,9 +18,10 @@ use crate::{Connection, LimboError, Numeric, Value};
 use amphora_engine_parser::ast;
 use amphora_pg_analysis::datetime::TimeZone;
 use amphora_pg_analysis::func::{char_text, text_char};
-use amphora_pg_analysis::{lower, Column, Relations, Session, Value as PgValue};
+use amphora_pg_analysis::{array, coerce, lower, Column, Relations, Session, Value as PgValue};
 use amphora_pg_catalog::data::type_oid;
 use amphora_pg_catalog::{Proc, SearchPath};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -326,30 +327,28 @@ impl super::Dialect for PostgresDialect {
     /// The engine's built-in functions, which the statements the engine generates call; which of
     /// them a PostgreSQL statement may name is analysis's (section 11's unit 8).
     fn resolve_function(&self, name: &str, arg_count: usize) -> crate::Result<Option<Func>> {
-        if let Some(function) = pg_proc(name) {
-            return Ok((function.args.len() == arg_count).then(|| Func::Dialect(name.to_string())));
+        if let Some((function, types)) = pg_proc(name) {
+            return Ok((function.args.len() == arg_count && types.len() == arg_count)
+                .then(|| Func::Dialect(name.to_string())));
         }
         super::sqlite::resolve_builtin_function(name, arg_count)
     }
 
-    /// A built-in function over the values its arguments' columns hold, or [`Value::Null`] over
-    /// one that is NULL: every body is of a strict function (section 4).
+    /// A built-in function over the values its arguments' columns hold.
     fn exec_scalar_function(
         &self,
         _conn: &Connection,
         name: &str,
         args: &[Value],
     ) -> crate::Result<Value> {
-        let function = pg_proc(name)
+        let (function, types) = pg_proc(name)
             .ok_or_else(|| LimboError::ParseError(format!("no such function: {name}")))?;
-        if args.iter().any(|value| matches!(value, Value::Null)) {
+        if function.strict && args.iter().any(|value| matches!(value, Value::Null)) {
             return Ok(Value::Null);
         }
         let mut values = Vec::with_capacity(args.len());
-        for (value, oid) in args.iter().zip(function.args) {
-            values.push(from_engine(*oid, value)?.ok_or_else(|| {
-                LimboError::InternalError("a NULL reached a strict function".to_string())
-            })?);
+        for (value, oid) in args.iter().zip(types.iter()) {
+            values.push(from_engine(*oid, value)?);
         }
         let path = SearchPath::new(&[], "", None, |_| None);
         let session = Session {
@@ -358,15 +357,22 @@ impl super::Dialect for PostgresDialect {
             time_zone: utc()?,
             now: None,
         };
-        let value = amphora_pg_analysis::call(function, &values, &session)?;
-        to_engine(function.result, &value)
+        match amphora_pg_analysis::call(function, &values, &session)? {
+            Some(value) => to_engine(function.result, &value),
+            None => Ok(Value::Null),
+        }
     }
 }
 
-/// The built-in function a lowered statement's call names ([`lower::PROC_FUNCTION`]).
-fn pg_proc(name: &str) -> Option<&'static Proc> {
-    let oid = name.strip_prefix(lower::PROC_FUNCTION)?.parse().ok()?;
-    amphora_pg_catalog::proc_by_oid(oid)
+/// The built-in function a lowered statement's call names ([`lower::PROC_FUNCTION`]), and its arguments' types.
+fn pg_proc(name: &str) -> Option<(&'static Proc, Cow<'static, [u32]>)> {
+    let mut oids = name.strip_prefix(lower::PROC_FUNCTION)?.split('_');
+    let function = amphora_pg_catalog::proc_by_oid(oids.next()?.parse().ok()?)?;
+    if !function.args.iter().any(|t| coerce::is_polymorphic(*t)) {
+        return Some((function, Cow::Borrowed(function.args)));
+    }
+    let types: Option<Vec<u32>> = oids.map(|oid| oid.parse().ok()).collect();
+    Some((function, Cow::Owned(types?)))
 }
 
 /// A `TimeZone` for functions that read none: lowering refuses the ones that do
@@ -413,7 +419,8 @@ impl From<amphora_pg_analysis::Error> for LimboError {
 }
 
 /// What the engine stores for a value of a type (section 5): the text types in their own, a
-/// `bpchar` without its trailing spaces, a `"char"` as `charout` prints it, the rest as integers.
+/// `bpchar` without its trailing spaces, a `"char"` as `charout` prints it, an array as its key, the rest as
+/// integers.
 pub fn to_engine(oid: u32, value: &PgValue) -> crate::Result<Value> {
     Ok(match value {
         PgValue::Bool(b) => Value::Numeric(Numeric::Integer(i64::from(*b))),
@@ -425,6 +432,7 @@ pub fn to_engine(oid: u32, value: &PgValue) -> crate::Result<Value> {
         }
         PgValue::Text(s) => Value::build_text(s.clone()),
         PgValue::Char(c) => Value::build_text(char_text(*c)),
+        PgValue::Array(array) => Value::Blob(array::key(array).ok_or_else(|| unstored(oid))?),
         PgValue::Numeric(_) | PgValue::Unknown(_) => return Err(unstored(oid)),
     })
 }
@@ -441,6 +449,10 @@ pub fn from_engine(oid: u32, value: &Value) -> crate::Result<Option<PgValue>> {
         _ => None,
     };
     let corrupt = || LimboError::Corrupt(format!("a stored value isn't one of type {oid}"));
+    if let (Value::Blob(key), element @ 1..) = (value, coerce::element_type(oid)) {
+        let array = array::of_key(element, key).ok_or_else(corrupt)?;
+        return Ok(Some(PgValue::Array(array)));
+    }
     Ok(Some(match oid {
         type_oid::BOOL => PgValue::Bool(integer.ok_or_else(corrupt)? != 0),
         type_oid::INT4 => {

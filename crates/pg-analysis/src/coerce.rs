@@ -3,6 +3,8 @@
 use amphora_pg_catalog::data::{self, type_oid};
 use amphora_pg_catalog::{Type, cast, type_by_oid};
 
+use crate::{Error, format_type, sqlstate};
+
 /// `CoercionContext` (src/include/nodes/primnodes.h), in its order: a context allows the casts of
 /// every context before it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -320,6 +322,55 @@ fn can_coerce_simple(input: u32, target: u32) -> bool {
         || target == type_oid::ANY
         || input == type_oid::UNKNOWN
         || pathway(target, input, Context::Implicit) != Path::None
+}
+
+/// `enforce_generic_type_consistency` (parse_coerce.c:2135) for a call `can_coerce` has allowed: the types its
+/// parameters of the anycompatible family take. No function of another family has a body yet.
+pub fn resolve_generics(actual: &[u32], declared: Vec<u32>) -> Result<Vec<u32>, Error> {
+    if !declared.iter().any(|t| is_polymorphic(*t)) {
+        return Ok(declared);
+    }
+    let mut compatible = Vec::new();
+    for (declared, actual) in declared.iter().zip(actual) {
+        if !is_polymorphic(*declared) || *actual == type_oid::UNKNOWN {
+            continue;
+        }
+        match *declared {
+            type_oid::ANYCOMPATIBLE | type_oid::ANYCOMPATIBLENONARRAY => compatible.push(*actual),
+            type_oid::ANYCOMPATIBLEARRAY => compatible.push(element_type(base_type(*actual))),
+            other => {
+                return Err(Error::unsupported(&format!(
+                    "a value of type {}",
+                    format_type(other)
+                )));
+            }
+        }
+    }
+    // Where every argument is an unknown literal, text (:2678).
+    let common = if compatible.is_empty() {
+        type_oid::TEXT
+    } else {
+        common_type(&compatible)
+            .ok_or_else(|| Error::internal("the arguments of a call have no common type"))?
+    };
+    let array = type_by_oid(common).map_or(0, |t| t.array);
+    if array == 0 && declared.contains(&type_oid::ANYCOMPATIBLEARRAY) {
+        return Err(Error::new(
+            sqlstate::UNDEFINED_OBJECT,
+            format!(
+                "could not find array type for data type {}",
+                format_type(common)
+            ),
+        ));
+    }
+    Ok(declared
+        .into_iter()
+        .map(|t| match t {
+            type_oid::ANYCOMPATIBLE | type_oid::ANYCOMPATIBLENONARRAY => common,
+            type_oid::ANYCOMPATIBLEARRAY => array,
+            t => t,
+        })
+        .collect())
 }
 
 /// `select_common_type_from_oids` (parse_coerce.c:1482) with `noerror`: none when the categories differ.

@@ -4,7 +4,9 @@
 //! An expression with no column in it is computed here, once, by [`func::eval`], a parameter of the
 //! client's with the value its Bind gave it, and its value is a parameter of the engine's. One over columns is the engine's own comparison where that compares what section 5 stores
 //! (integers, text, microseconds), else a call of the function [`PROC_FUNCTION`] names by its OID, which
-//! the engine's PostgreSQL dialect runs by [`func::call`]. Anything else refuses `0A000`.
+//! the engine's PostgreSQL dialect runs by [`func::call`]. `count` is the engine's, as joins, groups, orders and
+//! limits are; a subquery of expressions alone is those expressions in its columns' place. Anything else
+//! refuses `0A000`.
 
 use std::borrow::Cow;
 
@@ -14,10 +16,11 @@ use amphora_pg_parser::tree::BoolOp;
 
 use crate::expr::{ExprId, ExprKind, Table};
 use crate::func::{self, Value};
-use crate::stmt::{Command, Query, Target};
-use crate::{Error, Session, sqlstate};
+use crate::stmt::{Command, Join, Query, Target};
+use crate::{Error, Session, coerce, sqlstate};
 
-/// The prefix of the names the engine's PostgreSQL dialect knows built-in functions by: an OID follows.
+/// The prefix of the names the engine's PostgreSQL dialect knows built-in functions by: an OID follows, and
+/// where its parameters are polymorphic the OIDs of its arguments' types, each behind a `_`.
 pub const PROC_FUNCTION: &str = "pg_proc_";
 
 /// The engine's name of the rows of a generate_series.
@@ -50,31 +53,42 @@ pub fn lower(
     session: &Session<'_>,
     params: &[Option<Value>],
 ) -> Result<Lowered, Error> {
+    let read = query
+        .joins
+        .iter()
+        .filter(|join| match join {
+            Join::Table(at) => query.tables.get(*at).is_some_and(|t| t.outputs.is_none()),
+            Join::Of { .. } => false,
+        })
+        .count();
     let mut writer = Writer {
         query,
         session,
         params,
         constant: query.exprs.constant(),
         folded: query.exprs.folded(),
+        aliased: read > 1,
+        conditions: Vec::new(),
         sql: String::new(),
         binds: Vec::new(),
+        bound: Vec::new(),
     };
-    let table = writer.table()?;
     let fields = fields(query)?;
-    writer.with_series(query.source.as_ref().or(query.table.as_ref()))?;
+    writer.with_series()?;
     match query.command {
         Command::Select => {
-            if query.targets.is_empty() {
+            if query.targets.iter().all(|target| target.junk) {
                 return Err(Error::unsupported("a SELECT of no columns"));
             }
             writer.list("SELECT ", &query.targets, |w, target| w.expr(target.expr))?;
-            if let Some(from) = &query.table {
-                writer.from(from)?;
-            }
+            writer.from()?;
             writer.filter()?;
+            writer.grouped()?;
+            writer.ordered()?;
+            writer.limit()?;
         }
         Command::Update => {
-            let table = table.ok_or_else(|| Error::internal("an UPDATE has no table"))?;
+            let table = writer.assigned()?;
             writer.sql.push_str("UPDATE ");
             writer.sql.push_str(&table);
             writer.list(" SET ", &query.targets, |w, target| {
@@ -85,22 +99,19 @@ pub fn lower(
             writer.filter()?;
         }
         Command::Insert => {
-            let table = table.ok_or_else(|| Error::internal("an INSERT has no table"))?;
+            let table = writer.assigned()?;
             writer.sql.push_str("INSERT INTO ");
             writer.sql.push_str(&table);
             writer.list(" (", &query.targets, |w, target| w.assigned_name(target))?;
-            match &query.source {
-                None => {
-                    writer.list(") VALUES (", &query.targets, |w, target| {
-                        w.expr(target.expr)
-                    })?;
-                    writer.sql.push(')');
-                }
-                Some(source) => {
-                    writer.list(") SELECT ", &query.targets, |w, target| w.expr(target.expr))?;
-                    writer.from(source)?;
-                    writer.filter()?;
-                }
+            if query.from.is_none() {
+                writer.list(") VALUES (", &query.targets, |w, target| {
+                    w.expr(target.expr)
+                })?;
+                writer.sql.push(')');
+            } else {
+                writer.list(") SELECT ", &query.targets, |w, target| w.expr(target.expr))?;
+                writer.from()?;
+                writer.filter()?;
             }
         }
     }
@@ -117,10 +128,14 @@ pub fn fields(query: &Query) -> Result<Vec<Field>, Error> {
         return Ok(Vec::new());
     }
     let mut fields = Vec::with_capacity(query.targets.len());
-    for target in &query.targets {
+    for target in query.targets.iter().filter(|target| !target.junk) {
         let expr = query.exprs.get(target.expr)?;
-        let (table, attnum) = match (&expr.kind, &query.table) {
-            (ExprKind::Var { attnum }, Some(table)) if table.oid != 0 => (table.oid, *attnum),
+        // markTargetListOrigin (src/backend/parser/parse_target.c).
+        let (table, attnum) = match &expr.kind {
+            ExprKind::Var { table, attnum } => match query.tables.get(*table).map(|t| t.oid) {
+                Some(oid) if oid != 0 => (oid, *attnum),
+                _ => (0, 0),
+            },
             _ => (0, 0),
         };
         fields.push(Field {
@@ -140,6 +155,14 @@ enum Piece {
     Expr(ExprId),
 }
 
+/// A piece of FROM's text.
+enum Place {
+    Text(&'static str),
+    Condition(ExprId),
+    /// A place in the join tree.
+    Join(usize),
+}
+
 struct Writer<'a> {
     query: &'a Query,
     session: &'a Session<'a>,
@@ -149,49 +172,142 @@ struct Writer<'a> {
     constant: Vec<bool>,
     /// [`crate::expr::Exprs::folded`].
     folded: Vec<bool>,
+    /// Whether FROM's tables are written with aliases, and columns by them: there are several.
+    aliased: bool,
+    /// The conditions of joins with a subquery that is one row, which WHERE holds.
+    conditions: Vec<ExprId>,
     sql: String,
     binds: Vec<(u32, Option<Value>)>,
+    /// Each expression bound, and its parameter's number.
+    bound: Vec<(ExprId, usize)>,
 }
 
 impl Writer<'_> {
-    /// The quoted name of the table the statement is over: an engine table by that name, a catalog by
-    /// its own. None where it is none, or a series.
-    fn table(&self) -> Result<Option<String>, Error> {
-        let Some(table) = self.query.table.as_ref().filter(|t| t.series.is_none()) else {
-            return Ok(None);
-        };
+    /// The quoted name of a relation: an engine table by that name, a catalog by its own.
+    fn name(&self, table: &Table) -> Result<String, Error> {
         let (_, name) = self
             .session
             .relations
             .name(table.oid)
             .ok_or_else(|| Error::internal("the statement's table is missing"))?;
-        Ok(Some(quoted(&name)))
+        Ok(quoted(&name))
     }
 
-    /// ` FROM` what a SELECT reads: a relation, or the rows [`Self::with_series`] names.
-    fn from(&mut self, table: &Table) -> Result<(), Error> {
-        self.sql.push_str(" FROM ");
-        if table.series.is_some() {
-            self.sql.push_str(SERIES);
+    /// The quoted name of the table an INSERT or UPDATE assigns to.
+    fn assigned(&self) -> Result<String, Error> {
+        match self.query.tables.first() {
+            Some(table) => self.name(table),
+            None => Err(Error::internal("a statement has no table to assign to")),
+        }
+    }
+
+    fn table(&self, at: usize) -> Result<&Table, Error> {
+        self.query
+            .tables
+            .get(at)
+            .ok_or_else(|| Error::internal("a table of the statement's is missing"))
+    }
+
+    fn join(&self, at: usize) -> Result<Join, Error> {
+        let join = self.query.joins.get(at).copied();
+        join.ok_or_else(|| Error::internal("a join is missing"))
+    }
+
+    /// Whether a place in the join tree is a subquery of expressions alone.
+    fn one_row(&self, at: usize) -> Result<bool, Error> {
+        match self.join(at)? {
+            Join::Table(table) => Ok(self.table(table)?.outputs.is_some()),
+            Join::Of { .. } => Ok(false),
+        }
+    }
+
+    /// ` FROM` what a SELECT reads: relations, and the rows [`Self::with_series`] names, joined. A subquery that is
+    /// one row of expressions leaves its join, whose condition is WHERE's.
+    fn from(&mut self) -> Result<(), Error> {
+        let Some(root) = self.query.from else {
+            return Ok(());
+        };
+        if self.one_row(root)? {
             return Ok(());
         }
-        let (_, name) = self
-            .session
-            .relations
-            .name(table.oid)
-            .ok_or_else(|| Error::internal("the statement's table is missing"))?;
-        self.sql.push_str(&quoted(&name));
+        let mut places = vec![Place::Join(root), Place::Text(" FROM ")];
+        while let Some(place) = places.pop() {
+            match place {
+                Place::Text(text) => self.sql.push_str(text),
+                Place::Condition(on) => {
+                    self.sql.push_str(" ON ");
+                    self.expr(on)?;
+                }
+                Place::Join(at) => match self.join(at)? {
+                    Join::Table(table) => self.relation(table)?,
+                    Join::Of {
+                        left,
+                        right,
+                        outer,
+                        on,
+                    } => {
+                        let rest = match (self.one_row(left)?, self.one_row(right)?) {
+                            (true, true) => {
+                                return Err(Error::unsupported("a join of two subqueries"));
+                            }
+                            (true, false) => Some(right),
+                            (false, true) => Some(left),
+                            (false, false) => None,
+                        };
+                        if let Some(rest) = rest {
+                            if outer {
+                                return Err(Error::unsupported(
+                                    "an outer join with a subquery of expressions",
+                                ));
+                            }
+                            self.conditions.extend(on);
+                            places.push(Place::Join(rest));
+                            continue;
+                        }
+                        if matches!(self.join(right)?, Join::Of { .. }) {
+                            return Err(Error::unsupported("a join on the right of a join"));
+                        }
+                        places.extend(on.map(Place::Condition));
+                        places.push(Place::Join(right));
+                        places.push(Place::Text(match (outer, on) {
+                            (true, _) => " LEFT JOIN ",
+                            (false, Some(_)) => " JOIN ",
+                            (false, None) => " CROSS JOIN ",
+                        }));
+                        places.push(Place::Join(left));
+                    }
+                },
+            }
+        }
+        Ok(())
+    }
+
+    /// A table of FROM's, under its alias where there are several.
+    fn relation(&mut self, at: usize) -> Result<(), Error> {
+        let table = self.table(at)?;
+        let name = match table.series {
+            Some(_) => SERIES.to_owned(),
+            None => self.name(table)?,
+        };
+        self.sql.push_str(&name);
+        if self.aliased {
+            self.sql.push_str(&format!(" AS {}", alias(at)));
+        }
         Ok(())
     }
 
     /// `generate_series_step_int8` (src/backend/utils/adt/int8.c) as the engine's own rows, ahead of the statement that
     /// reads them: a NULL bound or step has none, and a step of 0 is refused as it runs. One whose next value would
     /// pass the largest bigint is refused, as the engine's sum of integers would then be a number that isn't one.
-    fn with_series(&mut self, table: Option<&Table>) -> Result<(), Error> {
-        let Some(series) = table.and_then(|table| table.series.as_ref()) else {
+    fn with_series(&mut self) -> Result<(), Error> {
+        let query = self.query;
+        let mut given = query.tables.iter().filter_map(|t| t.series.as_ref());
+        let Some(series) = given.next() else {
             return Ok(());
         };
-        let query = self.query;
+        if given.next().is_some() {
+            return Err(Error::unsupported("several generate_series"));
+        }
         let mut bounds = [None, None, Some(1i64)];
         let given = [Some(series.start), Some(series.stop), series.step];
         for (bound, expr) in bounds.iter_mut().zip(given) {
@@ -243,7 +359,7 @@ impl Writer<'_> {
     ) -> Result<(), Error> {
         self.sql.push_str(open);
         let mut first = true;
-        for target in targets {
+        for target in targets.iter().filter(|target| !target.junk) {
             if !first {
                 self.sql.push_str(", ");
             }
@@ -261,25 +377,116 @@ impl Writer<'_> {
     }
 
     fn column(&self, attnum: usize) -> Result<String, Error> {
-        column_of(self.query.table.as_ref(), attnum)
+        column_of(self.query.tables.first(), attnum)
     }
 
-    /// The name of a column read: of what the statement reads, which is a series' `value` for one.
-    fn read_name(&self, attnum: usize) -> Result<String, Error> {
-        let query = self.query;
-        let scope = query.source.as_ref().or(query.table.as_ref());
-        if scope.is_some_and(|table| table.series.is_some()) {
-            return Ok("value".to_owned());
-        }
-        column_of(scope, attnum)
+    /// A column read, by name: of a series it is `value`.
+    fn read_name(&self, at: usize, attnum: usize) -> Result<String, Error> {
+        let table = self.table(at)?;
+        let name = match table.series {
+            Some(_) => "value".to_owned(),
+            None => column_of(Some(table), attnum)?,
+        };
+        Ok(if self.aliased {
+            format!("{}.{}", alias(at), quoted(&name))
+        } else {
+            quoted(&name)
+        })
+    }
+
+    /// What a column of a subquery of expressions is: none of another table's.
+    fn output(&self, at: usize, attnum: usize) -> Result<Option<ExprId>, Error> {
+        let Some(outputs) = &self.table(at)?.outputs else {
+            return Ok(None);
+        };
+        let output = attnum.checked_sub(1).and_then(|at| outputs.get(at));
+        output
+            .copied()
+            .map(Some)
+            .ok_or_else(|| Error::internal("a subquery's column is missing"))
     }
 
     fn filter(&mut self) -> Result<(), Error> {
-        if let Some(filter) = self.query.filter {
-            self.sql.push_str(" WHERE ");
-            self.expr(filter)?;
+        let mut conditions = std::mem::take(&mut self.conditions);
+        conditions.extend(self.query.filter);
+        for (at, condition) in conditions.into_iter().enumerate() {
+            self.sql
+                .push_str(if at == 0 { " WHERE " } else { " AND " });
+            self.expr(condition)?;
         }
         Ok(())
+    }
+
+    /// A target GROUP BY or ORDER BY names: by its position, or written again where it is no column of the
+    /// result's.
+    fn target(&mut self, at: usize) -> Result<(), Error> {
+        let query = self.query;
+        let target = query
+            .targets
+            .get(at)
+            .ok_or_else(|| Error::internal("a target is missing"))?;
+        if target.junk {
+            return self.expr(target.expr);
+        }
+        // Junk targets are the last.
+        self.sql.push_str(&at.saturating_add(1).to_string());
+        Ok(())
+    }
+
+    fn grouped(&mut self) -> Result<(), Error> {
+        let query = self.query;
+        for (at, target) in query.group.iter().enumerate() {
+            self.sql
+                .push_str(if at == 0 { " GROUP BY " } else { ", " });
+            self.target(*target)?;
+        }
+        Ok(())
+    }
+
+    fn ordered(&mut self) -> Result<(), Error> {
+        let query = self.query;
+        for (at, sort) in query.sort.iter().enumerate() {
+            self.sql
+                .push_str(if at == 0 { " ORDER BY " } else { ", " });
+            self.target(sort.target)?;
+            self.sql.push_str(match (sort.descending, sort.nulls_first) {
+                (false, false) => " ASC NULLS LAST",
+                (false, true) => " ASC NULLS FIRST",
+                (true, false) => " DESC NULLS LAST",
+                (true, true) => " DESC NULLS FIRST",
+            });
+        }
+        Ok(())
+    }
+
+    /// `recompute_limits` (src/backend/executor/nodeLimit.c): a NULL is no limit.
+    fn limit(&mut self) -> Result<(), Error> {
+        let query = self.query;
+        let Some(limit) = query.limit else {
+            return Ok(());
+        };
+        let value = match self.value(limit)? {
+            None => return Ok(()),
+            Some(Value::Int8(value)) => value,
+            Some(_) => return Err(Error::internal("a limit isn't a bigint")),
+        };
+        if value < 0 {
+            return Err(Error::new(
+                sqlstate::INVALID_ROW_COUNT_IN_LIMIT_CLAUSE,
+                "LIMIT must not be negative".to_owned(),
+            )
+            .of_its_run());
+        }
+        self.binds.push((type_oid::INT8, Some(Value::Int8(value))));
+        self.sql.push_str(&format!(" LIMIT ?{}", self.binds.len()));
+        Ok(())
+    }
+
+    /// The value of an expression with no column in it: where 19's planner computes it, its refusal is the planner's.
+    fn value(&self, id: ExprId) -> Result<Option<Value>, Error> {
+        let folded = self.folded.get(id.index()) == Some(&true);
+        func::eval(&self.query.exprs, id, self.session, self.params)
+            .map_err(|e| if folded { e } else { e.of_its_run() })
     }
 
     /// An expression's text: a flat walk, whose stack is its own (CLAUDE.md section 11).
@@ -303,16 +510,28 @@ impl Writer<'_> {
         let query = self.query;
         let expr = query.exprs.get(id)?;
         if self.constant.get(id.index()) == Some(&true) {
-            let folded = self.folded.get(id.index()) == Some(&true);
-            let value = func::eval(&query.exprs, id, self.session, self.params)
-                .map_err(|e| if folded { e } else { e.of_its_run() })?;
-            return Ok(vec![self.bind(expr.type_oid, value)]);
+            if let Some((_, number)) = self.bound.iter().find(|(bound, _)| *bound == id) {
+                return Ok(vec![Piece::Text(format!("?{number}").into())]);
+            }
+            let value = self.value(id)?;
+            let piece = self.bind(expr.type_oid, value);
+            self.bound.push((id, self.binds.len()));
+            return Ok(vec![piece]);
         }
         let refuse = |what: &str| Err(Error::unsupported(what).at(expr.location));
         match &expr.kind {
-            ExprKind::Var { attnum } => {
-                Ok(vec![Piece::Text(quoted(&self.read_name(*attnum)?).into())])
-            }
+            ExprKind::Var { table, attnum } => Ok(vec![match self.output(*table, *attnum)? {
+                Some(output) => Piece::Expr(output),
+                None => Piece::Text(self.read_name(*table, *attnum)?.into()),
+            }]),
+            ExprKind::Agg { args, .. } => Ok(match args.as_slice() {
+                [arg] => vec![
+                    Piece::Text("count(".into()),
+                    Piece::Expr(*arg),
+                    Piece::Text(")".into()),
+                ],
+                _ => vec![Piece::Text("count(*)".into())],
+            }),
             ExprKind::Op { function, args, .. } | ExprKind::Func { function, args, .. } => {
                 match (args.as_slice(), comparison(function.src)) {
                     ([left, right], Some(op)) if self.plain(*left) && self.plain(*right) => {
@@ -325,7 +544,7 @@ impl Writer<'_> {
                         ])
                     }
                     _ if func::has_body(function) && !session_dependent(function.src) => {
-                        Ok(self.call(function, args))
+                        self.call(function, args)
                     }
                     _ => refuse(&format!("function {} over a column", function.name)),
                 }
@@ -380,10 +599,16 @@ impl Writer<'_> {
         }
     }
 
-    fn call(&self, function: &'static Proc, args: &[ExprId]) -> Vec<Piece> {
-        let mut pieces = vec![Piece::Text(
-            format!("{PROC_FUNCTION}{}(", function.oid).into(),
-        )];
+    fn call(&self, function: &'static Proc, args: &[ExprId]) -> Result<Vec<Piece>, Error> {
+        let mut name = format!("{PROC_FUNCTION}{}", function.oid);
+        if function.args.iter().any(|t| coerce::is_polymorphic(*t)) {
+            for arg in args {
+                let type_oid = self.query.exprs.get(*arg)?.type_oid;
+                name.push_str(&format!("_{type_oid}"));
+            }
+        }
+        name.push('(');
+        let mut pieces = vec![Piece::Text(name.into())];
         let mut first = true;
         for arg in args {
             if !first {
@@ -393,8 +618,13 @@ impl Writer<'_> {
             pieces.push(Piece::Expr(*arg));
         }
         pieces.push(Piece::Text(")".into()));
-        pieces
+        Ok(pieces)
     }
+}
+
+/// The alias of a table of FROM's, by its place in the range table.
+fn alias(at: usize) -> String {
+    format!("t{at}")
 }
 
 /// A column's name, by its `attnum`.
@@ -421,28 +651,22 @@ fn joined(args: &[ExprId], operator: &'static str) -> Vec<Piece> {
 }
 
 /// The engine's operator of a comparison whose arguments are stored as it compares them: the integers,
-/// the text types (a `bpchar`'s trailing spaces stripped, as it is stored and bound) and timestamps. A
+/// the text types (a `bpchar`'s trailing spaces stripped, as it is stored and bound), timestamps and OIDs. A
 /// text type's is its bytes', as the C and builtin C.UTF-8 collations have it (section 5).
 fn comparison(src: &str) -> Option<&'static str> {
     Some(match src {
-        "int4eq" | "int8eq" | "int48eq" | "int84eq" | "texteq" | "bpchareq" | "timestamp_eq" => {
-            " = "
-        }
-        "int4ne" | "int8ne" | "int48ne" | "int84ne" | "textne" | "bpcharne" | "timestamp_ne" => {
-            " <> "
-        }
-        "int4lt" | "int8lt" | "int48lt" | "int84lt" | "text_lt" | "bpcharlt" | "timestamp_lt" => {
-            " < "
-        }
-        "int4le" | "int8le" | "int48le" | "int84le" | "text_le" | "bpcharle" | "timestamp_le" => {
-            " <= "
-        }
-        "int4gt" | "int8gt" | "int48gt" | "int84gt" | "text_gt" | "bpchargt" | "timestamp_gt" => {
-            " > "
-        }
-        "int4ge" | "int8ge" | "int48ge" | "int84ge" | "text_ge" | "bpcharge" | "timestamp_ge" => {
-            " >= "
-        }
+        "int4eq" | "int8eq" | "int48eq" | "int84eq" | "texteq" | "bpchareq" | "timestamp_eq"
+        | "oideq" | "nameeq" | "nameeqtext" | "texteqname" => " = ",
+        "int4ne" | "int8ne" | "int48ne" | "int84ne" | "textne" | "bpcharne" | "timestamp_ne"
+        | "oidne" | "namene" | "namenetext" | "textnename" => " <> ",
+        "int4lt" | "int8lt" | "int48lt" | "int84lt" | "text_lt" | "bpcharlt" | "timestamp_lt"
+        | "oidlt" | "namelt" | "namelttext" | "textltname" => " < ",
+        "int4le" | "int8le" | "int48le" | "int84le" | "text_le" | "bpcharle" | "timestamp_le"
+        | "oidle" | "namele" | "nameletext" | "textlename" => " <= ",
+        "int4gt" | "int8gt" | "int48gt" | "int84gt" | "text_gt" | "bpchargt" | "timestamp_gt"
+        | "oidgt" | "namegt" | "namegttext" | "textgtname" => " > ",
+        "int4ge" | "int8ge" | "int48ge" | "int84ge" | "text_ge" | "bpcharge" | "timestamp_ge"
+        | "oidge" | "namege" | "namegetext" | "textgename" => " >= ",
         _ => return None,
     })
 }
@@ -450,7 +674,7 @@ fn comparison(src: &str) -> Option<&'static str> {
 /// Whether a function's value turns on more than its arguments: the session's `TimeZone` or its
 /// `search_path`, which the engine's dialect doesn't have.
 fn session_dependent(src: &str) -> bool {
-    src.contains("timestamptz") || src.contains("regclass")
+    src.contains("timestamptz") || src.contains("regclass") || src == "current_schemas"
 }
 
 /// `text` and `varchar`, stored alike (section 5).

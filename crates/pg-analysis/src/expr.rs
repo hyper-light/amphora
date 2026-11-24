@@ -37,8 +37,13 @@ pub enum ExprKind {
     Const(Option<Value>),
     /// Param of kind PARAM_EXTERN.
     Param(i32),
-    /// Var: a column of the statement's table, by its `attnum`.
-    Var { attnum: usize },
+    /// Var: a column of a table of the statement's range table, by its place there and its `attnum`.
+    Var { table: usize, attnum: usize },
+    /// Aggref: `count`, of nothing where its argument is `*`.
+    Agg {
+        function: &'static Proc,
+        args: Vec<ExprId>,
+    },
     /// OpExpr: its operator and that operator's function.
     Op {
         operator: u32,
@@ -147,7 +152,110 @@ impl Exprs {
     /// For each expression, whether it is computed from constants and parameters alone: there is no
     /// column in it. Analysis makes an expression after its arguments.
     pub(crate) fn constant(&self) -> Vec<bool> {
-        self.each(|expr| !matches!(expr.kind, ExprKind::Var { .. }))
+        self.each(|expr| !matches!(expr.kind, ExprKind::Var { .. } | ExprKind::Agg { .. }))
+    }
+
+    /// `equal` (src/backend/nodes/equalfuncs.c): whether two expressions are the same, their locations
+    /// and how their coercions show aside.
+    pub(crate) fn equal(&self, one: ExprId, other: ExprId) -> Result<bool, Error> {
+        let mut pairs = vec![(one, other)];
+        while let Some((one, other)) = pairs.pop() {
+            if one == other {
+                continue;
+            }
+            let (one, other) = (self.get(one)?, self.get(other)?);
+            let mut below = |one: &[ExprId], other: &[ExprId]| {
+                pairs.extend(one.iter().copied().zip(other.iter().copied()));
+                one.len() == other.len()
+            };
+            let same = match (&one.kind, &other.kind) {
+                (ExprKind::Const(a), ExprKind::Const(b)) => a == b,
+                (ExprKind::Param(a), ExprKind::Param(b)) => a == b,
+                (ExprKind::Var { .. }, ExprKind::Var { .. }) => one.kind == other.kind,
+                (ExprKind::CurrentTimestamp, ExprKind::CurrentTimestamp) => true,
+                (
+                    ExprKind::Op { operator, args, .. },
+                    ExprKind::Op {
+                        operator: b,
+                        args: others,
+                        ..
+                    },
+                ) => operator == b && below(args, others),
+                (
+                    ExprKind::Func { function, args, .. },
+                    ExprKind::Func {
+                        function: b,
+                        args: others,
+                        ..
+                    },
+                )
+                | (
+                    ExprKind::Agg { function, args },
+                    ExprKind::Agg {
+                        function: b,
+                        args: others,
+                    },
+                ) => function == b && below(args, others),
+                (
+                    ExprKind::Bool { op, args },
+                    ExprKind::Bool {
+                        op: b,
+                        args: others,
+                    },
+                ) => op == b && below(args, others),
+                (ExprKind::Relabel { arg, .. }, ExprKind::Relabel { arg: b, .. })
+                | (ExprKind::ViaIo { arg, .. }, ExprKind::ViaIo { arg: b, .. }) => {
+                    below(std::slice::from_ref(arg), std::slice::from_ref(b))
+                }
+                (ExprKind::NullTest { arg, not }, ExprKind::NullTest { arg: b, not: other }) => {
+                    not == other && below(std::slice::from_ref(arg), std::slice::from_ref(b))
+                }
+                _ => false,
+            };
+            if !same || one.type_oid != other.type_oid || one.typmod != other.typmod {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// What an expression is made of, in order.
+    fn below(&self, id: ExprId) -> Result<&[ExprId], Error> {
+        Ok(match &self.get(id)?.kind {
+            ExprKind::Const(_)
+            | ExprKind::CurrentTimestamp
+            | ExprKind::Param(_)
+            | ExprKind::Var { .. } => &[],
+            ExprKind::Op { args, .. }
+            | ExprKind::Func { args, .. }
+            | ExprKind::Agg { args, .. }
+            | ExprKind::Bool { args, .. } => args,
+            ExprKind::Relabel { arg, .. }
+            | ExprKind::ViaIo { arg, .. }
+            | ExprKind::NullTest { arg, .. } => std::slice::from_ref(arg),
+        })
+    }
+
+    /// The first expression within `root` that `is` so, in the order they were written, and none of those
+    /// within one that `past` says to pass over.
+    pub(crate) fn first(
+        &self,
+        root: ExprId,
+        is: impl Fn(&Expr) -> bool,
+        past: impl Fn(ExprId, &Expr) -> Result<bool, Error>,
+    ) -> Result<Option<ExprId>, Error> {
+        let mut rest = vec![root];
+        while let Some(id) = rest.pop() {
+            let expr = self.get(id)?;
+            if past(id, expr)? {
+                continue;
+            }
+            if is(expr) {
+                return Ok(Some(id));
+            }
+            rest.extend(self.below(id)?.iter().rev());
+        }
+        Ok(None)
     }
 
     /// For each expression, whether 19's planner computes it (`eval_const_expressions`, REL_19_0
@@ -157,7 +265,7 @@ impl Exprs {
         let immutable = |function: &Proc| function.volatile == b'i';
         let io = |oid: u32| proc_by_oid(oid).is_some_and(immutable);
         self.each(|expr| match &expr.kind {
-            ExprKind::Var { .. } | ExprKind::CurrentTimestamp => false,
+            ExprKind::Var { .. } | ExprKind::Agg { .. } | ExprKind::CurrentTimestamp => false,
             ExprKind::Op { function, .. } | ExprKind::Func { function, .. } => immutable(function),
             ExprKind::ViaIo { arg, .. } => {
                 let output = self.get(*arg).ok().and_then(|e| type_by_oid(e.type_oid));
@@ -184,6 +292,7 @@ impl Exprs {
                 | ExprKind::Var { .. } => true,
                 ExprKind::Op { args, .. }
                 | ExprKind::Func { args, .. }
+                | ExprKind::Agg { args, .. }
                 | ExprKind::Bool { args, .. } => all(args),
                 ExprKind::Relabel { arg, .. }
                 | ExprKind::ViaIo { arg, .. }
@@ -200,16 +309,51 @@ impl Exprs {
     }
 }
 
-/// The table whose columns a statement's names can mean (`ParseNamespaceItem`).
+/// A table of a statement's range table (`RangeTblEntry`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Table {
-    /// 0 for a function's rows.
+    /// 0 for a function's rows or a subquery's.
     pub oid: u32,
     /// The name its columns are qualified by: its alias, else its own.
     pub refname: String,
+    /// Whether that name is an alias.
+    pub aliased: bool,
     pub columns: Vec<crate::Column>,
     /// The rows it gives where it is no relation: `generate_series` of integers.
     pub series: Option<Series>,
+    /// What its columns are where it is a SELECT of expressions alone, one row of them.
+    pub outputs: Option<Vec<ExprId>>,
+}
+
+/// A table that names can mean (`ParseNamespaceItem`): only from a LATERAL item of FROM where
+/// `lateral_only`. A join's type is INNER or LEFT here, so `p_lateral_ok` always holds.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Visible {
+    pub table: usize,
+    pub lateral_only: bool,
+}
+
+/// What the names of one query can mean (`ParseState`'s `p_namespace` and `p_lateral_active`).
+#[derive(Debug, Default)]
+pub(crate) struct Scope {
+    pub visible: Vec<Visible>,
+    pub lateral: bool,
+}
+
+/// What an expression is part of (`ParseExprKind`), as far as an aggregate in it is judged by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Place {
+    Target,
+    Where,
+    JoinOn,
+    Function,
+    Subselect,
+    InsertSelect,
+    GroupBy,
+    OrderBy,
+    Limit,
+    Update,
+    Values,
 }
 
 /// `generate_series` of integers: its bounds and step (`generate_series_step_int4` and `_int8`, REL_19_0
@@ -228,9 +372,14 @@ pub struct Analysis<'a> {
     pub tree: &'a Tree,
     pub session: &'a Session<'a>,
     pub exprs: Exprs,
-    pub table: Option<Table>,
-    /// What an INSERT's SELECT reads, where its targets are not the columns of `table`.
-    pub source: Option<Table>,
+    /// The range table, and the join tree over it.
+    pub tables: Vec<Table>,
+    pub joins: Vec<crate::stmt::Join>,
+    /// What names mean, the innermost query's last.
+    pub(crate) scopes: Vec<Scope>,
+    pub(crate) place: Place,
+    /// `p_hasAggs`.
+    pub(crate) aggregates: bool,
     /// `$n`'s types (`VarParamState`): 0 not seen, UNKNOWN not resolved yet.
     pub params: Vec<u32>,
 }
@@ -410,8 +559,7 @@ impl Analysis<'_> {
                 self.exprs.push(kind, type_oid::BOOL, -1, *location)
             }
             Node::FuncCall(f) => {
-                if f.agg_star
-                    || f.agg_distinct
+                if f.agg_distinct
                     || f.func_variadic
                     || f.agg_within_group
                     || f.over.is_some()
@@ -423,7 +571,7 @@ impl Analysis<'_> {
                     );
                 }
                 let name = self.name(&f.funcname)?;
-                self.make_call(&name, args, f.location)
+                self.make_call(&name, args, f.agg_star, f.location)
             }
             _ => Err(Error::internal("an expression has no value")),
         }
@@ -475,43 +623,165 @@ impl Analysis<'_> {
             .push(ExprKind::Param(number), type_oid, -1, location)
     }
 
-    /// `transformColumnRef` (parse_expr.c) for `column` and `table.column`.
+    /// `transformColumnRef` (parse_expr.c:510) for `column`, `table.column` and `schema.table.column`.
     fn column(&mut self, fields: &[String], location: i32) -> Result<ExprId, Error> {
-        let (table, name) = match fields {
-            [name] => (None, name),
-            [table, name] => (Some(table), name),
+        let (schema, table, name) = match fields {
+            [name] => {
+                let found = match self.column_named(name, false, location)? {
+                    Some(found) => found,
+                    None if self.table_named(None, name, location)?.is_some() => {
+                        return Err(Error::unsupported("a whole-row reference").at(location));
+                    }
+                    None => return Err(no_column(None, name).at(location)),
+                };
+                return self.var(found, location);
+            }
+            [table, name] => (None, table, name),
+            [schema, table, name] => (Some(schema.as_str()), table, name),
             _ => {
                 return Err(Error::unsupported("a column name of this many parts").at(location));
             }
         };
-        let in_scope = self
-            .table
-            .as_ref()
-            .filter(|t| table.is_none_or(|name| t.refname == *name));
-        let found =
-            in_scope.and_then(|t| t.columns.iter().enumerate().find(|(_, c)| c.name == *name));
-        if let Some((i, c)) = found {
-            let kind = ExprKind::Var {
-                attnum: i.saturating_add(1),
-            };
-            return self.exprs.push(kind, c.type_oid, c.typmod, location);
-        }
-        // errorMissingRTE and errorMissingColumn (parse_relation.c).
-        let (sqlstate, message) = match table {
-            Some(table) if in_scope.is_none() => (
-                sqlstate::UNDEFINED_TABLE,
-                format!("missing FROM-clause entry for table \"{table}\""),
-            ),
-            Some(table) => (
-                sqlstate::UNDEFINED_COLUMN,
-                format!("column {table}.{name} does not exist"),
-            ),
-            None => (
-                sqlstate::UNDEFINED_COLUMN,
-                format!("column \"{name}\" does not exist"),
-            ),
+        let Some(at) = self.table_named(schema, table, location)? else {
+            return Err(self.no_table(schema, table).at(location));
         };
-        Err(Error::new(sqlstate, message).at(location))
+        match self.column_of(at, name, location)? {
+            Some(attnum) => self.var((at, attnum), location),
+            None => Err(no_column(Some(table), name).at(location)),
+        }
+    }
+
+    fn var(&mut self, (table, attnum): (usize, usize), location: i32) -> Result<ExprId, Error> {
+        let column = self
+            .tables
+            .get(table)
+            .and_then(|t| attnum.checked_sub(1).and_then(|at| t.columns.get(at)))
+            .ok_or_else(|| Error::internal("a column is missing"))?;
+        let (type_oid, typmod) = (column.type_oid, column.typmod);
+        let kind = ExprKind::Var { table, attnum };
+        self.exprs.push(kind, type_oid, typmod, location)
+    }
+
+    /// `scanNSItemForColumn` (parse_relation.c:716): a table's column of that name.
+    fn column_of(&self, table: usize, name: &str, location: i32) -> Result<Option<usize>, Error> {
+        let columns = self.tables.get(table).map(|t| t.columns.as_slice());
+        let mut named = columns
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.name == name);
+        let first = named.next();
+        if named.next().is_some() {
+            return Err(ambiguous(name).at(location));
+        }
+        Ok(first.map(|(at, _)| at.saturating_add(1)))
+    }
+
+    /// `colNameToVar` (parse_relation.c:926): the table and column a bare name means, in the innermost query
+    /// that has one, or in the innermost alone.
+    pub(crate) fn column_named(
+        &self,
+        name: &str,
+        innermost: bool,
+        location: i32,
+    ) -> Result<Option<(usize, usize)>, Error> {
+        for scope in self.scopes.iter().rev() {
+            let mut found = None;
+            for item in &scope.visible {
+                if item.lateral_only && !scope.lateral {
+                    continue;
+                }
+                let Some(attnum) = self.column_of(item.table, name, location)? else {
+                    continue;
+                };
+                if found.is_some() {
+                    return Err(ambiguous(name).at(location));
+                }
+                found = Some((item.table, attnum));
+            }
+            if found.is_some() || innermost {
+                return Ok(found);
+            }
+        }
+        Ok(None)
+    }
+
+    /// `refnameNamespaceItem` (parse_relation.c:130): the table a name means.
+    fn table_named(
+        &self,
+        schema: Option<&str>,
+        name: &str,
+        location: i32,
+    ) -> Result<Option<usize>, Error> {
+        let relations = self.session.relations;
+        let oid = match schema {
+            None => None,
+            Some(schema) => {
+                let namespace = relations.namespace(schema);
+                let Some(oid) = namespace.and_then(|ns| relations.relation(ns, name)) else {
+                    return Ok(None);
+                };
+                Some(oid)
+            }
+        };
+        for scope in self.scopes.iter().rev() {
+            let mut found = None;
+            for item in &scope.visible {
+                let Some(table) = self.tables.get(item.table) else {
+                    continue;
+                };
+                // A subquery without an alias has no name (addRangeTableEntryForSubquery).
+                let named = match oid {
+                    Some(oid) => table.oid == oid && !table.aliased,
+                    None => {
+                        table.refname == name && (table.outputs.is_none() || table.aliased)
+                    }
+                };
+                if !named || (item.lateral_only && !scope.lateral) {
+                    continue;
+                }
+                if found.is_some() {
+                    let name = oid.map_or_else(|| format!("\"{name}\""), |oid| oid.to_string());
+                    return Err(Error::new(
+                        sqlstate::AMBIGUOUS_ALIAS,
+                        format!("table reference {name} is ambiguous"),
+                    )
+                    .at(location));
+                }
+                found = Some(item.table);
+            }
+            if found.is_some() {
+                return Ok(found);
+            }
+        }
+        Ok(None)
+    }
+
+    /// `errorMissingRTE` (parse_relation.c:3723).
+    fn no_table(&self, schema: Option<&str>, name: &str) -> Error {
+        let relations = self.session.relations;
+        let oid = match schema {
+            Some(schema) => relations
+                .namespace(schema)
+                .and_then(|ns| relations.relation(ns, name)),
+            None => self
+                .session
+                .path
+                .resolve(Kind::Relation, |ns| relations.relation(ns, name)),
+        };
+        // searchRangeTableForRel (:360): the tables read so far, whether names can mean them here or not.
+        let there = self.tables.iter().any(|table| {
+            (table.oid != 0 && Some(table.oid) == oid) || table.refname == name
+        });
+        let what = if there {
+            "invalid reference to"
+        } else {
+            "missing"
+        };
+        Error::new(
+            sqlstate::UNDEFINED_TABLE,
+            format!("{what} FROM-clause entry for table \"{name}\""),
+        )
     }
 
     /// A list of String nodes' values.
@@ -552,7 +822,7 @@ impl Analysis<'_> {
         else {
             return Err(Error::internal("a cast has no type"));
         };
-        if *setof || *pct_type || !array_bounds.is_empty() {
+        if *setof || *pct_type {
             return Err(Error::unsupported("this type's name").at(*location));
         }
         let name = self.name(names)?;
@@ -579,8 +849,18 @@ impl Analysis<'_> {
             )
             .at(*location)
         })?;
+        // LookupTypeNameExtended (parse_type.c): an array's dimensions say nothing of its type.
+        let array = |oid: u32| match type_by_oid(oid).map(|t| t.array) {
+            _ if array_bounds.is_empty() => Ok(oid),
+            Some(array) if array != 0 => Ok(array),
+            _ => Err(Error::new(
+                sqlstate::UNDEFINED_OBJECT,
+                format!("type \"{}[]\" does not exist", name.text()),
+            )
+            .at(*location)),
+        };
         if typmods.is_empty() {
-            return Ok((t.oid, -1, *location));
+            return Ok((array(t.oid)?, -1, *location));
         }
         let mut modifiers = Vec::with_capacity(typmods.len());
         for m in typmods {
@@ -598,7 +878,7 @@ impl Analysis<'_> {
                 Error::new(sqlstate::INVALID_PARAMETER_VALUE, e.to_string()).at(*location)
             })?
             .typmod;
-        Ok((t.oid, typmod, *location))
+        Ok((array(t.oid)?, typmod, *location))
     }
 
     /// The functions and operators written so far (section 4): one with no body refuses here.
@@ -701,10 +981,13 @@ impl Analysis<'_> {
             return Err(refuse().at(f.location));
         }
         let name = self.name(&f.funcname)?;
+        // transformRangeFunction: a function's arguments are LATERAL, said or not.
+        self.lateral(true);
         let mut args = Vec::with_capacity(f.args.len());
         for arg in &f.args {
             args.push(self.expression(*arg)?);
         }
+        self.lateral(false);
         let mut inputs = Vec::with_capacity(args.len());
         for arg in &args {
             inputs.push(self.type_of(*arg)?);
@@ -753,6 +1036,7 @@ impl Analysis<'_> {
         Ok(Table {
             oid: 0,
             refname,
+            aliased: alias.is_some(),
             columns: vec![crate::Column {
                 name: column,
                 type_oid: function.result,
@@ -765,7 +1049,15 @@ impl Analysis<'_> {
                 step,
                 location: f.location,
             }),
+            outputs: None,
         })
+    }
+
+    /// `p_lateral_active` of the innermost query.
+    pub(crate) fn lateral(&mut self, active: bool) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.lateral = active;
+        }
     }
 
     /// `make_fn_arguments` (parse_func.c:2012).
@@ -777,11 +1069,12 @@ impl Analysis<'_> {
         Ok(coerced)
     }
 
-    /// `ParseFuncOrColumn` (parse_func.c:92) for a plain call of a function or of a type's name.
+    /// `ParseFuncOrColumn` (parse_func.c:92) for a plain call of a function, of an aggregate or of a type's name.
     fn make_call(
         &mut self,
         name: &Name,
         args: Vec<ExprId>,
+        star: bool,
         location: i32,
     ) -> Result<ExprId, Error> {
         let mut inputs = Vec::with_capacity(args.len());
@@ -800,6 +1093,16 @@ impl Analysis<'_> {
             literal,
         )
         .map_err(|e| e.at(location))?;
+        let wrong = |message: String| {
+            Err(Error::new(sqlstate::WRONG_OBJECT_TYPE, message).at(location))
+        };
+        let aggregate = matches!(&call, Call::Function { function, .. } if function.kind == b'a');
+        if star && !aggregate {
+            let name = name.text();
+            return wrong(format!(
+                "{name}(*) specified, but {name} is not an aggregate function"
+            ));
+        }
         match call {
             Call::Coercion(target) => {
                 let cast = Cast {
@@ -818,11 +1121,17 @@ impl Analysis<'_> {
                 defaults,
             } => {
                 if function.kind == b'p' {
-                    return Err(Error::new(
-                        sqlstate::WRONG_OBJECT_TYPE,
-                        format!("{} is a procedure", name.text()),
-                    )
-                    .at(location));
+                    return wrong(format!("{} is a procedure", name.text()));
+                }
+                if aggregate && function.name == "count" {
+                    let args = self.arguments(args, &declared)?;
+                    if args.is_empty() && !star {
+                        return wrong(format!(
+                            "{}(*) must be used to call a parameterless aggregate function",
+                            name.text()
+                        ));
+                    }
+                    return self.aggregate(function, args, location);
                 }
                 self.body(function, location)?;
                 if function.kind != b'f' || function.retset || variadic > 0 || defaults > 0 {
@@ -830,6 +1139,8 @@ impl Analysis<'_> {
                         Error::unsupported(&format!("the call of {}", name.text())).at(location)
                     );
                 }
+                let declared = coerce::resolve_generics(&inputs, declared)
+                    .map_err(|e| e.at(location))?;
                 let args = self.arguments(args, &declared)?;
                 let kind = ExprKind::Func {
                     function,
@@ -839,6 +1150,66 @@ impl Analysis<'_> {
                 self.exprs.push(kind, function.result, -1, location)
             }
         }
+    }
+
+    /// `transformAggregateCall` (parse_agg.c:113) and `check_agglevels_and_constraints` (:308).
+    fn aggregate(
+        &mut self,
+        function: &'static Proc,
+        args: Vec<ExprId>,
+        location: i32,
+    ) -> Result<ExprId, Error> {
+        let any = |_: ExprId, _: &Expr| Ok(false);
+        for arg in &args {
+            let nested = |e: &Expr| matches!(e.kind, ExprKind::Agg { .. });
+            if let Some(inner) = self.exprs.first(*arg, nested, any)? {
+                return Err(Error::new(
+                    sqlstate::GROUPING_ERROR,
+                    "aggregate function calls cannot be nested".to_owned(),
+                )
+                .at(self.exprs.get(inner)?.location));
+            }
+        }
+        let place = match self.place {
+            Place::Target | Place::OrderBy => None,
+            Place::Where => Some("WHERE"),
+            Place::JoinOn => Some("JOIN conditions"),
+            Place::Function => Some("functions in FROM"),
+            Place::GroupBy => Some("GROUP BY"),
+            Place::Limit => Some("LIMIT"),
+            Place::Update => Some("UPDATE"),
+            Place::Values => Some("VALUES"),
+            Place::InsertSelect => {
+                return Err(
+                    Error::unsupported("an aggregate in an INSERT's SELECT").at(location)
+                );
+            }
+            // Its level is its arguments' columns' query's, which is the one the subquery is read in: a
+            // subquery here reads no table of its own.
+            Place::Subselect => {
+                let column = |e: &Expr| matches!(e.kind, ExprKind::Var { .. });
+                let mut outer = false;
+                for arg in &args {
+                    outer = outer || self.exprs.first(*arg, column, any)?.is_some();
+                }
+                if !outer {
+                    return Err(
+                        Error::unsupported("an aggregate in a subquery in FROM").at(location)
+                    );
+                }
+                Some("FROM clause of their own query level")
+            }
+        };
+        if let Some(place) = place {
+            return Err(Error::new(
+                sqlstate::GROUPING_ERROR,
+                format!("aggregate functions are not allowed in {place}"),
+            )
+            .at(location));
+        }
+        self.aggregates = true;
+        let kind = ExprKind::Agg { function, args };
+        self.exprs.push(kind, function.result, -1, location)
     }
 
     /// `coerce_to_boolean` (parse_coerce.c:1163).
@@ -881,10 +1252,10 @@ impl Analysis<'_> {
         } = cast;
         let e = self.exprs.get(id)?;
         let input = e.type_oid;
-        if input == target {
+        if input == target || target == type_oid::ANY {
             return Ok(id);
         }
-        if target == type_oid::ANY || coerce::is_polymorphic(target) {
+        if coerce::is_polymorphic(target) {
             return Err(
                 Error::unsupported(&format!("a value of type {}", format_type(target)))
                     .at(e.location),
@@ -1047,6 +1418,22 @@ impl Analysis<'_> {
         }
         Ok(id)
     }
+}
+
+/// `errorMissingColumn` (parse_relation.c:3794).
+fn no_column(table: Option<&str>, name: &str) -> Error {
+    let message = match table {
+        Some(table) => format!("column {table}.{name} does not exist"),
+        None => format!("column \"{name}\" does not exist"),
+    };
+    Error::new(sqlstate::UNDEFINED_COLUMN, message)
+}
+
+fn ambiguous(name: &str) -> Error {
+    Error::new(
+        sqlstate::AMBIGUOUS_COLUMN,
+        format!("column reference \"{name}\" is ambiguous"),
+    )
 }
 
 /// The one argument of a node that has one.

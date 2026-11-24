@@ -1,6 +1,6 @@
 //! Values, and the functions of this unit's types: each built-in function's body under its `prosrc`,
 //! written from PostgreSQL's C (REL_19_0 src/backend/utils/adt: int.c, int8.c, bool.c, char.c, oid.c,
-//! regproc.c, timestamp.c, varchar.c, varlena.c), raising its SQLSTATEs. Text compares by its bytes,
+//! regproc.c, timestamp.c, varchar.c, varlena.c, name.c, array_userfuncs.c), raising its SQLSTATEs. Text compares by its bytes,
 //! as the `C` and builtin `C.UTF-8` collations do (docs/design/postgres.md section 5).
 
 use std::cmp::Ordering;
@@ -9,7 +9,9 @@ use amphora_pg_catalog::data::type_oid;
 use amphora_pg_catalog::{Kind, Proc, type_by_oid};
 use amphora_pg_parser::tree::BoolOp;
 
+use crate::array::{self, Array};
 use crate::binary::NAMEDATALEN;
+use crate::coerce::element_type;
 use crate::expr::{ExprId, ExprKind, Exprs};
 use crate::{Error, Session, datetime, format_type, sqlstate};
 
@@ -31,17 +33,25 @@ pub enum Value {
     Numeric(String),
     /// An unknown literal's text.
     Unknown(String),
+    Array(Array),
 }
 
+/// A strict function's body, over values that aren't NULL.
 type Body = fn(&[Value], &Session<'_>) -> Result<Value, Error>;
+
+/// The body of a function that takes a NULL.
+type OpenBody = fn(&[Option<Value>]) -> Result<Option<Value>, Error>;
 
 /// Whether a function can be called: its body is here, or it is an I/O function [`input`] or
 /// [`output`] has.
 pub fn has_body(function: &Proc) -> bool {
     body(function.src).is_some()
+        || open_body(function.src).is_some()
         || matches!(
             function.src,
-            "boolin"
+            "array_in"
+                | "array_out"
+                | "boolin"
                 | "boolout"
                 | "charin"
                 | "charout"
@@ -280,12 +290,12 @@ fn body(src: &str) -> Option<Body> {
         "boolle" => |a, _| bools(a, O::is_le),
         "boolgt" => |a, _| bools(a, O::is_gt),
         "boolge" => |a, _| bools(a, O::is_ge),
-        "texteq" => |a, _| texts(a, O::is_eq),
-        "textne" => |a, _| texts(a, O::is_ne),
-        "text_lt" | "text_pattern_lt" => |a, _| texts(a, O::is_lt),
-        "text_le" | "text_pattern_le" => |a, _| texts(a, O::is_le),
-        "text_gt" | "text_pattern_gt" => |a, _| texts(a, O::is_gt),
-        "text_ge" | "text_pattern_ge" => |a, _| texts(a, O::is_ge),
+        "texteq" | "nameeq" | "nameeqtext" | "texteqname" => |a, _| texts(a, O::is_eq),
+        "textne" | "namene" | "namenetext" | "textnename" => |a, _| texts(a, O::is_ne),
+        "text_lt" | "text_pattern_lt" | "namelt" | "namelttext" | "textltname" => |a, _| texts(a, O::is_lt),
+        "text_le" | "text_pattern_le" | "namele" | "nameletext" | "textlename" => |a, _| texts(a, O::is_le),
+        "text_gt" | "text_pattern_gt" | "namegt" | "namegttext" | "textgtname" => |a, _| texts(a, O::is_gt),
+        "text_ge" | "text_pattern_ge" | "namege" | "namegetext" | "textgename" => |a, _| texts(a, O::is_ge),
         "text_starts_with" => |a, _| Ok(Value::Bool(text(a.first())?.starts_with(text(a.get(1))?))),
         "textcat" => |a, _| {
             let mut s = text(a.first())?.to_owned();
@@ -358,6 +368,7 @@ fn body(src: &str) -> Option<Body> {
             Ok(Value::Text(trimmed.to_owned()))
         },
         "bpchar" => |a, _| bpchar(text(a.first())?, int4(a.get(1))?, boolean(a.get(2))?),
+        "current_schemas" => |a, s| current_schemas(boolean(a.first())?, s),
         "text_regclass" => |a, s| regclass(text(a.first())?, s),
         "timestamp_timestamptz" => |a, s| {
             datetime::to_timestamptz(timestamp(a.first())?, s.time_zone).map(Value::Timestamp)
@@ -371,6 +382,58 @@ fn body(src: &str) -> Option<Body> {
         _ => return None,
     };
     Some(body)
+}
+
+fn open_body(src: &str) -> Option<OpenBody> {
+    let body: OpenBody = match src {
+        "array_position" => |a| array_position(a.first(), a.get(1), None),
+        "array_position_start" => |a| match a.get(2) {
+            _ if matches!(a.first(), Some(None)) => Ok(None),
+            Some(Some(start)) => array_position(a.first(), a.get(1), Some(int4(Some(start))?)),
+            _ => Err(Error::new(
+                sqlstate::NULL_VALUE_NOT_ALLOWED,
+                "initial position must not be null".to_owned(),
+            )),
+        },
+        _ => return None,
+    };
+    Some(body)
+}
+
+/// `array_position_common` (array_userfuncs.c): a NULL array has no position of anything.
+fn array_position(
+    array: Option<&Option<Value>>,
+    sought: Option<&Option<Value>>,
+    start: Option<i32>,
+) -> Result<Option<Value>, Error> {
+    let array = match array {
+        Some(None) => return Ok(None),
+        Some(Some(Value::Array(array))) => array,
+        _ => return Err(mismatch()),
+    };
+    let sought = sought.ok_or_else(mismatch)?;
+    Ok(array::position(array, sought.as_ref(), start)?.map(Value::Int4))
+}
+
+/// `current_schemas` (src/backend/utils/adt/name.c): the search path, its implicit schemas or not.
+fn current_schemas(implicit: bool, session: &Session<'_>) -> Result<Value, Error> {
+    let elements: Vec<Option<Value>> = session
+        .path
+        .fetch(implicit)
+        .iter()
+        .filter_map(|oid| session.relations.namespace_name(*oid))
+        .map(|name| Some(Value::Text(name)))
+        .collect();
+    let dimensions = match i32::try_from(elements.len()) {
+        Ok(0) => Vec::new(),
+        Ok(length) => vec![array::Dimension { lower: 1, length }],
+        Err(_) => return Err(Error::internal("a search path is too long")),
+    };
+    Ok(Value::Array(Array {
+        element: type_oid::NAME,
+        dimensions,
+        elements,
+    }))
 }
 
 /// `bpchar` (varchar.c:272): a value fitted to `char(n)`'s n characters, its typmod less VARHDRSZ.
@@ -621,6 +684,14 @@ fn oid_input(s: &str) -> Result<Value, Error> {
 
 /// A type's input function on a literal's text (`stringTypeDatum`), with no type modifier.
 pub fn input(target: u32, s: &str, session: &Session<'_>) -> Result<Value, Error> {
+    match element_type(target) {
+        0 => plain_input(target, s, session),
+        element => array::input(element, s, |s| plain_input(element, s, session)).map(Value::Array),
+    }
+}
+
+/// [`input`] of a type that is no array.
+fn plain_input(target: u32, s: &str, session: &Session<'_>) -> Result<Value, Error> {
     let function = type_by_oid(target)
         .and_then(|t| amphora_pg_catalog::proc_by_oid(t.input))
         .ok_or_else(|| Error::internal("a type has no input function"))?;
@@ -653,6 +724,16 @@ pub fn input(target: u32, s: &str, session: &Session<'_>) -> Result<Value, Error
 
 /// A type's output function.
 pub fn output(type_oid: u32, value: &Value, session: &Session<'_>) -> Result<String, Error> {
+    match value {
+        Value::Array(array) => {
+            array::output(array, |value| plain_output(array.element, value, session))
+        }
+        value => plain_output(type_oid, value, session),
+    }
+}
+
+/// [`output`] of a value that is no array.
+fn plain_output(type_oid: u32, value: &Value, session: &Session<'_>) -> Result<String, Error> {
     Ok(match value {
         Value::Bool(b) => if *b { "t" } else { "f" }.to_owned(),
         Value::Char(c) => char_text(*c),
@@ -666,6 +747,7 @@ pub fn output(type_oid: u32, value: &Value, session: &Session<'_>) -> Result<Str
         }
         Value::Timestamp(t) => datetime::timestamp_out(*t)?,
         Value::Numeric(_) => return Err(Error::unsupported("a numeric value as text")),
+        Value::Array(_) => return Err(mismatch()),
     })
 }
 
@@ -766,6 +848,9 @@ pub fn eval(
                     steps.push(Step::Enter(*first));
                 }
                 ExprKind::Var { .. } => return Err(Error::unsupported("a column outside a row")),
+                ExprKind::Agg { .. } => {
+                    return Err(Error::unsupported("an aggregate outside its group"));
+                }
                 ExprKind::CurrentTimestamp => match session.now {
                     Some(t) => values.push(Some(Value::Timestamp(t))),
                     None => {
@@ -826,12 +911,8 @@ fn leave(
     let value = match &e.kind {
         ExprKind::Op { function, args, .. } | ExprKind::Func { function, args, .. } => {
             let at = values.len().saturating_sub(args.len());
-            let args: Option<Vec<Value>> = values.split_off(at).into_iter().collect();
-            match args {
-                // Every body is of a strict function.
-                None => None,
-                Some(args) => Some(call(function, &args, session)?),
-            }
+            let args = values.split_off(at);
+            call(function, &args, session)?
         }
         ExprKind::Relabel { .. } => values.pop().flatten().map(|v| relabel(v, e.type_oid)),
         ExprKind::ViaIo { arg, .. } => match values.pop().flatten() {
@@ -850,12 +931,20 @@ fn leave(
     Ok(())
 }
 
-/// A built-in function's value over these arguments, none of them NULL: every body is of a strict one
+/// A built-in function's value over these arguments: NULL over a NULL where it is strict
 /// (src/backend/utils/fmgr/README). `0A000` where its body isn't here.
-pub fn call(function: &Proc, args: &[Value], session: &Session<'_>) -> Result<Value, Error> {
+pub fn call(
+    function: &Proc,
+    args: &[Option<Value>],
+    session: &Session<'_>,
+) -> Result<Option<Value>, Error> {
+    if let (false, Some(body)) = (function.strict, open_body(function.src)) {
+        return body(args);
+    }
     let body = body(function.src)
         .ok_or_else(|| Error::unsupported(&format!("function {}", function.name)))?;
-    body(args, session)
+    let values: Option<Vec<Value>> = args.iter().cloned().collect();
+    values.map(|values| body(&values, session)).transpose()
 }
 
 /// A value under a binary-compatible type's name: an int4 and an oid are the same 32 bits.

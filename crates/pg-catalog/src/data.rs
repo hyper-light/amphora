@@ -1,4 +1,4 @@
-//! PostgreSQL 19's built-in rows of pg_namespace, pg_type, pg_class and pg_attribute, and what analysis
+//! PostgreSQL 19's built-in rows of pg_namespace, pg_type, pg_class, pg_attribute, pg_partitioned_table and pg_inherits, and what analysis
 //! reads of pg_type, pg_proc, pg_operator, pg_cast and pg_range: PostgreSQL's own genbki.pl run on the vendored
 //! catalog headers and .dat files (vendor/postgres, REL_19_0), its postgres.bki lifted by
 //! scripts/postgres-catalog.py. Generated; do not edit.
@@ -18,6 +18,7 @@ pub static PG_NAMESPACE: Catalog = Catalog {
         Column { name: "nspowner", type_oid: 26 },
         Column { name: "nspacl", type_oid: 1034 },
     ],
+    key: &[1],
     rows: &[
         &[Oid(11), Name("pg_catalog"), Oid(10), Null],
         &[Oid(99), Name("pg_toast"), Oid(10), Null],
@@ -62,6 +63,7 @@ pub static PG_TYPE: Catalog = Catalog {
         Column { name: "typdefault", type_oid: 25 },
         Column { name: "typacl", type_oid: 1034 },
     ],
+    key: &[1],
     rows: &[
         &[Oid(16), Name("bool"), Oid(11), Oid(10), Int2(1), Bool(true), Char(98), Char(66), Bool(true), Bool(true), Char(44), Oid(0), Oid(0), Oid(0), Oid(1000), Oid(1242), Oid(1243), Oid(2436), Oid(2437), Oid(0), Oid(0), Oid(0), Char(99), Char(112), Bool(false), Oid(0), Int4(-1), Int4(0), Oid(0), Null, Null, Null],
         &[Oid(17), Name("bytea"), Oid(11), Oid(10), Int2(-1), Bool(false), Char(98), Char(85), Bool(false), Bool(true), Char(44), Oid(0), Oid(0), Oid(0), Oid(1001), Oid(1244), Oid(31), Oid(2412), Oid(2413), Oid(0), Oid(0), Oid(0), Char(105), Char(120), Bool(false), Oid(0), Int4(-1), Int4(0), Oid(0), Null, Null, Null],
@@ -302,6 +304,7 @@ pub static PG_CLASS: Catalog = Catalog {
         Column { name: "reloptions", type_oid: 1009 },
         Column { name: "relpartbound", type_oid: 194 },
     ],
+    key: &[1],
     rows: &[
         &[Oid(1247), Name("pg_type"), Oid(11), Oid(71), Oid(0), Oid(10), Oid(2), Oid(0), Oid(0), Int4(0), Float4(-1.0), Int4(0), Int4(0), Oid(0), Bool(false), Bool(false), Char(112), Char(114), Int2(32), Int2(0), Bool(false), Bool(false), Bool(false), Bool(false), Bool(false), Bool(true), Char(110), Bool(false), Oid(0), Xid(3), Xid(1), Null, Null, Null],
         &[Oid(1249), Name("pg_attribute"), Oid(11), Oid(75), Oid(0), Oid(10), Oid(2), Oid(0), Oid(0), Int4(0), Float4(-1.0), Int4(0), Int4(0), Oid(0), Bool(false), Bool(false), Char(112), Char(114), Int2(25), Int2(0), Bool(false), Bool(false), Bool(false), Bool(false), Bool(false), Bool(true), Char(110), Bool(false), Oid(0), Xid(3), Xid(1), Null, Null, Null],
@@ -340,6 +343,7 @@ pub static PG_ATTRIBUTE: Catalog = Catalog {
         Column { name: "attfdwoptions", type_oid: 1009 },
         Column { name: "attmissingval", type_oid: 2277 },
     ],
+    key: &[1, 5],
     rows: &[
         &[Oid(1249), Name("attrelid"), Oid(26), Int2(4), Int2(1), Int4(-1), Int2(0), Bool(true), Char(105), Char(112), Char(0), Bool(true), Bool(false), Bool(false), Char(0), Char(0), Bool(false), Bool(true), Int2(0), Oid(0), Null, Null, Null, Null, Null],
         &[Oid(1249), Name("attname"), Oid(19), Int2(64), Int2(2), Int4(-1), Int2(0), Bool(false), Char(99), Char(112), Char(0), Bool(true), Bool(false), Bool(false), Char(0), Char(0), Bool(false), Bool(true), Int2(0), Oid(950), Null, Null, Null, Null, Null],
@@ -486,6 +490,38 @@ pub static PG_ATTRIBUTE: Catalog = Catalog {
         &[Oid(1247), Name("xmax"), Oid(28), Int2(4), Int2(-4), Int4(-1), Int2(0), Bool(true), Char(105), Char(112), Char(0), Bool(true), Bool(false), Bool(false), Char(0), Char(0), Bool(false), Bool(true), Int2(0), Oid(0), Null, Null, Null, Null, Null],
         &[Oid(1247), Name("cmax"), Oid(29), Int2(4), Int2(-5), Int4(-1), Int2(0), Bool(true), Char(105), Char(112), Char(0), Bool(true), Bool(false), Bool(false), Char(0), Char(0), Bool(false), Bool(true), Int2(0), Oid(0), Null, Null, Null, Null, Null],
         &[Oid(1247), Name("tableoid"), Oid(26), Int2(4), Int2(-6), Int4(-1), Int2(0), Bool(true), Char(105), Char(112), Char(0), Bool(true), Bool(false), Bool(false), Char(0), Char(0), Bool(false), Bool(true), Int2(0), Oid(0), Null, Null, Null, Null, Null],
+    ],
+};
+
+pub static PG_PARTITIONED_TABLE: Catalog = Catalog {
+    oid: 3350,
+    name: "pg_partitioned_table",
+    columns: &[
+        Column { name: "partrelid", type_oid: 26 },
+        Column { name: "partstrat", type_oid: 18 },
+        Column { name: "partnatts", type_oid: 21 },
+        Column { name: "partdefid", type_oid: 26 },
+        Column { name: "partattrs", type_oid: 22 },
+        Column { name: "partclass", type_oid: 30 },
+        Column { name: "partcollation", type_oid: 30 },
+        Column { name: "partexprs", type_oid: 194 },
+    ],
+    key: &[1],
+    rows: &[
+    ],
+};
+
+pub static PG_INHERITS: Catalog = Catalog {
+    oid: 2611,
+    name: "pg_inherits",
+    columns: &[
+        Column { name: "inhrelid", type_oid: 26 },
+        Column { name: "inhparent", type_oid: 26 },
+        Column { name: "inhseqno", type_oid: 23 },
+        Column { name: "inhdetachpending", type_oid: 16 },
+    ],
+    key: &[1, 3],
+    rows: &[
     ],
 };
 
