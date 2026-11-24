@@ -8031,6 +8031,9 @@ impl WalFile {
     /// 3. nbackfills > 0 - otherwise nothing was backfilled and there is no reason to truncate header
     /// 4. max_frame == nbackfills - otherwise there are some non-checkpointed frames in the WAL and we can't truncate the log
     pub fn try_restart_log_before_write(&self) -> Result<()> {
+        if self.restarts_by_switch() {
+            return Ok(());
+        }
         let max_frame_read_lock_index = self.max_frame_read_lock_index.load(Ordering::Acquire);
         if !matches!(
             ReadGuardKind::from_lock_index(max_frame_read_lock_index),
@@ -8073,8 +8076,22 @@ impl WalFile {
         result
     }
 
+    /// Whether the log's other segment has a file (decision 45): once it has, the log starts again
+    /// only by the writer's switch. A restart in place would take the current segment's sequence
+    /// two past the other's header, a pair recovery refuses, and a truncate would leave the other
+    /// segment's copied frames to be read as the log.
+    fn restarts_by_switch(&self) -> bool {
+        let log = self.coordination.shared_wal_state();
+        let other = log.segment(log.current_id().other());
+        let segment = other.read();
+        segment.runtime.file.is_some()
+    }
+
     fn restart_log(&self) -> Result<()> {
         tracing::debug!("restart_log");
+        if self.restarts_by_switch() {
+            return Err(LimboError::Busy);
+        }
         let snapshot = self.coordination.begin_restart(self.io.as_ref())?;
         self.apply_restart_snapshot(snapshot);
         Ok(())
