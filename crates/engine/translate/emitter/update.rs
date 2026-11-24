@@ -623,9 +623,12 @@ pub(crate) fn update_trigger_context(
     or_conflict: ResolveType,
     timing: TriggerTime,
 ) -> TriggerContext {
-    let override_conflict = program
-        .trigger_conflict_override
-        .or_else(|| program.flags.has_statement_conflict().then_some(or_conflict));
+    let override_conflict = program.trigger_conflict_override.or_else(|| {
+        program
+            .flags
+            .has_statement_conflict()
+            .then_some(or_conflict)
+    });
 
     let after = matches!(timing, TriggerTime::After);
     match (after, override_conflict) {
