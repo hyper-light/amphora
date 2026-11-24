@@ -2639,10 +2639,11 @@ it does now:
   a call it has no place for waits for one: the owner taking an input from its channel is the event that makes it.
 - The calls' bytes (`Control::called`, the queue's room less a wire record's) keep room for the wire record that finds a
   leader while calls wait for one; the budget admits writes up to its whole room. The bound stands, and so does the
-  queue's whole (`Control::admitted`); a call either has no room for waits for bytes given back. A counter that holds
-  nothing takes one call however large (`within`), as a window that holds nothing sends one entry (hyper-raft's
-  `Inflights::full`): a call the budget has room for never waits for room that nothing can make. A wire record is let in
-  beside such a call up to the queue's bytes, so a vote or a heartbeat still finds a leader; an image may wait for it.
+  queue's whole (`Control::admitted`); a call either has no room for waits for bytes given back. The calls' bytes, holding
+  none, take one call larger than their bound (`within`), as a window that holds nothing sends one entry (hyper-raft's
+  `Inflights::full`): a call the budget has room for never waits for room that nothing can make. Such a call leaves the
+  queue a record without entries and its envelope (`alone`), so a vote or a heartbeat enters beside it and finds a leader,
+  and an image waits for it; a call past that is refused `TooLarge` at once, as one past the budget's whole limit is.
 - The count of calls the owner holds behind its prepared write or for a leader (`Actor::waiting`, held to the inputs'
   count) bounded nothing the bytes don't: each of those calls holds its bytes of the calls' room and of the budget, none
   of them stands before a wire record, and the line finds the soonest deadline in O(log N). It is gone; a write taken
