@@ -113,6 +113,21 @@ pub fn default_pages(memory: Option<u64>) -> usize {
         .max(MIN_PROCESS_PAGES)
 }
 
+/// The pages a database's single writer keeps at most, derived from the process's memory budget:
+/// one [`MEMORY_SHARE_DIVISOR`]th of [`default_pages`] (1/16th of memory, matching PostgreSQL's
+/// `maintenance_work_mem` guidance), at least [`MIN_PROCESS_PAGES`]. The writer's page cache
+/// allocates pages lazily as touched, so small databases consume only their working set while
+/// write-heavy workloads avoid evicting hot index and leaf pages into WAL record reads.
+#[must_use]
+pub fn writer_pages(memory: Option<u64>) -> i64 {
+    let divisor = usize::try_from(MEMORY_SHARE_DIVISOR).unwrap_or(4);
+    let pages = default_pages(memory)
+        .checked_div(divisor)
+        .unwrap_or(0)
+        .max(MIN_PROCESS_PAGES);
+    i64::try_from(pages).unwrap_or(i64::MAX)
+}
+
 fn fail(e: impl std::error::Error + Send + Sync + 'static) -> anyhow::Error {
     anyhow::Error::new(e)
 }
@@ -383,7 +398,8 @@ impl Db {
         d.exec("PRAGMA synchronous = NORMAL")?;
         d.exec("PRAGMA foreign_keys = ON")?;
         d.exec("PRAGMA wal_autocheckpoint = 0")?;
-        d.exec(&format!("PRAGMA cache_size = {WRITER_PAGES}"))?;
+        let writer_cache = writer_pages(crate::memory::limit());
+        d.exec(&format!("PRAGMA cache_size = {writer_cache}"))?;
         // A commit logs its pages' changes (docs/design/store.md, decision 37).
         d.log_format(LogFormat::Mixed)?;
         match sharing {
@@ -816,7 +832,7 @@ impl Db {
         let result = self.conn.prepare_execute_batch(sql).map_err(fail);
         // A failed script may have executed DDL before refusing. Invalidate on its actual schema,
         // including rollback and raw-image reparses, without flushing every BEGIN/COMMIT.
-        self.statements.schema(&self.conn.current_schema())?;
+        self.statements.schema(self.conn.schema_identity())?;
         self.marked()?;
         result
     }
@@ -840,17 +856,17 @@ impl Db {
         each: impl FnMut(&Row) -> anyhow::Result<bool>,
     ) -> anyhow::Result<()> {
         self.ensure_unfenced()?;
-        let schema = self.conn.current_schema();
-        let (text, mut stmt, marked) = match self.statements.take(sql, &schema)? {
+        let schema = self.conn.schema_identity();
+        let (text, mut stmt, marked) = match self.statements.take(sql, schema)? {
             Some(taken) => (Some(taken.text), taken.statement, taken.validated),
             None => (None, self.conn.prepare(sql).map_err(fail)?, false),
         };
         step(self.io.as_ref(), &mut stmt, params, each)?;
         // A callback can change schema and run another query. The cache never keeps this
         // checked-out statement under that later schema's cache identity.
-        let current = self.conn.current_schema();
+        let current = self.conn.schema_identity();
         self.statements
-            .put(sql, text, stmt, marked, &schema, &current)?;
+            .put(sql, text, stmt, marked, schema, current)?;
         self.marked()
     }
 
@@ -861,14 +877,14 @@ impl Db {
     /// Keeps its cache entry's validation mark and never sets one, as [`Db::query_owned`].
     pub fn column_count(&self, sql: &str) -> anyhow::Result<usize> {
         self.ensure_unfenced()?;
-        let schema = self.conn.current_schema();
-        let (text, stmt, marked) = match self.statements.take(sql, &schema)? {
+        let schema = self.conn.schema_identity();
+        let (text, stmt, marked) = match self.statements.take(sql, schema)? {
             Some(taken) => (Some(taken.text), taken.statement, taken.validated),
             None => (None, self.conn.prepare(sql).map_err(fail)?, false),
         };
         let columns = stmt.num_columns();
         self.statements
-            .put(sql, text, stmt, marked, &schema, &schema)?;
+            .put(sql, text, stmt, marked, schema, schema)?;
         Ok(columns)
     }
 
@@ -878,8 +894,8 @@ impl Db {
     /// anew for anyone else.
     pub(crate) fn cached(&self, sql: &str) -> anyhow::Result<Option<Held>> {
         self.ensure_unfenced()?;
-        let schema = self.conn.current_schema();
-        Ok(self.statements.take(sql, &schema)?.map(|taken| Held {
+        let schema = self.conn.schema_identity();
+        Ok(self.statements.take(sql, schema)?.map(|taken| Held {
             sql: sql.to_owned(),
             statement: taken.statement,
             schema,
@@ -890,8 +906,8 @@ impl Db {
     /// Prepares `sql` for a caller that holds it as [`Db::cached`] says, unmarked.
     pub(crate) fn prepare_held(&self, sql: &str) -> anyhow::Result<Held> {
         self.ensure_unfenced()?;
-        let schema = self.conn.current_schema();
-        self.statements.schema(&schema)?;
+        let schema = self.conn.schema_identity();
+        self.statements.schema(schema)?;
         Ok(Held {
             sql: sql.to_owned(),
             statement: self.conn.prepare(sql).map_err(fail)?,
@@ -909,9 +925,9 @@ impl Db {
         each: impl FnMut(&Row) -> anyhow::Result<bool>,
     ) -> anyhow::Result<()> {
         self.ensure_unfenced()?;
-        let schema = self.conn.current_schema();
-        self.statements.schema(&schema)?;
-        if !same_schema(&held.schema, &schema) {
+        let schema = self.conn.schema_identity();
+        self.statements.schema(schema)?;
+        if held.schema != schema {
             held.statement = self.conn.prepare(&held.sql).map_err(fail)?;
             held.schema = schema;
         }
@@ -921,14 +937,14 @@ impl Db {
     /// Returns a held statement to the cache with its mark, kept for the next caller while the
     /// schema is the one it was prepared under.
     pub(crate) fn give_back(&self, held: Held) -> anyhow::Result<()> {
-        let current = self.conn.current_schema();
+        let current = self.conn.schema_identity();
         self.statements.put(
             &held.sql,
             None,
             held.statement,
             held.validated,
-            &held.schema,
-            &current,
+            held.schema,
+            current,
         )?;
         Ok(())
     }
@@ -1281,7 +1297,7 @@ impl Db {
         // writes the header's cookie, marks the transaction's schema changed (published to every
         // connection when it commits) and reads this writer's schema again.
         self.conn.write_schema_version(next).map_err(fail)?;
-        self.statements.schema(&self.conn.current_schema())?;
+        self.statements.schema(self.conn.schema_identity())?;
         Ok(())
     }
 
@@ -1397,12 +1413,12 @@ impl Db {
     }
 }
 
-/// A statement held by its caller between executes: its text, the schema it was prepared under,
-/// and whether the session's validation accepted the text.
+/// A statement held by its caller between executes: its text, the schema identity it was prepared
+/// under, and whether the session's validation accepted the text.
 pub(crate) struct Held {
     sql: String,
     statement: Statement,
-    schema: Arc<amphora_engine::schema::Schema>,
+    schema: u64,
     validated: bool,
 }
 
@@ -1426,14 +1442,6 @@ impl Held {
     pub(crate) fn mark(&mut self) {
         self.validated = true;
     }
-}
-
-/// The same schema, not another at the same address: the cache's own test (`cache::Cache::schema`).
-fn same_schema(
-    held: &Arc<amphora_engine::schema::Schema>,
-    current: &Arc<amphora_engine::schema::Schema>,
-) -> bool {
-    Arc::ptr_eq(held, current) && held.schema_version == current.schema_version
 }
 
 /// Runs `stmt` with `params` to its end, handing each row to `each` until it says stop (false).
@@ -1462,39 +1470,45 @@ fn step_between(
     }
     // The engine wakes this thread when a lock the statement found held is released, and the
     // statement tries again then: no delay of its own between tries (lane constants-22).
-    // `try_with`, not `with`: a statement stepped while the thread's locals are torn down gets a
-    // waker of its own rather than a panic.
-    let waker = UNPARK
-        .try_with(std::task::Waker::clone)
-        .unwrap_or_else(|_| std::task::Waker::from(Arc::new(Unpark(std::thread::current()))));
-    loop {
-        match stmt.step_with_waker(&waker).map_err(fail)? {
-            StepResult::Row => {
-                if let Some(row) = stmt.row()
-                    && !each(row)?
-                {
-                    return stmt.reset().map_err(fail);
+    // Borrow the thread-local waker directly (zero Arc refcount traffic per statement); fall back
+    // to a fresh waker if TLS is tearing down.
+    let mut run = |waker: &std::task::Waker| -> anyhow::Result<()> {
+        loop {
+            match stmt.step_with_waker(waker).map_err(fail)? {
+                StepResult::Row => {
+                    if let Some(row) = stmt.row()
+                        && !each(row)?
+                    {
+                        return stmt.reset().map_err(fail);
+                    }
                 }
-            }
-            StepResult::Done => return Ok(()),
-            StepResult::IO | StepResult::Yield => {
-                between()?;
-                io.step().map_err(fail)?;
-            }
-            // Busy: until the waker is woken (a release), or the deadline the duration says. A park
-            // that ends early for no reason only tries the step again.
-            StepResult::Sleep { duration } => {
-                if stmt.busy_wake() == BusyWake::Schedule {
-                    pause(duration);
-                } else if !duration.is_zero() {
-                    std::thread::park_timeout(duration);
+                StepResult::Done => return Ok(()),
+                StepResult::IO | StepResult::Yield => {
+                    between()?;
+                    io.step().map_err(fail)?;
                 }
-                io.step().map_err(fail)?;
+                // Busy: until the waker is woken (a release), or the deadline the duration says. A
+                // park that ends early for no reason only tries the step again.
+                StepResult::Sleep { duration } => {
+                    if stmt.busy_wake() == BusyWake::Schedule {
+                        pause(duration);
+                    } else if !duration.is_zero() {
+                        std::thread::park_timeout(duration);
+                    }
+                    io.step().map_err(fail)?;
+                }
+                StepResult::Busy => {
+                    anyhow::bail!("the database stayed busy")
+                }
+                StepResult::Interrupt => return Err(fail(LimboError::Interrupt)),
             }
-            StepResult::Busy => {
-                anyhow::bail!("the database stayed busy")
-            }
-            StepResult::Interrupt => return Err(fail(LimboError::Interrupt)),
+        }
+    };
+    match UNPARK.try_with(|waker| run(waker)) {
+        Ok(res) => res,
+        Err(_) => {
+            let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+            run(&waker)
         }
     }
 }
@@ -1929,5 +1943,17 @@ mod tests {
         assert_eq!(default_pages(Some(16 << 20)), MIN_PROCESS_PAGES);
         assert_eq!(default_pages(None), UNKNOWN_MEMORY_PAGES);
         assert!(default_pages(Some(u64::MAX)) >= MIN_PROCESS_PAGES);
+        assert_eq!(
+            writer_pages(Some(32 << 30)),
+            i64::try_from((2u64 << 30) / 4096).unwrap()
+        );
+        assert_eq!(
+            writer_pages(Some(16 << 20)),
+            i64::try_from(MIN_PROCESS_PAGES).unwrap()
+        );
+        assert_eq!(
+            writer_pages(None),
+            i64::try_from(UNKNOWN_MEMORY_PAGES / 4).unwrap()
+        );
     }
 }

@@ -62,11 +62,16 @@ impl ReadCheckout {
 #[repr(align(128))]
 struct Slot<R>(Mutex<Option<R>>);
 
+/// Cache-line-isolated waiter counter so `Slots::wake` loads do not false-share with `slots` or
+/// the fallback `wait`/`freed` mutex/condvar.
+#[repr(align(128))]
+struct PaddedCount(AtomicUsize);
+
 /// The slots and what a reader waiting for one waits on.
 pub(super) struct Slots<R> {
     slots: Box<[Slot<R>]>,
     /// Threads waiting for a slot: written by waiters alone, read by each read as it ends.
-    waiting: AtomicUsize,
+    waiting: PaddedCount,
     wait: Mutex<()>,
     freed: Condvar,
 }
@@ -115,7 +120,7 @@ impl<R> Slots<R> {
     pub(super) fn new(most: usize) -> Self {
         Self {
             slots: (0..most.max(1)).map(|_| Slot(Mutex::new(None))).collect(),
-            waiting: AtomicUsize::new(0),
+            waiting: PaddedCount(AtomicUsize::new(0)),
             wait: Mutex::new(()),
             freed: Condvar::new(),
         }
@@ -148,7 +153,7 @@ impl<R> Slots<R> {
                 slots: self,
             });
         }
-        self.waiting.fetch_add(1, Ordering::SeqCst);
+        self.waiting.0.fetch_add(1, Ordering::SeqCst);
         fence(Ordering::SeqCst);
         let mut wait = self.wait.lock().unwrap_or_else(PoisonError::into_inner);
         let taken = loop {
@@ -166,7 +171,7 @@ impl<R> Slots<R> {
                 .0;
         };
         drop(wait);
-        self.waiting.fetch_sub(1, Ordering::SeqCst);
+        self.waiting.0.fetch_sub(1, Ordering::SeqCst);
         taken.map(|reader| Taken {
             slot: Some(reader),
             slots: self,
@@ -178,7 +183,7 @@ impl<R> Slots<R> {
     /// fence), so a waiter whose try failed is either seen here or tries again after.
     fn wake(&self) {
         fence(Ordering::SeqCst);
-        if self.waiting.load(Ordering::SeqCst) > 0 {
+        if self.waiting.0.load(Ordering::SeqCst) > 0 {
             drop(self.wait.lock().unwrap_or_else(PoisonError::into_inner));
             self.freed.notify_one();
         }
@@ -187,7 +192,7 @@ impl<R> Slots<R> {
     /// Wakes every waiter, if any. Called when every slot is given back at once (`All::drop`).
     fn wake_all(&self) {
         fence(Ordering::SeqCst);
-        if self.waiting.load(Ordering::SeqCst) > 0 {
+        if self.waiting.0.load(Ordering::SeqCst) > 0 {
             drop(self.wait.lock().unwrap_or_else(PoisonError::into_inner));
             self.freed.notify_all();
         }
@@ -332,6 +337,7 @@ mod tests {
             .as_ref()
             .unwrap()
             .waiting
+            .0
             .load(Ordering::SeqCst)
             == 0
         {
@@ -353,7 +359,7 @@ mod tests {
             let all = slots.take_all();
             let waiter =
                 s.spawn(|| readers.with(Instant::now() + Duration::from_secs(60), |_| Ok(7)));
-            while slots.waiting.load(Ordering::SeqCst) == 0 {
+            while slots.waiting.0.load(Ordering::SeqCst) == 0 {
                 std::thread::yield_now();
             }
             drop(all);

@@ -2842,7 +2842,7 @@ impl Database {
             db: self.clone(),
             context,
             pager: ArcSwap::new(pager),
-            schema: RwLock::new(initial_schema),
+            schema: crate::connection::SchemaCell::new(initial_schema),
             local_schema_epoch: AtomicU64::new(initial_schema_epoch),
             database_schemas: RwLock::new(HashMap::default()),
             auto_commit: AtomicBool::new(true),

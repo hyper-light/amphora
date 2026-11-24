@@ -10,7 +10,7 @@
 //! and it goes with the entry when the entry is evicted, replaced or dropped for a schema change
 //! or a restore (decision 36).
 
-use amphora_engine::{Statement, schema::Schema};
+use amphora_engine::Statement;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -60,7 +60,7 @@ struct State {
     oldest: Option<usize>,
     newest: Option<usize>,
     sql_bytes: usize,
-    schema: Option<(Arc<Schema>, u32)>,
+    schema: Option<u64>,
 }
 impl State {
     fn unlink(&mut self, idx: usize) -> Result<Slot> {
@@ -120,16 +120,14 @@ impl State {
         Ok(slot.statement)
     }
 
-    /// Makes `current` the schema entries are kept under. A change of schema hands back every
-    /// entry kept under the old one, for the caller to drop once the lock is released.
-    fn align(&mut self, current: &Arc<Schema>) -> Option<State> {
-        if self.schema.as_ref().is_some_and(|(held, version)| {
-            Arc::ptr_eq(held, current) && *version == current.schema_version
-        }) {
+    /// Makes `current` the schema identity entries are kept under. A change of schema hands back
+    /// every entry kept under the old one, for the caller to drop once the lock is released.
+    fn align(&mut self, current: u64) -> Option<State> {
+        if self.schema == Some(current) {
             return None;
         }
         let previous = std::mem::take(self);
-        self.schema = Some((Arc::clone(current), current.schema_version));
+        self.schema = Some(current);
         Some(previous)
     }
 
@@ -196,9 +194,9 @@ impl Cache {
         self.state.lock().map_err(|_| Error::Poisoned)
     }
 
-    /// Keep the schema Arc, rather than its address alone, so allocator reuse cannot make a
-    /// stale schema look current. The cookie also fences any in-place metadata update.
-    pub(super) fn schema(&self, current: &Arc<Schema>) -> Result<()> {
+    /// Aligns the cache to the connection's monotonic `schema_identity`, which advances on every
+    /// schema replacement or in-place mutation without cloning `Arc<Schema>`.
+    pub(super) fn schema(&self, current: u64) -> Result<()> {
         let previous = self.locked()?.align(current);
         drop(previous);
         Ok(())
@@ -206,7 +204,7 @@ impl Cache {
 
     /// Takes `sql`'s statement out, with whether the session's validation accepted its text,
     /// under the lock that also makes `schema` current ([`Cache::schema`]).
-    pub(super) fn take(&self, sql: &str, schema: &Arc<Schema>) -> Result<Option<Taken>> {
+    pub(super) fn take(&self, sql: &str, schema: u64) -> Result<Option<Taken>> {
         let (previous, taken) = {
             let mut state = self.locked()?;
             let previous = state.align(schema);
@@ -228,10 +226,10 @@ impl Cache {
         text: Option<Arc<str>>,
         mut statement: Statement,
         validated: bool,
-        prepared: &Arc<Schema>,
-        current: &Arc<Schema>,
+        prepared: u64,
+        current: u64,
     ) -> Result<()> {
-        if !(Arc::ptr_eq(prepared, current) && prepared.schema_version == current.schema_version) {
+        if prepared != current {
             self.schema(current)?;
             drop(statement);
             return Ok(());
@@ -298,12 +296,12 @@ mod tests {
     use std::path::Path;
 
     fn put(cache: &Cache, db: &crate::db::Db, sql: &str, statement: Statement) -> Result<()> {
-        let schema = db.conn.current_schema();
-        cache.put(sql, None, statement, false, &schema, &schema)
+        let schema = db.conn.schema_identity();
+        cache.put(sql, None, statement, false, schema, schema)
     }
 
     fn take(cache: &Cache, db: &crate::db::Db, sql: &str) -> Result<Option<(Statement, bool)>> {
-        let taken = cache.take(sql, &db.conn.current_schema())?;
+        let taken = cache.take(sql, db.conn.schema_identity())?;
         Ok(taken.map(|taken| (taken.statement, taken.validated)))
     }
 

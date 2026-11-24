@@ -368,6 +368,9 @@ pub struct Statement {
     query_timeout_override: Option<Option<Duration>>,
     /// True once [Self::step] has returned a [Row].
     has_returned_row: bool,
+    /// True when the statement is freshly prepared or cleanly reset, allowing redundant
+    /// `reset()` calls (and drop of cached statements) to return in O(1).
+    clean_reset: bool,
     /// Byte offset in the original SQL string where this statement ends.
     /// Used by sqlite3_prepare_v2 to set the *pzTail output parameter.
     tail_offset: usize,
@@ -507,6 +510,7 @@ impl Statement {
             busy_interest: None,
             query_timeout_override: None,
             has_returned_row: false,
+            clean_reset: true,
             tail_offset,
             origin,
             counted_as_active_root: false,
@@ -669,6 +673,7 @@ impl Statement {
     /// - `Some(Some(duration))`: use query-specific timeout
     /// - `Some(None)`: disable timeout for this execution
     pub fn set_query_timeout_override(&mut self, timeout: Option<Option<Duration>>) {
+        self.clean_reset = false;
         self.query_timeout_override = timeout;
     }
 
@@ -891,6 +896,7 @@ impl Statement {
     }
 
     fn step_inner(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+        self.clean_reset = false;
         self.release_wait = None;
         // ANALYZE already ran to Done; only its stats refresh is outstanding.
         // Checked first: the root-statement count was released at Done, so
@@ -1274,12 +1280,14 @@ impl Statement {
     /// The parent statement handles all of those concerns.
     #[inline]
     pub fn step_subprogram(&mut self) -> Result<StepResult> {
+        self.clean_reset = false;
         self.program
             .step(&mut self.state, &self.pager, self.query_mode, None)
             .map_err(|err| *err)
     }
 
     pub(crate) fn abort_subprogram(&mut self, err: Option<&LimboError>) -> Result<()> {
+        self.clean_reset = false;
         let result = self.program.abort(&self.pager, err, &mut self.state, false);
         self.state.execution_state = vdbe::ProgramExecutionState::Failed;
         result
@@ -2066,6 +2074,9 @@ impl Statement {
     }
 
     pub fn reset(&mut self) -> Result<()> {
+        if self.clean_reset {
+            return Ok(());
+        }
         self.close_custom_run();
         self.handed_off = false;
         self.reset_internal(None, None, false)
@@ -2130,6 +2141,7 @@ impl Statement {
             .store(0, std::sync::atomic::Ordering::Release);
         self.busy = false;
         self.has_returned_row = false;
+        self.clean_reset = false;
     }
 
     fn reset_internal(
@@ -2306,8 +2318,10 @@ impl Statement {
         self.has_returned_row = false;
 
         if let Some(err) = reset_error {
+            self.clean_reset = false;
             return Err(err);
         }
+        self.clean_reset = !self.counted_as_active_root;
         Ok(())
     }
 
@@ -2373,7 +2387,9 @@ impl Drop for Statement {
         // That cleanup consults `is_nested_stmt()` to decide whether top-level
         // transaction/savepoint finalization belongs to this statement or to its
         // parent, so we release the nested guard only after reset completes.
-        self.reset_best_effort();
+        if !self.clean_reset {
+            self.reset_best_effort();
+        }
         if self.nested_guard_active {
             self.program.connection.end_nested();
             self.nested_guard_active = false;

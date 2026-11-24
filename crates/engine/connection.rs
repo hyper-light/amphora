@@ -11,7 +11,7 @@ use crate::sync::{
     atomic::{
         AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU32, AtomicU64, AtomicU8, Ordering,
     },
-    Arc, Mutex, RwLock,
+    Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
 use crate::types::IOResultOr;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
@@ -44,7 +44,7 @@ use smallvec::SmallVec;
 use std::any::Any;
 use std::cmp::Ordering as CmpOrdering;
 use std::fmt::Display;
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 #[cfg(feature = "simulator")]
 use std::path::Path;
 #[cfg(not(target_family = "wasm"))]
@@ -599,6 +599,69 @@ impl Drop for ExplicitCheckpointGuard {
     }
 }
 
+/// Connection-local schema slot whose monotonic `identity` advances on every write guard.
+/// Callers (such as statement caches) check [`SchemaCell::identity`] with a single private atomic
+/// load instead of taking `RwLock::read` and bumping the shared `Arc<Schema>` reference count.
+pub(crate) struct SchemaCell {
+    inner: RwLock<Arc<Schema>>,
+    identity: AtomicU64,
+}
+
+pub(crate) struct SchemaWriteGuard<'a> {
+    guard: RwLockWriteGuard<'a, Arc<Schema>>,
+    identity: &'a AtomicU64,
+}
+
+impl Deref for SchemaWriteGuard<'_> {
+    type Target = Arc<Schema>;
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl DerefMut for SchemaWriteGuard<'_> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl Drop for SchemaWriteGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.identity.fetch_add(1, Ordering::Release);
+    }
+}
+
+impl SchemaCell {
+    pub(crate) fn new(schema: Arc<Schema>) -> Self {
+        Self {
+            inner: RwLock::new(schema),
+            identity: AtomicU64::new(1),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn read(&self) -> RwLockReadGuard<'_, Arc<Schema>> {
+        self.inner.read()
+    }
+
+    #[inline]
+    pub(crate) fn write(&self) -> SchemaWriteGuard<'_> {
+        let guard = self.inner.write();
+        SchemaWriteGuard {
+            guard,
+            identity: &self.identity,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn identity(&self) -> u64 {
+        self.identity.load(Ordering::Acquire)
+    }
+}
+
 /// Database connection handle.
 ///
 /// If you add a setting that affects SQL compilation or execution, call
@@ -619,7 +682,7 @@ pub struct Connection {
     pub(crate) db: Arc<Database>,
     pub(super) context: Option<Arc<dyn Any + Send + Sync>>,
     pub(crate) pager: ArcSwap<Pager>,
-    pub(crate) schema: RwLock<Arc<Schema>>,
+    pub(crate) schema: SchemaCell,
     /// Epoch of `db.schema_epoch` last synchronized into `self.schema` (`u64::MAX` when mutated
     /// locally): allows `maybe_update_schema()` to skip locking `db.schema` when unchanged.
     pub(crate) local_schema_epoch: AtomicU64,
@@ -4071,6 +4134,13 @@ impl Connection {
 
     pub fn current_schema(&self) -> Arc<Schema> {
         self.schema.read().clone()
+    }
+
+    /// Monotonic connection-local identity that advances whenever this connection's schema is
+    /// replaced or mutated in place. Lock-free and avoids cloning the shared `Arc<Schema>`.
+    #[inline]
+    pub fn schema_identity(&self) -> u64 {
+        self.schema.identity()
     }
 
     pub fn attached_database_names(&self) -> Vec<String> {
