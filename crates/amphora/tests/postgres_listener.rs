@@ -699,7 +699,7 @@ fn t_pg_10_3_prepared_statements_are_charged_to_the_budget() {
         assert!(refused.contains(&(b'S', "ERROR".to_owned())), "{refused:?}");
         assert!(refused.contains(&(b'C', "53200".to_owned())), "{refused:?}");
         client.send(&frontend(b'C', b"Ss0\0")).await;
-        client.send(&parse("again")).await;
+        client.send(&parse("s0")).await;
         client.send(&sync).await;
         for tag in [b'3', b'1', b'Z'] {
             assert_eq!(client.recv().await.unwrap().0, tag);
