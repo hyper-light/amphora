@@ -741,6 +741,64 @@ mod tests {
         assert_eq!(of_key(type_oid::TEXT, &[1, 0xff, 0, 0, 0]), None);
     }
 
+    /// T-PG.12.2: an array's binary form reads back as it, cut anywhere it is refused, and with any byte another it is
+    /// refused or read.
+    #[test]
+    fn t_pg_12_2_a_binary_array_reads_back_and_a_hostile_one_is_refused_or_read() {
+        let array = input(type_oid::TEXT, "[2:3][-1:0]={{a,b},{c,NULL}}", text).unwrap();
+        let bytes = send(&array, |value| Ok(shown(value)?.into_bytes())).unwrap();
+        let read = |bytes: &[u8]| {
+            receive(type_oid::TEXT, bytes, |bytes| {
+                let text = String::from_utf8_lossy(bytes).into_owned();
+                Ok((Value::Text(text), bytes.len()))
+            })
+        };
+        assert_eq!(read(&bytes).unwrap(), (array, bytes.len()));
+        for cut in 0..bytes.len() {
+            assert!(read(&bytes[..cut]).is_err(), "cut at {cut}");
+        }
+        let mut refused = 0;
+        for at in 0..bytes.len() {
+            for byte in [0x00, 0x01, 0x7f, 0x80, 0xff] {
+                let mut other = bytes.clone();
+                other[at] = byte;
+                refused += usize::from(read(&other).is_err());
+            }
+        }
+        assert!(refused > bytes.len(), "{refused}");
+    }
+
+    /// T-PG.12.2: 20,000 texts of the characters an array's reader tells apart are refused or read, and what is read is
+    /// written as a text that reads as it, under a key that does.
+    #[test]
+    fn t_pg_12_2_what_is_read_is_written_as_a_text_that_reads_as_it() {
+        let alphabet: Vec<char> = "{}[]:=,,,\"\\ \tNULaab12-".chars().collect();
+        let mut seed = 12_u64;
+        let mut next = |below: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            usize::try_from(seed >> 33).unwrap() % below
+        };
+        let mut read = 0;
+        for _ in 0..20_000 {
+            let inner: String = (0..next(9))
+                .map(|_| alphabet[next(alphabet.len())])
+                .collect();
+            let literal = format!("{{{inner}}}");
+            let Ok(array) = input(type_oid::TEXT, &literal, text) else {
+                continue;
+            };
+            read += 1;
+            let written = output(&array, shown).unwrap();
+            let again = input(type_oid::TEXT, &written, text).unwrap();
+            assert_eq!(again, array, "{literal} as {written}");
+            let key = key(&array).unwrap();
+            assert_eq!(of_key(type_oid::TEXT, &key), Some(array), "{literal}");
+        }
+        assert!(read > 2_000, "{read} of 20,000 read");
+    }
+
     /// T-PG.12.2: keys are in `array_cmp`'s order: by the elements, a NULL after every value, a shorter array first.
     #[test]
     fn t_pg_12_2_keys_are_in_the_order_of_their_arrays() {
