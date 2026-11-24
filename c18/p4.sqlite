@@ -1,0 +1,38 @@
+--- WITH d AS (WITH g AS (SELECT k, v FROM q) SELECT a3.k AS k FROM g AS a3 WHERE 1 NOT IN (WITH d AS (SELECT k, v FROM g) SELECT a4.k FROM g AS a4)) SELECT k FROM d
+0:
+--- WITH d AS (WITH g AS (SELECT k, v FROM q) SELECT a3.k AS k FROM g AS a3 WHERE 1 NOT IN (SELECT a4.k FROM g AS a4)) SELECT k FROM d
+0:
+--- WITH d AS (WITH g AS (WITH d AS (SELECT k, v FROM q) SELECT k, v FROM d) SELECT a3.k AS k FROM g AS a3 WHERE 1 NOT IN (SELECT a4.k FROM g AS a4)) SELECT k FROM d
+0:
+--- WITH d AS (WITH g AS (WITH d AS (SELECT k, v FROM q), c AS (SELECT k, v FROM d) SELECT d.k, d.v FROM c JOIN d ON c.k = d.k) SELECT a3.k AS k FROM g AS a3) SELECT k FROM d
+5:2;2;2;2;3
+--- WITH d AS (WITH g AS (WITH d AS (SELECT k, v FROM q), c AS (SELECT k, v FROM d) SELECT d.k, d.v FROM c JOIN d ON c.k = d.k) SELECT a3.k AS k FROM g AS a3 WHERE a3.k IN (SELECT k FROM g)) SELECT k FROM d
+5:2;2;2;2;3
+--- WITH d AS (WITH g AS (WITH d AS (SELECT k, v FROM q) SELECT d.k, d.v FROM d) SELECT a3.k AS k FROM g AS a3) SELECT k FROM d
+4:2;2;3;NULL
+--- WITH d AS (WITH g AS (WITH d AS (SELECT k, v FROM q) SELECT d.k, d.v FROM d) SELECT a3.k AS k FROM g AS a3) SELECT (SELECT min(k) FROM d)
+1:2
+--- WITH d AS (WITH g AS (SELECT k FROM q) SELECT a3.k AS k FROM g AS a3 JOIN g ON a3.k = g.k) SELECT (SELECT min(k) FROM d)
+1:2
+--- WITH d AS (WITH g AS (SELECT k FROM q) SELECT a3.k AS k FROM g AS a3 JOIN g ON a3.k = g.k WHERE 1 NOT IN (SELECT a4.k FROM g AS a4 WHERE a4.k IS g.k)) SELECT (SELECT min(k) FROM d)
+1:2
+--- WITH f AS (WITH d AS (SELECT k, v FROM t) SELECT t.k AS k, (SELECT min(a5.v) FROM d AS a5) AS v FROM t), d AS (SELECT k, v FROM f) SELECT k FROM d
+3:1;2;3
+--- WITH g AS (WITH d(k, v) AS (SELECT 2, 101) SELECT a1.k AS k, (SELECT count(*) FROM t AS a2 LEFT JOIN d ON a2.k = d.k WHERE d.k = 1) AS v FROM (SELECT k, v FROM d WHERE 1) AS a1), d(k, v) AS (SELECT k, 103 FROM g) SELECT k FROM d
+1:2
+--- WITH g AS (WITH d(k, v) AS (SELECT 2, 101) SELECT a1.k AS k FROM (SELECT k, v FROM d WHERE 1) AS a1), d(k, v) AS (SELECT k, 103 FROM g) SELECT k FROM d
+1:2
+--- WITH g AS (WITH d(k, v) AS (SELECT 2, 101) SELECT a1.k AS k FROM d AS a1), d(k, v) AS (SELECT k, 103 FROM g) SELECT k FROM d
+1:2
+--- WITH g AS (SELECT 1 AS k, 2 AS v), d(k, v) AS (SELECT k, 103 FROM g UNION SELECT r.k + 1, r.v FROM d AS r JOIN f AS s ON s.k = r.k WHERE r.k < 4), f(k, v) AS (SELECT k, 102 FROM g) SELECT (SELECT min(f.v) FROM f WHERE f.k IN (SELECT a3.k FROM g AS a3 JOIN d AS a4 ON a3.k = a4.k WHERE a4.k IN (WITH d AS (SELECT a5.k AS k FROM q AS a5) SELECT g.k FROM g)))
+1:102
+--- WITH g AS (SELECT 1 AS k, 2 AS v), d(k, v) AS (SELECT k, 103 FROM g) SELECT (SELECT min(a3.k) FROM g AS a3 WHERE a3.k IN (WITH d AS (SELECT a5.k AS k FROM q AS a5) SELECT g.k FROM g))
+1:1
+--- WITH d AS (SELECT 1 AS k), c AS (WITH f AS (WITH c(k) AS (SELECT 1 UNION SELECT k + 1 FROM c WHERE k < 4), d(k, v) AS (SELECT 1, 102 UNION SELECT k + 1, v FROM d WHERE k < 2) SELECT d.k AS k, d.v AS v FROM d) SELECT a1.k AS k FROM f AS a1) SELECT k FROM c
+2:1;2
+--- WITH c AS (WITH f AS (SELECT 1 AS k, 2 AS v) SELECT a1.k AS k, a2.v AS v FROM f AS a1 FULL JOIN f AS a2 ON a1.k = a2.k WHERE a2.k NOT IN (SELECT a3.k FROM f JOIN f AS a3 ON f.k = a3.k WHERE a1.k >= 3)) SELECT k FROM c
+1:1
+--- WITH c AS (WITH f AS (WITH d(k, v) AS (SELECT 1, 102 UNION SELECT k + 1, v FROM d WHERE k < 2) SELECT d.k AS k, d.v AS v FROM d) SELECT a1.k AS k, a2.v AS v FROM f AS a1 FULL JOIN f AS a2 ON a1.k = a2.k) SELECT k FROM c
+2:1;2
+--- WITH c AS (WITH f AS (WITH c AS (SELECT 3 AS k), d(k, v) AS (SELECT 1, 102 UNION SELECT k + 1, v FROM d WHERE k < 2) SELECT d.k AS k, d.v AS v FROM d) SELECT a1.k AS k, a2.v AS v FROM f AS a1 FULL JOIN f AS a2 ON a1.k = a2.k) SELECT k FROM c
+2:1;2
