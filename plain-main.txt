@@ -1,0 +1,224 @@
+##### CI_json_pretty_indent
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT json_pretty('[1]', 100.0)
+      SQLite  1 rows / '[ / 100.01 / ]'
+      Amphora 1 rows / '[ / 1001 / ]'
+   rc 0 
+##### CJ_between_hoisted
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT body FROM ev WHERE NOT EXISTS (SELECT 1 FROM lim WHERE json_extract(ev.body, '$.n') BETWEEN 1 AND lim.hi)
+      SQLite  1 rows / 'no json'
+      Amphora error: Parse error: malformed JSON
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT body, (SELECT count(*) FROM lim WHERE json_extract(ev.body, '$.n') BETWEEN 1 AND lim.hi) FROM ev
+      SQLite  1 rows / 'no json', 0
+      Amphora error: Parse error: malformed JSON
+   same    :: SELECT body FROM ev WHERE NOT EXISTS (SELECT 1 FROM lim WHERE json_extract(ev.body, '$.n') >= 1 AND json_extract(ev.body, '$.n') <= lim.hi) -> error: malformed JSON
+   rc 0 
+##### CK_real_digits
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT hex(jsonb_array(asinh(1)))
+      SQLite  1 rows / 'CB15C513302E3838313337333538373031393534333035'
+      Amphora 1 rows / 'CB13C511302E383831333733353837303139353433'
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT octet_length(quote(asinh(1)))
+      SQLite  1 rows / 19
+      Amphora 1 rows / 17
+   rc 0 
+##### CM_row_between_value
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT ('a', 1) BETWEEN ('a', 0) AND ('a', 2)
+      SQLite  1 rows / 1
+      Amphora error: Parse error: insufficient registers allocated for expression vector write (start=2, count=2, next_free=3)
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT c FROM t WHERE (a, b) > (lower('X'), json_extract('["a"]', '$[0]'))
+      SQLite  0 rows
+      Amphora error: Parse error: insufficient registers allocated for expression vector write (start=7, count=2, next_free=8)
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT (a, b) BETWEEN (0, 0) AND (2, 2) FROM t
+      SQLite  2 rows / 1 / 0
+      Amphora error: Parse error: insufficient registers allocated for expression vector write (start=2, count=2, next_free=3)
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT c FROM t WHERE (a, b) BETWEEN (abs(0), 0) AND (2, 2)
+      SQLite  1 rows / 3
+      Amphora error: Parse error: insufficient registers allocated for expression vector write (start=7, count=2, next_free=8)
+   same    :: SELECT c FROM t WHERE ('x', 5) BETWEEN (a, b) AND (b, c) -> 0 rows
+   same    :: SELECT c FROM t WHERE (a, b) BETWEEN (0, 0) AND (2, 2) -> 1 rows / 3
+   rc 0 
+##### CN_row_misused
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT t.a FROM t JOIN s ON (t.a, 'z') <> (SELECT max(y), min(x) FROM s AS s2) OR 1
+      SQLite  1 rows / 1
+      Amphora error: Parse error: row value misused
+   same    :: SELECT t.a FROM t JOIN s ON (1, 2) = (SELECT count(*), max(y) FROM s AS s2) WHERE 1 -> 1 rows / 1
+   same    :: SELECT 1 FROM t WHERE (NULL, NULL) < (SELECT max(x), count(y) FROM s) GROUP BY 1.5 -> 0 rows
+   same    :: SELECT CASE WHEN (a, b) IN (SELECT x, y FROM s) THEN 1 ELSE 0 END FROM t -> 1 rows / 1
+   same    :: SELECT a FROM t WHERE ((a, b) IN (SELECT x, y FROM s)) BETWEEN 0 AND 1 -> 1 rows / 1
+   same    :: SELECT a FROM t GROUP BY a HAVING (a, 2) = (SELECT x, y FROM s) -> 1 rows / 1
+   rc 0 
+##### CW_pushed_down
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT (SELECT min(a) FROM dv WHERE dv.id > 100)
+      SQLite  1 rows / NULL
+      Amphora error: Parse error: malformed JSON
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT a FROM dv WHERE id = 1
+      SQLite  1 rows / 1
+      Amphora error: Parse error: malformed JSON
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT (SELECT sum(c) FROM ten WHERE c ISNULL)
+      SQLite  1 rows / NULL
+      Amphora error: Parse error: malformed JSON
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT count(*) FROM ten WHERE c = 11
+      SQLite  1 rows / 0
+      Amphora error: Parse error: malformed JSON
+   rc 0 
+##### CY_explicit_on_the_right
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT count(*) FROM (SELECT email FROM staff EXCEPT SELECT 'ANN@x.com' COLLATE NOCASE)
+      SQLite  1 rows / 3
+      Amphora 1 rows / 1
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT count(*) FROM (SELECT email FROM staff UNION SELECT 'ANN@x.com' COLLATE NOCASE)
+      SQLite  1 rows / 4
+      Amphora 1 rows / 2
+   rc 0 
+##### CY_in
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT 'ANN@X.COM' COLLATE NOCASE IN (SELECT email FROM staff WHERE email LIKE 'ann%' EXCEPT SELECT 'Ann@x.com')
+      SQLite  1 rows / 1
+      Amphora 1 rows / 0
+   rc 0 
+##### CY_order_by
+   same    :: SELECT 'zz' UNION ALL SELECT email FROM guest UNION ALL SELECT 'a' ORDER BY 1 -> 5 rows / 'a' / 'BOB@x.com' / 'cy@x.com' / 'CY@x.com' / 'zz'
+   rc 0 
+##### CY_recursive
+   DIFFERS default,parallel,statistics,parallel, statistics :: WITH RECURSIVE r(e) AS (SELECT email FROM staff UNION SELECT g.email FROM r JOIN guest AS g ON g.email = r.e COLLATE NOCASE) SELECT count(*) FROM r
+      SQLite  1 rows / 4
+      Amphora 1 rows / 2
+   rc 0 
+##### CY_three_arms
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT count(*) FROM (SELECT email FROM guest UNION SELECT 'x' UNION SELECT 'y')
+      SQLite  1 rows / 4
+      Amphora 1 rows / 5
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT count(*) FROM (SELECT email FROM guest UNION ALL SELECT 'x' EXCEPT SELECT NULL)
+      SQLite  1 rows / 3
+      Amphora 1 rows / 4
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT count(*) FROM (SELECT email FROM guest EXCEPT SELECT 'x' UNION SELECT NULL)
+      SQLite  1 rows / 3
+      Amphora 1 rows / 4
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT count(*) FROM (SELECT email COLLATE NOCASE FROM staff UNION ALL SELECT NULL UNION SELECT 7)
+      SQLite  1 rows / 4
+      Amphora 1 rows / 5
+   rc 0 
+##### CY_union_of_two_columns
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT count(*) FROM (SELECT email FROM staff UNION SELECT email FROM guest)
+      SQLite  1 rows / 6
+      Amphora 1 rows / 3
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT count(*) FROM (SELECT email FROM staff EXCEPT SELECT email FROM guest)
+      SQLite  1 rows / 3
+      Amphora 1 rows / 1
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT count(*) FROM (SELECT email FROM staff INTERSECT SELECT email FROM guest)
+      SQLite  1 rows / 0
+      Amphora 1 rows / 1
+   same    :: SELECT count(*) FROM (SELECT email FROM guest UNION SELECT email FROM staff) -> 1 rows / 3
+   rc 0 
+##### DU_min_max_collate
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT min(a || '' COLLATE NOCASE) FROM c
+      SQLite  1 rows / 'a '
+      Amphora 1 rows / 'ABC'
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT min(quote(a COLLATE NOCASE)), max(quote(a COLLATE NOCASE)) FROM c
+      SQLite  1 rows / '''a ''', '''ABC'''
+      Amphora 1 rows / '''ABC''', '''a '''
+   same    :: SELECT a FROM c ORDER BY quote(a COLLATE NOCASE) LIMIT 1 -> 1 rows / 'a '
+   same    :: SELECT min(quote(a COLLATE NOCASE)) OVER () FROM c LIMIT 1 -> 1 rows / '''a '''
+   same    :: SELECT min(a COLLATE NOCASE) FROM c -> 1 rows / 'a '
+   rc 0 
+##### DV_cast_numeric
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT CAST('-92233720368547758081' AS NUMERIC) = CAST('-92233720368547758081' AS REAL)
+      SQLite  1 rows / 1
+      Amphora 1 rows / 0
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT CAST('12345678901234567890' AS NUMERIC) = 12345678901234567890
+      SQLite  1 rows / 1
+      Amphora 1 rows / 0
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT CAST('18446744073709551616' AS NUMERIC) = 18446744073709551616.0
+      SQLite  1 rows / 1
+      Amphora 1 rows / 0
+   same    :: SELECT CAST('99999999999999999999' AS NUMERIC) - CAST('99999999999999999999' AS REAL) -> 1 rows / 0.0
+   same    :: SELECT '12345678901234567890' + 0 = 12345678901234567890 -> 1 rows / 1
+   rc 0 
+##### DV_cast_numeric_stored
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT a = r, a - r, typeof(a) FROM n
+      SQLite  2 rows / 1, 0.0, 'real' / 1, 0.0, 'real'
+      Amphora 2 rows / 1, 0.0, 'real' / 0, 32768.0, 'real'
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT count(DISTINCT a) FROM n
+      SQLite  1 rows / 1
+      Amphora 1 rows / 2
+   rc 0 
+##### DW_having_nested
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT q.k, count(*) FROM q GROUP BY q.k HAVING (SELECT count(*) FROM s WHERE s.v > (SELECT min(s2.v) FROM s AS s2 WHERE q.k <> s.k)) > 0
+      SQLite  2 rows / 'a', 2 / 'b', 1
+      Amphora 0 rows
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT q.k FROM q GROUP BY q.k HAVING EXISTS (SELECT 1 FROM s WHERE s.v = (SELECT max(s2.v) FROM s AS s2 WHERE s2.k = s.k AND s2.k = q.k))
+      SQLite  1 rows / 'a'
+      Amphora 0 rows
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT q.k FROM q GROUP BY q.k HAVING EXISTS (SELECT 1 FROM s WHERE EXISTS (SELECT 1 FROM s AS s2 WHERE s2.k = s.k AND s2.k = q.k))
+      SQLite  1 rows / 'a'
+      Amphora 0 rows
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT q.k FROM q GROUP BY q.k HAVING (SELECT count(*) FROM s WHERE (SELECT count(*) FROM s AS s2 WHERE s2.k = s.k AND s2.k = q.k) = 1) = 1
+      SQLite  1 rows / 'a'
+      Amphora 0 rows
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT q.k FROM q GROUP BY q.k HAVING (SELECT count(*) FROM s WHERE s.k IN (SELECT s2.k FROM s AS s2 WHERE s2.v = s.v AND s2.k = q.k)) = 1
+      SQLite  1 rows / 'a'
+      Amphora 0 rows
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT q.k FROM q GROUP BY q.k HAVING (SELECT count(*) FROM s WHERE (SELECT q.k || s.k) = 'aa') = 1
+      SQLite  1 rows / 'a'
+      Amphora 0 rows
+   rc 0 
+##### DX_jsonb_quote
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT hex(jsonb('''x"y'''))
+      SQLite  1 rows / '39782279'
+      Amphora 1 rows / '37782279'
+   same    :: SELECT json(jsonb('''x"y''')) -> 1 rows / '"x\"y"'
+   same    :: SELECT hex(jsonb('''x\''y''')) -> 1 rows / '49785C2779'
+   rc 0 
+##### DY_json_inf
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT json('Inf')
+      SQLite  1 rows / '9e999'
+      Amphora error: Parse error: malformed JSON
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT json('-inf')
+      SQLite  1 rows / '-9e999'
+      Amphora error: Parse error: malformed JSON
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT json('[1, INF]')
+      SQLite  1 rows / '[1,9e999]'
+      Amphora error: Parse error: malformed JSON
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT json('QNaN')
+      SQLite  1 rows / 'null'
+      Amphora error: Parse error: malformed JSON
+   same    :: SELECT json('Infinity') -> 1 rows / '9e999'
+   same    :: SELECT json('NaN') -> 1 rows / 'null'
+   rc 0 
+##### DZ_group_by_aggregate
+   same    :: SELECT 1, count(*) FROM t GROUP BY 2 -> error: aggregate functions are not allowed in the GROUP BY clause
+   same    :: SELECT count(*) FROM t GROUP BY 1 -> error: aggregate functions are not allowed in the GROUP BY clause
+   same    :: SELECT a, count(*) AS n FROM t GROUP BY n -> error: aggregate functions are not allowed in the GROUP BY clause
+   same    :: SELECT a, count(*) FROM t GROUP BY count(*) -> error: aggregate functions are not allowed in the GROUP BY clause
+   rc 0 
+##### INSTEAD_OF
+   refused: [Refused { error: "Parse error: INSTEAD OF triggers are not supported yet", statement: "CREATE TRIGGER g INSTEAD OF INSERT ON v BEGIN INSERT INTO t VALUES (new.a); END" }]
+   same    :: SELECT count(*) FROM t -> 1 rows / 0
+   rc 0 
+##### JP_json_patch_hex
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT hex(jsonb(json_patch(100, '0x10') || ''))
+      SQLite  1 rows / '4430783130'
+      Amphora 1 rows / '233136'
+   same    :: SELECT json_patch(100, '0x10') -> 1 rows / '16'
+   same    :: SELECT hex(jsonb('16')) -> 1 rows / '233136'
+   rc 0 
+##### rowid_has_a_columns_collation
+   same    :: SELECT count(*) FROM (SELECT id FROM p UNION SELECT a FROM t) -> 1 rows / 1
+   same    :: SELECT count(*) FROM (SELECT a FROM t UNION SELECT id FROM p) -> 1 rows / 1
+   rc 0 
+##### RW_sqlites_window_over_group_by
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT 1, (7 IS c0), NULL, count(*) OVER (ORDER BY NULL) FROM t GROUP BY 1, (7 IS c0)
+      SQLite  2 rows / 1, 0, NULL, 2 / 1, 0, NULL, 2
+      Amphora 1 rows / 1, 0, NULL, 1
+   same    :: SELECT (7 IS c0), count(*) FROM t GROUP BY (7 IS c0) -> 1 rows / 0, 2
+   rc 0 
+##### RX_sqlite_loses_a_row
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT ' ' FROM t UNION SELECT 'ABC' FROM t GROUP BY 'ABC', NULL ORDER BY (1 COLLATE NOCASE) DESC
+      SQLite  1 rows / ' '
+      Amphora 2 rows / 'ABC' / ' '
+   same    :: SELECT ' ' FROM t UNION SELECT 'ABC' FROM t GROUP BY 'ABC', NULL ORDER BY 1 DESC -> 2 rows / 'ABC' / ' '
+   rc 0 
+##### RX_sqlites_compound_order_collate
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT NULL, NULL FROM t UNION SELECT 'A', count(*) FROM t GROUP BY 'A' ORDER BY 1, 2 COLLATE RTRIM
+      SQLite  1 rows / 'A', 0
+      Amphora 0 rows
+   same    :: SELECT NULL, NULL FROM t UNION SELECT 'A', count(*) FROM t GROUP BY 'A' ORDER BY 1, 2 -> 0 rows
+   same    :: SELECT * FROM (SELECT NULL, NULL FROM t UNION SELECT 'A', count(*) FROM t GROUP BY 'A') ORDER BY 1, 2 COLLATE RTRIM -> 0 rows
+   rc 0 
