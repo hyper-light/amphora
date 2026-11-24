@@ -4626,8 +4626,9 @@ impl SharedLog {
                 }
             }
             free.metadata.enabled.store(true, Ordering::Release);
-            // Its read marks are set under their exclusive locks: no read holds one of a free
-            // segment's, so each is taken at once.
+            // Its read marks are set under their exclusive locks. No read holds one of a free
+            // segment's, but the checkpoint whose pass reset it does until it lets its locks go:
+            // not now, then, as while the segment closes.
             let held = free
                 .runtime
                 .read_locks
@@ -4640,9 +4641,7 @@ impl SharedLog {
                     .iter()
                     .take(held)
                     .for_each(|lock| lock.unlock());
-                return Err(LimboError::InternalError(
-                    "a read holds a mark of the log's free segment".into(),
-                ));
+                return Ok(None);
             }
             free.start_after(io, header, epoch, transaction_count);
             free.runtime
@@ -8551,7 +8550,9 @@ impl WalFile {
         }
         self.coordination
             .publish_backfill(result.wal_total_backfilled);
-        let _ = self.coordination.switch_unread(self.io.as_ref())?;
+        if self.coordination.switch_unread(self.io.as_ref())?.is_none() {
+            return Err(LimboError::Busy);
+        }
         self.read_from_file();
         Ok(())
     }
@@ -12282,6 +12283,51 @@ pub mod test {
             0,
             "nothing of the closing segment was copied"
         );
+    }
+
+    /// Do: copy the log whole; with the read mark 0 of the free segment held as a checkpoint whose
+    /// pass reset that segment holds it until it lets its locks go, write; let the mark go, and write
+    /// again. Expect: the first write taken, in the segment it would have left, and the second in the
+    /// other one: a write never fails for a switch it can't make yet.
+    #[test]
+    fn d45_a_write_beside_a_checkpoint_letting_go_of_the_free_segment_is_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let db = Database::open_file(
+            shared_wal_test_io(),
+            path.to_str().unwrap(),
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("pragma wal_autocheckpoint=0").unwrap();
+        conn.execute("create table t(id integer primary key)")
+            .unwrap();
+        assert!(db.switch_log(None).unwrap());
+        conn.execute("insert into t values(1)").unwrap();
+        let passive = CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        };
+        for _ in 0..2 {
+            run_checkpoint_until_done(&conn.pager.load(), passive);
+        }
+        assert_eq!(db.wal_segment(), SegmentId::Second);
+        let mark = |held: bool| {
+            let free = db.shared_wal.segment(SegmentId::First).read();
+            if held {
+                assert!(free.runtime.read_locks[0].write());
+            } else {
+                free.runtime.read_locks[0].unlock();
+            }
+        };
+        mark(true);
+        conn.execute("insert into t values(2)").unwrap();
+        assert_eq!(db.wal_segment(), SegmentId::Second);
+        mark(false);
+        run_checkpoint_until_done(&conn.pager.load(), passive);
+        conn.execute("insert into t values(3)").unwrap();
+        assert_eq!(db.wal_segment(), SegmentId::First);
+        assert_eq!(count_rows(&conn, "t"), 3);
     }
 
     /// Do (lane B19, tests/crash.rs's power cut at seed 45): write, switch, write, copy the closing

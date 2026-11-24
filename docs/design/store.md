@@ -2479,6 +2479,13 @@ before any frame of the current one.
   read_ended.rs and `d45_a_page_is_taken_in_wholly_before_its_read_ends_or_not_at_all`, `d45_a_shared_page_found_as_its_
   read_ends_is_never_taken_in` (wal.rs).
 
+**The store's slow read (Ada, 2026-11-24; lane B27).** The store's writer ends reads by the same rule, at the same event:
+its restart is asked past the log's bound, and where the current segment's file is past the room a restart keeps
+(decision 31's, twice the bound), `Db::restart_log` ends the reads that count on the closing segment before its two
+passes, so that the segment is copied whole, reset and switched to. No write waits or is refused, no timer runs, and with
+room to spare no read ends. Each ended read gets the error a replica's does (`snapshot_too_old`, database.rs). Test:
+`d45_a_slow_read_gives_way_when_the_logs_room_is_full` (crates/amphora/tests/store.rs).
+
 **Every restart switches (2026-11-24, lane B27).** RESTART, TRUNCATE and the writer's own restart before a write switch
 as the store's does, in a log of one process; nothing restarts a segment in place there. What SQLite documents for each
 (wal_checkpoint_v2, pragma.html's wal_checkpoint) is kept, over two files:
@@ -2507,6 +2514,8 @@ as the store's does, in a log of one process; nothing restarts a segment in plac
 - *Where it differs, counted only.* A RESTART that answered 0 leaves the log with no frame, so the next call counts none;
   SQLite's counts the old ones until a writer comes. A second RESTART or TRUNCATE beside one read of the file alone is
   busy: that read keeps the segment the first one closed.
+- *An owner's log.* A replica's writer turns its own restart off (`Db::own_restarts`): its owner starts the log again when
+  what it measures says so (replication.md, B), and a switch before the room is needed would end a local read sooner.
 - *A multi-process log* is its one segment, restarted in place as before: its shared memory publishes no switch
   (`ShmWalCoordination::switch_unread`). Not built.
 Tests: crates/engine/tests/log_restart.rs, its steps run in sqlite3 3.54.0 as they are.
