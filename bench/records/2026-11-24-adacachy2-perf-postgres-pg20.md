@@ -100,8 +100,9 @@ after r1318; the trees' differences since are named.
 | r1343, 08:43Z, cpus=4, load 42.1 36.5 45.9 | 0e132eb5 (the cursor left as an append leaves it) | the clippy command | exit 0, every crate above checked. |
 | same | same | check-production | exit 0, `Compiling amphora-engine`, 10617 as the ratchet holds. |
 | same | same | listener and protocol | 7 and 13 passed. |
-| same | same | `cargo test -p amphora-engine --lib -- dialect:: vtab alter rowid autoinc` | exit 0: 90 passed, 1 ignored, 3,167 filtered out (and four tests of one that those run in a process of their own), `Compiling amphora-engine` in its log, t_pg_9_3_transactions_that_insert_beside_each_other_both_commit among them. The versioned storage's own suite was not run before the landing. |
+| same | same | `cargo test -p amphora-engine --lib -- dialect:: vtab alter rowid autoinc` | exit 0: 90 passed, 1 ignored, 3,167 filtered out (and four tests of one that those run in a process of their own), `Compiling amphora-engine` in its log, t_pg_9_3_transactions_that_insert_beside_each_other_both_commit among them. The versioned storage's own suite ran after the landing, r1358. |
 | same | same | `scripts/postgres-clients.sh` | exit 0, every comparison the same: the table above, again. |
+| r1358, 08:50Z, cpus=4, load 28.0 35.9 43.2 | ede916ac, main as landed | `cargo test -p amphora-engine --lib -- storage::versioned::sql storage::versioned::cursor storage::versioned::switch` | exit 0: 21 passed, 3,237 filtered out, `Compiling amphora-engine` in its log. The rest of the engine's suites were not run. |
 | this machine | the branch | `cargo fmt --all --check`, `python3 scripts/test_requirements.py` | pass |
 
 The landed tree is 0e132eb5's with one test comment moved (83360d86, no code) and main merged since: main moved only in
