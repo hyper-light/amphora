@@ -1691,13 +1691,13 @@ AC-T1.8.D1 and AC-T1.8.D2, tests T-T1.8.D1 and T-T1.8.D2 (docs/requirements.toml
    for it (2026-11-24, lane V20): with a flush out, or the segment the last restart closed not yet free, it tries again
    at its next step. When a restart is due, and how far the log may grow are
    "A replica's database log bounded by what it measures" (2026-11-11), below, which replaces this point's picked
-   bound (`LOG_FRAMES`, 131,072 frames, and a 64th of it) and points 4 and 5. A leader's log is also started again
-   by the engine itself: a preparation is a write transaction, and the engine restarts the log at a write's begin
-   when every frame is copied and no reader reads from the log (`try_restart_log_before_write`; SQLite's
-   `walRestartLog` does the same, wal.c). That is safe beside the owner's restart: it discards no frame that isn't
-   in the file, it needs no reader in the log, as the owner's does, and the preparation's rollback writes nothing
-   into the restarted log. The flusher's durable prefix is taken against the log's generation, which a restart
-   moves (store.md, decision 15), so neither restart makes the other's state wrong.
+   bound (`LOG_FRAMES`, 131,072 frames, and a 64th of it) and points 4 and 5. Until 2026-11-24 a leader's log was also
+   started again by the engine itself: a preparation is a write transaction, and the engine restarted the log at a
+   write's begin when every frame was copied and no reader read from the log (SQLite's `walRestartLog` does the same,
+   wal.c). That restart is a switch now and waits for no read (store.md, decision 45), so it would close the segment a
+   local read began on, and end the read sooner, before the writes need the room. It is turned off on the owner's
+   connection and on its session worker's: the owner alone starts the log again (decision 45, "An owner's log"). The
+   flusher's durable prefix is taken against the log's generation, which a restart moves (store.md, decision 15).
 4. *(Replaced, 2026-11-11: the bound is stated in "A replica's database log bounded by what it measures", D.)*
 5. *(Replaced, 2026-11-11: the disk a log takes is that section's C.)*
 6. **Busy is a skip; only I/O fences.** A checkpoint pass that finds the log busy copies nothing and reports nothing:
@@ -1832,9 +1832,10 @@ benchmark, restarts on against off, not by this rule.
 **B. A restart waits for a pass, and for no read** (store.md, decision 45; revised 2026-11-24, lane V20). It is ready
 when it is due, no flush is out, and a pass has followed a flush of what the current segment holds (`Pass::ready`).
 The pass copied every durable frame the reads under way let it (its cap, store.md decision 15); how far it got is no
-part of the rule. The restart is the engine's switch alone (`Db::switch_log`): it copies nothing. It flushes what the
-current segment holds unflushed, what the owner applied since that flush was asked, at most one flush's growth, the
-least any rule can leave, and that segment closes. The flushing thread copies it: a pass is asked as the restart is
+part of the rule. The owner alone makes it: no write on the replica's connections, the owner's or its session worker's,
+starts the log again by itself (store.md, decision 45, "An owner's log"; lane B28). The restart is the engine's switch
+alone (`Db::switch_log`): it copies nothing. It flushes what the current segment holds unflushed, what the owner
+applied since that flush was asked, at most one flush's growth, the least any rule can leave, and that segment closes. The flushing thread copies it: a pass is asked as the restart is
 made, so it is copied at once, and one follows the flushes after. A local read holds off no restart, and a restart no
 read:
 - **What an open read keeps.** The segment it began on, to its end while there is room (below, "A read gives way"): the

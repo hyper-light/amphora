@@ -1603,6 +1603,9 @@ enum CheckpointPhase {
         clear_page_cache: bool,
         max_frame: u64,
     },
+    /// Start the log again after the DB file is safely synced (RESTART). This must happen AFTER
+    /// SyncDbFile: the next writer writes over frames the synced file holds.
+    RestartWal { clear_page_cache: bool },
     /// Truncate the WAL file after DB file is safely synced (only for TRUNCATE checkpoint mode).
     /// This must happen AFTER SyncDbFile to ensure data durability.
     TruncateWalFile { clear_page_cache: bool },
@@ -3786,7 +3789,7 @@ impl Pager {
     /// `allowed_auto_actions` controls which automatic WAL maintenance the
     /// caller permits during this begin. The only action consulted here is
     /// `WalAutoActions::Restart`, which gates the WAL-header restart inside
-    /// `try_restart_log_before_write`. Callers managing WAL state externally
+    /// `switch_before_write`. Callers managing WAL state externally
     /// (sync engine) must not pass `Restart` because rotating the WAL header
     /// behind their back invalidates watermarks they have already published.
     pub fn begin_write_tx(&self, allowed_auto_actions: WalAutoActions) -> IOResultOr<()> {
@@ -6001,15 +6004,8 @@ impl Pager {
         let state = self.checkpoint_state.read();
         let result = state.result.as_ref().expect("result should be set");
         let mode = state.mode.expect("mode should be set");
-        // A pass over the closing segment restarts nothing, so it publishes its backfill whatever
-        // its mode (decision 45).
-        if result.wal_checkpoint_backfilled > 0
-            && (result.closing.is_some()
-                || !matches!(
-                    mode,
-                    CheckpointMode::Restart | CheckpointMode::Truncate { .. }
-                ))
-        {
+        // RESTART and TRUNCATE publish their backfill as they start the log again.
+        if result.wal_checkpoint_backfilled > 0 && !mode.should_restart_log() {
             // if we are using a custom codec, then we might have to read the whole page 1 so that
             // it can be decoded. Otherwise reading the header is enough.
             let read_page = self.io_ctx.read().has_codec_transform();
@@ -6029,10 +6025,22 @@ impl Pager {
                 },
             };
         }
-        if matches!(mode, CheckpointMode::Truncate { .. }) && result.closing.is_none() {
-            CheckpointPhase::TruncateWalFile { clear_page_cache }
-        } else {
-            CheckpointPhase::Finalize { clear_page_cache }
+        Self::start_log_again_phase(mode, clear_page_cache)
+    }
+
+    /// What ends a checkpoint of `mode` once its copy is in the file: its log starts again, or not.
+    const fn start_log_again_phase(
+        mode: CheckpointMode,
+        clear_page_cache: bool,
+    ) -> CheckpointPhase {
+        match mode {
+            CheckpointMode::Truncate { .. } => {
+                CheckpointPhase::TruncateWalFile { clear_page_cache }
+            }
+            CheckpointMode::Restart => CheckpointPhase::RestartWal { clear_page_cache },
+            CheckpointMode::Passive { .. } | CheckpointMode::Full => {
+                CheckpointPhase::Finalize { clear_page_cache }
+            }
         }
     }
 
@@ -6118,7 +6126,6 @@ impl Pager {
                     if matches!(mode, CheckpointMode::Truncate { .. })
                         // `should_truncate` will be true for successful truncate checkpoint
                         && res.should_truncate()
-                        && res.closing.is_none()
                     {
                         state.phase = CheckpointPhase::TruncateDbFile {
                             sync_mode,
@@ -6128,7 +6135,7 @@ impl Pager {
                     } else if res.wal_checkpoint_backfilled == 0
                         || sync_mode == crate::SyncMode::Off
                     {
-                        state.phase = CheckpointPhase::Finalize { clear_page_cache };
+                        state.phase = Self::start_log_again_phase(mode, clear_page_cache);
                     } else {
                         state.phase = CheckpointPhase::SyncDbFile { clear_page_cache };
                     }
@@ -6380,17 +6387,16 @@ impl Pager {
                         );
                     }
                     wal.publish_backfill(max_frame);
-                    let next_phase = {
-                        let state = self.checkpoint_state.read();
-                        let closing = state.result.as_ref().is_some_and(|r| r.closing.is_some());
-                        if matches!(state.mode, Some(CheckpointMode::Truncate { .. })) && !closing {
-                            CheckpointPhase::TruncateWalFile { clear_page_cache }
-                        } else {
-                            CheckpointPhase::Finalize { clear_page_cache }
-                        }
-                    };
-                    self.checkpoint_state.write().phase = next_phase;
+                    self.checkpoint_state.write().phase =
+                        CheckpointPhase::Finalize { clear_page_cache };
                     continue;
+                }
+                CheckpointPhase::RestartWal { clear_page_cache } => {
+                    let mut state = self.checkpoint_state.write();
+                    if let Some(result) = &state.result {
+                        wal.restart_wal(result)?;
+                    }
+                    state.phase = CheckpointPhase::Finalize { clear_page_cache };
                 }
                 CheckpointPhase::TruncateWalFile { clear_page_cache } => {
                     // Truncate WAL file after DB is safely synced - this ensures data durability.
@@ -6402,7 +6408,7 @@ impl Pager {
                             "mode should be truncate in CheckpointPhase::TruncateWalFile"
                         );
                         let result = state.result.as_ref().expect("result should be set");
-                        !result.wal_truncate_sent || !result.wal_sync_sent
+                        !result.log_is_cut()
                     };
 
                     if !need_wal_truncate {
@@ -6424,13 +6430,6 @@ impl Pager {
                 CheckpointPhase::Finalize { clear_page_cache } => {
                     let mut state = self.checkpoint_state.write();
                     let mut res = state.result.take().expect("result should be set");
-                    // A Restart or Truncate whose pass copied the closing segment did not restart
-                    // the log: the current segment isn't copied yet (decision 45).
-                    let not_restarted = res.closing.is_some()
-                        && matches!(
-                            state.mode,
-                            Some(CheckpointMode::Restart | CheckpointMode::Truncate { .. })
-                        );
                     state.phase = CheckpointPhase::NotCheckpointing;
                     state.mode = None;
                     state.lock_source = CheckpointLockSource::Acquire;
@@ -6447,9 +6446,6 @@ impl Pager {
                     // Release checkpoint guard
                     res.release_guard();
 
-                    if not_restarted {
-                        return Err(LimboError::Busy.into());
-                    }
                     return Ok(IOResult::Done(res));
                 }
             }

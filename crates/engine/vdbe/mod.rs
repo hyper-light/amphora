@@ -928,6 +928,8 @@ pub struct ProgramState {
     pub query_deadline: Option<crate::MonotonicInstant>,
     /// Excludes new root statements while an explicit checkpoint is suspended.
     pub(crate) explicit_checkpoint_guard: Option<crate::connection::ExplicitCheckpointGuard>,
+    /// The wal_checkpoint under way was blocked, and goes on as a PASSIVE one.
+    pub(crate) checkpoint_blocked: bool,
     pub parameters: Vec<Value>,
     commit_state: CommitState,
     /// In-flight commit-state-machine for an autonomous sequence
@@ -1133,6 +1135,7 @@ impl ProgramState {
             execution_state: ProgramExecutionState::Init,
             query_deadline: None,
             explicit_checkpoint_guard: None,
+            checkpoint_blocked: false,
             parameters: Vec::new(),
             commit_state: CommitState::Ready,
             sequence_inner_commit: None,
@@ -1326,6 +1329,7 @@ impl ProgramState {
         self.execution_state = ProgramExecutionState::Init;
         self.query_deadline = None;
         self.explicit_checkpoint_guard = None;
+        self.checkpoint_blocked = false;
         #[cfg(feature = "json")]
         self.json_cache.clear();
 
@@ -3628,6 +3632,7 @@ impl Program {
         state.extension_state = crate::native_ext::ExtensionState::None;
         crate::native_ext::abort_aggregates(&mut state.registers);
         state.explicit_checkpoint_guard = None;
+        state.checkpoint_blocked = false;
         // PRAGMA journal_mode owns its MVCC checkpoint in active_op_state rather
         // than commit_state. Clean it before transaction abort logic inspects
         // pager checkpoint state or reset drops the opcode state.

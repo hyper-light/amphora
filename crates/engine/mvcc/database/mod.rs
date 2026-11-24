@@ -4178,7 +4178,7 @@ pub enum CompleteCheckpointState {
     /// `wal_max_frame == 0` branch: driving the early `wal.truncate_wal`.
     /// `checkpoint_result` must persist across IO yields because
     /// `truncate_wal`/`truncate_log` tracks its truncate/sync progress through
-    /// its `wal_truncate_sent` / `wal_sync_sent` flags; recreating it each
+    /// its `cut` steps; recreating it each
     /// re-entry would re-issue the truncate forever.
     DriveEarlyTruncate {
         header_result: HeaderReadResult,
