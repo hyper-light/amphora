@@ -221,6 +221,25 @@ def main():
     over = sum(1 for x in ratios if x[4] == "overlap")
     w(f"Counts over {len(ratios)} cells: ahead {ahead}, behind {behind}, overlapping ranges {over}. "
       f"By median ratio alone: {sum(1 for x in ratios if x[0] > 1)} above 1x, {sum(1 for x in ratios if x[0] < 1)} below.")
+    # ---- by family
+    w("")
+    w("### By family and client count: geometric mean of Amphora/best (cells where either side answered nothing left out, and counted)")
+    w("")
+    fam = {"point reads": ["point_pk", "point_secondary", "point_text", "json_field", "blob_read"],
+           "OLTP writes": ["insert_one", "insert_batch_100", "update_plain", "update_indexed", "upsert", "delete_insert", "txn_read_write"],
+           "analytics": ["table_count", "table_group_by", "filter_no_index", "aggregates_range", "join_three"]}
+    w("| family | " + " | ".join(f"{c} client{'s' if c != 1 else ''}" for c in sorted({c for _, c in keys})) + " |")
+    w("|---" * (1 + len({c for _, c in keys})) + "|")
+    for name, ops in fam.items():
+        row = []
+        for c in sorted({c for _, c in keys}):
+            rs = [(r, t) for r, op, cc, t, *_ in ratios if op in ops and cc == c]
+            vals = [r for r, _ in rs if 0 < r < float("inf")]
+            skip = len(rs) - len(vals)
+            import math
+            gm = math.exp(sum(math.log(v) for v in vals) / len(vals)) if vals else None
+            row.append(f"{gm:.2f}x over {len(vals)} ops" + (f", {skip} left out" if skip else "") if gm is not None else "no cell")
+        w(f"| {name} | " + " | ".join(row) + " |")
     # ---- gaps
     w("")
     w("## 3. The ten largest gaps (Amphora furthest behind the best competitor)")
