@@ -7103,6 +7103,13 @@ mod tests {
         fn moving(&self) -> bool {
             !self.movers().is_empty()
         }
+        /// Whether any owner's caller session is out on its session worker.
+        fn session_out(&self) -> bool {
+            self.owners
+                .iter()
+                .flatten()
+                .any(|(owner, _)| owner.sessions.out)
+        }
         /// After a round that relayed nothing and left nothing in transit, the driver waits for
         /// work out off its thread to end or come to a held gate ([`Driven::movers`]); with none
         /// out it waits for nothing, as only its own steps can move the group.
@@ -19237,7 +19244,7 @@ mod tests {
     /// up. Do, in each class: 32 writers, writer w at member w % 3, each writing three rows in turn
     /// into one table (every write conflicts with every other), a stale-base refusal made again at
     /// the same member as the bench's driver does, every member's clock moving a tick of its pace
-    /// each round. Expect: no write refused for a stale base, every other answer Ok, and each row
+    /// each round no session is out on a worker. Expect: no write refused for a stale base, every other answer Ok, and each row
     /// on every replica once.
     #[test]
     fn v13_thirty_two_spread_writers_on_moving_time_are_each_answered_with_no_stale_base() {
@@ -19306,8 +19313,13 @@ mod tests {
                     }
                 }
                 driven.round(&mut pump);
-                for owner in 0..3 {
-                    driven.advance_tick(owner);
+                // A session out on a worker holds every clock, as main's ran inside its owner's
+                // step: the worker moves where a session runs, not when (replication.md,
+                // "Decision (lane P6)", 5).
+                if !driven.session_out() {
+                    for owner in 0..3 {
+                        driven.advance_tick(owner);
+                    }
                 }
                 rounds += 1;
             }
