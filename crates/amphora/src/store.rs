@@ -875,31 +875,40 @@ fn notifier(sends: &Sends) {
 /// flush under way and the next; with more, an idle one begins the next at once. A flush that fails
 /// is the last.
 ///
-/// It never waits for more to be committed before it begins: what is committed during a flush
-/// joins the next (docs/design/store.md, decision 14).
+/// Before it begins, it waits for the batches handed to the writer by the time it found something
+/// to flush to be committed or refused, each a commit of the writer away; what is handed after
+/// joins the next flush (docs/design/store.md, decision 14).
 fn flusher(sends: &Sends, flush: &Flush, meter: &Meter) {
     loop {
         let target = {
             let mut committed = locked(&sends.committed);
+            let mut handed: Option<u64> = None;
             loop {
+                let ending = sends.stopping.load(Ordering::Relaxed)
+                    || sends.disk_failed.load(Ordering::SeqCst);
                 {
                     let mut claims = locked(&sends.claims);
                     if committed.batches > claims.batches {
-                        claims.batches = committed.batches;
-                        claims.under_way.push_back((*committed, false));
-                        break *committed;
+                        let before =
+                            *handed.get_or_insert_with(|| sends.handed.load(Ordering::Relaxed));
+                        if committed.batches >= before || ending {
+                            claims.batches = committed.batches;
+                            claims.under_way.push_back((*committed, false));
+                            break *committed;
+                        }
+                    } else {
+                        handed = None;
                     }
                 }
-                if sends.stopping.load(Ordering::Relaxed)
-                    || sends.disk_failed.load(Ordering::SeqCst)
-                {
+                if ending {
                     return;
                 }
+                // Every batch settled, the store stopping and a failed flush wake it (`Sends::wake`,
+                // `stop`, `disk_failed`, each under this lock).
                 committed = sends
                     .done
-                    .wait_timeout(committed, Duration::from_secs(1))
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .0;
+                    .wait(committed)
+                    .unwrap_or_else(PoisonError::into_inner);
             }
         };
         let began = Instant::now();
