@@ -3816,17 +3816,20 @@ impl Pager {
     /// (docs/design/store.md, decision 45). An MVCC database's say more already.
     fn mark_page1(&self) -> Result<()> {
         let version = self.io.block(|| self.with_header(|h| h.read_version))?;
-        if !matches!(version.to_version(), Ok(Version::Wal | Version::Wal2)) {
+        if !matches!(
+            version.to_version(),
+            Ok(sqlite3_ondisk::Version::Wal | sqlite3_ondisk::Version::Wal2)
+        ) {
             return Ok(());
         }
-        self.set_page1_version(Version::Wal2)
+        self.set_page1_version(sqlite3_ondisk::Version::Wal2)
     }
 
-    fn set_page1_version(&self, version: Version) -> Result<()> {
+    fn set_page1_version(&self, version: sqlite3_ondisk::Version) -> Result<()> {
         self.io.block(|| {
             self.with_header_mut(|header| {
-                header.read_version = RawVersion::from(version);
-                header.write_version = RawVersion::from(version);
+                header.read_version = sqlite3_ondisk::RawVersion::from(version);
+                header.write_version = sqlite3_ondisk::RawVersion::from(version);
             })
         })
     }
@@ -6636,10 +6639,10 @@ impl Pager {
             return Ok(false);
         }
         let version = self.io.block(|| self.with_header(|h| h.read_version))?;
-        if !matches!(version.to_version(), Ok(Version::Wal2)) {
+        if !matches!(version.to_version(), Ok(sqlite3_ondisk::Version::Wal2)) {
             return Ok(false);
         }
-        self.set_page1_version(Version::Wal)?;
+        self.set_page1_version(sqlite3_ondisk::Version::Wal)?;
         self.io
             .block(|| self.commit_wal(WalAutoActions::empty(), 0, crate::SyncMode::Full, true))?;
         Ok(true)
@@ -6835,10 +6838,12 @@ impl Pager {
                 self.set_reserved_space(reserved_space_bytes);
                 // Amphora: a new file keeps plain SQLite out from its first page on (decision 45).
                 if self.wal.as_ref().is_some_and(|wal| wal.mark_wanted())
-                    && default_header.read_version == RawVersion::from(Version::Wal)
+                    && default_header.read_version
+                        == sqlite3_ondisk::RawVersion::from(sqlite3_ondisk::Version::Wal)
                 {
-                    default_header.read_version = RawVersion::from(Version::Wal2);
-                    default_header.write_version = RawVersion::from(Version::Wal2);
+                    let marked = sqlite3_ondisk::RawVersion::from(sqlite3_ondisk::Version::Wal2);
+                    default_header.read_version = marked;
+                    default_header.write_version = marked;
                 }
 
                 turso_assert_eq!(Some(default_header.page_size), self.get_page_size());
