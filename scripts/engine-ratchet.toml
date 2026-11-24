@@ -17,7 +17,7 @@
 "clippy::cast_sign_loss" = 231
 "clippy::cast_possible_wrap" = 672
 "clippy::disallowed_macros" = 755
-"clippy::disallowed_methods" = 40
+"clippy::disallowed_methods" = 39
 "clippy::disallowed_types" = 0
 "clippy::dbg_macro" = 0
 "clippy::exit" = 0

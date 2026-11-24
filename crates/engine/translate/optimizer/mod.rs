@@ -3522,7 +3522,7 @@ fn find_table_access_plan(
         &best_plan,
         &access_methods_arena,
         &constraints_per_table,
-        table_references.joined_tables(),
+        table_references,
         where_clause,
         subqueries,
         initial_input_cardinality,

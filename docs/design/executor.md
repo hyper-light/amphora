@@ -214,6 +214,10 @@ coding named the first's cursors, hash tables and inner results by the same tabl
 (the oracles' findings CH and CQ). A WHERE term holding a subquery is tested in the first loop,
 after the terms that hold none, rather than before the loops (`planner.rs`,
 `determine_where_to_eval_term`), but where a RIGHT or FULL JOIN's unmatched rows would skip that loop.
+A WHERE term on a correlated EXISTS may be put off to a later loop that fewer rows reach
+(`optimizer/join.rs`, `count_subquery_calls_for_plan`), but not past a semi or anti join whose table
+it reads: it is that join's condition, and the join's loop, the condition not yet read, would take
+any row for its match (the oracles' finding DT).
 
 **Why.** Amphora ran each uncorrelated subquery before its loops, read or not, and each correlated one
 at every row of its loop. One that no row reaches still ran and raised its error where SQLite answers:

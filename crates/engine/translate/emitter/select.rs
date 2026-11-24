@@ -1,7 +1,7 @@
 use crate::{
     alloc::{TryClone, TursoFromIterator, TursoIteratorExt},
     emit_explain,
-    schema::{BTreeCharacteristics, BTreeTable},
+    schema::{BTreeCharacteristics, BTreeTable, Table},
     sync::Arc,
     translate::{
         aggregation::emit_ungrouped_aggregation,
@@ -939,7 +939,9 @@ fn collect_materialized_payload_columns(
                 payload_columns.push(col_ref);
             }
         }
-        if table.btree().is_some_and(|btree| btree.has_rowid) {
+        if table.btree().is_some_and(|btree| btree.has_rowid)
+            || matches!(table.table, Table::Virtual(_))
+        {
             let rowid_ref = MaterializedColumnRef::RowId {
                 table_id: table.internal_id,
             };
