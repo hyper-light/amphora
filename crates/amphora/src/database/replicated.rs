@@ -18912,6 +18912,155 @@ mod tests {
         }
     }
 
+    /// T-T1.8.W1 (CP-T1.8, lane V15): a follower whose write's deadline ends it at its barrier
+    /// closes the write slot that barrier began, so the leader's own write waits on no time. Do,
+    /// in each class: owner 0 leads and its answers to member 3's barriers are lost; member 3
+    /// writes with one tick of its pace left, its barrier begins its slot, and the leader's own
+    /// write waits on that slot; then member 3's clock passes the deadline. Expect: member 3's
+    /// write refused `Timeout`; the leader's answered Ok; one slot ended released and none
+    /// expired; and no clock moved for a slot's end (`Driven::lapses` 0). Before lane V14 such a
+    /// write sent no close, and its slot held until the leader's clock passed its length.
+    #[test]
+    fn v15_a_write_its_deadline_ends_at_its_barrier_closes_its_slot() {
+        use crate::meter::SlotEnd;
+        for durability in [Durability::Persisted, three_fates()] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut driven = Driven::new();
+            let clients: Vec<Client> = (1..=3)
+                .map(|n| driven.open_with(dir.path(), n, vec![1, 2, 3], None, durability.clone()))
+                .collect();
+            let mut pump = Pump::new(&clients);
+            let leader = driven.elect(&mut pump, &clients, 0, 1);
+            assert_eq!(leader, 0, "{durability:?}: owner 0 did not lead");
+            let holder = 2;
+            driven
+                .call(&mut pump, &clients[leader], |db| {
+                    db.exec("CREATE TABLE events(id INTEGER NOT NULL)")?;
+                    Ok(Vec::new())
+                })
+                .unwrap();
+            // Member 3's floor keeper attests once it applies the table: its session holds member
+            // 3's slot as a write's would, so it ends before member 3's write is made.
+            for _ in 0..ROUNDS {
+                driven.quiet(&mut pump);
+                if driven.owner(holder).pending.is_none() {
+                    break;
+                }
+            }
+            assert!(
+                driven.owner(holder).pending.is_none(),
+                "{durability:?}: member 3's floor session never ended"
+            );
+            assert_eq!(
+                driven.owner(leader).slots.holder(),
+                None,
+                "{durability:?}: a slot was held before member 3 wrote"
+            );
+            let ended = |how| clients[leader].handle().counters().write_slot_ended(how);
+            let (released, expired) = (ended(SlotEnd::Released), ended(SlotEnd::Expired));
+            let closes = Arc::new(AtomicUsize::new(0));
+            let losing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let (counted, lost) = (Arc::clone(&closes), Arc::clone(&losing));
+            pump.losing = Some(Box::new(move |from, message: &Message| {
+                if from == 3
+                    && message.msg_type == hyper_raft::proto::MessageType::MsgReadIndex
+                    && message
+                        .entries
+                        .first()
+                        .is_some_and(|entry| reads(&entry.data))
+                {
+                    counted.fetch_add(1, Ordering::AcqRel);
+                }
+                lost.load(Ordering::Acquire)
+                    && from == 1
+                    && message.to == 3
+                    && message.msg_type == hyper_raft::proto::MessageType::MsgReadIndexResp
+            }));
+            let tick = driven.period(holder);
+            let deadline = driven.base + offset(&driven.clock(holder)) + tick;
+            let late = submit(&clients[holder], deadline, |db| {
+                db.exec("INSERT INTO events VALUES (3)")?;
+                Ok(Vec::new())
+            });
+            let mut rounds = 0;
+            while driven.owner(leader).slots.holder() != Some(3) {
+                assert!(
+                    rounds < ROUNDS,
+                    "{durability:?}: member 3's write held no slot, {:?} did",
+                    driven.owner(leader).slots.holder()
+                );
+                driven.round(&mut pump);
+                rounds += 1;
+            }
+            let phase = |driven: &Driven| {
+                driven.owner(holder).pending.as_ref().map(|pending| {
+                    match (&pending.author, &pending.phase) {
+                        (Author::Application(_), Phase::Barrier(Some(_))) => "a write's barrier",
+                        (Author::Owner, _) => "an owner session",
+                        _ => "another phase",
+                    }
+                })
+            };
+            assert_eq!(
+                phase(&driven),
+                Some("a write's barrier"),
+                "{durability:?}: member 3's slot, waiting {}",
+                driven.owner(holder).waiting.len()
+            );
+            let own = submit(&clients[leader], driven.until(), |db| {
+                db.exec("INSERT INTO events VALUES (1)")?;
+                Ok(Vec::new())
+            });
+            driven.quiet(&mut pump);
+            assert!(
+                matches!(own.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                "{durability:?}: the leader's write did not wait on the slot"
+            );
+            driven.advance(holder, tick);
+            let mut refused = None;
+            for _ in 0..ROUNDS {
+                if let Ok(answer) = late.try_recv() {
+                    refused = Some(answer.map(called));
+                    break;
+                }
+                driven.round(&mut pump);
+            }
+            assert_eq!(
+                refused,
+                Some(Err(Refusal::Timeout)),
+                "{durability:?}: member 3's write"
+            );
+            losing.store(false, Ordering::Release);
+            driven.quiet(&mut pump);
+            pump.losing = None;
+            assert_eq!(
+                (
+                    closes.load(Ordering::Acquire) > 0,
+                    driven.owner(leader).slots.holder()
+                ),
+                (true, None),
+                "{durability:?}: member 3 closed, and the slot's holder after"
+            );
+            assert_eq!(
+                driven.settle(&mut pump, &own),
+                Ok(Vec::new()),
+                "{durability:?}: the leader's write"
+            );
+            assert_eq!(
+                (
+                    ended(SlotEnd::Released) - released,
+                    ended(SlotEnd::Expired) - expired,
+                    driven.lapses
+                ),
+                (1, 0, 0),
+                "{durability:?}: member 3's slot ended (released, expired) and the clock moves for a slot's end"
+            );
+            driven.quiet(&mut pump);
+            driven.drain(&mut pump);
+            pump.finish();
+        }
+    }
+
     /// T-T1.8.W1, the stale-base refusal's type (PostgreSQL's 40001): a write refused because
     /// what it read changed is to be asked again, and nothing else is answered as if it were. Do:
     /// on the persisted class, every member at once appends a row to one table (each write
