@@ -26,6 +26,7 @@ const UNDEFINED: i32 = 2;
 
 const SYNTAX_ERROR: &str = "42601";
 const FEATURE_NOT_SUPPORTED: &str = "0A000";
+const INVALID_PARAMETER_VALUE: &str = "22023";
 
 /// 19's refusal: its SQLSTATE, the ErrorResponse cursor (1-based characters, 0 for none) and message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,7 +205,7 @@ impl Reduce<'_> {
         }
     }
 
-    /// `char *` that may be NULL: an empty rule's `$$ = NULL`, else a token's or an action's string.
+    /// `char *` that may be NULL: an empty rule's `$$ = NULL`, else a token's or action's string.
     fn opt_string(&mut self, n: usize) -> Result<Option<String>, Refusal> {
         match self.take(n) {
             Value::Node(None) => Ok(None),
@@ -281,6 +282,8 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         1516 => (0xcafd_31ef_0f34_4799, |_| Ok(Value::Bool(true))),
         // opt_transaction_chain: AND NO CHAIN | /* EMPTY */
         1517 | 1518 => (0xc7dd_6751_cbba_2e22, |_| Ok(Value::Bool(false))),
+        // opt_qualified_name: /* EMPTY */
+        141 => (0x86b3_9e15_ebb4_d128, nil),
         // opt_drop_behavior: /* EMPTY */
         148 => (0x784d_d6d1_0e75_e150, |_| Ok(Value::Int(0))),
         // VariableSetStmt: SET set_rest
@@ -387,8 +390,16 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         582 => (0x1e2a_fd0a_a524_9ce8, nil),
         // OptInherit: /* EMPTY */
         606 => (0x1e2a_fd0a_a524_9ce8, nil),
+        // OptPartitionSpec: PartitionSpec
+        607 => (0xc85e_a996_47dc_cd93, top),
         // OptPartitionSpec: /* EMPTY */
         608 => (0x582e_440b_6ba4_80f6, null),
+        // PartitionSpec: PARTITION BY ColId '(' part_params ')'
+        609 => (0x8fd4_ba17_e148_e5d7, partition_spec),
+        // part_params: part_elem
+        610 => (0x57ea_2889_6e5b_5822, list1),
+        // part_elem: ColId opt_collate opt_qualified_name
+        612 => (0xfa06_b422_7cbf_f8b1, part_elem),
         // table_access_method_clause: /* EMPTY */
         616 => (0x9a64_6afd_218c_483b, null),
         // OptWith: WITH reloptions
@@ -423,6 +434,8 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         987 => (0x1fdb_3a96_2e09_cf75, truncate_stmt),
         // opt_restart_seqs: /* EMPTY */
         990 => (0x2562_84d6_595c_3282, |_| Ok(Value::Bool(false))),
+        // opt_collate: /* EMPTY */
+        1139 => (0x1e2a_fd0a_a524_9ce8, nil),
         // opt_asc_desc: ASC
         1140 => (0xe77c_326d_e6dc_6368, |_| Ok(Value::Int(1))),
         // opt_nulls_order: /* EMPTY */
@@ -1818,6 +1831,41 @@ fn set_stmt(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
     Ok(Value::Node(Some(stmt)))
 }
 
+/// `PartitionSpec: PARTITION BY ColId '(' part_params ')'`: parsePartitionStrategy, which refuses
+/// a strategy other than list, range or hash (pg_strcasecmp) at @3.
+fn partition_spec(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let strategy = match r.string(3)?.to_ascii_lowercase().as_str() {
+        "list" => 'l',
+        "range" => 'r',
+        "hash" => 'h',
+        _ => {
+            return Err(r.refuse(INVALID_PARAMETER_VALUE, 3, "unrecognized partitioning strategy"));
+        }
+    };
+    let part_params = r.list(5)?;
+    let location = r.at(1)?;
+    r.make(Node::PartitionSpec {
+        strategy,
+        part_params,
+        location,
+    })
+}
+
+/// `part_elem: ColId opt_collate opt_qualified_name`.
+fn part_elem(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let name = r.string(1)?;
+    let collation = r.list(2)?;
+    let opclass = r.list(3)?;
+    let location = r.at(1)?;
+    r.make(Node::PartitionElem {
+        name: Some(name),
+        expr: None,
+        collation,
+        opclass,
+        location,
+    })
+}
+
 /// `VariableShowStmt: SHOW var_name`.
 fn show_stmt(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
     let name = r.string(2)?;
@@ -2053,7 +2101,7 @@ mod tests {
                 n += 1;
             }
         }
-        assert_eq!(n, 226);
+        assert_eq!(n, 232);
     }
 
     /// T-PG.5.1: a syntax error is 42601 at the token 19 names (1-based characters), the end of
