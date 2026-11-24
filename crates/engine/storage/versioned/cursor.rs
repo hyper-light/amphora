@@ -651,13 +651,16 @@ impl VersionedCursor {
     /// no read of it, so no insert past it refuses its commit (`Dialect::next_rowid`).
     pub(crate) fn largest_rowid(&mut self) -> Result<Option<i64>> {
         let txn = self.txn.take();
-        let found = self.last_before(&Point::Last);
+        let rowid = match self.last_before(&Point::Last) {
+            Ok(true) => self.rowid_now(),
+            Ok(false) => Ok(None),
+            Err(error) => Err(error),
+        };
         self.txn = txn;
-        if found? {
-            self.rowid_now()
-        } else {
-            Ok(None)
-        }
+        // As an append leaves it: the insert that follows puts by key wherever the cursor is.
+        self.record_stale();
+        self.at = At::Nowhere;
+        rowid
     }
 
     /// Keeps, for the transaction's commit's validation, that the cursor read the keys from
