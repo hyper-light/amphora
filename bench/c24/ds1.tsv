@@ -1,0 +1,51 @@
+db	ds	plain
+sql	CREATE TABLE a(k INT)
+sql	INSERT INTO a VALUES (1),(2)
+sql	CREATE TABLE ti(x, y)
+sql	CREATE TABLE aj(k INT, j TEXT)
+sql	INSERT INTO aj VALUES (1,'[7,1]'),(2,'[[1,2],3]'),(3,'{"a":{"b":1},"c":[2]}'),(4,NULL),(5,'5')
+q	SELECT rowid FROM json_tree('[7]')	2:0;1
+q	SELECT x.k, je.id FROM a AS x RIGHT JOIN json_tree('[7,1]') AS je ON 1	6:1,0;1,1;1,3;2,0;2,1;2,3
+q	SELECT x.k, je.value FROM a AS x RIGHT JOIN json_tree('[7,1]') AS je ON 1	6:1,'[7,1]';1,1;1,7;2,'[7,1]';2,1;2,7
+q	SELECT x.k, je.value FROM a AS x FULL JOIN json_tree('[7,1]') AS je ON 1	6:1,'[7,1]';1,1;1,7;2,'[7,1]';2,1;2,7
+q	SELECT x.k, je.value FROM a AS x FULL JOIN json_tree('[7,1]') AS je ON je.value = x.k	4:1,1;2,NULL;NULL,'[7,1]';NULL,7
+q	SELECT rowid, value FROM json_each('[7,1]')	2:0,7;1,1
+q	SELECT rowid, value FROM json_tree('[[1,2],3]')	5:0,'[[1,2],3]';1,'[1,2]';2,1;3,2;4,3
+q	SELECT rowid, value FROM json_tree('{"a":{"b":1},"c":[2]}')	5:0,'{"a":{"b":1},"c":[2]}';1,'{"b":1}';2,1;3,'[2]';4,2
+q	SELECT rowid, value FROM generate_series(-1,2)	4:-1,-1;0,0;1,1;2,2
+q	SELECT x.k, g.rowid, g.value FROM a AS x FULL JOIN generate_series(0,2) AS g ON g.value = x.k	3:1,1,1;2,2,2;NULL,0,0
+q	SELECT x.k, g.rowid, g.value FROM a AS x RIGHT JOIN generate_series(0,2) AS g ON g.value >= x.k	4:1,1,1;1,2,2;2,2,2;NULL,0,0
+q	SELECT x.k, g.rowid, g.value FROM a AS x LEFT JOIN generate_series(0,2) AS g ON g.value = x.k AND x.k = 2	2:1,NULL,NULL;2,2,2
+q	SELECT x.k, p.rowid, p.cid FROM a AS x LEFT JOIN pragma_table_info('ti') AS p ON p.cid = x.k	2:1,2,1;2,NULL,NULL
+q	SELECT x.k, p.rowid, p.cid FROM a AS x FULL JOIN pragma_table_info('ti') AS p ON p.cid = x.k	3:1,2,1;2,NULL,NULL;NULL,1,0
+q	SELECT x.k, je.rowid FROM a AS x LEFT JOIN json_each('[7,1]') AS je ON je.value = x.k	2:1,1;2,NULL
+q	SELECT x.k, je.rowid FROM a AS x LEFT JOIN json_tree('[7,1]') AS je ON je.value = x.k	2:1,2;2,NULL
+q	SELECT x.k, je.rowid FROM aj AS x LEFT JOIN json_each(x.j) AS je	8:1,0;1,1;2,0;2,1;3,0;3,1;4,NULL;5,0
+q	SELECT x.k, je.rowid, je.type FROM aj AS x LEFT JOIN json_tree(x.j) AS je	15:1,0,'array';1,1,'integer';1,2,'integer';2,0,'array';2,1,'array';2,2,'integer';2,3,'integer';2,4,'integer';3,0,'object';3,1,'object';3,2,'integer';3,3,'array';3,4,'integer';4,NULL,NULL;5,0,'integer'
+q	SELECT x.k, je.rowid, je.type FROM aj AS x JOIN json_tree(x.j) AS je	14:1,0,'array';1,1,'integer';1,2,'integer';2,0,'array';2,1,'array';2,2,'integer';2,3,'integer';2,4,'integer';3,0,'object';3,1,'object';3,2,'integer';3,3,'array';3,4,'integer';5,0,'integer'
+q	SELECT x.k, je.rowid, je.type FROM aj AS x FULL JOIN json_tree(x.j) AS je ON je.type = 'integer'	9:1,1,'integer';1,2,'integer';2,2,'integer';2,3,'integer';2,4,'integer';3,2,'integer';3,4,'integer';4,NULL,NULL;5,0,'integer'
+q	SELECT x.k, je.rowid, je.type FROM aj AS x RIGHT JOIN json_tree(x.j) AS je ON je.type = 'integer'	8:1,1,'integer';1,2,'integer';2,2,'integer';2,3,'integer';2,4,'integer';3,2,'integer';3,4,'integer';5,0,'integer'
+q	SELECT value FROM json_each('[7,1]') WHERE rowid = 0	1:7
+q	SELECT value FROM json_each('[7,1]') WHERE rowid IS NULL	0:
+q	SELECT value FROM json_tree('[7,1]') WHERE rowid = 0	1:'[7,1]'
+q	SELECT value FROM json_tree('[7,1]') WHERE rowid >= 1	2:1;7
+q	SELECT value FROM generate_series(0,3) WHERE rowid = 0	1:0
+q	SELECT value FROM generate_series(0,3) WHERE rowid IN (0, 2)	2:0;2
+q	SELECT count(rowid), min(rowid), max(rowid) FROM json_tree('[7,1]')	1:3,0,2
+q	SELECT a.k, je.rowid FROM a JOIN json_tree('[7,1]') AS je ON je.rowid = a.k	2:1,1;2,2
+q	SELECT a.k, je.rowid FROM a LEFT JOIN json_tree('[7,1]') AS je ON je.rowid = a.k - 1	2:1,0;2,1
+q	SELECT a.k, je.rowid FROM a RIGHT JOIN json_tree('[7,1]') AS je ON je.rowid = a.k - 1	3:1,0;2,1;NULL,2
+q	SELECT oid, _rowid_ FROM json_tree('[7]')	2:0,0;1,1
+q	SELECT name, rowid FROM pragma_table_info('ti')	2:'x',1;'y',2
+q	SELECT seq, rowid FROM pragma_database_list	1:0,1
+q	SELECT quote(rowid), typeof(rowid) FROM json_tree('[7]')	2:'0','integer';'1','integer'
+q	SELECT (SELECT rowid FROM json_tree('[7]') LIMIT 1)	1:0
+q	SELECT a.k, (SELECT je.rowid FROM json_tree('[7,1]') AS je WHERE je.value = a.k) FROM a	2:1,2;2,NULL
+q	SELECT a.k FROM a WHERE EXISTS (SELECT 1 FROM json_tree('[7,1]') AS je WHERE je.rowid = a.k - 1)	2:1;2
+q	SELECT a.k FROM a WHERE a.k NOT IN (SELECT rowid FROM json_tree('[7,1]'))	0:
+q	SELECT rowid, count(*) FROM json_tree('[7,1]') GROUP BY rowid	3:0,1;1,1;2,1
+q	SELECT je.rowid, sum(je.rowid) OVER (ORDER BY je.rowid) FROM json_tree('[7,1]') AS je	3:0,0;1,1;2,3
+q	SELECT DISTINCT rowid FROM json_tree('[7,1]')	3:0;1;2
+q	SELECT t.rowid FROM json_tree('[7,1]') AS t ORDER BY t.rowid DESC LIMIT 1	1:2
+q	SELECT je.rowid, jf.rowid FROM json_tree('[7,1]') AS je FULL JOIN json_tree('[7,2]') AS jf ON je.rowid = jf.rowid + 1	4:0,NULL;1,0;2,1;NULL,2
+q	SELECT je.rowid, jf.rowid FROM json_each('[7,1]') AS je NATURAL JOIN json_each('[7,2]') AS jf	0:
