@@ -95,7 +95,7 @@ impl InternalVirtualTable for PgCatalogTable {
             idx_str: None,
             order_by_consumed: false,
             estimated_cost: built_in as f64,
-            estimated_rows: i64::try_from(built_in).unwrap_or(i64::MAX),
+            estimated_rows: u32::try_from(built_in).unwrap_or(u32::MAX),
             constraint_usages: constraints
                 .iter()
                 .map(|_| ConstraintUsage {
@@ -253,7 +253,7 @@ fn template(
         .rows
         .iter()
         .copied()
-        .find(|row| at.and_then(|i| row.get(i)) == Some(&key) && also(row))
+        .find(|row| at.and_then(|i| row.get(i)) == Some(&key) && also(*row))
         .ok_or_else(|| LimboError::InternalError(format!("{} has no template row", catalog.name)))
 }
 
@@ -326,7 +326,7 @@ fn attribute_rows(t: &UserTable) -> Result<Vec<Vec<Value>>> {
         .rows
         .iter()
         .filter(of_pg_class)
-        .filter(|row| negative(row))
+        .filter(|row| negative(**row))
         .map(|row| {
             derived(&PG_ATTRIBUTE, row, |c| {
                 (c == "attrelid").then(|| Datum::Oid(t.oid))
