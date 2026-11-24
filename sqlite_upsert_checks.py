@@ -6,9 +6,9 @@ A case is one table (with a rowid, an alias of it or not, or WITHOUT ROWID; STRI
 CHECKed (one column's and two columns' checks), UNIQUE, a foreign key's child and its parent, each constraint with a
 conflict clause or without; its triggers, BEFORE and AFTER each event, which log NEW and OLD and some of which RAISE or
 write the row they fire for; an index, plain, partial or on an expression; then UPSERTs of one row and several, under
-each OR clause, with one ON CONFLICT or two, beside UPDATEs, plain INSERTs and DELETEs, each its own transaction or in one. The refusal's text is held: it
-names the constraint SQLite met first. After each refused statement a pragma's table function is read, and
-at the end the rows of every table and the integrity check.
+each OR clause, with one ON CONFLICT or two, beside UPDATEs, plain INSERTs and DELETEs, each a transaction of its own or
+all in one. The refusal's text is held: it names the constraint SQLite met first. After each refused statement a pragma's
+table function is read, and at the end the rows of every table and the integrity check.
 
 Left out: which of two UNIQUE constraints a row meets first (no document says; a refusal is held as UNIQUE's), an
 expression that raises (SQLite evaluates a constant one before the statement's first row), what Amphora has no table
