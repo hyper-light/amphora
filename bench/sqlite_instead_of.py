@@ -310,6 +310,23 @@ FORMS = [
         ["INSERT INTO v VALUES (1, 2, 3)", LOG, COUNTS, "DELETE FROM v WHERE k < 3", LOG],
     ),
     (
+        "recursive triggers",
+        [
+            VIEW,
+            "CREATE VIEW o AS SELECT k, a FROM t",
+            "CREATE TRIGGER g INSTEAD OF INSERT ON v WHEN new.k < 6 BEGIN INSERT INTO lg VALUES ('v', new.k, (SELECT count(*) FROM lg), changes()); INSERT INTO v VALUES (new.k + 1, new.a, new.b); INSERT INTO lg VALUES ('w', new.k, NULL, changes()); END",
+            "CREATE TRIGGER h INSTEAD OF UPDATE ON v WHEN new.a < 14 BEGIN UPDATE t SET a = new.a WHERE k = old.k; UPDATE v SET a = new.a + 1 WHERE k = old.k; INSERT INTO lg VALUES ('h', old.a, new.a, NULL); END",
+            "CREATE TRIGGER i INSTEAD OF DELETE ON v BEGIN INSERT INTO lg VALUES ('i', old.k, NULL, NULL); DELETE FROM t WHERE k = old.k; DELETE FROM o WHERE k > old.k; END",
+            "CREATE TRIGGER j INSTEAD OF DELETE ON o BEGIN INSERT INTO lg VALUES ('j', old.k, NULL, NULL); DELETE FROM v WHERE k = old.k; END",
+        ],
+        sum((["PRAGMA recursive_triggers = " + on, "BEGIN", "INSERT INTO v VALUES (1, 0, 0), (4, 0, 0)", "UPDATE v SET a = a + 1 WHERE k = 1 RETURNING a", LOOK, COUNTS, "DELETE FROM v WHERE k = 1 RETURNING k", LOOK, "ROLLBACK"] for on in ("OFF", "ON", "OFF")), []),
+    ),
+    (
+        "recursive triggers without end",
+        ["CREATE VIEW e AS SELECT k FROM t", "CREATE TRIGGER ei INSTEAD OF INSERT ON e BEGIN INSERT INTO u VALUES (new.k, new.k); INSERT INTO e VALUES (new.k + 1); END"],
+        ["INSERT INTO e VALUES (100)", "SELECT count(*) FROM u", "PRAGMA recursive_triggers = ON", "INSERT INTO e VALUES (200)", "SELECT count(*) FROM u", "PRAGMA recursive_triggers = OFF", "INSERT INTO e VALUES (200)", "SELECT count(*) FROM u"],
+    ),
+    (
         "views over views, each with its triggers",
         [VIEW, "CREATE VIEW o(p, q) AS SELECT k, a FROM v WHERE a > 5", "CREATE TRIGGER gv INSTEAD OF UPDATE ON v BEGIN UPDATE t SET a = new.a, b = new.b WHERE k = old.k; END", "CREATE TRIGGER go INSTEAD OF UPDATE ON o BEGIN UPDATE v SET a = new.q WHERE k = old.p; INSERT INTO lg VALUES ('o', old.p, new.p, changes()); END", "CREATE TRIGGER gp INSTEAD OF DELETE ON o BEGIN UPDATE o SET q = 0 WHERE p = old.p; END"],
         ["UPDATE o SET q = q + 1 WHERE p > 1", LOOK, COUNTS, "DELETE FROM o WHERE p = 2 RETURNING *", LOOK, "UPDATE o SET q = q + 1 RETURNING p, q", LOOK, COUNTS],

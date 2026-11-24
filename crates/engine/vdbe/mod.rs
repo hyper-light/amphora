@@ -1031,6 +1031,10 @@ pub struct ProgramState {
     /// The transaction's deferred violations when this statement began to write, which it is
     /// refused back to whether or not a statement savepoint was opened for it.
     pub(crate) fk_deferred_violations_at_start: Option<isize>,
+    /// The program this one, itself a statement's, hands that statement to run.
+    pub(crate) called_program: Option<Box<execute::RunningProgram>>,
+    /// How many programs run this one: none for a statement's own.
+    pub(crate) program_depth: usize,
     /// True once the Halt opcode has started finishing the statement. The
     /// statement's outcome is decided at that point, so an interrupt request
     /// arriving during Halt's resumable work (staging index-method writes,
@@ -1186,6 +1190,8 @@ impl ProgramState {
             pending_fail_prepare_error: None,
             constraint_action: ResolveType::Abort,
             fk_deferred_violations_at_start: None,
+            called_program: None,
+            program_depth: 0,
             halt_in_progress: false,
             pending_cdc_info: None,
             subprogram_stmt_cache: HashMap::default(),
@@ -1398,6 +1404,7 @@ impl ProgramState {
         self.pending_fail_prepare_error = None;
         self.constraint_action = ResolveType::Abort;
         self.fk_deferred_violations_at_start = None;
+        self.called_program = None;
         self.halt_in_progress = false;
         self.pending_cdc_info = None;
         self.subprogram_stmt_cache.clear();
@@ -1575,7 +1582,7 @@ impl ProgramState {
     pub(crate) fn with_metrics<R>(&self, f: impl FnOnce(&StatementMetrics) -> R) -> R {
         let has_subprograms = matches!(
             self.active_op_state.program_ref(),
-            Some(OpProgramState::Step { .. })
+            Some(OpProgramState::Running(_))
         ) || !self.subprogram_stmt_cache.is_empty();
         if has_subprograms {
             f(&self.metrics())
@@ -1586,8 +1593,10 @@ impl ProgramState {
 
     pub(crate) fn metrics(&self) -> StatementMetrics {
         let mut metrics = self.metrics.clone();
-        if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_ref() {
-            metrics.merge(&statement.metrics());
+        if let Some(OpProgramState::Running(running)) = self.active_op_state.program_ref() {
+            for program in running {
+                metrics.merge(&program.statement.metrics());
+            }
         }
         for statement in self.subprogram_stmt_cache.values() {
             metrics.merge(&statement.metrics());
@@ -1597,8 +1606,10 @@ impl ProgramState {
 
     pub(crate) fn reset_metrics(&mut self) {
         self.metrics.reset();
-        if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
-            statement.reset_metrics();
+        if let Some(OpProgramState::Running(running)) = self.active_op_state.program_mut() {
+            for program in running {
+                program.statement.reset_metrics();
+            }
         }
         for statement in self.subprogram_stmt_cache.values_mut() {
             statement.reset_metrics();
@@ -1616,8 +1627,10 @@ impl ProgramState {
             crate::statement::StatementStatusCounter::RowsRead => self.metrics.rows_read = 0,
             crate::statement::StatementStatusCounter::RowsWritten => self.metrics.rows_written = 0,
         }
-        if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
-            statement.reset_stmt_status(counter);
+        if let Some(OpProgramState::Running(running)) = self.active_op_state.program_mut() {
+            for program in running {
+                program.statement.reset_stmt_status(counter);
+            }
         }
         for statement in self.subprogram_stmt_cache.values_mut() {
             statement.reset_stmt_status(counter);

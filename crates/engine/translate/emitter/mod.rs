@@ -30,6 +30,7 @@ use crate::schema::{
 };
 use crate::translate::fkeys::FkActionCompileStack;
 use crate::translate::plan::{Aggregate, ColumnMask};
+use crate::translate::trigger_exec::TriggerCompileStack;
 use crate::vdbe::{
     affinity::Affinity,
     builder::{CursorKey, CursorType, DmlColumnContext, ProgramBuilder, SelfTableContext},
@@ -277,6 +278,8 @@ pub struct Resolver<'a> {
     /// shared state, a self-referential `ON DELETE CASCADE` could fail to see
     /// that its own action program is already being built.
     pub(super) fk_action_compile_stack: FkActionCompileStack,
+    /// The trigger programs being compiled, shared with forked resolvers as the actions' are.
+    pub(super) trigger_compile_stack: TriggerCompileStack,
     unqualified_database_search_path: Option<Vec<String>>,
 }
 
@@ -404,6 +407,7 @@ impl<'a> Resolver<'a> {
             morsel_hook: MorselHookFor::Off,
             has_temp_schema,
             fk_action_compile_stack: FkActionCompileStack::default(),
+            trigger_compile_stack: TriggerCompileStack::default(),
             unqualified_database_search_path: unqualified_database_search_path.clone(),
         }
     }
@@ -664,6 +668,7 @@ impl<'a> Resolver<'a> {
             morsel_hook: self.morsel_hook,
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
+            trigger_compile_stack: self.trigger_compile_stack.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),
         }
     }
@@ -712,6 +717,7 @@ impl<'a> Resolver<'a> {
             morsel_hook: self.morsel_hook,
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
+            trigger_compile_stack: self.trigger_compile_stack.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),
         }
     }
