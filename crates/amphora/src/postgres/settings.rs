@@ -218,3 +218,25 @@ impl<T: Copy> Transactional<T> {
         self.session = self.committed;
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// T-PG.15.3: a role that is no superuser may not set `deadlock_timeout` (`PGC_SUSET`), and may set
+    /// `lock_timeout`.
+    #[test]
+    fn t_pg_15_3_only_a_superuser_sets_deadlock_timeout() {
+        let set = |name, superuser| Settings::default().with(name, Some("5s"), superuser);
+        let refused = set("deadlock_timeout", false).unwrap_err();
+        assert_eq!(refused.code.code(), "42501");
+        assert_eq!(
+            refused.message,
+            "permission denied to set parameter \"deadlock_timeout\""
+        );
+        let set = set("lock_timeout", false).unwrap();
+        assert_eq!(set.wait_limits().lock, Some(Duration::from_secs(5)));
+        assert!(Settings::default().with("deadlock_timeout", Some("5s"), true).is_ok());
+    }
+}

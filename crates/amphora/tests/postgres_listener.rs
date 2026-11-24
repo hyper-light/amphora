@@ -507,8 +507,7 @@ fn t_pg_14_3_a_waiting_session_holds_no_other_and_is_answered_when_its_holder_co
 
 /// T-PG.15.3: over sockets, the two deadlines end a wait by themselves: of two sessions that wait for
 /// each other, the one whose `deadlock_timeout` passes is refused `40P01` and the other, whose own
-/// is far off, is answered; and a wait longer than its `lock_timeout` is refused `55P03`. A role that is
-/// no superuser may not set the first.
+/// is far off, is answered; and a wait longer than its `lock_timeout` is refused `55P03`.
 #[test]
 fn t_pg_15_3_a_deadlock_and_a_lock_timeout_end_a_wait_by_themselves() {
     let dir = tempfile::tempdir().unwrap();

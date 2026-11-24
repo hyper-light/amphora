@@ -99,7 +99,7 @@ s1|insert into parttbl(a, b, c) values (1, 1, 1)
 s1|insert into parttbl(a, b, c) values (2, 2, 2)
 s1|begin isolation level read committed
 s2|begin isolation level read committed
-s1|update parttbl set b = b + 10
+s1|update parttbl set b = b + 10 where a >= 1
 s2>update parttbl set c = 0 - c where b < 10
 s1|commit
 s2<
@@ -113,7 +113,7 @@ s1|insert into q(id, v) values (2, 20)
 s1|insert into q(id, v) values (3, 30)
 s1|begin
 s1|update q set v = v + 1 where id = 2
-s2>update q set v = v + 100
+s2>update q set v = v + 100 where id >= 1
 s3>update q set v = v + 1000 where id = 1
 s1|commit
 s2<
@@ -142,7 +142,7 @@ s1|begin
 s1|update q set v = v + 1 where id = 1
 s3|begin
 s3|update q set v = v + 1 where id = 3
-s2>update q set v = v + 100
+s2>update q set v = v + 100 where id >= 1
 s1|commit
 s2+
 s3|rollback
@@ -225,7 +225,7 @@ s1|select v from q where id = 1
 s1|begin isolation level repeatable read
 s1|select v from q where id = 2
 s2|update q set v = v + 1 where id = 2
-s1|update q set v = v + 100
+s1|update q set v = v + 100 where id >= 1
 s1|rollback
 s1|select v from q where id = 1
 # deadlock-simple, by rows: two sessions, the second's check finds it

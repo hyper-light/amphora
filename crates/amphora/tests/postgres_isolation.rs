@@ -208,7 +208,9 @@ fn interleave(steps: &str, answers: &str) -> Compared {
         }
         let mut theirs = theirs.clone();
         let (z, body) = theirs.pop().unwrap();
-        assert_eq!((z, body[0]), (b'Z', status(&session.executor)), "{line}\n{out:?}");
+        let ready = (b'Z', status(&session.executor));
+        let answered = String::from_utf8_lossy(&out);
+        assert_eq!((z, body[0]), ready, "{line}: {answered}");
         let (ours, theirs) = (told(sql, &messages(&out)), told(sql, &theirs));
         if ours != theirs {
             wrong.push(format!("{line}\n  19 {theirs:?}\n  is {ours:?}"));
