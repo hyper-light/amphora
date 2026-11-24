@@ -1481,8 +1481,11 @@ impl Flushing {
                     if result.is_ok() {
                         meter.flushed(began.elapsed());
                     }
+                    let every = std::env::var("V22_EVERY_MS").ok().and_then(|v| v.parse().ok()).map_or(CHECKPOINT_EVERY, Duration::from_millis);
+                    let since = copied_at.map(|then| then.elapsed());
                     let due =
-                        copy || copied_at.is_none_or(|then| then.elapsed() >= CHECKPOINT_EVERY);
+                        copy || copied_at.is_none_or(|then| then.elapsed() >= every);
+                    if std::env::var("V22_SAY").is_ok() { eprintln!("V22 flush at {:?} copy={copy} since_last_pass={since:?} due={due}", at.index); }
                     if let Ok(flushed) = result.as_mut()
                         && due
                     {
@@ -19050,10 +19053,17 @@ mod tests {
             .machine()
             .set_free_bytes(free_for(0, 2));
         // A pass says the room as it now stands; no flush is let through after it.
+        let (room0, passes0) = (room(&clients, 0), handle.counters().checkpoints.iter().sum::<u64>());
         write(&mut driven, &mut pump, voter, 2);
         settle_log(&mut driven, &mut pump, &clients);
         driven.flushed(&mut pump, 0);
         log_idle(&mut driven, &mut pump, 0);
+        eprintln!(
+            "V22 room before {room0} after {} passes {passes0} then {} frames {}",
+            room(&clients, 0),
+            handle.counters().checkpoints.iter().sum::<u64>(),
+            driven.owner(0).replica.machine().log_frames().unwrap()
+        );
         let gate = driven.owner(0).replica.machine().flush_gate();
         gate.hold();
         let before = handle.counters().database_log_restarts;
