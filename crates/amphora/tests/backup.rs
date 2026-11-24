@@ -1567,9 +1567,9 @@ fn a_restore_of_a_truncated_generation_is_refused() {
 }
 
 /// AC-T1.12.4 (lane B25): a restore that is refused for a short archive leaves nothing at its path
-/// that opens as a whole database. Do: zero the end of a generation's last frame, sealed again;
-/// restore its last second; then restore the base's own second at the same path. Expect: the first
-/// is refused, typed, and no file stands at its path; the second holds its rows.
+/// that opens as a whole database. Do: zero a generation's last frame, sealed again; restore its last
+/// second; then restore the base's own second at the same path. Expect: the first is refused,
+/// typed, and no file stands at its path; the second holds its rows.
 #[test]
 fn a_short_restore_leaves_no_database() {
     let mut s = Source::new();
@@ -1586,8 +1586,9 @@ fn a_short_restore_leaves_no_database() {
     let last = s.second();
     s.now.fetch_add(SECOND_NS, Ordering::SeqCst);
     s.ship().unwrap();
-    let (_, name, mut body) = generation_segments(&s.blobs, 1).pop().unwrap();
-    let tail = body.frames.len() - 100;
+    let (key, name, mut body) = generation_segments(&s.blobs, 1).pop().unwrap();
+    let frames = usize::try_from(key.last - key.first + 1).unwrap();
+    let tail = body.frames.len() - body.frames.len() / frames;
     body.frames[tail..].fill(0);
     replace_segment(&s.blobs, &name, &body);
     let target = s.dir.path().join("short.db");
@@ -1687,17 +1688,20 @@ fn d45_a_shipper_opened_after_a_switch_carries_on_from_the_closed_segment() {
 }
 
 /// Decision 45 (lane B25): a new database takes nothing from a log segment left at its path, `-wal2` as
-/// `-wal`. Do: write 20 rows, start the log again (the writer switches to `-wal2`) and write 5 rows
-/// more; end, and remove the database's file and its `-wal`, the ones SQLite names, its `-wal2` left;
-/// open a database at that path, make a table and write 3 rows, and open it again. Expect: it begins
-/// empty, and holds the 3 rows alone, its file whole.
+/// `-wal`. Do: write 20 rows, start the log again (the writer switches to `-wal2`), and there make a
+/// second table and write 200 rows; end, and remove the database's file and its `-wal`, the ones
+/// SQLite names, its `-wal2` left; open a database at that path, make a table and write 3 rows, copy
+/// its log into its file, and open it again. Expect: it begins empty, and holds the 3 rows alone,
+/// its file whole.
 #[test]
 fn d45_a_new_database_takes_no_log_segment_left_at_its_path() {
     let mut s = Source::new();
     s.put(0..20, "a");
     s.ship().unwrap();
     assert!(s.db.restart_log().unwrap(), "shipped, so it starts again");
-    s.put(20..25, "b");
+    s.db.exec("CREATE TABLE removed (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    s.put(20..220, "b");
     let state = log_files(&s.path);
     let Source { path, db, dir, .. } = s;
     drop(db);
@@ -1740,6 +1744,8 @@ fn d45_a_new_database_takes_no_log_segment_left_at_its_path() {
         expected.insert(id, "new".into());
     }
     assert_eq!(rows(&db), expected);
+    let mut db = db;
+    let _copied = db.checkpoint().unwrap();
     drop(db);
     let db = Db::open(&path).unwrap();
     assert_eq!(rows(&db), expected, "opened again");
