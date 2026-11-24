@@ -123,6 +123,33 @@ enum Phase {
     Closed,
 }
 
+/// A transaction block's state, what ReadyForQuery reports (`src/backend/tcop/postgres.c`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxStatus {
+    Idle,
+    InTransaction,
+    Failed,
+}
+
+impl TxStatus {
+    fn byte(self) -> u8 {
+        match self {
+            Self::Idle => b'I',
+            Self::InTransaction => b'T',
+            Self::Failed => b'E',
+        }
+    }
+}
+
+/// What runs a session's statements: the shell that has a database, or a test's.
+pub trait Statements {
+    fn status(&self) -> TxStatus;
+    /// Runs a Query message's statements and appends the messages that answer them, all but the
+    /// ReadyForQuery that ends them. A statement's refusal is an ErrorResponse in `out`; `Err` is a
+    /// message that can't be written.
+    fn simple_query(&mut self, sql: &str, out: &mut Vec<u8>) -> Result<(), PgError>;
+}
+
 /// One connection.
 pub struct Session {
     config: Config,
@@ -130,6 +157,8 @@ pub struct Session {
     phase: Phase,
     /// Why the server can't take this session, answered once its StartupMessage is read.
     refused: Option<PgError>,
+    /// What runs its statements: none refuses each with `0A000`.
+    statements: Option<Box<dyn Statements>>,
 }
 
 fn fatal(out: &mut Vec<u8>, consumed: usize, error: &PgError) -> Result<Step, PgError> {
@@ -298,8 +327,8 @@ fn parameter_status(out: &mut Vec<u8>, name: &str, value: &str) -> Result<(), Pg
     })
 }
 
-fn ready_for_query(out: &mut Vec<u8>) -> Result<(), PgError> {
-    wire::message(out, b'Z', |out| out.push(b'I'))
+fn ready_for_query(out: &mut Vec<u8>, status: TxStatus) -> Result<(), PgError> {
+    wire::message(out, b'Z', |out| out.push(status.byte()))
 }
 
 fn authentication(out: &mut Vec<u8>, code: i32, data: &[u8]) -> Result<(), PgError> {
@@ -371,7 +400,22 @@ impl Session {
                 gss_done: false,
             },
             refused: None,
+            statements: None,
         }
+    }
+
+    /// The session whose statements `statements` runs.
+    #[must_use]
+    pub fn with_statements(mut self, statements: Box<dyn Statements>) -> Self {
+        self.statements = Some(statements);
+        self
+    }
+
+    /// What ReadyForQuery reports.
+    fn tx_status(&self) -> TxStatus {
+        self.statements
+            .as_ref()
+            .map_or(TxStatus::Idle, |s| s.status())
     }
 
     /// Refuses the session with `error` (FATAL) once its StartupMessage is read, where PostgreSQL
@@ -708,7 +752,7 @@ impl Session {
             out.extend_from_slice(&process_id.to_be_bytes());
             out.extend_from_slice(key);
         })?;
-        ready_for_query(out)?;
+        ready_for_query(out, self.tx_status())?;
         self.phase = Phase::Ready {
             startup,
             skip_to_sync: false,
@@ -786,24 +830,27 @@ impl Session {
                 };
                 let answer = utf8(sql)
                     .map_err(|e| PgError::error(e.code, e.message))
-                    .and_then(|_| empty_query(sql));
+                    .and_then(|text| empty_query(sql).map(|empty| (text, empty)));
                 match answer {
-                    Ok(true) => wire::message(out, b'I', |_| {})?,
-                    Ok(false) => wire::error_response(out, &not_yet())?,
+                    Ok((_, true)) => wire::message(out, b'I', |_| {})?,
+                    Ok((text, false)) => match &mut self.statements {
+                        Some(statements) => statements.simple_query(text, out)?,
+                        None => wire::error_response(out, &not_yet())?,
+                    },
                     Err(error) => wire::error_response(out, &error)?,
                 }
-                ready_for_query(out)?;
+                ready_for_query(out, self.tx_status())?;
             }
             b'F' => {
                 wire::error_response(out, &not_yet())?;
-                ready_for_query(out)?;
+                ready_for_query(out, self.tx_status())?;
             }
             b'P' | b'B' | b'D' | b'E' | b'C' => {
                 wire::error_response(out, &not_yet())?;
                 skip = true;
             }
             b'S' => {
-                ready_for_query(out)?;
+                ready_for_query(out, self.tx_status())?;
                 skip = false;
             }
             // Flush, and copy messages outside a COPY, which PostgreSQL also ignores
