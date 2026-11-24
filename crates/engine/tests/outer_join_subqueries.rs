@@ -1,4 +1,4 @@
-//! Oracle findings CH (lane C10), CO and CM (lane C13): LEFT, RIGHT and FULL JOINs whose WHERE, ON or
+//! Oracle findings CH (lane C10), CO and CM (lane C13) and CN (lane C12): joins whose WHERE, ON or
 //! select list holds subqueries, one inside another or over CTEs, and joins of WITHOUT ROWID tables,
 //! answer as SQLite 3.54.0 does (G2 step 3; AC-T1.1.1: reads as committed; AC-T1.8.6: the differential
 //! suite).
@@ -12,7 +12,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// One database of a fixture: the statements that fill it, and its queries with SQLite's answers
-/// (`bench/sqlite_outer_join_subqueries.py`, `bench/sqlite_on_ctes.py`).
+/// (`bench/sqlite_outer_join_subqueries.py`, `bench/sqlite_on_ctes.py`,
+/// `bench/sqlite_join_where_subqueries.py`).
 struct Cases {
     name: &'static str,
     fill: Vec<&'static str>,
@@ -64,33 +65,37 @@ struct Settings {
     joins: JoinMethods,
 }
 
-const SETTINGS: [Settings; 5] = {
-    let default = Settings {
-        parallel: false,
-        statistics: false,
-        joins: JoinMethods::ByCost,
-    };
-    [
-        default,
-        Settings {
-            parallel: true,
-            ..default
-        },
-        Settings {
-            statistics: true,
-            ..default
-        },
-        Settings {
-            parallel: true,
-            statistics: true,
-            ..default
-        },
-        Settings {
-            joins: JoinMethods::HashJoinsOnly,
-            ..default
-        },
-    ]
-};
+const fn settings(parallel: bool, statistics: bool, joins: JoinMethods) -> Settings {
+    Settings {
+        parallel,
+        statistics,
+        joins,
+    }
+}
+
+const SETTINGS: [Settings; 5] = [
+    settings(false, false, JoinMethods::ByCost),
+    settings(true, false, JoinMethods::ByCost),
+    settings(false, true, JoinMethods::ByCost),
+    settings(true, true, JoinMethods::ByCost),
+    settings(false, false, JoinMethods::HashJoinsOnly),
+];
+
+/// Each join method wherever a join can take it, over the tables' own statistics too: a hash join of
+/// more than two tables is planned over tables it knows are small.
+const JOIN_SETTINGS: [Settings; 11] = [
+    settings(false, false, JoinMethods::ByCost),
+    settings(true, false, JoinMethods::ByCost),
+    settings(false, true, JoinMethods::ByCost),
+    settings(true, true, JoinMethods::ByCost),
+    settings(false, false, JoinMethods::HashJoinsOnly),
+    settings(false, true, JoinMethods::HashJoinsOnly),
+    settings(true, true, JoinMethods::HashJoinsOnly),
+    settings(false, false, JoinMethods::MergeJoinsOnly),
+    settings(false, true, JoinMethods::MergeJoinsOnly),
+    settings(false, false, JoinMethods::NestedLoopsOnly),
+    settings(true, true, JoinMethods::NestedLoopsOnly),
+];
 
 fn set(conn: &Arc<Connection>, settings: Settings) {
     if settings.parallel {
@@ -144,9 +149,9 @@ fn outcome(io: &MemoryIO, conn: &Arc<Connection>, sql: &str) -> String {
     }
 }
 
-/// Do: run every query of the fixture under each setting. Expect: SQLite's rows, no panic and no
-/// error, and every table holding after the queries the rows it held before them.
-fn answers_as_sqlite(fixture: &'static str) {
+/// Do: run every query of the fixture under each of `all_settings`. Expect: SQLite's rows, no panic
+/// and no error, and every table holding after the queries the rows it held before them.
+fn answers_as_sqlite(fixture: &'static str, all_settings: &[Settings]) {
     let mut wrong: Vec<String> = Vec::new();
     let mut ran = 0;
     for db in cases(fixture) {
@@ -158,7 +163,7 @@ fn answers_as_sqlite(fixture: &'static str) {
             .map(|table| format!("SELECT * FROM {table}"))
             .collect();
         assert!(!tables.is_empty());
-        for settings in SETTINGS {
+        for &settings in all_settings {
             let (mut io, mut conn) = open(&db.fill);
             set(&conn, settings);
             let held: Vec<String> = tables.iter().map(|sql| outcome(&io, &conn, sql)).collect();
@@ -195,12 +200,25 @@ fn answers_as_sqlite(fixture: &'static str) {
 
 #[test]
 fn outer_joins_with_nested_subqueries_answer_as_sqlite() {
-    answers_as_sqlite(include_str!("fixtures/outer_join_subqueries.tsv"));
+    answers_as_sqlite(
+        include_str!("fixtures/outer_join_subqueries.tsv"),
+        &SETTINGS,
+    );
 }
 
 /// Subqueries of ON clauses that read CTEs (finding CO), and WITHOUT ROWID tables, with and without
 /// secondary indexes, on either side of a join (finding CM).
 #[test]
 fn on_clauses_over_ctes_and_joins_of_keyed_tables_answer_as_sqlite() {
-    answers_as_sqlite(include_str!("fixtures/on_ctes.tsv"));
+    answers_as_sqlite(include_str!("fixtures/on_ctes.tsv"), &SETTINGS);
+}
+
+/// Finding CN: WHERE terms on subqueries over some of the joined tables, beside columns of the others.
+/// A term no row can be tested with before its outer join's NULL row is made is tested on that row too.
+#[test]
+fn joins_filtered_by_subqueries_answer_as_sqlite_by_every_join_method() {
+    answers_as_sqlite(
+        include_str!("fixtures/join_where_subqueries.tsv"),
+        &JOIN_SETTINGS,
+    );
 }

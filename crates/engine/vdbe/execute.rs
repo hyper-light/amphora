@@ -1245,6 +1245,15 @@ fn comparison_slow(
         (_, _) => {}
     }
 
+    // SQLite's OP_Eq converts under TEXT affinity only to compare with a text: two numbers compare as
+    // numbers. A FULL JOIN's merged column is the case: its first column's affinity, TEXT, and the
+    // value of the other, a number (the oracles' finding CZ).
+    let affinity = match (lhs_value, rhs_value) {
+        (Value::Text(_), _) | (_, Value::Text(_)) => affinity,
+        _ if affinity == Affinity::Text => Affinity::Blob,
+        _ => affinity,
+    };
+
     // If all else failed, do an affinity-aware comparison
     let (new_lhs, new_rhs) = (
         affinity.convert_for_compare(lhs_value, program.connection.fp_digits()),
@@ -2930,6 +2939,7 @@ pub fn op_type_check(
             start_reg,
             count,
             check_generated,
+            check_null_keys,
             table_reference,
         },
         insn
@@ -2944,7 +2954,10 @@ pub fn op_type_check(
             assert!(offset < *count);
             let reg = &mut state.registers[*start_reg + offset];
             // INT PRIMARY KEY is not row_id_alias so we throw error if this col is NULL
-            if !col.is_rowid_alias() && col.primary_key() && matches!(reg.get_value(), Value::Null)
+            if *check_null_keys
+                && !col.is_rowid_alias()
+                && col.primary_key()
+                && matches!(reg.get_value(), Value::Null)
             {
                 bail_constraint_error!(
                     "NOT NULL constraint failed: {}.{} ({})",
@@ -6891,6 +6904,58 @@ pub fn op_finish_seek(
     state.deferred_seeks[*cursor_id] = None;
     count_deferred_seek(state);
     state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+fn locking_cursor(
+    state: &mut ProgramState,
+    cursor_id: usize,
+) -> Option<&mut crate::storage::versioned::cursor::VersionedCursor> {
+    match state.cursors.get_mut(cursor_id) {
+        Some(Some(Cursor::Dyn(cursor, ..))) => (cursor.as_mut() as &mut dyn Any).downcast_mut(),
+        _ => None,
+    }
+}
+
+/// Amphora (docs/design/postgres.md section 8): `Insn::LockRow`.
+pub fn op_lock_row(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    use crate::storage::versioned::cursor::RowLocked;
+    load_insn!(
+        LockRow {
+            cursor_id,
+            indexes,
+            held,
+            gone
+        },
+        insn
+    );
+    // A row of another storage (a temporary table's) is its one writer's already.
+    let locked =
+        locking_cursor(state, *cursor_id).map_or(Ok(RowLocked::Held), |cursor| cursor.lock_row());
+    state.pc = match locked {
+        Ok(RowLocked::Held) => held.as_offset_int(),
+        Ok(RowLocked::Gone) => gone.as_offset_int(),
+        Ok(RowLocked::Moved) => {
+            for index in indexes {
+                if let Some(cursor) = locking_cursor(state, *index) {
+                    cursor.read_newest()?;
+                }
+            }
+            state.pc.saturating_add(1)
+        }
+        // The same instruction again once the holder has ended.
+        Err(LimboError::RowTaken(Some(holder))) => {
+            program.connection.set_row_wait(holder);
+            let yielded = IOCompletions(Completion::new_yield());
+            return Ok(state.suspend_on_io(yielded));
+        }
+        Err(error) => return Err(error.into()),
+    };
     Ok(InsnFunctionStepResult::Step)
 }
 

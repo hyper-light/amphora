@@ -413,6 +413,12 @@ pub fn resolve_comparison_collseq_with_resolver(
         symbol_table,
         resolver,
     )?;
+    // datatype3.html 7.1: a column that declares no collation has BINARY, and the left operand's goes
+    // before the right's.
+    let lhs_column = match lhs_column {
+        None => comparison_operand_column_collseq(lhs_expr, referenced_tables)?,
+        declared => declared,
+    };
     Ok(lhs_explicit.or(rhs_explicit).or(lhs_column).or(rhs_column))
 }
 

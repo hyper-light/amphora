@@ -3,25 +3,29 @@
 //! which runs there, and its answer is written as PostgreSQL 19 writes it, RowDescription and DataRow
 //! in text, CommandComplete, under 19's transaction rules.
 
+use std::collections::BTreeMap;
 use std::num::NonZero;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 
 use amphora_engine::dialect::postgres::{from_engine, to_engine};
 use amphora_engine::storage::versioned::memory::Source;
 use amphora_engine::storage::versioned::switch::Level;
 use amphora_engine::{
-    ConnectOpts, Connection, LimboError, PlatformIO, PostgresDialect, Statement, Value,
+    ConnectOpts, Connection, LimboError, PlatformIO, PostgresDialect, Statement, StepResult, Value,
 };
 use amphora_pg_analysis::datetime::TimeZone;
 use amphora_pg_analysis::stmt::Command;
-use amphora_pg_analysis::{Column, Error, Field, Relations, analyze, lower, output, utility};
+use amphora_pg_analysis::{
+    Column, Error, Field, Lowered, Relations, analyze, lower, output, utility,
+};
 use amphora_pg_catalog::data::{PG_TYPE, type_oid};
 use amphora_pg_catalog::{Datum, SearchPath};
 use amphora_pg_parser::gram;
 use amphora_pg_parser::tree::{Node, NodeId, TransactionStmtKind, Tree, Val};
 
-use super::session::{Flow, Statements, TxStatus};
+use super::session::{Flow, Statements, TxStatus, WaitLimits};
+use super::settings::{Settings, Transactional};
 use super::wire::{self, PgError, Severity, SqlState};
 
 /// Microseconds from PostgreSQL's epoch, 2000-01-01 UTC, to Unix's (`src/include/datatype/timestamp.h`,
@@ -33,6 +37,25 @@ const UNIX_EPOCH_MICROS: i64 = -946_684_800_000_000;
 pub struct Database {
     engine: Arc<amphora_engine::Database>,
     memory: Arc<dyn Source>,
+    waiting: Arc<Waiting>,
+}
+
+/// The sessions that wait for a row, each by the transaction that waits: what a deadlock's report names
+/// them by (`DeadLockReport`, REL_19_0 src/backend/storage/lmgr/deadlock.c). Bounded by the sessions.
+#[derive(Default)]
+struct Waiting(Mutex<BTreeMap<u64, i32>>);
+
+impl Waiting {
+    fn change<R>(&self, f: impl FnOnce(&mut BTreeMap<u64, i32>) -> R) -> R {
+        f(&mut self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+}
+
+/// A session's role, and whether it is a superuser.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionRole<'a> {
+    pub name: &'a str,
+    pub superuser: bool,
 }
 
 impl Database {
@@ -43,7 +66,11 @@ impl Database {
             path,
             Arc::new(PostgresDialect::new()),
         )?;
-        let database = Self { engine, memory };
+        let database = Self {
+            engine,
+            memory,
+            waiting: Arc::default(),
+        };
         // The connection that makes the storage: one it refuses is refused here, not at a login.
         database.connect()?;
         Ok(database)
@@ -57,9 +84,14 @@ impl Database {
         )
     }
 
-    /// A session of `role`: an executor on a connection of its own. A refusal ends the session, as
-    /// PostgreSQL's does one it can't open a database for.
-    pub fn session(&self, role: &str, time_zone: &str) -> Result<Executor, PgError> {
+    /// A session of `role`, `process_id` its backend's: an executor on a connection of its own. A
+    /// refusal ends the session, as PostgreSQL's does one it can't open a database for.
+    pub fn session(
+        &self,
+        role: SessionRole<'_>,
+        time_zone: &str,
+        process_id: i32,
+    ) -> Result<Executor, PgError> {
         let fatal = |error: PgError| PgError {
             severity: Severity::Fatal,
             ..error
@@ -67,7 +99,11 @@ impl Database {
         let zone = amphora_pg_analysis::tz::time_zone(time_zone)
             .map_err(|error| fatal(refusal(error, "")))?;
         let conn = self.connect().map_err(|error| fatal(engine(error)))?;
-        Ok(Executor::new(conn, role, zone, Box::new(system_clock)))
+        let mut executor = Executor::new(conn, role.name, zone, Box::new(system_clock));
+        executor.process_id = process_id;
+        executor.waiting = Arc::clone(&self.waiting);
+        executor.superuser = role.superuser;
+        Ok(executor)
     }
 }
 
@@ -205,8 +241,13 @@ pub struct Executor {
     queried: bool,
     /// The Query a wait stopped, and the open transaction its statement waits for.
     stopped: Option<Stopped>,
-    /// Why a stopped statement won't run again: its wait closed a ring of waits.
+    /// Why a stopped statement won't go on: its wait is part of a ring of waits, or went on too long.
     refused: Option<PgError>,
+    /// The session among those that wait, and by what number.
+    waiting: Arc<Waiting>,
+    process_id: i32,
+    superuser: bool,
+    settings: Transactional<Settings>,
 }
 
 /// A Query's statements, the next one to run at `at`.
@@ -220,13 +261,34 @@ struct Query {
 struct Stopped {
     query: Query,
     holder: u64,
+    /// The statement stopped partway, what it changed kept; none for one undone, to run again.
+    running: Option<Box<Running>>,
+}
+
+/// A statement that changes rows, under way.
+struct Running {
+    statement: Statement,
+    command: Command,
+    lowered: Lowered,
+    /// Whether it has a savepoint of its own in the block's transaction, to be undone to.
+    in_block: bool,
 }
 
 /// Why a statement didn't complete: a refusal, or a row another session's open transaction (by its
 /// id) changed.
 enum Stop {
     Refused(PgError),
-    Wait(u64),
+    Wait {
+        holder: u64,
+        running: Option<Box<Running>>,
+    },
+}
+
+/// How far a statement's step got: to its end, with how many rows it changed, or to a row of the open
+/// transaction named.
+enum Ran {
+    Done(i64),
+    Waits(u64),
 }
 
 impl From<PgError> for Stop {
@@ -272,6 +334,10 @@ impl Executor {
             queried: false,
             stopped: None,
             refused: None,
+            waiting: Arc::default(),
+            process_id: 0,
+            superuser: false,
+            settings: Transactional::default(),
         }
         .at_level(Level::ReadCommitted)
     }
@@ -329,6 +395,18 @@ impl Executor {
             Node::VariableShowStmt { name: Some(name) } if name == "transaction_isolation" => {
                 return Ok(self.show_isolation(out)?);
             }
+            Node::VariableShowStmt { name: Some(name) } if Settings::has(name) => {
+                return Ok(self.show(name, out)?);
+            }
+            Node::VariableSetStmt {
+                kind,
+                name: Some(name),
+                args,
+                is_local,
+                ..
+            } if Settings::has(name) => {
+                return Ok(self.set(tree, *kind, name, args, *is_local, out)?);
+            }
             Node::VariableSetStmt {
                 kind: 3,
                 name: Some(name),
@@ -370,7 +448,7 @@ impl Executor {
             (query.command, lowered)
         };
         let (command, lowered) = lowered;
-        self.run(command, &lowered, out)
+        self.run(command, lowered, out)
     }
 
     /// Runs a statement that changes the catalog, whose transaction is validated in full from here on
@@ -386,14 +464,10 @@ impl Executor {
     }
 
     /// Runs a lowered statement and writes its answer.
-    fn run(
-        &self,
-        command: Command,
-        lowered: &amphora_pg_analysis::Lowered,
-        out: &mut Vec<u8>,
-    ) -> Result<(), Stop> {
+    fn run(&self, command: Command, lowered: Lowered, out: &mut Vec<u8>) -> Result<(), Stop> {
         match command {
             Command::Select => {
+                let lowered = &lowered;
                 let mut statement = self.prepared(lowered).map_err(engine)?;
                 row_description(out, &lowered.fields)?;
                 let rows = statement.run_collect_rows().map_err(engine)?;
@@ -405,48 +479,114 @@ impl Executor {
                 }
                 complete(out, &format!("SELECT {count}"))?;
             }
-            Command::Update => {
-                let changed = self.change(lowered)?;
-                complete(out, &format!("UPDATE {changed}"))?;
-            }
-            Command::Insert => {
-                let changed = self.change(lowered)?;
-                complete(out, &format!("INSERT 0 {changed}"))?;
+            Command::Update | Command::Insert => {
+                let running = self.begin_change(command, lowered)?;
+                self.change(running, out)?;
             }
         }
         Ok(())
     }
 
-    /// Runs a statement that changes rows, for how many it changed. A row another session's open
-    /// transaction changed stops it, its changes undone and its transaction kept ([`Stop::Wait`]);
-    /// one changed by a commit since its snapshot runs it again on a later one under READ COMMITTED
-    /// (19's recheck of that row alone is section 11's unit 15), and refuses it under the others. Each
-    /// turn of the loop follows a commit another session made since the last, so it ends with them.
-    fn change(&self, lowered: &amphora_pg_analysis::Lowered) -> Result<i64, Stop> {
+    /// A statement that changes rows, ready to run: in a block, undone alone when it has to be.
+    fn begin_change(&self, command: Command, lowered: Lowered) -> Result<Box<Running>, PgError> {
         let in_block = !self.conn.get_auto_commit();
-        loop {
-            if in_block {
-                self.conn.open_statement().map_err(engine)?;
-            }
-            let ran = self.prepared(lowered).and_then(|mut statement| {
-                statement.run_collect_rows()?;
-                Ok(statement.n_change())
-            });
-            if in_block {
-                self.conn.close_statement(ran.is_err()).map_err(engine)?;
-            }
-            match ran {
-                Ok(changed) => return Ok(changed),
-                Err(LimboError::RowTaken(Some(holder))) => return Err(Stop::Wait(holder)),
-                Err(LimboError::RowTaken(None)) if self.level.statement_snapshots() => {
-                    self.conn.renew_snapshot().map_err(engine)?;
+        if in_block {
+            self.conn.open_statement().map_err(engine)?;
+        }
+        match self.prepared(&lowered) {
+            Ok(statement) => Ok(Box::new(Running {
+                statement,
+                command,
+                lowered,
+                in_block,
+            })),
+            Err(error) => {
+                if in_block {
+                    self.conn.close_statement(true).map_err(engine)?;
                 }
-                Err(error) => return Err(engine(error).into()),
+                Err(engine(error))
             }
         }
     }
 
-    fn prepared(&self, lowered: &amphora_pg_analysis::Lowered) -> Result<Statement, LimboError> {
+    /// Runs a statement that changes rows to its end, and completes it. An UPDATE stops at a row that
+    /// another session's open transaction changed, what it changed before kept, and goes on from there
+    /// once that transaction has ended: with the row as it was before, or with the version that
+    /// transaction committed, which is judged by the WHERE again (19's EvalPlanQual, in
+    /// `Insn::LockRow`). A unique key taken so is an INSERT's whole row: undone and run again on a later
+    /// snapshot under READ COMMITTED. Each turn of the loop follows a commit another session made
+    /// since the last, so it ends with them.
+    fn change(&self, mut running: Box<Running>, out: &mut Vec<u8>) -> Result<(), Stop> {
+        loop {
+            let error = match self.step(&mut running.statement) {
+                Ok(Ran::Done(changed)) => {
+                    if running.in_block {
+                        self.conn.close_statement(false).map_err(engine)?;
+                    }
+                    let tag = match running.command {
+                        Command::Insert => format!("INSERT 0 {changed}"),
+                        Command::Select | Command::Update => format!("UPDATE {changed}"),
+                    };
+                    return Ok(complete(out, &tag)?);
+                }
+                Ok(Ran::Waits(holder)) => {
+                    return Err(Stop::Wait {
+                        holder,
+                        running: Some(running),
+                    });
+                }
+                Err(error) => error,
+            };
+            let (command, lowered) = self.undo(running)?;
+            match error {
+                LimboError::RowTaken(Some(holder)) => {
+                    return Err(Stop::Wait {
+                        holder,
+                        running: None,
+                    });
+                }
+                LimboError::RowTaken(None) if self.level.statement_snapshots() => {
+                    self.conn.renew_snapshot().map_err(engine)?;
+                    running = self.begin_change(command, lowered)?;
+                }
+                error => return Err(engine(error).into()),
+            }
+        }
+    }
+
+    /// Ends a statement partway, what it changed undone.
+    fn undo(&self, running: Box<Running>) -> Result<(Command, Lowered), PgError> {
+        let Running {
+            statement,
+            command,
+            lowered,
+            in_block,
+        } = *running;
+        drop(statement);
+        if in_block {
+            self.conn.close_statement(true).map_err(engine)?;
+        }
+        Ok((command, lowered))
+    }
+
+    fn step(&self, statement: &mut Statement) -> Result<Ran, LimboError> {
+        loop {
+            match statement.step()? {
+                StepResult::Done => return Ok(Ran::Done(statement.n_change())),
+                StepResult::Row => {}
+                StepResult::Yield | StepResult::IO | StepResult::Sleep { .. } => {
+                    if let Some(holder) = self.conn.take_row_wait() {
+                        return Ok(Ran::Waits(holder));
+                    }
+                    statement.get_pager().io.step()?;
+                }
+                StepResult::Interrupt => return Err(LimboError::Interrupt),
+                StepResult::Busy => return Err(LimboError::Busy),
+            }
+        }
+    }
+
+    fn prepared(&self, lowered: &Lowered) -> Result<Statement, LimboError> {
         let mut statement = self.conn.prepare(&lowered.sql)?;
         for (at, (type_oid, value)) in lowered.binds.iter().enumerate() {
             let value = match value {
@@ -504,6 +644,72 @@ impl Executor {
             self.set_level(level);
         }
         complete(out, "SET")
+    }
+
+    /// SHOW of one of [`Settings`].
+    fn show(&self, name: &str, out: &mut Vec<u8>) -> Result<(), PgError> {
+        let (name, value) = self.settings.current().show(name)?;
+        row_description(
+            out,
+            &[Field {
+                name: name.to_owned(),
+                table: 0,
+                attnum: 0,
+                type_oid: type_oid::TEXT,
+                typmod: -1,
+            }],
+        )?;
+        data_row(out, &[Some(value)])?;
+        complete(out, "SHOW")
+    }
+
+    /// SET, SET LOCAL and RESET of one of [`Settings`] (`ExecSetVariableStmt`, REL_19_0
+    /// src/backend/utils/misc/guc_funcs.c): the value lasts as the transaction that set it does.
+    fn set(
+        &mut self,
+        tree: &Tree,
+        kind: i32,
+        name: &str,
+        args: &[NodeId],
+        local: bool,
+        out: &mut Vec<u8>,
+    ) -> Result<(), PgError> {
+        // VAR_SET_VALUE, VAR_SET_DEFAULT and VAR_RESET.
+        let value = match (kind, args) {
+            (0, [arg]) => {
+                let Ok(Node::AConst { val, .. }) = tree.get(*arg) else {
+                    return Err(unsupported("this setting's value"));
+                };
+                Some(match val {
+                    Val::Integer(i) => i.to_string(),
+                    Val::Float(text) | Val::String(text) => text.clone(),
+                    Val::Boolean(b) => b.to_string(),
+                })
+            }
+            (1 | 4, []) => None,
+            _ => return Err(unsupported("this form of SET")),
+        };
+        let changed = self
+            .settings
+            .current()
+            .with(name, value.as_deref(), self.superuser)?;
+        if self.block == Block::None {
+            if local {
+                let text = "SET LOCAL can only be used in transaction blocks";
+                wire::notice_response(out, "WARNING", "25P01", text)?;
+            } else {
+                self.settings.set(changed);
+            }
+        } else if local {
+            self.settings.set_local(changed);
+        } else {
+            let session = self
+                .settings
+                .session()
+                .with(name, value.as_deref(), self.superuser)?;
+            self.settings.set_in_block(changed, session);
+        }
+        complete(out, if kind == 4 { "RESET" } else { "SET" })
     }
 
     /// A row's columns in text, as 19's output functions write them (`None` for NULL).
@@ -595,6 +801,9 @@ impl Executor {
     /// Commits the block's transaction: one the engine refuses ends without its writes.
     fn commit(&mut self, out: &mut Vec<u8>) -> Result<(), PgError> {
         let result = self.conn.execute("COMMIT").map_err(engine);
+        if result.is_ok() {
+            self.settings.commit();
+        }
         self.end();
         result?;
         complete(out, "COMMIT")
@@ -609,7 +818,15 @@ impl Executor {
     /// Leaves the block, without the writes of the engine's transaction if one is open.
     fn end(&mut self) {
         self.block = Block::None;
+        self.abandon();
         self.set_level(Level::ReadCommitted);
+    }
+
+    /// Ends the engine's transaction if one is open, without its writes, and what it set
+    /// (`AbortTransaction`, REL_19_0 src/backend/access/transam/xact.c): the sessions that wait for a
+    /// row of its go on.
+    fn abandon(&mut self) {
+        self.settings.rollback();
         if !self.conn.get_auto_commit() {
             // A refused ROLLBACK has nothing more to undo: the engine's own refusal is logged.
             if let Err(error) = self.conn.execute("ROLLBACK") {
@@ -618,42 +835,68 @@ impl Executor {
         }
     }
 
-    /// Answers with `error`, and ends what it ends: an implicit transaction, or the block but for END.
-    /// The statement's own writes are the engine's to undo, the block's are END's.
+    /// Answers with `error`, and ends what it ends: the transaction, at once
+    /// (`AbortCurrentTransaction`), and the block but for END.
     fn refuse(&mut self, error: &PgError, out: &mut Vec<u8>) -> Result<(), PgError> {
         match self.block {
             Block::None | Block::Implicit => self.end(),
-            Block::Explicit | Block::Failed => self.block = Block::Failed,
+            Block::Explicit | Block::Failed => {
+                self.block = Block::Failed;
+                self.abandon();
+            }
         }
         wire::error_response(out, error)
     }
 
     /// A Query's statements in order (`exec_simple_query`, REL_19_0 src/backend/tcop/postgres.c): several
     /// run in an implicit block, begun again after one that ends it.
-    fn statements(&mut self, query: &mut Query, out: &mut Vec<u8>) -> Result<(), Stop> {
+    fn statements(
+        &mut self,
+        query: &mut Query,
+        mut running: Option<Box<Running>>,
+        out: &mut Vec<u8>,
+    ) -> Result<(), Stop> {
         while let Some(id) = query.statements.get(query.at).copied() {
-            if query.statements.len() > 1 && self.block == Block::None {
-                self.set_level(Level::ReadCommitted);
-                self.begin()?;
-                self.block = Block::Implicit;
+            match running.take() {
+                Some(running) => self.change(running, out)?,
+                None => {
+                    if query.statements.len() > 1 && self.block == Block::None {
+                        self.set_level(Level::ReadCommitted);
+                        self.begin()?;
+                        self.block = Block::Implicit;
+                    }
+                    self.statement(&query.sql, &query.tree, id, out)?;
+                }
             }
-            self.statement(&query.sql, &query.tree, id, out)?;
             query.at = query.at.saturating_add(1);
         }
         if self.block == Block::Implicit {
             let result = self.conn.execute("COMMIT").map_err(engine);
+            if result.is_ok() {
+                self.settings.commit();
+            }
             self.end();
             result?;
         }
         Ok(())
     }
 
-    /// Runs the rest of a Query: stopped where a statement waits, else answered to its end.
-    fn run_query(&mut self, mut query: Query, out: &mut Vec<u8>) -> Result<Flow, PgError> {
-        match self.statements(&mut query, out) {
+    /// Runs the rest of a Query, from `running` where a statement of it is under way: stopped where a
+    /// statement waits, else answered to its end.
+    fn run_query(
+        &mut self,
+        mut query: Query,
+        running: Option<Box<Running>>,
+        out: &mut Vec<u8>,
+    ) -> Result<Flow, PgError> {
+        match self.statements(&mut query, running, out) {
             Ok(()) => Ok(Flow::Done),
-            Err(Stop::Wait(holder)) => {
-                self.stopped = Some(Stopped { query, holder });
+            Err(Stop::Wait { holder, running }) => {
+                self.stopped = Some(Stopped {
+                    query,
+                    holder,
+                    running,
+                });
                 Ok(Flow::Waiting)
             }
             Err(Stop::Refused(error)) => {
@@ -668,6 +911,14 @@ impl Executor {
 /// backend exits, REL_19_0 src/backend/access/transam/xact.c).
 impl Drop for Executor {
     fn drop(&mut self) {
+        self.stop_waiting();
+        if let Some(Stopped {
+            running: Some(running),
+            ..
+        }) = self.stopped.take()
+        {
+            drop(running.statement);
+        }
         self.end();
     }
 }
@@ -690,7 +941,7 @@ impl Statements for Executor {
                     statements,
                     at: 0,
                 };
-                self.run_query(query, out)
+                self.run_query(query, None, out)
             }
             Err(refused) => {
                 let position = match refused.cursor {
@@ -709,6 +960,10 @@ impl Statements for Executor {
         let Some(holder) = self.stopped.as_ref().map(|stopped| stopped.holder) else {
             return Poll::Ready(());
         };
+        if let Some(waiter) = self.conn.transaction_id() {
+            self.waiting
+                .change(|waiting| waiting.insert(waiter, self.process_id));
+        }
         match self.conn.wait_for(holder, cx.waker()) {
             Ok(true) => Poll::Pending,
             Ok(false) => Poll::Ready(()),
@@ -719,18 +974,77 @@ impl Statements for Executor {
         }
     }
 
+    fn wait_limits(&self) -> WaitLimits {
+        self.settings.current().wait_limits()
+    }
+
+    fn check_deadlock(&mut self) -> bool {
+        let ring = self.conn.deadlock();
+        if ring.is_empty() {
+            return false;
+        }
+        let lines: Vec<String> = self.waiting.change(|waiting| {
+            let pid = |id: u64| waiting.get(&id).copied().unwrap_or(0);
+            ring.iter()
+                .map(|(waiter, holder)| {
+                    format!(
+                        "Process {} waits for ShareLock on transaction {}; blocked by process {}.",
+                        pid(*waiter),
+                        transaction_number(*holder),
+                        pid(*holder)
+                    )
+                })
+                .collect()
+        });
+        self.stop_waiting();
+        self.refused = Some(
+            PgError::error(SqlState::new("40P01"), "deadlock detected")
+                .with_detail(lines.join("\n"))
+                .with_hint("See server log for query details."),
+        );
+        true
+    }
+
+    fn lock_timed_out(&mut self) {
+        self.stop_waiting();
+        self.refused = Some(PgError::error(
+            SqlState::new("55P03"),
+            "canceling statement due to lock timeout",
+        ));
+    }
+
     fn resume(&mut self, out: &mut Vec<u8>) -> Result<Flow, PgError> {
-        let Some(Stopped { query, .. }) = self.stopped.take() else {
+        self.stop_waiting();
+        let Some(Stopped { query, running, .. }) = self.stopped.take() else {
             return Ok(Flow::Done);
         };
         match self.refused.take() {
             Some(error) => {
+                if let Some(running) = running {
+                    self.undo(running)?;
+                }
                 self.refuse(&error, out)?;
                 Ok(Flow::Done)
             }
-            None => self.run_query(query, out),
+            None => self.run_query(query, running, out),
         }
     }
+}
+
+impl Executor {
+    /// The session waits no more: its wait is over, or refused.
+    fn stop_waiting(&self) {
+        if let Some(waiter) = self.conn.transaction_id() {
+            self.conn.stop_waiting();
+            self.waiting.change(|waiting| waiting.remove(&waiter));
+        }
+    }
+}
+
+/// A transaction's number as a message names it: the engine's, without the bit that tells it from a
+/// commit's timestamp.
+fn transaction_number(id: u64) -> u64 {
+    id & (u64::MAX >> 1)
 }
 
 /// `bpchar`'s trailing spaces, stripped in storage, put back to `char(n)`'s n characters.
@@ -814,7 +1128,6 @@ fn engine(error: LimboError) -> PgError {
         LimboError::Constraint(message) | LimboError::ForeignKeyConstraint(message) => {
             PgError::error(SqlState::new("23000"), message)
         }
-        LimboError::Deadlock => PgError::error(SqlState::new("40P01"), "deadlock detected"),
         LimboError::Busy
         | LimboError::BusySnapshot
         | LimboError::WriteWriteConflict

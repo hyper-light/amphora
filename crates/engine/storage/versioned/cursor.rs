@@ -31,6 +31,7 @@
 
 use super::blink::{Comparator, Descender, Leaf};
 use super::durable::Database;
+use super::durable::RowLock;
 use super::overflow;
 use super::version::{Snapshot, Txn, VTree};
 use crate::error::LimboError;
@@ -378,6 +379,9 @@ pub struct VersionedCursor {
     at: At,
     null_flag: bool,
     record: Option<ImmutableRecord>,
+    /// The row's newest version, which the cursor's transaction locked ([`VersionedCursor::lock_row`]):
+    /// what the cursor's columns are until it moves, its snapshot's otherwise.
+    moved: Option<Vec<u8>>,
     /// The row incremental blob I/O stands on (`sqlite3_blob_open`), as the handle last saw it.
     blob: Option<BlobPin>,
     /// Whether the blob handle's row was written by another cursor or removed: refused for good
@@ -390,6 +394,15 @@ pub struct VersionedCursor {
     /// This cursor among the connection's, for its yield injector's bookkeeping (tests only).
     #[cfg(any(test, injected_yields))]
     yield_instance: u64,
+}
+
+/// What [`VersionedCursor::lock_row`] took: the version the cursor's snapshot sees, a later one, to be
+/// judged again, or a row a later commit removed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RowLocked {
+    Held,
+    Moved,
+    Gone,
 }
 
 /// The leaf copies the process has made: each copy's number (`Rows::copy`).
@@ -463,6 +476,7 @@ impl VersionedCursor {
             at: At::Nowhere,
             null_flag: false,
             record: None,
+            moved: None,
             blob: None,
             blob_expired: false,
             conn: Weak::new(),
@@ -475,7 +489,11 @@ impl VersionedCursor {
     /// an index, a blob handle's row, a null row, a row the cursor put or removed since the copy,
     /// or a copy no longer the leaf's rows (the row is then read again, row-at-a-time).
     pub(crate) fn table_leaf_under_cursor(&self) -> Option<LeafUnderCursor<'_>> {
-        if self.null_flag || self.order.index.is_some() || self.blob.is_some() {
+        if self.null_flag
+            || self.order.index.is_some()
+            || self.blob.is_some()
+            || self.moved.is_some()
+        {
             return None;
         }
         let At::Row(cell) = self.at else {
@@ -711,7 +729,7 @@ impl VersionedCursor {
     }
 
     fn step_next(&mut self) -> Result<()> {
-        self.record_stale();
+        self.leave();
         let key = match std::mem::replace(&mut self.at, At::Nowhere) {
             At::Nowhere => return Ok(()),
             At::Row(i) => {
@@ -750,7 +768,7 @@ impl VersionedCursor {
     }
 
     fn step_prev(&mut self) -> Result<()> {
-        self.record_stale();
+        self.leave();
         let key = match std::mem::replace(&mut self.at, At::Nowhere) {
             At::Nowhere => return Ok(()),
             At::Row(i) => {
@@ -774,11 +792,25 @@ impl VersionedCursor {
         }
     }
 
+    /// The key of the row whose newest version the cursor holds ([`VersionedCursor::lock_row`]).
+    fn moved_key(&self) -> Option<&[u8]> {
+        match (&self.moved, &self.at) {
+            (Some(_), At::Put(key)) => Some(key),
+            _ => None,
+        }
+    }
+
+    /// The cursor leaves its row.
+    fn leave(&mut self) {
+        self.record_stale();
+        self.moved = None;
+    }
+
     /// Places the cursor for `op` at `point`: on the first row after it going forward, the last
     /// before it going back. Whether it found one.
     fn place(&mut self, point: &Point<'_>, op: SeekOp) -> Result<bool> {
         self.null_flag = false;
-        self.record_stale();
+        self.leave();
         match op {
             SeekOp::GE { .. } | SeekOp::GT => self.first_after(point, None),
             SeekOp::LE { .. } | SeekOp::LT => self.last_before(point),
@@ -867,8 +899,48 @@ impl VersionedCursor {
         self.order.check()
     }
 
+    /// The transaction takes the row the cursor is on before its statement changes it, and the
+    /// cursor's columns are then its newest version's ([`super::version::VTree::lock`]).
+    pub(crate) fn lock_row(&mut self) -> Result<RowLocked> {
+        let Some((key, _)) = self.current()? else {
+            return Err(LimboError::InternalError(
+                "a row's lock with the cursor on no row".into(),
+            ));
+        };
+        let key = key.to_vec();
+        let shared = self.txn()?;
+        let locked = {
+            let mut txn = shared.lock();
+            let txn = txn.as_mut().ok_or_else(ended)?;
+            self.db
+                .lock(&mut self.d, txn, self.tree, &key, self.snap.start)?
+        };
+        Ok(match locked {
+            RowLock::Held => RowLocked::Held,
+            RowLock::Gone => RowLocked::Gone,
+            RowLock::Moved(value) => {
+                self.record_stale();
+                self.at = At::Put(key);
+                self.moved = Some(value);
+                RowLocked::Moved
+            }
+        })
+    }
+
+    /// The cursor reads from here on what its transaction's changes are made against
+    /// ([`super::version::Txn::newest`]): an index's, whose entry for a row its statement follows
+    /// to a later version is that version's.
+    pub(crate) fn read_newest(&mut self) -> Result<()> {
+        let shared = self.txn()?;
+        let newest = shared.lock().as_ref().ok_or_else(ended)?.newest();
+        self.leave();
+        self.at = At::Nowhere;
+        self.snap = newest;
+        Ok(())
+    }
+
     fn insert_key(&mut self, key: &BTreeKey<'_>) -> Result<()> {
-        self.record_stale();
+        self.leave();
         let (k, value): (Vec<u8>, &[u8]) = match (key, self.order.index.clone()) {
             (BTreeKey::TableRowId((rowid, record)), None) => {
                 let record = record.ok_or_else(|| {
@@ -904,14 +976,15 @@ impl VersionedCursor {
     }
 
     fn delete_row(&mut self) -> Result<()> {
-        self.record_stale();
-        let key = match self.current()? {
-            Some((key, _)) => key.to_vec(),
-            None => {
-                return Err(LimboError::InternalError(
-                    "a delete with the cursor on no row".into(),
-                ))
-            }
+        let key = match self.moved_key() {
+            Some(key) => Some(key.to_vec()),
+            None => self.current()?.map(|(key, _)| key.to_vec()),
+        };
+        self.leave();
+        let Some(key) = key else {
+            return Err(LimboError::InternalError(
+                "a delete with the cursor on no row".into(),
+            ));
         };
         self.remove(&key)?;
         self.at = At::Gap(key);
@@ -977,6 +1050,9 @@ impl VersionedCursor {
             return Ok(None);
         }
         let is_index = self.order.index.is_some();
+        if let Some(key) = self.moved_key() {
+            return key_rowid(key).map(Some);
+        }
         let Some((key, _)) = self.current()? else {
             return Ok(None);
         };
@@ -993,6 +1069,9 @@ impl VersionedCursor {
     fn payload_now(&mut self) -> Result<Option<&[u8]>> {
         if self.null_flag {
             return Ok(None);
+        }
+        if self.moved.is_some() {
+            return Ok(self.moved.as_deref());
         }
         let is_index = self.order.index.is_some();
         Ok(self
@@ -1150,7 +1229,9 @@ impl VersionedCursor {
                 None => ImmutableRecord::new(0)?,
             };
             record.invalidate();
-            if let Some((key, value)) = self.current()? {
+            if let Some(moved) = &self.moved {
+                record.start_serialization(moved)?;
+            } else if let Some((key, value)) = self.current()? {
                 record.start_serialization(if is_index { key } else { value })?;
             }
             let empty = record.is_invalidated();

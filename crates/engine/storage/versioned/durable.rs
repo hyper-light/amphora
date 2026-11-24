@@ -34,7 +34,7 @@ use super::overflow;
 use super::page::PAGE_SIZE;
 use super::pool::{Pool, Room};
 use super::redo::{self, LaneId, Op, Redo};
-use super::version::{Savepoint, Snapshot, Ts, Txn, Versioned};
+use super::version::{Locked, Savepoint, Snapshot, Ts, Txn, Versioned};
 use crate::error::LimboError;
 use crate::sync::{Arc, Mutex, RwLock};
 use crate::Result;
@@ -431,6 +431,14 @@ pub struct Database {
 /// Orders the overflow tree's keys: by bytes, whatever the database's comparison.
 fn bytes_order() -> Comparator {
     Box::new(|a: &[u8], b: &[u8]| a.cmp(b))
+}
+
+/// What [`Database::lock`] took: the version its statement's snapshot saw, a later one (whole), or
+/// a row a later commit removed.
+pub enum RowLock {
+    Held,
+    Moved(Vec<u8>),
+    Gone,
 }
 
 impl Database {
@@ -937,6 +945,33 @@ impl Database {
         Err(corrupt(
             "a row with more chunks than its longest value takes",
         ))
+    }
+
+    /// `txn` takes the row under `key` in `tree`, which its statement found at `seen`
+    /// ([`super::version::VTree::lock`]), and its version if it is a later one: whole, none if
+    /// removed.
+    pub fn lock(
+        &self,
+        d: &mut Descender,
+        txn: &mut Txn,
+        tree: u64,
+        key: &[u8],
+        seen: Ts,
+    ) -> Result<RowLock> {
+        let id = self.user_tree(tree)?;
+        let _changing = self.gate.read();
+        let locked = self
+            .v
+            .tree(id)?
+            .lock(&self.v.pool, d, &self.v.clock, txn, key, seen)?;
+        Ok(match locked {
+            Locked::Held => RowLock::Held,
+            Locked::Moved { removed: true } => RowLock::Gone,
+            Locked::Moved { removed: false } => match self.get(d, &txn.newest(), tree, key)? {
+                Some(value) => RowLock::Moved(value),
+                None => RowLock::Gone,
+            },
+        })
     }
 
     /// `txn` removes the row under `key` in `tree` and its chunks (`AC-NS.2.4`): the row it saw

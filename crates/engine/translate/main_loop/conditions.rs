@@ -7,26 +7,31 @@ fn condition_references_subquery(expr: &Expr, subqueries: &[NonFromClauseSubquer
         .any(|s| expr_references_subquery_id(expr, s.internal_id))
 }
 
-/// Whether the table is a hash join's probe that keeps the build side's unmatched rows (LEFT, anti
-/// or FULL), which it reads in a path of their own after the probe.
-fn keeps_unmatched_build_rows(
-    table_references: &TableReferences,
-    table_id: TableInternalId,
-) -> bool {
-    table_references
-        .joined_tables()
-        .iter()
-        .find(|table| table.internal_id == table_id)
-        .is_some_and(|table| {
-            matches!(
-                &table.op,
-                Operation::HashJoin(hash_join)
-                    if matches!(
-                        hash_join.join_type,
-                        HashJoinType::LeftOuter | HashJoinType::LeftAnti | HashJoinType::FullOuter
-                    )
-            )
-        })
+/// The terms of its loop that one pass emits. A hash anti join tests the terms that read its probe
+/// table on the pairs the probe matches, and the loop's others on the build rows it keeps, which
+/// come after the probe; every other loop tests all its terms together.
+#[derive(Clone, Copy)]
+pub(super) enum LoopTerms {
+    All,
+    Reading(usize),
+    NotReading(usize),
+}
+
+impl LoopTerms {
+    fn hold(
+        self,
+        term: &WhereTerm,
+        table_references: &TableReferences,
+        subqueries: &[NonFromClauseSubquery],
+    ) -> Result<bool> {
+        let (table_idx, reading) = match self {
+            Self::All => return Ok(true),
+            Self::Reading(table_idx) => (table_idx, true),
+            Self::NotReading(table_idx) => (table_idx, false),
+        };
+        let read = table_mask_from_expr(&term.expr, table_references, subqueries)?;
+        Ok(read.get(table_idx) == reading)
+    }
 }
 
 /// Emit correlated subqueries at the loop that checks their conditions.
@@ -43,6 +48,7 @@ fn emit_correlated_subqueries(
     predicates: &[WhereTerm],
     subqueries: &mut [NonFromClauseSubquery],
     from_outer_join: bool,
+    terms: LoopTerms,
 ) -> Result<()> {
     let mut subqueries_to_emit = Vec::new();
     for (subquery_index, subquery) in subqueries.iter().enumerate() {
@@ -62,38 +68,17 @@ fn emit_correlated_subqueries(
             })
             .peekable();
         if conditions.peek().is_some() {
-            let conditions: Vec<&WhereTerm> = conditions.collect();
-            let at_condition = conditions.iter().any(|condition| {
-                condition.should_eval_at_loop(
+            for condition in conditions {
+                if condition.should_eval_at_loop(
                     join_index,
                     join_order,
                     subqueries,
                     Some(table_references),
-                )
-            });
-            // A hash join that keeps unmatched build rows checks its conditions again, in a path
-            // of its own that reads the subquery's result: a subquery whose condition such a join
-            // checks runs at its own earliest loop, before the join, where both paths see it.
-            let before_hash_join = !at_condition
-                && subquery.get_eval_at(join_order, Some(table_references))?
-                    == EvalAt::Loop(join_index)
-                && join_order
-                    .iter()
-                    .enumerate()
-                    .skip_while(|(later, _)| *later <= join_index)
-                    .any(|(later, member)| {
-                        keeps_unmatched_build_rows(table_references, member.table_id)
-                            && conditions.iter().any(|condition| {
-                                condition.should_eval_at_loop(
-                                    later,
-                                    join_order,
-                                    subqueries,
-                                    Some(table_references),
-                                )
-                            })
-                    });
-            if at_condition || before_hash_join {
-                subqueries_to_emit.push(subquery_index);
+                ) && terms.hold(condition, table_references, subqueries)?
+                {
+                    subqueries_to_emit.push(subquery_index);
+                    break;
+                }
             }
             continue;
         }
@@ -101,6 +86,7 @@ fn emit_correlated_subqueries(
         // The non-outer pass also emits correlated subqueries used outside
         // predicates, such as a subquery in the result list.
         if !from_outer_join
+            && !matches!(terms, LoopTerms::Reading(_))
             && subquery.get_eval_at(join_order, Some(table_references))? == EvalAt::Loop(join_index)
         {
             subqueries_to_emit.push(subquery_index);
@@ -143,6 +129,7 @@ fn emit_conditions(
     join_index: usize,
     next: BranchOffset,
     from_outer_join: bool,
+    loop_terms: LoopTerms,
     subqueries: &[NonFromClauseSubquery],
     subquery_ref_filter: SubqueryRefFilter,
 ) -> Result<()> {
@@ -154,23 +141,18 @@ fn emit_conditions(
         subqueries,
         join_index,
     )?;
-    let terms = predicates
-        .iter()
-        .enumerate()
-        .filter(|(cond_idx, _)| !prefiltered_terms.contains(cond_idx))
-        .map(|(_, cond)| cond)
-        .filter(|cond| cond.origin.is_outer_join() == from_outer_join)
-        .filter(|cond| {
-            cond.should_eval_at_loop(join_index, join_order, subqueries, Some(table_references))
-        })
-        .filter(|cond| match subquery_ref_filter {
-            SubqueryRefFilter::WithoutSubqueryRefs => {
-                !condition_references_subquery(&cond.expr, subqueries)
-            }
-            SubqueryRefFilter::WithSubqueryRefs => {
-                condition_references_subquery(&cond.expr, subqueries)
-            }
-        });
+    let mut terms = Vec::new();
+    let with_subquery_refs = matches!(subquery_ref_filter, SubqueryRefFilter::WithSubqueryRefs);
+    for (cond_idx, cond) in predicates.iter().enumerate() {
+        if !prefiltered_terms.contains(&cond_idx)
+            && cond.origin.is_outer_join() == from_outer_join
+            && cond.should_eval_at_loop(join_index, join_order, subqueries, Some(table_references))
+            && condition_references_subquery(&cond.expr, subqueries) == with_subquery_refs
+            && loop_terms.hold(cond, table_references, subqueries)?
+        {
+            terms.push(cond);
+        }
+    }
     // Amphora (docs/design/executor.md, decision 7; QT.3): on a loop over a non-covering index,
     // the terms that read only the index's columns run first, on the index entry, so a row they
     // drop is never fetched by the deferred seek; then the rest, each group in written order.
@@ -192,7 +174,7 @@ fn emit_conditions(
             }
             (first, rest)
         }
-        None => (terms.collect(), Vec::new()),
+        None => (terms, Vec::new()),
     };
     for cond in first.into_iter().chain(rest) {
         emit_where_term(program, table_references, cond, next, &t_ctx.resolver)?;
@@ -419,6 +401,7 @@ pub(super) struct LoopConditionEmitter<'a, 'ctx> {
     join_index: usize,
     condition_fail_target: BranchOffset,
     from_outer_join: bool,
+    terms: LoopTerms,
     subqueries: &'a mut [NonFromClauseSubquery],
 }
 
@@ -433,6 +416,7 @@ impl<'a, 'ctx> LoopConditionEmitter<'a, 'ctx> {
         join_index: usize,
         condition_fail_target: BranchOffset,
         from_outer_join: bool,
+        terms: LoopTerms,
         subqueries: &'a mut [NonFromClauseSubquery],
     ) -> Self {
         Self {
@@ -444,6 +428,7 @@ impl<'a, 'ctx> LoopConditionEmitter<'a, 'ctx> {
             join_index,
             condition_fail_target,
             from_outer_join,
+            terms,
             subqueries,
         }
     }
@@ -459,6 +444,7 @@ impl<'a, 'ctx> LoopConditionEmitter<'a, 'ctx> {
             self.join_index,
             self.condition_fail_target,
             self.from_outer_join,
+            self.terms,
             self.subqueries,
             SubqueryRefFilter::WithoutSubqueryRefs,
         )
@@ -475,6 +461,7 @@ impl<'a, 'ctx> LoopConditionEmitter<'a, 'ctx> {
             self.predicates,
             self.subqueries,
             self.from_outer_join,
+            self.terms,
         )
     }
 
@@ -489,6 +476,7 @@ impl<'a, 'ctx> LoopConditionEmitter<'a, 'ctx> {
             self.join_index,
             self.condition_fail_target,
             self.from_outer_join,
+            self.terms,
             self.subqueries,
             SubqueryRefFilter::WithSubqueryRefs,
         )

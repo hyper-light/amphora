@@ -610,6 +610,9 @@ pub struct Connection {
     /// Amphora (G7 step 2, `AC-NS.2.1`): the versioned storage its B-trees are on, when switched
     /// on (`storage::versioned::switch`); else the pager's.
     pub(crate) versioned: Option<Arc<crate::storage::versioned::switch::Switch>>,
+    /// Amphora (docs/design/postgres.md section 8): the open transaction the statement that last
+    /// yielded waits for ([`Connection::take_row_wait`]).
+    pub(crate) row_wait: crate::sync::Mutex<Option<u64>>,
     /// Amphora (G7 step 2, `AC-NS.2.1`): each attached database's own versioned storage, by its
     /// database index, when the main database's B-trees are on one: an attached database's trees
     /// are its own, never the main storage's, so the file reopened alone finds them.
@@ -6036,10 +6039,51 @@ impl Connection {
         }
     }
 
+    /// Amphora (docs/design/postgres.md section 8): whether the connection's transactions wait for a
+    /// row another session holds, so an UPDATE takes each row before it changes it
+    /// (`Insn::LockRow`).
+    pub(crate) fn locks_rows(&self) -> bool {
+        self.versioned
+            .as_ref()
+            .is_some_and(|switch| switch.locks_rows())
+    }
+
+    /// Amphora (docs/design/postgres.md section 8): the open transaction of another session that the
+    /// statement which just yielded waits for, once: step it again when that has ended.
+    pub fn take_row_wait(&self) -> Option<u64> {
+        self.row_wait.lock().take()
+    }
+
+    pub(crate) fn set_row_wait(&self, holder: u64) {
+        *self.row_wait.lock() = Some(holder);
+    }
+
+    /// Amphora (docs/design/postgres.md section 8): the connection's open transaction, as the waits
+    /// name it.
+    pub fn transaction_id(&self) -> Option<u64> {
+        self.versioned.as_ref().and_then(|switch| switch.txn_id())
+    }
+
+    /// Amphora (docs/design/postgres.md section 8): the ring of waits this connection's wait closes,
+    /// each transaction with the one it waits for, this connection's first; none when it closes none.
+    pub fn deadlock(&self) -> Vec<(u64, u64)> {
+        self.versioned
+            .as_ref()
+            .map_or_else(Vec::new, |switch| switch.deadlock())
+    }
+
+    /// Amphora (docs/design/postgres.md section 8): the connection's wait is over, its holder not
+    /// ended.
+    pub fn stop_waiting(&self) {
+        if let Some(switch) = &self.versioned {
+            switch.stop_waiting();
+        }
+    }
+
     /// Amphora (docs/design/postgres.md section 8): registers `wake` for the end of the open
-    /// transaction `holder` of another session, one this connection's statement was refused for
-    /// (`RowTaken`). `false`, registering nothing, when it has ended: the statement can run again. A
-    /// wait that would close a ring of waits is refused (`Deadlock`).
+    /// transaction `holder` of another session, one this connection's statement waits for
+    /// ([`Connection::take_row_wait`], or `RowTaken`). `false`, registering nothing, when it has ended:
+    /// the statement can run again.
     pub fn wait_for(&self, holder: u64, wake: &std::task::Waker) -> Result<bool> {
         match &self.versioned {
             Some(switch) => switch.wait_for(holder, wake),
