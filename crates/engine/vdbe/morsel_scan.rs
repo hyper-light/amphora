@@ -41,6 +41,8 @@ pub struct TableSource {
     rowid_alias: Option<usize>,
     /// Each column's value in a row written before it was added; empty when every one is NULL.
     defaults: Vec<Value>,
+    /// The columns whose INTEGER reads as a REAL ([`TableSource::read_reals`]); empty by default.
+    reals: Vec<usize>,
     /// Each leaf's greatest rowid in key order; `None` for the last leaf, which has no bound.
     upper: Vec<Option<i64>>,
     /// The greatest rowid before the first leaf `upper` holds; `None` when that is the table's
@@ -132,9 +134,29 @@ impl TableSource {
             columns,
             rowid_alias,
             defaults,
+            reals: Vec::new(),
             upper,
             floor: None,
         })
+    }
+
+    /// Reads an INTEGER in each of `reals`, columns of REAL affinity, as a REAL, as the serial
+    /// loop's `RealAffinity` makes it (lane R10: `MorselAggregateData::reals`).
+    pub fn read_reals(&mut self, reals: &[usize]) -> Result<(), MorselError> {
+        self.reals.clear();
+        self.reals.try_reserve_exact(reals.len())?;
+        self.reals.extend_from_slice(reals);
+        Ok(())
+    }
+
+    fn realify(&self, row: &mut [Value]) {
+        for at in &self.reals {
+            if let Some(slot) = row.get_mut(*at) {
+                if let Value::Numeric(crate::numeric::Numeric::Integer(i)) = *slot {
+                    *slot = Value::from_f64(i as f64);
+                }
+            }
+        }
     }
 
     /// Fills a short row out to the table's columns: a column added after the row was written
@@ -262,6 +284,7 @@ impl TableSource {
                 })?;
                 *slot = Value::from_i64(rowid);
             }
+            self.realify(&mut row);
             if !each(rowid, &row)? {
                 break;
             }
@@ -313,6 +336,7 @@ impl TableSource {
             })?;
             *slot = Value::from_i64(rowid);
         }
+        self.realify(row);
         Ok(true)
     }
 

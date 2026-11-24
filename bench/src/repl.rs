@@ -541,7 +541,8 @@ fn commit(c: &dyn Cluster, o: &Opts) -> anyhow::Result<serde_json::Value> {
                 let (down, refused) = (&down, &refused);
                 scope.spawn(move || -> anyhow::Result<([Hist; NODES], u64, u64)> {
                     let mut wr = Writer::new(w);
-                    let (mut h, mut writes, mut missed) = (std::array::from_fn(|_| Hist::new()), 0u64, 0u64);
+                    let (mut h, mut writes, mut missed) =
+                        (std::array::from_fn(|_| Hist::new()), 0u64, 0u64);
                     loop {
                         let t = Instant::now();
                         if t >= ends {
@@ -553,7 +554,14 @@ fn commit(c: &dyn Cluster, o: &Opts) -> anyhow::Result<serde_json::Value> {
                         // again unchanged (same ids), as `failover`'s writers do, and timed from its
                         // first send once acknowledged; one unacknowledged when the run ends is untimed.
                         let node = loop {
-                            match send_counting(c, down, to_leader.unwrap_or(w), &s, o.deadline, &mine) {
+                            match send_counting(
+                                c,
+                                down,
+                                to_leader.unwrap_or(w),
+                                &s,
+                                o.deadline,
+                                &mine,
+                            ) {
                                 Ok(node) => break Some(node),
                                 Err(_) if t >= counting => missed += 1,
                                 Err(_) => {}
@@ -1793,6 +1801,9 @@ mod procs {
         Ok(())
     }
 
+    /// A program and its arguments.
+    type Program = (String, Vec<String>);
+
     /// The three members over TCP, each request on a connection of the member's pool: a writer
     /// takes one, or opens one, and gives it back, so writers never queue behind each other here.
     pub struct Procs {
@@ -1801,7 +1812,7 @@ mod procs {
         cut: [AtomicBool; NODES],
         deadline: Duration,
         /// Each killed member's program and arguments, for `start`.
-        relaunch: [Mutex<Option<(String, Vec<String>)>>; NODES],
+        relaunch: [Mutex<Option<Program>>; NODES],
         /// The members `start` ran, waited for as the driver ends.
         started: Mutex<Vec<std::process::Child>>,
     }
@@ -2048,13 +2059,20 @@ mod tests {
         let mut rng = Rng(7);
         for i in 0..20_000u64 {
             let us = 1 + rng.next() % 5_000_000;
-            if i % 3 == 0 { a.record(us) } else { b.record(us) }
+            if i % 3 == 0 {
+                a.record(us)
+            } else {
+                b.record(us)
+            }
             merged.record(us);
             if i % 10 == 0 {
                 let mut one = Hist::new();
                 one.record(us);
                 let least = one.buckets()[0][0].as_u64().unwrap();
-                assert!(least <= us && us - least <= us / 64, "{us} reads back as {least}");
+                assert!(
+                    least <= us && us - least <= us / 64,
+                    "{us} reads back as {least}"
+                );
             }
         }
         let mut pooled = std::collections::BTreeMap::<u64, u64>::new();
@@ -2063,7 +2081,10 @@ mod tests {
                 *pooled.entry(p[0].as_u64().unwrap()).or_default() += p[1].as_u64().unwrap();
             }
         }
-        let pooled: Vec<_> = pooled.into_iter().map(|(least, n)| serde_json::json!([least, n])).collect();
+        let pooled: Vec<_> = pooled
+            .into_iter()
+            .map(|(least, n)| serde_json::json!([least, n]))
+            .collect();
         assert_eq!(serde_json::Value::from(pooled), merged.buckets());
     }
 
