@@ -2184,7 +2184,7 @@ holder is descheduled; spinning about as long as a block costs, then blocking, b
 parking_lot's `RwLock` (its documentation): readers share, a waiter spins a few rounds and then
 parks, and the lock is eventually fair, so a waiting writer is not starved by readers.
 
-**Evidence.** `storage::wal::tests::q6_reads_of_the_record_registry_do_not_wait_for_each_other`:
+**Evidence.** `storage::wal::test::q6_reads_of_the_record_registry_do_not_wait_for_each_other`:
 with one reader holding the registry, another reads a published record's slots and answers.
 
 **Falsified by.** A profile of the same phase after the change in which the registry's waits are not

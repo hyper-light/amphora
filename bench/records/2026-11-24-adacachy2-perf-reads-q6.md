@@ -4,7 +4,9 @@ Deliverable status, losses first.
 
 - Not done: the profile after the fix, the reads and writes a second alternated with main, and the
   answers held to SQLite's. adacachy2 was the verifier's from 03:00Z, past this lane's hour. The
-  fix merged once clippy and its tests passed (RULES 5b).
+  fix merged once clippy and its tests passed (RULES 5b). `q6_ab.sh`, beside this record, runs
+  that step on adacachy2 in one command (A = main before, B = main after, TOOLS = this folder
+  plus Q5's `q5_answers.py`); it was written, not run.
 - One profile a cell, not two: each at 32 and 128 clients, on main and on Q5's binary.
 - The held-by-a-preempted-holder share is inferred from scheduler counters, not measured per
   acquisition (below).
@@ -15,7 +17,7 @@ Deliverable status, losses first.
 - Fixed: the registry (`WalSharedRuntime::records`, `packed::Records`) is the engine's
   `sync::RwLock` (parking_lot's), no longer `fast_lock::SpinLock`. Its read-only lookups take it
   shared; what changes it takes it exclusive. Test:
-  `storage::wal::tests::q6_reads_of_the_record_registry_do_not_wait_for_each_other`. Decision:
+  `storage::wal::test::q6_reads_of_the_record_registry_do_not_wait_for_each_other`. Decision:
   `docs/design/store.md`, "Decision (lane perf-Q6)".
 
 ## What was measured
@@ -120,7 +122,7 @@ another on the same thread, so parking_lot's writer fairness can't deadlock a re
 
 On MacBook Pro 2 (runner e30189ea29182644fe5a4b2e06c7dac2, needs macos/arm64,cpus=8,mem=16g;
 adacachy2 was the verifier's): clippy on amphora-engine (`--all-targets --locked -D warnings`),
-`storage::wal::tests::`, `--test packed_log --test log_read_index --test spilled_log`, and
+`storage::wal::test::`, `--test packed_log --test log_read_index --test spilled_log`, and
 `scripts/check-production.sh`. Results in the merge commit.
 
 ## Commands
