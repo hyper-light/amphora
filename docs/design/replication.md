@@ -2713,9 +2713,8 @@ nothing. The wait now hears it (`memory::Ending`, held by the line and shared wi
 owner's reason, `Fenced`, as every call in line is, holding no charge (docs/design/store.md, "Decision (lane perf-A28)").
 The same wait takes the frames and the decoded values of a member's `Q` requests (serve.rs), whose owner is that member's
 replica. The models of the line and of the budget's wait (T-QB.1.19, T-MB.1.5) are in `scripts/gates.sh`.
-- *A term change is no end.* The owner goes on across one: a write the budget has no room for is answered once the room
-  comes, by the owner it was asked of, through the group's new leader (T-QB.1.23). What its owner is certain of, that it
-  can't be its leader for now, isn't a reason to end a wait whose write it would forward.
+- *A term change is no end.* The member that lost the lead forwards what its callers ask to the new leader, so a write that
+  waits for the budget across a term change is answered by the owner it was asked of once the room comes (T-QB.1.23).
 - *A record with no room beside a held call waits for that call.* A wire record is refused at once and raft sends it again,
   so an image the queue has no room for beside the largest call it holds alone is refused until that call is answered or its
   deadline passes: what bounds it. A call behind in line takes the place first (T-QB.1.24), so a steady line of calls that

@@ -2265,21 +2265,21 @@ waiting caller held its thread to its deadline, then `Full`, while those that ha
 - *Who the owner is.* A member's replica (`Room::line`'s, which the calls in line hear too) for its writes and its
   clients' requests; a store's writer (`Sends`), whose writer's stop and whose disk's failed flush end it; none, an
   `Ending` that never ends, for a client reading its own connection's answer.
-- *How it is told.* A waiter puts itself in its owner's list before it waits and takes itself out as it stops, so a wait
-  with no owner's end to hear costs a lock and a list entry and the end costs one wake of the budget, whatever waits on
-  it (two budgets, in a test, two wakes). `Ending::end` sets the reason, then wakes the budget's waiters under the lock
-  each waits with (`Waiters::look_again`); a waiter asks for the reason under that lock before each look for room, so
-  it sees the reason or hears the wake. No timer and no poll.
-- *What it costs where nothing ends.* The look that finds room takes no lock and asks no owner, as before (a wait's first
-  look); only a wait that finds none asks for the reason, at each look.
+- *How it is told.* A waiter puts itself in its owner's list as it begins to wait and takes itself out as it stops.
+  `Ending::end` sets the reason, then wakes the waiters of each budget in the list, once a budget however many wait on it,
+  under the lock each waits with (`Waiters::look_again`). A waiter asks for the reason under that lock before each look
+  for room, so it sees the reason or hears the wake. No timer and no poll.
+- *What it costs where nothing ends.* The look that finds room takes no lock and asks no owner, as before. A wait that
+  finds none takes its owner's lock to enter its list, at each look to ask, and to leave.
 
 **Evidence.** T-QB.1.23, T-MB.1.6 and T-MB.1.7 are red on main (the waits stood to their deadlines, `Full` at 120 s: the
 record, lane perf-A28) and pass on the fix. The wait alone is `crates/amphora/src/memory/wait.rs`, compiled by
 `crates/line-loom` over loom's types and run on every interleaving of a holder's wait, a give-back, its owner's end and
 its deadline (T-MB.1.5), and the line's model has the end beside a call that waits for the budget (T-QB.1.19).
 
-**What is left.** Resident bytes that fall without a charge given back still wake no one. A wait past its caller's
-interest (a client gone) is ended by its deadline alone.
+**What is left.** Resident bytes that fall without a charge given back still wake no one. A client that hangs up while
+its request waits doesn't end the wait: its deadline does. A writer thread that unwinds tells no one (CLAUDE.md, rule 1,
+forbids it).
 
 **Falsified if** a waiter sleeps to its deadline after its owner ended, or an owner's end takes another owner's wait.
 
