@@ -80,6 +80,10 @@ The engine pass's JSON, counted lint by lint the way scripts/engine-ratchet.py c
 At 2571f841, the T1 landing the verifier named, the engine pass counts the same 10903. From
 2571f841 to 39ecf1df only crates/amphora/src/database/replicated.rs changed under crates/.
 
+At main 5565eb10 (this record merged onto c39adf56, which brought lane R10's engine changes), the
+same run re-checked amphora-engine and the rest of the workspace and exited 0 at 04:22Z with the
+same 10903, each lint at its line.
+
 Each ceiling equals the pin's count today. Had a ceiling been lowered to a different toolchain's
 lower count, 1.99.1 would count above it now; had it been set from a higher one, 1.99.1 would count
 below it and check-production would fail asking to lower it. Neither happens, so no ceiling holds
