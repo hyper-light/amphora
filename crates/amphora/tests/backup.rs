@@ -1951,6 +1951,46 @@ fn a_base_that_does_not_say_what_its_file_holds_is_refused() {
     s.restores_every_second_from(s.history.last().unwrap().0.div_ceil(SECOND_NS));
 }
 
+/// Decision 45 (lane B26): a base begun by a shipper opened in a generation after a switch says what its
+/// file holds of the one before, as the log's recovery found it. Do: end a base, write and ship, start the
+/// log again, write and ship; end the process there and open it again backed up to the same archive;
+/// end a base once a pass copied the recovered segment, write and ship; restore every second from its
+/// end. Expect: the base is refused its beginning until the pass, its manifest names the closing
+/// segment, whole, and every second restores.
+#[test]
+fn d45_a_base_begun_after_an_opening_says_what_its_file_holds() {
+    let mut s = Source::new();
+    s.put(0..20, "a");
+    s.ship().unwrap();
+    let mut base = s.begin_base().unwrap();
+    s.copy_base(&mut base);
+    s.end_base(base).unwrap();
+    s.put(20..45, "b");
+    s.ship().unwrap();
+    let ended = generation_segments(&s.blobs, 1).pop().unwrap().0.last;
+    assert!(s.db.restart_log().unwrap(), "shipped, so it starts again");
+    s.put(45..50, "c");
+    s.ship().unwrap();
+    reopened(&mut s);
+    s.put(50..55, "d");
+    s.ship().unwrap();
+    assert!(
+        s.begin_base().is_err(),
+        "the segment recovered isn't copied"
+    );
+    let _copied = s.db.checkpoint().unwrap();
+    let mut base = s.begin_base().unwrap();
+    s.copy_base(&mut base);
+    s.end_base(base).unwrap();
+    let closed = newest_manifest(&s.blobs).1.held.closed.unwrap();
+    assert_eq!((closed.frames, closed.copied), (ended, ended));
+    let based = s.second();
+    s.put(55..60, "e");
+    s.now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    s.ship().unwrap();
+    s.restores_every_second_from(based);
+}
+
 /// The manifest of the newest base, and its key.
 fn newest_manifest(blobs: &dyn Blobs) -> (String, ManifestBody) {
     let key = newest_base(blobs).key("db");
