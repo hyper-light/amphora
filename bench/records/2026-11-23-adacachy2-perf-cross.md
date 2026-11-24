@@ -743,3 +743,54 @@ Main moved inside `crates/engine` twice more before the push, so each merge was 
 | r1944 | c1c0e531 (473b207e + these rows + main b1a92917: V13's database/replicated.rs and slot.rs) | needs cpus=4: clippy clean; `store::` 6/6, `database::` 256/256 (6 ignored), `xgroup::` 34/34, tests/store.rs 14/14, tests/crash.rs 10/10 (3 ignored); load 17-26 |
 
 Unit 4 (14e6d081) and the wait (bdfb19ff, f4e87ed0) land together. Unit 4 alone was not pushed first: its own check had `xgroup::` 33/34, and the tree with the wait was green on every check.
+
+## A19 checked and merged; the replicated ladder can't show it (perf-A20)
+
+**Where the checks ran.** adacachy2, needs cpus=4, script `~/.cache/amphora-perf/cross-a19-scripts/check19.sh`
+(A20's copies: `cross-a20-scripts/check20.sh`, which fetches perf/cross-a20, and `check20m.sh` for macOS, which runs in
+kiln's synced copy of the lane clone and refuses a synced HEAD other than the commit named). Each lib-test filter below
+holds A19's test of that module (`memory::tests::a19_…`, `database::admission_charge::a19_…`, `serve::tests::a19_…`).
+
+| run | commit | result |
+|---|---|---|
+| r7, 01:59Z | 1a19ead8 (A19) | clippy -p amphora --all-targets clean; `memory::` 11/11, `store::` 6/6; then collected by kiln's restart on adacachy (~02:00Z) inside `database::` |
+| r7 again, 02:02Z | 1a19ead8 | clippy clean; `memory::` 11/11, `store::` 6/6, `database::` 257/257 (6 ignored), `xgroup::` 34/34, `serve::` 12/12, tests/store.rs 14/14, tests/crash.rs 10/10 (3 ignored); load 30-49 |
+| r27, r40 (macOS, cpus=8 and 4) | 2912576e (1a19ead8 + 502375c9 + main 8738fcb9) | queued from 02:05Z and 02:10Z behind other lanes, then collected by kiln's restart on adacachy (~02:18Z) without starting. adacachy2 refused cpus=4 and cpus=2 meanwhile (1 of 32 cores idle); one cpus=2 admission (r34) ran nothing, its script not yet written there (exit 127, A20's slip) |
+| r10, 02:34Z | e7d493fc (2912576e + main 6d76681c) | needs cpus=4: clippy -p amphora --all-targets clean; `a19_` 3/3, `memory::` 11/11, `store::` 6/6, `database::` 260/260 (6 ignored), `xgroup::` 34/34, `serve::` 12/12, tests/store.rs 16/16, tests/crash.rs 10/10 (3 ignored); load 23-70 |
+
+**rustfmt (502375c9).** Of the five call sites A19 fixed in 1a19ead8, two ran past 100 columns (serve.rs's
+`let SqlAnswer::Tables(tables) = answer(..)` at 2542 and 2583); rustfmt's two hunks are applied alone. At 2912576e `cargo
+fmt -p amphora --check` also flagged main's own lines, present at 14fbf220 before A19 (database.rs, database/
+replicated.rs, database/restore.rs, replication.rs, xgroup/sql.rs); lane F1's `cargo fmt` on main cleared them, and on
+e7d493fc the check is clean.
+
+**The merges (2912576e, e7d493fc).** main 8738fcb9, then 6d76681c, merged without conflicts. main's changes since A19's base touch none of what
+A19 changed: no new caller of `Admission`, `read_frame`, `answer`, `Frame::Held`, `Shared::sql`, `take_until` or
+`charge_queue`, and no new match on `store::Refused` (its one exhaustive match, database.rs 808
+`admission_refusal`, is A19's). store.rs's change on main is the flusher's wait (decision 14), apart from `Store::charge`.
+
+**The A/B through bench/repl_ladder.sh was not run: its writes never reach A19's code.**
+- The ladder's members open `Database::open_replicated_with` (bench/src/repl.rs `procs::member_main`) and answer each
+  write with `Database::call` (`procs::Member::request`, op `exec`). A replicated writer's call goes
+  `Database::submit_selected` -> `Writer::Replicated { client }` -> `client.submit` (database.rs 3048): the replicated
+  owner's `submit` sizes it with `Admission::bytes_for` and queues it with `enqueue` on its own atomics
+  (database/replicated.rs 1507-1530), the path queued for a later lane. Only `Writer::Local` reaches `submit_local` ->
+  `Admission::reserve` -> `Store::charge_queue` -> `Budget::take_until` (database.rs 3069, 3099, 107).
+- `Budget::take_until`'s callers outside tests: store.rs 1393 and 1413 (`Store::charge`, a local store's batch),
+  database.rs 107 (`Admission`, a local writer's), serve.rs 798 and 838 (a request's frame and its decoded charge).
+  database/replicated.rs, database/slot.rs and replication.rs call none of them, nor `Store::put*`.
+- e530666c to main 8738fcb9 is 77 commits. Besides A18's (bdfb19ff, f4e87ed0) they change the path the ladder times:
+  a write slot's end (database/replicated.rs and slot.rs, V14's 7d08d4ff), the store's flusher (W5's 716ede4d and
+  0e83fc98), a batch's charge (A16's unit 4, 5e5ae655), and engine/storage's log segments and wal.rs (Q3's 36ed445e,
+  B17's 554b248e and 22173583). A difference between e530666c and main on the ladder could not be laid to A18 or A19.
+- What does reach A19's code:
+  - `amphora-bench --sql-api` (bench/src/sqlapi.rs: kiln's hot statements, each inside `Database::call` on a local
+    `Database::open`, sqlapi.rs 146) -> `submit_local` -> `Admission::reserve` -> `take_until`, on every call: A19's
+    admission and its lock-free first look. One client only.
+  - The suite's `amphora` target writes through `Groups::put_wait` (bench/src/suite_db.rs 453) -> `Store::charge` ->
+    `charge_queue` -> `take_until`, on every write, at any client count; not through `Database`.
+  - The `amphora-serve` target reaches serve.rs's frame and request charges (`take_until`); its member's database is
+    replicated (serve.rs 509), so not its admission.
+  - No bench drives a local `Database` from more than one client (cluster.rs and scale.rs open replicated groups).
+- On the way: `Store::charge` with no deadline (`Store::put`) now reads the clock once a batch
+  (`until.unwrap_or_else(Instant::now)`), where it read none before. Not measured.
