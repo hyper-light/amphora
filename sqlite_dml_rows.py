@@ -13,6 +13,11 @@ trigger of a column with a collation (CX), STRICT beside WITHOUT ROWID (refused)
 (refused), which of two unique constraints an UPSERT with no target meets first (no document says), an INSERT OR IGNORE
 of NULL into a STRICT key that is no rowid alias, a subquery in DO UPDATE (refused), and the text of a REAL past 15
 digits (CK).
+
+At a conflict on the rowid SQLite's `excluded.c` is the value as given, not as c converts it ('7' in an INT column is
+'7'), unless the table has a generated column or an earlier ON CONFLICT names another constraint. By lang_upsert.html it
+is "the value that would have been inserted had the constraint not failed", which is the converted one. A case is kept
+where SQLite's answer is the same on both readings.
 """
 import random
 import sqlite3
@@ -242,7 +247,7 @@ class Case:
             out.append(("do", "INSERT INTO t VALUES (" + ", ".join(self.value(c) for c in self.written) + ")"))
         for _ in range(self.rng.choice([1, 2, 2, 3])):
             out.append(("do", self.statement()))
-        out.append(("rows", "SELECT * FROM t" if self.without_rowid else "SELECT rowid, * FROM t"))
+        out.append(("rows", f"SELECT {'' if self.without_rowid else 'rowid, '}{', '.join(self.all)} FROM t"))
         if self.triggers:
             out.append(("rows", "SELECT rowid, * FROM lg"))
         return out
@@ -276,20 +281,38 @@ def answer(case):
     return out
 
 
+def converted_early(case):
+    """The same case on a table with one more generated column, which has SQLite convert a row's values before it looks
+    for the row that conflicts (sqlite3ComputeGeneratedColumns)."""
+    def one_more(sql):
+        head, tail = sql[: sql.rindex(")")], sql[sql.rindex(")"):]
+        at = head.find(", PRIMARY KEY(")
+        return (head + ", zz INT AS (1) VIRTUAL" + tail) if at < 0 else head[:at] + ", zz INT AS (1) VIRTUAL" + head[at:] + tail
+
+    return [(kind, one_more(sql) if kind == "sql" and sql.startswith("CREATE TABLE t(") else sql) for kind, sql in case]
+
+
 def main():
     count, seed = int(sys.argv[1]), int(sys.argv[2])
     rng = random.Random(seed)
-    print(f"# bench/sqlite_dml_rows.py {count} {seed}, SQLite {sqlite3.sqlite_version}: a case's statements, each with its outcome, and the rows it leaves")
-    made = 0
+    made, apart, lines = 0, 0, []
     while made < count:
-        case = Case(rng)
-        out = answer(case.text())
-        if out is None or not any(kind == "do" and got == "ok" for kind, _, got in (x for x in out if len(x) == 3)):
+        made_case = Case(rng)
+        case = made_case.text()
+        out = answer(case)
+        if out is None or not any(x[2] == "ok" for x in out if x[0] == "do"):
             continue
+        if not made_case.without_rowid:
+            early = answer(converted_early(case))
+            if early is None or [x[2:] for x in early] != [x[2:] for x in out]:
+                apart += 1
+                continue
         made += 1
-        print("case")
-        for line in out:
-            print("\t".join(line))
+        lines.append("case")
+        lines.extend("\t".join(line) for line in out)
+    print(f"# bench/sqlite_dml_rows.py {count} {seed}, SQLite {sqlite3.sqlite_version}: a case's statements, each with its outcome, and the rows it leaves.")
+    print(f"# {apart} more cases were left out: there SQLite reads excluded.* unconverted at a conflict on the rowid.")
+    print("\n".join(lines))
 
 
 main()
