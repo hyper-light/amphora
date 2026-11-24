@@ -124,9 +124,6 @@ pub enum LimboError {
     /// statement is undone and its transaction stays open.
     #[error("row changed by a concurrent transaction")]
     RowTaken(Option<u64>),
-    /// A wait for a row's holder would close a ring of waits.
-    #[error("deadlock detected")]
-    Deadlock,
     /// Amphora: a serializable transaction's commit refused by its validation (the versioned
     /// storage, docs/design/engine.md decision 5): its caller rolls back and runs it again.
     #[error("Serialization failure: run the transaction again")]

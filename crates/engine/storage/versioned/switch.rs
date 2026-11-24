@@ -364,6 +364,7 @@ impl Level {
                 Self::Serializable => None,
             },
             waits: true,
+            follows: self.statement_snapshots(),
         }
     }
 
@@ -484,15 +485,37 @@ impl Switch {
         }
     }
 
+    /// Whether the connection's transactions wait for a row another holds: an UPDATE of it then takes
+    /// each row before it changes it ([`super::version::VTree::lock`]).
+    pub(crate) fn locks_rows(&self) -> bool {
+        self.level.lock().is_some_and(|level| level.rules().waits)
+    }
+
+    /// The connection's open transaction, as the waits name it.
+    pub(crate) fn txn_id(&self) -> Option<u64> {
+        self.txn
+            .lock()
+            .as_ref()
+            .and_then(|shared| shared.lock().as_ref().map(|txn| txn.id))
+    }
+
     /// Registers `wake` for transaction `holder`'s end; `false` when it has ended
     /// ([`super::version::Clock::wait_for`]).
     pub(crate) fn wait_for(&self, holder: u64, wake: &std::task::Waker) -> Result<bool> {
-        let waiter = self
-            .txn
-            .lock()
-            .as_ref()
-            .and_then(|shared| shared.lock().as_ref().map(|txn| txn.id));
-        self.db.v.clock.wait_for(waiter, holder, wake)
+        self.db.v.clock.wait_for(self.txn_id(), holder, wake)
+    }
+
+    /// The ring of waits the connection's wait closes ([`super::version::Clock::deadlock`]).
+    pub(crate) fn deadlock(&self) -> Vec<(u64, u64)> {
+        self.txn_id()
+            .map_or_else(Vec::new, |waiter| self.db.v.clock.deadlock(waiter))
+    }
+
+    /// The connection waits no more ([`super::version::Clock::stop_waiting`]).
+    pub(crate) fn stop_waiting(&self) {
+        if let Some(waiter) = self.txn_id() {
+            self.db.v.clock.stop_waiting(waiter);
+        }
     }
 
     /// The connection's pager is about to begin a read (lane g7s2-19, `AC-NS.2.1`): the

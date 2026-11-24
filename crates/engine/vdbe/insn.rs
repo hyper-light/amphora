@@ -1477,6 +1477,19 @@ pub enum Insn {
         cursor_id: CursorID,
     },
 
+    /// Amphora (docs/design/postgres.md section 8): the transaction takes the row under table cursor
+    /// P1 before its statement changes it. Jumps to `held` when the row is as the statement's snapshot
+    /// sees it, and to `gone` when a later commit removed it. Falls through when a later commit changed
+    /// it: the cursor's columns are then its newest version's, and each cursor of `indexes` finds that
+    /// version's entries. A row another open transaction changed stops the statement here, its earlier
+    /// changes kept, until that transaction ends (`Connection::take_row_wait`).
+    LockRow {
+        cursor_id: CursorID,
+        indexes: Vec<CursorID>,
+        held: BranchOffset,
+        gone: BranchOffset,
+    },
+
     /// If cursor_id refers to an SQL table (B-Tree that uses integer keys), use the value in start_reg as the key.
     /// If cursor_id refers to an SQL index, then start_reg is the first in an array of num_regs registers that are used as an unpacked index key.
     /// Seek to the first index entry that is greater than or equal to the given key. If not found, jump to the given PC. Otherwise, continue to the next instruction.
@@ -2758,6 +2771,7 @@ impl InsnVariants {
             InsnVariants::SeekRowid => execute::op_seek_rowid,
             InsnVariants::DeferredSeek => execute::op_deferred_seek,
             InsnVariants::FinishSeek => execute::op_finish_seek,
+            InsnVariants::LockRow => execute::op_lock_row,
             InsnVariants::SeekGE
             | InsnVariants::SeekGT
             | InsnVariants::SeekLE

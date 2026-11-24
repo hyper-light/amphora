@@ -6881,6 +6881,58 @@ pub fn op_finish_seek(
     Ok(InsnFunctionStepResult::Step)
 }
 
+fn locking_cursor(
+    state: &mut ProgramState,
+    cursor_id: usize,
+) -> Option<&mut crate::storage::versioned::cursor::VersionedCursor> {
+    match state.cursors.get_mut(cursor_id) {
+        Some(Some(Cursor::Dyn(cursor, ..))) => (cursor.as_mut() as &mut dyn Any).downcast_mut(),
+        _ => None,
+    }
+}
+
+/// Amphora (docs/design/postgres.md section 8): `Insn::LockRow`.
+pub fn op_lock_row(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    use crate::storage::versioned::cursor::RowLocked;
+    load_insn!(
+        LockRow {
+            cursor_id,
+            indexes,
+            held,
+            gone
+        },
+        insn
+    );
+    // A row of another storage (a temporary table's) is its one writer's already.
+    let locked =
+        locking_cursor(state, *cursor_id).map_or(Ok(RowLocked::Held), |cursor| cursor.lock_row());
+    state.pc = match locked {
+        Ok(RowLocked::Held) => held.as_offset_int(),
+        Ok(RowLocked::Gone) => gone.as_offset_int(),
+        Ok(RowLocked::Moved) => {
+            for index in indexes {
+                if let Some(cursor) = locking_cursor(state, *index) {
+                    cursor.read_newest()?;
+                }
+            }
+            state.pc.saturating_add(1)
+        }
+        // The same instruction again once the holder has ended.
+        Err(LimboError::RowTaken(Some(holder))) => {
+            program.connection.set_row_wait(holder);
+            let yielded = IOCompletions(Completion::new_yield());
+            return Ok(state.suspend_on_io(yielded));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    Ok(InsnFunctionStepResult::Step)
+}
+
 /// Move a table cursor to the row that DeferredSeek saved.
 fn seek_deferred_row(
     state: &mut ProgramState,
