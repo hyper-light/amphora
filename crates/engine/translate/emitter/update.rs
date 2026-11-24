@@ -550,14 +550,7 @@ pub fn emit_program_for_update(
     )?;
 
     // Close the main loop
-    CloseLoop::emit(
-        program,
-        &mut t_ctx,
-        &write_phase_tables,
-        &join_order,
-        mode,
-        None,
-    )?;
+    CloseLoop::emit(program, &mut t_ctx, &write_phase_tables, &join_order, mode)?;
 
     program.preassign_label_to_next_insn(after_main_loop_label);
     if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
