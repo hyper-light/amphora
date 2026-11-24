@@ -426,7 +426,7 @@ impl Executor {
             match ran {
                 Ok(changed) => return Ok(changed),
                 Err(LimboError::RowTaken(Some(holder))) => return Err(Stop::Wait(holder)),
-                Err(LimboError::RowTaken(None)) if self.level == Level::ReadCommitted => {
+                Err(LimboError::RowTaken(None)) if self.level.statement_snapshots() => {
                     self.conn.renew_snapshot().map_err(engine)?;
                 }
                 Err(error) => return Err(engine(error).into()),
@@ -452,6 +452,7 @@ impl Executor {
     /// SHOW transaction_isolation: the level of the open transaction, READ COMMITTED out of one.
     fn show_isolation(&self, out: &mut Vec<u8>) -> Result<(), PgError> {
         let level = match self.level {
+            Level::ReadUncommitted => "read uncommitted",
             Level::ReadCommitted => "read committed",
             Level::RepeatableRead => "repeatable read",
             Level::Serializable => "serializable",
@@ -750,9 +751,8 @@ fn isolation_level(tree: &Tree, modes: &[NodeId]) -> Result<Option<Level>, PgErr
             return Err(unsupported("this transaction mode"));
         };
         level = match (defname.as_str(), name.as_str()) {
-            ("transaction_isolation", "read committed" | "read uncommitted") => {
-                Some(Level::ReadCommitted)
-            }
+            ("transaction_isolation", "read uncommitted") => Some(Level::ReadUncommitted),
+            ("transaction_isolation", "read committed") => Some(Level::ReadCommitted),
             ("transaction_isolation", "repeatable read") => Some(Level::RepeatableRead),
             ("transaction_isolation", "serializable") => Some(Level::Serializable),
             _ => return Err(unsupported("this transaction mode")),

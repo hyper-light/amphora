@@ -100,7 +100,8 @@ s1|begin
 s1|update j set v = v + 1 where id = 1
 s2|update j set v = v + 1 where id = 2
 s1|commit
-s1|select id, v from j where id <= 2
+s1|select v from j where id = 1
+s1|select v from j where id = 2
 # a-waiter-in-a-block-keeps-its-earlier-writes
 s1|create table k(id int not null, v int)
 s1|insert into k(id, v) values (1, 10)
@@ -113,7 +114,8 @@ s2>update k set v = v + 100 where id = 1
 s1|commit
 s2<
 s2|commit
-s1|select id, v from k where id <= 2
+s1|select v from k where id = 1
+s1|select v from k where id = 2
 # levels-and-set-transaction
 s1|show transaction_isolation
 s1|begin isolation level serializable

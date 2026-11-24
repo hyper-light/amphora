@@ -342,9 +342,10 @@ pub(crate) fn tree_of(root_page: i64) -> Result<u64> {
 }
 
 /// A session's isolation level on this storage, as PostgreSQL names them
-/// (docs/design/postgres.md section 8). READ UNCOMMITTED is READ COMMITTED, as 19's is.
+/// (docs/design/postgres.md section 8). READ UNCOMMITTED runs as READ COMMITTED, as 19's does.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Level {
+    ReadUncommitted,
     ReadCommitted,
     RepeatableRead,
     Serializable,
@@ -357,11 +358,19 @@ impl Level {
     fn rules(self) -> Rules {
         Rules {
             validation: match self {
-                Self::ReadCommitted | Self::RepeatableRead => Some(Validation::Snapshot),
+                Self::ReadUncommitted | Self::ReadCommitted | Self::RepeatableRead => {
+                    Some(Validation::Snapshot)
+                }
                 Self::Serializable => None,
             },
             waits: true,
         }
+    }
+
+    /// Whether each statement of its transactions reads a snapshot of its own.
+    #[must_use]
+    pub fn statement_snapshots(self) -> bool {
+        matches!(self, Self::ReadUncommitted | Self::ReadCommitted)
     }
 }
 
@@ -450,7 +459,7 @@ impl Switch {
     /// A READ COMMITTED transaction's next statement's snapshot: every commit published now; any
     /// other level keeps its own (docs/design/postgres.md section 8).
     pub(crate) fn renew(&self) -> Result<()> {
-        if *self.level.lock() != Some(Level::ReadCommitted) {
+        if !self.level.lock().is_some_and(Level::statement_snapshots) {
             return Ok(());
         }
         let Some(shared) = self.txn.lock().clone() else {
