@@ -593,9 +593,11 @@ other sessions run meanwhile. What differs from 19's recheck, EvalPlanQual (unit
 whole, so a row it changed before the wait is undone and can be changed by another session in the interval, and a WHERE
 is judged by the newer snapshot on every row, not on the waited-for row alone; a single row by its key answers as
 19's does (T-PG.14.1). A wait that would close a ring of waits is refused `40P01` at once, the session that closes it
-being the victim, where 19 waits out `deadlock_timeout` and refuses whichever session's check runs first. A level's
-change the catalog's change refuses at COMMIT as before (a transaction that wrote rows, open while another session's CREATE
-TABLE commits).
+being the victim, where 19 waits out `deadlock_timeout` and refuses whichever session's check runs first. A statement
+that changes the catalog (CREATE TABLE, ALTER TABLE) is validated by the storage's own validation at any level
+(`Txn::validate_fully`), since an index it built beside a commit that added rows would lack them (19 locks the table
+against the writers); and a transaction that wrote rows and stayed open while another session's schema change
+committed is refused at COMMIT, as before (PG20).
 
 An error inside a transaction block puts the session in PostgreSQL's aborted state (`25P02` until
 ROLLBACK); SAVEPOINT and ROLLBACK TO map to the engine's savepoints (`crates/engine/translate/rollback.rs`).
