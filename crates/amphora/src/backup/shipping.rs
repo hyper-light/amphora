@@ -870,11 +870,11 @@ mod tests {
         assert_eq!(ids(&Db::open(&target).unwrap()), ids(&db));
     }
 
-    /// Decision 45, AC-T1.12.3 (lane B24): a round between the writer's switch and the fence's word
-    /// of it ends the base under way. Do: begin a first base; write 5 rows and ship them; start the log again,
-    /// and in the writer's restart, the switch made and the fence not told of it yet, run the round
-    /// that copies the base's last chunk, as the shipping thread may; restore the last commit's
-    /// second. Expect: the base ended, so the second restores with every row.
+    /// Decision 45, AC-T1.12.3 (lane B24): a round within the writer's restart, its switch made and
+    /// the restart not ended, ends the base under way. Do: begin a first base; write 5 rows and ship
+    /// them; start the log again, and within the restart run the round that copies the base's last
+    /// chunk, as the shipping thread may; restore the last commit's second. Expect: the base ended,
+    /// so the second restores with every row.
     #[test]
     fn d45_a_round_within_the_writers_switch_ends_the_base_under_way() {
         let dir = tempfile::tempdir().unwrap();

@@ -633,6 +633,37 @@ mod tests {
         assert!(hooks.marks.latest().unwrap() >= drained.through);
     }
 
+    /// Decision 45 (lane B24): the fence is told how a generation ends before the switch that ends
+    /// it. Do: ship generation 4 whole and restart; ask within the switch; then, the shipper not yet
+    /// in 5, restart 5 unshipped (forced), asking within that switch, and make it not. Expect: 4
+    /// reaches 5 whole within its own switch, and still within and after the next one's.
+    #[test]
+    fn d45_the_fence_is_told_before_the_switch() {
+        let fence = Fence::default();
+        fence.shipped(4, 9).unwrap();
+        let mut whole = Vec::new();
+        let ask = |whole: &mut Vec<bool>| whole.push(fence.ended_whole(4, 9, 5).unwrap());
+        fence
+            .restart(4, 9, false, || {
+                ask(&mut whole);
+                Ok(true)
+            })
+            .unwrap();
+        let made = fence
+            .restart(5, 3, true, || {
+                ask(&mut whole);
+                Ok(false)
+            })
+            .unwrap();
+        assert!(!made);
+        ask(&mut whole);
+        assert_eq!(whole, [true, true, true]);
+        assert!(
+            !fence.ended_whole(5, 3, 6).unwrap(),
+            "a restart not made ended nothing"
+        );
+    }
+
     /// T-T1.12.P11: a log started again twice with no write between keeps its link whole; a
     /// restart forced before its frames were shipped, or one the fence wasn't told of, breaks it.
     #[test]
