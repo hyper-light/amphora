@@ -1545,3 +1545,5 @@ Times: F's runs 0 to 4, median 864 ms (809 to 1,006). S's warm runs 1 to 4, medi
   T17 recorded on main, none on the lines this lane changed (`planner/mod.rs` 573 to 577); the log checks amphora-engine.
 - r34 (f8a5e57d, merged again after main moved in `crates/engine/storage` and the bench): the same as r7, clippy clean
   (the log checks amphora-engine, 41 s), 69 of 69, 3 of 3 (the log compiling amphora-engine).
+- r50 (4f6725d4, merged again after main moved in `crates/engine` (database.rs, wal.rs) and `crates/amphora`): clippy
+  clean (the log checks amphora-engine, 34 s), 69 of 69, 3 of 3 (the log compiling amphora-engine).
