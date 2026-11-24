@@ -55,6 +55,21 @@ for step in "$@"; do
     first:*)  # first:KIND:SEED N: the first N differences of a wide run
       IFS=: read -r _ kind seed count <<< "$step"
       grep -E "^(plain|indexed) Settings" -A 2 "$O/$kind-$seed.log" | head -${count:-30} | cut -c1-900 ;;
+    clippy)
+      timeout 900 nice -n 10 cargo clippy -p amphora-engine --all-targets --locked -- -D warnings > "$O/clippy.log" 2>&1; rc=$?
+      grep -E "^error|^warning" -A 8 "$O/clippy.log" | head -40; grep -E "Checking amphora-engine|Compiling amphora-engine" "$O/clippy.log" | sort | uniq -c
+      echo "== clippy rc=$rc $(( $(date +%s) - s ))s load $(load)" ;;
+    fmt) cargo fmt --all --check > "$O/fmt.log" 2>&1; echo "== fmt rc=$? $(( $(date +%s) - s ))s"; head -5 "$O/fmt.log" ;;
+    prod)
+      timeout 900 nice -n 10 bash scripts/check-production.sh > "$O/prod.log" 2>&1; rc=$?
+      tail -6 "$O/prod.log" | cut -c1-300; echo "== check-production rc=$rc $(( $(date +%s) - s ))s load $(load)" ;;
+    libbuild)
+      timeout 900 nice -n 10 cargo test -p amphora-engine --locked --features simulator --lib --no-run > "$O/libbuild.log" 2>&1; rc=$?
+      grep -E "^error|Executable" -A 6 "$O/libbuild.log" | head; grep -oE "/[^ ]*deps/amphora_engine-[0-9a-f]+" "$O/libbuild.log" | tail -1 > "$O/libbin"; echo "== libbuild rc=$rc $(( $(date +%s) - s ))s load $(load)" ;;
+    lib:*)  # lib:FILTER [args]
+      filter=${step#lib:}
+      timeout 900 nice -n 10 "$(cat $O/libbin)" --test-threads=$T $filter > "$O/lib-${filter//[^a-z0-9_]/_}.log" 2>&1; rc=$?
+      echo "== lib $filter rc=$rc $(( $(date +%s) - s ))s load $(load)"; grep -E "^test result|FAILED|panicked" "$O/lib-${filter//[^a-z0-9_]/_}.log" | cut -c1-250 | head -12 ;;
     t:*)  # t:TEST [filter]: an integration test's run
       IFS=: read -r _ name filter <<< "$step"
       timeout 1200 nice -n 10 "$(bin $name)" --test-threads=$T $filter > "$O/t-$name.log" 2>&1; rc=$?
