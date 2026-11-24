@@ -1390,6 +1390,9 @@ pub trait Wal: Debug + Send + Sync {
     /// This should't be used with regular WAL mode.
     fn update_max_frame(&self);
 
+    /// The frames the log's segments hold, and how many of them are in the DB file (decision 45).
+    fn frames_and_copied(&self) -> (u64, u64);
+
     /// Start the log again in its free segment, after a RESTART's copy and the DB file's sync
     /// (decision 45). Busy while a read is in the log.
     fn restart_wal(&self, result: &CheckpointResult) -> Result<()>;
@@ -1568,10 +1571,6 @@ impl InProcessWalCoordination {
             }
         }
         min
-    }
-
-    fn set_read_mark_value_exclusive(&self, slot: usize, value: u32) {
-        self.log.current().read().runtime.read_locks[slot].set_value_exclusive(value);
     }
 
     fn try_upgrade_read_mark(&self, slot: usize) -> bool {
@@ -7736,6 +7735,19 @@ impl Wal for WalFile {
         self.max_frame.store(new_max_frame, Ordering::Release);
     }
 
+    fn frames_and_copied(&self) -> (u64, u64) {
+        let segments = self.coordination.segments();
+        std::iter::once(segments.current())
+            .chain(segments.closing())
+            .map(|segment| self.coordination.segment_snapshot(segment))
+            .fold((0, 0), |(frames, copied), held| {
+                (
+                    held.max_frame.saturating_add(frames),
+                    held.nbackfills.saturating_add(copied),
+                )
+            })
+    }
+
     fn restart_wal(&self, result: &CheckpointResult) -> Result<()> {
         self.start_log_again(result)
     }
@@ -9402,7 +9414,7 @@ pub mod test {
         TryBeginReadResult, Wal, WalAutoActions, WalCommitState, WalConnectionState,
         WalCoordination, WalFile, WalSnapshot, NO_LOCK_HELD,
     };
-    use crate::storage::log_segments::SegmentId;
+    use crate::storage::log_segments::{SegmentId, Segments};
     #[cfg(host_shared_wal)]
     use crate::storage::shared_wal_coordination::{
         MappedSharedWalCoordination, SharedWalCoordinationHeader, SharedWalCoordinationOpenMode,
@@ -12116,8 +12128,9 @@ pub mod test {
             conn.execute("insert into other(value) values ('closing')")
                 .unwrap();
         }
+        // Each TRUNCATE switches the log's segment.
         std::fs::copy(&source, &copy).unwrap();
-        std::fs::copy(format!("{source_path}-wal"), format!("{copy_path}-wal")).unwrap();
+        std::fs::copy(format!("{source_path}-wal2"), format!("{copy_path}-wal")).unwrap();
         conn.execute("pragma wal_checkpoint(TRUNCATE)").unwrap();
         bulk_inserts(&conn, 1, 10);
         std::fs::copy(format!("{source_path}-wal"), format!("{copy_path}-wal2")).unwrap();

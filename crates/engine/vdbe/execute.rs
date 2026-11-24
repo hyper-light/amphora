@@ -781,35 +781,52 @@ pub fn op_checkpoint(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
-    let step_result = pager.checkpoint(*checkpoint_mode, sync_mode, true);
-    match step_result {
-        Ok(IOResult::Done(CheckpointResult {
-            wal_max_frame,
-            wal_total_backfilled,
-            ..
-        })) => {
-            // https://sqlite.org/pragma.html#pragma_wal_checkpoint
-            // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).
-            state.registers[*dest].set_int(0);
-            // 2nd col: # modified pages written to wal file
-            state.registers[*dest + 1].set_int(wal_max_frame as i64);
-            // 3rd col: # pages moved to db after checkpoint
-            state.registers[*dest + 2].set_int(wal_total_backfilled as i64);
+    let passive = CheckpointMode::Passive {
+        upper_bound_inclusive: None,
+    };
+    let (busy, frames, copied) = loop {
+        let mode = if state.checkpoint_blocked {
+            passive
+        } else {
+            *checkpoint_mode
+        };
+        match pager.checkpoint(mode, sync_mode, true) {
+            Ok(IOResult::Done(result)) if !state.checkpoint_blocked => {
+                break (0, result.wal_max_frame as i64, result.wal_total_backfilled as i64);
+            }
+            // "the checkpoint operation proceeds from that point in the same way as
+            // SQLITE_CHECKPOINT_PASSIVE [...]. SQLITE_BUSY is returned in this case"
+            // (sqlite.org/c3ref/wal_checkpoint_v2.html).
+            Ok(IOResult::Done(_)) => {
+                let (frames, copied) = pager
+                    .wal
+                    .as_ref()
+                    .map_or((0, 0), |wal| wal.frames_and_copied());
+                break (1, frames as i64, copied as i64);
+            }
+            Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
+            Err(err) => {
+                tracing::debug!("PRAGMA wal_checkpoint failed: {err:?}");
+                pager.cleanup_after_checkpoint_failure();
+                if state.checkpoint_blocked || mode == passive || !matches!(*err, LimboError::Busy) {
+                    break (1, -1, -1);
+                }
+                state.checkpoint_blocked = true;
+            }
+        }
+    };
+    // https://sqlite.org/pragma.html#pragma_wal_checkpoint
+    // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).
+    state.registers[*dest].set_int(busy);
+    // 2nd col: # modified pages written to wal file
+    state.registers[*dest + 1].set_int(frames);
+    // 3rd col: # pages moved to db after checkpoint
+    state.registers[*dest + 2].set_int(copied);
 
-            state.explicit_checkpoint_guard = None;
-            state.pc += 1;
-            Ok(InsnFunctionStepResult::Step)
-        }
-        Ok(IOResult::IO(io)) => Ok(state.suspend_on_io(io)),
-        Err(err) => {
-            tracing::debug!("PRAGMA wal_checkpoint failed: {err:?}");
-            pager.clear_checkpoint_state();
-            state.explicit_checkpoint_guard = None;
-            state.registers[*dest].set_int(1);
-            state.pc += 1;
-            Ok(InsnFunctionStepResult::Step)
-        }
-    }
+    state.explicit_checkpoint_guard = None;
+    state.checkpoint_blocked = false;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
 }
 
 pub fn op_null(
