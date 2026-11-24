@@ -1,0 +1,7 @@
+CREATE TABLE a(id INTEGER PRIMARY KEY, total REAL, code TEXT UNIQUE, note TEXT)
+CREATE INDEX a_total ON a(total)
+CREATE TABLE b(id INTEGER PRIMARY KEY)
+INSERT INTO a VALUES (1, 255, '255', NULL), (2, 50, '050', NULL), (3, 300, '099', NULL)
+INSERT INTO b VALUES (1), (2), (3)
+--
+SELECT a.id, b.id FROM a LEFT JOIN b ON a.code = '255' AND b.id = a.id WHERE a.total > 100 AND a.note IS NULL
