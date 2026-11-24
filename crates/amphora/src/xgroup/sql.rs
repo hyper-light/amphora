@@ -213,6 +213,17 @@ pub(crate) fn held(db: &Db, key: &[u8]) -> anyhow::Result<bool> {
     Ok(held)
 }
 
+/// Exclusive end of a Records range in the lock table. Every binary row key begins
+/// below the successor of the family prefix, including keys starting with 0xff.
+fn lock_range_end(namespace: &str, family: &str, upper: Option<&[u8]>) -> anyhow::Result<Vec<u8>> {
+    let key = |row: &[u8]| record_key(namespace, family, row).map_err(|e| anyhow::anyhow!("{e}"));
+    match upper {
+        Some(upper) => key(upper),
+        None => crate::database::successor(&key(&[])?)
+            .ok_or_else(|| anyhow::anyhow!("a family's cross-group keys have no end")),
+    }
+}
+
 /// The cross-group key of the first Records row of `family` in a scan's range a transaction
 /// across groups holds a write lock on (as [`locked`]), if one is (T-T1.10.W10): rows from `lower` (past it when
 /// `continued`) below `upper` (none: the family's end), and no further than `last` when the
@@ -228,13 +239,8 @@ pub(crate) fn locked_in(
     last: Option<&[u8]>,
 ) -> anyhow::Result<Option<Vec<u8>>> {
     let at = |key: &[u8]| record_key(namespace, family, key).map_err(|e| anyhow::anyhow!("{e}"));
-    let base = at(&[])?;
     let from = at(lower)?;
-    let to = match upper {
-        Some(upper) => at(upper)?,
-        None => crate::database::successor(&base)
-            .ok_or_else(|| anyhow::anyhow!("a family's cross-group keys have no end"))?,
-    };
+    let to = lock_range_end(namespace, family, upper)?;
     let last = last.map(at).transpose()?;
     let mut held = None;
     db.query(
@@ -272,16 +278,7 @@ pub(crate) fn held_at(
 ) -> anyhow::Result<Option<Vec<u8>>> {
     let refused = |e: Refusal| anyhow::anyhow!("{e}");
     let from = record_key(namespace, family, lower).map_err(refused)?;
-    // Past every row of the family: its prefix with the next byte past the last (the four-byte
-    // lengths keep one family's prefix from being another's).
-    let to = match upper {
-        Some(upper) => record_key(namespace, family, upper).map_err(refused)?,
-        None => {
-            let mut end = record_key(namespace, family, &[]).map_err(refused)?;
-            end.push(u8::MAX);
-            end
-        }
-    };
+    let to = lock_range_end(namespace, family, upper)?;
     let mut held = None;
     db.query(
         "SELECT l.key FROM __amphora_xg_lock l JOIN __amphora_xg_lock_at t ON t.coordinator = l.coordinator AND t.epoch = l.epoch AND t.seq = l.seq WHERE l.key >= ?1 AND l.key < ?2 AND l.kind != ?3 AND t.stamp <= ?4 ORDER BY l.key LIMIT 1",
@@ -731,8 +728,8 @@ pub fn prepare(group: &Database, until: Instant) -> Result<(), Refusal> {
 /// newest stamp after it (none: the group makes no stamps), and its clock after it, the one
 /// cross-group clock's microseconds ([`Database::cross_clock`]: a replicated group's closed time, a
 /// backed-up group's writer clock; none: it keeps neither; AC-T1.10.1, T-T1.10.W4). Taken after
-/// the step answered, the clock is at or past the step's own commit, as a token taken after a
-/// write's answer is ([`Database::session_token`]).
+/// the step answered, the clock covers the step's own commit: an internal call waits
+/// for its write's index to apply here before answering.
 pub(crate) fn serve(
     group: &Database,
     here: GroupId,
@@ -3256,6 +3253,99 @@ mod sessions {
                 eprintln!("{reads:?}: {wakes} wakes, {OTHERS} other commits in the group");
             });
         }
+    }
+
+    /// T-T1.10.W9–W11: the writer carries out a resolution whose caller has already timed out.
+    /// Its retry finds a done row. The first commit must still have rung the sleeping reader.
+    #[test]
+    fn t_t1_10_w9_a_resolutions_lost_reply_does_not_lose_the_wake() {
+        use crate::database::LockedReads;
+        use crate::xgroup::Step;
+        use amphora_api::{Consistency, Records};
+
+        let dir = tempfile::tempdir().unwrap();
+        let group = Database::open(&dir.path().join("group.db"), until()).unwrap();
+        group.set_locked_reads(LockedReads::WaitOnLock);
+        let txn = TxnId {
+            coordinator: 1,
+            epoch: 1,
+            seq: 0,
+        };
+        let lock = Envelope {
+            coordinator: txn.coordinator,
+            epoch: txn.epoch,
+            floor: None,
+            step: Step::Lock {
+                txn,
+                anchor: 0,
+                reads: Vec::new(),
+                writes: vec![(row(1), Some(vec![7]))],
+                stage: None,
+            },
+        };
+        let started = Instant::now();
+        let (locked, _, _) = serve(&group, 0, 0, lock.clone(), until()).unwrap();
+        let lock_time = started.elapsed();
+        assert_eq!(locked, Reply::Locked { reads: Vec::new() });
+        let resolution = Envelope {
+            coordinator: txn.coordinator,
+            epoch: txn.epoch,
+            floor: None,
+            step: Step::Resolve {
+                txn,
+                outcome: Outcome::Committed,
+            },
+        };
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                group
+                    .namespace("ns")
+                    .unwrap()
+                    .get("rows", &[1], Consistency::Linearizable, until())
+            });
+            group.locked_waits_reach(1, until()).unwrap();
+            // Hold the actual writer until its caller has lost the answer. If an attempt
+            // expired before it reached the writer, give the next one longer to enter.
+            let limit = until();
+            let mut budget = lock_time;
+            loop {
+                let now = Instant::now();
+                assert!(now < limit, "the resolution never entered the writer");
+                let deadline = now + budget.min(limit.saturating_duration_since(now));
+                let (entered, applied) = mpsc::channel();
+                let (resume, held) = mpsc::channel();
+                let first = resolution.clone();
+                let answer = step_answer(&first);
+                let outcome = step(&group, &AtomicU64::new(0), deadline, answer, move |db| {
+                    let result = apply_step(db, 0, &first)?;
+                    entered.send(())?;
+                    held.recv_timeout(limit.saturating_duration_since(Instant::now()))?;
+                    Ok(result)
+                });
+                match applied.recv_timeout(limit.saturating_duration_since(Instant::now())) {
+                    Ok(()) => {
+                        resume.send(()).unwrap();
+                        assert_eq!(outcome.err(), Some(Refusal::UnknownOutcome));
+                        break;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        assert!(matches!(
+                            outcome,
+                            Err(Refusal::Timeout | Refusal::UnknownOutcome)
+                        ));
+                        budget = budget.saturating_mul(2);
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => panic!("writer did not report entry"),
+                }
+            }
+            // A new lock request is Late only once the original writer made its done row.
+            let (locked_again, _, _) = serve(&group, 0, 0, lock, until()).unwrap();
+            assert_eq!(locked_again, Reply::Late);
+            let (reply, _, _) = serve(&group, 0, 0, resolution, until()).unwrap();
+            assert_eq!(reply, Reply::Resolved);
+            assert_eq!(reader.join().unwrap().unwrap().unwrap().value, [7]);
+            assert_eq!(group.locked_wakes(), 1);
+        });
     }
 
     /// T-T1.10.W10 (AC-T1.10.1, lane xgroup-sql-11): a Records scan waits on a held lock in the

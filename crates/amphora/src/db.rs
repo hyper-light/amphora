@@ -1493,6 +1493,40 @@ mod tests {
         }
     }
 
+    /// A failed write's own cleanup cannot be the event it waits for.
+    #[test]
+    fn busy_write_does_not_wake_itself_on_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let holder = Db::open(&dir.path().join("busy.db")).unwrap();
+        holder.exec("CREATE TABLE t(x)").unwrap();
+        let waiter = holder.reader().unwrap();
+        waiter.conn.set_busy_wake(BusyWake::Release);
+        holder.exec("BEGIN IMMEDIATE").unwrap();
+        holder.exec("INSERT INTO t VALUES (1)").unwrap();
+        let task = Arc::new(Woken {
+            thread: std::thread::current(),
+            wakes: Default::default(),
+        });
+        let waker = std::task::Waker::from(task);
+        let mut stmt = waiter.conn.prepare("INSERT INTO t VALUES (2)").unwrap();
+        let mut waits = Vec::new();
+        while waits.len() < 4 {
+            match stmt.step_with_waker(&waker).unwrap() {
+                StepResult::IO | StepResult::Yield => waiter.io.step().unwrap(),
+                StepResult::Sleep { duration } => {
+                    waits.push(duration);
+                    if !duration.is_zero() {
+                        break;
+                    }
+                }
+                other => panic!("expected a blocked write, got {other:?}"),
+            }
+        }
+        eprintln!("busy writer sleeps with the same holder: {waits:?}");
+        holder.exec("COMMIT").unwrap();
+        assert!(waits.iter().any(|d| !d.is_zero()), "{waits:?}");
+    }
+
     /// T-QB.1.14 (lane constants-22; goal dfabffcc, "every wait wakes on an event"): a write busy
     /// on another connection's write lock wakes on its release. One connection holds the write lock; the
     /// other's insert finds it held and parks, saying so; then the first commits. Under the release

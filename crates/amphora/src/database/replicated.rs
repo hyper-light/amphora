@@ -296,11 +296,16 @@ impl Client {
         }
         self.handle.shared.local.with(until, f)
     }
-    /// Waits until this replica's published closed time is at least `at_least` and past `seen`
+    /// Waits until this replica has applied `token` and its closed time is past `seen`
     /// (the time a read found too old, if one did), on the caller's thread, until `until`
     /// (replication.md, "Follower reads at a closed time"). Refused Timeout at the deadline, and
     /// Fenced once the owner ended or is fenced.
-    fn wait_closed(&self, at_least: u64, seen: Option<u64>, until: Instant) -> Result<(), Refusal> {
+    pub(super) fn wait_closed(
+        &self,
+        token: Token,
+        seen: Option<u64>,
+        until: Instant,
+    ) -> Result<u64, Refusal> {
         let shared = &self.handle.shared;
         let mut closed = locked(&shared.closed)?;
         loop {
@@ -320,11 +325,12 @@ impl Client {
                     }
                 }
             }
-            if closed
-                .time
-                .is_some_and(|time| time >= at_least && seen.is_none_or(|seen| time > seen))
+            if let Some(time) = closed.time
+                && closed.applied >= token.index
+                && time >= token.micros
+                && seen.is_none_or(|seen| time > seen)
             {
-                return Ok(());
+                return Ok(time);
             }
             let left = until.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -351,7 +357,7 @@ impl Client {
     ) -> Result<R, Refusal> {
         let mut seen = None;
         loop {
-            self.wait_closed(at_least, seen, until)?;
+            self.wait_closed(Token::at(at_least), seen, until)?;
             match self.read_local(until, &mut read)? {
                 Ok(answer) => return Ok(answer),
                 Err(found) => seen = found.or(Some(0)),
@@ -1632,17 +1638,21 @@ impl ReplicaHandle {
         })
     }
 
-    /// The most records one [`Self::drain`] takes to keep up with this member's outgoing queue:
-    /// what its host drains in an election timeout, learned from the host's own drain (QB.1), so
-    /// a host that drains at it needs no count of its own to pick (lane ryw-6, kiln goal 8119f25d).
+    /// The queue's learned message limit (QB.1). It can fall below the records already
+    /// queued. A host draining the entire backlog in one pass uses [`Self::drain_all`].
     pub fn outgoing_bound(&self) -> Result<usize, Refusal> {
         let messages = locked(&self.shared.outgoing)?.bound.messages;
         Ok(usize::try_from(messages).unwrap_or(usize::MAX).max(1))
     }
 
-    /// Takes at most `limit` messages. A host that stays behind the egress bound, what it drains
-    /// in an election timeout, for a whole election timeout fences the owner explicitly (QB.1);
-    /// the actor never acknowledges a send the host has not taken.
+    /// Takes every record queued when the drain acquires the queue lock. The allocation
+    /// and work are bounded by the queue's actual depth, including before its first sample.
+    pub fn drain_all(&self) -> Result<Vec<Outbound>, Refusal> {
+        self.drain(usize::MAX)
+    }
+
+    /// Takes up to `limit` records currently queued, counting their bytes and destinations
+    /// toward the host's measured drain (QB.1).
     pub fn drain(&self, limit: usize) -> Result<Vec<Outbound>, Refusal> {
         let mut outgoing = locked(&self.shared.outgoing)?;
         if outgoing.messages.is_empty()
@@ -4804,9 +4814,8 @@ impl<F: BlockFile + 'static> Actor<F> {
                     "replica outgoing queue is past the memory budget's room for queues; drain and reopen from durable state",
                 ));
             }
-            // Past what the host drains in an election timeout (QB.1): a bound that starts at one
-            // message grows as the host's drain is measured, so only a host that stays behind it
-            // for a whole election timeout fences the owner.
+            // Under the fence policy, the queue may exceed its learned rate for one election
+            // timeout. Its cold byte bound is the memory room (QB.1).
             let count = u64::try_from(outgoing.messages.len())
                 .unwrap_or(u64::MAX)
                 .saturating_add(1);
@@ -5713,22 +5722,16 @@ mod tests {
         );
     }
 
-    /// Lane ryw-6 (kiln goal 8119f25d) on QB.1's learned bound: a host that drains at the
-    /// handle's bound, as the bench's relay does, takes the whole queue in one call and needs no
-    /// count of its own. Before anything is drained the bound is the memory room (QB.1), far past
-    /// what a test fills, so the queue holds a burst of records the bound covers. Do: a member's
-    /// queue holding 1,004 records (four times 251, the byte pattern's period); one drain at
-    /// `outgoing_bound`. Expect: the bound covers them, every record taken in order, none left and
-    /// no bytes charged.
+    /// QB.1 and lane ryw-6: queue a burst within the cold bound, then lower the learned
+    /// bound as a rebound can. The relay's one-pass drain still takes every queued byte.
     #[test]
-    fn a_drain_at_the_queues_bound_takes_the_whole_queue() {
+    fn a_whole_queue_drain_survives_a_shrinking_learned_bound() {
         let dir = tempfile::tempdir().unwrap();
         let mut driven = Driven::new();
         let client = driven.open(dir.path(), 1, vec![1, 2, 3], None);
         let handle = client.handle();
         let burst = 4 * 251;
-        let bound = handle.outgoing_bound().unwrap();
-        assert!(bound >= burst, "the bound {bound} covers the burst {burst}");
+        assert!(handle.outgoing_bound().unwrap() >= burst);
         {
             let mut outgoing = locked(&handle.shared.outgoing).unwrap();
             while outgoing.messages.len() < burst {
@@ -5742,8 +5745,12 @@ mod tests {
                     kind: hyper_raft::proto::MessageType::MsgAppend,
                 });
             }
+            // A rebound can lower the learned limit while the previous burst is queued.
+            outgoing.bound.messages = 2;
         }
-        let drained = handle.drain(bound).unwrap();
+        let bound = handle.outgoing_bound().unwrap();
+        assert_eq!(bound, 2);
+        let drained = handle.drain_all().unwrap();
         assert_eq!(drained.len(), burst);
         assert!(
             drained
@@ -7875,6 +7882,36 @@ mod tests {
             "the follower answered at its apply ({at}), not on the commit of {index}"
         );
         (leader, follower, index)
+    }
+
+    /// T-T1.9.R28, AC-T1.10.R4: with its flush held, a follower answers a committed
+    /// entry before applying it. A step waiting for that index can publish its clock
+    /// only once application resumes, even if its timestamp lower bound is already met.
+    #[test]
+    fn a_step_clock_covers_its_acknowledged_follower_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut driven, _powers, gates, clients) = gated(dir.path());
+        let mut pump = Pump::new(&clients);
+        let (_, follower, index) = answered_at_a_follower(&mut driven, &mut pump, &clients, &gates);
+        let client = &clients[follower];
+        let before = client.closed_token().unwrap();
+        assert!(before.index < index);
+        let write = Token {
+            index,
+            micros: before.micros,
+        };
+        let early = client.wait_closed(write, None, Instant::now());
+        gates[follower].release();
+        driven.follow(&mut pump, &clients, index);
+        let applied = client.wait_closed(write, None, Instant::now()).unwrap();
+        driven.drain(&mut pump);
+        pump.finish();
+        assert_eq!(
+            early,
+            Err(Refusal::Timeout),
+            "applied {before:?}, write {write:?}"
+        );
+        assert!(applied > before.micros);
     }
 
     /// CP-T1.8 (AC-T1.8.5), a follower's answer on its group's commit (replication.md, "A write
