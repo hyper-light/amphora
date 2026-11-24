@@ -7,6 +7,7 @@
 use super::scram::{self, Binding, ScramSecret, ScramServer};
 use super::wire::{self, Frame, PROTOCOL_3_2, PgError, Reader, SqlState};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 /// What PostgreSQL 19 reports as `server_version`.
 pub const SERVER_VERSION: &str = "19.0";
@@ -156,8 +157,26 @@ pub trait Statements {
     /// Ready once the transaction the stopped Query waits for has ended: the task's waker is called
     /// by that end, never by a timer.
     fn poll_wait(&mut self, cx: &mut Context<'_>) -> Poll<()>;
+    /// How long the wait that just began may go on.
+    fn wait_limits(&self) -> WaitLimits;
+    /// `deadlock_timeout` has passed since the wait began: whether the wait is part of a ring of
+    /// waits, which refuses its statement (`40P01`) when it is resumed.
+    fn check_deadlock(&mut self) -> bool;
+    /// `lock_timeout` has passed since the wait began: its statement is refused (`55P03`) when it is
+    /// resumed.
+    fn lock_timed_out(&mut self);
     /// Runs the rest of the Query a wait stopped.
     fn resume(&mut self, out: &mut Vec<u8>) -> Result<Flow, PgError>;
+}
+
+/// PostgreSQL's deadlines of one wait for a lock, from when it began (`ProcSleep`, REL_19_0
+/// src/backend/storage/lmgr/proc.c): neither is a poll, and the wait ends by its holder's end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaitLimits {
+    /// `deadlock_timeout`: when the session looks once for a ring of waits.
+    pub deadlock: Duration,
+    /// `lock_timeout`, none when it is 0.
+    pub lock: Option<Duration>,
 }
 
 /// How far a Query's statements got.
@@ -916,6 +935,25 @@ impl Session {
         match &mut self.statements {
             Some(statements) => statements.poll_wait(cx),
             None => Poll::Ready(()),
+        }
+    }
+
+    /// [`Statements::wait_limits`] of the wait that just began.
+    pub fn wait_limits(&self) -> Option<WaitLimits> {
+        self.statements.as_ref().map(|s| s.wait_limits())
+    }
+
+    /// [`Statements::check_deadlock`].
+    pub fn check_deadlock(&mut self) -> bool {
+        self.statements
+            .as_mut()
+            .is_some_and(|s| s.check_deadlock())
+    }
+
+    /// [`Statements::lock_timed_out`].
+    pub fn lock_timed_out(&mut self) {
+        if let Some(statements) = &mut self.statements {
+            statements.lock_timed_out();
         }
     }
 
