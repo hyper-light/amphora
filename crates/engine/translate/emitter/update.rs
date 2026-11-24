@@ -81,7 +81,11 @@ struct RowRecheck {
 impl RowRecheck {
     fn of(connection: &Arc<Connection>, plan: &UpdatePlan) -> Result<Option<Self>> {
         if !connection.locks_rows()
-            || plan.target_table.table.btree().is_none()
+            || plan
+                .target_table
+                .table
+                .btree()
+                .is_none_or(|table| !table.has_rowid)
             || plan
                 .set_clauses
                 .iter()

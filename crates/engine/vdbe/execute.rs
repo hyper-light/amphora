@@ -6880,14 +6880,11 @@ pub fn op_finish_seek(
 fn locking_cursor(
     state: &mut ProgramState,
     cursor_id: usize,
-) -> Result<&mut crate::storage::versioned::cursor::VersionedCursor, LimboError> {
-    let cursor = match state.cursors.get_mut(cursor_id) {
+) -> Option<&mut crate::storage::versioned::cursor::VersionedCursor> {
+    match state.cursors.get_mut(cursor_id) {
         Some(Some(Cursor::Dyn(cursor, ..))) => (cursor.as_mut() as &mut dyn Any).downcast_mut(),
         _ => None,
-    };
-    cursor.ok_or_else(|| {
-        LimboError::InternalError("a row's lock by a cursor of another storage".into())
-    })
+    }
 }
 
 /// Amphora (docs/design/postgres.md section 8): `Insn::LockRow`.
@@ -6907,12 +6904,17 @@ pub fn op_lock_row(
         },
         insn
     );
-    state.pc = match locking_cursor(state, *cursor_id)?.lock_row() {
+    // A row of another storage (a temporary table's) is its one writer's already.
+    let locked =
+        locking_cursor(state, *cursor_id).map_or(Ok(RowLocked::Held), |cursor| cursor.lock_row());
+    state.pc = match locked {
         Ok(RowLocked::Held) => held.as_offset_int(),
         Ok(RowLocked::Gone) => gone.as_offset_int(),
         Ok(RowLocked::Moved) => {
             for index in indexes {
-                locking_cursor(state, *index)?.read_newest()?;
+                if let Some(cursor) = locking_cursor(state, *index) {
+                    cursor.read_newest()?;
+                }
             }
             state.pc.saturating_add(1)
         }
