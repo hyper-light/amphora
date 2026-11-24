@@ -984,6 +984,9 @@ pub struct ProgramState {
     /// Scratch buffer for [Insn::HashDistinct] to avoid per-row allocations.
     distinct_key_values: Vec<Value>,
     hash_tables: id_map::IdMap<HashTable>,
+    /// Unspilled hash tables retained across `Statement::reset()` / `HashClose` so repeated
+    /// executions reuse bucket heads and entry slabs without hitting the global allocator.
+    spare_hash_tables: id_map::IdMap<HashTable>,
     /// Amphora (PL.13): each adaptive join's switch, by switch id; None for one that cannot
     /// switch (`optimizer::adaptive::JoinSwitch`).
     join_switches: HashMap<usize, Option<crate::translate::optimizer::adaptive::JoinSwitch>>,
@@ -999,6 +1002,12 @@ pub struct ProgramState {
     pub(crate) handoff_asked: bool,
     /// Amphora: each hash-aggregated GROUP BY's groups (`group_table.rs`), by table id.
     group_tables: id_map::IdMap<group_table::GroupTable>,
+    /// Group tables retained across `Statement::reset()` / `GroupClear` so repeated GROUP BY
+    /// queries reuse slab and open-addressed slot allocations.
+    spare_group_tables: id_map::IdMap<group_table::GroupTable>,
+    /// In-memory sorters retained across `Statement::reset()` by cursor id so repeated ORDER BY
+    /// queries reuse bump arenas and top-K heaps.
+    spare_sorters: id_map::IdMap<Box<sorter::Sorter>>,
     /// Amphora (QT.6): the rows [Insn::MorselAggregate] answered, read out by [Insn::MorselNext].
     morsel_rows: Option<std::vec::IntoIter<Vec<Value>>>,
     /// Amphora (CS.5, lane R6): the serial loop a column copy handed its statement to, timed while
@@ -1155,11 +1164,14 @@ impl ProgramState {
             spare_agg_payloads: Vec::new(),
             bloom_filters: id_map::IdMap::default(),
             hash_tables: id_map::IdMap::default(),
+            spare_hash_tables: id_map::IdMap::default(),
             join_switches: HashMap::default(),
             star_orders: id_map::IdMap::default(),
             handoff_open: false,
             handoff_asked: false,
             group_tables: id_map::IdMap::default(),
+            spare_group_tables: id_map::IdMap::default(),
+            spare_sorters: id_map::IdMap::default(),
             morsel_rows: None,
             rows_timed: None,
             ephemeral_temp_files: HashMap::default(),
@@ -1261,6 +1273,9 @@ impl ProgramState {
         let keep_ephemeral = max_cursors.is_none();
         if !keep_ephemeral {
             self.ephemeral_kept.clear();
+            self.spare_sorters.clear();
+            self.spare_hash_tables.clear();
+            self.spare_group_tables.clear();
         }
         // reset cursors as they can have cached information which will be no longer relevant on next program execution
         for (cursor_id, (cursor, context)) in self
@@ -1287,6 +1302,10 @@ impl ProgramState {
                     crate::storage::btree::CursorTrait::recycle(cursor)
                 }
                 Some(Cursor::Dyn(cursor, ..)) => cursor.recycle(),
+                Some(Cursor::Sorter(mut sorter)) if keep_ephemeral && sorter.can_reuse() => {
+                    sorter.clear_for_reuse();
+                    self.spare_sorters.insert(cursor_id, sorter);
+                }
                 _ => {}
             }
             *context = None;
@@ -1351,7 +1370,14 @@ impl ProgramState {
             self.bloom_filters.clear();
         }
         if !self.hash_tables.is_empty() {
-            self.hash_tables.clear();
+            if keep_ephemeral {
+                self.hash_tables
+                    .move_into(&mut self.spare_hash_tables, |ht| {
+                        !ht.has_spilled() && ht.clear().is_ok()
+                    });
+            } else {
+                self.hash_tables.clear();
+            }
         }
         if !self.join_switches.is_empty() {
             self.join_switches.clear();
@@ -1362,7 +1388,15 @@ impl ProgramState {
         self.handoff_open = false;
         self.handoff_asked = false;
         if !self.group_tables.is_empty() {
-            self.group_tables.clear();
+            if keep_ephemeral {
+                self.group_tables
+                    .move_into(&mut self.spare_group_tables, |gt| {
+                        gt.clear_entries();
+                        true
+                    });
+            } else {
+                self.group_tables.clear();
+            }
         }
         self.morsel_rows = None;
         self.rows_timed = None;

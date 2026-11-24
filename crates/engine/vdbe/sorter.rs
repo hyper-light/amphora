@@ -161,7 +161,7 @@ pub const MAX_KEPT: usize = 65_536;
 /// Amphora: a row a bounded sorter keeps, and when it arrived: rows that compare equal keep their
 /// arrival order, as the stable sort of every row keeps it.
 struct KeptRecord {
-    record: Box<BoxedSortableRecord>,
+    record: BoxedSortableRecord,
     arrived: u64,
 }
 
@@ -199,7 +199,8 @@ struct Kept {
 
 impl Kept {
     /// Offers `record`: kept if fewer than `limit` are, or if it orders before the worst kept one,
-    /// which then goes. A row that can't be kept is dropped with no copy.
+    /// which then goes. A row that can't be kept is dropped with no copy; a row that evicts the
+    /// worst reuses its `ImmutableRecord` buffer in place (zero heap allocations on replacement).
     fn offer(
         &mut self,
         record: &ImmutableRecord,
@@ -209,24 +210,31 @@ impl Kept {
     ) -> Result<()> {
         let arrived = self.arrived;
         self.arrived = self.arrived.saturating_add(1);
-        if self.heap.len() >= self.limit {
+        let payload = record.get_payload();
+        let copy = if self.heap.len() >= self.limit {
             let Some(worst) = self.heap.peek() else {
                 return Ok(());
             };
             if !orders_before(record, key_len, index_key_info, comparators, &worst.record)? {
                 return Ok(());
             }
-            self.heap.pop();
-        }
-        let payload = record.get_payload();
-        let mut copy = ImmutableRecord::new(payload.len())?;
-        copy.start_serialization(payload)?;
-        let record = Box::new(BoxedSortableRecord::new(
-            copy,
-            key_len,
-            index_key_info.clone(),
-            comparators.clone(),
-        )?);
+            if let Some(evicted) = self.heap.pop() {
+                let mut reused = evicted.record.record;
+                reused.invalidate();
+                reused.start_serialization(payload)?;
+                reused
+            } else {
+                let mut copy = ImmutableRecord::new(payload.len())?;
+                copy.start_serialization(payload)?;
+                copy
+            }
+        } else {
+            let mut copy = ImmutableRecord::new(payload.len())?;
+            copy.start_serialization(payload)?;
+            copy
+        };
+        let record =
+            BoxedSortableRecord::new(copy, key_len, index_key_info.clone(), comparators.clone())?;
         self.heap.try_push(KeptRecord { record, arrived })?;
         Ok(())
     }
@@ -377,12 +385,75 @@ impl Sorter {
         Ok(this)
     }
 
+    /// True when this sorter has not spilled to disk and can be reused across `Statement::reset()`.
+    pub fn can_reuse(&self) -> bool {
+        self.chunks.is_empty() && self.temp_file.is_none() && self.pending_completion.is_none()
+    }
+
+    /// Clears rows and resets the bump arena while retaining arena chunks and vector capacities
+    /// for the next run of the same statement.
+    pub fn clear_for_reuse(&mut self) {
+        self.records.clear();
+        self.arena.reset();
+        self.current = None;
+        self.current_buffer_size = 0;
+        self.max_payload_size_in_buffer = 0;
+        self.sort_state = SortState::Start;
+        self.insert_state = InsertState::Start;
+        self.init_chunk_heap_state = InitChunkHeapState::Start;
+        if let Some(kept) = self.kept.as_mut() {
+            kept.limit = 0;
+            kept.heap.clear();
+            kept.sorted.clear();
+            kept.arrived = 0;
+        }
+        self.limit_decided = false;
+        self.inserted = 0;
+        self.in_memory_sort = None;
+    }
+
+    /// Reconfigures an in-memory sorter for a new `SorterOpen` without reallocating its arena or
+    /// vectors.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reconfigure_for_reuse(
+        &mut self,
+        order: &[SortOrder],
+        collations: Vec<CollationSeq>,
+        nulls_orders: Vec<Option<amphora_engine_parser::ast::NullsOrder>>,
+        comparators: Vec<Option<SortComparator>>,
+        max_buffer_size_bytes: usize,
+        min_chunk_read_buffer_size_bytes: usize,
+        io: Arc<dyn IO>,
+        temp_store: crate::TempStore,
+    ) -> Result<()> {
+        self.clear_for_reuse();
+        self.key_len = order.len();
+        let index_key_info: Vec<KeyInfo> = order
+            .iter()
+            .zip(collations)
+            .zip(nulls_orders)
+            .map(|((order, collation), nulls)| KeyInfo {
+                sort_order: *order,
+                collation,
+                nulls_order: nulls,
+            })
+            .try_collect()?;
+        self.index_key_info = Rc::new(index_key_info);
+        self.comparators = Rc::new(comparators);
+        self.max_buffer_size = max_buffer_size_bytes;
+        self.min_chunk_read_buffer_size = min_chunk_read_buffer_size_bytes;
+        self.io = io;
+        self.temp_store = temp_store;
+        Ok(())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
             && self.chunks.is_empty()
             && self
                 .kept
                 .as_ref()
+                .filter(|kept| kept.limit > 0)
                 .is_none_or(|kept| kept.heap.is_empty() && kept.sorted.is_empty())
     }
 
@@ -396,12 +467,19 @@ impl Sorter {
         self.limit_decided = true;
         if let Some(limit) = limit.filter(|&l| l > 0 && l <= MAX_KEPT) {
             if self.records.is_empty() && self.chunks.is_empty() {
-                self.kept = Some(Kept {
-                    limit,
-                    heap: BinaryHeap::new(),
-                    arrived: 0,
-                    sorted: Vec::new(),
-                });
+                if let Some(kept) = self.kept.as_mut() {
+                    kept.limit = limit;
+                    kept.heap.clear();
+                    kept.sorted.clear();
+                    kept.arrived = 0;
+                } else {
+                    self.kept = Some(Kept {
+                        limit,
+                        heap: BinaryHeap::new(),
+                        arrived: 0,
+                        sorted: Vec::new(),
+                    });
+                }
             }
         }
     }
@@ -425,7 +503,7 @@ impl Sorter {
         loop {
             match self.sort_state {
                 SortState::Start => {
-                    if let Some(kept) = self.kept.as_mut() {
+                    if let Some(kept) = self.kept.as_mut().filter(|k| k.limit > 0) {
                         // The kept rows in output order, last first: served from the end.
                         let mut rows = std::mem::take(&mut kept.heap).into_vec();
                         rows.sort_unstable();
@@ -485,7 +563,7 @@ impl Sorter {
 
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> IOResultOr<()> {
-        if let Some(kept) = self.kept.as_mut() {
+        if let Some(kept) = self.kept.as_mut().filter(|k| k.limit > 0) {
             self.current = kept.sorted.pop().map(|kept| kept.record.record);
             return Ok(IOResult::Done(()));
         }
@@ -552,7 +630,7 @@ impl Sorter {
     }
 
     pub fn insert(&mut self, record: &ImmutableRecord) -> IOResultOr<()> {
-        if let Some(kept) = self.kept.as_mut() {
+        if let Some(kept) = self.kept.as_mut().filter(|k| k.limit > 0) {
             kept.offer(
                 record,
                 self.key_len,
@@ -1209,7 +1287,7 @@ impl Eq for ArenaSortableRecord {}
 /// back from chunk files. Normal Drop semantics apply.
 struct BoxedSortableRecord {
     record: ImmutableRecord,
-    key_values: Vec<ValueRef<'static>>,
+    key_values: smallvec::SmallVec<[ValueRef<'static>; 4]>,
     index_key_info: Rc<Vec<KeyInfo>>,
     comparators: Rc<Vec<Option<SortComparator>>>,
     deserialization_error: Option<LimboError>,
@@ -1227,7 +1305,12 @@ impl BoxedSortableRecord {
         comparators: Rc<Vec<Option<SortComparator>>>,
     ) -> Result<Self> {
         let mut value_iterator = record.iter()?;
-        let mut key_values = Vec::try_with_capacity_ext(key_len)?;
+        let mut key_values: smallvec::SmallVec<[ValueRef<'static>; 4]> = smallvec::SmallVec::new();
+        if key_len > 4 {
+            key_values
+                .try_reserve(key_len)
+                .map_err(|_| LimboError::OutOfMemory)?;
+        }
         let mut deserialization_error = None;
 
         for _ in 0..key_len {
@@ -1235,9 +1318,7 @@ impl BoxedSortableRecord {
                 Some(Ok(value)) => {
                     // SAFETY: value points into record which lives as long as this struct
                     let value: ValueRef<'static> = unsafe { std::mem::transmute(value) };
-                    key_values
-                        .push_within_capacity(value)
-                        .expect("sort key vector was preallocated");
+                    key_values.push(value);
                 }
                 Some(Err(err)) => {
                     mark_unlikely();

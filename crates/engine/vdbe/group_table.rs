@@ -17,7 +17,9 @@
 use crate::alloc::TryClone;
 use crate::translate::collate::CollationSeq;
 use crate::types::{compare_immutable, KeyInfo, Value, ValueRef};
-use crate::vdbe::hash_table::{hash_join_key, keys_equal_distinct, values_equal_distinct};
+use crate::vdbe::hash_table::{
+    hash_join_key, hash_single_key_ref, keys_equal_distinct, values_equal_distinct,
+};
 use crate::vdbe::Register;
 use crate::{LimboError, Result};
 use smallvec::SmallVec;
@@ -101,6 +103,46 @@ impl GroupTable {
             order: Vec::new(),
             next: 0,
         }
+    }
+
+    /// Clears all groups while retaining backing slab and slot allocations for reuse across
+    /// `Statement::reset()` and `GroupClear`.
+    pub fn reset_for_reuse(&mut self, num_keys: usize, collations: &[CollationSeq], budget: usize) {
+        self.num_keys = num_keys;
+        self.num_values = 0;
+        self.num_accs = 0;
+        self.num_groups = 0;
+        self.collations.clear();
+        self.collations.extend_from_slice(collations);
+        self.all_values.clear();
+        self.all_accs.clear();
+        self.hashes.clear();
+        if !self.slots.is_empty() {
+            self.slots.fill(EMPTY_SLOT);
+        }
+        self.bytes = 0;
+        self.budget = budget;
+        self.current = None;
+        self.order.clear();
+        self.next = 0;
+    }
+
+    /// Clears values and accumulators in place before stashing this table for reuse so owned
+    /// text/blob buffers are released immediately on `Statement::reset()`.
+    pub fn clear_entries(&mut self) {
+        self.num_values = 0;
+        self.num_accs = 0;
+        self.num_groups = 0;
+        self.all_values.clear();
+        self.all_accs.clear();
+        self.hashes.clear();
+        if !self.slots.is_empty() {
+            self.slots.fill(EMPTY_SLOT);
+        }
+        self.bytes = 0;
+        self.current = None;
+        self.order.clear();
+        self.next = 0;
     }
 
     #[inline(always)]
@@ -245,14 +287,23 @@ impl GroupTable {
 
     /// Hot VDBE path: find or insert a group directly from a contiguous slice of `Register`s,
     /// avoiding temporary `SmallVec<[&Value; 8]>` construction per row.
-    pub fn find_or_insert_regs(&mut self, regs: &[Register], num_accs: usize) -> Result<Option<u32>> {
+    pub fn find_or_insert_regs(
+        &mut self,
+        regs: &[Register],
+        num_accs: usize,
+    ) -> Result<Option<u32>> {
         let (hash, found) = if self.num_keys == 1 {
             let key0 = regs
                 .first()
                 .ok_or_else(|| missing("fewer values than keys"))?
                 .get_value()
                 .as_ref();
-            let hash = hash_join_key(&[key0], &self.collations);
+            let collation = self
+                .collations
+                .first()
+                .copied()
+                .unwrap_or(CollationSeq::Binary);
+            let hash = hash_single_key_ref(&key0, collation);
             (hash, self.probe_single_key(key0, hash)?)
         } else {
             let keys: SmallVec<[ValueRef; 4]> = regs

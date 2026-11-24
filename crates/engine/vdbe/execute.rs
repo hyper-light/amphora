@@ -10472,21 +10472,35 @@ pub fn op_sorter_open(
         sort_comparators.push(comparator);
     }
     let temp_store = program.connection.get_temp_store();
-    let cursor = Sorter::new(
-        &order,
-        collations,
-        nulls_orders,
-        sort_comparators,
-        max_buffer_size_bytes,
-        page_size,
-        pager.io.clone(),
-        temp_store,
-    )?;
+    let cursor = if let Some(mut reused) = state.spare_sorters.remove(cursor_id) {
+        reused.reconfigure_for_reuse(
+            &order,
+            collations,
+            nulls_orders,
+            sort_comparators,
+            max_buffer_size_bytes,
+            page_size,
+            pager.io.clone(),
+            temp_store,
+        )?;
+        Cursor::Sorter(reused)
+    } else {
+        Cursor::new_sorter(Sorter::new(
+            &order,
+            collations,
+            nulls_orders,
+            sort_comparators,
+            max_buffer_size_bytes,
+            page_size,
+            pager.io.clone(),
+            temp_store,
+        )?)
+    };
     let cursors = &mut state.cursors;
     cursors
         .get_mut(*cursor_id)
         .expect("cursor_id should be valid")
-        .replace(Cursor::new_sorter(cursor));
+        .replace(cursor);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -19395,7 +19409,13 @@ fn hash_build_run(
             track_matched: data.track_matched,
             partition_count: None,
         };
-        let mut table = HashTable::new(config, pager.io.clone())?;
+        let mut table =
+            if let Some(mut reused) = state.spare_hash_tables.remove(&data.hash_table_id) {
+                reused.reconfigure_for_reuse(config, pager.io.clone())?;
+                reused
+            } else {
+                HashTable::new(config, pager.io.clone())?
+            };
         // Amphora (QT.5 step 4, lane qs5-21): a sort-merge join's table.
         table.set_merge(data.merge);
         state.hash_tables.insert(data.hash_table_id, table);
@@ -19516,10 +19536,13 @@ pub fn op_hash_distinct(
             track_matched: false,
             partition_count: None,
         };
-        state.hash_tables.insert(
-            data.hash_table_id,
-            HashTable::new(config, pager.io.clone())?,
-        );
+        let table = if let Some(mut reused) = state.spare_hash_tables.remove(&data.hash_table_id) {
+            reused.reconfigure_for_reuse(config, pager.io.clone())?;
+            reused
+        } else {
+            HashTable::new(config, pager.io.clone())?
+        };
+        state.hash_tables.insert(data.hash_table_id, table);
     }
     let hash_table = state
         .hash_tables
@@ -19595,10 +19618,25 @@ pub fn op_group_find(
     // A table past its budget sends its new groups' rows to the sorter; with temp_store=memory
     // there is no budget, as for the hash join's tables. Amphora (AUDIT 3.2): the budget is read
     // once, when the table is made, not per row.
-    let table = state.group_tables.get_or_insert_with(data.table_id, || {
+    let table = if state.group_tables.contains_key(&data.table_id) {
+        state
+            .group_tables
+            .get_mut(&data.table_id)
+            .ok_or_else(|| group_error("group table missing"))?
+    } else {
         let (_, budget) = table_memory(program, pager);
-        group_table::GroupTable::new(data.num_keys, data.collations.clone(), budget)
-    });
+        let reused = if let Some(mut table) = state.spare_group_tables.remove(&data.table_id) {
+            table.reset_for_reuse(data.num_keys, &data.collations, budget);
+            table
+        } else {
+            group_table::GroupTable::new(data.num_keys, data.collations.clone(), budget)
+        };
+        state.group_tables.insert(data.table_id, reused);
+        state
+            .group_tables
+            .get_mut(&data.table_id)
+            .ok_or_else(|| group_error("group table missing"))?
+    };
     let end = data
         .values_start
         .checked_add(data.num_values)
@@ -19634,7 +19672,10 @@ pub fn op_group_clear(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(GroupClear { table_id }, insn);
-    state.group_tables.remove(table_id);
+    if let Some(mut table) = state.group_tables.remove(table_id) {
+        table.clear_entries();
+        state.spare_group_tables.insert(*table_id, table);
+    }
     state.pc = next_pc(state)?;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -20003,7 +20044,11 @@ pub fn op_hash_close(
 ) -> InsnResult {
     load_insn!(HashClose { hash_table_id }, insn);
     if let Some(mut hash_table) = state.hash_tables.remove(hash_table_id) {
-        hash_table.close();
+        if !hash_table.has_spilled() && hash_table.clear().is_ok() {
+            state.spare_hash_tables.insert(*hash_table_id, hash_table);
+        } else {
+            hash_table.close();
+        }
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)

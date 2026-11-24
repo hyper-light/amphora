@@ -63,9 +63,47 @@ fn hash_text_nocase(hasher: &mut impl Hasher, text: &str) {
     }
 }
 
+/// SplitMix64 finalizer (Steele, Lea, Flood, OOPSLA 2014) for single-key numeric hashing.
+#[inline(always)]
+const fn mix64(mut x: u64) -> u64 {
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
+/// Fast single-key hash for `GROUP BY` and single-key hash joins: hashes exact-f64 integers and
+/// floats with a 2-multiply SplitMix64 mix (preserving SQLite's `10 == 10.0` and `0.0 == -0.0`
+/// equivalence) without initializing `RapidHasher`.
+#[inline]
+pub(crate) fn hash_single_key_ref(value: &ValueRef, collation: CollationSeq) -> u64 {
+    match value {
+        ValueRef::Null => mix64(DEFAULT_SEED ^ u64::from(NULL_HASH)),
+        ValueRef::Numeric(Numeric::Integer(i)) => {
+            let f = *i as f64;
+            if (f as i64) == *i && f.is_finite() {
+                mix64(normalized_f64_bits(f) ^ 0x9e37_79b9_7f4a_7c15)
+            } else {
+                mix64(u64::from_ne_bytes(i.to_ne_bytes()) ^ 0x517c_c1b7_2722_0a95)
+            }
+        }
+        ValueRef::Numeric(Numeric::Float(f)) => {
+            mix64(normalized_f64_bits(f64::from(*f)) ^ 0x9e37_79b9_7f4a_7c15)
+        }
+        ValueRef::Text(_) | ValueRef::Blob(_) => {
+            let mut hasher = RapidHasher::new(DEFAULT_SEED);
+            hash_key_part(&mut hasher, 0, value, &[collation]);
+            hasher.finish()
+        }
+    }
+}
+
 /// Hash function for join keys using rapidhash
 /// Takes collation into account when hashing text values
 pub(crate) fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
+    if let [only] = key_values {
+        let collation = collations.first().copied().unwrap_or(CollationSeq::Binary);
+        return hash_single_key_ref(only, collation);
+    }
     let mut hasher = RapidHasher::new(DEFAULT_SEED);
     for (idx, value) in key_values.iter().enumerate() {
         hash_key_part(&mut hasher, idx, value, collations);
@@ -75,6 +113,10 @@ pub(crate) fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]
 
 /// AUDIT 3.1: [hash_join_key] of keys as a probe holds them, without a `ValueRef` copy of them.
 fn hash_join_values(key_values: &[Value], collations: &[CollationSeq]) -> u64 {
+    if let [only] = key_values {
+        let collation = collations.first().copied().unwrap_or(CollationSeq::Binary);
+        return hash_single_key_ref(&only.as_ref(), collation);
+    }
     let mut hasher = RapidHasher::new(DEFAULT_SEED);
     for (idx, value) in key_values.iter().enumerate() {
         hash_key_part(&mut hasher, idx, &value.as_ref(), collations);
@@ -1226,6 +1268,82 @@ impl HashTable {
         })
     }
 
+    /// Reconfigures an unspilled `HashTable` for reuse in a subsequent statement run, preserving
+    /// its `heads`, `entries`, `next`, `matched_bits`, `non_empty_buckets`, and `merge_order`
+    /// allocations without hitting the global allocator.
+    pub fn reconfigure_for_reuse(
+        &mut self,
+        config: HashTableConfig,
+        io: Arc<dyn IO>,
+    ) -> Result<()> {
+        if config
+            .collations
+            .iter()
+            .any(|collation| collation.is_custom())
+        {
+            return Err(LimboError::InternalError(
+                "custom collations are not supported by hash tables".to_string(),
+            ));
+        }
+        let num_buckets = config.initial_buckets.max(1).next_power_of_two();
+        // Reset only occupied bucket heads in O(buckets_used).
+        for &idx in &self.non_empty_buckets {
+            if let Some(head) = self.heads.get_mut(idx) {
+                *head = EMPTY_ENTRY;
+            }
+        }
+        self.non_empty_buckets.clear();
+        self.entries.clear();
+        self.next.clear();
+        self.matched_bits.clear();
+        self.merge_order.clear();
+        self.loaded_partitions_lru.borrow_mut().clear();
+
+        let extra_mem = self
+            .heads
+            .len()
+            .saturating_sub(num_buckets)
+            .saturating_mul(std::mem::size_of::<u32>());
+        if self.heads.len() < num_buckets || extra_mem > config.mem_budget {
+            self.heads.clear();
+            self.heads.try_reserve_exact(num_buckets)?;
+            self.heads.resize(num_buckets, EMPTY_ENTRY);
+            self.bucket_mem = 0;
+        } else {
+            self.bucket_mem = extra_mem;
+        }
+
+        self.initial_buckets = num_buckets;
+        self.num_entries = 0;
+        self.mem_used = 0;
+        self.mem_budget = config.mem_budget;
+        self.num_keys = config.num_keys;
+        self.collations = config.collations;
+        self.state = HashTableState::Building;
+        self.io = io;
+        self.probe_bucket_idx = 0;
+        self.probe_entry_idx = 0;
+        self.probe_current_entry = None;
+        self.probe_next_entry = EMPTY_ENTRY;
+        self.current_probe_hash = None;
+        self.current_probe_keys = None;
+        self.spill_state = None;
+        self.current_spill_partition_idx = 0;
+        self.loaded_partitions_mem = 0;
+        self.temp_store = config.temp_store;
+        self.track_matched = config.track_matched;
+        self.unmatched_scan_bucket = 0;
+        self.unmatched_scan_entry = 0;
+        self.unmatched_scan_partition = 0;
+        self.partition_count_override = config.partition_count;
+        self.probe_spill_state = None;
+        self.grace_state = None;
+        self.merge = false;
+        self.merge_run = 0;
+        self.merge_next = 0;
+        Ok(())
+    }
+
     /// Amphora (QT.5 step 4, lane qs5-21): makes this a sort-merge join's table
     /// (`HashJoinMethod::Merge`). Its rows are put in by hash as any table's, so a spill, the
     /// matched bits and the unmatched-row scan stay the hash table's; once the build is done
@@ -1240,9 +1358,7 @@ impl HashTable {
     /// Sorts the entries' indices by key into `merge_order`, within the table's budget: false,
     /// and nothing held, when the positions would pass it.
     fn build_merge_order(&mut self) -> Result<bool> {
-        let bytes = self
-            .num_entries
-            .saturating_mul(std::mem::size_of::<u32>());
+        let bytes = self.num_entries.saturating_mul(std::mem::size_of::<u32>());
         if self
             .mem_used
             .saturating_add(self.bucket_mem)
@@ -1414,7 +1530,8 @@ impl HashTable {
     /// Push `entry` into the flat slab and prepend it to bucket `bucket_idx`'s intrusive chain.
     #[inline]
     fn push_slab_entry(&mut self, bucket_idx: usize, entry: HashEntry) -> Result<()> {
-        let entry_idx = u32::try_from(self.entries.len()).map_err(|_| LimboError::IntegerOverflow)?;
+        let entry_idx =
+            u32::try_from(self.entries.len()).map_err(|_| LimboError::IntegerOverflow)?;
         let Some(head) = self.heads.get_mut(bucket_idx) else {
             return Err(LimboError::InternalError("hash bucket out of range".into()));
         };
@@ -1590,11 +1707,8 @@ impl HashTable {
                 } else {
                     HashKeyValues::from(key_values.iter().cloned().try_collect::<Vec<Value>>()?)
                 };
-                spill_state.partition_buffers[partition_idx].insert(HashEntry::new(
-                    hash,
-                    owned_keys,
-                    0,
-                ))?;
+                spill_state.partition_buffers[partition_idx]
+                    .insert(HashEntry::new(hash, owned_keys, 0))?;
             }
             self.num_entries += 1;
             self.mem_used += entry_size;
@@ -2360,8 +2474,7 @@ impl HashTable {
                     break;
                 };
                 let next_idx = self.next.get(i).copied().unwrap_or(EMPTY_ENTRY);
-                if entry.hash == hash
-                    && keys_equal_values(&entry.key_values, key, &self.collations)
+                if entry.hash == hash && keys_equal_values(&entry.key_values, key, &self.collations)
                 {
                     match_idx = Some((cur, i, next_idx));
                     break;
