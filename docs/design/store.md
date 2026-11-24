@@ -2504,8 +2504,13 @@ as the store's does, in a log of one process; nothing restarts a segment in plac
   blocks it no more than in SQLite.
 - *TRUNCATE.* "It also truncates the log file to zero bytes just prior to a successful return", and answers 0, 0: both
   files are cut. The file with the older header goes first and its cut is synced before the other is asked, since
-  recovery takes a lone valid header for the log and the older one's frames are older than the file's pages. The log is
-  then a new database's, as recovery takes two empty files: its first segment is current. A clean close is this.
+  recovery takes a lone valid header for the log and the older one's frames are older than the file's pages. It is cut and
+  synced whatever it reads as (lane B30): a switch cuts the file it goes to (decision 31) and syncs no cut, as the header
+  its next commit writes and syncs there says the same, so a file that reads as empty, in this process or in one opened
+  after a kill, may hold its older generation on disk yet. Skipped as "cut already", it came back alone after the other
+  file's cut, and the database opened at that generation; or, the next commits made in the first segment, beside a header
+  two past its own, a pair refused as corrupt. The log is then a new database's, as recovery takes two empty files: its
+  first segment is current. A clean close is this.
 - *Busy* (the pragma's first column 1) means what it does in SQLite: a writer is at work, another checkpoint is, a read of
   an older snapshot holds frames back, or, for RESTART and TRUNCATE, a read is in the log (either segment). "The checkpoint
   operation proceeds from that point in the same way as SQLITE_CHECKPOINT_PASSIVE", and the row counts the log's frames and
@@ -2536,7 +2541,8 @@ Amphora is not even released. This is not a concern.").** The two segments repla
 upgrade step, no reading of a one-segment format and no switch between the two, and the one-segment restart is deleted.
 Each segment's header is the log header the engine writes today (format, page size, checkpoint sequence, salts,
 checksums; its format one SQLite doesn't know where the log is two files, below), so a log whose `-wal2` is absent, or holds no valid header, is one of the two-segment log's own states (one
-segment `Current`, the other `Free`), read by the same recovery.
+segment `Current`, the other `Free`), read by the same recovery. The log's format (decisions 16 and 37) is both segments':
+`Database::wal_format` set the current one's alone until lane B30, so every second segment of a store was pages.
 
 **What plain SQLite sees (the coordinator, 2026-11-23, on lane B6's question; built and revised 2026-11-24, lane B29).**
 SQLite knows `-wal` alone, and SQLite writes no page's checksum (decision 12): a page it wrote is one Amphora refuses
@@ -2576,9 +2582,16 @@ SQLite knows `-wal` alone, and SQLite writes no page's checksum (decision 12): a
   because both files are empty and synced before it (`Wal::may_unmark`). A crash before it is durable leaves 3 (refused);
   after, the log's frame or the file says 2 and every commit is in the file. A commit of page 1 without the mark puts the
   database back where an opened one is (`Mark::Absent`), so a connection that comes meanwhile marks it again before any
-  switch. A close that can't fold (Busy three times) leaves 3. `Db` makes no clean close as it is dropped: its files stay
-  marked as the process ends. `Db::close` is one, and a restore ends in it, so SQLite reads a restored file too. VACUUM
-  INTO's file says 2 and 2, as before.
+  switch. A close that can't fold (Busy three times) leaves 3. `Db::close` is one, and a restore ends in it, so SQLite reads a
+  restored file too. `Db` makes none as it is dropped. VACUUM INTO's file says 2 and 2, as before.
+- *An orderly end closes cleanly (the coordinator, 2026-11-24, on lane B29's question; lane B30).* A store ends once its
+  last handle is let go: what was handed over committed and flushed, its readers and its checkpointer gone, and then its
+  engine closed (`store::Engine::close`, a database's `Db::close`), as SQLite's last connection does. `Store::close` and
+  `Database::close` let a handle go and wait for that, so that a process that stops knows it is done before it exits. A
+  process that is killed, before that or in it, leaves the files as they stand: refused, or closed whole (tests/crash.rs
+  cuts the power at each change). Not closed cleanly, so refused too: a store whose flush failed (decision 9: the log's
+  frames may not be what the disk holds) or whose engine's upkeep did, and a database backed up, whose log starts again
+  only once shipped (`Db::back_up`).
 
 **Crash recovery across a switch.** Recovery reads both segments' headers. A segment whose header checksum fails is
 empty. Of two valid segments, the one whose checkpoint sequence is one past the other's is current and the other

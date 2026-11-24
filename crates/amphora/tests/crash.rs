@@ -306,7 +306,7 @@ impl Disk {
             fates.extend((0..1u64 << n).map(|kept| {
                 (0..n)
                     .map(|i| {
-                        if kept >> i & 1 == 1 {
+                        if (kept >> i) & 1 == 1 {
                             Fate::Kept
                         } else {
                             Fate::Lost
@@ -708,10 +708,12 @@ struct Seen {
 }
 
 /// Whether plain SQLite reads the files a cut left, whole. None: it refuses them (docs/design/store.md,
-/// decision 45, What plain SQLite sees). It knows `-wal` alone: of a log whose header holds it refuses
-/// a format that isn't 3007000 (`wal.c`, `walIndexRecover`); the read version it goes by is page 1's, the
-/// log's last committed one where the log has one, and it refuses one above 2 (`btree.c`, `lockBtree`),
-/// but folds the log into the file and deletes it as it closes all the same.
+/// decision 45, What plain SQLite sees). It knows `-wal` alone: of a log longer than its header whose
+/// header holds it refuses a format that isn't 3007000 (`wal.c`, `walIndexRecover`, which reads no
+/// header of a shorter one: run, sqlite3 reads a cleanly closed file beside a log of 32 bytes); the
+/// read version it goes by is page 1's, the log's last committed one where the log has one, and it
+/// refuses one above 2 (`btree.c`, `lockBtree`), but folds the log into the file and deletes it as it
+/// closes all the same.
 fn plain_sqlite(image: &HashMap<String, Vec<u8>>, path: &str) -> Result<Option<()>, String> {
     let empty = Vec::new();
     let file = image.get(path).unwrap_or(&empty);
@@ -725,7 +727,7 @@ fn plain_sqlite(image: &HashMap<String, Vec<u8>>, path: &str) -> Result<Option<(
     };
     let (first, second) = (log("-wal"), log("-wal2"));
     let mut version = file.get(19).copied().unwrap_or(0);
-    if holds(first) {
+    if first.len() > 32 && holds(first) {
         if field(first, 4) != 3_007_000 {
             return Ok(None);
         }
@@ -1286,7 +1288,9 @@ fn drill_round(db: &Db) -> Result<usize, String> {
     let told: Vec<_> = found.iter().map(|(a, rows)| (&a[..4], *rows)).collect();
     match found.as_slice() {
         [(text, DRILL_ROWS)] => {
-            let round = text[..4].parse().map_err(|e| format!("{e}: {told:?}"))?;
+            let round = text[..4]
+                .parse::<usize>()
+                .map_err(|e| format!("{e}: {told:?}"))?;
             if *text == drill_text(round) {
                 Ok(round)
             } else {
@@ -1317,7 +1321,7 @@ fn sqlite3_round(image: &BTreeMap<String, Vec<u8>>) -> Option<Result<usize, Stri
     let said = format!("{out} {}", String::from_utf8_lossy(&ran.stderr).trim());
     let lines: Vec<&str> = out.lines().collect();
     Some(match lines.as_slice() {
-        [round, "40"] if ran.status.success() => round.parse().map_err(|_| said),
+        [round, "40"] if ran.status.success() => round.parse::<usize>().map_err(|_| said),
         _ => Err(said),
     })
 }
