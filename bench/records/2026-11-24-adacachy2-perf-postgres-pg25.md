@@ -23,6 +23,9 @@ accepted, gave no output, and were stopped. These remain, each with its command:
 
 ## Losses
 
+- **A fault on main, found by reading after the landing:** ORDER BY of a `"char"` column (`select relkind from pg_class order by relkind asc limit 5`) orders by what
+  section 5 stores, the text `charout` prints. For ASCII bytes that is 19's order; a byte past ASCII prints as a backslash and three octal digits, and comes among the
+  backslashes. No served catalog has one, and a user's `"char"` column may. Refused `0A000`, with T-PG.12.3, on `perf/postgres-pg25` (written 13:20Z, not compiled or run).
 - **Step `f` of `pgbench -i` isn't built**: `0A000`. It sends five `alter table ... add constraint <name> foreign key (<column>) references <table>`
   (REL_19_0 src/bin/pgbench/pgbench.c:5283). It needs: the grammar's ConstraintElem FOREIGN KEY, `opt_column_and_period_list`, `key_match`, `key_actions`
   and named table constraints (none is ported); analysis of the referenced table's primary key and the types' operator
