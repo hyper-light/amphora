@@ -4278,8 +4278,15 @@ impl SharedLog {
     /// next commit before any frame. It takes no read mark and waits for no read: the segment
     /// switched to is free, so no read counts on it. The caller holds `write_lock`. The segment
     /// now current, or None while the other one is still closing (the writer appends on and asks
-    /// again at its next turn). A free segment's file longer than `cut_past` bytes is cut to
-    /// nothing first: nothing in it is needed (decision 31's bound, kept at each segment's reuse).
+    /// again at its next turn) or while the current one holds no frame. A free segment's file
+    /// longer than `cut_past` bytes is cut to nothing first: nothing in it is needed (decision
+    /// 31's bound, kept at each segment's reuse).
+    ///
+    /// A segment with no frame has no header of its own on disk: its first commit writes it. A
+    /// switch from it would give the other segment a sequence two past the header its file still
+    /// holds, three past once that one's first commit lands, a pair recovery refuses as corrupt
+    /// (lane B19: tests/crash.rs's power cut at seed 45 reopened to sequences 4 and 1). Its log is
+    /// at its start already, so there is nothing to switch from.
     pub fn switch(&self, io: &dyn IO, cut_past: Option<u64>) -> Result<Option<SegmentId>> {
         let segments = self.segments.load();
         if segments.closing().is_some() {
@@ -4289,6 +4296,9 @@ impl SharedLog {
         let to = from.other();
         let (header, epoch, transaction_count) = {
             let closing = self.segment(from).read();
+            if closing.metadata.max_frame.load(Ordering::Acquire) == 0 {
+                return Ok(None);
+            }
             let header = *closing.metadata.wal_header.lock();
             (
                 header,
@@ -11722,6 +11732,73 @@ pub mod test {
             closing.metadata.nbackfills.load(Ordering::Acquire),
             0,
             "nothing of the closing segment was copied"
+        );
+    }
+
+    /// Do (lane B19, tests/crash.rs's power cut at seed 45): write, switch, write, copy the closing
+    /// segment, switch, copy it again, ask for a third switch with nothing written since the
+    /// second, write; open a copy of the database and both log files. Expect: the copy opens and
+    /// holds every row; the third switch was refused, its segment holding no frame (so no header
+    /// of its own on disk), and the log's two headers are one sequence apart.
+    #[test]
+    fn d45_a_switch_never_leaves_two_headers_recovery_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let io = shared_wal_test_io();
+        let source = dir.path().join("source.db");
+        let copy = dir.path().join("copy.db");
+        let (source_path, copy_path) = (source.to_str().unwrap(), copy.to_str().unwrap());
+        let db = Database::open_file(io.clone(), source_path, Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("pragma wal_autocheckpoint=0").unwrap();
+        conn.execute("create table t(id integer primary key, v text)")
+            .unwrap();
+        conn.execute("insert into t values(1, 'first segment')")
+            .unwrap();
+        let pager = conn.pager.load();
+        let passive = CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        };
+        assert!(db.switch_log(None).unwrap());
+        conn.execute("insert into t values(2, 'second segment')")
+            .unwrap();
+        run_checkpoint_until_done(&pager, passive);
+        assert_eq!(db.shared_wal.segments.load().closing(), None);
+        assert!(db.switch_log(None).unwrap());
+        run_checkpoint_until_done(&pager, passive);
+        assert_eq!(db.shared_wal.segments.load().closing(), None);
+        let third = db.switch_log(None).unwrap();
+        conn.execute("insert into t values(3, 'after the third ask')")
+            .unwrap();
+
+        std::fs::copy(&source, &copy).unwrap();
+        for suffix in ["-wal", "-wal2"] {
+            std::fs::copy(
+                format!("{source_path}{suffix}"),
+                format!("{copy_path}{suffix}"),
+            )
+            .unwrap();
+        }
+        let reopened = Database::open_file(io, copy_path, Arc::new(SqliteDialect));
+        let reopened = match reopened {
+            Ok(db) => db,
+            Err(e) => panic!("the copy doesn't open (third switch made: {third}): {e}"),
+        };
+        let conn = reopened.connect(ConnectOpts::new()).unwrap();
+        assert_eq!(count_rows(&conn, "t"), 3);
+        assert!(!third, "a segment with no frame is not switched from");
+        let sequence = |id| {
+            reopened
+                .shared_wal
+                .segment(id)
+                .read()
+                .metadata
+                .wal_header
+                .lock()
+                .checkpoint_seq
+        };
+        assert_eq!(
+            sequence(SegmentId::First),
+            sequence(SegmentId::Second).wrapping_add(1)
         );
     }
 
