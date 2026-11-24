@@ -2,8 +2,8 @@
 //! becomes a typed one, its names, operators, functions and casts resolved as 19's `parse_*.c` resolve
 //! them, over 19's own `pg_type`, `pg_operator`, `pg_proc` and `pg_cast` rows (amphora-pg-catalog). The
 //! values and functions are those of int4, int8, text, char(n), "char", timestamp, timestamptz and
-//! regclass; a statement that needs another refuses with `0A000` naming it. Pure: no I/O, no clock.
-//! Source lines are REL_19_0's.
+//! regclass, and name's input and output; a statement that needs another refuses with `0A000` naming
+//! it. Pure: no I/O, no clock. Source lines are REL_19_0's.
 #![cfg_attr(
     test,
     allow(

@@ -1247,6 +1247,22 @@ fn t_pg_9_1_tpcb_statements_answer_as_a_19_server_does() {
     );
 }
 
+/// A message as a client of the extended protocol can tell it: as [`tpcb::told`] does, but a row's values
+/// by their bytes, whatever their format, and a refusal's context with it.
+fn exactly(tag: u8, body: &[u8]) -> String {
+    match tag {
+        b'E' | b'N' => {
+            let fields: Vec<_> = error_fields(body)
+                .into_iter()
+                .filter(|(field, _)| b"SVCMWP".contains(field))
+                .collect();
+            format!("{} {fields:?}", char::from(tag))
+        }
+        b'D' => format!("D {body:02x?}"),
+        _ => tpcb::told("", &[(tag, body.to_vec())]).concat(),
+    }
+}
+
 /// T-PG.10.1: the extended protocol's messages (pgbench's `-M extended` and `-M prepared` flows, its relkind
 /// query, parameters and columns of each type in text and in binary, portals stopped and gone on with, what
 /// each message refuses, one transaction to each Sync, a failed block's, Flush, and messages malformed
@@ -1290,7 +1306,7 @@ fn t_pg_10_1_extended_messages_answer_as_a_19_server_does() {
             let told = |messages: &[(u8, Vec<u8>)]| -> Vec<String> {
                 messages
                     .iter()
-                    .map(|(tag, body)| tpcb::exactly(*tag, body))
+                    .map(|(tag, body)| exactly(*tag, body))
                     .collect()
             };
             let (got, want) = (told(&messages(&out)), told(theirs));

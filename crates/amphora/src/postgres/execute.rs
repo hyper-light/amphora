@@ -19,7 +19,7 @@ use amphora_engine::{
 use amphora_pg_analysis::datetime::TimeZone;
 use amphora_pg_analysis::stmt::Command;
 use amphora_pg_analysis::{
-    Column, Error, Field, Lowered, Relations, Value as Datum19, analyze, binary, lower, output,
+    Column, Error, Field, Lowered, Relations, Value as PgValue, analyze, binary, lower, output,
     utility,
 };
 use amphora_pg_catalog::data::{PG_TYPE, type_oid};
@@ -807,7 +807,7 @@ impl Executor {
             let bytes = match value {
                 None => None,
                 Some(mut value) => {
-                    if let (type_oid::BPCHAR, Datum19::Text(text)) = (field.type_oid, &mut value) {
+                    if let (type_oid::BPCHAR, PgValue::Text(text)) = (field.type_oid, &mut value) {
                         pad(text, field.typmod);
                     }
                     let bytes = if formats.of(at) == 0 {

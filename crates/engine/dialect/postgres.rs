@@ -413,7 +413,7 @@ impl From<amphora_pg_analysis::Error> for LimboError {
 }
 
 /// What the engine stores for a value of a type (section 5): the text types in their own, a
-/// `bpchar` without its trailing spaces, the rest as integers.
+/// `bpchar` without its trailing spaces, a `"char"` as `charout` prints it, the rest as integers.
 pub fn to_engine(oid: u32, value: &PgValue) -> crate::Result<Value> {
     Ok(match value {
         PgValue::Bool(b) => Value::Numeric(Numeric::Integer(i64::from(*b))),
