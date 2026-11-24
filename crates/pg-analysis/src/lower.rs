@@ -221,7 +221,7 @@ impl Writer<'_> {
         if self.constant.get(id.index()) == Some(&true) {
             let folded = self.folded.get(id.index()) == Some(&true);
             let value = func::eval(&query.exprs, id, self.session, self.params)
-                .map_err(|e| if folded { e } else { e.as_it_runs() })?;
+                .map_err(|e| if folded { e } else { e.of_its_run() })?;
             return Ok(vec![self.bind(expr.type_oid, value)]);
         }
         let refuse = |what: &str| Err(Error::unsupported(what).at(expr.location));

@@ -90,7 +90,7 @@ impl Error {
     }
 
     /// This refusal, raised as the statement runs.
-    fn as_it_runs(self) -> Self {
+    fn of_its_run(self) -> Self {
         Self { runs: true, ..self }
     }
 
