@@ -25,7 +25,10 @@ use crate::{
     progress::ProgressHandler,
     return_if_io,
     schema::{self, Schema},
-    stats::{refresh_analyze_stats, refresh_analyze_stats_nonblock, RefreshAnalyzeStatsState},
+    stats::{
+        refresh_analyze_stats_on_connect, refresh_analyze_stats_on_connect_nonblock,
+        RefreshAnalyzeStatsState,
+    },
     storage::{
         self,
         checksum::CHECKSUM_REQUIRED_RESERVED_BYTES,
@@ -725,6 +728,13 @@ pub struct Database<
     pub(crate) skipping: crate::skipping::SkipRegistry,
     pub(crate) allocators: DatabaseAllocators<A, F>,
     pub(crate) schema: Arc<Mutex<Arc<Schema>>>,
+    /// Schema version for which `ANALYZE` statistics were already loaded into `schema`
+    /// (`u64::MAX` until loaded): prevents every new connection from re-scanning `sqlite_stat1`
+    /// and deep-cloning `Schema` + column samples.
+    pub(crate) analyze_stats_version: AtomicU64,
+    /// Monotonic counter used to stagger per-connection `LearnedCosts::RunCounts` phases so
+    /// concurrent connections do not all sample on the exact same iteration.
+    pub(crate) cost_run_seed: AtomicU64,
     pub db_file: Arc<dyn DatabaseStorage>,
     pub path: String,
     wal_path: String,
@@ -925,6 +935,8 @@ impl Database {
                 s.generated_columns_enabled = opts.enable_generated_columns;
                 s
             }))),
+            analyze_stats_version: AtomicU64::new(u64::MAX),
+            cost_run_seed: AtomicU64::new(0),
             _shared_page_cache: shared_page_cache,
             learned_costs,
             row_changes: Arc::new(crate::row_changes::RowChanges::new()),
@@ -2709,7 +2721,7 @@ impl Database {
                 conn
             }
         };
-        match refresh_analyze_stats_nonblock(&conn, &mut state.refresh) {
+        match refresh_analyze_stats_on_connect_nonblock(&conn, &mut state.refresh) {
             Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
             Ok(IOResult::Done(())) => {}
             Err(err) => {
@@ -2764,7 +2776,7 @@ impl Database {
             context,
         )?;
         if stats == StatsRefresh::Blocking {
-            refresh_analyze_stats(&conn);
+            refresh_analyze_stats_on_connect(&conn);
         }
         Ok(conn)
     }
@@ -2786,7 +2798,7 @@ impl Database {
             default_cache_size,
             None,
         )?;
-        refresh_analyze_stats(&conn);
+        refresh_analyze_stats_on_connect(&conn);
         Ok(conn)
     }
 
@@ -2813,7 +2825,9 @@ impl Database {
             )?
             .map(|s| Arc::new(crate::storage::versioned::switch::Switch::new(s)));
         let conn = Arc::new(Connection {
-            cost_runs: Default::default(),
+            cost_runs: crate::translate::optimizer::learned_costs::RunCounts::staggered(
+                self.cost_run_seed.fetch_add(1, Ordering::Relaxed),
+            ),
             versioned,
             versioned_attached: RwLock::new(HashMap::default()),
             db: self.clone(),

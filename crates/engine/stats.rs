@@ -181,20 +181,22 @@ impl AnalyzeStats {
     }
 }
 
-/// Best-effort refresh of the connection's in-memory ANALYZE stats.
+/// Best-effort connect-time refresh of the connection's in-memory ANALYZE stats: skips scanning
+/// `sqlite_stat1` when the shared database schema already loaded statistics for its current
+/// `schema_version`, preserving `Arc<Schema>` sharing across connections instead of duplicating
+/// multi-MiB column samples per connection.
 ///
-/// Blocking form of [`refresh_analyze_stats_nonblock`]: the same state machine,
-/// driven to completion here by pumping IO. That is only correct when whatever
-/// the `sqlite_stat1` scan waits for can make progress without the caller's
-/// help (real I/O, or another thread). A host that schedules connections
-/// cooperatively on one thread must drive the non-blocking variant itself,
-/// because an explicit yield is a request to run *other* connections, which
-/// `io.step()` never does; see `Database::connect_async`.
-pub fn refresh_analyze_stats(conn: &Arc<Connection>) {
+/// Blocking form of [`refresh_analyze_stats_on_connect_nonblock`]: the same state machine,
+/// driven to completion here by pumping IO. That is only correct when whatever the `sqlite_stat1`
+/// scan waits for can make progress without the caller's help (real I/O, or another thread). A
+/// host that schedules connections cooperatively on one thread must drive the non-blocking variant
+/// itself, because an explicit yield is a request to run *other* connections, which `io.step()`
+/// never does; see `Database::connect_async`.
+pub fn refresh_analyze_stats_on_connect(conn: &Arc<Connection>) {
     let io = conn.db.io.clone();
     let mut state = RefreshAnalyzeStatsState::default();
     loop {
-        let pending = match refresh_analyze_stats_nonblock(conn, &mut state) {
+        let pending = match refresh_analyze_stats_on_connect_nonblock(conn, &mut state) {
             Ok(IOResult::Done(())) => return,
             Ok(IOResult::IO(pending)) => pending,
             Err(e) => {
@@ -214,6 +216,34 @@ pub fn refresh_analyze_stats(conn: &Arc<Connection>) {
             return;
         }
     }
+}
+
+/// Non-blocking connect-time stats refresh: skips scanning `sqlite_stat1` when the shared database
+/// schema already has loaded statistics for the current schema version, syncing `conn.schema` to
+/// the shared `Arc<Schema>` if another connection finished loading them concurrently.
+pub fn refresh_analyze_stats_on_connect_nonblock(
+    conn: &Arc<Connection>,
+    st: &mut RefreshAnalyzeStatsState,
+) -> IOResultOr<()> {
+    if matches!(st, RefreshAnalyzeStatsState::Start) {
+        let schema_version = conn.schema.read().schema_version;
+        if conn
+            .db
+            .analyze_stats_version
+            .load(crate::sync::atomic::Ordering::Acquire)
+            == u64::from(schema_version)
+        {
+            let shared = conn.db.schema.lock().clone();
+            if shared.schema_version == schema_version {
+                let mut current = conn.schema.write();
+                if !Arc::ptr_eq(&current, &shared) {
+                    *current = shared;
+                }
+                return Ok(IOResult::Done(()));
+            }
+        }
+    }
+    refresh_analyze_stats_nonblock(conn, st)
 }
 
 /// Carries the in-progress `sqlite_stat1` scan across IO yields for
@@ -248,6 +278,10 @@ pub fn refresh_analyze_stats_nonblock(
                 }
                 let schema_snapshot = { conn.schema.read().clone() };
                 if schema_snapshot.get_btree_table(STATS_TABLE).is_none() {
+                    conn.db.analyze_stats_version.store(
+                        u64::from(schema_snapshot.schema_version),
+                        crate::sync::atomic::Ordering::Release,
+                    );
                     return Ok(IOResult::Done(()));
                 }
                 let mv_tx = conn.get_mv_tx();
@@ -295,25 +329,35 @@ pub fn refresh_analyze_stats_nonblock(
     }
 }
 
-/// Store freshly gathered stats in the connection's schema and, when the shared
-/// database schema is the same schema version, in the shared schema too.
+/// Store freshly gathered stats in the shared database schema (when at the same schema version)
+/// and share that same `Arc<Schema>` on the connection, avoiding double deep-cloning `Schema` and
+/// preserving `Arc` sharing of multi-MiB column samples across connections.
 ///
-/// In MVCC mode the commit that wrote `sqlite_stat1` publishes the connection's
-/// schema to the shared schema before the stats are gathered. If only the
-/// connection copy were updated, the two copies would differ while having the
-/// same version, and the next statement would adopt the shared copy and lose
-/// the new stats.
-///
-/// The connection schema lock is released before the shared schema lock is
-/// taken: other code paths lock them in the opposite order.
+/// The shared schema lock and connection schema lock are never held together.
 fn install_analyze_stats(conn: &Arc<Connection>, stats: AnalyzeStats) -> Result<()> {
-    let schema_version = conn.with_schema_mut(|schema| {
-        schema.analyze_stats = stats.clone();
-        schema.schema_version
-    })?;
-    let mut shared = conn.db.schema.lock();
-    if shared.schema_version == schema_version {
-        Schema::try_make_mut(&mut shared)?.analyze_stats = stats;
+    let local_version = conn.schema.read().schema_version;
+    let mut pending = Some(stats);
+    let updated_shared = {
+        let mut shared = conn.db.schema.lock();
+        if shared.schema_version == local_version {
+            if let Some(stats) = pending.take() {
+                Schema::try_make_mut(&mut shared)?.analyze_stats = stats;
+            }
+            conn.db.analyze_stats_version.store(
+                u64::from(local_version),
+                crate::sync::atomic::Ordering::Release,
+            );
+            Some(Arc::clone(&shared))
+        } else {
+            None
+        }
+    };
+    if let Some(updated) = updated_shared {
+        *conn.schema.write() = updated;
+    } else if let Some(stats) = pending {
+        conn.with_schema_mut(|schema| {
+            schema.analyze_stats = stats;
+        })?;
     }
     Ok(())
 }

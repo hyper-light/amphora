@@ -7,11 +7,13 @@
 //! (`CostModelParams::with_learned`). The bench harness `bench/join_methods` checks what they choose;
 //! it is not where they come from.
 
+use std::cell::Cell;
 use std::hint::black_box;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
 
+use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 
@@ -616,6 +618,17 @@ pub(crate) struct RunCounts {
 }
 
 impl RunCounts {
+    /// Staggers initial per-connection sampling phases so concurrent connections do not hit
+    /// `run % every == 0` in lockstep.
+    pub(crate) fn staggered(seed: u64) -> Self {
+        let base = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        Self {
+            seek: RunCount(AtomicU64::new(base)),
+            hash_build: RunCount(AtomicU64::new(base.rotate_left(17))),
+            hash_probe: RunCount(AtomicU64::new(base.rotate_left(37))),
+        }
+    }
+
     const fn count(&self, work: Work) -> Option<&RunCount> {
         match work {
             Work::Seek => Some(&self.seek),
@@ -641,10 +654,33 @@ impl RunCount {
     }
 }
 
+/// Lock-free snapshot of derived planner weights, cost margin, and row nanos published whenever
+/// `Rates` updates, so `prepare()` never contends on `LearnedCosts::rates`.
+#[derive(Debug, Clone, Copy)]
+struct WeightsSnapshot {
+    weights: Option<LearnedWeights>,
+    cost_margin: f64,
+    row_nanos: Option<f64>,
+}
+
+impl WeightsSnapshot {
+    fn from_rates(rates: &Rates) -> Self {
+        Self {
+            weights: rates.weights(None),
+            cost_margin: rates.cost_margin(),
+            row_nanos: rates.row.nanos_per_unit(),
+        }
+    }
+}
+
 /// A database's running cost estimator, shared by its connections.
 #[derive(Debug)]
 pub(crate) struct LearnedCosts {
     rates: Mutex<Rates>,
+    /// Lock-free published snapshot for `prepare()` (`weights_at`, `cost_margin`, `nanos_per(Row)`).
+    snapshot: ArcSwap<WeightsSnapshot>,
+    /// True when the active weight rule is `WeightRule::BatchMeans`.
+    batch_means: AtomicBool,
     /// Which runs of the seek, the hash build and the hash probe are timed (step 3a).
     seek: Sampling,
     hash_build: Sampling,
@@ -653,9 +689,8 @@ pub(crate) struct LearnedCosts {
     timing_nanos: f64,
     /// PL.8: the join search's measured time a candidate, and what it chose.
     search: super::search_budget::SearchRate,
-    /// Lane T15: the page reads counted, which are timed and the batch under way, and what timing
+    /// Lane T15: which page reads are timed and the batch under way, and what timing
     /// each read of the epoch under way took (`observe_page_read`).
-    page_runs: RunCount,
     page: Sampling,
     page_costs: Mutex<Vec<f64>>,
 }
@@ -674,6 +709,8 @@ pub(crate) struct LearnedCosts {
 #[derive(Debug)]
 struct Sampling {
     every: AtomicU64,
+    epoch: f64,
+    epoch_len: usize,
     spread: Mutex<Spread>,
     /// PL.8 (T-PL.8.2, lane pl8-22): the timed runs of the batch under way, under
     /// [WeightRule::BatchMeans]: at most an epoch's, the work calibration timed a sample of
@@ -704,9 +741,12 @@ impl Spread {
 }
 
 impl Sampling {
-    fn new() -> Self {
+    fn new(epoch: f64) -> Self {
+        let epoch_len = saturating_usize(epoch.max(2.0).ceil()).max(2);
         Self {
             every: AtomicU64::new(1),
+            epoch,
+            epoch_len,
             spread: Mutex::new(Spread::default()),
             batch: Mutex::new(Vec::new()),
         }
@@ -717,10 +757,39 @@ impl Sampling {
         run.is_multiple_of(self.every.load(Ordering::Relaxed).max(1))
     }
 
+    /// Non-blocking batch append under `WeightRule::BatchMeans`: skips a redundant simultaneous
+    /// sample when another thread already holds the batch lock rather than spinning/parking query
+    /// threads, and hands the closed batch back to compute median and Welford spread lock-free.
+    fn try_push_batch(&self, nanos: f64) -> Option<Vec<f64>> {
+        let mut batch = self.batch.try_lock()?;
+        batch.push(nanos);
+        if batch.len() >= self.epoch_len {
+            Some(std::mem::replace(
+                &mut *batch,
+                Vec::with_capacity(self.epoch_len),
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Computes Welford spread over a closed batch lock-free and updates `every`.
+    fn update_every_from_batch(&self, samples: &[f64], timing_nanos: f64) {
+        let mut spread = Spread::default();
+        for &nanos in samples {
+            spread.add(nanos);
+        }
+        if let Some(every) = sample_every(timing_nanos, self.epoch, spread.sd()) {
+            self.every.store(every, Ordering::Relaxed);
+        }
+    }
+
     /// Adds a timed run's `nanos`; once an epoch's `epoch` samples are in, sets `every` from their
     /// spread and `timing_nanos` and starts the next.
     fn add(&self, nanos: f64, epoch: f64, timing_nanos: f64) {
-        let mut spread = self.spread.lock();
+        let Some(mut spread) = self.spread.try_lock() else {
+            return;
+        };
         spread.add(nanos);
         if spread.count < epoch.max(2.0) {
             return;
@@ -765,24 +834,37 @@ impl LearnedCosts {
     fn from_rates(rates: &Rates) -> Self {
         Self {
             rates: Mutex::new(*rates),
-            seek: Sampling::new(),
-            hash_build: Sampling::new(),
-            hash_probe: Sampling::new(),
+            snapshot: ArcSwap::from_pointee(WeightsSnapshot::from_rates(rates)),
+            batch_means: AtomicBool::new(rates.seek.rule == WeightRule::BatchMeans),
+            seek: Sampling::new(rates.seek.epoch),
+            hash_build: Sampling::new(rates.hash_build.epoch),
+            hash_probe: Sampling::new(rates.hash_probe.epoch),
             timing_nanos: rates.timing_nanos,
             search: super::search_budget::SearchRate::default(),
-            page_runs: RunCount::default(),
-            page: Sampling::new(),
+            page: Sampling::new(rates.page.epoch),
             page_costs: Mutex::new(Vec::new()),
         }
     }
 
-    /// Lane T15: starts timing a page read about to be submitted; None if this one isn't timed. One
-    /// read in the page `Sampling`'s `every` is, as the seeks are; every read where the wait can't be
-    /// read (`every` is set only from reads whose wait was).
+    fn publish_snapshot(&self, rates: &Rates) {
+        self.snapshot
+            .store(std::sync::Arc::new(WeightsSnapshot::from_rates(rates)));
+    }
+
+    /// Lane T15: starts timing a page read about to be submitted; None if this one isn't timed.
+    /// Uses a thread-local counter so concurrent page reads write no shared cache line.
     pub(crate) fn start_page_read(&self) -> Option<PageReadTimer> {
-        self.page
-            .sampled(self.page_runs.next())
-            .then(PageReadTimer::start)
+        crate::thread::thread_local! {
+            static PAGE_RUNS: Cell<u64> = const { Cell::new(0) };
+        }
+        let run = PAGE_RUNS
+            .try_with(|c| {
+                let r = c.get();
+                c.set(r.wrapping_add(1));
+                r
+            })
+            .unwrap_or(0);
+        self.page.sampled(run).then(PageReadTimer::start)
     }
 
     /// Lane T15: a page read `timer` timed has completed.
@@ -798,38 +880,55 @@ impl LearnedCosts {
     /// Windows; `run_delay`) counts its wall time, its batch closed at the median as the seeks' are
     /// (`Rate::close_runs`): a preempted read is one rank, not a share of the mean.
     pub(crate) fn observe_page_read(&self, read: TimedRead) {
-        let mut rates = self.rates.lock();
-        let rate = rates.rate_mut(Work::PageRead);
-        let epoch = rate.epoch;
-        match (rate.rule, read.less_waits()) {
-            (WeightRule::BatchMeans, Some(nanos)) => {
-                rate.observe(1.0, nanos);
-                drop(rates);
-                let cost = read.waited.map_or(0.0, |(_, cost)| cost);
-                let cost = {
-                    let mut costs = self.page_costs.lock();
-                    costs.push(cost);
-                    if costs.len() as f64 >= epoch.max(2.0) {
-                        let median = median(&mut costs);
-                        costs.clear();
-                        median.unwrap_or(cost)
-                    } else {
-                        cost
+        match (self.batch_means.load(Ordering::Relaxed), read.less_waits()) {
+            (true, None) => {
+                if let Some(mut closed) = self.page.try_push_batch(read.wall) {
+                    self.page
+                        .update_every_from_batch(&closed, self.timing_nanos);
+                    if let Some(med) = median(&mut closed) {
+                        let mut rates = self.rates.lock();
+                        if rates.rate_mut(Work::PageRead).rule == WeightRule::BatchMeans {
+                            rates.rate_mut(Work::PageRead).close_runs(med);
+                            self.publish_snapshot(&rates);
+                        }
                     }
-                };
-                self.page.add(nanos, epoch, cost);
-            }
-            (WeightRule::BatchMeans, None) => {
-                let mut batch = self.page.batch.lock();
-                batch.push(read.wall);
-                if batch.len() as f64 >= epoch.max(2.0) {
-                    if let Some(median) = median(&mut batch) {
-                        rate.close_runs(median);
-                    }
-                    batch.clear();
                 }
             }
-            _ => rate.observe(1.0, read.wall),
+            (true, Some(nanos)) => {
+                let epoch = {
+                    let mut rates = self.rates.lock();
+                    let rate = rates.rate_mut(Work::PageRead);
+                    let epoch = rate.epoch;
+                    rate.observe(1.0, nanos);
+                    self.publish_snapshot(&rates);
+                    epoch
+                };
+                let cost = read.waited.map_or(0.0, |(_, cost)| cost);
+                let closed_cost = {
+                    let Some(mut costs) = self.page_costs.try_lock() else {
+                        self.page.add(nanos, epoch, cost);
+                        return;
+                    };
+                    costs.push(cost);
+                    if costs.len() >= self.page.epoch_len {
+                        Some(std::mem::replace(
+                            &mut *costs,
+                            Vec::with_capacity(self.page.epoch_len),
+                        ))
+                    } else {
+                        None
+                    }
+                };
+                let cost = closed_cost
+                    .and_then(|mut batch| median(&mut batch))
+                    .unwrap_or(cost);
+                self.page.add(nanos, epoch, cost);
+            }
+            (false, _) => {
+                let mut rates = self.rates.lock();
+                rates.rate_mut(Work::PageRead).observe(1.0, read.wall);
+                self.publish_snapshot(&rates);
+            }
         }
     }
 
@@ -864,29 +963,35 @@ impl LearnedCosts {
 
     /// Records a timed run of `work`, one unit in `nanos`: it moves the rate, and its spread sets
     /// how often the runs are timed. Under [WeightRule::BatchMeans] a batch of runs closes at its
-    /// median run (`Rate::close_runs`); under [WeightRule::Blend], the control, each run blends in.
+    /// median run (`Rate::close_runs`) outside `rates` lock; under [WeightRule::Blend], the
+    /// control, each run blends in.
     pub(crate) fn observe_sampled(&self, work: Work, nanos: f64) {
         if !(nanos.is_finite() && nanos >= 0.0) {
             return;
         }
         let sampling = self.sampling(work);
+        if self.batch_means.load(Ordering::Relaxed) {
+            if let Some(sampling) = sampling {
+                if let Some(mut closed) = sampling.try_push_batch(nanos) {
+                    sampling.update_every_from_batch(&closed, self.timing_nanos);
+                    if let Some(med) = median(&mut closed) {
+                        let mut rates = self.rates.lock();
+                        if rates.rate_mut(work).rule == WeightRule::BatchMeans {
+                            rates.rate_mut(work).close_runs(med);
+                            self.publish_snapshot(&rates);
+                        }
+                    }
+                }
+                return;
+            }
+        }
         let epoch = {
             let mut rates = self.rates.lock();
             let rate = rates.rate_mut(work);
-            match (rate.rule, sampling) {
-                (WeightRule::BatchMeans, Some(sampling)) => {
-                    let mut batch = sampling.batch.lock();
-                    batch.push(nanos);
-                    if batch.len() as f64 >= rate.epoch.max(2.0) {
-                        if let Some(median) = median(&mut batch) {
-                            rate.close_runs(median);
-                        }
-                        batch.clear();
-                    }
-                }
-                _ => rate.observe(1.0, nanos),
-            }
-            rate.epoch
+            rate.observe(1.0, nanos);
+            let epoch = rate.epoch;
+            self.publish_snapshot(&rates);
+            epoch
         };
         if let Some(sampling) = sampling {
             sampling.add(nanos, epoch, self.timing_nanos);
@@ -895,13 +1000,18 @@ impl LearnedCosts {
 
     /// Records that `units` of `work` took `nanos`, as an operator timed it.
     pub(crate) fn observe(&self, work: Work, units: f64, nanos: f64) {
-        self.rates.lock().rate_mut(work).observe(units, nanos);
+        let mut rates = self.rates.lock();
+        rates.rate_mut(work).observe(units, nanos);
+        self.publish_snapshot(&rates);
     }
 
     /// Nanoseconds a unit of `work` takes as the rate stands, None before any time was seen: what
     /// G11 step 5's access paths weigh the column copy's measured scan against
     /// (`column_path::RowRates::learned`).
     pub(crate) fn nanos_per(&self, work: Work) -> Option<f64> {
+        if work == Work::Row {
+            return self.snapshot.load().row_nanos;
+        }
         self.rates.lock().rate_mut(work).nanos_per_unit()
     }
 
@@ -909,13 +1019,15 @@ impl LearnedCosts {
     /// while calibrating.
     #[cfg(test)]
     pub(crate) fn weights(&self) -> Option<LearnedWeights> {
-        self.rates.lock().weights(None)
+        self.snapshot.load().weights
     }
 
     /// The weights as they stand for a connection whose recent page fetches read the file `miss`
     /// of the time (`Pager::page_miss_ratio`; None before its first fetch).
     pub(crate) fn weights_at(&self, miss: Option<f64>) -> Option<LearnedWeights> {
-        self.rates.lock().weights(miss)
+        let mut weights = self.snapshot.load().weights?;
+        weights.page_miss = miss.filter(|m| m.is_finite()).map(|m| m.clamp(0.0, 1.0));
+        Some(weights)
     }
 
     /// Anchors the page read's rate to `reads` page reads timed at open in `nanos`
@@ -927,13 +1039,14 @@ impl LearnedCosts {
             return;
         }
         rates.page.anchor(reads, nanos);
+        self.publish_snapshot(&rates);
     }
 
     /// PL.8 (lane pl8-16): how much more than the search's best a statement's carried join order
     /// may cost and keep its place (`join::keep_carried`), as a share of the best's cost: what the
     /// weights' measured error could explain (`Rates::cost_margin`). 0 under [WeightRule::Blend].
     pub(crate) fn cost_margin(&self) -> f64 {
-        self.rates.lock().cost_margin()
+        self.snapshot.load().cost_margin
     }
 
     /// PL.8 (T-PL.8.6, lane pl8-16): moves every weight to `rule` (`WeightRule`), from the rates as
@@ -941,15 +1054,18 @@ impl LearnedCosts {
     pub(crate) fn set_rule(&self, rule: WeightRule) {
         let mut rates = self.rates.lock();
         rates.switch(rule);
+        self.batch_means
+            .store(rule == WeightRule::BatchMeans, Ordering::Relaxed);
         for sampling in [&self.seek, &self.hash_build, &self.hash_probe, &self.page] {
             sampling.batch.lock().clear();
         }
+        self.publish_snapshot(&rates);
     }
 
     /// The page reads an epoch of the page read's rate holds: the most the open's anchor times
     /// (`time_page_read`), as calibration times each kind of work up to a page of it.
     pub(crate) fn page_read_epoch(&self) -> usize {
-        saturating_usize(self.rates.lock().page.epoch.max(1.0))
+        saturating_usize(self.page.epoch.max(1.0))
     }
 }
 
