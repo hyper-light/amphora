@@ -34,11 +34,12 @@ def cause(kind, sql, diff):
     if "secondary index lacks primary key locator" in t: return "CQ"
     if "InSelect is not supported in this position" in t: return "CR"
     if "Scalar subquery is not supported in this context" in t: return "CS"
+    if kind == "Error" and "view" in sql.lower() and "finds the pivot" in t: return "CW"
     if kind == "Error": return "ERR " + re.sub(r"\d+", "#", t.splitlines()[0] if t else "")[:90]
     if kind == "Panic": return "PANIC " + re.sub(r"\d+", "#", t.splitlines()[0] if t else "")[:90]
     if re.search(r", [^()]*\) (NOT )?IN \(SELECT|\)\) (NOT )?IN \(SELECT|, [^;]{1,160}\) (NOT )?IN \(SELECT s\d+\.c\d+, s\d+", sql): return "CT"
     if "WITH RECURSIVE" in sql and re.search(r"ON \(b1\.c\d (=|IS) w\d\.c0\)", sql): return "CU"
-    if "CREATE TRIGGER" in sql and "STRICT" in sql and "BEFORE INSERT" in sql and "FROM lg" in sql: return "CV"
+    if "CREATE TRIGGER" in sql and "STRICT" in sql and re.search(r"BEFORE (INSERT|UPDATE)", sql) and "FROM lg" in sql: return "CV"
     if "CREATE TRIGGER" in sql: return "TRIGGER"
     return "LOOK"
 
@@ -66,10 +67,10 @@ def one(k):
     if r["kind"] == "Wrong":
         s2, _, _ = replay(f, syslib)
         r["system"] = s2
-        if s and all(x == "same" for v in s2.values() for x in v) and s2:
+        if s and all(x == "same" for v in s.values() for x in v):
+            r["cause"] = "CK"
+        elif s2 and all(x == "same" for v in s2.values() for x in v):
             r["cause"] = "AH"
-        elif s and all(x == "same" for v in s.values() for x in v):
-            r["cause"] = "SAME " + r["cause"]
     return r
 
 with cf.ThreadPoolExecutor(jobs) as ex:
