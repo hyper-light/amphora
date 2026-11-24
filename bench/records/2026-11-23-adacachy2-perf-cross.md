@@ -1084,3 +1084,72 @@ out of `perf/cross-a24` in ~/.cache/amphora-perf/cross-remote:
 2. The count: `JOBS=8 a24suite.sh 17 OUT fa44d54a84126cba36bbba1e9b64a78b2d45f187 e7a70c6441e137d5eb7d1737062d20a0fb83e8fc 1` (the
    suites, main then A21's change, alternated; the binaries print each r5 run's stamps), START=2 beside it for a second stream; then
    the same number of rounds on the fix (`a24build.sh perf/cross-a24:SHA`). A23's rounds took 40 to 147 s at 8 threads.
+
+## `t_t1_10_r5`'s fix on main, counted on Linux (perf-A25)
+
+**Lane times.** First command 06:56:43Z (2026-11-24); the hour ends 07:56:43Z. Branch `perf/cross-a25`: origin/main
+75efff54 with `perf/cross-a24` (a94d1a39: the fix 536f9730 and its record) merged (0af6bdba), then main's later landings.
+Ada's benchmark window on adacachy2 ended at 06:57Z; every run here is on adacachy2 (Linux), after it.
+
+**Losses.**
+- **The count does not show the failure on main.** r5 failed 0 of 17 rounds on main (75efff54) and 0 of 17 on the fix
+  (0af6bdba). At A24's rate of 1 in 6 a round, main was to fail 2.8 of 17 with a 4.5% chance of none, so the count
+  disagrees with that rate at the 5% level: either main's r5 now fails less often on Linux than in the records A24
+  counted, or this is that 1 in 22 chance. This lane did not look into which. Because main did not fail either, these
+  rounds cannot show that the fix stops a failure on Linux. A24's forced runs on macOS do: 11 of 17 fail without the fix,
+  0 of 8 with it. The fix's order itself is by construction (the test waits on the read's own count, under the lock that
+  publishes).
+- The 17 rounds ran as two streams at once (9 rounds and 8, the order alternated in each), not one stream of 17, to fit the
+  hour. That is 16 test threads at once, beside other lanes' runs (load 54 to 84, CPU pressure avg10 19 to 56%). Both
+  arms meet it alike. A24's 1 in 6 is from one suite at a time.
+- The known-flaky list is not edited. RULES.md has none, and the only written list is a sentence in
+  2026-11-23-adacachy2-perf-serve-p18.md that states that lane's brief (`t_t1_10_r1`). This lane's counts show no
+  difference between the trees, so they can't be cited for taking the entry out; A24's forced runs are the evidence for that.
+- Main moved inside crates/ four times while this lane ran: PG18's pg-analysis and pg-catalog (07:08Z), C5's one engine test
+  file (07:24Z; amphora's build never compiles it), B23's backup, db.rs and engine/database.rs (07:27Z), V20's
+  replicated.rs, db.rs and replication.rs (07:34Z). Each is merged, and the merged tree's clippy and touched tests re-run:
+  trees 0af6bdba, eb240c7d, 7f663325 and d8f0f253 below. Nine asks for room on adacachy2 were refused between 07:04Z and
+  07:28Z (0 to 5 of 32 cores idle); the smaller asks that started held 1, 2 or 4 cores. One ask at 07:10Z named a SHA whose
+  tail this lane typed by hand; it was refused for room and never started.
+
+**The count.** `a24suite.sh` (the replicated suites `database::replicated:: replication::`, 8 threads a suite), 17 rounds
+a side, main and the fix alternated within each stream, plain (unstamped) debug test binaries built at the two SHAs
+(r718). A24's stamped binaries on adacachy2 (fa44d54a: main ecdb013c; e7a70c64: A21's change) weren't used: neither
+holds the fix, and ecdb013c is 42 commits in crates/ older than 75efff54. `a25tally.py` (beside this record) reads every
+log: each has a `test result`, and each ran r5 (34 of 34). A round is 50 to 85 s.
+
+| failed in | main 75efff54 (17 rounds) | fix 0af6bdba (17 rounds) |
+|---|---|---|
+| **`session_reads::t_t1_10_r5_…`** | **0** | **0** |
+| `a_checkpoint_pass_copies_no_frame_past_the_last_finished_flush` (B19's, main's own) | 7 | 8 |
+| `every_falsifier_of_the_floor_holds_under_a_nemesis` (the floor test, main's own) | 7 | 7 |
+| `a_group_upgrading_to_the_floor_tracks_joins_only_once_every_member_attests` | 1 | 1 |
+| `v3_two_replicated_writes_in_a_row_answer_with_every_log_flush_held` | 1 | 0 |
+| `a_forward_that_arrives_mid_election_is_refused_no_leader_and_answers_unknown` | 0 | 1 |
+
+The last five aren't this change's and are noted only (rule 0): the change touches `tokens.rs` under `#[cfg(test)]` and
+the session_reads test.
+
+**The gates (Linux, adacachy2).** Clippy, check-production, `a21_` (5) and `session_reads::` (4) are `a24gates.sh` at the SHA;
+the tests that touch `tokens.rs` are the lib tests named `session`, `closed`, `token` or `t_t1_10` (43). `cargo fmt --all
+--check` passed on this machine at 0af6bdba, 7f663325 and d8f0f253.
+
+| run | tree | what |
+|---|---|---|
+| r718, 06:58Z, cpus=8 | 75efff54 and 0af6bdba | the lib tests of both built (59 s, 27 s): `a24-tests-<sha>` |
+| r734, 07:00Z, cpus=8 | 0af6bdba: main 75efff54 + the fix | clippy -p amphora --all-targets -D warnings rc 0 (65 s, "Checking amphora" in the log); check-production rc 0 (ratchet 10617); `a21_` 5 of 5 and `session_reads::` 4 of 4, three runs each (load 62; the copy of the binary failed "Text file busy" as r732 and r733 ran it, so the runs used r718's of the same SHA) |
+| r767, 07:05Z, cpus=1 | 0af6bdba | the tokens.rs tests: 43 passed, 0 failed, twice (1 thread, load 73 to 78) |
+| r732, 07:00Z to 07:21Z; r733, 07:00Z to 07:18Z; cpus=8 each | 75efff54 and 0af6bdba | the count above: 9 rounds (START 1) and 8 rounds (START 2) |
+| r947, 07:24Z, cpus=2 | eb240c7d: main 95669341 + the fix | the same gates: clippy rc 0 (31 s; the log shows `amphora-pg-catalog`, `amphora-engine` and `amphora`), check-production rc 0 (10617), `a21_` 5 of 5 and `session_reads::` 4 of 4, three runs each |
+| r976, 07:28Z, cpus=1 | 7f663325: main b53a29b1 + the fix | the same gates and the tokens.rs tests: clippy rc 0 (54 s), check-production rc 0 (10617), `a21_` 5 of 5 and `session_reads::` 4 of 4, three runs each, and the tokens.rs tests 43 passed, 0 failed, once (1 thread, load 68 to 76) |
+| r1022, 07:36Z, cpus=4 | d8f0f253: main 7bbbc320 + the fix (the landed tree) | clippy rc 0 (32 s; the log shows `amphora-engine` compiled and `amphora` checked), `a21_` 5 of 5 and `session_reads::` 4 of 4, two runs each, the tokens.rs tests 43 passed, 0 failed, twice (4 threads, load 34 to 47), check-production rc 0 (10617) |
+
+Not run: the whole-suite gate and the portable checks on macOS (r946, queued 07:24Z to 07:28Z, was stopped before it started:
+its place was a runner this lane may not use); the other platforms' clippy.
+
+**For the next lane.** QB.1 (the owner's queued-call limit refusing at once), as briefed. What this lane noted and left:
+- r5's natural failure rate on Linux is unmeasured for the current main: 17 rounds saw none.
+- `a_checkpoint_pass_copies_no_frame_past_the_last_finished_flush` fails about 7 of 17 rounds at load 54 to 84 on both
+  trees, and `every_falsifier_of_the_floor_holds_under_a_nemesis` the same: the suite's two most frequent reds.
+- Scripts: bench/records/2026-11-23-adacachy2-perf-cross-a25/a25tally.py; the rounds' logs are on adacachy2 in
+  ~/.cache/amphora-perf/cross-a25-out/suite (34 logs).
