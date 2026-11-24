@@ -54,6 +54,15 @@ FOUND = [
         ["INSERT INTO t VALUES ('a', 1, 'x', 1)", "INSERT INTO t VALUES ('b', 2, 'x', 1)"],
     ),
     (
+        "a row goes in its place after an upsert's other constraint replaced one",
+        [
+            "CREATE TABLE t(k TEXT, a INT, b TEXT, c INT UNIQUE ON CONFLICT REPLACE, PRIMARY KEY (k, a))",
+            "CREATE TABLE lg(ev, x, y, z)",
+            "INSERT INTO t VALUES ('e', 1, 'x', 2), ('e', 3, 'y', 5), ('d', 3, 'z', 1), ('a', 60, 'x', 3)",
+        ],
+        ["INSERT INTO t VALUES ('c', 60, 'x', 5) ON CONFLICT(k, a) DO NOTHING", "SELECT rowid FROM t WHERE rowid >= 3", "UPDATE t SET b = 'w'", "SELECT count(*) FROM t WHERE rowid IN (1, 3, 4, 5)", "PRAGMA integrity_check"],
+    ),
+    (
         "the table is left as a BEFORE trigger wrote it, without rowid",
         [
             "CREATE TABLE t(k TEXT PRIMARY KEY, a INT, b TEXT, c INT) WITHOUT ROWID",
