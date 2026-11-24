@@ -5,14 +5,9 @@ simulator`); SQLite 3.54.0 is the reference (adacachy's system library, 2026-10-
 
 Losses first.
 
-- **The sweep's queries still find two defects**, both on main before, in WHERE as in ON, both reached only under a WITH inside another:
-  - DH: an inner WITH's CTE of a name an outer one has is not read by a subquery below it, which reads the outer one: wrong rows.
-    `WITH d AS (SELECT k FROM q) SELECT t.k FROM t WHERE EXISTS (WITH d AS (SELECT k FROM t WHERE k = 1) SELECT 1 FROM d AS s WHERE t.k IN
-    (SELECT e.k FROM d AS e))`: SQLite 1, Amphora 2 (main and here). Where the outer CTE is unaliased in FROM and the inner query reads its
-    columns, main answers "no such column" (DG); with DG fixed that shape (the fix's own `d.k IN (SELECT e.k FROM d AS e)` form) answers 3 rows for
-    SQLite's 2. A candidate is on branch perf/planner-c13-dh (7f48e226, eight statements as its test): not built, not run (adacachy2 had no idle core).
-  - DI: a CTE that only an unread CTE of an inner WITH names is planned, and its error raised: SQLite 1 row, Amphora "no such table".
-- The drawn fixture that lands (1,000 queries, 5,000 answers) holds neither; seed w1 of 300 queries a database holds both (2 queries of 1,500).
+- **The sweep's queries still find one defect**, on main before, in WHERE as in ON, under a WITH inside another: DI, a CTE that only an unread CTE
+  of an inner WITH names is planned, and its error raised: SQLite 1 row, Amphora "no such table". (DH, the second, landed after: below.)
+- The drawn fixture that lands (1,000 queries, 5,000 answers) holds no query of DH or DI; seed w1 of 300 queries a database holds one of each (2 of 1,500).
 - DF and DG are fixed beyond CO and CM: the sweep of CO's queries could not answer without them.
 - An IN over a bare table name (`x IN c`) is not supported in Amphora at all (not new, not touched).
 - Two uses of one outer CTE, each inside a nested WITH's body, still read copies of one plan (`base_outer_refs_for_cte_planning` keeps the syntax
@@ -49,10 +44,13 @@ CM errors where the unmatched rows are read through the secondary index: a cover
   reads (a CTE's syntax is kept on the WITH clause's entry, and not for a recursive CTE). The copy kept its table IDs, so its cursors, hash
   tables and Once blocks. Now the WITH clause's entry holds every CTE's syntax, a read finds that entry by the CTE's id, and a recursive CTE is planned anew too.
 - **DG** (found the same way). `mark_outer_query_ref_cte_definition_only` hid the first outer entry of the CTE's name, a table's among them.
+- **DH** (found the same way, on main for WHERE too). `find_cte_outer_query_ref_by_identifier` took the first of the outer references with the name,
+  the outermost; an inner WITH's entries are added after. It takes the innermost definition's, the last on a tie. A CTE's body is planned where it is
+  read, so it could meet an inner WITH's entry of a name it reads: `cte_body_refs` gives it only those its own WITH clause sees.
 
 ## Held by tests (done when 3)
 
-- `tests/oracle_findings.rs`, five tests: 22 statements for CO, an INSERT and an UPDATE FROM, 18 for CM, 12 for DF, 3 for DG; six settings (default,
+- `tests/oracle_findings.rs`, six tests: 22 statements for CO, an INSERT and an UPDATE FROM, 18 for CM, 12 for DF, 3 for DG, 8 for DH; six settings (default,
   parallel, statistics, both, hash joins only, nested loops only).
 - `on_clauses_over_ctes_and_joins_of_keyed_tables_answer_as_sqlite` (`tests/outer_join_subqueries.rs`): `bench/sqlite_on_ctes.py` draws, and asks SQLite, 200
   queries in each of five databases: ON clauses with subqueries over CTEs (plain, over another CTE, recursive, a compound, aggregated, LIMITed, with a join of
@@ -69,6 +67,7 @@ CM errors where the unmatched rows are read through the secondary index: a cover
 | drawn, seeds w1 to w4 | ecbb33e1: DF but its last form, and DG | 30,000 | 12 | 5 errors (DI), 5 wrong (DH), 2 wrong (DF's last form: a nested WITH) |
 | the landed fixture | 82cd9499, 1c941245 (landed) | 5,000 | 0 | `oracle_findings` 91 passed |
 | drawn, seeds w1, w2, w3, w4, w7, w8 | 82cd9499: the landed engine | 45,000 | 10 | 5 errors (one query, DI), 5 wrong (one query, DH), both in w1 |
+| the landed fixture and C10's (3,000) | fedc9015: DH too, landed after | 8,000 | 0 | `oracle_findings` 92 passed; the wide seeds were not run again |
 
 No panic, and no table changed, in any run of the landed engine. C10's sweep (3,000 answers) differs in none.
 
@@ -82,7 +81,10 @@ No panic, and no table changed, in any run of the landed engine. C10's sweep (3,
 - Red, on aeea6a47 (the tests, main's engine): the five tests of `oracle_findings` fail (CO and DG "no such table: c" and "no such column: c.k", CM "secondary index lacks primary key
   locator", DF the rows of the plain CTE), and the sweep as in the table. The three statements of DF's last form were run on main's engine by hand: `(WITH x AS
   (SELECT k FROM d) SELECT count(*) FROM x) = 3` 1 row for SQLite's 3, the same over a recursive d a panic, and as an ON term 0 rows for 2.
-- The tree landed differs from 1c941245 in crates/amphora, crates/line-loom, docs, scripts and records (main's), which amphora-engine does not depend on (`cargo tree`).
+- DH (fedc9015: the first landing b549489e and DH's test and fix): clippy 0 (checked, 54 s), fmt 0, check-production 0 (10,616), oracle_findings 92, outer_join_subqueries 2
+  (8,000 answers), in_subquery 4, join_methods 4 (1 ignored), adaptive_joins 23, on_terms 5, planner 13 of 14: `planner.rs:182` (a whole-table GROUP BY, no CTE)
+  failed as lanes C4, C9 and C10 recorded of main, and passed on 1c941245. Lib suites, hash_semi_join, unnesting and the wide seeds were not run on it.
+- The tree of the first landing differs from 1c941245 in crates/amphora, crates/line-loom, docs, scripts and records (main's), which amphora-engine does not depend on (`cargo tree`).
 
 ## Reproduce
 
