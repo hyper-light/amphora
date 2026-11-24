@@ -1052,14 +1052,23 @@ fn d45_a_base_begun_while_a_read_holds_the_closing_segment_restores_every_commit
     assert_eq!(restored, s.model);
 }
 
-/// Decision 45 (lane B24): a restore never takes a log segment left at its path. Do: write 20 rows,
-/// ship them and end a base; start the log again (the writer switches to `-wal2`), and delete every
-/// row in a later second, shipped; end the process, remove the database's file and its `-wal`, the
-/// ones SQLite names, and leave its `-wal2`; restore the second before the delete at its path.
-/// Expect: the restore is refused and writes nothing, as it is where a `-wal` is left, or it holds
-/// that second's 20 rows; with the segment removed it holds them.
-#[test]
-fn d45_a_restore_never_takes_a_log_segment_left_at_its_path() {
+/// A pace that takes a restore's steps, its replay's in parts, and never waits.
+struct Steps;
+
+impl backup::Pace for Steps {
+    fn ready(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn done(&mut self, _: Option<&std::fs::File>, _: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// Backs up 20 rows and a base, has the writer switch to `-wal2` and delete every row in a later
+/// second, shipped; ends the process, removes the database's file and its `-wal`, the ones SQLite
+/// names, and leaves its `-wal2`; then restores, paced by `pace`, the second before the delete at
+/// its path: what stands there holds that second's rows, and where it is refused nothing does.
+fn restored_beside_a_segment_left(pace: &mut dyn backup::Pace) {
     let mut s = Source::new();
     s.put(0..20, "a");
     s.ship().unwrap();
@@ -1096,21 +1105,40 @@ fn d45_a_restore_never_takes_a_log_segment_left_at_its_path() {
         "non-vacuous: a segment with frames is left; {state}"
     );
 
-    match backup::restore(&blobs, "db", before, &path, until()) {
-        Ok(_) => assert_eq!(
-            rows(&Db::open(&path).unwrap()),
-            expected,
-            "the rows of the second before the delete, a `-wal2` left at its path; at the end {state}"
-        ),
-        Err(refused) => {
-            assert!(!path.exists(), "refused, nothing written: {refused:#}");
-            std::fs::remove_file(beside("-wal2")).unwrap();
-            backup::restore(&blobs, "db", before, &path, until())
-                .unwrap_or_else(|e| panic!("refused with no segment left: {e:#}"));
-            assert_eq!(rows(&Db::open(&path).unwrap()), expected);
-        }
+    let restored = backup::restore_paced(&blobs, "db", before, &path, pace, until());
+    if path.exists() {
+        let stands = Db::open(&path)
+            .map(|db| rows(&db))
+            .map_err(|e| format!("{e:#}"));
+        assert_eq!(
+            stands.as_ref().map(Rows::len),
+            Ok(expected.len()),
+            "the rows that stand at the path restored to the second before the delete, a `-wal2` \
+             left there (at the end {state}); the restore: {restored:?}"
+        );
+        assert_eq!(stands.unwrap(), expected);
+    } else {
+        let refused = restored.expect_err("a restore that made nothing says so");
+        std::fs::remove_file(beside("-wal2")).unwrap();
+        backup::restore_paced(&blobs, "db", before, &path, pace, until())
+            .unwrap_or_else(|e| panic!("refused with no segment left: {e:#}, after {refused:#}"));
+        assert_eq!(rows(&Db::open(&path).unwrap()), expected);
     }
     drop(dir);
+}
+
+/// Decision 45 (lane B24): a restore never takes a log segment left at its path. Do:
+/// [`restored_beside_a_segment_left`], as an operator's restore replays. Expect: it is refused and
+/// nothing is written, as where a `-wal` is left; with the segment removed, the second's 20 rows.
+#[test]
+fn d45_a_restore_never_takes_a_log_segment_left_at_its_path() {
+    restored_beside_a_segment_left(&mut backup::Unpaced);
+}
+
+/// Decision 45 (lane B24): nor does a paced one, as a check's, whose replay folds in parts.
+#[test]
+fn d45_a_paced_restore_never_takes_a_log_segment_left_at_its_path() {
+    restored_beside_a_segment_left(&mut Steps);
 }
 
 /// A store whose writer goes on while a send is under way: once the first part of a segment put
