@@ -782,6 +782,16 @@ main a5ae048c's own failures, A19 absent (B18's decision 45 switch; they passed 
 A19 landed on 238114df: every module it touches passes wherever main passes, and the tree's failures are main's own,
 the same tests with the same messages (rule 5b).
 
+main moved again inside crates/engine (T18's vdbe/execute.rs, 012b6b44), so the landing was checked once more:
+
+| run | commit | result |
+|---|---|---|
+| 02:50Z | 9ef81742 (A19's landing: 238114df's records + main 012b6b44) | needs cpus=4: clippy clean; `a19_` 3/3, `memory::` 11/11, `store::` 6/6, `serve::` 12/12, tests/store.rs 17/17, tests/crash.rs 10/10 (3 ignored); `database::` 256/260 (6 ignored): the three above and `a_replicas_database_log_stays_within_its_room` (replicated.rs:16805); `xgroup::` not run (A19 doesn't touch it); load 28-31 |
+| 02:54Z, foreground | main 012b6b44 alone, and 9ef81742's binary | `a_replicas_database_log_stays_within_its_room` fails 2/2 on main alone ("owner 1 after write 20: 125 frames, room 102, a write 6"); passes 2/2 alone on 9ef81742 |
+
+So every failure on the landed tree fails on main without A19. The power cut passed 10/10 on 9ef81742 and failed at
+seed 45 on a5ae048c: whether it is seed- or time-dependent is not known.
+
 **rustfmt (502375c9).** Of the five call sites A19 fixed in 1a19ead8, two ran past 100 columns (serve.rs's
 `let SqlAnswer::Tables(tables) = answer(..)` at 2542 and 2583); rustfmt's two hunks are applied alone. At 2912576e `cargo
 fmt -p amphora --check` also flagged main's own lines, present at 14fbf220 before A19 (database.rs, database/
