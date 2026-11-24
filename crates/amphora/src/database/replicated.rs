@@ -7322,6 +7322,7 @@ mod tests {
         assert_eq!(driven.owner(0).waiting.len(), 1);
         // Waits past the first, on the first's room, its deadline a second after the first's.
         let later = until + Duration::from_secs(1);
+        let beyond = until + Duration::from_secs(60);
         let second = {
             let (handle, budget) = (handle.clone(), Arc::clone(&budget));
             let evaluated = Arc::clone(&evaluated);
@@ -7335,9 +7336,7 @@ mod tests {
         // It fits the queue's bytes, not those beside the call.
         let record = vec![0xff; handle.queue_bound() - alone];
         let refused = |what: &str| {
-            let refused = handle
-                .admit_receive(2, record.clone(), driven.until())
-                .err();
+            let refused = handle.admit_receive(2, record.clone(), beyond).err();
             assert!(
                 matches!(refused, Some(Refusal::Full { .. })),
                 "{what}: {refused:?}"
@@ -7357,7 +7356,7 @@ mod tests {
             driven.step();
         });
         assert!(matches!(second.try_recv(), Ok(Err(Refusal::Timeout))));
-        let admitted = handle.admit_receive(2, record.clone(), driven.until());
+        let admitted = handle.admit_receive(2, record.clone(), beyond);
         assert!(admitted.is_ok(), "{:?}", admitted.err());
         drop(admitted);
         drop(driven);
