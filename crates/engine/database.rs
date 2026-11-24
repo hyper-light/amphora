@@ -2521,6 +2521,7 @@ impl Database {
                     pager.set_schema_cookie(None);
 
                     if !self.opts.enable_multiprocess_wal
+                        && !self.open_flags.contains(OpenFlags::ReadOnly)
                         && !self.io.is_memory()
                         && !is_memory_like(&self.path)
                     {
@@ -2554,27 +2555,21 @@ impl Database {
     }
 
     /// Whether the log recovered keeps the mark the file's page 1 has (decision 45): a clean close cut
-    /// short leaves a later page 1 without it there, which the next copy would put in the file.
+    /// short leaves a later page 1 without it there, which the next copy would put in the file. Read as
+    /// the open reads its schema, with no read transaction: the pager's view is the log's as recovered.
     fn log_is_marked(&self, pager: &Pager) -> Result<bool> {
-        let frames = |id| {
-            self.shared_wal
-                .segment(id)
-                .read()
-                .last_checksum_and_max_frame()
-                .1
-        };
         use storage::log_segments::SegmentId;
+        let frames = |id| {
+            let segment = self.shared_wal.segment(id).read();
+            segment.last_checksum_and_max_frame().1
+        };
         if frames(SegmentId::First) == 0 && frames(SegmentId::Second) == 0 {
             return Ok(true);
         }
-        pager.begin_read_tx()?;
         let version = pager
             .io
-            .block(|| pager.with_header(|header| header.read_version));
-        pager.end_read_tx();
-        pager.clear_page_cache(true);
-        pager.set_schema_cookie(None);
-        Ok(!version?.sqlite_reads())
+            .block(|| pager.with_header(|header| header.read_version))?;
+        Ok(!version.sqlite_reads())
     }
 
     /// The log's second segment (decision 45) as its file holds it. Frames left in it beside a

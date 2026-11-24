@@ -2030,7 +2030,10 @@ impl WalCoordination for InProcessWalCoordination {
 
     fn restart_unmarked(&self, io: &dyn IO) -> Result<bool> {
         let segments = self.log.segments.load();
-        let one_segment = segments.current() == SegmentId::First && segments.closing().is_none();
+        // Beside a second file its cut would come first, its header the newer one ([`LogCut`]).
+        let one_segment = segments.current() == SegmentId::First
+            && segments.closing().is_none()
+            && !self.log.has_other();
         if !one_segment || self.log.file_is_marked() {
             return Ok(false);
         }
