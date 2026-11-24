@@ -79,6 +79,14 @@ impl Engine for Convo {
         }
     }
 
+    fn row_bytes(row: &Row) -> usize {
+        let owned = match row {
+            Row::Session(id) => id.capacity(),
+            Row::Event(e) => [&e.session, &e.id, &e.text, &e.body].iter().fold(0usize, |n, s| n.saturating_add(s.capacity())),
+        };
+        std::mem::size_of::<Row>().saturating_add(owned)
+    }
+
     fn apply(&mut self, rows: &[Row]) -> anyhow::Result<usize> {
         let n = rows.len();
         let began = Instant::now();
@@ -197,8 +205,6 @@ impl Amphora {
             log_frames: env("AMPHORA_LOG_FRAMES").and_then(|f| u64::try_from(f).ok()).unwrap_or(defaults.log_frames),
             // AMPHORA_COMMIT_ROWS: rows that make a commit at once.
             commit_rows: env("AMPHORA_COMMIT_ROWS").and_then(|r| usize::try_from(r).ok()).unwrap_or(defaults.commit_rows),
-            // AMPHORA_QUEUE: batches a group's writer queues at most.
-            queue: env("AMPHORA_QUEUE").and_then(|q| usize::try_from(q).ok()).or(defaults.queue),
             ..defaults
         };
         // AMPHORA_PACK_LOG=1: packed logs (docs/design/store.md, decisions 16 and 17).
