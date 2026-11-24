@@ -18821,6 +18821,7 @@ mod tests {
                 let commands = handle.command_bound().min(64);
                 handle
                     .shared
+                    .room
                     .command_bound
                     .store(commands, Ordering::Release);
                 let mut receipts = Vec::new();
