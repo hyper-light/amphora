@@ -9,9 +9,20 @@
 //! The parsers are pure, so tests give them each file's text; [`limit`] reads the files.
 
 use amphora_api::Refusal;
-use std::sync::atomic::{AtomicU64, Ordering, fence};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
+
+mod wait;
+pub use wait::Ending;
+use wait::{NoRoom, Waiters};
+
+/// What `wait` shares between threads.
+mod sync {
+    pub(super) use std::sync::atomic::{AtomicU64, fence};
+    pub(super) use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+    pub(super) use std::time::Instant;
+}
 
 /// A cgroup v1 limit at or past this is "no limit" (the kernel reports its page-rounded
 /// `LONG_MAX`, 9,223,372,036,854,771,712 on 4 KiB pages).
@@ -435,12 +446,8 @@ pub struct Budget {
     held: [AtomicU64; 5],
     /// The streams of each use open now, each of which may hold a charge at once ([`Stream`]).
     streams: [AtomicU64; 5],
-    /// The holders waiting for room now ([`Budget::take_until`]): a charge given back with none
-    /// waiting takes no lock.
-    waiting: AtomicU64,
-    /// The charges given back while a holder waited, counted under this lock: a holder that found
-    /// no room waits on it until the count moves or its deadline passes.
-    given: (Mutex<u64>, Condvar),
+    /// The holders waiting for room ([`Budget::take_until`]).
+    waiters: Arc<Waiters>,
 }
 
 /// One stream of a use's that may hold a charge at any moment while it lives (a backup's base copy,
@@ -528,8 +535,7 @@ impl Budget {
             readings,
             held: Default::default(),
             streams: Default::default(),
-            waiting: AtomicU64::new(0),
-            given: (Mutex::new(0), Condvar::new()),
+            waiters: Waiters::new(),
         })
     }
 
@@ -631,62 +637,45 @@ impl Budget {
     /// `bytes` more held by `used`, as [`Budget::take`], waiting for room until `until`: woken by
     /// each charge given back anywhere in the budget ([`Budget::give`]), never by a timer, and
     /// `waits` told (under the budget's lock) each time it waits. Refused [`Refusal::Full`], with
-    /// the room it last saw, once `until` has passed. Refused at once, never waited on: bytes past
-    /// the whole limit, [`Refusal::TooLarge`] naming it (no charge given back makes room for them;
-    /// lane perf-A19), and a refusal other than no room.
+    /// the room it last saw, once `until` has passed; with `owner`'s reason, at once, when the owner
+    /// the room is for ends, nothing charged (lane perf-A28). Refused at once, never waited on: bytes
+    /// past the whole limit, [`Refusal::TooLarge`] naming it (no charge given back makes room for
+    /// them; lane perf-A19), and a refusal other than no room.
     pub fn take_until(
         self: &Arc<Self>,
         used: Use,
         bytes: u64,
         until: Instant,
-        mut waits: impl FnMut(),
+        owner: &Ending,
+        waits: impl FnMut(),
     ) -> Result<Charge, Refusal> {
         // Room found takes no lock, as Linux's `wait_event` looks before it joins the queue
         // (include/linux/wait.h); the look under the lock below is the one a give can't slip past.
         if let Ok(charge) = self.take(used, bytes) {
             return Ok(charge);
         }
-        let mut given = self.given.0.lock().unwrap_or_else(PoisonError::into_inner);
-        self.waiting.fetch_add(1, Ordering::Relaxed);
-        // Pairs with `give`'s sequentially consistent give-back and read of `waiting` (C++
-        // [atomics.order], the single total order; Linux's include/linux/wait.h, `waitqueue_active`):
-        // either this look for room sees bytes given back, or their giver sees this holder waiting.
-        fence(Ordering::SeqCst);
-        let held = 'look: loop {
-            let seen = *given;
-            let room = match self.hold(used, bytes) {
-                Err(Refusal::TooLarge { limit, .. }) => limit,
-                other => break other,
-            };
-            if let Some(limit) = self.readings.read().limit.filter(|limit| bytes > *limit) {
-                break Err(Refusal::TooLarge {
-                    what: format!("memory for {}", used.name()),
-                    size: usize::try_from(bytes).unwrap_or(usize::MAX),
-                    limit: usize::try_from(limit).unwrap_or(usize::MAX),
-                });
-            }
-            let refused = Refusal::Full { limit: room };
-            let mut left = until.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                break Err(refused);
-            }
-            waits();
-            while *given == seen {
-                if left.is_zero() {
-                    break 'look Err(refused);
-                }
-                given = self
-                    .given
-                    .1
-                    .wait_timeout(given, left)
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .0;
-                left = until.saturating_duration_since(Instant::now());
-            }
-        };
-        self.waiting.fetch_sub(1, Ordering::Relaxed);
-        drop(given);
-        held.map(|()| Charge {
+        Waiters::until(
+            &self.waiters,
+            until,
+            owner,
+            || {
+                let room = match self.hold(used, bytes) {
+                    Ok(()) => return Ok(()),
+                    Err(Refusal::TooLarge { limit, .. }) => limit,
+                    Err(refusal) => return Err(NoRoom::Refused(refusal)),
+                };
+                Err(match self.readings.read().limit {
+                    Some(limit) if bytes > limit => NoRoom::Refused(Refusal::TooLarge {
+                        what: format!("memory for {}", used.name()),
+                        size: usize::try_from(bytes).unwrap_or(usize::MAX),
+                        limit: usize::try_from(limit).unwrap_or(usize::MAX),
+                    }),
+                    _ => NoRoom::Now(room),
+                })
+            },
+            waits,
+        )?;
+        Ok(Charge {
             budget: Arc::clone(self),
             used,
             bytes,
@@ -696,7 +685,7 @@ impl Budget {
     /// The holders waiting for room now ([`Budget::take_until`]).
     #[must_use]
     pub fn waiting(&self) -> u64 {
-        self.waiting.load(Ordering::Relaxed)
+        self.waiters.holders()
     }
 
     /// `bytes` held by `used` ([`Budget::hold`]) given back, and the holders waiting for room
@@ -707,12 +696,7 @@ impl Budget {
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
                 Some(held.saturating_sub(bytes))
             });
-        if self.waiting.load(Ordering::SeqCst) > 0 {
-            let mut given = self.given.0.lock().unwrap_or_else(PoisonError::into_inner);
-            *given = given.wrapping_add(1);
-            drop(given);
-            self.given.1.notify_all();
-        }
+        self.waiters.given();
     }
 
     /// The room for one image: [`Use::Images`]' room, in the `usize` an image's bytes are
@@ -892,7 +876,9 @@ pub(crate) mod tests {
         let budget = Budget::new(Box::new(fed));
         let far = Instant::now() + std::time::Duration::from_secs(3600);
         let mut waits = 0u32;
-        let refused = budget.take_until(Use::Queues, (1 << 20) + 1, far, || waits += 1);
+        let refused = budget.take_until(Use::Queues, (1 << 20) + 1, far, &Ending::new(), || {
+            waits += 1
+        });
         assert!(
             matches!(&refused, Err(Refusal::TooLarge { what, size, limit })
                 if what.contains("queues") && *size == (1 << 20) + 1 && *limit == 1 << 20),
@@ -901,12 +887,14 @@ pub(crate) mod tests {
         );
         assert_eq!(waits, 0);
         let image = budget.take(Use::Images, 1 << 20).unwrap();
-        let refused = budget.take_until(Use::Queues, 1, Instant::now(), || waits += 1);
+        let refused = budget.take_until(Use::Queues, 1, Instant::now(), &Ending::new(), || {
+            waits += 1
+        });
         assert_eq!(refused.err(), Some(Refusal::Full { limit: 0 }));
         assert_eq!(waits, 0);
         drop(image);
         let whole = budget
-            .take_until(Use::Queues, 1 << 20, far, || waits += 1)
+            .take_until(Use::Queues, 1 << 20, far, &Ending::new(), || waits += 1)
             .unwrap();
         assert_eq!((whole.bytes(), waits), (1 << 20, 0));
         drop(whole);

@@ -2254,6 +2254,35 @@ charge, waits with a deadline an hour off and is woken when store A's commit giv
 **Falsified if** a waiter sleeps to its deadline after a give made room for it: the tests above then hang to their
 hour-off deadlines.
 
+## Decision (lane perf-A28): a wait for the budget's room ends with its owner (2026-11-24)
+
+A holder that finds no room (`Budget::take_until`: a local writer's rows and its requests' admissions, a replicated
+member's writes, a `Q` request's frame and its decoded values) woke on bytes given back and its deadline alone. Its
+owner's end made no room and gave it no news: the writer's disk failed, the replica was cut off and fenced, and each
+waiting caller held its thread to its deadline, then `Full`, while those that had a place in the queue were told at once.
+
+**The decision.** The wait is given its owner's `Ending` and ends with it, with the owner's reason, holding no charge.
+- *Who the owner is.* A member's replica (`Room::line`'s, which the calls in line hear too) for its writes and its
+  clients' requests; a store's writer (`Sends`), whose writer's stop and whose disk's failed flush end it; none, an
+  `Ending` that never ends, for a client reading its own connection's answer.
+- *How it is told.* A waiter puts itself in its owner's list as it begins to wait and takes itself out as it stops.
+  `Ending::end` sets the reason, then wakes the waiters of each budget in the list, once a budget however many wait on it,
+  under the lock each waits with (`Waiters::look_again`). A waiter asks for the reason under that lock before each look
+  for room, so it sees the reason or hears the wake. No timer and no poll.
+- *What it costs where nothing ends.* The look that finds room takes no lock and asks no owner, as before. A wait that
+  finds none takes its owner's lock to enter its list, at each look to ask, and to leave.
+
+**Evidence.** T-QB.1.23, T-MB.1.6 and T-MB.1.7 are red on main (the waits stood to their deadlines, `Full` at 120 s: the
+record, lane perf-A28) and pass on the fix. The wait alone is `crates/amphora/src/memory/wait.rs`, compiled by
+`crates/line-loom` over loom's types and run on every interleaving of a holder's wait, a give-back, its owner's end and
+its deadline (T-MB.1.5), and the line's model has the end beside a call that waits for the budget (T-QB.1.19).
+
+**What is left.** Resident bytes that fall without a charge given back still wake no one. A client that hangs up while
+its request waits doesn't end the wait: its deadline does. A writer thread that unwinds tells no one (CLAUDE.md, rule 1,
+forbids it).
+
+**Falsified if** a waiter sleeps to its deadline after its owner ended, or an owner's end takes another owner's wait.
+
 ## Decision (lane perf-A9): a call is charged the answer bound its caller declares (2026-11-23)
 
 A request admitted to a database's writer is charged what it and its answer can hold (MB.1, `Admission::bytes_for`).

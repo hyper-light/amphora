@@ -29,7 +29,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use crate::memory::Charge;
+use crate::memory::{Charge, Ending};
 use crate::meter::{Counters, Meter};
 use crate::reshard::{Pos, Seq, Span};
 
@@ -382,6 +382,18 @@ pub enum Refused {
     Away(crate::reshard::holding::Away),
 }
 
+impl Refused {
+    /// The API's refusal of what a store that has stopped, or whose disk failed, takes no more.
+    pub(crate) fn ended(self) -> amphora_api::Refusal {
+        match self {
+            Self::Disk => {
+                amphora_api::Refusal::Fenced("writer disk failed; reopen after recovery".into())
+            }
+            _ => amphora_api::Refusal::Unavailable("database writer stopped".into()),
+        }
+    }
+}
+
 impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Self::TooLarge { size, limit } = self {
@@ -499,6 +511,9 @@ struct Sends {
     stopping: AtomicBool,
     /// A flush failed: the store takes nothing more, and acknowledges nothing more durable.
     disk_failed: AtomicBool,
+    /// Either of the two above, told to the senders waiting for the memory budget's room
+    /// ([`Store::charge_queue`], lane perf-A28).
+    ending: Ending,
     claims: Mutex<Claims>,
     notices: Mutex<Notices>,
     noticed: Condvar,
@@ -564,6 +579,7 @@ impl Default for Sends {
             durable_as_committed: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             disk_failed: AtomicBool::new(false),
+            ending: Ending::new(),
             claims: Mutex::default(),
             notices: Mutex::default(),
             noticed: Condvar::new(),
@@ -790,8 +806,11 @@ impl Sends {
 
     fn stop(&self) {
         self.stopping.store(true, Ordering::Relaxed);
-        let _committed = locked(&self.committed);
-        self.done.notify_all();
+        {
+            let _committed = locked(&self.committed);
+            self.done.notify_all();
+        }
+        self.ending.end(&Refused::Stopped.ended());
     }
 
     /// A flush failed: whoever waits for a commit or a flush is told.
@@ -805,9 +824,23 @@ impl Sends {
             let _durable = locked(&self.durable);
             self.flushed.notify_all();
         }
-        let mut notices = locked(&self.notices);
-        notices.disk_failed = true;
-        self.noticed.notify_all();
+        {
+            let mut notices = locked(&self.notices);
+            notices.disk_failed = true;
+            self.noticed.notify_all();
+        }
+        self.ending.end(&Refused::Disk.ended());
+    }
+
+    /// Why the store takes nothing more, once it doesn't.
+    fn ended(&self) -> Option<Refused> {
+        if self.disk_failed.load(Ordering::SeqCst) {
+            Some(Refused::Disk)
+        } else if self.stopping.load(Ordering::Relaxed) {
+            Some(Refused::Stopped)
+        } else {
+            None
+        }
     }
 }
 
@@ -1367,8 +1400,8 @@ impl<E: Engine> Store<E> {
 
     /// Charges `rows`' bytes ([`Engine::row_bytes`]) to the memory budget's room for queues
     /// (MB.1) until their commit ends ([`Store::charge_queue`]; none: not waiting at all).
-    /// Refused [`Refused::Full`] past `until`, and [`Refused::TooLarge`] at once past the whole
-    /// limit.
+    /// Refused [`Refused::Full`] past `until`, [`Refused::TooLarge`] at once past the whole limit,
+    /// and why the store ended once it has.
     fn charge(&self, rows: &[E::Row], until: Option<Instant>) -> Result<Option<Charge>, Refused> {
         let bytes = rows.iter().fold(0u64, |n, row| {
             n.saturating_add(u64::try_from(E::row_bytes(row)).unwrap_or(u64::MAX))
@@ -1383,22 +1416,30 @@ impl<E: Engine> Store<E> {
                     size: u64::try_from(size).unwrap_or(u64::MAX),
                     limit: u64::try_from(limit).unwrap_or(u64::MAX),
                 },
-                _ => Refused::Full,
+                amphora_api::Refusal::Full { .. } => Refused::Full,
+                _ => self.sends.ended().unwrap_or(Refused::Full),
             })
     }
 
     /// `bytes` charged to the memory budget's room for queues, this writer's queue among them, until
-    /// the charge drops: waiting until `until` for room given back anywhere in the budget
-    /// ([`crate::memory::Budget::take_until`]), each wait counted ([`Counters::room_waits`]). Its
-    /// rows' charge, or a request's admitted to a database on this store (lane perf-A19).
+    /// the charge drops: waiting until `until` for room given back anywhere in the budget, or for the
+    /// store's end ([`crate::memory::Budget::take_until`]; lane perf-A28), each wait counted
+    /// ([`Counters::room_waits`]). Its rows' charge, or a request's admitted to a database on this
+    /// store (lane perf-A19).
     pub(crate) fn charge_queue(
         &self,
         bytes: u64,
         until: Instant,
     ) -> Result<Charge, amphora_api::Refusal> {
-        crate::memory::process().take_until(crate::memory::Use::Queues, bytes, until, || {
-            self.meter.waited_for_room();
-        })
+        crate::memory::process().take_until(
+            crate::memory::Use::Queues,
+            bytes,
+            until,
+            &self.sends.ending,
+            || {
+                self.meter.waited_for_room();
+            },
+        )
     }
 
     /// Run `f` on a reader, on this thread, once the writes of `key` (of every key: None) handed
@@ -1529,6 +1570,12 @@ impl<E: Engine> Store<E> {
     /// `w` is told after every commit, until it says it doesn't want to be.
     pub fn on_commit(&self, w: Watcher) {
         locked(&self.watchers).push(w);
+    }
+
+    /// As if its disk's flush failed.
+    #[cfg(test)]
+    pub(crate) fn fail_disk(&self) {
+        self.sends.disk_failed();
     }
 }
 
@@ -1785,6 +1832,132 @@ mod tests {
         assert_eq!(*kept.lock().unwrap(), vec!["a".to_owned(), "c".to_owned()]);
         assert!(store.counters().room_waits >= 1);
         assert_eq!(budget.held(crate::memory::Use::Queues), 0);
+    }
+
+    /// An engine whose upkeep and whose flush fail when told to, rows of no length charged nothing.
+    struct Failing(Arc<AtomicBool>);
+
+    impl Engine for Failing {
+        type Row = String;
+        type Reader = ();
+
+        fn key(row: &String) -> &str {
+            row
+        }
+
+        fn row_bytes(row: &String) -> usize {
+            if row.is_empty() {
+                0
+            } else {
+                std::mem::size_of::<String>() + row.capacity()
+            }
+        }
+
+        fn apply(&mut self, rows: &[String]) -> anyhow::Result<usize> {
+            Ok(rows.len())
+        }
+
+        fn upkeep(&mut self, _: bool) -> anyhow::Result<Upkept> {
+            anyhow::ensure!(!self.0.load(Ordering::SeqCst), "upkeep failed");
+            Ok(Upkept::default())
+        }
+    }
+
+    /// AUDIT 2026-11-23 §1, MB.1 (T-MB.1.6, lane perf-A28): a sender waiting for the memory budget's
+    /// room hears its store's end and holds nothing, and one that comes after is refused the same. Do:
+    /// another use holding the whole budget, a batch and an admission wait for room on threads; the
+    /// writer stops, its upkeep failed, or the disk's flush fails. Expect: both refused `Stopped`, or
+    /// `Disk`, none waiting, nothing held; a batch after refused the same.
+    #[test]
+    fn a28_a_sender_waiting_for_room_hears_its_stores_end_holding_nothing() {
+        for disk in [true, false] {
+            let fed = Fed::new(Some(1 << 20), Some(0));
+            let (budget, _unset) = budget(&fed);
+            let told = Arc::new(AtomicBool::new(false));
+            let flushes = Arc::clone(&told);
+            let flush: Flush = Box::new(move || {
+                if disk && flushes.load(Ordering::SeqCst) {
+                    return Err(std::io::Error::other("flush failed"));
+                }
+                Ok(())
+            });
+            let engine = Failing(Arc::new(AtomicBool::new(false)));
+            let upkeep = Arc::clone(&engine.0);
+            let store = Store::start_with(engine, Config::default(), Some(flush)).unwrap();
+            let other = budget.take(crate::memory::Use::Images, 1 << 20).unwrap();
+            let began = Instant::now();
+            let until = began + crate::transport::HANG;
+            let waiting = |admission: bool| {
+                let (store, on_waiter) = (store.clone(), Arc::clone(&budget));
+                std::thread::spawn(move || {
+                    BUDGET.with(|slot| *slot.borrow_mut() = Some(on_waiter));
+                    if admission {
+                        store
+                            .charge_queue(64, until)
+                            .map(drop)
+                            .map_err(|e| format!("{e:?}"))
+                    } else {
+                        store
+                            .put_wait(vec!["a".to_owned()], until)
+                            .map(drop)
+                            .map_err(|e| format!("{e:?}"))
+                    }
+                })
+            };
+            let waits = [waiting(false), waiting(true)];
+            while budget.waiting() < 2 {
+                assert!(began.elapsed() < crate::transport::HANG, "a hang");
+                std::thread::yield_now();
+            }
+            if disk {
+                // A batch that charges nothing is committed, and its flush fails.
+                told.store(true, Ordering::SeqCst);
+                let _ = store.put(vec![String::new()]);
+            } else {
+                upkeep.store(true, Ordering::SeqCst);
+                let _ = store.run(until, |_| Ok(()));
+            }
+            let refused: Vec<_> = waits
+                .into_iter()
+                .map(|waiting| {
+                    while !waiting.is_finished() {
+                        assert!(began.elapsed() < crate::transport::HANG * 2, "a hang");
+                        std::thread::yield_now();
+                    }
+                    waiting.join().unwrap().err().unwrap()
+                })
+                .collect();
+            let expected = if disk {
+                [
+                    "Disk".to_owned(),
+                    "Fenced(\"writer disk failed; reopen after recovery\")".to_owned(),
+                ]
+            } else {
+                [
+                    "Stopped".to_owned(),
+                    "Unavailable(\"database writer stopped\")".to_owned(),
+                ]
+            };
+            assert_eq!(
+                refused,
+                expected,
+                "after {:?}, disk: {disk}",
+                began.elapsed()
+            );
+            assert_eq!((budget.waiting(), store.sends.ending.waits()), (0, 0));
+            assert_eq!(budget.held(crate::memory::Use::Queues), 0);
+            drop(other);
+            let after = store.put(vec!["b".to_owned()]).err();
+            assert_eq!(
+                after,
+                Some(if disk {
+                    Refused::Disk
+                } else {
+                    Refused::Stopped
+                })
+            );
+            assert_eq!(budget.held(crate::memory::Use::Queues), 0);
+        }
     }
 
     /// AUDIT 2026-11-23 §1, MB.1: a sender waiting for room is woken by a charge given back
