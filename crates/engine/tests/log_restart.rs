@@ -43,7 +43,8 @@ struct Held {
 }
 
 fn open(path: &Path) -> Arc<Database> {
-    let options = OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new());
+    let options =
+        OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new().with_vacuum(true));
     Database::open(
         Arc::new(PlatformIO::new().unwrap()),
         path.to_str().unwrap(),

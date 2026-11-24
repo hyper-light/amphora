@@ -6393,7 +6393,9 @@ impl Pager {
                 }
                 CheckpointPhase::RestartWal { clear_page_cache } => {
                     let mut state = self.checkpoint_state.write();
-                    wal.restart_wal(state.result.as_ref().expect("result should be set"))?;
+                    if let Some(result) = &state.result {
+                        wal.restart_wal(result)?;
+                    }
                     state.phase = CheckpointPhase::Finalize { clear_page_cache };
                 }
                 CheckpointPhase::TruncateWalFile { clear_page_cache } => {

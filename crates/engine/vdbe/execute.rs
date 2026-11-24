@@ -784,7 +784,7 @@ pub fn op_checkpoint(
     let passive = CheckpointMode::Passive {
         upper_bound_inclusive: None,
     };
-    let (busy, frames, copied) = loop {
+    let (busy, counted) = loop {
         let mode = if state.checkpoint_blocked {
             passive
         } else {
@@ -792,21 +792,13 @@ pub fn op_checkpoint(
         };
         match pager.checkpoint(mode, sync_mode, true) {
             Ok(IOResult::Done(result)) if !state.checkpoint_blocked => {
-                break (
-                    0,
-                    result.wal_max_frame as i64,
-                    result.wal_total_backfilled as i64,
-                );
+                break (0, Some((result.wal_max_frame, result.wal_total_backfilled)));
             }
             // "the checkpoint operation proceeds from that point in the same way as
             // SQLITE_CHECKPOINT_PASSIVE [...]. SQLITE_BUSY is returned in this case"
             // (sqlite.org/c3ref/wal_checkpoint_v2.html).
             Ok(IOResult::Done(_)) => {
-                let (frames, copied) = pager
-                    .wal
-                    .as_ref()
-                    .map_or((0, 0), |wal| wal.frames_and_copied());
-                break (1, frames as i64, copied as i64);
+                break (1, pager.wal.as_ref().map(|wal| wal.frames_and_copied()));
             }
             Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
             Err(err) => {
@@ -814,12 +806,15 @@ pub fn op_checkpoint(
                 pager.cleanup_after_checkpoint_failure();
                 if state.checkpoint_blocked || mode == passive || !matches!(*err, LimboError::Busy)
                 {
-                    break (1, -1, -1);
+                    break (1, None);
                 }
                 state.checkpoint_blocked = true;
             }
         }
     };
+    let count = |frames: u64| i64::try_from(frames).unwrap_or(i64::MAX);
+    let (frames, copied) =
+        counted.map_or((-1, -1), |(frames, copied)| (count(frames), count(copied)));
     // https://sqlite.org/pragma.html#pragma_wal_checkpoint
     // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).
     state.registers[*dest].set_int(busy);

@@ -4596,7 +4596,12 @@ impl SharedLog {
         let (header, epoch, transaction_count, copied) = {
             let closing = self.segment(from).read();
             let frames = closing.metadata.max_frame.load(Ordering::Acquire);
-            let header = *closing.metadata.wal_header.lock();
+            let mut header = *closing.metadata.wal_header.lock();
+            if frames == 0 {
+                // Never written: the segment that follows it takes its place in the sequence.
+                header.checkpoint_seq = header.checkpoint_seq.wrapping_sub(1);
+                header.salt_1 = header.salt_1.wrapping_sub(1);
+            }
             (
                 header,
                 closing.runtime.epoch.load(Ordering::Acquire),
