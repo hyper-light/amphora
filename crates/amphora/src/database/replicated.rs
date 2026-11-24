@@ -407,6 +407,10 @@ struct Control {
     /// declared size (`Admission::bytes_for`), held to `applications` apart from the wire records
     /// beside them (QB.1, lane perf-A11). Calls are not counted: the bytes bound them.
     called: AtomicUsize,
+    /// The bytes of `admitted` that their writes hold on the memory budget themselves
+    /// (`ReplicaHandle::enqueue`, lane perf-A21): the queues' charge each tick takes leaves them
+    /// out (`Actor::rebound`), so no byte is charged twice.
+    charged: AtomicUsize,
     // The command queue's bound in bytes and a wire record's most, as the owner last learned them
     // (`queue_bounds`; QB.1).
     queued: AtomicUsize,
@@ -855,6 +859,9 @@ struct Reservation {
     bytes: usize,
     /// An application call's bytes in `called`, given back with it.
     called: usize,
+    /// A write's bytes held on the memory budget (`ReplicaHandle::enqueue`, lane perf-A21) and
+    /// counted in `charged`: given back with the rest, whether the write applied or was refused.
+    charge: Option<crate::memory::Charge>,
 }
 impl Reservation {
     /// The owner took its input from the channel: its place there is free, its bytes still held.
@@ -871,6 +878,10 @@ impl Drop for Reservation {
             .admitted
             .fetch_sub(self.bytes, Ordering::AcqRel);
         self.control.called.fetch_sub(self.called, Ordering::AcqRel);
+        if let Some(charge) = self.charge.take() {
+            let bytes = usize::try_from(charge.bytes()).unwrap_or(usize::MAX);
+            self.control.charged.fetch_sub(bytes, Ordering::AcqRel);
+        }
     }
 }
 struct Envelope {
@@ -1663,9 +1674,21 @@ fn answer<T>(response: Response<T>, result: Result<T, Refusal>) {
 
 impl ReplicaHandle {
     /// Queues `command`, charged `bytes` for what it carries and its envelope beside them
-    /// (`ENVELOPE_BYTES`).
+    /// (`ENVELOPE_BYTES`). A write's bytes are charged to the memory budget's room for queues
+    /// first, as a local writer's admission charges them (`Admission`, lane perf-A21): with no
+    /// room it waits for bytes given back until its deadline, holding no place in the queue
+    /// meanwhile, and is refused `Full` past it; past the budget's whole limit, `TooLarge` at once.
     fn enqueue(&self, command: Input, bytes: usize) -> Result<(), Refusal> {
         let bytes = bytes.saturating_add(ENVELOPE_BYTES);
+        let charge = match &command {
+            Input::Submit { until, .. } => Some(crate::memory::process().take_until(
+                crate::memory::Use::Queues,
+                u64::try_from(bytes).unwrap_or(u64::MAX),
+                *until,
+                || {},
+            )?),
+            _ => None,
+        };
         // Untouched application calls can wait for leadership. They hold no more than the owner
         // takes in an election timeout and the queue's room less a wire record's (QB.1), so that
         // waiting calls leave the rest of the queue to the wire records that discover it.
@@ -1685,7 +1708,12 @@ impl ReplicaHandle {
             slot: false,
             bytes: 0,
             called: 0,
+            charge: None,
         };
+        if let Some(charge) = charge {
+            self.shared.charged.fetch_add(bytes, Ordering::AcqRel);
+            reservation.charge = Some(charge);
+        }
         // Every input takes a place in the channel, held to the inputs' bound (lane constants-20); a
         // call never the last, which stays a wire record's.
         let places = if call {
@@ -2637,6 +2665,7 @@ fn open_on<F: BlockFile + 'static>(
         commands: AtomicUsize::new(0),
         command_bound: AtomicUsize::new(first.commands),
         called: AtomicUsize::new(0),
+        charged: AtomicUsize::new(0),
         queued: AtomicUsize::new(first.queued),
         applications: AtomicUsize::new(first.applications),
         wire: AtomicUsize::new(first.wire),
@@ -3659,7 +3688,12 @@ impl<F: BlockFile + 'static> Actor<F> {
             self.replica.core().raft.config().election_tick,
             self.pace.period(),
         );
-        let queued = self.queued();
+        // The writes hold their own bytes on the budget (`ReplicaHandle::enqueue`); the rest of the
+        // queue's are charged here.
+        let charged = self.control.charged.load(Ordering::Acquire);
+        let queued = self
+            .queued()
+            .saturating_sub(u64::try_from(charged).unwrap_or(u64::MAX));
         self.intake.sample(now, self.inputs_wait());
         let mut outgoing = locked(&self.control.outgoing)?;
         let (bytes, messages) = std::mem::take(&mut outgoing.drained);
@@ -5311,6 +5345,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                 slot: false,
                 bytes: 0,
                 called: 0,
+                charge: None,
             },
         });
         Ok(())
@@ -5491,6 +5526,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                 slot: false,
                 bytes: 0,
                 called: 0,
+                charge: None,
             },
         });
         self.floor_inflight = true;
@@ -6349,6 +6385,216 @@ mod tests {
             .collect::<Result<Vec<_>, _>>();
         assert_eq!(small.map(|calls| calls.len()), Ok(worst + 1));
         assert_eq!(evaluated.load(Ordering::Relaxed), 0);
+    }
+
+    /// Runs `f` with `budget` as this thread's process budget, so only what `f` charges is on it:
+    /// a driven owner's own ticks, on this thread too, charge the process's.
+    fn on_budget<T>(budget: &Arc<crate::memory::Budget>, f: impl FnOnce() -> T) -> T {
+        crate::memory::tests::BUDGET.with(|slot| *slot.borrow_mut() = Some(Arc::clone(budget)));
+        let out = f();
+        crate::memory::tests::BUDGET.with(|slot| slot.borrow_mut().take());
+        out
+    }
+
+    /// A budget of `limit` bytes, nothing else held on it.
+    fn budget_of(limit: u64) -> Arc<crate::memory::Budget> {
+        crate::memory::Budget::new(Box::new(crate::memory::tests::Fed::new(Some(limit), None)))
+    }
+
+    /// The bytes a write declaring `declared` holds on the memory budget once queued
+    /// ([`waiting_call`]): its operation's and its envelope.
+    fn written(declared: usize) -> u64 {
+        let operation = Operation::Call(Mutex::new(None), declared);
+        u64::try_from(Admission::bytes_for(&operation) + ENVELOPE_BYTES).unwrap()
+    }
+
+    /// AUDIT 2026-11-23 §1, lane perf-A21: a replicated write is charged on the memory budget as a
+    /// local writer's is, and waits there for room. Do: on a leaderless member, with a 64 MiB
+    /// budget, queue a write declaring 48 MiB, then one declaring 32 MiB on another thread; once it
+    /// waits, drop the first write's input untaken. Expect: the second waits, then is admitted,
+    /// the budget holding its bytes alone.
+    #[test]
+    fn a21_a_replicated_write_past_the_free_budget_waits_for_bytes_given_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let client = driven.open(dir.path(), 1, vec![1, 2, 3], None);
+        let handle = client.handle();
+        let until = driven.until();
+        let evaluated = Arc::new(AtomicUsize::new(0));
+        let budget = budget_of(64 << 20);
+        let first = on_budget(&budget, || {
+            waiting_call(&handle, 48 << 20, until, &evaluated)
+        });
+        assert!(first.is_ok(), "{:?}", first.err());
+        let second = {
+            let (handle, budget) = (handle.clone(), Arc::clone(&budget));
+            let evaluated = Arc::clone(&evaluated);
+            std::thread::spawn(move || {
+                on_budget(&budget, || {
+                    waiting_call(&handle, 32 << 20, until, &evaluated)
+                })
+                .map(drop)
+            })
+        };
+        while budget.waiting() == 0 && !second.is_finished() {
+            std::thread::yield_now();
+        }
+        assert_eq!(budget.waiting(), 1, "the second write waits for room");
+        assert_eq!(budget.held(crate::memory::Use::Queues), written(48 << 20));
+        let (_, inputs) = driven.owners.first().unwrap().as_ref().unwrap();
+        drop(inputs.try_recv().unwrap());
+        assert_eq!(second.join().unwrap(), Ok(()));
+        assert_eq!(budget.held(crate::memory::Use::Queues), written(32 << 20));
+        assert_eq!(evaluated.load(Ordering::Relaxed), 0);
+    }
+
+    /// AUDIT 2026-11-23 §1, lane perf-A21: a replicated write still waiting for room at its
+    /// deadline is refused `Full` and holds nothing. Do: with a 64 MiB budget, queue a write
+    /// declaring 48 MiB, then one declaring 32 MiB whose deadline comes before any room does.
+    /// Expect: the second refused `Full`, the budget and the queue holding the first alone.
+    #[test]
+    fn a21_a_replicated_write_still_waiting_at_its_deadline_is_refused_full_holding_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let client = driven.open(dir.path(), 1, vec![1, 2, 3], None);
+        let handle = client.handle();
+        let evaluated = Arc::new(AtomicUsize::new(0));
+        let budget = budget_of(64 << 20);
+        let first = on_budget(&budget, || {
+            waiting_call(&handle, 48 << 20, driven.until(), &evaluated)
+        });
+        assert!(first.is_ok(), "{:?}", first.err());
+        let admitted = handle.shared.admitted.load(Ordering::Acquire);
+        let soon = Instant::now() + Duration::from_millis(100);
+        let refused = on_budget(&budget, || {
+            waiting_call(&handle, 32 << 20, soon, &evaluated)
+        })
+        .err();
+        assert!(matches!(refused, Some(Refusal::Full { .. })), "{refused:?}");
+        assert_eq!(budget.held(crate::memory::Use::Queues), written(48 << 20));
+        assert_eq!(budget.waiting(), 0);
+        assert_eq!(handle.shared.admitted.load(Ordering::Acquire), admitted);
+    }
+
+    /// AUDIT 2026-11-23 §1, lane perf-A21: a replicated write past the memory budget's whole limit
+    /// is refused `TooLarge` at once, as a local writer's is: no bytes given back make room for it.
+    /// Do: with a 64 MiB budget, nothing held, queue a write declaring 64 MiB, its deadline far off.
+    /// Expect: `TooLarge`, nothing charged, none waiting.
+    #[test]
+    fn a21_a_replicated_write_past_the_budgets_whole_limit_is_refused_too_large_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let client = driven.open(dir.path(), 1, vec![1, 2, 3], None);
+        let handle = client.handle();
+        let evaluated = Arc::new(AtomicUsize::new(0));
+        let budget = budget_of(64 << 20);
+        let refused = on_budget(&budget, || {
+            waiting_call(&handle, 64 << 20, driven.until(), &evaluated)
+        })
+        .err();
+        assert!(
+            matches!(refused, Some(Refusal::TooLarge { .. })),
+            "{refused:?}"
+        );
+        assert_eq!(budget.held(crate::memory::Use::Queues), 0);
+        assert_eq!(budget.waiting(), 0);
+    }
+
+    /// AUDIT 2026-11-23 §1, lane perf-A21: a replicated write's charge is given back when a term
+    /// change ends it. Do: in a group of three voters, every append lost (a proposal's append goes
+    /// out in the step that proposes it: replication.md, "Decision (lane P9)", part 3), queue a
+    /// write that writes a table at the leader until it is proposed, then move the other two
+    /// members' clocks until they elect one of them. Expect: the write charged while under way;
+    /// refused once the term moved, its charge given back.
+    #[test]
+    fn a21_a_replicated_writes_charge_is_given_back_on_a_term_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        driven.drain(&mut pump);
+        let term = clients[leader].handle().status().unwrap().term;
+        let budget = budget_of(64 << 20);
+        let handle = clients[leader].handle();
+        let last = |driven: &Driven| {
+            driven
+                .owner(leader)
+                .replica
+                .core()
+                .raft
+                .log()
+                .last_index()
+                .unwrap()
+        };
+        let before = last(&driven);
+        pump.appends_lost = true;
+        let asked = on_budget(&budget, || {
+            submit(&clients[leader], driven.until(), |db| {
+                db.exec("CREATE TABLE a21(x)")?;
+                Ok(Vec::new())
+            })
+        });
+        reach(&mut driven, &mut pump, "the write proposed", |driven| {
+            last(driven) > before
+        });
+        assert!(matches!(asked.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        // The driven `submit` charges `REQUEST_MAX` for its call, beside its envelope.
+        assert_eq!(
+            budget.held(crate::memory::Use::Queues),
+            u64::try_from(api::REQUEST_MAX + ENVELOPE_BYTES).unwrap()
+        );
+        let others: Vec<usize> = (0..3).filter(|owner| *owner != leader).collect();
+        let answered = (0..ROUNDS)
+            .find_map(|_| {
+                for owner in &others {
+                    driven.advance_tick(*owner);
+                }
+                driven.round(&mut pump);
+                asked.try_recv().ok()
+            })
+            .unwrap();
+        assert!(
+            answered.is_err(),
+            "the write answered Ok though its term moved"
+        );
+        let status = clients[others[0]].handle().status().unwrap();
+        assert!(status.term > term, "{status:?}");
+        assert_eq!(budget.held(crate::memory::Use::Queues), 0);
+        assert_eq!(handle.shared.charged.load(Ordering::Acquire), 0);
+        pump.abandon();
+    }
+
+    /// AUDIT 2026-11-23 §1, lane perf-A21: a replicated write's charge is given back when its
+    /// owner stops. Do: on a leaderless member, queue a write and let the owner take it, queue a
+    /// second it doesn't take, then stop the owner. Expect: both charged, then nothing.
+    #[test]
+    fn a21_a_replicated_writes_charge_is_given_back_when_its_owner_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let client = driven.open(dir.path(), 1, vec![1, 2, 3], None);
+        let handle = client.handle();
+        let until = driven.until();
+        let evaluated = Arc::new(AtomicUsize::new(0));
+        let budget = budget_of(64 << 20);
+        let taken = on_budget(&budget, || {
+            waiting_call(&handle, 1 << 20, until, &evaluated)
+        });
+        assert!(taken.is_ok(), "{:?}", taken.err());
+        driven.step();
+        let queued = on_budget(&budget, || {
+            waiting_call(&handle, 2 << 20, until, &evaluated)
+        });
+        assert!(queued.is_ok(), "{:?}", queued.err());
+        assert_eq!(
+            budget.held(crate::memory::Use::Queues),
+            written(1 << 20) + written(2 << 20)
+        );
+        drop(driven);
+        assert_eq!(budget.held(crate::memory::Use::Queues), 0);
+        assert_eq!(handle.shared.charged.load(Ordering::Acquire), 0);
     }
 
     /// U15/CP-T1.8 on driven time: a real DeviceFile log, a product-driven election, a once-only
