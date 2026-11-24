@@ -27,18 +27,22 @@ for step in "$@"; do
       tests=""; IFS=, read -ra names <<< "${step#build:}"; for n in "${names[@]}"; do tests="$tests --test $n"; done
       timeout 1200 nice -n 10 cargo test -p amphora-engine --locked $tests --no-run > "$O/build.log" 2>&1; rc=$?
       grep -E "^(error|warning)|Executable|Finished" -A 8 "$O/build.log" | head -${BUILD_LINES:-120}
-      echo "== build rc=$rc in $(( $(date +%s) - s ))s"; [ $rc -ne 0 ] && exit $rc ;;
+      echo "== build rc=$rc in $(( $(date +%s) - s ))s"; [ $rc -ne 0 ] && exit $rc
+      mkdir -p "$O/bin"; cp "$(bin c26_probe)" "$O/bin/probe-$(git rev-parse --short=8 HEAD)" ;;
+    at:*)  # at:SHA8:FILE  the probe of a tree built before
+      IFS=: read -r _ sha file <<< "$step"
+      C26_FIXTURE=$S/$file timeout ${WIDE_TIMEOUT:-420} nice -n 10 "$O/bin/probe-$sha" --nocapture > "$O/at-$sha.log" 2>/dev/null; rc=$?
+      echo "== at $sha $file rc=$rc $(( $(date +%s) - s ))s"; python3 "$S/classify.py" "$O/at-$sha.log" ${CLASS_MAX:-12} | cut -c1-${CUT:-420} ;;
     probe:*)  # probe:FILE
       f=$S/${step#probe:}
       C26_FIXTURE=$f timeout ${WIDE_TIMEOUT:-420} nice -n 10 "$(bin c26_probe)" --nocapture > "$O/probe.log" 2>&1; rc=$?
-      echo "== probe $f rc=$rc $(( $(date +%s) - s ))s"; grep -av "^thread\|^note\|^stack" "$O/probe.log" | cut -c1-${CUT:-900} | tail -${PROBE_LINES:-200} ;;
+      echo "== probe $f rc=$rc $(( $(date +%s) - s ))s"; python3 "$S/classify.py" "$O/probe.log" ${CLASS_MAX:-12} | cut -c1-${CUT:-420} ;;
     gen:*)  # gen:COUNT:SEED
       IFS=: read -r _ count seed <<< "$step"
       python3 "$S/sqlite_foreign_keys.py" "$count" "$seed" > "$O/wide-$seed.tsv" || exit 9
       C26_FIXTURE=$O/wide-$seed.tsv timeout ${WIDE_TIMEOUT:-420} nice -n 10 "$(bin c26_probe)" --nocapture > "$O/wide-$seed.log" 2>&1; rc=$?
       echo "== wide $count $seed rc=$rc $(( $(date +%s) - s ))s load $(load)"
-      tail -5 "$O/wide-$seed.log" | cut -c1-2000
-      head -c ${WIDE_BYTES:-12000} "$O/wide-$seed.log" | cut -c1-${CUT:-700} ;;
+      python3 "$S/classify.py" "$O/wide-$seed.log" ${CLASS_MAX:-12} | cut -c1-${CUT:-420} ;;
     test:*)  # test:NAME[:FILTER]
       IFS=: read -r _ name filter <<< "$step"
       timeout 900 nice -n 10 "$(bin $name)" ${filter:-} --test-threads=${JOBS:-8} > "$O/test-$name.log" 2>&1; rc=$?
