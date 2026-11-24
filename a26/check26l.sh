@@ -7,7 +7,7 @@
 set -uo pipefail
 OUT=${1:?}; shift; T=${JOBS:-8}
 R=$HOME/.cache/amphora-perf/cross-remote
-W=$HOME/.cache/amphora-perf/cross-a22-wt
+W=${W:-$HOME/.cache/amphora-perf/cross-a22-wt}
 git -C "$R" fetch -q origin main perf/cross-a26 || exit 3
 git -C "$R" fetch -q origin '+refs/heads/diag/cross-a26*:refs/remotes/origin/diag/cross-a26*' || true
 [ -d "$W" ] || git -C "$R" worktree add -q --detach "$W" origin/main || exit 3
@@ -21,7 +21,7 @@ one() {
   timeout 1500 nice -n 10 "$B/a26-tests-$sha" --test-threads="$T" "$@" > "$OUT/$label-$sha.log" 2>&1; rc=$?
   stamp "$label $sha rc=$rc $(( $(date +%s) - s ))s: $(grep 'test result' "$OUT/$label-$sha.log" | tail -1)"
   grep -E '^test .* FAILED$' "$OUT/$label-$sha.log" | head -14
-  [ "$rc" = 0 ] || grep -E 'panicked at' -A 3 "$OUT/$label-$sha.log" | head -${LINES_MAX:-40}
+  [ "$rc" = 0 ] || grep -E "panicked at" -A 3 "$OUT/$label-$sha.log" | cut -c1-600 | head -${LINES_MAX:-40}
 }
 for step in "$@"; do
   IFS=: read -r what a b c d <<<"$step"
