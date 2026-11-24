@@ -36,10 +36,11 @@ impl Wake for Woken {
     }
 }
 
-/// A session and what its statement waits for.
+/// A session, the wakes of its wait, and what its Query answered before a statement waited.
 struct Session {
     executor: Executor,
     woken: Arc<Woken>,
+    answered: Vec<u8>,
 }
 
 /// The messages in `out` (ReadyForQuery's are the session's to write, so none is here).
@@ -76,6 +77,7 @@ fn sessions(dir: &tempfile::TempDir) -> BTreeMap<String, Session> {
             let session = Session {
                 executor: database.session("ada", "UTC").unwrap(),
                 woken: Arc::new(Woken::default()),
+                answered: Vec::new(),
             };
             (name.to_owned(), session)
         })
@@ -114,7 +116,7 @@ fn t_pg_14_1_two_sessions_interleave_as_a_19_server_does() {
             Kind::Waits => {
                 let flow = session.executor.simple_query(sql, &mut out).unwrap();
                 assert_eq!(flow, Flow::Waiting, "{line}");
-                assert!(out.is_empty(), "{line}: {out:?}");
+                session.answered = out;
                 let waker = Waker::from(Arc::clone(&session.woken));
                 let mut context = Context::from_waker(&waker);
                 assert_eq!(
@@ -138,6 +140,7 @@ fn t_pg_14_1_two_sessions_interleave_as_a_19_server_does() {
                     Poll::Ready(()),
                     "{line}"
                 );
+                out = std::mem::take(&mut session.answered);
                 let flow = session.executor.resume(&mut out).unwrap();
                 assert_eq!(flow, Flow::Done, "{line}");
             }
