@@ -665,6 +665,14 @@ impl Local {
                 }
             }
             let left = until.saturating_duration_since(Instant::now());
+            #[cfg(test)]
+            crate::v19_once(
+                &format!("with id={}", self.id),
+                &format!(
+                    "waits held={held} out={:?} idle={} left_s={}",
+                    ledger.out, ledger.idle.len(), left.as_secs()
+                ),
+            );
             if left.is_zero() {
                 self.meter.local_refused(LocalRefusal::Timeout);
                 return Err(Refusal::Timeout);
@@ -687,7 +695,11 @@ impl Local {
             }
         };
         self.meter.local_read();
+        #[cfg(test)]
+        crate::v19(&format!("with id={} reads", self.id));
         let answer = f(&mut reader).map_err(|error| refused(&error));
+        #[cfg(test)]
+        crate::v19(&format!("with id={} gives back", self.id));
         self.give_back(Some((reader, charge)));
         answer
     }
@@ -739,13 +751,19 @@ impl Local {
     /// The owner is to start the database's log again: no read of this replica begins until it
     /// has.
     fn hold_reads(&self) -> Result<(), Refusal> {
-        locked(&self.account.ledger)?.restarting.insert(self.id);
+        let _new = locked(&self.account.ledger)?.restarting.insert(self.id);
+        #[cfg(test)]
+        if _new {
+            crate::v19(&format!("hold_reads id={}", self.id));
+        }
         Ok(())
     }
     /// Reads begin again with no restart run: none runs while a session holds the write lock
     /// (`Actor::hand_off`), so none is held for one meanwhile.
     fn unhold_reads(&self) -> Result<(), Refusal> {
         if locked(&self.account.ledger)?.restarting.remove(&self.id) {
+            #[cfg(test)]
+            crate::v19(&format!("unhold_reads id={}", self.id));
             self.account.free();
         }
         Ok(())
@@ -757,10 +775,20 @@ impl Local {
         restart: impl FnOnce() -> anyhow::Result<bool>,
     ) -> Result<Option<bool>, Refusal> {
         if locked(&self.account.ledger)?.out.contains_key(&self.id) {
+            #[cfg(test)]
+            crate::v19_once(
+                &format!("restart_unread id={}", self.id),
+                "a read is out: none",
+            );
             return Ok(None);
         }
         // No read of this replica begins while it is restarting, so none is out meanwhile.
         let restarted = restart().map_err(|error| refused(&error))?;
+        #[cfg(test)]
+        crate::v19_once(
+            &format!("restart_unread id={}", self.id),
+            &format!("restart_log -> {restarted}"),
+        );
         if restarted {
             locked(&self.account.ledger)?.restarting.remove(&self.id);
             self.account.free();
@@ -1408,6 +1436,8 @@ impl Flushing {
                     {
                         let began = Instant::now();
                         copied_at = Some(began);
+                        #[cfg(test)]
+                        crate::v19(&format!("flusher copies (copy={copy})"));
                         let said = match copier.checkpoint() {
                             // A busy pass copied nothing and says nothing of the log: not counted.
                             Ok(copied) if copied == Checkpointed::default() => Ok(None),
@@ -1425,6 +1455,10 @@ impl Flushing {
                                 c.left == 0
                                     || through.is_some_and(|d| c.log.saturating_sub(c.left) >= d)
                             });
+                            #[cfg(test)]
+                            crate::v19(&format!(
+                                "flusher pass copied={copied:?} through={through:?} caught_up={caught_up} room={room}"
+                            ));
                             Ok(Pass {
                                 caught_up,
                                 busy: copied.is_none(),
@@ -3543,6 +3577,20 @@ impl<F: BlockFile + 'static> Actor<F> {
                     .log_limit_bytes(pass.room.saturating_mul(log_bound::FRAME_BYTES));
                 let past = frames > pass.room;
                 let due = past || (frames > 0 && self.spacing.due()?);
+                #[cfg(test)]
+                crate::v19_once(
+                    &format!("owner id={}", self.control.local.id),
+                    &format!(
+                        "flush frames={frames} room={} past={past} due={due} out={} caught_up={} busy={} lent={lent} applied={} flushed_backlog={} segs={:?}",
+                        pass.room,
+                        *out,
+                        pass.caught_up,
+                        pass.busy,
+                        self.replica.machine().applied().index,
+                        self.replica.machine().flush_backlog(),
+                        self.replica.machine().v19_segments(),
+                    ),
+                );
                 if hold_due(pass, due, past) && !lent {
                     self.control.local.hold_reads()?;
                 }
@@ -3591,6 +3639,11 @@ impl<F: BlockFile + 'static> Actor<F> {
                     None => None,
                 };
                 if !*out && let Some(at) = next {
+                    #[cfg(test)]
+                    crate::v19(&format!(
+                        "owner id={} asks at={} copy={due}",
+                        self.control.local.id, at.index
+                    ));
                     ask.try_send(Ask { at, copy: due })
                         .map_err(|_| fenced("the replica's flushing thread took no flush"))?;
                     *out = true;
@@ -17716,6 +17769,7 @@ mod tests {
         write(&mut driven, &mut pump, voter, 1);
         settle_log(&mut driven, &mut pump, &clients);
         let restarts = handle.counters().database_log_restarts;
+        crate::v19(&format!("TEST1 settled: restarts={restarts} limit={} log={} {}", handle.counters().database_log_limit_bytes, handle.counters().database_log_bytes, driven.owner(1).replica.machine().v19_segments()));
         let (first, second, frames, room, held_off, waited) = learner
             .read_local(Instant::now() + HANG_READ, |db| {
                 db.query_transaction(|db| {
@@ -17887,6 +17941,7 @@ mod tests {
         write(&mut driven, &mut pump, voter, 1);
         settle_log(&mut driven, &mut pump, &clients);
         let restarts = handle.counters().database_log_restarts;
+        crate::v19(&format!("TEST2 settled: restarts={restarts} limit={} log={} {}", handle.counters().database_log_limit_bytes, handle.counters().database_log_bytes, driven.owner(1).replica.machine().v19_segments()));
         let passed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         std::thread::scope(|scope| {
             let read = {

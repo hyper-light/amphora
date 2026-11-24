@@ -1253,6 +1253,11 @@ impl Machine {
         self.db.restart_log()
     }
 
+    #[cfg(test)]
+    pub(crate) fn v19_segments(&self) -> String {
+        self.db.v19_segments()
+    }
+
     /// A flush of the database's log, to run on the owner's flushing thread: what was committed
     /// before it began is durable once it ends (`Db::flusher`).
     pub(crate) fn log_flusher(&self) -> crate::store::Flush {

@@ -35,6 +35,28 @@
 //!
 //! The `amphora` binary says what it is ([`reply`]) and runs [`serve`]'s commands.
 
+#[cfg(test)]
+pub(crate) fn v19(line: &str) {
+    use std::sync::OnceLock;
+    static T0: OnceLock<std::time::Instant> = OnceLock::new();
+    let t = T0.get_or_init(std::time::Instant::now).elapsed().as_micros();
+    let thread = std::thread::current();
+    eprintln!("V19 {t:>9}us [{}] {line}", thread.name().unwrap_or("?"));
+}
+#[cfg(test)]
+pub(crate) fn v19_once(key: &str, line: &str) {
+    use std::sync::{Mutex, OnceLock};
+    static LAST: OnceLock<Mutex<std::collections::HashMap<String, String>>> = OnceLock::new();
+    let last = LAST.get_or_init(Mutex::default);
+    let mut last = last.lock().unwrap();
+    if last.get(key).is_some_and(|seen| seen == line) {
+        return;
+    }
+    last.insert(key.to_string(), line.to_string());
+    drop(last);
+    v19(&format!("{key} {line}"));
+}
+
 pub mod audit;
 pub mod backup;
 pub mod database;

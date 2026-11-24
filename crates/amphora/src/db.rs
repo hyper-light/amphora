@@ -535,6 +535,16 @@ impl Db {
     /// A database backed up ([`Db::back_up`]) starts its log again only once the backup has shipped
     /// all of it, until the log is past what a restart keeps (decision 31): then it starts again
     /// and the backup is told its log broke there (docs/design/backup.md).
+    #[cfg(test)]
+    pub(crate) fn v19_segments(&self) -> String {
+        format!(
+            "{} backfill={:?} end={:?}",
+            self.db.v19_segments(),
+            self.db.wal_backfill(),
+            self.db.wal_end()
+        )
+    }
+
     pub fn restart_log(&mut self) -> anyhow::Result<bool> {
         self.ensure_unfenced()?;
         let over = self.log_frames()? > self.log_kept;
