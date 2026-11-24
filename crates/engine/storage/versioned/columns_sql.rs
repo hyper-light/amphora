@@ -1339,6 +1339,31 @@ mod tests {
         assert_eq!(copies(&off).counts(), CopyCounts::default());
     }
 
+    /// T-QT.6.36. Do: groups whose ORDER BY the planner merged into the GROUP BY, up, down, NULLS
+    /// FIRST and NULLS LAST, from a table's copy and from its rows. Expect: the same groups in the
+    /// same order, and the copy answered.
+    #[test]
+    fn t_qt_6_36_a_copys_groups_come_out_in_the_order_stated() {
+        let (_a, on) = connect();
+        let (_b, off) = connect();
+        for (c, declared) in [(&on, true), (&off, false)] {
+            create(c, SCHEMA, declared);
+            fill(c, 1, 3000);
+        }
+        for q in [
+            "SELECT g, count(*), sum(v) FROM t GROUP BY g ORDER BY g",
+            "SELECT g, count(*), sum(v) FROM t GROUP BY g ORDER BY g DESC",
+            "SELECT s, count(*), max(v) FROM t GROUP BY s ORDER BY s DESC",
+            "SELECT s, count(*), max(v) FROM t GROUP BY s ORDER BY s NULLS LAST",
+            "SELECT s, count(*), max(v) FROM t GROUP BY s ORDER BY s DESC NULLS FIRST",
+            "SELECT g, s, count(*) FROM t GROUP BY g, s ORDER BY s DESC, g",
+        ] {
+            assert_eq!(rows(&on, q), rows(&off, q), "{q}");
+        }
+        let seen = copies(&on).counts();
+        assert!(seen.copy > 0, "no statement read the copy: {seen:?}");
+    }
+
     /// Do: a table no analytic statement reads, and one read once. Expect: neither keeps a copy
     /// (the first statement pays the rent; only a second buys).
     #[test]
