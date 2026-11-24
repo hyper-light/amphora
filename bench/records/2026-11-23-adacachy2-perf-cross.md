@@ -1417,3 +1417,116 @@ runner I must not use was stopped before it started).
 | r1527, 09:21Z, cpus=2 | the landed tree's lib tests (2f5c6d83, `database::replicated:: replication::`), three rounds, load 48 to 53 | 200 passed, 0 failed, each (145, 135 and 139 s) |
 | r1528, 09:20Z, cpus=2 | loom on the landed tree d16ea9d1 | 15 passed (186 s, three threads) |
 | r1438, 09:09Z, MacBook Pro 2, cpus=8 | macOS (arm64), 2b8977af: loom | 15 passed (919 s, all at once); stopped at 09:28Z before the lib tests were built there: the stress is not run on arm64 |
+
+## A wait for the memory budget hears its owner's end, and the models are in the gates (perf-A28)
+
+**Lane times.** First command 09:28:40Z; the hour ends 10:28:40Z. Branch `perf/cross-a28`, from origin/main a6d99484; main 07d95147 and
+507ba0f6 merged into it as it went.
+
+**Losses.**
+- A client that hangs up while its request waits for the budget's room doesn't end the wait (`read_frame`, `request_charge`): it holds its
+  connection's thread to the request's deadline. Read from the code, not run; not changed (out of this lane's line).
+- Resident bytes that fall without a charge given back still wake no one (A18's own loss). A local writer's thread that unwinds tells no one it
+  ended (`sends.stop` isn't called): read from the code, not run.
+- A wire record that has no room beside a held call is refused `TooLarge` (134,218,024 of 134,217,728 bytes), though the room comes: the type
+  says a permanent thing (a raft record is sent again all the same). Found by this lane's record test, not changed.
+- An image that has no room beside the largest call a queue holds waits for that call's answer or deadline, and a second such call in line
+  goes before it (T-QB.1.24). A steady line of calls that large at a member that needs an image holds it off as long as the line lasts:
+  shown by the second call, not run with a steady stream, not fixed (the rule it would need, that an image in want holds back the next call
+  alone, is a choice about which of the two waits).
+- The models run one or two holders and one call; a deadline in them is a wake of the holder (`Waiters::look_again`), not the timed wait's own
+  return (loom's `wait_timeout` never times out). TSan was not run on this lane's change.
+- The gate grows by the loom models: 21 models, 143 s at three threads (load 26) beside A27's 15 at 186 s (load 50), and the release build of
+  loom's dependencies. CI's job is held to 30 minutes; its present length was not measured.
+- The suites' first three fix rounds ran on d08f5edb (before the leak counters, the line model's change and main's B26), the landed tree's three
+  after it landed (r1693), main's three before (r1658), not side by side.
+- `every_falsifier_of_the_floor_holds_under_a_nemesis` failed in 1 of main's 3 rounds, 2 of the first fix's 3 and 1 of the landed tree's 3; alone,
+  3 of 8 on each. It is A25's known failure and this lane doesn't touch what it drives, but the rounds alone don't show that.
+- The term-change test landed too strict (28700321): it asked the write be answered `Ok`, and on macOS (r1749, 8c11e7ac's build) it was
+  `UnknownOutcome`, its term moved once more under it by the test's own ticks. Found after the landing; fixed forward (7a3e2cb6): any answer passes,
+  the wait's own property (it doesn't end with the term) is asked as before.
+- macOS: r1625 built in 465 s and its tests, the touched set at eight threads, didn't end in what was left of its 1,200 s at load 46 (no
+  output to say which); r1749 ran the `a28_` tests alone on that build: 4 of 5 passed in 12 s, the fifth the above. r1759 ran them five times on 7a3e2cb6: 8 passed each. The suites and the models were not run on macOS.
+- The landing commit's message names r1604 for the red run; it is r1614 (r1604 ended on a compile error of one of its own tests).
+
+**1. Shown on main** (the tests of this lane on main a6d99484's code, r1614 on 0d8cf6ea, the landing's message naming r1604, the run before it, which
+ended on a compile error; the `Q` request's three waits each in a test of its own and the term change on driven time, r1699 on ac6f9107; deadlines two minutes off, no test asserts a time):
+
+| the wait, and how its owner ended | main | fix |
+|---|---|---|
+| a replicated write (`ReplicaHandle::enqueue`, `Room::submit_by`), the owner dropped or its loop over | `Full { limit: 0 }` after 120.000 s (dropped; the loop's end not reached) | `Fenced`, at the end |
+| a local store's batch and its admission (`put_wait`, `charge_queue`), the disk's flush failed or the writer stopped | `Full` and `Full { limit: 0 }` after 120.000 s (the flush; the stop not reached) | `Disk` and `Fenced("writer disk failed; …")`, `Stopped` and `Unavailable(…)` |
+| a local database's call (`Admission::reserve`), its disk failed | `Full { limit: 0 }` after 120.000 s | `Fenced("writer disk failed; …")` |
+| a `Q` request's frame (`read_frame`), the log's disk cut, a fire drill | `Full` ("the store holds its most rows (0)") after 120.001 s | answered `Refused(Fenced)` |
+| the same request's decoded values (`request_charge`) | `Full { limit: 8192 }` after 120.004 s (the frame held, its 8 KiB room all there was) | answered `Refused(Fenced)` |
+| a call on the member's replica, its own owner thread | `Full { limit: 0 }` after 120.076 s | `Fenced` |
+| a write across a term change (no owner's end) | waits on, answered `Ok(())` once the room came: green on main as well | waits on, answered `Ok(())` once the room came |
+
+Each wait that hangs stands for its own caller's whole deadline, `Full` after it, though its owner can take nothing; where its deadline is a
+day, for a day.
+
+**2. Fixed.** `Budget::take_until` takes its owner's `Ending` (`crates/amphora/src/memory/wait.rs`): a waiter lists its budget's `Waiters` with it,
+the end sets the reason and wakes each listed budget's waiters under the lock they wait with, and a waiter asks for the reason under that lock
+before each look for room. The line's `ended` is that `Ending` now, so a call in line and one that waits for the budget hear one end. A local
+store's `Sends` ends with its writer's stop and its disk's failure, a replica's with `Actor::run` and `Drop`, a `Q` connection's with its member's
+replica. The waits leave nothing behind: `Budget::waiting` and `Ending::waits` are zero after each test (`holds_nothing`, the store's and the
+serve tests), as `Budget::held`.
+
+loom (`crates/line-loom`; `wait.rs` compiled as it is, its SeqCst fences stated as the line's are):
+
+| model | interleavings |
+|---|---|
+| bytes given back reach a holder that waits | 237 (all) |
+| an owner's end reaches a holder that waits | 24 (all) |
+| a give-back beside the end: charged, or the reason holding nothing | 267,991 (all) |
+| a deadline beside the end, and a wait after it | 27,015 (all) |
+| one owner's end ends no other owner's wait, a give-back wakes the other | 516,442 (all) |
+| the line: an owner's end reaches a call that waits for the budget, the budget kept | 24 (all; 929 at three preemptions before the rewrite, whose give-back could end the wait alone) |
+| the line: an owner's end, two in line, then one more (A27's) | 8,836 (3 preemptions; 5,660 with the line's own flag) |
+
+Broken copies, each red (r1649 on 703bcf5e and r1666 on d03bfefe): the reason not asked (main's rule; deadlock in both models), the end telling no one
+(deadlock in both), told before the reason is set (deadlock), no fence in the wait (deadlock), the giver's read of the waiters at `Relaxed` (deadlock), the
+watch never taken off (`left: (1, 1)`), one told instead of all (deadlock), the line's end not telling its `Ending` (deadlock in both).
+
+**3. The image behind an oversized call** (`a28_a_record_with_no_room_beside_a_held_call_enters_once_the_call_ended`, T-QB.1.24): the record that has
+no room beside the call is refused at once (`TooLarge`, 134,218,024 of 134,217,728 bytes) while the first call is held and while the second, in line
+behind it, holds its place, and enters once both have timed out. What ends its wait is the held call's answer or deadline, so it is bounded by
+the calls' own; see Losses.
+
+**4. The gate.** `scripts/gates.sh` runs `RUSTFLAGS="--cfg loom" cargo test -p amphora-line-loom --release --locked -- --test-threads=3` after the
+workspace's tests: 21 passed in 194 s with the build, 183 s the models (r1684, three threads, load 53; 143 s at load 26, r1628). The crate is empty in the workspace's builds (`cargo tree -p amphora-line-loom` names no loom without the flag: the crate alone, r1684).
+No run of this repository is listed on this kiln, so the gates job's length beside its 30 minutes was not measured.
+
+**5. Gates** (landed tree 280cf4b3's code, d03bfefe; main b0e68ba7 is the same tree): clippy -p amphora -p amphora-line-loom --all-targets rc 0 (98 s, engine
+compiled, both checked), the harness under `--cfg loom` rc 0, fmt rc 0, requirements OK, check-production rc 0 (86 s, ratchet 10616: r1668); the touched
+tests (`a28_ a27_ a26_ a21_ a19_ memory:: store::tests serve::tests`) 53 passed (r1679, 280cf4b3, engine compiled; 51 on d08f5edb, r1657).
+
+The suites (`database::replicated:: replication::`, two test threads an arm, FAILED only; main 07d95147 and the fix d08f5edb, whose engine is main
+07d95147's; the landed tree 280cf4b3's):
+
+| round | main 07d95147 | fix d08f5edb | landed 280cf4b3 |
+|---|---|---|---|
+| 1 | none (201 passed, 142 s, load 62) | `every_falsifier_…` (203 passed, 123 s) | `every_falsifier_…` (203 passed, 137 s, load 64) |
+| 2 | none (201 passed, 135 s, load 75) | none (204 passed, 155 s, load 101) | none (204 passed, 119 s, load 51) |
+| 3 | `every_falsifier_…` (200 passed, 156 s, load 71) | `every_falsifier_…` (203 passed, 114 s, load 49) | none (204 passed, 164 s, load 58) |
+
+`every_falsifier_…` alone, eight runs an arm, side by side (two of each at once, load 53 to 69): main 07d95147 3 of 8 failed, the landed tree 280cf4b3 3 of 8 (r1694; the messages "the group calm not reached in 60000 driven rounds" and "a driven operation was unanswered after 60000 rounds"): A25's known failure, on main as on this lane.
+
+Runs (scripts in bench/records/2026-11-23-adacachy2-perf-cross-a28/; Linux at needs of 1 to 6 cores on adacachy2, runs refused at times, load 25 to 110 beside
+them; outputs in `~/.cache/amphora-perf/cross-a28-out/` there):
+
+| run | what | result |
+|---|---|---|
+| r1570, 09:30Z | main a6d99484's lib tests built | 62 s |
+| r1604, 09:43Z; r1614, 09:47Z to 09:50Z | the tests on main's code (diag/cross-a28-red bbe32f8b, then 0d8cf6ea) | a compile error of a test of its own; 5 failed as above (the fifth, the term change, on its own mistaken deadline) |
+| r1612, r1627, r1643 | the touched tests as the lane went | found two of its own tests' mistakes (a deadline on real time, a borrow) |
+| r1613, r1628, 09:47Z and 09:50Z | loom as it was first, then all 21 models at three threads | 7 passed, 5.6 s; 21 passed, 143 s, load 26 |
+| r1625, MacBook Pro 2, cpus=8; r1749, cpus=4 | macOS, 8c11e7ac's lib tests | see Losses |
+| r1754, r1755 | 7a3e2cb6 (the term-change test), `a28_` five times on macOS and on Linux | Linux: 8 passed, five times, 1.2 to 1.7 s each (r1755); clippy -p amphora -p amphora-line-loom rc 0 on 9e5ab9c0 (engine compiled, amphora checked: r1762), fmt and requirements OK; macOS (MacBook Pro 2, cpus=4): built 95 s, 8 passed five times, 3.4 to 6.1 s each (r1759) |
+| r1646, r1668 | clippy, the loom harness, fmt, requirements, check-production | 703bcf5e red on dead code of its own; d03bfefe all rc 0 |
+| r1649, r1666 | the mutants | above |
+| r1657, r1658 | the suites | table |
+| r1665, r1682, r1699 | the `Q` waits and the term change on main's code (7c451b49, ac6f9107) | twice a compile error of mixed trees in one target folder (a build of another tree newer than this one's files: every file's time moved to now, `TOUCH`, and no other build beside); table 1 |
+| r1679 | the landed tree's touched tests | 53 passed |
+| r1693 | the landed tree's suites | table |
+| r1694 | `every_falsifier_…` alone, side by side | above |
