@@ -9,7 +9,7 @@ repository.workspace = true
 publish.workspace = true
 
 # Built only under RUSTFLAGS="--cfg loom" (src/lib.rs says how it is run); empty otherwise.
-[target.'cfg(loom)'.dependencies]
+[target.'cfg(loom)'.dev-dependencies]
 amphora-api = { path = "../api" }
 loom = { workspace = true }
 
