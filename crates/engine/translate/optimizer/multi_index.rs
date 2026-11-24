@@ -798,23 +798,31 @@ fn evaluate_multi_index_branches(
 /// Whether a multi-index scan on `table` may be driven by `term`.
 ///
 /// The scan *is* the term's evaluation: rows failing it are never visited, and
-/// the term is marked consumed so nothing checks it again. For a table that an
-/// outer join can null-extend (the right table of a LEFT/FULL JOIN, or any table
-/// on the left side of a RIGHT/FULL JOIN) that only holds for the join's
-/// own ON clause, which defines what counts as a match. Any other term must
-/// also reject the null-extended row the join emits when nothing matched, and
-/// that row is produced by jumping straight past the scan — so consuming such
-/// a term silently drops it.
+/// the term is marked consumed so nothing checks it again.
+///
+/// The join's own ON clause defines what counts as a match, so it may always
+/// drive the scan of the join's right table. Any other outer join's ON term may
+/// not: the row of `table` it refuses is a left row of that join, which keeps
+/// it and null-extends its own right table (`constraints_from_where_clause`
+/// sets such terms aside as `on_elsewhere`).
+///
+/// For a table that an outer join can null-extend (the right table of a
+/// LEFT/FULL JOIN, or any table on the left side of a RIGHT/FULL JOIN), any
+/// other term must also reject the null-extended row the join emits when
+/// nothing matched, and that row is produced by jumping straight past the scan,
+/// so consuming such a term silently drops it.
 fn multi_index_can_consume_term(
     table: &JoinedTable,
     term: &WhereTerm,
     table_references: &TableReferences,
 ) -> bool {
-    !table_references.outer_join_may_null_extend(table.internal_id)
-        || term
-            .origin
-            .join_origin()
-            .is_some_and(|origin| origin.right_table() == table.internal_id)
+    match term.origin.join_origin() {
+        Some(origin) if origin.right_table() == table.internal_id => true,
+        Some(JoinOrigin::Outer(_)) => false,
+        Some(JoinOrigin::Inner(_)) | None => {
+            !table_references.outer_join_may_null_extend(table.internal_id)
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
