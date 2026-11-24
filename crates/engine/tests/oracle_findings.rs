@@ -4,8 +4,8 @@
 //! (G2 step 3; AC-T1.1.1: reads as committed; AC-T1.8.6: the differential suite).
 
 use amphora_engine::{
-    ConnectOpts, Connection, Database, DatabaseOpts, MemoryIO, Numeric, OpenOptions, SqliteDialect,
-    StepResult, Value, IO,
+    ConnectOpts, Connection, Database, DatabaseOpts, JoinMethods, MemoryIO, Numeric, OpenOptions,
+    SqliteDialect, StepResult, Value, IO,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -2790,6 +2790,178 @@ fn a_not_exists_keeps_the_rows_no_branch_of_its_or_names() {
             let mut got = rows(&io, &conn, sql);
             got.sort();
             assert_eq!(got, *expected, "{setting}: {sql}");
+        }
+    }
+}
+
+/// Do: a RIGHT or FULL JOIN whose WHERE holds a subquery that holds another, which the planner joins
+/// into the one around it: the statements that found it, and each kind in plain SQL. Expect: SQLite's
+/// rows, and every table holding what it held. Amphora panicked ("indexbtree_seek_unpacked:
+/// index_info required"), or emptied the table it read first: the read of the unmatched right rows
+/// ran a copy of the subquery taken before it was planned, whose inner IN list had the cursor the
+/// planner had freed and the outer table had taken (finding CH: diff-57b34fd6d54e9f91,
+/// norec-d683f574f319ea5f, norec-81a40e3e4ac6bf23, norec-79280259aa4b7b64). And: a subquery whose
+/// tables hash join, under a left table with no row. Expect: SQLite's rows. Amphora gave none: the
+/// copy probed the hash table only the loops' subquery built.
+#[test]
+fn a_right_or_full_join_over_nested_subqueries_returns_sqlites_rows() {
+    let nested = "SELECT count(*) FROM r WHERE r.x IN (SELECT l.y FROM l WHERE b.x <= l.x)";
+    /// What fills a database, and its queries with SQLite's rows.
+    type Case<'a> = (&'a [&'a str], Vec<(String, &'a [&'a str])>);
+    let databases: Vec<Case> = vec![
+        (
+            &[
+                "CREATE TABLE t0(c0 INT NOT NULL)",
+                "INSERT INTO t0 VALUES (-100)",
+                "CREATE TABLE t1(c0 INT)",
+                "INSERT OR IGNORE INTO t1 VALUES (7)",
+                "CREATE TABLE t2(c0 NUMERIC, c1 REAL UNIQUE, c2 DECIMAL(10,2) COLLATE BINARY)",
+            ],
+            vec![(
+                "SELECT NULL FROM t1 AS a0 FULL JOIN t1 AS a1 ON NULL WHERE (SELECT count(s21.c0) FROM t0 AS s21 WHERE ((s21.c0 - s21.c0) IN (SELECT s361.c2 FROM t2 AS s361 WHERE (a1.c0 <= s361.c0))))".into(),
+                &[],
+            )],
+        ),
+        (
+            &[
+                "CREATE TABLE t0(c0 BLOB, c1 TEXT)",
+                "CREATE TABLE t1(c0 INTEGER)",
+                "INSERT INTO t1 VALUES ('10')",
+                "CREATE TABLE t2(c0 REAL, c1 DECIMAL(10,2) COLLATE NOCASE, c2 TEXT UNIQUE)",
+                "INSERT OR IGNORE INTO t2 VALUES (2.0, 9007199254740993, x'41')",
+            ],
+            {
+                let from = "SELECT -100 FROM t2 AS a0, t0 AS a1 FULL JOIN t2 AS a2 ON (a0.c0 NOT IN (SELECT s995.c1 FROM t0 AS s995 WHERE (NULL NOT IN (s995.c0, s995.c1))))";
+                let term = "((sign(a1.c0) | (a1.c1 = 9007199254740993)) IN (SELECT s117.c0 FROM t1 AS s117 WHERE ((s117.c0 IN ('true', s117.c0, -100)) IN (SELECT s527.c1 FROM t0 AS s527 WHERE (s527.c1 == a1.c1)))))";
+                vec![
+                    (from.into(), &["-100"]),
+                    (format!("{from} WHERE {term}"), &[]),
+                    (format!("{from} WHERE (NOT {term})"), &["-100"]),
+                    (format!("{from} WHERE ({term} ISNULL)"), &[]),
+                ]
+            },
+        ),
+        (
+            &[
+                "CREATE TABLE t0(c0 REAL, c1 DOUBLE PRIMARY KEY, c2 VARCHAR(10))",
+                "INSERT INTO t0 VALUES ('10', '10', 10)",
+                "CREATE TABLE t2(c0 BOOLEAN COLLATE RTRIM)",
+            ],
+            {
+                let from = "SELECT NULL FROM t0 AS a0 RIGHT JOIN t2 AS a1 ON NULL FULL JOIN t0 AS a2 ON NULL";
+                let term = "(NULL NOT IN (SELECT s411.c0 FROM t0 AS s411 WHERE ((s411.c0 COLLATE BINARY) IN (SELECT s624.c0 FROM t2 AS s624 WHERE (1000000000000000.0 AND (a2.c1 IS NOT s624.c0))))))";
+                vec![
+                    (from.into(), &["NULL"]),
+                    (format!("{from} WHERE {term}"), &["NULL"]),
+                    (format!("{from} WHERE (NOT {term})"), &[]),
+                    (format!("{from} WHERE ({term} ISNULL)"), &[]),
+                ]
+            },
+        ),
+        (
+            &[
+                "CREATE TABLE t0(c0 REAL, c1 TEXT, c2 VARCHAR(10))",
+                "CREATE TABLE t1(c0 INT, c1 NUMERIC, c2 NUMERIC COLLATE NOCASE, c3 NUMERIC NOT NULL)",
+                "INSERT OR IGNORE INTO t1 VALUES ('A', -2.5, 'x', ' ')",
+                "CREATE TABLE t2(c0 REAL COLLATE NOCASE NOT NULL, c1 DOUBLE COLLATE NOCASE PRIMARY KEY)",
+                "INSERT OR IGNORE INTO t2 VALUES ('é', 10)",
+            ],
+            {
+                let from = "SELECT -100 FROM t2 AS a0, t0 AS a1 FULL JOIN t2 AS a2 ON (a0.c1 NOT IN (SELECT s995.c0 FROM t0 AS s995 WHERE (NULL NOT IN (s995.c2, s995.c0))))";
+                let term = "((sign(a1.c2) | (a1.c1 = 9007199254740993)) IN (SELECT s117.c2 FROM t1 AS s117 WHERE ((s117.c2 IN ('true', s117.c1, -100)) IN (SELECT s527.c2 FROM t0 AS s527 WHERE (s527.c0 == a1.c0)))))";
+                vec![
+                    (from.into(), &["-100"]),
+                    (format!("{from} WHERE {term}"), &[]),
+                    (format!("{from} WHERE (NOT {term})"), &["-100"]),
+                    (format!("{from} WHERE ({term} ISNULL)"), &[]),
+                ]
+            },
+        ),
+        (
+            &[
+                "CREATE TABLE o(x INT)",
+                "INSERT INTO o VALUES (1), (2)",
+                "CREATE TABLE r(x INT)",
+                "INSERT INTO r VALUES (1), (5)",
+                "CREATE TABLE l(x INT, y INT)",
+                "INSERT INTO l VALUES (2, 5), (3, 7)",
+                "CREATE TABLE e(x INT)",
+                "CREATE TABLE d(id INTEGER PRIMARY KEY, k INT)",
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 400) INSERT INTO d SELECT x, x % 80 FROM n",
+                "CREATE INDEX d_k ON d(k)",
+            ],
+            vec![
+                (
+                    format!("SELECT a.x, b.x FROM o AS a FULL JOIN o AS b ON NULL WHERE ({nested})"),
+                    &["NULL|1", "NULL|2"],
+                ),
+                (
+                    format!("SELECT a.x, b.x FROM o AS a JOIN o AS c RIGHT JOIN o AS b ON NULL WHERE ({nested})"),
+                    &["NULL|1", "NULL|2"],
+                ),
+                (
+                    "SELECT a.x, b.x FROM o AS a FULL JOIN o AS b ON a.x = b.x + 1 WHERE EXISTS (SELECT 1 FROM r WHERE r.x IN (SELECT l.y FROM l WHERE b.x <= l.x))".into(),
+                    &["2|1", "NULL|2"],
+                ),
+                (
+                    "SELECT a.x, b.x, c.x FROM o AS a FULL JOIN o AS b ON NULL FULL JOIN o AS c ON b.x = c.x WHERE (SELECT count(*) FROM r WHERE r.x IN (SELECT l.y FROM l WHERE c.x <= l.x))".into(),
+                    &["NULL|1|1", "NULL|2|2"],
+                ),
+                (
+                    "SELECT b.x FROM e AS a FULL JOIN o AS b ON a.x = b.x WHERE b.x IN (SELECT r.x FROM r JOIN l ON r.x = l.y - 4)".into(),
+                    &["1"],
+                ),
+                (
+                    "SELECT a.x, b.x FROM e AS a FULL JOIN o AS b ON a.x = b.x WHERE b.x IN (SELECT l.x FROM r JOIN l ON r.x = l.y) AND EXISTS (SELECT 1 FROM r JOIN l ON r.x = l.y)".into(),
+                    &["NULL|2"],
+                ),
+                // The unmatched rows are found by the list the WHERE clause tests each of them against.
+                (
+                    "SELECT a.x, d.id FROM o AS a FULL JOIN d ON d.id = a.x + 5 WHERE d.k IN (SELECT l.y FROM l)".into(),
+                    &["2|7", "NULL|165", "NULL|167", "NULL|245", "NULL|247", "NULL|325", "NULL|327", "NULL|5", "NULL|85", "NULL|87"],
+                ),
+                (
+                    "SELECT a.x, d.id FROM o AS a FULL JOIN d ON d.id = a.x + 5 WHERE d.id = (SELECT max(l.y) FROM l) OR d.k IN (SELECT r.x + 1 FROM r)".into(),
+                    &["1|6", "2|7", "NULL|162", "NULL|166", "NULL|2", "NULL|242", "NULL|246", "NULL|322", "NULL|326", "NULL|82", "NULL|86"],
+                ),
+            ],
+        ),
+    ];
+    for (fill, statements) in &databases {
+        let tables: Vec<String> = fill
+            .iter()
+            .filter_map(|statement| statement.strip_prefix("CREATE TABLE "))
+            .filter_map(|rest| rest.split('(').next())
+            .map(|table| format!("SELECT * FROM {table}"))
+            .collect();
+        for (setting, parallel, statistics, joins) in [
+            ("default", false, false, JoinMethods::ByCost),
+            ("parallel", true, false, JoinMethods::ByCost),
+            ("statistics", false, true, JoinMethods::ByCost),
+            ("parallel, statistics", true, true, JoinMethods::ByCost),
+            ("hash joins", false, false, JoinMethods::HashJoinsOnly),
+            ("nested loops", false, false, JoinMethods::NestedLoopsOnly),
+        ] {
+            let (io, conn) = open();
+            for statement in *fill {
+                conn.execute(*statement).unwrap();
+            }
+            if parallel {
+                conn.set_parallel_mode(amphora_engine::morsel::ParallelMode::On);
+            }
+            if statistics {
+                conn.execute("ANALYZE").unwrap();
+            }
+            conn.set_join_methods(joins);
+            let held: Vec<Vec<String>> = tables.iter().map(|sql| rows(&io, &conn, sql)).collect();
+            for (sql, expected) in statements {
+                let mut got = rows(&io, &conn, sql);
+                got.sort();
+                assert_eq!(got, *expected, "{setting}: {sql}");
+                let holds: Vec<Vec<String>> =
+                    tables.iter().map(|sql| rows(&io, &conn, sql)).collect();
+                assert_eq!(holds, held, "{setting}: the tables after {sql}");
+            }
         }
     }
 }
