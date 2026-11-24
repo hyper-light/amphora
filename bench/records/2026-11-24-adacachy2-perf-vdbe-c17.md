@@ -82,20 +82,23 @@ SELECT 1 FROM t AS x JOIN u AS y ON (CASE WHEN x.a <= NULL THEN NULL END) JOIN t
 | sweep (generator) | questions | asked | main's translate (0c0a3b6c) | fixed |
 |---|---:|---:|---|---|
 | windows (`bench/sqlite_windows.py`): every window function and aggregate, 1 to 3 windows, ROWS RANGE GROUPS, EXCLUDE, FILTER, PARTITION BY, named, over joins, groups, DISTINCT, ORDER BY, derived, CTE | 820 | 3,280 | 88 differ, 17 panics | 0 |
-| triggers (`bench/sqlite_triggers.py`): every event and time, WHEN, UPDATE OF, RAISE, bodies writing a log, another table and the table itself; INSERT, REPLACE, UPDATE, DELETE, UPSERT, RETURNING under every clause; what the tables hold after each, PRAGMA integrity_check | 4,384 | 17,536 | 2,628 differ, 184 panics | 0 |
+| triggers (`bench/sqlite_triggers.py`): every event and time, WHEN, UPDATE OF, RAISE, bodies writing a log, another table and the table itself; INSERT, REPLACE, UPDATE, DELETE, UPSERT, RETURNING under every clause; what the tables hold after each, PRAGMA integrity_check | 4,399 | 17,596 | 2,628 of 17,536 differ, 184 panics (before the fourth panic's case was in) | 0 |
 | cursors (`bench/sqlite_unread_cursors.py`): subqueries of grouped and aggregate LEFT, RIGHT and FULL JOINs, row-value ranges across joins | 918 | 3,672 | 148 differ, 5 panics | 0 |
 
 (The panics are counted by distinct question. The fixtures' first questions are each finding's own form.) Wider draws, run once on the fixed tree: windows 2,500 a database (5,020 questions) and cursors 2,000 (6,018), seed wide1:
 none differ. Triggers, seed wide2, 900 databases: none differ.
 
-Each part taken out (mutants, on the merged tree 88eedf4e): CO 84 answers differ (17 panics), the late argument's aggregates 4, DC's output phase 132 (3 panics), DC's prefilter 16 (2 panics).
+Each part taken out (mutants; r1862 on the merged tree 88eedf4e, r1915 on main 837071af): CO 84 answers differ (17 panics), the late argument's aggregates 4, DC's output phase 132 (3 panics), DC's prefilter 16 (2 panics), the row
+not read again after BEFORE triggers 20, OR ABORT 16, the INSERT's seek 12 (1 panic). Not taken out: the key sought again after BEFORE DELETE, `new.rowid`'s refusal and the DO UPDATE's firing, whose cases
+are in the sweep. Sixteen window queries of shapes the sweep lacks (a window in ORDER BY past a unique key, in EXISTS, in IN, unread columns), 64 asked on main 837071af: none differ (r1915).
 
 ## 5. Checks
 
 Linux, adacachy2, the tree landed (20cf0b73, main 0c0a3b6c merged; r1887): `cargo fmt --all --check` 0; `cargo clippy -p amphora-engine --all-targets --locked -- -D warnings` 0; check-production 0 (10,596 left; expect_used
-857 to 856); windows_and_triggers 3 passed (24,500 answers), without_rowid_dml 4, oracle_findings 92, dml_rows 16, upsert_conflict_clauses 1, row_values 4. One commit before the last (88eedf4e, r1858: all but the INSERT's
-seek, its case and the ratchet): without_rowid_seek 6, without_rowid_affinity 2, row_value_seek 5, in_subquery 4, join_methods 4, on_terms 5, outer_join_subqueries 3, the same suites above green, and clippy 0. The
-library's vdbe, window, trigger and upsert tests run after the landing; the next record line says what they gave.
+857 to 856); windows_and_triggers 3 passed (24,548 answers), without_rowid_dml 4, oracle_findings 92, dml_rows 16, upsert_conflict_clauses 1, row_values 4. One commit before the last (88eedf4e, r1858: all but the INSERT's
+seek, its case and the ratchet): without_rowid_seek 6, without_rowid_affinity 2, row_value_seek 5, in_subquery 4, join_methods 4, on_terms 5, outer_join_subqueries 3, the same suites above green, and clippy 0. After
+the landing, on main 837071af: clippy 0 with the log's own `Checking amphora-engine v0.1.0` (r1901); the library's tests `vdbe::` 403 passed, 4 ignored, `translate::` 298 (22 ignored), `window` 6, `trigger` 14,
+`without_rowid` 7, `upsert` 6, none failed; in_subquery 4 (r1902). Not run: the suites that need the `simulator` feature (planner, adaptive_joins, unnesting), the corpus, the gate.
 
 Lost time: five runs refused for room (0 to 3 of 32 cores idle). Two copies of the last check, started by a program of mine that ended on an error, ran beside it for two minutes and were ended by their process groups.
 
