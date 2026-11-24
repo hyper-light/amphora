@@ -34,10 +34,16 @@ fn c23_sql() {
         let mut n = 0;
         let (mut io, mut conn) = open(name, parallel, joins, n);
         let mut setup: Vec<&str> = Vec::new();
+        let mut asked = false;
         for sql in text.split(";\n").map(str::trim).filter(|s| !s.is_empty()) {
-            let is_setup = ["CREATE", "INSERT", "ANALYZE", "DROP", "DELETE"].iter().any(|w| sql.starts_with(w));
+            let is_setup = !asked && ["CREATE", "INSERT", "ANALYZE", "DROP", "DELETE"].iter().any(|w| sql.starts_with(w));
+            asked |= !is_setup;
+            let write = !is_setup && ["INSERT", "UPDATE", "DELETE"].iter().any(|w| sql.starts_with(w));
+            if write { run(&io, &conn, "BEGIN").unwrap(); }
             if is_setup { setup.push(sql); } else if name == "statistics" && !analyzed { analyzed = true; run(&io, &conn, "ANALYZE").unwrap(); println!("--- [{name}] {sql}"); } else { println!("--- [{name}] {sql}"); }
-            match catch_unwind(AssertUnwindSafe(|| run(&io, &conn, sql))) {
+            let answer = catch_unwind(AssertUnwindSafe(|| run(&io, &conn, sql)));
+            if write { let _ = run(&io, &conn, "ROLLBACK"); }
+            match answer {
                 Ok(Ok(rows)) if sql.starts_with("EXPLAIN") => for r in rows { println!("{r}"); },
                 Ok(Ok(mut rows)) => if !is_setup { rows.sort(); println!("{}:{}", rows.len(), rows.join(";")) },
                 Ok(Err(e)) => println!("ERROR {e}"),
