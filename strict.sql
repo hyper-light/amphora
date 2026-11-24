@@ -1,0 +1,32 @@
+CREATE TABLE t(k TEXT PRIMARY KEY, n INT, r REAL) WITHOUT ROWID;
+INSERT INTO t VALUES (7, '8', 9), ('a', 1, NULL) ON CONFLICT DO NOTHING;
+INSERT INTO t VALUES (NULL, 1, 1);
+UPDATE t SET n = n + 1, k = k || 'z';
+SELECT * FROM pragma_integrity_check
+----
+CREATE TABLE t(k TEXT PRIMARY KEY, n INT, r REAL) STRICT, WITHOUT ROWID;
+INSERT INTO t VALUES (7, '8', 9), ('a', 1, NULL) ON CONFLICT DO NOTHING;
+SELECT * FROM pragma_integrity_check;
+PRAGMA integrity_check
+----
+CREATE TABLE t(k TEXT PRIMARY KEY, n INT, r REAL) STRICT, WITHOUT ROWID;
+INSERT INTO t VALUES (7, '8', 9), ('a', 1, NULL) ON CONFLICT DO NOTHING;
+INSERT INTO t VALUES ('b', 'x', 1);
+SELECT * FROM pragma_integrity_check
+----
+CREATE TABLE t(k TEXT PRIMARY KEY, n INT, r REAL) STRICT, WITHOUT ROWID;
+INSERT INTO t VALUES (7, '8', 9), ('a', 1, NULL) ON CONFLICT DO NOTHING;
+UPDATE t SET n = n + 1, k = k || 'z';
+SELECT * FROM pragma_integrity_check
+----
+CREATE TABLE t(k TEXT PRIMARY KEY, n INT, r REAL) STRICT;
+INSERT INTO t VALUES (7, '8', 9), ('a', 1, NULL) ON CONFLICT DO NOTHING;
+UPDATE t SET n = n + 1, k = k || 'z';
+SELECT rowid FROM t;
+SELECT nosuch FROM t;
+SELECT * FROM pragma_integrity_check
+----
+CREATE TABLE t(k TEXT PRIMARY KEY, n INT, r REAL) WITHOUT ROWID;
+INSERT INTO t VALUES (7, '8', 9), ('a', 1, NULL) ON CONFLICT DO NOTHING;
+SELECT rowid FROM t;
+SELECT * FROM pragma_integrity_check
