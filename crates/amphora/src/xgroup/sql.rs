@@ -3140,8 +3140,8 @@ mod sessions {
         }
     }
 
-    /// T-T1.10.W9–W11: discard the first resolving call's answer, then deliver the retry.
-    /// It finds a done row. The first commit must still have rung a reader already asleep.
+    /// T-T1.10.W9–W11: the writer carries out a resolution whose caller has already timed out.
+    /// Its retry finds a done row. The first commit must still have rung the sleeping reader.
     #[test]
     fn t_t1_10_w9_a_resolutions_lost_reply_does_not_lose_the_wake() {
         use crate::database::LockedReads;
@@ -3156,16 +3156,22 @@ mod sessions {
             epoch: 1,
             seq: 0,
         };
-        let lock = Lock {
-            txn,
-            anchor: 0,
-            intent: Intent::Put(vec![7]),
+        let lock = Envelope {
+            coordinator: txn.coordinator,
+            epoch: txn.epoch,
+            floor: None,
+            step: Step::Lock {
+                txn,
+                anchor: 0,
+                reads: Vec::new(),
+                writes: vec![(row(1), Some(vec![7]))],
+                stage: None,
+            },
         };
-        group
-            .call_internal(until(), move |db| {
-                SqlTablet::new(db).put_lock(&row(1), &lock)
-            })
-            .unwrap();
+        let started = Instant::now();
+        let (locked, _, _) = serve(&group, 0, 0, lock.clone(), until()).unwrap();
+        let lock_time = started.elapsed();
+        assert_eq!(locked, Reply::Locked { reads: Vec::new() });
         let resolution = Envelope {
             coordinator: txn.coordinator,
             epoch: txn.epoch,
@@ -3183,12 +3189,42 @@ mod sessions {
                     .get("rows", &[1], Consistency::Linearizable, until())
             });
             group.locked_waits_reach(1, until()).unwrap();
-            let first = resolution.clone();
-            drop(
-                group
-                    .call_internal(until(), move |db| apply_step(db, 0, &first))
-                    .unwrap(),
-            );
+            // Hold the actual writer until its caller has lost the answer. If an attempt
+            // expired before it reached the writer, give the next one longer to enter.
+            let limit = until();
+            let mut budget = lock_time;
+            loop {
+                let now = Instant::now();
+                assert!(now < limit, "the resolution never entered the writer");
+                let deadline = now + budget.min(limit.saturating_duration_since(now));
+                let (entered, applied) = mpsc::channel();
+                let (resume, held) = mpsc::channel();
+                let first = resolution.clone();
+                let outcome = step(&group, &AtomicU64::new(0), deadline, move |db| {
+                    let result = apply_step(db, 0, &first)?;
+                    entered.send(())?;
+                    held.recv_timeout(limit.saturating_duration_since(Instant::now()))?;
+                    Ok(result)
+                });
+                match applied.recv_timeout(limit.saturating_duration_since(Instant::now())) {
+                    Ok(()) => {
+                        resume.send(()).unwrap();
+                        assert_eq!(outcome.err(), Some(Refusal::UnknownOutcome));
+                        break;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        assert!(matches!(
+                            outcome,
+                            Err(Refusal::Timeout | Refusal::UnknownOutcome)
+                        ));
+                        budget = budget.saturating_mul(2);
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => panic!("writer did not report entry"),
+                }
+            }
+            // A new lock request is Late only once the original writer made its done row.
+            let (locked_again, _, _) = serve(&group, 0, 0, lock, until()).unwrap();
+            assert_eq!(locked_again, Reply::Late);
             let (reply, _, _) = serve(&group, 0, 0, resolution, until()).unwrap();
             assert_eq!(reply, Reply::Resolved);
             assert_eq!(reader.join().unwrap().unwrap().unwrap().value, [7]);
