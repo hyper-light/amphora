@@ -2963,7 +2963,11 @@ impl BTreeCursor {
                     return Ok(CurrentTableLeafSeek::SearchFromRoot);
                 }
                 let dense_cell = dense_leaf_cell(first_rowid, last_rowid, cell_count, rowid);
-                (CurrentTableLeafSeek::SearchCurrentLeaf, cell_count, dense_cell)
+                (
+                    CurrentTableLeafSeek::SearchCurrentLeaf,
+                    cell_count,
+                    dense_cell,
+                )
             }
         };
 
@@ -12148,7 +12152,7 @@ mod tests {
         assert_eq!(cursor.stack.top_ref().get().id(), rightmost_page);
     }
 
-    /// Lane T16 (CP-T1.8): seek every rowid in turn, as a deferred seek does row after row. On a
+    /// Lane T16 (QT.3, AC-QT.3.4): seek every rowid in turn, as a deferred seek does row after row. On a
     /// leaf whose rowids have no gap the search starts on the one cell that holds the rowid; on
     /// the leaf with a gap it halves the whole leaf; every rowid is found either way, and the
     /// missing one is not.
@@ -12198,7 +12202,9 @@ mod tests {
                         halved += 1;
                     }
                     assert!(matches!(
-                        cursor.tablebtree_seek(rowid, SeekOp::GE { eq_only: true }).unwrap(),
+                        cursor
+                            .tablebtree_seek(rowid, SeekOp::GE { eq_only: true })
+                            .unwrap(),
                         IOResult::Done(SeekResult::Found)
                     ));
                 } else {
@@ -12210,7 +12216,10 @@ mod tests {
                     .unwrap();
                     assert_eq!(found, SeekResult::Found);
                 }
-                assert_eq!(run_until_done(|| cursor.rowid(), &pager).unwrap(), Some(rowid));
+                assert_eq!(
+                    run_until_done(|| cursor.rowid(), &pager).unwrap(),
+                    Some(rowid)
+                );
             }
             assert!(narrowed > 0, "some seeks start on their cell");
             if let Some(missing) = gap {
