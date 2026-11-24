@@ -68,6 +68,26 @@ run at the hand-off even though `hand_off` now steps the flushing first. Candida
 RESTART checkpoint answering Busy (a reader mark held by an idle connection), `due` false, or a read out. probe16.py
 prints each at every flush and at the hand-off.
 
+## The variants and the probe (r1849, run after the record's first push)
+
+| tree | suite (4 threads), once |
+|---|---|
+| 970b4386 without the `Slots::released` change (V1) | 167 passed, 7 failed: the same writer tests and the new test |
+| 970b4386 without the `Actor::decide` deferral (V2) | 172 passed, 2 failed: the new test; closed_reads::no_read_under_leader_changes_sees_a_version_past_its_time (91 s suite) |
+
+The deferral is the cause of the regressions (V2), not the slot change (V1). It is removed in 1276d43b
+(`Actor::decide no longer waits on a held restart`), not rebuilt. The closed_reads failure is one run under load
+70 to 81; main passed it in all 3 rounds of r1808. Whether it is the hang class P15 traced, now in closed reads, is
+not measured.
+
+probe16 on the new restart test: the voter's log held 7 frames, wholly copied, through the setup, and 0 frames at the
+hand-off (`hand_off before flush`, then a flush line with `frames 0 due false`, and no restart tried). The engine
+starts a wholly copied log again by itself at the leader's next write (`voter_and_learner`'s doc says so), and the
+owner's restart count (1 before the call, 1 as the session ran) does not count that. So the test's premise fails on
+a leader: no owner restart is due at the hand-off, and it fails with or without the fix. A test of this needs a log
+the engine can't start again (a reader on it, as P15's trace had: passes `busy`), or the read the answer lets begin,
+asserted served.
+
 ## rustfmt
 
 `rustfmt --check --edition 2024 --config-path rustfmt.toml` on replicated.rs (with its test modules) and
