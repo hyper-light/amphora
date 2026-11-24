@@ -114,6 +114,15 @@ pub enum LimboError {
     TxTerminated,
     #[error("Write-write conflict")]
     WriteWriteConflict,
+    /// A row a session that waits for row locks (the PostgreSQL dialect's: docs/design/postgres.md
+    /// section 8) changes is another transaction's: `Some`, the open one that changed it, to wait
+    /// for; `None`, one that committed a change to it after the snapshot it was read in. The
+    /// statement is undone and its transaction stays open.
+    #[error("row changed by a concurrent transaction")]
+    RowTaken(Option<u64>),
+    /// A wait for a row's holder would close a ring of waits.
+    #[error("deadlock detected")]
+    Deadlock,
     /// Amphora: a serializable transaction's commit refused by its validation (the versioned
     /// storage, docs/design/engine.md decision 5): its caller rolls back and runs it again.
     #[error("Serialization failure: run the transaction again")]

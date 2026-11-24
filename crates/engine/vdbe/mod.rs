@@ -3799,6 +3799,16 @@ impl Program {
                 Some(LimboError::TableLocked) => {}
                 // Busy errors do not cause a rollback.
                 Some(LimboError::Busy) => {}
+                // Amphora (docs/design/postgres.md section 8): a row another transaction changed, in a
+                // session that waits for it. The caller's statement is undone (the statement's own
+                // savepoint above, or the caller's), and its transaction stays for it to run the
+                // statement again. A statement's own transaction (autocommit) ends.
+                Some(LimboError::RowTaken(_)) => {
+                    if must_rollback_tx_if_needed {
+                        self.rollback_current_txn(pager);
+                    }
+                    self.connection.set_changes(0);
+                }
                 // Same-connection "SQL statements in progress" rejections do
                 // not cause a rollback either: the rejected operation was
                 // refused before it touched any transaction or savepoint

@@ -5,9 +5,11 @@
 
 use std::num::NonZero;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use amphora_engine::dialect::postgres::{from_engine, to_engine};
 use amphora_engine::storage::versioned::memory::Source;
+use amphora_engine::storage::versioned::switch::Level;
 use amphora_engine::{
     ConnectOpts, Connection, LimboError, PlatformIO, PostgresDialect, Statement, Value,
 };
@@ -17,9 +19,9 @@ use amphora_pg_analysis::{Column, Error, Field, Relations, analyze, lower, outpu
 use amphora_pg_catalog::data::{PG_TYPE, type_oid};
 use amphora_pg_catalog::{Datum, SearchPath};
 use amphora_pg_parser::gram;
-use amphora_pg_parser::tree::{Node, NodeId, TransactionStmtKind, Tree};
+use amphora_pg_parser::tree::{Node, NodeId, TransactionStmtKind, Tree, Val};
 
-use super::session::{Statements, TxStatus};
+use super::session::{Flow, Statements, TxStatus};
 use super::wire::{self, PgError, Severity, SqlState};
 
 /// Microseconds from PostgreSQL's epoch, 2000-01-01 UTC, to Unix's (`src/include/datatype/timestamp.h`,
@@ -196,6 +198,41 @@ pub struct Executor {
     block: Block,
     /// The open transaction's start (`GetCurrentTransactionStartTimestamp`).
     began: i64,
+    /// The open transaction's isolation level (`XactIsoLevel`); READ COMMITTED out of one, 19's
+    /// `default_transaction_isolation`.
+    level: Level,
+    /// Whether a statement of the block has taken a snapshot (`FirstSnapshotSet`).
+    queried: bool,
+    /// The Query a wait stopped, and the open transaction its statement waits for.
+    stopped: Option<Stopped>,
+    /// Why a stopped statement won't run again: its wait closed a ring of waits.
+    refused: Option<PgError>,
+}
+
+/// A Query's statements, the next one to run at `at`.
+struct Query {
+    sql: String,
+    tree: Tree,
+    statements: Vec<NodeId>,
+    at: usize,
+}
+
+struct Stopped {
+    query: Query,
+    holder: u64,
+}
+
+/// Why a statement didn't complete: a refusal, or a row another session's open transaction (by its
+/// id) changed.
+enum Stop {
+    Refused(PgError),
+    Wait(u64),
+}
+
+impl From<PgError> for Stop {
+    fn from(error: PgError) -> Self {
+        Self::Refused(error)
+    }
 }
 
 /// `now` as [`Executor`]'s clock gives it, from the system's.
@@ -231,7 +268,23 @@ impl Executor {
             clock,
             block: Block::None,
             began: 0,
+            level: Level::ReadCommitted,
+            queried: false,
+            stopped: None,
+            refused: None,
         }
+        .at_level(Level::ReadCommitted)
+    }
+
+    fn at_level(mut self, level: Level) -> Self {
+        self.set_level(level);
+        self
+    }
+
+    /// The level of the transactions begun from now on.
+    fn set_level(&mut self, level: Level) {
+        self.level = level;
+        self.conn.set_isolation(level);
     }
 
     fn statement(
@@ -240,14 +293,14 @@ impl Executor {
         tree: &Tree,
         id: NodeId,
         out: &mut Vec<u8>,
-    ) -> Result<(), PgError> {
+    ) -> Result<(), Stop> {
         let Node::RawStmt {
             stmt: Some(stmt), ..
         } = tree
             .get(id)
             .map_err(|_| internal("a parse tree node is missing"))?
         else {
-            return Err(internal("an empty statement"));
+            return Err(internal("an empty statement").into());
         };
         if let Node::TransactionStmt {
             kind,
@@ -260,13 +313,36 @@ impl Executor {
             .get(*stmt)
             .map_err(|_| internal("a parse tree node is missing"))?
         {
-            if !options.is_empty() || *chain {
-                return Err(unsupported("this transaction command"));
+            if *chain {
+                return Err(unsupported("this transaction command").into());
             }
-            return self.transaction(*kind, out);
+            let level = isolation_level(tree, options)?;
+            return Ok(self.transaction(*kind, level, out)?);
         }
         if self.block == Block::Failed {
-            return Err(aborted());
+            return Err(aborted().into());
+        }
+        let top = tree
+            .get(*stmt)
+            .map_err(|_| internal("a parse tree node is missing"))?;
+        match top {
+            Node::VariableShowStmt { name: Some(name) } if name == "transaction_isolation" => {
+                return Ok(self.show_isolation(out)?);
+            }
+            Node::VariableSetStmt {
+                kind: 3,
+                name: Some(name),
+                args,
+                ..
+            } if name == "TRANSACTION" => {
+                let level = isolation_level(tree, args)?;
+                return Ok(self.set_transaction(level, out)?);
+            }
+            _ => {}
+        }
+        self.queried |= self.block != Block::None;
+        if self.block != Block::None {
+            self.conn.renew_snapshot().map_err(engine)?;
         }
         let now = if self.block == Block::None {
             (self.clock)()
@@ -282,14 +358,13 @@ impl Executor {
             };
             if let Some(utility) = utility(tree, id, &session).map_err(|e| refusal(e, sql))? {
                 self.conn.execute(&utility.sql).map_err(engine)?;
-                return complete(out, utility.tag);
+                return Ok(complete(out, utility.tag)?);
             }
             let query = analyze(tree, id, &session, &[]).map_err(|e| refusal(e, sql))?;
             if !query.params.is_empty() {
-                return Err(PgError::error(
-                    SqlState::new("42P02"),
-                    "there is no parameter $1",
-                ));
+                return Err(
+                    PgError::error(SqlState::new("42P02"), "there is no parameter $1").into(),
+                );
             }
             let lowered = lower(&query, &session).map_err(|e| refusal(e, sql))?;
             (query.command, lowered)
@@ -304,10 +379,10 @@ impl Executor {
         command: Command,
         lowered: &amphora_pg_analysis::Lowered,
         out: &mut Vec<u8>,
-    ) -> Result<(), PgError> {
-        let mut statement = self.prepared(lowered)?;
+    ) -> Result<(), Stop> {
         match command {
             Command::Select => {
+                let mut statement = self.prepared(lowered).map_err(engine)?;
                 row_description(out, &lowered.fields)?;
                 let rows = statement.run_collect_rows().map_err(engine)?;
                 let mut count = 0usize;
@@ -316,33 +391,106 @@ impl Executor {
                     data_row(out, &values)?;
                     count = count.saturating_add(1);
                 }
-                complete(out, &format!("SELECT {count}"))
+                complete(out, &format!("SELECT {count}"))?;
             }
             Command::Update => {
-                statement.run_collect_rows().map_err(engine)?;
-                complete(out, &format!("UPDATE {}", statement.n_change()))
+                let changed = self.change(lowered)?;
+                complete(out, &format!("UPDATE {changed}"))?;
             }
             Command::Insert => {
-                statement.run_collect_rows().map_err(engine)?;
-                complete(out, &format!("INSERT 0 {}", statement.n_change()))
+                let changed = self.change(lowered)?;
+                complete(out, &format!("INSERT 0 {changed}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Runs a statement that changes rows, for how many it changed. A row another session's open
+    /// transaction changed stops it, its changes undone and its transaction kept ([`Stop::Wait`]);
+    /// one changed by a commit since its snapshot runs it again on a later one under READ COMMITTED
+    /// (19's recheck of that row alone is section 11's unit 15), and refuses it under the others. Each
+    /// turn of the loop follows a commit another session made since the last, so it ends with them.
+    fn change(&self, lowered: &amphora_pg_analysis::Lowered) -> Result<i64, Stop> {
+        let in_block = !self.conn.get_auto_commit();
+        loop {
+            if in_block {
+                self.conn.open_statement().map_err(engine)?;
+            }
+            let ran = self.prepared(lowered).and_then(|mut statement| {
+                statement.run_collect_rows()?;
+                Ok(statement.n_change())
+            });
+            if in_block {
+                self.conn.close_statement(ran.is_err()).map_err(engine)?;
+            }
+            match ran {
+                Ok(changed) => return Ok(changed),
+                Err(LimboError::RowTaken(Some(holder))) => return Err(Stop::Wait(holder)),
+                Err(LimboError::RowTaken(None)) if self.level == Level::ReadCommitted => {
+                    self.conn.renew_snapshot().map_err(engine)?;
+                }
+                Err(error) => return Err(engine(error).into()),
             }
         }
     }
 
-    fn prepared(&self, lowered: &amphora_pg_analysis::Lowered) -> Result<Statement, PgError> {
-        let mut statement = self.conn.prepare(&lowered.sql).map_err(engine)?;
+    fn prepared(&self, lowered: &amphora_pg_analysis::Lowered) -> Result<Statement, LimboError> {
+        let mut statement = self.conn.prepare(&lowered.sql)?;
         for (at, (type_oid, value)) in lowered.binds.iter().enumerate() {
             let value = match value {
                 None => Value::Null,
-                Some(value) => to_engine(*type_oid, value).map_err(engine)?,
+                Some(value) => to_engine(*type_oid, value)?,
             };
-            let index = at
-                .checked_add(1)
-                .and_then(NonZero::new)
-                .ok_or_else(|| internal("a statement has too many parameters"))?;
-            statement.bind_at(index, value).map_err(engine)?;
+            let index = at.checked_add(1).and_then(NonZero::new).ok_or_else(|| {
+                LimboError::InternalError("a statement has too many parameters".to_owned())
+            })?;
+            statement.bind_at(index, value)?;
         }
         Ok(statement)
+    }
+
+    /// SHOW transaction_isolation: the level of the open transaction, READ COMMITTED out of one.
+    fn show_isolation(&self, out: &mut Vec<u8>) -> Result<(), PgError> {
+        let level = match self.level {
+            Level::ReadCommitted => "read committed",
+            Level::RepeatableRead => "repeatable read",
+            Level::Serializable => "serializable",
+        };
+        row_description(
+            out,
+            &[Field {
+                name: "transaction_isolation".to_owned(),
+                table: 0,
+                attnum: 0,
+                type_oid: type_oid::TEXT,
+                typmod: -1,
+            }],
+        )?;
+        data_row(out, &[Some(level.to_owned())])?;
+        complete(out, "SHOW")
+    }
+
+    /// SET TRANSACTION ISOLATION LEVEL (`ExecSetVariableStmt`'s VAR_SET_MULTI and
+    /// `check_transaction_isolation`, REL_19_0 src/backend/utils/misc/guc_funcs.c and
+    /// src/backend/commands/variable.c): out of a block it warns and is for the one statement.
+    fn set_transaction(&mut self, level: Option<Level>, out: &mut Vec<u8>) -> Result<(), PgError> {
+        if self.block == Block::None {
+            let text = "SET TRANSACTION can only be used in transaction blocks";
+            wire::notice_response(out, "WARNING", "25P01", text)?;
+            return complete(out, "SET");
+        }
+        if let Some(level) = level {
+            if level != self.level {
+                if self.queried {
+                    return Err(PgError::error(
+                        SqlState::new("25001"),
+                        "SET TRANSACTION ISOLATION LEVEL must be called before any query",
+                    ));
+                }
+                self.set_level(level);
+            }
+        }
+        complete(out, "SET")
     }
 
     /// A row's columns in text, as 19's output functions write them (`None` for NULL).
@@ -374,23 +522,41 @@ impl Executor {
 
     /// BEGIN, COMMIT and ROLLBACK, each in each block (xact.c's `BeginTransactionBlock`,
     /// `EndTransactionBlock` and `UserAbortTransactionBlock`).
-    fn transaction(&mut self, kind: TransactionStmtKind, out: &mut Vec<u8>) -> Result<(), PgError> {
+    fn transaction(
+        &mut self,
+        kind: TransactionStmtKind,
+        level: Option<Level>,
+        out: &mut Vec<u8>,
+    ) -> Result<(), PgError> {
+        let tag = match kind {
+            TransactionStmtKind::Start => "START TRANSACTION",
+            _ => "BEGIN",
+        };
         match (kind, self.block) {
-            (TransactionStmtKind::Begin, Block::None) => {
+            (TransactionStmtKind::Begin | TransactionStmtKind::Start, Block::None) => {
+                self.set_level(level.unwrap_or(Level::ReadCommitted));
                 self.begin()?;
                 self.block = Block::Explicit;
-                complete(out, "BEGIN")
+                complete(out, tag)
             }
-            (TransactionStmtKind::Begin, Block::Implicit) => {
+            (TransactionStmtKind::Begin | TransactionStmtKind::Start, Block::Implicit) => {
+                if level.is_some() {
+                    return Err(unsupported("a level in this transaction block"));
+                }
                 self.block = Block::Explicit;
-                complete(out, "BEGIN")
+                complete(out, tag)
             }
-            (TransactionStmtKind::Begin, Block::Explicit) => {
+            (TransactionStmtKind::Begin | TransactionStmtKind::Start, Block::Explicit) => {
+                if level.is_some() {
+                    return Err(unsupported("a level in this transaction block"));
+                }
                 let text = "there is already a transaction in progress";
                 wire::notice_response(out, "WARNING", "25001", text)?;
-                complete(out, "BEGIN")
+                complete(out, tag)
             }
-            (TransactionStmtKind::Begin, Block::Failed) => Err(aborted()),
+            (TransactionStmtKind::Begin | TransactionStmtKind::Start, Block::Failed) => {
+                Err(aborted())
+            }
             (TransactionStmtKind::Commit, Block::Explicit) => self.commit(out),
             (TransactionStmtKind::Commit, Block::Implicit) => {
                 no_transaction(out)?;
@@ -423,12 +589,14 @@ impl Executor {
 
     fn begin(&mut self) -> Result<(), PgError> {
         self.began = (self.clock)();
+        self.queried = false;
         self.conn.execute("BEGIN").map_err(engine)
     }
 
     /// Leaves the block, without the writes of the engine's transaction if one is open.
     fn end(&mut self) {
         self.block = Block::None;
+        self.set_level(Level::ReadCommitted);
         if !self.conn.get_auto_commit() {
             // A refused ROLLBACK has nothing more to undo: the engine's own refusal is logged.
             if let Err(error) = self.conn.execute("ROLLBACK") {
@@ -449,19 +617,15 @@ impl Executor {
 
     /// A Query's statements in order (`exec_simple_query`, REL_19_0 src/backend/tcop/postgres.c): several
     /// run in an implicit block, begun again after one that ends it.
-    fn statements(
-        &mut self,
-        sql: &str,
-        tree: &Tree,
-        statements: &[NodeId],
-        out: &mut Vec<u8>,
-    ) -> Result<(), PgError> {
-        for id in statements {
-            if statements.len() > 1 && self.block == Block::None {
+    fn statements(&mut self, query: &mut Query, out: &mut Vec<u8>) -> Result<(), Stop> {
+        while let Some(id) = query.statements.get(query.at).copied() {
+            if query.statements.len() > 1 && self.block == Block::None {
+                self.set_level(Level::ReadCommitted);
                 self.begin()?;
                 self.block = Block::Implicit;
             }
-            self.statement(sql, tree, *id, out)?;
+            self.statement(&query.sql, &query.tree, id, out)?;
+            query.at = query.at.saturating_add(1);
         }
         if self.block == Block::Implicit {
             let result = self.conn.execute("COMMIT").map_err(engine);
@@ -469,6 +633,21 @@ impl Executor {
             result?;
         }
         Ok(())
+    }
+
+    /// Runs the rest of a Query: stopped where a statement waits, else answered to its end.
+    fn run_query(&mut self, mut query: Query, out: &mut Vec<u8>) -> Result<Flow, PgError> {
+        match self.statements(&mut query, out) {
+            Ok(()) => Ok(Flow::Done),
+            Err(Stop::Wait(holder)) => {
+                self.stopped = Some(Stopped { query, holder });
+                Ok(Flow::Waiting)
+            }
+            Err(Stop::Refused(error)) => {
+                self.refuse(&error, out)?;
+                Ok(Flow::Done)
+            }
+        }
     }
 }
 
@@ -489,20 +668,54 @@ impl Statements for Executor {
         }
     }
 
-    fn simple_query(&mut self, sql: &str, out: &mut Vec<u8>) -> Result<(), PgError> {
-        let ran = gram::parse(sql.as_bytes())
-            .map_err(|refused| {
+    fn simple_query(&mut self, sql: &str, out: &mut Vec<u8>) -> Result<Flow, PgError> {
+        match gram::parse(sql.as_bytes()) {
+            Ok((tree, statements)) => {
+                let query = Query {
+                    sql: sql.to_owned(),
+                    tree,
+                    statements,
+                    at: 0,
+                };
+                self.run_query(query, out)
+            }
+            Err(refused) => {
                 let position = match refused.cursor {
                     0 => None,
                     at => Some(at),
                 };
-                PgError::error(SqlState::new(refused.sqlstate), refused.message)
-                    .with_position(position)
-            })
-            .and_then(|(tree, statements)| self.statements(sql, &tree, &statements, out));
-        match ran {
-            Ok(()) => Ok(()),
-            Err(error) => self.refuse(&error, out),
+                let error = PgError::error(SqlState::new(refused.sqlstate), refused.message)
+                    .with_position(position);
+                self.refuse(&error, out)?;
+                Ok(Flow::Done)
+            }
+        }
+    }
+
+    fn poll_wait(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        let Some(holder) = self.stopped.as_ref().map(|stopped| stopped.holder) else {
+            return Poll::Ready(());
+        };
+        match self.conn.wait_for(holder, cx.waker()) {
+            Ok(true) => Poll::Pending,
+            Ok(false) => Poll::Ready(()),
+            Err(error) => {
+                self.refused = Some(engine(error));
+                Poll::Ready(())
+            }
+        }
+    }
+
+    fn resume(&mut self, out: &mut Vec<u8>) -> Result<Flow, PgError> {
+        let Some(Stopped { query, .. }) = self.stopped.take() else {
+            return Ok(Flow::Done);
+        };
+        match self.refused.take() {
+            Some(error) => {
+                self.refuse(&error, out)?;
+                Ok(Flow::Done)
+            }
+            None => self.run_query(query, out),
         }
     }
 }
@@ -514,6 +727,38 @@ fn pad(text: &mut String, typmod: i32) {
     };
     let missing = width.saturating_sub(text.chars().count());
     text.extend(std::iter::repeat_n(' ', missing));
+}
+
+/// The level a transaction's modes name, none when they name none. Their other modes refuse `0A000`
+/// here, as their grammar actions aren't ported: only ISOLATION LEVEL's is.
+fn isolation_level(tree: &Tree, modes: &[NodeId]) -> Result<Option<Level>, PgError> {
+    let mut level = None;
+    for mode in modes {
+        let Ok(Node::DefElem {
+            defname,
+            arg: Some(arg),
+            ..
+        }) = tree.get(*mode)
+        else {
+            return Err(unsupported("this transaction mode"));
+        };
+        let Ok(Node::AConst {
+            val: Val::String(name),
+            ..
+        }) = tree.get(*arg)
+        else {
+            return Err(unsupported("this transaction mode"));
+        };
+        level = match (defname.as_str(), name.as_str()) {
+            ("transaction_isolation", "read committed" | "read uncommitted") => {
+                Some(Level::ReadCommitted)
+            }
+            ("transaction_isolation", "repeatable read") => Some(Level::RepeatableRead),
+            ("transaction_isolation", "serializable") => Some(Level::Serializable),
+            _ => return Err(unsupported("this transaction mode")),
+        };
+    }
+    Ok(level)
 }
 
 fn internal(message: &str) -> PgError {
@@ -557,9 +802,11 @@ fn engine(error: LimboError) -> PgError {
         LimboError::Constraint(message) | LimboError::ForeignKeyConstraint(message) => {
             PgError::error(SqlState::new("23000"), message)
         }
+        LimboError::Deadlock => PgError::error(SqlState::new("40P01"), "deadlock detected"),
         LimboError::Busy
         | LimboError::BusySnapshot
         | LimboError::WriteWriteConflict
+        | LimboError::RowTaken(_)
         | LimboError::SerializationFailure => PgError::error(
             SqlState::new("40001"),
             "could not serialize access due to concurrent update",

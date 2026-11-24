@@ -6010,6 +6010,47 @@ impl Connection {
     }
 
     /// Sets maximum total accumulated timeout. If the duration is Zero, we unset the busy handler.
+    /// Amphora (docs/design/postgres.md section 8): the isolation level of the transactions this
+    /// connection begins from now on, on the versioned storage.
+    pub fn set_isolation(&self, level: crate::storage::versioned::switch::Level) {
+        if let Some(switch) = &self.versioned {
+            switch.isolate(level);
+        }
+    }
+
+    /// Amphora (docs/design/postgres.md section 8): the snapshot of a READ COMMITTED transaction's
+    /// next statement, every commit published now.
+    pub fn renew_snapshot(&self) -> Result<()> {
+        match &self.versioned {
+            Some(switch) => switch.renew(),
+            None => Ok(()),
+        }
+    }
+
+    /// Amphora (docs/design/postgres.md section 8): registers `wake` for the end of the open
+    /// transaction `holder` of another session, one this connection's statement was refused for
+    /// (`RowTaken`). `false`, registering nothing, when it has ended: the statement can run again. A
+    /// wait that would close a ring of waits is refused (`Deadlock`).
+    pub fn wait_for(&self, holder: u64, wake: &std::task::Waker) -> Result<bool> {
+        match &self.versioned {
+            Some(switch) => switch.wait_for(holder, wake),
+            None => Ok(false),
+        }
+    }
+
+    /// Amphora (docs/design/postgres.md section 8): a savepoint for the next write statement of the
+    /// connection's explicit transaction, so it can be undone alone and run again
+    /// ([`Connection::close_statement`]).
+    pub fn open_statement(&self) -> Result<()> {
+        self.each_versioned(|switch| switch.begin_statement())
+    }
+
+    /// Amphora (docs/design/postgres.md section 8): ends the newest [`Connection::open_statement`]'s savepoint,
+    /// its statement's changes undone with `undo`.
+    pub fn close_statement(&self, undo: bool) -> Result<()> {
+        self.each_versioned(|switch| switch.end_statement(undo))
+    }
+
     pub fn set_busy_timeout(&self, duration: Duration) {
         *self.busy_handler.write() = if duration.is_zero() {
             BusyHandler::None

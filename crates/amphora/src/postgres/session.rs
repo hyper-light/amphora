@@ -6,6 +6,7 @@
 
 use super::scram::{self, Binding, ScramSecret, ScramServer};
 use super::wire::{self, Frame, PROTOCOL_3_2, PgError, Reader, SqlState};
+use std::task::{Context, Poll};
 
 /// What PostgreSQL 19 reports as `server_version`.
 pub const SERVER_VERSION: &str = "19.0";
@@ -60,6 +61,9 @@ pub enum Next {
     StartDirectTls,
     /// A CancelRequest for another session; this connection then ends with no reply.
     Cancel { process_id: i32, key: Vec<u8> },
+    /// A statement waits for another session's transaction ([`Session::poll_wait`]): when it has
+    /// ended, [`Session::resume`] the Query.
+    Wait,
     /// Send what was written, then close.
     Close,
     /// Close with nothing sent, and log why: PostgreSQL's COMMERROR, which goes to the server's log
@@ -146,8 +150,21 @@ pub trait Statements {
     fn status(&self) -> TxStatus;
     /// Runs a Query message's statements and appends the messages that answer them, all but the
     /// ReadyForQuery that ends them. A statement's refusal is an ErrorResponse in `out`; `Err` is a
-    /// message that can't be written.
-    fn simple_query(&mut self, sql: &str, out: &mut Vec<u8>) -> Result<(), PgError>;
+    /// message that can't be written. [`Flow::Waiting`] when a statement waits for another session's
+    /// transaction (docs/design/postgres.md section 8): the rest is [`Statements::resume`]'s.
+    fn simple_query(&mut self, sql: &str, out: &mut Vec<u8>) -> Result<Flow, PgError>;
+    /// Ready once the transaction the stopped Query waits for has ended: the task's waker is called
+    /// by that end, never by a timer.
+    fn poll_wait(&mut self, cx: &mut Context<'_>) -> Poll<()>;
+    /// Runs the rest of the Query a wait stopped.
+    fn resume(&mut self, out: &mut Vec<u8>) -> Result<Flow, PgError>;
+}
+
+/// How far a Query's statements got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flow {
+    Done,
+    Waiting,
 }
 
 /// What opens a session's database once its role is authenticated, as PostgreSQL's InitPostgres opens
@@ -843,13 +860,26 @@ impl Session {
                 let answer = utf8(sql)
                     .map_err(|e| PgError::error(e.code, e.message))
                     .and_then(|text| empty_query(sql).map(|empty| (text, empty)));
+                let mut waiting = false;
                 match answer {
                     Ok((_, true)) => wire::message(out, b'I', |_| {})?,
                     Ok((text, false)) => match &mut self.statements {
-                        Some(statements) => statements.simple_query(text, out)?,
+                        Some(statements) => {
+                            waiting = statements.simple_query(text, out)? == Flow::Waiting;
+                        }
                         None => wire::error_response(out, &not_yet())?,
                     },
                     Err(error) => wire::error_response(out, &error)?,
+                }
+                if waiting {
+                    self.phase = Phase::Ready {
+                        startup,
+                        skip_to_sync: skip,
+                    };
+                    return Ok(Step {
+                        consumed: len,
+                        next: Next::Wait,
+                    });
                 }
                 ready_for_query(out, self.tx_status())?;
             }
@@ -875,6 +905,36 @@ impl Session {
         };
         Ok(Step {
             consumed: len,
+            next: Next::Continue,
+        })
+    }
+}
+
+impl Session {
+    /// Ready once the statement the Query stopped at ([`Next::Wait`]) can run again.
+    pub fn poll_wait(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        match &mut self.statements {
+            Some(statements) => statements.poll_wait(cx),
+            None => Poll::Ready(()),
+        }
+    }
+
+    /// Goes on with the Query a wait stopped: its messages, and [`Next::Wait`] again if another
+    /// statement of it waits.
+    pub fn resume(&mut self, out: &mut Vec<u8>) -> Result<Step, PgError> {
+        let flow = match &mut self.statements {
+            Some(statements) => statements.resume(out)?,
+            None => Flow::Done,
+        };
+        if flow == Flow::Waiting {
+            return Ok(Step {
+                consumed: 0,
+                next: Next::Wait,
+            });
+        }
+        ready_for_query(out, self.tx_status())?;
+        Ok(Step {
+            consumed: 0,
             next: Next::Continue,
         })
     }
