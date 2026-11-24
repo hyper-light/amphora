@@ -141,4 +141,27 @@ new = """        p23("s_call", 0, 0);
 if old not in d: raise SystemExit("prepare_traced anchor missing")
 d = d.replace(old, new, 1)
 wr(D, d)
+V = "vendor/hyper-raft/crates/hyper-durable/src/replica.rs"
+L = "vendor/hyper-raft/crates/hyper-durable/src/lib.rs"
+if arm == "H2":
+    v = rd(V)
+    old = "        let issued = self.node.advance_issued(ready);\n        self.must(issued)?;\n        if let Some(hard) = hard {\n            self.issued = hard;\n        }\n        let tip = self.tip()?;"
+    if v.count(old) != 1: raise SystemExit("hyper-durable take_ready anchor: %d" % v.count(old))
+    v = v.replace(old, "        crate::p23d(\"wstart\", number, u64::from(carries) * 1000 + u64::from(state == State::Empty) * 100000 + u64::try_from(messages.len()).unwrap_or(0));\n" + old, 1)
+    old = "        if write.state == State::Submitted {\n            self.last_durable = Some(now);"
+    if v.count(old) != 1: raise SystemExit("hyper-durable durable anchor: %d" % v.count(old))
+    v = v.replace(old, "        if let Kind::Ready(n) = &write.kind { crate::p23d(\"wdone\", *n, now.saturating_sub(write.submitted) / 1000); }\n" + old, 1)
+    wr(V, v)
+    l = rd(L)
+    l += """
+/// P23 diag (never for main): a write's start and end, on stderr.
+pub fn p23d(stage: &str, a: u64, b: u64) {
+    use std::io::Write;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let sched = std::fs::read_to_string("/proc/thread-self/schedstat").unwrap_or_default();
+    let line = format!("P23 {now} {stage} {a} {b} {}\\n", sched.trim());
+    let _ = std::io::stderr().write_all(line.as_bytes());
+}
+"""
+    wr(L, l)
 print("patched", tree, arm)
