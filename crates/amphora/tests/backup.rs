@@ -1752,6 +1752,96 @@ fn d45_a_new_database_opened_and_closed_takes_no_log_segment_left_at_its_path() 
     drop(dir);
 }
 
+/// Decision 45 (lane B25): a pass of the checkpointer copies nothing of a log segment left at a new
+/// database's path into it. Do: [`second_segment_left`]; open a database at that path, run a pass and
+/// close it, nothing written; open it again. Expect: no table in it.
+#[test]
+fn d45_a_new_databases_checkpoint_copies_no_log_segment_left_at_its_path() {
+    let (dir, path, state) = second_segment_left();
+    let mut db = Db::open(&path).unwrap();
+    let copied = db.checkpoint().unwrap();
+    drop(db);
+    let held = Db::open(&path).and_then(|db| tables(&db));
+    assert!(
+        matches!(&held, Ok(names) if names.is_empty()),
+        "a new database, nothing written, after a pass that found {copied:?}: {held:?}; the log of \
+         the one removed: {state}"
+    );
+    drop(dir);
+}
+
+/// Decision 45, AC-T1.12.4 (lane B25): a new database's archive holds nothing of a log segment left at
+/// its path. Do: [`second_segment_left`]; open a database there, backed up to a new archive, its table
+/// made and a base ended, 10 rows written, all shipped; restore every second from the first the
+/// archive restores. Expect: each restores with the rows of the new database as of it, and no table
+/// but its own.
+#[test]
+fn d45_a_new_databases_archive_holds_no_log_segment_left_at_its_path() {
+    let (dir, path, state) = second_segment_left();
+    let now = Arc::new(AtomicU64::new(5_000 * SECOND_NS));
+    let read = Arc::clone(&now);
+    let hooks = Hooks::new(Arc::new(move || read.load(Ordering::SeqCst)), 1 << 16);
+    let mut db = Db::open(&path).unwrap();
+    db.back_up(Arc::clone(&hooks));
+    let blobs = backup::FolderBlobs::open(&dir.path().join("archive"), 64 * 1024).unwrap();
+    let mut shipper = Shipper::open("db", hooks, &blobs, &db, until()).unwrap();
+    let mut history: Vec<(u64, Vec<String>, Rows)> = Vec::new();
+    let mut note = |db: &Db, now: &AtomicU64| {
+        let names = tables(db).unwrap();
+        let held = if names.contains(&"t".to_owned()) {
+            rows(db)
+        } else {
+            Rows::new()
+        };
+        history.push((now.load(Ordering::SeqCst), names, held));
+    };
+    note(&db, &now);
+    shipper.ship(&db, &blobs, until()).unwrap();
+    now.fetch_add(5 * SECOND_NS, Ordering::SeqCst);
+    db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+        .unwrap();
+    note(&db, &now);
+    shipper.ship(&db, &blobs, until()).unwrap();
+    let mut base = shipper
+        .begin_base(&db, &blobs, &amphora::memory::process(), 32 * 1024)
+        .unwrap();
+    while shipper.copy_base(&db, &blobs, &mut base, until()).unwrap() {}
+    shipper.end_base(&db, &blobs, base, until()).unwrap();
+    let (mut model, mut written) = (Rows::new(), Vec::new());
+    for id in 0..10 {
+        put(&mut db, &now, id..id + 1, "new", &mut model, &mut written);
+        note(&db, &now);
+        shipper.ship(&db, &blobs, until()).unwrap();
+    }
+    now.fetch_add(2 * SECOND_NS, Ordering::SeqCst);
+    shipper.ship(&db, &blobs, until()).unwrap();
+    let (first, last) = (5_000, now.load(Ordering::SeqCst) / SECOND_NS);
+    let mut restored = 0;
+    for second in first..=last {
+        let target = dir.path().join(format!("at-{second}.db"));
+        if let Err(e) = backup::restore(&blobs, "db", second, &target, until()) {
+            assert!(
+                second < 5_005,
+                "second {second}, which a base restores, is refused: {e:#}"
+            );
+            continue;
+        }
+        restored += 1;
+        let held = Db::open(&target).unwrap();
+        let names = tables(&held).unwrap();
+        let (_, then, expected) = history
+            .iter()
+            .rfind(|(ns, _, _)| *ns <= second * SECOND_NS)
+            .unwrap();
+        assert_eq!(&names, then, "second {second}'s tables; left: {state}");
+        if names.contains(&"t".to_owned()) {
+            assert_eq!(&rows(&held), expected, "second {second}'s rows");
+        }
+        assert_eq!(integrity(&held), ["ok"], "second {second}");
+    }
+    assert!(restored >= 10, "{restored} seconds restored");
+}
+
 /// Decision 45 (lane B25): a new database grown past what a log segment left at its path held is its own.
 /// Do: [`second_segment_left`]; open a database there, make a table and write 400 rows, its log copied
 /// into its file part of the way, and open it again. Expect: the 400 rows alone, its file whole, both
