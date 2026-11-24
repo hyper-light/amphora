@@ -7,7 +7,7 @@ use crate::{
     translate::{
         emitter::Resolver,
         expr::{unwrap_parens, unwrap_parens_owned, walk_expr, WalkControl},
-        plan::{TableReferences, WhereTerm, WhereTermOrigin},
+        plan::{JoinInfo, TableReferences, WhereTerm, WhereTermOrigin},
     },
     util::exprs_are_equivalent,
     vdbe::value::MAX_LIKE_PATTERN_LENGTH,
@@ -21,9 +21,16 @@ use super::AvailableIndexes;
 /// For `(a.x = 1 AND b.y = 2) OR (a.x = 2 AND b.y = 1)`, the planner
 /// can use `a.x IN (1, 2)` and `b.y IN (1, 2)` to search each table.
 /// The original `OR` remains because the new filters also accept `(1, 1)`.
+///
+/// Amphora (oracle finding CF): an `OR` that reads a table of `anti_joined` is the condition that
+/// decides which rows match an anti join (an unnested `NOT EXISTS` or `NOT IN`), and the anti join
+/// keeps the outer rows that match none. A term taken from it may narrow the rows it looks among, so
+/// it must read the anti-joined table; one that reads only outer tables would drop, as a filter, the
+/// rows the anti join must keep.
 pub(crate) fn rewrite_or_terms(
     where_clause: &mut Vec<WhereTerm>,
     available_indexes: &AvailableIndexes,
+    anti_joined: &[TableInternalId],
     column_can_raise: &dyn Fn(TableInternalId, usize) -> bool,
 ) -> Result<()> {
     let mut term_index = 0;
@@ -37,6 +44,10 @@ pub(crate) fn rewrite_or_terms(
         }
         let or_expr = where_clause[term_index].expr.clone();
         let term_origin = where_clause[term_index].origin;
+        let matched_tables = tables_read(&or_expr, anti_joined)?;
+        let can_stand_alone = |expr: &Expr| -> Result<bool> {
+            Ok(tables_read(expr, &matched_tables)?.len() == matched_tables.len())
+        };
 
         let or_branches = flatten_or_expr_owned(or_expr)?;
 
@@ -51,9 +62,10 @@ pub(crate) fn rewrite_or_terms(
         }
 
         for expr in in_filters_implied_by_or_branches(&branch_terms, available_indexes) {
-            if !where_clause
-                .iter()
-                .any(|term| exprs_are_equivalent(&term.expr, &expr))
+            if can_stand_alone(&expr)?
+                && !where_clause
+                    .iter()
+                    .any(|term| exprs_are_equivalent(&term.expr, &expr))
             {
                 where_clause.push(WhereTerm {
                     expr,
@@ -68,7 +80,12 @@ pub(crate) fn rewrite_or_terms(
             }
         }
 
-        let mut common_terms = branch_terms[0].clone();
+        let mut common_terms = Vec::new();
+        for term in &branch_terms[0] {
+            if can_stand_alone(term)? {
+                common_terms.push(term.clone());
+            }
+        }
 
         for branch in branch_terms.iter().skip(1) {
             common_terms.retain(|common_expr| {
@@ -94,9 +111,10 @@ pub(crate) fn rewrite_or_terms(
                 })
                 .collect();
             for expr in table_shares_of_or_branches(&remaining_terms, column_can_raise)? {
-                if !where_clause
-                    .iter()
-                    .any(|term| exprs_are_equivalent(&term.expr, &expr))
+                if can_stand_alone(&expr)?
+                    && !where_clause
+                        .iter()
+                        .any(|term| exprs_are_equivalent(&term.expr, &expr))
                 {
                     where_clause.push(WhereTerm {
                         expr,
@@ -145,6 +163,30 @@ pub(crate) fn rewrite_or_terms(
         term_index += 1;
     }
     Ok(())
+}
+
+/// The tables an anti join (an unnested `NOT EXISTS` or `NOT IN`) looks for a match in.
+pub(crate) fn anti_joined_tables(tables: &TableReferences) -> Vec<TableInternalId> {
+    tables
+        .joined_tables()
+        .iter()
+        .filter(|table| table.join_info.as_ref().is_some_and(JoinInfo::is_anti))
+        .map(|table| table.internal_id)
+        .collect()
+}
+
+/// Those of `tables` that `expr` reads, each once.
+fn tables_read(expr: &Expr, tables: &[TableInternalId]) -> Result<Vec<TableInternalId>> {
+    let mut read = Vec::new();
+    walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
+        if let Expr::Column { table, .. } | Expr::RowId { table, .. } = e {
+            if tables.contains(table) && !read.contains(table) {
+                read.push(*table);
+            }
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(read)
 }
 
 /// Returns `IN` filters that hold for every `OR` branch.
@@ -628,9 +670,12 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
-            false
-        })?;
+        rewrite_or_terms(
+            &mut where_clause,
+            &AvailableIndexes::default(),
+            &[],
+            &|_, _| false,
+        )?;
 
         // Should now have 3 terms:
         // 1. (x = 1) OR (y = 1)
@@ -732,9 +777,12 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
-            false
-        })?;
+        rewrite_or_terms(
+            &mut where_clause,
+            &AvailableIndexes::default(),
+            &[],
+            &|_, _| false,
+        )?;
 
         // Should now have 2 terms:
         // 1. (x = 1) OR (y = 1) OR (z = 1)
@@ -801,9 +849,12 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
-            false
-        })?;
+        rewrite_or_terms(
+            &mut where_clause,
+            &AvailableIndexes::default(),
+            &[],
+            &|_, _| false,
+        )?;
 
         // Should remain unchanged since no common terms
         let nonconsumed_terms = where_clause
@@ -869,9 +920,12 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
-            false
-        })?;
+        rewrite_or_terms(
+            &mut where_clause,
+            &AvailableIndexes::default(),
+            &[],
+            &|_, _| false,
+        )?;
 
         let nonconsumed_terms = where_clause
             .iter()
@@ -922,9 +976,12 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
-            false
-        })?;
+        rewrite_or_terms(
+            &mut where_clause,
+            &AvailableIndexes::default(),
+            &[],
+            &|_, _| false,
+        )?;
 
         // Should remain unchanged
         let nonconsumed_terms = where_clause
@@ -973,9 +1030,12 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
-            false
-        })?;
+        rewrite_or_terms(
+            &mut where_clause,
+            &AvailableIndexes::default(),
+            &[],
+            &|_, _| false,
+        )?;
 
         let nonconsumed_terms = where_clause
             .iter()
@@ -1004,9 +1064,12 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
-            false
-        })?;
+        rewrite_or_terms(
+            &mut where_clause,
+            &AvailableIndexes::default(),
+            &[],
+            &|_, _| false,
+        )?;
 
         assert_eq!(where_clause.len(), 1);
         assert_eq!(where_clause[0].expr, or_expr);
@@ -1032,9 +1095,12 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
-            false
-        })?;
+        rewrite_or_terms(
+            &mut where_clause,
+            &AvailableIndexes::default(),
+            &[],
+            &|_, _| false,
+        )?;
 
         assert_eq!(where_clause.len(), 3);
         assert_eq!(where_clause[0].expr, or_expr);
@@ -1069,9 +1135,12 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
-            false
-        })?;
+        rewrite_or_terms(
+            &mut where_clause,
+            &AvailableIndexes::default(),
+            &[],
+            &|_, _| false,
+        )?;
 
         assert_eq!(where_clause.len(), 2);
         assert!(!where_clause
@@ -1096,9 +1165,12 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
-            false
-        })?;
+        rewrite_or_terms(
+            &mut where_clause,
+            &AvailableIndexes::default(),
+            &[],
+            &|_, _| false,
+        )?;
 
         assert_eq!(where_clause.len(), 2);
         assert_eq!(where_clause[1].origin, where_clause[0].origin);
@@ -1118,9 +1190,12 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
-            false
-        })?;
+        rewrite_or_terms(
+            &mut where_clause,
+            &AvailableIndexes::default(),
+            &[],
+            &|_, _| false,
+        )?;
 
         assert_eq!(where_clause.len(), 2);
         assert_eq!(where_clause[1].origin, where_clause[0].origin);
@@ -1150,9 +1225,12 @@ mod tests {
             consumed: false,
         }];
 
-        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default(), &|_, _| {
-            false
-        })?;
+        rewrite_or_terms(
+            &mut where_clause,
+            &AvailableIndexes::default(),
+            &[],
+            &|_, _| false,
+        )?;
 
         assert_eq!(where_clause.len(), 1);
         Ok(())

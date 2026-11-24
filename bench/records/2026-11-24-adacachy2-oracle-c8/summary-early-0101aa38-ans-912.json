@@ -1,0 +1,400 @@
+{
+  "duplicates": 0,
+  "findings": {
+    "diff-09231d22e6553f85": {
+      "at_seconds": 533.557111797,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-0a1b6286b83bd792": {
+      "at_seconds": 19.852882835,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-1a22c7033393da81": {
+      "at_seconds": 270.978727504,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-20dbfc400c28a33e": {
+      "at_seconds": 345.696342071,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    },
+    "diff-463ce966c959a6e2": {
+      "at_seconds": 267.781130763,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-4b7dfc63b402626d": {
+      "at_seconds": 330.756331264,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-59414881685c9c8c": {
+      "at_seconds": 439.904023304,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-5d01f8264cbc5300": {
+      "at_seconds": 361.072009147,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-616b13251343f9b0": {
+      "at_seconds": 676.596755919,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-67df56ed29ffcef6": {
+      "at_seconds": 663.497793437,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-7974f91c870d2c3d": {
+      "at_seconds": 638.253242182,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-7d5e8dd81b32f549": {
+      "at_seconds": 547.207459028,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-8587673d923019e7": {
+      "at_seconds": 35.975172383,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-aef500004035e86d": {
+      "at_seconds": 382.327967998,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-b2dcd1f2d4ace004": {
+      "at_seconds": 479.077137782,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 4
+    },
+    "diff-b6f5c615feba8bdb": {
+      "at_seconds": 466.702627223,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-bce8f58ccc772d95": {
+      "at_seconds": 248.192838692,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-c6d83167b590e803": {
+      "at_seconds": 600.295374793,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-c79b1e63b52d3494": {
+      "at_seconds": 224.907556759,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-c81d023bfc8dba5e": {
+      "at_seconds": 413.872769835,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-c9be501e98f9253a": {
+      "at_seconds": 63.738762912,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-e1a7f5968e0cc63f": {
+      "at_seconds": 60.393475595,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-ed3000af61dc7ac9": {
+      "at_seconds": 360.828782809,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-ef14b039a7d6487b": {
+      "at_seconds": 161.871708529,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-f7ffa3acfe669ef2": {
+      "at_seconds": 16.338391819,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 3
+    },
+    "diff-f80bdf593a876742": {
+      "at_seconds": 140.000412307,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "diff-fb578260657def20": {
+      "at_seconds": 674.998885037,
+      "detail": "Amphora's answer isn't SQLite's",
+      "kind": "Wrong",
+      "oracle": "diff",
+      "statements": 2
+    },
+    "pqs-b03851bb53df213f": {
+      "at_seconds": 294.695628332,
+      "detail": "the pivot (rowid 9), whose predicate SQLite rectified to TRUE, is missing",
+      "kind": "Wrong",
+      "oracle": "pqs",
+      "statements": 8
+    }
+  },
+  "functions": 101,
+  "label": "early-0101aa38-ans",
+  "oracles": {
+    "diff": {
+      "checks": 185475,
+      "failed": 27,
+      "passed": 151624,
+      "plans_changed": 0,
+      "refused": {
+        "ESCAPE expression must be a single character": 6,
+        "FLAGS parameter to json_valid() must be between # and ##": 8,
+        "JSON cannot hold BLOB values": 19,
+        "JSON path error near: \"#\"": 9,
+        "JSON path error near: \"###\"": 2,
+        "JSON path error near: \"################\"": 1,
+        "JSON path error near: \"###################\"": 1,
+        "JSON path error near: \"################.#\"": 3,
+        "JSON path error near: \"#.#\"": 11,
+        "JSON path error near: \"-#\"": 4,
+        "JSON path error near: \"-###\"": 1,
+        "JSON path error near: \"-###################\"": 1,
+        "JSON path error near: \"-###.#\"": 2,
+        "JSON path error near: \"-#.#\"": 3,
+        "JSON path error near: \"-#.#e-###\"": 1,
+        "Parse error: Unexpected character": 21,
+        "Parse error: Unexpected end of input": 4,
+        "Parse error: bad JSON path: '\u0001\u0002'": 3,
+        "Parse error: bad JSON path: ' '": 2,
+        "Parse error: bad JSON path: '###'": 1,
+        "Parse error: bad JSON path: '##'": 2,
+        "Parse error: bad JSON path: '#'": 3,
+        "Parse error: bad JSON path: '#.#'": 4,
+        "Parse error: bad JSON path: '#.#e+###'": 1,
+        "Parse error: bad JSON path: '#x##'": 2,
+        "Parse error: bad JSON path: '%'": 1,
+        "Parse error: bad JSON path: ''": 6,
+        "Parse error: bad JSON path: '-#'": 1,
+        "Parse error: bad JSON path: 'A'": 2,
+        "Parse error: bad JSON path: 'ABC'": 1,
+        "Parse error: bad JSON path: '_'": 2,
+        "Parse error: bad JSON path: 'abc'": 1,
+        "Parse error: bad JSON path: 'true'": 2,
+        "Parse error: bad JSON path: 'x'": 1,
+        "Parse error: bad JSON path: 'é'": 1,
+        "Parse error: bad JSON path: 'ÿ'": 1,
+        "Parse error: malformed JSON": 94,
+        "integer overflow": 1,
+        "json_array_insert() needs an odd number of arguments": 8,
+        "json_insert() needs an odd number of arguments": 12,
+        "json_object() labels must be TEXT": 11,
+        "json_object() requires an even number of arguments": 21,
+        "json_replace() needs an odd number of arguments": 14,
+        "json_set() needs an odd number of arguments": 13,
+        "string or blob too big": 3
+      },
+      "skipped": {
+        "SQLite's answer holds ill-formed UTF-8 (garbage in, garbage out)": 10,
+        "a LIMIT no longer keeps certain rows": 2296,
+        "a bare column: its row is any of its group's": 17073,
+        "sqlite refused": 14134
+      }
+    },
+    "dqp": {
+      "checks": 185476,
+      "failed": 0,
+      "passed": 141756,
+      "plans_changed": 49212,
+      "refused": {},
+      "skipped": {
+        "a LIMIT no longer keeps certain rows": 2270,
+        "a bare column: its row is any of its group's": 16784,
+        "a derived query meets a value's error (evaluation order)": 270,
+        "amphora refused the base": 13878,
+        "the index can't serve the query": 10517,
+        "the relation fails on SQLite too": 1
+      }
+    },
+    "eet": {
+      "checks": 185476,
+      "failed": 0,
+      "passed": 149578,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "a LIMIT no longer keeps certain rows": 2200,
+        "a bare column: its row is any of its group's": 19649,
+        "a derived query errors on SQLite too": 157,
+        "a derived query meets a value's error (evaluation order)": 219,
+        "amphora refused the base": 13672,
+        "the relation fails on SQLite too": 1
+      }
+    },
+    "norec": {
+      "checks": 185475,
+      "failed": 0,
+      "passed": 171021,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "a derived query meets a value's error (evaluation order)": 1833,
+        "amphora refused both": 12621
+      }
+    },
+    "pqs": {
+      "checks": 167396,
+      "failed": 1,
+      "passed": 155235,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "a derived query meets a value's error (evaluation order)": 8,
+        "sqlite can't evaluate it": 9161,
+        "sqlite misses its own pivot": 2991
+      }
+    },
+    "same": {
+      "checks": 27822,
+      "failed": 0,
+      "passed": 27822,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {}
+    },
+    "tlp": {
+      "checks": 185475,
+      "failed": 0,
+      "passed": 159848,
+      "plans_changed": 0,
+      "refused": {},
+      "skipped": {
+        "a REAL sum's partitions round apart from it": 1664,
+        "a derived query meets a value's error (evaluation order)": 5657,
+        "a partition's sum overflows": 7,
+        "amphora refused the base": 18299
+      }
+    }
+  },
+  "seconds": 700.014181427,
+  "seed": 912,
+  "setup_refused": {},
+  "sqlite": "3.54.0",
+  "sqlite_options": [
+    "ATOMIC_INTRINSICS=1",
+    "COMPILER=gcc-16.2.1 20260810",
+    "DEFAULT_AUTOVACUUM",
+    "DEFAULT_CACHE_SIZE=-2000",
+    "DEFAULT_FILE_FORMAT=4",
+    "DEFAULT_JOURNAL_SIZE_LIMIT=-1",
+    "DEFAULT_MMAP_SIZE=0",
+    "DEFAULT_PAGE_SIZE=4096",
+    "DEFAULT_PCACHE_INITSZ=20",
+    "DEFAULT_RECURSIVE_TRIGGERS",
+    "DEFAULT_SECTOR_SIZE=4096",
+    "DEFAULT_SYNCHRONOUS=2",
+    "DEFAULT_WAL_AUTOCHECKPOINT=1000",
+    "DEFAULT_WAL_SYNCHRONOUS=2",
+    "DEFAULT_WORKER_THREADS=0",
+    "DIRECT_OVERFLOW_READ",
+    "ENABLE_COLUMN_METADATA",
+    "ENABLE_DBSTAT_VTAB",
+    "ENABLE_FTS3",
+    "ENABLE_FTS3_PARENTHESIS",
+    "ENABLE_FTS4",
+    "ENABLE_FTS5",
+    "ENABLE_MATH_FUNCTIONS",
+    "ENABLE_PERCENTILE",
+    "ENABLE_PREUPDATE_HOOK",
+    "ENABLE_RTREE",
+    "ENABLE_SESSION",
+    "ENABLE_STAT4",
+    "ENABLE_STMTVTAB",
+    "ENABLE_UNLOCK_NOTIFY",
+    "HAVE_ISNAN",
+    "LIKE_DOESNT_MATCH_BLOBS",
+    "MALLOC_SOFT_LIMIT=1024",
+    "MAX_ATTACHED=10",
+    "MAX_COLUMN=2000",
+    "MAX_COMPOUND_SELECT=500",
+    "MAX_DEFAULT_PAGE_SIZE=8192",
+    "MAX_EXPR_DEPTH=10000",
+    "MAX_FUNCTION_ARG=1000",
+    "MAX_LENGTH=1000000000",
+    "MAX_LIKE_PATTERN_LENGTH=50000",
+    "MAX_MMAP_SIZE=0x7fff0000",
+    "MAX_PAGE_COUNT=0xfffffffe",
+    "MAX_PAGE_SIZE=65536",
+    "MAX_SCHEMA=10000000",
+    "MAX_SQL_LENGTH=1000000000",
+    "MAX_TRIGGER_DEPTH=1000",
+    "MAX_VARIABLE_NUMBER=250000",
+    "MAX_VDBE_OP=250000000",
+    "MAX_WORKER_THREADS=8",
+    "MUTEX_PTHREADS",
+    "SECURE_DELETE",
+    "SYSTEM_MALLOC",
+    "TEMP_STORE=1",
+    "THREADSAFE=1"
+  ],
+  "states": 27822
+}
