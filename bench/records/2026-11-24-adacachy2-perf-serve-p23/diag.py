@@ -50,8 +50,8 @@ sub("        let took = (self.clock)().saturating_duration_since(at);",
 # the pending write's path
 first("        self.tail = None;\n", f"        {P}(\"prep_go\", u64::from(self.replica.is_leader()), self.replica.applied().index);\n        self.tail = None;\n")
 sub("                self.tail = Some(target);", f"                {P}(\"tail_wait\", self.replica.applied().index, target);\n                self.tail = Some(target);")
-sub("                                pending.phase = Phase::Proposed(value);" if arm == "H" else "                            pending.phase = Phase::Proposed(value);",
-    (f"                                {P}(\"proposed\", u64::from(self.replica.is_leader()), 0);\n                                pending.phase = Phase::Proposed(value);" if arm == "H"
+sub("                                pending.phase = Phase::Proposed(value);" if arm in ("H", "H2") else "                            pending.phase = Phase::Proposed(value);",
+    (f"                                {P}(\"proposed\", u64::from(self.replica.is_leader()), 0);\n                                pending.phase = Phase::Proposed(value);" if arm in ("H", "H2")
      else f"                            {P}(\"proposed\", u64::from(self.replica.is_leader()), 0);\n                            pending.phase = Phase::Proposed(value);"))
 first("                    match self.replica.read(context.clone()) {", f"                    {P}(\"barrier\", 0, 0);\n                    match self.replica.read(context.clone()) {{")
 sub("        for (context, _) in output.reads {\n            if self.pending.as_ref().is_some_and(|p| p.context == context) {",
@@ -62,7 +62,7 @@ first("                if let Some(response) = pending.response.take() {\n      
       f"                if let Some(response) = pending.response.take() {{\n                    {P}(\"answered_apply\", 0, 0);\n                    answer(response, result);\n                }}\n            }}\n        }}\n        for (context, _) in output.reads {{")
 sub("        ) && let Some(response) = pending.response.take()\n        {\n            // The write's own token (`tokens`): its index, and its stamp for its time.",
     f"        ) && let Some(response) = pending.response.take()\n        {{\n            {P}(\"answered_commit\", index, 0);\n            // The write's own token (`tokens`): its index, and its stamp for its time.")
-if arm == "H":
+if arm in ("H", "H2"):
     sub("        // A restart due and ready runs before the write lock is lent, as after a session run\n        // inline;",
         f"        {P}(\"hand_begin\", u64::from(self.replica.is_leader()), 0);\n        // A restart due and ready runs before the write lock is lent, as after a session run\n        // inline;")
     sub("        self.control.local.unhold_reads()?;\n        let base = match self.replica.machine().session_base() {",
@@ -77,14 +77,22 @@ if arm == "H":
         f"            {P}(\"taken\", 0, 0);\n            self.replica.hold_apply(false);\n            self.ran = Some(ran);")
     sub("        let Some((ran, operation)) = self.ran.take() else {\n            return Ok(());\n        };",
         f"        let Some((ran, operation)) = self.ran.take() else {{\n            return Ok(());\n        }};\n        {P}(\"decide\", 0, 0);")
-else:
+if arm in ("H2", "M"):
     sub("            let clock = Arc::clone(&self.clock);\n            self.replica.machine_mut().prepare_db(|db| {",
         f"            let clock = Arc::clone(&self.clock);\n            {P}(\"sess_begin\", u64::from(self.replica.is_leader()), 0);\n            self.replica.machine_mut().prepare_db(|db| {{")
     sub("        // The preparation ran the caller's work, which takes time of its own: its deadline is\n        // judged at the clock's reading after it, never at the step's start.\n        self.at = (self.clock)();",
         f"        {P}(\"sess_end\", 0, 0);\n        // The preparation ran the caller's work, which takes time of its own: its deadline is\n        // judged at the clock's reading after it, never at the step's start.\n        self.at = (self.clock)();")
+if arm == "H2":
+    sub("        } else if matches!(pending.author, Author::Application(_)) {", "        } else if matches!(pending.author, Author::Application(_)) && !crate::db::p23_inline() {")
 wr(R, s)
 d = rd(D)
 d += """
+/// P23 diag (never for main): with P23_ALT set, every second application write runs inline on its owner.
+pub(crate) fn p23_inline() -> bool {
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    std::env::var_os("P23_ALT").is_some() && SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 2 == 1
+}
+
 /// P23 diag (never for main): a stage's time, its thread's CPU and run-queue wait, on stderr.
 pub(crate) fn p23(stage: &str, a: u64, b: u64) {
     use std::io::Write;

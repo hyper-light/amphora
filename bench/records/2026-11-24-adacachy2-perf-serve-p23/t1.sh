@@ -12,8 +12,8 @@ echo "start $(date -u +%T) jobs $J $(ld)"; df -h ~ | tail -1
 git -C "$A" fetch -q origin || git -C "$A" fetch -q origin || { echo FETCH_FAILED; exit 9; }
 for s in $H $M; do git -C "$A" cat-file -e "$s^{commit}" || { echo "NO $s"; exit 9; }; done
 git -C "$A" show ${S:-origin/perf/serve-p23}:bench/records/2026-11-24-adacachy2-perf-serve-p23/diag.py > "$L/diag.py" || exit 9
-for arm in M H; do
-  sha=$M; [ $arm = H ] && sha=$H
+for arm in ${ARMS:-M H}; do
+  sha=$M; case $arm in H*) sha=$H;; esac
   git -C "$B" fetch -q "$A" 2>/dev/null; git -C "$B" checkout -q -f --detach $sha || { git -C "$B" fetch -q origin; git -C "$B" checkout -q -f --detach $sha; } || exit 9
   python3 -I "$L/diag.py" "$B" $arm || exit 9
   s=$(date +%s); ( cd "$B/bench" && nice -n 10 cargo build --release --offline > "$L/build-$arm.log" 2>&1 ) && cp "$CARGO_TARGET_DIR/release/amphora-bench" "$BIN/diag-$arm" \
