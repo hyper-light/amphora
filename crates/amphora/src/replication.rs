@@ -660,6 +660,10 @@ impl Machine {
         }
         let mut db = open(&owner)?;
         db.hold_owner(owner.clone());
+        // The owner alone starts the log again, when a restart is due by what it measures
+        // (replication.md, B): a write's own restart would close a segment, and so end the reads on
+        // it, before the room is needed.
+        db.own_restarts();
         // Check before retaining a baseline image or writing a replica marker.
         unproven_floor(&db).map_err(|e| crate::database::refused(&e))?;
         let mut marked = false;
@@ -1019,6 +1023,9 @@ impl Machine {
     pub(crate) fn session_connection(&self) -> anyhow::Result<Db> {
         let db = self.db.reader()?;
         db.keep_pages(self.db.cache_pages()?)?;
+        // A session is a write transaction too, rolled back ([`prepare_at`]): the owner alone starts
+        // the log again, as on its own connection.
+        db.own_restarts();
         Ok(db)
     }
 

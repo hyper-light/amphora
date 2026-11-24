@@ -2,7 +2,6 @@ use super::gencol::compute_virtual_columns;
 use super::TranslateCtx;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::schema::{Column, ColumnLayout, GeneratedType, Table};
-use crate::translate::insert::halt_desc_and_on_error;
 use crate::translate::plan::ColumnMask;
 use crate::translate::stmt_journal::any_effective_replace;
 use crate::vdbe::builder::SelfTableContext;
@@ -10,13 +9,12 @@ use crate::{
     ast, emit_explain,
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
     schema::{
-        collect_column_dependencies_of_expr, BTreeTable, CheckConstraint, Index,
-        EXPR_INDEX_SENTINEL, ROWID_SENTINEL,
+        collect_column_dependencies_of_expr, BTreeTable, Index, EXPR_INDEX_SENTINEL, ROWID_SENTINEL,
     },
     sync::Arc,
     translate::{
         emitter::{
-            check_expr_references_columns, delete::emit_fk_child_decrement_on_delete,
+            check_constraints_of_update, delete::emit_fk_child_decrement_on_delete,
             emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
             emit_cdc_patch_record, emit_check_constraints, emit_index_column_value_new_image,
             emit_index_column_value_old_image, emit_make_record,
@@ -43,7 +41,6 @@ use crate::{
             Operation, OuterQueryReference, QueryDestination, ResultSetColumn, Scan, Search,
             SubqueryEvalPhase, TableReferences, UpdatePlan, UpdateSetClause,
         },
-        planner::ROWID_STRS,
         subquery::{emit_non_from_clause_subqueries_for_eval_at, emit_non_from_clause_subquery},
         trigger_exec::{
             fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
@@ -54,7 +51,9 @@ use crate::{
     vdbe::{
         affinity::Affinity,
         builder::{CursorKey, CursorType, DmlColumnContext},
-        insn::{to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral},
+        insn::{
+            to_u32, CmpInsFlags, HaltAction, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral,
+        },
         BranchOffset,
     },
     CaptureDataChangesExt, Connection, HashSet, Result, MAIN_DB_ID,
@@ -622,7 +621,8 @@ struct CdcUpdateRegisters {
 }
 
 /// Emit the VDBE instructions that enforce a `NOT NULL` constraint on the
-/// value currently in `target_reg`, honoring the UPDATE's OR conflict clause:
+/// value currently in `target_reg`, under the UPDATE's OR conflict clause when
+/// it has one and under the column's own otherwise:
 ///
 /// - `OR IGNORE`: branch to `skip_row_label` when the value is NULL, leaving
 ///   the existing row untouched.
@@ -637,10 +637,16 @@ fn emit_notnull_constraint_check(
     target_reg: usize,
     table_column: &Column,
     table_name: &str,
-    or_conflict: ResolveType,
     skip_row_label: BranchOffset,
     resolver: &Resolver,
 ) -> crate::Result<()> {
+    let conflict = if program.flags.has_statement_conflict() {
+        program.resolve_type
+    } else {
+        table_column
+            .notnull_conflict_clause
+            .unwrap_or(ResolveType::Abort)
+    };
     let description = || {
         format!(
             "{}.{}",
@@ -651,7 +657,7 @@ fn emit_notnull_constraint_check(
                 .expect("Column name must be present")
         )
     };
-    match or_conflict {
+    match conflict {
         ResolveType::Ignore => {
             program.emit_insn(Insn::IsNull {
                 reg: target_reg,
@@ -683,6 +689,7 @@ fn emit_notnull_constraint_check(
                 target_reg,
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
                 description: description(),
+                on_error: None,
             });
         }
         _ => {
@@ -690,6 +697,7 @@ fn emit_notnull_constraint_check(
                 target_reg,
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
                 description: description(),
+                on_error: HaltAction::of_constraint(conflict),
             });
         }
     }
@@ -889,7 +897,6 @@ fn emit_update_column_values<'a>(
     skip_row_label: BranchOffset,
     skip_notnull_checks: bool,
 ) -> crate::Result<bool> {
-    let or_conflict = program.resolve_type;
     let mut table_column_was_read = false;
     if let Some(expr) = set_clauses
         .iter()
@@ -1017,20 +1024,12 @@ fn emit_update_column_values<'a>(
                             program.target_union_type = prev_union;
                             translate_result?;
                             if table_column.notnull() && !skip_notnull_checks {
-                                let notnull_conflict = if program.flags.has_statement_conflict() {
-                                    or_conflict
-                                } else {
-                                    table_column
-                                        .notnull_conflict_clause
-                                        .unwrap_or(ResolveType::Abort)
-                                };
                                 emit_notnull_constraint_check(
                                     program,
                                     table_references,
                                     target_reg,
                                     table_column,
                                     column_ctx.table_name(),
-                                    notnull_conflict,
                                     skip_row_label,
                                     &t_ctx.resolver,
                                 )?;
@@ -1142,7 +1141,6 @@ fn emit_deferred_notnull_checks<'a>(
     skip_row_label: BranchOffset,
     t_ctx: &mut TranslateCtx<'a>,
 ) -> crate::Result<()> {
-    let or_conflict = program.resolve_type;
     for (idx, table_column) in target_table.table.columns().iter().enumerate() {
         if !table_column.notnull() {
             continue;
@@ -1158,7 +1156,6 @@ fn emit_deferred_notnull_checks<'a>(
             target_reg,
             table_column,
             column_ctx.table_name(),
-            or_conflict,
             skip_row_label,
             &t_ctx.resolver,
         )?;
@@ -1816,7 +1813,7 @@ fn emit_update_insns<'a>(
             }
             _ => {
                 // ABORT/FAIL/ROLLBACK behavior
-                let raw_desc = if let Some(idx) = rowid_alias_index {
+                let description = if let Some(idx) = rowid_alias_index {
                     String::from(table_name)
                         + "."
                         + target_table
@@ -1830,15 +1827,10 @@ fn emit_update_insns<'a>(
                 } else {
                     String::from(table_name) + ".rowid"
                 };
-                let (description, on_error) = halt_desc_and_on_error(
-                    &raw_desc,
-                    effective_rowid_alias_conflict,
-                    program.flags.has_statement_conflict(),
-                );
                 program.emit_insn(Insn::Halt {
                     err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                     description,
-                    on_error,
+                    on_error: HaltAction::of_constraint(effective_rowid_alias_conflict),
                     description_reg: None,
                 });
             }
@@ -1888,32 +1880,8 @@ fn emit_update_insns<'a>(
         }
 
         if !btree_table.check_constraints.is_empty() {
-            // SQLite only evaluates CHECK constraints that reference at least one
-            // column in the SET clause. Build a set of updated column names to filter.
-            let mut updated_col_names: HashSet<String> = btree_table
-                .columns()
-                .iter()
-                .enumerate()
-                .filter(|(idx, _)| affected_columns.get(*idx))
-                .filter_map(|(_, col)| col.name.as_deref())
-                .map(normalize_ident)
-                .collect();
-
-            // If the rowid is being updated (either directly via ROWID_SENTINEL or
-            // through a rowid alias column), also include the rowid pseudo-column
-            // names so that CHECK(rowid > 0) etc. are properly triggered.
-            if updates_rowid {
-                for name in ROWID_STRS {
-                    updated_col_names.insert(name.to_string());
-                }
-            }
-
-            let relevant_checks: Vec<CheckConstraint> = btree_table
-                .check_constraints
-                .iter()
-                .filter(|cc| check_expr_references_columns(&cc.expr, &updated_col_names))
-                .cloned()
-                .collect();
+            let relevant_checks =
+                check_constraints_of_update(&btree_table, &affected_columns, updates_rowid);
 
             let check_constraint_tables =
                 TableReferences::new(vec![target_table.as_ref().clone()], vec![]);
@@ -2193,15 +2161,10 @@ fn emit_update_insns<'a>(
                             accum
                         },
                     );
-                    let (description, on_error) = halt_desc_and_on_error(
-                        &column_names,
-                        idx_conflict,
-                        program.flags.has_statement_conflict(),
-                    );
                     program.emit_insn(Insn::Halt {
                         err_code: SQLITE_CONSTRAINT_UNIQUE,
-                        description,
-                        on_error,
+                        description: column_names,
+                        on_error: HaltAction::of_constraint(idx_conflict),
                         description_reg: None,
                     });
                 }

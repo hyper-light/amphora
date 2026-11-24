@@ -188,12 +188,19 @@ fn prepare_window_subquery(
     // they reference the subquery instead. The original expressions are included in the
     // subquery’s result columns.
     for col in outer_plan.result_columns.iter_mut() {
+        let names_a_column = reads_a_column(&col.expr);
         rewrite_terminal_expr(
             &mut outer_plan.aggregates,
             &mut col.expr,
             &mut current_window,
             &mut ctx,
         )?;
+        // An expression now read whole from the layer beneath (a call over another window, an
+        // aggregate, a subquery) keeps its own text for a name, as SQLite names it before it
+        // rewrites windows: the layer's column it has become a reference to has none.
+        if !names_a_column && reads_a_column(&col.expr) && col.alias.is_none() {
+            col.alias.clone_from(&col.implicit_column_name);
+        }
     }
     for (expr, _, _) in outer_plan.order_by.iter_mut() {
         rewrite_terminal_expr(
@@ -286,6 +293,11 @@ fn prepare_window_subquery(
     outer_plan.table_references.add_joined_table(subquery);
 
     Ok(())
+}
+
+/// Whether a result column of `expr` is named by the column it reads.
+fn reads_a_column(expr: &Expr) -> bool {
+    matches!(expr, Expr::Column { .. } | Expr::RowId { .. })
 }
 
 fn append_order_by(

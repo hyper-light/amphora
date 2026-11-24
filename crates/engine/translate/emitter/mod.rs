@@ -33,7 +33,7 @@ use crate::translate::plan::{Aggregate, ColumnMask};
 use crate::vdbe::{
     affinity::Affinity,
     builder::{CursorKey, CursorType, DmlColumnContext, ProgramBuilder, SelfTableContext},
-    insn::{to_u32, InsertFlags, Insn},
+    insn::{to_u32, HaltAction, InsertFlags, Insn},
     BranchOffset, CursorID,
 };
 use crate::{
@@ -2729,7 +2729,7 @@ fn emit_check_constraint_bytecode(
                 program.emit_insn(Insn::Halt {
                     err_code: SQLITE_CONSTRAINT_CHECK,
                     description: constraint_name.to_string(),
-                    on_error: None,
+                    on_error: HaltAction::of_constraint(or_conflict),
                     description_reg: None,
                 });
             }
@@ -2748,6 +2748,33 @@ fn check_expr_references_columns(expr: &ast::Expr, column_names: &HashSet<String
     column_names
         .iter()
         .any(|name| check_expr_references_column(expr, name))
+}
+
+/// The CHECK constraints an UPDATE checks: as SQLite does, those that read a column it sets or one
+/// computed from such a column (sqlite3ExprReferencesUpdatedColumn).
+pub(crate) fn check_constraints_of_update(
+    table: &BTreeTable,
+    affected_columns: &ColumnMask,
+    updates_rowid: bool,
+) -> Vec<CheckConstraint> {
+    let mut names: HashSet<String> = table
+        .columns()
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| affected_columns.get(*idx))
+        .filter_map(|(_, column)| column.name.as_deref())
+        .map(normalize_ident)
+        .collect();
+    // CHECK(rowid > 0) reads the rowid by a name of its own.
+    if updates_rowid {
+        names.extend(ROWID_STRS.iter().map(|name| (*name).to_string()));
+    }
+    table
+        .check_constraints
+        .iter()
+        .filter(|check| check_expr_references_columns(&check.expr, &names))
+        .cloned()
+        .collect()
 }
 
 /// Emit CHECK constraint evaluation with resolver cache setup and teardown.

@@ -3999,3 +3999,128 @@ fn an_aggregates_argument_compares_by_its_columns_collation() {
         ],
     );
 }
+
+/// Do: read the rowid of json_each, json_tree, generate_series and pragma_table_info, 0 among them,
+/// in a SELECT list, a WHERE, an aggregate and a join to a table; join each right of a LEFT, RIGHT and
+/// FULL JOIN, over documents a row gives. Expect: SQLite's rowids and rows (finding DS). A rowid of 0
+/// read NULL, so the row a RIGHT or FULL JOIN matched by it came out again as unmatched; the rowid of
+/// a LEFT JOIN's NULL row was the last row's; and json_each counted its rows from 1, json_tree with
+/// the ends of its containers among them.
+#[test]
+fn a_virtual_tables_rowid_is_its_rows_number_and_null_for_no_row() {
+    answers_under_five_settings(
+        &[
+            "CREATE TABLE a(k INT)",
+            "INSERT INTO a VALUES (1), (2)",
+            "CREATE TABLE d(k INT, j TEXT)",
+            "INSERT INTO d VALUES (1, '[7,1]'), (2, '[[1,2],3]'), (3, NULL), (4, '5')",
+            "CREATE TABLE b(id INTEGER PRIMARY KEY)",
+            "INSERT INTO b VALUES (0), (1), (5)",
+            "CREATE TABLE ti(x, y)",
+        ],
+        &[
+            (
+                "SELECT rowid, oid, _rowid_ FROM json_tree('[7]')",
+                &["0|0|0", "1|1|1"],
+            ),
+            (
+                "SELECT rowid, value FROM json_each('[7,1]')",
+                &["0|7", "1|1"],
+            ),
+            (
+                "SELECT rowid, atom FROM json_tree('[[1,2],3]')",
+                &["0|NULL", "1|NULL", "2|1", "3|2", "4|3"],
+            ),
+            (
+                "SELECT value FROM json_each('[7,1]') WHERE rowid = 0",
+                &["7"],
+            ),
+            (
+                "SELECT count(rowid), min(rowid), max(rowid) FROM generate_series(-1, 2)",
+                &["4|-1|2"],
+            ),
+            (
+                "SELECT x.k, je.atom FROM a AS x RIGHT JOIN json_tree('[7,1]') AS je ON 1",
+                &["1|1", "1|7", "1|NULL", "2|1", "2|7", "2|NULL"],
+            ),
+            (
+                "SELECT x.k, je.rowid FROM a AS x FULL JOIN json_tree('[7,1]') AS je ON je.atom = x.k",
+                &["1|2", "2|NULL", "NULL|0", "NULL|1"],
+            ),
+            (
+                "SELECT x.k, je.rowid FROM a AS x LEFT JOIN json_each('[7,1]') AS je ON je.value = x.k",
+                &["1|1", "2|NULL"],
+            ),
+            (
+                "SELECT x.k, g.rowid, g.value FROM a AS x FULL JOIN generate_series(0, 1) AS g ON g.value = x.k",
+                &["1|1|1", "2|NULL|NULL", "NULL|0|0"],
+            ),
+            (
+                "SELECT x.k, p.rowid, p.name FROM a AS x FULL JOIN pragma_table_info('ti') AS p ON p.cid = x.k",
+                &["1|2|'y'", "2|NULL|NULL", "NULL|1|'x'"],
+            ),
+            (
+                "SELECT d.k, je.rowid FROM d FULL JOIN json_tree(d.j) AS je ON je.type = 'integer'",
+                &["1|1", "1|2", "2|2", "2|3", "2|4", "3|NULL", "4|0"],
+            ),
+            (
+                "SELECT b.id, je.rowid FROM json_tree('[7,1]') AS je LEFT JOIN b ON b.id = je.rowid",
+                &["0|0", "1|1", "NULL|2"],
+            ),
+            (
+                "SELECT b.id FROM b WHERE b.id NOT IN (SELECT rowid FROM json_each('[7,1]'))",
+                &["5"],
+            ),
+        ],
+    );
+}
+
+/// Do: an EXISTS that becomes a semi join to a table its own nested EXISTS or NOT EXISTS reads, beside
+/// a subquery that becomes a grouped left join; over a few rows, where every join is a hash join and
+/// at defaults. Expect: SQLite's rows (finding DT). The nested subquery was put off to the left join's
+/// loop, which fewer rows reach: the semi join's loop, its condition not yet read, took its first row
+/// for a match and left whatever the condition then said.
+#[test]
+fn a_semi_joins_condition_is_read_in_its_own_loop() {
+    answers_under_five_settings(
+        &[
+            "CREATE TABLE p(k INT, v INT)",
+            "INSERT INTO p VALUES (1, 2), (2, 3), (NULL, 1), (4, NULL), (1, 0)",
+            "CREATE TABLE n(k INT)",
+            "INSERT INTO n VALUES (1), (NULL), (2), (3), (1)",
+            "CREATE TABLE e(k INT)",
+            "CREATE TABLE w(k INT PRIMARY KEY, v INT)",
+            "INSERT INTO w VALUES (1, 1), (2, 0), (6, NULL)",
+        ],
+        &[
+            (
+                "SELECT a0.k, a0.v, a1.k, a1.v FROM p AS a0 LEFT JOIN w AS a1 ON a0.v = a1.k WHERE EXISTS (SELECT 1 FROM n AS s1 WHERE NOT EXISTS (SELECT 1 FROM p AS s2 WHERE a1.v < s2.k AND s2.k = s1.k)) AND NOT EXISTS (SELECT 1 FROM e AS s9 WHERE s9.k = a1.v)",
+                &["1|0|NULL|NULL", "1|2|2|0", "2|3|NULL|NULL", "4|NULL|NULL|NULL", "NULL|1|1|1"],
+            ),
+        ],
+    );
+    answers_under_five_settings(
+        &[
+            "CREATE TABLE m(k INT, v INT)",
+            "INSERT INTO m VALUES (2, 1)",
+            "CREATE TABLE q(k INT, v INT)",
+            "INSERT INTO q VALUES (1, 2), (3, 2)",
+            "CREATE TABLE w(k INT)",
+            "INSERT INTO w VALUES (3)",
+        ],
+        &[
+            (
+                "SELECT a0.k, a1.v FROM m AS a0 LEFT JOIN m AS a1 ON a0.v = a1.v WHERE EXISTS (SELECT 1 FROM q AS s1 WHERE EXISTS (SELECT 1 FROM w AS s2 WHERE s2.k = s1.k) AND s1.v = a0.k) AND NOT EXISTS (SELECT 1 FROM m AS s9 WHERE s9.v = a1.k)",
+                &["2|1"],
+            ),
+            (
+                "SELECT a0.k, a1.v FROM m AS a0 LEFT JOIN m AS a1 ON a0.v = a1.v WHERE a0.k IN (SELECT s1.v FROM q AS s1 WHERE EXISTS (SELECT 1 FROM w AS s2 WHERE s2.k = s1.k)) AND NOT EXISTS (SELECT 1 FROM m AS s9 WHERE s9.v = a1.k)",
+                &["2|1"],
+            ),
+            (
+                "SELECT a0.k, a1.v FROM m AS a0 LEFT JOIN m AS a1 ON a0.v = a1.v WHERE EXISTS (SELECT 1 FROM q AS s1 WHERE (s1.k > 5 OR EXISTS (SELECT 1 FROM w AS s2 WHERE s2.k = s1.k)) AND s1.v = a0.k) AND NOT EXISTS (SELECT 1 FROM m AS s9 WHERE s9.v = a1.k)",
+                &["2|1"],
+            ),
+        ],
+    );
+}

@@ -57,13 +57,19 @@ fn upsert_update_aborts_without_changing_outer_fail_policy() {
         sql(&io, &connection, statement).unwrap();
     }
 
-    for assignment in ["n=NULL", "u='u2'", "n=''"] {
+    // The refusal is the constraint's own, as SQLite's is (sqlite.org/rescode.html,
+    // SQLITE_CONSTRAINT_NOTNULL, _UNIQUE and _CHECK) and as a rowid table's is.
+    for (assignment, refusal) in [
+        ("n=NULL", "NOT NULL constraint failed: t.n"),
+        ("u='u2'", "UNIQUE constraint failed: t.u"),
+        ("n=''", "CHECK constraint failed: length(n)>0"),
+    ] {
         let statement = format!(
             "INSERT OR FAIL INTO t VALUES('fresh','uf','new'),('conflict','u3','new') ON CONFLICT(k) DO UPDATE SET {assignment}"
         );
         let error = sql(&io, &connection, &statement).unwrap_err();
         assert!(
-            matches!(error, LimboError::Raise(ResolveType::Abort, _)),
+            matches!(&error, LimboError::Constraint(words) if words == refusal),
             "{assignment}: {error:?}"
         );
         assert_eq!(

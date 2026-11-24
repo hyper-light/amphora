@@ -249,7 +249,12 @@ fn run(path: &Path, crash: &Arc<Crash>) -> (Vec<Rows>, usize) {
     }
     // The crash: the files as the writes before it left them, copied before anything else runs.
     let copy = path.with_extension("crashed");
-    for (from, to) in [(path.to_path_buf(), copy.clone()), (wal(path), wal(&copy))] {
+    // The log's two segments are both its files (decision 45).
+    for (from, to) in [
+        (path.to_path_buf(), copy.clone()),
+        (wal(path), wal(&copy)),
+        (wal2(path), wal2(&copy)),
+    ] {
         if from.exists() {
             std::fs::copy(&from, &to).unwrap();
         }
@@ -277,6 +282,10 @@ fn put_model(rows: &mut Rows, ids: &[i64], version: u8) {
 
 fn wal(path: &Path) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("{}-wal", path.display()))
+}
+
+fn wal2(path: &Path) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{}-wal2", path.display()))
 }
 
 fn versioned(path: &Path) -> std::path::PathBuf {

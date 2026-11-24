@@ -19,7 +19,7 @@ Not drawn, and why:
 - A bare column's value, a text of a group or a tie's value: any of its rows may give it (lower(), rtrim()).
 - new.rowid in a BEFORE INSERT that gives no rowid: undefined (lang_createtrigger.html).
 - A subquery in a window function's argument: Amphora refuses it (finding CS).
-- json_tree right of a RIGHT or FULL JOIN: its root's rowid, 0, reads NULL in Amphora (finding DS).
+- json_tree right of a RIGHT or FULL JOIN: bench/sqlite_joined_rows.py draws it (finding DS, lane C24).
 - A subquery in an UPSERT's DO UPDATE: Amphora refuses it ("Scalar subquery is not supported in this context").
 usage: python3 bench/sqlite_columns_read.py [seed] > crates/engine/tests/fixtures/columns_read.tsv"""
 import random

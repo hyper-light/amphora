@@ -72,7 +72,7 @@ use crate::{
     util::{cast_real_to_integer, checked_cast_text_to_numeric},
     vdbe::{
         builder::CursorType,
-        insn::{IdxInsertFlags, Insn, SavepointOp},
+        insn::{HaltAction, IdxInsertFlags, Insn, SavepointOp},
     },
     CaptureDataChangesInfo, CdcVersion, CheckpointMode, Completion, ConnectOpts, Connection,
     Database, DatabaseStorage, IOExt, MvCursor, NonNan, OpenFlags, QueryMode, Statement,
@@ -781,35 +781,52 @@ pub fn op_checkpoint(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
-    let step_result = pager.checkpoint(*checkpoint_mode, sync_mode, true);
-    match step_result {
-        Ok(IOResult::Done(CheckpointResult {
-            wal_max_frame,
-            wal_total_backfilled,
-            ..
-        })) => {
-            // https://sqlite.org/pragma.html#pragma_wal_checkpoint
-            // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).
-            state.registers[*dest].set_int(0);
-            // 2nd col: # modified pages written to wal file
-            state.registers[*dest + 1].set_int(wal_max_frame as i64);
-            // 3rd col: # pages moved to db after checkpoint
-            state.registers[*dest + 2].set_int(wal_total_backfilled as i64);
+    let passive = CheckpointMode::Passive {
+        upper_bound_inclusive: None,
+    };
+    let (busy, counted) = loop {
+        let mode = if state.checkpoint_blocked {
+            passive
+        } else {
+            *checkpoint_mode
+        };
+        match pager.checkpoint(mode, sync_mode, true) {
+            Ok(IOResult::Done(result)) if !state.checkpoint_blocked => {
+                break (0, Some((result.wal_max_frame, result.wal_total_backfilled)));
+            }
+            // "the checkpoint operation proceeds from that point in the same way as
+            // SQLITE_CHECKPOINT_PASSIVE [...]. SQLITE_BUSY is returned in this case"
+            // (sqlite.org/c3ref/wal_checkpoint_v2.html).
+            Ok(IOResult::Done(_)) => {
+                break (1, pager.wal.as_ref().map(|wal| wal.frames_and_copied()));
+            }
+            Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
+            Err(err) => {
+                tracing::debug!("PRAGMA wal_checkpoint failed: {err:?}");
+                pager.cleanup_after_checkpoint_failure();
+                if state.checkpoint_blocked || mode == passive || !matches!(*err, LimboError::Busy)
+                {
+                    break (1, None);
+                }
+                state.checkpoint_blocked = true;
+            }
+        }
+    };
+    let count = |frames: u64| i64::try_from(frames).unwrap_or(i64::MAX);
+    let (frames, copied) =
+        counted.map_or((-1, -1), |(frames, copied)| (count(frames), count(copied)));
+    // https://sqlite.org/pragma.html#pragma_wal_checkpoint
+    // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).
+    state.registers[*dest].set_int(busy);
+    // 2nd col: # modified pages written to wal file
+    state.registers[*dest + 1].set_int(frames);
+    // 3rd col: # pages moved to db after checkpoint
+    state.registers[*dest + 2].set_int(copied);
 
-            state.explicit_checkpoint_guard = None;
-            state.pc += 1;
-            Ok(InsnFunctionStepResult::Step)
-        }
-        Ok(IOResult::IO(io)) => Ok(state.suspend_on_io(io)),
-        Err(err) => {
-            tracing::debug!("PRAGMA wal_checkpoint failed: {err:?}");
-            pager.clear_checkpoint_state();
-            state.explicit_checkpoint_guard = None;
-            state.registers[*dest].set_int(1);
-            state.pc += 1;
-            Ok(InsnFunctionStepResult::Step)
-        }
-    }
+    state.explicit_checkpoint_guard = None;
+    state.checkpoint_blocked = false;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
 }
 
 pub fn op_null(
@@ -4056,7 +4073,7 @@ pub fn halt(
     pager: &Arc<Pager>,
     err_code: usize,
     description: &str,
-    on_error: Option<ResolveType>,
+    on_error: Option<HaltAction>,
 ) -> InsnResult {
     state.halt_in_progress = true;
     let mv_store = state.mv_store(&program.connection).cloned();
@@ -4086,7 +4103,7 @@ pub fn halt(
     }
 
     // Handle RAISE errors - these carry their own resolve type
-    if let Some(resolve_type) = on_error {
+    if let Some(HaltAction::Raise(resolve_type)) = on_error {
         // RAISE(IGNORE) signals the parent to skip the current row
         if resolve_type == ResolveType::Ignore {
             // RAISE(IGNORE) is not an error: the frame unwinds, but everything
@@ -4148,10 +4165,15 @@ pub fn halt(
 
     // Handle constraint errors
     if let Some(error) = constraint_error {
+        state.constraint_action = match on_error {
+            Some(HaltAction::Fail) => ResolveType::Fail,
+            Some(HaltAction::Rollback) => ResolveType::Rollback,
+            Some(HaltAction::Raise(_)) | None => ResolveType::Abort,
+        };
         // For FAIL mode with autocommit, commit partial changes before returning error.
         // This matches SQLite behavior where FAIL keeps changes made before the error.
         // Note: ON CONFLICT FAIL does NOT apply to FK violations, so we check for those first.
-        if program.resolve_type == ResolveType::Fail && can_autocommit_now {
+        if state.constraint_action == ResolveType::Fail && can_autocommit_now {
             // Check for immediate FK violations - FK errors don't respect ON CONFLICT
             if program.connection.foreign_keys_enabled()
                 && state.get_fk_immediate_violations_during_stmt() > 0
@@ -4188,21 +4210,9 @@ pub fn halt(
             }
         }
 
-        // A FAIL resolution that cannot commit here because an outer statement
-        // is still running (this is a trigger subprogram fired mid-statement)
-        // must still tell the enclosing statement to keep the changes made
-        // before the error. Re-tag the constraint as a FAIL raise so the outer
-        // program's abort() preserves and commits them instead of rolling the
-        // statement back. FK errors do not respect ON CONFLICT, so leave them
-        // as-is.
-        if program.resolve_type == ResolveType::Fail {
-            if let LimboError::Constraint(msg) = error {
-                return Err(LimboError::Raise(ResolveType::Fail, msg).into());
-            }
-        }
-
         // For non-FAIL modes (or non-autocommit), just return the error.
-        // abort() will handle rollback based on resolve_type.
+        // abort() undoes what its action says, in this program or, for a trigger's, in the
+        // statement that fired it (op_program).
         return Err(error.into());
     }
 
@@ -4638,11 +4648,12 @@ pub fn op_halt_if_null(
             target_reg,
             err_code,
             description,
+            on_error,
         },
         insn
     );
     if matches!(state.registers[*target_reg].get_value(), Value::Null) {
-        halt(program, state, pager, *err_code, description, None)
+        halt(program, state, pager, *err_code, description, *on_error)
     } else {
         state.pc += 1;
         Ok(InsnFunctionStepResult::Step)
@@ -6413,6 +6424,7 @@ pub fn op_program(
                         }
                         Err(err) => {
                             subprogram_aborted = true;
+                            state.constraint_action = statement.constraint_action();
                             finish_subprogram(
                                 program,
                                 &statement,
@@ -6629,10 +6641,7 @@ fn op_row_id_read(state: &mut ProgramState, cursor_id: usize, dest: usize) -> In
     fn row_id_of_other_cursor(cursor: &mut Option<Cursor>) -> IOResultOr<Option<i64>> {
         match cursor {
             Some(Cursor::NullRow) => Ok(IOResult::Done(None)),
-            Some(Cursor::Virtual(virtual_cursor)) => {
-                let rowid = virtual_cursor.rowid();
-                Ok(IOResult::Done((rowid != 0).then_some(rowid)))
-            }
+            Some(Cursor::Virtual(virtual_cursor)) => Ok(IOResult::Done(virtual_cursor.rowid())),
             Some(Cursor::MaterializedView(mv_cursor)) => mv_cursor.rowid(),
             Some(Cursor::IndexMethod(cursor)) => cursor.query_rowid(),
             Some(Cursor::Pseudo(_)) => Ok(IOResult::Done(None)),

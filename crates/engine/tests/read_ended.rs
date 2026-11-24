@@ -5,6 +5,7 @@
 //! where the test says, so the order is the test's and not a thread's.
 
 use amphora_engine::io::{FileId, FileSyncType};
+use amphora_engine::storage::log_segments::SegmentId;
 use amphora_engine::{
     Buffer, CheckpointMode, Clock, Completion, CompletionError, ConnectOpts, Connection, Database,
     DatabaseOpts, File, LimboError, LogFormat, MonotonicInstant, OpenFlags, OpenOptions, PagePath,
@@ -153,9 +154,16 @@ impl IO for Hooked {
     }
 }
 
-/// The log's first segment, the one current at first, and the database's file.
-const FIRST: &str = "-wal";
+/// The database's file.
 const FILE: &str = ".db";
+
+/// The file of the log's current segment.
+fn log_file(db: &Arc<Database>) -> &'static str {
+    match db.wal_segment() {
+        SegmentId::First => "-wal",
+        SegmentId::Second => "-wal2",
+    }
+}
 
 fn connect(db: &Arc<Database>, path: PagePath) -> Arc<Connection> {
     let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -255,7 +263,7 @@ fn newer_after(db: &Arc<Database>, reader: &Arc<Connection>, newest: &str) {
     }
 }
 
-/// Do (decision 45): b's row set to 'old', its page in the log's first segment alone, in each log
+/// Do (decision 45): b's row set to 'old', its page in the log's current segment alone, in each log
 /// format; a read begun, b not read yet; the log switched, so that segment closes; b read, and
 /// within the read of its page from that segment, before the bytes: the read ended by the log's
 /// owner, the segment copied whole and reset, the log switched back into it, and b's row set 40
@@ -269,11 +277,12 @@ fn d45_a_log_page_in_flight_as_its_read_ends_is_never_taken_in() {
             let dir = tempfile::tempdir().unwrap();
             let (db, within, writer) = made(dir.path(), format, false);
             writer.execute("UPDATE b SET v = 'old'").unwrap();
+            let log = log_file(&db);
             let reader = begun(&db, path);
             assert!(db.switch_log(None).unwrap());
             writer.execute("UPDATE a SET x = 1").unwrap();
             let owner = db.clone();
-            within.arm(FIRST, At::BeforeBytes, move || {
+            within.arm(log, At::BeforeBytes, move || {
                 assert_eq!(owner.end_closing_reads(), 1);
                 copy_all(&owner);
                 assert!(owner.switch_log(None).unwrap());

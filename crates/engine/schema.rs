@@ -4083,6 +4083,49 @@ impl BTreeTable {
             .and_then(|unique_set| unique_set.conflict_clause)
     }
 
+    /// Whether a WITHOUT ROWID table's `index` meets a conflict before its primary key does. SQLite
+    /// lists the key with the table's indexes, the newest first and those under REPLACE last
+    /// (`sqlite3CreateIndex`), and makes an INTEGER PRIMARY KEY one of them when it has read the whole
+    /// table (`convertToWithoutRowidTable`).
+    pub(crate) fn checked_before_primary_key(&self, index: &Index) -> bool {
+        let Some(key_at) = self.unique_sets.iter().position(|set| set.is_primary_key) else {
+            return false;
+        };
+        let Some((key, newer)) = self
+            .unique_sets
+            .get(key_at..)
+            .and_then(|sets| sets.split_first())
+        else {
+            return false;
+        };
+        let key_replaces = key.conflict_clause == Some(ResolveType::Replace);
+        if key_replaces != (index.on_conflict == Some(ResolveType::Replace)) {
+            return key_replaces;
+        }
+        if !index
+            .name
+            .starts_with(crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX)
+        {
+            return true;
+        }
+        let integer_key = matches!(
+            key.columns.as_slice(),
+            [only] if only.sort_order == SortOrder::Asc
+                && self
+                    .get_column(&only.name)
+                    .is_some_and(|(_, column)| column.ty_str.eq_ignore_ascii_case("INTEGER"))
+        );
+        !integer_key
+            && newer.iter().any(|set| {
+                set.columns.len() == index.columns.len()
+                    && set
+                        .columns
+                        .iter()
+                        .zip(&index.columns)
+                        .all(|(a, b)| a.name.eq_ignore_ascii_case(&b.name))
+            })
+    }
+
     fn primary_key_conflict_clause(&self) -> Option<ResolveType> {
         self.unique_sets
             .iter()
@@ -4878,7 +4921,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
     let mut has_autoincrement = false;
     let mut primary_key_columns = vec![];
     let mut foreign_keys = vec![];
+    // A row meets its columns' checks first, then the table's, as they are written.
     let mut check_constraints = vec![];
+    let mut table_check_constraints = vec![];
     let mut cols: Vec<Column> = vec![];
     let is_strict: bool;
     let columnar: bool;
@@ -5051,7 +5096,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     foreign_keys.try_push(Arc::new(fk))?;
                     table_fk_order += 1;
                 } else if let ast::TableConstraint::Check { expr, source } = &c.constraint {
-                    check_constraints.try_push(CheckConstraint::new(
+                    table_check_constraints.try_push(CheckConstraint::new(
                         c.name.as_ref(),
                         expr,
                         source.as_deref(),
@@ -5410,6 +5455,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         }
     }
 
+    check_constraints.try_extend(table_check_constraints)?;
     let mut table = BTreeTable {
         root_page,
         name: table_name,

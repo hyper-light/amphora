@@ -1772,3 +1772,77 @@ r1860, r1864, r1898 and r1913 were stopped by this lane as the tree they ran was
 **For the next lane** (parts 1 and 2): rebase `perf/pagepath-b27`'s diff; keep `Db::own_restarts` and have the two replicated tests' owner start its log before the slow read begins (their 16
 and 32 frames are "past its own file"), or keep the writer's switch off for a log its owner has ever switched, and say which in replication.md; then the engine suite (1,239 on 027b3620), clippy,
 check-production (lower the ratchet by arithmetic 1, cast_possible_wrap 2, disallowed_macros 1, as the branch does) and the multi-process switch.
+
+## perf-B28 (2026-11-24, 11:13:02Z-12:13:02Z; every restart switches, lane B27's parts 1 and 2, on main)
+
+**Losses first.**
+- `every_falsifier_of_the_floor_holds_under_a_nemesis` fails on both sides and is not fixed, and it fails more often with the branch. In the same runs side by side: main 5 of 47, the
+  branch 11 of 47, and 4 of 19 more on the landed code alone. The difference is in one message, "the group calm not reached": 1 of 47 on main, 9 of 47 on the branch (one-sided p
+  0.008). Both messages are main's own, at rates as high (r1694: 3 of 8; lane A25: 7 of 17). What the stuck group waits for was traced (below): a heartbeat, with every clock of the test
+  standing still; 3 of 3 such groups were calm after 3 or 4 ticks. Why the branch leaves them so more often was not traced (a guess, untested: a clean close now empties a
+  member's log, where main's answered Busy and left it, and the nemesis restarts a member).
+- Not as SQLite yet, B27's list, left for the next lanes: a second RESTART or TRUNCATE beside one read of the file alone is busy (that read keeps the segment the first one
+  closed); a second RESTART counts 0 frames; a clean close leaves an empty `-wal2`; a multi-process log restarts its one segment in place; a crash leaves commits in `-wal2` that
+  plain SQLite reads without, more often now, since the writer's own restart writes there too.
+- Runs wasted: r1983 and r1984 were two worktrees building into one target folder. cargo names a workspace's crates by their place in it, so each rebuilt over the other's, and
+  r1984's tests may have linked the trace. Both were stopped, and nothing of r1984's is counted. Two runs the kiln server lost (r2051, r2055) cost six minutes.
+- The trace is one run a test a side (and B27's three failures). Three rounds of the replicated suites a side were run before C19's landing was merged (f12ee533 against main 20cffc15);
+  the landed code ran one round (178 passed, `every_falsifier_...` failed, "calm").
+
+**Landed** (a fast-forward from bba0f9fd at 11:51:25Z): 32f6619e (log_restart.rs, red on main: 3 of 4) and bad37a58 (the change).
+
+**The two failures, traced** (r1961 on main edc3b885 and the branch at 8665c72f, r1983 with the fix; `trace.py`, branch `perf/pagepath-b28-trace`): a line at each write, at each room the
+flushing thread learns, at each turn of the owner's flush that changed, and at each segment's start with its call stack.
+
+| | main edc3b885 | branch 8665c72f | with the fix |
+|---|---|---|---|
+| as the slow read begins, both tests | second segment current, 7 frames; files of 75 and 7 frames; 1 owner's restart | the same | the same |
+| in-place restarts in the test | 0 | 0 | 0 |
+| the first write after | 10 frames, same segment; 0 reads on a closing one | the writer's own switch (`switch_before_write`, 7 of 7 copied), to the file of 75; the read is on the closing segment | 10 frames, same segment |
+| writers' own switches after | 0 and 0 | 123 and 140 | 0 and 0 |
+| `..has_no_write_refused..` (32 frames) | the owner's restart at 64 frames of a room of 61; the read whole | room 69 (75 x 4,120 / 8,216 + 32); read ended at 39 frames and the 33 the pass grew by; owner's restarts 0 in 254 writes | the owner's restart at 61 of 59; the read whole |
+| `..ends_typed..` (16 frames) | restarts at 28 of 27, 30 of 28, 33 of 31, 33 of 31; read ended at 12 and 12 of 22 | room 53; read ended at 27 and 27; owner's restarts 0 in 253 writes | main's, number for number |
+
+- The first cause: `Machine::session_connection` opens the session worker's connection with every automatic action on. A session is a write transaction (rolled back), so each one's
+  BEGIN asked for the writer's restart, which is a switch now. `Db::own_restarts` was set on the owner's connection alone.
+- B27's inferred cause (main restarts the log in place at each write; the test's log is longer without it) is wrong: main made no in-place restart in either test, and the files
+  were the same as the read began. The tests assume nothing of the old restart: no room, log or assertion of theirs changed, one helper's comment did.
+- Fixed there: the session worker's connection leaves the log to its owner too (one line). With it the two tests pass, and the owner's restarts come at main's frames.
+- replication.md said the engine starts a leader's log again at a write's begin ("safe beside the owner's restart"); it no longer holds and says so (B and the 2026-11-09 decision's point 3).
+
+**`every_falsifier_...`**, each run alone, two of each side at once (r2025, r2037), and the three rounds of the suites (r2003).
+
+| | main 20cffc15 | f12ee533 |
+|---|---|---|
+| r2025, 16 a side (load 24 to 40) | 2 failed: unanswered 2 | 4 failed: unanswered 2, calm 2 |
+| r2037, 16 a side (load 21 to 34) | 1 failed: unanswered 1 | 5 failed: calm 5 |
+| r2003, three rounds (load 30 to 65) | 1 failed: calm 1 | 0 |
+| r2066, 12 a side (main bba0f9fd, the landed bad37a58, each with `dump.py`'s lines) | 1 failed: unanswered 1 | 2 failed: calm 2 |
+| in all | 5 of 47: unanswered 4, calm 1 | 11 of 47: unanswered 2, calm 9 |
+
+"unanswered": "a driven operation was unanswered after 60000 rounds", the leader's last entry or two past the committed one, nothing in flight, no clock moving, on both sides.
+"calm": "the group calm not reached in 60000 driven rounds".
+- A "calm" failure's members (r2066, two of two on bad37a58; `dump.py`): the follower that isn't calm holds the last entry, the one that ends the joint configuration (26 of committed 25; 33 of 32),
+  and lacks only the leader's word that it is committed; the leader and the other two have applied it. Nothing in flight, no flush, session or pass out, no read on a closing segment. That
+  follower's log holds 0 frames.
+- r2082 (bad37a58, 18 runs, six at once): 3 failed, all "calm"; with every clock then moved a tick at a time, each group was calm after 4, 3 and 4 ticks. The test's own comment names the wait: "a
+  heartbeat its driver, time standing still, never brings". In a running group time moves.
+
+**Runs** (adacachy2, `on` it; clone `pagepath-remote`, target `pagepath`; CARGO_INCREMENTAL=0; logs in `~/.cache/amphora-perf/pagepath-b28/` there).
+| run | tree | result |
+|---|---|---|
+| r1953 | 8665c72f (main edc3b885 merged, before the fix) | log_restart 4, read_ended 2, log_read_index 1; engine lib `storage:: vdbe:: mvcc::database::tests multiprocess_tests` 1,623 passed, 0 failed, 28 ignored (230 s) |
+| r1961 | edc3b885 and 8665c72f, traced | the two tests: 2 passed on main, 2 failed on the branch |
+| r1983 (stopped) | f22451a7, traced | the two tests passed |
+| r2003 (cpus=16) | main 20cffc15 and f12ee533 | log_restart.rs on main: 1 passed, 3 failed (red); on the branch 4 passed; read_ended 2, log_read_index 1; engine lib as above 1,623 passed, 0 failed, 28 ignored (255 s); store 18, files 3, crash 10 (3 ignored), backup 50 (1 ignored), `backup::` 48, amphora `d45_` 6; fmt 0; clippy 0; check-production 1 (indexing_slicing 3038, below the 3040 held: lowered); `database::replicated::` main 179, 179, 178; branch 179, 179, 179 (45 to 62 s a round, 6 threads) |
+| r2023 (cpus=4) | c4776969 (main 2ba5f5bb merged) | fmt 0; clippy `-p amphora -p amphora-engine --all-targets --locked -D warnings` 0 ("Compiling amphora-engine"); check-production 0 ("10573 left ... as the ratchet holds"); log_restart 4, read_ended 2, log_read_index 1; engine `d45_ storage::wal` 133 passed (1 ignored); store 18, files 3, crash 10, backup 50; the two tests, `backup::`, `d45_`, `log_bound` 59 passed |
+| r2042 (cpus=8) | 082a7830 (the landed tree) | fmt 0; `meter::` (the design's tables) 4; `database::replicated::` 178 passed, 1 failed (`every_falsifier_...`) |
+| r2025, r2037 (cpus=4) | main 20cffc15 and f12ee533 | the table above |
+| r2066 (cpus=8) | bad37a58 (main as landed) | the tests that read the log or checkpoint and were not run before: engine reader_cache 6, page_path_allocs 1, packed_log 16, shared_pages 14, spilled_log 2 (1 ignored), versioned_crash 1 (1 ignored); amphora groups 12, amplification 2; the table's last row |
+| r2082 (cpus=6) | bad37a58 | `every_falsifier_...` 18 runs, the clocks moved after a failure: above |
+
+main's pass set: the branch's `storage` and `vdbe` hold main's tests and one more (`d45_a_write_beside_a_checkpoint_letting_go_of_the_free_segment_is_taken`), one renamed with its function
+(`.._publishes_checkpoint_and_switch_state`); none of the run failed. Refused for room: r2044 (6 cpus, 2 idle), r2049 (6, 5 idle).
+
+**For the next lane.** B27's list above. `every_falsifier_...`: its `calm` waits with time standing still, where its `caught_up` moves the clocks; the dump and the ticks are in `~/.cache/amphora-perf/pagepath-b28/dump.py`
+and r2082's command. `perf/pagepath-b27` (WIP history) and `perf/pagepath-b28-land` hold nothing main doesn't.

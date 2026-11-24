@@ -1,6 +1,6 @@
 use crate::vdbe::{
     builder::CursorType,
-    insn::{ClearBtreeCount, IntegrityCkData, RegisterOrLiteral, SorterOpenData},
+    insn::{ClearBtreeCount, HaltAction, IntegrityCkData, RegisterOrLiteral, SorterOpenData},
 };
 use crate::HashSet;
 use amphora_engine_parser::ast::{ResolveType, SortOrder};
@@ -8,6 +8,18 @@ use amphora_engine_parser::ast::{ResolveType, SortOrder};
 use super::{Insn, InsnReference, PreparedProgram, Value};
 use crate::function::{Func, ScalarFunc};
 use crate::translate::eqp::EqpCteMaterialization;
+
+/// P2 of a Halt, as SQLite numbers its conflict actions.
+const fn halt_action_p2(on_error: Option<HaltAction>) -> i64 {
+    match on_error {
+        Some(HaltAction::Rollback | HaltAction::Raise(ResolveType::Rollback)) => 1,
+        Some(HaltAction::Raise(ResolveType::Abort)) => 2,
+        Some(HaltAction::Fail | HaltAction::Raise(ResolveType::Fail)) => 3,
+        Some(HaltAction::Raise(ResolveType::Ignore)) => 4,
+        Some(HaltAction::Raise(ResolveType::Replace)) => 5,
+        None => 0,
+    }
+}
 
 pub const EXPLAIN_COLUMNS: [&str; 8] = ["addr", "opcode", "p1", "p2", "p3", "p4", "p5", "comment"];
 pub const EXPLAIN_COLUMNS_TYPE: [&str; 8] = [
@@ -1016,14 +1028,7 @@ pub fn insn_to_row(
                 on_error,
                 description_reg,
             } => {
-                let p2 = match on_error {
-                    Some(ResolveType::Rollback) => 1,
-                    Some(ResolveType::Abort) => 2,
-                    Some(ResolveType::Fail) => 3,
-                    Some(ResolveType::Ignore) => 4,
-                    Some(ResolveType::Replace) => 5,
-                    None => 0,
-                };
+                let p2 = halt_action_p2(*on_error);
                 let p3 = description_reg.unwrap_or(0) as i64;
                 (
                     "Halt",
@@ -1039,10 +1044,11 @@ pub fn insn_to_row(
                 err_code,
                 target_reg,
                 description,
+                on_error,
             } => (
                 "HaltIfNull",
                 *err_code as i64,
-                0,
+                halt_action_p2(*on_error),
                 *target_reg as i64,
                 Value::build_text(description.clone()),
                 0,
