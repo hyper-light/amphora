@@ -19,7 +19,7 @@ use crate::translate::expr::{
 use crate::translate::plan::{
     ColumnUsedMask, EvalAt, JoinedTable, NonFromClauseSubquery, Operation, OuterQueryReference,
     Plan, QueryDestination, ResultSetColumn, SubqueryEvalPhase, SubqueryOrigin, SubqueryRun,
-    TableReferences, UpdateSetClause,
+    TableReferences,
 };
 use crate::translate::planner::{
     collect_from_clause_table_refs, collect_subquery_table_refs_in_expr, plan_ctes_as_outer_refs,

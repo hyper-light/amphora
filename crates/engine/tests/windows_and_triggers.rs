@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// A line of a fixture (`bench/sqlite_windows.py`, `bench/sqlite_triggers.py`,
-/// `bench/sqlite_unread_cursors.py`, `bench/sqlite_trigger_conflicts.py`): a statement that fills the
-/// database, or a query or a statement with what SQLite answered.
+/// `bench/sqlite_unread_cursors.py`, `bench/sqlite_trigger_conflicts.py`, `bench/sqlite_instead_of.py`):
+/// a statement that fills the database, or a query or a statement with what SQLite answered.
 enum Step {
     Fill(&'static str),
     Ask(&'static str, &'static str),
@@ -131,9 +131,12 @@ fn outcome(io: &MemoryIO, conn: &Arc<Connection>, sql: &str) -> String {
     }
 }
 
+/// `ERROR~words` is a refusal whose words end so, whatever kind of refusal Amphora says it is first.
 fn agrees(got: &str, want: &str) -> bool {
     if want == "ERROR" {
         got.starts_with("ERROR ")
+    } else if let Some(words) = want.strip_prefix("ERROR~") {
+        got.starts_with("ERROR ") && got.ends_with(words)
     } else {
         got == want
     }
@@ -217,6 +220,15 @@ fn triggers_fire_as_sqlite_fires_them() {
 #[test]
 fn a_conflict_is_judged_by_the_clause_of_the_statement_that_meets_it() {
     answers_as_sqlite(include_str!("fixtures/trigger_conflicts.tsv"));
+}
+
+/// Lane C28 (lang_createtrigger.html, section 3): INSTEAD OF INSERT, DELETE, UPDATE and UPDATE OF
+/// triggers on views of every kind, in main and in temp, fired by every statement under every conflict
+/// clause. Expect what the statement returns, what the tables and the triggers' log hold, `changes()`,
+/// `total_changes()`, `last_insert_rowid()`, and SQLite's words for what it refuses.
+#[test]
+fn instead_of_triggers_fire_as_sqlite_fires_them() {
+    answers_as_sqlite(include_str!("fixtures/instead_of.tsv"));
 }
 
 /// Finding DC: subqueries of grouped and aggregate outer joins, and row-value ranges across a join.
