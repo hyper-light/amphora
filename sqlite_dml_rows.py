@@ -6,18 +6,17 @@ ROWID, triggers on WITHOUT ROWID tables, INSERT OR IGNORE of a NULL into a STRIC
 A case is one table (a rowid alias in each form it is written, listed in the INSERT or not; a key that is no alias; no
 key; WITHOUT ROWID; STRICT or not; each column type; generated columns), its triggers, which log each NEW and OLD value
 with its type and some of which act (RAISE, a WHEN, a write to the table itself), rows put in, then statements.
-`excluded.*` is read for each column, the rowid and its aliases.
+`excluded.*` is read for each column, the rowid and its aliases, and in subqueries of SET and WHERE.
 
 usage: bench/sqlite_dml_rows.py COUNT SEED > crates/engine/tests/fixtures/dml_rows.tsv   (SQLite 3.54.0 in Python)
 
 Left out, each a difference of another cause (bench/records/2026-11-24-adacachy2-oracle-c11.md): a comparison in a
 trigger of a column with a collation (CX), a generated column on a WITHOUT ROWID table (refused), which of two unique
-constraints an UPSERT with no target meets first (no document says), a subquery in DO UPDATE (refused), the text of a
-REAL past 15 digits (CK), an UPDATE of the rowid where a generated column reads it (NEW holds the old one's), an index
-on a generated column (an UPSERT beside a BEFORE UPDATE trigger looks for the wrong entry), a type a STRICT table refuses
-in a trigger that an OR IGNORE fires (ignored with the rest), a BEFORE trigger that changes the row it fires for
-(lang_createtrigger.html: undefined), and the order a WITHOUT ROWID table's rows are changed in where another index may
-be read for them (no document says).
+constraints an UPSERT with no target meets first (no document says), the text of a REAL past 15 digits (CK), an UPDATE
+of the rowid where a generated column reads it (NEW holds the old one's), an index on a generated column (an UPSERT beside
+a BEFORE UPDATE trigger looks for the wrong entry), a RAISE in a BEFORE UPDATE trigger on a table with a rowid (an UPSERT's
+NOT NULL and CHECK go first), a BEFORE trigger that changes the row it fires for (lang_createtrigger.html: undefined), and
+the order a WITHOUT ROWID table's rows are changed in where another index may be read for them (no document says).
 
 At a conflict on the rowid SQLite's `excluded.c` is the value as given, not as c converts it ('7' in an INT column is
 '7'), unless the table has a generated column or an earlier ON CONFLICT names another constraint. By lang_upsert.html it
@@ -155,6 +154,8 @@ class Case:
         if rng.random() < 0.6:
             return when, ""
         raised = f" SELECT RAISE({rng.choice(['IGNORE', 'IGNORE', 'ABORT, 1', 'FAIL, 1', 'ROLLBACK, 1']).replace('1', chr(39) + 'no' + chr(39))}) WHERE {seen} {rng.choice(['IS NULL', 'IN (1, 2)', '> 2'])};"
+        if event == "BEFORE UPDATE" and not self.without_rowid:
+            return when, ""
         if event.startswith("BEFORE") or not self.pk:
             return when, raised
         others = [c for c in self.written if c not in (self.pk, "u", "p", "q")]
@@ -162,8 +163,7 @@ class Case:
                   f" DELETE FROM t WHERE {self.pk} IN (1, 'a');"]
         if others:
             c = rng.choice(others)
-            # of the column's type: a type a STRICT table refuses goes unrefused in a trigger an OR IGNORE fires
-            v = rng.choice(TAKES[self.types[c]] + ["NULL"]) if self.strict else self.value(c)
+            v = self.value(c)
             writes += [f" UPDATE t SET {c} = {v} WHERE {self.pk} IS {row}.{self.pk};", f" UPDATE OR IGNORE t SET {c} = {v};",
                        f" INSERT OR IGNORE INTO t({self.pk}, {c}) VALUES ({self.value(self.pk)}, {v});"]
         return when, rng.choice([raised] + writes * 2)
@@ -227,6 +227,15 @@ class Case:
         e, c = "excluded." + self.ref(), self.ref()
         own = rng.choice([f"t.{c}", c])
         lit = rng.choice(["1", "'7'", "'a'", "1.5", "NULL", "10", "'A'"])
+        if rng.random() < 0.2:
+            x = f"x.{rng.choice(self.written)}"
+            return rng.choice([
+                f"(SELECT {e})", f"(SELECT typeof({e}) || typeof({own}))", f"(SELECT y FROM (SELECT {e} AS y))", f"(SELECT {e} UNION ALL SELECT {own} LIMIT 1)",
+                f"(SELECT count(*) FROM t AS x WHERE {x} IS {e})", f"(SELECT max({x}) FROM t AS x)", f"(SELECT count(*) FROM t AS x WHERE {x} IS {x.replace('x.', 't.')})",
+                f"EXISTS (SELECT 1 FROM t AS x WHERE {x} IS NOT {e})", f"{e} IN (SELECT {x} FROM t AS x)", f"{own} NOT IN (SELECT {e})",
+                f"(SELECT count(*) FROM t AS x WHERE {x} IN (SELECT {e}))", f"coalesce((SELECT min({x}) FROM t AS x WHERE {x} > {e}), {lit})",
+                f"(SELECT {e} FROM t AS excluded LIMIT 1)" if "rowid" not in e and "oid" not in e and "_rowid_" not in e else f"(SELECT {e})",
+            ])
         return rng.choice([
             e, e, e, e, e,
             f"typeof({e})", f"quote({e})", f"coalesce({e}, {own})", f"coalesce({own}, {e})", f"{e} + 1", f"{own} + {e}", f"-{e}",
@@ -243,6 +252,8 @@ class Case:
         chosen = rng.sample(targets, min(len(targets), rng.choice([1, 1, 2, 3])))
         if len(chosen) == 2 and rng.random() < 0.15:
             return f"({chosen[0]}, {chosen[1]}) = ({self.expr()}, {self.expr()})"
+        if len(chosen) == 2 and rng.random() < 0.15:
+            return f"({chosen[0]}, {chosen[1]}) = (SELECT excluded.{self.ref()}, count(*) FROM t AS x WHERE x.{rng.choice(self.written)} IS NOT NULL)"
         return ", ".join(f"{c} = {self.expr()}" for c in chosen)
 
     def on_conflict(self):
@@ -255,7 +266,7 @@ class Case:
             return text + " DO NOTHING"
         text += " DO UPDATE SET " + self.sets()
         if rng.random() < 0.3:
-            text += " WHERE " + rng.choice([f"excluded.{self.ref()} {op} {x}" for op, x in (("=", "2"), (">", "1"), ("IS NOT", "NULL"), ("IS", f"t.{self.ref()}"), ("<>", "'a'"))])
+            text += " WHERE " + rng.choice([f"EXISTS (SELECT 1 FROM t AS x WHERE x.{rng.choice(self.written)} IS NOT excluded.{self.ref()})"] + [f"excluded.{self.ref()} {op} {x}" for op, x in (("=", "2"), (">", "1"), ("IS NOT", "NULL"), ("IS", f"t.{self.ref()}"), ("<>", "'a'"))])
         return text
 
     def statement(self):
