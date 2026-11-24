@@ -7,7 +7,8 @@ the run, and writes the bytes it sent and every backend message they were answer
 
 A step is `session: message ~ message ...`, its messages' parts between `|`:
   P|statement|sql|parameter types' OIDs        B|portal|statement|parameter formats|parameters|result formats
-  DS|statement  DP|portal  CS|statement  CP|portal  E|portal|row limit  S  H  Q|sql  R|type|hex body
+  DS|statement  DP|portal  CS|statement  CP|portal  E|portal|row limit  S  SI  H  Q|sql  R|type|hex body
+  d|data, with Python's string escapes        c        f|reason
 Lists are separated by commas; a parameter is `n` (NULL), `t:text` or `x:hex`. A step without Sync or Query ends in a
 Flush, and is answered once each of its messages is.
 
@@ -66,10 +67,19 @@ def encode(step):
         return message("E", text(parts[0]) + struct.pack("!i", int(parts[1]))), ["CsI"]
     if kind == "S":
         return message("S", b""), ["Z"]
+    if kind == "SI":
+        # A Sync a COPY ignores.
+        return message("S", b""), []
     if kind == "H":
         return message("H", b""), []
     if kind == "Q":
         return message("Q", text(parts[0])), ["q"]
+    if kind == "d":
+        return message("d", parts[0].encode().decode("unicode_escape").encode("latin-1")), []
+    if kind == "c":
+        return message("c", b""), []
+    if kind == "f":
+        return message("f", text(parts[0])), []
     if kind == "R":
         tag, body = parts
         ends = {"S": ["Z"], "Q": ["q"], "H": [], "P": ["1"], "B": ["2"], "C": ["3"], "D": ["Tn"], "E": ["CsI"]}

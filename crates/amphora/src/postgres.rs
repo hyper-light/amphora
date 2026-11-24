@@ -15,6 +15,7 @@
 //!
 //! PostgreSQL's source is cited as `path:line` at tag `REL_19_0`.
 
+mod copy;
 pub mod execute;
 pub mod extended;
 pub mod listener;

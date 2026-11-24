@@ -358,6 +358,33 @@ portals (`portal.rs`), and each message does what REL_19_0's `src/backend/tcop/p
   listener, over sockets), and `scripts/postgres-clients.sh`, where the postgres:19 image's own pgbench runs TPC-B at
   `-M extended` and `-M prepared` and its psql runs `\bind`, `\parse`, `\bind_named` and pipelines on both.
 
+**What COPY and `pgbench -i` have so far** (unit 11, lane PG24): pgbench's default steps `dtgvp`, and `G`, run as on a
+19.0 server; the statements it sends and no others (`crates/pg-analysis/src/{copy,reloptions,utility}.rs`,
+`crates/amphora/src/postgres/copy.rs`).
+
+- COPY FROM STDIN, text format, FREEZE, a list of columns: `copyfromparse.c`'s reader (line ends found on the first line,
+  backslash escapes, `\N`, `\.`) over data in pieces of any size; each row is a row of the engine's INSERT, converted as it
+  comes and inserted in batches of 1000 rows or 65,535 bytes, so the first of several refusals is 19's, with its CONTEXT. CSV,
+  binary, WHERE, other options, files and COPY TO refuse `0A000`. While it goes on, Flush and Sync are ignored and any other
+  message ends the connection as 19 does; a COPY of a Query, the statements after it, and one of the extended protocol, work.
+  FREEZE is refused where 19 refuses it (`55000`, `25000`) and changes nothing else: Amphora's rows are visible to no one
+  before their transaction commits, where 19's frozen rows are.
+- TRUNCATE is every row deleted as row versions, in the transaction that keeps them or not: other sessions' reads go on over
+  their snapshots, which 19's ACCESS EXCLUSIVE lock would hold up. RESTART IDENTITY and CASCADE change nothing here.
+- VACUUM, with or without ANALYZE, checks its tables and the block and does nothing: the versioned storage reclaims its own
+  dead versions, and the planner keeps its own statistics. FULL, FREEZE, VERBOSE and VACUUM of every table refuse `0A000`.
+- ALTER TABLE ADD PRIMARY KEY of one NOT NULL column is a unique index named as 19's, refused as 19's on a duplicate
+  (`23505`), a second key (`42P16`), a missing table or column; a key or NOT NULL refuses a row with 19's SQLSTATE and text.
+- CREATE TABLE's `WITH`: a heap's 26 storage parameters checked by name, type and range as `reloptions.c` does, none of
+  which changes anything here; `toast.`'s refuse `0A000`.
+- generate_series of integers in FROM, aliased or not by a column list, its bounds and step constants or parameters: the
+  engine's rows of a recursive query, so one whose next value would pass the largest bigint refuses `0A000`. INSERT of a
+  SELECT is of one series.
+- Checked by T-PG.11.1 (178 messages' steps, message by message) and T-PG.11.2, and by `scripts/postgres-clients.sh`, where
+  `pgbench -i -s 1` of the postgres:19 image leaves the same rows on both, its keys refuse the same rows, and TPC-B at `-c 8`
+  on its tables does the same transactions. `pg_index` and `pg_constraint` aren't served (the keys are checked by what they
+  refuse), and the built-in scripts' start-up query is unit 12's.
+
 **Against the 10x bar.** Arithmetic and comparison on the hot path lower to the engine's own
 instructions (integer add with an overflow check that raises `22003`; comparisons of stored keys,
 section 5), not function calls; the rest dispatch through `Func::Pg`'s table. Analysis and planning
