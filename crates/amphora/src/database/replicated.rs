@@ -6552,6 +6552,8 @@ mod tests {
         looked: u64,
         // Each gated member's gate, by member order (`Driven::gated_log`).
         gates: BTreeMap<usize, Arc<Gate>>,
+        // Lane V15's diagnostic: owners read the real clock.
+        real: bool,
     }
     /// A count of what happened off a driven shell's thread that may let its group move: anything
     /// that rings an owner's bell (its log's write or compaction done, its database's flush done,
@@ -6768,6 +6770,7 @@ mod tests {
                 moved: Arc::new(OffThread::default()),
                 looked: 0,
                 gates: BTreeMap::new(),
+                real: false,
             }
         }
         /// `actor`, its bell ringing this shell's [`OffThread`] too: whatever would wake the owner
@@ -6896,6 +6899,9 @@ mod tests {
         /// reads it through.
         fn reading(&self) -> (Arc<AtomicU64>, Clock) {
             let reading = Arc::new(AtomicU64::new(0));
+            if self.real {
+                return (reading, Arc::new(Instant::now));
+            }
             let (base, read) = (self.base, Arc::clone(&reading));
             (reading, Arc::new(move || base + offset(&read)))
         }
@@ -19361,6 +19367,162 @@ mod tests {
             driven.quiet(&mut pump);
             driven.drain(&mut pump);
             pump.finish();
+        }
+    }
+
+    /// Lane V15's stages (a diagnostic on real time, never for main): member 3's write forwards in
+    /// its slot and the forward is lost; the leader's own write and member 2's are called then.
+    /// Prints each stage's time from member 3's call, by the real clock.
+    #[test]
+    #[ignore]
+    fn v15_stages_a_lost_forward_on_real_time() {
+        use crate::meter::SlotEnd;
+        for durability in [Durability::Persisted, three_fates()] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut driven = Driven::new();
+            driven.real = true;
+            let clients: Vec<Client> = (1..=3)
+                .map(|n| driven.open_with(dir.path(), n, vec![1, 2, 3], None, durability.clone()))
+                .collect();
+            let mut pump = Pump::new(&clients);
+            let leader = driven.elect(&mut pump, &clients, 0, 1);
+            assert_eq!(leader, 0);
+            driven
+                .call(&mut pump, &clients[leader], |db| {
+                    db.exec("CREATE TABLE events(id INTEGER NOT NULL)")?;
+                    Ok(Vec::new())
+                })
+                .unwrap();
+            driven.quiet(&mut pump);
+            let (election_tick, heartbeat_tick) = {
+                let config = driven.owner(leader).replica.core().raft.config();
+                (config.election_tick, config.heartbeat_tick)
+            };
+            let period = driven.period(leader);
+            let ended = |how| clients[leader].handle().counters().write_slot_ended(how);
+            let before = SlotEnd::ALL.map(ended);
+            let dropped: Arc<Mutex<Vec<Instant>>> = Arc::new(Mutex::new(Vec::new()));
+            let drops = Arc::clone(&dropped);
+            pump.losing = Some(Box::new(move |from, message: &Message| {
+                if from == 3
+                    && message.to == 1
+                    && message.msg_type == hyper_raft::proto::MessageType::MsgPropose
+                {
+                    let mut at = drops.lock().unwrap();
+                    if at.is_empty() {
+                        at.push(Instant::now());
+                        return true;
+                    }
+                }
+                false
+            }));
+            let t0 = Instant::now();
+            let deadline = Duration::from_secs(10);
+            let ms = |at: Instant| at.saturating_duration_since(t0).as_secs_f64() * 1e3;
+            let mut stages: Vec<(f64, String)> =
+                vec![(0.0, "member 3's write is called, 10 s deadline".into())];
+            let mut calls: Vec<(&str, mpsc::Receiver<Result<Answered, Refusal>>)> = vec![(
+                "member 3",
+                submit(&clients[2], t0 + deadline, |db| {
+                    db.exec("INSERT INTO events VALUES (3)")?;
+                    Ok(Vec::new())
+                }),
+            )];
+            let (mut began, mut called, mut over) = (None, false, false);
+            let (mut start_last, mut appended, mut committed) = (0, false, false);
+            let mut rounds: u64 = 0;
+            while !calls.is_empty() || !called {
+                assert!(Instant::now() < t0 + 3 * deadline, "hung: {stages:#?}");
+                driven.round(&mut pump);
+                rounds += 1;
+                let now = Instant::now();
+                let (holds, last, commit) = {
+                    let owner = driven.owner(leader);
+                    let log = owner.replica.core().raft.log();
+                    (
+                        owner.slots.holds(),
+                        log.last_index().unwrap(),
+                        log.committed(),
+                    )
+                };
+                if began.is_none() && holds {
+                    began = Some(now);
+                    start_last = last;
+                    stages.push((
+                        ms(now),
+                        format!(
+                            "the leader's slot for member 3 begins at last {last}, commit {commit}"
+                        ),
+                    ));
+                }
+                if !called && let Some(at) = dropped.lock().unwrap().first().copied() {
+                    stages.push((ms(at), "member 3's forward is lost".into()));
+                    calls.push((
+                        "the leader",
+                        submit(&clients[leader], driven.until(), |db| {
+                            db.exec("INSERT INTO events VALUES (1)")?;
+                            Ok(Vec::new())
+                        }),
+                    ));
+                    calls.push((
+                        "member 2",
+                        submit(&clients[1], driven.until(), |db| {
+                            db.exec("INSERT INTO events VALUES (2)")?;
+                            Ok(Vec::new())
+                        }),
+                    ));
+                    called = true;
+                    stages.push((
+                        ms(Instant::now()),
+                        "the leader's own write and member 2's are called".into(),
+                    ));
+                }
+                if began.is_some() && !over && !holds {
+                    over = true;
+                    let after = SlotEnd::ALL.map(ended);
+                    stages.push((
+                        ms(now),
+                        format!(
+                            "the slot ends: (forwarded, expired, released) {before:?} -> {after:?}"
+                        ),
+                    ));
+                }
+                if over && !appended && last > start_last {
+                    appended = true;
+                    stages.push((
+                        ms(now),
+                        format!("the leader's log grows past the slot's start: last {last}"),
+                    ));
+                }
+                if appended && !committed && commit > start_last {
+                    committed = true;
+                    stages.push((
+                        ms(now),
+                        format!("the commit passes the slot's start: {commit}"),
+                    ));
+                }
+                calls.retain(|(who, answer)| match answer.try_recv() {
+                    Err(mpsc::TryRecvError::Empty) => true,
+                    Err(error) => panic!("owner ended: {error}"),
+                    Ok(result) => {
+                        stages.push((ms(now), format!("{who} answered: {:?}", result.map(|_| ()))));
+                        false
+                    }
+                });
+            }
+            let after = SlotEnd::ALL.map(ended);
+            println!(
+                "V15 STAGES {durability:?}: tick {period:?}, election_tick {election_tick}, heartbeat_tick {heartbeat_tick}, rounds {rounds}, slot ends (forwarded, expired, released) {before:?} -> {after:?}"
+            );
+            for (at, stage) in &stages {
+                println!("V15 STAGE {at:>10.2} ms  {stage}");
+            }
+            pump.losing = None;
+            drop(calls);
+            driven.drain(&mut pump);
+            pump.finish();
+            driven.real = false;
+            drop(clients);
         }
     }
 
