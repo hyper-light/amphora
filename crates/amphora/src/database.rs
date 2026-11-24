@@ -74,30 +74,37 @@ CREATE INDEX IF NOT EXISTS __amphora_moved_stamps_order ON __amphora_moved_stamp
 const LIVE_MAX: u64 = 10_000_000;
 /// A request admitted to the writer's queue: what the request and its answer can hold
 /// ([`Admission::bytes_for`]), charged to the memory budget's room for queues (MB.1;
-/// replication.md, "Decision (lane constants): the queue bounds by drain rate"; QB.1), refused
-/// `Full` at that room.
+/// replication.md, "Decision (lane constants): the queue bounds by drain rate"; QB.1). With no
+/// room it waits for room until its deadline, woken only by charges given back
+/// ([`Store::charge_queue`]), and is refused `Full` past it; past the budget's whole limit it is
+/// refused `TooLarge` at once (lane perf-A19).
 struct Admission {
     bytes: Arc<AtomicUsize>,
     charged: usize,
     _charge: crate::memory::Charge,
 }
 impl Admission {
-    fn reserve(bytes: &Arc<AtomicUsize>, operation: &Operation) -> Result<Self, Refusal> {
-        Self::charge(bytes, Self::bytes_for(operation))
+    fn reserve(
+        store: &Store<Local>,
+        bytes: &Arc<AtomicUsize>,
+        operation: &Operation,
+        until: Instant,
+    ) -> Result<Self, Refusal> {
+        Self::charge(store, bytes, Self::bytes_for(operation), until)
     }
 
     fn fixed() -> usize {
         std::mem::size_of::<Command>().saturating_add(std::mem::size_of::<Answer>())
     }
 
-    fn charge(bytes: &Arc<AtomicUsize>, charged: usize) -> Result<Self, Refusal> {
+    fn charge(
+        store: &Store<Local>,
+        bytes: &Arc<AtomicUsize>,
+        charged: usize,
+        until: Instant,
+    ) -> Result<Self, Refusal> {
         let request = u64::try_from(charged).unwrap_or(u64::MAX);
-        let charge = crate::memory::process()
-            .take(crate::memory::Use::Queues, request)
-            .map_err(|refusal| match refusal {
-                Refusal::TooLarge { limit, .. } => Refusal::Full { limit },
-                other => other,
-            })?;
+        let charge = store.charge_queue(request, until)?;
         bytes.fetch_add(charged, Ordering::AcqRel);
         Ok(Self {
             bytes: Arc::clone(bytes),
@@ -802,6 +809,11 @@ fn admission_refusal(error: store::Refused) -> Refusal {
     match error {
         store::Refused::Full => Refusal::Full {
             limit: queue_room(),
+        },
+        store::Refused::TooLarge { size, limit } => Refusal::TooLarge {
+            what: "memory for a database batch".into(),
+            size: usize::try_from(size).unwrap_or(usize::MAX),
+            limit: usize::try_from(limit).unwrap_or(usize::MAX),
         },
         store::Refused::Timeout => Refusal::Timeout,
         store::Refused::Disk => Refusal::Fenced("writer disk failed; reopen after recovery".into()),
@@ -2473,18 +2485,20 @@ impl Database {
             .map(crate::backup::Foreground::call);
         let session = Arc::new(Mutex::new(Some(f)));
         let claim = self.application.clone();
-        if let Some(read) =
-            store.on_reader(until, |reader| run_query(reader, until, claim.as_ref(), &session))
-        {
+        if let Some(read) = store.on_reader(until, |reader| {
+            run_query(reader, until, claim.as_ref(), &session)
+        }) {
             return read.map_err(|e| refused(&e));
         }
         let job =
             move |engine: &mut Local| run_query(&mut engine.db, until, claim.as_ref(), &session);
         let _admission = Admission::charge(
+            store,
             &self.shared.admitted,
             std::mem::size_of_val(&job)
                 .saturating_add(std::mem::size_of::<Mutex<Option<F>>>())
                 .saturating_add(answer.unwrap_or(0)),
+            until,
         )?;
         store.run(until, job).map_err(|e| refused(&e))
     }
@@ -3082,7 +3096,7 @@ impl Database {
                 "only a local owner queues a call without blocking; call answers here",
             ));
         };
-        let admission = Admission::reserve(&self.shared.admitted, &operation)?;
+        let admission = Admission::reserve(store, &self.shared.admitted, &operation, room_until)?;
         // In flight from here to its answer, as a backed-up writer's checks yield to it.
         let in_flight = self
             .shared
@@ -4497,6 +4511,42 @@ mod owner_table {
 #[cfg(test)]
 mod admission_charge {
     use super::*;
+
+    /// Lane perf-A19 (AUDIT 2026-11-23 §1, MB.1): a request admitted to a database waits for room
+    /// until its own deadline, woken by another's charge given back, never refused at once. Do: with
+    /// the memory budget's whole limit held by another charge, send a call whose deadline is an
+    /// hour off; once its wait is counted, give that charge back. Expect: the call committed, one
+    /// wait counted on the writer's store, and nothing held once it answers.
+    #[test]
+    fn a19_admission_waits_for_room_woken_by_another_charge_given_back() {
+        use crate::memory::Use;
+        use crate::memory::tests::{BUDGET, Fed, budget};
+        let far = Instant::now() + Duration::from_secs(3600);
+        let dir = tempfile::tempdir().unwrap();
+        let database = Database::open(&dir.path().join("wait.db"), far).unwrap();
+        let Writer::Local(store) = &database.shared.writer else {
+            panic!("a local writer");
+        };
+        let fed = Fed::new(Some(1 << 30), Some(0));
+        let (budget, _unset) = budget(&fed);
+        let other = budget.take(Use::Queues, 1 << 30).unwrap();
+        let (sending, on_sender) = (database.clone(), Arc::clone(&budget));
+        let sender = std::thread::spawn(move || {
+            BUDGET.with(|slot| *slot.borrow_mut() = Some(on_sender));
+            sending.call(far, AnswerMax::fixed(), |c| {
+                c.execute_batch("CREATE TABLE t(v)")?;
+                Ok(())
+            })
+        });
+        while store.counters().room_waits == 0 && !sender.is_finished() {
+            std::thread::yield_now();
+        }
+        assert_eq!(store.counters().room_waits, 1);
+        drop(other);
+        assert_eq!(sender.join().unwrap(), Ok(()));
+        assert_eq!(store.counters().room_waits, 1);
+        assert_eq!(budget.held(Use::Queues), 0);
+    }
 
     /// AUDIT 2026-11-23 §1 (lane perf-A12): the answers of `call_db` and `call_internal`'s
     /// callers (cross-group steps, restores, online changes, floor raises) count their heap, so

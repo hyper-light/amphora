@@ -367,9 +367,8 @@ impl SegmentsCell {
 
     fn pack(segments: &Segments) -> Option<u64> {
         let closing = segments.other.map_or(0, |closing| closing.reads);
-        (segments.reads <= READS && closing <= READS).then(|| {
-            segments.pack() | segments.reads | closing.wrapping_shl(CLOSING_READS_SHIFT)
-        })
+        (segments.reads <= READS && closing <= READS)
+            .then(|| segments.pack() | segments.reads | closing.wrapping_shl(CLOSING_READS_SHIFT))
     }
 
     fn unpack(word: u64) -> Segments {
@@ -429,8 +428,12 @@ impl SlotReads {
 
     /// These reads and `other`'s, each segment's count stopping at the most its bits hold.
     pub fn plus(self, other: Self) -> Self {
-        let first = self.on(SegmentId::First).saturating_add(other.on(SegmentId::First));
-        let second = self.on(SegmentId::Second).saturating_add(other.on(SegmentId::Second));
+        let first = self
+            .on(SegmentId::First)
+            .saturating_add(other.on(SegmentId::First));
+        let second = self
+            .on(SegmentId::Second)
+            .saturating_add(other.on(SegmentId::Second));
         Self(first.min(Self::COUNT) | second.min(Self::COUNT).wrapping_shl(Self::SECOND_SHIFT))
     }
 }
@@ -493,7 +496,10 @@ mod tests {
                     }
                 });
             }
-            assert_eq!(cell.update(|s| s.switch(false)), Some(Some(SegmentId::Second)));
+            assert_eq!(
+                cell.update(|s| s.switch(false)),
+                Some(Some(SegmentId::Second))
+            );
             cell.update(Segments::copied).unwrap();
             cell.update(Segments::shipped).unwrap();
         });
@@ -507,7 +513,10 @@ mod tests {
         let cell = SegmentsCell::new(Segments::new(SegmentId::First));
         cell.update(|s| s.reads = READS).unwrap();
         let before = cell.load();
-        assert_eq!(before.state(SegmentId::First), Segment::Current { reads: READS });
+        assert_eq!(
+            before.state(SegmentId::First),
+            Segment::Current { reads: READS }
+        );
         assert_eq!(cell.begin_read(), None);
         assert_eq!(cell.load(), before);
     }
@@ -695,7 +704,11 @@ mod tests {
         assert_eq!(log.shared_word(word), word);
         let at_most = log.pack() | CHANGES;
         assert!(log.copied().is_some());
-        assert_eq!(log.shared_word(at_most), log.pack(), "the count wraps, the flags kept");
+        assert_eq!(
+            log.shared_word(at_most),
+            log.pack(),
+            "the count wraps, the flags kept"
+        );
     }
 
     #[test]
@@ -721,7 +734,10 @@ mod tests {
                 })
                 .expect("one read fits");
             let filled = unpacked.with_reads(counted);
-            assert!(matches!(filled.state(filled.current()), Segment::Current { reads: 1 }));
+            assert!(matches!(
+                filled.state(filled.current()),
+                Segment::Current { reads: 1 }
+            ));
             if let Some(closing) = filled.closing() {
                 let Segment::Closing(closing) = filled.state(closing) else {
                     panic!("closing");
@@ -757,9 +773,15 @@ mod tests {
             closing: None,
         };
         let one_second = full.with(&second_only).expect("the second's count is free");
-        assert_eq!((one_second.on(First), one_second.on(Second)), (SlotReads::COUNT, 1));
+        assert_eq!(
+            (one_second.on(First), one_second.on(Second)),
+            (SlotReads::COUNT, 1)
+        );
         assert_eq!(SlotReads::default().without(&both), SlotReads::default());
-        assert_eq!(reads.without(&both).without(&first_only), SlotReads::default());
+        assert_eq!(
+            reads.without(&both).without(&first_only),
+            SlotReads::default()
+        );
         assert_eq!(
             full.plus(SlotReads(1)).on(First),
             SlotReads::COUNT,

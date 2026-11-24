@@ -1457,7 +1457,14 @@ impl InProcessWalCoordination {
 
     /// Unlock `slot` on `segment`: a read's guard is released on the segment it was locked on.
     fn unlock_segment_read_mark(&self, segment: SegmentId, slot: usize) {
-        if let Some(read_lock) = self.log.segment(segment).read().runtime.read_locks.get(slot) {
+        if let Some(read_lock) = self
+            .log
+            .segment(segment)
+            .read()
+            .runtime
+            .read_locks
+            .get(slot)
+        {
             read_lock.unlock();
         }
         self.log.released.notify();
@@ -1661,20 +1668,15 @@ impl WalCoordination for InProcessWalCoordination {
         max_frame: u64,
         frame_watermark: Option<u64>,
     ) -> Option<u64> {
-        // Amphora: without the shared state's lock or the index's where the switch says (G3 step 2,
-        // decision 40); what that path can't answer is answered under them. Frame numbers start
+        // Amphora: without the shared state's lock or the index's (G3 step 2, decision 40); what
+        // that path can't answer is answered under them. Frame numbers start
         // again in each segment, so the index searched is the segment's (decision 45).
         if self.lock_free {
             let read_index = self.log.read_index(segment);
             let (low, high) = frame_watermark.map_or((min_frame, max_frame), |x| (0, x));
             let index = |build: &mut super::log_index::FromIndex<'_>| {
                 let shared = self.log.segment(segment).read();
-                let frame_cache = shared.runtime.frame_cache.lock();
-                let high_water = shared
-                    .runtime
-                    .frame_cache_high_water
-                    .load(Ordering::Acquire);
-                build(&frame_cache, high_water);
+                build(&shared.runtime.frame_cache.lock());
             };
             match read_index.find(page_id, low, high, &index) {
                 Lookup::Absent => return None,
@@ -1867,7 +1869,9 @@ impl WalCoordination for InProcessWalCoordination {
         );
         let shared = self.log.segment(segment).read();
         let mut max_safe_frame = max_frame;
-        for (read_lock_idx, read_lock) in shared.runtime.read_locks.iter().enumerate().take(5).skip(1) {
+        for (read_lock_idx, read_lock) in
+            shared.runtime.read_locks.iter().enumerate().take(5).skip(1)
+        {
             let this_mark = read_lock.get_value();
             if this_mark < max_safe_frame as u32 {
                 let busy = !read_lock.write();
@@ -2953,9 +2957,13 @@ impl WalCoordination for ShmWalCoordination {
         // closing segment is answered from this process's scan of its file, complete because no
         // process appends to it (decision 45).
         if self.authority.frame_index_overflowed() || segment != self.current_segment() {
-            return self
-                .fallback
-                .find_frame(segment, page_id, min_frame, max_frame, frame_watermark);
+            return self.fallback.find_frame(
+                segment,
+                page_id,
+                min_frame,
+                max_frame,
+                frame_watermark,
+            );
         }
         self.authority
             .find_frame(page_id, min_frame, max_frame, frame_watermark)
@@ -2981,7 +2989,8 @@ impl WalCoordination for ShmWalCoordination {
         if segment == self.current_segment() {
             return self.iter_latest_frames(min_frame, max_frame);
         }
-        self.fallback.iter_segment_frames(segment, min_frame, max_frame)
+        self.fallback
+            .iter_segment_frames(segment, min_frame, max_frame)
     }
 
     fn segments(&self) -> Segments {
@@ -4129,6 +4138,10 @@ pub struct SharedLog {
     /// the current segment's state reads it without unpacking that word. Written only with
     /// `segments`.
     second_current: AtomicBool,
+    /// The second segment's file (`<db>-wal2`), made by the writer's first switch into it when the
+    /// open found none. None for a log with no path (tests'): its switch into a segment with no
+    /// file fails.
+    second_path: Option<String>,
     /// Lock used by in-place VACUUM to keep new read/write transactions out
     /// while VACUUM is in progress.
     /// Normal WAL transactions hold this shared for the lifetime of their
@@ -4154,6 +4167,7 @@ impl SharedLog {
             first,
             WalFileShared::new_noop(),
             Segments::new(SegmentId::First),
+            None,
         )
     }
 
@@ -4165,6 +4179,7 @@ impl SharedLog {
     pub fn recover(
         first: Arc<RwLock<WalFileShared>>,
         second: Arc<RwLock<WalFileShared>>,
+        second_path: Option<String>,
     ) -> Result<Arc<Self>> {
         let sequence = |segment: &Arc<RwLock<WalFileShared>>| {
             let shared = segment.read();
@@ -4181,13 +4196,14 @@ impl SharedLog {
                  neither one past the other: no switch leaves such a pair"
             ))
         })?;
-        Ok(Self::with_segments(first, second, segments))
+        Ok(Self::with_segments(first, second, segments, second_path))
     }
 
     fn with_segments(
         first: Arc<RwLock<WalFileShared>>,
         second: Arc<RwLock<WalFileShared>>,
         segments: Segments,
+        second_path: Option<String>,
     ) -> Arc<Self> {
         let read_index = |segment: &Arc<RwLock<WalFileShared>>| {
             let guard = segment.read();
@@ -4202,6 +4218,7 @@ impl SharedLog {
             read_indexes,
             second_current: AtomicBool::new(segments.current() == SegmentId::Second),
             segments: SegmentsCell::new(segments),
+            second_path,
             vacuum_lock: PaddedLock::new(TursoRwLock::new()),
             write_lock: PaddedLock::new(TursoRwLock::new()),
             checkpoint_lock: PaddedLock::new(TursoRwLock::new()),
@@ -4253,6 +4270,82 @@ impl SharedLog {
     /// next switch writes its header over it.
     pub(crate) fn end_read(&self, span: ReadSpan) {
         self.segments.end_read(span);
+    }
+
+    /// The writer's switch (decision 45), made where a restart started the log again: the current
+    /// segment closes, uncopied frames and the reads on it kept, and the free one becomes current,
+    /// its header one checkpoint sequence past the closing one's and written and synced by the
+    /// next commit before any frame. It takes no read mark and waits for no read: the segment
+    /// switched to is free, so no read counts on it. The caller holds `write_lock`. The segment
+    /// now current, or None while the other one is still closing (the writer appends on and asks
+    /// again at its next turn). A free segment's file longer than `cut_past` bytes is cut to
+    /// nothing first: nothing in it is needed (decision 31's bound, kept at each segment's reuse).
+    pub fn switch(&self, io: &dyn IO, cut_past: Option<u64>) -> Result<Option<SegmentId>> {
+        let segments = self.segments.load();
+        if segments.closing().is_some() {
+            return Ok(None);
+        }
+        let from = segments.current();
+        let to = from.other();
+        let (header, epoch, transaction_count) = {
+            let closing = self.segment(from).read();
+            let header = *closing.metadata.wal_header.lock();
+            (
+                header,
+                closing.runtime.epoch.load(Ordering::Acquire),
+                closing.metadata.transaction_count.load(Ordering::Acquire),
+            )
+        };
+        {
+            let mut free = self.segment(to).write();
+            if free.runtime.file.is_none() {
+                let path = self.second_path.as_deref().ok_or_else(|| {
+                    LimboError::InternalError(
+                        "the log's free segment has no file and no path to make one".into(),
+                    )
+                })?;
+                free.runtime.file = Some(io.open_file(path, crate::OpenFlags::Create, false)?);
+            }
+            if let (Some(limit), Some(file)) = (cut_past, free.runtime.file.as_ref()) {
+                if file.size()? > limit {
+                    let cut = file.truncate(0, Completion::new_trunc(|_| {}))?;
+                    io.wait_for_completion(cut)?;
+                }
+            }
+            free.metadata.enabled.store(true, Ordering::Release);
+            // Its read marks are set under their exclusive locks: no read holds one of a free
+            // segment's, so each is taken at once.
+            let held = free
+                .runtime
+                .read_locks
+                .iter()
+                .take_while(|lock| lock.write())
+                .count();
+            if held < free.runtime.read_locks.len() {
+                free.runtime
+                    .read_locks
+                    .iter()
+                    .take(held)
+                    .for_each(|lock| lock.unlock());
+                return Err(LimboError::InternalError(
+                    "a read holds a mark of the log's free segment".into(),
+                ));
+            }
+            free.start_after(io, header, epoch, transaction_count);
+            free.runtime
+                .read_locks
+                .iter()
+                .for_each(|lock| lock.unlock());
+        }
+        let switched = self.segments.update(|segments| segments.switch(false));
+        if switched != Some(Some(to)) {
+            return Err(LimboError::InternalError(format!(
+                "the log's switch to {to:?} found {switched:?}: only the writer switches"
+            )));
+        }
+        self.second_current
+            .store(to == SegmentId::Second, Ordering::Release);
+        Ok(Some(to))
     }
 }
 
@@ -5917,9 +6010,9 @@ impl Wal for WalFile {
             min_frame,
             max_frame
         );
-        let frame = self
-            .coordination
-            .find_frame(segment, page_id, min_frame, max_frame, frame_watermark);
+        let frame =
+            self.coordination
+                .find_frame(segment, page_id, min_frame, max_frame, frame_watermark);
         if let Some(frame) = frame {
             tracing::debug!(
                 "find_frame(page_id={}, frame_watermark={:?}): found frame={}",
@@ -5988,9 +6081,15 @@ impl Wal for WalFile {
             frame.set_wal_tag(frame_id, epoch_at_issue);
             None
         });
-        // Amphora: a page a record holds is read from the record.
-        let header = self.coordination.wal_header();
-        if self.holds_record(&header, frame_id) {
+        // Amphora: a page a record holds is read from the record, in the frame's own segment
+        // (decision 45). The current segment's header is read without a lock (decision 40), a
+        // closing one's under its segment's.
+        let header = if at.segment == self.coordination.current_segment() {
+            self.coordination.wal_header()
+        } else {
+            self.coordination.segment_header(at.segment)
+        };
+        if self.holds_segment_record(at.segment, &header, frame_id) {
             let number = u32::try_from(page_idx).map_err(|_| LimboError::IntegerOverflow)?;
             let complete = sqlite3_ondisk::wal_page_reader(
                 complete,
@@ -5999,7 +6098,7 @@ impl Wal for WalFile {
                 &self.io_ctx.read(),
             )?;
             return self.begin_read_record(
-                self.coordination.current_segment(),
+                at.segment,
                 frame_id,
                 vec![(number, complete)],
                 &header,
@@ -6468,7 +6567,8 @@ impl Wal for WalFile {
                 "current_max_frame": snapshot.max_frame
             }
         );
-        self.coordination.publish_segment_backfill(segment, max_frame);
+        self.coordination
+            .publish_segment_backfill(segment, max_frame);
         if closing.is_some() && max_frame == snapshot.max_frame {
             self.coordination.closing_copied();
         }
@@ -7549,7 +7649,9 @@ impl WalFile {
                         // only after the file's sync), or it holds none.
                         self.coordination.closing_copied();
                     }
-                    if matches!(lock_source, CheckpointLockSource::HeldByCaller) && closing.is_none() {
+                    if matches!(lock_source, CheckpointLockSource::HeldByCaller)
+                        && closing.is_none()
+                    {
                         turso_assert!(
                             needs_backfill,
                             "held checkpoint-lock path requires WAL frames to backfill",
@@ -7586,11 +7688,15 @@ impl WalFile {
                             return Err(LimboError::Busy.into());
                         }
                     }
+                    // The bound is the current segment's flushes: a closing segment's frames are
+                    // all durable, flushed before its switch (decision 45).
                     if let CheckpointMode::Passive {
                         upper_bound_inclusive: Some(upper_bound),
                     } = mode
                     {
-                        max_frame = max_frame.min(upper_bound);
+                        if closing.is_none() {
+                            max_frame = max_frame.min(upper_bound);
+                        }
                     }
 
                     {
@@ -7873,7 +7979,8 @@ impl WalFile {
                     // This ensures data durability: if a crash occurs after WAL truncation
                     // but before DB sync, the data would be lost. By truncating the WAL
                     // only after the DB is safely synced, we guarantee recoverability.
-                    if mode.should_restart_log() && self.ongoing_checkpoint.read().closing.is_none() {
+                    if mode.should_restart_log() && self.ongoing_checkpoint.read().closing.is_none()
+                    {
                         Self::unlock_after_restart(&self.coordination, None);
                     }
                     let mut checkpoint_result = {
@@ -7972,6 +8079,9 @@ impl WalFile {
     /// 3. nbackfills > 0 - otherwise nothing was backfilled and there is no reason to truncate header
     /// 4. max_frame == nbackfills - otherwise there are some non-checkpointed frames in the WAL and we can't truncate the log
     pub fn try_restart_log_before_write(&self) -> Result<()> {
+        if self.restarts_by_switch() {
+            return Ok(());
+        }
         let max_frame_read_lock_index = self.max_frame_read_lock_index.load(Ordering::Acquire);
         if !matches!(
             ReadGuardKind::from_lock_index(max_frame_read_lock_index),
@@ -8014,8 +8124,22 @@ impl WalFile {
         result
     }
 
+    /// Whether the log's other segment has a file (decision 45): once it has, the log starts again
+    /// only by the writer's switch. A restart in place would take the current segment's sequence
+    /// two past the other's header, a pair recovery refuses, and a truncate would leave the other
+    /// segment's copied frames to be read as the log.
+    fn restarts_by_switch(&self) -> bool {
+        let log = self.coordination.shared_wal_state();
+        let other = log.segment(log.current_id().other());
+        let segment = other.read();
+        segment.runtime.file.is_some()
+    }
+
     fn restart_log(&self) -> Result<()> {
         tracing::debug!("restart_log");
+        if self.restarts_by_switch() {
+            return Err(LimboError::Busy);
+        }
         let snapshot = self.coordination.begin_restart(self.io.as_ref())?;
         self.apply_restart_snapshot(snapshot);
         Ok(())
@@ -8747,6 +8871,20 @@ impl WalFileShared {
     /// This function updates the shared-memory structures so that the next
     /// client to write to the database (which may be this one) does so by
     /// writing frames into the start of the log file.
+    /// Make this free segment the one that follows `closing`'s header (decision 45): the same
+    /// format and page size, its sequence one past and its salts new ([`Self::restart_wal_header`]),
+    /// the epoch and transaction count carried on so that neither comes back to a value a
+    /// connection took from the closing segment.
+    fn start_after(&mut self, io: &dyn IO, closing: WalHeader, epoch: u32, transaction_count: u64) {
+        *self.metadata.wal_header.lock() = closing;
+        self.metadata.loaded.store(true, Ordering::Release);
+        self.metadata
+            .transaction_count
+            .store(transaction_count, Ordering::Release);
+        self.runtime.epoch.store(epoch, Ordering::Release);
+        self.restart_wal_header(io);
+    }
+
     fn restart_wal_header(&mut self, io: &dyn IO) {
         {
             let mut hdr = self.metadata.wal_header.lock();
@@ -10575,13 +10713,6 @@ pub mod test {
     #[test]
     fn in_process_frame_lookups_compare_few_frames_when_a_page_has_many_frames() {
         let shared = SharedLog::new(WalFileShared::new_noop());
-        // The index read under its lock, whatever `AMPHORA_LOG_READ_INDEX` says (decision 40).
-        shared
-            .current()
-            .read()
-            .runtime
-            .read_index
-            .set_mode(super::super::log_index::LogReadIndex::Locked);
         let coordination = make_test_coordination(&shared);
         let frame_count = 1000u64;
         for frame_id in 1..=frame_count {
@@ -10599,7 +10730,7 @@ pub mod test {
 
         for (min_frame, max_frame) in [(1, 10), (500, 990)] {
             assert_eq!(
-                coordination.find_frame(SegmentId::First, 7, min_frame, max_frame, None),
+                coordination.find_frame_locked(SegmentId::First, 7, min_frame, max_frame, None),
                 Some(max_frame)
             );
             assert!((1..=max_frames_compared).contains(&frames_compared()));
@@ -10718,16 +10849,9 @@ pub mod test {
         assert!(listed > 10_000, "the list answered {listed} ranges");
     }
 
-    /// The ways a page read finds its frame without the locks (G3 step 2, decision 40).
-    const LOCK_FREE_WAYS: [super::super::log_index::LogReadIndex; 3] = [
-        super::super::log_index::LogReadIndex::Filtered,
-        super::super::log_index::LogReadIndex::Published,
-        super::super::log_index::LogReadIndex::Optimistic,
-    ];
-
     /// Do (T-G3.2.1): random appends of frames and records, rewinds into them, rollbacks,
     /// checkpoints (the snapshot's first frame moved on) and log restarts, and after each, every
-    /// page read at random snapshots through each lock-free way. Expect: the frame the index read
+    /// page read at random snapshots through the lock-free lookup. Expect: the frame the index read
     /// under its lock gives, or none, for every read; most reads answered without the lock.
     #[test]
     fn g3_2_lock_free_page_reads_find_the_frame_the_locked_index_finds() {
@@ -10736,158 +10860,153 @@ pub mod test {
             rand_core::{RngCore, SeedableRng},
             ChaCha8Rng,
         };
-        for mode in LOCK_FREE_WAYS {
-            let mut answered = 0u64;
-            let mut reads = 0u64;
-            for seed in 0..12u64 {
-                let shared = SharedLog::new(WalFileShared::new_noop());
-                shared.current().read().runtime.read_index.set_mode(mode);
-                let coordination = make_test_coordination(&shared);
-                let read_index = shared.current().read().runtime.read_index.clone();
-                let mut rng = ChaCha8Rng::seed_from_u64(seed);
-                let mut next = 1u64;
-                // The first frame a snapshot reads: past what a checkpoint copied.
-                let mut first = 1u64;
-                for _ in 0..300 {
-                    match rng.next_u64() % 12 {
-                        0..=5 => {
-                            coordination.cache_frame(rng.next_u64() % 40, next);
-                            next += 1;
-                        }
-                        6 => {
-                            let slots = u32::try_from(1 + rng.next_u64() % 3).unwrap();
-                            let pages: Vec<u64> = (0..1 + rng.next_u64() % 4)
-                                .map(|_| rng.next_u64() % 40)
-                                .collect();
-                            coordination.cache_record(next, slots, &mut pages.into_iter());
-                            next += u64::from(slots);
-                        }
-                        7 if next > 2 => {
-                            next = 1 + rng.next_u64() % (next - 1);
-                            first = first.min(next);
-                            coordination.cache_frame(rng.next_u64() % 40, next);
-                            next += 1;
-                        }
-                        8 if next > 2 => {
-                            let to = rng.next_u64() % (next - 1);
-                            coordination.rollback_cache(to);
-                            next = to + 1;
-                            first = first.min(next);
-                        }
-                        9 => first = 1 + rng.next_u64() % next,
-                        10 if rng.next_u64() % 4 == 0 => {
-                            // The log restarted: its frames gone, the next one frame 1.
-                            let guard = shared.current().write();
-                            guard.runtime.read_index.invalidate();
-                            guard.runtime.frame_cache.lock().clear();
-                            guard
-                                .runtime
-                                .frame_cache_high_water
-                                .store(0, Ordering::Release);
-                            guard.runtime.records.lock().clear();
-                            guard.runtime.changes.lock().reset();
-                            drop(guard);
-                            next = 1;
-                            first = 1;
-                        }
-                        _ => {}
+        let mut answered = 0u64;
+        let mut reads = 0u64;
+        for seed in 0..12u64 {
+            let shared = SharedLog::new(WalFileShared::new_noop());
+            let coordination = make_test_coordination(&shared);
+            let read_index = shared.current().read().runtime.read_index.clone();
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            let mut next = 1u64;
+            // The first frame a snapshot reads: past what a checkpoint copied.
+            let mut first = 1u64;
+            for _ in 0..300 {
+                match rng.next_u64() % 12 {
+                    0..=5 => {
+                        coordination.cache_frame(rng.next_u64() % 40, next);
+                        next += 1;
                     }
-                    for _ in 0..4 {
-                        let max_frame = rng.next_u64() % next;
-                        let min_frame = first.min(max_frame.max(1));
-                        // Past the bitmap's words too: 64 and up are past every page written.
-                        for page in (0..48u64).chain([64, 200, 1 << 40]) {
-                            let locked = coordination.find_frame_locked(
-                                shared.current_id(),
+                    6 => {
+                        let slots = u32::try_from(1 + rng.next_u64() % 3).unwrap();
+                        let pages: Vec<u64> = (0..1 + rng.next_u64() % 4)
+                            .map(|_| rng.next_u64() % 40)
+                            .collect();
+                        coordination.cache_record(next, slots, &mut pages.into_iter());
+                        next += u64::from(slots);
+                    }
+                    7 if next > 2 => {
+                        next = 1 + rng.next_u64() % (next - 1);
+                        first = first.min(next);
+                        coordination.cache_frame(rng.next_u64() % 40, next);
+                        next += 1;
+                    }
+                    8 if next > 2 => {
+                        let to = rng.next_u64() % (next - 1);
+                        coordination.rollback_cache(to);
+                        next = to + 1;
+                        first = first.min(next);
+                    }
+                    9 => first = 1 + rng.next_u64() % next,
+                    10 if rng.next_u64() % 4 == 0 => {
+                        // The log restarted: its frames gone, the next one frame 1.
+                        let guard = shared.current().write();
+                        guard.runtime.read_index.invalidate();
+                        guard.runtime.frame_cache.lock().clear();
+                        guard
+                            .runtime
+                            .frame_cache_high_water
+                            .store(0, Ordering::Release);
+                        guard.runtime.records.lock().clear();
+                        guard.runtime.changes.lock().reset();
+                        drop(guard);
+                        next = 1;
+                        first = 1;
+                    }
+                    _ => {}
+                }
+                for _ in 0..4 {
+                    let max_frame = rng.next_u64() % next;
+                    let min_frame = first.min(max_frame.max(1));
+                    // Past the bitmap's words too: 64 and up are past every page written.
+                    for page in (0..48u64).chain([64, 200, 1 << 40]) {
+                        let locked = coordination.find_frame_locked(
+                            shared.current_id(),
+                            page,
+                            min_frame,
+                            max_frame,
+                            None,
+                        );
+                        let index = |build: &mut super::super::log_index::FromIndex<'_>| {
+                            let guard = shared.current().read();
+                            build(&guard.runtime.frame_cache.lock());
+                        };
+                        reads += 1;
+                        match read_index.find(page, min_frame, max_frame, &index) {
+                            Lookup::Ask => {}
+                            Lookup::Absent => {
+                                answered += 1;
+                                assert_eq!(
+                                    locked, None,
+                                    "seed {seed} page {page} {min_frame}..={max_frame}"
+                                );
+                            }
+                            Lookup::Frame(frame) => {
+                                answered += 1;
+                                assert_eq!(
+                                    locked,
+                                    Some(frame),
+                                    "seed {seed} page {page} {min_frame}..={max_frame}"
+                                );
+                            }
+                        }
+                        assert_eq!(
+                            coordination.find_frame(
+                                SegmentId::First,
                                 page,
                                 min_frame,
                                 max_frame,
-                                None,
-                            );
-                            let index = |build: &mut super::super::log_index::FromIndex<'_>| {
-                                let guard = shared.current().read();
-                                let frame_cache = guard.runtime.frame_cache.lock();
-                                let high_water =
-                                    guard.runtime.frame_cache_high_water.load(Ordering::Acquire);
-                                build(&frame_cache, high_water);
-                            };
-                            reads += 1;
-                            match read_index.find(page, min_frame, max_frame, &index) {
-                                Lookup::Ask => {}
-                                Lookup::Absent => {
-                                    answered += 1;
-                                    assert_eq!(locked, None, "{mode:?} seed {seed} page {page} {min_frame}..={max_frame}");
-                                }
-                                Lookup::Frame(frame) => {
-                                    answered += 1;
-                                    assert_eq!(locked, Some(frame), "{mode:?} seed {seed} page {page} {min_frame}..={max_frame}");
-                                }
-                            }
-                            assert_eq!(
-                                coordination.find_frame(SegmentId::First, page, min_frame, max_frame, None),
-                                locked,
-                                "{mode:?} seed {seed} page {page} {min_frame}..={max_frame}"
-                            );
-                        }
+                                None
+                            ),
+                            locked,
+                            "seed {seed} page {page} {min_frame}..={max_frame}"
+                        );
                     }
                 }
             }
-            // Non-vacuity: the way answers most reads itself (the filter alone answers the pages
-            // the log doesn't hold, 8 of every 48 at least).
-            assert!(
-                answered * 6 > reads,
-                "{mode:?} answered {answered} of {reads}"
-            );
         }
+        // Non-vacuity: the way answers most reads itself (the filter alone answers the pages
+        // the log doesn't hold, 8 of every 48 at least).
+        assert!(answered * 6 > reads, "answered {answered} of {reads}");
     }
 
     /// AUDIT 2.1 (perf-B4): a page past every page the log holds, past the bitmap's words, is
-    /// answered absent by each lock-free way itself, not asked under the lock; one the log holds
+    /// answered absent by the lock-free lookup itself, not asked under the lock; one the log holds
     /// still finds its frame.
     #[test]
     fn audit_2_1_a_page_past_the_logs_highest_is_absent_without_the_lock() {
         use super::super::log_index::Lookup;
-        for mode in LOCK_FREE_WAYS {
-            let shared = SharedLog::new(WalFileShared::new_noop());
-            shared.current().read().runtime.read_index.set_mode(mode);
-            let coordination = make_test_coordination(&shared);
-            for page in 1..=100u64 {
-                coordination.cache_frame(page, page);
-            }
-            let read_index = shared.current().read().runtime.read_index.clone();
-            let index = |build: &mut super::super::log_index::FromIndex<'_>| {
-                let guard = shared.current().read();
-                let frame_cache = guard.runtime.frame_cache.lock();
-                let high_water = guard.runtime.frame_cache_high_water.load(Ordering::Acquire);
-                build(&frame_cache, high_water);
-            };
-            for page in [101, 128, 4096, 1 << 40] {
-                assert_eq!(
-                    read_index.find(page, 1, 100, &index),
-                    Lookup::Absent,
-                    "{mode:?} page {page}"
-                );
-                assert_eq!(
-                    coordination.find_frame(SegmentId::First, page, 1, 100, None),
-                    None,
-                    "{mode:?} page {page}"
-                );
-            }
-            let held = read_index.find(100, 1, 100, &index);
-            assert!(
-                matches!(held, Lookup::Frame(100) | Lookup::Ask),
-                "{mode:?}: {held:?}"
+        let shared = SharedLog::new(WalFileShared::new_noop());
+        let coordination = make_test_coordination(&shared);
+        for page in 1..=100u64 {
+            coordination.cache_frame(page, page);
+        }
+        let read_index = shared.current().read().runtime.read_index.clone();
+        let index = |build: &mut super::super::log_index::FromIndex<'_>| {
+            let guard = shared.current().read();
+            build(&guard.runtime.frame_cache.lock());
+        };
+        for page in [101, 128, 4096, 1 << 40] {
+            assert_eq!(
+                read_index.find(page, 1, 100, &index),
+                Lookup::Absent,
+                "page {page}"
             );
             assert_eq!(
-                coordination.find_frame(SegmentId::First, 100, 1, 100, None),
-                Some(100),
-                "{mode:?}"
+                coordination.find_frame(SegmentId::First, page, 1, 100, None),
+                None,
+                "page {page}"
             );
         }
+        let held = read_index.find(100, 1, 100, &index);
+        assert!(matches!(held, Lookup::Frame(100) | Lookup::Ask), "{held:?}");
+        assert_eq!(
+            coordination.find_frame(SegmentId::First, 100, 1, 100, None),
+            Some(100)
+        );
     }
 
     /// Do (T-G3.2.1): one writer appends frames in commits (some appended and rolled back), while
-    /// four readers read every page at random committed snapshots through each lock-free way.
+    /// four readers read every page at random committed snapshots through the lock-free lookup.
     /// Expect: the frame the index read under its lock gives, or none, for every read.
     #[test]
     fn g3_2_readers_beside_a_writer_find_the_frame_the_locked_index_finds() {
@@ -10896,108 +11015,102 @@ pub mod test {
             rand_core::{RngCore, SeedableRng},
             ChaCha8Rng,
         };
-        for mode in LOCK_FREE_WAYS {
-            let shared = SharedLog::new(WalFileShared::new_noop());
-            shared.current().read().runtime.read_index.set_mode(mode);
-            let coordination = make_test_coordination(&shared);
-            let committed = AtomicU64::new(0);
-            let done = AtomicBool::new(false);
-            std::thread::scope(|scope| {
-                for reader in 0..4u64 {
-                    let (coordination, committed, done) = (&coordination, &committed, &done);
-                    scope.spawn(move || {
-                        let mut rng = ChaCha8Rng::seed_from_u64(reader);
-                        let mut rounds = 0u64;
-                        while !done.load(Ordering::Acquire) || rounds < 10 {
-                            rounds += 1;
-                            let upto = committed.load(Ordering::Acquire);
-                            let max_frame = rng.next_u64() % (upto + 1);
-                            let min_frame = 1 + rng.next_u64() % (max_frame + 1);
-                            for page in 0..48u64 {
-                                let fast =
-                                    coordination.find_frame(SegmentId::First, page, min_frame, max_frame, None);
-                                let locked = coordination.find_frame_locked(
-                                    coordination.log.current_id(),
-                                    page,
-                                    min_frame,
-                                    max_frame,
-                                    None,
-                                );
-                                assert_eq!(
-                                    fast, locked,
-                                    "{mode:?} page {page} {min_frame}..={max_frame}"
-                                );
-                            }
+        let shared = SharedLog::new(WalFileShared::new_noop());
+        let coordination = make_test_coordination(&shared);
+        let committed = AtomicU64::new(0);
+        let done = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            for reader in 0..4u64 {
+                let (coordination, committed, done) = (&coordination, &committed, &done);
+                scope.spawn(move || {
+                    let mut rng = ChaCha8Rng::seed_from_u64(reader);
+                    let mut rounds = 0u64;
+                    while !done.load(Ordering::Acquire) || rounds < 10 {
+                        rounds += 1;
+                        let upto = committed.load(Ordering::Acquire);
+                        let max_frame = rng.next_u64() % (upto + 1);
+                        let min_frame = 1 + rng.next_u64() % (max_frame + 1);
+                        for page in 0..48u64 {
+                            let fast = coordination.find_frame(
+                                SegmentId::First,
+                                page,
+                                min_frame,
+                                max_frame,
+                                None,
+                            );
+                            let locked = coordination.find_frame_locked(
+                                coordination.log.current_id(),
+                                page,
+                                min_frame,
+                                max_frame,
+                                None,
+                            );
+                            assert_eq!(fast, locked, "page {page} {min_frame}..={max_frame}");
                         }
-                    });
-                }
-                let mut rng = ChaCha8Rng::seed_from_u64(99);
-                let mut next = 1u64;
-                for _ in 0..2_000 {
-                    let frames = 1 + rng.next_u64() % 4;
-                    for _ in 0..frames {
-                        coordination.cache_frame(rng.next_u64() % 40, next);
-                        next += 1;
                     }
-                    if rng.next_u64() % 5 == 0 {
-                        let to = committed.load(Ordering::Acquire);
-                        coordination.rollback_cache(to);
-                        next = to + 1;
-                    } else {
-                        committed.store(next - 1, Ordering::Release);
-                    }
+                });
+            }
+            let mut rng = ChaCha8Rng::seed_from_u64(99);
+            let mut next = 1u64;
+            for _ in 0..2_000 {
+                let frames = 1 + rng.next_u64() % 4;
+                for _ in 0..frames {
+                    coordination.cache_frame(rng.next_u64() % 40, next);
+                    next += 1;
                 }
-                done.store(true, Ordering::Release);
-            });
-        }
+                if rng.next_u64() % 5 == 0 {
+                    let to = committed.load(Ordering::Acquire);
+                    coordination.rollback_cache(to);
+                    next = to + 1;
+                } else {
+                    committed.store(next - 1, Ordering::Release);
+                }
+            }
+            done.store(true, Ordering::Release);
+        });
     }
 
     /// Do (T-G3.2.1): change the log's header through its lock, then read it through the
-    /// coordination with each lock-free way. Expect: the header as last written, each time.
+    /// coordination's lock-free copy. Expect: the header as last written, each time.
     #[test]
     fn g3_2_the_header_read_without_its_lock_is_the_last_one_written() {
-        for mode in LOCK_FREE_WAYS {
-            let shared = SharedLog::new(WalFileShared::new_noop());
-            shared.current().read().runtime.read_index.set_mode(mode);
-            let coordination = make_test_coordination(&shared);
-            for round in 1..50u32 {
-                {
-                    let guard = shared.current().read();
-                    let mut header = guard.metadata.wal_header.lock();
-                    header.checkpoint_seq = round;
-                    header.salt_1 = round * 3;
-                    header.salt_2 = round * 7;
-                    header.checksum_1 = round * 11;
-                    header.checksum_2 = round * 13;
-                }
-                let header = coordination.wal_header();
-                assert_eq!(
-                    (
-                        header.checkpoint_seq,
-                        header.salt_1,
-                        header.salt_2,
-                        header.checksum_1,
-                        header.checksum_2
-                    ),
-                    (round, round * 3, round * 7, round * 11, round * 13),
-                    "{mode:?}"
-                );
+        let shared = SharedLog::new(WalFileShared::new_noop());
+        let coordination = make_test_coordination(&shared);
+        for round in 1..50u32 {
+            {
+                let guard = shared.current().read();
+                let mut header = guard.metadata.wal_header.lock();
+                header.checkpoint_seq = round;
+                header.salt_1 = round * 3;
+                header.salt_2 = round * 7;
+                header.checksum_1 = round * 11;
+                header.checksum_2 = round * 13;
             }
+            let header = coordination.wal_header();
+            assert_eq!(
+                (
+                    header.checkpoint_seq,
+                    header.salt_1,
+                    header.salt_2,
+                    header.checksum_1,
+                    header.checksum_2
+                ),
+                (round, round * 3, round * 7, round * 11, round * 13)
+            );
         }
     }
 
-    /// AUDIT 2.1 (decision 40): what a page read's frame lookup costs with the log full, each way,
+    /// AUDIT 2.1 (decision 40): what a page read's frame lookup costs with the log full,
     /// at one reader and at every thread the machine runs. The suite's reads can't show it: its
     /// settle truncates the log, so `find_frame` is reached with no frames. Run it, release:
     /// `cargo test -p amphora-engine --release --lib g3_2_log_lookup_bench -- --ignored --nocapture`
     /// (`AMPHORA_LOOKUP_BENCH_PAGES`, the database's pages the log holds, default the suite's
     /// 200,000-item database: 32,612 pages; `_LOOKUPS`, a thread's). Half the pages read aren't in
-    /// the log (the filter's case). It prints lookups a second, each way; it asserts nothing about
-    /// time, only that every way answers as the lock does.
+    /// the log (the filter's case). It prints lookups a second; it asserts nothing about
+    /// time, only that the lookup answers as the index does.
     #[test]
     #[ignore = "micro-benchmark: run on a quiet machine, release"]
     fn g3_2_log_lookup_bench() {
-        use super::super::log_index::LogReadIndex;
         use rand_chacha::{
             rand_core::{RngCore, SeedableRng},
             ChaCha8Rng,
@@ -11014,47 +11127,40 @@ pub mod test {
             .map(std::num::NonZeroUsize::get)
             .unwrap_or(1);
         for threads in [1, cores] {
-            for mode in [
-                LogReadIndex::Locked,
-                LogReadIndex::Filtered,
-                LogReadIndex::Published,
-                LogReadIndex::Optimistic,
-            ] {
-                let shared = SharedLog::new(WalFileShared::new_noop());
-                shared.current().read().runtime.read_index.set_mode(mode);
-                let coordination = make_test_coordination(&shared);
-                // Every page written twice, as a run of commits does: 2 x pages frames.
-                let mut frame = 0u64;
-                for _ in 0..2 {
-                    for page in 1..=pages {
-                        frame += 1;
-                        coordination.cache_frame(page, frame);
-                    }
+            let shared = SharedLog::new(WalFileShared::new_noop());
+            let coordination = make_test_coordination(&shared);
+            // Every page written twice, as a run of commits does: 2 x pages frames.
+            let mut frame = 0u64;
+            for _ in 0..2 {
+                for page in 1..=pages {
+                    frame += 1;
+                    coordination.cache_frame(page, frame);
                 }
-                let max_frame = frame;
-                let began = std::time::Instant::now();
-                std::thread::scope(|scope| {
-                    for reader in 0..threads {
-                        let coordination = &coordination;
-                        scope.spawn(move || {
-                            let mut rng = ChaCha8Rng::seed_from_u64(reader as u64);
-                            for _ in 0..lookups {
-                                let page = 1 + rng.next_u64() % (2 * pages);
-                                let found = coordination.find_frame(SegmentId::First, page, 1, max_frame, None);
-                                let expected = (page <= pages).then_some(page + pages);
-                                assert_eq!(found, expected, "{mode:?} page {page}");
-                            }
-                        });
-                    }
-                });
-                let seconds = began.elapsed().as_secs_f64();
-                let total = lookups as f64 * threads as f64;
-                println!(
-                    "g3_2_log_lookup_bench threads={threads} way={mode:?} lookups_per_s={:.0} ns_per_lookup_per_thread={:.1}",
-                    total / seconds,
-                    seconds * 1e9 / lookups as f64
-                );
             }
+            let max_frame = frame;
+            let began = std::time::Instant::now();
+            std::thread::scope(|scope| {
+                for reader in 0..threads {
+                    let coordination = &coordination;
+                    scope.spawn(move || {
+                        let mut rng = ChaCha8Rng::seed_from_u64(reader as u64);
+                        for _ in 0..lookups {
+                            let page = 1 + rng.next_u64() % (2 * pages);
+                            let found =
+                                coordination.find_frame(SegmentId::First, page, 1, max_frame, None);
+                            let expected = (page <= pages).then_some(page + pages);
+                            assert_eq!(found, expected, "page {page}");
+                        }
+                    });
+                }
+            });
+            let seconds = began.elapsed().as_secs_f64();
+            let total = lookups as f64 * threads as f64;
+            println!(
+                "g3_2_log_lookup_bench threads={threads} lookups_per_s={:.0} ns_per_lookup_per_thread={:.1}",
+                total / seconds,
+                seconds * 1e9 / lookups as f64
+            );
         }
     }
 
@@ -11082,8 +11188,14 @@ pub mod test {
 
         assert_eq!(coordination.load_snapshot(), snapshot);
         assert_eq!(coordination.checkpoint_epoch(), 5);
-        assert_eq!(coordination.find_frame(SegmentId::First, 1, 4, 9, None), Some(8));
-        assert_eq!(coordination.find_frame(SegmentId::First, 2, 4, 9, Some(5)), Some(2));
+        assert_eq!(
+            coordination.find_frame(SegmentId::First, 1, 4, 9, None),
+            Some(8)
+        );
+        assert_eq!(
+            coordination.find_frame(SegmentId::First, 2, 4, 9, Some(5)),
+            Some(2)
+        );
         assert_eq!(coordination.iter_latest_frames(4, 9), vec![(1, 8), (2, 6)]);
 
         coordination.publish_commit(WalCommitState {
@@ -11164,12 +11276,18 @@ pub mod test {
         coordination.cache_frame(9, 4);
         coordination.cache_frame(7, 5);
 
-        assert_eq!(coordination.find_frame(SegmentId::First, 7, 0, 5, None), Some(5));
+        assert_eq!(
+            coordination.find_frame(SegmentId::First, 7, 0, 5, None),
+            Some(5)
+        );
         assert_eq!(coordination.iter_latest_frames(0, 5), vec![(7, 5), (9, 4)]);
 
         coordination.rollback_cache(4);
 
-        assert_eq!(coordination.find_frame(SegmentId::First, 7, 0, 5, None), Some(2));
+        assert_eq!(
+            coordination.find_frame(SegmentId::First, 7, 0, 5, None),
+            Some(2)
+        );
         assert_eq!(coordination.iter_latest_frames(0, 5), vec![(7, 2), (9, 4)]);
         assert_eq!(
             shared.current().read().runtime.frame_cache.lock().get(&7),
@@ -11194,7 +11312,10 @@ pub mod test {
         coordination.cache_frame(7, 3);
         coordination.cache_frame(9, 4);
         coordination.cache_frame(7, 5);
-        assert_eq!(coordination.find_frame(SegmentId::First, 9, 0, 10, None), Some(4));
+        assert_eq!(
+            coordination.find_frame(SegmentId::First, 9, 0, 10, None),
+            Some(4)
+        );
 
         // The append position rewinds and frame slots 4 and 5 are overwritten,
         // now belonging to page 11 (@4) and page 13 (@5). The earlier owners of
@@ -11218,7 +11339,10 @@ pub mod test {
             "page 13 now owns frame slot 5"
         );
         // Page 7's still-valid lower frame (3) survives; its stale 5 is gone.
-        assert_eq!(coordination.find_frame(SegmentId::First, 7, 0, 10, None), Some(3));
+        assert_eq!(
+            coordination.find_frame(SegmentId::First, 7, 0, 10, None),
+            Some(3)
+        );
     }
 
     #[test]
@@ -11252,9 +11376,18 @@ pub mod test {
 
         // Mappings at or below the rollback point survive, later ones are
         // discarded; frames 26..=27 remain as unpublished spills.
-        assert_eq!(coordination.find_frame(SegmentId::First, 7, 0, 30, None), Some(10));
-        assert_eq!(coordination.find_frame(SegmentId::First, 9, 0, 30, None), Some(26));
-        assert_eq!(coordination.find_frame(SegmentId::First, 11, 0, 30, None), None);
+        assert_eq!(
+            coordination.find_frame(SegmentId::First, 7, 0, 30, None),
+            Some(10)
+        );
+        assert_eq!(
+            coordination.find_frame(SegmentId::First, 9, 0, 30, None),
+            Some(26)
+        );
+        assert_eq!(
+            coordination.find_frame(SegmentId::First, 11, 0, 30, None),
+            None
+        );
         assert_eq!(wal.get_max_frame(), 27);
         assert_eq!(wal.last_checksum(), (13, 21));
 
@@ -11265,7 +11398,10 @@ pub mod test {
             checksum: (55, 89),
             checkpoint_seq: 1,
         }));
-        assert_eq!(coordination.find_frame(SegmentId::First, 9, 0, 30, None), None);
+        assert_eq!(
+            coordination.find_frame(SegmentId::First, 9, 0, 30, None),
+            None
+        );
         assert_eq!(wal.get_max_frame(), 25);
     }
 
@@ -11382,8 +11518,7 @@ pub mod test {
         assert!(closing_frames > 0 && current_frames > 0);
         std::fs::copy(format!("{source_path}-wal"), format!("{copy_path}-wal2")).unwrap();
 
-        let reopened =
-            Database::open_file(io.clone(), copy_path, Arc::new(SqliteDialect)).unwrap();
+        let reopened = Database::open_file(io.clone(), copy_path, Arc::new(SqliteDialect)).unwrap();
         let log = &reopened.shared_wal;
         assert_eq!(log.current_id(), SegmentId::Second);
         let segments = log.segments.load();
@@ -11408,7 +11543,9 @@ pub mod test {
     }
 
     fn count_rows(conn: &Arc<Connection>, table: &str) -> i64 {
-        let mut stmt = conn.prepare(format!("select count(*) from {table}")).unwrap();
+        let mut stmt = conn
+            .prepare(format!("select count(*) from {table}"))
+            .unwrap();
         let mut count: i64 = 0;
         stmt.run_with_row_callback(|row| {
             count = row.get(0).unwrap();
@@ -11870,7 +12007,10 @@ pub mod test {
         assert_eq!(coordination_b.wal_header().page_size, 4096);
         assert_eq!(coordination_b.wal_header().salt_1, 17);
         assert_eq!(coordination_b.wal_header().salt_2, 23);
-        assert_eq!(coordination_b.find_frame(SegmentId::First, 7, 0, 5, None), Some(5));
+        assert_eq!(
+            coordination_b.find_frame(SegmentId::First, 7, 0, 5, None),
+            Some(5)
+        );
         assert_eq!(
             coordination_b.iter_latest_frames(0, 5),
             vec![(7, 5), (9, 4)]
@@ -11908,7 +12048,10 @@ pub mod test {
         );
 
         coordination_b.rollback_cache(4);
-        assert_eq!(coordination_a.find_frame(SegmentId::First, 7, 0, 5, None), Some(2));
+        assert_eq!(
+            coordination_a.find_frame(SegmentId::First, 7, 0, 5, None),
+            Some(2)
+        );
         assert_eq!(
             coordination_a.iter_latest_frames(0, 5),
             vec![(7, 2), (9, 4)]
@@ -12106,7 +12249,13 @@ pub mod test {
             Some(OLD_FIXED_LIMIT + 2)
         );
         assert_eq!(
-            coordination_b.find_frame(SegmentId::First, 7, 0, OLD_FIXED_LIMIT + 2, Some(OLD_FIXED_LIMIT + 1)),
+            coordination_b.find_frame(
+                SegmentId::First,
+                7,
+                0,
+                OLD_FIXED_LIMIT + 2,
+                Some(OLD_FIXED_LIMIT + 1)
+            ),
             Some(2)
         );
         assert!(coordination_b
@@ -12264,7 +12413,10 @@ pub mod test {
                 SharedWalCoordinationOpenMode::Exclusive
             );
             assert_eq!(coordination.load_snapshot(), snapshot);
-            assert_eq!(coordination.find_frame(SegmentId::First, 7, 0, 5, None), Some(5));
+            assert_eq!(
+                coordination.find_frame(SegmentId::First, 7, 0, 5, None),
+                Some(5)
+            );
         }
 
         let reopened_file = io
@@ -12593,7 +12745,10 @@ pub mod test {
         let exclusive_coordination =
             ShmWalCoordination::new(SharedLog::new(exclusive), authority.clone());
         assert_eq!(authority.iter_latest_frames(0, u64::MAX), vec![(7, 1)]);
-        assert_eq!(exclusive_coordination.find_frame(SegmentId::First, 7, 0, 1, None), Some(1));
+        assert_eq!(
+            exclusive_coordination.find_frame(SegmentId::First, 7, 0, 1, None),
+            Some(1)
+        );
 
         drop(exclusive_coordination);
         drop(authority);
@@ -12621,7 +12776,10 @@ pub mod test {
             .loaded_from_disk_scan
             .load(Ordering::Acquire));
         let reopened_coordination = ShmWalCoordination::new(reopened_shared, reopened_authority);
-        assert_eq!(reopened_coordination.find_frame(SegmentId::First, 7, 0, 1, None), Some(1));
+        assert_eq!(
+            reopened_coordination.find_frame(SegmentId::First, 7, 0, 1, None),
+            Some(1)
+        );
     }
 
     #[cfg(host_shared_wal)]
@@ -13121,7 +13279,10 @@ pub mod test {
             authority.snapshot().transaction_count,
             authoritative.transaction_count
         );
-        assert_eq!(coordination_b.find_frame(SegmentId::First, 7, 0, 5, None), Some(5));
+        assert_eq!(
+            coordination_b.find_frame(SegmentId::First, 7, 0, 5, None),
+            Some(5)
+        );
         authority.release_writer(authority.owner_record());
     }
 
@@ -13835,12 +13996,11 @@ pub mod test {
         vacuum_wal.end_write_tx();
         assert!(!vacuum_wal.holds_write_lock());
 
-        let guard =
-            CheckpointLocks::from_held_vacuum_checkpoint_lock(
-                vacuum_wal.coordination.clone(),
-                SegmentId::First,
-            )
-            .unwrap();
+        let guard = CheckpointLocks::from_held_vacuum_checkpoint_lock(
+            vacuum_wal.coordination.clone(),
+            SegmentId::First,
+        )
+        .unwrap();
         assert!(
             matches!(contender_wal.try_begin_read_tx(0), TryBeginReadResult::Busy),
             "VACUUM lock should continue blocking readers during final checkpoint"

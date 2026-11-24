@@ -98,6 +98,8 @@ struct Amphora {
     db: Arc<Database>,
     conn: Arc<amphora_engine::Connection>,
     storage: Arc<Storage>,
+    /// Its tables are declared `COLUMNAR`, so they keep column copies (decision 1, item 1).
+    columnar: bool,
 }
 
 impl Amphora {
@@ -113,7 +115,6 @@ impl Amphora {
         let storage = conn
             .versioned_storage()
             .ok_or_else(|| anyhow::anyhow!("no versioned storage"))?;
-        storage.set_copies_on(copies.is_some());
         if let Some(rebuy) = copies {
             storage.set_copy_rebuy(rebuy);
         }
@@ -122,11 +123,21 @@ impl Amphora {
             db,
             conn,
             storage,
+            columnar: copies.is_some(),
         })
     }
 
     fn exec(&self, sql: &str) -> anyhow::Result<()> {
         self.conn.execute(sql).map_err(e)
+    }
+
+    /// Runs `sql`, a CREATE TABLE, declared `COLUMNAR` when this database keeps copies.
+    fn create(&self, sql: &str) -> anyhow::Result<()> {
+        if self.columnar {
+            self.exec(&format!("{sql} COLUMNAR"))
+        } else {
+            self.exec(sql)
+        }
     }
 
     fn rows(&self, sql: &str) -> anyhow::Result<Answer> {
@@ -233,7 +244,7 @@ impl Duck {
 /// The bytes granted the copy of one table of `rows` rows, with room to spare: the A/B's `need`.
 fn need(rows: i64) -> anyhow::Result<u64> {
     let a = Amphora::open(None, Some(Rebuy::Rent))?;
-    a.exec(&schema(0))?;
+    a.create(&schema(0))?;
     a.exec(&fill(false, 0, 1, rows))?;
     let q = amphora_engine::storage::versioned::columns_ab::QUERIES
         .get(2)
@@ -252,7 +263,7 @@ fn need(rows: i64) -> anyhow::Result<u64> {
 /// its transaction, never the copies' state (lane colcopy-9, AC-CB.4.6).
 fn reach(rows: i64) -> anyhow::Result<Vec<Option<&'static str>>> {
     let a = Amphora::open(None, Some(Rebuy::Rent))?;
-    a.exec(&schema(0))?;
+    a.create(&schema(0))?;
     a.exec(&fill(false, 0, 1, rows))?;
     let mut out = Vec::with_capacity(QUERIES.len());
     for q in QUERIES {
@@ -349,10 +360,10 @@ fn run(
         Engine::Duck => (None, Some(Duck::open(cx.dir, cx.threads)?)),
     };
     for i in 0..s.tables {
-        reference.exec(&schema(i))?;
+        reference.create(&schema(i))?;
         reference.exec(&fill(false, i, 1, s.rows))?;
         if let Some(a) = &amphora {
-            a.exec(&schema(i))?;
+            a.create(&schema(i))?;
             a.exec(&fill(false, i, 1, s.rows))?;
         }
         if let Some(d) = &duck {
@@ -754,10 +765,10 @@ fn ladder_step(
         Engine::Duck => (None, Some(Duck::open(cx.dir, cx.threads)?)),
     };
     for i in 0..s.tables {
-        reference.exec(&schema(i))?;
+        reference.create(&schema(i))?;
         reference.exec(&fill(false, i, 1, s.rows))?;
         if let Some(a) = &amphora {
-            a.exec(&schema(i))?;
+            a.create(&schema(i))?;
             a.exec(&fill(false, i, 1, s.rows))?;
         }
         if let Some(d) = &duck {

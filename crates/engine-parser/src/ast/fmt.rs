@@ -1728,6 +1728,12 @@ impl ToTokens for CreateTableBody {
                 if let Some(ref strict) = options.strict_text {
                     s.append(TK_ID, Some(strict))?;
                 }
+                if let Some(ref columnar) = options.columnar_text {
+                    if options.without_rowid_text.is_some() || options.strict_text.is_some() {
+                        s.append(TK_COMMA, None)?;
+                    }
+                    s.append(TK_ID, Some(columnar))?;
+                }
                 Ok(())
             }
             Self::AsSelect(select) => {

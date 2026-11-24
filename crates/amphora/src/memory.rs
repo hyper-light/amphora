@@ -612,8 +612,10 @@ impl Budget {
 
     /// `bytes` more held by `used`, as [`Budget::take`], waiting for room until `until`: woken by
     /// each charge given back anywhere in the budget ([`Budget::give`]), never by a timer, and
-    /// `waits` told (under the budget's lock) each time it waits. Refused as [`Budget::hold`]
-    /// refuses once `until` has passed, and at once for a refusal other than no room.
+    /// `waits` told (under the budget's lock) each time it waits. Refused [`Refusal::Full`], with
+    /// the room it last saw, once `until` has passed. Refused at once, never waited on: bytes past
+    /// the whole limit, [`Refusal::TooLarge`] naming it (no charge given back makes room for them;
+    /// lane perf-A19), and a refusal other than no room.
     pub fn take_until(
         self: &Arc<Self>,
         used: Use,
@@ -621,6 +623,11 @@ impl Budget {
         until: Instant,
         mut waits: impl FnMut(),
     ) -> Result<Charge, Refusal> {
+        // Room found takes no lock, as Linux's `wait_event` looks before it joins the queue
+        // (include/linux/wait.h); the look under the lock below is the one a give can't slip past.
+        if let Ok(charge) = self.take(used, bytes) {
+            return Ok(charge);
+        }
         let mut given = self.given.0.lock().unwrap_or_else(PoisonError::into_inner);
         self.waiting.fetch_add(1, Ordering::Relaxed);
         // Pairs with `give`'s sequentially consistent give-back and read of `waiting` (C++
@@ -629,10 +636,18 @@ impl Budget {
         fence(Ordering::SeqCst);
         let held = 'look: loop {
             let seen = *given;
-            let refused = match self.hold(used, bytes) {
-                Err(refused @ Refusal::TooLarge { .. }) => refused,
+            let room = match self.hold(used, bytes) {
+                Err(Refusal::TooLarge { limit, .. }) => limit,
                 other => break other,
             };
+            if let Some(limit) = self.readings.read().limit.filter(|limit| bytes > *limit) {
+                break Err(Refusal::TooLarge {
+                    what: format!("memory for {}", used.name()),
+                    size: usize::try_from(bytes).unwrap_or(usize::MAX),
+                    limit: usize::try_from(limit).unwrap_or(usize::MAX),
+                });
+            }
+            let refused = Refusal::Full { limit: room };
             let mut left = until.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 break Err(refused);
@@ -658,6 +673,12 @@ impl Budget {
             used,
             bytes,
         })
+    }
+
+    /// The holders waiting for room now ([`Budget::take_until`]).
+    #[must_use]
+    pub fn waiting(&self) -> u64 {
+        self.waiting.load(Ordering::Relaxed)
     }
 
     /// `bytes` held by `used` ([`Budget::hold`]) given back, and the holders waiting for room
@@ -839,6 +860,39 @@ pub(crate) mod tests {
         assert_eq!(budget.room(Use::Caches).unwrap(), 100);
         drop(held);
         assert_eq!(budget.room(Use::Images).unwrap(), 100);
+    }
+
+    /// Lane perf-A19 (AUDIT 2026-11-23 §1, MB.1): a charge past the whole limit is refused at once,
+    /// never waited on. Do: on a budget with a 1 MiB limit and nothing held, take a byte past the
+    /// limit with a deadline an hour off; then, with the whole limit held, take a byte with a
+    /// deadline already passed; then, the limit given back, take the whole limit. Expect: the first
+    /// refused `TooLarge` naming its size and the limit, no wait told; the second refused `Full`
+    /// with no room, no wait told; the third taken; nothing held once it drops.
+    #[test]
+    fn a19_a_charge_past_the_whole_limit_is_refused_at_once_never_waited_on() {
+        let fed = Fed::new(Some(1 << 20), Some(0));
+        let budget = Budget::new(Box::new(fed));
+        let far = Instant::now() + std::time::Duration::from_secs(3600);
+        let mut waits = 0u32;
+        let refused = budget.take_until(Use::Queues, (1 << 20) + 1, far, || waits += 1);
+        assert!(
+            matches!(&refused, Err(Refusal::TooLarge { what, size, limit })
+                if what.contains("queues") && *size == (1 << 20) + 1 && *limit == 1 << 20),
+            "{:?}",
+            refused.err()
+        );
+        assert_eq!(waits, 0);
+        let image = budget.take(Use::Images, 1 << 20).unwrap();
+        let refused = budget.take_until(Use::Queues, 1, Instant::now(), || waits += 1);
+        assert_eq!(refused.err(), Some(Refusal::Full { limit: 0 }));
+        assert_eq!(waits, 0);
+        drop(image);
+        let whole = budget
+            .take_until(Use::Queues, 1 << 20, far, || waits += 1)
+            .unwrap();
+        assert_eq!((whole.bytes(), waits), (1 << 20, 0));
+        drop(whole);
+        assert_eq!(budget.held(Use::Queues), 0);
     }
 
     /// Do: read this process's limit and resident bytes where it runs (Linux, macOS, Windows).

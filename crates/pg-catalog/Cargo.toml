@@ -1,0 +1,15 @@
+[package]
+name = "amphora-pg-catalog"
+description = "PostgreSQL 19's catalog core (docs/design/postgres.md sections 7 and 9): its built-in rows from its own .dat files, and search_path resolution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dev-dependencies]
+sha2 = "0.10"
+
+[lints]
+workspace = true

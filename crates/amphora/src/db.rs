@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 pub use amphora_engine::LogFormat;
 use amphora_engine::busy::BusyWake;
 use amphora_engine::io::FileSyncType;
+use amphora_engine::storage::log_segments::SegmentId;
 use amphora_engine::{
     Buffer, CheckpointMode, Completion, CompletionError, ConnectOpts, Connection, Database,
     DatabaseOpts, IO, IOExt, LimboError, OpenFlags, OpenOptions, PlatformIO, Row, SqliteDialect,
@@ -154,6 +155,15 @@ fn wal_path(path: &Path) -> PathBuf {
     let mut wal = path.as_os_str().to_owned();
     wal.push("-wal");
     PathBuf::from(wal)
+}
+
+/// The file of one segment of the log beside the database at `path` (decision 45): `-wal` or
+/// `-wal2`.
+fn segment_path(path: &Path, segment: SegmentId) -> String {
+    match segment {
+        SegmentId::First => format!("{}-wal", path.display()),
+        SegmentId::Second => format!("{}-wal2", path.display()),
+    }
 }
 
 /// Makes `path`, if it doesn't exist yet, an empty file that a copy-on-write file system writes in
@@ -446,7 +456,7 @@ impl Db {
     /// leaving the disk's cache): the log keeps its length across restarts (within
     /// [`Db::keep_log`]), so once it has been as long as it gets, a flush writes no metadata.
     pub fn flusher(&self) -> Flush {
-        let wal = format!("{}-wal", self.path.display());
+        let path = self.path.clone();
         let held = EngineHandles {
             io: self.io.clone(),
             db: self.db.clone(),
@@ -464,6 +474,8 @@ impl Db {
             // Opened each time: a flush is a disk's round trip, an open a few microseconds, and the
             // log may have been made again. No log: everything is in the file, which the checkpoint
             // that emptied the log flushed.
+            // The segment the prefix is in: a switch flushes the one it closes (decision 45).
+            let wal = segment_path(&path, db.wal_segment());
             let file = match io.open_file(&wal, OpenFlags::NoLock, false) {
                 Ok(file) => file,
                 Err(LimboError::CompletionError(CompletionError::IOError(
@@ -512,10 +524,13 @@ impl Db {
         }
     }
 
-    /// With no reader reading (the store holds them back), copies what remains, flushes the file,
-    /// and starts the log from its beginning: whether it did. The log's file keeps its length
-    /// (decision 13), unless it holds room for more frames than [`Db::keep_log`] keeps: then it is
-    /// cut to nothing, once every frame is in the file (docs/design/store.md, decision 31).
+    /// Copies what the reads under way let it, then starts the log again by switching the writer
+    /// to its free segment (docs/design/store.md, decision 45): whether it did. The current
+    /// segment is flushed and closes; reads under way keep reading it. It waits for no read:
+    /// false while another connection writes, or while a read still counts on the segment the
+    /// last switch closed, and the caller asks again at its next turn. A segment switched to is
+    /// cut to nothing first if it holds room for more frames than [`Db::keep_log`] keeps
+    /// (decision 31).
     ///
     /// A database backed up ([`Db::back_up`]) starts its log again only once the backup has shipped
     /// all of it, until the log is past what a restart keeps (decision 31): then it starts again
@@ -531,23 +546,25 @@ impl Db {
         if !shipped && !over {
             return Ok(false);
         }
-        let mode = if over {
-            CheckpointMode::Truncate {
-                upper_bound_inclusive: None,
-            }
-        } else {
-            CheckpointMode::Restart
-        };
-        match self.conn.checkpoint(mode) {
-            Ok(_) => {
-                if let Some(hooks) = &self.backup {
-                    hooks.fence.ended(seq, frame, !shipped)?;
-                }
-                Ok(true)
-            }
-            Err(LimboError::Busy) => Ok(false),
-            Err(e) => Err(fail(e)),
+        // The segment switched to is cut to nothing if it holds room for more frames than a
+        // restart keeps (decision 31, at each segment's reuse).
+        let cut_past = PAGE_BYTES
+            .checked_add(FRAME_HEADER_BYTES)
+            .and_then(|frame| frame.checked_mul(self.log_kept))
+            .and_then(|frames| frames.checked_add(LOG_HEADER_BYTES));
+        // What the reads let a pass copy, the closing segment's and then the current one's: with
+        // no read under way every frame is in the file, as before. The switch needs the closing
+        // segment reset, which a read still on it holds off (the writer asks again at its next
+        // turn).
+        let _closing = self.checkpoint()?;
+        let _current = self.checkpoint()?;
+        if !self.db.switch_log(cut_past).map_err(fail)? {
+            return Ok(false);
         }
+        if let Some(hooks) = &self.backup {
+            hooks.fence.ended(seq, frame, !shipped)?;
+        }
+        Ok(true)
     }
 
     /// Backs this database up through `hooks` (docs/design/backup.md): each commit made on this
@@ -599,9 +616,14 @@ impl Db {
         self.db.wal_end()
     }
 
-    /// `len` bytes of the log's file from `offset`; None when there is no log file.
+    /// `len` bytes of the current segment's file of the log from `offset` (decision 45); None
+    /// when there is no such file.
     pub(crate) fn read_log(&self, offset: u64, len: usize) -> anyhow::Result<Option<Vec<u8>>> {
-        self.read_at(&wal_path(&self.path).display().to_string(), offset, len)
+        self.read_at(
+            &segment_path(&self.path, self.db.wal_segment()),
+            offset,
+            len,
+        )
     }
 
     /// `len` bytes of the database's file from `offset`.
@@ -714,7 +736,7 @@ impl Db {
 
     /// The frames the log's file holds room for: none without a log.
     pub(crate) fn log_frames(&self) -> anyhow::Result<u64> {
-        let wal = format!("{}-wal", self.path.display());
+        let wal = segment_path(&self.path, self.db.wal_segment());
         let bytes = match self.io.open_file(&wal, OpenFlags::NoLock, false) {
             Ok(file) => file.size().map_err(fail)?,
             Err(LimboError::CompletionError(CompletionError::IOError(

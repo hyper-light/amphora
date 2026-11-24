@@ -11,7 +11,11 @@ pub fn register_extension(ext_api: &mut ExtensionApi) {
         register_scalar_function(ext_api.ctx, c"ieee754_mantissa".as_ptr(), ieee754_mantissa);
         register_scalar_function(ext_api.ctx, c"ieee754_exponent".as_ptr(), ieee754_exponent);
         register_scalar_function(ext_api.ctx, c"ieee754_to_blob".as_ptr(), ieee754_to_blob);
-        register_scalar_function(ext_api.ctx, c"ieee754_from_blob".as_ptr(), ieee754_from_blob);
+        register_scalar_function(
+            ext_api.ctx,
+            c"ieee754_from_blob".as_ptr(),
+            ieee754_from_blob,
+        );
     }
 }
 
@@ -34,7 +38,11 @@ fn argument_double(v: &Value) -> f64 {
 /// (972 for the infinities and NaNs, whose M is 2^52 or more), and zero as (0, -1075).
 fn split(r: f64) -> (i64, i64) {
     let negative = r < 0.0;
-    let bits = if negative { (-r).to_bits() } else { r.to_bits() };
+    let bits = if negative {
+        (-r).to_bits()
+    } else {
+        r.to_bits()
+    };
     if bits == 0 {
         return (0, -BIAS);
     }
@@ -51,7 +59,10 @@ fn split(r: f64) -> (i64, i64) {
         e = e.wrapping_add(1);
     }
     let m = i64::try_from(m).unwrap_or(i64::MAX);
-    (if negative { m.wrapping_neg() } else { m }, e.wrapping_sub(BIAS))
+    (
+        if negative { m.wrapping_neg() } else { m },
+        e.wrapping_sub(BIAS),
+    )
 }
 
 /// M × 2^E as ieee754.c's two-argument form builds it: bits below the 53rd are dropped, a value
@@ -193,7 +204,10 @@ mod tests {
     /// The edges sqlite3 3.54.0 answers: dropped low bits, below the subnormals, past the largest.
     #[test]
     fn ieee754_join_truncates_as_sqlite_does() {
-        assert_eq!(join(9_007_199_254_740_993, 0), Some(9_007_199_254_740_992.0));
+        assert_eq!(
+            join(9_007_199_254_740_993, 0),
+            Some(9_007_199_254_740_992.0)
+        );
         assert_eq!(join(1, -1075), Some(0.0));
         assert_eq!(join(3, -1075), Some(f64::from_bits(1)));
         assert_eq!(join(0, 2000), Some(f64::INFINITY));

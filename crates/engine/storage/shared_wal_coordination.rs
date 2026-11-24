@@ -1334,12 +1334,13 @@ impl MappedSharedWalCoordination {
     /// where every process sees it. False when a count of the slot is at the most
     /// its bits hold: the read is refused and tried again.
     pub(crate) fn count_read(&self, slot: SharedReaderSlot, span: &ReadSpan) -> bool {
-        self.slot_reads(slot.slot_index as usize).is_some_and(|word| {
-            word.try_update(Ordering::AcqRel, Ordering::Acquire, |reads| {
-                SlotReads(reads).with(span).map(|reads| reads.0)
+        self.slot_reads(slot.slot_index as usize)
+            .is_some_and(|word| {
+                word.try_update(Ordering::AcqRel, Ordering::Acquire, |reads| {
+                    SlotReads(reads).with(span).map(|reads| reads.0)
+                })
+                .is_ok()
             })
-            .is_ok()
-        })
     }
 
     /// The read [`Self::count_read`] counted on `slot` with `span` is done.
@@ -4595,9 +4596,7 @@ mod tests {
         assert_eq!(log.switch(false), Some(SegmentId::Second));
         reading.seed_segments(log);
         let span = log.begin_read();
-        let slot = reading
-            .register_reader(reading.owner_record(), 5)
-            .unwrap();
+        let slot = reading.register_reader(reading.owner_record(), 5).unwrap();
         assert!(reading.count_read(slot, &span));
         let closing = |reads| {
             Segment::Closing(Closing {
@@ -4635,9 +4634,7 @@ mod tests {
         let mut log = Segments::new(SegmentId::First);
         reading.seed_segments(log);
         let (span, word) = reading.begin_span();
-        let slot = reading
-            .register_reader(reading.owner_record(), 5)
-            .unwrap();
+        let slot = reading.register_reader(reading.owner_record(), 5).unwrap();
         assert!(reading.count_read(slot, &span));
         assert!(reading.span_holds(word));
         assert_eq!(log.switch(false), Some(SegmentId::Second));
@@ -4657,8 +4654,15 @@ mod tests {
         reading.uncount_read(slot, &span);
         reading.unregister_reader(slot);
         assert_eq!(reading.reset_if_unread(), Some(SegmentId::First));
-        assert_eq!(checkpointing.segments().state(SegmentId::First), Segment::Free);
-        assert_eq!(checkpointing.reset_if_unread(), None, "a segment is reset once");
+        assert_eq!(
+            checkpointing.segments().state(SegmentId::First),
+            Segment::Free
+        );
+        assert_eq!(
+            checkpointing.reset_if_unread(),
+            None,
+            "a segment is reset once"
+        );
     }
 
     /// Do: a read takes its span while the closing segment is not yet copied, and another
@@ -4679,9 +4683,7 @@ mod tests {
         let (late, late_word) = reading.begin_span();
         assert_eq!(late.closing(), Some(SegmentId::First));
         assert_eq!(checkpointing.copied(), Some(SegmentId::First));
-        let slot = reading
-            .register_reader(reading.owner_record(), 5)
-            .unwrap();
+        let slot = reading.register_reader(reading.owner_record(), 5).unwrap();
         assert!(reading.count_read(slot, &late));
         assert!(
             !reading.span_holds(late_word),
@@ -4689,7 +4691,10 @@ mod tests {
         );
         reading.uncount_read(slot, &late);
         let (again, again_word) = reading.begin_span();
-        assert_eq!(again.lookup_order().collect::<Vec<_>>(), [SegmentId::Second]);
+        assert_eq!(
+            again.lookup_order().collect::<Vec<_>>(),
+            [SegmentId::Second]
+        );
         assert!(reading.count_read(slot, &again));
         assert!(reading.span_holds(again_word));
         reading.uncount_read(slot, &again);
@@ -4700,9 +4705,7 @@ mod tests {
         reading.seed_segments(log);
         let (early, early_word) = reading.begin_span();
         assert_eq!(early.closing(), Some(SegmentId::Second));
-        let slot = reading
-            .register_reader(reading.owner_record(), 5)
-            .unwrap();
+        let slot = reading.register_reader(reading.owner_record(), 5).unwrap();
         assert!(reading.count_read(slot, &early));
         assert!(reading.span_holds(early_word));
         assert_eq!(
@@ -4752,8 +4755,16 @@ mod tests {
         };
 
         let seen = mapped.segments();
-        assert_eq!(mapped.reader_owner(0), None, "the dead reader's slot is reclaimed");
-        assert_eq!(seen.state(SegmentId::First), closing(1), "the dead read stops counting");
+        assert_eq!(
+            mapped.reader_owner(0),
+            None,
+            "the dead reader's slot is reclaimed"
+        );
+        assert_eq!(
+            seen.state(SegmentId::First),
+            closing(1),
+            "the dead read stops counting"
+        );
         assert_eq!(seen.state(SegmentId::Second), Segment::Current { reads: 1 });
 
         mapped.uncount_read(live, &live_span);
