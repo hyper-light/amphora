@@ -19,7 +19,6 @@ fn open() -> (Arc<MemoryIO>, Arc<Connection>) {
 }
 
 fn answer(io: &MemoryIO, conn: &Arc<Connection>, sql: &str) -> Result<String, String> {
-    let ordered = sql.contains("ORDER BY") || sql.starts_with("EXPLAIN");
     let mut stmt = conn.prepare(sql).map_err(|error| error.to_string())?;
     let mut lines = Vec::new();
     loop {
@@ -46,7 +45,7 @@ fn answer(io: &MemoryIO, conn: &Arc<Connection>, sql: &str) -> Result<String, St
             other => return Err(format!("step: {other:?}")),
         }
     }
-    if !ordered {
+    if !sql.starts_with("EXPLAIN") {
         lines.sort();
     }
     let sep = if sql.starts_with("EXPLAIN") {
@@ -66,6 +65,7 @@ fn run() {
         let fields: Vec<&str> = line.split("\t").collect();
         match fields.as_slice() {
             ["db", name] => dbs.push((name.to_string(), Vec::new(), Vec::new())),
+            ["db", kind, name] => dbs.push((format!("{kind}:{name}"), Vec::new(), Vec::new())),
             ["sql", sql] => dbs.last_mut().unwrap().1.push(sql.to_string()),
             ["q", sql] => dbs.last_mut().unwrap().2.push((sql.to_string(), None)),
             ["q", sql, want] => dbs
