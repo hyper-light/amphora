@@ -1230,9 +1230,7 @@ mod tests {
     #[test]
     fn a_default_read_is_counted_when_the_copy_defers_to_the_rows() {
         let (_db, conn) = connect();
-        copies(&conn).set_on(true);
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
-            .unwrap();
+        create(&conn, "CREATE TABLE t(id INTEGER PRIMARY KEY)", true);
         conn.execute("INSERT INTO t VALUES (1)").unwrap();
         conn.execute("ALTER TABLE t ADD COLUMN v INTEGER DEFAULT 7")
             .unwrap();
