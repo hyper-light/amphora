@@ -1,0 +1,50 @@
+CREATE TABLE kv(id INTEGER PRIMARY KEY, n INT, m INT);
+CREATE TABLE s(b INT);
+INSERT INTO s VALUES (2), (30);
+INSERT INTO kv VALUES (1, 5, 0), (2, 6, 0);
+INSERT INTO kv VALUES (1, 7, 1), (2, 70, 2) ON CONFLICT(id) DO UPDATE SET n = (SELECT excluded.n + 1), m = (SELECT max(b) FROM s WHERE b > excluded.n);
+SELECT * FROM kv;
+INSERT INTO kv VALUES (1, 7, 1), (2, 70, 2) ON CONFLICT(id) DO UPDATE SET (n, m) = (SELECT kv.n + excluded.n, count(*) FROM s WHERE s.b < kv.n);
+SELECT * FROM kv;
+INSERT INTO kv VALUES (1, 1, 1), (2, 2, 2) ON CONFLICT(id) DO UPDATE SET n = excluded.n IN (SELECT b FROM s) WHERE EXISTS (SELECT 1 FROM s WHERE b = excluded.m);
+SELECT * FROM kv;
+INSERT INTO kv VALUES (1, 1, 1), (2, 2, 2) ON CONFLICT(id) DO UPDATE SET n = (SELECT sum(n) FROM kv), m = (SELECT count(*) FROM kv x WHERE x.n < kv.n);
+SELECT * FROM kv;
+INSERT INTO kv AS q VALUES (1, 1, 1) ON CONFLICT(id) DO UPDATE SET n = (SELECT q.n + excluded.id FROM s LIMIT 1);
+SELECT * FROM kv;
+WITH c(x) AS (SELECT 100) INSERT INTO kv SELECT 1, 1, 1 WHERE true ON CONFLICT(id) DO UPDATE SET n = (SELECT x FROM c);
+SELECT * FROM kv;
+INSERT INTO kv VALUES (1, 1, 1) ON CONFLICT(id) DO UPDATE SET n = (SELECT excluded.nosuch);
+INSERT INTO kv VALUES (1, 1, 1) ON CONFLICT(id) DO UPDATE SET n = (SELECT 1, 2);
+INSERT INTO kv VALUES (1, 1, 1) ON CONFLICT(id) DO UPDATE SET (n, m) = (SELECT 1);
+INSERT INTO kv VALUES (1, 9, 1), (2, 10, 1) ON CONFLICT(id) DO UPDATE SET n = (SELECT t.y FROM (SELECT excluded.n AS y) AS t), m = (SELECT b FROM s AS excluded WHERE excluded.b = 30) RETURNING n, m;
+SELECT * FROM kv
+----
+CREATE TABLE kv(id TEXT PRIMARY KEY, n INT) WITHOUT ROWID, STRICT;
+CREATE TABLE s(b INT);
+INSERT INTO s VALUES (2), (30);
+INSERT INTO kv VALUES ('a', 5), ('b', 6);
+INSERT INTO kv VALUES ('a', 7), ('b', 70) ON CONFLICT(id) DO UPDATE SET n = (SELECT excluded.n + kv.n + max(b) FROM s) WHERE (SELECT excluded.n > 0);
+SELECT * FROM kv;
+INSERT INTO kv VALUES ('a', 7) ON CONFLICT(id) DO UPDATE SET n = (SELECT count(*) FROM kv) WHERE id IN (SELECT 'a');
+SELECT * FROM kv
+----
+CREATE TABLE t(a INT, g INT);
+CREATE TABLE s(b INT);
+INSERT INTO t VALUES (1, 1), (2, 1), (3, 2);
+INSERT INTO s VALUES (2), (3);
+SELECT a, sum(CASE WHEN a IN (SELECT b FROM s) THEN 1 ELSE 0 END) OVER (ORDER BY a) FROM t;
+SELECT a, sum((SELECT max(b) FROM s)) OVER (ORDER BY a) FROM t;
+SELECT a, sum((SELECT max(b) FROM s WHERE b > t.a)) OVER (ORDER BY a) FROM t;
+SELECT a, lag(a, 1, (SELECT min(b) FROM s)) OVER (ORDER BY a) FROM t;
+SELECT a, lag((SELECT count(*) FROM s WHERE b <= t.a)) OVER (ORDER BY a DESC) FROM t;
+SELECT a, group_concat(a, (SELECT 'x')) OVER (ORDER BY a) FROM t;
+SELECT a, sum((SELECT 1, 2)) OVER () FROM t;
+SELECT a, sum((SELECT max(b) FROM s) + a) OVER w, count((SELECT a)) OVER w FROM t WINDOW w AS (PARTITION BY g ORDER BY a);
+SELECT g, sum(sum((SELECT max(b) FROM s WHERE b <> t.a))) OVER (ORDER BY g) FROM t GROUP BY g;
+SELECT a, json_group_array((SELECT max(b) FROM s WHERE b > t.a)) OVER (ORDER BY a) FROM t;
+SELECT a, sum((a, 1) IN (SELECT b, 1 FROM s)) OVER (ORDER BY a) FROM t;
+SELECT a, sum(a IN (SELECT b, 1 FROM s)) OVER (ORDER BY a) FROM t;
+SELECT DISTINCT sum((SELECT b FROM s LIMIT 1)) OVER (PARTITION BY g) FROM t;
+SELECT a FROM t ORDER BY sum((SELECT max(b) FROM s) * a) OVER (ORDER BY a DESC);
+SELECT max((SELECT max(b) FROM s WHERE b <= t.a)) FILTER (WHERE a IN (SELECT b FROM s)) OVER (ORDER BY a ROWS 1 PRECEDING) FROM t
