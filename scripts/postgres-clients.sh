@@ -85,6 +85,14 @@ cat > "$WORK/sql/tpcb-32.sql" <<SQL
 $(sed -n '/^BEGIN;/,$p' "$WORK/sql/tpcb-1.sql")
 SQL
 
+cat > "$WORK/sql/tpcb-init.sql" <<SQL
+\\set aid random(1, 100000)
+\\set bid random(1, 1)
+\\set tid random(1, 10)
+\\set delta random(-5000, 5000)
+$(sed -n '/^BEGIN;/,$p' "$WORK/sql/tpcb-1.sql")
+SQL
+
 # libpq's extended protocol as psql 19 drives it: PQsendQueryParams (pgbench.c:868's relkind query with it), PQsendPrepare,
 # PQsendQueryPrepared, PQsendClosePrepared, and a pipeline with PQsendFlushRequest, PQpipelineSync and an error in it.
 cat > "$WORK/sql/extended.sql" <<'SQL'
@@ -242,7 +250,7 @@ init() { # <steps>
 }
 init dtgvp
 for mode in simple extended prepared; do
-  both tpcb pgbench -h 127.0.0.1 -p PORT -U ada -n -M "$mode" -c 8 -j 1 -t 100 --random-seed=42 ada
+  both tpcb pgbench -h 127.0.0.1 -p PORT -U ada -n -f /sql/tpcb-init.sql -M "$mode" -c 8 -j 1 -t 100 --random-seed=42 ada
   for side in ours theirs; do
     cat "$WORK/tpcb.$side" "$WORK/tpcb.err.$side" | grep -E 'query mode|actually processed|failed|aborted|ERROR|error' > "$WORK/tpcb-counts.$side" || true
     echo "pgbench -M $mode -c 8 on pgbench -i's tables, $side: $(tr '\n' ';' < "$WORK/tpcb-counts.$side")"
