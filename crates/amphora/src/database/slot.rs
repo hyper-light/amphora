@@ -133,8 +133,11 @@ impl<T> Slots<T> {
         }
         self.term = term;
         let ended = self.end(at, SlotEnd::Released);
-        self.ready
-            .extend(self.waiting.drain(..).map(|(member, barrier, _)| (member, barrier)));
+        self.ready.extend(
+            self.waiting
+                .drain(..)
+                .map(|(member, barrier, _)| (member, barrier)),
+        );
         self.queue.clear();
         self.turn = false;
         for gap in &mut self.gaps {
@@ -368,8 +371,11 @@ impl<T> Slots<T> {
     pub(super) fn release(&mut self, at: Instant) -> Option<Ended> {
         let ended = self.end(at, SlotEnd::Released);
         self.took_turn();
-        self.ready
-            .extend(self.waiting.drain(..).map(|(member, barrier, _)| (member, barrier)));
+        self.ready.extend(
+            self.waiting
+                .drain(..)
+                .map(|(member, barrier, _)| (member, barrier)),
+        );
         self.queue.clear();
         ended
     }
@@ -653,7 +659,11 @@ mod tests {
         slots.ask(2);
         slots.read(2, next, "barrier", Some(500 * MS));
         assert_eq!(slots.start(next, 2, 2, false), Some((2, 500 * MS)));
-        assert_eq!(slots.expire(next + 500 * MS), None, "at its deadline it holds");
+        assert_eq!(
+            slots.expire(next + 500 * MS),
+            None,
+            "at its deadline it holds"
+        );
         let lost = slots.expire(next + 500 * MS + Duration::from_nanos(1));
         assert_eq!(lost.map(|e| e.how), Some(SlotEnd::Expired));
     }

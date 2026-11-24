@@ -111,7 +111,17 @@ moving rows out of blocks over positional deltas, which complicate reads [c80].
 1. **The rows stay the record.** Each table's rows stay in their B-tree, which alone serves writes,
    transactions and point reads [c3][c95]. A table's columns are a copy derived from its rows,
    declared on the table, as SQL Server's and TiDB's are [c39][c98]. Nothing about the copy is
-   ever needed to answer correctly: without it, a scan reads the rows.
+   ever needed to answer correctly: without it, a scan reads the rows. In the SQLite dialect the
+   declaration is a table option, `COLUMNAR`, after the column list:
+   `CREATE TABLE t (...) COLUMNAR`, or `STRICT, COLUMNAR`. Why that form: SQLite says what a table
+   is by its table options, `STRICT` and `WITHOUT ROWID`, written after the closing parenthesis
+   and separated by commas, and it keeps each CREATE statement's text in `sqlite_schema`, so the
+   declaration is read back at every open with no record of its own. A declared table keeps a
+   copy on the versioned storage, bought by its measured use (`columns_sql`: rent before buying);
+   a table not declared never keeps one, and the translator hands the copies no statement of its.
+   The pager's storage keeps no copies, so there the option changes no answer. No process-wide
+   switch turns copies on; changing the declaration means making the table anew, since no ALTER
+   form is built.
 2. **Fed by the commit stream, after the commit.** The copy takes the redo record each commit
    already writes [c1]: the commit hands it over, as built, to the copy's queue at the point it
    appends it to the redo log, under the lock that orders commits [c2], so the copy is offered
