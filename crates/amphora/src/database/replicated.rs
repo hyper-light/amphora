@@ -753,10 +753,48 @@ impl Local {
         self.account.free();
     }
 }
+/// A record queued for the host, with its raft kind: QB.2's shed takes only a kind the core sends
+/// again (`resent`).
+struct Queued {
+    outbound: Outbound,
+    kind: hyper_raft::proto::MessageType,
+}
+/// Whether the core sends a record of `kind` again on its own while its member still lacks what it
+/// carries, so QB.2's shed may take it as a lossy link would (hyper-raft's `raft.rs`): appends go
+/// again from the member's progress, which the shed's unreachable report sets probing, heartbeats
+/// at each beat, and a lost answer to either is made good by the next heartbeat's answer. Every
+/// other kind is sent once and kept: a hand-off's order to campaign (the core takes no proposal
+/// until its hand-off ends), a snapshot (its member's replication pauses until its fate is
+/// reported, which a shed one's never is), votes and their answers (once a campaign), reads and
+/// proposals forwarded and their answers, and the fast track's records (no resend of them is
+/// established).
+fn resent(kind: hyper_raft::proto::MessageType) -> bool {
+    use hyper_raft::proto::MessageType as M;
+    match kind {
+        M::MsgAppend | M::MsgAppendResponse | M::MsgHeartbeat | M::MsgHeartbeatResponse => true,
+        M::MsgHup
+        | M::MsgBeat
+        | M::MsgPropose
+        | M::MsgRequestVote
+        | M::MsgRequestVoteResponse
+        | M::MsgSnapshot
+        | M::MsgUnreachable
+        | M::MsgSnapStatus
+        | M::MsgCheckQuorum
+        | M::MsgTransferLeader
+        | M::MsgTimeoutNow
+        | M::MsgReadIndex
+        | M::MsgReadIndexResp
+        | M::MsgRequestPreVote
+        | M::MsgRequestPreVoteResponse
+        | M::MsgFastPropose
+        | M::MsgFastVote => false,
+    }
+}
 #[derive(Default)]
 struct Outgoing {
     bytes: usize,
-    messages: VecDeque<Outbound>,
+    messages: VecDeque<Queued>,
     /// Bytes and messages the host drained since the owner last weighed them (QB.1).
     drained: (u64, u64),
     /// The same, to each member: what its path carried (lane constants-21). At most one a member
@@ -1614,7 +1652,10 @@ impl ReplicaHandle {
         }
         let mut messages = Vec::with_capacity(limit.min(outgoing.messages.len()));
         for _ in 0..limit {
-            let Some(message) = outgoing.messages.pop_front() else {
+            let Some(Queued {
+                outbound: message, ..
+            }) = outgoing.messages.pop_front()
+            else {
                 break;
             };
             outgoing.bytes = outgoing
@@ -4722,8 +4763,8 @@ impl<F: BlockFile + 'static> Actor<F> {
             let mut bytes = Vec::new();
             message.encode(&mut bytes);
             api::bound("replica outgoing record", bytes.len(), wire)?;
-            // QB.2's shed: the oldest records go until the new one fits the bound, each counted;
-            // raft sends again what a member still lacks, as over a lossy link.
+            // QB.2's shed: the oldest records raft sends again go until the new one fits the
+            // bound, each counted, as over a lossy link; a record it sends once is never shed.
             if matches!(egress, super::drain::Egress::Shed) {
                 loop {
                     let held = u64::try_from(outgoing.bytes.saturating_add(bytes.len()))
@@ -4734,17 +4775,21 @@ impl<F: BlockFile + 'static> Actor<F> {
                     if !super::drain::past(outgoing.bound, held, count) {
                         break;
                     }
-                    let Some(oldest) = outgoing.messages.pop_front() else {
+                    let at = outgoing
+                        .messages
+                        .iter()
+                        .position(|queued| resent(queued.kind));
+                    let Some(oldest) = at.and_then(|at| outgoing.messages.remove(at)) else {
                         break;
                     };
                     outgoing.bytes = outgoing
                         .bytes
-                        .checked_sub(oldest.bytes.len())
+                        .checked_sub(oldest.outbound.bytes.len())
                         .ok_or_else(|| fenced("outgoing accounting underflow"))?;
                     outgoing.shed = outgoing.shed.saturating_add(1);
                     outgoing.owed = true;
-                    if !unreachable.contains(&oldest.to) {
-                        unreachable.push(oldest.to);
+                    if !unreachable.contains(&oldest.outbound.to) {
+                        unreachable.push(oldest.outbound.to);
                     }
                 }
             }
@@ -4776,9 +4821,12 @@ impl<F: BlockFile + 'static> Actor<F> {
                 }
             }
             outgoing.bytes = total;
-            outgoing.messages.push_back(Outbound {
-                to: message.to,
-                bytes,
+            outgoing.messages.push_back(Queued {
+                outbound: Outbound {
+                    to: message.to,
+                    bytes,
+                },
+                kind: message.msg_type,
             });
         }
         self.control.sent.notify_all();
@@ -5686,9 +5734,12 @@ mod tests {
             while outgoing.messages.len() < burst {
                 let n = u8::try_from(outgoing.messages.len() % 251).unwrap();
                 outgoing.bytes += 1;
-                outgoing.messages.push_back(Outbound {
-                    to: 2,
-                    bytes: vec![n],
+                outgoing.messages.push_back(Queued {
+                    outbound: Outbound {
+                        to: 2,
+                        bytes: vec![n],
+                    },
+                    kind: hyper_raft::proto::MessageType::MsgAppend,
                 });
             }
         }
