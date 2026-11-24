@@ -3255,6 +3255,99 @@ mod sessions {
         }
     }
 
+    /// T-T1.10.W9–W11: the writer carries out a resolution whose caller has already timed out.
+    /// Its retry finds a done row. The first commit must still have rung the sleeping reader.
+    #[test]
+    fn t_t1_10_w9_a_resolutions_lost_reply_does_not_lose_the_wake() {
+        use crate::database::LockedReads;
+        use crate::xgroup::Step;
+        use amphora_api::{Consistency, Records};
+
+        let dir = tempfile::tempdir().unwrap();
+        let group = Database::open(&dir.path().join("group.db"), until()).unwrap();
+        group.set_locked_reads(LockedReads::WaitOnLock);
+        let txn = TxnId {
+            coordinator: 1,
+            epoch: 1,
+            seq: 0,
+        };
+        let lock = Envelope {
+            coordinator: txn.coordinator,
+            epoch: txn.epoch,
+            floor: None,
+            step: Step::Lock {
+                txn,
+                anchor: 0,
+                reads: Vec::new(),
+                writes: vec![(row(1), Some(vec![7]))],
+                stage: None,
+            },
+        };
+        let started = Instant::now();
+        let (locked, _, _) = serve(&group, 0, 0, lock.clone(), until()).unwrap();
+        let lock_time = started.elapsed();
+        assert_eq!(locked, Reply::Locked { reads: Vec::new() });
+        let resolution = Envelope {
+            coordinator: txn.coordinator,
+            epoch: txn.epoch,
+            floor: None,
+            step: Step::Resolve {
+                txn,
+                outcome: Outcome::Committed,
+            },
+        };
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                group
+                    .namespace("ns")
+                    .unwrap()
+                    .get("rows", &[1], Consistency::Linearizable, until())
+            });
+            group.locked_waits_reach(1, until()).unwrap();
+            // Hold the actual writer until its caller has lost the answer. If an attempt
+            // expired before it reached the writer, give the next one longer to enter.
+            let limit = until();
+            let mut budget = lock_time;
+            loop {
+                let now = Instant::now();
+                assert!(now < limit, "the resolution never entered the writer");
+                let deadline = now + budget.min(limit.saturating_duration_since(now));
+                let (entered, applied) = mpsc::channel();
+                let (resume, held) = mpsc::channel();
+                let first = resolution.clone();
+                let answer = step_answer(&first);
+                let outcome = step(&group, &AtomicU64::new(0), deadline, answer, move |db| {
+                    let result = apply_step(db, 0, &first)?;
+                    entered.send(())?;
+                    held.recv_timeout(limit.saturating_duration_since(Instant::now()))?;
+                    Ok(result)
+                });
+                match applied.recv_timeout(limit.saturating_duration_since(Instant::now())) {
+                    Ok(()) => {
+                        resume.send(()).unwrap();
+                        assert_eq!(outcome.err(), Some(Refusal::UnknownOutcome));
+                        break;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        assert!(matches!(
+                            outcome,
+                            Err(Refusal::Timeout | Refusal::UnknownOutcome)
+                        ));
+                        budget = budget.saturating_mul(2);
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => panic!("writer did not report entry"),
+                }
+            }
+            // A new lock request is Late only once the original writer made its done row.
+            let (locked_again, _, _) = serve(&group, 0, 0, lock, until()).unwrap();
+            assert_eq!(locked_again, Reply::Late);
+            let (reply, _, _) = serve(&group, 0, 0, resolution, until()).unwrap();
+            assert_eq!(reply, Reply::Resolved);
+            assert_eq!(reader.join().unwrap().unwrap().unwrap().value, [7]);
+            assert_eq!(group.locked_wakes(), 1);
+        });
+    }
+
     /// T-T1.10.W10 (AC-T1.10.1, lane xgroup-sql-11): a Records scan waits on a held lock in the
     /// range its page covers, under [`LockedReads::Wait`] and [`LockedReads::WaitOnLock`]. Do:
     /// three standalone groups, the answer at the decision, group 1's resolution held back, rows
