@@ -7032,8 +7032,9 @@ mod tests {
             self.settle(pump, &answer)
         }
         /// Rounds, time standing still, until the group is quiet: no write out on any owner's
-        /// disk, every admitted record taken, and a round with nothing to relay. A held owner's
-        /// records wait in its own queue.
+        /// disk, no owner that stepped with more to drive (its thread steps again at once,
+        /// `run_loop`), every admitted record taken, and a round with nothing to relay. A held
+        /// owner's records wait in its own queue.
         fn quiet(&mut self, pump: &mut Pump<'_>) {
             for _ in 0..ROUNDS {
                 let admitted = pump.drive_until(self.until());
@@ -7043,7 +7044,7 @@ mod tests {
                         .owners
                         .iter()
                         .flatten()
-                        .all(|(owner, _)| owner.replica.in_flight() == 0)
+                        .all(|(owner, _)| owner.replica.in_flight() == 0 && !owner.driving)
                 {
                     return;
                 }
