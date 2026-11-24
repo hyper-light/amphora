@@ -1475,8 +1475,15 @@ mod tests {
         }
         let after = copies(&on).counts();
         let runs = u64::try_from(params.len() * 3).unwrap();
-        assert_eq!(after.handed - before.handed, runs, "every run handed to the copies");
-        assert_eq!(after.skipped_body, before.skipped_body, "none skipped as body");
+        assert_eq!(
+            after.handed - before.handed,
+            runs,
+            "every run handed to the copies"
+        );
+        assert_eq!(
+            after.skipped_body, before.skipped_body,
+            "none skipped as body"
+        );
         assert_eq!(
             bound(&on, &Value::build_text("500")),
             bound(&on, &Value::from_i64(500)),
