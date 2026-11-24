@@ -1119,6 +1119,7 @@ impl<R: Send + 'static> Readers<R> {
     }
 
     fn with_checkout(most: usize, meter: Arc<Meter>, checkout: ReadCheckout) -> Self {
+        let bounded = most.min(machine_readers()).max(1);
         Self {
             open: Mutex::new(None),
             pool: Mutex::new(Pool {
@@ -1127,13 +1128,13 @@ impl<R: Send + 'static> Readers<R> {
                 generation: 0,
             }),
             returned: Condvar::new(),
-            most: most.max(1),
+            most: bounded,
             checkpointer: Mutex::new(None),
             restart: Arc::new(AtomicBool::new(false)),
             meter,
             slots: match checkout {
                 ReadCheckout::Pool => None,
-                ReadCheckout::Slots => Some(checkout::Slots::new(most)),
+                ReadCheckout::Slots => Some(checkout::Slots::new(bounded)),
             },
         }
     }
