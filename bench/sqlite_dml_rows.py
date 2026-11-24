@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
-"""crates/engine/tests/fixtures/dml_rows.tsv: generated INSERTs, UPSERTs, REPLACEs and UPDATEs, and the rows SQLite
-stores after them (AC-T1.8.6; the oracles' findings DA and CV).
+"""crates/engine/tests/fixtures/dml_rows.tsv: generated INSERTs, UPSERTs, REPLACEs, UPDATEs and DELETEs, and the rows
+SQLite stores after them (AC-T1.8.6; the oracles' findings DA and CV, and what Amphora refused: STRICT beside WITHOUT
+ROWID, triggers on WITHOUT ROWID tables, INSERT OR IGNORE of a NULL into a STRICT table's key).
 
 A case is one table (a rowid alias in each form it is written, listed in the INSERT or not; a key that is no alias; no
 key; WITHOUT ROWID; STRICT or not; each column type; generated columns), its triggers, which log each NEW and OLD value
-with its type, rows put in, then statements. `excluded.*` is read for each column, the rowid and its aliases.
+with its type and some of which act (RAISE, a WHEN, a write to the table itself), rows put in, then statements.
+`excluded.*` is read for each column, the rowid and its aliases, and in subqueries of SET and WHERE.
 
 usage: bench/sqlite_dml_rows.py COUNT SEED > crates/engine/tests/fixtures/dml_rows.tsv   (SQLite 3.54.0 in Python)
 
 Left out, each a difference of another cause (bench/records/2026-11-24-adacachy2-oracle-c11.md): a comparison in a
-trigger of a column with a collation (CX), STRICT beside WITHOUT ROWID (refused), triggers on WITHOUT ROWID tables
-(refused), which of two unique constraints an UPSERT with no target meets first (no document says), an INSERT OR IGNORE
-of NULL into a STRICT key that is no rowid alias, a subquery in DO UPDATE (refused), the text of a REAL past 15 digits
-(CK), and an UPDATE of the rowid where a generated column reads it (NEW holds the old one's).
+trigger of a column with a collation (CX), a generated column on a WITHOUT ROWID table (refused), which of two unique
+constraints an UPSERT with no target meets first (no document says), the text of a REAL past 15 digits (CK), an UPDATE
+of the rowid where a generated column reads it (NEW holds the old one's), an index on a generated column (an UPSERT beside
+a BEFORE UPDATE trigger looks for the wrong entry), a RAISE in a BEFORE UPDATE trigger on a table with a rowid (an UPSERT's
+NOT NULL and CHECK go first), a BEFORE trigger that changes the row it fires for (lang_createtrigger.html: undefined), and
+the order a WITHOUT ROWID table's rows are changed in where another index may be read for them (no document says).
 
 At a conflict on the rowid SQLite's `excluded.c` is the value as given, not as c converts it ('7' in an INT column is
 '7'), unless the table has a generated column or an earlier ON CONFLICT names another constraint. By lang_upsert.html it
@@ -45,7 +49,7 @@ class Case:
         self.rng = rng
         pick = rng.choice
         self.strict = rng.random() < 0.55
-        self.without_rowid = not self.strict and rng.random() < 0.15
+        self.without_rowid = rng.random() < 0.4
         types = STRICT_TYPES if self.strict else PLAIN_TYPES
         key = pick(["alias"] * 6 + ["alias table"] * 2 + ["alias auto", "int", "text", "none", "desc"])
         if self.without_rowid:
@@ -117,25 +121,52 @@ class Case:
         self.all = order  # in the table's order
         self.types = dict(self.cols + self.gen)
         self.written = [c for c in order if c != "g"]
-        options = "STRICT" if self.strict else "WITHOUT ROWID" if self.without_rowid else ""
+        options = ["STRICT"] * self.strict + ["WITHOUT ROWID"] * self.without_rowid
+        if rng.random() < 0.5:
+            options.reverse()
+        options = ", ".join(options)
         self.ddl = [f"CREATE TABLE t({', '.join(defs + tail)}) {options}".strip()]
-        if rng.random() < 0.15 and not self.without_rowid:
-            self.ddl.append(f"CREATE INDEX i ON t({pick(self.all)})")
+        self.indexed = rng.random() < 0.15
+        if self.indexed:
+            self.ddl.append(f"CREATE INDEX i ON t({pick(self.written)})")
         self.triggers = 0
-        if not self.without_rowid and rng.random() < 0.6:
-            cells = [f"{w}.{c}" for c in self.all for w in ("X",)]
-            self.ddl.append("CREATE TABLE lg(e, " + ", ".join(f"v{i}, w{i}" for i in range(len(cells) + 1)) + ", " + ", ".join(f"o{i}" for i in range(len(cells) + 1)) + ")")
+        if rng.random() < 0.6:
+            # before an INSERT without its rowid, new.rowid is -1 (SQLite's documents call it undefined)
+            names = self.all + ([] if self.without_rowid else ["rowid"])
+            self.ddl.append("CREATE TABLE lg(e, " + ", ".join(f"v{i}, w{i}" for i in range(len(names))) + ", " + ", ".join(f"o{i}" for i in range(len(names))) + ")")
             events = rng.sample(["BEFORE INSERT", "AFTER INSERT", "BEFORE UPDATE", "AFTER UPDATE", "AFTER UPDATE OF", "BEFORE DELETE", "AFTER DELETE"], rng.randint(1, 4))
             for event in events:
                 new = event.split()[1] != "DELETE"
                 old = event.split()[1] != "INSERT"
-                # before an INSERT without its rowid, new.rowid is -1 (SQLite's documents call it undefined)
-                names = self.all + ["rowid"]
                 values = ", ".join((f"new.{c}, typeof(new.{c})" if new else "0, 0") for c in names)
                 olds = ", ".join((f"quote(old.{c})" if old else "0") for c in names)
                 of = f" {pick(self.written)}" if event.endswith("OF") else ""
-                self.ddl.append(f"CREATE TRIGGER g{self.triggers} {event}{of} ON t BEGIN INSERT INTO lg VALUES ('{event}', {values}, {olds}); END")
+                when, act = self.acts(event, new, old)
+                self.ddl.append(f"CREATE TRIGGER g{self.triggers} {event}{of} ON t{when} BEGIN INSERT INTO lg VALUES ('{event}', {values}, {olds});{act} END")
                 self.triggers += 1
+
+    def acts(self, event, new, old):
+        """A trigger's WHEN and what it does after it logs."""
+        rng = self.rng
+        row = rng.choice([w for w, on in (("new", new), ("old", old)) if on])
+        seen = rng.choice([f"{row}.{c}" for c in self.written])
+        when = rng.choice([""] * 5 + [f" WHEN {seen} IS NOT NULL", f" WHEN typeof({seen}) = '{rng.choice(['integer', 'text', 'real'])}'"])
+        if rng.random() < 0.6:
+            return when, ""
+        raised = f" SELECT RAISE({rng.choice(['IGNORE', 'IGNORE', 'ABORT, 1', 'FAIL, 1', 'ROLLBACK, 1']).replace('1', chr(39) + 'no' + chr(39))}) WHERE {seen} {rng.choice(['IS NULL', 'IN (1, 2)', '> 2'])};"
+        if event == "BEFORE UPDATE" and not self.without_rowid:
+            return when, ""
+        if event.startswith("BEFORE") or not self.pk:
+            return when, raised
+        others = [c for c in self.written if c not in (self.pk, "u", "p", "q")]
+        writes = [f" DELETE FROM t WHERE {self.pk} IS {row}.{self.pk} AND typeof({row}.{self.pk}) = 'integer';",
+                  f" DELETE FROM t WHERE {self.pk} IN (1, 'a');"]
+        if others:
+            c = rng.choice(others)
+            v = self.value(c)
+            writes += [f" UPDATE t SET {c} = {v} WHERE {self.pk} IS {row}.{self.pk};", f" UPDATE OR IGNORE t SET {c} = {v};",
+                       f" INSERT OR IGNORE INTO t({self.pk}, {c}) VALUES ({self.value(self.pk)}, {v});"]
+        return when, rng.choice([raised] + writes * 2)
 
     def value(self, col):
         rng = self.rng
@@ -143,12 +174,12 @@ class Case:
         if col == self.pk:
             if self.key in ("alias", "alias table", "alias auto"):
                 v = rng.choice(KEYS)
-                return "3" if v == "NULL" and self.without_rowid else v
+                return "3" if v == "NULL" and self.without_rowid and rng.random() < 0.7 else v
             if self.strict:
-                return rng.choice(["1", "2", "3", "'2'", "3.0"] if ty in ("INT", "INTEGER") else ["'a'", "'b'", "1", "'1'"])
+                return rng.choice(["1", "2", "3", "'2'", "3.0", "NULL"] if ty in ("INT", "INTEGER") else ["'a'", "'b'", "1", "'1'", "NULL"])
             return rng.choice(["1", "2", "'2'", "2.0", "'a'", "x'41'"] if ty in ("INT", "TEXT") else KEYS[:9])
         if col in ("p", "q", "u"):
-            return rng.choice(["1", "'1'", "2", "1.0"] if ty not in ("TEXT", "BLOB") or not self.strict else ["'a'", "'A'", "'b'", "1"] if ty == "TEXT" else ["x'41'"])
+            return rng.choice(["1", "'1'", "2", "1.0", "NULL"] if ty not in ("TEXT", "BLOB") or not self.strict else ["'a'", "'A'", "'b'", "1", "NULL"] if ty == "TEXT" else ["x'41'", "NULL"])
         if self.strict and rng.random() < 0.93:
             return "NULL" if rng.random() < 0.08 else rng.choice(TAKES[ty])
         return rng.choice(ANY_VALUE)
@@ -196,6 +227,16 @@ class Case:
         e, c = "excluded." + self.ref(), self.ref()
         own = rng.choice([f"t.{c}", c])
         lit = rng.choice(["1", "'7'", "'a'", "1.5", "NULL", "10", "'A'"])
+        if rng.random() < 0.2:
+            x = f"x.{rng.choice(self.written)}"
+            own = f"t.{c}"  # the rowid's bare name is no column of a query around (refused anywhere)
+            return rng.choice([
+                f"(SELECT {e})", f"(SELECT typeof({e}) || typeof({own}))", f"(SELECT y FROM (SELECT {e} AS y))",
+                f"(SELECT count(*) FROM t AS x WHERE {x} IS {e})", f"(SELECT max({x}) FROM t AS x)", f"(SELECT count(*) FROM t AS x WHERE {x} IS {x.replace('x.', 't.')})",
+                f"EXISTS (SELECT 1 FROM t AS x WHERE {x} IS NOT {e})", f"{e} IN (SELECT {x} FROM t AS x)", f"{own} NOT IN (SELECT {e})",
+                f"(SELECT count(*) FROM t AS x WHERE {x} IN (SELECT {e}))", f"coalesce((SELECT min({x}) FROM t AS x WHERE {x} > {e}), {lit})",
+                f"(SELECT {e} FROM t AS excluded LIMIT 1)" if "rowid" not in e and "oid" not in e and "_rowid_" not in e else f"(SELECT {e})",
+            ])
         return rng.choice([
             e, e, e, e, e,
             f"typeof({e})", f"quote({e})", f"coalesce({e}, {own})", f"coalesce({own}, {e})", f"{e} + 1", f"{own} + {e}", f"-{e}",
@@ -212,6 +253,8 @@ class Case:
         chosen = rng.sample(targets, min(len(targets), rng.choice([1, 1, 2, 3])))
         if len(chosen) == 2 and rng.random() < 0.15:
             return f"({chosen[0]}, {chosen[1]}) = ({self.expr()}, {self.expr()})"
+        if len(chosen) == 2 and rng.random() < 0.15:
+            return f"({chosen[0]}, {chosen[1]}) = (SELECT excluded.{self.ref()}, count(*) FROM t AS x WHERE x.{rng.choice(self.written)} IS NOT NULL)"
         return ", ".join(f"{c} = {self.expr()}" for c in chosen)
 
     def on_conflict(self):
@@ -224,17 +267,23 @@ class Case:
             return text + " DO NOTHING"
         text += " DO UPDATE SET " + self.sets()
         if rng.random() < 0.3:
-            text += " WHERE " + rng.choice([f"excluded.{self.ref()} {op} {x}" for op, x in (("=", "2"), (">", "1"), ("IS NOT", "NULL"), ("IS", f"t.{self.ref()}"), ("<>", "'a'"))])
+            text += " WHERE " + rng.choice([f"EXISTS (SELECT 1 FROM t AS x WHERE x.{rng.choice(self.written)} IS NOT excluded.{self.ref()})"] + [f"excluded.{self.ref()} {op} {x}" for op, x in (("=", "2"), (">", "1"), ("IS NOT", "NULL"), ("IS", f"t.{self.ref()}"), ("<>", "'a'"))])
         return text
 
     def statement(self):
         rng = self.rng
-        kind = rng.choice(["insert"] * 2 + ["upsert"] * 6 + ["replace", "or ignore", "or replace", "update"])
+        kind = rng.choice(["insert"] * 2 + ["upsert"] * 6 + ["replace", "or ignore", "or ignore", "or replace", "update", "update", "delete"])
+        where = rng.choice(["", f" WHERE {self.written[0]} IS NOT NULL", f" WHERE {rng.choice(self.written)} = {rng.choice(['1', '2', '10'])}"])
+        if self.without_rowid and len(self.unique) + self.indexed > 1:
+            # more rows than one, in the order of whichever index is read: no document says which
+            where = " WHERE " + " AND ".join(f"{c} = {self.value(c)}" for c in self.unique[0])
+        if kind == "delete":
+            return "DELETE FROM t" + where
         if kind == "update":
             open_to = [c for c in self.written if not (self.gen and c == self.alias)] or self.written
             cols = rng.sample(open_to, min(len(open_to), rng.choice([1, 1, 2])))
-            where = rng.choice(["", f" WHERE {self.written[0]} IS NOT NULL", f" WHERE {rng.choice(self.written)} = {rng.choice(['1', '2', '10'])}"])
-            return "UPDATE t SET " + ", ".join(f"{c} = {self.value(c)}" for c in cols) + where
+            clause = rng.choice([""] * 5 + [" OR IGNORE", " OR REPLACE", " OR FAIL"])
+            return f"UPDATE{clause} t SET " + ", ".join(f"{c} = {self.value(c)}" for c in cols) + where
         cols = self.listed()
         head = {"insert": "INSERT", "upsert": rng.choice(["INSERT"] * 8 + ["INSERT OR IGNORE", "INSERT OR REPLACE"]), "replace": "REPLACE", "or ignore": "INSERT OR IGNORE",
                 "or replace": "INSERT OR REPLACE"}[kind]
