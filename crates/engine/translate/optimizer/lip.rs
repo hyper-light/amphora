@@ -112,6 +112,9 @@ pub(crate) fn choose(
             // counts its cut, which `end_cost` can't weigh again.
             let fp_per_key = if let Some(price) = priced {
                 price.fp_per_key
+            } else if rule == StarFilters::ByCost {
+                // Lane T20 (arm C): by cost, only the filters the join search priced.
+                continue;
             } else {
                 let dim_rows = base_rows
                     .get(dim_idx)
@@ -125,12 +128,7 @@ pub(crate) fn choose(
                     build_cost(dim_rows, dim_terms.len(), params),
                     params,
                 );
-                match (rule, sized) {
-                    (_, Some((rate, true))) => rate,
-                    (StarFilters::Always, Some((rate, false))) => rate,
-                    (StarFilters::Always, None) => 0.0,
-                    _ => continue,
-                }
+                sized.map_or(0.0, |(rate, _)| rate)
             };
             chosen.push(LipFilter {
                 fact_idx,

@@ -25,8 +25,8 @@ Vendored code Amphora changes follows the same rule.
 The engine (`crates/engine*`, its `ORIGIN.md`) came from Turso with code that predates these rules.
 Every line Amphora writes or changes there follows them; its crates keep the lints they came with,
 and `scripts/check-production.sh` counts what is left of the inherited code that breaks the rule,
-lint by lint, against `scripts/engine-ratchet.toml`. A count may only fall, and the file is lowered
-with each fall.
+lint by lint, against `scripts/engine-ratchet.toml`, with the engine features the shipped `amphora`
+binary builds it with. A count may only fall, and the file is lowered with each fall.
 
 ## 2. Every resource has a bound
 

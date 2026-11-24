@@ -635,10 +635,9 @@ impl LogRecord {
 
 #[cfg(feature = "conn_raw_api")]
 fn portable_table_id_from_rootpage(rootpage: i64) -> MVTableId {
-    if rootpage > 0 {
-        MVTableId::from(-rootpage)
-    } else {
-        MVTableId::from(rootpage)
+    match rootpage.checked_neg() {
+        Some(negated) if rootpage > 0 => MVTableId::from(negated),
+        _ => MVTableId::from(rootpage),
     }
 }
 
@@ -652,13 +651,19 @@ struct PortableTableRef {
 fn rootpage_for_mv_table_id<Clock: LogicalClock, A: ConcurrentAllocator>(
     mvcc_store: &MvStore<Clock, A>,
     table_id: MVTableId,
-) -> i64 {
-    mvcc_store
+) -> Result<i64> {
+    let Some(rootpage) = mvcc_store
         .table_id_to_rootpage
         .get(&table_id)
         .and_then(|entry| entry.value().root_page)
-        .map(|rootpage| rootpage as i64)
-        .unwrap_or_else(|| i64::from(table_id))
+    else {
+        return Ok(i64::from(table_id));
+    };
+    i64::try_from(rootpage).map_err(|_| {
+        LimboError::Corrupt(format!(
+            "root page {rootpage} of table id {table_id} is out of range"
+        ))
+    })
 }
 
 #[cfg(feature = "conn_raw_api")]
@@ -669,7 +674,7 @@ fn table_name_for_rootpage_in_schema(schema: &Schema, rootpage: i64) -> Option<S
     if let Some(name) = schema.table_name_for_root_page(rootpage) {
         return Some(name.to_string());
     }
-    let alternate_rootpage = -rootpage;
+    let alternate_rootpage = rootpage.checked_neg()?;
     if alternate_rootpage == 0 {
         return None;
     }
@@ -699,7 +704,7 @@ fn table_name_for_rootpage_in_mvcc_schema<Clock: LogicalClock, A: ConcurrentAllo
     if rootpage == 0 {
         return None;
     }
-    let alternate_rootpage = -rootpage;
+    let alternate_rootpage = rootpage.checked_neg();
     for entry in mvcc_store.rows.iter() {
         if entry.key().table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
             continue;
@@ -712,7 +717,7 @@ fn table_name_for_rootpage_in_mvcc_schema<Clock: LogicalClock, A: ConcurrentAllo
             let Ok(row) = portable_schema_row_from_record(row_version.row.payload()) else {
                 continue;
             };
-            if row.rootpage == rootpage || row.rootpage == alternate_rootpage {
+            if row.rootpage == rootpage || Some(row.rootpage) == alternate_rootpage {
                 return Some(row.name);
             }
         }
@@ -725,7 +730,7 @@ fn portable_table_name_for_mv_table_id<Clock: LogicalClock, A: ConcurrentAllocat
     connection: &Connection,
     mvcc_store: &MvStore<Clock, A>,
     table_id: MVTableId,
-) -> Option<String> {
+) -> Result<Option<String>> {
     // `table_id` is the id as serialized into the log (see
     // `canonicalize_table_id`), so interpret it directly as a rootpage first;
     // `table_id_to_rootpage` is keyed by in-memory counter ids and a canonical
@@ -736,14 +741,14 @@ fn portable_table_name_for_mv_table_id<Clock: LogicalClock, A: ConcurrentAllocat
     if let Some(name) = table_name_for_rootpage(connection, direct)
         .or_else(|| table_name_for_rootpage_in_mvcc_schema(mvcc_store, direct))
     {
-        return Some(name);
+        return Ok(Some(name));
     }
-    let rootpage = rootpage_for_mv_table_id(mvcc_store, table_id);
+    let rootpage = rootpage_for_mv_table_id(mvcc_store, table_id)?;
     if rootpage == direct {
-        return None;
+        return Ok(None);
     }
-    table_name_for_rootpage(connection, rootpage)
-        .or_else(|| table_name_for_rootpage_in_mvcc_schema(mvcc_store, rootpage))
+    Ok(table_name_for_rootpage(connection, rootpage)
+        .or_else(|| table_name_for_rootpage_in_mvcc_schema(mvcc_store, rootpage)))
 }
 
 #[cfg(feature = "conn_raw_api")]
@@ -768,11 +773,15 @@ fn portable_delete_op_extension_for_row_version<Clock: LogicalClock, A: Concurre
             None,
             Some(rowid),
         )?;
-        return Ok((!extension.is_empty()).then_some(extension));
+        return Ok(if extension.is_empty() {
+            None
+        } else {
+            Some(extension)
+        });
     }
 
     let Some(table_name) =
-        portable_table_name_for_mv_table_id(connection, mvcc_store, row_version.row.id.table_id)
+        portable_table_name_for_mv_table_id(connection, mvcc_store, row_version.row.id.table_id)?
     else {
         return Ok(None);
     };
@@ -820,7 +829,11 @@ fn portable_delete_op_extension_for_row_version<Clock: LogicalClock, A: Concurre
     };
     let extension =
         LogSerializer::encode_delete_portable_extension(None, Some(&pk_record), Some(rowid))?;
-    Ok((!extension.is_empty()).then_some(extension))
+    Ok(if extension.is_empty() {
+        None
+    } else {
+        Some(extension)
+    })
 }
 
 /// A transaction timestamp or ID.
@@ -2838,7 +2851,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             // The portable extension only adds the metadata required to interpret
             // recovery table ids outside this database instance.
             let mut table_refs_by_id = HashMap::default();
-            let recovery_payload = &log_record.buf[LOG_RECORD_PREFIX_SIZE..];
+            let Some(recovery_payload) = log_record.buf.get(LOG_RECORD_PREFIX_SIZE..) else {
+                return Err(LimboError::InternalError(format!(
+                    "log record of {} bytes is shorter than its {LOG_RECORD_PREFIX_SIZE}-byte prefix",
+                    log_record.buf.len()
+                )));
+            };
             let parsed_ops = parse_ops_from_plaintext(
                 recovery_payload,
                 recovery_payload.len(),
@@ -2954,20 +2972,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             // page), sending resolution to the wrong rootpage. The map is only
             // a fallback for a payload id serialized before a concurrent
             // checkpoint published new roots.
-            let rootpage_for_table_id = |table_id: MVTableId| -> i64 {
+            let rootpage_for_table_id = |table_id: MVTableId| -> Result<i64> {
                 let direct = i64::from(table_id);
                 if table_name_for_rootpage(&self.connection, direct)
                     .or_else(|| table_name_for_rootpage_in_mvcc_schema(mvcc_store, direct))
                     .is_some()
                 {
-                    return direct;
+                    return Ok(direct);
                 }
-                mvcc_store
-                    .table_id_to_rootpage
-                    .get(&table_id)
-                    .and_then(|entry| entry.value().root_page)
-                    .map(|rootpage| rootpage as i64)
-                    .unwrap_or(direct)
+                rootpage_for_mv_table_id(mvcc_store, table_id)
             };
 
             let mut unresolved_data_tables = Vec::new();
@@ -2976,7 +2989,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                 if table_refs_by_id.contains_key(table_id) {
                     continue;
                 }
-                let rootpage = rootpage_for_table_id(*table_id);
+                let rootpage = rootpage_for_table_id(*table_id)?;
                 if rootpage == 0 {
                     continue;
                 }
@@ -2996,8 +3009,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                     else {
                         continue;
                     };
-                    let resolved_rootpage = if rootpage < 0 { -rootpage } else { rootpage };
-                    let resolved_table_id = portable_table_id_from_rootpage(resolved_rootpage);
+                    let resolved_table_id = portable_table_id_from_rootpage(rootpage);
                     let table_ref = PortableTableRef { name };
                     table_refs_by_id.insert(resolved_table_id, table_ref);
                 }
@@ -3017,10 +3029,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                     mv_table_id: i64::from(*table_id),
                     name: &table_ref.name,
                 })?;
-                turso_assert!(
-                    added,
-                    "portable object map unexpectedly rejected a user object"
-                );
+                if !added {
+                    return Err(LimboError::InternalError(
+                        "portable object map unexpectedly rejected a user object".to_string(),
+                    ));
+                }
             }
 
             for table_id in data_table_ids {
@@ -9719,6 +9732,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         connection.with_schema_mut(|schema| {
                             schema.schema_version = header.schema_cookie.get();
                         })?;
+                        connection
+                            .db
+                            .dialect()
+                            .load_next_oid(header.pg_next_oid.get());
                     }
                     *connection.db.schema.lock() = connection.schema.read().clone();
                     self.clock.reset(max_commit_ts_seen + 1);

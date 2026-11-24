@@ -2994,6 +2994,8 @@ pub enum Cookie {
     ApplicationId = 8,
     /// The page size, as read by the page_size pragma.
     PageSize = 9,
+    /// Amphora: the PostgreSQL dialect's next OID (`DatabaseHeader::pg_next_oid`).
+    PgNextOid = 10,
 }
 
 #[cfg(test)]

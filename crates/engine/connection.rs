@@ -3144,8 +3144,8 @@ impl Connection {
 
     /// Update schema version to the new value within opened write transaction
     ///
-    /// New version of the schema must be strictly greater than previous one - otherwise method will panic
-    /// Write transaction must be opened in advance - otherwise method will panic
+    /// New version of the schema must be strictly greater than previous one - otherwise it returns an error
+    /// Write transaction must be opened in advance - otherwise it returns an error
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn write_schema_version(self: &Arc<Connection>, version: u32) -> Result<()> {
         let TransactionState::Write { .. } = self.get_tx_state() else {
@@ -3156,10 +3156,12 @@ impl Connection {
         let pager = self.pager.load();
         pager.io.block(|| {
             pager.with_header_mut(|header| {
-                turso_assert!(
-                    header.schema_cookie.get() < version,
-                    "cookie can't go back in time"
-                );
+                let cookie = header.schema_cookie.get();
+                if cookie >= version {
+                    return Err(LimboError::InvalidArgument(format!(
+                        "cookie can't go back in time: schema version {version} is not above {cookie}"
+                    )));
+                }
                 self.with_schema_mut(|schema| schema.schema_version = version)
                     .map(|()| {
                         self.set_tx_state(TransactionState::Write {
@@ -3594,7 +3596,11 @@ impl Connection {
         while let IOResult::IO(io) = state_machine.step(mv_store)? {
             io.wait(self.db.io.as_ref())?;
         }
-        assert!(state_machine.is_finalized());
+        if !state_machine.is_finalized() {
+            return Err(LimboError::InternalError(
+                "main MVCC commit ended its steps without finalizing".to_string(),
+            ));
+        }
         self.set_mv_tx(None);
         self.publish_schema_if_newer();
         Ok(())
