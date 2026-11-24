@@ -1,0 +1,70 @@
+== smoke 2026-11-24T06:06:58Z
+    PID USER      NI %CPU ELAPSED COMMAND         COMMAND
+ 873176 adalund+  10  638   38564 kiln-5b8c64ebd8 /home/adalundhe/.cache/amphora-perf-target/u2-kiln/debug/build/kiln/5b8c64ebd8e73358/out/kiln-5b8c64ebd8e73358 --test-threads=8
+2428752 adalund+  10  171     451 build_script_bu /home/adalundhe/.kiln/reach/451397fcc585f7f7cb9aaf00e42064bb/agy-int-f7b7b83737/target/debug/build/kiln/6affa6ab374dc021/out/build_script_build
+2777668 adalund+  19 29.8  174630 kiln            /home/adalundhe/.cache/kiln-test-timeouts/target/debug/kiln --config /home/adalundhe/.cache/kiln-test-timeouts/t/iDnCzZ/.tmp3rWtFl/kiln.toml server
+ 689376 adalund+   0 16.0  702471 kiln            /home/adalundhe/.local/share/kiln/agent/versions/edf5df73a34f/kiln --config=/home/adalundhe/.config/kiln/kiln.toml agent --server http://192.168.1.90:7070 --name 00aad8daff2fa3c9da
+ 327881 adalund+   0 12.1  206736 kiln            /home/adalundhe/.local/share/kiln/agent/versions/05a329130172/kiln --config=/home/adalundhe/.config/kiln/kiln.toml agent --server http://192.168.1.90:7070 --name 00aad8daff2fa3c9da
+    243 root       0  3.6  780400 kswapd0         [kswapd0]
+   1874 root       0  2.6  780319 dockerd         /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+ 288470 root       9  2.1  121441 windows         qemu-system-x86_64 -nodefaults -machine type=q35,smm=off,graphics=off,vmport=off,dump-guest-core=off,hpet=off,accel=kvm -enable-kvm -global kvm-pit.lost_tick_policy=discard -cpu ho
+== round 1 2026-11-24T06:11:26Z
+    PID USER      NI %CPU ELAPSED COMMAND         COMMAND
+ 873176 adalund+  10  637   38832 kiln-5b8c64ebd8 /home/adalundhe/.cache/amphora-perf-target/u2-kiln/debug/build/kiln/5b8c64ebd8e73358/out/kiln-5b8c64ebd8e73358 --test-threads=8
+2428752 adalund+  10  141     718 build_script_bu /home/adalundhe/.kiln/reach/451397fcc585f7f7cb9aaf00e42064bb/agy-int-f7b7b83737/target/debug/build/kiln/6affa6ab374dc021/out/build_script_build
+ 860784 adalund+  10  100       0 rustc           /home/adalundhe/.rustup/toolchains/1.99.1-x86_64-unknown-linux-gnu/bin/rustc --crate-name syn --edition=2021 /home/adalundhe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sy
+ 860786 adalund+  10  100       0 rustc           /home/adalundhe/.rustup/toolchains/1.99.1-x86_64-unknown-linux-gnu/bin/rustc --crate-name syn --edition=2021 /home/adalundhe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sy
+ 861109 adalund+  10  100       0 rustc           /home/adalundhe/.rustup/toolchains/1.99.1-x86_64-unknown-linux-gnu/bin/rustc --crate-name polling --edition=2021 /home/adalundhe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557
+ 861115 adalund+  10  100       0 rustc           /home/adalundhe/.rustup/toolchains/1.99.1-x86_64-unknown-linux-gnu/bin/rustc --crate-name tempfile --edition=2021 /home/adalundhe/.cargo/registry/src/index.crates.io-1949cf8c6b5b55
+ 861117 adalund+  10  100       0 rustc           /home/adalundhe/.rustup/toolchains/1.99.1-x86_64-unknown-linux-gnu/bin/rustc --crate-name private_fs --edition=2024 /home/adalundhe/.cargo/registry/src/index.crates.io-1949cf8c6b5b
+ 861138 adalund+   0  100       0 docker          /usr/bin/docker version --format {{.Server.Version}}
+== round 2 2026-11-24T06:19:16Z
+    PID USER      NI %CPU ELAPSED COMMAND         COMMAND
+ 873176 adalund+  10  637   39302 kiln-5b8c64ebd8 /home/adalundhe/.cache/amphora-perf-target/u2-kiln/debug/build/kiln/5b8c64ebd8e73358/out/kiln-5b8c64ebd8e73358 --test-threads=8
+2394895 adalund+   0  122       0 git             /usr/lib/git-core/git index-pack --fix-thin --stdin
+2428752 adalund+  10  122    1189 build_script_bu /home/adalundhe/.kiln/reach/451397fcc585f7f7cb9aaf00e42064bb/agy-int-f7b7b83737/target/debug/build/kiln/6affa6ab374dc021/out/build_script_build
+2376869 adalund+   0 89.2       4 slates_server-3 /home/adalundhe/.cache/w-tsan-probe-target.noindex/debug/deps/slates_server-304c2c843294674c vcs_ssh:: --test-threads 4
+2777668 adalund+  19 29.7  175368 kiln            /home/adalundhe/.cache/kiln-test-timeouts/target/debug/kiln --config /home/adalundhe/.cache/kiln-test-timeouts/t/iDnCzZ/.tmp3rWtFl/kiln.toml server
+ 689376 adalund+   0 16.1  703209 kiln            /home/adalundhe/.local/share/kiln/agent/versions/edf5df73a34f/kiln --config=/home/adalundhe/.config/kiln/kiln.toml agent --server http://192.168.1.90:7070 --name 00aad8daff2fa3c9da
+ 327881 adalund+   0 12.1  207474 kiln            /home/adalundhe/.local/share/kiln/agent/versions/05a329130172/kiln --config=/home/adalundhe/.config/kiln/kiln.toml agent --server http://192.168.1.90:7070 --name 00aad8daff2fa3c9da
+    243 root       0  3.6  781138 kswapd0         [kswapd0]
+== round 3 2026-11-24T06:27:25Z
+    PID USER      NI %CPU ELAPSED COMMAND         COMMAND
+ 873176 adalund+  10  636   39791 kiln-5b8c64ebd8 /home/adalundhe/.cache/amphora-perf-target/u2-kiln/debug/build/kiln/5b8c64ebd8e73358/out/kiln-5b8c64ebd8e73358 --test-threads=8
+3673635 adalund+  10  188      92 rustc           /home/adalundhe/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/rustc --crate-name slates_server --edition=2024 crates/server/src/lib.rs --error-format=json --json=diagnosti
+2428752 adalund+  10  113    1677 build_script_bu /home/adalundhe/.kiln/reach/451397fcc585f7f7cb9aaf00e42064bb/agy-int-f7b7b83737/target/debug/build/kiln/6affa6ab374dc021/out/build_script_build
+3982513 adalund+  10  100       0 docker <defunct [docker] <defunct>
+3982514 adalund+   0  100       0 ps              ps -eo pid,user,ni,pcpu,etimes,comm,args --sort=-pcpu
+3982529 adalund+   0  100       0 slates_server-3 /home/adalundhe/.cache/w-tsan-target/debug/deps/slates_server-304c2c843294674c vcs_http::svn::tests::the_daemons_lender_serves_a_repositorys_committed_records --exact
+3974293 adalund+  10 83.4       2 rust-lld        /home/adalundhe/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld -flavor gnu -plugin /usr/lib/gcc/x86_64-pc-linux-gnu/16/liblto_
+2777668 adalund+  19 29.6  175856 kiln            /home/adalundhe/.cache/kiln-test-timeouts/target/debug/kiln --config /home/adalundhe/.cache/kiln-test-timeouts/t/iDnCzZ/.tmp3rWtFl/kiln.toml server
+== round 4 2026-11-24T06:35:32Z
+    PID USER      NI %CPU ELAPSED COMMAND         COMMAND
+ 873176 adalund+  10  635   40278 kiln-5b8c64ebd8 /home/adalundhe/.cache/amphora-perf-target/u2-kiln/debug/build/kiln/5b8c64ebd8e73358/out/kiln-5b8c64ebd8e73358 --test-threads=8
+2428752 adalund+  10  108    2164 build_script_bu /home/adalundhe/.kiln/reach/451397fcc585f7f7cb9aaf00e42064bb/agy-int-f7b7b83737/target/debug/build/kiln/6affa6ab374dc021/out/build_script_build
+1420877 adalund+  10  100       0 docker <defunct [docker] <defunct>
+2777668 adalund+  19 29.6  176344 kiln            /home/adalundhe/.cache/kiln-test-timeouts/target/debug/kiln --config /home/adalundhe/.cache/kiln-test-timeouts/t/iDnCzZ/.tmp3rWtFl/kiln.toml server
+ 689376 adalund+   0 16.2  704185 kiln            /home/adalundhe/.local/share/kiln/agent/versions/edf5df73a34f/kiln --config=/home/adalundhe/.config/kiln/kiln.toml agent --server http://192.168.1.90:7070 --name 00aad8daff2fa3c9da
+ 327881 adalund+   0 12.1  208449 kiln            /home/adalundhe/.local/share/kiln/agent/versions/05a329130172/kiln --config=/home/adalundhe/.config/kiln/kiln.toml agent --server http://192.168.1.90:7070 --name 00aad8daff2fa3c9da
+    243 root       0  3.6  782114 kswapd0         [kswapd0]
+   1874 root       0  2.6  782033 dockerd         /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+== round 5 2026-11-24T06:44:03Z
+    PID USER      NI %CPU ELAPSED COMMAND         COMMAND
+ 873176 adalund+  10  635   40789 kiln-5b8c64ebd8 /home/adalundhe/.cache/amphora-perf-target/u2-kiln/debug/build/kiln/5b8c64ebd8e73358/out/kiln-5b8c64ebd8e73358 --test-threads=8
+2836282 adalund+   0  155      64 rustc           /home/adalundhe/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/rustc --crate-name slates_server --edition=2024 crates/server/src/lib.rs --error-format=json --json=diagnosti
+3051339 adalund+   0  100       0 ps              ps -eo pid,user,ni,pcpu,etimes,comm,args --sort=-pcpu
+2777668 adalund+  19 29.5  176855 kiln            /home/adalundhe/.cache/kiln-test-timeouts/target/debug/kiln --config /home/adalundhe/.cache/kiln-test-timeouts/t/iDnCzZ/.tmp3rWtFl/kiln.toml server
+3051228 adalund+   0 25.0       0 docker <defunct [docker] <defunct>
+ 689376 adalund+   0 16.2  704696 kiln            /home/adalundhe/.local/share/kiln/agent/versions/edf5df73a34f/kiln --config=/home/adalundhe/.config/kiln/kiln.toml agent --server http://192.168.1.90:7070 --name 00aad8daff2fa3c9da
+ 327881 adalund+   0 12.1  208961 kiln            /home/adalundhe/.local/share/kiln/agent/versions/05a329130172/kiln --config=/home/adalundhe/.config/kiln/kiln.toml agent --server http://192.168.1.90:7070 --name 00aad8daff2fa3c9da
+    243 root       0  3.7  782625 kswapd0         [kswapd0]
+== end 2026-11-24T06:52:47Z
+    PID USER      NI %CPU ELAPSED COMMAND         COMMAND
+ 873176 adalund+  10  634   41313 kiln-5b8c64ebd8 /home/adalundhe/.cache/amphora-perf-target/u2-kiln/debug/build/kiln/5b8c64ebd8e73358/out/kiln-5b8c64ebd8e73358 --test-threads=8
+ 512904 adalund+   0  407       3 kiln-db277259ff target/debug/build/kiln/db277259ffc2c0f5/out/kiln-db277259ffc2c0f5 convo::raft
+ 454579 adalund+  10  164      19 door_progress-0 /home/adalundhe/.cache/reliquary-rq1-6d/target/debug/deps/door_progress-00035d348f7bf1de
+ 400295 adalund+  10  161      36 rustc           /home/adalundhe/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/rustc --crate-name slates_server --edition=2024 crates/server/src/lib.rs --error-format=json --json=diagnosti
+ 501191 adalund+   0  113       6 fleet-4fcf841eb /home/adalundhe/.cache/w-chaos-target/debug/deps/fleet-4fcf841eb3dc15a8 --exact a_successor_restarted_warm_owing_its_share_promises_the_volume_it_adopted --test-threads=1 --nocaptu
+ 524140 adalund+   0  100       0 docker <defunct [docker] <defunct>
+ 415307 adalund+  10 93.8      30 rustc           /home/adalundhe/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/rustc --crate-name slates_server --edition=2024 crates/server/src/lib.rs --error-format=json --json=diagnosti
+ 524141 adalund+   0 50.0       0 docker <defunct [docker] <defunct>
