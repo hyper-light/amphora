@@ -700,15 +700,24 @@ mod tests {
         let address = node.address().unwrap();
         let named = name("node-1").unwrap();
         assert!(matches!(
-            request(&dial, address, &named, Request::Probe, until()),
+            request(&dial, address, &named, Request::Probe, until(), |_| Ok(())),
             Ok(Answer::Done)
         ));
         assert!(matches!(
-            request(&dial, address, &named, Request::Identity, until()),
+            request(&dial, address, &named, Request::Identity, until(), |_| Ok(
+                ()
+            )),
             Err(Error::Refused(_))
         ));
         assert!(matches!(
-            request(&dial, address, &named, Request::Session, until()),
+            request(
+                &dial,
+                address,
+                &named,
+                Request::Session,
+                until(),
+                |_| Ok(())
+            ),
             Err(Error::Refused(_))
         ));
     }
