@@ -4740,7 +4740,11 @@ mod admission_charge {
         use crate::memory::Use;
         use crate::memory::tests::{BUDGET, Fed};
         let dir = tempfile::tempdir().unwrap();
-        let database = Database::open(&dir.path().join("a28.db"), until()).unwrap();
+        let database = Database::open(
+            &dir.path().join("a28.db"),
+            Instant::now() + crate::transport::HANG,
+        )
+        .unwrap();
         let budget = crate::memory::Budget::new(Box::new(Fed::new(Some(64 << 20), Some(0))));
         let other = budget.take(Use::Images, 64 << 20).unwrap();
         let began = Instant::now();
