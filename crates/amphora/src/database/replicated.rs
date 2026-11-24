@@ -410,7 +410,7 @@ struct Control {
     /// beside them (QB.1, lane perf-A11). Calls are not counted: the bytes bound them.
     called: AtomicUsize,
     /// The bytes of `admitted` that their writes hold on the memory budget themselves
-    /// (`ReplicaHandle::enqueue`, lane perf-A21): the queues' charge each tick takes leaves them
+    /// (`ReplicaHandle::submit_by`, lane perf-A21): the queues' charge each tick takes leaves them
     /// out (`Actor::rebound`), so no byte is charged twice.
     charged: AtomicUsize,
     // The command queue's bound in bytes and a wire record's most, as the owner last learned them
@@ -822,7 +822,7 @@ struct Reservation {
     bytes: usize,
     /// An application call's bytes in `called`, given back with it.
     called: usize,
-    /// A write's bytes held on the memory budget (`ReplicaHandle::enqueue`, lane perf-A21) and
+    /// A write's bytes held on the memory budget (`ReplicaHandle::submit_by`, lane perf-A21) and
     /// counted in `charged`: given back with the rest, whether the write applied or was refused.
     charge: Option<crate::memory::Charge>,
 }
@@ -1615,7 +1615,7 @@ fn queue_bounds(
 /// at its learned message rate, at least a call and a wire record, and no more than `room` holds of
 /// an input's least, its own envelope (a wire record may carry no bytes). Before anything is
 /// measured, what the room holds. Application calls are not counted apart: their waiting bytes
-/// bound them, and the queue's last input stays a wire record's (`ReplicaHandle::enqueue`).
+/// bound them, and the queue's last input stays a wire record's (`ReplicaHandle::place`).
 fn command_counts(intake: &super::drain::Drain, timeout: Duration, room: u64) -> u64 {
     let envelope = u64::try_from(ENVELOPE_BYTES).unwrap_or(u64::MAX);
     let input = super::drain::Bound {
@@ -3817,7 +3817,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             self.replica.core().raft.config().election_tick,
             self.pace.period(),
         );
-        // The writes hold their own bytes on the budget (`ReplicaHandle::enqueue`); the rest of the
+        // The writes hold their own bytes on the budget (`ReplicaHandle::submit_by`); the rest of the
         // queue's are charged here.
         let charged = self.control.charged.load(Ordering::Acquire);
         let queued = self
