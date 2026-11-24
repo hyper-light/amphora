@@ -7,7 +7,7 @@ documents are 3.54.1's (sqlite-doc-3540100). Goal G2 step 3; AC-T1.1.1, AC-T1.8.
 
 - **NOT MERGED.** adacachy2 stopped running what kiln accepted at 12:59:35Z (r2269; the lead's word: since 13:01Z, and the Macs' links down), and nothing may be built on adacachy. What was pushed after a9b78bbe has not been compiled:
   main's C26, C27 and B29 merged in (foreign keys, recursive triggers), and the fixes of section 4's right column. `cargo fmt` parses and passes it; nothing else of it is checked. Not run at all: clippy, check-production, the four suites
-  (windows_and_triggers, oracle_findings, dml_rows, without_rowid_dml), `tests/instead_of.rs`, the sweep at parallel and with statistics, and the red run on main (there CREATE TRIGGER refuses every database of the sweep but three).
+  (windows_and_triggers, oracle_findings, dml_rows, without_rowid_dml), `tests/instead_of.rs`, the sweep at parallel and with statistics, and the red run on main (read, not run: CREATE TRIGGER refuses there, and all but two of the sweep's databases make one).
 - **The last measured sweep is red: 435 of 5,871 questions differ at default settings** (tree a9b78bbe: this lane on main 8d70429d, before the fixes below). Each class is read and explained in section 4; the count after the fixes is not known.
 - **Found and left, each of another cause** (no query of a view does it on main either):
   - A view's column named with its database, `UPDATE v SET .. WHERE main.v.k = 1`: "no such column: main.v.k"; SQLite takes it. (SET and RETURNING take `main.v.k`.)
@@ -55,10 +55,11 @@ triggers, what a trigger changes under its statement, conflict clauses, transact
 | 5037b27e | a correlated subquery in SET panicked, "No index cursor found for table" | emitted without the old row's registers | emitted with them; compiled, passes at a9b78bbe |
 | 5037b27e | RETURNING's uncorrelated subqueries evaluated each row beside one that reads the view | one flag for the statement | a flag a column; compiled, passes at a9b78bbe |
 | 5037b27e | count_changes of a DELETE with RAISE(IGNORE) | counted after the triggers | before; compiled, passes at a9b78bbe |
-| a9b78bbe, 1 question and 5 after it | `SET a = main.v.b` panicked, "Cursor not found" | the cache has the column without its database | `seed_row` has both names |
+| a9b78bbe, 1 question and 4 after it | `SET a = main.v.b` panicked, "Cursor not found" | the cache has the column without its database | `seed_row` has both names |
 | a9b78bbe, 6 databases | a REAL column's integer stayed one in `new` and RETURNING | SQLite's OP_RealAffinity where it reads one | `real_columns` |
 | a9b78bbe, 2 views (12 questions) | a column list over VALUES and over `*` | section 1, a query's | drawn around |
 | a9b78bbe, 1 view | a scalar subquery's affinity | section 1, the document's | drawn around |
+| a9b78bbe, 1 question | "no such table: v" for "no such table: main.v" in a table's trigger | section 1, words | held as a refusal |
 | a9b78bbe, most of the rest | RETURNING where no trigger is of the event | section 1, the document's | drawn around: each drawn RETURNING is asked only where SQLite takes it without |
 | a9b78bbe, 4 databases | UPDATE FROM of a compound | section 1, the document's | drawn around, held by a test |
 | a9b78bbe | changes() after a refusal, total_changes() beside WITHOUT ROWID | section 1 | drawn around |
