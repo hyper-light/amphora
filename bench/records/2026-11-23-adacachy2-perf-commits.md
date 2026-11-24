@@ -1380,3 +1380,134 @@ What the trace says:
     # red on main dd9c3ce7 itself, 166 errors (disallowed println/args/temp_dir, items after a test module, ...); the
     # same 166 at b67ea4df and at the merged 2e662d8b, the 9 in repl.rs main's own, none in the lines changed (r1766, then two foreground runs whose ids were not shown)
     cargo clippy --release --manifest-path bench/Cargo.toml --all-targets --locked -- -D warnings
+
+# Lane V13 (commits) on adacachy2: the stale-base refusals traced to their first wrong decisions, and fixed (2026-11-24, 00:02Z to 01:00Z)
+
+Ada's goal is replicated commits about 10x faster than rqlite and dqlite, with no write refused under load. This
+lane's deliverable: no write refused for a stale base at 32 and 128 spread writers in either class, traced first,
+fixed where the first wrong decision is made, with a test that fails first, proved on the ladder and the replicated
+suite, merged to main.
+
+## Losses first
+
+LOSSES_PLACEHOLDER
+
+## The trace (r1814, branch `diag/commits-v13-refusals` 7907920e and 0d2e3e70, never for main)
+
+The diagnostic branch adds an env-gated log (`AMPHORA_TRACE13`, one line an event, CLOCK_MONOTONIC ns, the same clock
+on all three members) at the leader's slot (each barrier and forward with the slot's holder, turn, queue and held
+forwards before and after; each start with its last index, commit and length; each end by its site), at each
+forward's append (its base, the index it lands at, the verdict, and for a stale one every entry between its base and
+its append with its origin), at each owner's proposal (its base against its log's last, commit and applied), and at
+each member's barrier, read, prepare and apply result. `trace13.sh` runs 32 spread writers in both classes with V12's
+flags (`--batch 1 --text-bytes 600 --deadline-s 10 --relay-records 128 --warmup-s 1 --seconds 5`, `--spanning 2`
+for the replicated class), and `refusals.py` joins each refused write across the members and counts its first wrong
+decision. r1814 ran on adacachy2 at needs cpus=4 (cpus=8 refused twice: 1 of 32 cores idle), 00:13:08Z to 00:13:40Z,
+load (1 min) 90 to 99 on 32 cores, CPU "some" avg10 55 to 72%, I/O "some" 3.1 to 4.5%. Leader node 3 in every run.
+
+| class | round | commits/s | p50 ms | refusals by node (1, 2, 3) | forwards appended | stale | expired slots | detector verdicts |
+|---|---|---|---|---|---|---|---|---|
+| persisted | 1 | 26.4 | 679.9 | 11, 10, 3 | 121 | 33 | 37 | 0 |
+| replicated | 1 | 31.0 | 573.4 | 12, 12, 7 | 135 | 37 | 39 | 0 |
+| persisted | 2 | 27.6 | 720.9 | 13, 13, 1 | 132 | 41 | 45 | 0 |
+| replicated | 2 | 32.0 | 532.5 | 16, 9, 2 | 144 | 44 | 47 | 0 |
+
+**First wrong decision 1, 148 of 155 stale forwards: the leader ended a live holder's slot at its learned length.**
+Every slot end at the leader's own step was `expire`, 37 to 47 a run, none by the detector, a term, a change or a
+hand-off. The other 7 forwards arrived with no slot of their own after an earlier expiry (held, then stepped behind
+another member's entry). One, from round 1 persisted:
+
+| ms | member | event |
+|---|---|---|
+| 1250.68 | leader | member 2's slot begins: last 27, commit 26, learned length 29.2 ms |
+| 1274.59 | leader | the commit reaches 27 and member 2's barrier steps: 23.9 ms of its slot gone before it could start |
+| 1279.82 | leader | the slot expires (29.2 ms); the leader's turn is owed |
+| 1289.83 | leader | member 1's forward appends at 28 |
+| 1289.96 | member 2 | its read answers at 27 (applied 27); it prepares on 27 and forwards |
+| 1290.97 | leader | member 2's forward arrives, held through the leader's turn |
+| 1319.18 | leader | the leader's own write appends at 29 |
+| 1320.14 | leader | member 2's forward appends at 30 on base 27: stale, refused at apply |
+
+The slot's length is the longest of its member's last one or two gaps, timed from the slot's start, so it includes
+the leader's commit wait before the holder's barrier steps (24 ms here) as well as the holder's read round, apply and
+forward. Each is a wait that varies with the flushes, so a holder's next gap outruns that estimate often: about a
+third of the slots (37 to 47 of 121 to 144 a run). Every such slot refused its live holder's write.
+
+**First wrong decision 2, the leaders' own refusals (1 to 4 a run): the turn was given up while the holder's entry was
+uncommitted.** One, from round 1 persisted: at 2455.56 ms member 1's forward ends its slot and steps, with member 2's
+late forward held through that slot (since 2431.77 ms) released behind it; the leader's write arrives 6 ms later and
+prepares on its applied state, 66, with its log's last at 68 and `turn=false`, so the turn had been given up (by a
+start that found no barrier waiting and no write of the leader's), and it is refused at apply. Which forward holds 67
+and which 68 is inferred from that order, not logged. In its turn the write would have waited for its log's tail.
+
+## The fix (ff4433ba, red tests c3ebea5d)
+
+Both changes are in the slot's pure core (`database/slot.rs`), each where its decision is made. Nothing on the wire
+or in an entry changes.
+
+- `Slots::length`: a slot is at least the core's election timeout (`Bounds::election`, `election_tick` times the
+  owner's pace, the slot's first value since its design), and longer when its member's learned gap is longer. A slot
+  ends by time only once its holder is as late as the core takes a member for gone. The host's detector still ends a
+  gone holder's slot at once (`keep`), and a slow member's learned gap still lengthens its next slot.
+- `Slots::start`: a turn the leader has no write for passes only to a slot that begins. With no barrier waiting the
+  turn stays owed and only the forwards it held go, so the leader's next write prepares in its turn, behind its log's
+  tail, not on its applied state ahead of the holder's uncommitted entry.
+
+What it costs (inferred from the code, not measured): a holder that dies with no verdict from the detector holds the
+leader's writes up to an election timeout (200 ms at the 10 ms tick), where its learned gap held them about 30 ms.
+
+Tests, each "do X, expect Y" citing CP-T1.8: `slot::a_slot_outlasts_a_learned_gap_shorter_than_the_election_timeout`
+(new); `slot::forwards_wait_through_the_leaders_turn` and
+`slot::a_refused_members_barrier_begins_its_slot_and_its_forward_goes_first` (their expectations now these rules);
+`slot::a_learned_gap_is_believed_for_one_to_two_of_its_members_generations` (its gaps moved past the election
+timeout, so it still tests generations); and
+`replicated::v13_thirty_two_spread_writers_on_moving_time_are_each_answered_with_no_stale_base` (new, beside test 5):
+32 writers spread over the three members, three rows each, both classes, every member's clock moving a tick of its
+pace a round. A driven round holds every clock still, so no slot can end by time in test 5, which is why it stayed
+green on main while real time refused.
+
+## Runs
+
+r1896 on adacachy2, needs cpus=8 (00:28Z to 00:40Z; load (1 min) 70 to 131 on 32 cores, CPU "some" avg10 26 to 59%,
+I/O "some" 2.2 to 6.8%: a loaded host). Arms: c3ebea5d (main's product with the new tests: the red run) and
+2332e2ae (the fix, formatted), debug test binaries built in turn in the lane's one target dir (88 s, then 33 s).
+
+| check | c3ebea5d (main's product) | 2332e2ae (the fix) |
+|---|---|---|
+| focused: `database::slot::`, the new test, test 5 | 4 of 15 fail: the three slot tests (5 ms where 200 ms; `Expired` after 6 ms; the turn given up) and the new test, `stale-base refusals: [(7, "Persisted: in 617 rounds"), (5, "Replicated(...): in 540 rounds")]` | 15 of 15 pass |
+| `cargo clippy -p amphora --all-targets --locked -- -D warnings` | | exit 0 (36.6 s) |
+| `database::replicated:: replication::`, round 1 | 170 passed, 2 failed: the new test, `session_reads::t_t1_10_r1_a_session_reads_its_write_on_a_lagging_follower` (63 s) | 172 passed (50 s) |
+| round 2 (arm order reversed) | 171 passed, 1 failed: the new test (60 s) | 172 passed (67 s) |
+| round 3 | 171 passed, 1 failed: the new test (67 s) | 171 passed, 1 failed: `every_falsifier_of_the_floor_holds_under_a_nemesis` (52 s) |
+
+The new test on driven time with clocks moving gives main's product the refusals real time gives it: 7 and 5 over
+96 writes, and none with the fix. The suite's one fix-arm failure is main's own flake: r1920 ran that test alone 4
+times on each arm, alternated (load 64 to 90). The fix passed 4 of 4, and main's product failed 1 of 4, "a driven
+operation was unanswered after 60000 rounds" with its leader mid-change (`changing true`). Each arm failed it once in
+7 runs. The fix arm's round 3 panic was not kept (the suite's output was filtered), so whether it is the same
+failure is not shown. `t_t1_10_r1_...` failed on main's product in round 1, as lane V11 saw it fail on main.
+
+**The ladder (r1896, after the suites; the fix's release bench, 47.8 s warm).** `ladder13.sh`: Amphora alone, V12's
+flags, 32 and 128 spread writers, both classes, 3 rounds, cell order reversed in round 2. Refusals are the
+driver's `Serialization` count by node (node 3 led every run). Load (1 min) 70 to 90, CPU "some" avg10 26 to 59%.
+
+| class | writers | refusals by node, r1; r2; r3 | commits/s per round | p50 ms per round | misses |
+|---|---|---|---|---|---|
+| persisted | 32 | 0 0 0; 0 0 0; 0 0 0 | 36.8, 41.4, 39.0 | 737, 844, 598 | 0 |
+| persisted | 128 | 0 0 0; 0 0 0; 0 0 0 | 36.6, 43.2, 37.8 | 2,818, 2,228, 3,441 | 0 |
+| replicated | 32 | 0 0 0; 0 1 0; 0 0 0 | 48.0, 40.4, 46.8 | 631, 565, 582 | 0 |
+| replicated | 128 | 0 2 0; 3 1 1; 0 1 0 | 38.8, 42.8, 41.4 | 2,228, 3,572, 2,327 | 0 |
+
+Against V12's r1716 on main (9 to 41 refusals a run at 32 and 128 spread in both classes) and this lane's trace
+(24 to 31 at 32 spread): the persisted class has none left in 6 runs; the replicated class has 0 to 5 a run, its
+128-writer runs in each round. The rates are inside V12's (31.8 to 46.4 persisted, 30.4 to 38.6 replicated), one
+run a cell a round on a loaded host, so no speed is claimed either way.
+
+## Commands
+
+    # r1814: kiln run on 00aad8daff2fa3c9daa65d53c425d450, needs linux/amd64,cpus=4,mem=12g, sync false,
+    # cwd ~/.cache/amphora-perf/commits-remote at 7907920e, CARGO_TARGET_DIR=~/.cache/amphora-perf-target/commits,
+    # CARGO_INCREMENTAL=0, CARGO_BUILD_JOBS=4 (the release build took 1 min 19 s, warm)
+    bash bench/records/2026-11-23-adacachy2-perf-commits-v13/trace13.sh ~/.cache/amphora-perf/commits-v13-out/trace-001149 2
+    python3 -I bench/records/2026-11-23-adacachy2-perf-commits-v13/refusals.py ~/.cache/amphora-perf/commits-v13-out/trace-001149/<class>-32-spread-r<n>
+COMMANDS_PLACEHOLDER
