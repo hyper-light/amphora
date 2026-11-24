@@ -1,6 +1,6 @@
 # Lane C15 (expr), 2026-11-24 09:41:39Z to 10:41:39Z: a row with a NULL is compared by its other fields (the oracles' finding CT), and row values held to SQLite by a sweep
 
-Machine: adacachy2 (runner 00aad8da, Linux, 32 cores, 1-minute load 27 to 101 all hour from other lanes). Every build debug with `simulator`, `nice -n 10`, 2 to 8
+Machine: adacachy2 (runner 00aad8da, Linux, 32 cores, 1-minute load 23 to 149 over the hour from other lanes). Every build debug with `simulator`, `nice -n 10`, 2 to 8
 jobs. SQLite 3.54.0 (be8d059e, the system's `sqlite3` and the library Python links). Started on main 70f6712b. Runs named (r...) are in kiln's output log.
 
 ## 1. Losses first
@@ -10,7 +10,7 @@ jobs. SQLite 3.54.0 (be8d059e, the system's `sqlite3` and the library Python lin
   A sixth, a field's collation, the sweep found at 09:53Z; lane C16 fixed it at the place traced here (e89b0e9a) while this landed, so the fixture holds it.
 - **The fixture leaves those five forms out**, by name (`LEFT_OUT` in bench/sqlite_row_values.py). So BETWEEN is held in a WHERE, an ON, an EXISTS and a correlated subquery,
   not in a select list, and a row subquery is held only beside plain columns of its own names (29 of 1,500 queries).
-- **The sweep never met DB** (a range of a row of two tables): seed 77's 34 queries of the form all answered as SQLite. `LEFT_OUT` drops the form from the fixture anyway. DB's plain
+- **The sweep never met DB** (a range of a row of two tables): of seed 77's 34 queries of the form 27 answered as SQLite and 7 were refused as CM's (BETWEEN as a value). `LEFT_OUT` drops the form from the fixture anyway. DB's plain
   form still gives 8 rows for SQLite's 4 (section 5).
 - **The documents' own model test was blind.** `in_subquery.rs` "row values with NULLs in either place" binds its left sides as parameters, which are computed once, before the loop,
   so no field was ever skipped. It passed with CT on main. It is left as it is; `row_values.rs` reads columns.

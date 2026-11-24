@@ -76,6 +76,17 @@ s2<
 s3|select accountid, balance from accounts where accountid = 'cds'
 s3|select accountid, balance from accounts where accountid = 'checking'
 s1|update accounts set accountid = 'checking' where accountid = 'cds'
+# the key's index entry is the newest version's: its holder changed the key, which still matches, and the waiter does
+s1|begin
+s1|update accounts set accountid = 'cds' where accountid = 'checking'
+s2>update accounts set accountid = 'dvd' where accountid >= 'c' and accountid < 'd'
+s1|commit
+s2<
+s3|select accountid, balance from accounts where accountid = 'dvd'
+s3|select accountid, balance from accounts where accountid = 'cds'
+s3|select accountid, balance from accounts where accountid = 'checking'
+s1|update accounts set accountid = 'checking' where accountid = 'dvd'
+s3|select accountid, balance from accounts where accountid = 'checking'
 # eval-plan-qual: writep3a writep3b c1 c2 (one table for the spec's three)
 s1|create table p(id int not null, a int, b int, c int)
 s1|insert into p(id, a, b, c) values (1, 0, 1, 0)

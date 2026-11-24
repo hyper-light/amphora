@@ -1,0 +1,947 @@
+# SQLite 3.54.0: bench/sqlite_unread_cursors.py 300 DC
+db	plain
+sql	CREATE TABLE o(k INT, n INT)
+sql	CREATE TABLE p(k INT, n INT)
+sql	CREATE TABLE q(id INTEGER PRIMARY KEY, k INT, n INT)
+sql	CREATE TABLE w(k INT PRIMARY KEY, n INT) WITHOUT ROWID
+sql	INSERT INTO p VALUES (1, 1), (2, 5), (2, 7), (NULL, 3), (4, NULL)
+sql	INSERT INTO q VALUES (1, 2, 5), (2, 3, 1), (3, NULL, 2), (4, 2, 9)
+sql	INSERT INTO w VALUES (1, 4), (2, 1), (5, NULL)
+q	SELECT b.n NOT IN (SELECT s.k FROM p AS s WHERE b.k IS 5) FROM o AS b FULL JOIN w AS c ON NULL GROUP BY b.n NOT IN (SELECT s.k FROM p AS s WHERE b.k IS 5)	1:1
+q	SELECT d.c0 FROM (SELECT (CASE WHEN (b.n NOT IN (SELECT s.k FROM w AS s WHERE (b.k IS '1e3'))) THEN b.k ELSE b.n END) AS c0 FROM o AS b FULL JOIN w AS c ON NULL GROUP BY (CASE WHEN (b.n NOT IN (SELECT s.k FROM w AS s WHERE (b.k IS '1e3'))) THEN b.k ELSE b.n END)) AS d	1:NULL
+q	SELECT a1.c0 FROM w AS a0, (SELECT CAST((b.k NOT IN (SELECT s.k FROM o AS s WHERE (c.n NOT IN (3)))) AS INTEGER) AS c0 FROM o AS c FULL JOIN w AS b GROUP BY CAST((b.k NOT IN (SELECT s.k FROM o AS s WHERE (c.n NOT IN (3)))) AS INTEGER)) AS a1	3:1;1;1
+q	SELECT EXISTS (SELECT 1 FROM w AS s WHERE b.k IS NULL) FROM o AS b FULL JOIN w AS c ON NULL GROUP BY EXISTS (SELECT 1 FROM w AS s WHERE b.k IS NULL)	1:1
+q	SELECT 1 FROM p AS x JOIN w AS y ON (CASE WHEN x.k <= NULL THEN NULL END) JOIN p AS z ON ((x.k, NULL, z.n) BETWEEN (1, 1, x.k) AND (7, 10, 41)) WHERE z.n >= 1	0:
+q	SELECT e.k, f.n FROM p e JOIN p f ON ((e.k, f.n) BETWEEN (1, 10) AND (2, 4))	4:2,1;2,1;2,3;2,3
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 FULL JOIN w AS a1 ON a1.k = a0.k WHERE (a1.k, a0.k) < (2, 2) AND a1.k >= 1	1:NULL,NULL,1,4
+q	SELECT count(*), EXISTS (SELECT 1 FROM q AS s1 WHERE s1.n < a0.n) FROM w AS a0 FULL JOIN o AS a1 ON a1.k IS NULL GROUP BY EXISTS (SELECT 1 FROM q AS s1 WHERE s1.n < a0.n)	2:1,1;2,0
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM q AS a0 JOIN p AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n HAVING (a0.k IN (SELECT s1.k FROM o AS s1 WHERE s1.k = a1.k AND s1.n <> a0.n))	0:
+q	SELECT (SELECT min(s1.k) FROM p AS s1 WHERE s1.k = a1.n AND s1.n <> a1.k), sum(EXISTS (SELECT 1 FROM p AS s2 WHERE a1.k IS NULL)) FROM q AS a0 FULL JOIN p AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	7:NULL,0;NULL,0;NULL,0;NULL,0;NULL,1;NULL,1;NULL,1
+q	SELECT (SELECT count(*) FROM p AS s1 WHERE a1.n IS NOT NULL), sum((SELECT min(s2.k) FROM p AS s2 WHERE s2.k = a0.k)) FROM w AS a0 FULL JOIN p AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	6:0,NULL;0,NULL;5,1;5,2;5,2;5,NULL
+q	SELECT a1.n IN (SELECT s1.k FROM q AS s1 WHERE 1), count(*) FROM q AS a0 JOIN o AS a1 ON a1.k IS NULL LEFT JOIN o AS a2 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	0:
+q	SELECT (SELECT max(s1.n) FROM o AS s1 WHERE a1.k > 1), max(a0.k) FROM p AS a0 LEFT JOIN q AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	5:NULL,1;NULL,2;NULL,2;NULL,4;NULL,NULL
+q	SELECT count(*), a1.k IN (SELECT s1.k FROM w AS s1 WHERE a1.k IS NOT NULL) FROM p AS a0 FULL JOIN p AS a1 ON a1.n > a0.n GROUP BY a1.k IN (SELECT s1.k FROM w AS s1 WHERE a1.k IS NOT NULL)	2:4,0;6,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN w AS a1 ON NULL WHERE (a0.k, 10) NOT BETWEEN (NULL, NULL) AND (NULL, NULL) AND a0.n = a0.n	0:
+q	SELECT count(*), a1.n IN (SELECT s1.n FROM q AS s1 WHERE a1.k IS NOT NULL) FROM o AS a0 JOIN o AS a1 ON a1.n > a0.n GROUP BY a1.n IN (SELECT s1.n FROM q AS s1 WHERE a1.k IS NOT NULL)	0:
+q	SELECT a0.k NOT IN (SELECT s1.k FROM w AS s1 WHERE a1.k IS NULL), sum((SELECT sum(s2.n) FROM o AS s2 WHERE 1)) FROM w AS a0 FULL JOIN o AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n	3:0,NULL;0,NULL;0,NULL
+q	SELECT a1.k IN (SELECT s1.k FROM o AS s1 WHERE s1.k = a0.k AND s1.n <> a1.k), max(a0.k) FROM q AS a0 FULL JOIN q AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	8:0,2;0,2;0,3;0,3;0,3;0,NULL;0,NULL;0,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN w AS a1 ON a1.k = a0.k WHERE (a1.k, a0.k, a1.k) BETWEEN (a0.k, NULL, NULL) AND (a0.k, 5, a0.k)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM p AS a0 JOIN o AS a1 ON a1.k = a0.n JOIN q AS a2 ON a2.k = a1.k WHERE (a1.k, a0.n) NOT BETWEEN (a2.n, 1) AND (NULL, a0.n) AND a0.k = a1.n	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 JOIN q AS a1 ON NULL WHERE (a1.k, a0.n, a1.k) > (NULL, a0.n, NULL) AND a0.n >= 3	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 FULL JOIN w AS a1 ON a1.k = a0.n WHERE (a1.k, 10) NOT BETWEEN (a1.n, a1.k) AND (5, a0.n)	1:2,1,1,4
+q	SELECT a0.n IN (SELECT s1.n FROM q AS s1 WHERE a1.k IS NOT NULL), count(*) FROM w AS a0 RIGHT JOIN q AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	4:0,1;1,1;1,1;NULL,1
+q	SELECT count(*), (SELECT sum(s1.n) FROM w AS s1 WHERE 1) FROM o AS a0 LEFT JOIN w AS a1 ON a1.k = a0.k GROUP BY (SELECT sum(s1.n) FROM w AS s1 WHERE 1)	0:
+q	SELECT count(*) FROM w AS a0 RIGHT JOIN p AS a1 ON a1.k = a0.k GROUP BY a1.n NOT IN (SELECT s1.k FROM q AS s1 WHERE s1.n < a1.k)	2:1;4
+q	SELECT (SELECT sum(s1.n) FROM w AS s1 WHERE a2.k IS NOT NULL), max(a1.n) FROM q AS a0 FULL JOIN q AS a1 ON a1.k IS NULL FULL JOIN p AS a2 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	12:5,NULL;5,NULL;5,NULL;5,NULL;NULL,1;NULL,2;NULL,2;NULL,2;NULL,2;NULL,5;NULL,9;NULL,NULL
+q	SELECT count(*), sum(NOT EXISTS (SELECT 1 FROM w AS s2 WHERE s2.k = a1.k AND s2.n <> a1.k)), count(*) FILTER (WHERE a0.k IN (SELECT s1.n FROM p AS s1 WHERE s1.n < a0.k)) FROM q AS a0 FULL JOIN q AS a1 ON NULL JOIN o AS a2 ON NULL	1:0,NULL,0
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM w AS a0 JOIN p AS a1 ON a1.n > a0.n JOIN p AS a2 ON a2.k IS NULL WHERE (a1.k, NULL) BETWEEN (NULL, NULL) AND (a2.n, a0.k)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM w AS a0 FULL JOIN w AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n HAVING (a1.n NOT IN (SELECT s1.n FROM p AS s1 WHERE s1.n < a0.k))	4:1,4,NULL,NULL,1;2,1,1,4,1;NULL,NULL,2,1,1;NULL,NULL,5,NULL,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN p AS a1 ON a1.k IS NULL WHERE (a1.k, NULL) BETWEEN (a1.k, NULL) AND (NULL, NULL)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n, count(*) FROM q AS a0 JOIN p AS a1 ON a1.k IS NULL FULL JOIN o AS a2 ON a2.k = a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n HAVING NOT ((SELECT max(s1.n) FROM p AS s1 WHERE 1))	0:
+q	SELECT (SELECT sum(s1.n) FROM o AS s1 WHERE a0.n IS NULL), sum((SELECT count(*) FROM q AS s2 WHERE s2.k = a1.n AND s2.n <> a0.k)) FROM q AS a0 FULL JOIN w AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	6:NULL,0;NULL,0;NULL,0;NULL,0;NULL,0;NULL,0
+q	SELECT count(*), (SELECT min(s1.k) FROM q AS s1 WHERE s1.n < a1.k) FROM w AS a0 FULL JOIN w AS a1 ON a1.n > a0.n GROUP BY (SELECT min(s1.k) FROM q AS s1 WHERE s1.n < a1.k)	2:2,3;3,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM o AS a0 RIGHT JOIN o AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n HAVING ((SELECT max(s1.n) FROM q AS s1 WHERE a0.k > 1))	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n, count(*) FROM p AS a0 FULL JOIN w AS a1 ON NULL JOIN w AS a2 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n HAVING (a1.k IN (SELECT s1.n FROM w AS s1 WHERE s1.k = a2.k))	0:
+q	SELECT a0.k, a0.n FROM o AS a0 LEFT JOIN p AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n ORDER BY (SELECT max(s1.n) FROM w AS s1 WHERE 1), a0.k, a0.n, a1.k, a1.n LIMIT 2	0:
+q	SELECT a1.n IN (SELECT s1.n FROM q AS s1 WHERE a1.n > 1), max(a1.k) FROM o AS a0 LEFT JOIN p AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	0:
+q	SELECT count(*) FROM p AS a0 RIGHT JOIN o AS a1 ON a1.k = a0.n GROUP BY EXISTS (SELECT 1 FROM o AS s1 WHERE a0.k > 1)	0:
+q	SELECT count(*) FROM o AS a0 RIGHT JOIN p AS a1 ON NULL GROUP BY a0.n NOT IN (SELECT s1.k FROM p AS s1 WHERE s1.k = a1.k)	2:1;4
+q	SELECT count(*), sum(a1.n IN (SELECT s2.k FROM w AS s2 WHERE a0.k > 1)), count(*) FILTER (WHERE a1.k NOT IN (SELECT s1.n FROM q AS s1 WHERE s1.k = a1.n)) FROM q AS a0 JOIN p AS a1 ON NULL	1:0,NULL,0
+q	SELECT a1.n NOT IN (SELECT s1.k FROM w AS s1 WHERE s1.n < a0.k), count(*) FROM w AS a0 FULL JOIN q AS a1 ON a1.k = a0.n LEFT JOIN q AS a2 ON a2.n > a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	10:1,1;1,1;1,1;1,1;1,1;1,1;1,1;1,1;NULL,1;NULL,1
+q	SELECT NOT EXISTS (SELECT 1 FROM w AS s1 WHERE s1.n < a2.k), sum(a2.n NOT IN (SELECT s2.n FROM q AS s2 WHERE a1.k IS NULL)) FROM p AS a0 FULL JOIN w AS a1 ON NULL RIGHT JOIN p AS a2 ON a2.n > a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	7:0,1;0,1;0,1;0,1;0,NULL;1,0;1,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN w AS a1 ON NULL WHERE (a0.k, NULL) BETWEEN (a0.k, a1.n) AND (a0.n, NULL) AND a1.k = a0.k	0:
+q	SELECT (SELECT min(s1.k) FROM w AS s1 WHERE s1.k = a2.n), max(a2.n) FROM w AS a0 FULL JOIN p AS a1 ON NULL RIGHT JOIN p AS a2 ON a2.n > a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	8:1,1;5,5;5,5;NULL,3;NULL,7;NULL,7;NULL,7;NULL,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN q AS a1 ON a1.k IS NULL WHERE (a0.k, 2, 5) > (NULL, 1, a0.k)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM w AS a0 LEFT JOIN p AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n HAVING (a0.n NOT IN (SELECT s1.n FROM o AS s1 WHERE s1.k = a0.k))	3:1,4,4,NULL,1;2,1,1,1,1;5,NULL,NULL,NULL,1
+q	SELECT a0.k, a0.n FROM w AS a0 FULL JOIN w AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n ORDER BY (SELECT max(s1.n) FROM o AS s1 WHERE s1.k = a1.k), a0.k, a0.n, a1.k, a1.n LIMIT 5	5:1,4;2,1;5,NULL;NULL,NULL;NULL,NULL
+q	SELECT EXISTS (SELECT 1 FROM p AS s1 WHERE a0.k > 1), count(*) FROM o AS a0 FULL JOIN o AS a1 ON a1.k = a0.k JOIN q AS a2 ON a2.k = a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n, count(*) FROM o AS a0 LEFT JOIN w AS a1 ON a1.k IS NULL FULL JOIN p AS a2 ON a2.k = a1.k GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n HAVING NOT (EXISTS (SELECT 1 FROM q AS s1 WHERE a2.n IS NOT NULL))	1:NULL,NULL,NULL,NULL,4,NULL,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 RIGHT JOIN o AS a1 ON a1.k = a0.n WHERE (a0.n, 1) > (NULL, a1.k)	0:
+q	SELECT (SELECT count(*) FROM o AS s1 WHERE s1.k = a1.k), sum((SELECT sum(s2.n) FROM o AS s2 WHERE s2.k = a0.k)) FROM o AS a0 LEFT JOIN o AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n	0:
+q	SELECT a0.k, a0.n FROM q AS a0 LEFT JOIN o AS a1 ON a1.n > a0.n FULL JOIN p AS a2 ON a2.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n ORDER BY EXISTS (SELECT 1 FROM w AS s1 WHERE a1.n IS NULL), a0.k, a0.n, a1.k, a1.n, a2.k, a2.n LIMIT 5	5:NULL,2;NULL,NULL;NULL,NULL;NULL,NULL;NULL,NULL
+q	SELECT count(*), a0.k IN (SELECT s1.n FROM p AS s1 WHERE a1.k > 1) FROM o AS a0 FULL JOIN w AS a1 ON a1.k = a0.k GROUP BY a0.k IN (SELECT s1.n FROM p AS s1 WHERE a1.k > 1)	2:1,0;2,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 FULL JOIN q AS a1 ON a1.k = a0.n WHERE (a0.k, 1) NOT BETWEEN (NULL, a0.k) AND (a1.k, NULL)	0:
+q	SELECT a0.k, a0.n FROM q AS a0 RIGHT JOIN o AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n ORDER BY EXISTS (SELECT 1 FROM w AS s1 WHERE a0.k > 1), a0.k, a0.n, a1.k, a1.n LIMIT 2	0:
+q	SELECT a1.k IN (SELECT s1.n FROM o AS s1 WHERE s1.k IS a1.n), count(*) FROM w AS a0 RIGHT JOIN p AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	5:0,1;0,1;0,1;0,1;0,1
+q	SELECT EXISTS (SELECT 1 FROM w AS s1 WHERE a1.n IS NULL), sum(a0.k NOT IN (SELECT s2.k FROM o AS s2 WHERE s2.n < a0.n)) FROM p AS a0 FULL JOIN o AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	5:1,1;1,1;1,1;1,1;1,1
+q	SELECT a1.n IN (SELECT s1.n FROM o AS s1 WHERE 1), count(*) FROM o AS a0 FULL JOIN w AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n	3:0,1;0,1;0,1
+q	SELECT NOT EXISTS (SELECT 1 FROM q AS s1 WHERE 1), count(*) FROM o AS a0 FULL JOIN o AS a1 ON a1.k = a0.n FULL JOIN p AS a2 ON a2.k = a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	5:0,1;0,1;0,1;0,1;0,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 JOIN p AS a1 ON a1.k IS NULL WHERE (a1.n, a0.k, a0.k) <> (a0.k, 5, NULL)	0:
+q	SELECT EXISTS (SELECT 1 FROM q AS s1 WHERE a1.k IS NULL), max(a0.n) FROM w AS a0 FULL JOIN o AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n	3:1,1;1,4;1,NULL
+q	SELECT a0.k, a0.n FROM w AS a0 LEFT JOIN o AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n ORDER BY NOT EXISTS (SELECT 1 FROM q AS s1 WHERE s1.n < a0.n), a0.k, a0.n, a1.k, a1.n LIMIT 2	2:1,4;2,1
+q	SELECT a1.k NOT IN (SELECT s1.k FROM q AS s1 WHERE s1.k = a0.n), max(a0.k) FROM w AS a0 FULL JOIN q AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	7:1,1;1,1;1,2;1,2;1,2;1,5;1,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 LEFT JOIN p AS a1 ON a1.k IS NULL WHERE (a1.k, a1.k) NOT BETWEEN (a1.n, 10) AND (a1.k, a1.k)	0:
+q	SELECT EXISTS (SELECT 1 FROM p AS s1 WHERE s1.k = a1.n AND s1.n <> a0.n), sum(NOT EXISTS (SELECT 1 FROM w AS s2 WHERE s2.k IS a0.n)) FROM p AS a0 RIGHT JOIN q AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	4:0,1;0,1;0,1;0,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 JOIN p AS a1 ON a1.k = a0.n WHERE (a0.k, 5) BETWEEN (NULL, a1.k) AND (1, a0.k) AND a0.k >= 1	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 RIGHT JOIN w AS a1 ON a1.k = a0.k WHERE (a0.k, a1.n) >= (NULL, a1.n)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 LEFT JOIN q AS a1 ON a1.k IS NULL WHERE (a1.n, a0.n) BETWEEN (a1.k, NULL) AND (NULL, NULL)	0:
+q	SELECT (SELECT max(s1.n) FROM p AS s1 WHERE a1.k IS NULL), count(*) FROM o AS a0 FULL JOIN q AS a1 ON a1.k IS NULL FULL JOIN p AS a2 ON a2.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	8:7,1;7,1;7,1;7,1;7,1;NULL,1;NULL,1;NULL,1
+q	SELECT count(*), a1.n IN (SELECT s1.n FROM w AS s1 WHERE 1) FROM p AS a0 JOIN p AS a1 ON a1.k = a0.k GROUP BY a1.n IN (SELECT s1.n FROM w AS s1 WHERE 1)	2:1,1;5,NULL
+q	SELECT count(*) FROM q AS a0 RIGHT JOIN q AS a1 ON NULL GROUP BY (SELECT count(*) FROM p AS s1 WHERE s1.n < a1.n)	4:1;1;1;1
+q	SELECT a0.k NOT IN (SELECT s1.n FROM p AS s1 WHERE s1.k = a0.k AND s1.n <> a0.n), max(a0.n) FROM q AS a0 LEFT JOIN q AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n	4:1,1;1,2;1,5;1,9
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN w AS a1 ON a1.k = a0.n WHERE (a1.k, 5) BETWEEN (a1.k, NULL) AND (10, a0.k)	0:
+q	SELECT count(*), sum(a0.k IN (SELECT s2.k FROM o AS s2 WHERE a1.n > 1)), count(*) FILTER (WHERE (SELECT sum(s1.n) FROM w AS s1 WHERE a0.k IS NOT NULL)) FROM w AS a0 FULL JOIN q AS a1 ON a1.k = a0.k LEFT JOIN p AS a2 ON a2.k = a1.k	1:8,0,6
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n, count(*) FROM p AS a0 JOIN w AS a1 ON a1.k = a0.n LEFT JOIN w AS a2 ON a2.n > a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n HAVING (EXISTS (SELECT 1 FROM p AS s1 WHERE s1.n < a2.n))	0:
+q	SELECT (SELECT count(*) FROM p AS s1 WHERE a0.n > 1), count(*) FROM q AS a0 RIGHT JOIN p AS a1 ON NULL LEFT JOIN p AS a2 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	5:0,1;0,1;0,1;0,1;0,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN w AS a1 ON a1.n > a0.n WHERE (a1.k, a1.k, a0.k) NOT BETWEEN (10, NULL, a1.k) AND (a1.k, a1.k, 2)	2:3,1,1,4;NULL,2,1,4
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM p AS a0 JOIN q AS a1 ON NULL JOIN o AS a2 ON NULL WHERE (a0.k, 2) <= (a1.k, 2)	0:
+q	SELECT (SELECT min(s1.k) FROM p AS s1 WHERE a0.k > 1), max(a0.k) FROM q AS a0 RIGHT JOIN w AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	3:NULL,NULL;NULL,NULL;NULL,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 RIGHT JOIN o AS a1 ON a1.k = a0.k WHERE (a1.k, 10) NOT BETWEEN (a1.k, a0.k) AND (a0.k, a0.k)	0:
+q	SELECT count(*), sum(NOT EXISTS (SELECT 1 FROM p AS s2 WHERE a1.k IS NULL)), count(*) FILTER (WHERE (SELECT count(*) FROM p AS s1 WHERE a1.n IS NOT NULL)) FROM w AS a0 FULL JOIN w AS a1 ON NULL	1:6,3,2
+q	SELECT a1.k NOT IN (SELECT s1.k FROM w AS s1 WHERE s1.k = a0.k), sum(NOT EXISTS (SELECT 1 FROM q AS s2 WHERE a0.n IS NOT NULL)) FROM q AS a0 FULL JOIN o AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	4:1,0;1,0;NULL,0;NULL,0
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM o AS a0 RIGHT JOIN w AS a1 ON a1.k IS NULL LEFT JOIN q AS a2 ON a2.k = a1.k WHERE (a2.k, a2.k) NOT BETWEEN (10, a2.n) AND (NULL, NULL)	2:NULL,NULL,2,1,2,5;NULL,NULL,2,1,2,9
+q	SELECT (SELECT count(*) FROM o AS s1 WHERE s1.k = a0.k AND s1.n <> a2.k), count(*) FROM q AS a0 JOIN o AS a1 ON a1.k IS NULL FULL JOIN q AS a2 ON a2.k = a1.k GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	4:0,1;0,1;0,1;0,1
+q	SELECT EXISTS (SELECT 1 FROM o AS s1 WHERE s1.n < a0.k), max(a0.k) FROM q AS a0 FULL JOIN p AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	9:0,2;0,2;0,2;0,2;0,3;0,NULL;0,NULL;0,NULL;0,NULL
+q	SELECT EXISTS (SELECT 1 FROM p AS s1 WHERE a0.k IS NOT NULL), sum(NOT EXISTS (SELECT 1 FROM o AS s2 WHERE s2.k = a1.k)) FROM w AS a0 LEFT JOIN p AS a1 ON a1.k IS NULL JOIN o AS a2 ON a2.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM q AS a0 JOIN o AS a1 ON a1.n > a0.n RIGHT JOIN w AS a2 ON a2.k IS NULL WHERE (a2.k, a2.k) > (NULL, a0.k)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 JOIN q AS a1 ON a1.n > a0.n WHERE (a0.k, a1.n) BETWEEN (a0.n, 2) AND (1, a0.n)	0:
+q	SELECT a1.n IN (SELECT s1.k FROM q AS s1 WHERE a1.k IS NULL), sum(a0.n NOT IN (SELECT s2.n FROM w AS s2 WHERE 1)) FROM o AS a0 FULL JOIN q AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	4:0,NULL;0,NULL;0,NULL;1,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN o AS a1 ON NULL WHERE (a1.n, NULL, 1) <= (a1.n, NULL, 1) AND a1.k >= 1	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM q AS a0 FULL JOIN w AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n HAVING NOT (a1.n NOT IN (SELECT s1.k FROM p AS s1 WHERE s1.k = a1.n AND s1.n <> a0.k))	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 FULL JOIN q AS a1 ON a1.n > a0.n WHERE (a1.k, NULL) BETWEEN (a1.k, NULL) AND (a0.n, a1.k)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM o AS a0 LEFT JOIN q AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n HAVING NOT (a1.k NOT IN (SELECT s1.k FROM w AS s1 WHERE s1.k = a0.k))	0:
+q	SELECT a1.k IN (SELECT s1.k FROM w AS s1 WHERE 1), count(*) FROM o AS a0 FULL JOIN p AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	5:0,1;1,1;1,1;1,1;NULL,1
+q	SELECT count(*), sum(a1.k IN (SELECT s2.k FROM w AS s2 WHERE a0.n IS NOT NULL)), count(*) FILTER (WHERE (SELECT count(*) FROM o AS s1 WHERE a0.n IS NOT NULL)) FROM p AS a0 LEFT JOIN o AS a1 ON a1.k = a0.n	1:5,0,0
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n, count(*) FROM p AS a0 RIGHT JOIN q AS a1 ON a1.k = a0.n LEFT JOIN o AS a2 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n HAVING NOT (a2.k NOT IN (SELECT s1.n FROM p AS s1 WHERE s1.k = a1.n))	0:
+q	SELECT (SELECT sum(s1.n) FROM o AS s1 WHERE a2.n > 1), sum((SELECT sum(s2.n) FROM w AS s2 WHERE 1)) FROM w AS a0 LEFT JOIN q AS a1 ON a1.n > a0.n FULL JOIN q AS a2 ON a2.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	9:NULL,5;NULL,5;NULL,5;NULL,5;NULL,5;NULL,5;NULL,5;NULL,5;NULL,5
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM p AS a0 RIGHT JOIN o AS a1 ON a1.k IS NULL JOIN q AS a2 ON a2.k = a1.n WHERE (a0.k, NULL) >= (a0.n, 2) AND a2.n >= 3	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM p AS a0 FULL JOIN w AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n HAVING NOT (NOT EXISTS (SELECT 1 FROM p AS s1 WHERE s1.k = a0.n AND s1.n <> a1.k))	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 JOIN q AS a1 ON a1.k = a0.n WHERE (a1.n, 2) BETWEEN (NULL, a0.k) AND (a0.k, 5)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 RIGHT JOIN q AS a1 ON a1.n > a0.n WHERE (a1.k, 2, a0.k) > (NULL, 2, a1.n)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM o AS a0 LEFT JOIN w AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n HAVING (EXISTS (SELECT 1 FROM w AS s1 WHERE s1.k = a1.n))	0:
+q	SELECT a0.k, a0.n FROM w AS a0 LEFT JOIN o AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n ORDER BY a1.k NOT IN (SELECT s1.n FROM o AS s1 WHERE s1.n < a1.n), a0.k, a0.n, a1.k, a1.n LIMIT 2	2:1,4;2,1
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM o AS a0 FULL JOIN w AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n HAVING NOT (NOT EXISTS (SELECT 1 FROM w AS s1 WHERE s1.k = a1.n AND s1.n <> a1.k))	1:NULL,NULL,2,1,1
+q	SELECT (SELECT count(*) FROM p AS s1 WHERE a1.n > 1), max(a1.k) FROM p AS a0 RIGHT JOIN w AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	4:0,2;0,5;5,1;5,1
+q	SELECT NOT EXISTS (SELECT 1 FROM o AS s1 WHERE s1.k IS a0.k), count(*) FROM o AS a0 RIGHT JOIN p AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n	5:1,1;1,1;1,1;1,1;1,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 RIGHT JOIN q AS a1 ON a1.k = a0.n WHERE (a1.k, 5, NULL) NOT BETWEEN (a0.k, a1.k, a0.k) AND (1, a1.n, NULL) AND a1.k = a1.n	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM o AS a0 FULL JOIN o AS a1 ON a1.n > a0.n FULL JOIN p AS a2 ON a2.n > a1.n WHERE (a1.k, 5) >= (NULL, a1.k)	0:
+q	SELECT a0.k, a0.n FROM w AS a0 JOIN p AS a1 ON a1.k IS NULL RIGHT JOIN o AS a2 ON a2.k = a1.k GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n ORDER BY a1.k NOT IN (SELECT s1.k FROM q AS s1 WHERE a2.k > 1), a0.k, a0.n, a1.k, a1.n, a2.k, a2.n LIMIT 2	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM w AS a0 JOIN o AS a1 ON NULL JOIN q AS a2 ON a2.k = a1.n WHERE (a1.n, a1.k) BETWEEN (10, a1.k) AND (10, 10) AND a1.n >= 1	0:
+q	SELECT (SELECT min(s1.k) FROM w AS s1 WHERE s1.n < a0.k), max(a0.n) FROM w AS a0 RIGHT JOIN q AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n	6:1,NULL;2,1;NULL,4;NULL,NULL;NULL,NULL;NULL,NULL
+q	SELECT EXISTS (SELECT 1 FROM w AS s1 WHERE s1.k IS a1.k), count(*) FROM w AS a0 LEFT JOIN o AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	3:0,1;0,1;0,1
+q	SELECT count(*) FROM w AS a0 LEFT JOIN w AS a1 ON a1.k = a0.k GROUP BY EXISTS (SELECT 1 FROM o AS s1 WHERE a1.k > 1)	1:3
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM q AS a0 JOIN q AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n HAVING NOT (a0.n NOT IN (SELECT s1.k FROM p AS s1 WHERE a0.k IS NULL))	0:
+q	SELECT count(*) FROM p AS a0 FULL JOIN p AS a1 ON a1.k = a0.k GROUP BY (SELECT count(*) FROM w AS s1 WHERE 1)	1:8
+q	SELECT a0.k, a0.n FROM q AS a0 RIGHT JOIN w AS a1 ON a1.n > a0.n FULL JOIN p AS a2 ON a2.n > a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n ORDER BY (SELECT count(*) FROM q AS s1 WHERE s1.k = a2.k), a0.k, a0.n, a1.k, a1.n, a2.k, a2.n LIMIT 5	5:NULL,NULL;NULL,NULL;NULL,NULL;NULL,NULL;NULL,NULL
+q	SELECT (SELECT count(*) FROM q AS s1 WHERE a0.k > 1), count(*) FROM o AS a0 RIGHT JOIN o AS a1 ON a1.k = a0.n FULL JOIN o AS a2 ON a2.k = a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	0:
+q	SELECT a1.k IN (SELECT s1.k FROM q AS s1 WHERE s1.k IS a1.k), max(a1.k) FROM w AS a0 JOIN w AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	1:0,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 LEFT JOIN o AS a1 ON a1.k = a0.k WHERE (a1.n, 5) NOT BETWEEN (2, a0.n) AND (a1.n, NULL) AND a1.k >= 1	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM w AS a0 LEFT JOIN p AS a1 ON a1.k = a0.k FULL JOIN q AS a2 ON a2.k = a1.k WHERE (a0.k, NULL) <= (a2.k, NULL) AND a2.k = a1.k	0:
+q	SELECT count(*) FROM w AS a0 JOIN p AS a1 ON NULL GROUP BY EXISTS (SELECT 1 FROM w AS s1 WHERE s1.k = a0.n)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n, count(*) FROM o AS a0 JOIN w AS a1 ON a1.k = a0.k FULL JOIN p AS a2 ON a2.k = a1.k GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n HAVING NOT (a0.n IN (SELECT s1.k FROM o AS s1 WHERE a0.n IS NULL))	5:NULL,NULL,NULL,NULL,1,1,1;NULL,NULL,NULL,NULL,2,5,1;NULL,NULL,NULL,NULL,2,7,1;NULL,NULL,NULL,NULL,4,NULL,1;NULL,NULL,NULL,NULL,NULL,3,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN q AS a1 ON NULL WHERE (a0.k, 5) BETWEEN (a1.n, 1) AND (a1.k, a1.k)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN q AS a1 ON a1.n > a0.n WHERE (a0.n, a1.k) < (a1.n, 10)	6:2,5,2,9;3,1,2,5;3,1,2,9;3,1,NULL,2;NULL,2,2,5;NULL,2,2,9
+q	SELECT a0.k, a0.n FROM q AS a0 LEFT JOIN o AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n ORDER BY NOT EXISTS (SELECT 1 FROM w AS s1 WHERE a0.k IS NOT NULL), a0.k, a0.n, a1.k, a1.n LIMIT 5	4:2,5;2,9;3,1;NULL,2
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM w AS a0 JOIN q AS a1 ON a1.k = a0.n JOIN q AS a2 ON a2.k = a1.n WHERE (a2.k, NULL) <> (a2.k, NULL) AND a0.k = a0.k	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 LEFT JOIN p AS a1 ON NULL WHERE (a1.k, a0.k) NOT BETWEEN (a1.k, 2) AND (a1.k, 1) AND a1.k = a0.n	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 RIGHT JOIN p AS a1 ON a1.k IS NULL WHERE (a1.n, a1.n) NOT BETWEEN (1, NULL) AND (a0.k, a0.n) AND a0.k >= 1	3:2,5,NULL,3;2,9,NULL,3;3,1,NULL,3
+q	SELECT EXISTS (SELECT 1 FROM q AS s1 WHERE a1.k > 1), sum(EXISTS (SELECT 1 FROM p AS s2 WHERE a1.n IS NULL)) FROM q AS a0 JOIN w AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n	0:
+q	SELECT a0.k IN (SELECT s1.k FROM p AS s1 WHERE 1), count(*) FROM p AS a0 FULL JOIN o AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	5:1,1;1,1;1,1;1,1;NULL,1
+q	SELECT a0.k, a0.n FROM o AS a0 RIGHT JOIN o AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n ORDER BY a0.n IN (SELECT s1.k FROM q AS s1 WHERE s1.k IS a0.n), a0.k, a0.n, a1.k, a1.n LIMIT 5	0:
+q	SELECT NOT EXISTS (SELECT 1 FROM p AS s1 WHERE a1.k IS NULL), count(*) FROM o AS a0 JOIN q AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN o AS a1 ON NULL WHERE (a1.n, a0.n) = (a0.n, a0.k) AND a1.k >= 1	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 LEFT JOIN p AS a1 ON a1.n > a0.n WHERE (a0.k, NULL, a0.k) >= (2, 2, NULL)	3:3,1,2,5;3,1,2,7;3,1,NULL,3
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM o AS a0 LEFT JOIN w AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n HAVING ((SELECT max(s1.n) FROM o AS s1 WHERE a0.n IS NULL))	0:
+q	SELECT (SELECT max(s1.n) FROM q AS s1 WHERE s1.k = a0.n), max(a0.k) FROM q AS a0 LEFT JOIN q AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	5:9,NULL;9,NULL;NULL,2;NULL,2;NULL,3
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 JOIN w AS a1 ON a1.n > a0.n WHERE (a1.k, a1.k) <= (a1.n, a0.k) AND a1.n >= 3	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 RIGHT JOIN w AS a1 ON NULL WHERE (a1.k, a0.n, NULL) <= (a1.k, NULL, 10)	0:
+q	SELECT count(*), sum((SELECT count(*) FROM w AS s2 WHERE a0.k IS NULL)), count(*) FILTER (WHERE a1.n IN (SELECT s1.n FROM w AS s1 WHERE a1.k IS NOT NULL)) FROM w AS a0 JOIN q AS a1 ON NULL	1:0,NULL,0
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 RIGHT JOIN o AS a1 ON a1.n > a0.n WHERE (a1.n, a1.k) BETWEEN (a1.k, NULL) AND (a0.n, NULL)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM q AS a0 LEFT JOIN o AS a1 ON a1.k = a0.n JOIN q AS a2 ON a2.k = a1.k WHERE (a2.k, a0.k, NULL) BETWEEN (a0.k, NULL, a0.k) AND (a0.n, 2, NULL) AND a2.k >= 3	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN o AS a1 ON a1.k = a0.n WHERE (a1.k, a0.k, a0.k) > (NULL, 10, 10) AND a1.k >= 1	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM o AS a0 LEFT JOIN q AS a1 ON a1.k = a0.k FULL JOIN w AS a2 ON a2.k IS NULL WHERE (a1.k, 5) NOT BETWEEN (a1.n, 1) AND (a1.n, 10) AND a2.n = a0.k	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN o AS a1 ON a1.k = a0.k WHERE (a0.k, 5) < (NULL, 5) AND a0.k = a0.k	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN o AS a1 ON a1.k IS NULL WHERE (a0.n, a0.k, NULL) > (NULL, NULL, NULL) AND a0.k = a1.k	0:
+q	SELECT a1.n IN (SELECT s1.n FROM o AS s1 WHERE s1.k = a0.k AND s1.n <> a1.k), max(a1.k) FROM q AS a0 RIGHT JOIN o AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 JOIN o AS a1 ON a1.n > a0.n WHERE (a1.k, a0.k) NOT BETWEEN (1, a1.n) AND (a0.k, a1.k)	0:
+q	SELECT count(*), sum((SELECT sum(s2.n) FROM o AS s2 WHERE a1.k > 1)), count(*) FILTER (WHERE a1.k IN (SELECT s1.k FROM o AS s1 WHERE a0.k > 1)) FROM q AS a0 FULL JOIN p AS a1 ON a1.k = a0.k	1:9,NULL,0
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 LEFT JOIN o AS a1 ON a1.k IS NULL WHERE (a1.k, a0.k, a1.k) BETWEEN (a1.k, a0.k, NULL) AND (a1.k, a0.k, NULL)	0:
+q	SELECT count(*) FROM p AS a0 FULL JOIN p AS a1 ON NULL GROUP BY (SELECT sum(s1.n) FROM q AS s1 WHERE a0.n > 1)	2:3;7
+q	SELECT count(*) FROM q AS a0 JOIN p AS a1 ON NULL GROUP BY (SELECT min(s1.k) FROM q AS s1 WHERE a1.k > 1)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM q AS a0 RIGHT JOIN p AS a1 ON a1.k IS NULL RIGHT JOIN w AS a2 ON a2.k IS NULL WHERE (a0.k, 1, NULL) >= (a2.k, 10, NULL)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN q AS a1 ON a1.k IS NULL WHERE (a0.k, 2, a1.k) > (a0.k, 1, 1) AND a0.k >= 3	1:4,NULL,NULL,2
+q	SELECT count(*), NOT EXISTS (SELECT 1 FROM q AS s1 WHERE 1) FROM o AS a0 LEFT JOIN o AS a1 ON a1.k = a0.n GROUP BY NOT EXISTS (SELECT 1 FROM q AS s1 WHERE 1)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM q AS a0 JOIN o AS a1 ON NULL LEFT JOIN q AS a2 ON NULL WHERE (a2.n, NULL, 5) BETWEEN (2, 10, a1.n) AND (a1.n, a2.k, a0.k) AND a2.k >= 1	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM o AS a0 JOIN p AS a1 ON NULL RIGHT JOIN o AS a2 ON a2.k IS NULL WHERE (a1.k, 1, a1.n) <= (5, a0.k, NULL)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN p AS a1 ON a1.k = a0.n WHERE (a0.k, a0.k, a1.k) >= (NULL, a0.k, NULL) AND a0.k >= 3	0:
+q	SELECT count(*), sum((SELECT min(s2.k) FROM w AS s2 WHERE a0.k > 1)), count(*) FILTER (WHERE a0.n NOT IN (SELECT s1.n FROM o AS s1 WHERE a1.k > 1)) FROM p AS a0 LEFT JOIN w AS a1 ON a1.k = a0.n	1:5,3,5
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n, count(*) FROM q AS a0 LEFT JOIN o AS a1 ON NULL FULL JOIN w AS a2 ON a2.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n HAVING ((SELECT count(*) FROM q AS s1 WHERE a0.k IS NOT NULL))	3:2,5,NULL,NULL,NULL,NULL,1;2,9,NULL,NULL,NULL,NULL,1;3,1,NULL,NULL,NULL,NULL,1
+q	SELECT count(*) FROM o AS a0 FULL JOIN q AS a1 ON a1.k = a0.n GROUP BY NOT EXISTS (SELECT 1 FROM p AS s1 WHERE a0.k IS NOT NULL)	1:4
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN q AS a1 ON NULL WHERE (a1.n, a1.n) = (NULL, a0.k)	0:
+q	SELECT a0.k NOT IN (SELECT s1.n FROM o AS s1 WHERE 1), count(*) FROM o AS a0 FULL JOIN w AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	3:1,1;1,1;1,1
+q	SELECT count(*), EXISTS (SELECT 1 FROM q AS s1 WHERE s1.k = a0.k AND s1.n <> a0.k) FROM q AS a0 FULL JOIN p AS a1 ON a1.k = a0.n LEFT JOIN p AS a2 ON NULL GROUP BY EXISTS (SELECT 1 FROM q AS s1 WHERE s1.k = a0.k AND s1.n <> a0.k)	2:3,1;4,0
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN w AS a1 ON NULL WHERE (a0.k, 5, 10) NOT BETWEEN (a0.k, 1, 5) AND (NULL, 1, a1.k)	0:
+q	SELECT (SELECT max(s1.n) FROM w AS s1 WHERE s1.k = a0.n), count(*) FROM w AS a0 FULL JOIN q AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	6:4,1;4,1;NULL,1;NULL,1;NULL,1;NULL,1
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM q AS a0 RIGHT JOIN w AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n HAVING NOT (a1.k IN (SELECT s1.n FROM o AS s1 WHERE 1))	3:2,5,5,NULL,1;3,1,1,4,1;NULL,2,2,1,1
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM w AS a0 FULL JOIN p AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n HAVING ((SELECT min(s1.k) FROM o AS s1 WHERE a1.k > 1))	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN p AS a1 ON a1.n > a0.n WHERE (a1.n, a0.k) NOT BETWEEN (a1.n, a1.k) AND (NULL, NULL)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM q AS a0 FULL JOIN w AS a1 ON a1.k = a0.n LEFT JOIN o AS a2 ON a2.k = a1.k WHERE (a2.n, 2, a2.n) NOT BETWEEN (a2.k, NULL, a2.n) AND (a1.k, a2.k, 10) AND a2.k >= 1	0:
+q	SELECT a0.k, a0.n FROM q AS a0 JOIN w AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n ORDER BY (SELECT max(s1.n) FROM w AS s1 WHERE s1.n < a1.n), a0.k, a0.n, a1.k, a1.n LIMIT 5	3:2,5;3,1;NULL,2
+q	SELECT count(*) FROM w AS a0 FULL JOIN p AS a1 ON a1.k = a0.k GROUP BY a0.k NOT IN (SELECT s1.n FROM p AS s1 WHERE 1)	2:2;4
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n, count(*) FROM w AS a0 JOIN o AS a1 ON NULL LEFT JOIN q AS a2 ON a2.n > a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n HAVING NOT ((SELECT count(*) FROM q AS s1 WHERE s1.n < a0.n))	0:
+q	SELECT a0.n IN (SELECT s1.n FROM w AS s1 WHERE s1.k IS a2.k), sum(a0.n NOT IN (SELECT s2.n FROM p AS s2 WHERE s2.k IS a0.n)) FROM w AS a0 RIGHT JOIN p AS a1 ON NULL RIGHT JOIN o AS a2 ON a2.k = a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	0:
+q	SELECT EXISTS (SELECT 1 FROM p AS s1 WHERE s1.k = a1.k AND s1.n <> a1.n), max(a0.k) FROM w AS a0 FULL JOIN o AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	3:0,1;0,2;0,5
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM o AS a0 JOIN q AS a1 ON a1.n > a0.n FULL JOIN o AS a2 ON a2.k = a1.n WHERE (a1.n, a1.k) <> (a2.k, a1.n) AND a0.k >= 1	0:
+q	SELECT (SELECT min(s1.k) FROM o AS s1 WHERE s1.k = a1.k), count(*) FROM w AS a0 FULL JOIN o AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	3:NULL,1;NULL,1;NULL,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 LEFT JOIN q AS a1 ON NULL WHERE (a0.k, a0.n) BETWEEN (a1.k, a1.k) AND (NULL, a1.k) AND a1.k = a1.n	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN w AS a1 ON a1.n > a0.n WHERE (a0.n, a1.n, a1.n) NOT BETWEEN (a0.k, 5, 5) AND (NULL, 1, a1.k)	1:3,1,1,4
+q	SELECT count(*), sum(a1.k IN (SELECT s2.n FROM q AS s2 WHERE s2.k IS a0.k)), count(*) FILTER (WHERE a1.k IN (SELECT s1.k FROM o AS s1 WHERE s1.k = a1.k AND s1.n <> a0.k)) FROM q AS a0 LEFT JOIN w AS a1 ON a1.k = a0.k	1:4,0,0
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM p AS a0 FULL JOIN w AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n HAVING ((SELECT sum(s1.n) FROM p AS s1 WHERE s1.n < a1.k))	2:2,5,5,NULL,1;NULL,NULL,2,1,1
+q	SELECT count(*), sum((SELECT min(s2.k) FROM q AS s2 WHERE s2.k = a1.k)), count(*) FILTER (WHERE (SELECT min(s1.k) FROM w AS s1 WHERE s1.n < a1.k)) FROM q AS a0 FULL JOIN o AS a1 ON a1.n > a0.n	1:4,NULL,0
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM o AS a0 RIGHT JOIN o AS a1 ON NULL LEFT JOIN q AS a2 ON NULL WHERE (a2.k, a0.k, NULL) BETWEEN (10, a0.k, a0.k) AND (a2.k, 10, NULL)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM w AS a0 LEFT JOIN q AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n HAVING (a0.k NOT IN (SELECT s1.n FROM w AS s1 WHERE s1.k = a1.k AND s1.n <> a1.k))	3:1,4,NULL,NULL,1;2,1,NULL,NULL,1;5,NULL,NULL,NULL,1
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM q AS a0 JOIN o AS a1 ON a1.k IS NULL JOIN w AS a2 ON a2.k IS NULL WHERE (a2.n, a2.k) BETWEEN (a2.k, a1.k) AND (2, a1.n) AND a0.k >= 3	0:
+q	SELECT (SELECT min(s1.k) FROM w AS s1 WHERE s1.k IS a0.k), max(a0.n) FROM w AS a0 RIGHT JOIN o AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 JOIN o AS a1 ON NULL WHERE (a1.k, 1) > (NULL, a1.n)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 LEFT JOIN q AS a1 ON a1.k = a0.n WHERE (a0.k, a1.k) < (a0.n, NULL)	2:2,5,NULL,NULL;2,7,NULL,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM p AS a0 RIGHT JOIN o AS a1 ON a1.k = a0.n FULL JOIN w AS a2 ON a2.k = a1.n WHERE (a0.k, a1.k) NOT BETWEEN (NULL, 2) AND (2, 5) AND a2.k = a0.k	0:
+q	SELECT (SELECT count(*) FROM q AS s1 WHERE a1.k > 1), max(a0.n) FROM p AS a0 JOIN w AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	2:0,1;0,3
+q	SELECT EXISTS (SELECT 1 FROM p AS s1 WHERE a1.n IS NOT NULL), sum(a0.n NOT IN (SELECT s2.k FROM p AS s2 WHERE s2.k IS a1.k)) FROM p AS a0 JOIN q AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	0:
+q	SELECT (SELECT max(s1.n) FROM o AS s1 WHERE a1.k IS NULL), max(a0.k) FROM o AS a0 LEFT JOIN w AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	0:
+q	SELECT (SELECT max(s1.n) FROM o AS s1 WHERE a1.k IS NOT NULL), count(*) FROM p AS a0 LEFT JOIN w AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	5:NULL,1;NULL,1;NULL,1;NULL,1;NULL,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 LEFT JOIN w AS a1 ON a1.k IS NULL WHERE (a0.k, 5, NULL) = (a0.k, a0.n, NULL) AND a0.k = a0.k	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN o AS a1 ON a1.k = a0.k WHERE (a1.n, a0.k) >= (a0.n, a1.k) AND a0.k >= 3	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 LEFT JOIN o AS a1 ON a1.k = a0.n WHERE (a0.k, a1.k) <> (1, a0.k)	2:2,1,NULL,NULL;5,NULL,NULL,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 JOIN w AS a1 ON a1.n > a0.n WHERE (a0.k, NULL) < (5, a0.k) AND a0.k = a1.k	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 JOIN p AS a1 ON a1.k = a0.n WHERE (a0.n, 1, NULL) NOT BETWEEN (a0.k, 1, NULL) AND (2, NULL, a0.n) AND a0.k = a0.k	0:
+q	SELECT count(*), a0.k NOT IN (SELECT s1.n FROM q AS s1 WHERE s1.k IS a1.n) FROM p AS a0 JOIN p AS a1 ON NULL GROUP BY a0.k NOT IN (SELECT s1.n FROM q AS s1 WHERE s1.k IS a1.n)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM w AS a0 RIGHT JOIN q AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n HAVING ((SELECT count(*) FROM q AS s1 WHERE s1.n < a1.k))	5:1,4,2,5,1;1,4,2,9,1;2,1,2,5,1;2,1,2,9,1;NULL,NULL,3,1,1
+q	SELECT count(*), EXISTS (SELECT 1 FROM o AS s1 WHERE a1.k > 1) FROM o AS a0 FULL JOIN q AS a1 ON NULL GROUP BY EXISTS (SELECT 1 FROM o AS s1 WHERE a1.k > 1)	1:4,0
+q	SELECT a0.k NOT IN (SELECT s1.k FROM p AS s1 WHERE s1.k IS a1.k), sum((SELECT count(*) FROM q AS s2 WHERE a1.n > 1)) FROM p AS a0 FULL JOIN p AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	10:0,4;1,4;1,4;NULL,0;NULL,0;NULL,0;NULL,0;NULL,4;NULL,4;NULL,4
+q	SELECT count(*) FROM w AS a0 FULL JOIN o AS a1 ON NULL GROUP BY a1.k NOT IN (SELECT s1.n FROM o AS s1 WHERE a1.k IS NULL)	1:3
+q	SELECT a1.k NOT IN (SELECT s1.k FROM q AS s1 WHERE a0.k IS NOT NULL), sum((SELECT count(*) FROM q AS s2 WHERE a0.k IS NOT NULL)) FROM q AS a0 FULL JOIN w AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	6:1,0;1,0;1,0;NULL,4;NULL,4;NULL,4
+q	SELECT count(*), EXISTS (SELECT 1 FROM p AS s1 WHERE s1.k = a2.n AND s1.n <> a2.n) FROM p AS a0 FULL JOIN w AS a1 ON NULL FULL JOIN w AS a2 ON a2.n > a1.n GROUP BY EXISTS (SELECT 1 FROM p AS s1 WHERE s1.k = a2.n AND s1.n <> a2.n)	1:10,0
+q	SELECT (SELECT max(s1.n) FROM p AS s1 WHERE s1.k = a1.k AND s1.n <> a1.k), count(*) FROM o AS a0 FULL JOIN p AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	5:7,1;7,1;NULL,1;NULL,1;NULL,1
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM w AS a0 JOIN o AS a1 ON a1.k = a0.k JOIN o AS a2 ON NULL WHERE (a1.k, NULL, NULL) BETWEEN (NULL, NULL, a1.k) AND (10, 2, a0.n)	0:
+q	SELECT count(*) FROM o AS a0 FULL JOIN p AS a1 ON NULL JOIN q AS a2 ON a2.k = a1.k GROUP BY (SELECT max(s1.n) FROM o AS s1 WHERE a2.n > 1)	1:4
+q	SELECT count(*), a1.n NOT IN (SELECT s1.n FROM w AS s1 WHERE s1.k = a0.n AND s1.n <> a0.k) FROM o AS a0 JOIN w AS a1 ON a1.k = a0.n GROUP BY a1.n NOT IN (SELECT s1.n FROM w AS s1 WHERE s1.k = a0.n AND s1.n <> a0.k)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN o AS a1 ON a1.k = a0.n WHERE (a1.n, 1) <= (10, 10)	0:
+q	SELECT count(*), sum((SELECT min(s2.k) FROM p AS s2 WHERE 1)), count(*) FILTER (WHERE a0.k IN (SELECT s1.n FROM q AS s1 WHERE a0.n IS NULL)) FROM q AS a0 LEFT JOIN w AS a1 ON a1.k IS NULL	1:4,4,0
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 RIGHT JOIN p AS a1 ON a1.k = a0.n WHERE (a0.k, NULL, a1.k) < (10, a1.k, 1) AND a0.n = a1.k	1:3,1,1,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 LEFT JOIN w AS a1 ON a1.k = a0.k WHERE (a1.k, 5, 5) BETWEEN (1, a1.k, NULL) AND (a1.n, NULL, a0.k)	1:1,4,1,4
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 RIGHT JOIN q AS a1 ON a1.k IS NULL WHERE (a1.k, a1.n) = (a0.k, a1.k)	0:
+q	SELECT count(*), sum(a0.n IN (SELECT s2.n FROM w AS s2 WHERE s2.n < a0.k)), count(*) FILTER (WHERE EXISTS (SELECT 1 FROM w AS s1 WHERE s1.k IS a0.k)) FROM o AS a0 FULL JOIN w AS a1 ON a1.k IS NULL	1:3,0,0
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 LEFT JOIN o AS a1 ON a1.k = a0.n WHERE (a0.k, NULL, NULL) <> (a0.k, a0.n, a1.n) AND a0.n >= 1	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM w AS a0 JOIN q AS a1 ON a1.n > a0.n JOIN p AS a2 ON NULL WHERE (a0.k, 5) = (a1.n, 2) AND a0.k >= 3	0:
+q	SELECT a0.k, a0.n FROM p AS a0 RIGHT JOIN q AS a1 ON a1.k IS NULL LEFT JOIN p AS a2 ON a2.n > a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n ORDER BY EXISTS (SELECT 1 FROM p AS s1 WHERE a0.n > 1), a0.k, a0.n, a1.k, a1.n, a2.k, a2.n LIMIT 2	2:NULL,NULL;NULL,NULL
+q	SELECT (SELECT max(s1.n) FROM w AS s1 WHERE s1.k = a0.n), sum(a1.k IN (SELECT s2.n FROM p AS s2 WHERE a0.n > 1)) FROM q AS a0 FULL JOIN p AS a1 ON a1.k IS NULL LEFT JOIN w AS a2 ON a2.k = a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	8:1,NULL;4,0;NULL,0;NULL,0;NULL,0;NULL,0;NULL,NULL;NULL,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM o AS a0 JOIN o AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n HAVING ((SELECT sum(s1.n) FROM p AS s1 WHERE s1.k = a0.k AND s1.n <> a0.n))	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 RIGHT JOIN o AS a1 ON NULL WHERE (a0.k, NULL) > (NULL, NULL)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM w AS a0 RIGHT JOIN o AS a1 ON NULL JOIN p AS a2 ON a2.k = a1.k WHERE (a2.n, NULL) NOT BETWEEN (a2.k, a1.k) AND (NULL, 5)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN p AS a1 ON a1.k = a0.k WHERE (a0.k, NULL) NOT BETWEEN (5, NULL) AND (a1.n, a1.k)	4:2,5,2,5;2,5,2,7;2,9,2,5;2,9,2,7
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM q AS a0 FULL JOIN q AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n HAVING NOT (a1.k IN (SELECT s1.k FROM q AS s1 WHERE a0.k IS NULL))	5:2,5,2,9,1;2,9,NULL,NULL,1;3,1,2,5,1;3,1,2,9,1;3,1,NULL,2,1
+q	SELECT EXISTS (SELECT 1 FROM p AS s1 WHERE a1.k IS NULL), count(*) FROM o AS a0 LEFT JOIN p AS a1 ON a1.k = a0.n LEFT JOIN p AS a2 ON a2.n > a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 FULL JOIN w AS a1 ON a1.k = a0.k WHERE (a0.k, a0.k) >= (a1.k, 10) AND a1.k = a0.k	0:
+q	SELECT count(*), sum((SELECT min(s2.k) FROM w AS s2 WHERE a0.k IS NOT NULL)), count(*) FILTER (WHERE EXISTS (SELECT 1 FROM w AS s1 WHERE s1.n < a1.k)) FROM q AS a0 FULL JOIN p AS a1 ON a1.k IS NULL	1:8,3,3
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM p AS a0 LEFT JOIN q AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n HAVING ((SELECT max(s1.n) FROM q AS s1 WHERE s1.k IS a1.k))	5:1,1,NULL,2,1;2,5,NULL,2,1;2,7,NULL,2,1;4,NULL,NULL,2,1;NULL,3,NULL,2,1
+q	SELECT a2.k IN (SELECT s1.n FROM o AS s1 WHERE a1.n IS NULL), sum(EXISTS (SELECT 1 FROM p AS s2 WHERE s2.k = a2.k)) FROM q AS a0 RIGHT JOIN w AS a1 ON NULL FULL JOIN q AS a2 ON a2.k = a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	7:0,0;0,0;0,0;0,0;0,0;0,1;0,1
+q	SELECT count(*), (SELECT sum(s1.n) FROM o AS s1 WHERE s1.n < a1.n) FROM q AS a0 RIGHT JOIN w AS a1 ON a1.k = a0.k GROUP BY (SELECT sum(s1.n) FROM o AS s1 WHERE s1.n < a1.n)	1:4,NULL
+q	SELECT count(*), sum((SELECT min(s2.k) FROM q AS s2 WHERE s2.k IS a2.k)), count(*) FILTER (WHERE (SELECT sum(s1.n) FROM q AS s1 WHERE s1.n < a2.k)) FROM p AS a0 RIGHT JOIN p AS a1 ON a1.k IS NULL LEFT JOIN o AS a2 ON a2.k IS NULL	1:9,NULL,0
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM p AS a0 RIGHT JOIN o AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n HAVING ((SELECT min(s1.k) FROM q AS s1 WHERE s1.k = a1.n))	0:
+q	SELECT a1.k IN (SELECT s1.k FROM o AS s1 WHERE s1.k = a0.k), sum((SELECT count(*) FROM p AS s2 WHERE s2.k = a0.k)) FROM p AS a0 RIGHT JOIN o AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	0:
+q	SELECT count(*), sum((SELECT sum(s2.n) FROM p AS s2 WHERE s2.n < a1.n)), count(*) FILTER (WHERE EXISTS (SELECT 1 FROM w AS s1 WHERE a1.k > 1)) FROM w AS a0 RIGHT JOIN p AS a1 ON NULL	1:5,14,3
+q	SELECT (SELECT count(*) FROM p AS s1 WHERE a1.k IS NULL), sum((SELECT min(s2.k) FROM q AS s2 WHERE a1.n > 1)) FROM w AS a0 FULL JOIN p AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	8:0,2;0,2;0,2;0,2;0,NULL;0,NULL;5,2;5,NULL
+q	SELECT (SELECT min(s1.k) FROM w AS s1 WHERE 1), sum(a1.k IN (SELECT s2.k FROM p AS s2 WHERE s2.k IS a1.k)) FROM p AS a0 JOIN p AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n	5:1,NULL;1,NULL;1,NULL;1,NULL;1,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 RIGHT JOIN q AS a1 ON a1.k = a0.n WHERE (a0.n, NULL, 2) BETWEEN (a0.n, a0.k, a1.n) AND (1, 5, NULL) AND a1.n = a0.n	0:
+q	SELECT a0.n IN (SELECT s1.k FROM q AS s1 WHERE a0.k > 1), count(*) FROM w AS a0 FULL JOIN p AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	6:0,1;0,1;0,1;NULL,1;NULL,1;NULL,1
+q	SELECT (SELECT max(s1.n) FROM w AS s1 WHERE s1.k = a1.k), sum(a0.k NOT IN (SELECT s2.n FROM w AS s2 WHERE s2.k = a2.k AND s2.n <> a2.k)) FROM q AS a0 RIGHT JOIN o AS a1 ON a1.k IS NULL RIGHT JOIN p AS a2 ON a2.k = a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	5:NULL,1;NULL,1;NULL,NULL;NULL,NULL;NULL,NULL
+q	SELECT count(*), sum(a0.k IN (SELECT s2.n FROM q AS s2 WHERE s2.k = a1.k AND s2.n <> a1.k)), count(*) FILTER (WHERE (SELECT sum(s1.n) FROM p AS s1 WHERE a0.n IS NULL)) FROM p AS a0 JOIN o AS a1 ON a1.k = a0.n	1:0,NULL,0
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN q AS a1 ON NULL WHERE (a1.n, NULL) NOT BETWEEN (NULL, 1) AND (a1.k, NULL) AND a1.k >= 3	0:
+q	SELECT (SELECT min(s1.k) FROM o AS s1 WHERE s1.k IS a0.k), sum((SELECT max(s2.n) FROM o AS s2 WHERE s2.k IS a1.n)) FROM p AS a0 LEFT JOIN p AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	5:NULL,NULL;NULL,NULL;NULL,NULL;NULL,NULL;NULL,NULL
+q	SELECT NOT EXISTS (SELECT 1 FROM p AS s1 WHERE s1.k IS a2.k), sum(a0.n IN (SELECT s2.k FROM w AS s2 WHERE s2.k IS a0.n)) FROM o AS a0 LEFT JOIN q AS a1 ON a1.k = a0.n FULL JOIN p AS a2 ON a2.k = a1.k GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	5:0,0;0,0;0,0;0,0;0,0
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 RIGHT JOIN q AS a1 ON a1.n > a0.n WHERE (a1.n, a0.k) >= (a1.n, 5) AND a1.n >= 3	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM w AS a0 FULL JOIN w AS a1 ON a1.k = a0.k LEFT JOIN q AS a2 ON a2.k = a1.n WHERE (a0.k, 1) NOT BETWEEN (1, 10) AND (a1.n, NULL)	2:1,4,1,4,NULL,NULL;2,1,2,1,NULL,NULL
+q	SELECT count(*), EXISTS (SELECT 1 FROM o AS s1 WHERE s1.k = a1.n) FROM p AS a0 FULL JOIN o AS a1 ON a1.n > a0.n FULL JOIN q AS a2 ON a2.k IS NULL GROUP BY EXISTS (SELECT 1 FROM o AS s1 WHERE s1.k = a1.n)	1:8,0
+q	SELECT a1.n IN (SELECT s1.n FROM o AS s1 WHERE a0.k IS NOT NULL), sum((SELECT max(s2.n) FROM o AS s2 WHERE s2.k = a1.k AND s2.n <> a0.n)) FROM q AS a0 FULL JOIN q AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	7:0,NULL;0,NULL;0,NULL;0,NULL;0,NULL;0,NULL;0,NULL
+q	SELECT a0.k, a0.n FROM p AS a0 FULL JOIN w AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n ORDER BY a0.n IN (SELECT s1.n FROM w AS s1 WHERE s1.k IS a0.k), a0.k, a0.n, a1.k, a1.n LIMIT 5	5:1,1;NULL,3;NULL,NULL;NULL,NULL;NULL,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n, count(*) FROM o AS a0 RIGHT JOIN o AS a1 ON a1.n > a0.n LEFT JOIN q AS a2 ON a2.n > a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n HAVING (a0.k NOT IN (SELECT s1.n FROM p AS s1 WHERE a2.n IS NULL))	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN o AS a1 ON a1.n > a0.n WHERE (a0.n, a1.k) BETWEEN (NULL, a0.k) AND (a1.n, 10)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM w AS a0 FULL JOIN w AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n HAVING NOT (a0.k IN (SELECT s1.k FROM o AS s1 WHERE a1.n > 1))	5:1,4,NULL,NULL,1;2,1,1,4,1;5,NULL,NULL,NULL,1;NULL,NULL,2,1,1;NULL,NULL,5,NULL,1
+q	SELECT EXISTS (SELECT 1 FROM w AS s1 WHERE a1.k IS NULL), count(*) FROM p AS a0 JOIN q AS a1 ON a1.k = a0.n FULL JOIN o AS a2 ON a2.n > a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	1:0,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 JOIN q AS a1 ON a1.n > a0.n WHERE (a0.k, NULL, 5) BETWEEN (1, 1, NULL) AND (10, a0.k, NULL) AND a0.k = a0.k	3:2,1,2,5;2,1,2,9;2,1,NULL,2
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM p AS a0 RIGHT JOIN o AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n HAVING (a1.k IN (SELECT s1.n FROM q AS s1 WHERE s1.k = a1.k AND s1.n <> a0.n))	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 JOIN q AS a1 ON a1.n > a0.n WHERE (a0.k, 2) = (a0.n, 10)	0:
+q	SELECT count(*), sum((SELECT max(s2.n) FROM w AS s2 WHERE s2.k = a1.n)), count(*) FILTER (WHERE NOT EXISTS (SELECT 1 FROM w AS s1 WHERE a0.n IS NULL)) FROM p AS a0 JOIN o AS a1 ON NULL FULL JOIN q AS a2 ON a2.n > a1.n	1:4,NULL,0
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN w AS a1 ON a1.k = a0.n WHERE (a0.k, a1.n) BETWEEN (10, a1.n) AND (a0.k, 10)	0:
+q	SELECT (SELECT sum(s1.n) FROM q AS s1 WHERE s1.n < a1.k), count(*) FROM w AS a0 FULL JOIN p AS a1 ON a1.k = a0.n FULL JOIN q AS a2 ON a2.n > a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	10:1,1;1,1;3,1;NULL,1;NULL,1;NULL,1;NULL,1;NULL,1;NULL,1;NULL,1
+q	SELECT count(*), a0.k IN (SELECT s1.k FROM w AS s1 WHERE s1.n < a1.n) FROM p AS a0 FULL JOIN p AS a1 ON a1.k IS NULL GROUP BY a0.k IN (SELECT s1.k FROM w AS s1 WHERE s1.n < a1.n)	3:2,1;3,NULL;4,0
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 RIGHT JOIN w AS a1 ON a1.k IS NULL WHERE (a1.k, NULL, a1.k) BETWEEN (a1.k, a1.k, NULL) AND (a0.k, 2, 5) AND a0.k >= 1	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM p AS a0 FULL JOIN w AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n HAVING NOT ((SELECT min(s1.k) FROM q AS s1 WHERE a0.k > 1))	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN w AS a1 ON a1.n > a0.n WHERE (a0.n, NULL) > (a1.n, 5)	0:
+q	SELECT a1.k IN (SELECT s1.k FROM p AS s1 WHERE s1.k = a1.n AND s1.n <> a1.n), max(a1.k) FROM q AS a0 LEFT JOIN o AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	4:0,NULL;0,NULL;0,NULL;0,NULL
+q	SELECT count(*), sum((SELECT count(*) FROM q AS s2 WHERE a0.n IS NOT NULL)), count(*) FILTER (WHERE NOT EXISTS (SELECT 1 FROM p AS s1 WHERE a0.k > 1)) FROM w AS a0 JOIN w AS a1 ON a1.k IS NULL	1:0,NULL,0
+q	SELECT EXISTS (SELECT 1 FROM p AS s1 WHERE s1.k = a0.n), max(a1.k) FROM o AS a0 FULL JOIN w AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	3:0,1;0,2;0,5
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM p AS a0 JOIN p AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n HAVING NOT (NOT EXISTS (SELECT 1 FROM o AS s1 WHERE s1.n < a1.k))	0:
+q	SELECT count(*) FROM p AS a0 LEFT JOIN w AS a1 ON a1.k = a0.k LEFT JOIN o AS a2 ON a2.n > a1.n GROUP BY (SELECT count(*) FROM o AS s1 WHERE s1.k = a2.n)	1:5
+q	SELECT a0.k, a0.n FROM q AS a0 LEFT JOIN w AS a1 ON a1.n > a0.n LEFT JOIN o AS a2 ON a2.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n ORDER BY (SELECT max(s1.n) FROM w AS s1 WHERE 1), a0.k, a0.n, a1.k, a1.n, a2.k, a2.n LIMIT 2	2:2,5;NULL,2
+q	SELECT a0.k, a0.n FROM q AS a0 LEFT JOIN o AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n ORDER BY (SELECT count(*) FROM p AS s1 WHERE s1.k = a1.k AND s1.n <> a1.n), a0.k, a0.n, a1.k, a1.n LIMIT 5	4:2,5;2,9;3,1;NULL,2
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 RIGHT JOIN q AS a1 ON a1.k IS NULL WHERE (a1.k, 2) BETWEEN (1, a1.n) AND (10, a0.n)	3:NULL,NULL,2,5;NULL,NULL,2,9;NULL,NULL,3,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 FULL JOIN q AS a1 ON a1.k = a0.k WHERE (a0.k, NULL, NULL) = (5, a1.n, a0.n) AND a1.k >= 3	0:
+q	SELECT count(*) FROM w AS a0 FULL JOIN q AS a1 ON a1.k = a0.k GROUP BY (SELECT count(*) FROM p AS s1 WHERE 1)	1:6
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM q AS a0 LEFT JOIN q AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n HAVING (a0.k NOT IN (SELECT s1.k FROM q AS s1 WHERE s1.k IS a0.k))	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM w AS a0 RIGHT JOIN q AS a1 ON a1.k IS NULL JOIN o AS a2 ON NULL WHERE (a2.k, a1.n, a2.k) < (a0.n, a0.k, a1.k)	0:
+q	SELECT (SELECT min(s1.k) FROM p AS s1 WHERE s1.k = a1.k), count(*) FROM p AS a0 FULL JOIN w AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n	8:1,1;2,1;NULL,1;NULL,1;NULL,1;NULL,1;NULL,1;NULL,1
+q	SELECT (SELECT sum(s1.n) FROM q AS s1 WHERE s1.n < a1.k), max(a0.k) FROM q AS a0 RIGHT JOIN q AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	4:1,NULL;1,NULL;3,NULL;NULL,NULL
+q	SELECT EXISTS (SELECT 1 FROM q AS s1 WHERE s1.k = a0.k), max(a0.k) FROM p AS a0 LEFT JOIN o AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	5:0,1;0,4;0,NULL;1,2;1,2
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 JOIN q AS a1 ON a1.n > a0.n WHERE (a0.k, 1) NOT BETWEEN (a0.n, 10) AND (a1.k, a1.n)	2:1,4,2,5;1,4,2,9
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 RIGHT JOIN w AS a1 ON a1.k = a0.k WHERE (a0.n, NULL) < (a0.k, 2)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN w AS a1 ON a1.k IS NULL WHERE (a1.n, a1.k, a1.k) BETWEEN (a0.k, NULL, a1.k) AND (5, a1.k, a1.n) AND a0.n = a1.n	0:
+q	SELECT a0.k, a0.n FROM q AS a0 RIGHT JOIN q AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n ORDER BY EXISTS (SELECT 1 FROM p AS s1 WHERE a0.k > 1), a0.k, a0.n, a1.k, a1.n LIMIT 5	4:NULL,NULL;NULL,NULL;NULL,NULL;NULL,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 RIGHT JOIN q AS a1 ON a1.k = a0.n WHERE (a0.k, a1.n) NOT BETWEEN (a0.k, a0.k) AND (a1.n, a1.k) AND a1.k >= 1	0:
+q	SELECT NOT EXISTS (SELECT 1 FROM w AS s1 WHERE s1.k = a1.k), count(*) FROM p AS a0 LEFT JOIN o AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	5:1,1;1,1;1,1;1,1;1,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN q AS a1 ON a1.k IS NULL WHERE (a1.k, a1.n) <= (a0.k, a0.k)	0:
+q	SELECT count(*), (SELECT max(s1.n) FROM q AS s1 WHERE a0.n > 1) FROM q AS a0 FULL JOIN q AS a1 ON a1.k = a0.n GROUP BY (SELECT max(s1.n) FROM q AS s1 WHERE a0.n > 1)	2:3,NULL;4,9
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM w AS a0 FULL JOIN o AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n HAVING (a1.k NOT IN (SELECT s1.k FROM w AS s1 WHERE s1.k = a1.k))	3:1,4,NULL,NULL,1;2,1,NULL,NULL,1;5,NULL,NULL,NULL,1
+q	SELECT count(*), NOT EXISTS (SELECT 1 FROM p AS s1 WHERE s1.k = a1.k AND s1.n <> a1.k) FROM o AS a0 RIGHT JOIN p AS a1 ON a1.k = a0.n FULL JOIN q AS a2 ON NULL GROUP BY NOT EXISTS (SELECT 1 FROM p AS s1 WHERE s1.k = a1.k AND s1.n <> a1.k)	2:2,0;7,1
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM w AS a0 FULL JOIN w AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n HAVING (a1.k IN (SELECT s1.n FROM q AS s1 WHERE s1.k = a1.n))	0:
+q	SELECT count(*) FROM q AS a0 LEFT JOIN p AS a1 ON a1.k = a0.k FULL JOIN q AS a2 ON a2.k = a1.k GROUP BY (SELECT min(s1.k) FROM q AS s1 WHERE a2.n IS NULL)	2:10;2
+q	SELECT (SELECT min(s1.k) FROM q AS s1 WHERE s1.k = a0.k), sum(a0.k NOT IN (SELECT s2.k FROM p AS s2 WHERE s2.k = a0.k)) FROM w AS a0 RIGHT JOIN p AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n	7:2,0;NULL,0;NULL,1;NULL,1;NULL,1;NULL,1;NULL,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN o AS a1 ON a1.k IS NULL WHERE (a1.n, NULL) <> (NULL, 1)	0:
+q	SELECT (SELECT min(s1.k) FROM q AS s1 WHERE s1.k IS a0.k), sum((SELECT count(*) FROM w AS s2 WHERE a0.k IS NOT NULL)) FROM p AS a0 FULL JOIN q AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n	8:2,3;2,3;NULL,0;NULL,0;NULL,0;NULL,0;NULL,3;NULL,3
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 JOIN w AS a1 ON a1.k = a0.n WHERE (a0.k, NULL, NULL) < (a1.n, a1.k, 5) AND a1.n = a1.k	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 FULL JOIN p AS a1 ON NULL WHERE (a1.n, a1.n, 2) NOT BETWEEN (a0.n, NULL, a1.k) AND (a1.k, 1, NULL)	2:NULL,NULL,2,5;NULL,NULL,2,7
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM o AS a0 FULL JOIN p AS a1 ON NULL FULL JOIN o AS a2 ON a2.k IS NULL WHERE (a0.k, NULL) > (a0.k, 2)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 FULL JOIN o AS a1 ON a1.k IS NULL WHERE (a0.k, NULL) < (a1.k, NULL)	0:
+q	SELECT (SELECT min(s1.k) FROM w AS s1 WHERE s1.n < a1.k), count(*) FROM q AS a0 FULL JOIN p AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	9:2,1;2,1;2,1;2,1;2,1;NULL,1;NULL,1;NULL,1;NULL,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN p AS a1 ON a1.n > a0.n WHERE (a1.k, a0.k) NOT BETWEEN (2, a0.k) AND (a0.k, a0.k)	0:
+q	SELECT NOT EXISTS (SELECT 1 FROM w AS s1 WHERE a1.k IS NOT NULL), sum(a1.n NOT IN (SELECT s2.k FROM q AS s2 WHERE a1.n > 1)) FROM p AS a0 RIGHT JOIN w AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	4:0,1;0,1;0,NULL;0,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN w AS a1 ON a1.n > a0.n WHERE (a1.k, a0.n) <> (10, a0.k)	2:3,1,1,4;NULL,2,1,4
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 FULL JOIN o AS a1 ON a1.k = a0.n WHERE (a0.k, NULL, a1.k) > (10, NULL, 1)	0:
+q	SELECT a1.k NOT IN (SELECT s1.k FROM w AS s1 WHERE s1.n < a1.n), sum(NOT EXISTS (SELECT 1 FROM q AS s2 WHERE a1.k IS NULL)) FROM q AS a0 FULL JOIN p AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	9:0,1;0,1;0,1;0,1;1,0;1,0;1,1;1,1;NULL,0
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM o AS a0 JOIN o AS a1 ON a1.n > a0.n JOIN p AS a2 ON a2.k = a1.k WHERE (a1.k, NULL, NULL) NOT BETWEEN (a0.k, 10, a1.k) AND (5, a0.k, NULL) AND a0.n = a1.n	0:
+q	SELECT count(*) FROM o AS a0 RIGHT JOIN q AS a1 ON a1.n > a0.n LEFT JOIN o AS a2 ON a2.n > a1.n GROUP BY (SELECT count(*) FROM w AS s1 WHERE 1)	1:4
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 FULL JOIN o AS a1 ON a1.k IS NULL WHERE (a0.n, 5) NOT BETWEEN (a1.k, a1.k) AND (a0.k, NULL) AND a1.k >= 3	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 JOIN p AS a1 ON NULL WHERE (a1.n, NULL) NOT BETWEEN (NULL, NULL) AND (a1.n, 10) AND a0.n = a1.n	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM o AS a0 RIGHT JOIN q AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n HAVING ((SELECT max(s1.n) FROM p AS s1 WHERE s1.n < a1.k))	3:NULL,NULL,2,5,1;NULL,NULL,2,9,1;NULL,NULL,3,1,1
+db	rows
+sql	CREATE TABLE o(k INT, n INT)
+sql	CREATE TABLE p(k INT, n INT)
+sql	CREATE TABLE q(id INTEGER PRIMARY KEY, k INT, n INT)
+sql	CREATE TABLE w(k INT PRIMARY KEY, n INT) WITHOUT ROWID
+sql	INSERT INTO p VALUES (1, 1), (2, 5), (2, 7), (NULL, 3), (4, NULL)
+sql	INSERT INTO q VALUES (1, 2, 5), (2, 3, 1), (3, NULL, 2), (4, 2, 9)
+sql	INSERT INTO w VALUES (1, 4), (2, 1), (5, NULL)
+sql	INSERT INTO o VALUES (2, 1), (9, 2)
+q	SELECT b.n NOT IN (SELECT s.k FROM p AS s WHERE b.k IS 5) FROM o AS b FULL JOIN w AS c ON NULL GROUP BY b.n NOT IN (SELECT s.k FROM p AS s WHERE b.k IS 5)	1:1
+q	SELECT d.c0 FROM (SELECT (CASE WHEN (b.n NOT IN (SELECT s.k FROM w AS s WHERE (b.k IS '1e3'))) THEN b.k ELSE b.n END) AS c0 FROM o AS b FULL JOIN w AS c ON NULL GROUP BY (CASE WHEN (b.n NOT IN (SELECT s.k FROM w AS s WHERE (b.k IS '1e3'))) THEN b.k ELSE b.n END)) AS d	3:2;9;NULL
+q	SELECT a1.c0 FROM w AS a0, (SELECT CAST((b.k NOT IN (SELECT s.k FROM o AS s WHERE (c.n NOT IN (3)))) AS INTEGER) AS c0 FROM o AS c FULL JOIN w AS b GROUP BY CAST((b.k NOT IN (SELECT s.k FROM o AS s WHERE (c.n NOT IN (3)))) AS INTEGER)) AS a1	6:0;0;0;1;1;1
+q	SELECT EXISTS (SELECT 1 FROM w AS s WHERE b.k IS NULL) FROM o AS b FULL JOIN w AS c ON NULL GROUP BY EXISTS (SELECT 1 FROM w AS s WHERE b.k IS NULL)	2:0;1
+q	SELECT 1 FROM p AS x JOIN w AS y ON (CASE WHEN x.k <= NULL THEN NULL END) JOIN p AS z ON ((x.k, NULL, z.n) BETWEEN (1, 1, x.k) AND (7, 10, 41)) WHERE z.n >= 1	0:
+q	SELECT e.k, f.n FROM p e JOIN p f ON ((e.k, f.n) BETWEEN (1, 10) AND (2, 4))	4:2,1;2,1;2,3;2,3
+q	SELECT a0.k, a0.n FROM q AS a0 FULL JOIN w AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n ORDER BY EXISTS (SELECT 1 FROM w AS s1 WHERE a1.k IS NULL), a0.k, a0.n, a1.k, a1.n LIMIT 5	4:2,5;2,9;3,1;NULL,2
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 LEFT JOIN q AS a1 ON a1.n > a0.n WHERE (a1.n, a1.n) = (a0.n, a0.k)	0:
+q	SELECT count(*), sum((SELECT count(*) FROM q AS s2 WHERE a1.k IS NULL)), count(*) FILTER (WHERE (SELECT sum(s1.n) FROM p AS s1 WHERE a1.n IS NULL)) FROM w AS a0 JOIN q AS a1 ON a1.k = a0.n	1:0,NULL,0
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN p AS a1 ON a1.k IS NULL WHERE (a1.k, a1.k) < (10, NULL) AND a0.k = a1.n	0:
+q	SELECT EXISTS (SELECT 1 FROM q AS s1 WHERE s1.k = a0.k), count(*) FROM p AS a0 RIGHT JOIN p AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	5:0,1;0,1;0,1;0,1;0,1
+q	SELECT count(*), sum((SELECT max(s2.n) FROM o AS s2 WHERE a0.k IS NOT NULL)), count(*) FILTER (WHERE a0.k NOT IN (SELECT s1.n FROM p AS s1 WHERE s1.k IS a0.k)) FROM o AS a0 JOIN q AS a1 ON a1.n > a0.n	1:5,10,5
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN o AS a1 ON a1.k = a0.n WHERE (a0.k, NULL, a0.k) >= (a0.k, a1.n, NULL)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 LEFT JOIN p AS a1 ON a1.k = a0.k WHERE (a1.n, NULL, a0.n) > (NULL, a0.k, a1.k) AND a0.n = a1.n	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 FULL JOIN o AS a1 ON a1.k IS NULL WHERE (a1.k, NULL) NOT BETWEEN (a0.k, 5) AND (2, 5) AND a0.k = a0.n	0:
+q	SELECT (SELECT sum(s1.n) FROM o AS s1 WHERE 1), sum(a1.k IN (SELECT s2.k FROM w AS s2 WHERE a0.n IS NULL)) FROM w AS a0 LEFT JOIN w AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n	3:3,0;3,0;3,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM q AS a0 JOIN w AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n HAVING NOT ((SELECT max(s1.n) FROM o AS s1 WHERE a1.k IS NOT NULL))	0:
+q	SELECT count(*), sum(NOT EXISTS (SELECT 1 FROM w AS s2 WHERE s2.n < a0.n)), count(*) FILTER (WHERE NOT EXISTS (SELECT 1 FROM w AS s1 WHERE a0.k IS NOT NULL)) FROM o AS a0 FULL JOIN q AS a1 ON a1.k = a0.n	1:5,3,2
+q	SELECT count(*) FROM p AS a0 FULL JOIN p AS a1 ON a1.k = a0.n GROUP BY (SELECT min(s1.k) FROM w AS s1 WHERE a0.n > 1)	2:3;6
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 LEFT JOIN p AS a1 ON a1.k = a0.n WHERE (a0.k, a0.n) > (2, a0.n)	2:9,2,2,5;9,2,2,7
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 JOIN w AS a1 ON a1.k = a0.k WHERE (a0.k, a0.k) >= (NULL, NULL) AND a1.n = a0.k	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 FULL JOIN p AS a1 ON a1.n > a0.n WHERE (a1.n, 1) >= (NULL, a1.k)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN p AS a1 ON a1.k = a0.k WHERE (a1.k, a1.k) NOT BETWEEN (NULL, a1.n) AND (a1.k, 10) AND a1.n >= 3	0:
+q	SELECT NOT EXISTS (SELECT 1 FROM p AS s1 WHERE s1.n < a0.n), count(*) FROM o AS a0 JOIN p AS a1 ON a1.k IS NULL JOIN o AS a2 ON a2.k = a1.k GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	0:
+q	SELECT EXISTS (SELECT 1 FROM p AS s1 WHERE a1.k IS NULL), count(*) FROM o AS a0 FULL JOIN q AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	5:0,1;0,1;0,1;1,1;1,1
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM w AS a0 JOIN p AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n HAVING NOT (a0.k NOT IN (SELECT s1.k FROM o AS s1 WHERE a0.n IS NULL))	0:
+q	SELECT (SELECT max(s1.n) FROM o AS s1 WHERE a0.n > 1), max(a1.k) FROM o AS a0 LEFT JOIN w AS a1 ON a1.k = a0.k FULL JOIN q AS a2 ON a2.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	5:2,NULL;NULL,2;NULL,NULL;NULL,NULL;NULL,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 FULL JOIN p AS a1 ON a1.k = a0.k WHERE (a0.k, a0.k) = (NULL, 2) AND a0.n >= 3	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM w AS a0 FULL JOIN p AS a1 ON a1.k = a0.n RIGHT JOIN q AS a2 ON NULL WHERE (a0.n, a0.k) BETWEEN (a1.k, a1.k) AND (NULL, a1.n) AND a0.n = a2.k	0:
+q	SELECT a1.k IN (SELECT s1.k FROM w AS s1 WHERE a1.n IS NOT NULL), max(a1.n) FROM p AS a0 FULL JOIN w AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	7:0,NULL;0,NULL;0,NULL;0,NULL;1,1;1,4;1,4
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 LEFT JOIN p AS a1 ON NULL WHERE (a0.k, 10, a0.n) = (a1.k, 5, a1.k)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM o AS a0 FULL JOIN q AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n HAVING NOT ((SELECT sum(s1.n) FROM p AS s1 WHERE 1))	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN w AS a1 ON a1.k = a0.n WHERE (a0.k, a1.k) BETWEEN (a1.n, 5) AND (1, a0.k) AND a0.n >= 3	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM q AS a0 FULL JOIN p AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n HAVING (a1.n IN (SELECT s1.n FROM q AS s1 WHERE a1.n IS NULL))	0:
+q	SELECT (SELECT min(s1.k) FROM q AS s1 WHERE s1.n < a1.n), sum(a0.k IN (SELECT s2.n FROM o AS s2 WHERE a0.k IS NULL)) FROM w AS a0 FULL JOIN w AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	3:3,0;NULL,0;NULL,0
+q	SELECT (SELECT max(s1.n) FROM o AS s1 WHERE s1.k IS a0.k), sum(a0.k IN (SELECT s2.k FROM o AS s2 WHERE a0.n IS NOT NULL)) FROM o AS a0 JOIN p AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	6:1,1;1,1;1,1;2,1;2,1;2,1
+q	SELECT a1.k IN (SELECT s1.n FROM o AS s1 WHERE a1.k IS NULL), sum((SELECT min(s2.k) FROM w AS s2 WHERE a1.k IS NULL)) FROM p AS a0 RIGHT JOIN o AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	3:0,NULL;0,NULL;0,NULL
+q	SELECT count(*) FROM q AS a0 FULL JOIN o AS a1 ON a1.n > a0.n GROUP BY (SELECT count(*) FROM p AS s1 WHERE s1.k = a0.n)	3:1;1;3
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM q AS a0 FULL JOIN q AS a1 ON a1.k = a0.k RIGHT JOIN o AS a2 ON a2.k = a1.k WHERE (a2.n, NULL) NOT BETWEEN (2, a2.k) AND (a0.k, a1.k)	4:2,5,2,5,2,1;2,5,2,9,2,1;2,9,2,5,2,1;2,9,2,9,2,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 JOIN o AS a1 ON a1.k IS NULL WHERE (a1.n, a0.k) <= (a0.k, NULL)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM p AS a0 JOIN p AS a1 ON a1.k = a0.n FULL JOIN p AS a2 ON a2.n > a1.n WHERE (a1.n, a2.k, NULL) BETWEEN (NULL, a0.k, NULL) AND (5, a0.k, 2)	0:
+q	SELECT (SELECT max(s1.n) FROM o AS s1 WHERE a0.n IS NULL), max(a0.n) FROM o AS a0 FULL JOIN o AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	3:2,NULL;NULL,1;NULL,2
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM o AS a0 FULL JOIN w AS a1 ON NULL RIGHT JOIN w AS a2 ON a2.n > a1.n WHERE (a1.k, a0.k) >= (a2.k, a2.k) AND a2.k >= 1	1:NULL,NULL,2,1,1,4
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM o AS a0 RIGHT JOIN w AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n HAVING ((SELECT sum(s1.n) FROM o AS s1 WHERE a0.k > 1))	2:2,1,1,4,1;9,2,1,4,1
+q	SELECT (SELECT max(s1.n) FROM o AS s1 WHERE a0.k IS NOT NULL), max(a0.k) FROM o AS a0 FULL JOIN p AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n	6:2,2;2,9;NULL,NULL;NULL,NULL;NULL,NULL;NULL,NULL
+q	SELECT count(*) FROM q AS a0 LEFT JOIN p AS a1 ON a1.k = a0.k GROUP BY a1.n NOT IN (SELECT s1.k FROM q AS s1 WHERE s1.k IS a1.n)	2:2;4
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 RIGHT JOIN p AS a1 ON NULL WHERE (a0.k, a1.k, a1.k) NOT BETWEEN (a0.n, a0.k, a1.k) AND (10, 5, a0.n)	0:
+q	SELECT count(*) FROM o AS a0 JOIN w AS a1 ON a1.n > a0.n LEFT JOIN o AS a2 ON NULL GROUP BY a1.k IN (SELECT s1.k FROM q AS s1 WHERE a2.k > 1)	1:2
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM q AS a0 JOIN w AS a1 ON a1.k IS NULL JOIN q AS a2 ON a2.k IS NULL WHERE (a0.k, a0.n) = (a0.n, a0.k)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN p AS a1 ON a1.n > a0.n WHERE (a0.n, 5) NOT BETWEEN (a1.k, 5) AND (NULL, a1.k)	2:3,1,2,5;3,1,2,7
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM w AS a0 JOIN q AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n HAVING NOT (EXISTS (SELECT 1 FROM q AS s1 WHERE s1.k = a1.k AND s1.n <> a0.n))	0:
+q	SELECT count(*), (SELECT min(s1.k) FROM p AS s1 WHERE s1.k = a0.n) FROM q AS a0 LEFT JOIN q AS a1 ON a1.n > a0.n GROUP BY (SELECT min(s1.k) FROM p AS s1 WHERE s1.k = a0.n)	3:2,2;2,NULL;3,1
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM w AS a0 JOIN w AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n HAVING NOT (a0.n NOT IN (SELECT s1.k FROM p AS s1 WHERE s1.k IS a0.n))	0:
+q	SELECT (SELECT max(s1.n) FROM o AS s1 WHERE s1.k IS a1.k), count(*) FROM o AS a0 LEFT JOIN q AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	5:1,1;1,1;1,1;1,1;NULL,1
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM w AS a0 LEFT JOIN p AS a1 ON a1.n > a0.n JOIN o AS a2 ON a2.k = a1.k WHERE (a2.n, NULL, a1.n) < (2, a2.k, a1.k)	4:1,4,2,5,2,1;1,4,2,7,2,1;2,1,2,5,2,1;2,1,2,7,2,1
+q	SELECT (SELECT min(s1.k) FROM q AS s1 WHERE s1.k = a1.k AND s1.n <> a1.n), sum(NOT EXISTS (SELECT 1 FROM w AS s2 WHERE s2.k = a1.k AND s2.n <> a0.k)) FROM w AS a0 FULL JOIN w AS a1 ON a1.k = a0.n JOIN w AS a2 ON a2.k = a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	1:2,1
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM o AS a0 JOIN w AS a1 ON a1.k = a0.n JOIN q AS a2 ON a2.k IS NULL WHERE (a1.n, a0.n) = (NULL, 1) AND a0.k = a2.k	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN w AS a1 ON a1.n > a0.n WHERE (a1.k, 1) BETWEEN (NULL, a0.k) AND (a0.n, 5) AND a1.k = a1.k	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 FULL JOIN p AS a1 ON a1.k = a0.k WHERE (a0.n, NULL) = (a0.n, a0.n) AND a1.k >= 3	0:
+q	SELECT EXISTS (SELECT 1 FROM q AS s1 WHERE 1), sum(a2.k NOT IN (SELECT s2.k FROM q AS s2 WHERE a1.k IS NOT NULL)) FROM w AS a0 LEFT JOIN q AS a1 ON NULL LEFT JOIN o AS a2 ON a2.n > a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	3:1,1;1,1;1,1
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM o AS a0 JOIN q AS a1 ON a1.n > a0.n RIGHT JOIN w AS a2 ON a2.n > a1.n WHERE (a1.n, a1.k, 10) NOT BETWEEN (NULL, a0.k, NULL) AND (NULL, 5, NULL) AND a2.k = a2.k	0:
+q	SELECT count(*) FROM p AS a0 FULL JOIN q AS a1 ON a1.k = a0.n FULL JOIN o AS a2 ON a2.k IS NULL GROUP BY (SELECT count(*) FROM q AS s1 WHERE 1)	1:10
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n, count(*) FROM q AS a0 FULL JOIN w AS a1 ON NULL FULL JOIN q AS a2 ON a2.k = a1.k GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n HAVING (a1.k NOT IN (SELECT s1.n FROM w AS s1 WHERE a1.k > 1))	7:2,5,NULL,NULL,NULL,NULL,1;2,9,NULL,NULL,NULL,NULL,1;3,1,NULL,NULL,NULL,NULL,1;NULL,2,NULL,NULL,NULL,NULL,1;NULL,NULL,1,4,NULL,NULL,1;NULL,NULL,NULL,NULL,3,1,1;NULL,NULL,NULL,NULL,NULL,2,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 LEFT JOIN q AS a1 ON a1.k = a0.k WHERE (a0.n, 5, a1.n) BETWEEN (NULL, NULL, a0.k) AND (a1.k, a0.k, NULL)	0:
+q	SELECT count(*), sum(a2.k IN (SELECT s2.k FROM q AS s2 WHERE 1)), count(*) FILTER (WHERE a1.n IN (SELECT s1.k FROM p AS s1 WHERE s1.k = a1.k)) FROM q AS a0 LEFT JOIN o AS a1 ON a1.k = a0.k FULL JOIN p AS a2 ON a2.k = a1.k	1:9,4,0
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 FULL JOIN q AS a1 ON a1.k = a0.k WHERE (a1.k, NULL, NULL) >= (5, a0.k, 2) AND a0.k >= 1	0:
+q	SELECT (SELECT sum(s1.n) FROM w AS s1 WHERE a0.k IS NOT NULL), count(*) FROM w AS a0 JOIN q AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	0:
+q	SELECT a1.k NOT IN (SELECT s1.k FROM q AS s1 WHERE 1), count(*) FROM q AS a0 LEFT JOIN q AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	7:0,1;0,1;0,1;0,1;0,1;NULL,1;NULL,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 JOIN p AS a1 ON a1.k = a0.n WHERE (a0.k, a1.n) < (a1.k, NULL)	1:1,4,4,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 RIGHT JOIN p AS a1 ON a1.n > a0.n WHERE (a1.k, a0.k, NULL) > (NULL, 10, a0.k) AND a0.k = a1.k	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN o AS a1 ON a1.k IS NULL WHERE (a1.k, NULL) NOT BETWEEN (NULL, 2) AND (a1.k, a0.n) AND a1.k = a1.k	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 FULL JOIN q AS a1 ON a1.n > a0.n WHERE (a0.n, a0.n) <> (a1.n, a1.k) AND a1.n = a1.k	0:
+q	SELECT count(*), sum((SELECT count(*) FROM q AS s2 WHERE s2.n < a0.n)), count(*) FILTER (WHERE EXISTS (SELECT 1 FROM p AS s1 WHERE s1.k IS a1.n)) FROM q AS a0 FULL JOIN q AS a1 ON a1.k IS NULL JOIN w AS a2 ON a2.k = a1.n	1:6,6,5
+q	SELECT count(*), (SELECT max(s1.n) FROM w AS s1 WHERE s1.k = a2.n AND s1.n <> a0.n) FROM q AS a0 JOIN o AS a1 ON a1.n > a0.n FULL JOIN o AS a2 ON a2.k = a1.n GROUP BY (SELECT max(s1.n) FROM w AS s1 WHERE s1.k = a2.n AND s1.n <> a0.n)	2:1,4;1,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM p AS a0 JOIN w AS a1 ON a1.n > a0.n JOIN o AS a2 ON a2.k IS NULL WHERE (a2.k, NULL, 1) < (a1.k, NULL, a1.k)	0:
+q	SELECT count(*) FROM p AS a0 FULL JOIN w AS a1 ON a1.n > a0.n GROUP BY a0.n NOT IN (SELECT s1.n FROM q AS s1 WHERE s1.k = a1.k AND s1.n <> a1.k)	2:1;6
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN q AS a1 ON a1.k = a0.k WHERE (a0.k, a0.k) < (a1.n, 10)	4:2,5,2,5;2,5,2,9;2,9,2,5;2,9,2,9
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM q AS a0 RIGHT JOIN p AS a1 ON NULL LEFT JOIN w AS a2 ON NULL WHERE (a0.k, a2.k) NOT BETWEEN (1, a0.k) AND (a1.n, a2.n) AND a1.n >= 3	0:
+q	SELECT NOT EXISTS (SELECT 1 FROM o AS s1 WHERE a0.n > 1), count(*) FROM q AS a0 LEFT JOIN w AS a1 ON a1.k IS NULL FULL JOIN q AS a2 ON a2.k = a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	8:0,1;0,1;0,1;1,1;1,1;1,1;1,1;1,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 RIGHT JOIN q AS a1 ON a1.k = a0.n WHERE (a1.k, a1.k, NULL) NOT BETWEEN (a0.k, 2, 1) AND (a1.k, a1.n, NULL)	1:NULL,NULL,3,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN w AS a1 ON NULL WHERE (a0.n, 1, a1.k) NOT BETWEEN (2, a0.k, a0.n) AND (NULL, NULL, 10)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM q AS a0 FULL JOIN p AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n HAVING NOT (NOT EXISTS (SELECT 1 FROM w AS s1 WHERE s1.k = a0.k AND s1.n <> a0.n))	2:2,5,2,7,1;2,9,NULL,NULL,1
+q	SELECT (SELECT min(s1.k) FROM w AS s1 WHERE s1.k IS a1.n), sum((SELECT sum(s2.n) FROM q AS s2 WHERE s2.k = a0.n AND s2.n <> a1.n)) FROM w AS a0 FULL JOIN p AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	8:1,NULL;5,NULL;NULL,NULL;NULL,NULL;NULL,NULL;NULL,NULL;NULL,NULL;NULL,NULL
+q	SELECT count(*), NOT EXISTS (SELECT 1 FROM w AS s1 WHERE s1.n < a2.k) FROM q AS a0 RIGHT JOIN w AS a1 ON a1.k = a0.k FULL JOIN p AS a2 ON a2.k = a1.n GROUP BY NOT EXISTS (SELECT 1 FROM w AS s1 WHERE s1.n < a2.k)	2:3,0;4,1
+q	SELECT count(*), sum((SELECT max(s2.n) FROM q AS s2 WHERE a0.k IS NULL)), count(*) FILTER (WHERE a1.k IN (SELECT s1.n FROM w AS s1 WHERE s1.k IS a1.n)) FROM q AS a0 RIGHT JOIN p AS a1 ON a1.k = a0.n	1:5,36,0
+q	SELECT (SELECT sum(s1.n) FROM p AS s1 WHERE s1.k = a1.n), sum(NOT EXISTS (SELECT 1 FROM o AS s2 WHERE s2.k IS a1.n)) FROM o AS a0 FULL JOIN o AS a1 ON a1.n > a0.n LEFT JOIN o AS a2 ON a2.k = a1.k GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	3:1,1;12,0;NULL,1
+q	SELECT (SELECT sum(s1.n) FROM w AS s1 WHERE s1.k = a1.k), sum(EXISTS (SELECT 1 FROM o AS s2 WHERE a1.k > 1)) FROM q AS a0 FULL JOIN q AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	7:1,1;1,1;1,1;1,1;NULL,0;NULL,0;NULL,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 JOIN q AS a1 ON a1.n > a0.n WHERE (a1.k, a0.k, a1.k) NOT BETWEEN (5, 5, NULL) AND (NULL, a1.k, NULL) AND a0.k >= 3	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM o AS a0 JOIN q AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n HAVING NOT (a0.k NOT IN (SELECT s1.k FROM q AS s1 WHERE a0.k > 1))	0:
+q	SELECT a1.k IN (SELECT s1.n FROM w AS s1 WHERE s1.k = a0.n AND s1.n <> a1.k), max(a1.k) FROM p AS a0 JOIN w AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	3:0,1;0,2;0,2
+q	SELECT (SELECT max(s1.n) FROM w AS s1 WHERE s1.k IS a0.k), count(*) FROM o AS a0 FULL JOIN p AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	8:1,1;1,1;1,1;NULL,1;NULL,1;NULL,1;NULL,1;NULL,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 JOIN p AS a1 ON a1.k = a0.k WHERE (a0.k, 1, 2) NOT BETWEEN (NULL, 10, NULL) AND (NULL, 1, a1.n) AND a0.k >= 3	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 LEFT JOIN q AS a1 ON a1.k IS NULL WHERE (a1.n, a0.k, 1) <> (a0.k, a0.k, a0.k)	3:1,4,NULL,2;2,1,NULL,2;5,NULL,NULL,2
+q	SELECT a0.k, a0.n FROM o AS a0 FULL JOIN w AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n ORDER BY EXISTS (SELECT 1 FROM p AS s1 WHERE a0.k IS NOT NULL), a0.k, a0.n, a1.k, a1.n LIMIT 2	2:NULL,NULL;NULL,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN p AS a1 ON a1.k IS NULL WHERE (a0.n, NULL, NULL) BETWEEN (5, NULL, a0.k) AND (a0.k, a0.k, a0.k) AND a0.k = a1.k	0:
+q	SELECT a0.k, a0.n FROM p AS a0 FULL JOIN w AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n ORDER BY a0.n NOT IN (SELECT s1.k FROM p AS s1 WHERE s1.n < a1.n), a0.k, a0.n, a1.k, a1.n LIMIT 2	2:NULL,NULL;NULL,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM q AS a0 JOIN q AS a1 ON a1.k = a0.n LEFT JOIN w AS a2 ON NULL WHERE (a2.k, a0.k, 1) NOT BETWEEN (a0.k, a0.k, NULL) AND (1, 2, a0.k)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 RIGHT JOIN q AS a1 ON a1.k = a0.n WHERE (a0.n, 2) BETWEEN (NULL, a0.k) AND (a1.k, 10)	0:
+q	SELECT NOT EXISTS (SELECT 1 FROM o AS s1 WHERE 1), max(a1.k) FROM p AS a0 LEFT JOIN p AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	5:0,1;0,NULL;0,NULL;0,NULL;0,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM p AS a0 LEFT JOIN w AS a1 ON a1.k IS NULL LEFT JOIN o AS a2 ON a2.k IS NULL WHERE (a0.k, NULL) BETWEEN (a1.k, a1.k) AND (a2.n, a2.k) AND a1.n = a1.n	0:
+q	SELECT (SELECT min(s1.k) FROM q AS s1 WHERE s1.n < a0.n), max(a0.n) FROM w AS a0 FULL JOIN w AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	5:3,4;NULL,1;NULL,NULL;NULL,NULL;NULL,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM q AS a0 JOIN p AS a1 ON a1.k IS NULL JOIN q AS a2 ON a2.k = a1.n WHERE (a0.k, NULL, NULL) NOT BETWEEN (a0.k, a0.k, a0.n) AND (a2.k, 5, NULL)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 JOIN w AS a1 ON a1.k = a0.k WHERE (a0.k, a1.k) <= (2, a0.n) AND a1.k >= 3	0:
+q	SELECT count(*), a1.k IN (SELECT s1.k FROM q AS s1 WHERE s1.k = a1.k AND s1.n <> a1.n) FROM w AS a0 RIGHT JOIN w AS a1 ON a1.k IS NULL GROUP BY a1.k IN (SELECT s1.k FROM q AS s1 WHERE s1.k = a1.k AND s1.n <> a1.n)	2:1,1;2,0
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM o AS a0 JOIN w AS a1 ON a1.n > a0.n JOIN w AS a2 ON a2.n > a1.n WHERE (a1.n, NULL) <> (a1.n, a2.k) AND a2.k >= 3	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 JOIN w AS a1 ON a1.k = a0.n WHERE (a0.k, a0.k, a1.n) BETWEEN (2, a0.n, a0.n) AND (NULL, a1.k, a1.k) AND a1.n >= 1	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 FULL JOIN p AS a1 ON a1.k = a0.n WHERE (a0.n, a0.k, NULL) <> (NULL, NULL, 5) AND a1.k >= 1	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n, count(*) FROM w AS a0 RIGHT JOIN o AS a1 ON NULL RIGHT JOIN o AS a2 ON a2.n > a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n HAVING (a0.k NOT IN (SELECT s1.n FROM q AS s1 WHERE 1))	0:
+q	SELECT a0.k, a0.n FROM o AS a0 LEFT JOIN q AS a1 ON a1.k IS NULL RIGHT JOIN w AS a2 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n ORDER BY a2.n NOT IN (SELECT s1.n FROM w AS s1 WHERE 1), a0.k, a0.n, a1.k, a1.n, a2.k, a2.n LIMIT 5	3:NULL,NULL;NULL,NULL;NULL,NULL
+q	SELECT count(*), (SELECT max(s1.n) FROM o AS s1 WHERE a1.k > 1) FROM w AS a0 RIGHT JOIN o AS a1 ON a1.n > a0.n GROUP BY (SELECT max(s1.n) FROM o AS s1 WHERE a1.k > 1)	1:2,2
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM w AS a0 FULL JOIN o AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n HAVING NOT ((SELECT count(*) FROM p AS s1 WHERE s1.k = a1.k))	3:1,4,NULL,NULL,1;2,1,9,2,1;5,NULL,NULL,NULL,1
+q	SELECT count(*) FROM o AS a0 FULL JOIN p AS a1 ON NULL GROUP BY a0.k NOT IN (SELECT s1.n FROM q AS s1 WHERE a0.k IS NULL)	2:2;5
+q	SELECT count(*) FROM p AS a0 JOIN p AS a1 ON a1.k = a0.n GROUP BY a1.k NOT IN (SELECT s1.k FROM q AS s1 WHERE s1.k = a1.k)	1:1
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM o AS a0 LEFT JOIN q AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n HAVING NOT (a1.n NOT IN (SELECT s1.k FROM p AS s1 WHERE s1.k = a0.n AND s1.n <> a1.n))	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n, count(*) FROM o AS a0 JOIN p AS a1 ON a1.n > a0.n FULL JOIN q AS a2 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n HAVING NOT (a0.k NOT IN (SELECT s1.k FROM w AS s1 WHERE s1.k IS a1.n))	0:
+q	SELECT count(*), EXISTS (SELECT 1 FROM p AS s1 WHERE s1.k = a1.n) FROM o AS a0 LEFT JOIN o AS a1 ON a1.k = a0.k GROUP BY EXISTS (SELECT 1 FROM p AS s1 WHERE s1.k = a1.n)	1:2,1
+q	SELECT EXISTS (SELECT 1 FROM q AS s1 WHERE 1), sum((SELECT max(s2.n) FROM q AS s2 WHERE s2.k IS a0.k)) FROM q AS a0 FULL JOIN q AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	7:1,1;1,2;1,2;1,2;1,2;1,9;1,9
+q	SELECT count(*), sum(a0.n NOT IN (SELECT s2.n FROM w AS s2 WHERE a1.k > 1)), count(*) FILTER (WHERE (SELECT count(*) FROM q AS s1 WHERE a0.k IS NOT NULL)) FROM p AS a0 RIGHT JOIN w AS a1 ON a1.n > a0.n	1:4,2,1
+q	SELECT count(*) FROM p AS a0 FULL JOIN p AS a1 ON a1.n > a0.n GROUP BY (SELECT max(s1.n) FROM o AS s1 WHERE s1.k = a1.k AND s1.n <> a0.k)	2:1;9
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 RIGHT JOIN p AS a1 ON a1.k = a0.k WHERE (a0.n, 10) = (NULL, a1.k) AND a1.k >= 3	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 JOIN o AS a1 ON a1.k = a0.k WHERE (a1.k, NULL) NOT BETWEEN (NULL, a0.n) AND (NULL, 2)	0:
+q	SELECT count(*), sum(a1.k IN (SELECT s2.n FROM o AS s2 WHERE s2.k = a0.k)), count(*) FILTER (WHERE (SELECT count(*) FROM q AS s1 WHERE a1.n IS NOT NULL)) FROM q AS a0 JOIN p AS a1 ON a1.n > a0.n	1:7,0,7
+q	SELECT count(*), a0.k NOT IN (SELECT s1.n FROM q AS s1 WHERE a2.k IS NOT NULL) FROM w AS a0 LEFT JOIN p AS a1 ON a1.n > a0.n RIGHT JOIN q AS a2 ON a2.k = a1.n GROUP BY a0.k NOT IN (SELECT s1.n FROM q AS s1 WHERE a2.k IS NOT NULL)	3:1,0;1,1;2,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 JOIN o AS a1 ON a1.n > a0.n WHERE (a0.k, NULL) BETWEEN (a1.n, 10) AND (a1.n, NULL)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM q AS a0 JOIN w AS a1 ON NULL JOIN q AS a2 ON a2.n > a1.n WHERE (a0.k, a0.n) BETWEEN (10, NULL) AND (2, a0.k) AND a2.n = a2.k	0:
+q	SELECT a0.k IN (SELECT s1.n FROM w AS s1 WHERE 1), max(a1.k) FROM w AS a0 LEFT JOIN o AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	3:1,NULL;NULL,9;NULL,NULL
+q	SELECT count(*), a1.k IN (SELECT s1.n FROM q AS s1 WHERE a0.n > 1) FROM o AS a0 FULL JOIN w AS a1 ON a1.k = a0.n GROUP BY a1.k IN (SELECT s1.n FROM q AS s1 WHERE a0.n > 1)	2:1,1;2,0
+q	SELECT a1.k IN (SELECT s1.k FROM q AS s1 WHERE s1.n < a1.k), count(*) FROM o AS a0 FULL JOIN q AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	6:0,1;0,1;0,1;0,1;0,1;1,1
+q	SELECT NOT EXISTS (SELECT 1 FROM o AS s1 WHERE a1.k IS NULL), count(*) FROM p AS a0 JOIN p AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	1:1,1
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM w AS a0 FULL JOIN w AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n HAVING (NOT EXISTS (SELECT 1 FROM q AS s1 WHERE s1.k = a1.n))	6:1,4,NULL,NULL,1;2,1,NULL,NULL,1;5,NULL,NULL,NULL,1;NULL,NULL,1,4,1;NULL,NULL,2,1,1;NULL,NULL,5,NULL,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 JOIN o AS a1 ON a1.n > a0.n WHERE (a0.n, a0.k, 5) < (a1.k, 1, a1.k) AND a1.n = a0.n	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM o AS a0 LEFT JOIN w AS a1 ON NULL JOIN p AS a2 ON a2.k = a1.n WHERE (a1.k, 5) BETWEEN (a1.n, a0.n) AND (NULL, a0.k)	0:
+q	SELECT NOT EXISTS (SELECT 1 FROM w AS s1 WHERE a1.k > 1), count(*) FROM o AS a0 RIGHT JOIN q AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	4:0,1;0,1;0,1;1,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN w AS a1 ON a1.k = a0.n WHERE (a1.n, 10) <> (NULL, a1.n)	1:1,1,1,4
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN o AS a1 ON NULL WHERE (a0.k, NULL) > (5, NULL) AND a0.n = a0.k	0:
+q	SELECT count(*), sum((SELECT max(s2.n) FROM o AS s2 WHERE s2.k IS a1.n)), count(*) FILTER (WHERE (SELECT count(*) FROM q AS s1 WHERE a0.k > 1)) FROM p AS a0 FULL JOIN w AS a1 ON a1.k = a0.n	1:6,NULL,3
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM q AS a0 RIGHT JOIN w AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n HAVING (a0.k IN (SELECT s1.n FROM w AS s1 WHERE 1))	0:
+q	SELECT count(*) FROM o AS a0 FULL JOIN p AS a1 ON a1.k = a0.k GROUP BY EXISTS (SELECT 1 FROM o AS s1 WHERE a0.k IS NOT NULL)	2:3;3
+q	SELECT a0.n NOT IN (SELECT s1.k FROM o AS s1 WHERE s1.k = a1.n), sum((SELECT max(s2.n) FROM q AS s2 WHERE s2.k = a1.k)) FROM o AS a0 FULL JOIN p AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	6:1,9;1,9;1,NULL;1,NULL;1,NULL;1,NULL
+q	SELECT (SELECT min(s1.k) FROM w AS s1 WHERE s1.n < a0.k), max(a0.k) FROM o AS a0 FULL JOIN w AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	3:1,9;2,2;NULL,NULL
+q	SELECT a0.n IN (SELECT s1.n FROM q AS s1 WHERE a0.k IS NOT NULL), max(a2.n) FROM p AS a0 FULL JOIN p AS a1 ON a1.n > a0.n FULL JOIN w AS a2 ON a2.k = a1.k GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	11:0,1;0,1;0,4;0,NULL;0,NULL;0,NULL;1,1;1,1;1,1;1,NULL;NULL,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 RIGHT JOIN q AS a1 ON a1.k = a0.n WHERE (a0.n, a1.n, a0.n) NOT BETWEEN (a1.k, 10, NULL) AND (1, NULL, 2)	1:NULL,3,3,1
+q	SELECT a0.k IN (SELECT s1.k FROM o AS s1 WHERE 1), sum(NOT EXISTS (SELECT 1 FROM p AS s2 WHERE a1.n IS NOT NULL)) FROM q AS a0 JOIN q AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	0:
+q	SELECT count(*) FROM p AS a0 FULL JOIN q AS a1 ON a1.k = a0.n GROUP BY NOT EXISTS (SELECT 1 FROM q AS s1 WHERE a1.k IS NULL)	2:3;5
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 LEFT JOIN o AS a1 ON a1.k = a0.k WHERE (a0.n, NULL, NULL) NOT BETWEEN (5, a0.k, NULL) AND (1, NULL, a1.k) AND a0.n = a1.k	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM p AS a0 RIGHT JOIN q AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n HAVING NOT ((SELECT count(*) FROM o AS s1 WHERE a0.k > 1))	4:NULL,NULL,2,5,1;NULL,NULL,2,9,1;NULL,NULL,3,1,1;NULL,NULL,NULL,2,1
+q	SELECT a1.n NOT IN (SELECT s1.n FROM p AS s1 WHERE s1.k IS a1.n), sum(EXISTS (SELECT 1 FROM q AS s2 WHERE 1)) FROM q AS a0 RIGHT JOIN p AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	7:0,1;1,1;1,1;1,1;1,1;1,1;NULL,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 RIGHT JOIN o AS a1 ON a1.n > a0.n WHERE (a1.n, NULL) BETWEEN (a1.k, NULL) AND (a1.k, 2) AND a1.k >= 1	0:
+q	SELECT a1.n IN (SELECT s1.k FROM w AS s1 WHERE 1), count(*) FROM q AS a0 FULL JOIN q AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	8:0,1;1,1;1,1;1,1;NULL,1;NULL,1;NULL,1;NULL,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 FULL JOIN o AS a1 ON a1.k IS NULL WHERE (a1.n, a0.k, 10) <= (NULL, a1.k, 2) AND a0.n = a0.n	0:
+q	SELECT count(*), sum(a0.n IN (SELECT s2.n FROM q AS s2 WHERE a1.k > 1)), count(*) FILTER (WHERE a0.k IN (SELECT s1.n FROM o AS s1 WHERE 1)) FROM q AS a0 FULL JOIN q AS a1 ON a1.k = a0.k FULL JOIN w AS a2 ON a2.k = a1.n	1:7,5,4
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n, count(*) FROM o AS a0 LEFT JOIN p AS a1 ON a1.k IS NULL FULL JOIN o AS a2 ON a2.n > a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n HAVING (a0.k NOT IN (SELECT s1.n FROM q AS s1 WHERE s1.k = a0.k))	4:2,1,NULL,3,NULL,NULL,1;9,2,NULL,3,NULL,NULL,1;NULL,NULL,NULL,NULL,2,1,1;NULL,NULL,NULL,NULL,9,2,1
+q	SELECT (SELECT sum(s1.n) FROM o AS s1 WHERE a1.k IS NULL), max(a2.n) FROM w AS a0 LEFT JOIN w AS a1 ON NULL JOIN q AS a2 ON a2.k = a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	0:
+q	SELECT count(*), sum(a1.k NOT IN (SELECT s2.k FROM w AS s2 WHERE a1.k > 1)), count(*) FILTER (WHERE a0.k NOT IN (SELECT s1.n FROM w AS s1 WHERE 1)) FROM w AS a0 JOIN o AS a1 ON a1.k IS NULL	1:0,NULL,0
+q	SELECT a0.k, a0.n FROM q AS a0 JOIN p AS a1 ON a1.k = a0.k FULL JOIN q AS a2 ON a2.n > a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n ORDER BY (SELECT count(*) FROM w AS s1 WHERE a2.n IS NULL), a0.k, a0.n, a1.k, a1.n, a2.k, a2.n LIMIT 5	5:2,5;2,5;NULL,NULL;NULL,NULL;NULL,NULL
+q	SELECT (SELECT count(*) FROM p AS s1 WHERE s1.k IS a0.k), count(*) FROM p AS a0 FULL JOIN q AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	9:1,1;1,1;1,1;1,1;1,1;2,1;2,1;2,1;2,1
+q	SELECT (SELECT min(s1.k) FROM o AS s1 WHERE s1.k = a0.k AND s1.n <> a2.k), count(*) FROM p AS a0 LEFT JOIN p AS a1 ON a1.k = a0.k RIGHT JOIN q AS a2 ON a2.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	10:NULL,1;NULL,1;NULL,1;NULL,1;NULL,1;NULL,1;NULL,1;NULL,1;NULL,1;NULL,1
+q	SELECT a1.k NOT IN (SELECT s1.k FROM p AS s1 WHERE s1.k = a1.n AND s1.n <> a0.k), count(*) FROM w AS a0 RIGHT JOIN w AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	3:1,1;1,1;1,1
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n, count(*) FROM q AS a0 LEFT JOIN o AS a1 ON a1.n > a0.n FULL JOIN o AS a2 ON a2.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n HAVING NOT (EXISTS (SELECT 1 FROM o AS s1 WHERE a2.k > 1))	4:2,5,NULL,NULL,NULL,NULL,1;2,9,NULL,NULL,NULL,NULL,1;3,1,9,2,NULL,NULL,1;NULL,2,NULL,NULL,NULL,NULL,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN p AS a1 ON a1.k = a0.k WHERE (a0.k, a0.k, a0.n) < (5, 1, 10) AND a1.n = a1.k	1:1,1,1,1
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n, count(*) FROM o AS a0 RIGHT JOIN p AS a1 ON a1.n > a0.n FULL JOIN o AS a2 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n HAVING (NOT EXISTS (SELECT 1 FROM q AS s1 WHERE a2.k IS NULL))	2:NULL,NULL,NULL,NULL,2,1,1;NULL,NULL,NULL,NULL,9,2,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 RIGHT JOIN p AS a1 ON a1.k = a0.k WHERE (a1.n, 10) NOT BETWEEN (5, NULL) AND (a1.n, a0.k) AND a1.k = a0.k	3:1,4,1,1;2,1,2,5;2,1,2,7
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 JOIN w AS a1 ON a1.k IS NULL WHERE (a0.n, NULL, 5) <> (10, a0.k, a1.k)	0:
+q	SELECT count(*), sum((SELECT count(*) FROM p AS s2 WHERE a0.n IS NOT NULL)), count(*) FILTER (WHERE (SELECT min(s1.k) FROM p AS s1 WHERE s1.k IS a0.k)) FROM p AS a0 RIGHT JOIN o AS a1 ON NULL JOIN q AS a2 ON NULL	1:0,NULL,0
+q	SELECT count(*) FROM p AS a0 RIGHT JOIN p AS a1 ON a1.k = a0.n GROUP BY (SELECT sum(s1.n) FROM q AS s1 WHERE a1.k IS NOT NULL)	2:1;4
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 LEFT JOIN w AS a1 ON a1.n > a0.n WHERE (a1.k, NULL) >= (5, 2) AND a0.k >= 3	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 FULL JOIN w AS a1 ON NULL WHERE (a0.n, 5) NOT BETWEEN (a0.k, NULL) AND (NULL, NULL) AND a0.k >= 3	0:
+q	SELECT count(*), sum(a1.n IN (SELECT s2.n FROM w AS s2 WHERE s2.k = a0.n)), count(*) FILTER (WHERE EXISTS (SELECT 1 FROM p AS s1 WHERE a1.n IS NULL)) FROM p AS a0 FULL JOIN q AS a1 ON a1.k = a0.n	1:8,0,4
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM o AS a0 JOIN q AS a1 ON a1.k = a0.n RIGHT JOIN q AS a2 ON a2.n > a1.n WHERE (a2.k, NULL) <> (5, 2)	3:9,2,2,5,2,9;NULL,NULL,NULL,NULL,2,5;NULL,NULL,NULL,NULL,3,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 JOIN o AS a1 ON a1.k IS NULL WHERE (a1.n, a1.k, a1.k) BETWEEN (a1.k, a0.k, 1) AND (a1.n, a1.k, a0.k)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM o AS a0 JOIN w AS a1 ON NULL RIGHT JOIN w AS a2 ON NULL WHERE (a1.k, NULL) = (a2.k, a2.k)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 FULL JOIN o AS a1 ON a1.k = a0.n WHERE (a0.k, 1, 2) < (a1.k, NULL, NULL)	1:2,9,9,2
+q	SELECT (SELECT min(s1.k) FROM q AS s1 WHERE s1.k IS a1.k), max(a0.k) FROM q AS a0 FULL JOIN p AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	9:2,NULL;2,NULL;NULL,2;NULL,2;NULL,3;NULL,NULL;NULL,NULL;NULL,NULL;NULL,NULL
+q	SELECT a0.k IN (SELECT s1.n FROM o AS s1 WHERE a1.k IS NULL), sum(a1.k IN (SELECT s2.n FROM w AS s2 WHERE s2.k = a2.k)) FROM q AS a0 FULL JOIN o AS a1 ON a1.k IS NULL RIGHT JOIN q AS a2 ON a2.n > a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	6:0,0;0,0;0,0;0,0;0,0;NULL,0
+q	SELECT a0.k, a0.n FROM w AS a0 JOIN q AS a1 ON a1.k = a0.n JOIN q AS a2 ON a2.n > a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n ORDER BY a1.k NOT IN (SELECT s1.k FROM o AS s1 WHERE s1.k = a1.k), a0.k, a0.n, a1.k, a1.n, a2.k, a2.n LIMIT 5	0:
+q	SELECT a1.n NOT IN (SELECT s1.n FROM p AS s1 WHERE s1.k = a0.n), sum(a1.n IN (SELECT s2.n FROM p AS s2 WHERE s2.k IS a0.n)) FROM o AS a0 RIGHT JOIN q AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	6:0,1;1,0;1,0;1,0;1,0;1,0
+q	SELECT count(*) FROM p AS a0 JOIN o AS a1 ON NULL GROUP BY NOT EXISTS (SELECT 1 FROM p AS s1 WHERE 1)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN p AS a1 ON a1.n > a0.n WHERE (a1.k, a1.k) >= (a0.n, a1.k)	2:1,1,2,5;1,1,2,7
+q	SELECT count(*) FROM w AS a0 FULL JOIN o AS a1 ON a1.n > a0.n FULL JOIN q AS a2 ON a2.k = a1.n GROUP BY EXISTS (SELECT 1 FROM q AS s1 WHERE s1.n < a1.k)	2:3;4
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 LEFT JOIN w AS a1 ON a1.k = a0.k WHERE (a1.k, NULL, NULL) NOT BETWEEN (a0.k, a1.n, 5) AND (NULL, NULL, a0.n)	0:
+q	SELECT EXISTS (SELECT 1 FROM w AS s1 WHERE s1.k = a0.k), sum(a1.n IN (SELECT s2.n FROM q AS s2 WHERE 1)) FROM q AS a0 LEFT JOIN p AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	5:0,0;0,1;0,1;1,NULL;1,NULL
+q	SELECT count(*) FROM w AS a0 FULL JOIN q AS a1 ON a1.k = a0.n GROUP BY (SELECT sum(s1.n) FROM q AS s1 WHERE s1.n < a1.n)	4:1;1;1;4
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM w AS a0 FULL JOIN p AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n HAVING NOT ((SELECT max(s1.n) FROM q AS s1 WHERE a0.k > 1))	0:
+q	SELECT (SELECT sum(s1.n) FROM o AS s1 WHERE 1), max(a1.k) FROM p AS a0 LEFT JOIN q AS a1 ON a1.k IS NULL FULL JOIN q AS a2 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	9:3,NULL;3,NULL;3,NULL;3,NULL;3,NULL;3,NULL;3,NULL;3,NULL;3,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 JOIN o AS a1 ON a1.k = a0.k WHERE (a0.n, NULL, a1.k) NOT BETWEEN (10, a0.n, a0.k) AND (2, 1, a0.k)	2:2,1,2,1;9,2,9,2
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM w AS a0 JOIN o AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n HAVING NOT ((SELECT count(*) FROM o AS s1 WHERE s1.k = a1.k AND s1.n <> a0.n))	1:2,1,2,1,1
+q	SELECT NOT EXISTS (SELECT 1 FROM p AS s1 WHERE s1.k = a0.k), max(a1.k) FROM q AS a0 RIGHT JOIN w AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	3:1,1;1,2;1,5
+q	SELECT (SELECT count(*) FROM q AS s1 WHERE s1.n < a1.k), count(*) FROM w AS a0 FULL JOIN q AS a1 ON a1.k IS NULL RIGHT JOIN o AS a2 ON a2.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	2:0,1;0,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 RIGHT JOIN p AS a1 ON a1.k IS NULL WHERE (a0.k, NULL) < (2, a0.k)	1:1,1,NULL,3
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM w AS a0 RIGHT JOIN o AS a1 ON a1.k IS NULL JOIN w AS a2 ON a2.k = a1.k WHERE (a1.k, NULL, 1) < (a1.k, NULL, 2) AND a0.k = a0.n	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM o AS a0 RIGHT JOIN p AS a1 ON a1.k = a0.k JOIN q AS a2 ON a2.k IS NULL WHERE (a1.n, a2.k) BETWEEN (a1.k, a0.n) AND (a1.n, a0.k) AND a0.k = a1.k	0:
+q	SELECT count(*) FROM o AS a0 LEFT JOIN q AS a1 ON a1.n > a0.n GROUP BY a1.n IN (SELECT s1.n FROM p AS s1 WHERE 1)	2:2;3
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 JOIN w AS a1 ON a1.n > a0.n WHERE (a1.k, NULL) NOT BETWEEN (1, NULL) AND (2, NULL) AND a1.n >= 3	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 JOIN w AS a1 ON a1.k = a0.n WHERE (a1.k, a1.k) <> (a1.n, a1.k) AND a1.k = a1.k	1:2,1,1,4
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM p AS a0 LEFT JOIN o AS a1 ON a1.k IS NULL LEFT JOIN o AS a2 ON a2.n > a1.n WHERE (a0.n, NULL) NOT BETWEEN (a2.k, NULL) AND (a2.k, a2.n)	0:
+q	SELECT a0.k, a0.n FROM w AS a0 FULL JOIN p AS a1 ON a1.k = a0.n RIGHT JOIN o AS a2 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n ORDER BY (SELECT sum(s1.n) FROM p AS s1 WHERE s1.k = a1.n), a0.k, a0.n, a1.k, a1.n, a2.k, a2.n LIMIT 2	2:NULL,NULL;NULL,NULL
+q	SELECT a1.k IN (SELECT s1.k FROM w AS s1 WHERE a0.k IS NULL), max(a0.k) FROM q AS a0 FULL JOIN o AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n	6:0,2;0,2;0,3;0,NULL;1,NULL;NULL,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM q AS a0 RIGHT JOIN p AS a1 ON a1.k IS NULL FULL JOIN p AS a2 ON NULL WHERE (a2.k, a0.n, 1) BETWEEN (2, a0.k, NULL) AND (5, a2.n, 2) AND a0.n >= 3	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM o AS a0 JOIN p AS a1 ON a1.n > a0.n LEFT JOIN q AS a2 ON NULL WHERE (a0.k, a0.n, a2.n) >= (a1.n, a2.n, a1.k)	3:9,2,2,5,NULL,NULL;9,2,2,7,NULL,NULL;9,2,NULL,3,NULL,NULL
+q	SELECT a1.n NOT IN (SELECT s1.n FROM q AS s1 WHERE s1.n < a0.k), max(a1.k) FROM q AS a0 FULL JOIN q AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	8:1,2;1,2;1,3;1,NULL;1,NULL;NULL,NULL;NULL,NULL;NULL,NULL
+q	SELECT a1.n NOT IN (SELECT s1.n FROM q AS s1 WHERE s1.n < a0.k), sum(a1.n NOT IN (SELECT s2.n FROM q AS s2 WHERE s2.k = a1.n)) FROM w AS a0 FULL JOIN q AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	7:1,1;1,1;1,1;1,1;1,1;NULL,1;NULL,1
+q	SELECT count(*) FROM o AS a0 LEFT JOIN o AS a1 ON a1.k IS NULL RIGHT JOIN w AS a2 ON NULL GROUP BY a0.n IN (SELECT s1.k FROM p AS s1 WHERE s1.k = a0.n)	1:3
+q	SELECT count(*), a1.k NOT IN (SELECT s1.k FROM p AS s1 WHERE s1.k = a1.n AND s1.n <> a1.k) FROM o AS a0 LEFT JOIN o AS a1 ON a1.k IS NULL GROUP BY a1.k NOT IN (SELECT s1.k FROM p AS s1 WHERE s1.k = a1.n AND s1.n <> a1.k)	1:2,1
+q	SELECT count(*) FROM w AS a0 FULL JOIN o AS a1 ON a1.k = a0.k GROUP BY a1.k NOT IN (SELECT s1.n FROM o AS s1 WHERE a1.k > 1)	2:1;3
+q	SELECT a2.n NOT IN (SELECT s1.k FROM o AS s1 WHERE a2.k IS NOT NULL), max(a1.k) FROM w AS a0 RIGHT JOIN q AS a1 ON a1.k = a0.k JOIN q AS a2 ON a2.k = a1.k GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	5:0,2;0,2;1,2;1,2;1,3
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM o AS a0 LEFT JOIN w AS a1 ON a1.k = a0.k FULL JOIN o AS a2 ON a2.k = a1.k WHERE (a0.k, a0.k) <= (NULL, a2.k) AND a2.n >= 1	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN q AS a1 ON NULL WHERE (a0.k, 2) BETWEEN (2, a0.n) AND (1, NULL)	0:
+q	SELECT NOT EXISTS (SELECT 1 FROM p AS s1 WHERE s1.k = a1.k), sum(a1.n IN (SELECT s2.k FROM o AS s2 WHERE s2.k = a0.n)) FROM w AS a0 JOIN q AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	2:0,0;0,0
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 FULL JOIN p AS a1 ON a1.n > a0.n WHERE (a1.k, NULL) BETWEEN (a0.k, NULL) AND (a0.k, 1)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n, count(*) FROM q AS a0 FULL JOIN q AS a1 ON NULL RIGHT JOIN q AS a2 ON a2.n > a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n HAVING (a2.k IN (SELECT s1.k FROM p AS s1 WHERE a1.n IS NOT NULL))	5:NULL,NULL,2,5,2,9,1;NULL,NULL,3,1,2,5,1;NULL,NULL,3,1,2,9,1;NULL,NULL,NULL,2,2,5,1;NULL,NULL,NULL,2,2,9,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 JOIN o AS a1 ON a1.n > a0.n WHERE (a1.k, a1.n, NULL) BETWEEN (a0.n, 2, a0.n) AND (2, a1.k, NULL)	0:
+q	SELECT a1.n NOT IN (SELECT s1.n FROM p AS s1 WHERE s1.k = a1.k AND s1.n <> a1.n), sum((SELECT min(s2.k) FROM q AS s2 WHERE a1.n > 1)) FROM w AS a0 LEFT JOIN q AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	3:1,NULL;1,NULL;1,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN q AS a1 ON a1.k = a0.k WHERE (a0.n, a1.n, 5) NOT BETWEEN (2, 2, a1.k) AND (a1.k, a1.n, 5) AND a1.k = a1.k	4:2,5,2,5;2,5,2,9;2,7,2,5;2,7,2,9
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 RIGHT JOIN p AS a1 ON a1.n > a0.n WHERE (a1.k, NULL, 1) > (a0.k, a1.k, a1.n) AND a1.k >= 3	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 JOIN p AS a1 ON a1.k IS NULL WHERE (a1.k, a1.n, NULL) BETWEEN (a0.k, 2, 2) AND (a0.n, a1.k, NULL) AND a0.k = a1.k	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 JOIN q AS a1 ON a1.k IS NULL WHERE (a0.n, 5) <> (a1.n, NULL) AND a1.k = a0.k	0:
+q	SELECT a1.k NOT IN (SELECT s1.k FROM q AS s1 WHERE s1.k = a1.k AND s1.n <> a0.k), max(a0.n) FROM q AS a0 FULL JOIN w AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	4:1,1;1,2;1,5;1,9
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM o AS a0 JOIN q AS a1 ON NULL FULL JOIN o AS a2 ON NULL WHERE (a1.k, 10) < (a0.n, a0.k) AND a0.n = a1.k	0:
+q	SELECT count(*), a0.k NOT IN (SELECT s1.k FROM o AS s1 WHERE a1.k > 1) FROM q AS a0 FULL JOIN q AS a1 ON a1.k = a0.n GROUP BY a0.k NOT IN (SELECT s1.k FROM o AS s1 WHERE a1.k > 1)	2:3,NULL;4,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 JOIN p AS a1 ON a1.k IS NULL WHERE (a1.k, 10) BETWEEN (NULL, a0.k) AND (a0.n, a1.n)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN q AS a1 ON a1.k IS NULL WHERE (a1.n, a0.k, 10) < (a0.k, a1.n, 5)	1:3,1,NULL,2
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN o AS a1 ON a1.n > a0.n WHERE (a0.n, a0.k) > (NULL, a1.k) AND a0.k = a1.n	0:
+q	SELECT (SELECT sum(s1.n) FROM w AS s1 WHERE a0.k IS NOT NULL), sum(a0.k IN (SELECT s2.n FROM w AS s2 WHERE a1.k IS NOT NULL)) FROM w AS a0 RIGHT JOIN p AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	5:NULL,0;NULL,NULL;NULL,NULL;NULL,NULL;NULL,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 JOIN o AS a1 ON a1.k = a0.k WHERE (a0.n, NULL, a1.k) BETWEEN (NULL, 2, NULL) AND (a1.k, a0.k, 1) AND a0.n >= 3	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM p AS a0 FULL JOIN w AS a1 ON a1.k = a0.k FULL JOIN q AS a2 ON a2.k IS NULL WHERE (a1.k, a0.k) = (NULL, 10)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM q AS a0 RIGHT JOIN p AS a1 ON a1.n > a0.n JOIN p AS a2 ON a2.k IS NULL WHERE (a1.k, NULL) <> (a2.k, 2) AND a1.k >= 1	0:
+q	SELECT (SELECT sum(s1.n) FROM w AS s1 WHERE s1.k = a1.k), max(a1.k) FROM w AS a0 JOIN w AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM w AS a0 FULL JOIN w AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n HAVING ((SELECT max(s1.n) FROM q AS s1 WHERE a0.k > 1))	2:2,1,NULL,NULL,1;5,NULL,NULL,NULL,1
+q	SELECT count(*), sum((SELECT sum(s2.n) FROM w AS s2 WHERE s2.k IS a2.k)), count(*) FILTER (WHERE a2.k IN (SELECT s1.n FROM q AS s1 WHERE a2.k IS NULL)) FROM q AS a0 FULL JOIN p AS a1 ON NULL FULL JOIN p AS a2 ON a2.k = a1.n	1:13,6,0
+q	SELECT (SELECT min(s1.k) FROM w AS s1 WHERE a1.k IS NOT NULL), count(*) FROM q AS a0 LEFT JOIN w AS a1 ON NULL RIGHT JOIN q AS a2 ON a2.n > a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	4:NULL,1;NULL,1;NULL,1;NULL,1
+q	SELECT count(*), NOT EXISTS (SELECT 1 FROM o AS s1 WHERE s1.n < a0.k) FROM p AS a0 FULL JOIN q AS a1 ON a1.k = a0.k GROUP BY NOT EXISTS (SELECT 1 FROM o AS s1 WHERE s1.n < a0.k)	2:4,1;5,0
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 FULL JOIN q AS a1 ON a1.n > a0.n WHERE (a1.k, a1.k, a0.n) <> (NULL, NULL, a0.n)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 RIGHT JOIN p AS a1 ON a1.k IS NULL WHERE (a1.k, a1.n) >= (a0.n, 5)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN p AS a1 ON NULL WHERE (a1.k, a1.k) NOT BETWEEN (a0.n, NULL) AND (a1.k, a0.k) AND a0.n >= 3	0:
+q	SELECT a1.n NOT IN (SELECT s1.n FROM w AS s1 WHERE s1.k = a0.k), count(*) FROM o AS a0 LEFT JOIN o AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	2:1,1;NULL,1
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM w AS a0 FULL JOIN q AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n HAVING NOT (EXISTS (SELECT 1 FROM w AS s1 WHERE a1.n > 1))	2:5,NULL,NULL,NULL,1;NULL,NULL,3,1,1
+q	SELECT EXISTS (SELECT 1 FROM o AS s1 WHERE s1.k IS a0.k), max(a2.k) FROM p AS a0 RIGHT JOIN p AS a1 ON a1.k = a0.k LEFT JOIN q AS a2 ON a2.n > a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	10:0,2;0,2;0,2;0,2;0,NULL;0,NULL;1,2;1,2;1,2;1,2
+q	SELECT count(*), EXISTS (SELECT 1 FROM p AS s1 WHERE s1.k IS a1.k) FROM w AS a0 LEFT JOIN w AS a1 ON a1.k IS NULL GROUP BY EXISTS (SELECT 1 FROM p AS s1 WHERE s1.k IS a1.k)	1:3,1
+q	SELECT count(*), sum(a0.k IN (SELECT s2.k FROM w AS s2 WHERE s2.k = a1.k)), count(*) FILTER (WHERE (SELECT sum(s1.n) FROM w AS s1 WHERE s1.k = a1.k)) FROM o AS a0 LEFT JOIN q AS a1 ON a1.k = a0.n	1:3,0,2
+q	SELECT a1.k NOT IN (SELECT s1.n FROM o AS s1 WHERE a0.n IS NOT NULL), count(*) FROM q AS a0 LEFT JOIN p AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	8:0,1;0,1;0,1;0,1;0,1;NULL,1;NULL,1;NULL,1
+q	SELECT count(*), sum(a1.k NOT IN (SELECT s2.n FROM q AS s2 WHERE a1.k IS NOT NULL)), count(*) FILTER (WHERE a0.n IN (SELECT s1.k FROM o AS s1 WHERE s1.k = a1.k AND s1.n <> a0.k)) FROM w AS a0 JOIN o AS a1 ON a1.n > a0.n	1:1,0,0
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 FULL JOIN o AS a1 ON a1.k = a0.n WHERE (a1.k, a0.k) > (NULL, a0.k)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM q AS a0 LEFT JOIN w AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n HAVING NOT ((SELECT count(*) FROM w AS s1 WHERE a0.k IS NULL))	3:2,5,NULL,NULL,1;2,9,NULL,NULL,1;3,1,NULL,NULL,1
+q	SELECT a1.k NOT IN (SELECT s1.k FROM w AS s1 WHERE s1.k = a1.k), max(a1.k) FROM w AS a0 LEFT JOIN q AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	6:0,2;0,2;0,2;0,2;1,NULL;1,NULL
+q	SELECT count(*), EXISTS (SELECT 1 FROM p AS s1 WHERE s1.k = a0.k) FROM q AS a0 FULL JOIN o AS a1 ON a1.k = a0.k GROUP BY EXISTS (SELECT 1 FROM p AS s1 WHERE s1.k = a0.k)	2:2,1;3,0
+q	SELECT count(*), sum((SELECT min(s2.k) FROM o AS s2 WHERE s2.k = a0.k)), count(*) FILTER (WHERE a0.k NOT IN (SELECT s1.k FROM q AS s1 WHERE a1.n IS NOT NULL)) FROM o AS a0 JOIN w AS a1 ON a1.k = a0.n	1:2,11,0
+q	SELECT (SELECT min(s1.k) FROM o AS s1 WHERE a0.k > 1), sum(a1.k NOT IN (SELECT s2.k FROM p AS s2 WHERE s2.k IS a0.n)) FROM q AS a0 JOIN w AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	0:
+q	SELECT count(*), (SELECT min(s1.k) FROM p AS s1 WHERE s1.k = a0.n AND s1.n <> a1.k) FROM q AS a0 LEFT JOIN p AS a1 ON a1.n > a0.n GROUP BY (SELECT min(s1.k) FROM p AS s1 WHERE s1.k = a0.n AND s1.n <> a1.k)	3:2,1;2,2;4,NULL
+q	SELECT a1.k NOT IN (SELECT s1.k FROM w AS s1 WHERE a0.n IS NULL), max(a2.k) FROM o AS a0 JOIN o AS a1 ON a1.k = a0.n FULL JOIN w AS a2 ON a2.k = a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	3:1,1;NULL,2;NULL,5
+q	SELECT a1.n IN (SELECT s1.n FROM q AS s1 WHERE s1.n < a0.n), count(*) FROM p AS a0 FULL JOIN q AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n	8:0,1;0,1;0,1;0,1;0,1;1,1;1,1;1,1
+q	SELECT a1.k IN (SELECT s1.k FROM q AS s1 WHERE a1.k > 1), count(*) FROM q AS a0 RIGHT JOIN o AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	2:1,1;NULL,1
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM o AS a0 JOIN o AS a1 ON a1.k IS NULL JOIN o AS a2 ON NULL WHERE (a2.n, 5, a1.n) BETWEEN (5, 5, 1) AND (a0.k, a2.n, a1.n) AND a0.k = a0.k	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 LEFT JOIN o AS a1 ON a1.k = a0.k WHERE (a0.k, NULL) <> (a1.k, a1.k) AND a1.k >= 3	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM o AS a0 LEFT JOIN w AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n HAVING ((SELECT min(s1.k) FROM w AS s1 WHERE s1.k IS a1.k))	0:
+q	SELECT a0.k IN (SELECT s1.k FROM q AS s1 WHERE s1.k = a0.k), max(a0.n) FROM q AS a0 LEFT JOIN p AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	4:0,2;1,1;1,5;1,9
+q	SELECT a0.n NOT IN (SELECT s1.n FROM q AS s1 WHERE 1), max(a1.k) FROM q AS a0 FULL JOIN p AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	10:0,2;0,2;0,2;0,2;0,2;0,NULL;0,NULL;0,NULL;NULL,1;NULL,4
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM w AS a0 LEFT JOIN p AS a1 ON a1.n > a0.n RIGHT JOIN o AS a2 ON NULL WHERE (a0.k, NULL) NOT BETWEEN (NULL, a1.n) AND (a1.k, a1.k) AND a0.k >= 1	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 JOIN p AS a1 ON a1.k = a0.n WHERE (a1.k, a1.n) NOT BETWEEN (a0.k, a0.k) AND (a0.n, 1) AND a1.k >= 3	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 FULL JOIN p AS a1 ON a1.k = a0.n WHERE (a0.k, NULL) BETWEEN (NULL, 10) AND (1, a0.k)	0:
+q	SELECT a0.k IN (SELECT s1.k FROM q AS s1 WHERE 1), count(*) FROM w AS a0 RIGHT JOIN p AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	5:1,1;NULL,1;NULL,1;NULL,1;NULL,1
+q	SELECT a0.k NOT IN (SELECT s1.k FROM q AS s1 WHERE a0.k > 1), sum(NOT EXISTS (SELECT 1 FROM o AS s2 WHERE s2.k IS a1.k)) FROM q AS a0 FULL JOIN q AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n	7:0,1;0,1;0,1;1,0;1,0;1,1;1,1
+q	SELECT count(*) FROM p AS a0 FULL JOIN q AS a1 ON NULL RIGHT JOIN w AS a2 ON NULL GROUP BY EXISTS (SELECT 1 FROM w AS s1 WHERE 1)	1:3
+q	SELECT count(*), sum(a0.k NOT IN (SELECT s2.n FROM p AS s2 WHERE s2.k = a1.n AND s2.n <> a0.k)), count(*) FILTER (WHERE a0.k IN (SELECT s1.n FROM o AS s1 WHERE 1)) FROM w AS a0 JOIN o AS a1 ON a1.k = a0.n	1:0,NULL,0
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN w AS a1 ON a1.k = a0.k WHERE (a1.k, 2, NULL) >= (a0.k, a0.k, a0.k) AND a0.k >= 3	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM p AS a0 JOIN p AS a1 ON a1.n > a0.n RIGHT JOIN o AS a2 ON a2.n > a1.n WHERE (a2.k, a1.k) >= (a2.n, 1)	2:NULL,NULL,NULL,NULL,2,1;NULL,NULL,NULL,NULL,9,2
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 JOIN q AS a1 ON a1.n > a0.n WHERE (a1.k, NULL) BETWEEN (2, NULL) AND (10, NULL) AND a0.k = a1.n	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 JOIN p AS a1 ON NULL WHERE (a1.k, a1.n) BETWEEN (NULL, a0.k) AND (a0.n, NULL) AND a1.n >= 3	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 LEFT JOIN w AS a1 ON a1.k = a0.n WHERE (a1.k, NULL) BETWEEN (NULL, NULL) AND (NULL, NULL)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 LEFT JOIN p AS a1 ON a1.k = a0.k WHERE (a0.n, NULL) <= (a0.n, a1.k)	0:
+q	SELECT (SELECT min(s1.k) FROM o AS s1 WHERE a1.k IS NULL), count(*) FROM p AS a0 LEFT JOIN w AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	5:2,1;2,1;2,1;NULL,1;NULL,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN p AS a1 ON a1.k = a0.k WHERE (a1.k, NULL) BETWEEN (10, NULL) AND (a1.n, NULL)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN w AS a1 ON a1.k IS NULL WHERE (a1.k, a0.k) >= (a1.k, a1.k)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM w AS a0 JOIN o AS a1 ON a1.k IS NULL JOIN q AS a2 ON a2.n > a1.n WHERE (a1.n, a1.k) NOT BETWEEN (2, a2.k) AND (NULL, a2.k) AND a1.n >= 1	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN o AS a1 ON a1.n > a0.n WHERE (a1.n, NULL) NOT BETWEEN (NULL, 2) AND (5, a0.n)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM o AS a0 JOIN q AS a1 ON a1.k IS NULL FULL JOIN p AS a2 ON a2.n > a1.n WHERE (a0.k, NULL) BETWEEN (a0.k, NULL) AND (NULL, 10)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM q AS a0 FULL JOIN p AS a1 ON a1.k = a0.n FULL JOIN q AS a2 ON NULL WHERE (a0.k, 5, NULL) <> (1, a2.n, 1) AND a2.n >= 3	1:NULL,NULL,NULL,NULL,2,9
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN q AS a1 ON a1.k = a0.n WHERE (a1.k, 1, 1) >= (a1.k, a0.k, NULL)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 JOIN o AS a1 ON a1.k IS NULL WHERE (a0.k, 5, a1.n) BETWEEN (5, NULL, a0.k) AND (1, a1.n, a0.k)	0:
+q	SELECT count(*), sum((SELECT min(s2.k) FROM q AS s2 WHERE s2.k = a1.k AND s2.n <> a1.k)), count(*) FILTER (WHERE a0.n NOT IN (SELECT s1.k FROM q AS s1 WHERE s1.k IS a0.k)) FROM q AS a0 LEFT JOIN p AS a1 ON a1.n > a0.n	1:8,10,5
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM q AS a0 RIGHT JOIN o AS a1 ON NULL JOIN q AS a2 ON NULL WHERE (a0.k, 2) <= (2, a2.n)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM o AS a0 JOIN w AS a1 ON NULL FULL JOIN p AS a2 ON a2.k = a1.n WHERE (a1.n, NULL) BETWEEN (NULL, a0.k) AND (NULL, a1.k)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 LEFT JOIN p AS a1 ON a1.n > a0.n WHERE (a0.n, NULL) > (a1.k, NULL) AND a1.k = a0.k	0:
+q	SELECT count(*), sum((SELECT min(s2.k) FROM p AS s2 WHERE a1.k IS NULL)), count(*) FILTER (WHERE (SELECT sum(s1.n) FROM q AS s1 WHERE s1.n < a1.k)) FROM o AS a0 RIGHT JOIN o AS a1 ON NULL RIGHT JOIN o AS a2 ON a2.k = a1.n	1:2,1,1
+q	SELECT count(*) FROM q AS a0 FULL JOIN p AS a1 ON NULL GROUP BY a0.n IN (SELECT s1.k FROM w AS s1 WHERE a1.k IS NOT NULL)	2:4;5
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 JOIN o AS a1 ON a1.n > a0.n WHERE (a0.k, 5) BETWEEN (a0.k, a0.n) AND (NULL, a0.k) AND a0.k >= 1	0:
+q	SELECT count(*), a1.n IN (SELECT s1.n FROM o AS s1 WHERE s1.k = a0.k AND s1.n <> a0.k) FROM o AS a0 RIGHT JOIN p AS a1 ON a1.k IS NULL GROUP BY a1.n IN (SELECT s1.n FROM o AS s1 WHERE s1.k = a0.k AND s1.n <> a0.k)	1:6,0
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n, count(*) FROM q AS a0 FULL JOIN q AS a1 ON a1.k = a0.k FULL JOIN q AS a2 ON a2.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n HAVING (NOT EXISTS (SELECT 1 FROM o AS s1 WHERE s1.k = a0.k AND s1.n <> a2.k))	10:2,5,2,5,NULL,2,1;2,5,2,9,NULL,2,1;2,9,2,5,NULL,2,1;2,9,2,9,NULL,2,1;3,1,3,1,NULL,2,1;NULL,2,NULL,NULL,NULL,2,1;NULL,NULL,NULL,2,NULL,2,1;NULL,NULL,NULL,NULL,2,5,1;NULL,NULL,NULL,NULL,2,9,1;NULL,NULL,NULL,NULL,3,1,1
+q	SELECT a0.k, a0.n FROM w AS a0 FULL JOIN o AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n ORDER BY a1.k NOT IN (SELECT s1.n FROM o AS s1 WHERE s1.k IS a0.k), a0.k, a0.n, a1.k, a1.n LIMIT 5	5:1,4;2,1;5,NULL;NULL,NULL;NULL,NULL
+q	SELECT a1.k NOT IN (SELECT s1.n FROM p AS s1 WHERE s1.k IS a1.k), sum(a0.k IN (SELECT s2.n FROM o AS s2 WHERE s2.k = a0.k)) FROM p AS a0 FULL JOIN q AS a1 ON a1.n > a0.n FULL JOIN o AS a2 ON a2.k = a1.k GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	10:1,0;1,0;1,0;1,0;1,0;1,0;1,0;NULL,0;NULL,0;NULL,0
+q	SELECT a1.k IN (SELECT s1.n FROM p AS s1 WHERE s1.k = a1.k), max(a0.n) FROM q AS a0 FULL JOIN o AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	5:0,1;0,2;0,5;0,9;0,NULL
+q	SELECT count(*), sum(a1.k IN (SELECT s2.k FROM p AS s2 WHERE s2.k = a1.k)), count(*) FILTER (WHERE EXISTS (SELECT 1 FROM q AS s1 WHERE s1.k = a0.k)) FROM w AS a0 RIGHT JOIN w AS a1 ON a1.k IS NULL RIGHT JOIN p AS a2 ON a2.k = a1.n	1:5,2,0
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN q AS a1 ON NULL WHERE (a0.k, a0.n) NOT BETWEEN (5, a1.k) AND (a1.k, 10)	0:
+q	SELECT count(*) FROM q AS a0 FULL JOIN q AS a1 ON a1.n > a0.n GROUP BY (SELECT sum(s1.n) FROM o AS s1 WHERE 1)	1:8
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN p AS a1 ON a1.n > a0.n WHERE (a1.k, a0.k) <= (a0.k, NULL) AND a1.k >= 1	0:
+q	SELECT EXISTS (SELECT 1 FROM q AS s1 WHERE 1), sum((SELECT count(*) FROM w AS s2 WHERE a1.n IS NULL)) FROM w AS a0 JOIN w AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	0:
+q	SELECT a1.n IN (SELECT s1.n FROM w AS s1 WHERE a1.n IS NULL), sum(a0.n NOT IN (SELECT s2.n FROM p AS s2 WHERE s2.k = a1.n)) FROM w AS a0 FULL JOIN q AS a1 ON a1.k = a0.k FULL JOIN q AS a2 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	10:0,1;0,1;0,NULL;0,NULL;NULL,1;NULL,1;NULL,1;NULL,1;NULL,1;NULL,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN w AS a1 ON NULL WHERE (a1.n, a0.n) = (2, a1.n) AND a0.k >= 3	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM p AS a0 JOIN o AS a1 ON a1.k = a0.k JOIN q AS a2 ON a2.k IS NULL WHERE (a1.k, NULL, a0.k) BETWEEN (NULL, 10, NULL) AND (a1.k, a0.k, NULL)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM w AS a0 FULL JOIN w AS a1 ON a1.k = a0.n JOIN w AS a2 ON a2.k = a1.k WHERE (a2.n, 1, 5) NOT BETWEEN (1, a0.n, 1) AND (a0.k, a0.k, NULL)	1:2,1,1,4,1,4
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 FULL JOIN w AS a1 ON a1.k = a0.k WHERE (a0.k, a1.k) >= (2, NULL)	1:9,2,NULL,NULL
+q	SELECT a1.n IN (SELECT s1.k FROM w AS s1 WHERE s1.n < a0.k), max(a0.k) FROM o AS a0 JOIN p AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN o AS a1 ON a1.n > a0.n WHERE (a1.n, 5) BETWEEN (a0.k, 1) AND (a1.n, a0.k) AND a1.k = a1.n	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM o AS a0 LEFT JOIN q AS a1 ON a1.n > a0.n JOIN p AS a2 ON a2.k = a1.n WHERE (a2.n, 2, 5) BETWEEN (NULL, NULL, NULL) AND (a2.k, 10, a0.n) AND a1.k >= 3	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM p AS a0 FULL JOIN q AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n HAVING ((SELECT count(*) FROM q AS s1 WHERE s1.n < a1.k))	3:NULL,NULL,2,5,1;NULL,NULL,2,9,1;NULL,NULL,3,1,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 JOIN o AS a1 ON NULL WHERE (a1.n, NULL) <> (NULL, a0.n) AND a1.k >= 1	0:
+q	SELECT (SELECT min(s1.k) FROM o AS s1 WHERE s1.n < a0.k), count(*) FROM w AS a0 FULL JOIN p AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	6:2,1;2,1;NULL,1;NULL,1;NULL,1;NULL,1
+db	indexed
+sql	CREATE TABLE o(k INT, n INT)
+sql	CREATE TABLE p(k INT, n INT)
+sql	CREATE TABLE q(id INTEGER PRIMARY KEY, k INT, n INT)
+sql	CREATE TABLE w(k INT PRIMARY KEY, n INT) WITHOUT ROWID
+sql	INSERT INTO p VALUES (1, 1), (2, 5), (2, 7), (NULL, 3), (4, NULL)
+sql	INSERT INTO q VALUES (1, 2, 5), (2, 3, 1), (3, NULL, 2), (4, 2, 9)
+sql	INSERT INTO w VALUES (1, 4), (2, 1), (5, NULL)
+sql	INSERT INTO o VALUES (2, 1), (9, 2)
+sql	CREATE INDEX p_k ON p(k)
+sql	CREATE INDEX q_kn ON q(k, n)
+q	SELECT b.n NOT IN (SELECT s.k FROM p AS s WHERE b.k IS 5) FROM o AS b FULL JOIN w AS c ON NULL GROUP BY b.n NOT IN (SELECT s.k FROM p AS s WHERE b.k IS 5)	1:1
+q	SELECT d.c0 FROM (SELECT (CASE WHEN (b.n NOT IN (SELECT s.k FROM w AS s WHERE (b.k IS '1e3'))) THEN b.k ELSE b.n END) AS c0 FROM o AS b FULL JOIN w AS c ON NULL GROUP BY (CASE WHEN (b.n NOT IN (SELECT s.k FROM w AS s WHERE (b.k IS '1e3'))) THEN b.k ELSE b.n END)) AS d	3:2;9;NULL
+q	SELECT a1.c0 FROM w AS a0, (SELECT CAST((b.k NOT IN (SELECT s.k FROM o AS s WHERE (c.n NOT IN (3)))) AS INTEGER) AS c0 FROM o AS c FULL JOIN w AS b GROUP BY CAST((b.k NOT IN (SELECT s.k FROM o AS s WHERE (c.n NOT IN (3)))) AS INTEGER)) AS a1	6:0;0;0;1;1;1
+q	SELECT EXISTS (SELECT 1 FROM w AS s WHERE b.k IS NULL) FROM o AS b FULL JOIN w AS c ON NULL GROUP BY EXISTS (SELECT 1 FROM w AS s WHERE b.k IS NULL)	2:0;1
+q	SELECT 1 FROM p AS x JOIN w AS y ON (CASE WHEN x.k <= NULL THEN NULL END) JOIN p AS z ON ((x.k, NULL, z.n) BETWEEN (1, 1, x.k) AND (7, 10, 41)) WHERE z.n >= 1	0:
+q	SELECT e.k, f.n FROM p e JOIN p f ON ((e.k, f.n) BETWEEN (1, 10) AND (2, 4))	4:2,1;2,1;2,3;2,3
+q	SELECT count(*), a0.k NOT IN (SELECT s1.n FROM p AS s1 WHERE s1.k IS a0.n) FROM o AS a0 FULL JOIN q AS a1 ON a1.k IS NULL GROUP BY a0.k NOT IN (SELECT s1.n FROM p AS s1 WHERE s1.k IS a0.n)	2:2,1;3,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN w AS a1 ON a1.k IS NULL WHERE (a1.k, NULL) BETWEEN (a0.n, NULL) AND (a1.k, 5)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM q AS a0 JOIN o AS a1 ON a1.k = a0.k JOIN w AS a2 ON NULL WHERE (a1.k, 5, a0.n) = (a2.n, NULL, a0.k) AND a1.n = a2.n	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 JOIN o AS a1 ON a1.k IS NULL WHERE (a0.n, a0.k, NULL) BETWEEN (a0.k, NULL, 1) AND (5, NULL, a1.k)	0:
+q	SELECT a0.k, a0.n FROM w AS a0 RIGHT JOIN p AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n ORDER BY (SELECT max(s1.n) FROM o AS s1 WHERE 1), a0.k, a0.n, a1.k, a1.n LIMIT 2	2:NULL,NULL;NULL,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM q AS a0 FULL JOIN w AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n HAVING ((SELECT max(s1.n) FROM o AS s1 WHERE a1.k > 1))	2:NULL,NULL,2,1,1;NULL,NULL,5,NULL,1
+q	SELECT count(*), a1.n IN (SELECT s1.k FROM p AS s1 WHERE s1.k = a1.k) FROM w AS a0 RIGHT JOIN p AS a1 ON a1.n > a0.n GROUP BY a1.n IN (SELECT s1.k FROM p AS s1 WHERE s1.k = a1.k)	3:1,1;1,NULL;5,0
+q	SELECT (SELECT min(s1.k) FROM w AS s1 WHERE a1.k IS NOT NULL), sum(a0.k IN (SELECT s2.n FROM w AS s2 WHERE a0.n IS NOT NULL)) FROM w AS a0 FULL JOIN o AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	5:1,0;1,0;NULL,0;NULL,1;NULL,NULL
+q	SELECT a1.n IN (SELECT s1.k FROM p AS s1 WHERE s1.n < a0.k), count(*) FROM w AS a0 LEFT JOIN q AS a1 ON a1.k IS NULL RIGHT JOIN o AS a2 ON a2.k = a1.k GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	2:0,1;0,1
+q	SELECT a0.n IN (SELECT s1.k FROM q AS s1 WHERE 1), sum(EXISTS (SELECT 1 FROM q AS s2 WHERE 1)) FROM o AS a0 FULL JOIN w AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	5:1,1;NULL,1;NULL,1;NULL,1;NULL,1
+q	SELECT count(*), a0.k IN (SELECT s1.n FROM q AS s1 WHERE 1) FROM q AS a0 LEFT JOIN o AS a1 ON a1.k = a0.n GROUP BY a0.k IN (SELECT s1.n FROM q AS s1 WHERE 1)	3:1,0;1,NULL;2,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 FULL JOIN w AS a1 ON a1.k = a0.n WHERE (a0.n, NULL) BETWEEN (a1.k, NULL) AND (a0.k, a1.n) AND a1.n = a1.k	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM p AS a0 JOIN p AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n HAVING NOT (EXISTS (SELECT 1 FROM w AS s1 WHERE s1.k IS a0.n))	0:
+q	SELECT count(*) FROM w AS a0 LEFT JOIN q AS a1 ON a1.k = a0.n GROUP BY NOT EXISTS (SELECT 1 FROM w AS s1 WHERE s1.n < a0.k)	2:1;2
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 RIGHT JOIN o AS a1 ON a1.k = a0.n WHERE (a0.n, a0.k) BETWEEN (1, NULL) AND (a1.n, a0.k) AND a0.n = a0.n	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM p AS a0 FULL JOIN w AS a1 ON a1.k IS NULL LEFT JOIN o AS a2 ON NULL WHERE (a2.n, NULL) NOT BETWEEN (a0.n, a2.n) AND (a0.k, a2.k) AND a0.n >= 1	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM o AS a0 LEFT JOIN p AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n HAVING NOT (a0.k NOT IN (SELECT s1.k FROM w AS s1 WHERE s1.k = a0.k))	1:2,1,NULL,NULL,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN p AS a1 ON NULL WHERE (a0.k, NULL) NOT BETWEEN (a0.k, a0.k) AND (a1.k, a0.k) AND a1.n >= 1	0:
+q	SELECT (SELECT count(*) FROM p AS s1 WHERE 1), sum(NOT EXISTS (SELECT 1 FROM o AS s2 WHERE a1.n IS NULL)) FROM o AS a0 JOIN q AS a1 ON a1.n > a0.n FULL JOIN o AS a2 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	7:5,0;5,0;5,1;5,1;5,1;5,1;5,1
+q	SELECT count(*), a1.k IN (SELECT s1.k FROM q AS s1 WHERE a1.n > 1) FROM q AS a0 FULL JOIN p AS a1 ON a1.k = a0.k GROUP BY a1.k IN (SELECT s1.k FROM q AS s1 WHERE a1.n > 1)	3:1,NULL;4,0;4,1
+q	SELECT count(*), a0.k NOT IN (SELECT s1.k FROM p AS s1 WHERE s1.k IS a1.n) FROM o AS a0 RIGHT JOIN o AS a1 ON NULL GROUP BY a0.k NOT IN (SELECT s1.k FROM p AS s1 WHERE s1.k IS a1.n)	1:2,NULL
+q	SELECT a0.k, a0.n FROM o AS a0 LEFT JOIN o AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n ORDER BY (SELECT max(s1.n) FROM q AS s1 WHERE a0.n IS NOT NULL), a0.k, a0.n, a1.k, a1.n LIMIT 2	2:2,1;9,2
+q	SELECT a0.k, a0.n FROM o AS a0 LEFT JOIN w AS a1 ON a1.n > a0.n FULL JOIN p AS a2 ON a2.n > a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n ORDER BY a1.k IN (SELECT s1.k FROM q AS s1 WHERE s1.n < a1.n), a0.k, a0.n, a1.k, a1.n, a2.k, a2.n LIMIT 2	2:2,1;2,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN w AS a1 ON a1.n > a0.n WHERE (a1.k, NULL) BETWEEN (5, 2) AND (5, a0.k) AND a0.k = a0.k	0:
+q	SELECT count(*) FROM w AS a0 JOIN q AS a1 ON a1.k = a0.n GROUP BY a1.k NOT IN (SELECT s1.n FROM q AS s1 WHERE a1.n IS NULL)	0:
+q	SELECT a0.k IN (SELECT s1.k FROM p AS s1 WHERE s1.k IS a1.k), count(*) FROM w AS a0 FULL JOIN w AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n	6:0,1;NULL,1;NULL,1;NULL,1;NULL,1;NULL,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 LEFT JOIN w AS a1 ON a1.n > a0.n WHERE (a0.k, a0.k, NULL) BETWEEN (a0.k, 1, a0.n) AND (10, 10, a1.k) AND a1.k >= 3	0:
+q	SELECT (SELECT max(s1.n) FROM o AS s1 WHERE a1.k IS NULL), max(a0.k) FROM p AS a0 FULL JOIN p AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	8:2,NULL;2,NULL;NULL,1;NULL,2;NULL,2;NULL,2;NULL,2;NULL,4
+q	SELECT a0.k IN (SELECT s1.n FROM o AS s1 WHERE a1.n IS NOT NULL), sum(a1.k IN (SELECT s2.k FROM o AS s2 WHERE s2.n < a0.k)) FROM p AS a0 RIGHT JOIN p AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	5:0,0;NULL,0;NULL,0;NULL,0;NULL,0
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 RIGHT JOIN q AS a1 ON a1.n > a0.n WHERE (a0.n, NULL) < (10, a1.n)	6:2,5,2,9;3,1,2,5;3,1,2,9;3,1,NULL,2;NULL,2,2,5;NULL,2,2,9
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 LEFT JOIN q AS a1 ON a1.n > a0.n WHERE (a1.n, 2) >= (NULL, a1.k) AND a1.k >= 3	0:
+q	SELECT count(*), a0.k NOT IN (SELECT s1.k FROM p AS s1 WHERE s1.k = a0.n AND s1.n <> a0.n) FROM q AS a0 RIGHT JOIN q AS a1 ON a1.k = a0.k GROUP BY a0.k NOT IN (SELECT s1.k FROM p AS s1 WHERE s1.k = a0.n AND s1.n <> a0.n)	1:6,1
+q	SELECT count(*), sum(NOT EXISTS (SELECT 1 FROM q AS s2 WHERE a1.n > 1)), count(*) FILTER (WHERE (SELECT count(*) FROM p AS s1 WHERE a0.k IS NULL)) FROM w AS a0 FULL JOIN p AS a1 ON a1.k = a0.k	1:6,3,2
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 FULL JOIN w AS a1 ON a1.n > a0.n WHERE (a0.k, NULL, 2) NOT BETWEEN (a1.k, 1, 10) AND (a0.k, 1, a0.n) AND a0.n >= 3	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM q AS a0 JOIN o AS a1 ON NULL JOIN w AS a2 ON NULL WHERE (a2.n, 10) < (a2.k, 2)	0:
+q	SELECT a1.n NOT IN (SELECT s1.n FROM p AS s1 WHERE s1.k IS a0.n), sum((SELECT sum(s2.n) FROM o AS s2 WHERE s2.k IS a1.k)) FROM q AS a0 LEFT JOIN o AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	4:1,1;1,1;NULL,NULL;NULL,NULL
+q	SELECT count(*) FROM o AS a0 JOIN q AS a1 ON a1.k = a0.k GROUP BY NOT EXISTS (SELECT 1 FROM o AS s1 WHERE s1.k = a0.k)	1:2
+q	SELECT count(*) FROM w AS a0 FULL JOIN o AS a1 ON a1.k = a0.k GROUP BY a1.n NOT IN (SELECT s1.k FROM q AS s1 WHERE s1.k = a1.k AND s1.n <> a0.k)	1:4
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n, count(*) FROM w AS a0 LEFT JOIN o AS a1 ON a1.k = a0.n JOIN q AS a2 ON a2.k = a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n HAVING ((SELECT max(s1.n) FROM w AS s1 WHERE s1.k = a1.n AND s1.n <> a2.k))	0:
+q	SELECT count(*), (SELECT count(*) FROM p AS s1 WHERE s1.n < a1.k) FROM p AS a0 FULL JOIN w AS a1 ON NULL GROUP BY (SELECT count(*) FROM p AS s1 WHERE s1.n < a1.k)	3:1,1;1,2;6,0
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 LEFT JOIN q AS a1 ON a1.k IS NULL WHERE (a0.k, a1.n, NULL) >= (a1.n, a0.k, 5)	1:4,NULL,NULL,2
+q	SELECT a0.k, a0.n FROM p AS a0 FULL JOIN p AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n ORDER BY a0.n IN (SELECT s1.n FROM o AS s1 WHERE a1.k > 1), a0.k, a0.n, a1.k, a1.n LIMIT 5	5:1,1;2,5;4,NULL;NULL,3;NULL,NULL
+q	SELECT (SELECT sum(s1.n) FROM q AS s1 WHERE s1.k = a0.k AND s1.n <> a0.n), sum(EXISTS (SELECT 1 FROM q AS s2 WHERE s2.n < a1.k)) FROM w AS a0 FULL JOIN q AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	7:14,0;14,1;14,1;NULL,0;NULL,1;NULL,1;NULL,1
+q	SELECT a0.k, a0.n FROM w AS a0 FULL JOIN w AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n ORDER BY a1.k NOT IN (SELECT s1.k FROM w AS s1 WHERE s1.n < a1.k), a0.k, a0.n, a1.k, a1.n LIMIT 2	2:1,4;2,1
+q	SELECT count(*), sum((SELECT sum(s2.n) FROM o AS s2 WHERE 1)), count(*) FILTER (WHERE a1.n IN (SELECT s1.n FROM o AS s1 WHERE s1.k IS a0.k)) FROM w AS a0 FULL JOIN w AS a1 ON a1.k IS NULL	1:6,18,0
+q	SELECT EXISTS (SELECT 1 FROM w AS s1 WHERE s1.k = a0.k AND s1.n <> a0.k), max(a1.n) FROM o AS a0 FULL JOIN o AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	4:0,1;0,2;0,NULL;1,NULL
+q	SELECT NOT EXISTS (SELECT 1 FROM o AS s1 WHERE a0.n IS NULL), sum((SELECT min(s2.k) FROM w AS s2 WHERE a0.n > 1)) FROM p AS a0 FULL JOIN q AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	9:0,NULL;0,NULL;0,NULL;1,1;1,1;1,1;1,1;1,1;1,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM q AS a0 FULL JOIN o AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n HAVING ((SELECT sum(s1.n) FROM p AS s1 WHERE a0.k IS NOT NULL))	3:2,5,NULL,NULL,1;2,9,NULL,NULL,1;3,1,NULL,NULL,1
+q	SELECT a0.k IN (SELECT s1.n FROM o AS s1 WHERE a0.k IS NULL), sum((SELECT sum(s2.n) FROM w AS s2 WHERE s2.n < a1.k)) FROM o AS a0 FULL JOIN q AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	5:0,1;0,1;0,NULL;NULL,1;NULL,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN w AS a1 ON a1.k = a0.n WHERE (a1.n, NULL) <= (NULL, 1)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM w AS a0 JOIN w AS a1 ON a1.k = a0.n RIGHT JOIN o AS a2 ON NULL WHERE (a1.k, 2) <> (a0.k, a1.k)	0:
+q	SELECT count(*), sum(EXISTS (SELECT 1 FROM p AS s2 WHERE a1.k > 1)), count(*) FILTER (WHERE (SELECT sum(s1.n) FROM o AS s1 WHERE s1.k = a2.n)) FROM p AS a0 FULL JOIN o AS a1 ON a1.k = a0.n RIGHT JOIN o AS a2 ON a2.k = a1.n	1:2,1,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN q AS a1 ON a1.k = a0.n WHERE (a1.k, a1.n) BETWEEN (a1.n, a1.n) AND (NULL, a1.n)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN q AS a1 ON a1.k IS NULL WHERE (a0.k, NULL) NOT BETWEEN (10, a1.k) AND (a0.n, NULL) AND a1.k = a0.k	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 JOIN q AS a1 ON a1.k = a0.k WHERE (a1.n, a1.k) <= (a1.k, a1.k)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM w AS a0 JOIN o AS a1 ON a1.k = a0.n FULL JOIN w AS a2 ON a2.k IS NULL WHERE (a2.k, a2.k) = (a2.k, NULL)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 JOIN q AS a1 ON a1.n > a0.n WHERE (a0.k, 5) = (a0.n, a1.n)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 JOIN p AS a1 ON NULL WHERE (a1.n, a0.n) = (a1.n, a1.n)	0:
+q	SELECT (SELECT max(s1.n) FROM w AS s1 WHERE a1.n > 1), max(a1.k) FROM q AS a0 RIGHT JOIN q AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	4:4,2;4,2;4,NULL;NULL,3
+q	SELECT a1.n NOT IN (SELECT s1.k FROM q AS s1 WHERE s1.k = a0.k AND s1.n <> a0.k), sum((SELECT count(*) FROM p AS s2 WHERE a1.k IS NULL)) FROM w AS a0 FULL JOIN w AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	3:1,0;1,0;1,0
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 FULL JOIN q AS a1 ON a1.n > a0.n WHERE (a0.k, a0.n) <= (1, a1.k) AND a0.k = a1.n	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM q AS a0 JOIN q AS a1 ON a1.k = a0.k JOIN p AS a2 ON a2.k = a1.k WHERE (a1.k, NULL, 1) > (a1.k, a2.n, 1) AND a1.n = a1.k	0:
+q	SELECT count(*) FROM p AS a0 FULL JOIN w AS a1 ON a1.k = a0.n GROUP BY a1.n IN (SELECT s1.n FROM o AS s1 WHERE a1.k IS NOT NULL)	3:1;1;4
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 LEFT JOIN o AS a1 ON a1.k = a0.k WHERE (a1.k, a1.n, 5) = (NULL, NULL, a1.n)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM w AS a0 JOIN p AS a1 ON a1.k = a0.n FULL JOIN q AS a2 ON a2.k = a1.k WHERE (a2.n, a2.k, NULL) BETWEEN (a2.n, a2.n, a2.k) AND (a1.k, NULL, NULL) AND a0.k = a1.k	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM p AS a0 RIGHT JOIN o AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n HAVING (NOT EXISTS (SELECT 1 FROM w AS s1 WHERE s1.k = a0.k AND s1.n <> a1.k))	2:NULL,NULL,2,1,1;NULL,NULL,9,2,1
+q	SELECT a0.k, a0.n FROM w AS a0 RIGHT JOIN p AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n ORDER BY a1.n IN (SELECT s1.n FROM p AS s1 WHERE a0.k IS NOT NULL), a0.k, a0.n, a1.k, a1.n LIMIT 2	2:NULL,NULL;NULL,NULL
+q	SELECT count(*) FROM w AS a0 LEFT JOIN q AS a1 ON a1.n > a0.n JOIN q AS a2 ON a2.k = a1.k GROUP BY a1.k NOT IN (SELECT s1.k FROM p AS s1 WHERE s1.k IS a0.k)	2:4;4
+q	SELECT count(*), (SELECT count(*) FROM p AS s1 WHERE a0.n IS NOT NULL) FROM q AS a0 FULL JOIN w AS a1 ON a1.k = a0.n GROUP BY (SELECT count(*) FROM p AS s1 WHERE a0.n IS NOT NULL)	1:4,5
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 FULL JOIN p AS a1 ON a1.k IS NULL WHERE (a1.k, NULL) BETWEEN (NULL, a1.n) AND (NULL, 10)	0:
+q	SELECT count(*), a1.k IN (SELECT s1.n FROM q AS s1 WHERE a0.n IS NOT NULL) FROM q AS a0 RIGHT JOIN w AS a1 ON a1.k = a0.k GROUP BY a1.k IN (SELECT s1.n FROM q AS s1 WHERE a0.n IS NOT NULL)	2:2,0;2,1
+q	SELECT (SELECT count(*) FROM o AS s1 WHERE s1.n < a1.k), max(a0.k) FROM p AS a0 FULL JOIN w AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n	8:0,1;0,2;0,2;0,4;0,NULL;0,NULL;1,NULL;2,NULL
+q	SELECT NOT EXISTS (SELECT 1 FROM o AS s1 WHERE a0.k > 1), count(*) FROM w AS a0 FULL JOIN w AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n	6:0,1;0,1;1,1;1,1;1,1;1,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 RIGHT JOIN q AS a1 ON a1.n > a0.n WHERE (a0.k, a0.k) BETWEEN (2, NULL) AND (2, a1.k) AND a0.n >= 3	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN w AS a1 ON a1.k IS NULL WHERE (a0.k, a1.k) NOT BETWEEN (a1.n, a1.k) AND (NULL, a0.n)	0:
+q	SELECT a0.k, a0.n FROM p AS a0 JOIN o AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n ORDER BY EXISTS (SELECT 1 FROM q AS s1 WHERE a1.n IS NULL), a0.k, a0.n, a1.k, a1.n LIMIT 5	0:
+q	SELECT (SELECT count(*) FROM o AS s1 WHERE s1.k IS a1.k), sum((SELECT count(*) FROM q AS s2 WHERE a0.k IS NULL)) FROM p AS a0 RIGHT JOIN w AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n	3:0,4;0,4;1,4
+q	SELECT a1.k NOT IN (SELECT s1.k FROM q AS s1 WHERE s1.n < a1.n), sum((SELECT min(s2.k) FROM p AS s2 WHERE s2.k = a0.n AND s2.n <> a0.k)) FROM o AS a0 RIGHT JOIN q AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n	5:0,NULL;1,NULL;NULL,1;NULL,2;NULL,NULL
+q	SELECT count(*), (SELECT count(*) FROM p AS s1 WHERE s1.n < a0.n) FROM o AS a0 RIGHT JOIN o AS a1 ON NULL GROUP BY (SELECT count(*) FROM p AS s1 WHERE s1.n < a0.n)	1:2,0
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 RIGHT JOIN q AS a1 ON NULL WHERE (a1.k, NULL, NULL) > (2, a0.n, NULL)	1:NULL,NULL,3,1
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM w AS a0 LEFT JOIN q AS a1 ON NULL LEFT JOIN w AS a2 ON a2.k IS NULL WHERE (a0.n, NULL) NOT BETWEEN (2, 10) AND (NULL, NULL)	1:2,1,NULL,NULL,NULL,NULL
+q	SELECT a0.k, a0.n FROM p AS a0 LEFT JOIN o AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n ORDER BY a0.k NOT IN (SELECT s1.k FROM w AS s1 WHERE a1.k > 1), a0.k, a0.n, a1.k, a1.n LIMIT 2	2:1,1;NULL,3
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN o AS a1 ON a1.k = a0.n WHERE (a0.k, NULL) BETWEEN (10, a0.k) AND (a0.n, a0.k) AND a0.k = a0.k	0:
+q	SELECT (SELECT min(s1.k) FROM w AS s1 WHERE s1.k = a0.k), max(a1.n) FROM w AS a0 JOIN w AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	3:1,4;2,1;5,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM q AS a0 FULL JOIN o AS a1 ON a1.k = a0.k JOIN o AS a2 ON NULL WHERE (a1.k, 1) BETWEEN (a0.k, a2.n) AND (1, 2)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 FULL JOIN p AS a1 ON a1.n > a0.n WHERE (a0.k, 5) BETWEEN (a1.n, a1.k) AND (a0.k, a1.k) AND a1.k >= 3	0:
+q	SELECT a1.n IN (SELECT s1.k FROM p AS s1 WHERE s1.k = a0.n AND s1.n <> a0.k), count(*) FROM q AS a0 JOIN q AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	0:
+q	SELECT count(*) FROM o AS a0 LEFT JOIN o AS a1 ON a1.k = a0.n RIGHT JOIN q AS a2 ON a2.k = a1.k GROUP BY (SELECT max(s1.n) FROM o AS s1 WHERE 1)	1:4
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 RIGHT JOIN p AS a1 ON a1.k IS NULL WHERE (a0.n, NULL, NULL) < (a0.n, a0.k, a1.k) AND a0.k = a0.k	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 JOIN q AS a1 ON a1.k = a0.n WHERE (a0.n, a0.k) NOT BETWEEN (NULL, NULL) AND (NULL, 2)	0:
+q	SELECT count(*), (SELECT max(s1.n) FROM w AS s1 WHERE s1.n < a2.k) FROM w AS a0 FULL JOIN p AS a1 ON a1.n > a0.n RIGHT JOIN p AS a2 ON NULL GROUP BY (SELECT max(s1.n) FROM w AS s1 WHERE s1.n < a2.k)	2:2,NULL;3,1
+q	SELECT a0.k IN (SELECT s1.k FROM w AS s1 WHERE 1), sum(a0.k NOT IN (SELECT s2.k FROM q AS s2 WHERE 1)) FROM p AS a0 JOIN w AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	2:1,0;1,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 FULL JOIN q AS a1 ON a1.k = a0.n WHERE (a0.n, NULL) < (a0.n, 2)	0:
+q	SELECT a0.k NOT IN (SELECT s1.k FROM w AS s1 WHERE s1.k = a0.k), sum((SELECT sum(s2.n) FROM q AS s2 WHERE a1.n > 1)) FROM q AS a0 FULL JOIN w AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	6:0,NULL;0,NULL;1,17;1,NULL;1,NULL;1,NULL
+q	SELECT count(*) FROM p AS a0 FULL JOIN p AS a1 ON a1.k = a0.n FULL JOIN p AS a2 ON a2.k IS NULL GROUP BY NOT EXISTS (SELECT 1 FROM o AS s1 WHERE s1.k = a0.n)	1:13
+q	SELECT a1.k NOT IN (SELECT s1.k FROM q AS s1 WHERE s1.k = a1.n), count(*) FROM p AS a0 FULL JOIN o AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	6:1,1;1,1;1,1;1,1;1,1;1,1
+q	SELECT count(*) FROM w AS a0 LEFT JOIN o AS a1 ON a1.n > a0.n GROUP BY NOT EXISTS (SELECT 1 FROM o AS s1 WHERE 1)	1:3
+q	SELECT count(*), sum(NOT EXISTS (SELECT 1 FROM q AS s2 WHERE s2.k = a2.n AND s2.n <> a2.k)), count(*) FILTER (WHERE a0.k NOT IN (SELECT s1.k FROM p AS s1 WHERE a1.k IS NULL)) FROM q AS a0 FULL JOIN w AS a1 ON a1.k IS NULL FULL JOIN w AS a2 ON a2.n > a1.n	1:9,9,3
+q	SELECT (SELECT max(s1.n) FROM o AS s1 WHERE a1.k IS NOT NULL), sum((SELECT min(s2.k) FROM o AS s2 WHERE s2.k = a1.n AND s2.n <> a1.k)) FROM o AS a0 RIGHT JOIN w AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	3:2,NULL;2,NULL;2,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM q AS a0 JOIN w AS a1 ON a1.k = a0.n LEFT JOIN q AS a2 ON a2.k = a1.k WHERE (a2.k, a1.k, a2.n) = (a1.n, a1.n, NULL)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 LEFT JOIN o AS a1 ON a1.n > a0.n WHERE (a0.n, NULL, a1.n) NOT BETWEEN (NULL, a0.k, a1.k) AND (a1.k, NULL, 5)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 FULL JOIN w AS a1 ON a1.k IS NULL WHERE (a1.n, 5) BETWEEN (a1.k, NULL) AND (a0.k, NULL)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM q AS a0 FULL JOIN o AS a1 ON a1.k = a0.n FULL JOIN o AS a2 ON a2.k = a1.n WHERE (a2.k, a2.k) < (a0.k, a1.n)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 RIGHT JOIN p AS a1 ON a1.n > a0.n WHERE (a1.k, NULL, NULL) NOT BETWEEN (2, a1.k, 2) AND (a1.k, a1.k, NULL)	1:NULL,NULL,1,1
+q	SELECT count(*), sum(a2.n NOT IN (SELECT s2.k FROM p AS s2 WHERE s2.n < a1.n)), count(*) FILTER (WHERE (SELECT count(*) FROM o AS s1 WHERE a2.n IS NULL)) FROM p AS a0 JOIN o AS a1 ON NULL RIGHT JOIN o AS a2 ON a2.k IS NULL	1:2,2,0
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM q AS a0 JOIN p AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n HAVING (NOT EXISTS (SELECT 1 FROM w AS s1 WHERE a0.k > 1))	2:NULL,2,2,5,1;NULL,2,2,7,1
+q	SELECT count(*), a1.n NOT IN (SELECT s1.k FROM w AS s1 WHERE a1.k IS NOT NULL) FROM o AS a0 FULL JOIN o AS a1 ON a1.k = a0.n GROUP BY a1.n NOT IN (SELECT s1.k FROM w AS s1 WHERE a1.k IS NOT NULL)	2:1,1;2,0
+q	SELECT count(*), a1.n NOT IN (SELECT s1.n FROM q AS s1 WHERE s1.k = a1.n) FROM q AS a0 FULL JOIN w AS a1 ON a1.k IS NULL GROUP BY a1.n NOT IN (SELECT s1.n FROM q AS s1 WHERE s1.k = a1.n)	1:7,1
+q	SELECT count(*), sum((SELECT max(s2.n) FROM p AS s2 WHERE s2.n < a0.n)), count(*) FILTER (WHERE a1.k IN (SELECT s1.k FROM o AS s1 WHERE s1.k = a1.k)) FROM o AS a0 LEFT JOIN o AS a1 ON a1.k IS NULL	1:2,1,0
+q	SELECT count(*), sum(a0.k IN (SELECT s2.n FROM q AS s2 WHERE s2.n < a1.k)), count(*) FILTER (WHERE (SELECT sum(s1.n) FROM p AS s1 WHERE s1.k IS a0.k)) FROM q AS a0 FULL JOIN w AS a1 ON a1.k IS NULL	1:7,0,6
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n, count(*) FROM q AS a0 LEFT JOIN o AS a1 ON a1.n > a0.n RIGHT JOIN q AS a2 ON a2.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n HAVING NOT (a0.k NOT IN (SELECT s1.n FROM o AS s1 WHERE 1))	2:2,5,NULL,NULL,NULL,2,1;2,9,NULL,NULL,NULL,2,1
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM o AS a0 JOIN q AS a1 ON a1.k = a0.n FULL JOIN q AS a2 ON a2.k IS NULL WHERE (a1.k, NULL) < (a1.k, a0.k)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN q AS a1 ON a1.k = a0.n WHERE (a0.k, 5) NOT BETWEEN (a1.k, a1.n) AND (NULL, 2)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 LEFT JOIN p AS a1 ON a1.n > a0.n WHERE (a0.n, a0.k) <= (10, a1.k)	5:1,4,2,5;1,4,2,7;2,1,2,5;2,1,2,7;2,1,NULL,3
+q	SELECT count(*), sum(a1.n IN (SELECT s2.n FROM p AS s2 WHERE a0.n > 1)), count(*) FILTER (WHERE (SELECT count(*) FROM q AS s1 WHERE a0.k > 1)) FROM w AS a0 RIGHT JOIN w AS a1 ON a1.n > a0.n	1:3,0,1
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM q AS a0 FULL JOIN q AS a1 ON a1.n > a0.n FULL JOIN p AS a2 ON a2.k = a1.k WHERE (a2.k, a2.k) = (5, a2.k) AND a0.n >= 3	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 JOIN p AS a1 ON a1.k = a0.k WHERE (a0.k, a1.n, a0.k) NOT BETWEEN (a1.k, a0.n, 2) AND (a0.n, a1.k, a0.k)	2:2,1,2,5;2,1,2,7
+q	SELECT a0.k IN (SELECT s1.k FROM w AS s1 WHERE s1.k = a0.n), sum((SELECT max(s2.n) FROM q AS s2 WHERE s2.n < a0.k)) FROM p AS a0 FULL JOIN q AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	9:0,1;0,1;0,2;0,NULL;0,NULL;0,NULL;0,NULL;0,NULL;1,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN o AS a1 ON NULL WHERE (a0.n, 10, a1.k) <> (NULL, 5, a1.k)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM q AS a0 JOIN q AS a1 ON a1.k = a0.k JOIN o AS a2 ON a2.k IS NULL WHERE (a0.k, NULL, a1.k) < (10, a0.k, a1.k)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM q AS a0 JOIN w AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n HAVING NOT ((SELECT sum(s1.n) FROM q AS s1 WHERE a0.n IS NULL))	0:
+q	SELECT a0.k, a0.n FROM q AS a0 FULL JOIN o AS a1 ON NULL JOIN q AS a2 ON a2.n > a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n ORDER BY a0.k IN (SELECT s1.k FROM o AS s1 WHERE s1.k IS a2.k), a0.k, a0.n, a1.k, a1.n, a2.k, a2.n LIMIT 5	5:NULL,NULL;NULL,NULL;NULL,NULL;NULL,NULL;NULL,NULL
+q	SELECT NOT EXISTS (SELECT 1 FROM o AS s1 WHERE 1), count(*) FROM p AS a0 FULL JOIN o AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	6:0,1;0,1;0,1;0,1;0,1;0,1
+q	SELECT count(*) FROM o AS a0 FULL JOIN p AS a1 ON NULL GROUP BY a0.k NOT IN (SELECT s1.k FROM o AS s1 WHERE s1.k = a0.k AND s1.n <> a1.k)	1:7
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM q AS a0 JOIN w AS a1 ON a1.n > a0.n JOIN p AS a2 ON a2.k IS NULL WHERE (a0.k, a0.n) NOT BETWEEN (NULL, a0.k) AND (a1.n, a2.k)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n, count(*) FROM w AS a0 RIGHT JOIN o AS a1 ON a1.k IS NULL FULL JOIN q AS a2 ON a2.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n HAVING NOT (EXISTS (SELECT 1 FROM o AS s1 WHERE s1.n < a0.k))	5:NULL,NULL,2,1,NULL,2,1;NULL,NULL,9,2,NULL,2,1;NULL,NULL,NULL,NULL,2,5,1;NULL,NULL,NULL,NULL,2,9,1;NULL,NULL,NULL,NULL,3,1,1
+q	SELECT count(*), a1.k NOT IN (SELECT s1.n FROM q AS s1 WHERE 1) FROM p AS a0 LEFT JOIN w AS a1 ON a1.n > a0.n GROUP BY a1.k NOT IN (SELECT s1.n FROM q AS s1 WHERE 1)	2:2,0;3,NULL
+q	SELECT count(*), sum(a1.k NOT IN (SELECT s2.k FROM q AS s2 WHERE s2.k = a1.k)), count(*) FILTER (WHERE a0.k IN (SELECT s1.k FROM q AS s1 WHERE a0.n IS NOT NULL)) FROM o AS a0 FULL JOIN w AS a1 ON a1.k = a0.k	1:4,3,1
+q	SELECT count(*) FROM p AS a0 RIGHT JOIN p AS a1 ON a1.k = a0.n GROUP BY EXISTS (SELECT 1 FROM o AS s1 WHERE s1.k = a0.k AND s1.n <> a0.k)	1:5
+q	SELECT a0.k, a0.n FROM w AS a0 FULL JOIN p AS a1 ON a1.k = a0.k FULL JOIN q AS a2 ON a2.k = a1.k GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n ORDER BY (SELECT sum(s1.n) FROM q AS s1 WHERE a2.k > 1), a0.k, a0.n, a1.k, a1.n, a2.k, a2.n LIMIT 5	5:1,4;5,NULL;NULL,NULL;NULL,NULL;NULL,NULL
+q	SELECT EXISTS (SELECT 1 FROM q AS s1 WHERE a1.k IS NOT NULL), max(a0.k) FROM w AS a0 JOIN o AS a1 ON a1.n > a0.n LEFT JOIN o AS a2 ON a2.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	1:1,2
+q	SELECT NOT EXISTS (SELECT 1 FROM q AS s1 WHERE a0.n > 1), max(a1.n) FROM q AS a0 JOIN o AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n	0:
+q	SELECT count(*), (SELECT sum(s1.n) FROM o AS s1 WHERE a1.k > 1) FROM q AS a0 FULL JOIN w AS a1 ON a1.n > a0.n GROUP BY (SELECT sum(s1.n) FROM o AS s1 WHERE a1.k > 1)	2:2,3;4,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM p AS a0 JOIN q AS a1 ON a1.k = a0.k LEFT JOIN p AS a2 ON a2.n > a1.n WHERE (a1.k, 10, a1.k) = (a2.k, a1.k, a2.n)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM w AS a0 FULL JOIN o AS a1 ON NULL JOIN o AS a2 ON NULL WHERE (a2.n, 5) BETWEEN (a0.k, a1.k) AND (NULL, 2) AND a0.n >= 1	0:
+q	SELECT NOT EXISTS (SELECT 1 FROM w AS s1 WHERE s1.n < a1.n), count(*) FROM q AS a0 RIGHT JOIN q AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	7:0,1;0,1;0,1;0,1;0,1;0,1;1,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN w AS a1 ON a1.k = a0.k WHERE (a0.k, NULL) NOT BETWEEN (a1.k, 1) AND (a1.k, NULL) AND a0.k >= 1	0:
+q	SELECT a0.k, a0.n FROM w AS a0 LEFT JOIN w AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n ORDER BY EXISTS (SELECT 1 FROM p AS s1 WHERE a0.k IS NULL), a0.k, a0.n, a1.k, a1.n LIMIT 2	2:1,4;2,1
+q	SELECT (SELECT sum(s1.n) FROM q AS s1 WHERE s1.k = a0.k AND s1.n <> a0.k), sum(a2.n NOT IN (SELECT s2.n FROM o AS s2 WHERE s2.k IS a1.n)) FROM q AS a0 RIGHT JOIN p AS a1 ON a1.k IS NULL FULL JOIN o AS a2 ON a2.k = a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	10:1,1;14,1;14,1;NULL,1;NULL,1;NULL,1;NULL,1;NULL,1;NULL,1;NULL,1
+q	SELECT a2.n IN (SELECT s1.n FROM p AS s1 WHERE 1), max(a2.k) FROM q AS a0 FULL JOIN o AS a1 ON NULL JOIN o AS a2 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN p AS a1 ON a1.k IS NULL WHERE (a0.n, 10) NOT BETWEEN (NULL, a1.n) AND (NULL, 1)	0:
+q	SELECT count(*) FROM p AS a0 FULL JOIN w AS a1 ON a1.k = a0.n GROUP BY EXISTS (SELECT 1 FROM w AS s1 WHERE s1.k = a1.k)	2:3;3
+q	SELECT (SELECT count(*) FROM o AS s1 WHERE s1.k = a0.n), count(*) FROM p AS a0 LEFT JOIN p AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	7:0,1;0,1;0,1;0,1;0,1;0,1;0,1
+q	SELECT (SELECT min(s1.k) FROM q AS s1 WHERE a0.k IS NOT NULL), max(a1.k) FROM w AS a0 JOIN w AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	1:2,1
+q	SELECT count(*), NOT EXISTS (SELECT 1 FROM w AS s1 WHERE s1.k = a2.k AND s1.n <> a1.n) FROM w AS a0 RIGHT JOIN w AS a1 ON NULL FULL JOIN p AS a2 ON a2.n > a1.n GROUP BY NOT EXISTS (SELECT 1 FROM w AS s1 WHERE s1.k = a2.k AND s1.n <> a1.n)	2:2,0;6,1
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM o AS a0 RIGHT JOIN o AS a1 ON a1.k IS NULL JOIN q AS a2 ON a2.k = a1.k WHERE (a2.k, a1.n) NOT BETWEEN (a2.n, a0.k) AND (NULL, 5)	2:NULL,NULL,2,1,2,5;NULL,NULL,2,1,2,9
+q	SELECT a0.k, a0.n FROM q AS a0 FULL JOIN p AS a1 ON a1.k = a0.n RIGHT JOIN q AS a2 ON a2.k = a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n ORDER BY a2.n IN (SELECT s1.k FROM q AS s1 WHERE s1.k = a1.k), a0.k, a0.n, a1.k, a1.n, a2.k, a2.n LIMIT 2	2:NULL,NULL;NULL,NULL
+q	SELECT a0.k, a0.n FROM p AS a0 RIGHT JOIN o AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n ORDER BY a0.k NOT IN (SELECT s1.n FROM o AS s1 WHERE a0.n > 1), a0.k, a0.n, a1.k, a1.n LIMIT 2	2:NULL,NULL;NULL,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM w AS a0 LEFT JOIN o AS a1 ON a1.n > a0.n JOIN w AS a2 ON a2.k = a1.k WHERE (a2.n, a0.k) <= (NULL, a0.k) AND a2.k >= 1	0:
+q	SELECT (SELECT sum(s1.n) FROM o AS s1 WHERE 1), count(*) FROM q AS a0 JOIN q AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	2:3,1;3,1
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM p AS a0 RIGHT JOIN q AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n HAVING (NOT EXISTS (SELECT 1 FROM q AS s1 WHERE s1.k IS a1.n))	3:NULL,NULL,2,5,1;NULL,NULL,2,9,1;NULL,NULL,3,1,1
+q	SELECT count(*), sum(a2.k IN (SELECT s2.k FROM w AS s2 WHERE s2.k = a0.k AND s2.n <> a2.n)), count(*) FILTER (WHERE EXISTS (SELECT 1 FROM q AS s1 WHERE s1.k IS a2.n)) FROM w AS a0 LEFT JOIN w AS a1 ON NULL LEFT JOIN o AS a2 ON NULL	1:3,0,3
+q	SELECT a0.k IN (SELECT s1.n FROM q AS s1 WHERE a0.k IS NOT NULL), count(*) FROM o AS a0 LEFT JOIN o AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	2:1,1;1,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 FULL JOIN o AS a1 ON a1.n > a0.n WHERE (a0.k, NULL, a1.n) BETWEEN (NULL, NULL, a1.k) AND (1, NULL, NULL)	0:
+q	SELECT count(*), EXISTS (SELECT 1 FROM p AS s1 WHERE a0.n > 1) FROM q AS a0 FULL JOIN o AS a1 ON a1.k = a0.n GROUP BY EXISTS (SELECT 1 FROM p AS s1 WHERE a0.n > 1)	2:1,0;3,1
+q	SELECT count(*), EXISTS (SELECT 1 FROM o AS s1 WHERE a0.k IS NOT NULL) FROM q AS a0 LEFT JOIN w AS a1 ON NULL GROUP BY EXISTS (SELECT 1 FROM o AS s1 WHERE a0.k IS NOT NULL)	2:1,0;3,1
+q	SELECT count(*) FROM o AS a0 LEFT JOIN q AS a1 ON NULL GROUP BY NOT EXISTS (SELECT 1 FROM q AS s1 WHERE a0.k > 1)	1:2
+q	SELECT count(*), a1.k IN (SELECT s1.n FROM o AS s1 WHERE a1.n IS NULL) FROM p AS a0 RIGHT JOIN w AS a1 ON NULL GROUP BY a1.k IN (SELECT s1.n FROM o AS s1 WHERE a1.n IS NULL)	1:3,0
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 JOIN q AS a1 ON a1.k IS NULL WHERE (a1.k, a1.n, NULL) NOT BETWEEN (a1.k, NULL, 1) AND (NULL, NULL, NULL)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM o AS a0 JOIN o AS a1 ON NULL JOIN w AS a2 ON a2.k = a1.n WHERE (a0.k, NULL, a0.n) NOT BETWEEN (NULL, NULL, a1.k) AND (5, a2.k, 2)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM q AS a0 RIGHT JOIN w AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n HAVING NOT (NOT EXISTS (SELECT 1 FROM o AS s1 WHERE a1.n IS NULL))	1:NULL,NULL,5,NULL,1
+q	SELECT a1.n NOT IN (SELECT s1.n FROM q AS s1 WHERE s1.k IS a0.k), count(*) FROM q AS a0 LEFT JOIN p AS a1 ON NULL FULL JOIN q AS a2 ON a2.k = a1.k GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	8:NULL,1;NULL,1;NULL,1;NULL,1;NULL,1;NULL,1;NULL,1;NULL,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 JOIN o AS a1 ON a1.k IS NULL WHERE (a1.k, 1) BETWEEN (10, NULL) AND (1, a1.k) AND a1.n >= 3	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 JOIN q AS a1 ON a1.k IS NULL WHERE (a1.n, 2) = (NULL, a1.k)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN w AS a1 ON a1.k = a0.k WHERE (a0.k, 5) < (NULL, NULL) AND a0.k >= 1	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN q AS a1 ON a1.k = a0.k WHERE (a1.k, NULL, a0.k) <> (a1.k, NULL, NULL) AND a0.k >= 1	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 LEFT JOIN w AS a1 ON a1.k = a0.k WHERE (a0.k, a0.n) NOT BETWEEN (a0.k, a0.k) AND (NULL, a0.n)	1:3,1,NULL,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 LEFT JOIN p AS a1 ON NULL WHERE (a1.k, NULL, a1.n) <> (a0.k, a1.k, 5)	0:
+q	SELECT count(*), sum((SELECT max(s2.n) FROM q AS s2 WHERE s2.k = a0.k AND s2.n <> a2.k)), count(*) FILTER (WHERE NOT EXISTS (SELECT 1 FROM p AS s1 WHERE s1.k = a2.k AND s1.n <> a2.k)) FROM w AS a0 FULL JOIN w AS a1 ON a1.n > a0.n RIGHT JOIN q AS a2 ON a2.k = a1.n	1:4,NULL,2
+q	SELECT NOT EXISTS (SELECT 1 FROM o AS s1 WHERE a1.n IS NULL), count(*) FROM p AS a0 LEFT JOIN w AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	5:0,1;0,1;0,1;1,1;1,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 FULL JOIN p AS a1 ON NULL WHERE (a1.k, NULL) > (a0.k, 10)	0:
+q	SELECT a0.k, a0.n FROM w AS a0 RIGHT JOIN q AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n ORDER BY EXISTS (SELECT 1 FROM q AS s1 WHERE s1.k IS a1.k), a0.k, a0.n, a1.k, a1.n LIMIT 2	2:NULL,NULL;NULL,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 JOIN q AS a1 ON a1.k IS NULL WHERE (a1.k, NULL) BETWEEN (a0.n, a1.k) AND (10, NULL)	0:
+q	SELECT a0.k NOT IN (SELECT s1.n FROM p AS s1 WHERE s1.n < a0.k), count(*) FROM o AS a0 JOIN p AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	3:1,1;1,1;1,1
+q	SELECT a1.n NOT IN (SELECT s1.n FROM o AS s1 WHERE s1.n < a1.k), max(a0.k) FROM q AS a0 FULL JOIN q AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	7:0,NULL;1,2;1,2;1,3;1,NULL;1,NULL;1,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM w AS a0 LEFT JOIN p AS a1 ON a1.k = a0.n JOIN o AS a2 ON a2.k IS NULL WHERE (a0.k, 1) = (NULL, a0.n) AND a0.k = a0.k	0:
+q	SELECT count(*), sum(NOT EXISTS (SELECT 1 FROM q AS s2 WHERE s2.n < a1.n)), count(*) FILTER (WHERE (SELECT sum(s1.n) FROM w AS s1 WHERE a0.k > 1)) FROM w AS a0 RIGHT JOIN o AS a1 ON a1.k IS NULL	1:2,1,0
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 LEFT JOIN o AS a1 ON a1.k IS NULL WHERE (a1.n, a0.k) >= (a1.n, 10)	0:
+q	SELECT count(*), NOT EXISTS (SELECT 1 FROM p AS s1 WHERE 1) FROM o AS a0 JOIN q AS a1 ON NULL GROUP BY NOT EXISTS (SELECT 1 FROM p AS s1 WHERE 1)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 JOIN w AS a1 ON a1.n > a0.n WHERE (a0.k, a1.k, a1.k) BETWEEN (a0.k, a0.n, a0.k) AND (NULL, NULL, 5) AND a1.k >= 1	0:
+q	SELECT count(*), EXISTS (SELECT 1 FROM o AS s1 WHERE a0.k IS NOT NULL) FROM p AS a0 JOIN q AS a1 ON a1.n > a0.n GROUP BY EXISTS (SELECT 1 FROM o AS s1 WHERE a0.k IS NOT NULL)	2:2,0;5,1
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM o AS a0 RIGHT JOIN w AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n HAVING NOT (a1.k NOT IN (SELECT s1.k FROM o AS s1 WHERE a1.k IS NULL))	0:
+q	SELECT count(*), sum((SELECT sum(s2.n) FROM o AS s2 WHERE s2.k = a0.k AND s2.n <> a0.k)), count(*) FILTER (WHERE (SELECT max(s1.n) FROM q AS s1 WHERE 1)) FROM q AS a0 FULL JOIN w AS a1 ON a1.k = a0.n	1:4,2,4
+q	SELECT count(*) FROM p AS a0 JOIN p AS a1 ON a1.n > a0.n GROUP BY a0.k IN (SELECT s1.n FROM w AS s1 WHERE a0.k IS NOT NULL)	3:1;2;3
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM p AS a0 JOIN q AS a1 ON a1.n > a0.n FULL JOIN p AS a2 ON NULL WHERE (a1.n, a2.k) > (a2.k, a2.k) AND a0.k = a0.k	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM p AS a0 RIGHT JOIN p AS a1 ON NULL JOIN o AS a2 ON a2.k = a1.n WHERE (a2.k, 2) NOT BETWEEN (a2.k, a1.k) AND (a1.n, a2.k)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 RIGHT JOIN w AS a1 ON a1.k IS NULL WHERE (a0.k, NULL) < (5, 5) AND a0.k = a1.k	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 RIGHT JOIN p AS a1 ON a1.k IS NULL WHERE (a0.k, NULL) NOT BETWEEN (a1.n, NULL) AND (NULL, a0.k) AND a1.k = a0.k	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM p AS a0 JOIN q AS a1 ON a1.n > a0.n JOIN w AS a2 ON a2.k = a1.k WHERE (a2.n, NULL) BETWEEN (10, NULL) AND (a2.k, NULL) AND a2.n >= 1	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 LEFT JOIN p AS a1 ON NULL WHERE (a0.n, NULL) >= (1, a0.k)	1:1,4,NULL,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 RIGHT JOIN o AS a1 ON a1.n > a0.n WHERE (a0.k, a1.k, a0.n) = (a0.k, 1, 2) AND a0.k = a1.k	0:
+q	SELECT a0.k, a0.n FROM q AS a0 LEFT JOIN o AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n ORDER BY a1.k NOT IN (SELECT s1.k FROM p AS s1 WHERE 1), a0.k, a0.n, a1.k, a1.n LIMIT 5	4:2,5;2,9;3,1;NULL,2
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM p AS a0 RIGHT JOIN p AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n HAVING NOT (a1.n NOT IN (SELECT s1.k FROM o AS s1 WHERE a1.k IS NOT NULL))	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM q AS a0 JOIN p AS a1 ON a1.k = a0.n FULL JOIN o AS a2 ON a2.k = a1.n WHERE (a0.k, a2.n) = (a2.k, NULL)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM q AS a0 RIGHT JOIN o AS a1 ON a1.k = a0.n LEFT JOIN o AS a2 ON a2.k IS NULL WHERE (a2.k, NULL) NOT BETWEEN (a1.n, 10) AND (a0.k, NULL)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 FULL JOIN w AS a1 ON a1.k = a0.k WHERE (a0.n, a0.k, a0.k) BETWEEN (a1.k, 2, a1.n) AND (a0.k, a1.k, a0.k) AND a0.k >= 1	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 RIGHT JOIN w AS a1 ON a1.k IS NULL WHERE (a0.n, NULL) >= (a1.k, NULL)	0:
+q	SELECT a0.k, a0.n FROM o AS a0 RIGHT JOIN w AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n ORDER BY (SELECT sum(s1.n) FROM w AS s1 WHERE a1.k IS NOT NULL), a0.k, a0.n, a1.k, a1.n LIMIT 5	3:NULL,NULL;NULL,NULL;NULL,NULL
+q	SELECT (SELECT sum(s1.n) FROM p AS s1 WHERE s1.k IS a2.k), sum(a1.k IN (SELECT s2.k FROM q AS s2 WHERE a1.n > 1)) FROM w AS a0 JOIN o AS a1 ON a1.k IS NULL JOIN w AS a2 ON a2.k = a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 LEFT JOIN p AS a1 ON a1.k = a0.k WHERE (a0.k, a1.k) NOT BETWEEN (5, a1.k) AND (a1.n, 1)	2:2,1,2,5;2,1,2,7
+q	SELECT (SELECT sum(s1.n) FROM p AS s1 WHERE s1.k IS a0.k), sum(EXISTS (SELECT 1 FROM q AS s2 WHERE 1)) FROM p AS a0 FULL JOIN w AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n	8:1,1;12,1;12,1;3,1;3,1;3,1;3,1;NULL,1
+q	SELECT count(*), (SELECT count(*) FROM p AS s1 WHERE 1) FROM w AS a0 RIGHT JOIN p AS a1 ON a1.k IS NULL FULL JOIN p AS a2 ON NULL GROUP BY (SELECT count(*) FROM p AS s1 WHERE 1)	1:12,5
+q	SELECT a0.k NOT IN (SELECT s1.k FROM o AS s1 WHERE a1.k > 1), sum((SELECT count(*) FROM p AS s2 WHERE a2.n IS NOT NULL)) FROM p AS a0 FULL JOIN o AS a1 ON a1.n > a0.n LEFT JOIN p AS a2 ON a2.n > a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	10:1,0;1,0;1,0;1,0;1,5;1,5;1,5;NULL,5;NULL,5;NULL,5
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM p AS a0 RIGHT JOIN w AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n HAVING (NOT EXISTS (SELECT 1 FROM w AS s1 WHERE a0.k > 1))	3:NULL,NULL,1,4,1;NULL,NULL,2,1,1;NULL,NULL,5,NULL,1
+q	SELECT count(*), a0.n IN (SELECT s1.k FROM w AS s1 WHERE a2.n > 1) FROM o AS a0 JOIN p AS a1 ON a1.k = a0.n FULL JOIN w AS a2 ON NULL GROUP BY a0.n IN (SELECT s1.k FROM w AS s1 WHERE a2.n > 1)	2:1,NULL;5,0
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 JOIN q AS a1 ON a1.k = a0.n WHERE (a1.n, a0.k, a0.n) <= (10, a0.n, NULL) AND a0.k = a1.k	0:
+q	SELECT count(*) FROM w AS a0 FULL JOIN q AS a1 ON a1.k = a0.n GROUP BY a0.n NOT IN (SELECT s1.k FROM p AS s1 WHERE s1.k = a1.k)	2:2;5
+q	SELECT a0.k, a0.n FROM p AS a0 JOIN w AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n ORDER BY (SELECT max(s1.n) FROM q AS s1 WHERE s1.n < a1.k), a0.k, a0.n, a1.k, a1.n LIMIT 2	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN q AS a1 ON a1.k = a0.n WHERE (a0.n, 1) NOT BETWEEN (5, a1.k) AND (NULL, a1.k) AND a1.k = a0.n	1:NULL,3,3,1
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM p AS a0 LEFT JOIN q AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n HAVING NOT ((SELECT sum(s1.n) FROM w AS s1 WHERE a0.k IS NOT NULL))	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 LEFT JOIN q AS a1 ON a1.k IS NULL WHERE (a0.n, a1.n) <> (a0.k, NULL)	2:2,5,NULL,2;2,7,NULL,2
+q	SELECT count(*) FROM q AS a0 LEFT JOIN p AS a1 ON a1.k = a0.k GROUP BY EXISTS (SELECT 1 FROM q AS s1 WHERE 1)	1:6
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM w AS a0 FULL JOIN w AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n HAVING (a0.n IN (SELECT s1.n FROM o AS s1 WHERE s1.n < a0.k))	1:2,1,1,4,1
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM w AS a0 JOIN o AS a1 ON a1.k = a0.k LEFT JOIN o AS a2 ON NULL WHERE (a0.k, a2.n, a2.k) <> (2, a0.k, 1) AND a0.k >= 3	0:
+q	SELECT (SELECT max(s1.n) FROM w AS s1 WHERE s1.k = a0.k), sum(EXISTS (SELECT 1 FROM w AS s2 WHERE s2.k = a1.k AND s2.n <> a0.k)) FROM p AS a0 LEFT JOIN p AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n	5:1,0;1,0;4,0;NULL,0;NULL,0
+q	SELECT (SELECT min(s1.k) FROM o AS s1 WHERE s1.n < a0.k), max(a1.k) FROM q AS a0 RIGHT JOIN o AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	3:2,2;2,2;NULL,9
+q	SELECT count(*), sum((SELECT max(s2.n) FROM w AS s2 WHERE s2.k = a0.n)), count(*) FILTER (WHERE NOT EXISTS (SELECT 1 FROM q AS s1 WHERE a1.k IS NOT NULL)) FROM q AS a0 FULL JOIN q AS a1 ON a1.k = a0.n	1:7,6,4
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n, count(*) FROM o AS a0 RIGHT JOIN q AS a1 ON a1.k = a0.k FULL JOIN o AS a2 ON a2.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n HAVING ((SELECT min(s1.k) FROM p AS s1 WHERE s1.k = a1.k))	2:2,1,2,5,NULL,NULL,1;2,1,2,9,NULL,NULL,1
+q	SELECT count(*), sum(a1.n IN (SELECT s2.n FROM o AS s2 WHERE 1)), count(*) FILTER (WHERE a0.k NOT IN (SELECT s1.k FROM q AS s1 WHERE a1.k IS NOT NULL)) FROM q AS a0 FULL JOIN q AS a1 ON a1.k = a0.k	1:7,2,2
+q	SELECT count(*) FROM q AS a0 FULL JOIN w AS a1 ON a1.k = a0.n GROUP BY a1.k NOT IN (SELECT s1.k FROM q AS s1 WHERE s1.k = a0.k)	2:1;3
+q	SELECT count(*) FROM q AS a0 FULL JOIN q AS a1 ON NULL GROUP BY a0.k IN (SELECT s1.n FROM q AS s1 WHERE a0.k IS NOT NULL)	2:2;6
+q	SELECT (SELECT sum(s1.n) FROM o AS s1 WHERE s1.k IS a0.n), count(*) FROM q AS a0 LEFT JOIN q AS a1 ON a1.k = a0.n JOIN w AS a2 ON a2.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	0:
+q	SELECT NOT EXISTS (SELECT 1 FROM w AS s1 WHERE 1), max(a0.k) FROM o AS a0 JOIN q AS a1 ON a1.k IS NULL LEFT JOIN p AS a2 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	2:0,2;0,9
+q	SELECT EXISTS (SELECT 1 FROM q AS s1 WHERE 1), sum((SELECT sum(s2.n) FROM q AS s2 WHERE a1.k > 1)) FROM q AS a0 FULL JOIN q AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n	7:1,17;1,17;1,17;1,NULL;1,NULL;1,NULL;1,NULL
+q	SELECT (SELECT count(*) FROM p AS s1 WHERE a1.k IS NULL), max(a0.k) FROM w AS a0 LEFT JOIN p AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	4:0,1;0,2;0,2;5,5
+q	SELECT (SELECT count(*) FROM q AS s1 WHERE s1.k = a0.k AND s1.n <> a0.k), count(*) FROM o AS a0 JOIN p AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	6:0,1;0,1;0,1;2,1;2,1;2,1
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM p AS a0 FULL JOIN q AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n HAVING (a1.k IN (SELECT s1.n FROM w AS s1 WHERE s1.k = a0.k AND s1.n <> a0.k))	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN o AS a1 ON a1.k = a0.k WHERE (a0.k, a1.n) <= (10, a1.k) AND a0.k >= 1	2:2,5,2,1;2,9,2,1
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM w AS a0 FULL JOIN w AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n HAVING (a1.k IN (SELECT s1.k FROM p AS s1 WHERE 1))	2:2,1,1,4,1;NULL,NULL,2,1,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 JOIN w AS a1 ON a1.n > a0.n WHERE (a1.n, 2) <= (a0.k, 2)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM q AS a0 RIGHT JOIN w AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n HAVING (EXISTS (SELECT 1 FROM w AS s1 WHERE a1.k > 1))	2:2,5,5,NULL,1;NULL,2,2,1,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 RIGHT JOIN p AS a1 ON a1.n > a0.n WHERE (a1.n, 5, a1.n) > (NULL, NULL, 1)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN p AS a1 ON a1.k = a0.k WHERE (a0.n, a1.k, a0.n) NOT BETWEEN (a1.k, NULL, a0.k) AND (1, 10, NULL) AND a0.k = a1.n	0:
+q	SELECT EXISTS (SELECT 1 FROM w AS s1 WHERE a1.k > 1), max(a1.k) FROM o AS a0 LEFT JOIN q AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	5:0,NULL;1,2;1,2;1,2;1,2
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 LEFT JOIN w AS a1 ON a1.k IS NULL WHERE (a1.k, a1.k) BETWEEN (a1.k, 5) AND (NULL, 5) AND a1.k = a1.k	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN q AS a1 ON a1.k = a0.n WHERE (a0.k, a1.n) NOT BETWEEN (2, 2) AND (a0.k, a0.k) AND a0.n >= 3	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 LEFT JOIN w AS a1 ON NULL WHERE (a1.k, NULL) < (a1.n, a1.n) AND a0.n = a0.k	0:
+q	SELECT (SELECT count(*) FROM p AS s1 WHERE s1.k = a0.k AND s1.n <> a1.k), sum((SELECT max(s2.n) FROM p AS s2 WHERE s2.k = a0.n AND s2.n <> a1.n)) FROM p AS a0 FULL JOIN q AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	9:0,NULL;0,NULL;0,NULL;0,NULL;0,NULL;0,NULL;0,NULL;0,NULL;0,NULL
+q	SELECT a1.n NOT IN (SELECT s1.n FROM o AS s1 WHERE s1.n < a1.k), max(a1.k) FROM o AS a0 FULL JOIN p AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	8:1,1;1,2;1,2;1,2;1,2;1,NULL;1,NULL;NULL,4
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM p AS a0 JOIN q AS a1 ON a1.n > a0.n FULL JOIN w AS a2 ON NULL WHERE (a1.n, a1.k, a1.k) <= (NULL, NULL, 5) AND a0.k >= 3	0:
+q	SELECT (SELECT count(*) FROM w AS s1 WHERE 1), max(a1.k) FROM p AS a0 RIGHT JOIN o AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n	2:3,2;3,9
+q	SELECT count(*), sum((SELECT max(s2.n) FROM p AS s2 WHERE a1.k IS NULL)), count(*) FILTER (WHERE a1.k NOT IN (SELECT s1.k FROM w AS s1 WHERE s1.k = a0.k)) FROM p AS a0 RIGHT JOIN p AS a1 ON a1.k = a0.k	1:7,7,2
+q	SELECT a1.n NOT IN (SELECT s1.k FROM p AS s1 WHERE s1.k = a1.n AND s1.n <> a2.k), count(*) FROM o AS a0 LEFT JOIN p AS a1 ON a1.k = a0.k RIGHT JOIN p AS a2 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	5:1,1;1,1;1,1;1,1;1,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN w AS a1 ON a1.n > a0.n WHERE (a1.n, a1.n) BETWEEN (a0.n, a1.k) AND (10, NULL)	2:3,1,1,4;NULL,2,1,4
+q	SELECT count(*) FROM p AS a0 FULL JOIN q AS a1 ON a1.k = a0.n GROUP BY (SELECT min(s1.k) FROM w AS s1 WHERE s1.n < a1.k)	2:3;5
+q	SELECT count(*), (SELECT sum(s1.n) FROM p AS s1 WHERE s1.k IS a1.k) FROM w AS a0 FULL JOIN o AS a1 ON a1.k = a0.k GROUP BY (SELECT sum(s1.n) FROM p AS s1 WHERE s1.k IS a1.k)	3:1,12;1,NULL;2,3
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM o AS a0 LEFT JOIN p AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n HAVING (EXISTS (SELECT 1 FROM p AS s1 WHERE s1.k = a1.n AND s1.n <> a1.k))	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 LEFT JOIN q AS a1 ON NULL WHERE (a0.k, 10) NOT BETWEEN (a1.k, a0.k) AND (NULL, NULL) AND a0.k = a1.k	0:
+q	SELECT a0.n NOT IN (SELECT s1.n FROM w AS s1 WHERE s1.k = a0.k), max(a1.k) FROM o AS a0 FULL JOIN o AS a1 ON a1.k = a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	3:0,NULL;1,2;1,9
+q	SELECT a1.k NOT IN (SELECT s1.k FROM w AS s1 WHERE a1.k > 1), max(a1.n) FROM p AS a0 RIGHT JOIN w AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	4:0,1;0,NULL;1,4;1,4
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 LEFT JOIN o AS a1 ON a1.k IS NULL WHERE (a1.n, a0.k) BETWEEN (5, a1.k) AND (NULL, 10)	0:
+q	SELECT (SELECT count(*) FROM q AS s1 WHERE a1.k IS NULL), max(a1.n) FROM p AS a0 FULL JOIN q AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	9:0,1;0,5;0,5;0,9;0,9;4,2;4,NULL;4,NULL;4,NULL
+q	SELECT a0.k NOT IN (SELECT s1.k FROM o AS s1 WHERE s1.k = a0.n AND s1.n <> a2.k), count(*) FROM p AS a0 FULL JOIN p AS a1 ON a1.n > a0.n FULL JOIN q AS a2 ON a2.k = a1.k GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	17:1,1;1,1;1,1;1,1;1,1;1,1;1,1;1,1;1,1;1,1;1,1;1,1;1,1;1,1;1,1;1,1;1,1
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM q AS a0 RIGHT JOIN w AS a1 ON a1.k = a0.k FULL JOIN w AS a2 ON a2.k IS NULL WHERE (a2.k, NULL) NOT BETWEEN (NULL, a0.k) AND (2, NULL) AND a0.k = a1.k	0:
+q	SELECT a0.k NOT IN (SELECT s1.n FROM o AS s1 WHERE s1.n < a1.n), sum(a0.k NOT IN (SELECT s2.k FROM w AS s2 WHERE 1)) FROM w AS a0 RIGHT JOIN w AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	3:0,0;1,0;1,0
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 JOIN q AS a1 ON a1.k = a0.n WHERE (a0.k, 10, 2) NOT BETWEEN (a0.k, a1.n, a1.k) AND (NULL, a1.k, a1.n)	0:
+q	SELECT count(*), sum((SELECT count(*) FROM q AS s2 WHERE s2.n < a0.k)), count(*) FILTER (WHERE (SELECT sum(s1.n) FROM p AS s1 WHERE s1.k = a1.k AND s1.n <> a2.k)) FROM w AS a0 RIGHT JOIN o AS a1 ON a1.n > a0.n FULL JOIN q AS a2 ON a2.n > a1.n	1:6,2,2
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 LEFT JOIN o AS a1 ON NULL WHERE (a1.n, a0.n, 10) < (5, 2, a1.n)	0:
+q	SELECT count(*), sum((SELECT count(*) FROM p AS s2 WHERE a0.k IS NOT NULL)), count(*) FILTER (WHERE NOT EXISTS (SELECT 1 FROM q AS s1 WHERE 1)) FROM o AS a0 JOIN w AS a1 ON a1.k IS NULL	1:0,NULL,0
+q	SELECT count(*), sum(a1.n NOT IN (SELECT s2.n FROM o AS s2 WHERE s2.k IS a0.k)), count(*) FILTER (WHERE a0.n NOT IN (SELECT s1.k FROM o AS s1 WHERE s1.k = a0.k AND s1.n <> a0.n)) FROM q AS a0 FULL JOIN w AS a1 ON a1.k IS NULL	1:7,5,7
+q	SELECT count(*) FROM p AS a0 FULL JOIN q AS a1 ON a1.k = a0.n GROUP BY (SELECT max(s1.n) FROM o AS s1 WHERE a0.k IS NOT NULL)	2:4;4
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM o AS a0 RIGHT JOIN q AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n HAVING NOT ((SELECT sum(s1.n) FROM o AS s1 WHERE a1.k IS NULL))	0:
+q	SELECT count(*) FROM o AS a0 FULL JOIN q AS a1 ON a1.n > a0.n GROUP BY a1.k IN (SELECT s1.n FROM p AS s1 WHERE s1.k = a0.n AND s1.n <> a0.k)	2:1;5
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n, count(*) FROM p AS a0 RIGHT JOIN o AS a1 ON a1.n > a0.n RIGHT JOIN q AS a2 ON a2.k = a1.k GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n HAVING ((SELECT min(s1.k) FROM q AS s1 WHERE s1.k = a2.k))	3:NULL,NULL,2,1,2,5,1;NULL,NULL,2,1,2,9,1;NULL,NULL,NULL,NULL,3,1,1
+q	SELECT a0.k NOT IN (SELECT s1.n FROM o AS s1 WHERE a1.k IS NOT NULL), max(a2.k) FROM q AS a0 JOIN w AS a1 ON NULL LEFT JOIN p AS a2 ON a2.k = a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	0:
+q	SELECT (SELECT count(*) FROM p AS s1 WHERE 1), count(*) FROM p AS a0 JOIN q AS a1 ON a1.k = a0.k GROUP BY a0.k, a0.n, a1.k, a1.n	4:5,1;5,1;5,1;5,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 JOIN q AS a1 ON a1.n > a0.n WHERE (a1.n, a0.k) NOT BETWEEN (a1.n, a0.k) AND (a1.k, a0.n)	4:2,1,2,5;2,1,2,9;9,2,2,5;9,2,2,9
+q	SELECT NOT EXISTS (SELECT 1 FROM p AS s1 WHERE s1.k = a1.k AND s1.n <> a1.k), sum((SELECT count(*) FROM w AS s2 WHERE s2.k = a0.k)) FROM w AS a0 LEFT JOIN o AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n	3:1,1;1,1;1,1
+q	SELECT a0.k IN (SELECT s1.k FROM w AS s1 WHERE a0.k IS NOT NULL), max(a1.k) FROM w AS a0 FULL JOIN p AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	8:0,1;0,4;1,2;1,2;1,2;1,2;1,NULL;1,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 RIGHT JOIN o AS a1 ON NULL WHERE (a1.n, a1.k, a1.n) < (10, 5, NULL) AND a1.n >= 3	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM w AS a0 FULL JOIN o AS a1 ON a1.k = a0.n FULL JOIN q AS a2 ON NULL WHERE (a1.n, 2) BETWEEN (a0.n, 5) AND (NULL, NULL) AND a0.k >= 3	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 LEFT JOIN w AS a1 ON NULL WHERE (a0.n, a1.k) < (2, NULL) AND a1.n >= 3	0:
+q	SELECT EXISTS (SELECT 1 FROM p AS s1 WHERE s1.k = a0.n), sum(a2.n NOT IN (SELECT s2.k FROM q AS s2 WHERE 1)) FROM w AS a0 LEFT JOIN w AS a1 ON a1.k = a0.k LEFT JOIN o AS a2 ON a2.k = a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	3:0,NULL;1,NULL;1,NULL
+q	SELECT a2.n IN (SELECT s1.n FROM w AS s1 WHERE s1.k = a1.k AND s1.n <> a1.k), count(*) FROM w AS a0 FULL JOIN p AS a1 ON a1.n > a0.n FULL JOIN o AS a2 ON a2.k = a1.n GROUP BY a0.k, a0.n, a1.k, a1.n, a2.k, a2.n	10:0,1;0,1;0,1;0,1;0,1;NULL,1;NULL,1;NULL,1;NULL,1;NULL,1
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM q AS a0 RIGHT JOIN p AS a1 ON a1.n > a0.n RIGHT JOIN p AS a2 ON a2.n > a1.n WHERE (a0.k, 1, a2.n) BETWEEN (a2.k, a2.k, NULL) AND (a0.n, a1.k, NULL)	0:
+q	SELECT count(*), sum(a1.k NOT IN (SELECT s2.n FROM q AS s2 WHERE a1.n IS NULL)), count(*) FILTER (WHERE EXISTS (SELECT 1 FROM q AS s1 WHERE a1.k > 1)) FROM w AS a0 JOIN o AS a1 ON a1.k = a0.n	1:0,NULL,0
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 LEFT JOIN p AS a1 ON a1.k IS NULL WHERE (a0.k, a1.k) NOT BETWEEN (a1.k, a1.k) AND (NULL, a1.k)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM o AS a0 RIGHT JOIN w AS a1 ON NULL WHERE (a1.k, a0.n) > (5, a1.k) AND a0.k >= 3	0:
+q	SELECT count(*) FROM p AS a0 RIGHT JOIN p AS a1 ON a1.k = a0.n JOIN q AS a2 ON a2.n > a1.n GROUP BY a1.k IN (SELECT s1.n FROM w AS s1 WHERE s1.k = a0.k AND s1.n <> a0.k)	1:7
+q	SELECT a1.k NOT IN (SELECT s1.k FROM p AS s1 WHERE s1.n < a0.k), sum((SELECT max(s2.n) FROM p AS s2 WHERE a0.k IS NULL)) FROM o AS a0 RIGHT JOIN q AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	4:1,7;1,7;1,7;1,7
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM q AS a0 FULL JOIN w AS a1 ON NULL FULL JOIN p AS a2 ON a2.k = a1.k WHERE (a0.n, a2.k) < (a1.k, 5) AND a2.k = a2.n	0:
+q	SELECT NOT EXISTS (SELECT 1 FROM o AS s1 WHERE a1.k IS NULL), sum(NOT EXISTS (SELECT 1 FROM p AS s2 WHERE s2.k = a0.n)) FROM p AS a0 RIGHT JOIN o AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n	2:1,1;1,1
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN w AS a1 ON a1.k = a0.n WHERE (a1.k, 10) = (a0.k, 10) AND a0.k = a0.k	1:1,1,1,4
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 JOIN o AS a1 ON a1.k IS NULL WHERE (a1.k, a0.n) BETWEEN (a1.k, NULL) AND (NULL, NULL) AND a0.n = a0.k	0:
+q	SELECT a1.n IN (SELECT s1.n FROM p AS s1 WHERE a0.k > 1), sum(EXISTS (SELECT 1 FROM w AS s2 WHERE s2.k = a1.k)) FROM p AS a0 LEFT JOIN p AS a1 ON a1.k IS NULL GROUP BY a0.k, a0.n, a1.k, a1.n	5:0,0;0,0;1,0;1,0;1,0
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM w AS a0 RIGHT JOIN w AS a1 ON NULL WHERE (a1.k, NULL) <= (NULL, 2) AND a0.n >= 1	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM q AS a0 JOIN o AS a1 ON a1.k = a0.n RIGHT JOIN o AS a2 ON a2.k IS NULL WHERE (a0.k, 2) = (a1.k, a0.k)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM w AS a0 JOIN w AS a1 ON a1.n > a0.n FULL JOIN o AS a2 ON a2.k = a1.k WHERE (a1.k, a1.k, a0.k) <= (a0.k, 5, a0.k) AND a1.n = a1.n	1:2,1,1,4,NULL,NULL
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM q AS a0 JOIN o AS a1 ON a1.n > a0.n WHERE (a0.k, NULL) BETWEEN (a1.n, 1) AND (NULL, 5)	0:
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM w AS a0 RIGHT JOIN p AS a1 ON NULL RIGHT JOIN p AS a2 ON a2.k = a1.n WHERE (a0.n, 10, 1) BETWEEN (a1.k, NULL, NULL) AND (a1.n, NULL, 10) AND a0.k = a0.n	0:
+q	SELECT (SELECT max(s1.n) FROM p AS s1 WHERE s1.k = a0.k), sum(EXISTS (SELECT 1 FROM o AS s2 WHERE s2.k = a0.n)) FROM o AS a0 JOIN q AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n	5:7,0;7,0;7,0;NULL,1;NULL,1
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM w AS a0 FULL JOIN w AS a1 ON a1.n > a0.n RIGHT JOIN q AS a2 ON NULL WHERE (a2.n, a0.n, a2.k) > (a1.n, a2.n, 2)	0:
+q	SELECT count(*) FROM p AS a0 RIGHT JOIN p AS a1 ON a1.k = a0.n GROUP BY NOT EXISTS (SELECT 1 FROM q AS s1 WHERE a0.n > 1)	1:5
+q	SELECT a0.k, a0.n, a1.k, a1.n FROM p AS a0 RIGHT JOIN p AS a1 ON a1.k = a0.k WHERE (a0.k, a0.n, a0.n) NOT BETWEEN (a1.n, a0.k, NULL) AND (a0.k, a0.k, a0.n)	4:2,5,2,5;2,5,2,7;2,7,2,5;2,7,2,7
+q	SELECT count(*), sum(NOT EXISTS (SELECT 1 FROM o AS s2 WHERE a1.n > 1)), count(*) FILTER (WHERE (SELECT max(s1.n) FROM o AS s1 WHERE s1.n < a1.k)) FROM o AS a0 LEFT JOIN w AS a1 ON NULL	1:2,2,0
+q	SELECT a0.k, a0.n, a1.k, a1.n, count(*) FROM o AS a0 LEFT JOIN p AS a1 ON a1.n > a0.n GROUP BY a0.k, a0.n, a1.k, a1.n HAVING NOT (a0.n IN (SELECT s1.k FROM o AS s1 WHERE s1.k = a0.n))	3:2,1,2,5,1;2,1,2,7,1;2,1,NULL,3,1
+q	SELECT a0.k, a0.n, a1.k, a1.n, a2.k, a2.n FROM p AS a0 JOIN q AS a1 ON a1.k IS NULL JOIN q AS a2 ON a2.n > a1.n WHERE (a1.n, a1.n, a2.n) <> (NULL, NULL, a0.k)	8:1,1,NULL,2,2,5;1,1,NULL,2,2,9;2,5,NULL,2,2,5;2,5,NULL,2,2,9;2,7,NULL,2,2,5;2,7,NULL,2,2,9;4,NULL,NULL,2,2,5;4,NULL,NULL,2,2,9
+q	SELECT count(*) FROM q AS a0 FULL JOIN p AS a1 ON a1.n > a0.n GROUP BY NOT EXISTS (SELECT 1 FROM o AS s1 WHERE s1.k = a1.n)	1:10
+q	SELECT a0.n NOT IN (SELECT s1.k FROM p AS s1 WHERE s1.k IS a1.n), max(a0.k) FROM w AS a0 RIGHT JOIN p AS a1 ON NULL GROUP BY a0.k, a0.n, a1.k, a1.n	5:1,NULL;1,NULL;1,NULL;NULL,NULL;NULL,NULL
+q	SELECT count(*) FROM w AS a0 FULL JOIN o AS a1 ON a1.k = a0.n GROUP BY (SELECT min(s1.k) FROM p AS s1 WHERE a1.k > 1)	2:2;3

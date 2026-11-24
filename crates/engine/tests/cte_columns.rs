@@ -326,3 +326,50 @@ fn nested_recursive_ctes_are_planned_again_a_bounded_number_of_times() {
         .unwrap();
     assert_eq!(nested.join().unwrap().unwrap(), ["1,0"]);
 }
+
+/// Do: compare the merged column of a FULL or RIGHT JOIN's USING or NATURAL, TEXT on the left and REAL on
+/// the right, with numbers and texts, under each setting. Expect: SQLite 3.54.0's rows. The column has the
+/// left's affinity, and TEXT affinity converts a number only to compare it with a text: Amphora compared
+/// '0.0' with '0' (the oracles' finding CZ).
+#[test]
+fn a_merged_columns_numbers_compare_as_numbers() {
+    let fill = [
+        "CREATE TABLE a(k TEXT, x)",
+        "CREATE TABLE b(k REAL, y)",
+        "INSERT INTO a VALUES ('1', 'a1')",
+        "INSERT INTO b VALUES (0.0, 'b0'), (2.5, 'b2'), (3, 'b3'), (10, 'b10')",
+    ];
+    let cases: [(&str, &[&str]); 5] = [
+        (
+            "SELECT y, k = 0, k = 0.0, k = '0', k = '0.0', k < 1, k > 2, k IN (0), k BETWEEN 0 AND 1 FROM a FULL JOIN b USING (k)",
+            &[
+                "NULL,0,0,0,0,0,0,0,1",
+                "b0,1,1,0,1,1,0,1,1",
+                "b10,0,0,0,0,0,1,0,0",
+                "b2,0,0,0,0,0,1,0,0",
+                "b3,0,0,0,0,0,1,0,0",
+            ],
+        ),
+        ("SELECT y FROM a FULL JOIN b USING (k) WHERE 0 == k", &["b0"]),
+        (
+            "SELECT y FROM a RIGHT JOIN b USING (k) WHERE k >= 3",
+            &["b10", "b3"],
+        ),
+        (
+            "SELECT y FROM a NATURAL FULL JOIN b WHERE k BETWEEN 3.0 AND 'ABC'",
+            &["b10", "b3"],
+        ),
+        (
+            "SELECT y FROM a FULL JOIN b USING (k) WHERE k IN (3, 2.5)",
+            &["b2", "b3"],
+        ),
+    ];
+    for (setting, parallel, statistics) in SETTINGS {
+        let conn = open(&fill, parallel, statistics);
+        for (sql, want) in cases {
+            let mut got = rows(&conn, sql).unwrap();
+            got.sort();
+            assert_eq!(got, want, "{setting}: {sql}");
+        }
+    }
+}

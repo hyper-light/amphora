@@ -17,7 +17,7 @@ use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{to_u32, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral};
 use crate::vdbe::BranchOffset;
 use crate::{Connection, LimboError, Result};
-use amphora_engine_parser::ast::{self, Expr, ResolveType, TriggerEvent, TriggerTime};
+use amphora_engine_parser::ast::{self, Expr, ResolveType};
 
 fn offset(start: usize, n: usize) -> Result<usize> {
     start
@@ -612,26 +612,27 @@ fn check_supported(table: &BTreeTable, resolver: &Resolver, db: usize) -> Result
     Ok(())
 }
 
-/// A table's row triggers of one event, in the order they fire, and the row each is given.
+/// The triggers of one event a statement fires for each row it changes, in firing order.
 struct RowTriggers {
     before: Vec<Arc<Trigger>>,
     after: Vec<Arc<Trigger>>,
 }
 
 impl RowTriggers {
-    fn new(
+    /// `updated` is the columns an UPDATE or an UPSERT sets, which an UPDATE OF trigger is asked by.
+    fn of(
         resolver: &Resolver,
-        table: &BTreeTable,
         db: usize,
-        event: TriggerEvent,
+        event: ast::TriggerEvent,
         updated: Option<&ColumnMask>,
+        table: &BTreeTable,
     ) -> Self {
         let at = |time| {
             get_triggers_including_temp(resolver, db, event.clone(), time, updated.cloned(), table)
         };
         Self {
-            before: at(TriggerTime::Before),
-            after: at(TriggerTime::After),
+            before: at(ast::TriggerTime::Before),
+            after: at(ast::TriggerTime::After),
         }
     }
 
@@ -640,39 +641,48 @@ impl RowTriggers {
     }
 }
 
-/// A row as triggers read it: the register of each column and, last, of the rowid, which no
-/// trigger of this table can name (`trigger_exec` refuses it).
+/// The registers of a row image as `TriggerContext` takes them: the columns in declaration order,
+/// then the rowid's, which a trigger on a WITHOUT ROWID table can't name.
 fn trigger_row(
     program: &mut ProgramBuilder,
     table: &BTreeTable,
     image: usize,
 ) -> Result<Vec<usize>> {
     let layout = table.column_layout()?;
-    let rowid = program.alloc_register();
-    program.emit_null(rowid, None);
+    let no_rowid = program.alloc_register();
+    program.emit_null(no_rowid, None);
     Ok((0..table.columns().len())
-        .map(|column| layout.to_register(image, column))
-        .chain(std::iter::once(rowid))
+        .map(|i| layout.to_register(image, i))
+        .chain(std::iter::once(no_rowid))
         .collect())
 }
 
+/// Fires `triggers` for the row in hand. `skip` is where RAISE(IGNORE) goes.
 fn fire_row_triggers(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
     connection: &Arc<Connection>,
     db: usize,
-    triggers: Vec<Arc<Trigger>>,
-    row: &TriggerContext,
-    ignore: BranchOffset,
+    triggers: &[Arc<Trigger>],
+    ctx: &TriggerContext,
+    skip: BranchOffset,
 ) -> Result<()> {
     for trigger in triggers {
-        fire_trigger(program, resolver, trigger, row, connection, db, ignore)?;
+        fire_trigger(
+            program,
+            resolver,
+            trigger.clone(),
+            ctx,
+            connection,
+            db,
+            skip,
+        )?;
     }
     Ok(())
 }
 
-/// Amphora: converts `image` as its columns do before its BEFORE triggers see it, as SQLite's
-/// sqlite3TableAffinity does: by the columns' affinities, and a STRICT table's checked types.
+/// Converts a NEW image to its columns' types, which SQLite does before BEFORE triggers read it
+/// (update.c: `sqlite3TableAffinity`, for a STRICT table its type check).
 fn convert_image(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -694,20 +704,45 @@ fn convert_image(
     Ok(())
 }
 
-/// Reads again the columns `updated` leaves alone: a BEFORE trigger may have changed them, and
-/// the row keeps what it wrote, as SQLite's sqlite3Update reloads them.
-fn reload_unchanged(
+/// Fires the BEFORE UPDATE triggers of the row at `old_pk`, then reads the row again as they left
+/// it: one they deleted or moved to another key is done with (`skip`), and a column the statement
+/// doesn't set keeps what they wrote (update.c, after its BEFORE triggers). Returns the image of the
+/// row as it is stored, which its index entries are deleted by.
+#[allow(clippy::too_many_arguments)]
+fn fire_before_update(
     program: &mut ProgramBuilder,
-    table: &BTreeTable,
+    resolver: &mut Resolver,
+    connection: &Arc<Connection>,
+    table: &Arc<BTreeTable>,
+    db: usize,
     cursor: usize,
-    image: usize,
+    triggers: &[Arc<Trigger>],
+    ctx: &TriggerContext,
+    old_pk: usize,
+    new: usize,
     updated: &ColumnMask,
-) -> Result<()> {
+    skip: BranchOffset,
+) -> Result<usize> {
+    convert_image(program, resolver, table, new)?;
+    fire_row_triggers(program, resolver, connection, db, triggers, ctx, skip)?;
+    program.emit_insn(Insn::NoConflict {
+        cursor_id: cursor,
+        target_pc: skip,
+        record_reg: old_pk,
+        num_regs: table.primary_key_columns.len(),
+    });
+    let stored = read_image(program, table, cursor)?;
     let layout = table.column_layout()?;
-    for i in (0..table.columns().len()).filter(|i| !updated.get(*i)) {
-        program.emit_column_or_rowid(cursor, i, layout.to_register(image, i));
+    for (i, _) in table.columns().iter().enumerate() {
+        if !updated.get(i) {
+            program.emit_insn(Insn::Copy {
+                src_reg: layout.to_register(stored, i),
+                dst_reg: layout.to_register(new, i),
+                extra_amount: 0,
+            });
+        }
     }
-    Ok(())
+    Ok(stored)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -880,6 +915,17 @@ pub(crate) fn emit_update(
     if !update.from_tables.joined_tables().is_empty() {
         crate::bail_parse_error!("UPDATE FROM of WITHOUT ROWID tables is not supported");
     }
+    let mut updated = ColumnMask::default();
+    for set in &update.set_clauses {
+        updated.set(set.column_index)?;
+    }
+    let triggers = RowTriggers::of(
+        &resolver,
+        db,
+        ast::TriggerEvent::Update,
+        Some(&updated),
+        &table,
+    );
     let columns = primary_key_columns(&table, target.internal_id, db)?;
     let scratch = scratch_table(&table);
     let read_cursor = program.alloc_cursor_id(CursorType::BTreeTable(scratch.clone()));
@@ -944,10 +990,6 @@ pub(crate) fn emit_update(
             extra_amount: 0,
         });
     }
-    let mut updated = ColumnMask::default();
-    for set in &update.set_clauses {
-        updated.set(set.column_index)?;
-    }
     let overrides = [(
         crate::vdbe::builder::CursorKey::table(target.internal_id),
         cursor,
@@ -982,46 +1024,32 @@ pub(crate) fn emit_update(
         &table.name,
         &layout,
     )?;
-    let triggers = RowTriggers::new(&resolver, &table, db, TriggerEvent::Update, Some(&updated));
-    let fires_before = !triggers.before.is_empty();
-    let trigger_rows = if triggers.is_empty() {
-        None
-    } else {
-        Some((
-            trigger_row(program, &table, new)?,
-            trigger_row(program, &table, old)?,
-        ))
-    };
-    // The row as it is when its index entries go, which a BEFORE trigger may have changed.
     let mut stored = old;
-    if let (true, Some((new_row, old_row))) = (fires_before, &trigger_rows) {
-        convert_image(program, &resolver, &table, new)?;
-        let row = update_trigger_context(
+    if !triggers.before.is_empty() {
+        let new_row = trigger_row(program, &table, new)?;
+        let old_row = trigger_row(program, &table, old)?;
+        let ctx = update_trigger_context(
             program,
             &table,
-            Some(new_row.clone()),
-            Some(old_row.clone()),
+            Some(new_row),
+            Some(old_row),
             conflict,
-            TriggerTime::Before,
+            ast::TriggerTime::Before,
         );
-        fire_row_triggers(
+        stored = fire_before_update(
             program,
             &mut resolver,
             connection,
+            &table,
             db,
-            triggers.before,
-            &row,
+            cursor,
+            &triggers.before,
+            &ctx,
+            old_pk,
+            new,
+            &updated,
             next,
         )?;
-        // A BEFORE trigger may have moved the cursor, and changed or deleted the row.
-        program.emit_insn(Insn::NoConflict {
-            cursor_id: cursor,
-            target_pc: next,
-            record_reg: old_pk,
-            num_regs: table.primary_key_columns.len(),
-        });
-        reload_unchanged(program, &table, cursor, new, &updated)?;
-        stored = read_image(program, &table, cursor)?;
     }
     let new_pk = pk_registers(program, &table, new)?;
     validate_image(
@@ -1044,7 +1072,7 @@ pub(crate) fn emit_update(
         &table,
         cursor,
         new,
-        Some(old),
+        Some(stored),
         &indexes,
         conflict,
         next,
@@ -1152,22 +1180,24 @@ pub(crate) fn emit_update(
         buffer.as_ref(),
         &layout,
     )?;
-    if let Some((new_row, old_row)) = trigger_rows {
-        let row = update_trigger_context(
+    if !triggers.after.is_empty() {
+        let new_row = trigger_row(program, &table, new)?;
+        let old_row = trigger_row(program, &table, old)?;
+        let ctx = update_trigger_context(
             program,
             &table,
             Some(new_row),
             Some(old_row),
             conflict,
-            TriggerTime::After,
+            ast::TriggerTime::After,
         );
         fire_row_triggers(
             program,
             &mut resolver,
             connection,
             db,
-            triggers.after,
-            &row,
+            &triggers.after,
+            &ctx,
             next,
         )?;
     }
@@ -1212,6 +1242,7 @@ pub(crate) fn emit_delete(
     program.set_multi_write(true);
     program.set_may_abort(true);
     let mut resolver = resolver.fork();
+    let triggers = RowTriggers::of(&resolver, db, ast::TriggerEvent::Delete, None, &table);
     let scratch = scratch_table(&table);
     let read_cursor = program.alloc_cursor_id(CursorType::BTreeTable(scratch.clone()));
     program.emit_insn(Insn::OpenEphemeral {
@@ -1268,26 +1299,24 @@ pub(crate) fn emit_delete(
     });
     let image = read_image(program, &table, cursor)?;
     let layout = table.column_layout()?;
-    let triggers = RowTriggers::new(&resolver, &table, db, TriggerEvent::Delete, None);
-    // A DELETE fires its triggers with their own conflict resolution, never an OR clause's
-    // (SQLite's sqlite3GenerateRowDelete).
-    let row = if triggers.is_empty() {
+    // SQLite codes a DELETE's triggers with OE_Default (delete.c): no conflict clause of an
+    // enclosing statement reaches theirs.
+    let old_row = if triggers.is_empty() {
         None
     } else {
-        let old_row = trigger_row(program, &table, image)?;
-        Some(TriggerContext::new(table.clone(), None, Some(old_row)))
+        Some(trigger_row(program, &table, image)?)
     };
-    if let (false, Some(row)) = (triggers.before.is_empty(), &row) {
+    let trigger_ctx = TriggerContext::new(table.clone(), None, old_row);
+    if !triggers.before.is_empty() {
         fire_row_triggers(
             program,
             &mut resolver,
             connection,
             db,
-            triggers.before,
-            row,
+            &triggers.before,
+            &trigger_ctx,
             next,
         )?;
-        // A BEFORE trigger may have moved the cursor or deleted the row.
         program.emit_insn(Insn::NoConflict {
             cursor_id: cursor,
             target_pc: next,
@@ -1338,14 +1367,14 @@ pub(crate) fn emit_delete(
         buffer.as_ref(),
         &layout,
     )?;
-    if let Some(row) = row {
+    if !triggers.after.is_empty() {
         fire_row_triggers(
             program,
             &mut resolver,
             connection,
             db,
-            triggers.after,
-            &row,
+            &triggers.after,
+            &trigger_ctx,
             next,
         )?;
     }
@@ -1460,51 +1489,41 @@ pub(crate) fn emit_upsert(
         }
         Ok(())
     })?;
-    let triggers = RowTriggers::new(
+    let triggers = RowTriggers::of(
         resolver,
-        bt,
         ctx.database_id,
-        TriggerEvent::Update,
+        ast::TriggerEvent::Update,
         Some(&updated),
+        bt,
     );
-    let trigger_rows = if triggers.is_empty() {
-        None
-    } else {
-        Some((
-            trigger_row(program, bt, new)?,
-            trigger_row(program, bt, old)?,
-        ))
-    };
     let mut stored = old;
-    if let (false, Some((new_row, old_row))) = (triggers.before.is_empty(), &trigger_rows) {
-        convert_image(program, resolver, bt, new)?;
-        let row = TriggerContext::new_with_override_conflict(
+    if !triggers.before.is_empty() {
+        let new_row = trigger_row(program, bt, new)?;
+        let old_row = trigger_row(program, bt, old)?;
+        let trigger_ctx = TriggerContext::new_with_override_conflict(
             bt.clone(),
-            Some(new_row.clone()),
-            Some(old_row.clone()),
+            Some(new_row),
+            Some(old_row),
             ResolveType::Abort,
         );
-        fire_row_triggers(
+        stored = fire_before_update(
             program,
             resolver,
             connection,
+            bt,
             ctx.database_id,
-            triggers.before,
-            &row,
+            ctx.cursor_id,
+            &triggers.before,
+            &trigger_ctx,
+            old_pk,
+            new,
+            &updated,
             ctx.loop_labels.row_done,
         )?;
-        program.emit_insn(Insn::NoConflict {
-            cursor_id: ctx.cursor_id,
-            target_pc: ctx.loop_labels.row_done,
-            record_reg: old_pk,
-            num_regs: bt.primary_key_columns.len(),
-        });
-        reload_unchanged(program, bt, ctx.cursor_id, new, &updated)?;
-        stored = read_image(program, bt, ctx.cursor_id)?;
     }
     let new_pk = pk_registers(program, bt, new)?;
     // SQLite specifies that the DO UPDATE arm always uses ABORT, including when
-    // the enclosing INSERT selected another conflict algorithm.
+    // the enclosing INSERT selected another conflict algorithm, and its triggers' statements with it.
     validate_image(
         program,
         resolver,
@@ -1526,7 +1545,7 @@ pub(crate) fn emit_upsert(
         bt,
         ctx.cursor_id,
         new,
-        Some(old),
+        Some(stored),
         &indexes,
         ResolveType::Abort,
         ctx.loop_labels.row_done,
@@ -1617,8 +1636,10 @@ pub(crate) fn emit_upsert(
         ctx.returning_buffer.as_ref(),
         &layout,
     )?;
-    if let Some((new_row, old_row)) = trigger_rows {
-        let row = TriggerContext::new_after_with_override_conflict(
+    if !triggers.after.is_empty() {
+        let new_row = trigger_row(program, bt, new)?;
+        let old_row = trigger_row(program, bt, old)?;
+        let trigger_ctx = TriggerContext::new_after_with_override_conflict(
             bt.clone(),
             Some(new_row),
             Some(old_row),
@@ -1629,8 +1650,8 @@ pub(crate) fn emit_upsert(
             resolver,
             connection,
             ctx.database_id,
-            triggers.after,
-            &row,
+            &triggers.after,
+            &trigger_ctx,
             ctx.loop_labels.row_done,
         )?;
     }

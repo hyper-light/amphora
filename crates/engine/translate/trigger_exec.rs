@@ -196,12 +196,6 @@ struct TriggerSubprogramContext {
     db_name: Option<ast::Name>,
 }
 
-/// Amphora: whether `name`, no column of `table`, is its rowid, which a WITHOUT ROWID table has
-/// none of.
-fn names_rowid(table: &BTreeTable, name: &str) -> bool {
-    table.has_rowid && ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(name))
-}
-
 fn variable_from_parameter_index(index: NonZero<usize>, col_type: Option<&str>) -> Expr {
     let nz = u32::try_from(index.get())
         .ok()
@@ -241,6 +235,11 @@ impl TriggerSubprogramContext {
         }
         Some(self.param_alloc.borrow_mut().alloc_old_rowid())
     }
+}
+
+/// Whether `name`, no column of `table`, names its rowid, which a WITHOUT ROWID table has none of.
+fn names_rowid(table: &BTreeTable, name: &str) -> bool {
+    table.has_rowid && ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(name))
 }
 
 /// Rewrite NEW and OLD references in trigger expressions to use Variable instructions (parameters)
