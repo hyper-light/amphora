@@ -33,7 +33,6 @@ use crate::translate::subquery::{
 };
 use crate::translate::trigger_exec::{fire_trigger, instead_of_triggers, TriggerContext};
 use crate::translate::update::split_update_set_values;
-use crate::translate::without_rowid::emit_write_subqueries;
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{to_u32, InsertFlags, Insn};
@@ -403,10 +402,9 @@ fn open_ephemeral(program: &mut ProgramBuilder, columns: usize) -> usize {
 struct Returning {
     refs: TableReferences,
     columns: Vec<ResultSetColumn>,
-    subqueries: Vec<NonFromClauseSubquery>,
-    /// A subquery reads the view, so it's evaluated for each row
-    /// (`sqlite3ProcessReturningSubqueries`).
-    reads_view: bool,
+    /// Each subquery, and whether its column reads the view in one, which SQLite then evaluates for
+    /// each row (`sqlite3ProcessReturningSubqueries`).
+    subqueries: Vec<(NonFromClauseSubquery, bool)>,
     buffer: Option<ReturningBufferCtx>,
 }
 
@@ -429,22 +427,30 @@ impl Returning {
         }
         plan_ctes_as_outer_refs(with, &reads, resolver, program, &mut refs, connection)?;
         let mut subqueries = Vec::new();
-        plan_subqueries_from_returning(
-            program,
-            &mut subqueries,
-            &mut refs,
-            &mut returning,
-            resolver,
-            connection,
-        )?;
+        for column in &mut returning {
+            let mut reads = Vec::new();
+            if let ResultColumn::Expr(expr, _) = column {
+                collect_subquery_table_refs_in_expr(expr, &mut reads);
+            }
+            let reads_view = reads
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&target.table.name));
+            let mut planned = Vec::new();
+            plan_subqueries_from_returning(
+                program,
+                &mut planned,
+                &mut refs,
+                std::slice::from_mut(column),
+                resolver,
+                connection,
+            )?;
+            subqueries.extend(planned.into_iter().map(|subquery| (subquery, reads_view)));
+        }
         let columns = process_returning_clause(&mut returning, &mut refs, resolver)?;
         Ok(Self {
             refs,
             columns,
             subqueries,
-            reads_view: reads
-                .iter()
-                .any(|name| name.eq_ignore_ascii_case(&target.table.name)),
             buffer: None,
         })
     }
@@ -474,26 +480,13 @@ impl Returning {
         let cache = seed_returning_row_image_in_cache(
             program, &self.refs, image, no_rowid, resolver, &layout,
         )?;
-        for subquery in self
-            .subqueries
-            .iter_mut()
-            .filter(|subquery| !subquery.has_been_evaluated())
-        {
-            let run = if subquery.correlated || self.reads_view {
+        for (subquery, reads_view) in &mut self.subqueries {
+            let run = if subquery.correlated || *reads_view {
                 SubqueryRun::EveryRead
             } else {
                 SubqueryRun::Once
             };
-            let plan = subquery.consume_plan(EvalAt::Loop(0));
-            emit_non_from_clause_subquery(
-                program,
-                resolver,
-                subquery.internal_id,
-                *plan,
-                &subquery.query_type,
-                run,
-                true,
-            )?;
+            emit_row_subquery(program, resolver, subquery, run)?;
         }
         restore_returning_row_image_in_cache(resolver, cache);
         emit_returning_results(
@@ -516,6 +509,29 @@ impl Returning {
         program.result_columns = self.columns;
         program.table_references.extend(self.refs);
     }
+}
+
+/// Emits a subquery of an expression evaluated for the row in hand, whose columns are read from the
+/// registers the resolver has them in.
+fn emit_row_subquery(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    subquery: &mut NonFromClauseSubquery,
+    run: SubqueryRun,
+) -> Result<()> {
+    if subquery.has_been_evaluated() {
+        return Ok(());
+    }
+    let plan = subquery.consume_plan(EvalAt::Loop(0));
+    emit_non_from_clause_subquery(
+        program,
+        resolver,
+        subquery.internal_id,
+        *plan,
+        &subquery.query_type,
+        run,
+        true,
+    )
 }
 
 /// What `PRAGMA count_changes` counts: the rows the triggers fired for (lang_createtrigger.html,
@@ -913,14 +929,16 @@ pub(crate) fn translate_update(
             &mut resolver,
             &layout,
         )?;
-        emit_write_subqueries(
-            program,
-            &resolver,
-            &mut set_subqueries,
-            false,
-            target.database_id,
-            &target.table.name,
-        )?;
+        for subquery in &mut set_subqueries {
+            let run = match (subquery.correlated, &subquery.query_type) {
+                (false, _) => SubqueryRun::Once,
+                (true, ast::SubqueryType::RowValue { num_regs, .. }) if *num_regs > 1 => {
+                    SubqueryRun::EveryRow
+                }
+                (true, _) => SubqueryRun::EveryRead,
+            };
+            emit_row_subquery(program, &resolver, subquery, run)?;
+        }
         for (position, set) in sets.iter().enumerate() {
             let dest = match set.column {
                 Some(column) => offset(new, column)?,
@@ -1145,8 +1163,9 @@ pub(crate) fn translate_delete(
             None,
             Some(target.trigger_row(old, no_rowid)?),
         );
-        target.fire(program, &mut resolver, connection, &context, skip)?;
+        // SQLite counts the rows a DELETE is for, those RAISE(IGNORE) leaves among them.
         count.row(program);
+        target.fire(program, &mut resolver, connection, &context, skip)?;
         returning.row(&target, old, no_rowid, program, &mut resolver)
     })?;
     returning.finish(program);

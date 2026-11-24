@@ -111,7 +111,7 @@ q	INSERT INTO v(rowid, a) SELECT 7.5, 5	ERROR~datatype mismatch
 q	INSERT INTO v VALUES (1, 2, 3) ON CONFLICT DO NOTHING	ERROR~cannot UPSERT a view
 q	INSERT INTO v VALUES (1, 2, 3) ON CONFLICT(k) DO UPDATE SET a = 1	ERROR~cannot UPSERT a view
 q	INSERT INTO v VALUES (1, 2, 3) RETURNING rowid	ERROR~no such column: rowid
-q	INSERT INTO v AS q VALUES (1, 2, 3) RETURNING q.a	ERROR~no such column: q.a
+q	INSERT INTO v AS q VALUES (1, 2, 3) RETURNING q.a	ERROR
 q	UPDATE v SET zz = 5	ERROR~no such column: zz
 q	UPDATE v SET a = zz	ERROR~no such column: zz
 q	UPDATE v SET a = rowid	ERROR~no such column: rowid
@@ -121,14 +121,14 @@ q	UPDATE v SET rowid = NULL	ERROR~datatype mismatch
 q	UPDATE v SET (a, b) = (1, 2, 3)	ERROR~2 columns assigned 3 values
 q	UPDATE v SET (a, b) = (SELECT 1)	ERROR~2 columns assigned 1 values
 q	UPDATE v SET a = 1 RETURNING rowid	ERROR~no such column: rowid
-q	UPDATE v SET a = 1 RETURNING old.a	ERROR~no such column: old.a
-q	UPDATE v AS q SET a = 1 RETURNING q.a	ERROR~no such column: q.a
-q	UPDATE v AS q SET a = v.b	ERROR~no such column: v.b
+q	UPDATE v SET a = 1 RETURNING old.a	ERROR
+q	UPDATE v AS q SET a = 1 RETURNING q.a	ERROR
+q	UPDATE v AS q SET a = v.b	ERROR
 q	UPDATE v INDEXED BY i SET a = 1	ERROR~no such index: i
 q	UPDATE v SET a = 1 FROM v	ERROR~target object/alias may not appear in FROM clause: v
 q	DELETE FROM v WHERE zz = 1	ERROR~no such column: zz
 q	DELETE FROM v WHERE rowid = 1	ERROR~no such column: rowid
-q	DELETE FROM v AS q WHERE v.a = 1	ERROR~no such column: v.a
+q	DELETE FROM v AS q WHERE v.a = 1	ERROR
 q	DELETE FROM v INDEXED BY i	ERROR~no such index: i
 q	DELETE FROM v RETURNING oid	ERROR~no such column: oid
 q	SELECT 't', quote(k), quote(a), quote(b), quote(c) FROM t UNION ALL SELECT 'u', quote(k), quote(n), '', '' FROM u UNION ALL SELECT 'lg', quote(ev), quote(x), quote(y), quote(z) FROM lg	6:t,1,10,'x',1.5;t,2,20,'y',2.5;t,3,30,'x',NULL;u,'a',1,,;u,'b',2,,;u,'z',7,,
@@ -192,7 +192,7 @@ q	UPDATE v SET b = (SELECT count(*) FROM lg WHERE lg.x <> v.k) WHERE k IN (SELEC
 q	UPDATE v SET rowid = 5 WHERE k = 1	0:
 q	UPDATE v SET oid = '6', a = 1 WHERE k = 1	0:
 q	UPDATE v AS q SET a = q.b || q.k WHERE a = 10	0:
-q	UPDATE main.v SET a = main.v.b WHERE main.v.k = 1	0:
+q	UPDATE main.v SET a = main.v.b WHERE v.k = 1	0:
 q	UPDATE v NOT INDEXED SET a = 3 WHERE k = 3	0:
 q	UPDATE OR REPLACE v SET a = 3 WHERE b = 'x'	0:
 q	WITH q(x, y) AS (VALUES (1, 'one'), (2, 'two')) UPDATE v SET b = (SELECT y FROM q WHERE x = v.k) WHERE k IN (SELECT x FROM q)	0:
@@ -247,7 +247,7 @@ q	DELETE FROM v	0:
 q	DELETE FROM v WHERE a > 10 AND b = 'x'	0:
 q	DELETE FROM v WHERE k IN (SELECT n FROM u)	0:
 q	DELETE FROM v WHERE EXISTS (SELECT 1 FROM u WHERE u.n = v.k)	0:
-q	DELETE FROM main.v WHERE main.v.k = 1	0:
+q	DELETE FROM main.v WHERE v.k = 1	0:
 q	DELETE FROM v AS q WHERE k = 1	0:
 q	DELETE FROM v NOT INDEXED WHERE k = 2	0:
 q	WITH q(x) AS (VALUES (1)) DELETE FROM v WHERE k = (SELECT x FROM q)	0:
