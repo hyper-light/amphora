@@ -18,7 +18,7 @@ for base in sys.argv[1:]:
             lead.append(h[3][hl][1] / m[3][ml][1])
             hf = statistics.mean(h[3][i][1] for i in range(3) if i != hl); mf = statistics.mean(m[3][i][1] for i in range(3) if i != ml)
             fol.append(hf / mf)
-        def gm(v): 
+        def gm(v):
             lr=[math.log(x) for x in v]; m=statistics.mean(lr); s=statistics.stdev(lr)/math.sqrt(len(lr)) if len(lr)>1 else 0
             return "%.2f (%.2f..%.2f)" % (math.exp(m), math.exp(m-2*s), math.exp(m+2*s))
         print(os.path.basename(base), cls, "rounds", len(rs), "H/M commits/s", gm(rate), "| pooled p50", gm(p50), "| leader p50", gm(lead), "| followers p50", gm(fol))
