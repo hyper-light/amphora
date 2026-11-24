@@ -777,6 +777,34 @@ mod tests {
         assert_eq!(slots.length(2), BOUNDS.election, "a close teaches no gap");
     }
 
+    /// T-T1.8.W4 (CP-T1.13, lane P16): do let member 2's slot pass its length, then take its late
+    /// close marked a read's (`pass`: its write forwarded nothing, lane V11), then its next
+    /// write's barrier as the owner takes it (`ask`, then `read`); expect the close stepped,
+    /// ending nothing, and the next write's barrier waiting for a slot of its own, which begins:
+    /// a marked close closes the slot as an unmarked one does.
+    #[test]
+    fn a_late_marked_close_after_its_slot_expired_leaves_the_next_write_its_slot() {
+        let t = Instant::now();
+        let mut slots = leading(t);
+        slots.ask(2);
+        waits(&mut slots, 2, t);
+        assert_eq!(slots.start(t, 1, 1, false).map(|(m, _)| m), Some(2));
+        drained(&mut slots);
+        let expired = slots.expire(t + BOUNDS.election + MS).unwrap();
+        assert_eq!((expired.member, expired.how), (2, SlotEnd::Expired));
+        let late = t + 300 * MS;
+        let close = slots.pass(2, late, "close");
+        assert_eq!(close.step, Some("close"));
+        assert_eq!(close.ended, None, "its slot ended already");
+        slots.ask(2);
+        assert_eq!(
+            slots.read(2, late + MS, "next").step,
+            None,
+            "the next write stepped without a slot"
+        );
+        assert_eq!(slots.start(late + MS, 1, 1, false).map(|(m, _)| m), Some(2));
+    }
+
     /// T-T1.8.W4 (Q3): do let the host's detector suspect a member while its retry is awaited,
     /// then trust it again, and the retry come; expect the gap refused, typed, and not learned
     /// (the next slot keeps the election timeout), and a later retry no detector suspected

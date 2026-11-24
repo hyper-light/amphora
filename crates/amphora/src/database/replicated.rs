@@ -17468,6 +17468,63 @@ mod tests {
         pump.finish();
     }
 
+    /// CP-T1.13, AC-T1.8.D1 (replication.md, "Decision (lane P6)" and "A replica's database log
+    /// bounded by what it measures"; lane P16): a restart due and ready as a caller's session is
+    /// handed to the session worker runs before the write lock is lent, as it does after a
+    /// session run inline, and no read waits on it once the write is answered. Do: a voter and
+    /// its learner; 1 written and the logs settled; the voter's log wholly copied, its restarts
+    /// forgotten (a restart due by its share), its last pass caught up and no flush out; then a
+    /// call that reads the voter's restart count as it runs and writes 2, and a local read on the
+    /// voter once the call is answered. Expect: the count the call read past the one before it;
+    /// the read served, 1 and 2.
+    #[test]
+    fn t_t1_13_a_restart_due_and_ready_runs_before_a_session_is_lent() {
+        own_account();
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = voter_and_learner(&mut driven, dir.path());
+        let mut pump = Pump::new(&clients);
+        let voter = &clients[0];
+        write(&mut driven, &mut pump, voter, 1);
+        settle_log(&mut driven, &mut pump, &clients);
+        driven.flushed(&mut pump, 0);
+        for _ in 0..ROUNDS {
+            if matches!(&driven.owner(0).flushing, Flushing::Thread { out: false, .. }) {
+                break;
+            }
+            driven.round(&mut pump);
+        }
+        let whole = driven.owner(0).replica.machine().reader()().unwrap().checkpoint().unwrap();
+        assert_eq!(whole.left, 0, "{whole:?}");
+        let handle = voter.handle();
+        let restarts = handle.counters().database_log_restarts;
+        let owner = driven.owner_mut(0);
+        owner.spacing = log_bound::Spacing::default();
+        owner.spacing.stepped(1, Duration::ZERO, 0).unwrap();
+        let Flushing::Thread { out, pass, .. } = &mut owner.flushing else {
+            panic!("the voter's log flushes on its own thread");
+        };
+        assert!(!*out, "a flush is out on the voter");
+        pass.caught_up = true;
+        pass.busy = false;
+        let answer = submit(voter, driven.until(), move |db| {
+            let restarted = handle.counters().database_log_restarts;
+            db.exec("INSERT INTO member_items VALUES(2)")?;
+            Ok(restarted.to_le_bytes().to_vec())
+        });
+        let ran: [u8; 8] = driven.settle(&mut pump, &answer).unwrap().try_into().unwrap();
+        assert!(
+            u64::from_le_bytes(ran) > restarts,
+            "the session ran lent the write lock with a restart due and ready not run"
+        );
+        assert_eq!(
+            voter.read_local(Instant::now() + HANG_READ, values),
+            Ok(vec![1, 2])
+        );
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
     /// AC-T1.8.D1, T-T1.8.D1 (replication.md, "A replica's database log bounded by what it
     /// measures", B): the owner holds reads past the log's room whatever a pass said, and with a
     /// restart due once a pass copied every durable frame or found the log busy; otherwise not.
