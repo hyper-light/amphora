@@ -1182,6 +1182,9 @@ pub enum Insn {
         count: usize,     // P2
         /// Check generated columns after their values have been computed.
         check_generated: bool, // P3
+        /// Amphora: refuse a NULL in a primary key column that is no rowid alias. False where a
+        /// BEFORE trigger is still to fire: NOT NULL is checked after it, the types before (CV).
+        check_null_keys: bool,
         table_reference: Arc<BTreeTable>, // P4
     },
 
