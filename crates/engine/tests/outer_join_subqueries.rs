@@ -1,6 +1,7 @@
-//! Oracle findings CH (lane C10) and CN (lane C12): joins whose WHERE, ON or select list holds
-//! subqueries, one inside another, answer as SQLite 3.54.0 does (G2 step 3; AC-T1.1.1: reads as
-//! committed; AC-T1.8.6: the differential suite).
+//! Oracle findings CH (lane C10), CO and CM (lane C13) and CN (lane C12): joins whose WHERE, ON or
+//! select list holds subqueries, one inside another or over CTEs, and joins of WITHOUT ROWID tables,
+//! answer as SQLite 3.54.0 does (G2 step 3; AC-T1.1.1: reads as committed; AC-T1.8.6: the differential
+//! suite).
 
 use amphora_engine::{
     ConnectOpts, Connection, Database, DatabaseOpts, JoinMethods, MemoryIO, OpenOptions,
@@ -11,7 +12,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// One database of a fixture: the statements that fill it, and its queries with SQLite's answers
-/// (`bench/sqlite_outer_join_subqueries.py`, `bench/sqlite_join_where_subqueries.py`).
+/// (`bench/sqlite_outer_join_subqueries.py`, `bench/sqlite_on_ctes.py`,
+/// `bench/sqlite_join_where_subqueries.py`).
 struct Cases {
     name: &'static str,
     fill: Vec<&'static str>,
@@ -147,9 +149,9 @@ fn outcome(io: &MemoryIO, conn: &Arc<Connection>, sql: &str) -> String {
     }
 }
 
-/// Every query of the fixture under each setting: how many ran, and those that did not answer with
-/// SQLite's rows, or left a table without the rows it held.
-fn differences(fixture: &'static str, all_settings: &[Settings]) -> (usize, Vec<String>) {
+/// Do: run every query of the fixture under each of `all_settings`. Expect: SQLite's rows, no panic
+/// and no error, and every table holding after the queries the rows it held before them.
+fn answers_as_sqlite(fixture: &'static str, all_settings: &[Settings]) {
     let mut wrong: Vec<String> = Vec::new();
     let mut ran = 0;
     for db in cases(fixture) {
@@ -187,15 +189,6 @@ fn differences(fixture: &'static str, all_settings: &[Settings]) -> (usize, Vec<
             }
         }
     }
-    (ran, wrong)
-}
-
-/// Do: run every query of the fixture under each setting. Expect: SQLite's rows, no panic and no
-/// error, and every table holding after the queries the rows it held before them.
-#[test]
-fn outer_joins_with_nested_subqueries_answer_as_sqlite() {
-    let fixture = include_str!("fixtures/outer_join_subqueries.tsv");
-    let (ran, wrong) = differences(fixture, &SETTINGS);
     assert!(ran > 0);
     assert!(
         wrong.is_empty(),
@@ -205,18 +198,27 @@ fn outer_joins_with_nested_subqueries_answer_as_sqlite() {
     );
 }
 
-/// Finding CN. Do: run joins whose WHERE terms read subqueries on some of the joined tables beside
-/// columns of the others, by every join method. Expect: SQLite's rows; a term no row can be tested
-/// with before its LEFT, RIGHT or FULL JOIN's NULL row is made is tested on that row too.
+#[test]
+fn outer_joins_with_nested_subqueries_answer_as_sqlite() {
+    answers_as_sqlite(
+        include_str!("fixtures/outer_join_subqueries.tsv"),
+        &SETTINGS,
+    );
+}
+
+/// Subqueries of ON clauses that read CTEs (finding CO), and WITHOUT ROWID tables, with and without
+/// secondary indexes, on either side of a join (finding CM).
+#[test]
+fn on_clauses_over_ctes_and_joins_of_keyed_tables_answer_as_sqlite() {
+    answers_as_sqlite(include_str!("fixtures/on_ctes.tsv"), &SETTINGS);
+}
+
+/// Finding CN: WHERE terms on subqueries over some of the joined tables, beside columns of the others.
+/// A term no row can be tested with before its outer join's NULL row is made is tested on that row too.
 #[test]
 fn joins_filtered_by_subqueries_answer_as_sqlite_by_every_join_method() {
-    let fixture = include_str!("fixtures/join_where_subqueries.tsv");
-    let (ran, wrong) = differences(fixture, &JOIN_SETTINGS);
-    assert!(ran > 0);
-    assert!(
-        wrong.is_empty(),
-        "{} of {ran} answers differ from SQLite's:\n{}",
-        wrong.len(),
-        wrong.join("\n")
+    answers_as_sqlite(
+        include_str!("fixtures/join_where_subqueries.tsv"),
+        &JOIN_SETTINGS,
     );
 }

@@ -424,3 +424,155 @@ fn t_qb_1_19_two_writes_that_need_all_the_room_are_both_admitted() {
         assert_eq!(budget.held(), 0);
     });
 }
+
+/// T-QB.1.19: an owner's end reaches a call that waits for the memory budget, as it reaches those in
+/// line, and takes nothing from the budget. Do: the budget's all held by another holder, and kept, a
+/// write comes and waits for its room as the owner ends. Expect: the write refused with the owner's
+/// reason on every interleaving, nothing held after but the other's.
+#[test]
+fn t_qb_1_19_the_owners_end_reaches_a_call_that_waits_for_the_budget() {
+    every(None, || {
+        let budget = memory::Budget::of(5);
+        let room = queue(2);
+        let other = budget.take(memory::Use::Queues, 5).unwrap();
+        let write = {
+            let room = Arc::clone(&room);
+            thread::spawn(move || Room::submit_by(&room, 5, FAR).map(drop))
+        };
+        room.line.end(&reason());
+        assert_eq!(write.join().unwrap(), Err(reason()));
+        holds_nothing(&room);
+        assert_eq!((budget.held(), budget.waiting()), (5, 0));
+        assert_eq!(room.line.ending.waits(), 0);
+        drop(other);
+        assert_eq!(budget.held(), 0);
+    });
+}
+
+/// T-MB.1.5: the budget's wait alone (the five below). Do: a holder that finds no room waits for an
+/// owner's work; what it waits for is given back, or the owner ends, or both, or its deadline passes,
+/// as it looks. Expect: the holder charged where the bytes came and the owner stood, refused with the
+/// owner's reason where it ended, `Full` at its deadline, answered on every interleaving, nothing
+/// charged where refused; none counted waiting after.
+#[test]
+fn t_mb_1_5_bytes_given_back_reach_a_holder_that_waits() {
+    every(None, || {
+        let budget = memory::Budget::of(5);
+        let other = budget.take(memory::Use::Queues, 5).unwrap();
+        let waited = waits(&budget, Arc::new(memory::Ending::new()));
+        drop(other);
+        assert_eq!(waited.join().unwrap(), Ok(5));
+        ended_holding_nothing(&budget);
+    });
+}
+#[test]
+fn t_mb_1_5_an_owners_end_reaches_a_holder_that_waits() {
+    every(None, || {
+        let budget = memory::Budget::of(5);
+        let other = budget.take(memory::Use::Queues, 5).unwrap();
+        let owner = Arc::new(memory::Ending::new());
+        let waited = waits(&budget, Arc::clone(&owner));
+        owner.end(&reason());
+        assert_eq!(waited.join().unwrap(), Err(reason()));
+        assert_eq!(owner.waits(), 0);
+        drop(other);
+        ended_holding_nothing(&budget);
+    });
+}
+#[test]
+fn t_mb_1_5_bytes_given_back_beside_the_end_are_charged_or_not_never_held_by_a_refusal() {
+    every(None, || {
+        let budget = memory::Budget::of(5);
+        let other = budget.take(memory::Use::Queues, 5).unwrap();
+        let owner = Arc::new(memory::Ending::new());
+        let waited = waits(&budget, Arc::clone(&owner));
+        let ender = {
+            let owner = Arc::clone(&owner);
+            thread::spawn(move || owner.end(&reason()))
+        };
+        drop(other);
+        match waited.join().unwrap() {
+            Ok(5) => {}
+            answered => assert_eq!(answered, Err(reason())),
+        }
+        ender.join().unwrap();
+        assert_eq!(owner.waits(), 0);
+        ended_holding_nothing(&budget);
+    });
+}
+/// Two owners' holders on one budget: one owner's end takes no other's wait, and a give-back wakes the
+/// other.
+#[test]
+fn t_mb_1_5_an_owners_end_ends_no_other_owners_wait() {
+    every(None, || {
+        let budget = memory::Budget::of(5);
+        let other = budget.take(memory::Use::Queues, 5).unwrap();
+        let (ended, stands) = (
+            Arc::new(memory::Ending::new()),
+            Arc::new(memory::Ending::new()),
+        );
+        let first = waits(&budget, Arc::clone(&ended));
+        let second = waits(&budget, Arc::clone(&stands));
+        ended.end(&reason());
+        assert_eq!(first.join().unwrap(), Err(reason()));
+        drop(other);
+        assert_eq!(second.join().unwrap(), Ok(5));
+        assert_eq!((ended.waits(), stands.waits()), (0, 0));
+        ended_holding_nothing(&budget);
+    });
+}
+/// A deadline beside the end: the holder is answered one way, `Full` or the reason; a wait that begins
+/// after the end is refused at once.
+#[test]
+fn t_mb_1_5_a_deadline_beside_the_end_is_answered_and_a_wait_after_it_is_refused_at_once() {
+    every(None, || {
+        let budget = memory::Budget::of(5);
+        let other = budget.take(memory::Use::Queues, 5).unwrap();
+        let owner = Arc::new(memory::Ending::new());
+        let waited = {
+            let (budget, owner) = (budget.clone(), Arc::clone(&owner));
+            thread::spawn(move || {
+                budget
+                    .take_until(memory::Use::Queues, 5, SOON, &owner, || {})
+                    .map(|charge| charge.bytes())
+            })
+        };
+        let timer = thread::spawn(|| CLOCK.pass(1));
+        owner.end(&reason());
+        let answered = waited.join().unwrap();
+        assert!(
+            matches!(&answered, Err(Refusal::Full { .. })) || answered == Err(reason()),
+            "{answered:?}"
+        );
+        assert_eq!(
+            budget
+                .take_until(memory::Use::Queues, 5, FAR, &owner, || {})
+                .map(|charge| charge.bytes()),
+            Err(reason())
+        );
+        timer.join().unwrap();
+        assert_eq!((budget.held(), budget.waiting(), owner.waits()), (5, 0, 0));
+        drop(other);
+        ended_holding_nothing(&budget);
+    });
+}
+fn reason() -> Refusal {
+    Refusal::Fenced("ended".into())
+}
+/// A holder of five bytes of `budget`, its wait for `owner`'s work, on a thread: the bytes charged,
+/// given back as it returns, or why not.
+fn waits(
+    budget: &memory::Budget,
+    owner: Arc<memory::Ending>,
+) -> thread::JoinHandle<Result<u64, Refusal>> {
+    let budget = budget.clone();
+    thread::spawn(move || {
+        budget
+            .take_until(memory::Use::Queues, 5, FAR, &owner, || {})
+            .map(|charge| charge.bytes())
+    })
+}
+/// Nothing is charged on `budget` and none waits for it.
+fn ended_holding_nothing(budget: &memory::Budget) {
+    assert_eq!((budget.held(), budget.waiting()), (0, 0));
+}

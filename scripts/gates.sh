@@ -13,6 +13,10 @@ gate cargo clippy --workspace --all-targets --locked --target aarch64-apple-darw
 gate cargo clippy --workspace --all-targets --locked --target x86_64-pc-windows-msvc -- -D warnings
 gate bash scripts/check-production.sh
 gate cargo test --workspace --locked
+# T-QB.1.19, T-MB.1.5: the queue's line and the budget's wait on every interleaving that moves them (crates/line-loom, about
+# three minutes on three cores: each model is a thread of its own). The crate is empty in the workspace's builds above: what
+# it holds and its one dependency past the API are under --cfg loom, which this alone sets.
+gate env RUSTFLAGS="--cfg loom" cargo test -p amphora-line-loom --release --locked -- --test-threads=3
 # T-PL.10.1: nested against unnested answers reads the engine's simulator unnesting control, so the
 # test needs that feature (crates/engine/Cargo.toml) and the workspace run above skips it.
 gate cargo test -p amphora-engine --locked --features simulator --test unnesting

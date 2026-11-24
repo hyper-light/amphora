@@ -69,7 +69,13 @@ impl Room {
         let budget = crate::memory::process();
         let size = u64::try_from(bytes).unwrap_or(u64::MAX);
         loop {
-            let charge = budget.take_until(crate::memory::Use::Queues, size, until, || {})?;
+            let charge = budget.take_until(
+                crate::memory::Use::Queues,
+                size,
+                until,
+                &room.line.ending,
+                || {},
+            )?;
             if room.line.waiting.load(Ordering::Acquire) == 0
                 && let Ok(place) = Self::place(room, bytes, true)
             {
@@ -268,13 +274,14 @@ pub(super) struct Line {
     /// waiting takes no lock.
     pub(super) waiting: AtomicUsize,
     turns: Mutex<Turns>,
+    /// The owner's end: its reason, which every call in line is refused with, and every call that
+    /// waits for the memory budget's room ([`Room::submit_by`], lane perf-A28).
+    pub(super) ending: crate::memory::Ending,
 }
 struct Turns {
     /// Each waiting call's bell by its turn, the first in line first.
     line: std::collections::BTreeMap<u64, Arc<Bell>>,
     next: u64,
-    /// The owner ended: its reason, which every call in line is refused with.
-    ended: Option<Refusal>,
 }
 impl Line {
     fn new() -> Self {
@@ -283,8 +290,8 @@ impl Line {
             turns: Mutex::new(Turns {
                 line: std::collections::BTreeMap::new(),
                 next: 0,
-                ended: None,
             }),
+            ending: crate::memory::Ending::new(),
         }
     }
     /// The queue's room moved, by a sequentially consistent change made before this: the first in
@@ -319,10 +326,11 @@ impl Line {
             bell,
         })
     }
-    /// The owner ended: every call in line, and each that joins after, is refused with `reason`.
+    /// The owner ended: every call in line, each that waits for the memory budget's room, and each
+    /// that comes after, is refused with `reason`.
     pub(super) fn end(&self, reason: &Refusal) {
-        if let Ok(mut turns) = self.turns.lock() {
-            turns.ended.get_or_insert_with(|| reason.clone());
+        self.ending.end(reason);
+        if let Ok(turns) = self.turns.lock() {
             for bell in turns.line.values() {
                 bell.ring();
             }
@@ -341,8 +349,8 @@ impl Turn<'_> {
     /// Whether this call is the first in line, or the owner's reason once it ended.
     fn first(&self) -> Result<bool, Refusal> {
         let turns = locked(&self.line.turns)?;
-        match &turns.ended {
-            Some(reason) => Err(reason.clone()),
+        match self.line.ending.reason() {
+            Some(reason) => Err(reason),
             None => Ok(turns.line.keys().next() == Some(&self.turn)),
         }
     }

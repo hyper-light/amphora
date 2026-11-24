@@ -119,7 +119,7 @@ class Draw:
             return f"CASE WHEN {rng.choice(['', 'NOT '])}EXISTS ({self.select(outer, depth, 'exists')}) THEN {self.plain(beside)} ELSE {self.plain(beside)} END"
         if drawn < 0.95 and not self.negated:
             # A row value's NOT IN, and a NOT over its IN, answer otherwise than SQLite where a value is
-            # NULL, with a join or without (this lane's record, not traced), so neither is drawn.
+            # NULL, by every join method (finding DJ, open), so neither is drawn.
             return f"({self.column(beside)}, {self.column(beside)}) IN ({self.select(outer, depth, 'pairs')})"
         self.negated += 1
         term = self.term(scope, depth)
