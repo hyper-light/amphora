@@ -523,8 +523,6 @@ mod tests {
         rows.remove(0)
     }
 
-    /// T-PG.7.3: a database of the PostgreSQL dialect serves pg_namespace, pg_type, pg_class and
-    /// pg_attribute, each with exactly PostgreSQL 19's built-in rows while it has no tables.
     /// T-PG.9.3: two transactions that insert into one table beside each other both commit, as 19's do,
     /// and rows inserted after a rollback and a reopen are kept apart from the ones there.
     #[test]
@@ -561,6 +559,8 @@ mod tests {
         assert_eq!(tids, [2, 4, 5]);
     }
 
+    /// T-PG.7.3: a database of the PostgreSQL dialect serves pg_namespace, pg_type, pg_class and
+    /// pg_attribute, each with exactly PostgreSQL 19's built-in rows while it has no tables.
     #[test]
     fn t_pg_7_3_each_catalog_serves_19s_built_in_rows() {
         let dir = tempfile::TempDir::new().unwrap();
