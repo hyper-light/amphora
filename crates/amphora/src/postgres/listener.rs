@@ -208,14 +208,27 @@ impl Listener {
         let mut input = Vec::new();
         let mut out = Vec::new();
         let mut held: Option<Charge> = None;
+        let mut waited = false;
         loop {
-            let step = match session.step(&input, &self.roles, &mut out) {
+            let step = if waited {
+                session.resume(&mut out)
+            } else {
+                session.step(&input, &self.roles, &mut out)
+            };
+            waited = false;
+            let step = match step {
                 Ok(step) => step,
                 Err(error) => return Ended::Unwritable(error),
             };
             input.drain(..step.consumed.min(input.len()));
             match step.next {
                 Next::Continue => {}
+                // The end of the transaction it waits for wakes this task (docs/design/postgres.md
+                // section 8); nothing it held is another's, so its other sessions go on meanwhile.
+                Next::Wait => {
+                    std::future::poll_fn(|cx| session.poll_wait(cx)).await;
+                    waited = true;
+                }
                 Next::Need(total) => {
                     if let Err(error) = flush(stream, &mut out).await {
                         return Ended::Socket(error);

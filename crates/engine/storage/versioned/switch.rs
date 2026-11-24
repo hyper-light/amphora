@@ -21,7 +21,7 @@ use super::disk::{Disk, Files, Simulated};
 use super::durable::Database as VDatabase;
 use super::memory::Source;
 use super::pool::Room;
-use super::version::{Savepoint, Ts, UnwrittenRefusal};
+use super::version::{Rules, Savepoint, Ts, UnwrittenRefusal, Validation};
 use crate::error::LimboError;
 use crate::sync::{Arc, Mutex, OnceLock};
 use crate::translate::collate::CollationSeq;
@@ -341,6 +341,39 @@ pub(crate) fn tree_of(root_page: i64) -> Result<u64> {
     })
 }
 
+/// A session's isolation level on this storage, as PostgreSQL names them
+/// (docs/design/postgres.md section 8). READ UNCOMMITTED runs as READ COMMITTED, as 19's does.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Level {
+    ReadUncommitted,
+    ReadCommitted,
+    RepeatableRead,
+    Serializable,
+}
+
+impl Level {
+    /// Its transactions' rules: each statement's snapshot and the wait for a row's holder are the
+    /// session's ([`Switch::renew`], `RowTaken`). SERIALIZABLE keeps the database's validation until
+    /// PostgreSQL's SSI is ported (section 8).
+    fn rules(self) -> Rules {
+        Rules {
+            validation: match self {
+                Self::ReadUncommitted | Self::ReadCommitted | Self::RepeatableRead => {
+                    Some(Validation::Snapshot)
+                }
+                Self::Serializable => None,
+            },
+            waits: true,
+        }
+    }
+
+    /// Whether each statement of its transactions reads a snapshot of its own.
+    #[must_use]
+    pub fn statement_snapshots(self) -> bool {
+        matches!(self, Self::ReadUncommitted | Self::ReadCommitted)
+    }
+}
+
 /// One connection's side of the switch: the storage, and the transaction its cursors share.
 pub struct Switch {
     storage: Arc<Storage>,
@@ -363,6 +396,9 @@ pub struct Switch {
     /// `rollback_tx`, ending an aborted statement): the next transaction begun on this
     /// connection is refused with it, once (G7 step 2, `AC-NS.2.1`: not only logged).
     failed: Mutex<Option<LimboError>>,
+    /// The isolation of the transactions the connection begins ([`Switch::isolate`]), none to keep the
+    /// database's.
+    level: Mutex<Option<Level>>,
     /// The storage's newest commit as the connection's pager last began a read
     /// ([`Switch::pager_read_begins`], lane g7s2-19, `AC-NS.2.1`): the schema checks of the
     /// transaction begun in that read are as old as it.
@@ -409,8 +445,54 @@ impl Switch {
             named: Mutex::new(Vec::new()),
             d: Mutex::new(Descender::new()),
             failed: Mutex::new(None),
+            level: Mutex::new(None),
             header_at: Mutex::new(None),
         }
+    }
+
+    /// The level of the transactions this connection begins from now on, and of no transaction open
+    /// (docs/design/postgres.md section 8).
+    pub(crate) fn isolate(&self, level: Level) {
+        *self.level.lock() = Some(level);
+    }
+
+    /// A READ COMMITTED transaction's next statement's snapshot: every commit published now; any
+    /// other level keeps its own (docs/design/postgres.md section 8).
+    pub(crate) fn renew(&self) -> Result<()> {
+        if !self.level.lock().is_some_and(Level::statement_snapshots) {
+            return Ok(());
+        }
+        let Some(shared) = self.txn.lock().clone() else {
+            return Ok(());
+        };
+        let mut guard = shared.lock();
+        match guard.as_mut() {
+            Some(txn) => self.db.v.clock.renew(txn),
+            None => Ok(()),
+        }
+    }
+
+    /// The connection's open transaction is validated by the database's validation from here on
+    /// ([`super::version::Txn::validate_fully`]).
+    pub(crate) fn validate_fully(&self) {
+        let Some(shared) = self.txn.lock().clone() else {
+            return;
+        };
+        let mut guard = shared.lock();
+        if let Some(txn) = guard.as_mut() {
+            txn.validate_fully();
+        }
+    }
+
+    /// Registers `wake` for transaction `holder`'s end; `false` when it has ended
+    /// ([`super::version::Clock::wait_for`]).
+    pub(crate) fn wait_for(&self, holder: u64, wake: &std::task::Waker) -> Result<bool> {
+        let waiter = self
+            .txn
+            .lock()
+            .as_ref()
+            .and_then(|shared| shared.lock().as_ref().map(|txn| txn.id));
+        self.db.v.clock.wait_for(waiter, holder, wake)
     }
 
     /// The connection's pager is about to begin a read (lane g7s2-19, `AC-NS.2.1`): the
@@ -663,6 +745,9 @@ impl Switch {
             return Err(error);
         }
         let mut began = self.db.begin()?;
+        if let Some(level) = *self.level.lock() {
+            began.isolate(level.rules());
+        }
         // Its statements' schema checks are as old as the pager's read they ran in (lane
         // g7s2-19, `AC-NS.2.1`).
         if let Some(at) = *self.header_at.lock() {
