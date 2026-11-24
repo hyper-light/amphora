@@ -130,7 +130,21 @@ left and the 13 this lane fixed). The old gate compiled none of those 13 (`conn_
   changed with main's new engine code); workspace clippy `--all-targets -D warnings` exit 0 in 45 s;
   `cargo test -p amphora-engine --locked --features conn_raw_api --lib -- mvcc::`: 558 passed, 0 failed, 12 ignored.
 - `cargo fmt --all --check`: exit 0 (this machine, 5237f16e and the merge).
-@@LIB@@
+- r446 at 15dd57d8 (main as landed): the engine's whole lib suite, `--features conn_raw_api --lib`, 2 threads,
+  capped at 780 s: exit 124, NOT finished. 3250 tests; at the cap 3235 `... ok` lines (the suite's child test
+  processes print some too), 31 ignored, 2 FAILED, 4 past 60 s each. The failures, neither in a file this lane
+  changed and neither compared with main by this lane:
+  `translate::optimizer::bushy_search_tests::tests::t_pl_8_13_a_left_join_inside_a_bushy_run_keeps_its_null_rows`
+  (an earlier lane's record has it failing on main: 2026-11-23-adacachy2-perf-tpch.md:155 and :179), and
+  `vdbe::morsel_scan::tests::t_qt_6_35_joins_over_rowid_ranges_run_on_morsels_as_the_serial_loop` (an earlier
+  record has main 9fbfdbaf alone failing it, on macOS: 2026-11-24-macstudio2-perf-durable.md:45). Not shown by
+  this lane: that either fails on main 15dd57d8 on this machine.
+- r477 at 00c9534a (main ac2c429a merged: T21's translate/optimizer/lip.rs, V18's replicated.rs): check-production
+  exit 0 in 58 s, 10617, the engine compiled in both passes. r489, same tree: workspace clippy
+  `--all-targets -D warnings` exit 0 in 100 s.
+- The last tree, 4a9a668e (main 219603df merged: lane Q8's database.rs, sqlite3_ondisk.rs, wal.rs): check-production
+  exit 0 in 62 s, 10617, the engine compiled in both passes. This lane's delta over main there is this record and a
+  comment in scripts/check-production.sh.
 - macOS run r351 (portable checks, no `on`) queued and never started; stopped at 05:36Z, unneeded. Its last
   candidate was runner 2768d0d5, which RULES rule 6 forbids: a macOS run without `on` can be placed there.
 
