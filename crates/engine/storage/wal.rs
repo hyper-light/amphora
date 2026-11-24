@@ -5531,7 +5531,11 @@ impl WalFile {
     /// after it labels with an epoch no frame of the next segment is copied under.
     fn label_epoch(&self, segment: SegmentId) -> Option<u32> {
         let epoch = self.coordination.checkpoint_epoch();
-        (segment == self.coordination.current_segment()).then_some(epoch)
+        if segment == self.coordination.current_segment() {
+            Some(epoch)
+        } else {
+            None
+        }
     }
 
     /// A page the read's own segment lacks, in the closing segment the read counts on (decision
