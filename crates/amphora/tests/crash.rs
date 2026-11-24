@@ -956,6 +956,32 @@ fn to_close(disk: &Arc<Disk>, format: LogFormat, back: bool) -> Db {
     db
 }
 
+/// The files left by a process that opened `image` and wrote 30 rows on, its log started again as
+/// often as it lets it, the last rows in the log alone.
+fn written_on(
+    image: HashMap<String, Vec<u8>>,
+    format: LogFormat,
+    at: u64,
+) -> HashMap<String, Vec<u8>> {
+    let path = std::path::Path::new(CLOSE_PATH);
+    let disk = Disk::new(at, image);
+    let mut db = Db::open_with_sharing(path, disk.clone(), &Sharing::Off).unwrap();
+    db.log_format(format).unwrap();
+    for part in 4..7 {
+        for row in part * 10..(part + 1) * 10 {
+            db.exec(&format!("INSERT INTO t VALUES ({row}, 'on')"))
+                .unwrap();
+        }
+        db.flusher()().unwrap();
+        if part < 6 {
+            db.checkpoint().unwrap();
+            assert!(db.restart_log().unwrap(), "{format:?}, part {part}");
+        }
+    }
+    drop(db);
+    disk.image()
+}
+
 fn rows_found(image: HashMap<String, Vec<u8>>, at: u64) -> Result<i64, String> {
     let path = std::path::Path::new(CLOSE_PATH);
     let db = Db::open_with_sharing(path, Disk::new(at, image), &Sharing::Off)
@@ -1005,6 +1031,15 @@ fn d45_a_power_cut_at_any_change_of_a_clean_close_leaves_sqlite_all_of_it_or_non
                 let said =
                     format!("{format:?}, back {back}, cut at {at} of {changes} ({closed:?})");
                 assert_eq!(rows_found(image.clone(), at), Ok(40), "{said}");
+                let wrote_on = written_on(image.clone(), format, at);
+                assert_eq!(
+                    rows_found(wrote_on.clone(), at),
+                    Ok(70),
+                    "{said}: written on"
+                );
+                if let Err(e) = plain_sqlite(&wrote_on, CLOSE_PATH) {
+                    panic!("{said}: written on, its log started again: {e}");
+                }
                 match plain_sqlite(&image, CLOSE_PATH) {
                     Ok(None) => refused += 1,
                     Ok(Some(())) => {
