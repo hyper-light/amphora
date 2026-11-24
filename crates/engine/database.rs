@@ -67,6 +67,17 @@ use storage::database::DatabaseFile;
 use storage::shared_wal_coordination::MappedSharedWalCoordination;
 use tracing::{instrument, Level};
 
+/// Amphora: how the log's generation before the current one ended ([`Database::wal_before`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogBefore {
+    /// The segment that holds it, its header's `checkpoint_seq` and its last committed frame.
+    pub segment: storage::log_segments::SegmentId,
+    pub generation: u32,
+    pub frames: u64,
+    /// How many of its frames a pass copied into the file, since flushed.
+    pub copied: u64,
+}
+
 /// Configuration for database features
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DatabaseOpts {
@@ -3483,10 +3494,9 @@ impl Database {
     }
 
     /// Amphora: how the log's generation before the current one ended, where the segment the last
-    /// switch left still holds it (decision 45): that segment, its header's `checkpoint_seq` and its
-    /// last committed frame. None for a log in one segment, and where the other holds another
-    /// generation.
-    pub fn wal_before(&self) -> Option<(storage::log_segments::SegmentId, u32, u64)> {
+    /// switch left still holds it (decision 45). None for a log in one segment, and where the other
+    /// holds another generation.
+    pub fn wal_before(&self) -> Option<LogBefore> {
         let before = self.shared_wal.current_id().other();
         let (current, _) = self.wal_end();
         let shared = self.shared_wal.segment(before).read();
@@ -3494,11 +3504,16 @@ impl Database {
             return None;
         }
         let generation = shared.metadata.wal_header.lock().checkpoint_seq;
-        let frame = shared.metadata.max_frame.load(Ordering::Acquire);
-        if frame == 0 || generation.wrapping_add(1) != current {
+        let frames = shared.metadata.max_frame.load(Ordering::Acquire);
+        if frames == 0 || generation.wrapping_add(1) != current {
             return None;
         }
-        Some((before, generation, frame))
+        Some(LogBefore {
+            segment: before,
+            generation,
+            frames,
+            copied: shared.metadata.nbackfills.load(Ordering::Acquire),
+        })
     }
 
     /// Amphora: the log's last committed frame and how many of its frames are copied into the

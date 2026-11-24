@@ -1,9 +1,10 @@
 //! The shell that restores a second from the archive (docs/design/backup.md): the base's pages
 //! written as the file, then each generation of log after it written as the log's file and
-//! replayed by the engine's own recovery, the last one up to the second's last commit.
+//! replayed by the engine's own recovery, the last one up to the second's last commit. The file is
+//! made under a name no open takes, and put at its path only once it is whole ([`Making`]).
 
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -11,10 +12,11 @@ use amphora_api::blobs::Blobs;
 
 use super::Mark;
 use super::drill::{Pace, Unpaced};
+use super::folder::sync_dir;
 use super::object::{self, SegmentHead};
-use super::plan::{self, BaseKey, SegmentKey, ThroughKey, Unrestorable};
-use super::ship::{FRAME_BYTES, fetch_charge, frame_offset, list_all};
-use crate::db::{Db, log_paths};
+use super::plan::{self, BaseKey, BaseLack, SegmentKey, ThroughKey, Unrestorable};
+use super::ship::{FRAME_BYTES, fetch_charge, frame_offset, identity_of, list_all};
+use crate::db::{Db, log_paths, restoring_path};
 use crate::memory::{Budget as Memory, Charge, Use};
 
 /// What a restore did.
@@ -174,8 +176,10 @@ pub(super) fn read_segment(
 /// makes the file. A chunk whose sum fails is refused after its parts are written: the restored
 /// file is a failed restore's.
 ///
-/// An archive short of the frames its keys say is refused, typed ([`Unrestorable::Short`]), and the
-/// files made are removed: they would open as a whole database (AC-T1.12.4).
+/// An archive short of the frames its keys say is refused, typed ([`Unrestorable::Short`]), and so is
+/// a base whose manifest doesn't show its file holds every frame before the generation it began in
+/// ([`Unrestorable::Unproven`]). A restore that fails, whatever for, leaves no file that opens as a
+/// database ([`Making`]; AC-T1.12.4).
 pub fn restore_within(
     blobs: &dyn Blobs,
     prefix: &str,
@@ -185,23 +189,117 @@ pub fn restore_within(
     memory: &Arc<Memory>,
     until: Instant,
 ) -> anyhow::Result<Restored> {
-    let refused = match make(blobs, prefix, second, path, pace, memory, until) {
-        Err(e) if matches!(e.downcast_ref(), Some(Unrestorable::Short { .. })) => e,
-        restored => return restored,
-    };
-    let [log_path, second_path] = log_paths(path);
-    for file in [path, &log_path, &second_path] {
-        match std::fs::remove_file(file) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                return Err(refused.context(format!("{} is left: {e}", file.display())));
+    let (making, restored) = restore_aside(blobs, prefix, second, path, pace, memory, until)?;
+    making.end()?;
+    Ok(restored)
+}
+
+/// [`restore_within`] to a file nothing opens until [`Making::end`] puts it at `path`.
+pub(super) fn restore_aside(
+    blobs: &dyn Blobs,
+    prefix: &str,
+    second: u64,
+    path: &Path,
+    pace: &mut dyn Pace,
+    memory: &Arc<Memory>,
+    until: Instant,
+) -> anyhow::Result<(Making, Restored)> {
+    let making = Making::begin(path)?;
+    let restored = make(blobs, prefix, second, &making.file, pace, memory, until)?;
+    Ok((making, restored))
+}
+
+/// A database a restore makes, under a name no open takes ([`restoring_path`]), its log's files
+/// beside it: whatever ends the restore before it is whole, a kill between two writes too, nothing
+/// that opens as a database is left (lane B26). Its files are removed where it fails.
+pub(super) struct Making {
+    path: PathBuf,
+    file: PathBuf,
+}
+
+impl Making {
+    /// Refused where the database, or a segment of a log, is at `path` already: the engine would
+    /// recover one left there as the restored log's own (decision 45). And where another restore to
+    /// it is under way, or one ended midway.
+    fn begin(path: &Path) -> anyhow::Result<Self> {
+        let file = restoring_path(path);
+        for path in [path, &file] {
+            let [first, second] = log_paths(path);
+            for there in [path, &first, &second] {
+                if there.try_exists()? {
+                    anyhow::bail!("{} exists: a restore makes a new database", there.display());
+                }
             }
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+        })
+    }
+
+    /// Puts the database, whole and its log folded into it, at its path. Linked there, as a link
+    /// refuses a name that exists (docs/design/backup.md, "The folder store"): a database made at the
+    /// path meanwhile is never replaced. Where the file system has no links, renamed.
+    pub(super) fn end(self) -> anyhow::Result<()> {
+        for log in log_paths(&self.file) {
+            match std::fs::metadata(&log) {
+                Ok(left) if left.len() > 0 => anyhow::bail!(
+                    "{} holds {} bytes the restore's last fold left",
+                    log.display(),
+                    left.len()
+                ),
+                Ok(_) => std::fs::remove_file(&log)?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&self.file)?
+            .sync_all()?;
+        for log in log_paths(&self.path) {
+            if log.try_exists()? {
+                anyhow::bail!("{} exists: a restore makes a new database", log.display());
+            }
+        }
+        match std::fs::hard_link(&self.file, &self.path) {
+            Ok(()) => std::fs::remove_file(&self.file)?,
+            Err(e) if self.path.try_exists()? => {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "{} exists: a restore makes a new database",
+                    self.path.display()
+                )));
+            }
+            Err(_) => std::fs::rename(&self.file, &self.path)?,
+        }
+        if let Some(dir) = self.path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+            sync_dir(dir)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Making {
+    fn drop(&mut self) {
+        if let Err(e) = remove(&self.file) {
+            tracing::warn!(target: "amphora.backup", event = "backup.restore_left", file = %self.file.display(), error = %format!("{e:#}"), "a restore's file is left: no open takes it");
+        }
+    }
+}
+
+/// Removes the database at `path` and its log, if there.
+pub(super) fn remove(path: &Path) -> anyhow::Result<()> {
+    let [first, second] = log_paths(path);
+    for file in [path, &first, &second] {
+        match std::fs::remove_file(file) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
             _ => {}
         }
     }
-    Err(refused)
+    Ok(())
 }
 
-/// [`restore_within`]'s restore, its files left as it ends.
+/// [`restore_within`]'s restore, to the file it makes at `path`.
 fn make(
     blobs: &dyn Blobs,
     prefix: &str,
@@ -211,14 +309,7 @@ fn make(
     memory: &Arc<Memory>,
     until: Instant,
 ) -> anyhow::Result<Restored> {
-    // Nor a segment of a log left there (decision 45): the engine would recover it as the restored
-    // log's own.
-    let [log_path, second_path] = log_paths(path);
-    for file in [path, &log_path, &second_path] {
-        if file.try_exists()? {
-            anyhow::bail!("{} exists: a restore makes a new database", file.display());
-        }
-    }
+    let [log_path, _] = log_paths(path);
     let mut listed = Vec::new();
     for (key, size) in list_all(blobs, &format!("{prefix}/log/"), until)? {
         listed.push((SegmentKey::parse(prefix, &key)?, key, size));
@@ -279,9 +370,34 @@ fn make(
     let mut bytes = 0u64;
     let mut log_bytes = 0u64;
 
-    // The base's pages, as the file.
+    // What the base's file holds, first: the log before the generation it began in, replayed by
+    // nothing here.
+    let unproven = |lack: BaseLack| Unrestorable::Unproven {
+        base: plan.base.id,
+        lack,
+    };
     let manifest_key = plan.base.key(prefix);
-    let manifest = object::manifest(&manifest_key, &blobs.get(&manifest_key, until)?)?;
+    let Some(manifest) = object::manifest(&manifest_key, &blobs.get(&manifest_key, until)?)? else {
+        return Err(unproven(BaseLack::Unsaid {
+            generation: plan.base.start_gen,
+        })
+        .into());
+    };
+    if (manifest.id, manifest.start_gen, manifest.end)
+        != (plan.base.id, plan.base.start_gen, plan.base.end)
+    {
+        return Err(Unrestorable::Malformed {
+            key: manifest_key,
+            why: "its manifest is another base's".into(),
+        }
+        .into());
+    }
+    let began = plan.segments.first().and_then(|i| segments.get(*i));
+    if let Some(lack) = manifest.held.lacks(began.and_then(|s| s.link)) {
+        return Err(unproven(lack).into());
+    }
+
+    // The base's pages, as the file.
     let part = room.min(fetch_charge(manifest.chunk_bytes.min(manifest.file_bytes)));
     if part == 0 {
         return Err(Unrestorable::PastRoom { base: manifest.id }.into());
@@ -377,6 +493,15 @@ fn make(
             // compared with it, a frame at a time, and refused where they differ (T-T1.12.M6).
             let mut put = |head: &SegmentHead, offset: u64, part: &[u8]| -> anyhow::Result<()> {
                 if offset == 0 {
+                    let archived = identity_of(&head.header)?;
+                    if generation == manifest.start_gen && archived != manifest.held.own {
+                        return Err(unproven(BaseLack::Own {
+                            generation,
+                            began: manifest.held.own.seq,
+                            archived: archived.seq,
+                        })
+                        .into());
+                    }
                     if head.first != begins {
                         anyhow::bail!(
                             "segment {name} begins at frame {}, its key says {begins}",
@@ -468,7 +593,7 @@ fn make(
 /// salts and running sums), up to their last commit, and drops the rest as a crash's tail; a
 /// segment's own sum says its bytes are those sent, not that they are its generation's.
 fn replay(path: &Path, frames: u64, step: u64, pace: &mut dyn Pace) -> anyhow::Result<u64> {
-    let mut db = Db::open(path)?;
+    let mut db = Db::open_restoring(path)?;
     let (_, replayed) = db.log_end();
     if replayed != frames {
         return Ok(replayed);
@@ -529,7 +654,10 @@ pub fn expire(
         if gone.contains(&key) {
             continue;
         }
-        let manifest = object::manifest(&key, &blobs.get(&key, until)?)?;
+        // A base no restore takes keeps no other's chunk.
+        let Some(manifest) = object::manifest(&key, &blobs.get(&key, until)?)? else {
+            continue;
+        };
         for (chunk, from) in (0u64..).zip(manifest.chunk_bases()?) {
             if from != manifest.id {
                 reused.insert(plan::chunk_key(prefix, from, chunk));
