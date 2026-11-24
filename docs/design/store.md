@@ -2310,6 +2310,11 @@ before any frame of the current one.
   frames are all copied (0 of 0), and the one-log test would send the read to the file alone, which lacks the
   closing segment's frames not yet copied. Each segment keeps its own frame index: the frame cache and decision 40's
   lock-free index are per segment, because frame numbers start again in each.
+- **In one process, one word.** The segments, their flags and both read counts are one 64-bit word
+  (`log_segments::SegmentsCell`: 30 bits a count), changed by compare-and-swap, each change one step of the state machine
+  above applied whole; a read past a count's 30 bits is refused and tried again. A spin lock held them before, and
+  every read takes two steps (its begin and its end): at 32 and 128 point-read clients that lock was the hottest spin,
+  7.2-20.6% of the CPU samples (lane Q3, 2026-11-23; bench/records/2026-11-23-adacachy2-perf-reads-q3.md).
 - **Checkpoints.** The checkpointer copies the closing segment first and the current one's frames only after it. The
   other order is wrong: a frame copied from the current segment would be overwritten by an older one copied after it.
   It copies the current segment only once the closing one is reset (the coordinator, 2026-11-23, of lane B10's two

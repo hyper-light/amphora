@@ -1,15 +1,31 @@
 141 nil
 148 |_| Ok(Value::Int(0))
-215 set_stmt
+215 |r| set_stmt(r, 2, false)
+216 |r| set_stmt(r, 3, true)
+217 |r| set_stmt(r, 3, false)
 221 generic_set
+222 generic_set
+225 |r| named_set_kind(r, 1)
+226 |r| named_set_kind(r, 1)
 227 top
 238 top
+239 dotted_name
 240 list1
+241 append
 242 string_const
+243 numeric_const
+248 |_| Ok(word("true"))
+249 |_| Ok(word("false"))
 250 |_| Ok(word("on"))
 251 top
+262 top
 263 top
+264 |r| Ok(r.take(2))
+265 top
+269 |r| named_set_kind(r, 4)
+270 |r| set_kind(r, 5, None)
 275 show_stmt
+279 show_all
 291 alter_table
 312 list1
 342 add_constraint
@@ -63,6 +79,9 @@
 623 |_| Ok(Value::Int(0))
 625 null
 627 null
+678 |r| float_value(r, 1, false)
+679 |r| float_value(r, 2, false)
+680 |r| float_value(r, 2, true)
 681 integer
 742 nil
 845 |_| Ok(Value::Int(0))
@@ -72,6 +91,8 @@
 979 any_name_list
 980 any_name_append
 981 any_name
+983 attrs_first
+984 attrs_append
 987 truncate_stmt
 990 |_| Ok(Value::Bool(false))
 1139 nil
@@ -153,9 +174,13 @@
 1923 top
 1964 typename
 1972 nil
+1973 top
 1974 top
 1976 top
 1977 top
+1986 |r| generic_type(r, false)
+1987 |r| generic_type(r, true)
+1989 nil
 1990 |r| system_type_at(r, "int4")
 1993 |r| system_type_at(r, "int8")
 2009 top
@@ -165,6 +190,7 @@
 2024 timestamp
 2030 |_| Ok(Value::Bool(false))
 2048 top
+2049 type_cast
 2054 negate
 2055 |r| a_expr_op(r, "+")
 2056 |r| a_expr_op(r, "-")
@@ -177,6 +203,7 @@
 2142 param
 2143 parenthesized
 2145 top
+2154 func_no_args
 2155 func_call
 2160 func_star
 2161 func_expr
@@ -216,7 +243,13 @@
 2486 top
 2487 top
 2488 top
+2489 |r| Ok(Value::Int(r.int(2)?))
+2490 negative_iconst
 2504 top
 2507 top
+2510 top
+2511 top
+2512 top
+2513 top
 2514 top
 2517 top

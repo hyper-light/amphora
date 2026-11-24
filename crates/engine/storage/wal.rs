@@ -23,7 +23,7 @@ use super::buffer_pool::BufferPool;
 use super::changes::{latest_by_page, ChangeLog};
 use super::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
 use super::log_index::{Lookup, ReadIndex};
-use super::log_segments::{ReadSpan, SegmentId, Segments};
+use super::log_segments::{ReadSpan, SegmentId, Segments, SegmentsCell};
 use super::packed::{self, LogFormat, Record, Records};
 use super::pager::{Logged, PageRef, Pager};
 use super::sqlite3_ondisk::{
@@ -1690,7 +1690,7 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn segments(&self) -> Segments {
-        *self.log.segments.lock()
+        self.log.segments.load()
     }
 
     fn segment_snapshot(&self, segment: SegmentId) -> WalSnapshot {
@@ -1711,7 +1711,7 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn closing_copied(&self) {
-        let _ = self.log.segments.lock().copied();
+        let _ = self.log.segments.update(Segments::copied);
     }
 
     fn iter_segment_frames(
@@ -1754,7 +1754,7 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn try_begin_read_tx(&self, snapshot: WalSnapshot) -> Option<(ReadGuardKind, ReadSpan)> {
-        let span = self.log.begin_read();
+        let span = self.log.begin_read()?;
         match self.try_read_mark(snapshot, &span) {
             Some(guard) => Some((guard, span)),
             None => {
@@ -2749,7 +2749,7 @@ impl ShmWalCoordination {
     /// Publish the log's segments as this process recovered them at open, and the header of
     /// the one not current (decision 45).
     fn seed_segments_from_local(&self) {
-        let segments = *self.log.segments.lock();
+        let segments = self.log.segments.load();
         self.authority.seed_segments(segments);
         let other = self.log.segment(segments.current().other()).read();
         let header = other.metadata.wal_header.lock();
@@ -4120,9 +4120,10 @@ pub struct SharedLog {
     /// Each segment's lock-free frame index (decision 40), the `Arc` its runtime holds and never
     /// replaces, kept here so a lookup reaches it without the segment's lock: first, then second.
     read_indexes: [Arc<ReadIndex>; 2],
-    pub(crate) segments: SpinLock<Segments>,
+    pub(crate) segments: SegmentsCell,
     /// Whether `segments` says the second segment is current, published so that every access to
-    /// the current segment's state reads it without that lock. Written only with `segments`.
+    /// the current segment's state reads it without unpacking that word. Written only with
+    /// `segments`.
     second_current: AtomicBool,
     /// Lock used by in-place VACUUM to keep new read/write transactions out
     /// while VACUUM is in progress.
@@ -4196,7 +4197,7 @@ impl SharedLog {
             second,
             read_indexes,
             second_current: AtomicBool::new(segments.current() == SegmentId::Second),
-            segments: SpinLock::new(segments),
+            segments: SegmentsCell::new(segments),
             vacuum_lock: PaddedLock::new(TursoRwLock::new()),
             write_lock: PaddedLock::new(TursoRwLock::new()),
             checkpoint_lock: PaddedLock::new(TursoRwLock::new()),
@@ -4234,26 +4235,27 @@ impl SharedLog {
 
     /// The segment a switch left, until its reset: copied first by the checkpointer.
     pub fn closing(&self) -> Option<&Arc<RwLock<WalFileShared>>> {
-        let closing = self.segments.lock().closing();
+        let closing = self.segments.load().closing();
         closing.map(|id| self.segment(id))
     }
 
-    /// A read begins: the segments it counts on, given back to [`Self::end_read`] at its end.
-    pub(crate) fn begin_read(&self) -> ReadSpan {
-        self.segments.lock().begin_read()
+    /// A read begins: the segments it counts on, given back to [`Self::end_read`] at its end. None
+    /// when a segment counts as many reads as its word holds: the read is refused and tried again.
+    pub(crate) fn begin_read(&self) -> Option<ReadSpan> {
+        self.segments.begin_read()
     }
 
     /// The read that began with `span` is done. A segment this resets needs no I/O: the writer's
     /// next switch writes its header over it.
     pub(crate) fn end_read(&self, span: ReadSpan) {
-        self.segments.lock().end_read(span);
+        self.segments.end_read(span);
     }
 }
 
 impl fmt::Debug for SharedLog {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SharedLog")
-            .field("segments", &*self.segments.lock())
+            .field("segments", &self.segments.load())
             .field("current", &**self.current())
             .finish()
     }
@@ -11260,7 +11262,10 @@ pub mod test {
             panic!("expected a read mark on the first segment, got {before:?}");
         };
 
-        assert_eq!(shared.segments.lock().switch(false), Some(SegmentId::Second));
+        assert_eq!(
+            shared.segments.update(|segments| segments.switch(false)),
+            Some(Some(SegmentId::Second))
+        );
         shared.second_current.store(true, Ordering::Release);
         set_shared_snapshot(&shared, snapshot);
         let (after, after_span) = coordination.try_begin_read_tx(snapshot).unwrap();
@@ -11294,7 +11299,7 @@ pub mod test {
 
         coordination.end_read_tx(rule_2, rule_2_span);
         coordination.end_read_tx(after, after_span);
-        let segments = *shared.segments.lock();
+        let segments = shared.segments.load();
         assert_eq!(
             segments.state(SegmentId::First),
             Segment::Closing(Closing {
@@ -11351,7 +11356,7 @@ pub mod test {
             Database::open_file(io.clone(), copy_path, Arc::new(SqliteDialect)).unwrap();
         let log = &reopened.shared_wal;
         assert_eq!(log.current_id(), SegmentId::Second);
-        let segments = *log.segments.lock();
+        let segments = log.segments.load();
         assert_eq!(segments.closing(), Some(SegmentId::First));
         assert_eq!(
             segments.state(SegmentId::First),
@@ -11414,7 +11419,7 @@ pub mod test {
         std::fs::copy(format!("{source_path}-wal"), format!("{copy_path}-wal2")).unwrap();
         let reopened = Database::open_file(io, copy_path, Arc::new(SqliteDialect)).unwrap();
         assert_eq!(
-            reopened.shared_wal.segments.lock().closing(),
+            reopened.shared_wal.segments.load().closing(),
             Some(SegmentId::First)
         );
         reopened
@@ -11455,7 +11460,7 @@ pub mod test {
         assert_eq!(copy.wal_total_backfilled, closing_frames);
         assert_eq!(frames(SegmentId::First), (closing_frames, closing_frames));
         assert_eq!(
-            log.segments.lock().state(SegmentId::First),
+            log.segments.load().state(SegmentId::First),
             Segment::Closing(Closing {
                 reads: 1,
                 copied: true,
@@ -11485,7 +11490,7 @@ pub mod test {
 
         assert_eq!(count_test_table(&reader), 30);
         reader.execute("commit").unwrap();
-        assert_eq!(log.segments.lock().state(SegmentId::First), Segment::Free);
+        assert_eq!(log.segments.load().state(SegmentId::First), Segment::Free);
         let current = run_checkpoint_until_done(&pager, passive);
         assert_eq!(current.closing, None);
         assert_eq!(frames(SegmentId::Second), (current_frames, current_frames));
@@ -11520,7 +11525,7 @@ pub mod test {
         during.execute("begin").unwrap();
         assert_eq!(count_test_table(&during), 30);
         held.execute("commit").unwrap();
-        assert_eq!(db.shared_wal.segments.lock().closing(), None);
+        assert_eq!(db.shared_wal.segments.load().closing(), None);
         let closing_file = dir.path().join("copy.db-wal");
         std::fs::OpenOptions::new()
             .write(true)
