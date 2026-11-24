@@ -4731,6 +4731,55 @@ mod admission_charge {
         ));
     }
 
+    /// AUDIT 2026-11-23 §1, MB.1 (T-MB.1.8, lane perf-A28): a request waiting for the memory
+    /// budget's room hears its database's writer end. Do: on a local database, another use holding the
+    /// whole budget, a call waits for room on a thread; its disk fails. Expect: the call refused
+    /// `Fenced` as a call after a failed disk is, none waiting, nothing held.
+    #[test]
+    fn a28_a_call_waiting_for_room_hears_its_disk_fail_holding_nothing() {
+        use crate::memory::Use;
+        use crate::memory::tests::{BUDGET, Fed};
+        let dir = tempfile::tempdir().unwrap();
+        let database = Database::open(&dir.path().join("a28.db"), until()).unwrap();
+        let budget = crate::memory::Budget::new(Box::new(Fed::new(Some(64 << 20), Some(0))));
+        let other = budget.take(Use::Images, 64 << 20).unwrap();
+        let began = Instant::now();
+        let call = {
+            let (database, on_call) = (database.clone(), Arc::clone(&budget));
+            std::thread::spawn(move || {
+                BUDGET.with(|slot| *slot.borrow_mut() = Some(on_call));
+                database.call(began + crate::transport::HANG, AnswerMax::fixed(), |_| {
+                    Ok(())
+                })
+            })
+        };
+        while budget.waiting() == 0 {
+            assert!(!call.is_finished(), "the call was answered");
+            assert!(began.elapsed() < crate::transport::HANG, "a hang");
+            std::thread::yield_now();
+        }
+        let Writer::Local(store) = &database.shared.writer else {
+            panic!("a local database");
+        };
+        store.fail_disk();
+        while !call.is_finished() {
+            assert!(began.elapsed() < crate::transport::HANG * 2, "a hang");
+            std::thread::yield_now();
+        }
+        let refused = call.join().unwrap().err();
+        assert_eq!(
+            refused,
+            Some(Refusal::Fenced(
+                "writer disk failed; reopen after recovery".into()
+            )),
+            "after {:?}",
+            began.elapsed()
+        );
+        assert_eq!(budget.waiting(), 0);
+        assert_eq!(budget.held(Use::Queues), 0);
+        drop(other);
+    }
+
     fn put(value: usize) -> Operation {
         Operation::Mutation(Mutation::Records {
             namespace: "ns".into(),

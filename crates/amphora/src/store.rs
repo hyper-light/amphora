@@ -1530,6 +1530,12 @@ impl<E: Engine> Store<E> {
     pub fn on_commit(&self, w: Watcher) {
         locked(&self.watchers).push(w);
     }
+
+    /// As if its disk's flush failed.
+    #[cfg(test)]
+    pub(crate) fn fail_disk(&self) {
+        self.sends.disk_failed();
+    }
 }
 
 fn notify(watchers: &Mutex<Vec<Watcher>>) {
@@ -1785,6 +1791,132 @@ mod tests {
         assert_eq!(*kept.lock().unwrap(), vec!["a".to_owned(), "c".to_owned()]);
         assert!(store.counters().room_waits >= 1);
         assert_eq!(budget.held(crate::memory::Use::Queues), 0);
+    }
+
+    /// An engine whose upkeep and whose flush fail when told to, rows of no length charged nothing.
+    struct Failing(Arc<AtomicBool>);
+
+    impl Engine for Failing {
+        type Row = String;
+        type Reader = ();
+
+        fn key(row: &String) -> &str {
+            row
+        }
+
+        fn row_bytes(row: &String) -> usize {
+            if row.is_empty() {
+                0
+            } else {
+                std::mem::size_of::<String>() + row.capacity()
+            }
+        }
+
+        fn apply(&mut self, rows: &[String]) -> anyhow::Result<usize> {
+            Ok(rows.len())
+        }
+
+        fn upkeep(&mut self, _: bool) -> anyhow::Result<Upkept> {
+            anyhow::ensure!(!self.0.load(Ordering::SeqCst), "upkeep failed");
+            Ok(Upkept::default())
+        }
+    }
+
+    /// AUDIT 2026-11-23 §1, MB.1 (T-MB.1.8, lane perf-A28): a sender waiting for the memory budget's
+    /// room hears its store's end and holds nothing, and one that comes after is refused the same. Do:
+    /// another use holding the whole budget, a batch and an admission wait for room on threads; the
+    /// writer stops, its upkeep failed, or the disk's flush fails. Expect: both refused `Stopped`, or
+    /// `Disk`, none waiting, nothing held; a batch after refused the same.
+    #[test]
+    fn a28_a_sender_waiting_for_room_hears_its_stores_end_holding_nothing() {
+        for disk in [true, false] {
+            let fed = Fed::new(Some(1 << 20), Some(0));
+            let (budget, _unset) = budget(&fed);
+            let told = Arc::new(AtomicBool::new(false));
+            let flushes = Arc::clone(&told);
+            let flush: Flush = Box::new(move || {
+                if disk && flushes.load(Ordering::SeqCst) {
+                    return Err(std::io::Error::other("flush failed"));
+                }
+                Ok(())
+            });
+            let engine = Failing(Arc::new(AtomicBool::new(false)));
+            let upkeep = Arc::clone(&engine.0);
+            let store = Store::start_with(engine, Config::default(), Some(flush)).unwrap();
+            let other = budget.take(crate::memory::Use::Images, 1 << 20).unwrap();
+            let began = Instant::now();
+            let until = began + crate::transport::HANG;
+            let waiting = |admission: bool| {
+                let (store, on_waiter) = (store.clone(), Arc::clone(&budget));
+                std::thread::spawn(move || {
+                    BUDGET.with(|slot| *slot.borrow_mut() = Some(on_waiter));
+                    if admission {
+                        store
+                            .charge_queue(64, until)
+                            .map(drop)
+                            .map_err(|e| format!("{e:?}"))
+                    } else {
+                        store
+                            .put_wait(vec!["a".to_owned()], until)
+                            .map(drop)
+                            .map_err(|e| format!("{e:?}"))
+                    }
+                })
+            };
+            let waits = [waiting(false), waiting(true)];
+            while budget.waiting() < 2 {
+                assert!(began.elapsed() < crate::transport::HANG, "a hang");
+                std::thread::yield_now();
+            }
+            if disk {
+                // A batch that charges nothing is committed, and its flush fails.
+                told.store(true, Ordering::SeqCst);
+                let _ = store.put(vec![String::new()]);
+            } else {
+                upkeep.store(true, Ordering::SeqCst);
+                let _ = store.run(until, |_| Ok(()));
+            }
+            let refused: Vec<_> = waits
+                .into_iter()
+                .map(|waiting| {
+                    while !waiting.is_finished() {
+                        assert!(began.elapsed() < crate::transport::HANG * 2, "a hang");
+                        std::thread::yield_now();
+                    }
+                    waiting.join().unwrap().err().unwrap()
+                })
+                .collect();
+            let expected = if disk {
+                [
+                    "Disk".to_owned(),
+                    "Fenced(\"writer disk failed; reopen after recovery\")".to_owned(),
+                ]
+            } else {
+                [
+                    "Stopped".to_owned(),
+                    "Unavailable(\"database writer stopped\")".to_owned(),
+                ]
+            };
+            assert_eq!(
+                refused,
+                expected,
+                "after {:?}, disk: {disk}",
+                began.elapsed()
+            );
+            assert_eq!(budget.waiting(), 0);
+            assert_eq!(budget.held(crate::memory::Use::Queues), 0);
+            drop(other);
+            let after = store.put(vec!["b".to_owned()]).err();
+            assert_eq!(
+                after,
+                Some(if disk {
+                    Refused::Disk
+                } else {
+                    Refused::Stopped
+                })
+            );
+            assert_eq!(budget.held(crate::memory::Use::Queues), 0);
+        }
     }
 
     /// AUDIT 2026-11-23 §1, MB.1: a sender waiting for room is woken by a charge given back

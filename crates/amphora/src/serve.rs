@@ -2302,6 +2302,124 @@ mod tests {
         assert_eq!(budget.held(Use::Queues), 0);
     }
 
+    /// A member of one over `dir`, as `serve` opens it, its drills on.
+    fn member_of_one(dir: &Path, deadline: Duration) -> Arc<Shared> {
+        let replica = ReplicaConfig {
+            node_id: 1,
+            voters: vec![1],
+            learners: Vec::new(),
+            bootstrap: None,
+        };
+        let db = Database::open_replicated_with(
+            &dir.join("state.db"),
+            &dir.join("raft.log"),
+            replica,
+            Durability::Persisted,
+            sql_until(),
+        )
+        .unwrap();
+        Arc::new(Shared {
+            node: 1,
+            ids: BTreeSet::from([1]),
+            db,
+            cut: AtomicBool::new(false),
+            deadline,
+            keys: Keys {
+                secret: vec![7; 32],
+                tls: None,
+            },
+            drills: true,
+            log: dir.join("raft.log"),
+            addrs: BTreeMap::new(),
+            links: Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    /// MB.1 (T-MB.1.9, lane perf-A28): what waits for the memory budget's room for a member's work
+    /// hears its replica end, as a disk cut off ends it, and holds nothing. Do: on a member of one,
+    /// another use holding the budget, a `Q` request whose frame finds no room, one whose decoded
+    /// values find none, or a call on the member's replica, waits for room; its log's disk is cut and
+    /// the next write fences its owner. Expect: the request answered `Refused(Fenced)`, the call
+    /// refused so; none waiting, nothing held.
+    #[test]
+    fn a28_what_waits_for_room_hears_its_replicas_end_holding_nothing() {
+        use crate::memory::tests::{BUDGET, Fed};
+        const LIMIT: u64 = 1 << 20;
+        for (waits, room) in [("a frame", 0), ("its values", 8 << 10), ("a call", 0)] {
+            let dir = tempfile::tempdir().unwrap();
+            let shared = member_of_one(dir.path(), crate::transport::HANG);
+            shared
+                .db
+                .call(sql_until(), crate::database::AnswerMax::fixed(), |c| {
+                    c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")?;
+                    Ok(())
+                })
+                .unwrap();
+            let budget = memory::Budget::new(Box::new(Fed::new(Some(LIMIT), Some(0))));
+            let began = Instant::now();
+            // Its deadline past the member's own, so that the member's answer is what it reads.
+            let far = crate::transport::HANG * 2;
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let served = {
+                let (shared, on_served) = (Arc::clone(&shared), Arc::clone(&budget));
+                std::thread::spawn(move || {
+                    BUDGET.with(|slot| *slot.borrow_mut() = Some(on_served));
+                    let (s, _) = listener.accept().unwrap();
+                    connection(&shared, s)
+                })
+            };
+            let mut client = SqlClient::connect(&addr, &shared.keys, far).unwrap();
+            let other = budget.take(Use::Images, LIMIT - room).unwrap();
+            let on_request = Arc::clone(&budget);
+            let called = Arc::clone(&shared);
+            let asked = std::thread::spawn(move || -> anyhow::Result<()> {
+                if waits == "a call" {
+                    BUDGET.with(|slot| *slot.borrow_mut() = Some(on_request));
+                    let until = after(crate::transport::HANG)?;
+                    called
+                        .db
+                        .call(until, crate::database::AnswerMax::fixed(), |c| {
+                            c.execute_batch("INSERT INTO t VALUES (1)")?;
+                            Ok(())
+                        })?;
+                } else {
+                    let nulls = vec![Value::Null; amphora_api::TX_MAX];
+                    client.read(statement("SELECT 1", nulls))?;
+                }
+                Ok(())
+            });
+            while budget.waiting() == 0 {
+                assert!(!asked.is_finished(), "{waits}: answered");
+                assert!(began.elapsed() < crate::transport::HANG, "{waits}: a hang");
+                std::thread::yield_now();
+            }
+            Database::set_log_disk(&shared.log, LogDisk::Cut).unwrap();
+            let fenced = shared
+                .db
+                .call(sql_until(), crate::database::AnswerMax::fixed(), |c| {
+                    c.execute_batch("INSERT INTO t VALUES (2)")?;
+                    Ok(())
+                });
+            assert!(fenced.is_err(), "{waits}: a write on a cut disk");
+            while !asked.is_finished() {
+                assert!(began.elapsed() < far, "{waits}: a hang");
+                std::thread::yield_now();
+            }
+            let refused = asked.join().unwrap().unwrap_err();
+            assert!(
+                matches!(refused.downcast_ref::<Refusal>(), Some(Refusal::Fenced(_))),
+                "{waits}: {refused:#} after {:?}",
+                began.elapsed()
+            );
+            assert_eq!(budget.waiting(), 0, "{waits}");
+            drop(other);
+            drop(shared);
+            let _ = served;
+            assert_eq!(budget.held(Use::Queues), 0, "{waits}");
+        }
+    }
+
     /// CP-T1.13, AC-T1.2.3 (decision 2's bounds): do decode a `Q` request with one parameter past
     /// the API's transaction bound, as a write and as a read; expect both refused while decoding,
     /// as a `C` connection's are, and the same request at the bound decoded and its memory charged.
