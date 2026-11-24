@@ -3504,10 +3504,11 @@ impl Connection {
             && should_checkpoint_on_close
         {
             // Amphora: rows on the versioned storage are not in the file, which stays marked.
+            let whole = self.db.versioned_storage(false, None)?.is_none();
             self.pager.load().checkpoint_shutdown(
                 self.wal_auto_actions(),
                 self.get_sync_mode(),
-                self.versioned.is_none(),
+                whole,
             )?;
         };
         Ok(())
