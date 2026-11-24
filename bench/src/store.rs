@@ -154,6 +154,14 @@ impl Engine for Convo {
     fn restart_log(&mut self) -> anyhow::Result<bool> {
         self.db.restart_log()
     }
+
+    fn holding(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
+        crate::suite_db::amphora_holding(&mut self.db)
+    }
+
+    fn keep_holding(&mut self, holding: &[u8]) -> anyhow::Result<()> {
+        crate::suite_db::amphora_keep_holding(&mut self.db, holding)
+    }
 }
 
 /// A session's latest page, every column taken.
@@ -167,6 +175,17 @@ fn page(db: &mut Db, session: &str, limit: usize) -> anyhow::Result<usize> {
         Ok(true)
     })?;
     Ok(n)
+}
+
+/// A session's latest page's event ids, newest first.
+fn page_ids(db: &mut Db, session: &str, limit: usize) -> anyhow::Result<Vec<String>> {
+    let mut ids = Vec::new();
+    let params = [t(session), Value::from_i64(i64::try_from(limit).unwrap_or(i64::MAX))];
+    db.query(schema::EVENTS_LAST, params, |r| {
+        ids.push(r.get_value(1).to_text().unwrap_or_default().to_owned());
+        Ok(true)
+    })?;
+    Ok(ids)
 }
 
 fn search_on(db: &mut Db, word: &str, limit: usize) -> anyhow::Result<usize> {
@@ -254,6 +273,11 @@ impl Driver for Amphora {
         self.groups.read_committed(session, Instant::now() + WAIT, move |db| page(db, &s, limit), move |e| page(&mut e.db, &w, limit))
     }
 
+    fn page(&self, session: &str, limit: usize) -> anyhow::Result<Vec<String>> {
+        let (s, w) = (session.to_owned(), session.to_owned());
+        self.groups.read_committed(session, Instant::now() + WAIT, move |db| page_ids(db, &s, limit), move |e| page_ids(&mut e.db, &w, limit))
+    }
+
     fn search(&self, word: &str, limit: usize) -> anyhow::Result<usize> {
         let (s, w) = (word.to_owned(), word.to_owned());
         let each = self.groups.read_each(Instant::now() + WAIT, true, move |db| search_on(db, &s, limit), move |e| search_on(&mut e.db, &w, limit))?;
@@ -292,5 +316,30 @@ impl Driver for Amphora {
             "slowest_commit_stmt_us": SLOWEST.1.load(Ordering::Relaxed),
             "slowest_apply_us": SLOWEST.2.load(Ordering::Relaxed),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Lane Q5 (decision 40): K0's mixed phase opens on `--target amphora` and reads what it wrote.
+    // It stopped at open ("this engine keeps no holding, so it can't be a group's") once
+    // `Groups::start` asked every engine for its group's holding and this one kept none.
+    #[test]
+    fn q5_k0_amphora_opens_and_reads_what_it_wrote() {
+        let dir = std::env::temp_dir().join(format!("amphora-q5-k0-{}", std::process::id()));
+        let amphora = Amphora::open(dir.to_str().unwrap()).unwrap();
+        let events: Vec<Event> = (0..3)
+            .map(|seq| Event { session: "s-000001".into(), id: format!("e-{seq}"), seq, at: 0, kind: "user", text: "quorum".into(), body: "{}".into() })
+            .collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        amphora.write(events, Box::new(move |r| drop(tx.send(r)))).unwrap();
+        rx.recv().unwrap().unwrap();
+        assert_eq!(amphora.history("s-000001", 50).unwrap(), 3);
+        assert_eq!(amphora.history("s-000002", 50).unwrap(), 0);
+        assert_eq!(amphora.page("s-000001", 50).unwrap(), ["e-2", "e-1", "e-0"]);
+        drop(amphora);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
