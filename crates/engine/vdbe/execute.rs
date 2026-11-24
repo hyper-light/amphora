@@ -22115,6 +22115,7 @@ pub fn op_morsel_aggregate(
                     .run_mode(connection.parallel_mode(), &mut costs, &budget)
                     .map(|(rows, _)| (rows, false));
             }
+            table.read_reals(&data.reals)?;
             let shape = ScanAggregate {
                 rows: &[],
                 filter: &data.filter,
