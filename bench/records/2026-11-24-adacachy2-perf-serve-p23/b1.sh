@@ -7,7 +7,7 @@ set -u
 H=d0c5722de0fb1085bd052ce1655856c13517af53; M=6d8e7dcd38be29214187a06bbfabdf9b054acb2a
 R=${R:-5} W=${W:-2} PORT=${PORT:-31740}
 A=$HOME/.cache/amphora-perf/serve-p7-remote; BIN=$HOME/.cache/amphora-perf-bin/serve-p22
-L=$HOME/.cache/amphora-perf/serve-p23-b1; mkdir -p "$L/cells" "$L/watch"
+L=$HOME/.cache/amphora-perf/${LDIR:-serve-p23-b1}; mkdir -p "$L/cells" "$L/watch"
 ld() { echo "load $(cut -d' ' -f1-3 /proc/loadavg) cpu-some $(sed -n 's/^some avg10=\([0-9.]*\).*/\1/p' /proc/pressure/cpu) io-some $(sed -n 's/^some avg10=\([0-9.]*\).*/\1/p' /proc/pressure/io)"; }
 echo "start $(date -u +%T) $(ld)"; df -h ~ | tail -1
 for s in $H $M; do [ -x "$BIN/$s/bench" ] || { echo "NO BIN $s"; exit 9; }; done
