@@ -998,8 +998,9 @@ fn a_restored_database_is_backed_up_to_its_archive_again() {
 /// pass has copied into the file yet. Do: write 20 rows, open a read on them and leave it open,
 /// write 20 more, ship, and start the log again: the read keeps the pass from copying the later 20
 /// (the closing segment's frames past its mark). Write 1 row in the new segment, ship it, and copy
-/// a base; then end the read and restore the last second. Expect: the restore holds every row
-/// committed, those 20 too.
+/// a base, once the read has ended and a pass ran where it is refused before; then restore the last
+/// second. Expect: the file alone lacks the 20 rows as the base begins, and the restore holds every
+/// row committed, those too.
 #[test]
 fn d45_a_base_begun_while_a_read_holds_the_closing_segment_restores_every_commit() {
     let mut s = Source::new();
@@ -1014,13 +1015,26 @@ fn d45_a_base_begun_while_a_read_holds_the_closing_segment_restores_every_commit
     let state = log_files(&s.path);
     s.put(40..41, "c");
     s.ship().unwrap();
-    let mut base = s.begin_base().unwrap();
+    let alone = s.dir.path().join("alone.db");
+    std::fs::copy(&s.path, &alone).unwrap();
+    assert_eq!(
+        rows(&Db::open(&alone).unwrap()).len(),
+        20,
+        "non-vacuous: the read keeps the later commits out of the file"
+    );
+    let mut base = match s.begin_base() {
+        Ok(base) => base,
+        Err(refused) => {
+            slow.exec("COMMIT").unwrap();
+            let _copied = s.db.checkpoint().unwrap();
+            s.begin_base()
+                .unwrap_or_else(|e| panic!("refused with the read ended: {e:#}, after {refused:#}"))
+        }
+    };
     s.copy_base(&mut base);
     s.end_base(base).unwrap();
     s.now.fetch_add(SECOND_NS, Ordering::SeqCst);
     s.ship().unwrap();
-    assert_eq!(rows(&slow).len(), 20, "the read keeps its snapshot");
-    slow.exec("COMMIT").unwrap();
     let last = s.history.last().unwrap().0.div_ceil(SECOND_NS);
     let restored = s.restored(last).unwrap();
     let lost: Vec<i64> = s

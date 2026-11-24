@@ -161,6 +161,8 @@ pub(crate) struct Prepared {
     foreground: Arc<Foreground>,
     counters: Arc<CheckCounters>,
     meter: Arc<DrillMeter>,
+    /// Whether a base that was to begin waits for the log's closing segment to be copied.
+    base_waits: bool,
 }
 
 /// What the shipping thread tells the check thread: rounds ended, the latest base, the log shipped
@@ -343,6 +345,7 @@ impl Prepared {
             foreground,
             counters,
             meter,
+            base_waits: false,
         })
     }
 
@@ -479,21 +482,30 @@ impl Prepared {
                 // A base begins in a generation the shipper has shipped: after a round that
                 // shipped, or once there's nothing left to (`begin_base` refuses otherwise); and
                 // just after the log starts again, so the next base copies least (T-T1.12.I4).
-                if self.shipper.base_due(None)
-                    && self.shipper.ships_current(&self.reader)
-                    && plan::base_begins_now(
+                let begins = self.base_waits
+                    || plan::base_begins_now(
                         self.shipper.base_needed(),
                         self.shipper.generation() != generation,
                         self.shipper.frames_in_generation(),
                         self.reader.log_kept_frames(),
-                    )
+                    );
+                if self.shipper.base_due(None) && self.shipper.ships_current(&self.reader) && begins
                 {
-                    *copy = Some(self.shipper.begin_base(
-                        &self.reader,
-                        blobs,
-                        &crate::memory::process(),
-                        self.archive.memory,
-                    )?);
+                    // The file must hold the closing segment first (decision 45): a pass copies
+                    // what the reads under way let it, and where one holds it back the base waits
+                    // for a later round.
+                    if !self.reader.closing_copied() {
+                        let _copied = self.reader.checkpoint()?;
+                    }
+                    self.base_waits = !self.reader.closing_copied();
+                    if !self.base_waits {
+                        *copy = Some(self.shipper.begin_base(
+                            &self.reader,
+                            blobs,
+                            &crate::memory::process(),
+                            self.archive.memory,
+                        )?);
+                    }
                 }
                 Ok((shipped, false))
             }

@@ -638,6 +638,12 @@ impl Db {
             .filter(|header| header.len() == len))
     }
 
+    /// Whether the file holds every frame committed before the log's current segment (decision
+    /// 45): what a copy of the file needs before it begins in the current generation.
+    pub(crate) fn closing_copied(&self) -> bool {
+        self.db.wal_closing_copied()
+    }
+
     /// `len` bytes of the database's file from `offset`.
     pub(crate) fn read_file(&self, offset: u64, len: usize) -> anyhow::Result<Vec<u8>> {
         self.read_at(&self.path.display().to_string(), offset, len)?

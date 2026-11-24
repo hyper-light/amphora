@@ -995,7 +995,9 @@ impl Shipper {
     /// Begins a copy of the database's file, in chunks as large as the store's objects, `cap` and
     /// this copy's room in `memory` allow: a chunk is a request, and a restore's fetch moves more
     /// bytes a second the fewer requests it waits on. Refused until the log's generation now has
-    /// been seen by [`Shipper::ship`].
+    /// been seen by [`Shipper::ship`], and while the file lacks frames of the generations before
+    /// it (decision 45: the closing segment's, a read under way holding their copy back): a
+    /// restore of the base replays the log from its own generation's first frame.
     ///
     /// The room (T-T1.12.M1): the copy opens a stream of [`Use::Chunks`], and a chunk takes at
     /// most that stream's share of the budget's room for chunks, measured now, read and sealed
@@ -1012,6 +1014,11 @@ impl Shipper {
         let (seq, _) = db.log_end();
         if self.identity.is_none_or(|i| i.seq != seq) {
             anyhow::bail!("ship the log's generation before copying a base in it");
+        }
+        if !db.closing_copied() {
+            anyhow::bail!(
+                "a base begins once the log's closing segment is copied into the file: a read under way holds it"
+            );
         }
         let stream = memory.stream(Use::Chunks);
         let share = memory.stream_room(Use::Chunks)?;
