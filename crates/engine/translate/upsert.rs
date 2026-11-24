@@ -634,10 +634,9 @@ pub fn emit_upsert(
     // collation. Comparisons in the WHERE/SET expressions must still apply
     // them (`int_col < '2'` compares numerically, a NOCASE column compares
     // case-insensitively), so record both per register for the conflicting
-    // row image and its rowid. The excluded (insertion) registers are
-    // already recorded by the enclosing INSERT translation, except for the
-    // decoded copies made for STRICT custom-type tables. Cleared wholesale
-    // at the end of the enclosing INSERT translation.
+    // row image and its rowid. Amphora: not for the excluded registers, which
+    // SQLite compares with no affinity and no collation, STRICT or not.
+    // Cleared wholesale at the end of the enclosing INSERT translation.
     for (idx, col) in table.columns().iter().enumerate() {
         if col.is_rowid_alias() {
             // The rewrite maps rowid-alias references to conflict_rowid_reg;
@@ -647,15 +646,6 @@ pub fn emit_upsert(
         let reg = layout.to_register(expr_current_start, idx);
         resolver.register_affinities.insert(reg, col.affinity());
         resolver.register_collations.insert(reg, col.collation());
-        if let Some(decoded_start) = excluded_decoded_start {
-            let excluded_reg = layout.to_register(decoded_start, idx);
-            resolver
-                .register_affinities
-                .insert(excluded_reg, col.affinity());
-            resolver
-                .register_collations
-                .insert(excluded_reg, col.collation());
-        }
     }
     resolver
         .register_affinities
@@ -758,6 +748,25 @@ pub fn emit_upsert(
                     None,
                 )?,
             });
+        } else {
+            // For non-STRICT tables, apply column affinity to the values.
+            // This must happen early so that the virtual columns, the index records and the
+            // table record all use the converted values.
+            let affinity = bt
+                .columns()
+                .iter()
+                .filter(|c| !c.is_virtual_generated())
+                .map(|c| c.affinity());
+
+            if affinity.clone().any(|a| a != Affinity::Blob) {
+                if let Ok(count) = NonZeroUsize::try_from(layout.num_non_virtual_cols()) {
+                    program.emit_insn(Insn::Affinity {
+                        start_reg: new_start,
+                        count,
+                        affinities: affinity.map(|a| a.aff_mask()).collect(),
+                    });
+                }
+            }
         }
     }
 
@@ -795,25 +804,6 @@ pub fn emit_upsert(
                 check_null_keys: true,
                 table_reference: BTreeTable::type_check_table_ref(&bt, resolver.schema()),
             });
-        } else {
-            // For non-STRICT tables, apply column affinity to the values.
-            // This must happen early so that both index records and the table record
-            // use the converted values.
-            let affinity = bt
-                .columns()
-                .iter()
-                .filter(|c| !c.is_virtual_generated())
-                .map(|c| c.affinity());
-
-            if affinity.clone().any(|a| a != Affinity::Blob) {
-                if let Ok(count) = NonZeroUsize::try_from(layout.num_non_virtual_cols()) {
-                    program.emit_insn(Insn::Affinity {
-                        start_reg: new_start,
-                        count,
-                        affinities: affinity.map(|a| a.aff_mask()).collect(),
-                    });
-                }
-            }
         }
 
         // Evaluate CHECK constraints on the new values
