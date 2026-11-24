@@ -22,21 +22,39 @@ point ("Continuous Archiving and Point-in-Time Recovery", postgresql.org/docs/cu
 - **The log's restarts wait for shipping.** `Db::restart_log` starts the log again only once the
   backup shipped all of it (`backup::Fence`), until the log is past what a restart keeps (decision
   31); then it starts again and the archive records a break: seconds across it need a base after it.
+  A send under way then may ship the rest, from the segment it is in (below): once it has shipped the
+  generation's last frame the archive holds it whole, and nothing broke there (lane B25).
   The engine's own restarts (at the writer's next write once every frame is in the file, and on
   the last connection's close, as SQLite's) are off for a backed-up writer: they skipped the wait.
   The fence follows restarts one by one (each raises the header's checkpoint sequence by one), so a
   log started again twice with no write between, its middle generation empty, stays linked whole.
   It is told how a generation ends before the switch that ends it is made (`Fence::restart`, lane
   B24): a round on another thread sees the generation after at once, and would find the fence not
-  told of it, so its base under way was refused its end and started over.
+  told of it, so its base under way was refused its end and started over. A shipper opened on an
+  archive finds the generation it ends in in either segment (decision 45, lane B25): the current one, or
+  the one the last switch closed, where the process ended between that switch and the next round. If
+  the archive holds the closed one through its last frame, the fence is told so and the log runs on;
+  if it doesn't, the log broke there.
 - **A send reads its generation's own segment** (decision 45, lane B24). A log past what a restart
   keeps starts again with a send of its frames under way (the store's put may take long). They stay
   in the segment that closed, so a send reads the segment its generation's header was in, not the
   current one, and ends. A log started again a second time meanwhile writes over that segment: a
   generation's header is durable before any frame of it, so the segment's header, read after each
   part's frames and the generation's own still, says the frames are too; else the send is refused
-  and the log is broken there. No sum catches frames of another generation: a restore's recovery
-  would end at the first of them, with no error.
+  and the log is broken there. No sum catches frames of another generation: an object's sum says its
+  bytes are those sent.
+- **A restore proves what it replayed** (lane B25, AC-T1.12.4). The frames say whose they are: each one's
+  salts are its generation's and its sum runs on from the frame before (sqlite.org/fileformat2.html, "WAL
+  Format"), and the engine's recovery keeps those that do, up to their last commit, and drops the rest as
+  a crash's tail. So a restore compares the frames the engine recovered of each generation with those the
+  archive's keys gave it, up to the cut, before it folds them: fewer is refused, typed
+  (`Unrestorable::Short`, naming the generation and the frames), never answered with the shorter
+  database. The files it made are removed then, as they would open as a whole database. Nothing new is
+  written for it, so an archive made before proves itself the same: whole, it restores as it did; one that
+  holds another generation's frames under a key (a shipper before lane B24 sent some so, its log started
+  again under a send) restores every second before them and refuses every second after. What no frame
+  says is what a base's file held: a base begun by a shipper before lane B22's fix, its file short of the
+  closing segment's frames, can't be told from a whole one.
 - **A segment with no header yet** (decision 45, lane B22). The store switches the log's segments once
   a batch is committed, and a segment's header is written by its first commit. Until then, which is
   as long as the writer is idle, the current segment's file is empty (a switch made it, or cut it),
@@ -58,7 +76,10 @@ point ("Continuous Archiving and Point-in-Time Recovery", postgresql.org/docs/cu
   45), so a read under way can keep the closing segment's later frames out of the file, and a base
   begun then would lose them. So a base begins only once a pass has copied the closing segment whole:
   the shipping thread asks for one, and where a read still holds it back the base waits for a later
-  round.
+  round. A base begun before the log broke restores no second after the break (a restore's chain starts
+  at the break), so it mends nothing (lane B25): it is refused its end (`Shipper::end_base`), the
+  shipping thread drops one under way as soon as the log broke and begins another, and a shipper opened
+  on an archive holding one (one before lane B25 ended them) needs a base.
 - **No picked numbers.** Shipping has no timer: each round sends what became durable while the last
   put ran, so a segment's size and the cadence follow the observed log rate and the store's put time
   (Ada, 2026-11-21: learned as they run). A segment is split only by the store's own object size. A

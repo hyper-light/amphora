@@ -1446,6 +1446,8 @@ enum Wrong {
     NextGenerations,
     /// The frames of its last part's end, gone (zeroes).
     Truncated,
+    /// Its last part two frames shorter than its key says.
+    Fewer,
 }
 
 /// Archives a base, then a generation in several parts and one after it, makes the first of the two
@@ -1492,6 +1494,13 @@ fn restored_from_a_wrong_generation(wrong: Wrong) {
             let mut body = body.clone();
             let kept = body.frames.len() - 2 * frame;
             body.frames[kept..].fill(0);
+            replace_segment(&s.blobs, name, &body);
+            key.last - 2
+        }
+        Wrong::Fewer => {
+            let (key, name, body) = sent.last().unwrap();
+            let mut body = body.clone();
+            body.frames.truncate(body.frames.len() - 2 * frame);
             replace_segment(&s.blobs, name, &body);
             key.last - 2
         }
@@ -1564,6 +1573,12 @@ fn a_restore_of_an_archive_short_of_its_frames_is_refused() {
 #[test]
 fn a_restore_of_a_truncated_generation_is_refused() {
     restored_from_a_wrong_generation(Wrong::Truncated);
+}
+
+/// AC-T1.12.4 (lane B25): the same, a part holding fewer frames than its key says.
+#[test]
+fn a_restore_of_a_part_shorter_than_its_key_is_refused() {
+    restored_from_a_wrong_generation(Wrong::Fewer);
 }
 
 /// AC-T1.12.4 (lane B25): a restore that is refused for a short archive leaves nothing at its path
@@ -1687,14 +1702,48 @@ fn d45_a_shipper_opened_after_a_switch_carries_on_from_the_closed_segment() {
     );
 }
 
-/// Decision 45 (lane B25): a new database takes nothing from a log segment left at its path, `-wal2` as
-/// `-wal`. Do: write 20 rows, start the log again (the writer switches to `-wal2`), and there make a
-/// second table and write 200 rows; end, and remove the database's file and its `-wal`, the ones
-/// SQLite names, its `-wal2` left; open a database at that path, make a table and write 3 rows, copy
-/// its log into its file, and open it again. Expect: it begins empty, and holds the 3 rows alone,
-/// its file whole.
+/// AC-T1.12.3 (lane B25): a base begun before the log broke is refused its end, so the archive never
+/// counts as mended by a base no restore takes. Do: begin a base and copy it; commit past what a restart
+/// keeps with no round, start the log again unshipped, commit and ship; end the base; then end one
+/// begun since, commit and ship; restore every second from its end. Expect: the first is refused, a
+/// base needed still; after the second none is, and every second restores with its rows.
 #[test]
-fn d45_a_new_database_takes_no_log_segment_left_at_its_path() {
+fn a_base_begun_before_a_break_is_refused_its_end() {
+    let mut s = Source::new();
+    s.db.keep_log(20);
+    s.put(0..10, "a");
+    s.ship().unwrap();
+    let mut base = s.begin_base().unwrap();
+    s.copy_base(&mut base);
+    s.put(10..70, "b");
+    assert!(
+        s.db.restart_log().unwrap(),
+        "past what a restart keeps, it starts again unshipped"
+    );
+    s.put(70..75, "c");
+    s.ship().unwrap();
+    let ended = s.end_base(base);
+    assert!(
+        ended.is_err() && s.shipper.base_needed(),
+        "a base begun before the break: its end {ended:?}, a base needed after it: {}",
+        s.shipper.base_needed()
+    );
+    let _copied = s.db.checkpoint().unwrap();
+    let mut base = s.begin_base().unwrap();
+    s.copy_base(&mut base);
+    s.end_base(base).unwrap();
+    assert!(!s.shipper.base_needed());
+    let based = s.second();
+    s.put(75..80, "d");
+    s.now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    s.ship().unwrap();
+    s.restores_every_second_from(based);
+}
+
+/// A folder where a database was removed and its `-wal2` left: 20 rows, the log started again (the
+/// writer switched to `-wal2`), a second table made there and 200 rows more; ended, the database's
+/// file and its `-wal`, the ones SQLite names, removed. Its path, and what its log held.
+fn second_segment_left() -> (tempfile::TempDir, std::path::PathBuf, String) {
     let mut s = Source::new();
     s.put(0..20, "a");
     s.ship().unwrap();
@@ -1713,49 +1762,171 @@ fn d45_a_new_database_takes_no_log_segment_left_at_its_path() {
     std::fs::remove_file(&path).unwrap();
     std::fs::remove_file(beside("-wal")).unwrap();
     assert!(
-        std::fs::metadata(beside("-wal2")).unwrap().len() > 32,
+        std::fs::metadata(beside("-wal2")).unwrap().len() > 100 * (4096 + 24),
         "non-vacuous: a segment with frames is left; {state}"
     );
+    (dir, path, state)
+}
 
-    let tables = |db: &Db| -> anyhow::Result<Vec<String>> {
-        let mut names = Vec::new();
-        db.query("SELECT name FROM sqlite_schema ORDER BY name", [], |r| {
-            names.push(r.get::<String>(0).map_err(|e| anyhow::anyhow!("{e}"))?);
-            Ok(true)
-        })?;
-        Ok(names)
-    };
-    let opened = Db::open(&path).and_then(|db| tables(&db).map(|names| (db, names)));
-    let (db, names) = match opened {
-        Ok(opened) => opened,
-        Err(e) => panic!("a new database where `-wal2` is left doesn't open: {e:#}; {state}"),
-    };
-    assert_eq!(
-        names,
-        Vec::<String>::new(),
-        "a new database holds tables of the one removed; {state}"
-    );
-    let mut expected = Rows::new();
-    db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
-        .unwrap();
-    for id in 0..3 {
-        db.exec(&format!("INSERT INTO t (id, v) VALUES ({id}, 'new')"))
-            .unwrap();
-        expected.insert(id, "new".into());
-    }
-    assert_eq!(rows(&db), expected);
-    let mut db = db;
-    let _copied = db.checkpoint().unwrap();
-    drop(db);
-    let db = Db::open(&path).unwrap();
-    assert_eq!(rows(&db), expected, "opened again");
+fn tables(db: &Db) -> anyhow::Result<Vec<String>> {
+    let mut names = Vec::new();
+    db.query("SELECT name FROM sqlite_schema ORDER BY name", [], |r| {
+        names.push(r.get::<String>(0).map_err(|e| anyhow::anyhow!("{e}"))?);
+        Ok(true)
+    })?;
+    Ok(names)
+}
+
+fn integrity(db: &Db) -> Vec<String> {
     let mut whole = Vec::new();
     db.query("PRAGMA integrity_check", [], |r| {
         whole.push(r.get::<String>(0).map_err(|e| anyhow::anyhow!("{e}"))?);
         Ok(true)
     })
     .unwrap();
-    assert_eq!(whole, ["ok"]);
+    whole
+}
+
+/// Decision 45 (lane B25): a new database opened where a log segment is left, `-wal2` as `-wal`, is new.
+/// Do: [`second_segment_left`]; open a database at that path and close it, nothing written, twice;
+/// then open it again. Expect: no table in it, each time.
+#[test]
+fn d45_a_new_database_opened_and_closed_takes_no_log_segment_left_at_its_path() {
+    let (dir, path, state) = second_segment_left();
+    for time in 1..=3 {
+        let held = Db::open(&path).and_then(|db| tables(&db));
+        assert!(
+            matches!(&held, Ok(names) if names.is_empty()),
+            "open {time} of a new database, nothing written: {held:?}; the log of the one removed: \
+             {state}; now {}",
+            log_files(&path)
+        );
+    }
+    drop(dir);
+}
+
+/// Decision 45 (lane B25): a pass of the checkpointer copies nothing of a log segment left at a new
+/// database's path into it. Do: [`second_segment_left`]; open a database at that path, run a pass and
+/// close it, nothing written; open it again. Expect: no table in it.
+#[test]
+fn d45_a_new_databases_checkpoint_copies_no_log_segment_left_at_its_path() {
+    let (dir, path, state) = second_segment_left();
+    let mut db = Db::open(&path).unwrap();
+    let copied = db.checkpoint().unwrap();
+    drop(db);
+    let held = Db::open(&path).and_then(|db| tables(&db));
+    assert!(
+        matches!(&held, Ok(names) if names.is_empty()),
+        "a new database, nothing written, after a pass that found {copied:?}: {held:?}; the log of \
+         the one removed: {state}"
+    );
+    drop(dir);
+}
+
+/// Decision 45, AC-T1.12.4 (lane B25): a new database's archive holds nothing of a log segment left at
+/// its path. Do: [`second_segment_left`]; open a database there, backed up to a new archive, its table
+/// made and a base ended, 10 rows written, all shipped; restore every second from the first the
+/// archive restores. Expect: each restores with the rows of the new database as of it, and no table
+/// but its own.
+#[test]
+fn d45_a_new_databases_archive_holds_no_log_segment_left_at_its_path() {
+    let (dir, path, state) = second_segment_left();
+    let now = Arc::new(AtomicU64::new(5_000 * SECOND_NS));
+    let read = Arc::clone(&now);
+    let hooks = Hooks::new(Arc::new(move || read.load(Ordering::SeqCst)), 1 << 16);
+    let mut db = Db::open(&path).unwrap();
+    db.back_up(Arc::clone(&hooks));
+    let blobs = backup::FolderBlobs::open(&dir.path().join("archive"), 64 * 1024).unwrap();
+    let mut shipper = Shipper::open("db", hooks, &blobs, &db, until()).unwrap();
+    let mut history: Vec<(u64, Vec<String>, Rows)> = Vec::new();
+    let mut note = |db: &Db, now: &AtomicU64| {
+        let names = tables(db).unwrap();
+        let held = if names.contains(&"t".to_owned()) {
+            rows(db)
+        } else {
+            Rows::new()
+        };
+        history.push((now.load(Ordering::SeqCst), names, held));
+    };
+    note(&db, &now);
+    shipper.ship(&db, &blobs, until()).unwrap();
+    now.fetch_add(5 * SECOND_NS, Ordering::SeqCst);
+    db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+        .unwrap();
+    note(&db, &now);
+    shipper.ship(&db, &blobs, until()).unwrap();
+    let mut base = shipper
+        .begin_base(&db, &blobs, &amphora::memory::process(), 32 * 1024)
+        .unwrap();
+    while shipper.copy_base(&db, &blobs, &mut base, until()).unwrap() {}
+    shipper.end_base(&db, &blobs, base, until()).unwrap();
+    let (mut model, mut written) = (Rows::new(), Vec::new());
+    for id in 0..10 {
+        put(&mut db, &now, id..id + 1, "new", &mut model, &mut written);
+        note(&db, &now);
+        shipper.ship(&db, &blobs, until()).unwrap();
+    }
+    now.fetch_add(2 * SECOND_NS, Ordering::SeqCst);
+    shipper.ship(&db, &blobs, until()).unwrap();
+    let (first, last) = (5_000, now.load(Ordering::SeqCst) / SECOND_NS);
+    let mut restored = 0;
+    for second in first..=last {
+        let target = dir.path().join(format!("at-{second}.db"));
+        if let Err(e) = backup::restore(&blobs, "db", second, &target, until()) {
+            assert!(
+                second < 5_005,
+                "second {second}, which a base restores, is refused: {e:#}"
+            );
+            continue;
+        }
+        restored += 1;
+        let held = Db::open(&target).unwrap();
+        let names = tables(&held).unwrap();
+        let (_, then, expected) = history
+            .iter()
+            .rfind(|(ns, _, _)| *ns <= second * SECOND_NS)
+            .unwrap();
+        assert_eq!(&names, then, "second {second}'s tables; left: {state}");
+        if names.contains(&"t".to_owned()) {
+            assert_eq!(&rows(&held), expected, "second {second}'s rows");
+        }
+        assert_eq!(integrity(&held), ["ok"], "second {second}");
+    }
+    assert!(restored >= 10, "{restored} seconds restored");
+}
+
+/// Decision 45 (lane B25): a new database grown past what a log segment left at its path held is its own.
+/// Do: [`second_segment_left`]; open a database there, make a table and write 400 rows, its log copied
+/// into its file part of the way, and open it again. Expect: the 400 rows alone, its file whole, both
+/// before and after.
+#[test]
+fn d45_a_new_database_grows_over_no_log_segment_left_at_its_path() {
+    let (dir, path, state) = second_segment_left();
+    let now = AtomicU64::new(1_000 * SECOND_NS);
+    let (mut model, mut history) = (Rows::new(), Vec::new());
+    let mut db = Db::open(&path).unwrap();
+    db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+        .unwrap();
+    for part in 0..4 {
+        let ids = part * 100..(part + 1) * 100;
+        put(&mut db, &now, ids, "new", &mut model, &mut history);
+        let _copied = db.checkpoint().unwrap();
+    }
+    let check = |db: &Db, when: &str| {
+        let held = rows(db);
+        let wrong = model
+            .iter()
+            .filter(|(id, v)| held.get(id) != Some(v))
+            .count();
+        assert_eq!(
+            (wrong, held.len(), tables(db).unwrap(), integrity(db)),
+            (0, model.len(), vec!["t".to_owned()], vec!["ok".to_owned()]),
+            "{when}: rows wrong, rows, tables, integrity; the log of the one removed: {state}"
+        );
+    };
+    check(&db, "as written");
+    drop(db);
+    check(&Db::open(&path).unwrap(), "opened again");
     drop(dir);
 }
 

@@ -477,6 +477,10 @@ impl Prepared {
         let shipped = self.ship()?;
         let blobs = self.archive.blobs.as_ref();
         let until = self.until();
+        // A base begun before the log broke restores nothing after it: another begins.
+        if copy.as_ref().is_some_and(|c| self.shipper.broke_since(c)) {
+            *copy = None;
+        }
         match copy.as_mut() {
             None => {
                 // A base begins in a generation the shipper has shipped: after a round that
@@ -978,8 +982,8 @@ mod tests {
         match restored_now(dir.path(), &blobs, &now) {
             Ok(restored) => assert_eq!(restored, ids(&db)),
             Err(e) => panic!(
-                "the last commit's second is refused, bases ended and none due ({}): {e:#}",
-                prepared.shipper.base_due(None)
+                "the last commit's second is refused, a base ended and another needed: {}: {e:#}",
+                prepared.shipper.base_needed()
             ),
         }
     }
@@ -1037,8 +1041,8 @@ mod tests {
         match restored_now(dir.path(), &blobs, &now) {
             Ok(restored) => assert_eq!(restored, ids(&db)),
             Err(e) => panic!(
-                "the last commit's second is refused, and no base is due ({}): {e:#}",
-                prepared.shipper.base_due(None)
+                "the last commit's second is refused, another base needed: {}: {e:#}",
+                prepared.shipper.base_needed()
             ),
         }
     }
