@@ -1,6 +1,6 @@
 //! Statements: `analyze.c`, `parse_target.c` and `parse_relation.c` (REL_19_0 src/backend/parser) for
-//! SELECT over one table with a WHERE, UPDATE of a column, and INSERT of a VALUES row. Every other
-//! clause refuses `0A000`.
+//! SELECT over one table or one generate_series with a WHERE, UPDATE of a column, INSERT of a VALUES row, and
+//! INSERT of a SELECT from one generate_series. Every other clause refuses `0A000`.
 
 use amphora_pg_catalog::Kind;
 use amphora_pg_catalog::data::type_oid;
@@ -34,6 +34,8 @@ pub struct Query {
     pub exprs: Exprs,
     /// The table selected from or assigned to.
     pub table: Option<Table>,
+    /// What an INSERT's SELECT reads: none for one of VALUES.
+    pub source: Option<Table>,
     pub targets: Vec<Target>,
     pub filter: Option<ExprId>,
     /// `$n`'s types, `$1` first.
@@ -53,6 +55,7 @@ pub fn analyze(
         session,
         exprs: Exprs::default(),
         table: None,
+        source: None,
         params: params.to_vec(),
     };
     let Node::RawStmt {
@@ -87,6 +90,7 @@ pub fn analyze(
         command,
         exprs: a.exprs,
         table: a.table,
+        source: a.source,
         targets,
         filter,
         params: a.params,
@@ -110,7 +114,7 @@ impl Analysis<'_> {
         }
         self.table = match s.from_clause.as_slice() {
             [] => None,
-            [item] => Some(self.table(*item)?),
+            [item] => Some(self.from_item(*item)?),
             _ => return Err(Error::unsupported("a FROM of several items")),
         };
         let mut targets = Vec::with_capacity(s.target_list.len());
@@ -188,6 +192,14 @@ impl Analysis<'_> {
         }
     }
 
+    /// `transformFromClauseItem` (parse_clause.c): a relation, or a function's rows.
+    fn from_item(&mut self, id: NodeId) -> Result<Table, Error> {
+        match self.tree.get(id)? {
+            Node::RangeFunction { .. } => self.function_table(id),
+            _ => self.table(id),
+        }
+    }
+
     /// `parserOpenTable` (parse_relation.c) and the table's columns.
     fn table(&self, id: NodeId) -> Result<Table, Error> {
         let Node::RangeVar {
@@ -236,6 +248,7 @@ impl Analysis<'_> {
             oid,
             refname,
             columns: relations.columns(oid),
+            series: None,
         })
     }
 
@@ -283,6 +296,9 @@ impl Analysis<'_> {
         let Some(Node::SelectStmt(select)) = select.map(|id| self.tree.get(id)).transpose()? else {
             return Err(Error::unsupported("INSERT without VALUES"));
         };
+        if select.values_lists.is_empty() {
+            return self.insert_of_select(table, &attnums, cols, select);
+        }
         let plain = SelectStmt {
             values_lists: select.values_lists.clone(),
             limit_option: select.limit_option,
@@ -302,6 +318,67 @@ impl Analysis<'_> {
         for item in items.iter().flatten() {
             values.push(self.expression(*item)?);
         }
+        let targets = self.row_targets(&table, &attnums, cols, values)?;
+        self.table = Some(table);
+        Ok((Command::Insert, targets, None))
+    }
+
+    /// `transformInsertStmt` of a SELECT whose FROM is one generate_series: a column's unknown literal takes its
+    /// column's type, as `p_resolve_unknowns` off leaves it.
+    fn insert_of_select(
+        &mut self,
+        table: Table,
+        attnums: &[usize],
+        cols: &[NodeId],
+        select: &SelectStmt,
+    ) -> Result<Analyzed, Error> {
+        let plain = SelectStmt {
+            target_list: select.target_list.clone(),
+            from_clause: select.from_clause.clone(),
+            where_clause: select.where_clause,
+            limit_option: select.limit_option,
+            ..SelectStmt::default()
+        };
+        let [item] = select.from_clause.as_slice() else {
+            return Err(Error::unsupported("INSERT of this SELECT"));
+        };
+        if plain != *select {
+            return Err(Error::unsupported("INSERT of this SELECT"));
+        }
+        let Node::RangeFunction { .. } = self.tree.get(*item)? else {
+            return Err(Error::unsupported("INSERT of a SELECT from a table"));
+        };
+        let source = self.function_table(*item)?;
+        self.table = Some(source);
+        let mut values = Vec::with_capacity(select.target_list.len());
+        for id in &select.target_list {
+            let Node::ResTarget {
+                indirection,
+                val: Some(val),
+                ..
+            } = self.tree.get(*id)?
+            else {
+                return Err(Error::unsupported("this target"));
+            };
+            if !indirection.is_empty() {
+                return Err(Error::unsupported("this target"));
+            }
+            values.push(self.expression(*val)?);
+        }
+        let filter = self.filter(select.where_clause)?;
+        let targets = self.row_targets(&table, attnums, cols, values)?;
+        self.source = self.table.replace(table);
+        Ok((Command::Insert, targets, filter))
+    }
+
+    /// `transformInsertRow` (analyze.c): the values under an INSERT's columns, each assigned to its own.
+    fn row_targets(
+        &mut self,
+        table: &Table,
+        attnums: &[usize],
+        cols: &[NodeId],
+        values: Vec<ExprId>,
+    ) -> Result<Vec<Target>, Error> {
         // transformInsertRow.
         if let Some(extra) = values.get(attnums.len()) {
             let location = self.exprs.get(*extra)?.location;
@@ -324,10 +401,9 @@ impl Analysis<'_> {
         }
         let mut targets = Vec::with_capacity(values.len());
         for (attnum, expr) in attnums.iter().zip(values) {
-            targets.push(self.assigned(&table, *attnum, expr)?);
+            targets.push(self.assigned(table, *attnum, expr)?);
         }
-        self.table = Some(table);
-        Ok((Command::Insert, targets, None))
+        Ok(targets)
     }
 
     /// `checkInsertTargets` (parse_target.c:1017): the columns an INSERT names.

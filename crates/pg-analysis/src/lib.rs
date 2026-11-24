@@ -22,6 +22,7 @@ pub mod datetime;
 pub mod expr;
 pub mod func;
 pub mod lower;
+pub(crate) mod reloptions;
 pub mod resolve;
 pub mod stmt;
 pub mod tz;
@@ -62,6 +63,10 @@ pub mod sqlstate {
     pub const UNDEFINED_FUNCTION: &str = "42883";
     pub const UNDEFINED_TABLE: &str = "42P01";
     pub const DUPLICATE_TABLE: &str = "42P07";
+    pub const INVALID_TABLE_DEFINITION: &str = "42P16";
+    pub const INSUFFICIENT_PRIVILEGE: &str = "42501";
+    pub const BAD_COPY_FILE_FORMAT: &str = "22P04";
+    pub const NOT_NULL_VIOLATION: &str = "23502";
     pub const UNDEFINED_PARAMETER: &str = "42P02";
     pub const AMBIGUOUS_PARAMETER: &str = "42P08";
     pub const INDETERMINATE_DATATYPE: &str = "42P18";
@@ -150,6 +155,10 @@ pub trait Relations {
     fn namespace_name(&self, oid: u32) -> Option<String>;
     /// A relation's user columns, in `attnum` order.
     fn columns(&self, oid: u32) -> Vec<Column>;
+    /// Whether a relation has an index of that name.
+    fn index(&self, _relation: u32, _name: &str) -> bool {
+        false
+    }
 }
 
 /// What a session brings to its statements' analysis.

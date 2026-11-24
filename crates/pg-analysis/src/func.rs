@@ -485,7 +485,7 @@ fn integer_range(s: &str, name: &str) -> Error {
 
 /// `parse_bool_with_len` (src/backend/utils/adt/bool.c): a case-insensitive prefix of true, false, yes
 /// or no, on, off (by two letters at least), 1 or 0, with spaces around it.
-fn parse_bool(s: &str) -> Option<bool> {
+pub(crate) fn parse_bool(s: &str) -> Option<bool> {
     let word = s
         .trim_matches(|c| matches!(c, ' ' | '\t'..='\r'))
         .to_ascii_lowercase();

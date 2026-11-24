@@ -203,10 +203,24 @@ impl Exprs {
 /// The table whose columns a statement's names can mean (`ParseNamespaceItem`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Table {
+    /// 0 for a function's rows.
     pub oid: u32,
     /// The name its columns are qualified by: its alias, else its own.
     pub refname: String,
     pub columns: Vec<crate::Column>,
+    /// The rows it gives where it is no relation: `generate_series` of integers.
+    pub series: Option<Series>,
+}
+
+/// `generate_series` of integers: its bounds and step (`generate_series_step_int4` and `_int8`, REL_19_0
+/// src/backend/utils/adt/int.c and int8.c).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Series {
+    pub start: ExprId,
+    pub stop: ExprId,
+    /// 1 where there is none.
+    pub step: Option<ExprId>,
+    pub location: i32,
 }
 
 /// A statement's analysis under way (`ParseState`).
@@ -215,6 +229,8 @@ pub struct Analysis<'a> {
     pub session: &'a Session<'a>,
     pub exprs: Exprs,
     pub table: Option<Table>,
+    /// What an INSERT's SELECT reads, where its targets are not the columns of `table`.
+    pub source: Option<Table>,
     /// `$n`'s types (`VarParamState`): 0 not seen, UNKNOWN not resolved yet.
     pub params: Vec<u32>,
 }
@@ -645,6 +661,111 @@ impl Analysis<'_> {
             args,
         };
         self.exprs.push(kind, operator.result, -1, location)
+    }
+
+    /// A function in FROM (`transformRangeFunction`, parse_clause.c): `generate_series` of integers, whose rows are a
+    /// column of the same name as its alias or its own (`addRangeTableEntryForFunction`, parse_relation.c).
+    pub(crate) fn function_table(&mut self, id: NodeId) -> Result<Table, Error> {
+        let refuse = || Error::unsupported("this function in FROM");
+        let Node::RangeFunction {
+            lateral: false,
+            ordinality: false,
+            is_rowsfrom: false,
+            functions,
+            alias,
+            coldeflist,
+        } = self.tree.get(id)?
+        else {
+            return Err(refuse());
+        };
+        let [function] = functions.as_slice() else {
+            return Err(refuse());
+        };
+        let Node::List(items) = self.tree.get(*function)? else {
+            return Err(refuse());
+        };
+        let ([Some(call), None], true) = (items.as_slice(), coldeflist.is_empty()) else {
+            return Err(refuse());
+        };
+        let Node::FuncCall(f) = self.tree.get(*call)? else {
+            return Err(refuse());
+        };
+        if f.agg_star
+            || f.agg_distinct
+            || f.func_variadic
+            || f.agg_within_group
+            || f.over.is_some()
+            || f.agg_filter.is_some()
+            || !f.agg_order.is_empty()
+        {
+            return Err(refuse().at(f.location));
+        }
+        let name = self.name(&f.funcname)?;
+        let mut args = Vec::with_capacity(f.args.len());
+        for arg in &f.args {
+            args.push(self.expression(*arg)?);
+        }
+        let mut inputs = Vec::with_capacity(args.len());
+        for arg in &args {
+            inputs.push(self.type_of(*arg)?);
+        }
+        let call = resolve::function(
+            self.session.path,
+            |schema| self.session.relations.namespace(schema),
+            &name,
+            &inputs,
+            false,
+        )
+        .map_err(|e| e.at(f.location))?;
+        let Call::Function {
+            function,
+            args: declared,
+            variadic: 0,
+            defaults: 0,
+        } = call
+        else {
+            return Err(refuse().at(f.location));
+        };
+        let steps = match function.src {
+            "generate_series_int4" | "generate_series_int8" => 2,
+            "generate_series_step_int4" | "generate_series_step_int8" => 3,
+            _ => return Err(refuse().at(f.location)),
+        };
+        let args = self.arguments(args, &declared)?;
+        let mut bounds = args.into_iter();
+        let (Some(start), Some(stop)) = (bounds.next(), bounds.next()) else {
+            return Err(refuse().at(f.location));
+        };
+        let step = bounds.next().filter(|_| steps == 3);
+        let own = name.name.clone();
+        let (refname, column) = match alias.map(|id| self.tree.get(id)).transpose()? {
+            None => (own.clone(), own),
+            Some(Node::Alias {
+                aliasname,
+                colnames,
+            }) => match self.strings(colnames)?.as_slice() {
+                [] => (aliasname.clone(), aliasname.clone()),
+                [column] => (aliasname.clone(), column.clone()),
+                _ => return Err(refuse().at(f.location)),
+            },
+            Some(_) => return Err(refuse().at(f.location)),
+        };
+        Ok(Table {
+            oid: 0,
+            refname,
+            columns: vec![crate::Column {
+                name: column,
+                type_oid: function.result,
+                typmod: -1,
+                not_null: false,
+            }],
+            series: Some(Series {
+                start,
+                stop,
+                step,
+                location: f.location,
+            }),
+        })
     }
 
     /// `make_fn_arguments` (parse_func.c:2012).
