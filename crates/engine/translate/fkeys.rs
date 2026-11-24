@@ -18,6 +18,10 @@ use crate::{
 };
 use std::{cell::RefCell, num::NonZero, num::NonZeroUsize, rc::Rc};
 
+/// What a foreign key's action does under, whatever the clauses of the statement that fired it, of
+/// the table it writes and of the triggers it fires (SQLite's `sqlite3FkActions`).
+const ACTION_CONFLICT: ast::ResolveType = ast::ResolveType::Abort;
+
 /// Tracks foreign-key action programs that are currently being compiled.
 ///
 /// This is needed when generated foreign-key action SQL reaches the same
@@ -2003,7 +2007,7 @@ fn generate_set_null_stmt(
         .collect();
     ast::Stmt::Update(ast::Update {
         with: None,
-        or_conflict: None,
+        or_conflict: Some(ACTION_CONFLICT),
         tbl_name: qualified_table_name(child_table, db_name),
         indexed: None,
         sets,
@@ -2039,7 +2043,7 @@ fn generate_set_default_stmt(
 
     ast::Stmt::Update(ast::Update {
         with: None,
-        or_conflict: None,
+        or_conflict: Some(ACTION_CONFLICT),
         tbl_name: qualified_table_name(&child_table.name, db_name),
         indexed: None,
         sets,
@@ -2080,7 +2084,7 @@ fn generate_cascade_update_stmt(
     let where_clause = build_fk_match_where_clause(child_cols, ctx);
     ast::Stmt::Update(ast::Update {
         with: None,
-        or_conflict: None,
+        or_conflict: Some(ACTION_CONFLICT),
         tbl_name: qualified_table_name(child_table, db_name),
         indexed: None,
         sets,

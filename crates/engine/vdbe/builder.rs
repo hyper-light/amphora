@@ -2646,7 +2646,6 @@ impl ProgramBuilder {
             )),
             trigger: self.trigger.take(),
             is_subprogram: self.flags.is_subprogram(),
-            resolve_type: self.resolve_type,
             prepare_context,
             write_databases: self.write_databases,
             skip_hints: self.skip_hints,

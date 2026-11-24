@@ -713,6 +713,7 @@ pub fn emit_upsert(
             program.emit_insn(Insn::HaltIfNull {
                 target_reg: layout.to_register(new_start, *col_idx),
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
+                on_error: None,
                 description: String::from(table.get_name()) + "." + col.name.as_ref().unwrap(),
             });
         }

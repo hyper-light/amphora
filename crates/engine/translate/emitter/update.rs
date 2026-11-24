@@ -2,7 +2,6 @@ use super::gencol::compute_virtual_columns;
 use super::TranslateCtx;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::schema::{Column, ColumnLayout, GeneratedType, Table};
-use crate::translate::insert::halt_desc_and_on_error;
 use crate::translate::plan::ColumnMask;
 use crate::translate::stmt_journal::any_effective_replace;
 use crate::vdbe::builder::SelfTableContext;
@@ -54,7 +53,9 @@ use crate::{
     vdbe::{
         affinity::Affinity,
         builder::{CursorKey, CursorType, DmlColumnContext},
-        insn::{to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral},
+        insn::{
+            to_u32, CmpInsFlags, HaltAction, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral,
+        },
         BranchOffset,
     },
     CaptureDataChangesExt, Connection, HashSet, Result, MAIN_DB_ID,
@@ -684,6 +685,7 @@ fn emit_notnull_constraint_check(
                 target_reg,
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
                 description: description(),
+                on_error: None,
             });
         }
         _ => {
@@ -691,6 +693,7 @@ fn emit_notnull_constraint_check(
                 target_reg,
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
                 description: description(),
+                on_error: HaltAction::of_constraint(or_conflict),
             });
         }
     }
@@ -1819,7 +1822,7 @@ fn emit_update_insns<'a>(
             }
             _ => {
                 // ABORT/FAIL/ROLLBACK behavior
-                let raw_desc = if let Some(idx) = rowid_alias_index {
+                let description = if let Some(idx) = rowid_alias_index {
                     String::from(table_name)
                         + "."
                         + target_table
@@ -1833,15 +1836,10 @@ fn emit_update_insns<'a>(
                 } else {
                     String::from(table_name) + ".rowid"
                 };
-                let (description, on_error) = halt_desc_and_on_error(
-                    &raw_desc,
-                    effective_rowid_alias_conflict,
-                    program.flags.has_statement_conflict(),
-                );
                 program.emit_insn(Insn::Halt {
                     err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                     description,
-                    on_error,
+                    on_error: HaltAction::of_constraint(effective_rowid_alias_conflict),
                     description_reg: None,
                 });
             }
@@ -2197,15 +2195,10 @@ fn emit_update_insns<'a>(
                             accum
                         },
                     );
-                    let (description, on_error) = halt_desc_and_on_error(
-                        &column_names,
-                        idx_conflict,
-                        program.flags.has_statement_conflict(),
-                    );
                     program.emit_insn(Insn::Halt {
                         err_code: SQLITE_CONSTRAINT_UNIQUE,
-                        description,
-                        on_error,
+                        description: column_names,
+                        on_error: HaltAction::of_constraint(idx_conflict),
                         description_reg: None,
                     });
                 }

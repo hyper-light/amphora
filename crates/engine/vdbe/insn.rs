@@ -25,6 +25,32 @@ use amphora_engine_parser::ast::{ResolveType, SortOrder};
 use strum::EnumCount;
 use strum_macros::{EnumDiscriminants, FromRepr, VariantArray};
 
+/// What an error a Halt raises does beyond ABORT, which undoes its statement and nothing else
+/// (SQLite's OP_Halt P2; sqlite.org/lang_conflict.html). It's the instruction's, not its program's: a
+/// trigger's program holds several statements, each under a conflict clause of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HaltAction {
+    /// A constraint under FAIL: what the statement changed before it stays.
+    Fail,
+    /// A constraint under ROLLBACK: the transaction ends.
+    Rollback,
+    /// RAISE in a trigger's program, with its own action and its own words.
+    Raise(ResolveType),
+}
+
+impl HaltAction {
+    /// The action of a constraint refused under `conflict`, its statement's clause or its own. IGNORE
+    /// and REPLACE settle a conflict where it's met; what REPLACE can't (a CHECK, a NOT NULL with no
+    /// default) is refused as under ABORT.
+    pub const fn of_constraint(conflict: ResolveType) -> Option<Self> {
+        match conflict {
+            ResolveType::Fail => Some(Self::Fail),
+            ResolveType::Rollback => Some(Self::Rollback),
+            ResolveType::Abort | ResolveType::Ignore | ResolveType::Replace => None,
+        }
+    }
+}
+
 /// The program run by an `Insn::Program` instruction.
 ///
 /// Most callers already have a finished trigger or foreign-key action program.
@@ -1357,8 +1383,8 @@ pub enum Insn {
     Halt {
         err_code: usize,
         description: String,
-        /// Override the program's resolve_type for error handling (used by RAISE).
-        on_error: Option<ResolveType>,
+        /// What the error does beyond ABORT, the action of every error that names none.
+        on_error: Option<HaltAction>,
         /// If set, read the error description from this register instead of
         /// the static `description` field (used by RAISE with expression messages).
         description_reg: Option<usize>,
@@ -1366,9 +1392,10 @@ pub enum Insn {
 
     /// Halt the program if P3 is null.
     HaltIfNull {
-        target_reg: usize,   // P3
-        description: String, // p4
-        err_code: usize,     // p1
+        target_reg: usize,            // P3
+        description: String,          // p4
+        err_code: usize,              // p1
+        on_error: Option<HaltAction>, // p2
     },
 
     /// Start a transaction.

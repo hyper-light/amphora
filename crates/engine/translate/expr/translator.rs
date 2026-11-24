@@ -3538,7 +3538,7 @@ fn translate_raise_expr(
             program.emit_insn(Insn::Halt {
                 err_code: 0,
                 description: String::new(),
-                on_error: Some(ResolveType::Ignore),
+                on_error: Some(HaltAction::Raise(ResolveType::Ignore)),
                 description_reg: None,
             });
         }
@@ -3557,7 +3557,7 @@ fn translate_raise_expr(
                         program.emit_insn(Insn::Halt {
                             err_code,
                             description: sanitize_string(s),
-                            on_error: Some(*resolve_type),
+                            on_error: Some(HaltAction::Raise(*resolve_type)),
                             description_reg: None,
                         });
                     }
@@ -3568,7 +3568,7 @@ fn translate_raise_expr(
                         program.emit_insn(Insn::Halt {
                             err_code,
                             description: String::new(),
-                            on_error: Some(*resolve_type),
+                            on_error: Some(HaltAction::Raise(*resolve_type)),
                             description_reg: Some(reg),
                         });
                     }
