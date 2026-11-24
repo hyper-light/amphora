@@ -18775,6 +18775,121 @@ mod tests {
         assert!(stale.iter().all(|(n, _)| *n == 0), "stale-base refusals: {stale:?}");
     }
 
+    /// T-T1.8.W1 (CP-T1.8, lane V13): test 5's writers with time moving, as it does on real time.
+    /// A driven round holds every clock still, so no write slot ends by time there; lane V13's
+    /// trace of 32 spread writers on real time (r1814, both classes) found every stale-base
+    /// refusal was a slot ended at its learned length while its live holder's forward was on its
+    /// way, or the leader's next write prepared behind a holder's entry once its turn was given
+    /// up. Do, in each class: 32 writers, writer w at member w % 3, each writing three rows in turn
+    /// into one table (every write conflicts with every other), a stale-base refusal made again at
+    /// the same member as the bench's driver does, every member's clock moving a tick of its pace
+    /// each round. Expect: no write refused for a stale base, every other answer Ok, and each row
+    /// on every replica once.
+    #[test]
+    fn v13_thirty_two_spread_writers_on_moving_time_are_each_answered_with_no_stale_base() {
+        const WRITERS: usize = 32;
+        const ROWS: usize = 3;
+        let mut stale = Vec::new();
+        for durability in [Durability::Persisted, three_fates()] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut driven = Driven::new();
+            let clients: Vec<Client> = (1..=3)
+                .map(|n| driven.open_with(dir.path(), n, vec![1, 2, 3], None, durability.clone()))
+                .collect();
+            let mut pump = Pump::new(&clients);
+            let leader = driven.elect(&mut pump, &clients, 0, 1);
+            driven
+                .call(&mut pump, &clients[leader], |db| {
+                    db.exec("CREATE TABLE events(id INTEGER NOT NULL, body TEXT NOT NULL)")?;
+                    Ok(Vec::new())
+                })
+                .unwrap();
+            driven.tick(&mut pump, leader);
+            let write = |id: usize| {
+                move |db: &mut Db| {
+                    db.exec(&format!(
+                        "INSERT INTO events VALUES ({id}, '{}')",
+                        "x".repeat(600)
+                    ))?;
+                    Ok(Vec::new())
+                }
+            };
+            // Each writer's row in flight (its k-th, id w + WRITERS * k) and its answer.
+            let mut inflight: Vec<Option<(usize, Answering)>> = (0..WRITERS)
+                .map(|w| Some((0, submit(&clients[w % 3], driven.until(), write(w)))))
+                .collect();
+            let mut refused = 0u64;
+            let mut rounds = 0;
+            while inflight.iter().any(Option::is_some) {
+                assert!(
+                    rounds < ROUNDS,
+                    "{durability:?}: unanswered: {}",
+                    inflight.iter().flatten().count()
+                );
+                for (w, slot) in inflight.iter_mut().enumerate() {
+                    let Some((k, answer)) = slot.take() else {
+                        continue;
+                    };
+                    let id = w + WRITERS * k;
+                    match answer.try_recv() {
+                        Err(mpsc::TryRecvError::Empty) => *slot = Some((k, answer)),
+                        Err(error) => panic!("owner ended: {error}"),
+                        Ok(Ok(_)) if k + 1 < ROWS => {
+                            let next = submit(&clients[w % 3], driven.until(), write(id + WRITERS));
+                            *slot = Some((k + 1, next));
+                        }
+                        Ok(Ok(_)) => {}
+                        Ok(Err(Refusal::Serialization { .. })) => {
+                            refused += 1;
+                            *slot = Some((k, submit(&clients[w % 3], driven.until(), write(id))));
+                        }
+                        Ok(Err(refusal)) => {
+                            panic!(
+                                "{durability:?}: row {id} at member {}: {refusal:?}",
+                                w % 3 + 1
+                            )
+                        }
+                    }
+                }
+                driven.round(&mut pump);
+                for owner in 0..3 {
+                    driven.advance_tick(owner);
+                }
+                rounds += 1;
+            }
+            driven.quiet(&mut pump);
+            driven.tick(&mut pump, leader);
+            driven.tick(&mut pump, leader);
+            for owner in 0..3 {
+                let ids = driven
+                    .owner_mut(owner)
+                    .replica
+                    .machine_mut()
+                    .read_db(|db| {
+                        let mut ids = Vec::new();
+                        db.query_owned("SELECT id FROM events ORDER BY id", [], |row| {
+                            ids.push(usize::try_from(row.get::<i64>(0)?).unwrap());
+                            Ok(true)
+                        })?;
+                        Ok(ids)
+                    })
+                    .unwrap();
+                assert_eq!(
+                    ids,
+                    (0..WRITERS * ROWS).collect::<Vec<_>>(),
+                    "{durability:?}: owner {owner}"
+                );
+            }
+            driven.drain(&mut pump);
+            pump.finish();
+            stale.push((refused, format!("{durability:?}: in {rounds} rounds")));
+        }
+        assert!(
+            stale.iter().all(|(n, _)| *n == 0),
+            "stale-base refusals: {stale:?}"
+        );
+    }
+
     /// T-T1.8.W1, the stale-base refusal's type (PostgreSQL's 40001): a write refused because
     /// what it read changed is to be asked again, and nothing else is answered as if it were. Do:
     /// on the persisted class, every member at once appends a row to one table (each write
