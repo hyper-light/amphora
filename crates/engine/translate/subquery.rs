@@ -544,12 +544,33 @@ pub fn plan_subqueries_from_update_sets(
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<()> {
+    let mut exprs: Vec<&mut ast::Expr> = sets.iter_mut().map(|set| set.expr.as_mut()).collect();
+    plan_subqueries_from_row_writes(
+        program,
+        non_from_clause_subqueries,
+        table_references,
+        &mut exprs,
+        resolver,
+        connection,
+    )
+}
+
+/// Plan the subqueries of expressions evaluated for the row a statement is about to write: an
+/// UPDATE's SET, a DO UPDATE's SET and WHERE. They read that row as `table_references`' table.
+pub fn plan_subqueries_from_row_writes(
+    program: &mut ProgramBuilder,
+    non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
+    table_references: &mut TableReferences,
+    exprs: &mut [&mut ast::Expr],
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+) -> Result<()> {
     plan_subqueries_with_outer_query_access(
         program,
         non_from_clause_subqueries,
         table_references,
         resolver,
-        sets.iter_mut().map(|set| set.expr.as_mut()),
+        exprs.iter_mut().map(|expr| &mut **expr),
         connection,
         SubqueryPosition::ResultColumn,
         SubqueryOrigin::DmlSet,
@@ -559,7 +580,7 @@ pub fn plan_subqueries_from_update_sets(
         &[],
     )?;
     drop_settled_subqueries(
-        sets.iter_mut().map(|set| set.expr.as_mut()),
+        exprs.iter_mut().map(|expr| &mut **expr),
         Vec::new(),
         non_from_clause_subqueries,
         resolver,
