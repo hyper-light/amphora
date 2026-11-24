@@ -2090,12 +2090,16 @@ impl WalCoordination for InProcessWalCoordination {
                 frame_cache.insert(page_id, vec![frame_id]);
             }
         }
+        let q8_t = std::time::Instant::now();
         shared
             .runtime
             .read_index
             .appended(&frame_cache, &mut std::iter::once(page_id), frame_id);
+        crate::fast_lock::diag::extra(4, q8_t.elapsed().as_nanos() as u64);
         // Amphora: listed in frame order for readers to forget (decision 18).
+        let q8_t = std::time::Instant::now();
         let mut changes = shared.runtime.changes.lock();
+        crate::fast_lock::diag::extra(5, q8_t.elapsed().as_nanos() as u64);
         if let Some(from) = cut {
             changes.drop_from(from);
         }
@@ -2110,7 +2114,9 @@ impl WalCoordination for InProcessWalCoordination {
     fn cache_record(&self, head: u64, slots: u32, pages: &mut dyn Iterator<Item = u64>) {
         let shared = self.log.current().read();
         let mut frame_cache = shared.runtime.frame_cache.lock();
+        let q8_t = std::time::Instant::now();
         let mut records = shared.runtime.records.write();
+        crate::fast_lock::diag::extra(0, q8_t.elapsed().as_nanos() as u64);
         let high_water = shared
             .runtime
             .frame_cache_high_water
@@ -2134,6 +2140,7 @@ impl WalCoordination for InProcessWalCoordination {
         records.publish(head, slots);
         drop(records);
         let pages: Vec<u64> = pages.collect();
+        let q8_t = std::time::Instant::now();
         for &page_id in &pages {
             match frame_cache.get_mut(&page_id) {
                 Some(frames) => frames.push(head),
@@ -2142,11 +2149,16 @@ impl WalCoordination for InProcessWalCoordination {
                 }
             }
         }
+        crate::fast_lock::diag::extra(1, q8_t.elapsed().as_nanos() as u64);
+        let q8_t = std::time::Instant::now();
         shared
             .runtime
             .read_index
             .appended(&frame_cache, &mut pages.iter().copied(), head);
+        crate::fast_lock::diag::extra(2, q8_t.elapsed().as_nanos() as u64);
+        let q8_t = std::time::Instant::now();
         let mut changes = shared.runtime.changes.lock();
+        crate::fast_lock::diag::extra(3, q8_t.elapsed().as_nanos() as u64);
         // The frames the cut record began at are gone from the cache: from the list too, which the
         // checkpointer reads as the cache (decision 24).
         if let Some(from) = cut {
@@ -4015,7 +4027,7 @@ pub struct WalSharedRuntime {
     // One difference between SQLite and limbo is that we will never support multi process, meaning
     // we don't need WAL's index file. So we can do stuff like this without shared memory.
     // TODO: this will need refactoring because this is incredible memory inefficient.
-    pub frame_cache: Arc<SpinLock<FxHashMap<u64, Vec<u64>>>>,
+    pub frame_cache: Arc<crate::fast_lock::diag::DiagLock<FxHashMap<u64, Vec<u64>>>>,
     /// Highest frame number currently recorded in `frame_cache` for the active
     /// WAL generation. Used to detect frame-slot reuse / append-position
     /// rewinds: within a generation frames are appended with strictly
@@ -8687,7 +8699,7 @@ impl WalFileShared {
                 initialized: AtomicBool::new(wal_is_initialized),
             },
             runtime: WalSharedRuntime {
-                frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
+                frame_cache: Arc::new(crate::fast_lock::diag::DiagLock::new(FxHashMap::default())),
                 frame_cache_high_water: AtomicU64::new(0),
                 file: Some(file),
                 read_locks,
@@ -8784,7 +8796,7 @@ impl WalFileShared {
                 initialized: AtomicBool::new(false),
             },
             runtime: WalSharedRuntime {
-                frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
+                frame_cache: Arc::new(crate::fast_lock::diag::DiagLock::new(FxHashMap::default())),
                 frame_cache_high_water: AtomicU64::new(0),
                 file: None,
                 read_locks,
@@ -8831,7 +8843,7 @@ impl WalFileShared {
                 initialized: AtomicBool::new(false),
             },
             runtime: WalSharedRuntime {
-                frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
+                frame_cache: Arc::new(crate::fast_lock::diag::DiagLock::new(FxHashMap::default())),
                 frame_cache_high_water: AtomicU64::new(0),
                 file: Some(file),
                 read_locks,
