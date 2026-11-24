@@ -1,0 +1,40 @@
+start 05:04:18Z load 38.90 22.57 24.84 cpu_psi avg10=20.70 io_psi avg10=13.76 nproc 32
+build a64549cce7f0406929ca64ff32a61255c5821d87 start 05:04:20Z load 38.90 22.57 24.84 cpu_psi avg10=17.85 io_psi avg10=13.26
+   Compiling amphora-engine v0.1.0 (/home/adalundhe/.cache/tpch-ab/t21/crates/engine)
+built a64549cce7f0406929ca64ff32a61255c5821d87 in 106 s load 49.05 30.94 27.60 cpu_psi avg10=23.96 io_psi avg10=7.82
+build b0f09f9a033929db1618c83f59f426c17573f5de start 05:06:06Z load 49.05 30.94 27.60 cpu_psi avg10=23.96 io_psi avg10=7.82
+   Compiling amphora-engine v0.1.0 (/home/adalundhe/.cache/tpch-ab/t21/crates/engine)
+built b0f09f9a033929db1618c83f59f426c17573f5de in 118 s load 64.20 41.89 31.96 cpu_psi avg10=44.40 io_psi avg10=12.76
+build 7d19a8faa520a32f828c7936e89d5c593761e26c start 05:08:04Z load 64.20 41.89 31.96 cpu_psi avg10=44.40 io_psi avg10=12.76
+   Compiling amphora-engine v0.1.0 (/home/adalundhe/.cache/tpch-ab/t21/crates/engine)
+built 7d19a8faa520a32f828c7936e89d5c593761e26c in 113 s load 56.45 45.05 34.21 cpu_psi avg10=37.40 io_psi avg10=10.86
+pin eecf5d727dc3a6ab: {"row_in_pages": 0.00027709217195621494, "seek": 1274.0681790610215, "hash_build": 399.51279873832345, "hash_probe": 1393.3257309232076, "sort": 0.717376359739577, "bloom_probe": 6.369525658134174, "where_step": 11.047919446803348, "page_miss": 0.29427745248361237}
+3.6G	/home/adalundhe/.cache/tpch-t11/db-sf1
+open B rc=0 1 s: 
+open A rc=0 0 s: 
+open C rc=0 0 s: 
+calibration 3d28714e12d5b88e a64549cce7f0406929ca64ff32a61255c5821d87 body sha256 b7661c2007aeb06d
+calibration c8d566799fda6939 b0f09f9a033929db1618c83f59f426c17573f5de body sha256 b7661c2007aeb06d
+calibration b417bf28bd4b54a4 7d19a8faa520a32f828c7936e89d5c593761e26c body sha256 b7661c2007aeb06d
+=== A r1 05:09:58Z load 56.45 45.05 34.21 cpu_psi avg10=36.24 io_psi avg10=9.44
+cpu_s 107.966 11.350 wall_s 133.590
+rc=0 load 43.86 43.62 35.11 cpu_psi avg10=26.95 io_psi avg10=3.38
+=== B r1 05:12:12Z load 43.86 43.62 35.11 cpu_psi avg10=26.95 io_psi avg10=3.38
+cpu_s 85.392 3.464 wall_s 93.876
+rc=0 load 34.41 40.96 34.97 cpu_psi avg10=5.05 io_psi avg10=0.50
+=== C r1 05:13:46Z load 34.41 40.96 34.97 cpu_psi avg10=5.05 io_psi avg10=0.50
+cpu_s 82.736 2.759 wall_s 87.958
+rc=0 load 30.67 37.73 34.37 cpu_psi avg10=12.57 io_psi avg10=2.52
+=== B r2 05:15:14Z load 30.67 37.73 34.37 cpu_psi avg10=12.57 io_psi avg10=2.52
+cpu_s 102.053 14.154 wall_s 146.512
+rc=0 load 55.06 45.78 37.92 cpu_psi avg10=39.99 io_psi avg10=2.08
+=== C r2 05:17:40Z load 55.06 45.78 37.92 cpu_psi avg10=39.99 io_psi avg10=2.08
+cpu_s 95.317 7.001 wall_s 122.341
+rc=0 load 62.27 49.72 40.24 cpu_psi avg10=50.19 io_psi avg10=5.55
+=== A r2 05:19:43Z load 62.27 49.72 40.24 cpu_psi avg10=50.19 io_psi avg10=5.55
+cpu_s 104.073 10.758 wall_s 144.363
+rc=0 load 47.24 49.40 41.59 cpu_psi avg10=18.48 io_psi avg10=13.29
+checks started pid 2804297 05:22:07Z
+=== sqlite 05:22:07Z load 47.24 49.40 41.59 cpu_psi avg10=18.48 io_psi avg10=13.29
+cpu_s 105.924 1.326 wall_s 116.996
+rc=0 lo
