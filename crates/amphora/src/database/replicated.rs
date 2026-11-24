@@ -18744,6 +18744,95 @@ mod tests {
         );
     }
 
+    /// T-T1.8.W1 (CP-T1.8, lane V14): a slow but live holder keeps its write slot past the
+    /// leader's election timeout, as on real time. Lane V13's r1942 found the replicated class's
+    /// last stale-base refusals were slots ended by time while their holders, answering
+    /// heartbeats, still prepared: on real time the election timeout follows the owner's pace (28
+    /// to 49 ms), while a driven round holds every clock still. Do, in each class: owner 2 leads;
+    /// member 1 writes, and its preparation moves the leader's clock two election timeouts on, as
+    /// a slow holder takes on real time; the leader's own write waits on that slot. Expect: both
+    /// writes answered Ok, neither refused for a stale base, and both rows on every replica.
+    #[test]
+    fn v14_a_slow_live_holder_keeps_its_slot_past_the_election_timeout() {
+        for durability in [Durability::Persisted, three_fates()] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut driven = Driven::new();
+            let clients: Vec<Client> = (1..=3)
+                .map(|n| driven.open_with(dir.path(), n, vec![1, 2, 3], None, durability.clone()))
+                .collect();
+            let mut pump = Pump::new(&clients);
+            let leader = driven.elect(&mut pump, &clients, 2, 1);
+            assert_eq!(leader, 2, "{durability:?}: owner 2 did not lead");
+            driven
+                .call(&mut pump, &clients[leader], |db| {
+                    db.exec("CREATE TABLE events(id INTEGER NOT NULL)")?;
+                    Ok(Vec::new())
+                })
+                .unwrap();
+            driven.tick(&mut pump, leader);
+            let ticks = driven.owner(leader).replica.core().raft.config().election_tick;
+            let election = driven.period(leader) * u32::try_from(ticks).unwrap();
+            let clock = driven.clock(leader);
+            let slow = submit(&clients[0], driven.until(), move |db| {
+                clock.fetch_add(u64::try_from((2 * election).as_nanos()).unwrap(), Ordering::AcqRel);
+                db.exec("INSERT INTO events VALUES (1)")?;
+                Ok(Vec::new())
+            });
+            let mut rounds = 0;
+            while !driven.owner(leader).slots.holds() {
+                assert!(rounds < ROUNDS, "{durability:?}: member 1's write held no slot");
+                driven.round(&mut pump);
+                rounds += 1;
+            }
+            let own = submit(&clients[leader], driven.until(), |db| {
+                db.exec("INSERT INTO events VALUES (2)")?;
+                Ok(Vec::new())
+            });
+            let mut pending = [("member 1", Some(slow)), ("the leader", Some(own))];
+            let mut answered = Vec::new();
+            while pending.iter().any(|(_, answer)| answer.is_some()) {
+                assert!(rounds < ROUNDS, "{durability:?}: unanswered, {answered:?}");
+                for (who, slot) in &mut pending {
+                    let Some(answer) = slot.take() else {
+                        continue;
+                    };
+                    match answer.try_recv() {
+                        Err(mpsc::TryRecvError::Empty) => *slot = Some(answer),
+                        Err(error) => panic!("owner ended: {error}"),
+                        Ok(result) => answered.push((*who, result.map(|_| ()))),
+                    }
+                }
+                driven.round(&mut pump);
+                rounds += 1;
+            }
+            assert!(
+                answered.iter().all(|(_, result)| result.is_ok()),
+                "{durability:?}: {answered:?}"
+            );
+            driven.quiet(&mut pump);
+            driven.tick(&mut pump, leader);
+            driven.tick(&mut pump, leader);
+            for owner in 0..3 {
+                let ids = driven
+                    .owner_mut(owner)
+                    .replica
+                    .machine_mut()
+                    .read_db(|db| {
+                        let mut ids = Vec::new();
+                        db.query_owned("SELECT id FROM events ORDER BY id", [], |row| {
+                            ids.push(row.get::<i64>(0)?);
+                            Ok(true)
+                        })?;
+                        Ok(ids)
+                    })
+                    .unwrap();
+                assert_eq!(ids, vec![1, 2], "{durability:?}: owner {owner}");
+            }
+            driven.drain(&mut pump);
+            pump.finish();
+        }
+    }
+
     /// T-T1.8.W1, the stale-base refusal's type (PostgreSQL's 40001): a write refused because
     /// what it read changed is to be asked again, and nothing else is answered as if it were. Do:
     /// on the persisted class, every member at once appends a row to one table (each write
