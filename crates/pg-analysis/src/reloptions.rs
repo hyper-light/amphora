@@ -27,22 +27,40 @@ const HEAP: &[(&str, Kind)] = &[
     ("autovacuum_parallel_workers", Kind::Int(-1, 1024)),
     ("autovacuum_vacuum_threshold", Kind::Int(0, i32::MAX)),
     ("autovacuum_vacuum_max_threshold", Kind::Int(-1, i32::MAX)),
-    ("autovacuum_vacuum_insert_threshold", Kind::Int(-1, i32::MAX)),
+    (
+        "autovacuum_vacuum_insert_threshold",
+        Kind::Int(-1, i32::MAX),
+    ),
     ("autovacuum_analyze_threshold", Kind::Int(0, i32::MAX)),
     ("autovacuum_vacuum_cost_limit", Kind::Int(1, 10_000)),
     ("autovacuum_freeze_min_age", Kind::Int(0, 1_000_000_000)),
-    ("autovacuum_multixact_freeze_min_age", Kind::Int(0, 1_000_000_000)),
-    ("autovacuum_freeze_max_age", Kind::Int(100_000, 2_000_000_000)),
-    ("autovacuum_multixact_freeze_max_age", Kind::Int(10_000, 2_000_000_000)),
+    (
+        "autovacuum_multixact_freeze_min_age",
+        Kind::Int(0, 1_000_000_000),
+    ),
+    (
+        "autovacuum_freeze_max_age",
+        Kind::Int(100_000, 2_000_000_000),
+    ),
+    (
+        "autovacuum_multixact_freeze_max_age",
+        Kind::Int(10_000, 2_000_000_000),
+    ),
     ("autovacuum_freeze_table_age", Kind::Int(0, 2_000_000_000)),
-    ("autovacuum_multixact_freeze_table_age", Kind::Int(0, 2_000_000_000)),
+    (
+        "autovacuum_multixact_freeze_table_age",
+        Kind::Int(0, 2_000_000_000),
+    ),
     ("log_autovacuum_min_duration", Kind::Int(-1, i32::MAX)),
     ("log_autoanalyze_min_duration", Kind::Int(-1, i32::MAX)),
     ("toast_tuple_target", Kind::Int(128, 8160)),
     ("parallel_workers", Kind::Int(0, 1024)),
     ("autovacuum_vacuum_cost_delay", Kind::Real(0.0, 100.0)),
     ("autovacuum_vacuum_scale_factor", Kind::Real(0.0, 100.0)),
-    ("autovacuum_vacuum_insert_scale_factor", Kind::Real(0.0, 100.0)),
+    (
+        "autovacuum_vacuum_insert_scale_factor",
+        Kind::Real(0.0, 100.0),
+    ),
     ("autovacuum_analyze_scale_factor", Kind::Real(0.0, 100.0)),
     ("vacuum_max_eager_freeze_failure_rate", Kind::Real(0.0, 1.0)),
     (
@@ -112,17 +130,20 @@ pub(crate) fn heap(tree: &Tree, options: &[NodeId]) -> Result<(), Error> {
         }
         given.push(name);
         let value = text(tree, *arg)?;
-        let out_of_bounds =
-            || refuse(format!("value {value} out of bounds for option \"{name}\""));
+        let out_of_bounds = || refuse(format!("value {value} out of bounds for option \"{name}\""));
         match kind {
             Kind::Bool => {
                 parse_bool(&value).ok_or_else(|| {
-                    refuse(format!("invalid value for boolean option \"{name}\": {value}"))
+                    refuse(format!(
+                        "invalid value for boolean option \"{name}\": {value}"
+                    ))
                 })?;
             }
             Kind::Int(low, high) => {
                 let i = integer(&value).ok_or_else(|| {
-                    refuse(format!("invalid value for integer option \"{name}\": {value}"))
+                    refuse(format!(
+                        "invalid value for integer option \"{name}\": {value}"
+                    ))
                 })?;
                 if !(*low..=*high).contains(&i) {
                     return Err(out_of_bounds());

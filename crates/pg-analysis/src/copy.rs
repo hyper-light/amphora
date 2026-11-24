@@ -157,9 +157,20 @@ fn options_freeze(tree: &Tree, options: &[NodeId]) -> Result<bool, Error> {
                 }
                 freeze = Some(boolean(tree, *arg)?);
             }
-            "delimiter" | "null" | "default" | "header" | "quote" | "escape" | "force_quote"
-            | "force_not_null" | "force_null" | "convert_selectively" | "encoding" | "on_error"
-            | "log_verbosity" | "reject_limit" => {
+            "delimiter"
+            | "null"
+            | "default"
+            | "header"
+            | "quote"
+            | "escape"
+            | "force_quote"
+            | "force_not_null"
+            | "force_null"
+            | "convert_selectively"
+            | "encoding"
+            | "on_error"
+            | "log_verbosity"
+            | "reject_limit" => {
                 return Err(Error::unsupported(&format!("COPY's {defname}")));
             }
             other => {
@@ -368,7 +379,8 @@ impl Lines {
     fn end_marker(&self, start: usize, after: usize, eof: bool) -> Result<Found, String> {
         let byte = |i: usize| self.held.get(i).copied();
         let mut i = after;
-        let mismatch = || Err("end-of-copy marker does not match previous newline style".to_owned());
+        let mismatch =
+            || Err("end-of-copy marker does not match previous newline style".to_owned());
         let not_alone = || Err("end-of-copy marker is not alone on its line".to_owned());
         // The byte past the data's end is a NUL, as the buffer is padded with one.
         let next = |i: &mut usize| match byte(*i) {
@@ -453,11 +465,15 @@ impl CopyIn {
             }
         }
         if fields.len() > self.fields.len() {
-            return Err(whole(bad_format("extra data after last expected column".to_owned())));
+            return Err(whole(bad_format(
+                "extra data after last expected column".to_owned(),
+            )));
         }
         for (position, at) in self.fields.iter().enumerate() {
             let Some(column) = self.columns.get(*at) else {
-                return Err(whole(Error::internal("a column of the copied table is missing")));
+                return Err(whole(Error::internal(
+                    "a column of the copied table is missing",
+                )));
             };
             let Some(field) = fields.get(position) else {
                 return Err(whole(bad_format(format!(
@@ -537,7 +553,11 @@ fn invalid_encoding(text: &[u8]) -> Option<Error> {
         0xf0..=0xf7 => 4,
         _ => 1,
     };
-    let bytes: Vec<String> = rest.iter().take(width).map(|b| format!("0x{b:02x}")).collect();
+    let bytes: Vec<String> = rest
+        .iter()
+        .take(width)
+        .map(|b| format!("0x{b:02x}"))
+        .collect();
     Some(Error::new(
         sqlstate::CHARACTER_NOT_IN_REPERTOIRE,
         format!(
@@ -576,7 +596,9 @@ fn split(line: &[u8]) -> Vec<Option<Vec<u8>>> {
                 b'0'..=b'7' => {
                     let mut value = u32::from(escaped).saturating_sub(u32::from(b'0'));
                     for _ in 0..2 {
-                        let Some(d) = digit(rest.get(at), 8) else { break };
+                        let Some(d) = digit(rest.get(at), 8) else {
+                            break;
+                        };
                         value = value.wrapping_mul(8).wrapping_add(d);
                         at = at.saturating_add(1);
                     }
@@ -585,7 +607,9 @@ fn split(line: &[u8]) -> Vec<Option<Vec<u8>>> {
                 b'x' if digit(rest.get(at), 16).is_some() => {
                     let mut value = 0u32;
                     for _ in 0..2 {
-                        let Some(d) = digit(rest.get(at), 16) else { break };
+                        let Some(d) = digit(rest.get(at), 16) else {
+                            break;
+                        };
                         value = value.wrapping_mul(16).wrapping_add(d);
                         at = at.saturating_add(1);
                     }
@@ -609,4 +633,3 @@ fn split(line: &[u8]) -> Vec<Option<Vec<u8>>> {
         rest = start.get(at..).unwrap_or_default();
     }
 }
-

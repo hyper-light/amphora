@@ -22,7 +22,6 @@ const TABLE: i32 = 42;
 /// The longest name, in bytes: `NAMEDATALEN - 1` (src/include/pg_config_manual.h:39).
 const NAME_MAX: usize = 63;
 
-
 /// What a utility statement leaves of the tables it is about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
@@ -396,11 +395,7 @@ pub(crate) fn undefined_relation(name: &str) -> Error {
 
 /// `RemoveRelations` (tablecmds.c) of an IF EXISTS list: the tables there are, and a notice of each there isn't
 /// (`DropErrorMsgNonExistent`).
-fn drop_tables(
-    tree: &Tree,
-    objects: &[NodeId],
-    session: &Session<'_>,
-) -> Result<Utility, Error> {
+fn drop_tables(tree: &Tree, objects: &[NodeId], session: &Session<'_>) -> Result<Utility, Error> {
     let mut sql = Vec::with_capacity(objects.len());
     let mut notices = Vec::new();
     let mut dropped: Vec<u32> = Vec::with_capacity(objects.len());
@@ -445,17 +440,12 @@ fn drop_tables(
 
 /// `ExecuteTruncate` (tablecmds.c): every row of the tables deleted. RESTART IDENTITY and CASCADE change nothing
 /// here: no column has a sequence, and no key refers to a table.
-fn truncate(
-    tree: &Tree,
-    relations: &[NodeId],
-    session: &Session<'_>,
-) -> Result<Utility, Error> {
+fn truncate(tree: &Tree, relations: &[NodeId], session: &Session<'_>) -> Result<Utility, Error> {
     let mut sql = Vec::with_capacity(relations.len());
     let mut emptied: Vec<u32> = Vec::with_capacity(relations.len());
     for relation in relations {
         let table = table_name(tree, Some(*relation))?;
-        let oid =
-            user_table(session, None, table)?.ok_or_else(|| undefined_relation(table))?;
+        let oid = user_table(session, None, table)?.ok_or_else(|| undefined_relation(table))?;
         if !emptied.contains(&oid) {
             emptied.push(oid);
             sql.push(format!("DELETE FROM {}", quoted(table)));

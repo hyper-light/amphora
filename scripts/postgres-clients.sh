@@ -206,4 +206,54 @@ for side in ours theirs; do
   grep -q 'actually processed: 1600/1600' "$WORK/pgbench-32.$side" && grep -q 'failed transactions: 0 ' "$WORK/pgbench-32.$side" || failed=1
   [ "${moves[0]}" = "${moves[1]}" ] && [ "${moves[1]}" = "${moves[2]}" ] && [ "${moves[2]}" = "${moves[3]}" ] || failed=1
 done
+# pgbench -i of unit 11, its default steps and the server-side ones: the tables it leaves, row for row, its notices and
+# output, its keys (by what they refuse), and TPC-B at -c 8 on them.
+init() { # <steps>
+  local what="pgbench -i -I $1"
+  for side in ours theirs; do
+    port=$OURS
+    [ "$side" = ours ] || port=$THEIRS
+    client pgbench -h 127.0.0.1 -p "$port" -U ada -i -s 1 -I "$1" ada > "$WORK/init.$side" 2>&1 || { echo "$what, $side: failed"; failed=1; }
+    # The times vary; nothing else does.
+    sed -E 's/[0-9]+\.[0-9]+ s/T s/g' "$WORK/init.$side" > "$WORK/init-text.$side"
+  done
+  compare "$what's output, times aside" "$WORK/init-text.ours" "$WORK/init-text.theirs"
+  grep -q 'done in T s' "$WORK/init-text.ours" || failed=1
+  for query in "SELECT bid, bbalance, filler FROM pgbench_branches" "SELECT tid, bid, tbalance, filler FROM pgbench_tellers" "SELECT aid, bid, abalance, filler FROM pgbench_accounts" "SELECT tid, bid, aid, delta, filler FROM pgbench_history"; do
+    both rows psql -h 127.0.0.1 -p PORT -U ada -d ada -X -At -c "$query"
+    sort "$WORK/rows.ours" > "$WORK/rows.sorted.ours"
+    sort "$WORK/rows.theirs" > "$WORK/rows.sorted.theirs"
+    compare "after $what, sorted: $query" "$WORK/rows.sorted.ours" "$WORK/rows.sorted.theirs"
+    echo "  $(wc -l < "$WORK/rows.sorted.ours") rows"
+  done
+  # Each key and each NOT NULL refuses as on 19.
+  for insert in "INSERT INTO pgbench_branches (bid, bbalance) VALUES (1, 0)" "INSERT INTO pgbench_tellers (tid, bid, tbalance) VALUES (1, 1, 0)" "INSERT INTO pgbench_accounts (aid, bid, abalance) VALUES (100000, 1, 0)" "INSERT INTO pgbench_branches (bbalance) VALUES (0)" "INSERT INTO pgbench_accounts (bid, abalance) VALUES (1, 0)" "INSERT INTO pgbench_history (tid, bid, aid, delta) VALUES (1, 1, 1, 1)"; do
+    both key psql -h 127.0.0.1 -p PORT -U ada -d ada -X -v VERBOSITY=terse -c "$insert" -c '\echo :SQLSTATE'
+    cat "$WORK/key.ours" "$WORK/key.err.ours" > "$WORK/key-all.ours"
+    cat "$WORK/key.theirs" "$WORK/key.err.theirs" > "$WORK/key-all.theirs"
+    compare "after $what: $insert" "$WORK/key-all.ours" "$WORK/key-all.theirs"
+  done
+  for query in "ALTER TABLE pgbench_branches ADD PRIMARY KEY (bid)" "ALTER TABLE pgbench_tellers ADD PRIMARY KEY (tid)" "ALTER TABLE pgbench_accounts ADD PRIMARY KEY (aid)"; do
+    both key psql -h 127.0.0.1 -p PORT -U ada -d ada -X -v VERBOSITY=terse -c "$query" -c '\echo :SQLSTATE'
+    cat "$WORK/key.ours" "$WORK/key.err.ours" > "$WORK/key-all.ours"
+    cat "$WORK/key.theirs" "$WORK/key.err.theirs" > "$WORK/key-all.theirs"
+    compare "after $what: $query" "$WORK/key-all.ours" "$WORK/key-all.theirs"
+  done
+}
+init dtgvp
+for mode in simple extended prepared; do
+  both tpcb pgbench -h 127.0.0.1 -p PORT -U ada -n -M "$mode" -c 8 -j 1 -t 100 --random-seed=42 ada
+  for side in ours theirs; do
+    cat "$WORK/tpcb.$side" "$WORK/tpcb.err.$side" | grep -E 'query mode|actually processed|failed|aborted|ERROR|error' > "$WORK/tpcb-counts.$side" || true
+    echo "pgbench -M $mode -c 8 on pgbench -i's tables, $side: $(tr '\n' ';' < "$WORK/tpcb-counts.$side")"
+  done
+  compare "pgbench -M $mode -c 8's transactions on pgbench -i's tables" "$WORK/tpcb-counts.ours" "$WORK/tpcb-counts.theirs"
+  for query in "SELECT aid, bid, abalance, filler FROM pgbench_accounts" "SELECT tid, bid, tbalance, filler FROM pgbench_tellers" "SELECT bid, bbalance, filler FROM pgbench_branches" "SELECT tid, bid, aid, delta, filler FROM pgbench_history"; do
+    both rows psql -h 127.0.0.1 -p PORT -U ada -d ada -X -At -c "$query"
+    sort "$WORK/rows.ours" > "$WORK/rows.sorted.ours"
+    sort "$WORK/rows.theirs" > "$WORK/rows.sorted.theirs"
+    compare "after pgbench -M $mode -c 8 on pgbench -i's tables, sorted: $query" "$WORK/rows.sorted.ours" "$WORK/rows.sorted.theirs"
+  done
+done
+init dtGvp
 exit "$failed"

@@ -20,8 +20,8 @@ use amphora_pg_analysis::datetime::TimeZone;
 use amphora_pg_analysis::stmt::Command;
 use amphora_pg_analysis::utility::{Effect, Utility};
 use amphora_pg_analysis::{
-    Column, Error, Field, Lowered, Relations, Value as PgValue, analyze, binary, fields, lower, output,
-    utility,
+    Column, Error, Field, Lowered, Relations, Value as PgValue, analyze, binary, fields, lower,
+    output, utility,
 };
 use amphora_pg_catalog::data::{PG_TYPE, type_oid};
 use amphora_pg_catalog::{Datum, SearchPath};
@@ -221,10 +221,7 @@ impl Relations for Catalog {
         };
         self.first(
             "SELECT 1 FROM sqlite_schema WHERE type = 'index' AND name = ?1 AND tbl_name = ?2",
-            &[
-                Value::build_text(name.to_owned()),
-                Value::build_text(table),
-            ],
+            &[Value::build_text(name.to_owned()), Value::build_text(table)],
         )
         .is_some()
     }

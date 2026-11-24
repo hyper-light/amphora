@@ -148,10 +148,7 @@ impl Executor {
                 SqlState::new("57014"),
                 format!("COPY from stdin failed: {reason}"),
             )
-            .with_context(
-                copy.spec
-                    .at_line(copy.lines.number().saturating_add(1)),
-            )),
+            .with_context(copy.spec.at_line(copy.lines.number().saturating_add(1)))),
             Copy::Done => self.copy_done(&mut copy, out),
         };
         match (ended, then) {
@@ -215,9 +212,7 @@ impl Executor {
                     }
                 }
                 Err(error) => {
-                    return Err(
-                        refusal(error, "").with_context(copy.spec.at_line(number))
-                    );
+                    return Err(refusal(error, "").with_context(copy.spec.at_line(number)));
                 }
             }
         }
@@ -236,21 +231,16 @@ impl Executor {
         Ok(())
     }
 
-    fn copy_insert(
-        &mut self,
-        copy: &mut CopyIn,
-        row: &[Option<Value>],
-    ) -> Result<(), PgError> {
+    fn copy_insert(&mut self, copy: &mut CopyIn, row: &[Option<Value>]) -> Result<(), PgError> {
         copy.insert.reset().map_err(engine)?;
         for (at, (column, value)) in copy.spec.columns.iter().zip(row).enumerate() {
             let stored = match value {
                 None => amphora_engine::Value::Null,
                 Some(value) => to_engine(column.type_oid, value).map_err(engine)?,
             };
-            let index = at
-                .checked_add(1)
-                .and_then(NonZero::new)
-                .ok_or_else(|| PgError::error(SqlState::INTERNAL_ERROR, "a COPY has too many columns"))?;
+            let index = at.checked_add(1).and_then(NonZero::new).ok_or_else(|| {
+                PgError::error(SqlState::INTERNAL_ERROR, "a COPY has too many columns")
+            })?;
             copy.insert.bind_at(index, stored).map_err(engine)?;
         }
         match self.step(&mut copy.insert) {
