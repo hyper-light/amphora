@@ -10,13 +10,12 @@ use crate::{
     ast, emit_explain,
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
     schema::{
-        collect_column_dependencies_of_expr, BTreeTable, CheckConstraint, Index,
-        EXPR_INDEX_SENTINEL, ROWID_SENTINEL,
+        collect_column_dependencies_of_expr, BTreeTable, Index, EXPR_INDEX_SENTINEL, ROWID_SENTINEL,
     },
     sync::Arc,
     translate::{
         emitter::{
-            check_expr_references_columns, delete::emit_fk_child_decrement_on_delete,
+            check_constraints_of_update, delete::emit_fk_child_decrement_on_delete,
             emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
             emit_cdc_patch_record, emit_check_constraints, emit_index_column_value_new_image,
             emit_index_column_value_old_image, emit_make_record,
@@ -43,7 +42,6 @@ use crate::{
             Operation, OuterQueryReference, QueryDestination, ResultSetColumn, Scan, Search,
             SubqueryEvalPhase, TableReferences, UpdatePlan, UpdateSetClause,
         },
-        planner::ROWID_STRS,
         subquery::{emit_non_from_clause_subqueries_for_eval_at, emit_non_from_clause_subquery},
         trigger_exec::{
             fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
@@ -1888,32 +1886,8 @@ fn emit_update_insns<'a>(
         }
 
         if !btree_table.check_constraints.is_empty() {
-            // SQLite only evaluates CHECK constraints that reference at least one
-            // column in the SET clause. Build a set of updated column names to filter.
-            let mut updated_col_names: HashSet<String> = btree_table
-                .columns()
-                .iter()
-                .enumerate()
-                .filter(|(idx, _)| affected_columns.get(*idx))
-                .filter_map(|(_, col)| col.name.as_deref())
-                .map(normalize_ident)
-                .collect();
-
-            // If the rowid is being updated (either directly via ROWID_SENTINEL or
-            // through a rowid alias column), also include the rowid pseudo-column
-            // names so that CHECK(rowid > 0) etc. are properly triggered.
-            if updates_rowid {
-                for name in ROWID_STRS {
-                    updated_col_names.insert(name.to_string());
-                }
-            }
-
-            let relevant_checks: Vec<CheckConstraint> = btree_table
-                .check_constraints
-                .iter()
-                .filter(|cc| check_expr_references_columns(&cc.expr, &updated_col_names))
-                .cloned()
-                .collect();
+            let relevant_checks =
+                check_constraints_of_update(&btree_table, &affected_columns, updates_rowid);
 
             let check_constraint_tables =
                 TableReferences::new(vec![target_table.as_ref().clone()], vec![]);

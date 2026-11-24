@@ -2750,6 +2750,33 @@ fn check_expr_references_columns(expr: &ast::Expr, column_names: &HashSet<String
         .any(|name| check_expr_references_column(expr, name))
 }
 
+/// The CHECK constraints an UPDATE checks: as SQLite does, those that read a column it sets or one
+/// computed from such a column (sqlite3ExprReferencesUpdatedColumn).
+pub(crate) fn check_constraints_of_update(
+    table: &BTreeTable,
+    affected_columns: &ColumnMask,
+    updates_rowid: bool,
+) -> Vec<CheckConstraint> {
+    let mut names: HashSet<String> = table
+        .columns()
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| affected_columns.get(*idx))
+        .filter_map(|(_, column)| column.name.as_deref())
+        .map(normalize_ident)
+        .collect();
+    // CHECK(rowid > 0) reads the rowid by a name of its own.
+    if updates_rowid {
+        names.extend(ROWID_STRS.iter().map(|name| (*name).to_string()));
+    }
+    table
+        .check_constraints
+        .iter()
+        .filter(|check| check_expr_references_columns(&check.expr, &names))
+        .cloned()
+        .collect()
+}
+
 /// Emit CHECK constraint evaluation with resolver cache setup and teardown.
 /// Takes column-to-register mappings as an iterator to avoid heap allocation.
 #[allow(clippy::too_many_arguments)]
