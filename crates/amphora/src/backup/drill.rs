@@ -88,9 +88,11 @@ impl Deferred {
 pub struct Budget {
     /// Bytes free on the scratch file's disk.
     pub free: u64,
-    /// Bytes the restore writes: the source's file and log as they stand.
+    /// Bytes the restore takes at most: the source's pages and its log, both segments', as they
+    /// stand.
     pub restore: u64,
-    /// Bytes the source's log may grow to before it starts again ([`crate::db::Db`]'s kept frames).
+    /// Bytes the source's log may grow to, both segments', before it starts again over either
+    /// ([`crate::db::Db`]'s kept frames, each).
     pub log_headroom: u64,
 }
 
