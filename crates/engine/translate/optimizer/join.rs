@@ -1203,11 +1203,19 @@ fn join_lhs_and_rhs<'a>(
                                 &lhs_mask,
                             )?;
 
+                        // A materialized input takes the place of the loops of every table it
+                        // joins, and a correlated subquery reads its outer columns from the
+                        // loops' cursors: as for the build and probe tables
+                        // (`should_not_use_hash_join`), no hash join takes such a table's loop.
+                        let materialization_drops_a_subquerys_loop = needs_materialization
+                            && correlated_subqueries_read_any(subqueries, joined_tables, &lhs_mask);
+
                         hash_join_allowed = build_is_eligible
                             && (!needs_materialization || build_has_rowid)
                             && (!materialization_too_large
                                 || *join_type == HashJoinType::FullOuter)
-                            && !materialization_reads_an_outer_query;
+                            && !materialization_reads_an_outer_query
+                            && !materialization_drops_a_subquerys_loop;
 
                         if hash_join_allowed {
                             let should_materialize = needs_materialization && build_has_rowid;
@@ -1509,6 +1517,30 @@ fn materialized_build_input_reads_an_outer_query(
         }
     }
     Ok(false)
+}
+
+/// Whether a correlated subquery reads a column of one of `tables`.
+fn correlated_subqueries_read_any(
+    subqueries: &[NonFromClauseSubquery],
+    joined_tables: &[JoinedTable],
+    tables: &TableMask,
+) -> bool {
+    subqueries
+        .iter()
+        .filter(|subquery| subquery.correlated)
+        .filter_map(|subquery| match &subquery.state {
+            SubqueryState::Unevaluated { plan } => plan.as_ref(),
+            SubqueryState::Evaluated { .. } => None,
+        })
+        .flat_map(|plan| plan.used_outer_query_ref_ids())
+        .any(|outer_ref_id| {
+            joined_tables
+                .iter()
+                .enumerate()
+                .any(|(table_idx, table)| {
+                    table.internal_id == outer_ref_id && tables.get(table_idx)
+                })
+        })
 }
 
 /// Returns true when build-side constraints reference prior tables in ways that
