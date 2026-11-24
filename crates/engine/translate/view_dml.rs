@@ -14,7 +14,7 @@ use crate::translate::expr::{
     bind_and_rewrite_expr, emit_returning_results, emit_returning_scan_back,
     process_returning_clause, restore_returning_row_image_in_cache,
     seed_returning_row_image_in_cache, translate_expr_no_constant_opt, BindingBehavior,
-    NoConstantOptReason, ReturningBufferCtx,
+    NoConstantOptReason, ReturningBufferCtx, ReturningRowImageCacheState,
 };
 use crate::translate::plan::{
     ColumnUsedMask, EvalAt, JoinedTable, NonFromClauseSubquery, Operation, OuterQueryReference,
@@ -34,6 +34,7 @@ use crate::translate::subquery::{
 use crate::translate::trigger_exec::{fire_trigger, instead_of_triggers, TriggerContext};
 use crate::translate::update::split_update_set_values;
 use crate::util::normalize_ident;
+use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{to_u32, InsertFlags, Insn};
 use crate::vdbe::BranchOffset;
@@ -158,6 +159,19 @@ impl Target {
         Ok(())
     }
 
+    /// Makes the integers of a row's REAL columns reals, as SQLite does where it reads one (expr.c,
+    /// TK_TRIGGER, and `sqlite3ColumnDefault`).
+    fn real_columns(&self, program: &mut ProgramBuilder, image: usize) -> Result<()> {
+        for (index, column) in self.table.columns().iter().enumerate() {
+            if column.affinity() == Affinity::Real {
+                program.emit_insn(Insn::RealAffinity {
+                    register: offset(image, index)?,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// The registers of a row at `image` as a trigger names them: the columns, then the rowid's,
     /// which a trigger on a view can't name.
     fn trigger_row(&self, image: usize, no_rowid: usize) -> Result<Vec<usize>> {
@@ -166,6 +180,35 @@ impl Target {
             .chain(std::iter::once(Ok(no_rowid)))
             .collect()
     }
+}
+
+/// Has the columns of the row at `image` read from its registers, by the view's name and by its
+/// database's, until the cache is restored.
+fn seed_row(
+    target: &Target,
+    refs: &TableReferences,
+    image: usize,
+    no_rowid: usize,
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+) -> Result<ReturningRowImageCacheState> {
+    let layout = target.table.column_layout()?;
+    let state =
+        seed_returning_row_image_in_cache(program, refs, image, no_rowid, resolver, &layout)?;
+    for column in 0..target.columns() {
+        resolver.cache_scalar_expr_reg(
+            std::borrow::Cow::Owned(Expr::Column {
+                database: Some(target.database_id),
+                table: target.internal_id,
+                column,
+                is_rowid_alias: false,
+            }),
+            offset(image, column)?,
+            false,
+            refs,
+        )?;
+    }
+    Ok(state)
 }
 
 /// The view as a table of its columns.
@@ -477,9 +520,7 @@ impl Returning {
             return Ok(());
         }
         let layout = target.table.column_layout()?;
-        let cache = seed_returning_row_image_in_cache(
-            program, &self.refs, image, no_rowid, resolver, &layout,
-        )?;
+        let cache = seed_row(target, &self.refs, image, no_rowid, program, resolver)?;
         for (subquery, reads_view) in &mut self.subqueries {
             let run = if subquery.correlated || *reads_view {
                 SubqueryRun::EveryRead
@@ -488,7 +529,6 @@ impl Returning {
             };
             emit_row_subquery(program, resolver, subquery, run)?;
         }
-        restore_returning_row_image_in_cache(resolver, cache);
         emit_returning_results(
             program,
             &self.refs,
@@ -498,7 +538,9 @@ impl Returning {
             resolver,
             self.buffer.as_ref(),
             &layout,
-        )
+        )?;
+        restore_returning_row_image_in_cache(resolver, cache);
+        Ok(())
     }
 
     fn finish(self, program: &mut ProgramBuilder) {
@@ -692,7 +734,8 @@ pub(crate) fn translate_insert(
                 _ => program.emit_null(dest, None),
             }
         }
-        // SQLite converts no value of an INSERT on a view (insert.c, `if( !isView )`).
+        // SQLite converts no other value of an INSERT on a view (insert.c, `if( !isView )`).
+        target.real_columns(program, image)?;
         let context = update_trigger_context(
             program,
             &target.table,
@@ -910,25 +953,19 @@ pub(crate) fn translate_update(
     let old = program.alloc_registers(target.columns());
     let new = program.alloc_registers(target.columns());
     let rowid = program.alloc_register();
-    let layout = target.table.column_layout()?;
     rows.each(program, |program, skip| {
         for column in 0..target.columns() {
-            let dest = offset(old, column)?;
-            rows.column(program, column, dest);
+            rows.column(program, column, offset(old, column)?);
+        }
+        target.real_columns(program, old)?;
+        for column in 0..target.columns() {
             program.emit_insn(Insn::Copy {
-                src_reg: dest,
+                src_reg: offset(old, column)?,
                 dst_reg: offset(new, column)?,
                 extra_amount: 0,
             });
         }
-        let cache = seed_returning_row_image_in_cache(
-            program,
-            &refs,
-            old,
-            no_rowid,
-            &mut resolver,
-            &layout,
-        )?;
+        let cache = seed_row(&target, &refs, old, no_rowid, program, &mut resolver)?;
         for subquery in &mut set_subqueries {
             let run = match (subquery.correlated, &subquery.query_type) {
                 (false, _) => SubqueryRun::Once,
@@ -1156,6 +1193,7 @@ pub(crate) fn translate_delete(
         for column in 0..target.columns() {
             rows.column(program, column, offset(old, column)?);
         }
+        target.real_columns(program, old)?;
         // SQLite codes a DELETE's triggers with OE_Default (delete.c): no conflict clause of an
         // enclosing statement reaches theirs.
         let context = TriggerContext::new(
