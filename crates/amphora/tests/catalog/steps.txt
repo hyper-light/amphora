@@ -72,6 +72,19 @@ s1: Q|select count(*) from pgbench_tellers limit 0
 s1: Q|select aid, abalance from pgbench_accounts where abalance = 0 order by aid asc limit 1 + 1
 s1: P||select count($1) from pgbench_branches| ~ B||||t:a| ~ E||0 ~ S
 s1: P||select count($1::int) from pgbench_branches| ~ DS| ~ B||||n| ~ E||0 ~ S
+# A NULL is grouped by, and comes last.
+s1: Q|insert into pgbench_history (tid, bid, filler) values (3, 2, 'a')
+s1: Q|insert into pgbench_history (tid, bid) values (1, 2)
+s1: Q|insert into pgbench_history (tid) values (2)
+s1: Q|insert into pgbench_history (tid, bid) values (4, 1)
+s1: Q|insert into pgbench_history (tid) values (5)
+s1: Q|select bid, count(*), count(bid), count(filler) from pgbench_history group by bid order by bid asc limit 5
+s1: Q|select bid, tid from pgbench_history order by bid asc limit 3
+s1: Q|select filler, count(*) from pgbench_history group by filler order by filler asc limit 5
+s1: Q|select bid, filler, count(*) from pgbench_history group by 1, 2 order by 1 asc limit 1
+s1: Q|select h.bid, b.bid, count(h.tid) from pgbench_history as h left join pgbench_branches as b on b.bid = h.bid group by h.bid, b.bid order by h.bid asc limit 5
+s1: Q|select h.tid, o.n from pgbench_history as h cross join lateral (select h.bid + 1) as o(n) where o.n is not null order by 1 asc limit 5
+s1: Q|truncate pgbench_history
 # Joins.
 s1: Q|select b.bid, count(t.tid) from pgbench_branches as b left join pgbench_tellers as t on (t.bid = b.bid) group by b.bid order by 1 asc limit 5
 s1: Q|select b.bid, t.tid from pgbench_branches as b left join pgbench_history as t on (t.bid = b.bid) order by 1 asc limit 5
@@ -87,6 +100,10 @@ s1: Q|select n, count(*) from pgbench_tellers as t cross join lateral (select t.
 s1: Q|select n, count(*) from pgbench_tellers as t cross join lateral (select t.bid - 1) as o(n) group by n order by 1 asc limit 5
 s1: Q|select b.bid, o.n from pgbench_branches as b join lateral (select b.bid + 1) as o(n) on o.n = 3
 s1: Q|select n from lateral (select 1) as o(n)
+s1: Q|select n from lateral (select 1) as o(n) where n = 2
+s1: Q|select n, count(*) from lateral (select 1) as o(n) group by n order by 1 asc limit 1
+s1: Q|select o.n, p.n, o.n + 1 from pgbench_branches as b cross join lateral (select b.bid) as o(n) cross join lateral (select o.n) as p(n) order by 1 asc limit 1
+s1: Q|select n, 1 / n from pgbench_branches as b cross join lateral (select b.bid - 1) as o(n) order by 1 asc limit 1
 s1: Q|select o.x, p.y from pgbench_branches as b cross join lateral (select b.bid + 1) as o(x) cross join lateral (select o.x + 1) as p(y) order by 1 asc limit 5
 s1: Q|select b.bid, s from pgbench_branches as b cross join lateral (select 'a') as o(s) order by 1 asc limit 1
 s1: Q|select count(*) from pgbench_branches as b cross join lateral (select b.bid) as o(n) left join pgbench_tellers as t on t.tid = o.n

@@ -489,7 +489,9 @@ mod tests {
     use crate::pg_catalog_vtab::value;
     use crate::sync::Arc;
     use crate::{ConnectOpts, Connection, Database, Numeric, PlatformIO, Value, IO};
-    use amphora_pg_catalog::data::{PG_ATTRIBUTE, PG_CLASS, PG_NAMESPACE, PG_TYPE};
+    use amphora_pg_catalog::data::{
+        PG_ATTRIBUTE, PG_CLASS, PG_INHERITS, PG_NAMESPACE, PG_PARTITIONED_TABLE, PG_TYPE,
+    };
     use amphora_pg_catalog::Catalog;
 
     fn open(path: &str) -> (Arc<Database>, Arc<Connection>) {
@@ -576,8 +578,8 @@ mod tests {
         assert_eq!(tids, [2, 4, 5]);
     }
 
-    /// T-PG.7.3: a database of the PostgreSQL dialect serves pg_namespace, pg_type, pg_class and
-    /// pg_attribute, each with exactly PostgreSQL 19's built-in rows while it has no tables.
+    /// T-PG.7.3: a database of the PostgreSQL dialect serves pg_namespace, pg_type, pg_class, pg_attribute,
+    /// pg_partitioned_table and pg_inherits, each with exactly PostgreSQL 19's built-in rows while it has no tables.
     #[test]
     fn t_pg_7_3_each_catalog_serves_19s_built_in_rows() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -588,6 +590,8 @@ mod tests {
             (&PG_TYPE, 197),
             (&PG_CLASS, 4),
             (&PG_ATTRIBUTE, 145),
+            (&PG_PARTITIONED_TABLE, 0),
+            (&PG_INHERITS, 0),
         ] {
             let got = query(&conn, &format!("SELECT * FROM {}", catalog.name));
             let expected: Vec<Vec<Value>> = catalog

@@ -71,7 +71,7 @@ pub fn lower(
         conditions: Vec::new(),
         sql: String::new(),
         binds: Vec::new(),
-        bound: Vec::new(),
+        bound: vec![0; query.exprs.iter().count()],
     };
     let fields = fields(query)?;
     writer.with_series()?;
@@ -130,14 +130,7 @@ pub fn fields(query: &Query) -> Result<Vec<Field>, Error> {
     let mut fields = Vec::with_capacity(query.targets.len());
     for target in query.targets.iter().filter(|target| !target.junk) {
         let expr = query.exprs.get(target.expr)?;
-        // markTargetListOrigin (src/backend/parser/parse_target.c).
-        let (table, attnum) = match &expr.kind {
-            ExprKind::Var { table, attnum } => match query.tables.get(*table).map(|t| t.oid) {
-                Some(oid) if oid != 0 => (oid, *attnum),
-                _ => (0, 0),
-            },
-            _ => (0, 0),
-        };
+        let (table, attnum) = origin(query, target.expr)?;
         fields.push(Field {
             name: target.name.clone(),
             table,
@@ -147,6 +140,32 @@ pub fn fields(query: &Query) -> Result<Vec<Field>, Error> {
         });
     }
     Ok(fields)
+}
+
+/// `markTargetListOrigin` (src/backend/parser/parse_target.c): the table and column a result's is, a subquery's
+/// column being what its expression is; zeros for an expression's.
+fn origin(query: &Query, root: ExprId) -> Result<(u32, usize), Error> {
+    let mut id = root;
+    // A subquery's expressions are of tables before it.
+    for _ in 0..=query.tables.len() {
+        let ExprKind::Var { table, attnum } = query.exprs.get(id)?.kind else {
+            return Ok((0, 0));
+        };
+        let table = query
+            .tables
+            .get(table)
+            .ok_or_else(|| Error::internal("a table of the statement's is missing"))?;
+        let output = table
+            .outputs
+            .as_ref()
+            .and_then(|outputs| outputs.get(attnum.checked_sub(1)?));
+        match output {
+            Some(output) => id = *output,
+            None if table.oid == 0 => return Ok((0, 0)),
+            None => return Ok((table.oid, attnum)),
+        }
+    }
+    Err(Error::internal("a subquery's column is of its own"))
 }
 
 /// A piece of an expression's text.
@@ -178,8 +197,8 @@ struct Writer<'a> {
     conditions: Vec<ExprId>,
     sql: String,
     binds: Vec<(u32, Option<Value>)>,
-    /// Each expression bound, and its parameter's number.
-    bound: Vec<(ExprId, usize)>,
+    /// Each expression's parameter's number, 0 for one that isn't bound.
+    bound: Vec<usize>,
 }
 
 impl Writer<'_> {
@@ -508,12 +527,14 @@ impl Writer<'_> {
         let query = self.query;
         let expr = query.exprs.get(id)?;
         if self.constant.get(id.index()) == Some(&true) {
-            if let Some((_, number)) = self.bound.iter().find(|(bound, _)| *bound == id) {
+            if let Some(number) = self.bound.get(id.index()).filter(|number| **number > 0) {
                 return Ok(vec![Piece::Text(format!("?{number}").into())]);
             }
             let value = self.value(id)?;
             let piece = self.bind(expr.type_oid, value);
-            self.bound.push((id, self.binds.len()));
+            if let Some(number) = self.bound.get_mut(id.index()) {
+                *number = self.binds.len();
+            }
             return Ok(vec![piece]);
         }
         let refuse = |what: &str| Err(Error::unsupported(what).at(expr.location));
