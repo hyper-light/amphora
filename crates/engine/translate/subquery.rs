@@ -375,8 +375,12 @@ pub fn plan_subqueries_from_select_plan(
         )?;
     }
 
-    // LIMIT and OFFSET cannot reference columns from the outer query
-    let get_outer_query_refs = |_: &TableReferences| Ok(crate::alloc::try_vec![]?);
+    // LIMIT and OFFSET cannot reference columns from the outer query, and read its CTEs.
+    let get_outer_query_refs = |tables: &TableReferences| {
+        let mut outer_query_refs = outer_query_refs_for_correlated_subquery(tables)?;
+        outer_query_refs.retain(|entry| entry.cte_scope.is_some());
+        Ok(outer_query_refs)
+    };
     {
         let mut subquery_parser = get_subquery_parser(
             program,
@@ -708,8 +712,7 @@ pub(crate) fn outer_query_refs_for_correlated_subquery(
                 internal_id: t.internal_id,
                 join_info: t.join_info.clone(),
                 col_used_mask: ColumnUsedMask::default(),
-                cte_select: None,
-                cte_explicit_columns: Vec::new(),
+                cte_scope: None,
                 cte_id,
                 cte_definition_only: false,
                 rowid_referenced: false,
@@ -726,8 +729,7 @@ pub(crate) fn outer_query_refs_for_correlated_subquery(
                 internal_id: t.internal_id,
                 join_info: t.join_info.clone(),
                 col_used_mask: ColumnUsedMask::default(),
-                cte_select: t.cte_select.clone(),
-                cte_explicit_columns: t.cte_explicit_columns.clone(),
+                cte_scope: t.cte_scope.clone(),
                 cte_id: t.cte_id, // Preserve CTE ID from outer query refs
                 cte_definition_only: t.cte_definition_only,
                 rowid_referenced: false,
