@@ -3002,6 +3002,27 @@ fn rewrite_trigger_sql_for_table_rename(
     .to_string())
 }
 
+/// What a trigger of `database_id` is on: a table, or a view as a table of its columns.
+fn trigger_table(resolver: &Resolver, database_id: usize, name: &str) -> Option<Arc<BTreeTable>> {
+    resolver.with_schema(database_id, |schema| {
+        schema.get_btree_table(name).or_else(|| {
+            schema.get_view(name).map(|view| {
+                Arc::new(BTreeTable::new(
+                    0,
+                    view.name.clone(),
+                    vec![],
+                    view.columns.clone(),
+                    crate::schema::BTreeCharacteristics::empty(),
+                    vec![],
+                    vec![],
+                    vec![],
+                    None,
+                ))
+            })
+        })
+    })
+}
+
 /// Check if a trigger contains qualified references to a specific column in its owning table.
 /// Rewrite trigger SQL to replace old column name with new column name.
 /// This handles old.x, new.x, and unqualified x references.
@@ -3042,10 +3063,9 @@ fn rewrite_trigger_sql_for_column_rename(
     // Get the trigger's owning table to check unqualified column references
     let trigger_table_name_raw = tbl_name.name.as_str();
     let trigger_table_name = normalize_ident(trigger_table_name_raw);
-    let trigger_table = resolver
-        .with_schema(trigger_database_id, |schema| {
-            schema.get_btree_table(&trigger_table_name)
-        })
+    let trigger_table = trigger_table(resolver, trigger_database_id, &trigger_table_name)
+        // A TEMP trigger may be on a view of another schema.
+        .or_else(|| trigger_table(resolver, target_database_id, &trigger_table_name))
         .ok_or_else(|| {
             LimboError::ParseError(format!("trigger table not found: {trigger_table_name}"))
         })?;
