@@ -19,8 +19,9 @@ change: no A/B, nothing timed.
   extension. A client that calls `plpgsql_validator` is told `42883`; a stock 19 resolves it.
 - amphora-engine's focused tests ran on 9c324607 (main fab12d7e merged), not on 25538fc1.
 - The sweep asks calls of one and two arguments only, as PG16 wrote it. A default is checked by it in 12
-  of the 37 functions (those one or two arguments can call). The other 25 have the same source, and no
-  server's answer.
+  of the 37 functions (those one or two arguments can call), counted with a Python copy of the resolver over
+  data.rs that agrees with the Rust sweep on every call. The other 25 have the same source, and no server's
+  answer.
 - scripts/postgres-answers.sql's new filter (`oid < 12000`) has not run on a server. It drops the rows of
   the functions above and no others.
 
