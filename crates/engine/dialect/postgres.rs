@@ -100,9 +100,11 @@ pub(crate) fn split_stored(sql: &str) -> crate::Result<Option<(u32, &str)>> {
 
 /// The `pg_class` OIDs of the tables `conn`'s transaction sees, sorted: read from `sqlite_schema`,
 /// which `pg_class` is served from ([`crate::pg_catalog_vtab`]), as GetNewOidWithIndex reads
-/// `pg_class`.
+/// `pg_class`. CREATE TABLE asks while it is translated, before any statement of its own runs, so
+/// the read is a statement of its own that ends its transaction unless the caller's is open (an
+/// internal statement would leave it open, as it runs inside another's).
 fn live_oids(conn: &Arc<Connection>) -> crate::Result<Vec<u32>> {
-    let mut stmt = conn.prepare_internal("SELECT sql FROM sqlite_schema WHERE type = 'table'")?;
+    let mut stmt = conn.prepare("SELECT sql FROM sqlite_schema WHERE type = 'table'")?;
     let mut oids = Vec::new();
     for row in stmt.run_collect_rows()? {
         if let Some(Value::Text(sql)) = row.first() {
