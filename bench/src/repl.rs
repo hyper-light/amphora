@@ -457,6 +457,7 @@ fn send_counting(
                         r.fetch_add(1, Ordering::Relaxed);
                     }
                 } else {
+                    a26_count(&e);
                     n += 1;
                 }
                 last = Some(e);
@@ -466,6 +467,32 @@ fn send_counting(
     Err(anyhow::anyhow!(
         "no live node acknowledged a write within --deadline-s: {last:?}"
     ))
+}
+
+/// diag (lane A26; not for main): every failure the driver met past a `Serialization` refusal, by
+/// kind: how many, and the least and most limit a `Full` named.
+static A26_KINDS: std::sync::Mutex<std::collections::BTreeMap<String, (u64, usize, usize)>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+fn a26_count(e: &anyhow::Error) {
+    let (kind, limit) = match e.downcast_ref::<amphora_api::Refusal>() {
+        Some(amphora_api::Refusal::Full { limit }) => ("Full".to_owned(), *limit),
+        Some(other) => {
+            let text = format!("{other:?}");
+            let kind = text
+                .split(|c: char| !c.is_alphanumeric())
+                .next()
+                .unwrap_or("?")
+                .to_owned();
+            (kind, 0)
+        }
+        None => (format!("{e:#}").chars().take(48).collect(), 0),
+    };
+    if let Ok(mut kinds) = A26_KINDS.lock() {
+        let entry = kinds.entry(kind).or_insert((0, usize::MAX, 0));
+        entry.0 += 1;
+        entry.1 = entry.1.min(limit);
+        entry.2 = entry.2.max(limit);
+    }
 }
 
 /// The commit this bench was built from (Amphora's version in a record).
@@ -609,6 +636,9 @@ fn commit(c: &dyn Cluster, o: &Opts) -> anyhow::Result<serde_json::Value> {
         .map(|(h, r)| serde_json::json!({ "buckets_us": h.buckets(), "max_us": h.max, "latency_ms": summary(h), "refused": r.load(Ordering::Relaxed) }))
         .collect();
     let leader = c.leader(Instant::now() + o.deadline).ok().flatten();
+    if let Ok(kinds) = A26_KINDS.lock() {
+        eprintln!("A26 failures by kind (count, least limit, most limit): {kinds:?}");
+    }
     let secs = seconds.as_secs_f64();
     Ok(serde_json::json!({
         "writers": writers, "route": match o.route { Route::Spread => "spread", Route::Leader => "leader" },
