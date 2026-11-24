@@ -1,5 +1,5 @@
 use crate::{
-    alloc::{self, TursoIteratorExt, TursoVecExt},
+    alloc::{self, TryClone, TursoIteratorExt, TursoVecExt},
     function::{AccumulatorFunc, AggFunc},
     schema::{
         BTreeTable, ColDef, Column, FromClauseSubquery, Index, ParenthesizedJoinColumnSource,
@@ -52,54 +52,57 @@ fn infer_type_from_expr(expr: &ast::Expr, tables: Option<&TableReferences>) -> A
     get_expr_affinity(expr, tables, None)
 }
 
-/// Computes the affinity of column `i` of a compound (UNION/INTERSECT/EXCEPT)
-/// subquery, matching SQLite's `sqlite3SubqueryColumnTypes` (select.c).
+/// The affinity of one column of a compound (UNION/INTERSECT/EXCEPT) subquery, read arm by arm from
+/// the left as SQLite's `sqlite3SubqueryColumnTypes` (select.c) reads it.
 ///
-/// Scanning the arms left-to-right, the affinity is the first arm's affinity,
-/// skipping leading arms that have no affinity (adopting the next arm's). If
-/// every arm has no affinity the result is BLOB (none). Otherwise the column
-/// keeps that affinity unless a later arm yields a conflicting datatype class
+/// The affinity is the first arm's that has one. If no arm has one the column has none. Otherwise
+/// the column keeps that affinity unless another arm yields a conflicting datatype class
 /// (TEXT affinity + a numeric arm, or numeric affinity + a text arm), in which
-/// case it is downgraded to BLOB (none) so the column is compared by storage
+/// case it is downgraded to BLOB so the column is compared by storage
 /// class.
-pub(super) fn compound_column_affinity(arms: &[&SelectPlan], i: usize) -> Affinity {
-    if arms.is_empty() {
-        return Affinity::None;
-    }
-    let col_affinities = |arm: &SelectPlan| {
-        arm.result_columns
-            .get(i)
-            .map(|rc| get_expr_affinity(&rc.expr, Some(&arm.table_references), None))
-            .unwrap_or(Affinity::None)
-    };
-    let col_data_type = |arm: &SelectPlan| {
-        arm.result_columns
-            .get(i)
-            .map(|rc| expr_data_type(&rc.expr, Some(&arm.table_references)))
-            .unwrap_or(StorageClassMask::from_null())
-    };
+struct CompoundColumnAffinity {
+    affinity: Affinity,
+    /// The storage classes of the arms but the one the affinity is from.
+    classes: StorageClassMask,
+}
 
-    let mut affinity = col_affinities(arms[0]);
-    let mut data_types = StorageClassMask::from_null();
-    let mut idx = 0;
-    // Skip leading arms with no affinity, adopting the next arm's affinity.
-    while affinity == Affinity::None && idx + 1 < arms.len() {
-        data_types |= col_data_type(arms[idx]);
-        idx += 1;
-        affinity = col_affinities(arms[idx]);
+impl CompoundColumnAffinity {
+    fn new() -> Self {
+        Self {
+            affinity: Affinity::None,
+            classes: StorageClassMask::from_null(),
+        }
     }
-    if affinity == Affinity::None {
-        return Affinity::None;
+
+    fn add_arm(&mut self, arm: &SelectPlan, tables: &TableReferences, column: usize) {
+        let Some(result_column) = arm.result_columns.get(column) else {
+            return;
+        };
+        if self.affinity == Affinity::None {
+            self.affinity = get_expr_affinity(&result_column.expr, Some(tables), None);
+            if self.affinity != Affinity::None {
+                return;
+            }
+        }
+        self.classes |= expr_data_type(&result_column.expr, Some(tables));
     }
-    // This arm has a real affinity; accumulate the remaining arms' classes.
-    for &arm in &arms[idx + 1..] {
-        data_types |= col_data_type(arm);
+
+    fn finish(&self) -> Affinity {
+        match self.affinity {
+            Affinity::Text if self.classes.has_numeric() => Affinity::Blob,
+            affinity if affinity.is_numeric() && self.classes.has_text() => Affinity::Blob,
+            affinity => affinity,
+        }
     }
-    match affinity {
-        Affinity::Text if data_types.has_numeric() => Affinity::Blob,
-        a if a.is_numeric() && data_types.has_text() => Affinity::Blob,
-        _ => affinity,
+}
+
+/// The affinity of column `i` of a compound subquery ([CompoundColumnAffinity]).
+pub(super) fn compound_column_affinity(arms: &[&SelectPlan], i: usize) -> Affinity {
+    let mut column = CompoundColumnAffinity::new();
+    for arm in arms {
+        column.add_arm(arm, &arm.table_references, i);
     }
+    column.finish()
 }
 
 #[derive(Debug, Clone)]
@@ -476,6 +479,8 @@ pub enum Plan {
 /// Everything needed to emit one self-referencing CTE.
 pub struct RecursiveCtePlan {
     pub name: String,
+    /// The CTE's columns, as [recursive_cte_columns] types them.
+    pub columns: alloc::Vec<Column>,
     pub initial_query: Box<Plan>,
     pub recursive_query: Box<Plan>,
     pub input_table_id: TableInternalId,
@@ -3194,10 +3199,7 @@ pub(super) fn query_output_columns(
             .first()
             .map(|(select, _)| (&select.result_columns[..], &select.table_references))
             .unwrap_or((&right_most.result_columns, &right_most.table_references)),
-        Plan::RecursiveCte(recursive_cte) => (
-            recursive_cte.initial_query.select_result_columns(),
-            recursive_cte.initial_query.select_table_references(),
-        ),
+        Plan::RecursiveCte(recursive_cte) => return Ok(recursive_cte.columns.try_clone()?),
         Plan::Delete(_) | Plan::Update(_) => {
             unreachable!("DELETE/UPDATE plans cannot define query output columns")
         }
@@ -3230,18 +3232,7 @@ pub(super) fn query_output_columns(
                 .unwrap_or_else(|| {
                     infer_type_from_expr(&result_column.expr, Some(table_references))
                 });
-            let column_type = affinity.to_type();
-            let mut column = Column::new(
-                name,
-                column_type.to_string(),
-                None,
-                None,
-                column_type,
-                None,
-                ColDef::default(),
-            );
-            column.override_affinity(affinity);
-            column
+            output_column(name, affinity)
         })
         .try_collect::<alloc::Vec<_>>()?;
 
@@ -3255,13 +3246,117 @@ pub(super) fn query_output_columns(
     Ok(columns)
 }
 
-fn subquery_output_columns(
+fn output_column(name: Option<String>, affinity: Affinity) -> Column {
+    let column_type = affinity.to_type();
+    let mut column = Column::new(
+        name,
+        column_type.to_string(),
+        None,
+        None,
+        column_type,
+        None,
+        ColDef::default(),
+    );
+    column.override_affinity(affinity);
+    column
+}
+
+pub(super) fn subquery_output_columns(
     plan: &Plan,
     explicit_columns: Option<&[String]>,
 ) -> Result<alloc::Vec<Column>> {
     let mut columns = query_output_columns(plan, explicit_columns)?;
     make_column_names_unique(&mut columns);
     Ok(columns)
+}
+
+/// The SELECTs of a query's plan, left to right.
+fn select_arms(plan: &Plan) -> Result<alloc::Vec<&SelectPlan>> {
+    match plan {
+        Plan::Select(select) => {
+            let mut arms = alloc::Vec::new();
+            arms.try_push(select.as_ref())?;
+            Ok(arms)
+        }
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            let mut arms = left
+                .iter()
+                .map(|(select, _)| select)
+                .try_collect::<alloc::Vec<_>>()?;
+            arms.try_push(right_most.as_ref())?;
+            Ok(arms)
+        }
+        Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => Err(
+            crate::LimboError::InternalError("a compound's arm is not a SELECT".to_string()),
+        ),
+    }
+}
+
+/// A recursive CTE's columns, from its initial query's (`initial_columns`) and every arm.
+///
+/// SQLite gives the CTE one table, which the recursive arms and the query around the CTE both read,
+/// and types its columns as any compound's, from all the arms (sqlite3SubqueryColumnTypes):
+/// datatype3.html 3.3.1, "the affinity of each column of the VIEW or subquery will be the affinity of
+/// the corresponding result column for one of the individual SELECT statements that make up the
+/// compound", and none where no arm's expression has one (3.2). A column's collation is the first
+/// arm's. The columns are typed in order: where an arm reads the CTE's own column, its affinity is
+/// what is known of that column so far, and none for a column not yet typed.
+pub(super) fn recursive_cte_columns(
+    initial_columns: &alloc::Vec<Column>,
+    initial_query: &Plan,
+    recursive_query: &Plan,
+    input_table_id: TableInternalId,
+) -> Result<alloc::Vec<Column>> {
+    let initial_arms = select_arms(initial_query)?;
+    let recursive_arms = select_arms(recursive_query)?;
+    let mut recursive_tables = recursive_arms
+        .iter()
+        .map(|arm| arm.table_references.clone())
+        .try_collect::<alloc::Vec<_>>()?;
+    let mut columns = initial_columns.try_clone()?;
+    for tables in recursive_tables.iter_mut() {
+        for column in 0..columns.len() {
+            set_recursive_input_affinity(tables, input_table_id, column, Affinity::None);
+        }
+    }
+    for (index, column) in columns.iter_mut().enumerate() {
+        let mut typed = CompoundColumnAffinity::new();
+        for arm in &initial_arms {
+            typed.add_arm(arm, &arm.table_references, index);
+        }
+        for (arm, tables) in recursive_arms.iter().zip(recursive_tables.iter_mut()) {
+            set_recursive_input_affinity(tables, input_table_id, index, typed.affinity);
+            typed.add_arm(arm, tables, index);
+        }
+        let affinity = typed.finish();
+        for tables in recursive_tables.iter_mut() {
+            set_recursive_input_affinity(tables, input_table_id, index, affinity);
+        }
+        let collation = column.collation_opt();
+        let array_dimensions = column.array_dimensions();
+        *column = output_column(column.name.take(), affinity);
+        column.set_collation(collation);
+        column.set_array_dimensions(array_dimensions);
+    }
+    Ok(columns)
+}
+
+fn set_recursive_input_affinity(
+    tables: &mut TableReferences,
+    input_table_id: TableInternalId,
+    column: usize,
+    affinity: Affinity,
+) {
+    let Some(joined_table) = tables.find_joined_table_by_internal_id_mut(input_table_id) else {
+        return;
+    };
+    if let Table::RecursiveCteInput(input) = &mut joined_table.table {
+        if let Some(column) = Arc::make_mut(input).columns.get_mut(column) {
+            column.override_affinity(affinity);
+        }
+    }
 }
 
 fn make_column_names_unique(columns: &mut [Column]) {
@@ -3400,25 +3495,17 @@ impl JoinedTable {
         })
     }
 
+    /// The table a recursive CTE's own arms read it by.
     pub fn new_recursive_cte_input(
         identifier: String,
-        query: &Plan,
+        columns: alloc::Vec<Column>,
         internal_id: TableInternalId,
-        explicit_columns: Option<&[String]>,
-    ) -> Result<Self> {
-        let mut columns = subquery_output_columns(query, explicit_columns)?;
-        // The recursive self-reference reads SQLite's queue table, whose
-        // columns have no declared type: comparisons in the recursive term
-        // see the stored value without the anchor query's affinity. Only the
-        // outer read of the CTE keeps the derived affinity.
-        for column in columns.iter_mut() {
-            column.override_affinity(Affinity::Blob);
-        }
+    ) -> Self {
         let table = Table::RecursiveCteInput(Arc::new(RecursiveCteInput {
             name: identifier.clone(),
             columns,
         }));
-        Ok(Self {
+        Self {
             op: Operation::default_scan_for(&table),
             unmatched_right_rows_plan: None,
             table,
@@ -3431,7 +3518,7 @@ impl JoinedTable {
             database_id: MAIN_DB_ID,
             indexed: None,
             plan_estimate: None,
-        })
+        }
     }
 
     pub fn columns(&self) -> &[Column] {
