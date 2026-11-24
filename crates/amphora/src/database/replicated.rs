@@ -4915,7 +4915,11 @@ impl<F: BlockFile + 'static> Actor<F> {
             return Ok(());
         }
         let context = self.read_context()?;
-        self.replica.read(context).map_err(raft_error)
+        self.replica.read(context).map_err(raft_error)?;
+        // The read waits in the core for a drive, and this step's one drive is behind it: the
+        // owner drives again at once, not at its next wake (CP-T1.8, lane V16).
+        self.driving = true;
+        Ok(())
     }
     fn bootstrap(&mut self) -> Result<(), Refusal> {
         if !self.replica.machine().bootstrap_pending() || self.pending.is_some() {
