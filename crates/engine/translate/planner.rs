@@ -2087,6 +2087,7 @@ fn parse_table(
             };
 
             if let Some(cte_select) = cte_select_syntax {
+                let body_refs = table_references.cte_body_refs(definition);
                 // Amphora (PL.13, lane replan-6): every use of the CTE has its syntax's identity.
                 let identity = crate::subquery_rows::identity(&cte_select);
                 // Plan each use separately so two uses do not receive the same
@@ -2098,11 +2099,9 @@ fn parse_table(
                 );
                 let cte_query_plan = if references_itself {
                     // Its own name in its body is the recursive input's.
-                    let outer_query_refs: Vec<OuterQueryReference> = table_references
-                        .outer_query_refs()
-                        .iter()
+                    let body_refs: Vec<OuterQueryReference> = body_refs
+                        .into_iter()
                         .filter(|reference| reference.identifier != normalized_qualified_name)
-                        .cloned()
                         .collect();
                     prepare_recursive_cte_plan(
                         &normalized_qualified_name,
@@ -2110,7 +2109,7 @@ fn parse_table(
                         &cte_explicit_columns,
                         resolver,
                         program,
-                        &outer_query_refs,
+                        &body_refs,
                         connection,
                     )?
                 } else {
@@ -2118,7 +2117,7 @@ fn parse_table(
                         cte_select,
                         resolver,
                         program,
-                        table_references.outer_query_refs(),
+                        &body_refs,
                         QueryDestination::placeholder_for_subquery(),
                         connection,
                     )?
