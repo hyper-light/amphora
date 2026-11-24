@@ -18909,13 +18909,25 @@ mod tests {
             let mut pump = Pump::new(&clients);
             let leader = driven.elect(&mut pump, &clients, 0, 1);
             assert_eq!(leader, 0, "{durability:?}: owner 0 did not lead");
+            let holder = 2;
             driven
                 .call(&mut pump, &clients[leader], |db| {
                     db.exec("CREATE TABLE events(id INTEGER NOT NULL)")?;
                     Ok(Vec::new())
                 })
                 .unwrap();
-            driven.quiet(&mut pump);
+            // Member 3's floor keeper attests once it applies the table: its session holds member
+            // 3's slot as a write's would, so it ends before member 3's write is made.
+            for _ in 0..ROUNDS {
+                driven.quiet(&mut pump);
+                if driven.owner(holder).pending.is_none() {
+                    break;
+                }
+            }
+            assert!(
+                driven.owner(holder).pending.is_none(),
+                "{durability:?}: member 3's floor session never ended"
+            );
             assert_eq!(
                 driven.owner(leader).slots.holder(),
                 None,
@@ -18923,9 +18935,9 @@ mod tests {
             );
             let ended = |how| clients[leader].handle().counters().write_slot_ended(how);
             let (released, expired) = (ended(SlotEnd::Released), ended(SlotEnd::Expired));
-            let holder = 2;
             let closes = Arc::new(AtomicUsize::new(0));
-            let counted = Arc::clone(&closes);
+            let losing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let (counted, lost) = (Arc::clone(&closes), Arc::clone(&losing));
             pump.losing = Some(Box::new(move |from, message: &Message| {
                 if from == 3
                     && message.msg_type == hyper_raft::proto::MessageType::MsgReadIndex
@@ -18933,7 +18945,8 @@ mod tests {
                 {
                     counted.fetch_add(1, Ordering::AcqRel);
                 }
-                from == 1
+                lost.load(Ordering::Acquire)
+                    && from == 1
                     && message.to == 3
                     && message.msg_type == hyper_raft::proto::MessageType::MsgReadIndexResp
             }));
@@ -18954,11 +18967,12 @@ mod tests {
                 rounds += 1;
             }
             let phase = |driven: &Driven| {
-                driven.owner(holder).pending.as_ref().map(|pending| match &pending.phase {
-                    Phase::Barrier(Some(_)) => "a write's barrier",
-                    Phase::Barrier(None) => "an owner session's barrier",
-                    Phase::Proposed(_) => "proposed",
-                    _ => "another phase",
+                driven.owner(holder).pending.as_ref().map(|pending| {
+                    match (&pending.author, &pending.phase) {
+                        (Author::Application(_), Phase::Barrier(Some(_))) => "a write's barrier",
+                        (Author::Owner, _) => "an owner session",
+                        _ => "another phase",
+                    }
                 })
             };
             assert_eq!(
@@ -18990,12 +19004,13 @@ mod tests {
                 Some(Err(Refusal::Timeout)),
                 "{durability:?}: member 3's write"
             );
+            losing.store(false, Ordering::Release);
             driven.quiet(&mut pump);
             pump.losing = None;
             assert_eq!(
-                (closes.load(Ordering::Acquire), driven.owner(leader).slots.holder()),
-                (1, None),
-                "{durability:?}: member 3's closes sent, and the slot's holder after them"
+                (closes.load(Ordering::Acquire) > 0, driven.owner(leader).slots.holder()),
+                (true, None),
+                "{durability:?}: member 3 closed, and the slot's holder after"
             );
             assert_eq!(
                 driven.settle(&mut pump, &own),
