@@ -270,32 +270,40 @@ fn d45_sqlite3_refuses_a_database_carried_off_without_its_log() {
 }
 
 /// Do: close a database cleanly, its log standing four ways; read and write its file with sqlite3;
-/// open it with Amphora, write and switch, and end there. Expect: sqlite3 reads every row and takes
-/// the write, Amphora finds it, and sqlite3 is refused again once Amphora's commits need `-wal2`.
+/// open it with Amphora, write and switch, and end there. Expect: sqlite3 reads every row and is
+/// refused the write (a page it wrote would fail its checksum in Amphora, decision 12: without the
+/// guard Amphora no longer opens the database), Amphora finds every row, and sqlite3 is refused once
+/// Amphora's commits need `-wal2`.
 #[test]
-fn d45_sqlite3_reads_a_cleanly_closed_database_whole() {
+fn d45_sqlite3_reads_a_cleanly_closed_database_whole_and_never_writes_it() {
     for format in FORMATS {
         for log in LOGS {
             let at = format!("{format:?}, {log:?}");
-            let (dir, db, conn, mut there) = left(log, format);
+            let (dir, db, conn, there) = left(log, format);
             conn.close().unwrap();
             drop((conn, db));
             let files = Files::of(dir.path(), &[]);
+            if let Some(read) = sqlite3(files.dir.path(), "SELECT count(*) FROM t") {
+                assert_eq!(read, (true, there.to_string()), "{at}");
+                let sql = "INSERT INTO t VALUES(1000, 'sqlite')";
+                let (ran, printed) = sqlite3(files.dir.path(), sql).unwrap();
+                files.holds(
+                    there,
+                    &format!("{at}: sqlite3 ran `{sql}`: {ran}, {printed}"),
+                );
+                assert!(!ran && printed.contains("readonly"), "{at}: {printed}");
+            }
             assert!(
                 !files.refused(),
                 "{at}: a cleanly closed database is SQLite's to read"
             );
+            let file = std::fs::read(beside(files.dir.path(), "")).unwrap();
+            assert_eq!(file[18..20], [3, 2], "{at}: its write and read versions");
             let log_bytes: Vec<usize> = files.bytes()[1..]
                 .iter()
                 .map(|file| file.as_ref().map_or(0, Vec::len))
                 .collect();
             assert_eq!(log_bytes, [0, 0], "{at}");
-            if let Some(read) = sqlite3(files.dir.path(), "SELECT count(*) FROM t") {
-                assert_eq!(read, (true, there.to_string()), "{at}");
-                let wrote = sqlite3(files.dir.path(), "INSERT INTO t VALUES(1000, 'sqlite')");
-                assert_eq!(wrote, Some((true, String::new())), "{at}");
-                there += 1;
-            }
             let (db, conn) = open(files.dir.path());
             db.wal_format(format).unwrap();
             assert_eq!(

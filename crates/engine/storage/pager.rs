@@ -3822,14 +3822,10 @@ impl Pager {
         ) {
             return Ok(());
         }
-        self.set_page1_version(sqlite3_ondisk::Version::Wal2)
-    }
-
-    fn set_page1_version(&self, version: sqlite3_ondisk::Version) -> Result<()> {
         self.io.block(|| {
             self.with_header_mut(|header| {
-                header.read_version = sqlite3_ondisk::RawVersion::from(version);
-                header.write_version = sqlite3_ondisk::RawVersion::from(version);
+                header.read_version = sqlite3_ondisk::Version::Wal2.into();
+                header.write_version = sqlite3_ondisk::Version::Wal2.into();
             })
         })
     }
@@ -6592,10 +6588,10 @@ impl Pager {
     }
 
     /// Amphora: at a clean close, its log folded into the file and both of the log's files empty, the
-    /// database is SQLite's to read again (docs/design/store.md, decision 45): page 1 says version 2,
-    /// in a commit of its own that a checkpoint then folds. Through the log, as any page is changed: a
-    /// page 1 torn in the file would fail its checksum, with no log to restore it from. It stays marked
-    /// where another connection came meanwhile.
+    /// database is SQLite's to read again (docs/design/store.md, decision 45): page 1's read version is
+    /// 2, in a commit of its own that a checkpoint then folds. Through the log, as any page is changed:
+    /// a page 1 torn in the file would fail its checksum, with no log to restore it from. It stays
+    /// marked where another connection came meanwhile.
     fn leave_to_sqlite(&self, sync_mode: crate::SyncMode) -> Result<()> {
         match self.unmark() {
             Ok(false) | Err(LimboError::Busy | LimboError::BusySnapshot) => Ok(()),
@@ -6642,7 +6638,17 @@ impl Pager {
         if !matches!(version.to_version(), Ok(sqlite3_ondisk::Version::Wal2)) {
             return Ok(false);
         }
-        self.set_page1_version(sqlite3_ondisk::Version::Wal)?;
+        self.io.block(|| {
+            self.with_header_mut(|header| {
+                header.read_version = sqlite3_ondisk::Version::Wal.into();
+                // SQLite doesn't keep what a page reserves: one it wrote would fail its checksum here
+                // (decision 12). A write version above 2 is a file it only reads (fileformat2.html,
+                // 1.3.3).
+                if header.reserved_space == 0 {
+                    header.write_version = sqlite3_ondisk::Version::Wal.into();
+                }
+            })
+        })?;
         self.io
             .block(|| self.commit_wal(WalAutoActions::empty(), 0, crate::SyncMode::Full, true))?;
         Ok(true)

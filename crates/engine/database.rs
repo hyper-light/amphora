@@ -2197,7 +2197,11 @@ impl Database {
 
                     // TODO: right now we don't support READ ONLY and no READ or WRITE in the Version header
                     // https://www.sqlite.org/fileformat.html#file_format_version_numbers
-                    if read_version != write_version {
+                    // Amphora: but the pair a clean close leaves SQLite to read and not to write
+                    // (docs/design/store.md, decision 45).
+                    let closed_cleanly = read_version == RawVersion::from(Version::Wal)
+                        && write_version == RawVersion::from(Version::Wal2);
+                    if read_version != write_version && !closed_cleanly {
                         return Err(LimboError::Corrupt(format!(
                             "Read version `{read_version:?}` is not equal to Write version `{write_version:?} in database header`"
                         )).into());

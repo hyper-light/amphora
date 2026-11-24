@@ -234,7 +234,7 @@ impl VacuumDbHeaderMeta {
     /// VACUUM INTO's file is whole, with no log beside it: SQLite reads it, though its source's
     /// versions may keep SQLite out (Amphora's docs/design/store.md, decision 45).
     pub(crate) fn of_a_whole_file(self) -> Self {
-        if self.read_version != RawVersion::from(Version::Wal2) {
+        if self.write_version != RawVersion::from(Version::Wal2) {
             return self;
         }
         Self {
