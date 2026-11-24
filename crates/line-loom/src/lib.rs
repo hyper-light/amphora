@@ -2,10 +2,13 @@
 //! perf-A27; replication.md, QB.1's amendment of that lane), on every interleaving of the events
 //! that move them: a call's arrival, a place or bytes given back, a wire record's arrival, a
 //! deadline, the bounds learned again, the owner's end, and the memory budget's room going after a
-//! place was granted. The code under test is the owner's own file, `line.rs`, compiled here over
-//! loom's types; the stand-ins below are what it takes from around it.
+//! place was granted. And the wait for the memory budget's room (T-MB.1.7, lane perf-A28; store.md),
+//! on every interleaving of a holder's wait, bytes given back and an owner's end. The code under test
+//! is the owner's own file, `line.rs`, and the budget's, `memory/wait.rs`, compiled here over loom's
+//! types; the stand-ins below are what they take from around them.
 //!
-//! Run: `RUSTFLAGS="--cfg loom" cargo test -p amphora-line-loom --release --locked`.
+//! Run: `RUSTFLAGS="--cfg loom" cargo test -p amphora-line-loom --release --locked -- --test-threads=3`
+//! (scripts/gates.sh; about three minutes on three cores).
 #![cfg(all(loom, test))]
 #![allow(
     clippy::unwrap_used,
@@ -24,6 +27,10 @@ use std::time::Duration;
 #[allow(dead_code)]
 mod line;
 
+#[path = "../../amphora/src/memory/wait.rs"]
+#[allow(dead_code)]
+mod wait;
+
 fn unavailable(e: impl std::fmt::Display) -> Refusal {
     Refusal::Unavailable(e.to_string())
 }
@@ -31,14 +38,14 @@ fn locked<T>(m: &Mutex<T>) -> Result<MutexGuard<'_, T>, Refusal> {
     m.lock().map_err(|_| unavailable("poisoned"))
 }
 
-/// What `line` shares between threads. Loom takes a sequentially consistent access for an
+/// What `line` and `wait` share between threads. Loom takes a sequentially consistent access for an
 /// acquire-release one and models only `fence(SeqCst)` as C++ states it (its README, "SeqCst
 /// accesses"), so each such access carries the fence before it: the mapping of C++'s onto a machine
 /// with none of its own (Power's, "leading sync"), in which no access of `join`'s stands after its
 /// own `fence` but by that fence.
 mod sync {
     pub(crate) use loom::sync::atomic::fence;
-    pub(crate) use loom::sync::{Arc, Mutex};
+    pub(crate) use loom::sync::{Arc, Condvar, Mutex, MutexGuard};
     use std::sync::atomic::Ordering;
 
     pub(crate) struct AtomicUsize(loom::sync::atomic::AtomicUsize);
@@ -78,6 +85,34 @@ mod sync {
         }
     }
 
+    pub(crate) struct AtomicU64(loom::sync::atomic::AtomicU64);
+    impl AtomicU64 {
+        pub(crate) fn new(value: u64) -> Self {
+            Self(loom::sync::atomic::AtomicU64::new(value))
+        }
+        pub(crate) fn load(&self, order: Ordering) -> u64 {
+            AtomicUsize::fenced(order);
+            self.0.load(order)
+        }
+        pub(crate) fn fetch_add(&self, by: u64, order: Ordering) -> u64 {
+            AtomicUsize::fenced(order);
+            self.0.fetch_add(by, order)
+        }
+        pub(crate) fn fetch_sub(&self, by: u64, order: Ordering) -> u64 {
+            AtomicUsize::fenced(order);
+            self.0.fetch_sub(by, order)
+        }
+        pub(crate) fn try_update(
+            &self,
+            set: Ordering,
+            fetch: Ordering,
+            change: impl FnMut(u64) -> Option<u64>,
+        ) -> Result<u64, u64> {
+            AtomicUsize::fenced(set);
+            self.0.fetch_update(set, fetch, change)
+        }
+    }
+
     /// A moment of the model's clock, in ticks: what a deadline is compared with.
     #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
     pub(crate) struct Instant(pub(crate) u64);
@@ -93,7 +128,7 @@ mod sync {
 use sync::{Arc, Instant};
 
 /// The model's clock: it stands still but as a test's thread moves it, and moving it wakes whatever
-/// waits with a time, as a timer would.
+/// waits with a time, as a timer would (loom's `Condvar::wait_timeout` never times out).
 struct Clock {
     now: loom::sync::atomic::AtomicUsize,
     /// The bells that wait with a time, or have.
@@ -165,10 +200,14 @@ impl Bell {
     }
 }
 
-/// The process's memory budget (`crate::memory`): its limit less what is charged, waited for on
-/// each charge given back, one with a deadline until it passes.
+/// The process's memory budget (`crate::memory`): its limit less what is charged, its waits the
+/// budget's own (`wait`).
 mod memory {
-    use super::{Arc, CLOCK, Condvar, Instant, Mutex, Refusal};
+    use super::sync::{Arc, AtomicU64, Instant};
+    pub(crate) use super::wait::Ending;
+    use super::wait::{NoRoom, Waiters};
+    use super::{CLOCK, Refusal};
+    use std::sync::atomic::Ordering;
 
     #[derive(Clone, Copy)]
     pub(crate) enum Use {
@@ -177,9 +216,9 @@ mod memory {
     #[derive(Clone)]
     pub(crate) struct Budget(Arc<Held>);
     struct Held {
-        /// The room left, and the waiters told each time some comes back.
-        left: Mutex<u64>,
-        given: Condvar,
+        /// The room left.
+        left: AtomicU64,
+        waiters: Arc<Waiters>,
         limit: u64,
     }
     pub(crate) struct Charge {
@@ -193,29 +232,31 @@ mod memory {
     }
     impl Drop for Charge {
         fn drop(&mut self) {
-            *self.budget.0.left.lock().unwrap() += self.bytes;
-            self.budget.0.given.notify_all();
+            self.budget.0.left.fetch_add(self.bytes, Ordering::SeqCst);
+            self.budget.0.waiters.given();
         }
     }
     impl Budget {
         /// The process's budget from here on, of `limit` bytes.
         pub(crate) fn of(limit: u64) -> Self {
             let budget = Self(Arc::new(Held {
-                left: Mutex::new(limit),
-                given: Condvar::new(),
+                left: AtomicU64::new(limit),
+                waiters: Waiters::new(),
                 limit,
             }));
             CLOCK.budget.lock().unwrap().push(budget.clone());
             *super::BUDGET.lock().unwrap() = Some(budget.clone());
             budget
         }
+        /// A timed wait's time passing: a holder looks again, as the timer's wake would have it.
         pub(crate) fn timer(&self) {
-            let left = self.0.left.lock().unwrap();
-            self.0.given.notify_all();
-            drop(left);
+            self.0.waiters.look_again();
         }
         pub(crate) fn held(&self) -> u64 {
-            self.0.limit - *self.0.left.lock().unwrap()
+            self.0.limit - self.0.left.load(Ordering::SeqCst)
+        }
+        pub(crate) fn waiting(&self) -> u64 {
+            self.0.waiters.holders()
         }
         fn too_large(bytes: u64, limit: u64) -> Refusal {
             Refusal::TooLarge {
@@ -224,41 +265,45 @@ mod memory {
                 limit: usize::try_from(limit).unwrap(),
             }
         }
-        fn charge(&self, left: &mut u64, bytes: u64) -> Option<Charge> {
-            *left = left.checked_sub(bytes)?;
-            Some(Charge {
-                budget: self.clone(),
-                bytes,
-            })
+        fn charged(&self, bytes: u64) -> Result<Charge, u64> {
+            self.0
+                .left
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                    left.checked_sub(bytes)
+                })
+                .map(|_| Charge {
+                    budget: self.clone(),
+                    bytes,
+                })
         }
         pub(crate) fn take(&self, _: Use, bytes: u64) -> Result<Charge, Refusal> {
-            let mut left = self.0.left.lock().unwrap();
-            self.charge(&mut left, bytes)
-                .ok_or_else(|| Self::too_large(bytes, *left))
+            self.charged(bytes)
+                .map_err(|left| Self::too_large(bytes, left))
         }
         pub(crate) fn take_until(
             &self,
-            _: Use,
+            used: Use,
             bytes: u64,
             until: Instant,
-            mut waits: impl FnMut(),
+            owner: &Ending,
+            waits: impl FnMut(),
         ) -> Result<Charge, Refusal> {
-            let mut left = self.0.left.lock().unwrap();
-            loop {
-                if bytes > self.0.limit {
-                    return Err(Self::too_large(bytes, self.0.limit));
-                }
-                if let Some(charge) = self.charge(&mut left, bytes) {
-                    return Ok(charge);
-                }
-                if Instant::now() >= until {
-                    return Err(Refusal::Full {
-                        limit: usize::try_from(*left).unwrap(),
-                    });
-                }
-                waits();
-                left = self.0.given.wait(left).unwrap();
+            if let Ok(charge) = self.take(used, bytes) {
+                return Ok(charge);
             }
+            Waiters::until(
+                &self.0.waiters,
+                until,
+                owner,
+                || match self.charged(bytes) {
+                    Ok(charge) => Ok(charge),
+                    Err(_) if bytes > self.0.limit => {
+                        Err(NoRoom::Refused(Self::too_large(bytes, self.0.limit)))
+                    }
+                    Err(left) => Err(NoRoom::Now(usize::try_from(left).unwrap())),
+                },
+                waits,
+            )
         }
     }
     pub(crate) fn process() -> Budget {
