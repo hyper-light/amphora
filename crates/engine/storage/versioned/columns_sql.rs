@@ -896,6 +896,21 @@ fn read(
     let rates = RowRates::learned(&connection.db.learned_costs);
     let chosen =
         rates.map(|r| columns_path::aggregate_choice(&copy.columns, snap.start, q, r, true));
+    if let (Some((choice, view)), Some(r)) = (&chosen, rates) {
+        tracing::debug!(
+            target: "amphora::column_path",
+            tree,
+            rows = view.rows,
+            queued = view.queued,
+            exact = view.exact,
+            copy_nanos_per_row = ?view.nanos_per_row,
+            rows_nanos_per_row = r.row,
+            rows_cost = choice.rows_cost,
+            copy_cost = ?choice.copy_cost,
+            path = ?choice.path,
+            "column copy or rows: the choice and its two costs"
+        );
+    }
     let answer = match chosen {
         Some((choice, view)) if choice.path == Path::Copy => {
             let budget = MemoryBudget::new(q.budget);
@@ -1018,8 +1033,32 @@ mod tests {
         connect_in(None)
     }
 
+    /// `AMPHORA_PLAN_TRACE`: the copies' choices, each with its two costs, to stderr, each line
+    /// named by its test's thread.
+    fn trace() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        if std::env::var_os("AMPHORA_PLAN_TRACE").is_none() {
+            return;
+        }
+        ONCE.call_once(|| {
+            use tracing_subscriber::filter::{LevelFilter, Targets};
+            use tracing_subscriber::layer::SubscriberExt;
+            use tracing_subscriber::util::SubscriberInitExt;
+            let only = Targets::new().with_target("amphora::column_path", LevelFilter::DEBUG);
+            let shown = tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_ansi(false)
+                .with_thread_names(true);
+            let _ = tracing_subscriber::registry()
+                .with(shown)
+                .with(only)
+                .try_init();
+        });
+    }
+
     /// A connection on a versioned storage whose memory source is `room` (None: the machine's).
     fn connect_in(room: Option<Arc<dyn Source>>) -> (Arc<Database>, Arc<crate::Connection>) {
+        trace();
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
         let opts = ConnectOpts::new().with_versioned_storage();
