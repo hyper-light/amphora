@@ -3391,6 +3391,13 @@ impl Database {
     /// the other segment is still closing: the caller asks again at its next turn. It waits for
     /// no read.
     pub fn switch_log(&self) -> Result<bool> {
+        if self.opts.enable_multiprocess_wal {
+            return Err(LimboError::InvalidArgument(
+                "a multi-process log can't switch segments yet: its shared memory doesn't publish \
+                 the switch (decision 45)"
+                    .into(),
+            ));
+        }
         if !self.shared_wal.write_lock.write() {
             return Ok(false);
         }
