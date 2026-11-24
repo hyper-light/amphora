@@ -1839,7 +1839,11 @@ fn partition_spec(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
         "range" => 'r',
         "hash" => 'h',
         _ => {
-            return Err(r.refuse(INVALID_PARAMETER_VALUE, 3, "unrecognized partitioning strategy"));
+            return Err(r.refuse(
+                INVALID_PARAMETER_VALUE,
+                3,
+                "unrecognized partitioning strategy",
+            ));
         }
     };
     let part_params = r.list(5)?;
