@@ -1687,14 +1687,10 @@ fn d45_a_shipper_opened_after_a_switch_carries_on_from_the_closed_segment() {
     );
 }
 
-/// Decision 45 (lane B25): a new database takes nothing from a log segment left at its path, `-wal2` as
-/// `-wal`. Do: write 20 rows, start the log again (the writer switches to `-wal2`), and there make a
-/// second table and write 200 rows; end, and remove the database's file and its `-wal`, the ones
-/// SQLite names, its `-wal2` left; open a database at that path, make a table and write 3 rows, copy
-/// its log into its file, and open it again. Expect: it begins empty, and holds the 3 rows alone,
-/// its file whole.
-#[test]
-fn d45_a_new_database_takes_no_log_segment_left_at_its_path() {
+/// A folder where a database was removed and its `-wal2` left: 20 rows, the log started again (the
+/// writer switched to `-wal2`), a second table made there and 200 rows more; ended, the database's
+/// file and its `-wal`, the ones SQLite names, removed. Its path, and what its log held.
+fn second_segment_left() -> (tempfile::TempDir, std::path::PathBuf, String) {
     let mut s = Source::new();
     s.put(0..20, "a");
     s.ship().unwrap();
@@ -1713,49 +1709,81 @@ fn d45_a_new_database_takes_no_log_segment_left_at_its_path() {
     std::fs::remove_file(&path).unwrap();
     std::fs::remove_file(beside("-wal")).unwrap();
     assert!(
-        std::fs::metadata(beside("-wal2")).unwrap().len() > 32,
+        std::fs::metadata(beside("-wal2")).unwrap().len() > 100 * (4096 + 24),
         "non-vacuous: a segment with frames is left; {state}"
     );
+    (dir, path, state)
+}
 
-    let tables = |db: &Db| -> anyhow::Result<Vec<String>> {
-        let mut names = Vec::new();
-        db.query("SELECT name FROM sqlite_schema ORDER BY name", [], |r| {
-            names.push(r.get::<String>(0).map_err(|e| anyhow::anyhow!("{e}"))?);
-            Ok(true)
-        })?;
-        Ok(names)
-    };
-    let opened = Db::open(&path).and_then(|db| tables(&db).map(|names| (db, names)));
-    let (db, names) = match opened {
-        Ok(opened) => opened,
-        Err(e) => panic!("a new database where `-wal2` is left doesn't open: {e:#}; {state}"),
-    };
-    assert_eq!(
-        names,
-        Vec::<String>::new(),
-        "a new database holds tables of the one removed; {state}"
-    );
-    let mut expected = Rows::new();
-    db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
-        .unwrap();
-    for id in 0..3 {
-        db.exec(&format!("INSERT INTO t (id, v) VALUES ({id}, 'new')"))
-            .unwrap();
-        expected.insert(id, "new".into());
-    }
-    assert_eq!(rows(&db), expected);
-    let mut db = db;
-    let _copied = db.checkpoint().unwrap();
-    drop(db);
-    let db = Db::open(&path).unwrap();
-    assert_eq!(rows(&db), expected, "opened again");
+fn tables(db: &Db) -> anyhow::Result<Vec<String>> {
+    let mut names = Vec::new();
+    db.query("SELECT name FROM sqlite_schema ORDER BY name", [], |r| {
+        names.push(r.get::<String>(0).map_err(|e| anyhow::anyhow!("{e}"))?);
+        Ok(true)
+    })?;
+    Ok(names)
+}
+
+fn integrity(db: &Db) -> Vec<String> {
     let mut whole = Vec::new();
     db.query("PRAGMA integrity_check", [], |r| {
         whole.push(r.get::<String>(0).map_err(|e| anyhow::anyhow!("{e}"))?);
         Ok(true)
     })
     .unwrap();
-    assert_eq!(whole, ["ok"]);
+    whole
+}
+
+/// Decision 45 (lane B25): a new database opened where a log segment is left, `-wal2` as `-wal`, is new.
+/// Do: [`second_segment_left`]; open a database at that path and close it, nothing written, twice;
+/// then open it again. Expect: no table in it, each time.
+#[test]
+fn d45_a_new_database_opened_and_closed_takes_no_log_segment_left_at_its_path() {
+    let (dir, path, state) = second_segment_left();
+    for time in 1..=3 {
+        let held = Db::open(&path).and_then(|db| tables(&db));
+        assert!(
+            matches!(&held, Ok(names) if names.is_empty()),
+            "open {time} of a new database, nothing written: {held:?}; the log of the one removed: \
+             {state}; now {}",
+            log_files(&path)
+        );
+    }
+    drop(dir);
+}
+
+/// Decision 45 (lane B25): a new database grown past what a log segment left at its path held is its own.
+/// Do: [`second_segment_left`]; open a database there, make a table and write 400 rows, its log copied
+/// into its file part of the way, and open it again. Expect: the 400 rows alone, its file whole, both
+/// before and after.
+#[test]
+fn d45_a_new_database_grows_over_no_log_segment_left_at_its_path() {
+    let (dir, path, state) = second_segment_left();
+    let now = AtomicU64::new(1_000 * SECOND_NS);
+    let (mut model, mut history) = (Rows::new(), Vec::new());
+    let mut db = Db::open(&path).unwrap();
+    db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+        .unwrap();
+    for part in 0..4 {
+        let ids = part * 100..(part + 1) * 100;
+        put(&mut db, &now, ids, "new", &mut model, &mut history);
+        let _copied = db.checkpoint().unwrap();
+    }
+    let check = |db: &Db, when: &str| {
+        let held = rows(db);
+        let wrong = model
+            .iter()
+            .filter(|(id, v)| held.get(id) != Some(v))
+            .count();
+        assert_eq!(
+            (wrong, held.len(), tables(db).unwrap(), integrity(db)),
+            (0, model.len(), vec!["t".to_owned()], vec!["ok".to_owned()]),
+            "{when}: rows wrong, rows, tables, integrity; the log of the one removed: {state}"
+        );
+    };
+    check(&db, "as written");
+    drop(db);
+    check(&Db::open(&path).unwrap(), "opened again");
     drop(dir);
 }
 
