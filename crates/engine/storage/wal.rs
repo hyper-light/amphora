@@ -5523,6 +5523,17 @@ impl WalFile {
         )
     }
 
+    /// The epoch a page read from `segment`'s frames is labelled with for the checkpoint's cache
+    /// lookup, or None: the cache keys a page by its frame in the current segment (decision 45),
+    /// and frame numbers start again in each, so a page read from a closing segment is not
+    /// labelled (lane B20). The epoch is read first: a switch stores the free segment's epoch,
+    /// one past, before it makes that segment current, so a read that sees `segment` current
+    /// after it labels with an epoch no frame of the next segment is copied under.
+    fn label_epoch(&self, segment: SegmentId) -> Option<u32> {
+        let epoch = self.coordination.checkpoint_epoch();
+        (segment == self.coordination.current_segment()).then_some(epoch)
+    }
+
     /// A page the read's own segment lacks, in the closing segment the read counts on (decision
     /// 45): the file lacks that segment's frames until its copy. Every frame of it was committed
     /// before any of the read's own segment, so the newest there is the read's version.
@@ -6056,17 +6067,18 @@ impl Wal for WalFile {
         group: Option<&mut CompletionGroup>,
     ) -> Result<Completion> {
         let frame_id = at.frame;
-        tracing::debug!(
-            "read_frame(page_idx = {}, frame_id = {}, segment = {:?})",
-            page.get().id(),
-            frame_id,
-            at.segment
-        );
         let offset = self.frame_offset(frame_id);
         page.set_locked();
         let frame = page.clone();
         let page_idx = page.get().id();
-        let epoch_at_issue = self.coordination.checkpoint_epoch();
+        let label = self.label_epoch(at.segment);
+        tracing::debug!(
+            "read_frame(page_idx = {}, frame_id = {}, segment = {:?}, label epoch = {:?})",
+            page_idx,
+            frame_id,
+            at.segment,
+            label
+        );
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
             let Ok((buf, bytes_read)) = res else {
                 tracing::debug!(err = ?res.unwrap_err());
@@ -6089,7 +6101,10 @@ impl Wal for WalFile {
             }
             let cloned = frame.clone();
             finish_read_page(page.get().id(), buf, cloned);
-            frame.set_wal_tag(frame_id, epoch_at_issue);
+            match label {
+                Some(epoch) => frame.set_wal_tag(frame_id, epoch),
+                None => frame.clear_wal_tag(),
+            }
             None
         });
         // Amphora: a page a record holds is read from the record, in the frame's own segment
@@ -6184,7 +6199,7 @@ impl Wal for WalFile {
             slots.push((page.clone(), Arc::new(buffer_pool.get_page())));
         }
 
-        let epoch = self.coordination.checkpoint_epoch();
+        let label = self.label_epoch(start.segment);
         let page_transform = self.io_ctx.read().page_transform().clone();
         let raw_buf = scratch_buf.unwrap_or_else(|| Arc::new(Buffer::new_temporary(total)));
 
@@ -6278,7 +6293,10 @@ impl Wal for WalFile {
             for (i, (page, page_buf)) in slots.iter().enumerate() {
                 let page_id = page.get().id();
                 finish_read_page(page_id, page_buf.clone(), page.clone());
-                page.set_wal_tag(start_frame + i as u64, epoch);
+                match label {
+                    Some(epoch) => page.set_wal_tag(start_frame + i as u64, epoch),
+                    None => page.clear_wal_tag(),
+                }
             }
             None
         });
@@ -8884,15 +8902,19 @@ impl WalFileShared {
     /// writing frames into the start of the log file.
     /// Make this free segment the one that follows `closing`'s header (decision 45): the same
     /// format and page size, its sequence one past and its salts new ([`Self::restart_wal_header`]),
-    /// the epoch and transaction count carried on so that neither comes back to a value a
-    /// connection took from the closing segment.
+    /// the transaction count carried on so that it never comes back to a value a connection took
+    /// from the closing segment, and the epoch one past the closing one's `epoch`, as a restart
+    /// bumps it: frame numbers start again here, so no page labelled from the closing segment's
+    /// frames passes for this one's (lane B20).
     fn start_after(&mut self, io: &dyn IO, closing: WalHeader, epoch: u32, transaction_count: u64) {
         *self.metadata.wal_header.lock() = closing;
         self.metadata.loaded.store(true, Ordering::Release);
         self.metadata
             .transaction_count
             .store(transaction_count, Ordering::Release);
-        self.runtime.epoch.store(epoch, Ordering::Release);
+        self.runtime
+            .epoch
+            .store(epoch.wrapping_add(1), Ordering::Release);
         self.restart_wal_header(io);
     }
 
