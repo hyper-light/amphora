@@ -2181,16 +2181,33 @@ impl TableReferences {
             .find(|t| t.identifier == identifier && t.is_cte_name_in_scope())
     }
 
+    /// The entry that holds the syntax of the CTE `cte_ref` names, from which each use of it is
+    /// planned: a FROM clause's use of a CTE holds the plan it reads alone, and the entry its WITH
+    /// clause made, the syntax.
+    pub fn cte_definition<'a>(
+        &'a self,
+        cte_ref: &'a OuterQueryReference,
+    ) -> &'a OuterQueryReference {
+        if cte_ref.cte_select.is_some() || cte_ref.cte_id.is_none() {
+            return cte_ref;
+        }
+        self.outer_query_refs
+            .iter()
+            .find(|other| other.cte_id == cte_ref.cte_id && other.cte_select.is_some())
+            .unwrap_or(cte_ref)
+    }
+
     /// Marks the pre-planned [OuterQueryReference] with the given identifier as
     /// "CTE definition only". This prevents it from being used for column
     /// resolution while still allowing CTE definition lookup in subquery FROM
     /// clauses. Called when a CTE is consumed by a FROM clause, since column
-    /// resolution is then handled by the joined_table entry instead.
+    /// resolution is then handled by the joined_table entry instead. A table of an outer FROM
+    /// clause that has the CTE's name, which holds no syntax, keeps its columns in reach.
     pub fn mark_outer_query_ref_cte_definition_only(&mut self, identifier: &str) {
         if let Some(outer_ref) = self
             .outer_query_refs
             .iter_mut()
-            .find(|t| t.identifier == identifier)
+            .find(|t| t.identifier == identifier && t.cte_select.is_some())
         {
             outer_ref.cte_definition_only = true;
         }
@@ -3546,14 +3563,9 @@ impl JoinedTable {
                 } else {
                     index
                         .map(|index| {
-                            let physical = if !btree.has_rowid && !index.ephemeral {
-                                Arc::new(index.physical_index(btree)?)
-                            } else {
-                                index.clone()
-                            };
                             program.alloc_cursor_index_if_not_exists(
                                 CursorKey::index(self.internal_id, index.clone()),
-                                &physical,
+                                &self.index_of_cursor(index)?,
                             )
                         })
                         .transpose()?
@@ -3586,6 +3598,17 @@ impl JoinedTable {
                 );
                 Ok((Some(cursor_id), None))
             }
+        }
+    }
+
+    /// `index` as a cursor over it reads its entries: those of a WITHOUT ROWID table's secondary
+    /// index end in the primary key that finds the row, which the declared columns leave out.
+    pub(crate) fn index_of_cursor(&self, index: &Arc<Index>) -> Result<Arc<Index>> {
+        match &self.table {
+            Table::BTree(btree) if !btree.has_rowid && !index.ephemeral => {
+                Ok(Arc::new(index.physical_index(btree)?))
+            }
+            _ => Ok(index.clone()),
         }
     }
 
