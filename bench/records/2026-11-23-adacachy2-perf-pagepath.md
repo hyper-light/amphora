@@ -1986,3 +1986,30 @@ r2286 (MacBook Pro 2) | 785d7e5f | "disk low" (20 GB free), by the guard |
 r2292, r2297 (Mac Studio 2) | 785d7e5f | r2292 stopped (its sync may have taken an edit of mine); r2297 didn't compile (a test's borrowed SQL) |
 r2301 (Mac Studio 2, cpus=8) | 128d4ca2 | the red above |
 r2302 (macOS, cpus=8) | 48aac3ab | queued 4th to 7th, stopped unstarted at the coordinator's word |
+
+**For the next lane.** First the loss, alone if the rest is in its way: `perf/pagepath-b30-land` through 8d1a4ae8 (the red test and the fix). Then the rest, then the server. On Linux (`on` adacachy2, sync false, cwd
+`~/.cache/amphora-perf/pagepath-remote`, `git fetch -q origin && git checkout -q <sha>`; CARGO_HOME, CARGO_TARGET_DIR and the rest as RULES rule 6 with area `pagepath`, CARGO_INCREMENTAL=0):
+
+    # red (main's engine, the test alone), then green
+    git checkout -q 21c21a24 && cargo test --locked -p amphora --test crash -- --nocapture d45_a_power_cut
+    git checkout -q 8d1a4ae8 && cargo test --locked -p amphora --test crash -- --nocapture d45_a_power_cut
+    # the whole, at the branch's tip
+    cargo fmt --all --check
+    cargo test --locked -p amphora --test crash --test shutdown --test files --test store --test backup --test restore --test groups --test amplification -- --test-threads=8
+    cargo test --locked -p amphora-engine --test plain_sqlite --test log_restart --test read_ended --test log_read_index --test packed_log --test shared_pages --test spilled_log --test reader_cache -- --test-threads=8
+    cargo test --locked -p amphora-engine --lib -- --test-threads=8 storage:: vdbe:: mvcc::database::tests multiprocess_tests   # main's set, r2106: 1,623 passed, 0 failed, 28 ignored
+    cargo test --locked -p amphora --lib -- --test-threads=8 store:: database:: backup:: d45_
+    cargo clippy --locked -p amphora -p amphora-engine --all-targets -- -D warnings   # the log shows "Checking amphora-engine"
+    bash scripts/check-production.sh
+    # and, on 128d4ca2 or 21c21a24, the two tests not yet red on main: cargo test -p amphora-engine --test plain_sqlite d45_ with plain_sqlite.rs of the tip
+
+What to expect: red as the table above, its images written to `<target>/tmp/crash-images/`; green prints "54 drills: ... power cuts, ... images" and "200 seeds: ...". A drill that fails with the fix is a second fault:
+its message names the format, the steps, the change cut at, the image and both headers. Likeliest trouble in the orderly end: something else on the process's database holding a connection as the writer ends
+(`n_connections`), which leaves the file marked (shutdown.rs `marks`), and a test that reads a database's log after its last handle (none found by grep in tests/; the library's were not read).
+
+The server, not built. `amphora serve` ends only by a signal's default action, and its owner only once every handle is gone, which its accept and connection threads hold (serve.rs `serve`, replicated.rs `run_loop`). In order:
+(1) an end the owner is asked for (a flag in `Control` and its bell, `run_loop` then returning Ok); (2) after it, in `Actor::run`, the session worker and the flushing thread joined (both handles are dropped as they
+start, and each holds a connection), the local readers gone, and the machine's `Db` closed; (3) SIGTERM and SIGINT by hyper-rt's `signal::subscribe` on a `LocalRuntime` of its own thread (`amphora postgres` makes one), then the
+end, its wait, and exit 0; (4) the test: the binary run, written to, sent SIGTERM, its state.db read by sqlite3; killed with SIGKILL, refused. `amphora postgres` has rows on the versioned storage alone, so nothing of it is SQLite's to read.
+
+**Decisions left.** A backed-up database: is its orderly end to ship what is left and then close cleanly (one more log break, a new base), or stay refused as now? And `Connection::close`'s Ok for a fold that failed: SQLite's own close says nothing of it either.
