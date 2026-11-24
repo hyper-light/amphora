@@ -2206,6 +2206,7 @@ impl Schema {
                 primary_key_columns: vec![],
                 has_rowid: true,
                 is_strict: false,
+                columnar: false,
                 has_autoincrement: false,
                 foreign_keys: vec![],
                 check_constraints: vec![],
@@ -2969,6 +2970,7 @@ impl TryClone for BTreeTable {
             columns: self.columns.try_clone()?,
             has_rowid: self.has_rowid,
             is_strict: self.is_strict,
+            columnar: self.columnar,
             has_autoincrement: self.has_autoincrement,
             unique_sets: self.unique_sets.try_clone()?,
             foreign_keys: self.foreign_keys.try_clone()?,
@@ -3475,6 +3477,8 @@ bitflags! {
         const STRICT            = 0b0000_0010;
         /// Table has an `AUTOINCREMENT` column.
         const HAS_AUTOINCREMENT = 0b0000_0100;
+        /// Amphora: table is declared `COLUMNAR`: it keeps a column copy on the versioned storage.
+        const COLUMNAR          = 0b0000_1000;
     }
 }
 
@@ -3578,6 +3582,10 @@ pub struct BTreeTable {
     columns: Vec<Column>,
     pub has_rowid: bool,
     pub is_strict: bool,
+    /// Amphora: declared `COLUMNAR` (`docs/design/columnar.md`, decision 1, item 1): on the
+    /// versioned storage its analytic statements are handed to its column copy, which no
+    /// undeclared table keeps.
+    pub columnar: bool,
     pub has_autoincrement: bool,
     pub unique_sets: Vec<UniqueSet>,
     pub foreign_keys: Vec<Arc<ForeignKey>>,
@@ -3644,6 +3652,7 @@ impl BTreeTable {
             columns,
             has_rowid,
             is_strict: characteristics.contains(BTreeCharacteristics::STRICT),
+            columnar: characteristics.contains(BTreeCharacteristics::COLUMNAR),
             has_autoincrement: characteristics.contains(BTreeCharacteristics::HAS_AUTOINCREMENT),
             unique_sets,
             foreign_keys,
@@ -4049,6 +4058,13 @@ impl BTreeTable {
                 sql.push_str(", WITHOUT ROWID");
             } else {
                 sql.push_str(" WITHOUT ROWID");
+            }
+        }
+        if self.columnar {
+            if self.is_strict || !self.has_rowid {
+                sql.push_str(", COLUMNAR");
+            } else {
+                sql.push_str(" COLUMNAR");
             }
         }
 
@@ -4864,6 +4880,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
     let mut check_constraints = vec![];
     let mut cols: Vec<Column> = vec![];
     let is_strict: bool;
+    let columnar: bool;
     let mut unique_sets_columns: Vec<UniqueSet> = vec![];
     let mut unique_sets_constraints: Vec<UniqueSet> = vec![];
     match body {
@@ -4874,6 +4891,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         } => {
             has_rowid = !options.contains_without_rowid();
             is_strict = options.contains_strict();
+            columnar = options.contains_columnar();
             let column_fk_count = columns
                 .iter()
                 .flat_map(|col| col.constraints.iter())
@@ -5399,6 +5417,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         has_autoincrement,
         columns: cols,
         is_strict,
+        columnar,
         foreign_keys,
         unique_sets: {
             // If there are any unique sets that have identical column names in the same order (even if they are PRIMARY KEY and UNIQUE and have different sort orders), remove the duplicates.
@@ -6138,6 +6157,7 @@ pub fn sqlite_schema_table() -> Result<BTreeTable> {
         name: "sqlite_schema".to_string(),
         has_rowid: true,
         is_strict: false,
+                columnar: false,
         has_autoincrement: false,
         primary_key_columns: try_vec![]?,
         columns,
@@ -7384,6 +7404,7 @@ mod tests {
             name: "t1".to_string(),
             has_rowid: true,
             is_strict: false,
+                columnar: false,
             has_autoincrement: false,
             primary_key_columns: vec![("nonexistent".to_string(), SortOrder::Asc)],
             columns,
