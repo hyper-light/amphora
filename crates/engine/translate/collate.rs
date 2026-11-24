@@ -5,7 +5,7 @@ use std::{
     str::FromStr as _,
 };
 
-use amphora_engine_parser::ast::Expr;
+use amphora_engine_parser::ast::{Expr, TriggerColumn, Variable};
 use icu_collator::{options::CollatorOptions, Collator, CollatorBorrowed};
 use icu_locale::Locale;
 
@@ -511,6 +511,39 @@ pub fn resolve_comparison_collseq_with_symbols(
         .unwrap_or(CollationSeq::Binary))
 }
 
+/// The collation of the column a trigger's `new.c` or `old.c` names: the one it declares, or BINARY.
+/// The rowid has none.
+pub(crate) fn trigger_column_collseq(column: &TriggerColumn) -> Result<Option<CollationSeq>> {
+    Ok(match column {
+        TriggerColumn::Declared { .. } => {
+            Some(declared_trigger_collseq(column)?.unwrap_or(CollationSeq::Binary))
+        }
+        TriggerColumn::Rowid => None,
+    })
+}
+
+/// [trigger_column_collseq], but `None` where the column declares no collation.
+fn declared_trigger_collseq(column: &TriggerColumn) -> Result<Option<CollationSeq>> {
+    match column {
+        TriggerColumn::Declared { collation } => {
+            collation.as_deref().map(CollationSeq::new).transpose()
+        }
+        TriggerColumn::Rowid => Ok(None),
+    }
+}
+
+/// What `expr` keeps of a trigger row's column, when it is `new.c` or `old.c`.
+fn trigger_column(expr: &Expr) -> Option<&TriggerColumn> {
+    match expr {
+        Expr::TriggerRegister(_, column)
+        | Expr::Variable(Variable {
+            trigger_column: Some(column),
+            ..
+        }) => Some(column),
+        _ => None,
+    }
+}
+
 /// The collation a comparison operand contributes when it is a column.
 ///
 /// A column name behind any number of unary "+" operators, CAST operators, or
@@ -560,7 +593,9 @@ fn comparison_operand_column_collseq(
                 });
                 return Ok(Some(alias_collation.unwrap_or(CollationSeq::Binary)));
             }
-            _ => return Ok(None),
+            _ => {
+                return trigger_column(expr).map_or(Ok(None), trigger_column_collseq);
+            }
         }
     }
 }
@@ -671,7 +706,9 @@ fn operand_column_collseq(
                     .get_rowid_alias_column()
                     .and_then(|(_, column)| column.collation_opt()));
             }
-            _ => return Ok(None),
+            _ => {
+                return trigger_column(expr).map_or(Ok(None), declared_trigger_collseq);
+            }
         }
     }
 }

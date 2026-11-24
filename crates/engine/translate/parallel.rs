@@ -508,6 +508,7 @@ fn body_reads_numeric(exprs: &[&Expr], places: &[BodyTable], numeric: bool) -> O
                 | Expr::Exists(..)
                 | Expr::InSelect { .. }
                 | Expr::Subquery(..)
+                | Expr::TriggerRegister(..)
                 | Expr::Register(..) => fine = false,
                 _ => {}
             }
@@ -785,6 +786,7 @@ fn having_terms(plan: &SelectPlan, first: usize) -> Option<Vec<Expr>> {
                     | Expr::Exists(..)
                     | Expr::InSelect { .. }
                     | Expr::Subquery(..)
+                    | Expr::TriggerRegister(..)
                     | Expr::Register(..) => fine = false,
                     _ => {}
                 }

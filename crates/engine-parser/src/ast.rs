@@ -447,6 +447,9 @@ pub enum Expr {
     /// Register reference for DBSP expression compilation
     /// This is not part of SQL syntax but used internally for incremental computation
     Register(usize),
+    /// A trigger's `new.c` or `old.c` in its WHEN clause, in the register that holds it. Not part of
+    /// SQL syntax.
+    TriggerRegister(usize, TriggerColumn),
     /// `CASE` expression
     Case {
         /// operand
@@ -638,6 +641,16 @@ impl Default for Expr {
     }
 }
 
+/// What a trigger's `new.c` or `old.c` keeps of the column it names (SQLite's TK_TRIGGER).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum TriggerColumn {
+    /// A column: the name of the collation it declares, if it declares one. It has no affinity.
+    Declared { collation: Option<Box<str>> },
+    /// The rowid: INTEGER affinity, and no collation.
+    Rowid,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Variable {
@@ -645,6 +658,9 @@ pub struct Variable {
     pub name: Option<Box<str>>,
     /// Type of the source column, if known (e.g. from trigger NEW/OLD rewrite).
     pub col_type: Option<Box<str>>,
+    /// What it keeps of the column it stands for, when it is a trigger's `new.c` or `old.c`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub trigger_column: Option<TriggerColumn>,
     /// True for an explicit `?N` marker. Numbered markers carry no allocated
     /// name; their "?N" spelling is derived from the index on demand.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -657,6 +673,7 @@ impl Variable {
             index,
             name: None,
             col_type: None,
+            trigger_column: None,
             numbered: false,
         }
     }
@@ -667,19 +684,22 @@ impl Variable {
             index,
             name: None,
             col_type: None,
+            trigger_column: None,
             numbered: true,
         }
     }
 
-    pub fn indexed_typed(index: NonZeroU32, col_type: &str) -> Self {
+    /// A trigger's `new.c` or `old.c`, bound as a parameter of the trigger's program.
+    pub fn of_trigger(
+        index: NonZeroU32,
+        col_type: Option<&str>,
+        trigger_column: TriggerColumn,
+    ) -> Self {
         Self {
             index,
             name: None,
-            col_type: if col_type.is_empty() {
-                None
-            } else {
-                Some(col_type.into())
-            },
+            col_type: col_type.filter(|ty| !ty.is_empty()).map(Into::into),
+            trigger_column: Some(trigger_column),
             numbered: false,
         }
     }
@@ -689,6 +709,7 @@ impl Variable {
             index,
             name: Some(name.into()),
             col_type: None,
+            trigger_column: None,
             numbered: false,
         }
     }

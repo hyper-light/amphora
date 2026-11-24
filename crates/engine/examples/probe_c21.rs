@@ -49,7 +49,11 @@ fn answer(io: &MemoryIO, conn: &Arc<Connection>, sql: &str) -> Result<String, St
     if !ordered {
         lines.sort();
     }
-    let sep = if sql.starts_with("EXPLAIN") { "\n" } else { ";" };
+    let sep = if sql.starts_with("EXPLAIN") {
+        "\n"
+    } else {
+        ";"
+    };
     Ok(format!("{}:{}", lines.len(), lines.join(sep)))
 }
 
@@ -64,7 +68,11 @@ fn run() {
             ["db", name] => dbs.push((name.to_string(), Vec::new(), Vec::new())),
             ["sql", sql] => dbs.last_mut().unwrap().1.push(sql.to_string()),
             ["q", sql] => dbs.last_mut().unwrap().2.push((sql.to_string(), None)),
-            ["q", sql, want] => dbs.last_mut().unwrap().2.push((sql.to_string(), Some(want.to_string()))),
+            ["q", sql, want] => dbs
+                .last_mut()
+                .unwrap()
+                .2
+                .push((sql.to_string(), Some(want.to_string()))),
             _ => assert!(line.is_empty() || line.starts_with("#"), "{line}"),
         }
     }
@@ -131,10 +139,18 @@ fn run() {
         }
     }
     for (s, (label, ..)) in settings.iter().enumerate() {
-        println!("TOTAL\t{label}\t{} run, {} differ ({} errors, {} panics)", total[s].0, total[s].1, total[s].2, total[s].3);
+        println!(
+            "TOTAL\t{label}\t{} run, {} differ ({} errors, {} panics)",
+            total[s].0, total[s].1, total[s].2, total[s].3
+        );
     }
 }
 
 fn main() {
-    std::thread::Builder::new().stack_size(256 << 20).spawn(run).unwrap().join().unwrap();
+    std::thread::Builder::new()
+        .stack_size(256 << 20)
+        .spawn(run)
+        .unwrap()
+        .join()
+        .unwrap();
 }
