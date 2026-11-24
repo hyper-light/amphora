@@ -21966,7 +21966,7 @@ pub fn op_morsel_aggregate(
         };
         &bound
     } else {
-        &**data
+        data
     };
     // G11 step 5 (CS.5): on the versioned storage the pager holds no table's rows; the table's
     // column copy answers when the planner chooses it, else the serial loop reads the rows.
