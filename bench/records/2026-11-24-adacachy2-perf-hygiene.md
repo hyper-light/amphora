@@ -32,6 +32,8 @@ target dir `~/.cache/amphora-perf-target/hygiene`:
 | aad61ad1 | F2's head (03:59Z, 2 jobs) | 23 | 101 |
 | b02b2759 | this lane's fixes (04:10Z, 1 job; the bench crate re-checked, 8 s) | 0 | 0 |
 | f3700bad | b02b2759 merged with main 9ed5b097 (r251, 04:14Z, 2 jobs; `Checking amphora-engine`, `amphora`, `amphora-bench`, 45 s) | 0 | 0 |
+| b5632498 | merged with main 5bd0f46e (r292, 04:27Z, 4 jobs; `amphora` and `amphora-bench` re-checked); tests 49 of 49, per-test identical to 7de5344d | 0 | 0 |
+| 81b3cb3d | merged with main 0c13cf68 (r295, 04:30Z, 4 jobs; `amphora-engine`, `amphora`, `amphora-bench` re-checked); tests 49 of 49, identical. Pushed as main at 04:33Z | 0 | 0 |
 
 The 23, fixed in code (no `#[expect]` or `#[allow]` added):
 - collapsible_if (7): oracle/mod.rs (2), oracle/reduce.rs (2), oracle/synth.rs, planner/prepared.rs,
