@@ -44,7 +44,7 @@ impl PostgresDialect {
 
     fn allocate_oid(&self) -> crate::Result<u32> {
         self.next_oid
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |oid| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |oid| {
                 oid.checked_add(1)
             })
             .map_err(|_| {
@@ -108,7 +108,17 @@ fn definition_sql(
     };
     for column in columns {
         let (name, modifiers) = match &column.col_type {
-            Some(ast::Type { name, size }) => {
+            Some(ast::Type {
+                name,
+                size,
+                array_dimensions,
+            }) => {
+                if *array_dimensions > 0 {
+                    return Err(LimboError::SqlError(format!(
+                        "column \"{}\": array columns are not supported yet",
+                        column.col_name.as_str()
+                    )));
+                }
                 let modifiers = match size {
                     None => Vec::new(),
                     Some(ast::TypeSize::MaxSize(n)) => vec![type_modifier(n)?],
