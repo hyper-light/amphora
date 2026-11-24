@@ -238,13 +238,20 @@ fn begun(db: &Arc<Database>, path: PagePath) -> Arc<Connection> {
     reader
 }
 
-/// After the read `reader` was refused: it ends, and the row as it now is, 'new 40', is what it and
-/// any other read find.
+/// After the read `reader` was refused, which ended its transaction: the row as it now is is what
+/// it and any other read find.
 fn newer_after(db: &Arc<Database>, reader: &Arc<Connection>, newest: &str) {
-    reader.execute("ROLLBACK").unwrap();
+    assert!(
+        reader.get_auto_commit(),
+        "the refused read's transaction is open"
+    );
     assert_eq!(b(reader).unwrap(), newest, "the read asked again");
     for path in [PagePath::Today, PagePath::Plain] {
-        assert_eq!(b(&connect(db, path)).unwrap(), newest, "another read, {path:?}");
+        assert_eq!(
+            b(&connect(db, path)).unwrap(),
+            newest,
+            "another read, {path:?}"
+        );
     }
 }
 
@@ -313,7 +320,10 @@ fn d45_a_file_page_in_flight_as_its_read_ends_is_never_taken_in_nor_shared() {
                 });
                 let read = b(&reader);
                 let case = format!("{path:?}, shared {share}, {at:?}");
-                assert!(!within.armed(), "b's page was not read from the file: {case}");
+                assert!(
+                    !within.armed(),
+                    "b's page was not read from the file: {case}"
+                );
                 assert!(too_old(&read), "{case}: {read:?}");
                 newer_after(&db, &reader, "new");
             }

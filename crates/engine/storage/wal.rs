@@ -12391,7 +12391,10 @@ pub mod test {
                 "{path:?}: {answer:?}"
             );
             drop(read);
-            reader.execute("rollback").unwrap();
+            assert!(
+                reader.get_auto_commit(),
+                "the refused read's transaction is open: {path:?}"
+            );
             assert_eq!(count_rows(&reader, "t where v = 'new'"), 1, "{path:?}");
         }
     }

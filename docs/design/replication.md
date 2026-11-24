@@ -1852,8 +1852,9 @@ read:
   over, then its read mark and its counts are given back for it, so that nothing but the segment's copy holds its
   reset, and a pass is asked for at once. A read counting on the current segment alone is not ended. No timer, no
   grace, no fixed share: the event is the room, and what it ends is exactly the reads that hold what it needs. It ends
-  none while a pass that may free the segment is out, unless the room is gone already. The read finds it at its next step: a page it reads after (from the log or the file, checked
-  once the bytes have arrived, so none of another generation is used), the next statement of its transaction, or, for
+  none while a pass that may free the segment is out, unless the room is gone already. The read finds it at its next step: a page it looks up, or whose
+  bytes it still waits for (from the log, the file or the shared pages: taken in, and shared with other reads, wholly
+  before the read is ended or not at all, so none of another generation is; store.md, decision 45), the next statement of its transaction, or, for
   one that works in memory alone, its next 1,024 instructions (the deadline's check, `Db::deadline`). A page it read
   before is its snapshot's, and stays so. It is answered `Refusal::Serialization` ("snapshot too old: the database's
   log took back the segment it began on, for a write that needed the room"): the repository's typed retry, so no wire
