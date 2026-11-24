@@ -1702,6 +1702,44 @@ fn d45_a_shipper_opened_after_a_switch_carries_on_from_the_closed_segment() {
     );
 }
 
+/// AC-T1.12.3 (lane B25): a base begun before the log broke is refused its end, so the archive never
+/// counts as mended by a base no restore takes. Do: begin a base and copy it; commit past what a restart
+/// keeps with no round, start the log again unshipped, commit and ship; end the base; then end one
+/// begun since, commit and ship; restore every second from its end. Expect: the first is refused, a
+/// base needed still; after the second none is, and every second restores with its rows.
+#[test]
+fn a_base_begun_before_a_break_is_refused_its_end() {
+    let mut s = Source::new();
+    s.db.keep_log(20);
+    s.put(0..10, "a");
+    s.ship().unwrap();
+    let mut base = s.begin_base().unwrap();
+    s.copy_base(&mut base);
+    s.put(10..70, "b");
+    assert!(
+        s.db.restart_log().unwrap(),
+        "past what a restart keeps, it starts again unshipped"
+    );
+    s.put(70..75, "c");
+    s.ship().unwrap();
+    let ended = s.end_base(base);
+    assert!(
+        ended.is_err() && s.shipper.base_needed(),
+        "a base begun before the break: its end {ended:?}, a base needed after it: {}",
+        s.shipper.base_needed()
+    );
+    let _copied = s.db.checkpoint().unwrap();
+    let mut base = s.begin_base().unwrap();
+    s.copy_base(&mut base);
+    s.end_base(base).unwrap();
+    assert!(!s.shipper.base_needed());
+    let based = s.second();
+    s.put(75..80, "d");
+    s.now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    s.ship().unwrap();
+    s.restores_every_second_from(based);
+}
+
 /// A folder where a database was removed and its `-wal2` left: 20 rows, the log started again (the
 /// writer switched to `-wal2`), a second table made there and 200 rows more; ended, the database's
 /// file and its `-wal`, the ones SQLite names, removed. Its path, and what its log held.
