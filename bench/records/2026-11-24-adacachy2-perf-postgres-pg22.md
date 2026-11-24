@@ -75,11 +75,28 @@ T-PG.15.2: the ring found from each transaction in it. T-PG.15.3: over sockets, 
 other session's help. PG21's T-PG.14.2 is gone: it asserted that a ring is refused at the wait that closes it, which is
 not 19's.
 
-MUTATIONS
+## Red runs
+
+The two red runs of T-PG.15.1 are r1702 and r1713 below (grammar the steps then left out); the landed code's parts taken out one at
+a time, the clients' script and check-production on main as landed are this record's later commits.
 
 ## Runs
 
 All on adacachy2 (load 46 to 149), `sync: false`, the GitHub clone (`~/.cache/amphora-perf/postgres-remote`), CARGO_HOME of the lane's,
 CARGO_TARGET_DIR ~/.cache/amphora-perf-target/postgres, CARGO_INCREMENTAL=0, nice -n 10. Runs refused for room aren't listed.
 
-RUNS
+| Run | Tree | Command | Result |
+|---|---|---|---|
+| r1616, 09:47Z, cpus=4, load 34 | 07d95147 | `cargo test -p amphora --test postgres_protocol --test postgres_listener --test postgres_isolation --no-run` | exit 0: the build folder warm |
+| r1685, 10:01Z, cpus=2 | ce1d2247 | `cargo check -p amphora-engine -p amphora` | a name used twice (`versioned_cursor`) |
+| r1689, 10:02Z, cpus=2 | 002cc04c | the same | no error |
+| a foreground run, 10:04Z, cpus=2 | 63b69356 | the capture (exit 0; answers.txt the same bytes) | 1165 lines, md5 31960fa72bed749056237889d98cc543 (the first list) |
+| r1702, 10:05Z, cpus=4 | 63b69356 and that capture | `cargo test -p amphora --test postgres_isolation` | RED: T-PG.15.1 at its first statement (a `text` column has no ported grammar action); 2 passed, T-PG.14.1's 149 steps among them on the new path |
+| r1713, 10:06Z, cpus=3 | d445b237 | the capture; isolation and listener | RED: an UPDATE without WHERE has no ported action |
+| r1720, 10:07Z, cpus=3 | 22d11218 | the same | 3 and 9 passed |
+| r1747, 10:11Z, cpus=2 | 219e1767 | the capture (md5 5ecaeb38...); isolation, listener, protocol | 3, 9 and 13 passed |
+| r1763, 10:14Z, cpus=3 | f557cc58 | `cargo clippy -p amphora-pg-parser -p amphora-pg-analysis -p amphora-pg-catalog -p amphora-engine -p amphora --all-targets --locked -- -D warnings`; `bash scripts/check-production.sh` | clippy exit 0 (every crate `Checking`); check-production exit 1: `cast_possible_wrap` 675 over the ratchet's 674, one cast in explain.rs, taken out |
+| r1778, 10:17Z, cpus=4, load 149 | 176b1c6a | `cargo test -p amphora-engine --lib -- storage::versioned::version storage::versioned::switch storage::versioned::sql storage::versioned::cursor dialect::`; `cargo test -p amphora --lib postgres::` | 74 passed (3,191 filtered out); 4 passed |
+| r1783, 10:19Z, cpus=4, load 65 | fbdb04d9, main c0ec09f4 merged | the clippy command; isolation, listener, protocol; the engine command; check-production | clippy exit 0; 3, 9, 13 passed; 74 passed; check-production exit 0, 10616 as the ratchet holds |
+| r1800, 10:25Z, cpus=6, load 30 | 76a844ed, main 4b5c78b4 merged (lane C16's engine change) | fmt; `cargo clippy -p amphora -p amphora-engine --all-targets --locked -- -D warnings`; isolation, listener, protocol | fmt 0, clippy exit 0 (both `Checking`); 3, 9 and 13 passed |
+| r1809, 10:27Z, cpus=6, load 34 | 73271948, main 58cd91cd merged (lane C12's engine change) | the same | fmt 0, clippy exit 0 (both `Checking`); 3, 9 and 13 passed. The tree that landed |
