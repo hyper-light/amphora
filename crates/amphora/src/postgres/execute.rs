@@ -480,16 +480,16 @@ impl Executor {
             wire::notice_response(out, "WARNING", "25P01", text)?;
             return complete(out, "SET");
         }
-        if let Some(level) = level {
-            if level != self.level {
-                if self.queried {
-                    return Err(PgError::error(
-                        SqlState::new("25001"),
-                        "SET TRANSACTION ISOLATION LEVEL must be called before any query",
-                    ));
-                }
-                self.set_level(level);
+        if let Some(level) = level
+            && level != self.level
+        {
+            if self.queried {
+                return Err(PgError::error(
+                    SqlState::new("25001"),
+                    "SET TRANSACTION ISOLATION LEVEL must be called before any query",
+                ));
             }
+            self.set_level(level);
         }
         complete(out, "SET")
     }
