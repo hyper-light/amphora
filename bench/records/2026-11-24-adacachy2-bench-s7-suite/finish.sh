@@ -11,7 +11,7 @@ cd "$SRC" || exit 1
 if [ "${1:-}" = analyze ]; then
   git fetch -q origin perf/bench-s7b || exit 1
   REV=$(git rev-parse FETCH_HEAD)
-  for f in s7_tables.py phases_summary.py finish.sh; do git show $REV:$S/$f >"$L/scripts/$f" || exit 1; done
+  for f in s7_tables.py phases_summary.py verdict.py finish.sh; do git show $REV:$S/$f >"$L/scripts/$f" || exit 1; done
   echo "scripts at branch commit $REV"
   python3 -I "$L/scripts/phases_summary.py" "$O" >"$O/PHASES.md" 2>&1
   python3 -I "$L/scripts/s7_tables.py" "$O" "$SRC/bench/records/2026-11-23-adacachy2-suite-inproc/records.jsonl" >"$O/TABLES.md" 2>"$O/TABLES.err"
@@ -50,7 +50,7 @@ for p in sorted(glob.glob(os.path.join(src, "round[0-9]*.jsonl"))) + [os.path.jo
 PY
   cp "$L/bench-cargo-lock.diff" "$W/$S/" 2>/dev/null
   tail -5 "$L/build.log" >"$W/$S/build.log.tail"
-  (cd "$L/scripts" && cp rounds.sh smoke_summary.py s7_tables.py phases_summary.py finish.sh "$W/$S/")
+  (cd "$L/scripts" && cp rounds.sh smoke_summary.py s7_tables.py phases_summary.py verdict.py finish.sh "$W/$S/")
   git -C "$SRC" fetch -q origin perf/bench-s7b
   git -C "$SRC" show FETCH_HEAD:$S/record-head.md >"$W/$S/record-head.txt" 2>/dev/null || { echo "no record head at FETCH_HEAD"; exit 1; }
   git -C "$SRC" show FETCH_HEAD:$S/record-tail.md >"$W/$S/record-tail.txt" 2>/dev/null || { echo "no record tail at FETCH_HEAD"; exit 1; }
