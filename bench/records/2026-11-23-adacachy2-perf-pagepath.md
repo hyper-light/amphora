@@ -781,3 +781,75 @@ started (the kiln server timed out answering, then had no record of it).
   switch, so a closing segment exists only from recovery, and each process's own scan of that file is complete and the
   same: a closed segment is never appended to.
 - Test (b), "the current segment isn't copied while the closing one is unreset", belongs with this part.
+
+## perf-B16 (2026-11-23 23:59Z to 2026-11-24 00:55Z)
+
+**Losses first.** Unit 4 is built and merged; what it leaves, by the brief's scope:
+- The shared-memory backend holds a closing pass at every live reader's frame, whichever segment the frame is in: its
+  reader slots don't say which segment a read's mark is on. That is safe (the pass copies less), but a read begun after
+  the switch can hold the closing segment's copy back while reads overlap. Before unit 5 a closing segment comes only
+  from recovery, where no read began before a switch.
+- In the shared-memory backend a closing pass reads this process's own copy of the closing segment's backfill, so a
+  process that didn't make the copy copies it again: the same pages, since the current segment isn't copied before the
+  reset.
+- Reads still look a page up in their current segment only (unit 2 left the closing segment's lookup to the switch). A
+  page only the closing segment holds is read from the file, which lacks it until the closing segment's copy. The tests
+  read such a page only after the copy.
+- Under `synchronous=OFF` the pager publishes no backfill (it skips the file's sync and the publish), so a closing
+  segment is never reported copied and the current segment is never copied. Unchanged.
+- VACUUM's checkpoint (TRUNCATE, its lock held by the caller) answers Busy while a closing segment exists.
+- A PASSIVE checkpoint's upper bound, in the current segment's frame numbers, bounds a closing pass too. That is safe
+  (the pass can only copy less).
+- No A/B (the brief: none). A pass now asks for the segments twice (at its start and once its locks are held); in the
+  shared-memory backend each ask reclaims dead reader slots and sums every slot's reads.
+
+**Built** (perf/pagepath-d45 06d01018, 886dbb54, 5d2e6023, 0ca4af89; merged with origin/main as e4434c95 and 3c075124).
+1. *Segment choice.* A pass picks its segment once, in `CheckpointState::Start`: `Segments::to_copy` (log_segments.rs),
+   the closing segment while one exists, else the current one, from `WalCoordination::segments` (the log's
+   `Segments` in one process, `MappedSharedWalCoordination::segments` across processes). `OngoingCheckpoint` keeps it
+   (`segment`, `closing`). Every call of the pass takes that segment: its snapshot (`segment_snapshot`), read mark 0 in
+   the guard (`acquire_checkpoint_guard`, `CheckpointLocks` names its segment and a held guard is reused only on the
+   same one), the safe frame (`determine_max_safe_checkpoint_frame`), the frames to copy (`iter_segment_frames`), the
+   header (`segment_header`), the record reads (`holds_segment_record`, `issue_record_reads`, `begin_read_record` and
+   `page_frames` take the segment), the frame reads (`issue_wal_read_into_buffer`, the segment's file) and the WAL's
+   sync (the segment's file). A closing pass skips the page cache (`cache_get_for_checkpoint` keys a page by its frame
+   in the current segment, and frame numbers start again in each), the shared memory's frame-cache fill (no process
+   appends to a closing segment) and the durable backfill proof (the current segment's; a closing segment is copied
+   again whole after a crash). The shared-memory backend answers the closing segment from its fallback, this
+   process's scan of the file.
+2. *Reporting the copy.* After the database file's sync, the pager's `PublishBackfill` publishes the backfill on the
+   pass's segment (`publish_segment_backfill`). When it reaches the closing segment's last frame, it reports the copy
+   (`closing_copied`: `Segments::copied` in one process, `MappedSharedWalCoordination::copied` across processes). A
+   closing segment found already copied whole at a pass's start (or holding no frame) is reported there.
+3. *No early restart.* A RESTART or TRUNCATE whose pass copied the closing segment restarts and truncates nothing; it
+   publishes its backfill as a PASSIVE does, then answers Busy. Its caller asks again, and once the closing segment is
+   reset the next pass copies the current one and restarts the log (the shutdown checkpoint asks up to four times).
+4. *The pass's segment re-checked under its locks* (5d2e6023). Between a pass's choice and its locks, a read's end can
+   reset the closing segment and another pass copy the current one; a closing pass after that would write older pages
+   over newer ones in the file. With its locks held, a pass whose segment rule 1 no longer names answers Busy.
+
+**Tests** (wal.rs, a real database whose log opens in two segments: the recovery test's copy, with a second table
+whose page only the closing segment holds).
+- `d45_the_current_segment_is_not_copied_while_the_closing_one_is_unreset`: with a read held, a PASSIVE copies the
+  closing segment whole and reports it (closing, copied, one read); a second PASSIVE copies nothing and a TRUNCATE
+  answers Busy, the current segment's backfill still 0; the read's end resets the closing segment, and only then does
+  a PASSIVE copy the current segment. Every row is then read back.
+- `d45_a_query_read_counted_during_a_checkpoints_reset_never_reads_the_reset_segment`: a query's read begun after the
+  copy, while the reset waits on a held read, doesn't count on the closing segment (the held read's end resets it);
+  with the reset segment's file then cut to nothing, the query reads the table only that segment had, from the file.
+- `d45_a_checkpoint_copies_the_closing_segment_until_its_reset` (log_segments.rs): the segment a pass copies across a
+  switch, a copy and a reset.
+
+**Checks** (adacachy2, script `~/.cache/amphora-perf/pagepath-b16/check.sh`, B15's with its logs named b16; asks refused
+at cpus=4, 2 and 1 with 0 of 32 cores idle at 00:18Z, then taken at cpus=4 and at cpus=3 when room came, each run held to
+its ask by `JOBS`). Run r1790 on main 5cea6cde: `d45_` passed 15. Run r1825 on 06d01018 (load 64-101): `cargo check -p
+amphora-engine --lib --tests` exit 0; `d45_` passed 18 (the 15 and the 3 above). Run r1846 on 5d2e6023 (origin/main
+c6f915b1 merged; load 56-88): the workspace clippy exit 0 in 39 s; `d45_` passed 18; `storage:: vdbe::vacuum
+--test-threads=4` passed 730, failed 2 and ignored 14 in 274 s, the two main's own (`cb4_a_read_only_transaction_reads_the_copy_at_its_snapshot`,
+`cb4_ab_both_rebuy_policies_at_the_extremes`); 730 is B15's 724, lane R5's 2 and lane Q2's 1 (counted in the diffs, not run
+on main this hour) and the 3 above; `cargo test -p amphora --locked --test store` passed 15; `scripts/check-production.sh`
+exit 1: `clippy::disallowed_methods` 42 against 40 (this unit's two `then_some`), and 2 fewer `indexing_slicing`, 2 fewer
+`cast_possible_truncation` and 1 fewer `disallowed_macros` than the ratchet held, all fixed in 0ca4af89. Run r1899 on
+3c075124 (0ca4af89 with origin/main 2f29b288 merged, which moved only `crates/pg-parser`; load 95-139, at cpus=3):
+check-production exit 0 ("10903 left in the engine's production code across 17 lints, as the ratchet holds"); the
+workspace clippy exit 0 in 62 s; `d45_` passed 18.
