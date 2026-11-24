@@ -142,12 +142,23 @@ fn lab_keeping(
     flush: impl FnOnce(&Db) -> Option<Flush>,
     pages: Option<i64>,
 ) -> Lab {
+    lab_set(config, flush, |db| {
+        if let Some(pages) = pages {
+            db.keep_pages(pages).unwrap();
+        }
+    })
+}
+
+/// A lab whose writer is as `set` makes it.
+fn lab_set(
+    config: Config,
+    flush: impl FnOnce(&Db) -> Option<Flush>,
+    set: impl FnOnce(&mut Db),
+) -> Lab {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("events.db");
-    let db = Db::open(&path).unwrap();
-    if let Some(pages) = pages {
-        db.keep_pages(pages).unwrap();
-    }
+    let mut db = Db::open(&path).unwrap();
+    set(&mut db);
     // A row of negative seq can't be written: a batch that holds one fails.
     db.exec("CREATE TABLE events (key TEXT, seq INTEGER CHECK (seq >= 0), text TEXT); CREATE INDEX by_key ON events (key, seq)")
         .unwrap();
@@ -234,6 +245,103 @@ fn d45_a_reader_that_never_finishes_holds_up_no_restart_and_no_commit() {
     assert_eq!(rows_in(&slow), 10, "the open read keeps its snapshot");
     slow.exec("COMMIT").unwrap();
     assert_eq!(rows_in(&slow), 60);
+}
+
+/// Decision 45 (Ada, 2026-11-24: one slow read never holds up a write; lane B27). Do: on a store
+/// whose log's bound is 64 frames, its room 512 a segment, hold a read in a transaction of its own
+/// and put rows until the log has filled its room with that read on the segment it closed; then let
+/// the read go on to pages it had not read. The same with a room the rows never fill. Expect: every
+/// row durable and read back at once throughout, and each of the log's two files within its room and
+/// one turn's frames; the slow read answered that its snapshot is too old, and answered whole when
+/// asked again; with room to spare, the slow read answered from its own snapshot.
+#[test]
+fn d45_a_slow_read_gives_way_when_the_logs_room_is_full() {
+    use amphora_engine::{CompletionError, LimboError};
+    for (room, ended) in [(512u64, true), (1 << 20, false)] {
+        let lab = lab_set(
+            Config {
+                log_frames: 64,
+                checkpoint_every: Duration::from_millis(1),
+                ..Config::default()
+            },
+            |_| None,
+            |db| db.keep_log(room),
+        );
+        for batch in 0..20 {
+            let rows = (0..100).map(|n| row("slow", batch * 100 + n)).collect();
+            lab.store.put(rows).unwrap();
+        }
+        lab.store.sync(soon()).unwrap();
+        let (begun, is_begun) = std::sync::mpsc::channel::<()>();
+        let (go_on, goes_on) = std::sync::mpsc::channel::<()>();
+        let store = lab.store.clone();
+        let slow = std::thread::spawn(move || {
+            store.read(
+                Some("slow"),
+                Instant::now() + Duration::from_secs(120),
+                move |r| {
+                    r.exec("BEGIN")?;
+                    r.query("SELECT seq FROM events WHERE rowid = 1", [], |_| Ok(true))?;
+                    begun.send(())?;
+                    goes_on.recv_timeout(Duration::from_secs(100))?;
+                    let mut text = 0;
+                    let read = r.query("SELECT sum(length(text)) FROM events", [], |r| {
+                        text = r.get::<i64>(0).map_err(|e| anyhow::anyhow!("{e}"))?;
+                        Ok(true)
+                    });
+                    r.exec(if read.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
+                    Ok(read.map(|_| text))
+                },
+                |_| Err(anyhow::anyhow!("the writer read")),
+            )
+        });
+        is_begun.recv_timeout(Duration::from_secs(30)).unwrap();
+        let files = ["-wal", "-wal2"].map(|suffix| {
+            let mut p = lab.path.clone().into_os_string();
+            p.push(suffix);
+            std::path::PathBuf::from(p)
+        });
+        let mut most = 0;
+        for seq in 0..1500 {
+            lab.store.put(vec![row("fast", seq)]).unwrap();
+            if seq % 3 == 0 {
+                lab.store.sync(soon()).unwrap();
+            }
+            if seq % 30 == 0 {
+                assert_eq!(count(&lab.store, "fast"), seq + 1);
+                for file in &files {
+                    most = most.max(std::fs::metadata(file).map_or(0, |m| m.len()));
+                }
+            }
+        }
+        lab.store.sync(soon()).unwrap();
+        assert_eq!(count(&lab.store, "fast"), 1500);
+        go_on.send(()).unwrap();
+        let read = slow.join().unwrap().unwrap();
+        if ended {
+            let error = read.expect_err("the slow read kept the log past its room");
+            assert!(
+                error.chain().any(|cause| matches!(
+                    cause.downcast_ref::<LimboError>(),
+                    Some(
+                        LimboError::SnapshotTooOld
+                            | LimboError::CompletionError(CompletionError::SnapshotTooOld)
+                    )
+                )),
+                "{error:#}"
+            );
+            assert!(
+                most <= 32 + (room + 64) * (24 + 4096),
+                "a file of the log grew to {most} bytes"
+            );
+        } else {
+            let own: i64 = (0..2000)
+                .map(|n| i64::try_from(format!("event {n} of slow").len()).unwrap())
+                .sum();
+            assert_eq!(read.unwrap(), own, "the slow read's own snapshot");
+        }
+        assert_eq!(count(&lab.store, "slow"), 2000);
+    }
 }
 
 #[test]
