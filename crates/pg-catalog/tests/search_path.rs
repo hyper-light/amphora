@@ -23,24 +23,36 @@ const INT4: u32 = 23;
 const ANYRANGE: u32 = 3831;
 const ANYMULTIRANGE: u32 = 4537;
 
+/// A user function, as CREATE FUNCTION's defaults make it.
+const USER_PROC: Proc = Proc {
+    oid: 0,
+    name: "lower",
+    namespace: PUBLIC,
+    kind: b'f',
+    strict: false,
+    retset: false,
+    volatile: b'v',
+    variadic: 0,
+    defaults: 0,
+    result: TEXT,
+    args: &[TEXT],
+    src: "",
+};
+
 static USER_PROCS: &[Proc] = &[
     Proc {
         oid: 16394,
-        name: "lower",
-        namespace: PUBLIC,
-        args: &[TEXT],
+        ..USER_PROC
     },
     Proc {
         oid: 16395,
-        name: "lower",
         namespace: TEMP,
-        args: &[TEXT],
+        ..USER_PROC
     },
     Proc {
         oid: 16396,
-        name: "lower",
-        namespace: PUBLIC,
         args: &[INT4],
+        ..USER_PROC
     },
 ];
 

@@ -1,0 +1,441 @@
+UTC|SELECT 1|| -> int4 = 1
+UTC|SELECT 2147483647|| -> int4 = 2147483647
+UTC|SELECT 2147483648|| -> int8 = 2147483648
+UTC|SELECT 9223372036854775807|| -> int8 = 9223372036854775807
+UTC|SELECT 9223372036854775808|| -> numeric = 9223372036854775808
+UTC|SELECT -2147483648|| -> int4 = -2147483648
+UTC|SELECT -9223372036854775808|| -> int8 = -9223372036854775808
+UTC|SELECT 1.5|| -> numeric = 1.5
+UTC|SELECT 'abc'|| -> text = abc
+UTC|SELECT true|| -> bool = t
+UTC|SELECT 2147483647 + 1|| -> int4 = 22003
+UTC|SELECT 2147483647 + 2147483648|| -> int8 = 4294967295
+UTC|SELECT 9223372036854775807 + 1|| -> int8 = 22003
+UTC|SELECT -9223372036854775808 - 1|| -> int8 = 22003
+UTC|SELECT 1 / 0|| -> int4 = 22012
+UTC|SELECT 1 / 0::int8|| -> int8 = 22012
+UTC|SELECT 7 / 2|| -> int4 = 3
+UTC|SELECT -7 / 2|| -> int4 = -3
+UTC|SELECT (-2147483648) / (-1)|| -> int4 = 22003
+UTC|SELECT (-9223372036854775808) / (-1)|| -> int8 = 22003
+UTC|SELECT - (-2147483648)|| -> int8 = 2147483648
+UTC|SELECT 1 + '2'|| -> int4 = 3
+UTC|SELECT 1 + ' 2 '|| -> int4 = 3
+UTC|SELECT 1 + '0x1F'|| -> int4 = 32
+UTC|SELECT 1 + '1_000'|| -> int4 = 1001
+UTC|SELECT 1 + '1__0'||22P02
+UTC|SELECT 1 + '_1'||22P02
+UTC|SELECT 1 + ''||22P02
+UTC|SELECT 1 + '-'||22P02
+UTC|SELECT 1 + 'x'||22P02
+UTC|SELECT 1 + '3000000000'||22003
+UTC|SELECT 1::int8 + '3000000000'|| -> int8 = 3000000001
+UTC|SELECT 1::int8 + '9223372036854775808'||22003
+UTC|SELECT 'a' + 'b'||42725
+UTC|SELECT 1 + true||42883
+UTC|SELECT 'a' = 'b'|| -> bool = f
+UTC|SELECT 1 = 1::int8|| -> bool = t
+UTC|SELECT 1 = 'x'||22P02
+UTC|SELECT 1 = 'x'::"text"||42883
+UTC|SELECT 1 = 1 AND 'a' = 'b'|| -> bool = f
+UTC|SELECT 1 = 2 AND 1 / 0 = 1|| -> bool = f
+UTC|SELECT 1 AND true||42804
+UTC|SELECT 1 IS NOT NULL|| -> bool = t
+UTC|SELECT 'ab'::char(5)|| -> bpchar:9 = ab   
+UTC|SELECT 'abcdefgh'::char(3)|| -> bpchar:7 = abc
+UTC|SELECT 'ab'::char(5) = 'ab'|| -> bool = t
+UTC|SELECT 'ab'::char(5) = 'ab   '::"text"|| -> bool = f
+UTC|SELECT 'ab'::char(5)::"text"|| -> text = ab
+UTC|SELECT 'ab'::char(5)::char(3)|| -> bpchar:7 = ab 
+UTC|SELECT 'ab'::bpchar|| -> bpchar = ab
+UTC|SELECT 5::char(3)|| -> bpchar:7 = 5  
+UTC|SELECT 12345::char(3)|| -> bpchar:7 = 123
+UTC|SELECT 'x'::"char"|| -> char = x
+UTC|SELECT 'xyz'::"char"|| -> char = x
+UTC|SELECT ''::"char"|| -> char = 
+UTC|SELECT '\101'::"char"|| -> char = A
+UTC|SELECT '\377'::"char"|| -> char = \377
+UTC|SELECT '\377'::"char"::int4|| -> int4 = -1
+UTC|SELECT 65::"char"|| -> char = A
+UTC|SELECT 200::"char"|| -> char = 22003
+UTC|SELECT -200::"char"||42883
+UTC|SELECT 'a'::"char"::int4|| -> int4 = 97
+UTC|SELECT 'a'::"char"::"text"|| -> text = a
+UTC|SELECT 'a'::"char"::char(3)|| -> bpchar:7 = a  
+UTC|SELECT 'a'::"char" = 'a'|| -> bool = t
+UTC|SELECT 'ab'::"text"::"char"|| -> char = a
+UTC|SELECT 1::"text"|| -> text = 1
+UTC|SELECT 1::int8::"text"|| -> text = 1
+UTC|SELECT 1::int8|| -> int8 = 1
+UTC|SELECT 3000000000::int4|| -> int4 = 22003
+UTC|SELECT '123'::"text"::int4|| -> int4 = 123
+UTC|SELECT 'abc'::"text"::int4|| -> int4 = 22P02
+UTC|SELECT '12'::char(5)::int8|| -> int8 = 12
+UTC|SELECT true::int4|| -> int4 = 1
+UTC|SELECT 1::bool|| -> bool = t
+UTC|SELECT 't'::bool|| -> bool = t
+UTC|SELECT 'of'::bool|| -> bool = f
+UTC|SELECT 'o'::bool||22P02
+UTC|SELECT 1::timestamp||42846
+UTC|SELECT '2026-11-23 10:11:12'::timestamp|| -> timestamp = 2026-11-23 10:11:12
+UTC|SELECT '2026-11-23 10:11:12.345678'::timestamp|| -> timestamp = 2026-11-23 10:11:12.345678
+UTC|SELECT '2026-11-23 10:11:12.3'::timestamp|| -> timestamp = 2026-11-23 10:11:12.3
+UTC|SELECT '2026-11-23T10:11:12'::timestamp|| -> timestamp = 2026-11-23 10:11:12
+UTC|SELECT '2026-11-23 10:11'::timestamp|| -> timestamp = 2026-11-23 10:11:00
+UTC|SELECT '2026-11-23'::timestamp|| -> timestamp = 2026-11-23 00:00:00
+UTC|SELECT '2026-1-2 3:04:05'::timestamp|| -> timestamp = 2026-01-02 03:04:05
+UTC|SELECT '2026-11-23 10:11:12+05'::timestamp|| -> timestamp = 2026-11-23 10:11:12
+UTC|SELECT '2024-02-29'::timestamp|| -> timestamp = 2024-02-29 00:00:00
+UTC|SELECT '2026-02-29'::timestamp||22008
+UTC|SELECT '2026-02-30'::timestamp||22008
+UTC|SELECT '2026-13-01'::timestamp||22008
+UTC|SELECT '2026-00-01'::timestamp||22008
+UTC|SELECT '2026-01-00'::timestamp||22008
+UTC|SELECT '2026-01-32'::timestamp||22008
+UTC|SELECT '2026-11-23 24:00:00'::timestamp|| -> timestamp = 2026-11-24 00:00:00
+UTC|SELECT '2026-11-23 24:00:01'::timestamp||22008
+UTC|SELECT '2026-11-23 25:00:00'::timestamp||22008
+UTC|SELECT '2026-11-23 10:60:00'::timestamp||22008
+UTC|SELECT '2026-11-23 10:11:60'::timestamp|| -> timestamp = 2026-11-23 10:12:00
+UTC|SELECT '2026-11-23 10:11:61'::timestamp||22008
+UTC|SELECT 'infinity'::timestamp|| -> timestamp = infinity
+UTC|SELECT '-infinity'::timestamp|| -> timestamp = -infinity
+UTC|SELECT 'epoch'::timestamp|| -> timestamp = 1970-01-01 00:00:00
+UTC|SELECT '0001-01-01'::timestamp|| -> timestamp = 0001-01-01 00:00:00
+UTC|SELECT '0000-01-01'::timestamp||22008
+UTC|SELECT '294276-12-31 23:59:59.999999'::timestamp|| -> timestamp = 294276-12-31 23:59:59.999999
+UTC|SELECT '294277-01-01'::timestamp||22008
+UTC|SELECT '2026-11-23 10:11:12Z'::timestamptz|| -> timestamptz = 2026-11-23 10:11:12+00
+UTC|SELECT '2026-11-23T10:11:12Z'::timestamptz|| -> timestamptz = 2026-11-23 10:11:12+00
+UTC|SELECT '2026-11-23 10:11:12+05:30'::timestamptz|| -> timestamptz = 2026-11-23 04:41:12+00
+UTC|SELECT '2026-11-23 10:11:12 -08'::timestamptz|| -> timestamptz = 2026-11-23 18:11:12+00
+UTC|SELECT '2026-11-23 10:11:12-08:15:30'::timestamptz|| -> timestamptz = 2026-11-23 18:26:42+00
+UTC|SELECT '2026-11-23 10:11:12+16'::timestamptz||22009
+UTC|SELECT '2026-11-23 10:11:12+10:60'::timestamptz||22009
+UTC|SELECT '2026-11-23'::timestamptz|| -> timestamptz = 2026-11-23 00:00:00+00
+UTC|SELECT '-infinity'::timestamptz|| -> timestamptz = -infinity
+UTC|SELECT '2026-11-23 10:11:12'::timestamp = '2026-11-23 10:11:12+00'::timestamptz|| -> bool = t
+UTC|SELECT '2026-11-23 10:11:12'::timestamp::"text"|| -> text = 2026-11-23 10:11:12
+UTC|SELECT '2026-11-23 10:11:12'::"text"::timestamp|| -> timestamp = 2026-11-23 10:11:12
+UTC|SELECT 'pg_class'::regclass|| -> regclass = pg_class
+UTC|SELECT 'pg_catalog.pg_class'::regclass|| -> regclass = pg_class
+UTC|SELECT 'no_such'::regclass||42P01
+UTC|SELECT 'no_schema.x'::regclass||42P01
+UTC|SELECT 'public.pg_class'::regclass||42P01
+UTC|SELECT 'pgbench_accounts'::regclass|| -> regclass = pgbench_accounts
+UTC|SELECT 'public.pgbench_accounts'::regclass|| -> regclass = pgbench_accounts
+UTC|SELECT '"PGBENCH_ACCOUNTS"'::regclass||42P01
+UTC|SELECT 'PGBENCH_ACCOUNTS'::regclass|| -> regclass = pgbench_accounts
+UTC|SELECT ' Public . PgBench_Accounts '::regclass|| -> regclass = pgbench_accounts
+UTC|SELECT 'a b'::regclass||42602
+UTC|SELECT 'a.'::regclass||42602
+UTC|SELECT '"a'::regclass||42602
+UTC|SELECT '""'::regclass||42P01
+UTC|SELECT ''::regclass||42602
+UTC|SELECT '-'::regclass|| -> regclass = -
+UTC|SELECT '1259'::regclass|| -> regclass = pg_class
+UTC|SELECT '99999999999'::regclass||22003
+UTC|SELECT 1259::regclass|| -> regclass = pg_class
+UTC|SELECT 999999::regclass|| -> regclass = 999999
+UTC|SELECT 'pg_class'::regclass = 1259|| -> bool = t
+UTC|SELECT 'pg_class'::regclass::int4|| -> int4 = 1259
+UTC|SELECT 'pg_class'::regclass::int8|| -> int8 = 1259
+UTC|SELECT 'pg_class'::regclass::"text"|| -> text = pg_class
+UTC|SELECT 'pg_class'::"text"::regclass|| -> regclass = pg_class
+UTC|SELECT 'a.b.c.d'::regclass||42601
+UTC|SELECT $1||text -> text
+UTC|SELECT $1::pg_catalog.regclass|pgbench_accounts|regclass -> regclass = pgbench_accounts
+UTC|SELECT $1::pg_catalog.regclass|public.pgbench_history|regclass -> regclass = pgbench_history
+UTC|SELECT $1::pg_catalog.regclass|pg_class|regclass -> regclass = pg_class
+UTC|SELECT $1::pg_catalog.regclass|no_such|regclass -> regclass = 42P01
+UTC|SELECT relkind FROM pg_catalog.pg_class WHERE oid=$1::pg_catalog.regclass||regclass -> char
+UTC|SELECT $1 + 1|41|int4 -> int4 = 42
+UTC|SELECT 1 + $1|2147483647|int4 -> int4 = 22003
+UTC|SELECT $1 + 1::int8||int8 -> int8
+UTC|SELECT $1 = 'a'||text -> bool
+UTC|SELECT $1 + $2||42725
+UTC|SELECT $2||42P18
+UTC|SELECT $1 IS NOT NULL||42P18
+UTC|SELECT $1, $1 + 1||42P08
+UTC|SELECT $1 + 1, $1||int4 -> int4,int4
+UTC|SELECT $1::int4, $1::"text"||int4 -> int4,text
+UTC|SELECT $1::timestamp = $2::timestamptz||timestamp,timestamptz -> bool
+UTC|SELECT nosuch||42703
+UTC|SELECT nosuch FROM t||42703
+UTC|SELECT t.nosuch FROM t||42703
+UTC|SELECT t.i4 FROM t|| -> int4
+UTC|SELECT x.i4 FROM t||42P01
+UTC|SELECT x.i4 FROM t AS x|| -> int4
+UTC|SELECT t.i4 FROM t AS x||42P01
+UTC|SELECT i4 FROM nosuch||42P01
+UTC|SELECT i4 FROM nosuch.t||42P01
+UTC|SELECT i4 FROM public.t|| -> int4
+UTC|SELECT i4, i8, tx, bp, ch, ts, tz, rc FROM t|| -> int4,int8,text,bpchar:9,char,timestamp,timestamptz,regclass
+UTC|SELECT i4 + i8 FROM t|| -> int8
+UTC|SELECT i8 + i4 FROM t|| -> int8
+UTC|SELECT i4 / i4 FROM t|| -> int4
+UTC|SELECT i8 / 2 FROM t|| -> int8
+UTC|SELECT i4 + tx FROM t||42883
+UTC|SELECT -i4 FROM t|| -> int4
+UTC|SELECT -i8 FROM t|| -> int8
+UTC|SELECT -tx FROM t||42883
+UTC|SELECT tx = bp FROM t|| -> bool
+UTC|SELECT bp::"text" FROM t|| -> text
+UTC|SELECT bp::char(3) FROM t|| -> bpchar:7
+UTC|SELECT ch::"text" FROM t|| -> text
+UTC|SELECT ts::timestamptz, tz::timestamp FROM t|| -> timestamptz,timestamp
+UTC|SELECT i4 FROM t WHERE i4||42804
+UTC|SELECT i4 FROM t WHERE ts = tz|| -> int4
+UTC|SELECT i4 FROM t WHERE tz = ts|| -> int4
+UTC|SELECT i4 FROM t WHERE ts = '2026-11-23'|| -> int4
+UTC|SELECT i4 FROM t WHERE ts = 1||42883
+UTC|SELECT i4 FROM t WHERE ch = 'a'|| -> int4
+UTC|SELECT i4 FROM t WHERE rc = 1259|| -> int4
+UTC|SELECT i4 FROM t WHERE rc = 'pg_class'||22P02
+UTC|SELECT i4 FROM t WHERE rc = tx||42883
+UTC|SELECT i4 FROM t WHERE i4 = 'x'||22P02
+UTC|SELECT i4 FROM t WHERE i4 = tx||42883
+UTC|SELECT i4 FROM t WHERE i8 = i4 AND tx = 'a'|| -> int4
+UTC|SELECT i4 FROM t WHERE i4 IS NOT NULL|| -> int4
+UTC|SELECT nosuch(1)||42883
+UTC|SELECT int8(1)|| -> int8 = 1
+UTC|SELECT int4(1::int8)|| -> int4 = 1
+UTC|SELECT int4('12')|| -> int4 = 12
+UTC|SELECT "text"('ab'::char(5))|| -> text = ab
+UTC|SELECT bool(1)|| -> bool = t
+UTC|SELECT pg_catalog.int8(1)|| -> int8 = 1
+UTC|SELECT nosuch.int8(1)||3F000
+UTC|SELECT int4(true, 1)||42883
+UTC|SELECT int4eq(1, 2)|| -> bool = f
+UTC|SELECT int4eq(1, '2')|| -> bool = f
+UTC|SELECT int4eq(1, true)||42883
+UTC|SELECT int4pl(2147483647, 1)|| -> int4 = 22003
+UTC|SELECT 1::nosuch||42704
+UTC|SELECT 1::nosuch.int4||3F000
+UTC|SELECT 1::pg_catalog.int8|| -> int8 = 1
+UTC|SELECT CURRENT_TIMESTAMP|| -> timestamptz
+UTC|SELECT CURRENT_TIMESTAMP::timestamp|| -> timestamp
+UTC|INSERT INTO t(i4) VALUES (1)|| ->  = 1
+UTC|INSERT INTO t(i4) VALUES ('12')|| ->  = 12
+UTC|INSERT INTO t(i4) VALUES ('abc')||22P02
+UTC|INSERT INTO t(i4) VALUES ('abc'::"text")||42804
+UTC|INSERT INTO t(i4) VALUES (3000000000)|| ->  = 22003
+UTC|INSERT INTO t(i4) VALUES (true)||42804
+UTC|INSERT INTO t(i8) VALUES (1)|| ->  = 1
+UTC|INSERT INTO t(tx) VALUES (5)|| ->  = 5
+UTC|INSERT INTO t(tx) VALUES ('a'::"char")|| ->  = a
+UTC|INSERT INTO t(bp) VALUES ('ab')|| ->  = ab   
+UTC|INSERT INTO t(bp) VALUES ('toolongvalue')|| ->  = 22001
+UTC|INSERT INTO t(bp) VALUES ('abc    ')|| ->  = abc  
+UTC|INSERT INTO t(bp) VALUES (123456)|| ->  = 22001
+UTC|INSERT INTO t(ch) VALUES ('xyz')|| ->  = x
+UTC|INSERT INTO t(ch) VALUES ('xyz'::"text")|| ->  = x
+UTC|INSERT INTO t(ch) VALUES (65)||42804
+UTC|INSERT INTO t(ts) VALUES ('2026-07-01 12:00:00')|| ->  = 2026-07-01 12:00:00
+UTC|INSERT INTO t(ts) VALUES (1)||42804
+UTC|INSERT INTO t(rc) VALUES ('pg_class')|| ->  = pg_class
+UTC|INSERT INTO t(rc) VALUES ('pg_class'::"text")|| ->  = pg_class
+UTC|INSERT INTO t(rc) VALUES (1259)|| ->  = pg_class
+UTC|INSERT INTO t(nosuch) VALUES (1)||42703
+UTC|INSERT INTO t(i4, i4) VALUES (1, 2)||42701
+UTC|INSERT INTO t(i4) VALUES (1, 2)||42601
+UTC|INSERT INTO t(i4, i8) VALUES (1)||42601
+UTC|INSERT INTO t(i4) VALUES (i8)||42703
+UTC|INSERT INTO t(i4) VALUES ($1)||int4 -> 
+UTC|INSERT INTO t(bp) VALUES ($1)||bpchar -> 
+UTC|INSERT INTO nosuch(i4) VALUES (1)||42P01
+UTC|INSERT INTO pgbench_history (tid, bid, aid, delta, mtime) VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)||int4,int4,int4,int4 -> 
+UTC|INSERT INTO pgbench_history (tid, bid, aid, delta, mtime) VALUES (7, 1, 34521, -2741, CURRENT_TIMESTAMP)|| -> 
+UTC|UPDATE pgbench_accounts SET abalance = abalance + $1 WHERE aid = $2||int4,int4 -> 
+UTC|UPDATE pgbench_accounts SET abalance = abalance + -2741 WHERE aid = 34521|| -> 
+UTC|UPDATE pgbench_accounts SET nosuch = 1 WHERE true||42703
+UTC|UPDATE pgbench_accounts SET abalance = 'x'::"text" WHERE true||42804
+UTC|UPDATE pgbench_accounts SET abalance = $1 WHERE aid = $1||int4 -> 
+UTC|UPDATE pgbench_accounts SET abalance = 1 WHERE aid||42804
+UTC|UPDATE nosuch SET abalance = 1 WHERE true||42P01
+UTC|UPDATE t SET bp = 'ab' WHERE true|| ->  = ab   
+UTC|UPDATE t SET tx = 12 WHERE true|| ->  = 12
+UTC|SELECT abalance FROM pgbench_accounts WHERE aid = $1||int4 -> int4
+UTC|SELECT filler FROM pgbench_accounts WHERE aid = 34521|| -> bpchar:88
+-8|SELECT '2026-11-23 10:11:12'::timestamp::timestamptz|| -> timestamptz = 2026-11-23 10:11:12-08
+-8|SELECT '2026-07-01 10:11:12'::timestamp::timestamptz|| -> timestamptz = 2026-07-01 10:11:12-08
+-8|SELECT '2026-11-23 10:11:12+00'::timestamptz::timestamp|| -> timestamp = 2026-11-23 02:11:12
+-8|SELECT '2026-07-01 10:11:12+00'::timestamptz::timestamp|| -> timestamp = 2026-07-01 02:11:12
+-8|SELECT '2026-07-01 10:11:12'::timestamptz|| -> timestamptz = 2026-07-01 10:11:12-08
+-8|SELECT '1950-07-01 10:11:12'::timestamp::timestamptz|| -> timestamptz = 1950-07-01 10:11:12-08
+-8|SELECT '1800-01-01'::timestamp::timestamptz|| -> timestamptz = 1800-01-01 00:00:00-08
+-8|SELECT '2500-07-01 10:11:12'::timestamp::timestamptz|| -> timestamptz = 2500-07-01 10:11:12-08
+-8|SELECT '9999-12-31 23:59:59'::timestamptz::timestamp|| -> timestamp = 9999-12-31 23:59:59
+-8|SELECT '294276-12-31 23:59:59'::timestamp::timestamptz|| -> timestamptz = 22008
+-8|SELECT 'infinity'::timestamp::timestamptz|| -> timestamptz = infinity
+-8|SELECT '-infinity'::timestamptz::timestamp|| -> timestamp = -infinity
+-8|SELECT '2026-07-01 10:11:12'::timestamp = '2026-07-01 10:11:12+00'::timestamptz|| -> bool = f
+-8|INSERT INTO t(tz) VALUES ('2026-07-01 12:00:00'::timestamp)|| ->  = 2026-07-01 12:00:00-08
+-8|INSERT INTO t(tz) VALUES ('2026-12-01 12:00:00'::timestamp)|| ->  = 2026-12-01 12:00:00-08
+-8|INSERT INTO t(ts) VALUES ('2026-07-01 12:00:00+00'::timestamptz)|| ->  = 2026-07-01 04:00:00
+-8|INSERT INTO t(ts) VALUES ('2026-12-01 12:00:00+00'::timestamptz)|| ->  = 2026-12-01 04:00:00
+-8|INSERT INTO t(tz) VALUES ('2026-07-01 12:00:00')|| ->  = 2026-07-01 12:00:00-08
+-8|UPDATE t SET tz = '2026-07-01 12:00:00'::timestamp WHERE true|| ->  = 2026-07-01 12:00:00-08
+-8|UPDATE t SET ts = '2026-07-01 12:00:00+00'::timestamptz WHERE true|| ->  = 2026-07-01 04:00:00
+5.5|SELECT '2026-11-23 10:11:12'::timestamp::timestamptz|| -> timestamptz = 2026-11-23 10:11:12+05:30
+5.5|SELECT '2026-07-01 10:11:12'::timestamp::timestamptz|| -> timestamptz = 2026-07-01 10:11:12+05:30
+5.5|SELECT '2026-11-23 10:11:12+00'::timestamptz::timestamp|| -> timestamp = 2026-11-23 15:41:12
+5.5|SELECT '2026-07-01 10:11:12+00'::timestamptz::timestamp|| -> timestamp = 2026-07-01 15:41:12
+5.5|SELECT '2026-07-01 10:11:12'::timestamptz|| -> timestamptz = 2026-07-01 10:11:12+05:30
+5.5|SELECT '1950-07-01 10:11:12'::timestamp::timestamptz|| -> timestamptz = 1950-07-01 10:11:12+05:30
+5.5|SELECT '1800-01-01'::timestamp::timestamptz|| -> timestamptz = 1800-01-01 00:00:00+05:30
+5.5|SELECT '2500-07-01 10:11:12'::timestamp::timestamptz|| -> timestamptz = 2500-07-01 10:11:12+05:30
+5.5|SELECT '9999-12-31 23:59:59'::timestamptz::timestamp|| -> timestamp = 9999-12-31 23:59:59
+5.5|SELECT '294276-12-31 23:59:59'::timestamp::timestamptz|| -> timestamptz = 294276-12-31 23:59:59+05:30
+5.5|SELECT 'infinity'::timestamp::timestamptz|| -> timestamptz = infinity
+5.5|SELECT '-infinity'::timestamptz::timestamp|| -> timestamp = -infinity
+5.5|SELECT '2026-07-01 10:11:12'::timestamp = '2026-07-01 10:11:12+00'::timestamptz|| -> bool = f
+5.5|INSERT INTO t(tz) VALUES ('2026-07-01 12:00:00'::timestamp)|| ->  = 2026-07-01 12:00:00+05:30
+5.5|INSERT INTO t(tz) VALUES ('2026-12-01 12:00:00'::timestamp)|| ->  = 2026-12-01 12:00:00+05:30
+5.5|INSERT INTO t(ts) VALUES ('2026-07-01 12:00:00+00'::timestamptz)|| ->  = 2026-07-01 17:30:00
+5.5|INSERT INTO t(ts) VALUES ('2026-12-01 12:00:00+00'::timestamptz)|| ->  = 2026-12-01 17:30:00
+5.5|INSERT INTO t(tz) VALUES ('2026-07-01 12:00:00')|| ->  = 2026-07-01 12:00:00+05:30
+5.5|UPDATE t SET tz = '2026-07-01 12:00:00'::timestamp WHERE true|| ->  = 2026-07-01 12:00:00+05:30
+5.5|UPDATE t SET ts = '2026-07-01 12:00:00+00'::timestamptz WHERE true|| ->  = 2026-07-01 17:30:00
+America/New_York|SELECT '2026-11-23 10:11:12'::timestamp::timestamptz|| -> timestamptz = 2026-11-23 10:11:12-05
+America/New_York|SELECT '2026-07-01 10:11:12'::timestamp::timestamptz|| -> timestamptz = 2026-07-01 10:11:12-04
+America/New_York|SELECT '2026-11-23 10:11:12+00'::timestamptz::timestamp|| -> timestamp = 2026-11-23 05:11:12
+America/New_York|SELECT '2026-07-01 10:11:12+00'::timestamptz::timestamp|| -> timestamp = 2026-07-01 06:11:12
+America/New_York|SELECT '2026-07-01 10:11:12'::timestamptz|| -> timestamptz = 2026-07-01 10:11:12-04
+America/New_York|SELECT '1950-07-01 10:11:12'::timestamp::timestamptz|| -> timestamptz = 1950-07-01 10:11:12-04
+America/New_York|SELECT '1800-01-01'::timestamp::timestamptz|| -> timestamptz = 1800-01-01 00:00:00-04:56:02
+America/New_York|SELECT '2500-07-01 10:11:12'::timestamp::timestamptz|| -> timestamptz = 2500-07-01 10:11:12-04
+America/New_York|SELECT '9999-12-31 23:59:59'::timestamptz::timestamp|| -> timestamp = 9999-12-31 23:59:59
+America/New_York|SELECT '294276-12-31 23:59:59'::timestamp::timestamptz|| -> timestamptz = 22008
+America/New_York|SELECT 'infinity'::timestamp::timestamptz|| -> timestamptz = infinity
+America/New_York|SELECT '-infinity'::timestamptz::timestamp|| -> timestamp = -infinity
+America/New_York|SELECT '2026-07-01 10:11:12'::timestamp = '2026-07-01 10:11:12+00'::timestamptz|| -> bool = f
+America/New_York|INSERT INTO t(tz) VALUES ('2026-07-01 12:00:00'::timestamp)|| ->  = 2026-07-01 12:00:00-04
+America/New_York|INSERT INTO t(tz) VALUES ('2026-12-01 12:00:00'::timestamp)|| ->  = 2026-12-01 12:00:00-05
+America/New_York|INSERT INTO t(ts) VALUES ('2026-07-01 12:00:00+00'::timestamptz)|| ->  = 2026-07-01 08:00:00
+America/New_York|INSERT INTO t(ts) VALUES ('2026-12-01 12:00:00+00'::timestamptz)|| ->  = 2026-12-01 07:00:00
+America/New_York|INSERT INTO t(tz) VALUES ('2026-07-01 12:00:00')|| ->  = 2026-07-01 12:00:00-04
+America/New_York|UPDATE t SET tz = '2026-07-01 12:00:00'::timestamp WHERE true|| ->  = 2026-07-01 12:00:00-04
+America/New_York|UPDATE t SET ts = '2026-07-01 12:00:00+00'::timestamptz WHERE true|| ->  = 2026-07-01 08:00:00
+Europe/London|SELECT '2026-11-23 10:11:12'::timestamp::timestamptz|| -> timestamptz = 2026-11-23 10:11:12+00
+Europe/London|SELECT '2026-07-01 10:11:12'::timestamp::timestamptz|| -> timestamptz = 2026-07-01 10:11:12+01
+Europe/London|SELECT '2026-11-23 10:11:12+00'::timestamptz::timestamp|| -> timestamp = 2026-11-23 10:11:12
+Europe/London|SELECT '2026-07-01 10:11:12+00'::timestamptz::timestamp|| -> timestamp = 2026-07-01 11:11:12
+Europe/London|SELECT '2026-07-01 10:11:12'::timestamptz|| -> timestamptz = 2026-07-01 10:11:12+01
+Europe/London|SELECT '1950-07-01 10:11:12'::timestamp::timestamptz|| -> timestamptz = 1950-07-01 10:11:12+01
+Europe/London|SELECT '1800-01-01'::timestamp::timestamptz|| -> timestamptz = 1800-01-01 00:00:00-00:01:15
+Europe/London|SELECT '2500-07-01 10:11:12'::timestamp::timestamptz|| -> timestamptz = 2500-07-01 10:11:12+01
+Europe/London|SELECT '9999-12-31 23:59:59'::timestamptz::timestamp|| -> timestamp = 9999-12-31 23:59:59
+Europe/London|SELECT '294276-12-31 23:59:59'::timestamp::timestamptz|| -> timestamptz = 294276-12-31 23:59:59+00
+Europe/London|SELECT 'infinity'::timestamp::timestamptz|| -> timestamptz = infinity
+Europe/London|SELECT '-infinity'::timestamptz::timestamp|| -> timestamp = -infinity
+Europe/London|SELECT '2026-07-01 10:11:12'::timestamp = '2026-07-01 10:11:12+00'::timestamptz|| -> bool = f
+Europe/London|INSERT INTO t(tz) VALUES ('2026-07-01 12:00:00'::timestamp)|| ->  = 2026-07-01 12:00:00+01
+Europe/London|INSERT INTO t(tz) VALUES ('2026-12-01 12:00:00'::timestamp)|| ->  = 2026-12-01 12:00:00+00
+Europe/London|INSERT INTO t(ts) VALUES ('2026-07-01 12:00:00+00'::timestamptz)|| ->  = 2026-07-01 13:00:00
+Europe/London|INSERT INTO t(ts) VALUES ('2026-12-01 12:00:00+00'::timestamptz)|| ->  = 2026-12-01 12:00:00
+Europe/London|INSERT INTO t(tz) VALUES ('2026-07-01 12:00:00')|| ->  = 2026-07-01 12:00:00+01
+Europe/London|UPDATE t SET tz = '2026-07-01 12:00:00'::timestamp WHERE true|| ->  = 2026-07-01 12:00:00+01
+Europe/London|UPDATE t SET ts = '2026-07-01 12:00:00+00'::timestamptz WHERE true|| ->  = 2026-07-01 13:00:00
+Asia/Kolkata|SELECT '2026-11-23 10:11:12'::timestamp::timestamptz|| -> timestamptz = 2026-11-23 10:11:12+05:30
+Asia/Kolkata|SELECT '2026-07-01 10:11:12'::timestamp::timestamptz|| -> timestamptz = 2026-07-01 10:11:12+05:30
+Asia/Kolkata|SELECT '2026-11-23 10:11:12+00'::timestamptz::timestamp|| -> timestamp = 2026-11-23 15:41:12
+Asia/Kolkata|SELECT '2026-07-01 10:11:12+00'::timestamptz::timestamp|| -> timestamp = 2026-07-01 15:41:12
+Asia/Kolkata|SELECT '2026-07-01 10:11:12'::timestamptz|| -> timestamptz = 2026-07-01 10:11:12+05:30
+Asia/Kolkata|SELECT '1950-07-01 10:11:12'::timestamp::timestamptz|| -> timestamptz = 1950-07-01 10:11:12+05:30
+Asia/Kolkata|SELECT '1800-01-01'::timestamp::timestamptz|| -> timestamptz = 1800-01-01 00:00:00+05:53:28
+Asia/Kolkata|SELECT '2500-07-01 10:11:12'::timestamp::timestamptz|| -> timestamptz = 2500-07-01 10:11:12+05:30
+Asia/Kolkata|SELECT '9999-12-31 23:59:59'::timestamptz::timestamp|| -> timestamp = 9999-12-31 23:59:59
+Asia/Kolkata|SELECT '294276-12-31 23:59:59'::timestamp::timestamptz|| -> timestamptz = 294276-12-31 23:59:59+05:30
+Asia/Kolkata|SELECT 'infinity'::timestamp::timestamptz|| -> timestamptz = infinity
+Asia/Kolkata|SELECT '-infinity'::timestamptz::timestamp|| -> timestamp = -infinity
+Asia/Kolkata|SELECT '2026-07-01 10:11:12'::timestamp = '2026-07-01 10:11:12+00'::timestamptz|| -> bool = f
+Asia/Kolkata|INSERT INTO t(tz) VALUES ('2026-07-01 12:00:00'::timestamp)|| ->  = 2026-07-01 12:00:00+05:30
+Asia/Kolkata|INSERT INTO t(tz) VALUES ('2026-12-01 12:00:00'::timestamp)|| ->  = 2026-12-01 12:00:00+05:30
+Asia/Kolkata|INSERT INTO t(ts) VALUES ('2026-07-01 12:00:00+00'::timestamptz)|| ->  = 2026-07-01 17:30:00
+Asia/Kolkata|INSERT INTO t(ts) VALUES ('2026-12-01 12:00:00+00'::timestamptz)|| ->  = 2026-12-01 17:30:00
+Asia/Kolkata|INSERT INTO t(tz) VALUES ('2026-07-01 12:00:00')|| ->  = 2026-07-01 12:00:00+05:30
+Asia/Kolkata|UPDATE t SET tz = '2026-07-01 12:00:00'::timestamp WHERE true|| ->  = 2026-07-01 12:00:00+05:30
+Asia/Kolkata|UPDATE t SET ts = '2026-07-01 12:00:00+00'::timestamptz WHERE true|| ->  = 2026-07-01 17:30:00
+America/New_York|SELECT '2026-03-08 01:59:59'::timestamp::timestamptz|| -> timestamptz = 2026-03-08 01:59:59-05
+America/New_York|SELECT '2026-03-08 01:59:59+00'::timestamptz::timestamp|| -> timestamp = 2026-03-07 20:59:59
+America/New_York|SELECT '2026-03-08 02:00:00'::timestamp::timestamptz|| -> timestamptz = 2026-03-08 03:00:00-04
+America/New_York|SELECT '2026-03-08 02:00:00+00'::timestamptz::timestamp|| -> timestamp = 2026-03-07 21:00:00
+America/New_York|SELECT '2026-03-08 02:30:00'::timestamp::timestamptz|| -> timestamptz = 2026-03-08 03:30:00-04
+America/New_York|SELECT '2026-03-08 02:30:00+00'::timestamptz::timestamp|| -> timestamp = 2026-03-07 21:30:00
+America/New_York|SELECT '2026-03-08 03:00:00'::timestamp::timestamptz|| -> timestamptz = 2026-03-08 03:00:00-04
+America/New_York|SELECT '2026-03-08 03:00:00+00'::timestamptz::timestamp|| -> timestamp = 2026-03-07 22:00:00
+America/New_York|SELECT '2026-11-01 00:59:59'::timestamp::timestamptz|| -> timestamptz = 2026-11-01 00:59:59-04
+America/New_York|SELECT '2026-11-01 00:59:59+00'::timestamptz::timestamp|| -> timestamp = 2026-10-31 20:59:59
+America/New_York|SELECT '2026-11-01 01:30:00'::timestamp::timestamptz|| -> timestamptz = 2026-11-01 01:30:00-05
+America/New_York|SELECT '2026-11-01 01:30:00+00'::timestamptz::timestamp|| -> timestamp = 2026-10-31 21:30:00
+America/New_York|SELECT '2026-11-01 02:00:00'::timestamp::timestamptz|| -> timestamptz = 2026-11-01 02:00:00-05
+America/New_York|SELECT '2026-11-01 02:00:00+00'::timestamptz::timestamp|| -> timestamp = 2026-10-31 22:00:00
+America/New_York|SELECT '1883-11-18 12:00:00'::timestamp::timestamptz|| -> timestamptz = 1883-11-18 12:00:00-05
+America/New_York|SELECT '1883-11-18 12:00:00+00'::timestamptz::timestamp|| -> timestamp = 1883-11-18 07:03:58
+America/New_York|SELECT '1918-03-31 02:30:00'::timestamp::timestamptz|| -> timestamptz = 1918-03-31 03:30:00-04
+America/New_York|SELECT '1918-03-31 02:30:00+00'::timestamptz::timestamp|| -> timestamp = 1918-03-30 21:30:00
+America/New_York|SELECT '1945-08-14 19:30:00'::timestamp::timestamptz|| -> timestamptz = 1945-08-14 19:30:00-04
+America/New_York|SELECT '1945-08-14 19:30:00+00'::timestamptz::timestamp|| -> timestamp = 1945-08-14 15:30:00
+America/New_York|SELECT '1974-01-06 02:30:00'::timestamp::timestamptz|| -> timestamptz = 1974-01-06 03:30:00-04
+America/New_York|SELECT '1974-01-06 02:30:00+00'::timestamptz::timestamp|| -> timestamp = 1974-01-05 21:30:00
+Europe/London|SELECT '2026-03-29 01:30:00'::timestamp::timestamptz|| -> timestamptz = 2026-03-29 02:30:00+01
+Europe/London|SELECT '2026-03-29 01:30:00+00'::timestamptz::timestamp|| -> timestamp = 2026-03-29 02:30:00
+Europe/London|SELECT '2026-10-25 01:30:00'::timestamp::timestamptz|| -> timestamptz = 2026-10-25 01:30:00+00
+Europe/London|SELECT '2026-10-25 01:30:00+00'::timestamptz::timestamp|| -> timestamp = 2026-10-25 01:30:00
+Europe/London|SELECT '1941-05-04 02:30:00'::timestamp::timestamptz|| -> timestamptz = 1941-05-04 03:30:00+02
+Europe/London|SELECT '1941-05-04 02:30:00+00'::timestamptz::timestamp|| -> timestamp = 1941-05-04 04:30:00
+Europe/London|SELECT '1968-10-27 00:30:00'::timestamp::timestamptz|| -> timestamptz = 1968-10-27 00:30:00+01
+Europe/London|SELECT '1968-10-27 00:30:00+00'::timestamptz::timestamp|| -> timestamp = 1968-10-27 01:30:00
+Europe/London|SELECT '1971-10-31 02:30:00'::timestamp::timestamptz|| -> timestamptz = 1971-10-31 02:30:00+00
+Europe/London|SELECT '1971-10-31 02:30:00+00'::timestamptz::timestamp|| -> timestamp = 1971-10-31 02:30:00
+Australia/Lord_Howe|SELECT '2026-04-05 01:45:00'::timestamp::timestamptz|| -> timestamptz = 2026-04-05 01:45:00+10:30
+Australia/Lord_Howe|SELECT '2026-04-05 01:45:00+00'::timestamptz::timestamp|| -> timestamp = 2026-04-05 12:15:00
+Australia/Lord_Howe|SELECT '2026-10-04 02:15:00'::timestamp::timestamptz|| -> timestamptz = 2026-10-04 02:45:00+11
+Australia/Lord_Howe|SELECT '2026-10-04 02:15:00+00'::timestamptz::timestamp|| -> timestamp = 2026-10-04 13:15:00
+Australia/Lord_Howe|SELECT '2026-01-01 00:00:00'::timestamp::timestamptz|| -> timestamptz = 2026-01-01 00:00:00+11
+Australia/Lord_Howe|SELECT '2026-01-01 00:00:00+00'::timestamptz::timestamp|| -> timestamp = 2026-01-01 11:00:00
+Asia/Kolkata|SELECT '1945-10-15 00:30:00'::timestamp::timestamptz|| -> timestamptz = 1945-10-15 00:30:00+05:30
+Asia/Kolkata|SELECT '1945-10-15 00:30:00+00'::timestamptz::timestamp|| -> timestamp = 1945-10-15 06:00:00
+Asia/Kolkata|SELECT '2026-01-01 00:00:00'::timestamp::timestamptz|| -> timestamptz = 2026-01-01 00:00:00+05:30
+Asia/Kolkata|SELECT '2026-01-01 00:00:00+00'::timestamptz::timestamp|| -> timestamp = 2026-01-01 05:30:00
+Africa/Casablanca|SELECT '2026-02-15 02:30:00'::timestamp::timestamptz|| -> timestamptz = 2026-02-15 02:30:00+00
+Africa/Casablanca|SELECT '2026-02-15 02:30:00+00'::timestamptz::timestamp|| -> timestamp = 2026-02-15 02:30:00
+Africa/Casablanca|SELECT '2026-03-22 02:30:00'::timestamp::timestamptz|| -> timestamptz = 2026-03-22 03:30:00+01
+Africa/Casablanca|SELECT '2026-03-22 02:30:00+00'::timestamptz::timestamp|| -> timestamp = 2026-03-22 03:30:00
+Africa/Casablanca|SELECT '2030-01-06 03:00:00'::timestamp::timestamptz|| -> timestamptz = 2030-01-06 03:00:00+00
+Africa/Casablanca|SELECT '2030-01-06 03:00:00+00'::timestamptz::timestamp|| -> timestamp = 2030-01-06 03:00:00
+Europe/Dublin|SELECT '2026-03-29 01:30:00'::timestamp::timestamptz|| -> timestamptz = 2026-03-29 02:30:00+01
+Europe/Dublin|SELECT '2026-03-29 01:30:00+00'::timestamptz::timestamp|| -> timestamp = 2026-03-29 02:30:00
+Europe/Dublin|SELECT '2026-10-25 01:30:00'::timestamp::timestamptz|| -> timestamptz = 2026-10-25 01:30:00+00
+Europe/Dublin|SELECT '2026-10-25 01:30:00+00'::timestamptz::timestamp|| -> timestamp = 2026-10-25 01:30:00
+Europe/Dublin|SELECT '1971-10-31 02:30:00'::timestamp::timestamptz|| -> timestamptz = 1971-10-31 02:30:00+00
+Europe/Dublin|SELECT '1971-10-31 02:30:00+00'::timestamptz::timestamp|| -> timestamp = 1971-10-31 02:30:00
+Pacific/Apia|SELECT '2011-12-30 12:00:00'::timestamp::timestamptz|| -> timestamptz = 2011-12-31 12:00:00+14
+Pacific/Apia|SELECT '2011-12-30 12:00:00+00'::timestamptz::timestamp|| -> timestamp = 2011-12-31 02:00:00
+Pacific/Apia|SELECT '2011-12-31 00:30:00'::timestamp::timestamptz|| -> timestamptz = 2011-12-31 00:30:00+14
+Pacific/Apia|SELECT '2011-12-31 00:30:00+00'::timestamptz::timestamp|| -> timestamp = 2011-12-31 14:30:00
+America/Sao_Paulo|SELECT '2018-11-04 00:30:00'::timestamp::timestamptz|| -> timestamptz = 2018-11-04 01:30:00-02
+America/Sao_Paulo|SELECT '2018-11-04 00:30:00+00'::timestamptz::timestamp|| -> timestamp = 2018-11-03 21:30:00
+America/Sao_Paulo|SELECT '2019-02-16 23:30:00'::timestamp::timestamptz|| -> timestamptz = 2019-02-16 23:30:00-03
+America/Sao_Paulo|SELECT '2019-02-16 23:30:00+00'::timestamptz::timestamp|| -> timestamp = 2019-02-16 21:30:00
+America/Sao_Paulo|SELECT '2026-01-01 00:00:00'::timestamp::timestamptz|| -> timestamptz = 2026-01-01 00:00:00-03
+America/Sao_Paulo|SELECT '2026-01-01 00:00:00+00'::timestamptz::timestamp|| -> timestamp = 2025-12-31 21:00:00
+Asia/Tehran|SELECT '2022-09-21 23:30:00'::timestamp::timestamptz|| -> timestamptz = 2022-09-21 23:30:00+03:30
+Asia/Tehran|SELECT '2022-09-21 23:30:00+00'::timestamptz::timestamp|| -> timestamp = 2022-09-22 03:00:00
+Asia/Tehran|SELECT '2022-03-22 00:30:00'::timestamp::timestamptz|| -> timestamptz = 2022-03-22 01:30:00+04:30
+Asia/Tehran|SELECT '2022-03-22 00:30:00+00'::timestamptz::timestamp|| -> timestamp = 2022-03-22 05:00:00
+Antarctica/Troll|SELECT '2026-03-29 01:30:00'::timestamp::timestamptz|| -> timestamptz = 2026-03-29 03:30:00+02
+Antarctica/Troll|SELECT '2026-03-29 01:30:00+00'::timestamptz::timestamp|| -> timestamp = 2026-03-29 03:30:00
+Antarctica/Troll|SELECT '2026-10-25 01:30:00'::timestamp::timestamptz|| -> timestamptz = 2026-10-25 01:30:00+00
+Antarctica/Troll|SELECT '2026-10-25 01:30:00+00'::timestamptz::timestamp|| -> timestamp = 2026-10-25 01:30:00
+america/new_york|SELECT '2026-07-01 00:00:00'::timestamp::timestamptz|| -> timestamptz = 2026-07-01 00:00:00-04
+america/new_york|SELECT '2026-07-01 00:00:00+00'::timestamptz::timestamp|| -> timestamp = 2026-06-30 20:00:00
+EST5EDT|SELECT '2026-07-01 00:00:00'::timestamp::timestamptz|| -> timestamptz = 2026-07-01 00:00:00-04
+EST5EDT|SELECT '2026-07-01 00:00:00+00'::timestamptz::timestamp|| -> timestamp = 2026-06-30 20:00:00
+Etc/GMT+8|SELECT '2026-07-01 00:00:00'::timestamp::timestamptz|| -> timestamptz = 2026-07-01 00:00:00-08
+Etc/GMT+8|SELECT '2026-07-01 00:00:00+00'::timestamptz::timestamp|| -> timestamp = 2026-06-30 16:00:00
+UTC|SELECT '2026-07-01 00:00:00'::timestamp::timestamptz|| -> timestamptz = 2026-07-01 00:00:00+00
+UTC|SELECT '2026-07-01 00:00:00+00'::timestamptz::timestamp|| -> timestamp = 2026-07-01 00:00:00
+GMT|SELECT '2026-07-01 00:00:00'::timestamp::timestamptz|| -> timestamptz = 2026-07-01 00:00:00+00
+GMT|SELECT '2026-07-01 00:00:00+00'::timestamptz::timestamp|| -> timestamp = 2026-07-01 00:00:00
