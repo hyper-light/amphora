@@ -4491,6 +4491,7 @@ pub(crate) mod bushy_test_hook {
                     sort: 1.27,
                     bloom_probe: 4.99,
                     where_step,
+                    scan_row: None,
                     page_miss: Some(1.0),
                 }));
             };

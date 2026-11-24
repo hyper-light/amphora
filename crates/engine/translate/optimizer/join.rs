@@ -6540,6 +6540,7 @@ mod tests {
             sort: 0.7174,
             bloom_probe: 6.3695,
             where_step: 11.0479,
+            scan_row: None,
             page_miss: Some(0.2943),
         }));
         let plan = lines(&format!("EXPLAIN QUERY PLAN {sql}"));
@@ -6573,5 +6574,113 @@ mod tests {
         );
         assert!(!nested_loops.is_empty());
         assert_eq!(chosen, nested_loops, "{plan:?}");
+    }
+
+    /// Lane T22 (TPC-H q10 at SF1 chose the plan that scans lineitem, 594 ms of it where its price
+    /// was 80 ms, and took 1,273 ms against the 875 ms of the plan that seeks it): q10's shape
+    /// with statistics, at T17's S weights pinned, whose row visit is a loop over plain keys. With
+    /// no scan's row in the set the planner scans lineitem, the star filter from orders dropping
+    /// most of it; with the scan's row timed at lineitem's scan on adacachy2, 99 ns, 283 row visits
+    /// of 0.35 ns, it scans orders and seeks lineitem by its key. The answers are the nested loops'
+    /// either way.
+    #[test]
+    fn t22_q10_scan_rows_priced_as_measured_seek_lineitem() {
+        use crate::translate::optimizer::learned_costs::LearnedWeights;
+        let io = crate::sync::Arc::new(crate::io::MemoryIO::new());
+        let db =
+            crate::Database::open_file(io, ":memory:", crate::sync::Arc::new(crate::SqliteDialect))
+                .unwrap();
+        let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+        let pad = "x".repeat(100);
+        for sql in [
+            "CREATE TABLE nation(n_nationkey INTEGER PRIMARY KEY, n_name TEXT)".to_string(),
+            "CREATE TABLE customer(c_custkey INTEGER PRIMARY KEY, c_name TEXT, c_nationkey INT, \
+             c_acctbal REAL, c_pad TEXT)"
+                .to_string(),
+            "CREATE TABLE orders(o_orderkey INTEGER PRIMARY KEY, o_custkey INT, o_orderdate INT, \
+             o_pad TEXT)"
+                .to_string(),
+            "CREATE TABLE lineitem(l_orderkey INT, l_linenumber INT, l_extendedprice REAL, \
+             l_discount REAL, l_returnflag TEXT, l_pad TEXT, PRIMARY KEY (l_orderkey, l_linenumber))"
+                .to_string(),
+            "WITH RECURSIVE x(i) AS (VALUES(0) UNION ALL SELECT i + 1 FROM x WHERE i < 24) \
+             INSERT INTO nation SELECT i, 'nation' || i FROM x"
+                .to_string(),
+            format!(
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 1500) \
+                 INSERT INTO customer SELECT i, 'customer' || i, i % 25, i % 1000 / 7.0, '{pad}' FROM x"
+            ),
+            format!(
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 15000) \
+                 INSERT INTO orders SELECT i, i * 7919 % 1500 + 1, i * 31 % 100, '{pad}' FROM x"
+            ),
+            format!(
+                "WITH RECURSIVE x(i) AS (VALUES(0) UNION ALL SELECT i + 1 FROM x WHERE i < 59999) \
+                 INSERT INTO lineitem SELECT i / 4 + 1, i % 4, i % 1000 + 1.0, i % 10 / 100.0, \
+                 CASE i % 4 WHEN 0 THEN 'R' WHEN 1 THEN 'A' ELSE 'N' END, '{pad}' FROM x"
+            ),
+            "ANALYZE".to_string(),
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        let sql = "SELECT c_custkey, c_name, sum(l_extendedprice * (1 - l_discount)) AS revenue, \
+                   c_acctbal, n_name FROM customer, orders, lineitem, nation \
+                   WHERE c_custkey = o_custkey AND l_orderkey = o_orderkey AND o_orderdate >= 10 \
+                   AND o_orderdate < 14 AND l_returnflag = 'R' AND c_nationkey = n_nationkey \
+                   GROUP BY c_custkey, c_name, c_acctbal, n_name \
+                   ORDER BY revenue DESC, c_custkey LIMIT 20";
+        let lines = |sql: &str| -> Vec<String> {
+            let mut stmt = conn.prepare(sql).unwrap();
+            stmt.run_collect_rows()
+                .unwrap()
+                .into_iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|value| value.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .collect()
+        };
+        conn.set_join_methods(crate::JoinMethods::NestedLoopsOnly);
+        let nested_loops = lines(sql);
+        conn.set_join_methods(crate::JoinMethods::ByCost);
+        let plan_of = |scan_row: Option<f64>| {
+            conn.pin_cost_weights(Some(LearnedWeights {
+                row_in_pages: Some(2.771e-4),
+                seek: 1274.07,
+                hash_build: 399.51,
+                hash_probe: 1393.33,
+                sort: 0.7174,
+                bloom_probe: 6.3695,
+                where_step: 11.0479,
+                page_miss: Some(0.2943),
+                scan_row,
+            }));
+            let plan = lines(&format!("EXPLAIN QUERY PLAN {sql}"));
+            let answer = lines(sql);
+            conn.pin_cost_weights(None);
+            (plan, answer)
+        };
+        let at = |plan: &[String], step: &str| plan.iter().position(|line| line.contains(step));
+
+        let (plan, answer) = plan_of(None);
+        assert!(
+            at(&plan, "SCAN lineitem").is_some() && at(&plan, "SCAN orders").is_none(),
+            "with no scan's row the planner scans lineitem: {plan:?}"
+        );
+        assert_eq!(answer, nested_loops, "{plan:?}");
+
+        let (plan, answer) = plan_of(Some(283.0));
+        let (orders, lineitem) = (
+            at(&plan, "SCAN orders"),
+            at(&plan, "SEARCH lineitem USING INDEX"),
+        );
+        assert!(
+            orders.is_some() && orders < lineitem,
+            "with the scan's row measured the planner seeks lineitem: {plan:?}"
+        );
+        assert!(!nested_loops.is_empty());
+        assert_eq!(answer, nested_loops, "{plan:?}");
     }
 }

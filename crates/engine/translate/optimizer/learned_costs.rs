@@ -36,6 +36,11 @@ pub(crate) enum Work {
     /// One step of a `WHERE` condition: two of the engine's values compared, as a condition's
     /// comparison compares them (`cpu_cost_per_where_step`).
     WhereStep,
+    /// Lane T22: a row a scan visits, as the statement loop that runs it does: the cursor steps to
+    /// the row, its column is decoded and a condition tests it once. [Work::Row] is that visit over
+    /// a page of plain keys, without the engine's work around it, and the scans' prices were 7 to 10
+    /// times under their times (the record's lane T22: lineitem at SF1 99 ns a row against 4.2).
+    ScanRow,
     /// One page read from the database's file, as the pager times it from the read's submission
     /// to its completion, less what the reading thread waited for a CPU meanwhile
     /// (`sqlite3_ondisk::begin_read_page`, `PageReadTimer`). The planner's unit of cost.
@@ -503,6 +508,7 @@ struct Rates {
     sort: Rate,
     bloom_probe: Rate,
     where_step: Rate,
+    scan_row: Rate,
     page: Rate,
     /// What timing one run costs: a pair of clock reads (step 3a, `Sampling`).
     timing_nanos: f64,
@@ -548,6 +554,7 @@ impl Rates {
             &mut self.sort,
             &mut self.bloom_probe,
             &mut self.where_step,
+            &mut self.scan_row,
             &mut self.page,
         ] {
             rate.switch(rule);
@@ -563,6 +570,7 @@ impl Rates {
             Work::Sort => &mut self.sort,
             Work::BloomProbe => &mut self.bloom_probe,
             Work::WhereStep => &mut self.where_step,
+            Work::ScanRow => &mut self.scan_row,
             Work::PageRead => &mut self.page,
         }
     }
@@ -579,6 +587,7 @@ impl Rates {
             sort: self.sort.nanos_per_unit()? / row,
             bloom_probe: self.bloom_probe.nanos_per_unit()? / row,
             where_step: self.where_step.nanos_per_unit()? / row,
+            scan_row: self.scan_row.nanos_per_unit().map(|scan| scan / row),
             page_miss: miss.filter(|m| m.is_finite()).map(|m| m.clamp(0.0, 1.0)),
         })
     }
@@ -600,6 +609,9 @@ pub struct LearnedWeights {
     pub bloom_probe: f64,
     /// A `WHERE` condition's step (`Work::WhereStep`).
     pub where_step: f64,
+    /// A row a scan visits (`Work::ScanRow`); None where it wasn't timed (a set pinned without it),
+    /// and then a scan's rows take a row's visit (`CostModelParams::with_learned`).
+    pub scan_row: Option<f64>,
     /// The share of the connection's recent page fetches that read a file, None before its first
     /// fetch (`Pager::page_miss_ratio`): how many of the pages a plan would first read from a cold
     /// cache it reads from the file (`cost::file_reads`).
@@ -621,7 +633,12 @@ impl RunCounts {
             Work::Seek => Some(&self.seek),
             Work::HashBuild => Some(&self.hash_build),
             Work::HashProbe => Some(&self.hash_probe),
-            Work::Row | Work::Sort | Work::BloomProbe | Work::WhereStep | Work::PageRead => None,
+            Work::Row
+            | Work::Sort
+            | Work::BloomProbe
+            | Work::WhereStep
+            | Work::ScanRow
+            | Work::PageRead => None,
         }
     }
 }
@@ -756,9 +773,18 @@ fn saturating_usize(x: f64) -> usize {
     }
 }
 
+std::thread_local! {
+    /// Set while this thread opens calibration's own database ([CalibrationScan::open]), whose
+    /// costs must not calibrate in turn.
+    static OPENING_SCAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl LearnedCosts {
     /// An estimator that starts from this process's calibration.
     pub(crate) fn new() -> Self {
+        if OPENING_SCAN.with(std::cell::Cell::get) {
+            return Self::from_rates(&Rates::default());
+        }
         Self::from_rates(process_calibration())
     }
 
@@ -843,7 +869,12 @@ impl LearnedCosts {
             Work::Seek => Some(&self.seek),
             Work::HashBuild => Some(&self.hash_build),
             Work::HashProbe => Some(&self.hash_probe),
-            Work::Row | Work::Sort | Work::BloomProbe | Work::WhereStep | Work::PageRead => None,
+            Work::Row
+            | Work::Sort
+            | Work::BloomProbe
+            | Work::WhereStep
+            | Work::ScanRow
+            | Work::PageRead => None,
         }
     }
 
@@ -982,11 +1013,11 @@ fn process_calibration() -> &'static Rates {
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Calibration {
     timing_nanos: f64,
-    kinds: [(f64, f64); 7],
+    kinds: [(f64, f64); CALIBRATED.len()],
 }
 
 /// The kinds of work calibration times, in [Calibration::kinds]' order.
-const CALIBRATED: [Work; 7] = [
+const CALIBRATED: [Work; 8] = [
     Work::Row,
     Work::Seek,
     Work::HashBuild,
@@ -994,6 +1025,7 @@ const CALIBRATED: [Work; 7] = [
     Work::Sort,
     Work::BloomProbe,
     Work::WhereStep,
+    Work::ScanRow,
 ];
 
 /// The 8-byte keys of one page (`BufferPool::DEFAULT_PAGE_SIZE`): calibration's repetition
@@ -1145,7 +1177,7 @@ mod stored {
             u64::from_str_radix(word, 16).ok().map(f64::from_bits)
         };
         let timing_nanos = number(lines.next()?.strip_prefix("timing ")?)?;
-        let mut kinds = [(0.0, 0.0); 7];
+        let mut kinds = [(0.0, 0.0); CALIBRATED.len()];
         for (slot, kind) in kinds.iter_mut().zip(CALIBRATED) {
             let (name, pair) = lines.next()?.split_once(' ')?;
             if name != format!("{kind:?}") {
@@ -1267,6 +1299,52 @@ pub(crate) fn mix(i: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// Lane T22: a page's keys in a table of a database of their own, and a statement that scans it:
+/// what calibration times a scan's row visit by ([Work::ScanRow]), from the engine's loop rather
+/// than from a loop over the keys. Its condition's value is none of the keys, so every row is read,
+/// decoded and tested once and no row goes on.
+struct CalibrationScan {
+    statement: crate::Statement,
+}
+
+impl CalibrationScan {
+    /// The table of `keys`, and the statement over it; None where the engine can't make them.
+    fn open(keys: &[u64]) -> Option<Self> {
+        OPENING_SCAN.with(|opening| opening.set(true));
+        let opened = Self::over(keys);
+        OPENING_SCAN.with(|opening| opening.set(false));
+        opened.ok()
+    }
+
+    fn over(keys: &[u64]) -> crate::Result<Self> {
+        let key = |i: u64| i64::from_ne_bytes(mix(i).to_ne_bytes());
+        let io: crate::sync::Arc<dyn crate::IO> = crate::sync::Arc::new(crate::io::MemoryIO::new());
+        let database = crate::Database::open(
+            io,
+            crate::util::MEMORY_PATH,
+            crate::OpenOptions::new(crate::sync::Arc::new(crate::SqliteDialect)),
+        )?;
+        let connection = database.connect(crate::ConnectOpts::new())?;
+        connection.execute("CREATE TABLE scanned(key INTEGER)")?;
+        let rows: Vec<String> = keys
+            .iter()
+            .map(|k| format!("({})", i64::from_ne_bytes(k.to_ne_bytes())))
+            .collect();
+        connection.execute(format!("INSERT INTO scanned VALUES {}", rows.join(",")))?;
+        // The next key after the page's, none of them.
+        let absent = key(u64::try_from(keys.len()).unwrap_or(u64::MAX));
+        let statement =
+            connection.prepare(format!("SELECT count(*) FROM scanned WHERE key = {absent}"))?;
+        Ok(Self { statement })
+    }
+
+    /// One scan of the page's keys, an error as no scan: the clock then times nothing.
+    fn run(&mut self) {
+        let _ = self.statement.run_ignore_rows();
+        let _ = self.statement.reset();
+    }
+}
+
 /// Times `work` `reps` times over, doubling `reps` up to `most_reps` until the time reaches
 /// `target`: (repetitions, nanoseconds).
 fn measure(
@@ -1383,7 +1461,16 @@ fn measure_calibration(clock: &mut dyn FnMut() -> f64) -> Calibration {
             black_box(black_box(v) < &pivot);
         }
     };
-    let mut kinds: [(Work, f64, &mut dyn FnMut()); 7] = [
+    // A statement's scan of the page's keys, each row tested once, matching none (`CalibrationScan`).
+    let mut scan = CalibrationScan::open(&keys);
+    // With no scan there is nothing to time, and no unit of it.
+    let scanned = if scan.is_some() { rows } else { 0.0 };
+    let mut scan_row = || {
+        if let Some(scan) = &mut scan {
+            scan.run();
+        }
+    };
+    let mut kinds: [(Work, f64, &mut dyn FnMut()); CALIBRATED.len()] = [
         (Work::Row, rows, &mut row),
         (Work::Seek, rows, &mut seek),
         (Work::HashBuild, rows, &mut build),
@@ -1391,6 +1478,7 @@ fn measure_calibration(clock: &mut dyn FnMut() -> f64) -> Calibration {
         (Work::Sort, rows * rows.log2(), &mut sort),
         (Work::BloomProbe, rows, &mut bloom),
         (Work::WhereStep, rows, &mut step),
+        (Work::ScanRow, scanned, &mut scan_row),
     ];
     let mut target: f64 = 0.0;
     for (_, _, work) in kinds.iter_mut() {
@@ -1398,7 +1486,7 @@ fn measure_calibration(clock: &mut dyn FnMut() -> f64) -> Calibration {
     }
     let mut calibration = Calibration {
         timing_nanos: 0.0,
-        kinds: [(0.0, 0.0); 7],
+        kinds: [(0.0, 0.0); CALIBRATED.len()],
     };
     // A pair of clock reads, timed as the kinds are, a page's keys' worth of times at most: what
     // timing one run costs (step 3a), and the finest a sample's reading resolves.
@@ -1410,7 +1498,7 @@ fn measure_calibration(clock: &mut dyn FnMut() -> f64) -> Calibration {
     calibration.timing_nanos = nanos / reps;
     // Each kind's repetitions a sample, found as `measure` finds them; then its samples, a round
     // at a time.
-    let mut sampled: [(usize, Vec<f64>, bool); 7] = Default::default();
+    let mut sampled: [(usize, Vec<f64>, bool); CALIBRATED.len()] = Default::default();
     for ((_, _, work), (reps, _, _)) in kinds.iter_mut().zip(sampled.iter_mut()) {
         *reps = saturating_usize(measure(clock, target, n, &mut **work).0);
     }
@@ -1723,6 +1811,7 @@ mod tests {
                 (4_608.0, 20_000.125),
                 (512.0, 1_000.0),
                 (512.0, 650.0),
+                (512.0, 50_000.0),
             ],
         }
     }
@@ -2433,6 +2522,25 @@ mod tests {
         ] {
             assert!((a - b).abs() <= 1e-12 * a.abs(), "{steady:?} {preempted:?}");
         }
+    }
+
+    /// Lane T22. Do: open calibration's scan of a page's keys and run it. Expect: each run reads
+    /// every key once and gives no row; and calibration on a clock that moves times it, a scan's
+    /// row beside the other kinds.
+    #[test]
+    fn t22_calibration_times_a_scan_of_a_page_of_keys() {
+        let keys: Vec<u64> = (0..calibration_keys() as u64).map(mix).collect();
+        let mut scan = CalibrationScan::open(&keys).expect("the engine opens a database in memory");
+        let answer = scan.statement.run_collect_rows().unwrap();
+        assert_eq!(answer, vec![vec![crate::Value::from_i64(0)]]);
+        assert!(scan.statement.metrics().rows_read >= keys.len() as u64);
+        scan.statement.reset().unwrap();
+        let mut ticks = 0.0;
+        let rates = calibrate(&mut || {
+            ticks += 1_000.0;
+            ticks
+        });
+        assert!(rates.weights(None).unwrap().scan_row.is_some());
     }
 
     /// Do: calibrate with a clock that never moves. Expect: no weights, so the planner is told it

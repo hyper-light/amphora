@@ -207,7 +207,8 @@ pub(super) fn estimate_scan_cost(
     let io_cost = rescan_reads(table_pages, num_scans, params.cache_pages);
 
     // CPU cost for processing all rows on each scan
-    let cpu_cost = num_scans * base_row_count * params.cpu_cost_per_row;
+    // Lane T22: each row a scan visits, as the statement's loop reads and tests it.
+    let cpu_cost = num_scans * base_row_count * params.cpu_cost_per_scan_row;
 
     Cost(file_reads(io_cost, table_pages, params.cache_pages, params.page_miss) + cpu_cost)
 }

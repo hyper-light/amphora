@@ -66,6 +66,7 @@ fn pinned(seek: f64, hash_build: f64, hash_probe: f64) -> LearnedWeights {
         sort: 0.0,
         bloom_probe: 0.0,
         where_step: 0.0,
+        scan_row: None,
         page_miss: None,
     }
 }

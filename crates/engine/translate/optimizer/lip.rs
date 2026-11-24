@@ -156,7 +156,7 @@ pub(crate) fn choose(
 /// The dimension read once more into its filter: its rows, its terms on each, and its pages at
 /// the connection's measured share that miss the cache (`cost::file_reads`).
 fn build_cost(dim_rows: f64, dim_terms: usize, params: &CostModelParams) -> f64 {
-    dim_rows * (params.cpu_cost_per_row + params.cpu_cost_per_where_step * dim_terms as f64)
+    dim_rows * (params.cpu_cost_per_scan_row + params.cpu_cost_per_where_step * dim_terms as f64)
         + dim_rows / params.rows_per_table_page.max(1.0) * params.page_miss
 }
 

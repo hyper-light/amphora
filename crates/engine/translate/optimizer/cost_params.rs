@@ -72,6 +72,10 @@ pub struct CostModelParams {
     /// CPU cost per row processed (relative to page IO = 1.0).
     pub cpu_cost_per_row: f64,
 
+    /// Lane T22: CPU cost per row a scan visits (read, decoded and tested once by the statement's
+    /// loop): `cpu_cost_per_row` unless `with_learned` has a measured one.
+    pub cpu_cost_per_scan_row: f64,
+
     /// CPU cost for one extra operation in a `WHERE` condition. Learned where the engine runs
     /// (`learned_costs`, `Work::WhereStep`: two of the engine's values compared) and set by
     /// `with_learned`; the default stands only where the clock never moved.
@@ -167,6 +171,7 @@ impl CostModelParams {
 
             // Scan/Seek costs
             cpu_cost_per_row: 0.003,
+            cpu_cost_per_scan_row: 0.003,
             cpu_cost_per_where_step: 0.003,
             cpu_cost_per_seek: 0.01,
             cache_pages: 2000.0,
@@ -381,6 +386,7 @@ impl CostModelParams {
         let row = learned.row_in_pages.unwrap_or(self.cpu_cost_per_row);
         Self {
             cpu_cost_per_row: row,
+            cpu_cost_per_scan_row: row * learned.scan_row.unwrap_or(1.0),
             cpu_cost_per_seek: row * learned.seek,
             hash_cpu_cost: 0.0,
             hash_insert_cost: row * learned.hash_build,
@@ -405,6 +411,7 @@ impl CostModelParams {
         let row = f.in_pages(Term::Row, self.cpu_cost_per_row, self.cpu_cost_per_row);
         Self {
             cpu_cost_per_row: row,
+            cpu_cost_per_scan_row: f.in_pages(Term::Row, self.cpu_cost_per_scan_row, row),
             cpu_cost_per_seek: f.in_pages(Term::Seek, self.cpu_cost_per_seek, row),
             hash_insert_cost: f.in_pages(Term::HashBuild, self.hash_insert_cost, row),
             hash_lookup_cost: f.in_pages(Term::HashProbe, self.hash_lookup_cost, row),
@@ -519,6 +526,7 @@ impl CostModelParams {
         // Cost multipliers must be non-negative
         let cost_params = [
             ("cpu_cost_per_row", self.cpu_cost_per_row),
+            ("cpu_cost_per_scan_row", self.cpu_cost_per_scan_row),
             ("cpu_cost_per_where_step", self.cpu_cost_per_where_step),
             ("cpu_cost_per_seek", self.cpu_cost_per_seek),
             ("sort_cpu_per_row", self.sort_cpu_per_row),

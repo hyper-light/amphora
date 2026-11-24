@@ -207,7 +207,7 @@ fn pinned_weights(path: &Path) -> anyhow::Result<amphora_engine::LearnedWeights>
 /// `row_in_pages` and `page_miss` may be null, as a process that has read no page from its file
 /// has them. The trace's "the weights this plan is made on" prints the same fields.
 fn weights_json(text: &str) -> anyhow::Result<amphora_engine::LearnedWeights> {
-    const FIELDS: [&str; 8] = [
+    const FIELDS: [&str; 9] = [
         "row_in_pages",
         "seek",
         "hash_build",
@@ -216,6 +216,7 @@ fn weights_json(text: &str) -> anyhow::Result<amphora_engine::LearnedWeights> {
         "bloom_probe",
         "where_step",
         "page_miss",
+        "scan_row",
     ];
     let v: serde_json::Value = serde_json::from_str(text)?;
     let fields = v
@@ -244,6 +245,11 @@ fn weights_json(text: &str) -> anyhow::Result<amphora_engine::LearnedWeights> {
         bloom_probe: number("bloom_probe")?,
         where_step: number("where_step")?,
         page_miss: maybe("page_miss")?,
+        // Lane T22: a set measured before scans' rows were has none of them.
+        scan_row: match fields.get("scan_row") {
+            None => None,
+            Some(_) => maybe("scan_row")?,
+        },
     })
 }
 
@@ -999,6 +1005,7 @@ mod tests {
             bloom_probe: 6.37,
             where_step: 11.05,
             page_miss: Some(0.294),
+            scan_row: None,
         };
         assert_eq!(w, want);
         let w = weights_json(
