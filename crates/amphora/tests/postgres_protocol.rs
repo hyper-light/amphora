@@ -98,7 +98,7 @@ fn drive(
         assert!(step.consumed <= held.len(), "consumed only what was held");
         held.drain(..step.consumed);
         match step.next {
-            Next::Continue => {}
+            Next::Continue | Next::Flush => {}
             Next::Need(total) => {
                 assert!(total > held.len(), "a Need asks for more than is held");
                 assert!(
@@ -1245,4 +1245,153 @@ fn t_pg_9_1_tpcb_statements_answer_as_a_19_server_does() {
         compared > 100,
         "every message of every statement is compared"
     );
+}
+
+/// A message as a client of the extended protocol can tell it: as [`tpcb::told`] does, but a row's values
+/// by their bytes, whatever their format, and a refusal's context with it.
+fn exactly(tag: u8, body: &[u8]) -> String {
+    match tag {
+        b'E' | b'N' => {
+            let fields: Vec<_> = error_fields(body)
+                .into_iter()
+                .filter(|(field, _)| b"SVCMWP".contains(field))
+                .collect();
+            format!("{} {fields:?}", char::from(tag))
+        }
+        b'D' => format!("D {body:02x?}"),
+        _ => tpcb::told("", &[(tag, body.to_vec())]).concat(),
+    }
+}
+
+/// T-PG.10.1: the extended protocol's messages (pgbench's `-M extended` and `-M prepared` flows, its relkind
+/// query, parameters and columns of each type in text and in binary, portals stopped and gone on with, what
+/// each message refuses, one transaction to each Sync, a failed block's, Flush, and messages malformed
+/// inside), each step's sent at once to the wire core, are answered as a PostgreSQL 19.0 server answered
+/// them (scripts/postgres-extended-answers.sh), message by message.
+#[test]
+fn t_pg_10_1_extended_messages_answer_as_a_19_server_does() {
+    for pace in [Pace::Frames, Pace::Bytes] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("postgres.db");
+        let database = execute::Database::open(
+            path.to_str().unwrap(),
+            amphora_engine::storage::versioned::memory::machine(),
+        )
+        .unwrap();
+        let role = execute::SessionRole {
+            name: "ada",
+            superuser: true,
+        };
+        let mut sessions = std::collections::BTreeMap::new();
+        for (name, process_id) in [("s1", 1001), ("s2", 1002)] {
+            let executor = database.session(role, "UTC", process_id).unwrap();
+            sessions.insert(name.to_owned(), log_in(Box::new(executor)));
+        }
+        let answers = tpcb::answers(include_str!("extended/answers.txt"));
+        let steps: Vec<&str> = include_str!("extended/steps.txt")
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+            .collect();
+        assert_eq!(answers.len(), steps.len());
+        let mut wrong = Vec::new();
+        let mut compared = std::collections::BTreeMap::new();
+        for ((name, step, answer), line) in answers.iter().zip(steps) {
+            assert_eq!(line, format!("{name}: {step}"));
+            let ((b'>', sent), theirs) = answer.split_first().unwrap() else {
+                panic!("{line}: the bytes sent come first");
+            };
+            let session = sessions.get_mut(name).unwrap();
+            let (out, next) = drive(session, roles(), sent, pace);
+            assert_eq!(next, None, "{line}");
+            let told = |messages: &[(u8, Vec<u8>)]| -> Vec<String> {
+                messages
+                    .iter()
+                    .map(|(tag, body)| exactly(*tag, body))
+                    .collect()
+            };
+            let (got, want) = (told(&messages(&out)), told(theirs));
+            for (tag, _) in theirs {
+                *compared.entry(char::from(*tag)).or_insert(0) += 1;
+            }
+            if got != want {
+                wrong.push(format!("{line}:\n  here: {got:#?}\n  19:   {want:#?}"));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} steps\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
+        for tag in [
+            '1', '2', '3', 't', 'T', 'n', 'D', 'C', 's', 'I', 'E', 'N', 'Z',
+        ] {
+            assert!(compared.contains_key(&tag), "no {tag} among {compared:?}");
+        }
+        assert!(compared.values().sum::<i32>() > 1000, "{compared:?}");
+    }
+}
+
+/// T-PG.10.4: each message of T-PG.10.1's steps cut at each byte, a byte longer, and (but for a Parse's, whose
+/// text is the parser's own hostile input) with each byte at three others, a Sync behind it, is answered to
+/// its ReadyForQuery with at most one ErrorResponse, and the session goes on.
+#[test]
+fn t_pg_10_4_hostile_extended_messages_are_answered_to_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("postgres.db");
+    let database = execute::Database::open(
+        path.to_str().unwrap(),
+        amphora_engine::storage::versioned::memory::machine(),
+    )
+    .unwrap();
+    let role = execute::SessionRole {
+        name: "ada",
+        superuser: true,
+    };
+    let executor = database.session(role, "UTC", 1).unwrap();
+    let mut session = log_in(Box::new(executor));
+    let mut given = BTreeSet::new();
+    for (_, _, answer) in tpcb::answers(include_str!("extended/answers.txt")) {
+        for message in messages(&answer[0].1) {
+            if b"PBDEC".contains(&message.0) {
+                given.insert(message);
+            }
+        }
+    }
+    let mut send = |bytes: &[u8]| {
+        let (out, next) = drive(&mut session, roles(), bytes, Pace::Frames);
+        assert_eq!(next, None, "{bytes:02x?}");
+        messages(&out)
+    };
+    for (tag, body) in given
+        .iter()
+        .filter(|(tag, body)| *tag == b'P' && body[0] != 0)
+    {
+        send(&frontend(*tag, body));
+        send(&frontend(b'S', b""));
+    }
+    let mut sent = 0;
+    for (tag, body) in &given {
+        let mut hostile: Vec<Vec<u8>> = (0..body.len()).map(|at| body[..at].to_vec()).collect();
+        hostile.push([body.as_slice(), &[0xff]].concat());
+        for at in (0..body.len()).filter(|_| *tag != b'P') {
+            for byte in [0x00, 0x7f, 0xff] {
+                let mut other = body.clone();
+                other[at] = byte;
+                hostile.push(other);
+            }
+        }
+        for body in hostile {
+            let mut bytes = frontend(*tag, &body);
+            bytes.extend(frontend(b'S', b""));
+            let answer = send(&bytes);
+            assert_eq!(answer.last().map(|m| m.0), Some(b'Z'), "{bytes:02x?}");
+            let refusals = answer.iter().filter(|m| m.0 == b'E').count();
+            assert!(refusals <= 1, "{bytes:02x?}");
+            sent += 1;
+        }
+    }
+    assert!(sent > 10_000, "{sent} hostile messages");
+    let answer = send(&query(b"SELECT 1"));
+    assert_eq!(answer[2], (b'C', b"SELECT 1\0".to_vec()));
 }

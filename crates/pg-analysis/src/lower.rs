@@ -1,8 +1,8 @@
 //! Lowering: a typed statement as the engine's planner runs it (docs/design/postgres.md section 4), its
 //! canonical SQL text with every constant a parameter, and the columns of its result.
 //!
-//! An expression with no column in it is computed here, once, by [`func::eval`], and its value is a
-//! parameter. One over columns is the engine's own comparison where that compares what section 5 stores
+//! An expression with no column in it is computed here, once, by [`func::eval`], a parameter of the
+//! client's with the value its Bind gave it, and its value is a parameter of the engine's. One over columns is the engine's own comparison where that compares what section 5 stores
 //! (integers, text, microseconds), else a call of the function [`PROC_FUNCTION`] names by its OID, which
 //! the engine's PostgreSQL dialect runs by [`func::call`]. Anything else refuses `0A000`.
 
@@ -41,26 +41,29 @@ pub struct Lowered {
     pub fields: Vec<Field>,
 }
 
-/// The engine's statement of a typed one.
-pub fn lower(query: &Query, session: &Session<'_>) -> Result<Lowered, Error> {
+/// The engine's statement of a typed one, its parameters' values `params`.
+pub fn lower(
+    query: &Query,
+    session: &Session<'_>,
+    params: &[Option<Value>],
+) -> Result<Lowered, Error> {
     let mut writer = Writer {
         query,
         session,
+        params,
         constant: query.exprs.constant(),
+        folded: query.exprs.folded(),
         sql: String::new(),
         binds: Vec::new(),
     };
     let table = writer.table()?;
-    let mut fields = Vec::new();
+    let fields = fields(query)?;
     match query.command {
         Command::Select => {
             if query.targets.is_empty() {
                 return Err(Error::unsupported("a SELECT of no columns"));
             }
             writer.list("SELECT ", &query.targets, |w, target| w.expr(target.expr))?;
-            for target in &query.targets {
-                fields.push(writer.field(target)?);
-            }
             if let Some(table) = &table {
                 writer.sql.push_str(" FROM ");
                 writer.sql.push_str(table);
@@ -96,6 +99,29 @@ pub fn lower(query: &Query, session: &Session<'_>) -> Result<Lowered, Error> {
     })
 }
 
+/// A statement's result columns: none for one that isn't a SELECT.
+pub fn fields(query: &Query) -> Result<Vec<Field>, Error> {
+    if query.command != Command::Select {
+        return Ok(Vec::new());
+    }
+    let mut fields = Vec::with_capacity(query.targets.len());
+    for target in &query.targets {
+        let expr = query.exprs.get(target.expr)?;
+        let (table, attnum) = match (&expr.kind, &query.table) {
+            (ExprKind::Var { attnum }, Some(table)) => (table.oid, *attnum),
+            _ => (0, 0),
+        };
+        fields.push(Field {
+            name: target.name.clone(),
+            table,
+            attnum,
+            type_oid: expr.type_oid,
+            typmod: expr.typmod,
+        });
+    }
+    Ok(fields)
+}
+
 /// A piece of an expression's text.
 enum Piece {
     Text(Cow<'static, str>),
@@ -105,8 +131,12 @@ enum Piece {
 struct Writer<'a> {
     query: &'a Query,
     session: &'a Session<'a>,
+    /// `$n`'s values.
+    params: &'a [Option<Value>],
     /// [`crate::expr::Exprs::constant`].
     constant: Vec<bool>,
+    /// [`crate::expr::Exprs::folded`].
+    folded: Vec<bool>,
     sql: String,
     binds: Vec<(u32, Option<Value>)>,
 }
@@ -124,21 +154,6 @@ impl Writer<'_> {
             .name(table.oid)
             .ok_or_else(|| Error::internal("the statement's table is missing"))?;
         Ok(Some(quoted(&name)))
-    }
-
-    fn field(&self, target: &Target) -> Result<Field, Error> {
-        let expr = self.query.exprs.get(target.expr)?;
-        let (table, attnum) = match (&expr.kind, &self.query.table) {
-            (ExprKind::Var { attnum }, Some(table)) => (table.oid, *attnum),
-            _ => (0, 0),
-        };
-        Ok(Field {
-            name: target.name.clone(),
-            table,
-            attnum,
-            type_oid: expr.type_oid,
-            typmod: expr.typmod,
-        })
     }
 
     fn list(
@@ -204,7 +219,9 @@ impl Writer<'_> {
         let query = self.query;
         let expr = query.exprs.get(id)?;
         if self.constant.get(id.index()) == Some(&true) {
-            let value = func::eval(&query.exprs, id, self.session, &[])?;
+            let folded = self.folded.get(id.index()) == Some(&true);
+            let value = func::eval(&query.exprs, id, self.session, self.params)
+                .map_err(|e| if folded { e } else { e.of_its_run() })?;
             return Ok(vec![self.bind(expr.type_oid, value)]);
         }
         let refuse = |what: &str| Err(Error::unsupported(what).at(expr.location));
@@ -414,7 +431,7 @@ mod tests {
         };
         let (tree, statements) = gram::parse(sql.as_bytes()).unwrap();
         let query = analyze(&tree, statements[0], &session, &[])?;
-        lower(&query, &session)
+        lower(&query, &session, &[])
     }
 
     /// T-PG.9.2: TPC-B's account update lowers to the engine's update, its key compared by the engine,

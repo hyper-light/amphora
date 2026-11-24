@@ -420,6 +420,13 @@ enum Piece<'t> {
 }
 
 impl Tree {
+    /// The bytes its nodes take, less what the strings in them are.
+    pub fn bytes(&self) -> usize {
+        self.nodes
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Node>())
+    }
+
     pub fn push(&mut self, node: Node) -> Result<NodeId, TreeFault> {
         let id = u32::try_from(self.nodes.len()).map_err(|_| TreeFault)?;
         self.nodes.push(node);
