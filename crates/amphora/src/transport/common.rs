@@ -1695,6 +1695,15 @@ mod tests {
         assert_eq!(wake_address(address), address);
     }
 
+    /// AC-T1.9.1, AUDIT 6. Waking an owner bound to a scoped IPv6 address uses its interface.
+    #[test]
+    fn audit_review_wake_keeps_the_ipv6_listener_scope() {
+        let scoped = SocketAddr::V6(std::net::SocketAddrV6::new(
+            "fe80::1".parse().unwrap(), 42, 0, 7,
+        ));
+        assert_eq!(wake_address(scoped), scoped);
+    }
+
     /// An owner answering each connection with one byte, at the loopback.
     fn answering_owner() -> (Owner, std::net::SocketAddr) {
         let listener = endpoint::listener(std::net::SocketAddr::from((
