@@ -732,12 +732,6 @@ fn subquery_resources(plan: &Plan) -> SubqueryResources {
             if let Table::FromClauseSubquery(subquery) = &table.table {
                 add_plan(&subquery.plan, resources);
             }
-            // A RIGHT or FULL JOIN's unmatched-row read runs its own copy of a correlated subquery
-            // in a table function's arguments, taken before it was planned: a copy still holds,
-            // and writes, what unnesting removed from the subquery the loops run.
-            if let Some(unmatched) = &table.unmatched_right_rows_plan {
-                add_subqueries(&unmatched.subqueries, resources);
-            }
         }
     }
 
@@ -2078,14 +2072,14 @@ fn plan_correlated_subqueries(
             else {
                 continue;
             };
-            // The last such right table at or before the term, not the one whose ON the term is:
-            // the pass reads no ON of its own table.
-            let on_table = match term.origin {
-                WhereTermOrigin::Join(JoinOrigin::Inner(id) | JoinOrigin::Outer(id)) => {
-                    tables.iter().position(|table| table.internal_id == id)
-                }
-                _ => None,
-            };
+            // The last such right table at or before the term, not the one whose ON or argument the
+            // term is: the pass reads no ON of its own table, and a table function's argument is
+            // read before the function's own loop, by the loops and by the pass alike.
+            let on_table = term.origin.join_origin().and_then(|origin| {
+                tables
+                    .iter()
+                    .position(|table| table.internal_id == origin.right_table())
+            });
             let Some((region, region_table)) = tables.get(..=term_position).and_then(|before| {
                 before.iter().enumerate().rev().find(|(position, table)| {
                     Some(*position) != on_table
@@ -3586,20 +3580,6 @@ fn plan_unmatched_right_rows(
                 "the unmatched-row read found no access method".to_string(),
             ));
         };
-        // A correlated subquery left here is in a table function's arguments, which the read can't
-        // leave out. SQLite compiles it again: the new code must run after the left sources enter
-        // their NULL-row state. An uncorrelated one's result is the one the loops read.
-        let unmatched_rows_subqueries = subqueries
-            .iter()
-            .filter(|subquery| {
-                subquery.correlated
-                    && where_clause_for_unmatched_rows.iter().any(|term| {
-                        !term.consumed
-                            && expr_references_subquery_id(&term.expr, subquery.internal_id)
-                    })
-            })
-            .cloned()
-            .collect();
         let operation = operation_for_unmatched_right_rows(
             resolver,
             table_references,
@@ -3616,7 +3596,6 @@ fn plan_unmatched_right_rows(
             .collect();
         plans[table_index] = Some(UnmatchedRightRowsPlan {
             operation,
-            subqueries: unmatched_rows_subqueries,
             conditions,
         });
     }
