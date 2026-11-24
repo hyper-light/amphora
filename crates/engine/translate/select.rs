@@ -1334,7 +1334,44 @@ fn replace_column_number_with_copy_of_column_expr(
     Ok(())
 }
 
-/// Resolves a compound SELECT ORDER BY term to a 0-based result column index.
+/// The integer an ORDER BY term is, as SQLite's sqlite3ExprIsInteger reads one: a literal that
+/// fits 32 bits, under any signs and parentheses.
+fn integer_term(mut expr: &ast::Expr) -> Option<i32> {
+    let mut negative = false;
+    loop {
+        match expr {
+            ast::Expr::Parenthesized(inner) => {
+                let [one] = inner.as_slice() else {
+                    return None;
+                };
+                expr = one;
+            }
+            ast::Expr::Unary(ast::UnaryOperator::Positive, inner) => expr = inner,
+            ast::Expr::Unary(ast::UnaryOperator::Negative, inner) => {
+                negative = !negative;
+                expr = inner;
+            }
+            ast::Expr::Literal(ast::Literal::Numeric(digits)) => {
+                let hex = digits
+                    .strip_prefix("0x")
+                    .or_else(|| digits.strip_prefix("0X"));
+                let value = match hex {
+                    Some(hex) => i32::from_str_radix(hex, 16).ok()?,
+                    None => digits.parse().ok()?,
+                };
+                return if negative {
+                    value.checked_neg()
+                } else {
+                    Some(value)
+                };
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Resolves a compound SELECT ORDER BY term to a 0-based result column index, and the collation
+/// the term itself states.
 fn resolve_compound_order_by_expr(
     expr: &ast::Expr,
     all_plans: &[&SelectPlan],
@@ -1342,31 +1379,36 @@ fn resolve_compound_order_by_expr(
     term_number: usize,
 ) -> Result<(usize, Option<CollationSeq>)> {
     let num_result_columns = all_plans[0].result_columns.len();
-    match expr {
-        // An explicit COLLATE wraps the column reference. Resolve the inner
-        // reference and carry the collation so it overrides the referenced
-        // column's own collation when the compound result is sorted.
-        ast::Expr::Collate(inner, collation_name) => {
-            let (col_idx, _) =
-                resolve_compound_order_by_expr(inner, all_plans, resolver, term_number)?;
-            return Ok((col_idx, Some(CollationSeq::new(collation_name.as_str())?)));
-        }
-        // Case 1: Numeric column reference (e.g., ORDER BY 1). As in SQLite's
-        // sqlite3ExprIsInteger, only literals that fit a 32-bit int count as
-        // column positions.
-        ast::Expr::Literal(ast::Literal::Numeric(num)) => {
-            if let Ok(column_number) = num.parse::<i32>() {
-                if column_number <= 0 || column_number as usize > num_result_columns {
-                    crate::bail_parse_error!(
-                        "{} ORDER BY term out of range - should be between 1 and {}",
-                        column_number,
-                        num_result_columns
-                    );
+    // A COLLATE is the term's own, however it is parenthesized, and the outermost is the one that
+    // sorts; what is under it names the column.
+    let mut expr = expr;
+    let mut collation = None;
+    loop {
+        match expr {
+            ast::Expr::Collate(inner, name) => {
+                if collation.is_none() {
+                    collation = Some(CollationSeq::new(name.as_str())?);
                 }
-                return Ok((column_number as usize - 1, None));
+                expr = inner;
             }
+            ast::Expr::Parenthesized(inner) => match inner.as_slice() {
+                [one] => expr = one,
+                _ => break,
+            },
+            _ => break,
         }
-        _ => {}
+    }
+    if let Some(position) = integer_term(expr) {
+        return match usize::try_from(position) {
+            Ok(position @ 1..) if position <= num_result_columns => {
+                Ok((position - 1, collation))
+            }
+            _ => crate::bail_parse_error!(
+                "{} ORDER BY term out of range - should be between 1 and {}",
+                ordinal(term_number),
+                num_result_columns
+            ),
+        };
     }
 
     for plan in all_plans {
@@ -1375,14 +1417,14 @@ fn resolve_compound_order_by_expr(
             for (index, result_column) in plan.result_columns.iter().enumerate() {
                 if let Some(alias) = &result_column.alias {
                     if normalize_ident(alias) == normalized_name {
-                        return Ok((index, None));
+                        return Ok((index, collation));
                     }
                 }
             }
             for (index, result_column) in plan.result_columns.iter().enumerate() {
                 if let Some(column_name) = result_column.name(&plan.table_references) {
                     if normalize_ident(column_name) == normalized_name {
-                        return Ok((index, None));
+                        return Ok((index, collation));
                     }
                 }
             }
@@ -1406,7 +1448,7 @@ fn resolve_compound_order_by_expr(
             .iter()
             .position(|result_column| exprs_are_equivalent(&bound_expr, &result_column.expr))
         {
-            return Ok((index, None));
+            return Ok((index, collation));
         }
     }
 

@@ -196,6 +196,12 @@ struct TriggerSubprogramContext {
     db_name: Option<ast::Name>,
 }
 
+/// Amphora: whether `name`, no column of `table`, is its rowid, which a WITHOUT ROWID table has
+/// none of.
+fn names_rowid(table: &BTreeTable, name: &str) -> bool {
+    table.has_rowid && ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(name))
+}
+
 fn variable_from_parameter_index(index: NonZero<usize>, col_type: Option<&str>) -> Expr {
     let nz = u32::try_from(index.get())
         .ok()
@@ -449,7 +455,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                         }
                     }
                     // Handle NEW.rowid
-                    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&col)) {
+                    if names_rowid(&ctx.table, &col) {
                         *e = variable_from_parameter_index(
                             ctx.get_new_rowid_param()
                                 .expect("NEW parameters must be provided"),
@@ -491,7 +497,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                         }
                     }
                     // Handle OLD.rowid
-                    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&col)) {
+                    if names_rowid(&ctx.table, &col) {
                         *e = variable_from_parameter_index(
                             ctx.get_old_rowid_param()
                                 .expect("OLD parameters must be provided"),
@@ -1356,7 +1362,7 @@ fn rewrite_trigger_expr_single_for_when_clause(
                         }
                     }
                     // Handle NEW.rowid
-                    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&col)) {
+                    if names_rowid(table, &col) {
                         *expr = Expr::Register(
                             *ctx.new_registers
                                 .as_ref()
@@ -1384,7 +1390,7 @@ fn rewrite_trigger_expr_single_for_when_clause(
                         }
                     }
                     // Handle OLD.rowid
-                    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&col)) {
+                    if names_rowid(table, &col) {
                         *expr = Expr::Register(
                             *ctx.old_registers
                                 .as_ref()

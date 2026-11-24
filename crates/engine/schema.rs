@@ -3887,7 +3887,7 @@ impl BTreeTable {
             }
 
             if column.notnull()
-                && (column.explicit_notnull() || !self.is_without_rowid_inline_pk(column))
+                && (column.explicit_notnull() || !self.key_implies_notnull(column))
             {
                 sql.push_str(" NOT NULL");
                 push_on_conflict_clause(&mut sql, column.notnull_conflict_clause);
@@ -4109,8 +4109,10 @@ impl BTreeTable {
             .and_then(|column| column.collation)
     }
 
-    fn is_without_rowid_inline_pk(&self, column: &Column) -> bool {
-        !self.has_rowid && self.primary_key_columns.len() == 1 && column.primary_key()
+    /// Whether the column's NOT NULL is its key's, which a STRICT or a WITHOUT ROWID table's is.
+    fn key_implies_notnull(&self, column: &Column) -> bool {
+        let keyed = self.is_strict || (!self.has_rowid && self.primary_key_columns.len() == 1);
+        keyed && column.primary_key()
     }
 
     pub fn column_collations(&self) -> Result<Vec<CollationSeq>> {
@@ -5483,6 +5485,17 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     unreachable!("PRIMARY KEY column should exist");
                 };
                 table.columns[idx].set_notnull(true);
+            }
+        }
+    } else if table.is_strict {
+        // Amphora: a STRICT table's PRIMARY KEY columns are NOT NULL, but for an INTEGER PRIMARY
+        // KEY, whose NULL is the next rowid (stricttables.html, section 2).
+        let keys = &table.primary_key_columns;
+        for column in table.columns.iter_mut() {
+            let name = column.name.as_deref().unwrap_or_default();
+            let keyed = keys.iter().any(|(key, _)| key.eq_ignore_ascii_case(name));
+            if keyed && !column.is_rowid_alias() {
+                column.set_notnull(true);
             }
         }
     }

@@ -741,7 +741,6 @@ pub fn emit_upsert(
                 start_reg: new_start,
                 count: layout.num_non_virtual_cols(),
                 check_generated: false,
-                check_null_keys: true,
                 table_reference: BTreeTable::input_type_check_table_ref(
                     &bt,
                     resolver.schema(),
@@ -801,7 +800,6 @@ pub fn emit_upsert(
                 start_reg: new_start,
                 count: bt.columns().len(),
                 check_generated: true,
-                check_null_keys: true,
                 table_reference: BTreeTable::type_check_table_ref(&bt, resolver.schema()),
             });
         }
