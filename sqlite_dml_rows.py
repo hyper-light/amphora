@@ -185,6 +185,8 @@ class Case:
         names = self.all[:]
         if not self.without_rowid:
             names += ["rowid", rng.choice(["oid", "_rowid_"])]
+        elif rng.random() < 0.03:
+            names = ["rowid"]
         if self.pk and rng.random() < 0.35:
             return self.pk
         return rng.choice(names)
