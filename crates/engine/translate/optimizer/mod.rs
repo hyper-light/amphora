@@ -5066,6 +5066,234 @@ pub(crate) mod bushy_search_tests {
             }
         }
 
+        /// Lane C3's probe, not for main: `facts`, analyzed or not.
+        fn c3_facts(analyze: bool) -> (Arc<Database>, Arc<crate::Connection>) {
+            let io = Arc::new(MemoryIO::new());
+            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            for sql in C3_DATA {
+                conn.execute(sql).unwrap();
+            }
+            if analyze {
+                conn.execute("ANALYZE").unwrap();
+            }
+            (db, conn)
+        }
+
+        const C3_DATA: [&str; 8] = [
+            "CREATE TABLE d1(id INTEGER PRIMARY KEY, cat INT)",
+            "CREATE TABLE d2(id INTEGER PRIMARY KEY, cat INT)",
+            "CREATE TABLE f1(id INTEGER PRIMARY KEY, d1 INT, k INT)",
+            "CREATE TABLE f2(id INTEGER PRIMARY KEY, d2 INT, k INT)",
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 50) \
+             INSERT INTO d1 SELECT x, x % 25 FROM n",
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 50) \
+             INSERT INTO d2 SELECT x, x % 25 FROM n",
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 12000) \
+             INSERT INTO f1 SELECT x, x % 50 + 1, x % 2 FROM n",
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 12000) \
+             INSERT INTO f2 SELECT x, x % 50 + 1, x % 2 FROM n",
+        ];
+
+        /// The eight queries of `t_pl_8_13_a_left_join_inside_a_bushy_run_keeps_its_null_rows`, in
+        /// its order.
+        fn c3_queries() -> Vec<String> {
+            let select = "SELECT count(*), sum(f1.id), sum(f2.id), count(s.id), sum(s.cat)";
+            let mut out = Vec::new();
+            for (on_extra, above) in [
+                ("", ""),
+                (" AND s.cat <> 11 AND s.cat <> 17", ""),
+                ("", " AND s.id IS NULL"),
+                ("", " AND (s.id IS NULL OR s.cat + f2.k = 11)"),
+            ] {
+                for (from, filter) in [
+                    (
+                        format!(
+                            "FROM d1 LEFT JOIN d2 s ON s.id = d1.id * 12{on_extra} \
+                             JOIN f1 ON f1.d1 = d1.id JOIN f2 ON f2.k = f1.k \
+                             JOIN d2 ON f2.d2 = d2.id"
+                        ),
+                        "WHERE d1.cat < 3 AND d2.id = 7",
+                    ),
+                    (
+                        format!(
+                            "FROM d2 LEFT JOIN d1 s ON s.id = d2.id * 6{on_extra} \
+                             JOIN f2 ON f2.d2 = d2.id JOIN f1 ON f2.k = f1.k \
+                             JOIN d1 ON f1.d1 = d1.id"
+                        ),
+                        "WHERE d2.cat < 3 AND d1.id = 3",
+                    ),
+                ] {
+                    out.push(format!("{select} {from} {filter}{above}"));
+                }
+            }
+            out
+        }
+
+        /// Every whole plan the search weighed for the first query and its mirror, at the weights
+        /// after `facts()` and again after the query has run, with the weights themselves
+        /// (`RUST_LOG=amphora::join_search=debug`).
+        #[test_log::test]
+        fn c3_probe_weighed() {
+            let (db, conn) = c3_facts(true);
+            for (n, sql) in c3_queries().iter().enumerate().take(2) {
+                for round in ["before", "after"] {
+                    eprintln!("C3W|q{n}|{round}|weights={:?}", db.learned_costs.weights());
+                    let (plan, cost) = plan_and_cost(&conn, sql);
+                    eprintln!("C3W|q{n}|{round}|cost={cost}|{plan:?}");
+                    if round == "before" {
+                        let answer = rows(&conn, sql);
+                        eprintln!("C3W|q{n}|ran|{answer:?}");
+                    }
+                }
+            }
+        }
+
+        /// The plan with the LEFT JOIN in the run and its mirror, each forced, timed and counted.
+        #[test]
+        fn c3_probe_forced() {
+            use super::super::bushy_test_hook::{APPLIED, PIN, PIN_HASH_JOINS, SPLIT};
+            let (db, conn) = c3_facts(true);
+            conn.set_row_counters(true);
+            let select = "SELECT count(*), sum(f1.id), sum(f2.id), count(s.id), sum(s.cat)";
+            let left = "LEFT JOIN d2 s ON s.id = d1.id * 12";
+            let filter = "WHERE d1.cat < 3 AND d2.id = 7";
+            let a = format!(
+                "{select} FROM d2 JOIN d1 {left} JOIN f1 ON f1.d1 = d1.id \
+                 JOIN f2 ON f2.k = f1.k AND f2.d2 = d2.id {filter}"
+            );
+            let b = format!(
+                "{select} FROM d1 {left} JOIN d2 JOIN f2 ON f2.d2 = d2.id \
+                 JOIN f1 ON f1.d1 = d1.id AND f2.k = f1.k {filter}"
+            );
+            let searched = c3_queries()[0].clone();
+            for (name, sql, pin, split) in [
+                ("left join in the run: d2 ((d1 s f1) f2)", &a, true, 1usize),
+                ("its mirror: d1 s ((d2 f2) f1)", &b, true, 2usize),
+                ("the search's own", &searched, false, 0usize),
+            ] {
+                PIN.with(|p| p.set(pin));
+                PIN_HASH_JOINS.with(|p| p.set(0));
+                SPLIT.with(|s| s.set(if pin { Some(split) } else { None }));
+                let mut times = Vec::new();
+                let mut counts = Vec::new();
+                let mut answer = Vec::new();
+                APPLIED.with(|applied| applied.set(0));
+                LEFT_JOINS_IN_RUNS.with(|runs| runs.set(0));
+                for _ in 0..15 {
+                    let mut stmt = conn.prepare(sql.as_str()).unwrap();
+                    let began = std::time::Instant::now();
+                    let got = stmt.run_collect_rows().unwrap();
+                    times.push(began.elapsed().as_micros());
+                    counts = stmt.row_counts();
+                    answer = got
+                        .iter()
+                        .map(|row| {
+                            row.iter()
+                                .map(|value| value.to_string())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        })
+                        .collect();
+                }
+                let applied = APPLIED.with(Cell::get);
+                let in_runs = LEFT_JOINS_IN_RUNS.with(Cell::get);
+                let plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+                let cost = LAST_JOIN_COST.with(Cell::get);
+                PIN.with(|p| p.set(false));
+                SPLIT.with(|s| s.set(None));
+                times.sort();
+                eprintln!(
+                    "C3F|{name}|applied={applied} in_runs={in_runs}|cost={cost}|us median {} min {} max {}|{answer:?}|{plan:?}",
+                    times[times.len() / 2],
+                    times[0],
+                    times[times.len() - 1]
+                );
+                for count in &counts {
+                    eprintln!("C3F|{name}|{count:?}");
+                }
+                eprintln!("C3F|{name}|weights={:?}", db.learned_costs.weights());
+            }
+        }
+
+        /// Lane C6's probe, not for main: each of t_pl_8_13's eight queries planned under pinned
+        /// weights, the shape and the estimated cost printed.
+        #[test]
+        fn c6_probe_weights() {
+            use crate::translate::optimizer::learned_costs::LearnedWeights;
+            let (db, conn) = c3_facts(true);
+            let start = db.learned_costs.weights().unwrap();
+            eprintln!("C6W|start|{start:?}");
+            for (seek, build) in [(start.seek, start.hash_build), (12.79, 20.77), (8.2, 25.0)] {
+                for probe in [
+                    start.hash_probe,
+                    9.2,
+                    20.0,
+                    40.0,
+                    60.0,
+                    88.0,
+                    150.0,
+                    312.9,
+                    400.0,
+                ] {
+                    let mut shapes = Vec::new();
+                    for sql in &c3_queries() {
+                        conn.pin_cost_weights(Some(LearnedWeights {
+                            row_in_pages: Some(0.005736),
+                            seek,
+                            hash_build: build,
+                            hash_probe: probe,
+                            sort: 3.0,
+                            bloom_probe: 10.0,
+                            where_step: 1.0,
+                            page_miss: None,
+                        }));
+                        BUSHY_PLANS.with(|plans| plans.set(0));
+                        LEFT_JOINS_IN_RUNS.with(|runs| runs.set(0));
+                        let (_, cost) = plan_and_cost(&conn, sql);
+                        shapes.push(format!(
+                            "bushy={} in_runs={} cost={cost:.0}",
+                            BUSHY_PLANS.with(Cell::get).min(1),
+                            LEFT_JOINS_IN_RUNS.with(Cell::get).min(1)
+                        ));
+                    }
+                    let held = shapes
+                        .iter()
+                        .filter(|shape| shape.contains("in_runs=1"))
+                        .count();
+                    eprintln!("C6W|seek={seek:.2}|build={build:.2}|probe={probe:.2}|in_runs of 8: {held}|{shapes:?}");
+                }
+            }
+            conn.pin_cost_weights(None);
+        }
+
+        /// Lane C6's probe, not for main: what t_pl_8_13's own sequence does to the weights: before
+        /// and after each query's first run, and the plan at the first, second and third prepare.
+        #[test]
+        fn c6_probe_trajectory() {
+            let (db, conn) = c3_facts(true);
+            for (n, sql) in c3_queries().iter().enumerate() {
+                for step in ["first", "second", "explain"] {
+                    let weights = db.learned_costs.weights();
+                    BUSHY_PLANS.with(|plans| plans.set(0));
+                    LEFT_JOINS_IN_RUNS.with(|runs| runs.set(0));
+                    if step == "explain" {
+                        rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+                    } else {
+                        rows(&conn, sql);
+                    }
+                    eprintln!(
+                        "C6T|q{n}|{step}|bushy={} in_runs={}|seek={:.2} build={:.2} probe={:.2}",
+                        BUSHY_PLANS.with(Cell::get).min(1),
+                        LEFT_JOINS_IN_RUNS.with(Cell::get).min(1),
+                        weights.map_or(0.0, |w| w.seek),
+                        weights.map_or(0.0, |w| w.hash_build),
+                        weights.map_or(0.0, |w| w.hash_probe),
+                    );
+                }
+            }
+        }
+
         /// One database of `tests/fixtures/outer_joins.tsv`: the statements that fill it, and its
         /// queries with SQLite's answers, each with how many columns its ORDER BY reads (0: one row
         /// of aggregates, compared as it stands).
