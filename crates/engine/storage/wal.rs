@@ -1086,8 +1086,7 @@ trait WalCoordination: Debug + Send + Sync {
 
     /// [`Self::switch`] with no read in the log, as RESTART and TRUNCATE promise: Busy while a read
     /// mark of the current segment guards one. The caller holds a checkpoint's locks and the writer's.
-    /// `to_cut`: its files are cut next (TRUNCATE), so a segment never switched to needs none yet.
-    fn switch_unread(&self, io: &dyn IO, to_cut: bool) -> Result<Option<SegmentId>>;
+    fn switch_unread(&self, io: &dyn IO) -> Result<Option<SegmentId>>;
 
     /// Both of the log's files are cut: it starts as a new database's does ([`SharedLog::start_first`]).
     fn start_first(&self, io: &dyn IO) -> Result<()>;
@@ -1982,17 +1981,15 @@ impl WalCoordination for InProcessWalCoordination {
         switched
     }
 
-    fn switch_unread(&self, io: &dyn IO, to_cut: bool) -> Result<Option<SegmentId>> {
+    fn switch_unread(&self, io: &dyn IO) -> Result<Option<SegmentId>> {
         let segment = self.log.current_id();
         let held = (1..READ_MARKS)
             .take_while(|&slot| self.try_segment_read_mark_exclusive(segment, slot))
             .count();
-        let switched = if held < READ_MARKS.saturating_sub(1) {
-            Err(LimboError::Busy)
-        } else if to_cut {
-            self.log.switch_to_free(io, None, false)
-        } else {
+        let switched = if held == READ_MARKS.saturating_sub(1) {
             self.log.switch(io, None)
+        } else {
+            Err(LimboError::Busy)
         };
         (1..=held).for_each(|slot| self.unlock_segment_read_mark(segment, slot));
         switched
@@ -3300,7 +3297,7 @@ impl WalCoordination for ShmWalCoordination {
         id = "restart_ignores_db_file_readers",
         parent = "wal_protocol_correctness"
     )]
-    fn switch_unread(&self, io: &dyn IO, _to_cut: bool) -> Result<Option<SegmentId>> {
+    fn switch_unread(&self, io: &dyn IO) -> Result<Option<SegmentId>> {
         let current = self.current_segment();
         // A log another process left in two segments: a restart of one would take its sequence two
         // past the header the other's file holds, a pair recovery refuses.
@@ -3344,7 +3341,7 @@ impl WalCoordination for ShmWalCoordination {
         if !matches!(held, ReadGuardKind::DbFile(_)) || !self.fallback.try_upgrade_read_mark(0) {
             return Ok(None);
         }
-        let switched = self.switch_unread(io, false);
+        let switched = self.switch_unread(io);
         self.fallback.downgrade_read_mark(0);
         match switched {
             Err(LimboError::Busy) => Ok(None),
@@ -4579,7 +4576,7 @@ impl SharedLog {
         {
             return Ok(None);
         }
-        self.switch_to_free(io, cut_past, true)
+        self.switch_to_free(io, cut_past)
     }
 
     /// Both of the log's files are cut to nothing (TRUNCATE's end): no header is on disk, and the log
@@ -4587,33 +4584,13 @@ impl SharedLog {
     /// while a read counts on that segment: the second one then stays current. The caller holds
     /// `write_lock`.
     fn start_first(&self, io: &dyn IO) -> Result<()> {
-        if self.current_id() == SegmentId::Second
-            && self.switch_to_free(io, None, true)?.is_none()
-        {
-            self.make_file(&mut self.second.write(), io)?;
+        if self.current_id() == SegmentId::Second {
+            let _ = self.switch_to_free(io, None)?;
         }
         Ok(())
     }
 
-    /// The second segment's file, made where the open found none.
-    fn make_file(&self, segment: &mut WalFileShared, io: &dyn IO) -> Result<()> {
-        if segment.runtime.file.is_none() {
-            let path = self.second_path.as_deref().ok_or_else(|| {
-                LimboError::InternalError(
-                    "the log's free segment has no file and no path to make one".into(),
-                )
-            })?;
-            segment.runtime.file = Some(io.open_file(path, crate::OpenFlags::Create, false)?);
-        }
-        Ok(())
-    }
-
-    fn switch_to_free(
-        &self,
-        io: &dyn IO,
-        cut_past: Option<u64>,
-        make_file: bool,
-    ) -> Result<Option<SegmentId>> {
+    fn switch_to_free(&self, io: &dyn IO, cut_past: Option<u64>) -> Result<Option<SegmentId>> {
         let segments = self.segments.load();
         if segments.closing().is_some() {
             return Ok(None);
@@ -4633,8 +4610,13 @@ impl SharedLog {
         };
         {
             let mut free = self.segment(to).write();
-            if make_file {
-                self.make_file(&mut free, io)?;
+            if free.runtime.file.is_none() {
+                let path = self.second_path.as_deref().ok_or_else(|| {
+                    LimboError::InternalError(
+                        "the log's free segment has no file and no path to make one".into(),
+                    )
+                })?;
+                free.runtime.file = Some(io.open_file(path, crate::OpenFlags::Create, false)?);
             }
             if let (Some(limit), Some(file)) = (cut_past, free.runtime.file.as_ref()) {
                 if file.size()? > limit {
@@ -4859,12 +4841,14 @@ impl CheckpointLocks {
         }
     }
 
-    /// The read mark 0 moved to `to`, the segment the checkpoint's next pass copies, the other locks
-    /// kept: no writer and no other checkpoint comes between the two passes. Asked after a pass that
-    /// copied, which held the mark.
+    /// The read mark 0, where it is held, moved to `to`, the segment the checkpoint goes on in, the
+    /// other locks kept: no writer and no other checkpoint comes between.
     fn move_to(&mut self, to: SegmentId) -> Result<()> {
-        self.coordination.move_checkpoint_guard(self.segment, to)?;
-        self.segment = to;
+        let holds_mark = self.kind != CoordinationCheckpointGuardKind::WriterBesideFileReads;
+        if holds_mark && self.segment != to {
+            self.coordination.move_checkpoint_guard(self.segment, to)?;
+            self.segment = to;
+        }
         Ok(())
     }
 
@@ -7768,7 +7752,7 @@ impl Wal for WalFile {
     }
 
     fn restart_wal(&self, result: &CheckpointResult) -> Result<()> {
-        self.start_log_again(result, false)
+        self.start_log_again(result)
     }
 
     fn truncate_wal(
@@ -8560,15 +8544,13 @@ impl WalFile {
     /// from its first frame. Busy while a read is in the log, as SQLite answers one ("blocks (calls
     /// the busy-handler callback) until all readers are reading from the database file only",
     /// sqlite.org/c3ref/wal_checkpoint_v2.html); what was copied stays copied.
-    fn start_log_again(&self, result: &CheckpointResult, to_cut: bool) -> Result<()> {
+    fn start_log_again(&self, result: &CheckpointResult) -> Result<()> {
         if result.wal_max_frame == 0 {
             return Ok(());
         }
         self.coordination
             .publish_backfill(result.wal_total_backfilled);
-        let _ = self
-            .coordination
-            .switch_unread(self.io.as_ref(), to_cut)?;
+        let _ = self.coordination.switch_unread(self.io.as_ref())?;
         self.read_from_file();
         Ok(())
     }
@@ -8585,7 +8567,7 @@ impl WalFile {
         loop {
             match result.cut {
                 LogCut::Asked => {
-                    self.start_log_again(result, true)?;
+                    self.start_log_again(result)?;
                     // A segment switched to has its header written by its first commit: until then
                     // its file holds the older one, of its life before.
                     let current = self.coordination.current_segment();
@@ -8594,9 +8576,7 @@ impl WalFile {
                     } else {
                         current
                     };
-                    if result.wal_max_frame == 0 {
-                        let _current_file = self.coordination.prepare_truncate()?;
-                    }
+                    let _current_file = self.coordination.prepare_truncate()?;
                     // after truncation - there will be nothing in the WAL
                     result.wal_max_frame = 0;
                     result.wal_total_backfilled = 0;
@@ -8642,8 +8622,17 @@ impl WalFile {
                     io_yield_one!(c);
                 }
                 LogCut::Cut => {
-                    self.coordination.start_first(self.io.as_ref())?;
-                    self.read_from_file();
+                    // This checkpoint's own read mark 0 is on the segment it copied: it goes where the
+                    // log is now, unless a read of the file alone began there, and the log stays there.
+                    let current = self.coordination.current_segment();
+                    let unread = result
+                        .maybe_guard
+                        .as_mut()
+                        .is_none_or(|guard| guard.move_to(current).is_ok());
+                    if unread {
+                        self.coordination.start_first(self.io.as_ref())?;
+                        self.read_from_file();
+                    }
                     result.cut = LogCut::Done;
                 }
                 LogCut::Done => return Ok(IOResult::Done(())),
@@ -11779,12 +11768,12 @@ pub mod test {
         // once it ends.
         assert!(coordination.try_read_mark_shared(1));
         assert!(matches!(
-            coordination.switch_unread(&io, false),
+            coordination.switch_unread(&io),
             Err(LimboError::Busy)
         ));
         coordination.unlock_read_mark(1);
         assert_eq!(
-            coordination.switch_unread(&io, false).unwrap(),
+            coordination.switch_unread(&io).unwrap(),
             Some(SegmentId::Second)
         );
         let restarted = coordination.load_snapshot();
@@ -13223,7 +13212,7 @@ pub mod test {
         }
 
         assert!(coordination_b.fallback.try_read_mark_exclusive(0));
-        let started = coordination_b.switch_unread(&io, false).unwrap();
+        let started = coordination_b.switch_unread(&io).unwrap();
         coordination_b.fallback.unlock_read_mark(0);
         assert_eq!(started, Some(SegmentId::First));
 
