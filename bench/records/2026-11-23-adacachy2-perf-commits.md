@@ -1442,7 +1442,29 @@ and which 68 is inferred from that order, not logged. In its turn the write woul
 
 ## The fix (ff4433ba, red tests c3ebea5d)
 
-FIX_PLACEHOLDER
+Both changes are in the slot's pure core (`database/slot.rs`), each where its decision is made. Nothing on the wire
+or in an entry changes.
+
+- `Slots::length`: a slot is at least the core's election timeout (`Bounds::election`, `election_tick` times the
+  owner's pace, the slot's first value since its design), and longer when its member's learned gap is longer. A slot
+  ends by time only once its holder is as late as the core takes a member for gone. The host's detector still ends a
+  gone holder's slot at once (`keep`), and a slow member's learned gap still lengthens its next slot.
+- `Slots::start`: a turn the leader has no write for passes only to a slot that begins. With no barrier waiting the
+  turn stays owed and only the forwards it held go, so the leader's next write prepares in its turn, behind its log's
+  tail, not on its applied state ahead of the holder's uncommitted entry.
+
+What it costs (inferred from the code, not measured): a holder that dies with no verdict from the detector holds the
+leader's writes up to an election timeout (200 ms at the 10 ms tick), where its learned gap held them about 30 ms.
+
+Tests, each "do X, expect Y" citing CP-T1.8: `slot::a_slot_outlasts_a_learned_gap_shorter_than_the_election_timeout`
+(new); `slot::forwards_wait_through_the_leaders_turn` and
+`slot::a_refused_members_barrier_begins_its_slot_and_its_forward_goes_first` (their expectations now these rules);
+`slot::a_learned_gap_is_believed_for_one_to_two_of_its_members_generations` (its gaps moved past the election
+timeout, so it still tests generations); and
+`replicated::v13_thirty_two_spread_writers_on_moving_time_are_each_answered_with_no_stale_base` (new, beside test 5):
+32 writers spread over the three members, three rows each, both classes, every member's clock moving a tick of its
+pace a round. A driven round holds every clock still, so no slot can end by time in test 5, which is why it stayed
+green on main while real time refused.
 
 ## Runs
 
