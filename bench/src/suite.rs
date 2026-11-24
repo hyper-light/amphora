@@ -600,10 +600,13 @@ struct Opts {
     /// new one: a statement profiled again without loading ten million rows again. A diagnosis,
     /// never a record (its runs follow whatever the last run's writes left).
     reuse: bool,
+    /// Amphora's tables declared `COLUMNAR`: on its versioned storage they keep column copies
+    /// (docs/design/columnar.md, decision 1, item 1).
+    columnar: bool,
 }
 
 fn opts() -> anyhow::Result<Opts> {
-    let mut o = Opts { target: String::new(), dir: "/tmp/amphora-suite".into(), dsn: None, items: 200_000, clients: vec![1, 32], seconds: 5.0, warmup: 1.0, only: None, explain: false, reuse: false };
+    let mut o = Opts { target: String::new(), dir: "/tmp/amphora-suite".into(), dsn: None, items: 200_000, clients: vec![1, 32], seconds: 5.0, warmup: 1.0, only: None, explain: false, reuse: false, columnar: false };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut v = || args.next().ok_or_else(|| anyhow::anyhow!("{a} takes a value"));
@@ -619,8 +622,12 @@ fn opts() -> anyhow::Result<Opts> {
             "--only" => o.only = Some(v()?),
             "--explain" => o.explain = true,
             "--reuse" => o.reuse = true,
-            other => anyhow::bail!("unknown argument {other} (the suite takes --target, --dir, --dsn, --items, --clients, --seconds, --warmup, --only, --explain, --reuse)"),
+            "--columnar" => o.columnar = true,
+            other => anyhow::bail!("unknown argument {other} (the suite takes --target, --dir, --dsn, --items, --clients, --seconds, --warmup, --only, --explain, --reuse, --columnar)"),
         }
+    }
+    if o.columnar && o.target != "amphora" {
+        anyhow::bail!("--columnar declares Amphora's tables COLUMNAR; target {} has no such option", o.target);
     }
     Ok(o)
 }
@@ -842,9 +849,10 @@ fn selected(only: Option<&str>, name: &str) -> bool {
 
 /// Makes the suite's tables, loads them, builds their indexes and settles the database: each
 /// step's seconds.
-fn load_all(target: &Arc<dyn Target>, d: Dialect, shape: &Shape, cedardb: bool) -> anyhow::Result<(f64, f64, f64)> {
+fn load_all(target: &Arc<dyn Target>, d: Dialect, shape: &Shape, cedardb: bool, columnar: bool) -> anyhow::Result<(f64, f64, f64)> {
     let began = Instant::now();
-    target.setup(&tables(d, cedardb).into_iter().map(|s| (s, vec![])).collect::<Vec<_>>())?;
+    let declare = |s: String| if columnar { format!("{s} COLUMNAR") } else { s };
+    target.setup(&tables(d, cedardb).into_iter().map(|s| (declare(s), vec![])).collect::<Vec<_>>())?;
     // A hundred rows a statement keeps every placeholder-bound engine under its parameter limit
     // (SQLite 32,766, PostgreSQL's and MySQL's 65,535). ClickHouse makes each INSERT a part it then
     // merges, and asks for bulk inserts of at least 1,000 rows, better 10,000 to 100,000 (its
@@ -875,7 +883,7 @@ pub fn main() -> anyhow::Result<()> {
     let d = target.dialect();
 
     // --reuse: the database a run left, as that run loaded, indexed and settled it.
-    let (loaded_s, indexed_s, settle_s) = if o.reuse { (0.0, 0.0, 0.0) } else { load_all(&target, d, &shape, o.target == "cedardb")? };
+    let (loaded_s, indexed_s, settle_s) = if o.reuse { (0.0, 0.0, 0.0) } else { load_all(&target, d, &shape, o.target == "cedardb", o.columnar)? };
     target.ready()?;
     let rss_after_load_mb = crate::rss_mb();
     forget_peaks();

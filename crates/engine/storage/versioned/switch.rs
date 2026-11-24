@@ -131,10 +131,7 @@ pub fn open(path: &str, memory: bool, source: Option<Arc<dyn Source>>) -> Result
         orders: Mutex::new(recovered.into_inner()),
         // The copies' queues, decoded blocks and blocks take from the same source as they grow,
         // as the pages and row versions do: no share is set aside for them.
-        copies: super::columns_sql::Copies::new(
-            crate::translate::optimizer::column_path::asked(),
-            source,
-        ),
+        copies: super::columns_sql::Copies::new(source),
         #[cfg(test)]
         build_pause: Mutex::new(None),
         #[cfg(test)]
@@ -154,13 +151,6 @@ impl Storage {
     /// The last SQL table's column copy let go for its memory, and why (G11 step 5).
     pub fn copy_dropped(&self) -> Option<super::columns_sql::Dropped> {
         self.copies.last_dropped()
-    }
-
-    /// Turns the SQL tables' column copies on or off, as `AMPHORA_COLUMN_PATH=on` does at open,
-    /// for a driver outside the crate: the bench's comparison against DuckDB (lane colcopy-5,
-    /// AC-CB.4.2).
-    pub fn set_copies_on(&self, on: bool) {
-        self.copies.set_on(on);
     }
 
     /// Sets how a copy the memory source refused is bought again, as `AMPHORA_COLUMN_REBUY` does

@@ -1577,8 +1577,9 @@ impl Connection {
     /// Amphora (PL.13, T-PL.13.1; lane T9, the versioned cost snapshot): plans newly prepared
     /// statements with this whole set of weights in place of the learned ones, the page-miss ratio
     /// included, so no cost input of a test's plans moves with the machine's timings, its cache or
-    /// the test's earlier runs. None: the learned ones again.
-    #[cfg(any(test, feature = "simulator"))]
+    /// the test's earlier runs. None: the learned ones again. Lane T17: the bench's too
+    /// (`--pin-weights`), so two arms or two plans are made on identical cost inputs.
+    #[cfg(any(test, feature = "simulator", feature = "bench"))]
     pub fn pin_cost_weights(
         &self,
         weights: Option<crate::translate::optimizer::learned_costs::LearnedWeights>,

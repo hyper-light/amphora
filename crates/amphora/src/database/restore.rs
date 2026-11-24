@@ -153,16 +153,17 @@ impl Restore {
 
     pub fn finish(self, expected_cursor: Vec<u8>, until: Instant) -> Result<Database, Refusal> {
         let source = self.source.clone();
-        self.database.call_db(until, AnswerMax::fixed(), move |db| {
-            fence(db, &source, &expected_cursor)?;
-            db.validate_foreign_keys()?;
-            db.query(
-                "UPDATE __amphora_restore SET done = 1 WHERE id = 1",
-                [],
-                |_| Ok(true),
-            )?;
-            Ok(())
-        })?;
+        self.database
+            .call_db(until, AnswerMax::fixed(), move |db| {
+                fence(db, &source, &expected_cursor)?;
+                db.validate_foreign_keys()?;
+                db.query(
+                    "UPDATE __amphora_restore SET done = 1 WHERE id = 1",
+                    [],
+                    |_| Ok(true),
+                )?;
+                Ok(())
+            })?;
         let Writer::Local(store) = &self.database.shared.writer else {
             return Err(api::invalid(
                 "restore",

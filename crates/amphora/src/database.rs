@@ -2485,9 +2485,9 @@ impl Database {
             .map(crate::backup::Foreground::call);
         let session = Arc::new(Mutex::new(Some(f)));
         let claim = self.application.clone();
-        if let Some(read) =
-            store.on_reader(until, |reader| run_query(reader, until, claim.as_ref(), &session))
-        {
+        if let Some(read) = store.on_reader(until, |reader| {
+            run_query(reader, until, claim.as_ref(), &session)
+        }) {
             return read.map_err(|e| refused(&e));
         }
         let job =
