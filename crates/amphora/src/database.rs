@@ -2325,9 +2325,8 @@ impl Database {
                 "an attached client can't run Amphora's own SQL; run it on the owner",
             ));
         }
-        let (value, write) = database.call_db_session(until, answer.get(), move |db| {
-            Ok(within(f(db)?, answer)?)
-        })?;
+        let (value, write) =
+            database.call_db_session(until, answer.get(), move |db| Ok(within(f(db)?, answer)?))?;
         if let (Writer::Replicated { client, .. }, Some(write)) = (&database.shared.writer, write) {
             // A follower can answer on the group's commit before its own apply. The step's
             // subsequent clock read must cover the applied entry, including any HLC lift.

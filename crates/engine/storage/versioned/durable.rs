@@ -48,8 +48,7 @@ const PAGES_FLUSHED: u64 = 1;
 /// The seal's magic, body length and hash are each an encoded u64.
 const SEAL_LEN: usize = size_of::<[u64; 3]>();
 /// A header page holds the seal, the four fixed words in `Stamp::encode`, and one word per root.
-const HEADER_ROOT_SLOTS: usize =
-    (PAGE_SIZE - SEAL_LEN - size_of::<[u64; 4]>()) / size_of::<u64>();
+const HEADER_ROOT_SLOTS: usize = (PAGE_SIZE - SEAL_LEN - size_of::<[u64; 4]>()) / size_of::<u64>();
 
 /// A checkpoint as a header or journal names it.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -770,7 +769,12 @@ impl Database {
         stamp.encode(&mut body)?;
         let marker = PAGES_FLUSHED.to_le_bytes();
         // Preserve every root slot in the legacy page. A full page replays its journal on open.
-        if body.len().saturating_add(SEAL_LEN).saturating_add(marker.len()) <= PAGE_SIZE {
+        if body
+            .len()
+            .saturating_add(SEAL_LEN)
+            .saturating_add(marker.len())
+            <= PAGE_SIZE
+        {
             body.extend_from_slice(&marker);
         }
         let mut page = seal(HEADER_MAGIC, &body)?;
@@ -1490,8 +1494,8 @@ mod tests {
         disk.power_cut().unwrap();
 
         let want = [(b"row".to_vec(), b"kept".to_vec())].into_iter().collect();
-        let db = Database::open(disk.clone(), 2_000, 1, cmp)
-            .expect("recover the full legacy header");
+        let db =
+            Database::open(disk.clone(), 2_000, 1, cmp).expect("recover the full legacy header");
         assert_eq!(rows(&db), want);
         db.checkpoint().unwrap();
         drop(db);
@@ -1720,7 +1724,8 @@ mod tests {
                 } else {
                     disk.power_cut().unwrap();
                 }
-                let at = format!("crash after {crash} of {steps}, seed {seed}, finished {finished}");
+                let at =
+                    format!("crash after {crash} of {steps}, seed {seed}, finished {finished}");
                 for reopen in 0..2 {
                     if restart_with_cache && reopen == 1 {
                         disk.power_cut().unwrap();

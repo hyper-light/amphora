@@ -61,7 +61,11 @@ fn a_kept_side_merge_join_stays_serial() {
             r.get(1)
                 .is_some_and(|v| v.to_string().contains("MorselAggregate"))
         });
-        assert_eq!(sql_rows(&conn, sql), serial, "{method:?}: the serial answer");
+        assert_eq!(
+            sql_rows(&conn, sql),
+            serial,
+            "{method:?}: the serial answer"
+        );
         assert_eq!(hooked, morsels, "{method:?}");
     }
 }

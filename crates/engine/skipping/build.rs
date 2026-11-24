@@ -88,7 +88,11 @@ struct ReadTx {
 
 impl Drop for ReadTx {
     fn drop(&mut self) {
-        if let Some(error) = self.versioned.as_ref().and_then(|switch| switch.finish(true).err()) {
+        if let Some(error) = self
+            .versioned
+            .as_ref()
+            .and_then(|switch| switch.finish(true).err())
+        {
             tracing::error!(target: "amphora.skipping", %error, "could not close the build's versioned snapshot");
         }
         self.pager.end_read_tx();

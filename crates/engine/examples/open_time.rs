@@ -35,13 +35,19 @@ fn open(path: &str) -> Result<(f64, f64), Box<dyn std::error::Error>> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let dir = args.next().ok_or("usage: open_time <dir> <opens>")?;
-    let opens: usize = args.next().ok_or("usage: open_time <dir> <opens>")?.parse()?;
+    let opens: usize = args
+        .next()
+        .ok_or("usage: open_time <dir> <opens>")?
+        .parse()?;
     if opens == 0 {
         return Err("open_time needs at least one measured open".into());
     }
     std::fs::create_dir_all(&dir)?;
     let fixture = tempfile::tempdir_in(&dir)?;
-    let dir = fixture.path().to_str().ok_or("database path is not UTF-8")?;
+    let dir = fixture
+        .path()
+        .to_str()
+        .ok_or("database path is not UTF-8")?;
     let start = Instant::now();
     let (process_first, _) = open(&format!("{dir}/first.db"))?;
     println!(
