@@ -6057,9 +6057,10 @@ impl Wal for WalFile {
     ) -> Result<Completion> {
         let frame_id = at.frame;
         tracing::debug!(
-            "read_frame(page_idx = {}, frame_id = {})",
+            "read_frame(page_idx = {}, frame_id = {}, segment = {:?})",
             page.get().id(),
-            frame_id
+            frame_id,
+            at.segment
         );
         let offset = self.frame_offset(frame_id);
         page.set_locked();
@@ -11873,7 +11874,7 @@ pub mod test {
     /// connection checkpoints both segments, its page cache kept; the file read alone. Expect:
     /// the file holds 'B': the page the reader cached from the closing segment's frame 1 never
     /// passes for the current segment's frame 1.
-    #[test]
+    #[test_log::test]
     fn d45_a_page_cached_from_the_closing_segment_never_passes_for_the_current_ones() {
         let dir = tempfile::tempdir().unwrap();
         let (db, writer) = switched_database(dir.path());
@@ -11916,7 +11917,7 @@ pub mod test {
     /// read alone. Expect: the empty segment isn't switched from; the file holds 'B': the page
     /// the reader cached from the second segment's frame 1 never passes for that frame after the
     /// segment's reuse.
-    #[test]
+    #[test_log::test]
     fn d45_a_page_cached_from_a_segment_never_passes_for_its_frames_after_reuse() {
         let dir = tempfile::tempdir().unwrap();
         let (db, writer) = switched_database(dir.path());
