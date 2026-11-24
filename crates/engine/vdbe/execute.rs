@@ -6320,6 +6320,10 @@ pub fn op_change_count(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// How deep programs may run programs: SQLITE_MAX_TRIGGER_DEPTH (sqlite.org/limits.html, 10: "The
+/// default maximum trigger depth is 1000"), which bounds foreign keys' actions too.
+const MAX_TRIGGER_DEPTH: usize = 1000;
+
 /// Execute a subprogram (Program opcode).
 /// Used for both triggers and FK actions (CASCADE, SET NULL, etc.)
 pub fn op_program(
@@ -6340,6 +6344,24 @@ pub fn op_program(
     loop {
         match std::mem::take(state.active_op_state.program()) {
             OpProgramState::Start => {
+                // A trigger doesn't fire from a program it runs, a foreign key's action among them,
+                // unless PRAGMA recursive_triggers says so (SQLite's OP_Program, P5).
+                let fires_itself = subprogram.trigger.as_ref().is_some_and(|trigger| {
+                    !program.connection.recursive_triggers()
+                        && program.connection.is_trigger_executing(trigger)
+                });
+                if fires_itself {
+                    state.pc += 1;
+                    state.active_op_state.clear();
+                    return Ok(InsnFunctionStepResult::Step);
+                }
+                let depth = state
+                    .program_depth
+                    .checked_add(1)
+                    .filter(|depth| *depth <= MAX_TRIGGER_DEPTH)
+                    .ok_or_else(|| {
+                        LimboError::SqlError("too many levels of trigger recursion".to_string())
+                    })?;
                 // Try to reuse a cached statement for this PC, otherwise create a new one.
                 // When we have triggers or fk-actions with multi-row inserts, we can re-use
                 // cached statements by storing them key'd by the state.pc if we are in a loop
@@ -6382,6 +6404,7 @@ pub fn op_program(
                 }
                 statement
                     .set_fk_immediate_violations(state.get_fk_immediate_violations_during_stmt());
+                statement.set_program_depth(depth);
 
                 *state.active_op_state.program() = OpProgramState::Step {
                     is_trigger,

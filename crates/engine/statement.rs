@@ -1267,6 +1267,10 @@ impl Statement {
         self.state.get_fk_immediate_violations_during_stmt()
     }
 
+    pub(crate) const fn set_program_depth(&mut self, depth: usize) {
+        self.state.program_depth = depth;
+    }
+
     pub(crate) fn set_fk_immediate_violations(&self, violations: isize) {
         self.state
             .set_fk_immediate_violations_during_stmt(violations);
