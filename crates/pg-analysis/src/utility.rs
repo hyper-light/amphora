@@ -340,11 +340,17 @@ mod tests {
 
     impl Relations for Public {
         fn namespace(&self, name: &str) -> Option<u32> {
-            (name == "public").then(|| 2200)
+            match name {
+                "public" => Some(2200),
+                _ => None,
+            }
         }
 
         fn relation(&self, namespace: u32, name: &str) -> Option<u32> {
-            (namespace == 2200 && name == "t").then(|| 16384)
+            match (namespace, name) {
+                (2200, "t") => Some(16384),
+                _ => None,
+            }
         }
 
         fn name(&self, oid: u32) -> Option<(u32, String)> {

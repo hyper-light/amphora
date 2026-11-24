@@ -492,8 +492,12 @@ impl Statements for Executor {
     fn simple_query(&mut self, sql: &str, out: &mut Vec<u8>) -> Result<(), PgError> {
         let ran = gram::parse(sql.as_bytes())
             .map_err(|refused| {
+                let position = match refused.cursor {
+                    0 => None,
+                    at => Some(at),
+                };
                 PgError::error(SqlState::new(refused.sqlstate), refused.message)
-                    .with_position((refused.cursor > 0).then(|| refused.cursor))
+                    .with_position(position)
             })
             .and_then(|(tree, statements)| self.statements(sql, &tree, &statements, out));
         match ran {
