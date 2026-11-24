@@ -370,11 +370,11 @@ pub fn translate_insert(
     )?;
 
     let mut around_select = TableReferences::new_empty();
-    if let InsertBody::Select(select, _) = &body {
+    if let (Some(with), InsertBody::Select(select, _)) = (with_around_select, &body) {
         let mut select_table_refs = Vec::new();
         collect_from_clause_table_refs(select, &mut select_table_refs);
         plan_ctes_as_outer_refs(
-            with_around_select,
+            Some(with),
             &select_table_refs,
             resolver,
             program,
