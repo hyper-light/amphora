@@ -561,7 +561,7 @@ struct WorkerResult<T> {
 /// where a running sum passes the double's range and comes back. Finite partials never overlap,
 /// so there are at most as many as the double's exponent range over its precision (2098 / 53,
 /// about 40): the bound is the format's.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ExactSum {
     /// Each below [`CARRY_UNIT`], so together below twice it.
     partials: Vec<f64>,
@@ -704,11 +704,15 @@ impl ExactSum {
         self.special.is_some_and(f64::is_nan)
     }
 
-    /// The exact sum of the finite inputs rounded once to the nearest double, ties to even, then
-    /// the non-finite inputs added.
+    /// The exact sum of the finite inputs rounded once to the nearest double, ties to even; with
+    /// non-finite inputs, their sum. The finite inputs' exact sum is a real number however far
+    /// past the double's range, so it never turns an infinite input into NaN (lane R5).
     pub fn value(&self) -> f64 {
+        if let Some(special) = self.special {
+            return special;
+        }
         let partials = self.partials.iter().rev().copied();
-        let finite = match i8::try_from(self.carry) {
+        match i8::try_from(self.carry) {
             Ok(0) => round_once(partials),
             // The carry's units are the largest partial (the others are below one), and the sum
             // is below 2^1023, so no step of the rounding overflows.
@@ -732,8 +736,7 @@ impl ExactSum {
             // At least (10 - 2) units, 2^1024: past the range.
             _ if self.carry < 0 => f64::NEG_INFINITY,
             _ => f64::INFINITY,
-        };
-        self.special.map_or(finite, |special| finite + special)
+        }
     }
 }
 
@@ -2078,7 +2081,7 @@ mod tests {
         let max = f64::MAX;
         let half_ulp = 2f64.powi(970);
         let tiny = f64::from_bits(1);
-        let cases: [(&str, &[f64], f64); 6] = [
+        let cases: [(&str, &[f64], f64); 7] = [
             (
                 "bigpairs",
                 &[1e308, 1e308, -1e308, -1e308, 1e308, 1e308],
@@ -2097,6 +2100,11 @@ mod tests {
             ("max again", &[max, max, -max], max),
             ("the tie past max", &[max, half_ulp], f64::INFINITY),
             ("a tiny term breaks the tie", &[max, half_ulp, -tiny], max),
+            (
+                "an infinity beside an overflow the other way",
+                &[f64::INFINITY, -1e308, -1e308],
+                f64::INFINITY,
+            ),
         ];
         for (name, terms, expected) in cases {
             for cut in 0..=terms.len() {
