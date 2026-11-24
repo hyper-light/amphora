@@ -34,16 +34,18 @@ impl<B: Blocking> Pooled<B> {
         let rx = Arc::new(Mutex::new(rx));
         for i in 0..connections.max(1) {
             let (inner, rx) = (inner.clone(), rx.clone());
-            std::thread::Builder::new().name(format!("pool-{i}")).spawn(move || {
-                loop {
-                    let next = match rx.lock() {
-                        Ok(rx) => rx.recv(),
-                        Err(_) => return,
-                    };
-                    let Ok((events, done)) = next else { return };
-                    done(inner.write(&events));
-                }
-            })?;
+            std::thread::Builder::new()
+                .name(format!("pool-{i}"))
+                .spawn(move || {
+                    loop {
+                        let next = match rx.lock() {
+                            Ok(rx) => rx.recv(),
+                            Err(_) => return,
+                        };
+                        let Ok((events, done)) = next else { return };
+                        done(inner.write(&events));
+                    }
+                })?;
         }
         Ok(Self { inner, tx })
     }
@@ -51,7 +53,9 @@ impl<B: Blocking> Pooled<B> {
 
 impl<B: Blocking> Driver for Pooled<B> {
     fn write(&self, events: Vec<Event>, done: Done) -> anyhow::Result<()> {
-        self.tx.send((events, done)).map_err(|_| anyhow::anyhow!("the pool stopped"))
+        self.tx
+            .send((events, done))
+            .map_err(|_| anyhow::anyhow!("the pool stopped"))
     }
 
     fn history(&self, session: &str, limit: usize) -> anyhow::Result<usize> {

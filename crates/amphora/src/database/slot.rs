@@ -475,6 +475,12 @@ impl<T> Slots<T> {
         self.read.is_some()
     }
 
+    /// The member whose slot is held: a test's view.
+    #[cfg(test)]
+    pub(super) fn holder(&self) -> Option<u64> {
+        self.holding.as_ref().map(|holding| holding.member)
+    }
+
     /// The next held message an end released, with its sender, in the order they arrived.
     pub(super) fn ready(&mut self) -> Option<(u64, T)> {
         self.ready.pop_front()

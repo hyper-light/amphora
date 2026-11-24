@@ -24,7 +24,10 @@ pub fn main() -> anyhow::Result<()> {
     let mut value = 64usize;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
-        let mut v = || args.next().ok_or_else(|| anyhow::anyhow!("{a} takes a value"));
+        let mut v = || {
+            args.next()
+                .ok_or_else(|| anyhow::anyhow!("{a} takes a value"))
+        };
         match a.as_str() {
             "--blink" => {}
             "--threads" => threads = v()?.split(',').map(str::parse).collect::<Result<_, _>>()?,
@@ -39,7 +42,10 @@ pub fn main() -> anyhow::Result<()> {
         let row = 8 + value as u64 + 6;
         let frames = usize::try_from(keys * row / 1_500 + 1_000)?;
         let pool = Arc::new(Pool::new(frames));
-        let tree = Arc::new(Tree::create(&pool, Box::new(|a: &[u8], b: &[u8]| a.cmp(b))).map_err(|e| anyhow::anyhow!("{e}"))?);
+        let tree = Arc::new(
+            Tree::create(&pool, Box::new(|a: &[u8], b: &[u8]| a.cmp(b)))
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+        );
         let each = keys / t as u64;
         let began = Instant::now();
         let handles: Vec<_> = (0..t as u64)
@@ -50,14 +56,16 @@ pub fn main() -> anyhow::Result<()> {
                     let v = vec![7u8; value];
                     for i in 0..each {
                         let k = mix(i * t as u64 + w).to_be_bytes();
-                        tree.put(&pool, &mut d, &k, &v).map_err(|e| anyhow::anyhow!("{e}"))?;
+                        tree.put(&pool, &mut d, &k, &v)
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
                     }
                     Ok(())
                 })
             })
             .collect();
         for h in handles {
-            h.join().map_err(|_| anyhow::anyhow!("a writer panicked"))??;
+            h.join()
+                .map_err(|_| anyhow::anyhow!("a writer panicked"))??;
         }
         let put_s = began.elapsed().as_secs_f64();
         let began = Instant::now();
@@ -70,7 +78,11 @@ pub fn main() -> anyhow::Result<()> {
                     for i in 0..each {
                         let n = mix(i ^ (w << 40)) % (each * t as u64);
                         let k = mix(n).to_be_bytes();
-                        if tree.get(&pool, &mut d, &k).map_err(|e| anyhow::anyhow!("{e}"))?.is_some() {
+                        if tree
+                            .get(&pool, &mut d, &k)
+                            .map_err(|e| anyhow::anyhow!("{e}"))?
+                            .is_some()
+                        {
                             found += 1;
                         }
                     }
@@ -80,7 +92,9 @@ pub fn main() -> anyhow::Result<()> {
             .collect();
         let mut found = 0;
         for h in handles {
-            found += h.join().map_err(|_| anyhow::anyhow!("a reader panicked"))??;
+            found += h
+                .join()
+                .map_err(|_| anyhow::anyhow!("a reader panicked"))??;
         }
         let get_s = began.elapsed().as_secs_f64();
         let n = (each * t as u64) as f64;

@@ -14,8 +14,10 @@ pub struct Vitess {
 
 impl Vitess {
     pub fn connect(dsn: &str, connections: usize) -> anyhow::Result<Self> {
-        let constraints = PoolConstraints::new(connections.min(8), connections.max(8)).ok_or_else(|| anyhow::anyhow!("bad pool size"))?;
-        let opts = mysql::OptsBuilder::from_opts(Opts::from_url(dsn)?).pool_opts(PoolOpts::default().with_constraints(constraints));
+        let constraints = PoolConstraints::new(connections.min(8), connections.max(8))
+            .ok_or_else(|| anyhow::anyhow!("bad pool size"))?;
+        let opts = mysql::OptsBuilder::from_opts(Opts::from_url(dsn)?)
+            .pool_opts(PoolOpts::default().with_constraints(constraints));
         let pool = Pool::new(opts)?;
         // Every run starts from an empty table, as the local store starts from an empty folder (the
         // events' ids repeat from run to run).
@@ -46,19 +48,28 @@ impl Blocking for Vitess {
                 e.body.clone().into(),
             ]);
         }
-        conn.exec_drop(format!("INSERT INTO events (session, id, seq, at, kind, text, body) VALUES {rows}"), params)?;
+        conn.exec_drop(
+            format!("INSERT INTO events (session, id, seq, at, kind, text, body) VALUES {rows}"),
+            params,
+        )?;
         Ok(())
     }
 
     fn history(&self, session: &str, limit: usize) -> anyhow::Result<usize> {
         let mut conn = self.pool.get_conn()?;
-        let rows: Vec<(String, u64)> = conn.exec("SELECT id, seq FROM events WHERE session = ? ORDER BY seq DESC LIMIT ?", (session, limit as u64))?;
+        let rows: Vec<(String, u64)> = conn.exec(
+            "SELECT id, seq FROM events WHERE session = ? ORDER BY seq DESC LIMIT ?",
+            (session, limit as u64),
+        )?;
         Ok(rows.len())
     }
 
     fn search(&self, word: &str, limit: usize) -> anyhow::Result<usize> {
         let mut conn = self.pool.get_conn()?;
-        let rows: Vec<(String, String)> = conn.exec("SELECT session, id FROM events WHERE text LIKE ? ORDER BY at DESC LIMIT ?", (format!("%{word}%"), limit as u64))?;
+        let rows: Vec<(String, String)> = conn.exec(
+            "SELECT session, id FROM events WHERE text LIKE ? ORDER BY at DESC LIMIT ?",
+            (format!("%{word}%"), limit as u64),
+        )?;
         Ok(rows.len())
     }
 }
