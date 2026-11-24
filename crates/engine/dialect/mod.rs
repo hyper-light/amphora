@@ -94,6 +94,19 @@ pub trait Dialect: Send + Sync + 'static {
         body: &amphora_engine_parser::ast::CreateTableBody,
     ) -> crate::Result<String>;
 
+    /// The stored SQL of the table a CREATE TABLE makes, with the connection whose transaction it
+    /// runs in, for a dialect that reads what that transaction holds (the PostgreSQL dialect reads
+    /// the OIDs live tables hold): by default [`Dialect::format_table_sql`]'s.
+    fn format_created_table_sql(
+        &self,
+        _conn: &crate::sync::Arc<crate::Connection>,
+        input: &str,
+        tbl_name: &amphora_engine_parser::ast::QualifiedName,
+        body: &amphora_engine_parser::ast::CreateTableBody,
+    ) -> crate::Result<String> {
+        self.format_table_sql(input, tbl_name, body)
+    }
+
     /// Produce stored SQL after the engine rewrites a `CREATE TABLE` AST.
     ///
     /// Schema rewrites cannot reuse the original frontend text because it no
@@ -137,6 +150,16 @@ pub trait Dialect: Send + Sync + 'static {
         schema: &mut crate::schema::Schema,
         enable_custom_types: bool,
     ) -> crate::Result<()>;
+
+    /// The next OID the database's header stores (`DatabaseHeader::pg_next_oid`), given as the
+    /// database opens: zero until a CREATE TABLE of a dialect with OIDs has stored one.
+    fn load_next_oid(&self, _stored: u32) {}
+
+    /// The next OID to store in the header, in the same transaction, with a table whose stored
+    /// definition [`Dialect::format_table_sql`] made: `None` for a dialect without OIDs.
+    fn next_oid_after(&self, _stored_sql: &str) -> crate::Result<Option<u32>> {
+        Ok(None)
+    }
 
     fn register_native_extensions(&self, options: crate::OpenOptions) -> crate::OpenOptions {
         options

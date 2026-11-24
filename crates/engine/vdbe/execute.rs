@@ -16957,6 +16957,7 @@ pub fn op_read_cookie(
                 Cookie::LargestRootPageNumber => header.vacuum_mode_largest_root_page.get().into(),
                 Cookie::PageSize => header.page_size.get().into(),
                 Cookie::FreePageCount => header.freelist_pages.get().into(),
+                Cookie::PgNextOid => header.pg_next_oid.get().into(),
                 cookie => todo!("{cookie:?} is not yet implement for ReadCookie"),
             },
         ) {
@@ -17002,6 +17003,7 @@ pub fn op_set_cookie(
     match with_header_mut(&pager, mv_store.as_ref(), program, *db, |header| {
         match cookie {
             Cookie::ApplicationId => header.application_id = (*value).into(),
+            Cookie::PgNextOid => header.pg_next_oid = value.cast_unsigned().into(),
             Cookie::DatabaseFormat => header.schema_format = (*value as u32).into(),
             Cookie::DatabaseTextEncoding => {
                 header.text_encoding = match *value {

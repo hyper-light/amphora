@@ -354,8 +354,13 @@ pub struct DatabaseHeader {
     pub incremental_vacuum_enabled: U32BE,
     /// The "Application ID" set by PRAGMA application_id.
     pub application_id: I32BE,
+    /// Amphora: the PostgreSQL dialect's next OID, PostgreSQL's `nextOid` as its control file and
+    /// `XLOG_NEXTOID` records keep it (docs/design/postgres.md section 7), written by the CREATE
+    /// TABLE that hands an OID out, in its own transaction. Zero until then, so a SQLite dialect's
+    /// database keeps the four bytes SQLite reserves zero.
+    pub pg_next_oid: U32BE,
     /// Reserved for expansion. Must be zero.
-    _padding: [u8; 20],
+    _padding: [u8; 16],
     /// The version-valid-for number.
     pub version_valid_for: U32BE,
     /// SQLITE_VERSION_NUMBER
@@ -398,7 +403,8 @@ impl Default for DatabaseHeader {
             user_version: I32BE::new(0),
             incremental_vacuum_enabled: U32BE::new(0),
             application_id: I32BE::new(0),
-            _padding: [0; 20],
+            pg_next_oid: U32BE::new(0),
+            _padding: [0; 16],
             version_valid_for: U32BE::new(3047000),
             version_number: U32BE::new(3047000),
         }

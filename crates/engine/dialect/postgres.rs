@@ -13,7 +13,8 @@ use crate::function::Func;
 use crate::pg_catalog_vtab::{PgCatalog, PgCatalogTable};
 use crate::schema::{BTreeTable, Schema};
 use crate::sync::atomic::{AtomicU32, Ordering};
-use crate::LimboError;
+use crate::sync::Arc;
+use crate::{Connection, LimboError, Value};
 use amphora_engine_parser::ast;
 
 /// What follows the prefix in a stored definition: `/* pg_class.oid <oid> */ `.
@@ -22,10 +23,12 @@ const OID_CLOSE: &str = " */ ";
 
 /// The PostgreSQL dialect.
 pub struct PostgresDialect {
-    /// The OID the next table takes: PostgreSQL's OID counter, outside the caller's transaction
-    /// (section 7), so a rolled-back CREATE TABLE spends its OID as PostgreSQL's does. It starts at
-    /// `FirstNormalObjectId` and passes every OID a loaded definition holds, so a reopened database
-    /// never gives a live table's OID to another.
+    /// PostgreSQL's `TransamVariables->nextOid` (REL_19_0 src/backend/access/transam/varsup.c:554):
+    /// in memory and outside every transaction, so a rolled-back CREATE TABLE spends its OID while
+    /// the database is open, as PostgreSQL's does. Its durable copy is the header's `pg_next_oid`,
+    /// which each CREATE TABLE writes in its own transaction ([`super::Dialect::next_oid_after`])
+    /// and an open loads ([`super::Dialect::load_next_oid`]): a reopen continues from it, never
+    /// from the OIDs live tables hold (section 7).
     next_oid: AtomicU32,
 }
 
@@ -42,27 +45,35 @@ impl PostgresDialect {
         }
     }
 
-    fn allocate_oid(&self) -> crate::Result<u32> {
-        self.next_oid
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |oid| {
-                oid.checked_add(1)
-            })
-            .map_err(|_| {
-                LimboError::SqlError(
-                    "no OID is left for a new table: OIDs don't wrap around yet".to_string(),
-                )
-            })
+    /// GetNewObjectId (varsup.c:578-596) in GetNewOidWithIndex's loop (REL_19_0
+    /// src/backend/catalog/catalog.c:489-535): a counter below `FirstNormalObjectId`, after it
+    /// wrapped through zero or in a database that never stored one, starts again there; it counts
+    /// as an unsigned 32-bit `Oid`, so it wraps; and an OID a live table holds (`live`, sorted) is
+    /// spent and passed over, as PostgreSQL passes over one `pg_class` holds.
+    fn allocate_oid(&self, live: &[u32]) -> crate::Result<u32> {
+        let normal = |next: u32| next.max(amphora_pg_catalog::FIRST_NORMAL_OBJECT_ID);
+        // Of `live.len() + 1` OIDs in a row, one is free.
+        for _ in 0..=live.len() {
+            let oid = match self
+                .next_oid
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                    Some(normal(next).wrapping_add(1))
+                }) {
+                Ok(previous) | Err(previous) => normal(previous),
+            };
+            if live.binary_search(&oid).is_err() {
+                return Ok(oid);
+            }
+        }
+        Err(LimboError::InternalError(
+            "every OID the counter tried is held by a live table".to_string(),
+        ))
     }
 
-    /// The table definition in a stored definition, noting its OID as taken.
+    /// The table definition in a stored definition.
     fn definition<'a>(&self, sql: &'a str) -> crate::Result<&'a str> {
         Ok(match split_stored(sql)? {
-            Some((oid, definition)) => {
-                if let Some(next) = oid.checked_add(1) {
-                    self.next_oid.fetch_max(next, Ordering::Relaxed);
-                }
-                definition
-            }
+            Some((_, definition)) => definition,
             None => sql,
         })
     }
@@ -85,6 +96,23 @@ pub(crate) fn split_stored(sql: &str) -> crate::Result<Option<(u32, &str)>> {
         .ok_or_else(corrupt)?;
     let oid = oid.parse::<u32>().map_err(|_| corrupt())?;
     Ok(Some((oid, definition)))
+}
+
+/// The `pg_class` OIDs of the tables `conn`'s transaction sees, sorted: read from `sqlite_schema`,
+/// which `pg_class` is served from ([`crate::pg_catalog_vtab`]), as GetNewOidWithIndex reads
+/// `pg_class`.
+fn live_oids(conn: &Arc<Connection>) -> crate::Result<Vec<u32>> {
+    let mut stmt = conn.prepare_internal("SELECT sql FROM sqlite_schema WHERE type = 'table'")?;
+    let mut oids = Vec::new();
+    for row in stmt.run_collect_rows()? {
+        if let Some(Value::Text(sql)) = row.first() {
+            if let Some((oid, _)) = split_stored(sql.as_str())? {
+                oids.push(oid);
+            }
+        }
+    }
+    oids.sort_unstable();
+    Ok(oids)
 }
 
 /// The stored definition of a table with `oid`.
@@ -189,14 +217,39 @@ impl super::Dialect for PostgresDialect {
         super::sqlite::table_sql_for_replay(sql)
     }
 
+    /// A PostgreSQL table's OID is chosen against the tables a connection's transaction holds
+    /// ([`super::Dialect::format_created_table_sql`]); a rewrite keeps the one it has
+    /// ([`super::Dialect::format_rewritten_table_sql`]).
     fn format_table_sql(
         &self,
+        _input: &str,
+        _tbl_name: &ast::QualifiedName,
+        _body: &ast::CreateTableBody,
+    ) -> crate::Result<String> {
+        Err(LimboError::InternalError(
+            "a PostgreSQL table's definition is made with its connection".to_string(),
+        ))
+    }
+
+    fn format_created_table_sql(
+        &self,
+        conn: &Arc<Connection>,
         _input: &str,
         tbl_name: &ast::QualifiedName,
         body: &ast::CreateTableBody,
     ) -> crate::Result<String> {
         let definition = definition_sql(tbl_name, body)?;
-        Ok(stored(self.allocate_oid()?, &definition))
+        Ok(stored(self.allocate_oid(&live_oids(conn)?)?, &definition))
+    }
+
+    fn load_next_oid(&self, stored: u32) {
+        self.next_oid.store(stored, Ordering::Relaxed);
+    }
+
+    /// The OID after the table's, as `GetNewObjectId` leaves `nextOid`: past every OID a committed
+    /// table took, so a reopen gives none of them again, dropped ones included.
+    fn next_oid_after(&self, stored_sql: &str) -> crate::Result<Option<u32>> {
+        Ok(split_stored(stored_sql)?.map(|(oid, _)| oid.wrapping_add(1)))
     }
 
     fn format_rewritten_table_sql(
@@ -243,6 +296,7 @@ impl super::Dialect for PostgresDialect {
 #[cfg(test)]
 mod tests {
     use super::PostgresDialect;
+    use crate::dialect::Dialect;
     use crate::pg_catalog_vtab::value;
     use crate::sync::Arc;
     use crate::{ConnectOpts, Connection, Database, Numeric, PlatformIO, Value, IO};
@@ -250,10 +304,19 @@ mod tests {
     use amphora_pg_catalog::Catalog;
 
     fn open(path: &str) -> (Arc<Database>, Arc<Connection>) {
+        open_with(path, Arc::new(PostgresDialect::new()))
+    }
+
+    fn open_with(path: &str, dialect: Arc<PostgresDialect>) -> (Arc<Database>, Arc<Connection>) {
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io, path, Arc::new(PostgresDialect::new())).unwrap();
+        let db = Database::open_file(io, path, dialect).unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
         (db, conn)
+    }
+
+    /// The `pg_class` OID of the table named `name`.
+    fn oid(conn: &Arc<Connection>, name: &str) -> i64 {
+        int(field(&PG_CLASS, &class_row(conn, name), "oid"))
     }
 
     fn query(conn: &Arc<Connection>, sql: &str) -> Vec<Vec<Value>> {
@@ -427,5 +490,107 @@ mod tests {
             third > first.max(second),
             "{third} is past every OID the reopened database holds"
         );
+    }
+
+    /// T-PG.7.6: the OID counter is durable (section 7): a table created after a dropped table
+    /// and a reopen takes the OID after the dropped one's, never the dropped one's, as PostgreSQL
+    /// keeps `nextOid` across restarts (REL_19_0 src/backend/access/transam/xlog.c:7280).
+    #[test]
+    fn t_pg_7_6_a_dropped_tables_oid_is_not_given_again_after_a_reopen() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("dropped.db");
+        let path = path.to_str().unwrap();
+        let dropped = {
+            let (_db, conn) = open(path);
+            conn.execute("CREATE TABLE gone (a int4)").unwrap();
+            let dropped = oid(&conn, "gone");
+            conn.execute("DROP TABLE gone").unwrap();
+            dropped
+        };
+
+        let (_db, conn) = open(path);
+        conn.execute("CREATE TABLE next (b int4)").unwrap();
+        let next = oid(&conn, "next");
+        assert_ne!(next, dropped, "the dropped table's OID is not given again");
+        assert_eq!(next, dropped + 1, "the counter continues from its stored value");
+    }
+
+    /// T-PG.7.7: two CREATE TABLEs in one transaction take distinct OIDs, and the transaction
+    /// stores the counter past both: after the later table is dropped and the database reopened,
+    /// a new table takes neither.
+    #[test]
+    fn t_pg_7_7_two_creates_in_one_transaction_take_distinct_oids_stored_past_both() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("one-transaction.db");
+        let path = path.to_str().unwrap();
+        let (first, second) = {
+            let (_db, conn) = open(path);
+            conn.execute("BEGIN").unwrap();
+            conn.execute("CREATE TABLE first (a int4)").unwrap();
+            conn.execute("CREATE TABLE second (b int4)").unwrap();
+            conn.execute("COMMIT").unwrap();
+            let first = oid(&conn, "first");
+            let second = oid(&conn, "second");
+            assert_ne!(first, second, "one transaction's tables take distinct OIDs");
+            conn.execute("DROP TABLE second").unwrap();
+            (first, second)
+        };
+
+        let (_db, conn) = open(path);
+        conn.execute("CREATE TABLE third (c int4)").unwrap();
+        let third = oid(&conn, "third");
+        assert!(
+            third != first && third != second,
+            "{third} is neither {first} nor {second}"
+        );
+        assert_eq!(third, first.max(second) + 1);
+    }
+
+    /// T-PG.7.8: the counter wraps as PostgreSQL's (GetNewObjectId, varsup.c:578-596, in
+    /// GetNewOidWithIndex's loop, catalog.c:489-535): past 4294967295 it starts again at
+    /// FirstNormalObjectId, never below it, and passes over an OID a live table holds; the counter
+    /// stored after the wrap is the one a reopen continues from.
+    #[test]
+    fn t_pg_7_8_the_oid_counter_wraps_past_reserved_and_live_oids() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("wrap.db");
+        let path = path.to_str().unwrap();
+        {
+            let dialect = Arc::new(PostgresDialect::new());
+            let (_db, conn) = open_with(path, dialect.clone());
+            conn.execute("CREATE TABLE low (a int4)").unwrap();
+            assert_eq!(oid(&conn, "low"), 16384);
+            // As `pg_resetwal -o 4294967294` sets PostgreSQL's next OID.
+            dialect.load_next_oid(u32::MAX - 1);
+            conn.execute("CREATE TABLE top (a int4)").unwrap();
+            conn.execute("CREATE TABLE last (a int4)").unwrap();
+            conn.execute("CREATE TABLE wrapped (a int4)").unwrap();
+            assert_eq!(oid(&conn, "top"), 4294967294);
+            assert_eq!(oid(&conn, "last"), 4294967295, "the largest OID is given");
+            assert_eq!(
+                oid(&conn, "wrapped"),
+                16385,
+                "past the wrap: not 0, nor below FirstNormalObjectId, nor low's 16384"
+            );
+        }
+
+        let (_db, conn) = open(path);
+        conn.execute("CREATE TABLE after (a int4)").unwrap();
+        assert_eq!(oid(&conn, "after"), 16386, "a reopen continues after the wrap");
+    }
+
+    /// T-PG.7.9: a rolled-back CREATE TABLE spends its OID: the counter is outside the transaction,
+    /// as PostgreSQL's `nextOid` is (varsup.c:554-613), so the next table takes the OID after it.
+    #[test]
+    fn t_pg_7_9_a_rolled_back_create_table_spends_its_oid() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("rolled-back.db");
+        let (_db, conn) = open(path.to_str().unwrap());
+        conn.execute("BEGIN").unwrap();
+        conn.execute("CREATE TABLE undone (a int4)").unwrap();
+        let undone = oid(&conn, "undone");
+        conn.execute("ROLLBACK").unwrap();
+        conn.execute("CREATE TABLE kept (a int4)").unwrap();
+        assert_eq!(oid(&conn, "kept"), undone + 1);
     }
 }
