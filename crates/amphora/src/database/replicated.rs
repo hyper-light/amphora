@@ -47,6 +47,23 @@ const READ_BARRIER: u8 = 1;
 fn reads(context: &[u8]) -> bool {
     context.get(CONTEXT_BYTES..) == Some([READ_BARRIER].as_slice())
 }
+/// Whether `close` is the context of the close a follower sent right behind its forward, whose
+/// request identity is `forward` (`Actor::close_behind`; CP-T1.8, lane V18): the same member, term
+/// and incarnation, the serial after the forward's, and a read's mark. No other context of that
+/// member, in that term and incarnation, has that serial: each names one request once, and the
+/// forward's owner makes none between the forward and its close.
+fn follows(forward: &[u8], close: &[u8]) -> bool {
+    let head = CONTEXT_BYTES.saturating_sub(std::mem::size_of::<u64>());
+    let serial = |context: &[u8]| {
+        let bytes: [u8; 8] = context.get(head..CONTEXT_BYTES)?.try_into().ok()?;
+        Some(u64::from_le_bytes(bytes))
+    };
+    reads(close)
+        && forward.get(..head).is_some()
+        && forward.get(..head) == close.get(..head)
+        && serial(forward).and_then(|serial| serial.checked_add(1)) == serial(close)
+        && serial(close).is_some()
+}
 /// Format: the byte a write's barrier context carries past the request identity, then the time
 /// left to its write's deadline as it was sent, in nanoseconds, a little-endian `u64` (CP-T1.8,
 /// lane V14). Its leader ends the write's slot by time at that end, which bounds a lost forward;
@@ -1030,6 +1047,12 @@ struct Actor<F: BlockFile + 'static = LogDevice> {
     slot_deferred: bool,
     // The close a follower's write owes its slot's leader, by the barrier's term and leader.
     closing: Option<(u64, u64)>,
+    // A close sent behind a forward (`close_behind`) since the step's drive: the next step
+    // drives again at once.
+    behind: bool,
+    // At the leader: the request identity of the last forward each member's arrived with, so that
+    // the close behind it is consumed, its read round unneeded (`follows`).
+    forwarded: std::collections::BTreeMap<u64, Vec<u8>>,
     serial: u64,
     // Every time this owner reads comes from this clock (replication.md, "The owner's time").
     clock: Clock,
@@ -2681,6 +2704,8 @@ fn open_on<F: BlockFile + 'static>(
         slots,
         slot_deferred: false,
         closing: None,
+        behind: false,
+        forwarded: std::collections::BTreeMap::new(),
         serial: 0,
         transferred: None,
         spacing: log_bound::Spacing::default(),
@@ -3332,8 +3357,10 @@ impl<F: BlockFile + 'static> Actor<F> {
             locked(stalls)?.wrote(Duration::from_nanos(taken.saturating_sub(submitted)));
         }
         self.release(output)?;
-        // Inputs a pause kept are taken at once, one a step.
-        self.driving = driven.more || !self.paused_inputs.is_empty();
+        // Inputs a pause kept are taken at once, one a step; so is the forward a close follows, which
+        // this step's drive left behind it in the core (`close_behind`).
+        let behind = std::mem::take(&mut self.behind);
+        self.driving = driven.more || !self.paused_inputs.is_empty() || behind;
         #[cfg(test)]
         if driven.more {
             self.drove_more = self.drove_more.saturating_add(1);
@@ -4444,6 +4471,11 @@ impl<F: BlockFile + 'static> Actor<F> {
         if self.replica.is_leader() && !self.slot_off() {
             match message.msg_type {
                 hyper_raft::proto::MessageType::MsgPropose => {
+                    if let [entry] = message.entries.as_slice()
+                        && let Some(identity) = entry.context.get(..CONTEXT_BYTES)
+                    {
+                        self.forwarded.insert(from, identity.to_vec());
+                    }
                     let forward = self.slots.forward(from, self.at, (message, reservation));
                     if let Some(unmeasured) = forward.unmeasured {
                         tracing::warn!(target: "amphora.replication", event = "write_slot_unmeasured", error = %unmeasured, "a retry's gap was not learned for the write slot");
@@ -4465,7 +4497,18 @@ impl<F: BlockFile + 'static> Actor<F> {
                         .first()
                         .is_some_and(|entry| reads(&entry.data));
                     let read = if marked {
-                        self.slots.pass(from, self.at, (message, reservation))
+                        // The close behind a forward this leader stepped has nothing left to do:
+                        // its forward ended its slot, and nothing here reads its answer (lane V18).
+                        let behind = message.entries.first().is_some_and(|entry| {
+                            self.forwarded
+                                .get(&from)
+                                .is_some_and(|forward| follows(forward, &entry.data))
+                        });
+                        let mut taken = self.slots.pass(from, self.at, (message, reservation));
+                        if behind {
+                            taken.step = None;
+                        }
+                        taken
                     } else {
                         let stated = message
                             .entries
@@ -4682,6 +4725,9 @@ impl<F: BlockFile + 'static> Actor<F> {
         let leading = (self.replica.is_leader() && !self.slot_off()).then(|| self.replica.term());
         let ended = self.slots.lead(leading, at);
         self.slot_ended(ended);
+        if leading.is_none() {
+            self.forwarded.clear();
+        }
         if leading.is_some() {
             let configuration = self.replica.core().raft.configuration();
             let detected = &self.detected;
@@ -5187,6 +5233,31 @@ impl<F: BlockFile + 'static> Actor<F> {
         // The read waits in the core for a drive, and this step's one drive is behind it: the
         // owner drives again at once, not at its next wake (CP-T1.8, lane V16).
         self.driving = true;
+        Ok(())
+    }
+    /// Sends a close right behind the forward a follower just proposed: a barrier marked a read's
+    /// ([`READ_BARRIER`]), which the leader steps at once and takes as the end of a slot its
+    /// member holds (`Slots::pass`). It leaves in the same drive as the forward, behind it on the
+    /// same ordered link, so a forward lost on the way leaves its slot, and the leader's other
+    /// writes, waiting no longer than this close takes to arrive (CP-T1.8, lane V18; before it, the
+    /// slot held to its write's stated deadline, or the host's detector). The forward's write stays
+    /// this member's to answer; the close's own read state matches nothing here and is dropped. A
+    /// read the core drops leaves the bound the deadline's, so only a fenced core's error ends
+    /// the step.
+    fn close_behind(&mut self) -> Result<(), Refusal> {
+        let context = self.read_context()?;
+        if let Err(error) = self.replica.read(context) {
+            let refusal = raft_error(error);
+            if matches!(refusal, Refusal::Fenced(_)) {
+                return Err(refusal);
+            }
+            tracing::debug!(target: "amphora.replication", event = "replication.close_behind_dropped", ?refusal, "a close behind a follower's forward was not sent; the forward's slot ends by its deadline");
+            return Ok(());
+        }
+        // The forward and its close wait in the core past the step's one drive: the owner drives
+        // again at once, so both leave now, not at the next wake (`close`, lane V16).
+        self.driving = true;
+        self.behind = true;
         Ok(())
     }
     fn bootstrap(&mut self) -> Result<(), Refusal> {
@@ -5859,7 +5930,8 @@ impl<F: BlockFile + 'static> Actor<F> {
                             .and_then(|stamped| self.propose_stamped(&pending.context, stamped))
                         {
                             Ok(()) => {
-                                if self.replica.is_leader() {
+                                let leads = self.replica.is_leader();
+                                if leads {
                                     #[cfg(test)]
                                     if self.slots.turn() {
                                         self.turn_context = Some(pending.context.clone());
@@ -5869,7 +5941,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                                 }
                                 pending.phase = Phase::Proposed(value);
                                 self.pending = Some(pending);
-                                return Ok(());
+                                return if leads { Ok(()) } else { self.close_behind() };
                             }
                             Err(error) => Err(error),
                         }
@@ -19645,6 +19717,232 @@ mod tests {
                 ),
                 (1, 0, 0),
                 "{durability:?}: member 3's slot ended (released, expired) and the clock moves for a slot's end"
+            );
+            driven.quiet(&mut pump);
+            driven.drain(&mut pump);
+            pump.finish();
+        }
+    }
+
+    /// T-T1.8.W1 (CP-T1.8, lane V18): a follower's forward lost on the way holds the leader's other
+    /// writes no longer than the close it is followed by takes to arrive, an event, not the write's
+    /// deadline. Do, in each class: owner 0 leads; member 3's forward to it is lost (the close
+    /// behind it is not); the leader's own write is called while member 3's slot holds. Expect, with
+    /// no clock moved: the leader's write answered Ok; one slot ended released and none expired; no
+    /// clock moved for a slot's end (`Driven::lapses` 0). Before lane V18 the slot held until member
+    /// 3's write's stated deadline on the leader's clock, and the leader's write with it.
+    #[test]
+    fn v18_a_lost_forward_is_bounded_by_the_close_behind_it() {
+        use crate::meter::SlotEnd;
+        for durability in [Durability::Persisted, three_fates()] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut driven = Driven::new();
+            let clients: Vec<Client> = (1..=3)
+                .map(|n| driven.open_with(dir.path(), n, vec![1, 2, 3], None, durability.clone()))
+                .collect();
+            let mut pump = Pump::new(&clients);
+            let leader = driven.elect(&mut pump, &clients, 0, 1);
+            assert_eq!(leader, 0, "{durability:?}: owner 0 did not lead");
+            let holder = 2;
+            driven
+                .call(&mut pump, &clients[leader], |db| {
+                    db.exec("CREATE TABLE events(id INTEGER NOT NULL)")?;
+                    Ok(Vec::new())
+                })
+                .unwrap();
+            // Member 3's floor session ends before its write is made (its slot is a write's).
+            for _ in 0..ROUNDS {
+                driven.quiet(&mut pump);
+                if driven.owner(holder).pending.is_none() {
+                    break;
+                }
+            }
+            assert!(
+                driven.owner(holder).pending.is_none(),
+                "{durability:?}: member 3's floor session never ended"
+            );
+            let ended = |how| clients[leader].handle().counters().write_slot_ended(how);
+            let (released, expired) = (ended(SlotEnd::Released), ended(SlotEnd::Expired));
+            // Member 3's first forward to the leader is lost, and the closes behind it are counted.
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let closes = Arc::new(AtomicUsize::new(0));
+            let (drops, counted) = (Arc::clone(&dropped), Arc::clone(&closes));
+            pump.losing = Some(Box::new(move |from, message: &Message| {
+                if from != 3 || message.to != 1 {
+                    return false;
+                }
+                match message.msg_type {
+                    hyper_raft::proto::MessageType::MsgPropose => {
+                        drops.fetch_add(1, Ordering::AcqRel) == 0
+                    }
+                    hyper_raft::proto::MessageType::MsgReadIndex => {
+                        if message
+                            .entries
+                            .first()
+                            .is_some_and(|entry| reads(&entry.data))
+                        {
+                            counted.fetch_add(1, Ordering::AcqRel);
+                        }
+                        false
+                    }
+                    _ => false,
+                }
+            }));
+            let late = submit(&clients[holder], driven.until(), |db| {
+                db.exec("INSERT INTO events VALUES (3)")?;
+                Ok(Vec::new())
+            });
+            let mut rounds = 0;
+            while driven.owner(leader).slots.holder() != Some(3) {
+                assert!(
+                    rounds < ROUNDS,
+                    "{durability:?}: member 3's write held no slot"
+                );
+                driven.round(&mut pump);
+                rounds += 1;
+            }
+            let own = submit(&clients[leader], driven.until(), |db| {
+                db.exec("INSERT INTO events VALUES (1)")?;
+                Ok(Vec::new())
+            });
+            let mut answered = None;
+            for _ in 0..ROUNDS {
+                match own.try_recv() {
+                    Ok(result) => {
+                        answered = Some(result);
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(error) => panic!("{durability:?}: the leader's owner ended: {error}"),
+                }
+                driven.round(&mut pump);
+            }
+            assert_eq!(
+                answered.map(|result| result.map(called)),
+                Some(Ok(Vec::new())),
+                "{durability:?}: the leader's write, with member 3's forward lost ({} lost) and {} closes seen",
+                dropped.load(Ordering::Acquire),
+                closes.load(Ordering::Acquire),
+            );
+            assert!(
+                dropped.load(Ordering::Acquire) >= 1 && closes.load(Ordering::Acquire) >= 1,
+                "{durability:?}: member 3's forward was never lost, or its close never sent: {} lost, {} closes",
+                dropped.load(Ordering::Acquire),
+                closes.load(Ordering::Acquire)
+            );
+            assert_eq!(
+                (
+                    ended(SlotEnd::Released) - released >= 1,
+                    ended(SlotEnd::Expired) - expired,
+                    driven.lapses
+                ),
+                (true, 0, 0),
+                "{durability:?}: slots ended released at least once, none expired, and no clock moved for a slot's end"
+            );
+            pump.losing = None;
+            drop(late);
+            driven.quiet(&mut pump);
+            driven.drain(&mut pump);
+            pump.finish();
+        }
+    }
+
+    /// T-T1.8.W1 (CP-T1.8, lane V18): a close is the one behind a member's forward exactly when it
+    /// names the member, term and incarnation the forward did, the next serial, and a read's mark.
+    #[test]
+    fn v18_a_close_follows_its_own_forward_only() {
+        let identity = |member: u64, term: u64, incarnation: u64, serial: u64| -> Vec<u8> {
+            [member, term, incarnation, serial]
+                .iter()
+                .flat_map(|part| part.to_le_bytes())
+                .collect()
+        };
+        let close = |member, term, incarnation, serial| {
+            let mut context = identity(member, term, incarnation, serial);
+            context.push(READ_BARRIER);
+            context
+        };
+        let forward = identity(3, 2, 7, 5);
+        assert!(follows(&forward, &close(3, 2, 7, 6)));
+        for other in [
+            close(3, 2, 7, 5),
+            close(3, 2, 7, 7),
+            close(2, 2, 7, 6),
+            close(3, 3, 7, 6),
+            close(3, 2, 8, 6),
+            identity(3, 2, 7, 6),
+            vec![READ_BARRIER],
+            Vec::new(),
+        ] {
+            assert!(!follows(&forward, &other), "{other:?}");
+        }
+        assert!(!follows(&[0; 8], &close(3, 2, 7, 6)));
+    }
+
+    /// T-T1.8.W1 (CP-T1.8, lane V18): the close behind a forward the leader stepped costs no read
+    /// round. Do, in each class: owner 0 leads; member 3 makes four writes one at a time, none lost.
+    /// Expect: one answer to a read per write (the barrier's), and one close sent per write.
+    #[test]
+    fn v18_a_close_behind_a_stepped_forward_costs_no_read_round() {
+        for durability in [Durability::Persisted, three_fates()] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut driven = Driven::new();
+            let clients: Vec<Client> = (1..=3)
+                .map(|n| driven.open_with(dir.path(), n, vec![1, 2, 3], None, durability.clone()))
+                .collect();
+            let mut pump = Pump::new(&clients);
+            let leader = driven.elect(&mut pump, &clients, 0, 1);
+            assert_eq!(leader, 0, "{durability:?}: owner 0 did not lead");
+            driven
+                .call(&mut pump, &clients[leader], |db| {
+                    db.exec("CREATE TABLE events(id INTEGER NOT NULL)")?;
+                    Ok(Vec::new())
+                })
+                .unwrap();
+            for _ in 0..ROUNDS {
+                driven.quiet(&mut pump);
+                if driven.owner(2).pending.is_none() {
+                    break;
+                }
+            }
+            let answers = Arc::new(AtomicUsize::new(0));
+            let closes = Arc::new(AtomicUsize::new(0));
+            let (answered, closed) = (Arc::clone(&answers), Arc::clone(&closes));
+            pump.losing = Some(Box::new(move |from, message: &Message| {
+                use hyper_raft::proto::MessageType;
+                if from == 1 && message.to == 3 && message.msg_type == MessageType::MsgReadIndexResp
+                {
+                    answered.fetch_add(1, Ordering::AcqRel);
+                }
+                if from == 3
+                    && message.to == 1
+                    && message.msg_type == MessageType::MsgReadIndex
+                    && message
+                        .entries
+                        .first()
+                        .is_some_and(|entry| reads(&entry.data))
+                {
+                    closed.fetch_add(1, Ordering::AcqRel);
+                }
+                false
+            }));
+            let writes: usize = 4;
+            for n in 0..writes {
+                driven
+                    .call(&mut pump, &clients[2], move |db| {
+                        db.exec(&format!("INSERT INTO events VALUES ({n})"))?;
+                        Ok(Vec::new())
+                    })
+                    .unwrap();
+            }
+            pump.losing = None;
+            assert_eq!(
+                (
+                    answers.load(Ordering::Acquire),
+                    closes.load(Ordering::Acquire)
+                ),
+                (writes, writes),
+                "{durability:?}: read answers to member 3 (one a write, its barrier's) and closes sent"
             );
             driven.quiet(&mut pump);
             driven.drain(&mut pump);
