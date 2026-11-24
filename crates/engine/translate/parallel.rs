@@ -1777,7 +1777,9 @@ fn shape_chain(
             return None;
         }
         match &table.op {
-            Operation::Scan(Scan::BTreeTable { index: None, .. }) | Operation::HashJoin(_) => {}
+            Operation::Scan(Scan::BTreeTable { index: None, .. }) => {}
+            Operation::HashJoin(op)
+                if op.method == crate::translate::plan::HashJoinMethod::Hash => {}
             // As in `shape_join` (lane qs6-17).
             op if scanned_rowids(op).is_some() => {}
             Operation::Search(Search::Seek {
