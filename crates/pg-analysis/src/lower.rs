@@ -20,6 +20,9 @@ use crate::{Error, Session, sqlstate};
 /// The prefix of the names the engine's PostgreSQL dialect knows built-in functions by: an OID follows.
 pub const PROC_FUNCTION: &str = "pg_proc_";
 
+/// The engine's name of the rows of a generate_series.
+const SERIES: &str = "pg_generate_series";
+
 /// A result column, as RowDescription describes it (doc/src/sgml/protocol.sgml).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Field {
@@ -58,6 +61,7 @@ pub fn lower(
     };
     let table = writer.table()?;
     let fields = fields(query)?;
+    writer.with_series(query.source.as_ref().or(query.table.as_ref()))?;
     match query.command {
         Command::Select => {
             if query.targets.is_empty() {
@@ -164,27 +168,29 @@ impl Writer<'_> {
         Ok(Some(quoted(&name)))
     }
 
-    /// ` FROM` what a SELECT reads: a relation, or a series' rows, each a column the engine names `value`.
+    /// ` FROM` what a SELECT reads: a relation, or the rows [`Self::with_series`] names.
     fn from(&mut self, table: &Table) -> Result<(), Error> {
         self.sql.push_str(" FROM ");
-        match &table.series {
-            Some(series) => self.series(series),
-            None => {
-                let (_, name) = self
-                    .session
-                    .relations
-                    .name(table.oid)
-                    .ok_or_else(|| Error::internal("the statement's table is missing"))?;
-                self.sql.push_str(&quoted(&name));
-                Ok(())
-            }
+        if table.series.is_some() {
+            self.sql.push_str(SERIES);
+            return Ok(());
         }
+        let (_, name) = self
+            .session
+            .relations
+            .name(table.oid)
+            .ok_or_else(|| Error::internal("the statement's table is missing"))?;
+        self.sql.push_str(&quoted(&name));
+        Ok(())
     }
 
-    /// `generate_series_step_int8` (src/backend/utils/adt/int8.c): the engine's own series, where 19's of a NULL has
-    /// no rows and one of step 0 is refused as it runs. One whose next value would pass the largest bigint, where
-    /// the engine's stops on, is refused.
-    fn series(&mut self, series: &crate::expr::Series) -> Result<(), Error> {
+    /// `generate_series_step_int8` (src/backend/utils/adt/int8.c) as the engine's own rows, ahead of the statement that
+    /// reads them: a NULL bound or step has none, and a step of 0 is refused as it runs. One whose next value would
+    /// pass the largest bigint is refused, as the engine's sum of integers would then be a number that isn't one.
+    fn with_series(&mut self, table: Option<&Table>) -> Result<(), Error> {
+        let Some(series) = table.and_then(|table| table.series.as_ref()) else {
+            return Ok(());
+        };
         let query = self.query;
         let mut bounds = [None, None, Some(1i64)];
         let given = [Some(series.start), Some(series.stop), series.step];
@@ -197,9 +203,10 @@ impl Writer<'_> {
                 Some(_) => return Err(Error::internal("a series' bound isn't an integer")),
             };
         }
-        let [Some(start), Some(stop), Some(step)] = bounds else {
-            self.sql.push_str("generate_series(1, 0)");
-            return Ok(());
+        // A NULL's: no rows.
+        let (start, stop, step) = match bounds {
+            [Some(start), Some(stop), Some(step)] => (start, stop, step),
+            _ => (1, 0, 1),
         };
         if step == 0 {
             return Err(Error::new(
@@ -208,20 +215,23 @@ impl Writer<'_> {
             )
             .of_its_run());
         }
+        let rows = (step > 0) == (start <= stop);
         let past = i128::from(stop).saturating_add(i128::from(step));
-        if i64::try_from(past).is_err() && (step > 0) == (start <= stop) {
-            return Err(Error::unsupported("a generate_series this near the largest bigint")
-                .at(series.location));
+        if rows && i64::try_from(past).is_err() {
+            return Err(
+                Error::unsupported("a generate_series this near the largest bigint")
+                    .at(series.location),
+            );
         }
-        for (at, value) in [start, stop, step].into_iter().enumerate() {
-            let separator = if at == 0 { "generate_series(" } else { ", " };
-            let piece = self.bind(type_oid::INT8, Some(Value::Int8(value)));
-            self.sql.push_str(separator);
-            if let Piece::Text(text) = piece {
-                self.sql.push_str(&text);
-            }
-        }
-        self.sql.push(')');
+        let mut bind = |value: i64| {
+            self.binds.push((type_oid::INT8, Some(Value::Int8(value))));
+            format!("?{}", self.binds.len())
+        };
+        let (first, last, by) = (bind(start), bind(stop), bind(step));
+        let within = if step > 0 { "<=" } else { ">=" };
+        self.sql.push_str(&format!(
+            "WITH RECURSIVE {SERIES}(value) AS (SELECT {first} WHERE {first} {within} {last} UNION ALL SELECT value + {by} FROM {SERIES} WHERE value + {by} {within} {last}) "
+        ));
         Ok(())
     }
 
