@@ -229,7 +229,7 @@ pub fn check_due(last: Option<(u64, u64)>, newest_base: u64, log_since: u64) -> 
 /// Restores the newest whole second under `prefix` into a new file at `scratch` and checks it:
 /// `PRAGMA integrity_check`, then its rows against `source(second)` (the source's digest at that
 /// second; none when it can no longer say). Counts the outcome. The scratch file is the caller's to
-/// remove (it is kept on a failure to look into).
+/// remove (it is kept, where the second restored and failed its check, to look into).
 pub fn restore_and_check(
     blobs: &dyn Blobs,
     prefix: &str,

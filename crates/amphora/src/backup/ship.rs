@@ -354,7 +354,8 @@ fn same(
     Ok(blobs.get_range(key, at, 1, until)?.is_empty())
 }
 
-fn identity_of(header: &[u8]) -> anyhow::Result<Identity> {
+/// The generation a log's header names.
+pub(super) fn identity_of(header: &[u8]) -> anyhow::Result<Identity> {
     let word = |at: usize| -> anyhow::Result<u32> {
         let bytes: [u8; 4] = header
             .get(at..at.saturating_add(4))

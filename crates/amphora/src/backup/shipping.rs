@@ -51,7 +51,7 @@ pub struct Archive {
     /// to know (Needs Ada's word: no measured default yet).
     pub patience: Duration,
     /// Whether and where the thread restores its archive to check it (T-T1.12.C3, C4): a new file
-    /// each check, removed once it passes and kept on a failure to look into. By default
+    /// each check, removed once it passes and kept where it restored and failed, to look into. By default
     /// ([`CheckPolicy::Continuous`]) beside the database, within the machine's budget.
     pub check: CheckPolicy,
     /// Whether a new base's chunks grow with the room or keep the latest base's size
@@ -1098,6 +1098,51 @@ mod tests {
                 prepared.shipper.base_needed()
             ),
         }
+    }
+
+    /// AC-T1.12.4 (lane B26): a check that finds the archive lacking gets one base for it, and another
+    /// only where that one lacks too and a commit moved the log since: a check that fails again and
+    /// again never keeps a base copying for nothing. Do: end a first base; ask for one for frames of
+    /// the generation shipped now and run rounds; ask again for the same frames, for frames of the
+    /// generation after, which the base begun began in, and for that base's proof; commit, ask for its proof
+    /// again, and run rounds; restore the last second. Expect: a base ends at the first ask, in a
+    /// generation of its own with the log shipped again, and at the last; none in between; the second
+    /// restores with every row.
+    #[test]
+    fn a_check_that_finds_the_archive_lacking_gets_one_base_until_a_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = Arc::new(SimBlobs::new(64 * 1024, 1_000_000, 1 << 30));
+        let (db, mut prepared, now) = backed_up(
+            &dir.path().join("source.db"),
+            &blobs,
+            None,
+            CheckPolicy::Off,
+        );
+        write(&db, &now, 0, 10);
+        let mut copy = None;
+        assert!(rounds(&mut prepared, &mut copy), "the first base ends");
+        let generation = prepared.shipper.generation();
+        prepared.mends.ask(Lacks::Frames { generation });
+        assert!(rounds(&mut prepared, &mut copy), "a base for the frames");
+        assert_eq!(prepared.shipper.generation(), generation + 1);
+        let id = prepared.shipper.latest_base().unwrap();
+        for lacks in [
+            Lacks::Frames { generation },
+            Lacks::Frames {
+                generation: generation + 1,
+            },
+            Lacks::Base { id },
+        ] {
+            prepared.mends.ask(lacks);
+            assert!(!rounds(&mut prepared, &mut copy), "{lacks:?}, no commit");
+        }
+        write(&db, &now, 10, 1);
+        prepared.mends.ask(Lacks::Base { id });
+        assert!(rounds(&mut prepared, &mut copy), "a base for the proof");
+        assert_ne!(prepared.shipper.latest_base(), Some(id));
+        now.fetch_add(SECOND_NS, Ordering::SeqCst);
+        prepared.round(&mut copy).unwrap();
+        assert_eq!(restored_now(dir.path(), &blobs, &now).unwrap(), ids(&db));
     }
 
     /// The most bytes the files in a restore's folder held together, seen at each of its steps.

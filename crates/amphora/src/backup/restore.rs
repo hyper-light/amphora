@@ -15,7 +15,7 @@ use super::drill::{Pace, Unpaced};
 use super::folder::sync_dir;
 use super::object::{self, SegmentHead};
 use super::plan::{self, BaseKey, BaseLack, SegmentKey, ThroughKey, Unrestorable};
-use super::ship::{FRAME_BYTES, fetch_charge, frame_offset, list_all};
+use super::ship::{FRAME_BYTES, fetch_charge, frame_offset, identity_of, list_all};
 use crate::db::{Db, log_paths, restoring_path};
 use crate::memory::{Budget as Memory, Charge, Use};
 
@@ -493,11 +493,12 @@ fn make(
             // compared with it, a frame at a time, and refused where they differ (T-T1.12.M6).
             let mut put = |head: &SegmentHead, offset: u64, part: &[u8]| -> anyhow::Result<()> {
                 if offset == 0 {
-                    if generation == manifest.start_gen && head.identity != manifest.held.own {
+                    let archived = identity_of(&head.header)?;
+                    if generation == manifest.start_gen && archived != manifest.held.own {
                         return Err(unproven(BaseLack::Own {
                             generation,
                             began: manifest.held.own.seq,
-                            archived: head.identity.seq,
+                            archived: archived.seq,
                         })
                         .into());
                     }
