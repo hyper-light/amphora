@@ -120,36 +120,46 @@ impl Files {
         version > 2
     }
 
-    /// SQLite's visit, a read and then a write: both refused, nothing printed but why.
-    fn refuses(&self, at: &str) {
-        assert!(
-            self.refused(),
-            "{at}: nothing in these files keeps SQLite out"
-        );
-        for sql in [
+    /// SQLite's visit, a read and then a write: what it ran of the two, and what it printed.
+    fn visited(&self) -> Vec<String> {
+        [
             "SELECT count(*) FROM t",
             "INSERT INTO t VALUES(1000, 'sqlite')",
-        ] {
-            let Some((ran, printed)) = sqlite3(self.dir.path(), sql) else {
-                continue;
-            };
-            assert!(
-                !ran && (printed.contains("file is not a database")
-                    || printed.contains("unable to open database file")),
-                "{at}: sqlite3 ran `{sql}`: {printed}"
-            );
-        }
+        ]
+        .into_iter()
+        .filter_map(|sql| Some((sql, sqlite3(self.dir.path(), sql)?)))
+        .filter(|(_, (ran, printed))| {
+            *ran || !(printed.contains("file is not a database")
+                || printed.contains("unable to open database file"))
+        })
+        .map(|(sql, (_, printed))| format!("`{sql}`: {printed}"))
+        .collect()
     }
 
-    /// What Amphora finds here: how many rows, and a whole database.
+    /// SQLite is kept out of these files, by itself where its shell is here and by what it goes by.
+    fn refuses(&self, at: &str) {
+        let refused = self.refused();
+        let ran = self.visited();
+        assert!(ran.is_empty(), "{at}: sqlite3 ran {ran:?}");
+        assert!(refused, "{at}: nothing in these files keeps SQLite out");
+    }
+
+    /// What Amphora finds here: how many rows, and what its integrity check says.
+    fn found(&self) -> Result<(String, String), String> {
+        let found = std::panic::catch_unwind(|| {
+            let (_db, conn) = open(self.dir.path());
+            let count = rows(&conn, "SELECT count(*) FROM t").join(",");
+            (count, rows(&conn, "PRAGMA integrity_check").join(","))
+        });
+        found.map_err(|e| match e.downcast_ref::<String>() {
+            Some(said) => said.clone(),
+            None => "a panic".to_owned(),
+        })
+    }
+
     fn holds(&self, rows_there: u32, at: &str) {
-        let (_db, conn) = open(self.dir.path());
-        assert_eq!(
-            rows(&conn, "SELECT count(*) FROM t"),
-            [rows_there.to_string()],
-            "{at}: the rows committed"
-        );
-        assert_eq!(rows(&conn, "PRAGMA integrity_check"), ["ok"], "{at}");
+        let whole = (rows_there.to_string(), "ok".to_owned());
+        assert_eq!(self.found(), Ok(whole), "{at}: the rows committed");
     }
 }
 
@@ -210,26 +220,32 @@ fn left(log: Log, format: LogFormat) -> (tempfile::TempDir, Arc<Database>, Arc<C
 /// older count, takes the write, and folds and deletes `-wal`: Amphora then finds fewer rows.
 #[test]
 fn d45_sqlite3_never_reads_or_writes_a_database_a_crash_left() {
+    let mut wrong = Vec::new();
     for format in FORMATS {
         for log in LOGS {
             let at = format!("{format:?}, {log:?}");
             let (dir, _db, _conn, there) = left(log, format);
             let files = Files::of(dir.path(), &[]);
-            let before = files.bytes();
-            files.refuses(&at);
+            let (before, refused) = (files.bytes(), files.refused());
+            let ran = files.visited();
+            let after = files.bytes();
+            let found = files.found();
             // A first segment of SQLite's own format holds only frames older than the second's:
             // SQLite folds it into the file as it closes, as Amphora would.
             let sqlites_own =
                 format == LogFormat::Pages && matches!(log, Log::Second | Log::SecondUncopied);
-            if !sqlites_own {
-                assert!(
-                    files.bytes() == before,
-                    "{at}: sqlite3 changed a file it refused"
-                );
+            let changed = after != before && !sqlites_own;
+            let whole = (there.to_string(), "ok".to_owned());
+            if found.as_ref() != Ok(&whole) || !ran.is_empty() || changed || !refused {
+                wrong.push(format!(
+                    "{at}: {there} rows committed, Amphora finds {found:?} after sqlite3's visit; \
+                     sqlite3 ran {ran:?}; a file it refused changed: {changed}; refused by what it \
+                     goes by: {refused}"
+                ));
             }
-            files.holds(there, &at);
         }
     }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
 /// Do: carry off a database a process left without `-wal2`, without `-wal`, and without both; read

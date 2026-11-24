@@ -605,6 +605,62 @@ struct Seen {
     log_cuts: u64,
     acknowledged: usize,
     refused: usize,
+    /// The images plain SQLite refuses, of those the cut left.
+    sqlite_refused: usize,
+}
+
+/// Whether plain SQLite reads the files a cut left, whole. None: it refuses them (docs/design/store.md,
+/// decision 45, What plain SQLite sees). It knows `-wal` alone: of a log whose header holds it refuses
+/// a format that isn't 3007000 (`wal.c`, `walIndexRecover`); the read version it goes by is page 1's, the
+/// log's last committed one where the log has one, and it refuses one above 2 (`btree.c`, `lockBtree`),
+/// but folds the log into the file and deletes it as it closes all the same.
+fn plain_sqlite(image: &HashMap<String, Vec<u8>>, path: &str) -> Result<Option<()>, String> {
+    let empty = Vec::new();
+    let file = image.get(path).unwrap_or(&empty);
+    let log = |suffix: &str| image.get(&format!("{path}{suffix}")).unwrap_or(&empty);
+    let field = |log: &[u8], at: usize| u32::from_be_bytes(log[at..at + 4].try_into().unwrap());
+    let holds = |log: &[u8]| {
+        log.len() >= 32
+            && matches!(field(log, 0), 0x377f_0682 | 0x377f_0683)
+            && wal_checksum(&log[..24], (0, 0), field(log, 0) == 0x377f_0682)
+                == (field(log, 24), field(log, 28))
+    };
+    let (first, second) = (log("-wal"), log("-wal2"));
+    let mut version = file.get(19).copied().unwrap_or(0);
+    if holds(first) {
+        if field(first, 4) != 3_007_000 {
+            return Ok(None);
+        }
+        if holds(second) && field(second, 12) != field(first, 12).wrapping_add(1) {
+            return Err("SQLite would fold `-wal`, the newer segment, and delete it".into());
+        }
+        let little = field(first, 0) == 0x377f_0682;
+        let mut sum = (field(first, 24), field(first, 28));
+        let mut seen = version;
+        for frame in first[32..].chunks_exact(24 + field(first, 8) as usize) {
+            sum = wal_checksum(&frame[24..], wal_checksum(&frame[..8], sum, little), little);
+            if frame[8..16] != first[16..24] || sum != (field(frame, 16), field(frame, 20)) {
+                break;
+            }
+            if field(frame, 0) == 1 {
+                seen = frame[24 + 19];
+            }
+            if field(frame, 4) > 0 {
+                version = seen;
+            }
+        }
+    }
+    if version > 2 {
+        return Ok(None);
+    }
+    if holds(second) {
+        return Err(format!(
+            "SQLite would read the file and `-wal` ({} bytes) without `-wal2`'s {}",
+            first.len(),
+            second.len()
+        ));
+    }
+    Ok(Some(()))
 }
 
 /// One seed: a workload on a disk that loses its power at a change the seed draws, then the
@@ -772,6 +828,8 @@ fn one_seed(seed: u64) -> Result<Seen, String> {
     if let Some((batch, n)) = found.into_iter().next() {
         return Err(format!("{n} rows of batch {batch}, which was never sent"));
     }
+    let sqlite = plain_sqlite(&image, PATH).map_err(|e| format!("{e}{}", account()))?;
+    seen.sqlite_refused += usize::from(sqlite.is_none());
     Ok(seen)
 }
 
@@ -833,6 +891,7 @@ fn run_seeds<S: Send>(n: u64, from: u64, one: impl Fn(u64) -> Result<S, String> 
 fn seeds(n: u64, from: u64) {
     let (mut midway, mut acknowledged, mut refused) = (0u64, 0usize, 0usize);
     let (mut checkpoints, mut restarts, mut log_cuts) = (0u64, 0u64, 0u64);
+    let mut sqlite_refused = 0usize;
     // What whole workloads changed, to draw crash points from.
     let mut whole: Vec<u64> = Vec::new();
     for seen in run_seeds(n, from, one_seed) {
@@ -845,12 +904,14 @@ fn seeds(n: u64, from: u64) {
         checkpoints += seen.checkpoints;
         restarts += seen.restarts;
         log_cuts += seen.log_cuts;
+        sqlite_refused += seen.sqlite_refused;
     }
     eprintln!(
         "{n} seeds: cut midway in {midway}; {checkpoints} checkpoints, {restarts} restarts of the log \
          and {log_cuts} cuts of its file before a cut; {acknowledged} batches acknowledged, \
-         {refused} refused"
+         {refused} refused; plain SQLite refuses {sqlite_refused} of the images"
     );
+    assert!(sqlite_refused > 0, "no image plain SQLite refuses");
     whole.sort_unstable();
     assert!(
         midway * 2 > n,
@@ -867,6 +928,106 @@ fn seeds(n: u64, from: u64) {
         "{checkpoints} checkpoints, {restarts} restarts of the log and {log_cuts} cuts of its file \
          before a cut"
     );
+}
+
+const CLOSE_PATH: &str = "/crash/close.db";
+
+/// A database of 40 rows in `format` whose log has both segments: the second current, or the first
+/// again (`back`), with commits that aren't in the file.
+fn to_close(disk: &Arc<Disk>, format: LogFormat, back: bool) -> Db {
+    let path = std::path::Path::new(CLOSE_PATH);
+    let mut db = Db::open_with_sharing(path, disk.clone(), &Sharing::Off).unwrap();
+    db.log_format(format).unwrap();
+    db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)")
+        .unwrap();
+    for part in 0..4 {
+        for row in part * 10..(part + 1) * 10 {
+            db.exec(&format!(
+                "INSERT INTO t VALUES ({row}, '{}')",
+                "x".repeat(700)
+            ))
+            .unwrap();
+        }
+        db.flusher()().unwrap();
+        if part == 1 || (part == 2 && back) {
+            assert!(db.restart_log().unwrap(), "{format:?}, part {part}");
+        }
+    }
+    db
+}
+
+fn rows_found(image: HashMap<String, Vec<u8>>, at: u64) -> Result<i64, String> {
+    let path = std::path::Path::new(CLOSE_PATH);
+    let db = Db::open_with_sharing(path, Disk::new(at, image), &Sharing::Off)
+        .map_err(|e| format!("reopen: {e:#}"))?;
+    let (mut check, mut rows) = (String::new(), 0);
+    db.query("PRAGMA integrity_check", [], |r| {
+        check = r.get::<String>(0).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(true)
+    })
+    .map_err(|e| format!("integrity_check: {e:#}"))?;
+    if check != "ok" {
+        return Err(format!("integrity_check: {check}"));
+    }
+    db.query("SELECT count(*) FROM t", [], |r| {
+        rows = r.get::<i64>(0).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(true)
+    })
+    .map_err(|e| format!("rows: {e:#}"))?;
+    Ok(rows)
+}
+
+/// Do (decision 45, What plain SQLite sees): cut the power at each change of a clean close, the log's
+/// second segment current and the first again. Expect: each image holds every row, and plain SQLite
+/// refuses it or reads it whole, the file and `-wal` alone holding every row; it refuses the first and
+/// reads the last, which the close made whole.
+#[test]
+fn d45_a_power_cut_at_any_change_of_a_clean_close_leaves_sqlite_all_of_it_or_none() {
+    for format in [LogFormat::Mixed, LogFormat::Pages] {
+        for back in [false, true] {
+            let disk = Disk::new(0, HashMap::new());
+            let db = to_close(&disk, format, back);
+            disk.arm(u64::MAX);
+            let began = disk.changes.load(Ordering::SeqCst);
+            db.close().unwrap();
+            let changes = disk.changes.load(Ordering::SeqCst) - began;
+            assert!(
+                changes > 5,
+                "{format:?}: the close made only {changes} changes"
+            );
+            let (mut refused, mut read) = (0u64, 0u64);
+            for at in 1..=changes + 1 {
+                let disk = Disk::new(at, HashMap::new());
+                let db = to_close(&disk, format, back);
+                disk.arm(at);
+                let closed = db.close();
+                let image = disk.image();
+                let said =
+                    format!("{format:?}, back {back}, cut at {at} of {changes} ({closed:?})");
+                assert_eq!(rows_found(image.clone(), at), Ok(40), "{said}");
+                match plain_sqlite(&image, CLOSE_PATH) {
+                    Ok(None) => refused += 1,
+                    Ok(Some(())) => {
+                        read += 1;
+                        let mut seen = image;
+                        seen.remove(&format!("{CLOSE_PATH}-wal2"));
+                        assert_eq!(rows_found(seen, at), Ok(40), "{said}: what SQLite sees");
+                    }
+                    Err(e) => panic!("{said}: {e}"),
+                }
+                if at == 1 {
+                    assert_eq!((refused, read), (1, 0), "{said}");
+                }
+                if at > changes {
+                    closed.unwrap();
+                    assert!(
+                        read > 0,
+                        "{said}: a cleanly closed database is SQLite's to read"
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// The database the spilling transaction's seeds write.
