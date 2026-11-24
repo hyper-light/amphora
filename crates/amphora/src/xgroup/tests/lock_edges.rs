@@ -277,10 +277,11 @@ fn left(says: &Says, heard: u64) -> &'static str {
 
 /// What a recovery hears of a group a crash left so ([`left`]).
 fn told(state: &str, heard: u64) -> Reply {
+    let when = |named: &str| if state == named { Some(heard) } else { None };
     Reply::PresentAt {
         present: state != "nothing",
-        committed: (state == "resolved").then_some(heard),
-        locked: (state == "locked").then_some(heard),
+        committed: when("resolved"),
+        locked: when("locked"),
     }
 }
 
@@ -683,7 +684,9 @@ fn t_t1_9_r30_whichever_groups_missed_the_stamp_recover_at_it() {
                     panic!("{protocol:?} {decided} {landed:03b}: {heard:?}");
                 };
                 assert_eq!(at, Some(50));
-                let expected: Vec<_> = (0..3).map(|g| resolved(g).then_some(50)).collect();
+                let expected: Vec<_> = (0..3)
+                    .map(|g| if resolved(g) { Some(50) } else { None })
+                    .collect();
                 assert_eq!(row_stamps(&mut groups), expected);
                 for finished in [false, true] {
                     let (mut next, events) = Coordinator::start(config.clone()).unwrap();
