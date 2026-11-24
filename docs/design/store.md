@@ -1951,7 +1951,11 @@ The switch and the other three are deleted.
   33.6/29.6%, 1.9/1.9%. The lookup's lock alone took 12.5-24.4% under the first three at 32 and
   128 clients, 0.1-0.2% under the table. `filtered` sends every page the log holds to the lock,
   and a reader beside writers reads those. `published` copies the index once for each commit a
-  reader sees, under the lock: at 128 clients it cost the most of the four.
+  reader sees, under the lock: at 128 clients it cost the most of the four. Reads a second, median
+  of three rounds: 32 clients `locked` 22,437, `filtered` 31,989, `published` 22,344, `optimistic`
+  35,962 (its range above every other way's); 128 clients 12,698, 16,570, 8,312 and 18,403. Every
+  way's pages after the mixed phase matched SQLite's answers on the same rows (12,000 pages, 0
+  differ), with no failed or unanswered write.
 
 Tests: `storage::wal::tests::g3_2_*` (the model against the index read under its lock, and readers
 beside a writer) and `crates/engine/tests/log_read_index.rs` (a crash at every write of a checkpoint
