@@ -349,6 +349,84 @@ T 00017600000040290002000000170004ffffffff0000
 D 0001000000023237
 C 53454c454354203100
 Z 49
+@ s1 create table m(id int not null, v int)
+C 435245415445205441424c4500
+Z 49
+@ s1 insert into m(id, v) values (1, 10)
+C 494e534552542030203100
+Z 49
+@ s1 insert into m(id, v) values (2, 20)
+C 494e534552542030203100
+Z 49
+@ s1 begin
+C 424547494e00
+Z 54
+@ s1 update m set v = v + 1 where id = 1
+C 555044415445203100
+Z 54
+@ s2> update m set v = v + 100 where id = 2; update m set v = v + 100 where id = 1; select v from m where id = 1
+@ s1 commit
+C 434f4d4d495400
+Z 49
+@ s2<
+C 555044415445203100
+C 555044415445203100
+T 000176000000402d0002000000170004ffffffff0000
+D 000100000003313131
+C 53454c454354203100
+Z 49
+@ s1 select v from m where id = 2
+T 000176000000402d0002000000170004ffffffff0000
+D 000100000003313230
+C 53454c454354203100
+Z 49
+@ s1 create table n(id int not null, v int)
+C 435245415445205441424c4500
+Z 49
+@ s1 insert into n(id, v) values (1, 10)
+C 494e534552542030203100
+Z 49
+@ s1 begin isolation level repeatable read
+C 424547494e00
+Z 54
+@ s2 update n set v = v + 1 where id = 1
+C 555044415445203100
+Z 49
+@ s1 update n set v = v + 5 where id = 1
+C 555044415445203100
+Z 54
+@ s1 commit
+C 434f4d4d495400
+Z 49
+@ s1 select v from n where id = 1
+T 00017600000040310002000000170004ffffffff0000
+D 0001000000023136
+C 53454c454354203100
+Z 49
+@ s1 create table o(id int not null, v int)
+C 435245415445205441424c4500
+Z 49
+@ s1 insert into o(id, v) values (1, 10)
+C 494e534552542030203100
+Z 49
+@ s1 begin
+C 424547494e00
+Z 54
+@ s1 update o set v = 5 where id = 1
+C 555044415445203100
+Z 54
+@ s2> update o set v = v + 1 where v >= 5
+@ s1 commit
+C 434f4d4d495400
+Z 49
+@ s2<
+C 555044415445203100
+Z 49
+@ s1 select v from o where id = 1
+T 00017600000040350002000000170004ffffffff0000
+D 00010000000136
+C 53454c454354203100
+Z 49
 @ s1 show transaction_isolation
 T 00017472616e73616374696f6e5f69736f6c6174696f6e0000000000000000000019ffffffffffff0000
 D 00010000000e7265616420636f6d6d6974746564

@@ -105,8 +105,10 @@ pub struct Clock {
     /// `AC-NS.2.1`): a summary built beside one would miss its rows once it commits. Bounded by
     /// the trees, each counted once a transaction.
     writing: Mutex<Writing>,
-    /// The transactions that wait for another's end (docs/design/postgres.md section 8).
+    /// The transactions that wait for another's end (docs/design/postgres.md section 8), and how many
+    /// wakers they left: none, and an end takes no lock.
     waits: Mutex<Waits>,
+    waiting: AtomicU64,
     /// What versions, transactions' records and kept commits may hold.
     budget: Budget,
 }
@@ -117,7 +119,7 @@ pub struct Clock {
 #[derive(Default)]
 struct Waits {
     on: FxHashMap<u64, u64>,
-    told: FxHashMap<u64, Vec<Waker>>,
+    told: FxHashMap<u64, Vec<(Option<u64>, Waker)>>,
 }
 
 /// Each tree's open writers, and who waits for a tree to have none (G7 step 2, `AC-NS.2.1`): one
@@ -618,6 +620,7 @@ impl Clock {
             open: Mutex::new(Open::default()),
             writing: Mutex::new(Writing::default()),
             waits: Mutex::new(Waits::default()),
+            waiting: AtomicU64::new(0),
             budget,
         }
     }
@@ -722,8 +725,14 @@ impl Clock {
     /// no end is missed. A wait that would close a ring of waits is refused (`Deadlock`),
     /// registering nothing.
     pub fn wait_for(&self, waiter: Option<u64>, holder: u64, wake: &Waker) -> Result<bool> {
+        let states = self.states(holder)?;
         let mut waits = self.waits.lock();
-        if !matches!(self.states(holder)?.lock().get(&holder), Some(State::Open)) {
+        // Counted before the holder's state is read, under the lock its end takes to change it: an end
+        // after that read finds the count, and takes the waits' lock.
+        self.waiting.fetch_add(1, Ordering::SeqCst);
+        let held = || self.waiting.fetch_sub(1, Ordering::SeqCst);
+        if !matches!(states.lock().get(&holder), Some(State::Open)) {
+            held();
             return Ok(false);
         }
         if let Some(waiter) = waiter {
@@ -731,6 +740,7 @@ impl Clock {
             let mut at = holder;
             for _ in 0..=waits.on.len() {
                 if at == waiter {
+                    held();
                     return Err(LimboError::Deadlock);
                 }
                 match waits.on.get(&at) {
@@ -740,7 +750,13 @@ impl Clock {
             }
             waits.on.insert(waiter, holder);
         }
-        waits.told.entry(holder).or_default().push(wake.clone());
+        let told = waits.told.entry(holder).or_default();
+        if told.iter().any(|(_, other)| other.will_wake(wake)) {
+            // A task that polls again is told once.
+            held();
+        } else {
+            told.push((waiter, wake.clone()));
+        }
         Ok(true)
     }
 
@@ -838,13 +854,21 @@ impl Clock {
         for waiter in woken {
             let _ = waiter.try_send(());
         }
-        let told = {
-            let mut waits = self.waits.lock();
-            waits.on.remove(&txn.id);
-            waits.told.remove(&txn.id).unwrap_or_default()
-        };
-        for waker in told {
-            waker.wake();
+        if self.waiting.load(Ordering::SeqCst) > 0 {
+            let told = {
+                let mut waits = self.waits.lock();
+                let told = waits.told.remove(&txn.id).unwrap_or_default();
+                for (waiter, _) in &told {
+                    if let Some(waiter) = waiter {
+                        waits.on.remove(waiter);
+                    }
+                }
+                told
+            };
+            for (_, waker) in told {
+                self.waiting.fetch_sub(1, Ordering::SeqCst);
+                waker.wake();
+            }
         }
         self.budget
             .release(txn.charged.saturating_add(txn.read_bytes));
@@ -2336,6 +2360,112 @@ mod tests {
         );
         v.clock.close(reader.start);
         v.clock.close(later.start);
+    }
+
+    #[derive(Default)]
+    struct Told(std::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for Told {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl Told {
+        fn times(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    fn told() -> (std::sync::Arc<Told>, Waker) {
+        let told = std::sync::Arc::new(Told::default());
+        (told.clone(), Waker::from(told))
+    }
+
+    /// Do: a waiting transaction changes the row another open transaction changed, for a session that
+    /// waits (`Rules`); the holder commits, and then one rolls back. Expect: `RowTaken` naming the
+    /// holder while it is open, and none once its commit passed the snapshot; the waiter told once,
+    /// by the holder's end, and a wait for an ended holder not registered (T-PG.14.1).
+    #[test]
+    fn t_pg_14_1_a_waiting_writer_is_told_once_by_the_holders_end() {
+        let v = db();
+        let t = v.tree(0).unwrap();
+        let mut d = Descender::new();
+        let waits = Rules {
+            validation: Some(Validation::Snapshot),
+            waits: true,
+        };
+        let mut a = v.clock.begin().unwrap();
+        let mut b = v.clock.begin().unwrap();
+        b.isolate(waits);
+        t.put(&v.pool, &mut d, &v.clock, &mut a, b"k", b"a")
+            .unwrap();
+        let holder = a.id;
+        assert!(matches!(
+            t.put(&v.pool, &mut d, &v.clock, &mut b, b"k", b"b"),
+            Err(LimboError::RowTaken(Some(id))) if id == holder
+        ));
+        let (told_b, waker) = told();
+        assert!(v.clock.wait_for(Some(b.id), holder, &waker).unwrap());
+        assert!(v.clock.wait_for(Some(b.id), holder, &waker).unwrap());
+        assert_eq!(told_b.times(), 0);
+        v.commit(a, &mut d).unwrap();
+        assert_eq!(told_b.times(), 1);
+        assert!(!v.clock.wait_for(Some(b.id), holder, &waker).unwrap());
+        assert!(matches!(
+            t.put(&v.pool, &mut d, &v.clock, &mut b, b"k", b"b"),
+            Err(LimboError::RowTaken(None))
+        ));
+        v.clock.renew(&mut b).unwrap();
+        t.put(&v.pool, &mut d, &v.clock, &mut b, b"k", b"b")
+            .unwrap();
+        let mut c = v.clock.begin().unwrap();
+        c.isolate(waits);
+        assert!(matches!(
+            t.remove(&v.pool, &mut d, &v.clock, &mut c, b"k"),
+            Err(LimboError::RowTaken(Some(id))) if id == b.id
+        ));
+        let (told_c, waker) = told();
+        assert!(v.clock.wait_for(Some(c.id), b.id, &waker).unwrap());
+        v.abort(b, &mut d).unwrap();
+        assert_eq!(told_c.times(), 1);
+        t.remove(&v.pool, &mut d, &v.clock, &mut c, b"k").unwrap();
+        v.commit(c, &mut d).unwrap();
+        assert_eq!(told_b.times(), 1);
+    }
+
+    /// Do: a wait for `b` of `a`, then one for `a` of `b`. Expect: the second refused `Deadlock`, one
+    /// that names no transaction of its own never refused, and each end tells who waits
+    /// (T-PG.14.2).
+    #[test]
+    fn t_pg_14_2_a_wait_that_closes_a_ring_is_refused() {
+        let v = db();
+        let mut d = Descender::new();
+        let a = v.clock.begin().unwrap();
+        let b = v.clock.begin().unwrap();
+        let c = v.clock.begin().unwrap();
+        let (told_a, waker_a) = told();
+        let (told_b, waker_b) = told();
+        let (told_c, waker_c) = told();
+        assert!(v.clock.wait_for(Some(a.id), b.id, &waker_a).unwrap());
+        assert!(matches!(
+            v.clock.wait_for(Some(b.id), a.id, &waker_b),
+            Err(LimboError::Deadlock)
+        ));
+        assert!(v.clock.wait_for(Some(c.id), a.id, &waker_c).unwrap());
+        assert!(v.clock.wait_for(None, a.id, &waker_b).unwrap());
+        assert!(matches!(
+            v.clock.wait_for(Some(b.id), c.id, &waker_b),
+            Err(LimboError::Deadlock)
+        ));
+        v.abort(a, &mut d).unwrap();
+        assert_eq!((told_b.times(), told_c.times()), (1, 1));
+        assert!(v.clock.wait_for(Some(b.id), c.id, &waker_b).unwrap());
+        assert_eq!(told_a.times(), 0);
+        v.abort(c, &mut d).unwrap();
+        assert_eq!((told_a.times(), told_b.times()), (0, 2));
+        v.abort(b, &mut d).unwrap();
+        assert_eq!(told_a.times(), 1);
     }
 
     /// Do: two open transactions change the same row; then one commits and a transaction begun
