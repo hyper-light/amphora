@@ -3626,8 +3626,8 @@ struct OngoingCheckpoint {
     pages_to_checkpoint: Vec<(u64, u64)>,
     /// The segment this pass copies, chosen once at its start (decision 45's rule 1).
     segment: SegmentId,
-    /// Whether `segment` is the closing one rather than the current one.
-    closing: bool,
+    /// `segment` when it is the closing one rather than the current one.
+    closing: Option<SegmentId>,
 }
 
 struct InflightWriteBatch {
@@ -6409,7 +6409,7 @@ impl Wal for WalFile {
     ) -> Result<Option<Completion>> {
         // The proof is the current segment's backfill: a closing one is copied again whole after
         // a crash (decision 45, Crash recovery).
-        if self.ongoing_checkpoint.read().closing {
+        if self.ongoing_checkpoint.read().closing.is_some() {
             return Ok(None);
         }
         self.coordination.install_durable_backfill_proof(
@@ -6438,7 +6438,7 @@ impl Wal for WalFile {
             }
         );
         self.coordination.publish_segment_backfill(segment, max_frame);
-        if closing && max_frame == snapshot.max_frame {
+        if closing.is_some() && max_frame == snapshot.max_frame {
             self.coordination.closing_copied();
         }
     }
@@ -7321,7 +7321,7 @@ impl WalFile {
                 pages_to_checkpoint: Vec::new(),
                 inflight_reads: Vec::with_capacity(MAX_INFLIGHT_READS),
                 segment: SegmentId::First,
-                closing: false,
+                closing: None,
             }),
             buffer_pool,
             checkpoint_seq: AtomicU32::new(0),
@@ -7501,7 +7501,7 @@ impl WalFile {
                     // one only once the closing one is reset.
                     let segments = self.coordination.segments();
                     let segment = segments.to_copy();
-                    let closing = segments.closing().is_some();
+                    let closing = segments.closing();
                     {
                         let mut oc = self.ongoing_checkpoint.write();
                         oc.segment = segment;
@@ -7512,12 +7512,12 @@ impl WalFile {
                     let nbackfills = snapshot.nbackfills;
                     tracing::debug!("shared_wal: max_frame={max_frame}, nbackfills={nbackfills}");
                     let needs_backfill = max_frame > nbackfills;
-                    if closing && !needs_backfill {
+                    if closing.is_some() && !needs_backfill {
                         // Every frame of it is in a flushed file already (a backfill is published
                         // only after the file's sync), or it holds none.
                         self.coordination.closing_copied();
                     }
-                    if matches!(lock_source, CheckpointLockSource::HeldByCaller) && !closing {
+                    if matches!(lock_source, CheckpointLockSource::HeldByCaller) && closing.is_none() {
                         turso_assert!(
                             needs_backfill,
                             "held checkpoint-lock path requires WAL frames to backfill",
@@ -7528,7 +7528,7 @@ impl WalFile {
                         // there are no frames to copy over and we don't need to reset
                         // the log so we can return early success.
                         let mut result = CheckpointResult::new(max_frame, nbackfills, 0);
-                        result.closing = closing.then_some(segment);
+                        result.closing = closing;
                         return Ok(IOResult::Done(result));
                     }
                     // acquire the appropriate exclusive locks depending on the checkpoint mode
@@ -7537,7 +7537,7 @@ impl WalFile {
                     // another pass, while this one waited for its locks: a pass copies the
                     // segment rule 1 names with them held, or none.
                     let held = self.coordination.segments();
-                    if held.to_copy() != segment || held.closing().is_some() != closing {
+                    if held.to_copy() != segment || held.closing() != closing {
                         return Err(LimboError::Busy.into());
                     }
                     let mut max_frame = self.determine_max_safe_checkpoint_frame(segment);
@@ -7572,7 +7572,7 @@ impl WalFile {
                     };
                     // A closing segment's frames are in this process's own scan of its file: no
                     // process appends to it.
-                    if !closing {
+                    if closing.is_none() {
                         self.coordination.ensure_local_frame_cache_covers(
                             &self.io,
                             WalSnapshot {
@@ -7603,7 +7603,7 @@ impl WalFile {
                     // Amphora: and for frames a flush already made durable (`durable_through`).
                     let needs_wal_sync = !to_checkpoint.is_empty()
                         && sync_mode != SyncMode::Off
-                        && (closing || !self.coordination.durable_through(oc_max_frame));
+                        && (closing.is_some() || !self.coordination.durable_through(oc_max_frame));
                     {
                         let mut oc = self.ongoing_checkpoint.write();
                         oc.pages_to_checkpoint = to_checkpoint;
@@ -7634,7 +7634,7 @@ impl WalFile {
                         let oc = self.ongoing_checkpoint.read();
                         (oc.segment, oc.closing)
                     };
-                    let c = if closing {
+                    let c = if closing.is_some() {
                         self.coordination
                             .segment_file(segment)?
                             .sync(Completion::new_sync(|_| {}), pager.get_sync_type())?
@@ -7685,7 +7685,7 @@ impl WalFile {
                         };
                         // The page cache keys a page by its frame in the current segment: frame
                         // numbers start again in each, so a closing pass reads its own frames.
-                        let cached = if closing {
+                        let cached = if closing.is_some() {
                             None
                         } else {
                             pager.cache_get_for_checkpoint(page_id as usize, target_frame, epoch)?
@@ -7812,14 +7812,14 @@ impl WalFile {
                         wal_total_backfilled,
                         wal_checkpoint_backfilled,
                     );
-                    checkpoint_result.closing = closing.then_some(segment);
+                    checkpoint_result.closing = closing;
                     tracing::debug!("checkpoint_result={:?}, mode={:?}", checkpoint_result, mode);
                     if mode.require_all_backfilled() && !checkpoint_result.everything_backfilled() {
                         return Err(LimboError::Busy.into());
                     }
                     // A pass over the closing segment restarts nothing: the current segment isn't
                     // copied yet (decision 45).
-                    if mode.should_restart_log() && !closing {
+                    if mode.should_restart_log() && closing.is_none() {
                         turso_assert!(
                             matches!(
                                 *self.checkpoint_guard.read(),
@@ -7841,7 +7841,7 @@ impl WalFile {
                     // This ensures data durability: if a crash occurs after WAL truncation
                     // but before DB sync, the data would be lost. By truncating the WAL
                     // only after the DB is safely synced, we guarantee recoverability.
-                    if mode.should_restart_log() && !self.ongoing_checkpoint.read().closing {
+                    if mode.should_restart_log() && self.ongoing_checkpoint.read().closing.is_none() {
                         Self::unlock_after_restart(&self.coordination, None);
                     }
                     let mut checkpoint_result = {
