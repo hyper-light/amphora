@@ -4,11 +4,12 @@
 
 - A compound SELECT's ORDER BY terms: a position, a name or an expression, under any parentheses, signs and COLLATEs.
 - A window function's arguments, its FILTER, PARTITION BY and ORDER BY that hold subqueries, correlated or not.
+- A view's, a derived table's or a CTE's columns that fail on some row and that nothing reads.
 
 usage: bench/sqlite_refused_queries.py COUNT SEED > crates/engine/tests/fixtures/refused_queries.tsv   (SQLite 3.54.0)
 
 A compound's values are distinct under every collation, so that the order is one; its columns declare no collation (which
-arm's collation sorts is CY). One lag, lead, first_value, last_value or nth_value a query (two beside another window is CO).
+arm's collation sorts is CY). No correlated subquery is a compound (refused anywhere). One lag, lead, first_value, last_value or nth_value a query (two beside another window is CO).
 """
 import random
 import sqlite3
@@ -62,7 +63,7 @@ def window(rng):
                            "t.g NOT IN (SELECT b FROM s WHERE b IS NOT NULL)", "EXISTS (SELECT 1 FROM s WHERE b = t.a)", "NOT EXISTS (SELECT 1 FROM s WHERE b > t.a)",
                            "CASE WHEN t.a IN (SELECT b FROM s) THEN t.a ELSE 0 END", "coalesce((SELECT b FROM s WHERE b = t.a), -1)", "(SELECT count(*) FROM t AS x WHERE x.a < t.a) + t.a",
                            "(t.a, t.g) IN (SELECT b, 1 FROM s)", "(SELECT (SELECT max(b) FROM s) + t.a)", "t.v = (SELECT max(w) FROM s)", "(SELECT t.a)", "length((SELECT max(w) FROM s))",
-                           "(SELECT b FROM s UNION ALL SELECT t.a ORDER BY 1 LIMIT 1)", "iif((SELECT count(*) FROM s) > 2, t.a, t.v)"])
+                           "iif((SELECT count(*) FROM s) > 2, t.a, t.v)"])
 
     def bad():
         return rng.choice(["(SELECT 1, 2)", "t.a IN (SELECT b, w FROM s)", "(SELECT nosuch FROM s)", "(SELECT b, w FROM s) = 1"])
@@ -108,6 +109,60 @@ def window(rng):
     return setup, [("rows", query)]
 
 
+def derived(rng):
+    """A view's, a derived table's or a CTE's columns that fail on some row, most of them read by nothing."""
+    bodies = rng.sample(["'{\"a\":1}'", "'{\"a\":\"x\"}'", "'not json'", "'[1,2]'", "NULL", "'{'"], rng.randint(2, 4))
+    setup = ["CREATE TABLE doc(id INTEGER PRIMARY KEY, body TEXT, k INT)", "CREATE TABLE o(id INTEGER PRIMARY KEY, j INT)",
+             "INSERT INTO doc VALUES " + ", ".join(f"({i}, {b}, {rng.choice(['1', '2', '3', 'NULL'])})" for i, b in enumerate(bodies, 1)),
+             "INSERT INTO o VALUES " + ", ".join(f"({i}, {rng.randint(1, 3)})" for i in range(1, 5))]
+    good = ["id", "k", "d", "e", "m"]
+    texts = {"id": "id", "k": "k", "d": "k * 2 AS d", "e": "coalesce(k, 0) AS e", "m": "'m' || id AS m", "a": "json_extract(body, '$.a') AS a", "b": "json(body) AS b",
+             "c": "abs(-9223372036854775808 + coalesce(k, 0) * 0) AS c", "n": "json_array_length(body) + 1 AS n", "q": "(SELECT json(body)) AS q"}
+    bad = rng.sample(["a", "b", "c", "n", "q"], rng.choice([1, 1, 2]))
+    cols = ["id"] + rng.sample(good[1:], rng.randint(1, 3)) + bad
+    if rng.random() < 0.3:
+        rng.shuffle(cols)
+    body = f"SELECT {', '.join(texts[c] for c in cols)} FROM doc" + rng.choice(["", "", "", " WHERE id > 1", " WHERE k IS NOT NULL", " ORDER BY id", " ORDER BY k DESC, id", " ORDER BY id LIMIT 2"])
+    shape = rng.random()
+    if shape < 0.15 and "ORDER" not in body:
+        body += f" UNION ALL SELECT {', '.join(texts[c] for c in cols)} FROM doc WHERE id < 3"
+    elif shape < 0.2:
+        body = body.replace("SELECT", "SELECT DISTINCT", 1)
+    elif shape < 0.25 and "ORDER" not in body:
+        body += " GROUP BY id"
+    names = [c for c in cols]
+    for _ in range(rng.choice([0, 0, 0, 1, 2])):
+        inner = f"({body})" if rng.random() < 0.5 else None
+        if inner is None:
+            setup.append(f"CREATE VIEW v{len(setup)} AS {body}")
+            inner = f"v{len(setup) - 1}"
+        names = rng.choice([names, names, [c for c in names if c == "id" or rng.random() < 0.8]])
+        body = f"SELECT {'*' if rng.random() < 0.3 and len(names) == len(cols) else ', '.join(names)} FROM {inner}" + rng.choice(["", "", " WHERE id < 9"])
+    how = rng.random()
+    if how < 0.5:
+        setup.append(f"CREATE VIEW v AS {body}")
+        src, head = "v", ""
+    elif how < 0.8:
+        src, head = f"({body}) AS v", ""
+    else:
+        src, head = "v", f"WITH v AS ({body}) "
+    reads = [c for c in names if c not in bad] or ["id"]
+    c, d = rng.choice(reads), rng.choice(reads)
+    if rng.random() < 0.08:
+        c = rng.choice(names)
+    once = [
+        f"SELECT count(*) FROM {src}", f"SELECT {c} FROM {src}", f"SELECT v.{c}, v.{d} FROM {src}", f"SELECT {c}, count(*) FROM {src} GROUP BY {c}", f"SELECT max({c}), min({d}) FROM {src}",
+        f"SELECT {c} FROM {src} WHERE id > 1", f"SELECT v.{c}, o.j FROM {src} JOIN o ON o.id = v.id", f"SELECT o.id, v.{c} FROM o LEFT JOIN {src} ON v.id = o.j",
+        f"SELECT o.id FROM o WHERE o.id IN (SELECT id FROM {src})", f"SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM {src} WHERE v.id = o.id)", f"SELECT o.id, (SELECT max({c}) FROM {src}) FROM o",
+        f"SELECT o.id, (SELECT count(*) FROM {src} WHERE v.id <= o.j) FROM o", f"SELECT DISTINCT {c} FROM {src}", f"SELECT {c} FROM {src} UNION SELECT j FROM o", f"SELECT {c} FROM {src} ORDER BY {d}, id",
+        f"SELECT id, sum({c}) OVER (ORDER BY id) FROM {src}", f"SELECT * FROM (SELECT {c}, id FROM {src}) WHERE id < 3", f"SELECT {c} FROM {src} JOIN o USING (id)", f"SELECT o.j FROM o NATURAL JOIN (SELECT id, {c} AS zz FROM {src})",
+        f"SELECT j FROM {src} JOIN o ON v.{c} = o.j", f"SELECT v.id FROM {src} RIGHT JOIN o ON o.id = v.id", f"SELECT o.id, v.{c} FROM o FULL JOIN {src} ON v.id = o.id", f"SELECT x.id FROM doc AS x, {src} WHERE x.id = v.id AND v.{c} IS NOT NULL",
+        f"SELECT {c} FROM {src} LIMIT 2", f"SELECT id FROM {src} GROUP BY id HAVING max({c}) IS NOT NULL", f"SELECT CASE WHEN {c} IS NULL THEN {d} ELSE id END FROM {src}", f"SELECT rowid FROM o WHERE j NOT IN (SELECT {c} FROM {src} WHERE {c} IS NOT NULL)",
+    ]
+    queries = [("rows", head + rng.choice(once))]
+    return setup, queries
+
+
 def cell(v):
     if v is None:
         return "NULL"
@@ -123,7 +178,7 @@ def main():
     rng = random.Random(seed)
     lines = []
     for made in range(count):
-        setup, queries = (compound if made % 2 else window)(rng)
+        setup, queries = (window, compound, derived)[made % 3](rng)
         conn = sqlite3.connect(":memory:", isolation_level=None)
         lines.append("case")
         for sql in setup:

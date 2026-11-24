@@ -480,7 +480,8 @@ pub(crate) struct DoUpdateSubqueries {
     sets: RowSubqueries,
 }
 
-/// Each subquery beside whether it reads the row to insert, which is another at each conflict.
+/// Each subquery beside whether it reads the row to insert, which is another at each conflict: what
+/// ran once within it then runs again.
 #[derive(Default)]
 struct RowSubqueries {
     planned: Vec<(NonFromClauseSubquery, bool)>,
@@ -564,7 +565,11 @@ impl DoUpdateSubqueries {
                         resolver,
                         connection,
                     )?;
-                    planned.extend(found.into_iter().map(|subquery| (subquery, reads_excluded)));
+                    // What reads the row to insert runs for each, as what reads the conflicting row.
+                    planned.extend(found.into_iter().map(|mut subquery| {
+                        subquery.correlated |= reads_excluded;
+                        (subquery, reads_excluded)
+                    }));
                     Ok(WalkControl::SkipChildren)
                 })?;
             }
