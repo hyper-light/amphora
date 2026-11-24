@@ -31,6 +31,8 @@ pub enum SegmentId {
 }
 
 impl SegmentId {
+    pub const BOTH: [Self; 2] = [Self::First, Self::Second];
+
     pub const fn other(self) -> Self {
         match self {
             Self::First => Self::Second,

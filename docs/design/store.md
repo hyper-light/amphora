@@ -2541,7 +2541,8 @@ Amphora is not even released. This is not a concern.").** The two segments repla
 upgrade step, no reading of a one-segment format and no switch between the two, and the one-segment restart is deleted.
 Each segment's header is the log header the engine writes today (format, page size, checkpoint sequence, salts,
 checksums; its format one SQLite doesn't know where the log is two files, below), so a log whose `-wal2` is absent, or holds no valid header, is one of the two-segment log's own states (one
-segment `Current`, the other `Free`), read by the same recovery.
+segment `Current`, the other `Free`), read by the same recovery. The log's format (decisions 16 and 37) is both segments':
+`Database::wal_format` set the current one's alone until lane B30, so every second segment of a store was pages.
 
 **What plain SQLite sees (the coordinator, 2026-11-23, on lane B6's question; built and revised 2026-11-24, lane B29).**
 SQLite knows `-wal` alone, and SQLite writes no page's checksum (decision 12): a page it wrote is one Amphora refuses

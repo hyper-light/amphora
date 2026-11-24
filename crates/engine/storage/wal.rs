@@ -6416,7 +6416,7 @@ impl Wal for WalFile {
         if log.mark() != Mark::InFile || log.current_id() != SegmentId::First {
             return Ok(false);
         }
-        for segment in [SegmentId::First, SegmentId::Second] {
+        for segment in SegmentId::BOTH {
             let file = log.segment(segment).read().runtime.file.clone();
             let Some(file) = file else { continue };
             if file.size()? > 0 {

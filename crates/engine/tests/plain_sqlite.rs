@@ -410,6 +410,35 @@ fn d45_a_database_sqlite3_left_is_marked_before_its_second_segment_is_written() 
     }
 }
 
+/// Do: set a log's format and commit past two switches. Expect: every generation is in that format, the
+/// second segment's as the first's (lane B30, item 2).
+#[test]
+fn d45_a_logs_format_is_both_its_segments() {
+    for (format, named) in [
+        (LogFormat::Mixed, 0x414d_5007),
+        (LogFormat::Packed, 0x414d_5004),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, conn) = open(dir.path());
+        db.wal_format(format).unwrap();
+        conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)")
+            .unwrap();
+        insert(&conn, 1, 3);
+        for switch in 1..=2 {
+            copy(&conn);
+            assert!(db.switch_log(None).unwrap(), "{format:?}, switch {switch}");
+            insert(&conn, 3 * switch + 1, 3 * switch + 3);
+        }
+        for suffix in ["-wal", "-wal2"] {
+            let log = std::fs::read(beside(dir.path(), suffix)).unwrap();
+            let of = u32::from_be_bytes(log[4..8].try_into().unwrap());
+            assert_eq!(of, named, "{format:?}: {suffix}'s format is {of:#x}");
+        }
+        let files = Files::of(dir.path(), &[]);
+        files.holds(9, &format!("{format:?}"));
+    }
+}
+
 /// Do: VACUUM INTO a file from a database whose commits need `-wal2`; read the file with sqlite3.
 /// Expect: every row: that file is whole, with no log.
 #[test]
