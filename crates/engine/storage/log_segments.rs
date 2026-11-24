@@ -1,8 +1,9 @@
 //! The log's two segments (docs/design/store.md, decision 45): `<db>-wal` and `<db>-wal2`, which
 //! one the writer appends to, which one is closing, and when the closing one may be written over.
-//! Pure: the log keeps one [`Segments`] under its shared state's lock and makes the I/O a step
-//! names (a switch's header and its sync before any frame; nothing at a reset).
+//! Pure: the log keeps one [`Segments`] in a [`SegmentsCell`], each change one of its steps, and
+//! makes the I/O a step names (a switch's header and its sync before any frame; nothing at a reset).
 
+use crate::sync::atomic::{AtomicU64, Ordering};
 use std::iter;
 
 /// [`Segments::pack`]'s word: bit 60 says the closing segment is shipped, 61 that it is copied,
@@ -12,6 +13,10 @@ const SHIPPED: u64 = 0x1000_0000_0000_0000;
 const COPIED: u64 = 0x2000_0000_0000_0000;
 const CLOSING: u64 = 0x4000_0000_0000_0000;
 const SECOND_CURRENT: u64 = 0x8000_0000_0000_0000;
+/// [`SegmentsCell`]'s word holds the reads as well: bits 0-29 count those on the current segment
+/// and bits 30-59 those on the closing one.
+const READS: u64 = 0x3FFF_FFFF;
+const CLOSING_READS_SHIFT: u32 = 30;
 
 /// One of the log's two files.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -284,6 +289,77 @@ impl Segments {
     }
 }
 
+/// One process's [`Segments`], its reads counted, in one word: read without a lock, and changed by
+/// compare-and-swap, each change one step of the state machine applied whole. Every read's begin
+/// and end is such a change; under a spin lock they were point reads' hottest spin at 32 and 128
+/// clients (bench/records/2026-11-23-adacachy2-perf-reads-q3.md).
+#[derive(Debug)]
+pub struct SegmentsCell(AtomicU64);
+
+impl SegmentsCell {
+    /// A cell holding `segments`' segments and flags, no read counted.
+    pub fn new(segments: Segments) -> Self {
+        Self(AtomicU64::new(segments.pack()))
+    }
+
+    /// The state now.
+    pub fn load(&self) -> Segments {
+        Self::unpack(self.0.load(Ordering::Acquire))
+    }
+
+    /// Applies `step` to the state as one change, and gives back what it returned. None, with
+    /// nothing changed, when the step would count more reads on a segment than its 30 bits hold.
+    pub fn update<T>(&self, mut step: impl FnMut(&mut Segments) -> T) -> Option<T> {
+        let mut word = self.0.load(Ordering::Acquire);
+        loop {
+            let mut segments = Self::unpack(word);
+            let out = step(&mut segments);
+            let next = Self::pack(&segments)?;
+            match self
+                .0
+                .compare_exchange_weak(word, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Some(out),
+                Err(seen) => word = seen,
+            }
+        }
+    }
+
+    /// [`Segments::begin_read`]. None when a segment already counts as many reads as its bits
+    /// hold: the read is refused and tried again.
+    pub fn begin_read(&self) -> Option<ReadSpan> {
+        self.update(Segments::begin_read)
+    }
+
+    /// [`Segments::end_read`]: the segment this resets, if the read was the last thing it waited
+    /// for. Counts only fall here, so the change always fits the word.
+    pub fn end_read(&self, span: ReadSpan) -> Option<SegmentId> {
+        self.update(|segments| {
+            segments.end_read(ReadSpan {
+                current: span.current,
+                closing: span.closing,
+            })
+        })
+        .flatten()
+    }
+
+    fn pack(segments: &Segments) -> Option<u64> {
+        let closing = segments.other.map_or(0, |closing| closing.reads);
+        (segments.reads <= READS && closing <= READS).then(|| {
+            segments.pack() | segments.reads | closing.wrapping_shl(CLOSING_READS_SHIFT)
+        })
+    }
+
+    fn unpack(word: u64) -> Segments {
+        let mut segments = Segments::unpack(word);
+        segments.reads = word & READS;
+        if let Some(closing) = &mut segments.other {
+            closing.reads = word.wrapping_shr(CLOSING_READS_SHIFT) & READS;
+        }
+        segments
+    }
+}
+
 /// The reads that count on each segment: one reader slot's in the multi-process shared memory, or
 /// the sum of every live slot's. Bits 0-31 count the reads on the first segment and bits 32-63 on
 /// the second. One slot serves every read of a snapshot in its process, so it counts rather than
@@ -340,6 +416,79 @@ impl SlotReads {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Do (decision 45, lane Q3): the same 20,000 steps (reads begun and ended, switches, copies,
+    /// shipments, in a seeded random order) on a plain state and on a cell. Expect: after each
+    /// step both hold the same state and the step answered the same.
+    #[test]
+    fn q3_the_cell_steps_as_the_state_machine_does() {
+        let mut plain = Segments::new(SegmentId::First);
+        let cell = SegmentsCell::new(plain);
+        let (mut plain_spans, mut cell_spans) = (Vec::new(), Vec::new());
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..20_000 {
+            match next() % 6 {
+                0 | 1 => {
+                    plain_spans.push(plain.begin_read());
+                    cell_spans.push(cell.begin_read().unwrap());
+                }
+                2 if !plain_spans.is_empty() => {
+                    let at = (next() % plain_spans.len() as u64) as usize;
+                    let reset = plain.end_read(plain_spans.swap_remove(at));
+                    assert_eq!(cell.end_read(cell_spans.swap_remove(at)), reset);
+                }
+                3 => {
+                    let backed_up = next() % 2 == 0;
+                    let switched = plain.switch(backed_up);
+                    assert_eq!(cell.update(|s| s.switch(backed_up)), Some(switched));
+                }
+                4 => assert_eq!(cell.update(Segments::copied), Some(plain.copied())),
+                _ => assert_eq!(cell.update(Segments::shipped), Some(plain.shipped())),
+            }
+            assert_eq!(cell.load(), plain);
+            assert_eq!(cell_spans, plain_spans);
+        }
+    }
+
+    /// Do (decision 45, lane Q3): eight threads each begin and end 20,000 reads on one cell while
+    /// the writer switches, and the closing segment is copied and shipped. Expect: once every read
+    /// has ended no read is counted, and the closing segment is free again.
+    #[test]
+    fn q3_reads_on_many_threads_leave_no_count_and_free_the_closing_segment() {
+        let cell = SegmentsCell::new(Segments::new(SegmentId::First));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..20_000 {
+                        let span = cell.begin_read().unwrap();
+                        cell.end_read(span);
+                    }
+                });
+            }
+            assert_eq!(cell.update(|s| s.switch(false)), Some(Some(SegmentId::Second)));
+            cell.update(Segments::copied).unwrap();
+            cell.update(Segments::shipped).unwrap();
+        });
+        assert_eq!(cell.load(), Segments::new(SegmentId::Second));
+    }
+
+    /// Do (lane Q3): begin a read on a cell whose current segment counts as many reads as its 30
+    /// bits hold. Expect: the read is refused and the state is unchanged.
+    #[test]
+    fn q3_a_read_past_what_the_word_counts_is_refused() {
+        let cell = SegmentsCell::new(Segments::new(SegmentId::First));
+        cell.update(|s| s.reads = READS).unwrap();
+        let before = cell.load();
+        assert_eq!(before.state(SegmentId::First), Segment::Current { reads: READS });
+        assert_eq!(cell.begin_read(), None);
+        assert_eq!(cell.load(), before);
+    }
 
     /// Do: switch, then ask for a second switch before the closing segment is reset, and again
     /// after. Expect: the second ask is refused and changes nothing; the third switches back.
