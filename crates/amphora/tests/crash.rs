@@ -854,6 +854,12 @@ fn one_seed(seed: u64) -> Result<Seen, String> {
         });
     }
     let counted = store.counters();
+    let log_cuts = disk
+        .files
+        .lock()
+        .unwrap()
+        .get(&format!("{PATH}-wal"))
+        .map_or(0, |f| f.held.lock().unwrap().cuts);
     // Half the stores end in order before the power goes, if it hasn't; the others as it does.
     let whole = if seed.is_multiple_of(2) {
         let closed = store.close(soon());
@@ -871,12 +877,7 @@ fn one_seed(seed: u64) -> Result<Seen, String> {
         changes: disk.changes.load(Ordering::SeqCst),
         checkpoints: counted.checkpoints,
         restarts: counted.restarts,
-        log_cuts: disk
-            .files
-            .lock()
-            .unwrap()
-            .get(&format!("{PATH}-wal"))
-            .map_or(0, |f| f.held.lock().unwrap().cuts),
+        log_cuts,
         ..Seen::default()
     };
 
