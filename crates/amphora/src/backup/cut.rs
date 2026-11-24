@@ -10,7 +10,8 @@ use std::time::Instant;
 
 use amphora_api::blobs::Blobs;
 
-use super::restore::{Restored, restore};
+use super::drill::Unpaced;
+use super::restore::{Restored, remove, restore_aside};
 use crate::database::Database;
 use crate::xgroup::{Cluster, Protocol};
 
@@ -26,9 +27,24 @@ pub fn restore_cut(
     protocol: Protocol,
     until: Instant,
 ) -> anyhow::Result<Vec<Restored>> {
-    let mut restored = Vec::with_capacity(groups.len());
+    // Every group restored before any is put at its path, so one that fails leaves none of them.
+    let memory = crate::memory::process();
+    let mut made = Vec::with_capacity(groups.len());
     for (prefix, path) in groups {
-        restored.push(restore(blobs, prefix, second, path, until)?);
+        let mut pace = Unpaced;
+        made.push(restore_aside(
+            blobs, prefix, second, path, &mut pace, &memory, until,
+        )?);
+    }
+    let mut restored = Vec::with_capacity(groups.len());
+    for ((making, group), (_, path)) in made.into_iter().zip(groups) {
+        if let Err(e) = making.end() {
+            for (_, put) in groups.iter().take_while(|(_, put)| put != path) {
+                remove(put)?;
+            }
+            return Err(e);
+        }
+        restored.push(group);
     }
     let mut databases = Vec::with_capacity(groups.len());
     for (_, path) in groups {

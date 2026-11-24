@@ -529,7 +529,7 @@ tests = [
   { id = "T-T1.12.C1", text = "Restore-and-check on a folder passes at the newest whole second against the source's rows and fails naming the rows against rows that differ" },
   { id = "T-T1.12.C2", text = "A check is due at the first, at each new base, and once the log since the last check outweighs what it replayed" },
   { id = "T-T1.12.I1", text = "A second base keeps the first's unchanged chunks and copies the changed; seconds across both restore equal, and after the first expires too" },
-  { id = "T-T1.12.I2", text = "Manifests of format 1 still read; format 2's runs give each chunk's base and are refused when they don't add up" },
+  { id = "T-T1.12.I2", text = "A manifest of a format before the one that says what its base's file held names no base a restore takes; its runs give each chunk's base and are refused when they don't add up" },
   { id = "T-T1.12.I3", text = "An incremental base is due once the log since the latest base outweighs what it would copy" },
   { id = "T-T1.12.X1", text = "Two groups restored to every second of two cross-group transactions, under both protocols: both keys or neither at every cut, never moving back" },
   # lane pitr-8

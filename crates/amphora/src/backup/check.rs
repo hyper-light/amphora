@@ -15,7 +15,7 @@ use amphora_engine_parser::parser::Parser;
 use sha2::{Digest as _, Sha256};
 
 use super::drill::{Pace, Unpaced};
-use super::plan::{self, SegmentKey, ThroughKey};
+use super::plan::{self, Lacks, SegmentKey, ThroughKey};
 use super::restore::{Restored, restore_paced, through_marks};
 use super::ship::list_all;
 use super::{SECOND_NS, second_of};
@@ -114,6 +114,8 @@ pub(crate) fn step_bytes(blobs: &dyn Blobs) -> u64 {
 pub enum CheckFailure {
     /// The archive didn't restore the second.
     Restore(String),
+    /// It didn't for what it lacks, which a new base mends ([`super::Shipper::mend`]).
+    Lacking { lacks: Lacks, why: String },
     /// The restored file failed `PRAGMA integrity_check`; its first lines.
     Integrity(String),
     /// The restored rows differ from the source's at that second.
@@ -227,7 +229,7 @@ pub fn check_due(last: Option<(u64, u64)>, newest_base: u64, log_since: u64) -> 
 /// Restores the newest whole second under `prefix` into a new file at `scratch` and checks it:
 /// `PRAGMA integrity_check`, then its rows against `source(second)` (the source's digest at that
 /// second; none when it can no longer say). Counts the outcome. The scratch file is the caller's to
-/// remove (it is kept on a failure to look into).
+/// remove (it is kept, where the second restored and failed its check, to look into).
 pub fn restore_and_check(
     blobs: &dyn Blobs,
     prefix: &str,
@@ -295,10 +297,15 @@ fn check_second(
             return Ok(Check::Expired { second });
         }
         Err(e) => {
-            return Ok(Check::Failed {
-                second,
-                why: CheckFailure::Restore(format!("{e:#}")),
-            });
+            let lacks = e
+                .downcast_ref::<plan::Unrestorable>()
+                .and_then(plan::Unrestorable::lacks);
+            let why = format!("{e:#}");
+            let why = match lacks {
+                Some(lacks) => CheckFailure::Lacking { lacks, why },
+                None => CheckFailure::Restore(why),
+            };
+            return Ok(Check::Failed { second, why });
         }
     };
     let db = Db::open(scratch)?;
