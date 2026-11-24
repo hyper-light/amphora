@@ -780,7 +780,6 @@ fn evaluate_multi_index_branches(
         // terms consumed, and the estimate lost that term's selectivity (the oracles' CERT check:
         // `c0 < c0 AND (c0 = '1' OR ...)` estimated above `c0 < c0` alone).
         Ok(Some(AccessMethod {
-            star_filter: None,
             cost: multi_index_cost,
             estimated_rows_per_outer_row: estimated_rows,
             consumed_where_terms,
