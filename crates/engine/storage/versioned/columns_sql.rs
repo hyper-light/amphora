@@ -1420,6 +1420,7 @@ mod tests {
     /// the copies counted for it.
     #[test]
     fn r8_s8_statements_on_declared_tables_say_why_they_skip_the_copy() {
+        trace();
         let (_a, on) = connect();
         let (_b, off) = connect();
         let tables = [

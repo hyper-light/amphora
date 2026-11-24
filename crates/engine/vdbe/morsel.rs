@@ -943,20 +943,22 @@ impl Predicate {
 }
 
 /// The rowids a scan reads (lane R11): those every term of `filter` on the rowid's alias column
-/// `alias` admits, within `range` (each end inclusive, None unbounded). A term admits the rowids
-/// [`Predicate::holds`] passes, comparing the rowid with its bound value as SQLite compares an
-/// INTEGER with the value after NUMERIC affinity: a real by its value (SQLite 3.54's OP_SeekGE
-/// on a table b-tree seeks `rowid >= 4.5` as `rowid > 4`, vdbe.c), a text or a blob above every
-/// integer, NULL true of none. It may admit rowids the terms don't, never fewer: the terms still
-/// decide each row. When none is admitted, `(Some(i64::MAX), Some(i64::MIN))`, which no rowid
-/// is between.
+/// `alias` admits, within `range`, each end inclusive, None unbounded: a term's bound that admits
+/// every rowid on its side (an i64's end, a text or a blob as an upper bound) bounds nothing, so a
+/// statement no term bounds, or bounds at both ends of the i64s, is a scan of the whole table. A
+/// term admits the rowids [`Predicate::holds`] passes, as SQLite compares an INTEGER with the
+/// value under NUMERIC affinity: an integer as itself, a real by its value (a start of 4.5 seeks
+/// 5: `OP_SeekGE` in vdbe.c shifts the seek past the integer it truncates to), a text or a blob
+/// no number reads as above every rowid, NULL true of none (`OP_SeekGE` jumps past the table for
+/// one of them; the end's `OP_Gt` carries `SQLITE_JUMPIFNULL`, wherecode.c). It may admit rowids
+/// the terms don't, never fewer: the terms still decide each row. When none is admitted,
+/// `(Some(i64::MAX), Some(i64::MIN))`, which no rowid is between.
 pub(crate) fn rowid_range(
     filter: &[Predicate],
     alias: usize,
     range: (Option<i64>, Option<i64>),
 ) -> (Option<i64>, Option<i64>) {
-    let mut lo = range.0.unwrap_or(i64::MIN);
-    let mut hi = range.1.unwrap_or(i64::MAX);
+    let (mut lo, mut hi) = range;
     for term in filter {
         let Predicate::Compare { column, op, value } = term else {
             continue;
@@ -964,18 +966,20 @@ pub(crate) fn rowid_range(
         if *column != alias {
             continue;
         }
-        match admitted(*op, value) {
-            Some((least, greatest)) => {
-                lo = lo.max(least);
-                hi = hi.min(greatest);
-            }
-            None => return (Some(i64::MAX), Some(i64::MIN)),
+        let Some((least, greatest)) = admitted(*op, value) else {
+            return (Some(i64::MAX), Some(i64::MIN));
+        };
+        if least > i64::MIN {
+            lo = Some(lo.map_or(least, |at| at.max(least)));
+        }
+        if greatest < i64::MAX {
+            hi = Some(hi.map_or(greatest, |at| at.min(greatest)));
         }
     }
-    if lo > hi {
-        return (Some(i64::MAX), Some(i64::MIN));
+    match (lo, hi) {
+        (Some(least), Some(greatest)) if least > greatest => (Some(i64::MAX), Some(i64::MIN)),
+        _ => (lo, hi),
     }
-    (Some(lo), Some(hi))
 }
 
 /// The least and greatest rowid `rowid op value` holds for; None: none.
