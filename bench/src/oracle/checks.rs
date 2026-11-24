@@ -4,8 +4,8 @@
 //! (Diff), and PQS rectifies its predicate by SQLite's evaluation; TLP, NoREC, DQP and EET hold
 //! within Amphora alone, and CERT on Amphora's estimates.
 
-use super::engines::{same_rows_by, show, Amphora, Engine, Rows, Sqlite, ILL_FORMED, V};
-use super::synth::{self, Func, Hint, Join, Rng, Schema, Scope, Sel, E};
+use super::engines::{Amphora, Engine, ILL_FORMED, Rows, Sqlite, V, same_rows_by, show};
+use super::synth::{self, E, Func, Hint, Join, Rng, Schema, Scope, Sel};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Oracle {
@@ -24,7 +24,16 @@ pub enum Oracle {
 
 impl Oracle {
     /// The oracles a run rotates through (`Same` runs once a database, after its statements).
-    pub const ALL: [Oracle; 8] = [Oracle::Diff, Oracle::Tlp, Oracle::Norec, Oracle::Pqs, Oracle::Dqp, Oracle::Eet, Oracle::Cert, Oracle::Order];
+    pub const ALL: [Oracle; 8] = [
+        Oracle::Diff,
+        Oracle::Tlp,
+        Oracle::Norec,
+        Oracle::Pqs,
+        Oracle::Dqp,
+        Oracle::Eet,
+        Oracle::Cert,
+        Oracle::Order,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -115,7 +124,18 @@ impl CertQuery {
 
     /// The same query with `more` applied to its restricted arm.
     pub fn restricted(&self, more: &More) -> String {
-        let arms: Vec<Sel> = self.arms.iter().enumerate().map(|(i, q)| if i == self.arm { more.apply(q) } else { q.clone() }).collect();
+        let arms: Vec<Sel> = self
+            .arms
+            .iter()
+            .enumerate()
+            .map(|(i, q)| {
+                if i == self.arm {
+                    more.apply(q)
+                } else {
+                    q.clone()
+                }
+            })
+            .collect();
         Self::sql_of(&arms, &self.ops)
     }
 }
@@ -144,7 +164,11 @@ impl Case {
         match self {
             Case::Same(_) => Oracle::Same,
             Case::Diff(_) => Oracle::Diff,
-            Case::TlpWhere(..) | Case::TlpDistinct(..) | Case::TlpGroup(..) | Case::TlpHaving(..) | Case::TlpAgg(..) => Oracle::Tlp,
+            Case::TlpWhere(..)
+            | Case::TlpDistinct(..)
+            | Case::TlpGroup(..)
+            | Case::TlpHaving(..)
+            | Case::TlpAgg(..) => Oracle::Tlp,
             Case::Norec(..) => Oracle::Norec,
             Case::Pqs(..) => Oracle::Pqs,
             Case::Dqp(..) => Oracle::Dqp,
@@ -159,7 +183,13 @@ impl Case {
         match self {
             Case::Same(_) => (vec![], vec![]),
             Case::Diff(q) | Case::Dqp(q, _) | Case::Order(q) => (vec![q], vec![]),
-            Case::TlpWhere(q, p) | Case::TlpDistinct(q, p) | Case::TlpGroup(q, p) | Case::TlpHaving(q, p) | Case::TlpAgg(q, p, _) | Case::Norec(q, p) | Case::Pqs(q, _, p) => (vec![q], vec![p]),
+            Case::TlpWhere(q, p)
+            | Case::TlpDistinct(q, p)
+            | Case::TlpGroup(q, p)
+            | Case::TlpHaving(q, p)
+            | Case::TlpAgg(q, p, _)
+            | Case::Norec(q, p)
+            | Case::Pqs(q, _, p) => (vec![q], vec![p]),
             Case::Eet(q, t) => (vec![q, t], vec![]),
             Case::Cert(q, More::Conjunct(p)) => (q.arms.iter_mut().collect(), vec![p]),
             Case::Cert(q, More::Inner(_)) => (q.arms.iter_mut().collect(), vec![]),
@@ -190,7 +220,9 @@ pub struct Failure {
 }
 
 pub enum Outcome {
-    Pass { plan_changed: bool },
+    Pass {
+        plan_changed: bool,
+    },
     /// Not checkable (why): SQLite refused the query, or Amphora refused its base form.
     Skip(&'static str),
     /// Amphora refused what SQLite answers: a missing feature, not a wrong answer (counted).
@@ -199,11 +231,21 @@ pub enum Outcome {
 }
 
 fn fail(kind: Kind, detail: String, queries: Vec<String>) -> Outcome {
-    Outcome::Fail(Failure { kind, detail, queries, cause: None })
+    Outcome::Fail(Failure {
+        kind,
+        detail,
+        queries,
+        cause: None,
+    })
 }
 
 fn error(detail: String, cause: &str, queries: Vec<String>) -> Outcome {
-    Outcome::Fail(Failure { kind: Kind::Error, detail, queries, cause: Some(cause.to_owned()) })
+    Outcome::Fail(Failure {
+        kind: Kind::Error,
+        detail,
+        queries,
+        cause: Some(cause.to_owned()),
+    })
 }
 
 /// An error a value raises when it's evaluated (a JSON function's malformed input or path, a blob
@@ -211,7 +253,24 @@ fn error(detail: String, cause: &str, queries: Vec<String>) -> Outcome {
 /// on which rows is the engine's choice, so a query derived from another may meet it where its base
 /// didn't, in SQLite as in Amphora.
 fn value_error(e: &str) -> bool {
-    ["too big", "malformed JSON", "JSON path", "bad JSON path", "JSON cannot hold", "overflow", "Unexpected character", "must be TEXT", "number of arguments", "argument count", "must be between", "not an array element", "single character", "Unexpected end of input"].iter().any(|m| e.contains(m))
+    [
+        "too big",
+        "malformed JSON",
+        "JSON path",
+        "bad JSON path",
+        "JSON cannot hold",
+        "overflow",
+        "Unexpected character",
+        "must be TEXT",
+        "number of arguments",
+        "argument count",
+        "must be between",
+        "not an array element",
+        "single character",
+        "Unexpected end of input",
+    ]
+    .iter()
+    .any(|m| e.contains(m))
 }
 
 /// Whether SQLite meets an error `counts` evaluating one of `p`'s function calls on some row the
@@ -223,20 +282,41 @@ fn value_error(e: &str) -> bool {
 /// SQLite on each, and over an empty table never (cause Q too). Text SQLite gives that isn't
 /// well-formed UTF-8 makes `p` one SQLite promises no answer for (cause AN). Flat, on a stack of
 /// its own.
-fn sqlite_call_meets(s: &mut Sqlite, from: &[synth::From], p: &E, counts: impl Fn(&str) -> bool) -> bool {
+fn sqlite_call_meets(
+    s: &mut Sqlite,
+    from: &[synth::From],
+    p: &E,
+    counts: impl Fn(&str) -> bool,
+) -> bool {
     // A subquery's expressions, each with the rows it reads: its own tables and its outer query's.
     fn subquery<'a>(todo: &mut Vec<(&'a E, Vec<synth::From>)>, q: &'a Sel, outer: &[synth::From]) {
         let mut inner = q.from.clone();
         inner.extend(outer.iter().cloned());
-        for x in q.cols.iter().chain(q.wh.iter()).chain(q.from.iter().filter_map(|f| f.on.as_ref())) {
+        for x in q
+            .cols
+            .iter()
+            .chain(q.wh.iter())
+            .chain(q.from.iter().filter_map(|f| f.on.as_ref()))
+        {
             todo.push((x, inner.clone()));
         }
     }
     let mut todo: Vec<(&E, Vec<synth::From>)> = vec![(p, from.to_vec())];
     while let Some((e, scope)) = todo.pop() {
         if let E::Fn(..) = e {
-            let tables: Vec<String> = if constant(e) { Vec::new() } else { scope.iter().map(|f| format!("{} AS {}", f.table, f.alias)).collect() };
-            let sql = if tables.is_empty() { format!("SELECT {}", e.sql()) } else { format!("SELECT {} FROM {}", e.sql(), tables.join(", ")) };
+            let tables: Vec<String> = if constant(e) {
+                Vec::new()
+            } else {
+                scope
+                    .iter()
+                    .map(|f| format!("{} AS {}", f.table, f.alias))
+                    .collect()
+            };
+            let sql = if tables.is_empty() {
+                format!("SELECT {}", e.sql())
+            } else {
+                format!("SELECT {} FROM {}", e.sql(), tables.join(", "))
+            };
             if s.run(&sql).is_err_and(|e| counts(&e)) {
                 return true;
             }
@@ -250,8 +330,15 @@ fn sqlite_call_meets(s: &mut Sqlite, from: &[synth::From], p: &E, counts: impl F
                     f.hint = Hint::NotIndexed;
                 }
             }
-            let tables: Vec<String> = scope.iter().map(|f| format!("{} AS {}", f.table, f.alias)).collect();
-            let sql = if tables.is_empty() { format!("SELECT {}", plain.sql()) } else { format!("SELECT {} FROM {}", plain.sql(), tables.join(", ")) };
+            let tables: Vec<String> = scope
+                .iter()
+                .map(|f| format!("{} AS {}", f.table, f.alias))
+                .collect();
+            let sql = if tables.is_empty() {
+                format!("SELECT {}", plain.sql())
+            } else {
+                format!("SELECT {} FROM {}", plain.sql(), tables.join(", "))
+            };
             if s.run(&sql).is_err_and(|e| counts(&e)) {
                 return true;
             }
@@ -298,21 +385,30 @@ fn limit_certain(q: &Sel) -> bool {
         || (!q.distinct
             && q.group.is_empty()
             && q.cols.iter().all(|c| {
-                constant(c) || (order.contains(&E::Collate(Box::new(c.clone()), "BINARY").sql()) && order.contains(&E::Fn("typeof".into(), vec![c.clone()]).sql()))
+                constant(c)
+                    || (order.contains(&E::Collate(Box::new(c.clone()), "BINARY").sql())
+                        && order.contains(&E::Fn("typeof".into(), vec![c.clone()]).sql()))
             }))
 }
 
 /// Whether `e` is the same in every row: it reads no column, no subquery and no aggregate.
 fn constant(e: &E) -> bool {
     let mut reads = false;
-    e.walk(&mut |x| reads |= matches!(x, E::Col(..) | E::Exists(..) | E::Scalar(_) | E::InSel(..) | E::Agg(..)));
+    e.walk(&mut |x| {
+        reads |= matches!(
+            x,
+            E::Col(..) | E::Exists(..) | E::Scalar(_) | E::InSel(..) | E::Agg(..)
+        )
+    });
     !reads
 }
 
 /// Whether a TLP aggregate case's columns are still the one aggregate its partitions combine to:
 /// count or sum of a value, min or max of one under BINARY (what the combined query applies).
 fn is_partitioned_aggregate(cols: &[E], f: Agg) -> bool {
-    let [E::Agg(name, false, args)] = cols else { return false };
+    let [E::Agg(name, false, args)] = cols else {
+        return false;
+    };
     match f {
         Agg::Count => name == "count" && args.len() == 1,
         Agg::Sum => name == "sum" && args.len() == 1,
@@ -330,7 +426,11 @@ fn and(w: &Option<E>, p: E) -> E {
 
 /// The three ways a predicate can come out for a row: TRUE, FALSE, NULL.
 fn partitions(p: &E) -> [E; 3] {
-    [p.clone(), E::Un("NOT", Box::new(p.clone())), E::Null(Box::new(p.clone()), false)]
+    [
+        p.clone(),
+        E::Un("NOT", Box::new(p.clone())),
+        E::Null(Box::new(p.clone()), false),
+    ]
 }
 
 /// A query derived from the case's errors on Amphora: a failure only if SQLite runs it (a predicate
@@ -347,38 +447,69 @@ fn derived(s: &mut Sqlite, sql: &str, what: &str, e: &str, queries: Vec<String>)
     if s.run(sql).is_err() {
         return Outcome::Skip("a derived query errors on SQLite too");
     }
-    error(format!("{what} errors on Amphora, not on SQLite: {e}"), e, queries)
+    error(
+        format!("{what} errors on Amphora, not on SQLite: {e}"),
+        e,
+        queries,
+    )
 }
 
 fn loose(q: &Sel) -> bool {
     q.distinct || q.aggregates()
 }
 
-fn wrong(what: &str, a: &Result<Rows, String>, b: &Result<Rows, String>, queries: Vec<String>) -> Outcome {
-    fail(Kind::Wrong, format!("{what}\n  expected: {}\n  Amphora:  {}", show(b), show(a)), queries)
+fn wrong(
+    what: &str,
+    a: &Result<Rows, String>,
+    b: &Result<Rows, String>,
+    queries: Vec<String>,
+) -> Outcome {
+    fail(
+        Kind::Wrong,
+        format!("{what}\n  expected: {}\n  Amphora:  {}", show(b), show(a)),
+        queries,
+    )
 }
 
 /// The queries a case runs, without running them: what a panic's finding shows.
 pub fn sqls(case: &Case) -> Vec<String> {
     let with_where = |q: &Sel, p: &E| -> Vec<String> {
-        std::iter::once(q.sql()).chain(partitions(p).into_iter().map(|part| {
-            let mut qp = q.clone();
-            qp.wh = Some(and(&q.wh, part));
-            qp.sql()
-        })).collect()
+        std::iter::once(q.sql())
+            .chain(partitions(p).into_iter().map(|part| {
+                let mut qp = q.clone();
+                qp.wh = Some(and(&q.wh, part));
+                qp.sql()
+            }))
+            .collect()
     };
     match case {
-        Case::Same(tables) => tables.iter().map(|t| format!("SELECT rowid, * FROM {t}")).collect(),
+        Case::Same(tables) => tables
+            .iter()
+            .map(|t| format!("SELECT rowid, * FROM {t}"))
+            .collect(),
         Case::Diff(q) | Case::Dqp(q, _) => vec![q.sql()],
-        Case::TlpWhere(q, p) | Case::TlpDistinct(q, p) | Case::TlpGroup(q, p) | Case::TlpAgg(q, p, _) | Case::Norec(q, p) | Case::Pqs(q, _, p) => with_where(q, p),
-        Case::TlpHaving(q, p) => std::iter::once(q.sql()).chain(partitions(p).into_iter().map(|part| {
-            let mut qp = q.clone();
-            qp.having = Some(and(&q.having, part));
-            qp.sql()
-        })).collect(),
+        Case::TlpWhere(q, p)
+        | Case::TlpDistinct(q, p)
+        | Case::TlpGroup(q, p)
+        | Case::TlpAgg(q, p, _)
+        | Case::Norec(q, p)
+        | Case::Pqs(q, _, p) => with_where(q, p),
+        Case::TlpHaving(q, p) => std::iter::once(q.sql())
+            .chain(partitions(p).into_iter().map(|part| {
+                let mut qp = q.clone();
+                qp.having = Some(and(&q.having, part));
+                qp.sql()
+            }))
+            .collect(),
         Case::Eet(q, t) => vec![q.sql(), t.sql()],
-        Case::Cert(q, more) => vec![format!("EXPLAIN QUERY PLAN FORMAT=JSON {}", q.sql()), format!("EXPLAIN QUERY PLAN FORMAT=JSON {}", q.restricted(more))],
-        Case::Order(q) => std::iter::once(q.clone()).chain(orders(q)).map(|o| format!("EXPLAIN QUERY PLAN FORMAT=JSON {}", o.sql())).collect(),
+        Case::Cert(q, more) => vec![
+            format!("EXPLAIN QUERY PLAN FORMAT=JSON {}", q.sql()),
+            format!("EXPLAIN QUERY PLAN FORMAT=JSON {}", q.restricted(more)),
+        ],
+        Case::Order(q) => std::iter::once(q.clone())
+            .chain(orders(q))
+            .map(|o| format!("EXPLAIN QUERY PLAN FORMAT=JSON {}", o.sql()))
+            .collect(),
     }
 }
 
@@ -392,7 +523,8 @@ pub fn check(case: &Case, a: &mut Amphora, s: &mut Sqlite) -> Outcome {
         return Outcome::Skip("a bare column: its row is any of its group's");
     }
     // (The case's own query: EET's equivalent form rewrites its columns, not its ORDER BY.)
-    if !matches!(case, Case::Cert(..)) && c.parts_mut().0.first().is_some_and(|q| !limit_certain(q)) {
+    if !matches!(case, Case::Cert(..)) && c.parts_mut().0.first().is_some_and(|q| !limit_certain(q))
+    {
         return Outcome::Skip("a LIMIT no longer keeps certain rows");
     }
     match case {
@@ -403,28 +535,54 @@ pub fn check(case: &Case, a: &mut Amphora, s: &mut Sqlite) -> Outcome {
                 match (&got, &want) {
                     (Ok(g), Ok(w)) if same_rows_by(g, w, false) => {}
                     (Err(_), Err(_)) => {}
-                    (_, Err(e)) if e == ILL_FORMED => return Outcome::Skip("SQLite's rows hold ill-formed UTF-8 (garbage in, garbage out)"),
-                    _ => return wrong(&format!("the statements leave {t} with other rows"), &got, &want, vec![sql]),
+                    (_, Err(e)) if e == ILL_FORMED => {
+                        return Outcome::Skip(
+                            "SQLite's rows hold ill-formed UTF-8 (garbage in, garbage out)",
+                        );
+                    }
+                    _ => {
+                        return wrong(
+                            &format!("the statements leave {t} with other rows"),
+                            &got,
+                            &want,
+                            vec![sql],
+                        );
+                    }
                 }
             }
-            Outcome::Pass { plan_changed: false }
+            Outcome::Pass {
+                plan_changed: false,
+            }
         }
         Case::Diff(q) => {
             let sql = q.sql();
             let want = match s.run(&sql) {
                 Ok(want) => want,
-                Err(e) if e == ILL_FORMED => return Outcome::Skip("SQLite's answer holds ill-formed UTF-8 (garbage in, garbage out)"),
+                Err(e) if e == ILL_FORMED => {
+                    return Outcome::Skip(
+                        "SQLite's answer holds ill-formed UTF-8 (garbage in, garbage out)",
+                    );
+                }
                 Err(_) => return Outcome::Skip("sqlite refused"),
             };
             match a.run(&sql) {
                 Err(e) => Outcome::Refused(e),
-                Ok(got) if same_rows_by(&got, &want, loose(q)) => Outcome::Pass { plan_changed: false },
-                Ok(got) => wrong("Amphora's answer isn't SQLite's", &Ok(got), &Ok(want), vec![sql]),
+                Ok(got) if same_rows_by(&got, &want, loose(q)) => Outcome::Pass {
+                    plan_changed: false,
+                },
+                Ok(got) => wrong(
+                    "Amphora's answer isn't SQLite's",
+                    &Ok(got),
+                    &Ok(want),
+                    vec![sql],
+                ),
             }
         }
         Case::TlpWhere(q, p) | Case::TlpHaving(q, p) => {
             let base = q.sql();
-            let Ok(all) = a.run(&base) else { return Outcome::Skip("amphora refused the base") };
+            let Ok(all) = a.run(&base) else {
+                return Outcome::Skip("amphora refused the base");
+            };
             let having = matches!(case, Case::TlpHaving(..));
             let mut sqls = vec![base];
             let mut union = Vec::new();
@@ -443,11 +601,18 @@ pub fn check(case: &Case, a: &mut Amphora, s: &mut Sqlite) -> Outcome {
                 }
             }
             if same_rows_by(&all, &union, loose(q)) {
-                Outcome::Pass { plan_changed: false }
+                Outcome::Pass {
+                    plan_changed: false,
+                }
             } else if relation_fails_on_sqlite(s, &sqls[0], &sqls[1..], loose(q)) {
                 Outcome::Skip("the relation fails on SQLite too")
             } else {
-                wrong("the query's rows aren't its three partitions' (p, NOT p, p IS NULL)", &Ok(union), &Ok(all), sqls)
+                wrong(
+                    "the query's rows aren't its three partitions' (p, NOT p, p IS NULL)",
+                    &Ok(union),
+                    &Ok(all),
+                    sqls,
+                )
             }
         }
         Case::TlpDistinct(q, p) | Case::TlpGroup(q, p) => {
@@ -455,25 +620,47 @@ pub fn check(case: &Case, a: &mut Amphora, s: &mut Sqlite) -> Outcome {
             // DISTINCT or groups by exactly what it selects: one cut down past that is no case.
             let distinct = match case {
                 Case::TlpDistinct(..) => q.distinct,
-                _ => !q.group.is_empty() && q.cols.iter().map(E::sql).eq(q.group.iter().map(E::sql)),
+                _ => {
+                    !q.group.is_empty() && q.cols.iter().map(E::sql).eq(q.group.iter().map(E::sql))
+                }
             };
             if !distinct {
                 return Outcome::Skip("the query's rows are no longer distinct");
             }
             let base = q.sql();
-            let Ok(all) = a.run(&base) else { return Outcome::Skip("amphora refused the base") };
-            let parts: Vec<String> = partitions(p).into_iter().map(|part| {
-                let mut qp = q.clone();
-                qp.wh = Some(and(&q.wh, part));
-                qp.sql()
-            }).collect();
+            let Ok(all) = a.run(&base) else {
+                return Outcome::Skip("amphora refused the base");
+            };
+            let parts: Vec<String> = partitions(p)
+                .into_iter()
+                .map(|part| {
+                    let mut qp = q.clone();
+                    qp.wh = Some(and(&q.wh, part));
+                    qp.sql()
+                })
+                .collect();
             // the engine's own UNION decides which values are equal, as its DISTINCT and GROUP BY do
             let union = parts.join(" UNION ");
             match a.run(&union) {
-                Err(e) => derived(s, &union, "the partitions' UNION", &e, vec![base, union.clone()]),
-                Ok(rows) if same_rows_by(&all, &rows, true) => Outcome::Pass { plan_changed: false },
-                Ok(_) if relation_fails_on_sqlite(s, &base, std::slice::from_ref(&union), true) => Outcome::Skip("the relation fails on SQLite too"),
-                Ok(rows) => wrong("the query's rows aren't the UNION of its partitions'", &Ok(rows), &Ok(all), vec![base, union]),
+                Err(e) => derived(
+                    s,
+                    &union,
+                    "the partitions' UNION",
+                    &e,
+                    vec![base, union.clone()],
+                ),
+                Ok(rows) if same_rows_by(&all, &rows, true) => Outcome::Pass {
+                    plan_changed: false,
+                },
+                Ok(_) if relation_fails_on_sqlite(s, &base, std::slice::from_ref(&union), true) => {
+                    Outcome::Skip("the relation fails on SQLite too")
+                }
+                Ok(rows) => wrong(
+                    "the query's rows aren't the UNION of its partitions'",
+                    &Ok(rows),
+                    &Ok(all),
+                    vec![base, union],
+                ),
             }
         }
         Case::TlpAgg(q, p, f) => {
@@ -483,33 +670,68 @@ pub fn check(case: &Case, a: &mut Amphora, s: &mut Sqlite) -> Outcome {
                 return Outcome::Skip("the query is no longer the partitioned aggregate");
             }
             let base = q.sql();
-            let Ok(all) = a.run(&base) else { return Outcome::Skip("amphora refused the base") };
+            let Ok(all) = a.run(&base) else {
+                return Outcome::Skip("amphora refused the base");
+            };
             // A REAL sum is summed in its own order (Kahan-Babuska-Neumaier, as SQLite's): its
             // partitions' sums, summed again, may round apart from it.
             if matches!(f, Agg::Sum) && all.iter().flatten().any(|v| matches!(v, V::Real(_))) {
                 return Outcome::Skip("a REAL sum's partitions round apart from it");
             }
-            let parts: Vec<String> = partitions(p).into_iter().map(|part| {
-                let mut qp = q.clone();
-                qp.wh = Some(and(&q.wh, part));
-                qp.sql()
-            }).collect();
+            let parts: Vec<String> = partitions(p)
+                .into_iter()
+                .map(|part| {
+                    let mut qp = q.clone();
+                    qp.wh = Some(and(&q.wh, part));
+                    qp.sql()
+                })
+                .collect();
             let outer = match f {
                 Agg::Count | Agg::Sum => "sum(m)",
                 Agg::Min => "min(m COLLATE BINARY)",
                 Agg::Max => "max(m COLLATE BINARY)",
             };
             // the first arm names the column and adds no row
-            let combined = format!("SELECT {outer} FROM (SELECT NULL AS m WHERE 0 UNION ALL {})", parts.join(" UNION ALL "));
+            let combined = format!(
+                "SELECT {outer} FROM (SELECT NULL AS m WHERE 0 UNION ALL {})",
+                parts.join(" UNION ALL ")
+            );
             match a.run(&combined) {
                 Err(e) if e.contains("overflow") => Outcome::Skip("a partition's sum overflows"),
                 // ... and so may theirs where the query's is NULL: infinities of both signs make a
                 // NaN, which is NULL, in one grouping of the rows and not in another.
-                Ok(rows) if matches!(f, Agg::Sum) && rows.iter().flatten().any(|v| matches!(v, V::Real(_))) => Outcome::Skip("a REAL sum's partitions round apart from it"),
-                Err(e) => derived(s, &combined, "the partitions' aggregate", &e, vec![base, combined.clone()]),
-                Ok(rows) if same_rows_by(&all, &rows, true) => Outcome::Pass { plan_changed: false },
-                Ok(_) if relation_fails_on_sqlite(s, &base, std::slice::from_ref(&combined), true) => Outcome::Skip("the relation fails on SQLite too"),
-                Ok(rows) => wrong("the query's aggregate isn't its partitions' combined", &Ok(rows), &Ok(all), vec![base, combined]),
+                Ok(rows)
+                    if matches!(f, Agg::Sum)
+                        && rows.iter().flatten().any(|v| matches!(v, V::Real(_))) =>
+                {
+                    Outcome::Skip("a REAL sum's partitions round apart from it")
+                }
+                Err(e) => derived(
+                    s,
+                    &combined,
+                    "the partitions' aggregate",
+                    &e,
+                    vec![base, combined.clone()],
+                ),
+                Ok(rows) if same_rows_by(&all, &rows, true) => Outcome::Pass {
+                    plan_changed: false,
+                },
+                Ok(_)
+                    if relation_fails_on_sqlite(
+                        s,
+                        &base,
+                        std::slice::from_ref(&combined),
+                        true,
+                    ) =>
+                {
+                    Outcome::Skip("the relation fails on SQLite too")
+                }
+                Ok(rows) => wrong(
+                    "the query's aggregate isn't its partitions' combined",
+                    &Ok(rows),
+                    &Ok(all),
+                    vec![base, combined],
+                ),
             }
         }
         Case::Norec(q, p) => {
@@ -518,31 +740,67 @@ pub fn check(case: &Case, a: &mut Amphora, s: &mut Sqlite) -> Outcome {
             opt.wh = Some(p.clone());
             let mut unopt = q.clone();
             // 1 where p is TRUE (truth, as WHERE reads it: 5 is TRUE), else 0
-            unopt.cols = vec![E::Case(None, vec![(p.clone(), E::Lit(V::Int(1)))], Some(Box::new(E::Lit(V::Int(0)))))];
+            unopt.cols = vec![E::Case(
+                None,
+                vec![(p.clone(), E::Lit(V::Int(1)))],
+                Some(Box::new(E::Lit(V::Int(0)))),
+            )];
             unopt.wh = None;
             let (os, us) = (opt.sql(), unopt.sql());
             let o = a.run(&os);
             let u = a.run(&us);
             match (o, u) {
                 (Err(_), Err(_)) => Outcome::Skip("amphora refused both"),
-                (Ok(_), Err(e)) => derived(s, &us, "the unoptimized form", &e, vec![os.clone(), us.clone()]),
-                (Err(e), Ok(_)) => derived(s, &os, "the optimized form", &e, vec![os.clone(), us.clone()]),
+                (Ok(_), Err(e)) => derived(
+                    s,
+                    &us,
+                    "the unoptimized form",
+                    &e,
+                    vec![os.clone(), us.clone()],
+                ),
+                (Err(e), Ok(_)) => derived(
+                    s,
+                    &os,
+                    "the optimized form",
+                    &e,
+                    vec![os.clone(), us.clone()],
+                ),
                 (Ok(o), Ok(u)) => {
                     let n = o.len() as i64;
-                    let m = u.iter().filter(|r| matches!(r.first(), Some(V::Int(1)))).count() as i64;
+                    let m = u
+                        .iter()
+                        .filter(|r| matches!(r.first(), Some(V::Int(1))))
+                        .count() as i64;
                     if n == m {
-                        Outcome::Pass { plan_changed: false }
+                        Outcome::Pass {
+                            plan_changed: false,
+                        }
                     } else {
-                        fail(Kind::Wrong, format!("WHERE p keeps {n} rows; p is TRUE for {m} of them"), vec![os, us])
+                        fail(
+                            Kind::Wrong,
+                            format!("WHERE p keeps {n} rows; p is TRUE for {m} of them"),
+                            vec![os, us],
+                        )
                     }
                 }
             }
         }
         Case::Pqs(q, pivot, p) => {
             let t = &q.from[0];
-            let eval = format!("SELECT ({}) IS TRUE, ({}) IS FALSE FROM {} AS {} WHERE {}.rowid = {pivot}", p.sql(), p.sql(), t.table, t.alias, t.alias);
-            let Ok(ev) = s.run(&eval) else { return Outcome::Skip("sqlite can't evaluate it") };
-            let Some(row) = ev.first() else { return Outcome::Skip("no pivot") };
+            let eval = format!(
+                "SELECT ({}) IS TRUE, ({}) IS FALSE FROM {} AS {} WHERE {}.rowid = {pivot}",
+                p.sql(),
+                p.sql(),
+                t.table,
+                t.alias,
+                t.alias
+            );
+            let Ok(ev) = s.run(&eval) else {
+                return Outcome::Skip("sqlite can't evaluate it");
+            };
+            let Some(row) = ev.first() else {
+                return Outcome::Skip("no pivot");
+            };
             let rectified = match (row.first(), row.get(1)) {
                 (Some(V::Int(1)), _) => p.clone(),
                 (_, Some(V::Int(1))) => E::Un("NOT", Box::new(p.clone())),
@@ -552,51 +810,113 @@ pub fn check(case: &Case, a: &mut Amphora, s: &mut Sqlite) -> Outcome {
             find.cols = vec![E::Col(t.alias.clone(), "rowid".into())];
             find.wh = Some(rectified);
             let sql = find.sql();
-            let has = |rows: &Rows| rows.iter().any(|r| matches!(r.first(), Some(V::Int(i)) if i == pivot));
+            let has = |rows: &Rows| {
+                rows.iter()
+                    .any(|r| matches!(r.first(), Some(V::Int(i)) if i == pivot))
+            };
             match s.run(&sql) {
                 Ok(rows) if has(&rows) => {}
                 _ => return Outcome::Skip("sqlite misses its own pivot"),
             }
             match a.run(&sql) {
-                Err(e) if value_error(&e) && sqlite_call_meets(s, &q.from, p, |e| e != ILL_FORMED) => Outcome::Skip("a derived query meets a value's error (evaluation order)"),
-                Err(e) => error(format!("Amphora errors where SQLite finds the pivot: {e}"), &e, vec![eval, sql]),
-                Ok(rows) if has(&rows) => Outcome::Pass { plan_changed: false },
-                Ok(_) if sqlite_call_meets(s, &q.from, p, |e| e == ILL_FORMED) => Outcome::Skip("SQLite's answer holds ill-formed UTF-8 (garbage in, garbage out)"),
-                Ok(rows) => fail(Kind::Wrong, format!("the pivot (rowid {pivot}), whose predicate SQLite rectified to TRUE, is missing\n  Amphora: {}", show(&Ok(rows))), vec![eval, sql]),
+                Err(e)
+                    if value_error(&e) && sqlite_call_meets(s, &q.from, p, |e| e != ILL_FORMED) =>
+                {
+                    Outcome::Skip("a derived query meets a value's error (evaluation order)")
+                }
+                Err(e) => error(
+                    format!("Amphora errors where SQLite finds the pivot: {e}"),
+                    &e,
+                    vec![eval, sql],
+                ),
+                Ok(rows) if has(&rows) => Outcome::Pass {
+                    plan_changed: false,
+                },
+                Ok(_) if sqlite_call_meets(s, &q.from, p, |e| e == ILL_FORMED) => Outcome::Skip(
+                    "SQLite's answer holds ill-formed UTF-8 (garbage in, garbage out)",
+                ),
+                Ok(rows) => fail(
+                    Kind::Wrong,
+                    format!(
+                        "the pivot (rowid {pivot}), whose predicate SQLite rectified to TRUE, is missing\n  Amphora: {}",
+                        show(&Ok(rows))
+                    ),
+                    vec![eval, sql],
+                ),
             }
         }
         Case::Dqp(q, v) => {
             let base = q.sql();
-            let Ok(want) = a.run(&base) else { return Outcome::Skip("amphora refused the base") };
-            let plan = |a: &mut Amphora, sql: &str| a.run(&format!("EXPLAIN QUERY PLAN {sql}")).ok().map(|r| show(&Ok(r)));
+            let Ok(want) = a.run(&base) else {
+                return Outcome::Skip("amphora refused the base");
+            };
+            let plan = |a: &mut Amphora, sql: &str| {
+                a.run(&format!("EXPLAIN QUERY PLAN {sql}"))
+                    .ok()
+                    .map(|r| show(&Ok(r)))
+            };
             let before = plan(a, &base);
             let q2 = variant(q, v);
             let sql = q2.sql();
             let got = a.run(&sql);
             let after = plan(a, &sql);
             match got {
-                Err(_) if matches!(v, Variant::IndexedBy(..)) => Outcome::Skip("the index can't serve the query"),
+                Err(_) if matches!(v, Variant::IndexedBy(..)) => {
+                    Outcome::Skip("the index can't serve the query")
+                }
                 Err(e) => derived(s, &sql, "another plan", &e, vec![base, sql.clone()]),
-                Ok(rows) if same_rows_by(&rows, &want, loose(q)) => Outcome::Pass { plan_changed: before != after },
-                Ok(_) if relation_fails_on_sqlite(s, &base, std::slice::from_ref(&sql), loose(q)) => Outcome::Skip("the relation fails on SQLite too"),
-                Ok(rows) => wrong("another plan gives other rows", &Ok(rows), &Ok(want), vec![base, sql]),
+                Ok(rows) if same_rows_by(&rows, &want, loose(q)) => Outcome::Pass {
+                    plan_changed: before != after,
+                },
+                Ok(_)
+                    if relation_fails_on_sqlite(s, &base, std::slice::from_ref(&sql), loose(q)) =>
+                {
+                    Outcome::Skip("the relation fails on SQLite too")
+                }
+                Ok(rows) => wrong(
+                    "another plan gives other rows",
+                    &Ok(rows),
+                    &Ok(want),
+                    vec![base, sql],
+                ),
             }
         }
         Case::Eet(q, t) => {
             let (qs, ts) = (q.sql(), t.sql());
-            let Ok(want) = a.run(&qs) else { return Outcome::Skip("amphora refused the base") };
+            let Ok(want) = a.run(&qs) else {
+                return Outcome::Skip("amphora refused the base");
+            };
             match a.run(&ts) {
-                Err(e) => derived(s, &ts, "the equivalent form", &e, vec![qs.clone(), ts.clone()]),
-                Ok(got) if same_rows_by(&got, &want, loose(q)) => Outcome::Pass { plan_changed: false },
+                Err(e) => derived(
+                    s,
+                    &ts,
+                    "the equivalent form",
+                    &e,
+                    vec![qs.clone(), ts.clone()],
+                ),
+                Ok(got) if same_rows_by(&got, &want, loose(q)) => Outcome::Pass {
+                    plan_changed: false,
+                },
                 // SQLite's two forms apart as well: the transformation isn't equivalent for this query
                 // (`- 0.0` and `-(CASE .. 0.0 END)`, a negative zero and 0 - x)
-                Ok(_) if relation_fails_on_sqlite(s, &qs, std::slice::from_ref(&ts), loose(q)) => Outcome::Skip("the relation fails on SQLite too"),
-                Ok(got) => wrong("an equivalent form gives other rows", &Ok(got), &Ok(want), vec![qs, ts]),
+                Ok(_) if relation_fails_on_sqlite(s, &qs, std::slice::from_ref(&ts), loose(q)) => {
+                    Outcome::Skip("the relation fails on SQLite too")
+                }
+                Ok(got) => wrong(
+                    "an equivalent form gives other rows",
+                    &Ok(got),
+                    &Ok(want),
+                    vec![qs, ts],
+                ),
             }
         }
         Case::Cert(q, more) => {
             let (qs, rs) = (q.sql(), q.restricted(more));
-            let aliases: Vec<String> = q.arms.iter().flat_map(|arm| arm.from.iter().map(|f| f.alias.clone())).collect();
+            let aliases: Vec<String> = q
+                .arms
+                .iter()
+                .flat_map(|arm| arm.from.iter().map(|f| f.alias.clone()))
+                .collect();
             // A query Amphora can't plan has no estimate to check: SQLite refuses it too (a call
             // to a function at an arity it hasn't), or it's a refusal counted as the differential
             // check counts one. Only a query planned without an estimate is "no estimate".
@@ -604,19 +924,38 @@ pub fn check(case: &Case, a: &mut Amphora, s: &mut Sqlite) -> Outcome {
             for (slot, sql) in got.iter_mut().zip([&qs, &rs]) {
                 match estimate(a, sql, &aliases) {
                     Ok(e) => *slot = e,
-                    Err(_) if s.run(&format!("EXPLAIN QUERY PLAN {sql}")).is_err() => return Outcome::Skip("sqlite refused"),
+                    Err(_) if s.run(&format!("EXPLAIN QUERY PLAN {sql}")).is_err() => {
+                        return Outcome::Skip("sqlite refused");
+                    }
                     Err(e) => return Outcome::Refused(e),
                 }
             }
-            let [Some(eq), Some(er)] = got else { return Outcome::Skip("no estimate") };
+            let [Some(eq), Some(er)] = got else {
+                return Outcome::Skip("no estimate");
+            };
             if no_more(er, eq) {
-                Outcome::Pass { plan_changed: false }
+                Outcome::Pass {
+                    plan_changed: false,
+                }
             } else {
-                fail(Kind::Estimate, format!("the more restrictive query is estimated at {er} rows, the query at {eq}"), vec![qs, rs])
+                fail(
+                    Kind::Estimate,
+                    format!(
+                        "the more restrictive query is estimated at {er} rows, the query at {eq}"
+                    ),
+                    vec![qs, rs],
+                )
             }
         }
         Case::Order(q) => {
-            if q.from.len() < 2 || !q.from.iter().all(|f| matches!(f.join, Join::First | Join::Inner | Join::Comma | Join::Cross)) {
+            if q.from.len() < 2
+                || !q.from.iter().all(|f| {
+                    matches!(
+                        f.join,
+                        Join::First | Join::Inner | Join::Comma | Join::Cross
+                    )
+                })
+            {
                 return Outcome::Skip("no longer an inner join of two tables or more");
             }
             let aliases: Vec<String> = q.from.iter().map(|f| f.alias.clone()).collect();
@@ -635,11 +974,29 @@ pub fn check(case: &Case, a: &mut Amphora, s: &mut Sqlite) -> Outcome {
                 }
                 match estimate(a, &sql, &aliases) {
                     Ok(Some(got)) if same_estimate(got, want) => {}
-                    Ok(Some(got)) => return fail(Kind::Estimate, format!("one join order is estimated at {got} rows, the query as written at {want}"), vec![base, sql]),
-                    Ok(None) | Err(_) => return fail(Kind::Estimate, format!("one join order has no estimate, the query as written {want} rows"), vec![base, sql]),
+                    Ok(Some(got)) => {
+                        return fail(
+                            Kind::Estimate,
+                            format!(
+                                "one join order is estimated at {got} rows, the query as written at {want}"
+                            ),
+                            vec![base, sql],
+                        );
+                    }
+                    Ok(None) | Err(_) => {
+                        return fail(
+                            Kind::Estimate,
+                            format!(
+                                "one join order has no estimate, the query as written {want} rows"
+                            ),
+                            vec![base, sql],
+                        );
+                    }
                 }
             }
-            Outcome::Pass { plan_changed: false }
+            Outcome::Pass {
+                plan_changed: false,
+            }
         }
     }
 }
@@ -691,11 +1048,21 @@ pub fn orders(q: &Sel) -> Vec<Sel> {
     for p in perms {
         for cross in [false, true] {
             let mut o = flat.clone();
-            o.from = p.iter().enumerate().map(|(k, &j)| {
-                let mut f = flat.from[j].clone();
-                f.join = if k == 0 { Join::First } else if cross { Join::Cross } else { Join::Comma };
-                f
-            }).collect();
+            o.from = p
+                .iter()
+                .enumerate()
+                .map(|(k, &j)| {
+                    let mut f = flat.from[j].clone();
+                    f.join = if k == 0 {
+                        Join::First
+                    } else if cross {
+                        Join::Cross
+                    } else {
+                        Join::Comma
+                    };
+                    f
+                })
+                .collect();
             out.push(o);
         }
     }
@@ -714,14 +1081,18 @@ pub fn no_more(more: f64, base: f64) -> bool {
 /// The estimate of the last table the plan reads at its top level, whatever its alias (a replayed
 /// finding's queries, whose aliases the file doesn't list).
 pub fn estimate_any(a: &mut Amphora, sql: &str) -> Option<f64> {
-    let rows = a.run(&format!("EXPLAIN QUERY PLAN FORMAT=JSON {sql}")).ok()?;
+    let rows = a
+        .run(&format!("EXPLAIN QUERY PLAN FORMAT=JSON {sql}"))
+        .ok()?;
     let text = match rows.first()?.first()? {
         V::Text(t) => t.clone(),
         _ => return None,
     };
     let j: serde_json::Value = serde_json::from_str(&text).ok()?;
     j["output_rows"].as_f64().or_else(|| {
-        j["nodes"].as_array()?.iter()
+        j["nodes"]
+            .as_array()?
+            .iter()
             .filter(|n| n["parent"].is_null())
             .filter_map(|n| n["op"]["estimate"]["output_rows"].as_f64())
             .next_back()
@@ -731,14 +1102,25 @@ pub fn estimate_any(a: &mut Amphora, sql: &str) -> Option<f64> {
 /// The plan's estimate of `sql`'s rows, or Amphora's refusal to plan it.
 fn estimate(a: &mut Amphora, sql: &str, aliases: &[String]) -> Result<Option<f64>, String> {
     let rows = a.run(&format!("EXPLAIN QUERY PLAN FORMAT=JSON {sql}"))?;
-    let Some(V::Text(text)) = rows.first().and_then(|r| r.first()) else { return Ok(None) };
-    let Ok(j) = serde_json::from_str::<serde_json::Value>(text) else { return Ok(None) };
+    let Some(V::Text(text)) = rows.first().and_then(|r| r.first()) else {
+        return Ok(None);
+    };
+    let Ok(j) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Ok(None);
+    };
     // The join's own estimate where the plan gives it; else the last table read at the top.
     Ok(j["output_rows"].as_f64().or_else(|| {
-        j["nodes"].as_array()?.iter()
-            .filter(|n| n["parent"].is_null() && n["op"]["alias"].as_str().is_some_and(|al| aliases.iter().any(|x| x == al)))
+        j["nodes"]
+            .as_array()?
+            .iter()
+            .filter(|n| {
+                n["parent"].is_null()
+                    && n["op"]["alias"]
+                        .as_str()
+                        .is_some_and(|al| aliases.iter().any(|x| x == al))
+            })
             .filter_map(|n| n["op"]["estimate"]["output_rows"].as_f64())
-            .last()
+            .next_back()
     }))
 }
 
@@ -755,7 +1137,11 @@ fn variant(q: &Sel, v: &Variant) -> Sel {
             }
         }
         Variant::Likely | Variant::Unlikely => {
-            let hint = if matches!(v, Variant::Likely) { "likely" } else { "unlikely" };
+            let hint = if matches!(v, Variant::Likely) {
+                "likely"
+            } else {
+                "unlikely"
+            };
             q.wh = q.wh.take().map(|w| E::Fn(hint.into(), vec![w]));
         }
     }
@@ -771,15 +1157,33 @@ fn having_pred(r: &mut Rng, s: &Scope, group: &[E], depth: u32) -> E {
         _ => E::Lit(synth::literal(r)),
     };
     match r.below(6) {
-        0 if depth > 0 => E::Bin("AND", Box::new(having_pred(r, s, group, depth - 1)), Box::new(having_pred(r, s, group, depth - 1))),
-        1 if depth > 0 => E::Bin("OR", Box::new(having_pred(r, s, group, depth - 1)), Box::new(having_pred(r, s, group, depth - 1))),
+        0 if depth > 0 => E::Bin(
+            "AND",
+            Box::new(having_pred(r, s, group, depth - 1)),
+            Box::new(having_pred(r, s, group, depth - 1)),
+        ),
+        1 if depth > 0 => E::Bin(
+            "OR",
+            Box::new(having_pred(r, s, group, depth - 1)),
+            Box::new(having_pred(r, s, group, depth - 1)),
+        ),
         2 => E::Null(Box::new(term(r)), r.chance(0.5)),
-        _ => E::Bin(*r.pick(&["=", "<", ">", "<=", ">=", "<>", "IS", "IS NOT"]), Box::new(term(r)), Box::new(term(r))),
+        _ => E::Bin(
+            r.pick(&["=", "<", ">", "<=", ">=", "<>", "IS", "IS NOT"]),
+            Box::new(term(r)),
+            Box::new(term(r)),
+        ),
     }
 }
 
 /// A case for the oracle, over the database (its schema; SQLite for the rows PQS pivots on).
-pub fn build(o: Oracle, r: &mut Rng, schema: &Schema, funcs: &[Func], s: &mut Sqlite) -> Option<Case> {
+pub fn build(
+    o: Oracle,
+    r: &mut Rng,
+    schema: &Schema,
+    funcs: &[Func],
+    s: &mut Sqlite,
+) -> Option<Case> {
     Some(match o {
         Oracle::Same => Case::Same(schema.tables.iter().map(|t| t.name.clone()).collect()),
         Oracle::Diff => Case::Diff(synth::query(r, schema, funcs)),
@@ -804,7 +1208,11 @@ pub fn build(o: Oracle, r: &mut Rng, schema: &Schema, funcs: &[Func], s: &mut Sq
                     q.group = (0..1 + r.below(2)).map(|_| sc.expr(r, 1)).collect();
                     q.cols = q.group.clone();
                     q.cols.push(sa.expr_agg(r));
-                    q.having = if r.chance(0.5) { Some(having_pred(r, &sa, &q.group, 1)) } else { None };
+                    q.having = if r.chance(0.5) {
+                        Some(having_pred(r, &sa, &q.group, 1))
+                    } else {
+                        None
+                    };
                     let hp = having_pred(r, &sa, &q.group, 2);
                     Case::TlpHaving(q, hp)
                 }
@@ -814,8 +1222,12 @@ pub fn build(o: Oracle, r: &mut Rng, schema: &Schema, funcs: &[Func], s: &mut Sq
                     q.cols = vec![match f {
                         Agg::Count => E::Agg("count".into(), false, vec![e]),
                         Agg::Sum => E::Agg("sum".into(), false, vec![e]),
-                        Agg::Min => E::Agg("min".into(), false, vec![E::Collate(Box::new(e), "BINARY")]),
-                        Agg::Max => E::Agg("max".into(), false, vec![E::Collate(Box::new(e), "BINARY")]),
+                        Agg::Min => {
+                            E::Agg("min".into(), false, vec![E::Collate(Box::new(e), "BINARY")])
+                        }
+                        Agg::Max => {
+                            E::Agg("max".into(), false, vec![E::Collate(Box::new(e), "BINARY")])
+                        }
                     }];
                     Case::TlpAgg(q, p, f)
                 }
@@ -833,9 +1245,28 @@ pub fn build(o: Oracle, r: &mut Rng, schema: &Schema, funcs: &[Func], s: &mut Sq
                 V::Int(i) => *i,
                 _ => return None,
             };
-            let from = vec![synth::From { table: t, alias: "a0".into(), join: Join::First, on: None, hint: Hint::None }];
+            let from = vec![synth::From {
+                table: t,
+                alias: "a0".into(),
+                join: Join::First,
+                on: None,
+                hint: Hint::None,
+            }];
             let p = synth::scope(schema, &from, funcs, false).pred(r, 3);
-            Case::Pqs(Sel { distinct: false, cols: vec![], from, wh: None, group: vec![], having: None, order: vec![], limit: None }, pivot, p)
+            Case::Pqs(
+                Sel {
+                    distinct: false,
+                    cols: vec![],
+                    from,
+                    wh: None,
+                    group: vec![],
+                    having: None,
+                    order: vec![],
+                    limit: None,
+                },
+                pivot,
+                p,
+            )
         }
         Oracle::Dqp => {
             let q = synth::query(r, schema, funcs);
@@ -848,7 +1279,11 @@ pub fn build(o: Oracle, r: &mut Rng, schema: &Schema, funcs: &[Func], s: &mut Sq
                     }
                 }
             }
-            if q.from.iter().skip(1).any(|f| matches!(f.join, Join::Inner | Join::Comma)) {
+            if q.from
+                .iter()
+                .skip(1)
+                .any(|f| matches!(f.join, Join::Inner | Join::Comma))
+            {
                 vs.push(Variant::CrossJoins);
             }
             if q.wh.is_some() {
@@ -892,10 +1327,18 @@ pub fn build(o: Oracle, r: &mut Rng, schema: &Schema, funcs: &[Func], s: &mut Sq
                     a.limit = None;
                 }
             }
-            let places: Vec<usize> = (0..arms.len()).filter(|&k| k == 0 || ops[k - 1] != "EXCEPT").collect();
+            let places: Vec<usize> = (0..arms.len())
+                .filter(|&k| k == 0 || ops[k - 1] != "EXCEPT")
+                .collect();
             let k = *r.pick(&places);
             let q = &arms[k];
-            let outer = q.from.iter().enumerate().skip(1).find(|(_, f)| matches!(f.join, Join::Left | Join::Right | Join::Full)).map(|(i, _)| i);
+            let outer = q
+                .from
+                .iter()
+                .enumerate()
+                .skip(1)
+                .find(|(_, f)| matches!(f.join, Join::Left | Join::Right | Join::Full))
+                .map(|(i, _)| i);
             let more = match outer {
                 Some(i) if r.chance(0.5) => More::Inner(i),
                 _ => More::Conjunct(synth::scope(schema, &q.from, funcs, false).pred(r, 2)),
@@ -909,11 +1352,27 @@ pub fn build(o: Oracle, r: &mut Rng, schema: &Schema, funcs: &[Func], s: &mut Sq
 // ---------------------------------------------------------------- EET
 
 fn true_expr(q: &E) -> E {
-    E::Bin("OR", Box::new(E::Bin("OR", Box::new(q.clone()), Box::new(E::Un("NOT", Box::new(q.clone()))))), Box::new(E::Null(Box::new(q.clone()), false)))
+    E::Bin(
+        "OR",
+        Box::new(E::Bin(
+            "OR",
+            Box::new(q.clone()),
+            Box::new(E::Un("NOT", Box::new(q.clone()))),
+        )),
+        Box::new(E::Null(Box::new(q.clone()), false)),
+    )
 }
 
 fn false_expr(q: &E) -> E {
-    E::Bin("AND", Box::new(E::Bin("AND", Box::new(q.clone()), Box::new(E::Un("NOT", Box::new(q.clone()))))), Box::new(E::Null(Box::new(q.clone()), true)))
+    E::Bin(
+        "AND",
+        Box::new(E::Bin(
+            "AND",
+            Box::new(q.clone()),
+            Box::new(E::Un("NOT", Box::new(q.clone()))),
+        )),
+        Box::new(E::Null(Box::new(q.clone()), true)),
+    )
 }
 
 /// Visits every rewritable node: `truth` where only its truth is read (WHERE, HAVING, ON, a searched
@@ -923,7 +1382,11 @@ fn false_expr(q: &E) -> E {
 /// affinity), or likely(), unlikely() and likelihood() (which SQLite sees through).
 fn visit(e: &mut E, truth: bool, f: &mut dyn FnMut(&mut E, bool, bool)) {
     let transparent = matches!(e, E::Fn(name, _) if matches!(name.as_str(), "likely" | "unlikely" | "likelihood"));
-    let value = !transparent && !matches!(e, E::Col(..) | E::Cast(..) | E::Collate(..) | E::Scalar(_) | E::Un("+", _));
+    let value = !transparent
+        && !matches!(
+            e,
+            E::Col(..) | E::Cast(..) | E::Collate(..) | E::Scalar(_) | E::Un("+", _)
+        );
     f(e, truth, value);
     if let E::Case(base, whens, els) = e {
         let searched = base.is_none();
@@ -960,7 +1423,8 @@ pub fn transform(q: &Sel, r: &mut Rng, schema: &Schema, funcs: &[Func]) -> Sel {
     let sc = synth::scope(schema, &q.from, funcs, false);
     for _ in 0..1 + r.below(3) {
         let mut slots = 0usize;
-        let mut count = |_: &mut E, truth: bool, value: bool| slots += usize::from(truth) + usize::from(value);
+        let mut count =
+            |_: &mut E, truth: bool, value: bool| slots += usize::from(truth) + usize::from(value);
         for_each_root(&mut t, &mut count);
         if slots == 0 {
             break;
@@ -972,7 +1436,11 @@ pub fn transform(q: &Sel, r: &mut Rng, schema: &Schema, funcs: &[Func]) -> Sel {
         // the rule's own parts bring none
         // in an ON clause, a literal: SQLite lets an inner join's ON name a table to its right, Amphora
         // doesn't (a finding of its own, made once, not by every EET case)
-        let mut q1 = if agg || in_on { E::Lit(synth::literal(r)) } else { sc.pred(r, 1) };
+        let mut q1 = if agg || in_on {
+            E::Lit(synth::literal(r))
+        } else {
+            sc.pred(r, 1)
+        };
         if q1.has_agg() || has_collate(&q1) {
             q1 = E::Lit(synth::literal(r));
         }
@@ -989,11 +1457,23 @@ pub fn transform(q: &Sel, r: &mut Rng, schema: &Schema, funcs: &[Func]) -> Sel {
                 k = usize::MAX;
                 let old = e.clone();
                 *e = if is {
-                    if rule % 2 == 0 { E::Bin("OR", Box::new(false_expr(&q1)), Box::new(old)) } else { E::Bin("AND", Box::new(true_expr(&q1)), Box::new(old)) }
+                    if rule.is_multiple_of(2) {
+                        E::Bin("OR", Box::new(false_expr(&q1)), Box::new(old))
+                    } else {
+                        E::Bin("AND", Box::new(true_expr(&q1)), Box::new(old))
+                    }
                 } else {
                     match rule % 4 {
-                        0 => E::Case(None, vec![(false_expr(&q1), other.clone())], Some(Box::new(old))),
-                        1 => E::Case(None, vec![(true_expr(&q1), old)], Some(Box::new(other.clone()))),
+                        0 => E::Case(
+                            None,
+                            vec![(false_expr(&q1), other.clone())],
+                            Some(Box::new(old)),
+                        ),
+                        1 => E::Case(
+                            None,
+                            vec![(true_expr(&q1), old)],
+                            Some(Box::new(other.clone())),
+                        ),
                         _ => E::Case(None, vec![(q1.clone(), old.clone())], Some(Box::new(old))),
                     }
                 };
@@ -1027,7 +1507,8 @@ fn for_each_root(q: &mut Sel, f: &mut dyn FnMut(&mut E, bool, bool)) {
 /// How many slots the query's expressions outside its ON clauses hold.
 fn slots_before_on(q: &mut Sel) -> usize {
     let mut n = 0usize;
-    let mut count = |_: &mut E, truth: bool, value: bool| n += usize::from(truth) + usize::from(value);
+    let mut count =
+        |_: &mut E, truth: bool, value: bool| n += usize::from(truth) + usize::from(value);
     for c in q.cols.iter_mut() {
         visit(c, false, &mut count);
     }

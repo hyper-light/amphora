@@ -1,0 +1,37 @@
+# The bench's clippy.toml: clippy reads only the nearest one, so this is the workspace's
+# (../clippy.toml) less five bans, and the rest must stay in step with it. The bench is a
+# command-line tool (Ada, lane F2): it may print and read its arguments; nothing else is lifted.
+#   std::print      its results are the lines it prints
+#   std::println    its results are the lines it prints
+#   std::eprint     its progress and errors go to the terminal that ran it
+#   std::eprintln   its progress and errors go to the terminal that ran it
+#   std::env::args  it reads its arguments; one that isn't Unicode panics, ending the run as a refusal would
+
+# Tests may unwrap, expect, panic, index and print; production may not (CLAUDE.md §1). Test code
+# opts out of the macro bans with the crate-root `cfg_attr(test, allow(..))` block.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-dbg-in-tests = true
+allow-indexing-slicing-in-tests = true
+
+disallowed-macros = [
+  { path = "std::assert", reason = "unwinds; return a typed error" },
+  { path = "std::assert_eq", reason = "unwinds; return a typed error" },
+  { path = "std::assert_ne", reason = "unwinds; return a typed error" },
+  { path = "std::debug_assert", reason = "a check only debug builds make is a check production skips; return a typed error" },
+  { path = "std::debug_assert_eq", reason = "as debug_assert" },
+  { path = "std::debug_assert_ne", reason = "as debug_assert" },
+  { path = "core::assert", reason = "unwinds; return a typed error" },
+  { path = "core::assert_eq", reason = "unwinds; return a typed error" },
+  { path = "core::assert_ne", reason = "unwinds; return a typed error" },
+  { path = "core::debug_assert", reason = "as debug_assert" },
+  { path = "core::debug_assert_eq", reason = "as debug_assert" },
+  { path = "core::debug_assert_ne", reason = "as debug_assert" },
+]
+
+disallowed-methods = [
+  { path = "bool::then_some", reason = "builds its argument even when false; use `then(|| ..)` or if/else" },
+  { path = "std::env::temp_dir", reason = "tests use tempfile's directories; production writes only where it is configured to" },
+  { path = "std::thread::sleep", reason = "a blocking sleep stalls a worker; wait on an event or a runtime timer" },
+]

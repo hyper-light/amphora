@@ -11,6 +11,9 @@ use std::time::Instant;
 
 use crate::suite::P;
 
+/// One statement with its parameters, run on the target: its rows as text.
+type Run = Box<dyn FnMut(&str, &[P]) -> anyhow::Result<Vec<String>>>;
+
 struct Opts {
     target: String,
     dir: String,
@@ -30,22 +33,43 @@ fn param(s: &str) -> anyhow::Result<P> {
 }
 
 fn opts() -> anyhow::Result<Opts> {
-    let mut o = Opts { target: String::new(), dir: String::new(), sql: String::new(), params: Vec::new(), repeat: 3, explain: false };
+    let mut o = Opts {
+        target: String::new(),
+        dir: String::new(),
+        sql: String::new(),
+        params: Vec::new(),
+        repeat: 3,
+        explain: false,
+    };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
-        let mut v = || args.next().ok_or_else(|| anyhow::anyhow!("{a} takes a value"));
+        let mut v = || {
+            args.next()
+                .ok_or_else(|| anyhow::anyhow!("{a} takes a value"))
+        };
         match a.as_str() {
             "--query" => {}
             "--target" => o.target = v()?,
             "--dir" => o.dir = v()?,
             "--sql" => o.sql = v()?,
-            "--params" => o.params = v()?.split(',').filter(|s| !s.is_empty()).map(param).collect::<anyhow::Result<_>>()?,
+            "--params" => {
+                o.params = v()?
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(param)
+                    .collect::<anyhow::Result<_>>()?
+            }
             "--repeat" => o.repeat = v()?.parse()?,
             "--explain" => o.explain = true,
-            other => anyhow::bail!("unknown argument {other} (--query takes --target, --dir, --sql, --params, --repeat, --explain)"),
+            other => anyhow::bail!(
+                "unknown argument {other} (--query takes --target, --dir, --sql, --params, --repeat, --explain)"
+            ),
         }
     }
-    anyhow::ensure!(!o.dir.is_empty() && !o.sql.is_empty(), "--query needs --dir and --sql");
+    anyhow::ensure!(
+        !o.dir.is_empty() && !o.sql.is_empty(),
+        "--query needs --dir and --sql"
+    );
     Ok(o)
 }
 
@@ -53,12 +77,16 @@ pub fn main() -> anyhow::Result<()> {
     let o = opts()?;
     let path = Path::new(&o.dir).join("suite.db");
     anyhow::ensure!(path.exists(), "no database at {}", path.display());
-    let mut run: Box<dyn FnMut(&str, &[P]) -> anyhow::Result<Vec<String>>> = match o.target.as_str() {
+    let mut run: Run = match o.target.as_str() {
         "amphora" => {
             // The suite's readers read on connections of their own beside the writer's: so does this.
-            let writer = amphora::db::Db::open_sharing(&path, &crate::suite_db::amphora_sharing()?)?;
+            let writer =
+                amphora::db::Db::open_sharing(&path, &crate::suite_db::amphora_sharing()?)?;
             let db = writer.reader()?;
-            if let Some(pages) = std::env::var("AMPHORA_READER_PAGES").ok().and_then(|v| v.parse().ok()) {
+            if let Some(pages) = std::env::var("AMPHORA_READER_PAGES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
                 db.keep_pages(pages)?;
             }
             Box::new(move |sql, ps| {
@@ -67,21 +95,33 @@ pub fn main() -> anyhow::Result<()> {
                 let sql: &'static str = Box::leak(sql.to_owned().into_boxed_str());
                 let mut out = Vec::new();
                 db.query(sql, ps.iter().map(crate::suite_db::amphora_value), |r| {
-                    out.push(r.get_values().map(|v| v.to_string()).collect::<Vec<_>>().join(" | "));
+                    out.push(
+                        r.get_values()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join(" | "),
+                    );
                     Ok(true)
                 })?;
                 Ok(out)
             })
         }
         "sqlite" => {
-            let c = rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            let c = rusqlite::Connection::open_with_flags(
+                &path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
             Box::new(move |sql, ps| {
                 let mut stmt = c.prepare_cached(sql)?;
                 let columns = stmt.column_count();
-                let mut rows = stmt.query(rusqlite::params_from_iter(ps.iter().map(crate::suite_db::sqlite_value)))?;
+                let mut rows = stmt.query(rusqlite::params_from_iter(
+                    ps.iter().map(crate::suite_db::sqlite_value),
+                ))?;
                 let mut out = Vec::new();
                 while let Some(r) = rows.next()? {
-                    let cells: Vec<String> = (0..columns).map(|i| r.get_ref(i).map(|v| format!("{v:?}")).unwrap_or_default()).collect();
+                    let cells: Vec<String> = (0..columns)
+                        .map(|i| r.get_ref(i).map(|v| format!("{v:?}")).unwrap_or_default())
+                        .collect();
                     out.push(cells.join(" | "));
                 }
                 Ok(out)
@@ -101,13 +141,21 @@ pub fn main() -> anyhow::Result<()> {
     for i in 0..o.repeat {
         let began = Instant::now();
         let rows = run(&o.sql, &o.params)?;
-        println!("run {i}: {} rows in {:.3} ms", rows.len(), began.elapsed().as_secs_f64() * 1000.0);
+        println!(
+            "run {i}: {} rows in {:.3} ms",
+            rows.len(),
+            began.elapsed().as_secs_f64() * 1000.0
+        );
         if i == 0 {
             for r in rows.iter().take(5) {
                 println!("  {r}");
             }
         }
     }
-    println!("rss {:?} MB, peak {:?} MB", crate::rss_mb(), crate::rss_max_mb());
+    println!(
+        "rss {:?} MB, peak {:?} MB",
+        crate::rss_mb(),
+        crate::rss_max_mb()
+    );
     Ok(())
 }

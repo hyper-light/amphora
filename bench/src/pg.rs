@@ -67,6 +67,22 @@ const EVENTS_LAST: &str = "SELECT session, id, seq, at, parent, \"by\", kind, le
 
 const SEARCH: &str = "SELECT session, id FROM events WHERE text LIKE $1 ORDER BY at DESC LIMIT $2";
 
+/// A row of `EVENTS_LAST`, each column as the store reads it.
+type EventRow = (
+    String,
+    String,
+    i64,
+    i64,
+    Option<String>,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+);
+
 /// A client with the workload's statements prepared on it.
 struct Conn {
     client: Client,
@@ -86,7 +102,13 @@ pub struct Pg {
 
 impl Pg {
     pub fn connect(dsn: &str, engine: Engine) -> anyhow::Result<Self> {
-        let pg = Self { dsn: dsn.to_owned(), engine, pool: Mutex::new(Vec::new()), rev: AtomicU64::new(0), seen: Mutex::new(HashSet::new()) };
+        let pg = Self {
+            dsn: dsn.to_owned(),
+            engine,
+            pool: Mutex::new(Vec::new()),
+            rev: AtomicU64::new(0),
+            seen: Mutex::new(HashSet::new()),
+        };
         let mut client = pg.client()?;
         if engine == Engine::Orioledb {
             client.batch_execute("CREATE EXTENSION IF NOT EXISTS orioledb")?;
@@ -94,13 +116,25 @@ impl Pg {
         for table in ["events", "sessions", "meta"] {
             client.batch_execute(&format!("DROP TABLE IF EXISTS {table}"))?;
         }
-        let using = if engine == Engine::Orioledb { " USING orioledb" } else { "" };
+        let using = if engine == Engine::Orioledb {
+            " USING orioledb"
+        } else {
+            ""
+        };
         for table in TABLES {
-            let table = if engine == Engine::Cedardb { table.replace(" COLLATE \"C\"", "") } else { table.to_owned() };
-            client.batch_execute(&format!("{table}{using}")).map_err(|e| anyhow::anyhow!("{e} (in: {table}{using})"))?;
+            let table = if engine == Engine::Cedardb {
+                table.replace(" COLLATE \"C\"", "")
+            } else {
+                table.to_owned()
+            };
+            client
+                .batch_execute(&format!("{table}{using}"))
+                .map_err(|e| anyhow::anyhow!("{e} (in: {table}{using})"))?;
         }
         for index in INDEXES {
-            client.batch_execute(index).map_err(|e| anyhow::anyhow!("{e} (in: {index})"))?;
+            client
+                .batch_execute(index)
+                .map_err(|e| anyhow::anyhow!("{e} (in: {index})"))?;
         }
         let conn = Self::prepare(client)?;
         pg.give(conn);
@@ -117,11 +151,22 @@ impl Pg {
     }
 
     fn prepare(mut client: Client) -> anyhow::Result<Conn> {
-        Ok(Conn { session_upsert: client.prepare(SESSION_UPSERT)?, event_upsert: client.prepare(EVENT_UPSERT)?, last: client.prepare(EVENTS_LAST)?, search: client.prepare(SEARCH)?, client })
+        Ok(Conn {
+            session_upsert: client.prepare(SESSION_UPSERT)?,
+            event_upsert: client.prepare(EVENT_UPSERT)?,
+            last: client.prepare(EVENTS_LAST)?,
+            search: client.prepare(SEARCH)?,
+            client,
+        })
     }
 
     fn connection(&self) -> anyhow::Result<Conn> {
-        if let Some(c) = self.pool.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.pop() {
+        if let Some(c) = self
+            .pool
+            .lock()
+            .map_err(|_| anyhow::anyhow!("poisoned"))?
+            .pop()
+        {
             return Ok(c);
         }
         Self::prepare(self.client()?)
@@ -142,19 +187,52 @@ impl Blocking for Pg {
     fn write(&self, events: &[Event]) -> anyhow::Result<()> {
         let new: Vec<String> = {
             let mut seen = self.seen.lock().map_err(|_| anyhow::anyhow!("poisoned"))?;
-            events.iter().filter(|e| seen.insert(e.session.clone())).map(|e| e.session.clone()).collect()
+            events
+                .iter()
+                .filter(|e| seen.insert(e.session.clone()))
+                .map(|e| e.session.clone())
+                .collect()
         };
         let mut c = self.connection()?;
         let done = (|| -> anyhow::Result<()> {
             let mut tx = c.client.transaction()?;
             for s in &new {
                 let rev = i64::try_from(self.rev.fetch_add(1, Ordering::Relaxed) + 1)?;
-                tx.execute(&c.session_upsert, &[s, &"{}", &None::<&str>, &None::<&str>, &None::<&str>, &0i64, &0i64, &rev])?;
+                tx.execute(
+                    &c.session_upsert,
+                    &[
+                        s,
+                        &"{}",
+                        &None::<&str>,
+                        &None::<&str>,
+                        &None::<&str>,
+                        &0i64,
+                        &0i64,
+                        &rev,
+                    ],
+                )?;
             }
             for e in events {
                 let rev = i64::try_from(self.rev.fetch_add(1, Ordering::Relaxed) + 1)?;
                 let seq = i64::try_from(e.seq)?;
-                tx.execute(&c.event_upsert, &[&e.session, &e.id, &seq, &e.at, &None::<&str>, &None::<&str>, &e.kind, &None::<&str>, &None::<&str>, &None::<&str>, &e.text, &e.body, &rev])?;
+                tx.execute(
+                    &c.event_upsert,
+                    &[
+                        &e.session,
+                        &e.id,
+                        &seq,
+                        &e.at,
+                        &None::<&str>,
+                        &None::<&str>,
+                        &e.kind,
+                        &None::<&str>,
+                        &None::<&str>,
+                        &None::<&str>,
+                        &e.text,
+                        &e.body,
+                        &rev,
+                    ],
+                )?;
             }
             tx.commit()?;
             Ok(())
@@ -166,11 +244,25 @@ impl Blocking for Pg {
     fn history(&self, session: &str, limit: usize) -> anyhow::Result<usize> {
         let mut c = self.connection()?;
         let done = (|| -> anyhow::Result<usize> {
-            let rows = c.client.query(&c.last, &[&session, &i64::try_from(limit)?])?;
+            let rows = c
+                .client
+                .query(&c.last, &[&session, &i64::try_from(limit)?])?;
             // Every column taken, as a reader of the page would (the store builds its rows).
             for r in &rows {
-                let row: (String, String, i64, i64, Option<String>, Option<String>, String, Option<String>, Option<String>, Option<String>, String, String) =
-                    (r.try_get(0)?, r.try_get(1)?, r.try_get(2)?, r.try_get(3)?, r.try_get(4)?, r.try_get(5)?, r.try_get(6)?, r.try_get(7)?, r.try_get(8)?, r.try_get(9)?, r.try_get(10)?, r.try_get(11)?);
+                let row: EventRow = (
+                    r.try_get(0)?,
+                    r.try_get(1)?,
+                    r.try_get(2)?,
+                    r.try_get(3)?,
+                    r.try_get(4)?,
+                    r.try_get(5)?,
+                    r.try_get(6)?,
+                    r.try_get(7)?,
+                    r.try_get(8)?,
+                    r.try_get(9)?,
+                    r.try_get(10)?,
+                    r.try_get(11)?,
+                );
                 std::hint::black_box(row);
             }
             Ok(rows.len())
@@ -181,7 +273,11 @@ impl Blocking for Pg {
 
     fn search(&self, word: &str, limit: usize) -> anyhow::Result<usize> {
         let mut c = self.connection()?;
-        let done = (|| -> anyhow::Result<usize> { Ok(c.client.query(&c.search, &[&format!("%{word}%"), &i64::try_from(limit)?])?.len()) })();
+        let done = (|| -> anyhow::Result<usize> {
+            Ok(c.client
+                .query(&c.search, &[&format!("%{word}%"), &i64::try_from(limit)?])?
+                .len())
+        })();
         self.give(c);
         done
     }

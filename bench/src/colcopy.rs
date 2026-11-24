@@ -797,10 +797,9 @@ fn ladder_step(
     // Every statement's answer, from the row loop, before the step.
     let mut answers: HashMap<String, Answer> = HashMap::new();
     for k in 0..s.statements {
-        let q = s.query(k);
-        if !answers.contains_key(&q) {
-            let a = reference.rows(&q)?;
-            answers.insert(q, a);
+        if let std::collections::hash_map::Entry::Vacant(slot) = answers.entry(s.query(k)) {
+            let a = reference.rows(slot.key())?;
+            slot.insert(a);
         }
     }
     let mut openers = Vec::with_capacity(clients);

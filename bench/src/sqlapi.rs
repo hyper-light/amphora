@@ -91,7 +91,13 @@ struct Timed {
 
 impl Timed {
     fn new() -> Self {
-        Timed { executes: 0, inside: Duration::ZERO, cpu: Some(0), whole: Duration::ZERO, checksum: 0 }
+        Timed {
+            executes: 0,
+            inside: Duration::ZERO,
+            cpu: Some(0),
+            whole: Duration::ZERO,
+            checksum: 0,
+        }
     }
     /// One call's figures added in.
     fn add(&mut self, executes: u64, inside: Duration, cpu: Option<u64>, whole: Duration) {
@@ -115,7 +121,12 @@ fn mix(mut x: u64) -> u64 {
 
 /// The calling thread's time on a CPU so far, in nanoseconds: Linux's schedstat, elsewhere unknown.
 fn cpu_ns() -> Option<u64> {
-    std::fs::read_to_string("/proc/thread-self/schedstat").ok()?.split_whitespace().next()?.parse().ok()
+    std::fs::read_to_string("/proc/thread-self/schedstat")
+        .ok()?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// The CPU time since `from` (a `cpu_ns` reading on this thread).
@@ -132,7 +143,13 @@ fn refused(e: impl std::fmt::Display) -> anyhow::Error {
 }
 
 fn digest(i: u64) -> String {
-    format!("{:016x}{:016x}{:016x}{:016x}", mix(i), mix(i ^ 1), mix(i ^ 2), mix(i ^ 3))
+    format!(
+        "{:016x}{:016x}{:016x}{:016x}",
+        mix(i),
+        mix(i ^ 1),
+        mix(i ^ 2),
+        mix(i ^ 3)
+    )
 }
 
 fn key(d: &str) -> String {
@@ -142,7 +159,11 @@ fn key(d: &str) -> String {
 /// A fresh database file: one that is there already is refused, never reused.
 fn fresh(dir: &Path, name: &str) -> anyhow::Result<Database> {
     let path = dir.join(name);
-    anyhow::ensure!(!path.exists(), "{} is there already: --sql-api wants fresh files", path.display());
+    anyhow::ensure!(
+        !path.exists(),
+        "{} is there already: --sql-api wants fresh files",
+        path.display()
+    );
     Database::open(&path, until()).map_err(refused)
 }
 
@@ -177,7 +198,10 @@ fn fold(mut h: u64, value: &Value) -> u64 {
 }
 
 fn reapi_setup(db: &Database, digests: &[String]) -> anyhow::Result<()> {
-    db.call(until(), AnswerMax::fixed(), |c| Ok(c.execute_batch(REAPI_SCHEMA)?)).map_err(refused)?;
+    db.call(until(), AnswerMax::fixed(), |c| {
+        Ok(c.execute_batch(REAPI_SCHEMA)?)
+    })
+    .map_err(refused)?;
     for (n, chunk) in digests.chunks(1_000).enumerate() {
         let chunk = chunk.to_vec();
         let first = n as i64 * 1_000;
@@ -207,10 +231,21 @@ fn reapi_run(db: &Database, digests: &[String], per_call: u64) -> anyhow::Result
                 let mut size = c.prepare_cached(SIZE)?;
                 let mut touch = c.prepare_cached(TOUCH)?;
                 for d in &chunk {
-                    let kept: bool = held.query_row(vec![Value::Text("object".into()), Value::Text(key(d)), Value::Integer(NOW - 3_600), Value::Text(d.clone())], |r| r.get(0))?;
+                    let kept: bool = held.query_row(
+                        vec![
+                            Value::Text("object".into()),
+                            Value::Text(key(d)),
+                            Value::Integer(NOW - 3_600),
+                            Value::Text(d.clone()),
+                        ],
+                        |r| r.get(0),
+                    )?;
                     anyhow::ensure!(kept, "digest {d} isn't held");
                     let _: i64 = size.query_row(vec![Value::Text(d.clone())], |r| r.get(0))?;
-                    anyhow::ensure!(touch.execute(vec![Value::Text(d.clone()), Value::Integer(NOW + 1)])? == 1, "digest {d} wasn't touched");
+                    anyhow::ensure!(
+                        touch.execute(vec![Value::Text(d.clone()), Value::Integer(NOW + 1)])? == 1,
+                        "digest {d} wasn't touched"
+                    );
                 }
                 Ok((chunk.len() as u64 * 3, started.elapsed(), cpu_since(cpu)))
             })
@@ -221,7 +256,10 @@ fn reapi_run(db: &Database, digests: &[String], per_call: u64) -> anyhow::Result
 }
 
 fn logsearch_setup(db: &Database, docs: u64) -> anyhow::Result<()> {
-    db.call(until(), AnswerMax::fixed(), |c| Ok(c.execute_batch(LOG_SCHEMA)?)).map_err(refused)?;
+    db.call(until(), AnswerMax::fixed(), |c| {
+        Ok(c.execute_batch(LOG_SCHEMA)?)
+    })
+    .map_err(refused)?;
     db.call(until(), AnswerMax::fixed(), |c| {
         let mut run = c.prepare_cached("INSERT INTO runs (id, number, repo_id, workflow_id, pipeline, branch, conclusion, status, created_at) VALUES (?1, ?2, ?3, 'build', NULL, 'main', 'success', 'done', ?4)")?;
         let mut job = c.prepare_cached("INSERT INTO jobs (id, run_id, key, finished_at) VALUES (?1, ?2, 'test', ?3)")?;
@@ -260,7 +298,10 @@ fn logsearch_setup(db: &Database, docs: u64) -> anyhow::Result<()> {
 }
 
 fn logsearch_run(db: &Database, pages: u64, per_call: u64) -> anyhow::Result<Timed> {
-    let mut t = Timed { checksum: 0xcbf29ce484222325, ..Timed::new() };
+    let mut t = Timed {
+        checksum: 0xcbf29ce484222325,
+        ..Timed::new()
+    };
     let (mut cursor, mut left) = (i64::MAX, pages);
     while left > 0 {
         let n = left.min(per_call.max(1));
@@ -291,7 +332,11 @@ fn logsearch_run(db: &Database, pages: u64, per_call: u64) -> anyhow::Result<Tim
                             last = Some(*id);
                         }
                     }
-                    let Some(id) = last else { anyhow::bail!("a page below {cursor} came back empty: --pages is past the documents") };
+                    let Some(id) = last else {
+                        anyhow::bail!(
+                            "a page below {cursor} came back empty: --pages is past the documents"
+                        )
+                    };
                     cursor = id - 1;
                 }
                 Ok((h, cursor, started.elapsed(), cpu_since(cpu)))
@@ -321,7 +366,12 @@ impl TokenStream for Reserved {
                 Some(b'\'' | b'"' | b'`' | b'[') => name.get(1..).unwrap_or(""),
                 _ => name,
             };
-            anyhow::ensure!(!name.get(..10).is_some_and(|p| p.eq_ignore_ascii_case("__amphora_")), "{name} is reserved");
+            anyhow::ensure!(
+                !name
+                    .get(..10)
+                    .is_some_and(|p| p.eq_ignore_ascii_case("__amphora_")),
+                "{name} is reserved"
+            );
         }
         Ok(())
     }
@@ -342,7 +392,13 @@ fn validate_like(sql: &str) -> anyhow::Result<usize> {
 /// Nanoseconds a validation of each statement, over `parses` of each: wall clock, and CPU time where known.
 fn parse_run(parses: u64) -> anyhow::Result<Vec<(&'static str, f64, Option<f64>)>> {
     let mut each = Vec::new();
-    for (name, sql) in [("exists", EXISTS), ("size", SIZE), ("touch", TOUCH), ("page", PAGE), ("posting", POSTING)] {
+    for (name, sql) in [
+        ("exists", EXISTS),
+        ("size", SIZE),
+        ("touch", TOUCH),
+        ("page", PAGE),
+        ("posting", POSTING),
+    ] {
         let (began, cpu) = (Instant::now(), cpu_ns());
         let mut tokens = 0usize;
         for _ in 0..parses {
@@ -350,7 +406,11 @@ fn parse_run(parses: u64) -> anyhow::Result<Vec<(&'static str, f64, Option<f64>)
         }
         std::hint::black_box(tokens);
         let wall = Timed::per_execute(began.elapsed(), parses);
-        each.push((name, wall, cpu_since(cpu).map(|ns| ns as f64 / parses.max(1) as f64)));
+        each.push((
+            name,
+            wall,
+            cpu_since(cpu).map(|ns| ns as f64 / parses.max(1) as f64),
+        ));
     }
     Ok(each)
 }
@@ -371,7 +431,10 @@ fn insert_run(db: &Database, rows: u64, per_call: u64) -> anyhow::Result<Timed> 
                     // A hundred postings a document, each its own gram: (gram, doc) never repeats.
                     let doc = i / 100 + 1;
                     let gram = (i % 100) * 100_000 + mix(doc) % 100_000;
-                    posting.execute(vec![Value::Integer(gram as i64), Value::Integer(doc as i64)])?;
+                    posting.execute(vec![
+                        Value::Integer(gram as i64),
+                        Value::Integer(doc as i64),
+                    ])?;
                 }
                 Ok((started.elapsed(), cpu_since(cpu)))
             })
@@ -397,7 +460,10 @@ fn opts() -> anyhow::Result<Opts> {
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
-        let mut v = || args.next().ok_or_else(|| anyhow::anyhow!("{a} takes a value"));
+        let mut v = || {
+            args.next()
+                .ok_or_else(|| anyhow::anyhow!("{a} takes a value"))
+        };
         match a.as_str() {
             "--sql-api" => {}
             "--dir" => o.dir = PathBuf::from(v()?),
@@ -413,7 +479,10 @@ fn opts() -> anyhow::Result<Opts> {
             other => anyhow::bail!("unknown argument {other}"),
         }
     }
-    anyhow::ensure!(!o.dir.as_os_str().is_empty(), "--dir names where the databases go");
+    anyhow::ensure!(
+        !o.dir.as_os_str().is_empty(),
+        "--dir names where the databases go"
+    );
     std::fs::create_dir_all(&o.dir)?;
     Ok(o)
 }
@@ -474,16 +543,31 @@ pub fn main() -> anyhow::Result<()> {
                 None => None,
             };
             let t = match (shape.as_str(), &db) {
-                ("reapi", Some(db)) => reapi_run(db, reapi.as_deref().unwrap_or_default(), o.per_call)?,
+                ("reapi", Some(db)) => {
+                    reapi_run(db, reapi.as_deref().unwrap_or_default(), o.per_call)?
+                }
                 ("logsearch", Some(db)) => logsearch_run(db, o.pages, o.pages_per_call)?,
-                _ => insert_run(&fresh(&o.dir, &format!("insert-{run}.db"))?, o.rows, o.per_call)?,
+                _ => insert_run(
+                    &fresh(&o.dir, &format!("insert-{run}.db"))?,
+                    o.rows,
+                    o.per_call,
+                )?,
             };
             if let (Some(prefix), Some(guard)) = (&profile, profiler) {
                 crate::write_profile(&format!("{prefix}-{shape}-{run}"), &guard)?;
             }
-            let (inside, whole) = (Timed::per_execute(t.inside, t.executes), Timed::per_execute(t.whole, t.executes));
+            let (inside, whole) = (
+                Timed::per_execute(t.inside, t.executes),
+                Timed::per_execute(t.whole, t.executes),
+            );
             let cpu = t.cpu.map(|ns| ns as f64 / t.executes.max(1) as f64);
-            best = Some(best.map_or((inside, whole, cpu), |(i, w, c)| (i.min(inside), w.min(whole), c.zip(cpu).map(|(c, cpu)| c.min(cpu)))));
+            best = Some(best.map_or((inside, whole, cpu), |(i, w, c)| {
+                (
+                    i.min(inside),
+                    w.min(whole),
+                    c.zip(cpu).map(|(c, cpu)| c.min(cpu)),
+                )
+            }));
             if shape == "logsearch" {
                 checksums.push(t.checksum);
             }
@@ -494,7 +578,10 @@ pub fn main() -> anyhow::Result<()> {
                     "checksum": (shape == "logsearch").then(|| format!("{:016x}", t.checksum)) })
             );
         }
-        anyhow::ensure!(checksums.windows(2).all(|w| w.first() == w.last()), "the {shape} runs answered differently: {checksums:x?}");
+        anyhow::ensure!(
+            checksums.windows(2).all(|w| w.first() == w.last()),
+            "the {shape} runs answered differently: {checksums:x?}"
+        );
         if let Some((inside, whole, cpu)) = best {
             println!(
                 "{}",
