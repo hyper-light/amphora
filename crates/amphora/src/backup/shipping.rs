@@ -1141,14 +1141,19 @@ mod tests {
             db.exec(&format!("UPDATE t SET v = '{v}' WHERE id = 5"))
                 .unwrap();
         };
-        change(&db, "a");
-        prepared.ship().unwrap();
-        assert!(db.restart_log().unwrap(), "shipped, so it starts again");
-        change(&db, "b");
-        prepared.mends.ask(Lacks::Base { id });
-        assert!(rounds(&mut prepared, &mut copy), "a base for the proof");
-        let whole = prepared.shipper.latest_base().unwrap();
-        assert_ne!(whole, id);
+        // Twice: the second's base could keep the first's chunks, whose generation wrote few pages.
+        let mut whole = id;
+        for (before, after) in [("a", "b"), ("c", "d")] {
+            change(&db, before);
+            prepared.ship().unwrap();
+            assert!(db.restart_log().unwrap(), "shipped, so it starts again");
+            change(&db, after);
+            prepared.mends.ask(Lacks::Base { id: whole });
+            assert!(rounds(&mut prepared, &mut copy), "a base for the proof");
+            let ended = prepared.shipper.latest_base().unwrap();
+            assert_ne!(ended, whole);
+            whole = ended;
+        }
         let listed = blobs.list("db/base/", None, 10, until()).unwrap().objects;
         let (key, _) = listed.last().unwrap();
         let manifest = crate::backup::object::manifest(key, &blobs.get(key, until()).unwrap())
