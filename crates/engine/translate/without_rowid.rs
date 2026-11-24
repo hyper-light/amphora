@@ -14,9 +14,7 @@ use crate::translate::plan::{
 };
 use crate::translate::trigger_exec::{fire_trigger, get_triggers_including_temp, TriggerContext};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
-use crate::vdbe::insn::{
-    to_u32, HaltAction, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral,
-};
+use crate::vdbe::insn::{to_u32, HaltAction, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral};
 use crate::vdbe::BranchOffset;
 use crate::{Connection, LimboError, Result};
 use amphora_engine_parser::ast::{self, Expr, ResolveType};
@@ -328,55 +326,67 @@ pub(crate) fn check_constraints(
     force_abort: bool,
 ) -> Result<()> {
     let mut replacements = Vec::new();
-    let replace_flag = program.alloc_register();
-    program.emit_bool(false, replace_flag);
     let pk_count = table.primary_key_columns.len();
-    let key = pk_registers(program, table, image)?;
-    let ok = program.allocate_label();
-    program.emit_insn(Insn::NoConflict {
-        cursor_id: cursor,
-        target_pc: ok,
-        record_reg: key,
-        num_regs: pk_count,
-    });
-    if let Some(old) = old {
-        let old_key = pk_registers(program, table, old)?;
-        let different = program.allocate_label();
-        for (i, (name, _)) in table.primary_key_columns.iter().enumerate() {
-            let (_, col) = table
-                .get_column(name)
-                .ok_or_else(|| internal("primary key missing"))?;
-            program.emit_insn(Insn::Ne {
-                lhs: offset(key, i)?,
-                rhs: offset(old_key, i)?,
-                target_pc: different,
-                flags: Default::default(),
-                collation: Some(
-                    table
-                        .primary_key_constraint_collation(name)
-                        .unwrap_or_else(|| col.collation()),
-                ),
+    let (before, after): (Vec<_>, Vec<_>) = indexes
+        .iter()
+        .filter(|item| item.index.unique)
+        .partition(|item| table.checked_before_primary_key(&item.index));
+    let constraints = before
+        .into_iter()
+        .map(Some)
+        .chain([None])
+        .chain(after.into_iter().map(Some));
+    for constraint in constraints {
+        let Some(item) = constraint else {
+            let replace_flag = program.alloc_register();
+            program.emit_bool(false, replace_flag);
+            let key = pk_registers(program, table, image)?;
+            let ok = program.allocate_label();
+            program.emit_insn(Insn::NoConflict {
+                cursor_id: cursor,
+                target_pc: ok,
+                record_reg: key,
+                num_regs: pk_count,
             });
-        }
-        program.emit_insn(Insn::Goto { target_pc: ok });
-        program.preassign_label_to_next_insn(different);
-    }
-    let pk_conflict = if force_abort || program.flags.has_statement_conflict() {
-        conflict
-    } else {
-        primary_key_policy(table)
-    };
-    match pk_conflict {
-        ResolveType::Ignore => {
-            program.emit_insn(Insn::Goto { target_pc: skip });
-        }
-        ResolveType::Replace => {
-            replacements.push(queue_replace(program, table, cursor, replace_flag)?)
-        }
-        _ => halt_constraint(program, table, None, pk_conflict),
-    }
-    program.preassign_label_to_next_insn(ok);
-    for item in indexes.iter().filter(|i| i.index.unique) {
+            if let Some(old) = old {
+                let old_key = pk_registers(program, table, old)?;
+                let different = program.allocate_label();
+                for (i, (name, _)) in table.primary_key_columns.iter().enumerate() {
+                    let (_, col) = table
+                        .get_column(name)
+                        .ok_or_else(|| internal("primary key missing"))?;
+                    program.emit_insn(Insn::Ne {
+                        lhs: offset(key, i)?,
+                        rhs: offset(old_key, i)?,
+                        target_pc: different,
+                        flags: Default::default(),
+                        collation: Some(
+                            table
+                                .primary_key_constraint_collation(name)
+                                .unwrap_or_else(|| col.collation()),
+                        ),
+                    });
+                }
+                program.emit_insn(Insn::Goto { target_pc: ok });
+                program.preassign_label_to_next_insn(different);
+            }
+            let pk_conflict = if force_abort || program.flags.has_statement_conflict() {
+                conflict
+            } else {
+                primary_key_policy(table)
+            };
+            match pk_conflict {
+                ResolveType::Ignore => {
+                    program.emit_insn(Insn::Goto { target_pc: skip });
+                }
+                ResolveType::Replace => {
+                    replacements.push(queue_replace(program, table, cursor, replace_flag)?)
+                }
+                _ => halt_constraint(program, table, None, pk_conflict),
+            }
+            program.preassign_label_to_next_insn(ok);
+            continue;
+        };
         let replace_flag = program.alloc_register();
         program.emit_bool(false, replace_flag);
         let ok = program.allocate_label();

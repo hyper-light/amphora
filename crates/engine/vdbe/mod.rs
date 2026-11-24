@@ -3697,8 +3697,8 @@ impl Program {
         // path, already committed by halt()), so discarding cursor state here
         // would deliver a rollback outcome for work that commits below.
         let error_action = err.and_then(|err| state.error_action(err));
-        let keeps_prior_changes = matches!(err, Some(LimboError::RaiseIgnore))
-            || error_action == Some(ResolveType::Fail);
+        let keeps_prior_changes =
+            matches!(err, Some(LimboError::RaiseIgnore)) || error_action == Some(ResolveType::Fail);
         if (err.is_some() || state.execution_state.is_running()) && !keeps_prior_changes {
             execute::index_method_abort_statement_all(state);
         }
