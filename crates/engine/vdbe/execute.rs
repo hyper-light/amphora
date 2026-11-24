@@ -12666,7 +12666,7 @@ pub fn op_function(
                                         program
                                             .connection
                                             .dialect()
-                                            .format_rewritten_table_sql(&new_stmt)?,
+                                            .format_rewritten_table_sql(sql.as_str(), &new_stmt)?,
                                     )
                                 } else {
                                     // Other tables: only emit if we actually changed their FK targets.
@@ -12687,7 +12687,7 @@ pub fn op_function(
                                         program
                                             .connection
                                             .dialect()
-                                            .format_rewritten_table_sql(&new_stmt)?,
+                                            .format_rewritten_table_sql(sql.as_str(), &new_stmt)?,
                                     )
                                 }
                             }
@@ -13049,7 +13049,7 @@ pub fn op_function(
                                     program
                                         .connection
                                         .dialect()
-                                        .format_rewritten_table_sql(&new_stmt)?,
+                                        .format_rewritten_table_sql(sql.as_str(), &new_stmt)?,
                                 )
                             }
                             // Trigger SQL is rewritten by separate UPDATE statements
@@ -21942,6 +21942,32 @@ pub fn op_morsel_aggregate(
         )))
     };
     let connection = &program.connection;
+    // A term against a bound parameter takes the parameter's value now, for the column copy and
+    // the morsels alike (lane R9).
+    let bound;
+    let data: &crate::vdbe::insn::MorselAggregateData = if data
+        .filter
+        .iter()
+        .any(|p| matches!(p, crate::vdbe::morsel::Predicate::Parameter { .. }))
+    {
+        let mut filter = Vec::new();
+        filter
+            .try_reserve_exact(data.filter.len())
+            .map_err(|_| Box::new(LimboError::OutOfMemory))?;
+        for p in &data.filter {
+            filter.push(
+                p.bind(&state.parameters, connection.fp_digits())
+                    .map_err(refused)?,
+            );
+        }
+        bound = crate::vdbe::insn::MorselAggregateData {
+            filter,
+            ..(**data).clone()
+        };
+        &bound
+    } else {
+        data
+    };
     // G11 step 5 (CS.5): on the versioned storage the pager holds no table's rows; the table's
     // column copy answers when the planner chooses it, else the serial loop reads the rows.
     if let Some(switch) = connection.versioned.as_ref() {
