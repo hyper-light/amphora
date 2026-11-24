@@ -1030,6 +1030,7 @@ impl Statement {
                     .last_restore_epoch
                     .load(Ordering::Acquire)
                     != self.program.connection.db.shared_wal.restore_epoch()
+                || self.program.connection.has_stale_attached_restore_epoch()
             {
                 // MVCC checkpoints and quiescent external restores can replace the catalog without
                 // changing SQLite's `schema_cookie`, so refresh before deciding whether to

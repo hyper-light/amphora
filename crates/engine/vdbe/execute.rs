@@ -5510,12 +5510,30 @@ pub fn op_transaction_inner(
             // Can only read header if page 1 has been allocated already
             // begin_write_tx that happens, but not begin_read_tx
             OpTransactionState::CheckSchemaCookie => {
-                if is_main_db
-                    && program.prepare_context.restore_epoch
+                if is_main_db {
+                    if program.prepare_context.restore_epoch
                         != program.connection.db.shared_wal.restore_epoch()
-                {
-                    program.connection.maybe_update_schema();
-                    return Err(LimboError::SchemaUpdated.into());
+                    {
+                        program.connection.maybe_update_schema();
+                        return Err(LimboError::SchemaUpdated.into());
+                    }
+                } else if is_secondary_db {
+                    let live_epoch = program
+                        .connection
+                        .attached_databases()
+                        .read()
+                        .index_to_data
+                        .get(db)
+                        .map(|entry| entry.db.shared_wal.restore_epoch());
+                    let prepared_epoch = program
+                        .prepare_context
+                        .attached_restore_epochs
+                        .iter()
+                        .find_map(|&(id, epoch)| if id == *db { Some(epoch) } else { None });
+                    if live_epoch != prepared_epoch {
+                        program.connection.sync_attached_restore_epochs();
+                        return Err(LimboError::SchemaUpdated.into());
+                    }
                 }
                 let res = get_schema_cookie(&pager, mv_store.as_ref(), program, *db);
                 match res {

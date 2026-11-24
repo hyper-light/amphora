@@ -971,3 +971,51 @@ fn review_concurrent_log_switches_and_paused_readers_keep_exact_sum() {
         "expected paused readers to complete snapshot checks"
     );
 }
+
+/// Worth-Fixing 1 regression: if a read callback panics while holding an open read transaction on
+/// a reader connection, neither `ReadCheckout::Pool` nor `ReadCheckout::Slots` may retain the
+/// poisoned connection's stale snapshot for subsequent reads (and `Pool` must not leak `out`).
+#[test]
+fn worth_fixing_panic_inside_read_tx_never_serves_stale_data() {
+    use amphora::store::ReadCheckout;
+
+    for mode in [ReadCheckout::Pool, ReadCheckout::Slots] {
+        ReadCheckout::set_process_default(mode);
+        let config = Config {
+            readers: 1,
+            ..Config::default()
+        };
+        let lab = lab(config, None);
+        let store = &lab.store;
+
+        let t1 = store.put(vec![row("k", 1)]).unwrap();
+        store.durable(&t1, soon()).unwrap();
+        assert_eq!(count(store, "k"), 1);
+
+        // Panic mid-read-transaction without committing or rolling back.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: Option<anyhow::Result<()>> = store.on_reader(soon(), |db| {
+                db.exec("BEGIN")?;
+                let seen = count_on(db, "k")?;
+                assert_eq!(seen, 1);
+                panic!("simulated reader panic mid-transaction");
+            });
+        }));
+        assert!(
+            panicked.is_err(),
+            "expected panic inside read tx ({mode:?})"
+        );
+
+        // Commit a second row while the panicked reader was dropped.
+        let t2 = store.put(vec![row("k", 2)]).unwrap();
+        store.durable(&t2, soon()).unwrap();
+
+        // Subsequent reads MUST open a fresh reader and see the updated count 2 (not stale 1).
+        assert_eq!(
+            count(store, "k"),
+            2,
+            "reader slot/pool served stale snapshot after panic under {mode:?}"
+        );
+    }
+    ReadCheckout::set_process_default(ReadCheckout::Pool);
+}

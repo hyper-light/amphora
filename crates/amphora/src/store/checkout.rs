@@ -7,9 +7,9 @@
 //! 22's effect, LeanStore's rule: "programs that frequently write to memory locations accessed by
 //! multiple threads do not scale"). Here each reader lives in a slot of its own, on a line of its
 //! own; a thread takes the slot its number names, so at most as many threads as slots each write
-//! only their own slot's lock. A thread whose slot is busy tries the others; when all are, it waits
-//! on the pool's condition variable, and a read that ends wakes it only when someone waits (a read
-//! of a counter only waiters write).
+//! only their own slot's atomic state. When all slots are busy, waiters join a single global FIFO
+//! wait queue so a long read on one slot never blocks short reads from receiving any other slot
+//! that frees up; an uncontended read or release never touches the wait queue lock.
 //!
 //! Holding a slot is what holding the gate's read side was: the writer's restart of the log and
 //! the readers' release take every slot, so no read is under way meanwhile.
@@ -17,7 +17,7 @@
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering, fence};
 use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::thread::Thread;
+use std::thread::{Thread, ThreadId};
 use std::time::Instant;
 
 /// How a read takes its reader (the prototype's switch; `AMPHORA_READ_CHECKOUT` sets it for a
@@ -37,14 +37,14 @@ const UNSET: u8 = u8::MAX;
 
 impl ReadCheckout {
     /// The way stores started from now on take: `set_process_default`'s if called, else
-    /// `AMPHORA_READ_CHECKOUT` (read once), else `Slots`.
+    /// `AMPHORA_READ_CHECKOUT` (read once), else `Pool`.
     pub fn process_default() -> Self {
         static FROM_ENV: std::sync::OnceLock<ReadCheckout> = std::sync::OnceLock::new();
         match PROCESS_DEFAULT.load(Ordering::Relaxed) {
             UNSET => {
                 *FROM_ENV.get_or_init(|| match std::env::var("AMPHORA_READ_CHECKOUT").as_deref() {
-                    Ok("pool") => Self::Pool,
-                    _ => Self::Slots,
+                    Ok("slots") => Self::Slots,
+                    _ => Self::Pool,
                 })
             }
             1 => Self::Slots,
@@ -61,38 +61,29 @@ impl ReadCheckout {
 const SLOT_FREE: u8 = 0;
 const SLOT_HELD: u8 = 1;
 
-/// Packed layout of `Slot::wait_flags` (mutated only under `Slot::queue`, read lock-free on the
-/// release fast path):
-/// - bit 0 (`WOKEN_BIT`): the front waiter has been unparked for a barging wakeup and has not yet
-///   claimed a slot or re-parked, suppressing redundant wakeups while barging is active.
-/// - bit 1 (`HANDOFF_BIT`): the front waiter woke once and lost to a barger (observed starvation,
-///   no arbitrary timer), requesting direct FIFO handoff on the next release.
-/// - bits `2..`: number of live waiters queued on this slot.
-const WOKEN_BIT: usize = 1;
-const HANDOFF_BIT: usize = 2;
-const WAIT_SHIFT: u32 = 2;
-const WAIT_INC: usize = 1 << WAIT_SHIFT;
-
 /// A slot, alone on its cache line pair (the adjacent-line prefetcher pulls lines in pairs, so
 /// 128 bytes, as crossbeam's `CachePadded` aligns on x86_64 and aarch64). Each slot owns its own
-/// state, packed local waiter flags/count, reader, and FIFO queue so threads on disjoint slots
-/// share no locks and no writable cache lines under steady-state concurrency.
+/// atomic state and reader mutex so threads on disjoint slots share no locks and no writable cache
+/// lines while uncontended.
 #[repr(align(128))]
 struct Slot<R> {
     state: AtomicU8,
-    /// Packed `WOKEN_BIT | HANDOFF_BIT | (local_waiting << WAIT_SHIFT)` (mutated under `queue`).
-    wait_flags: AtomicUsize,
     reader: Mutex<Option<R>>,
-    queue: Mutex<SlotQueue>,
 }
 
-/// Cache-line-isolated aggregate counts:
-/// - `.0`: number of slots that currently have at least one queued read waiter (updated only on
-///   a slot's `0 -> 1` and `1 -> 0` `local_waiting` transitions, so steady-state contended readers
-///   never write this line).
-/// - `.1`: active `take_all()` drainers.
+/// Cache-line-isolated wait coordination shared only when all slots are busy or `take_all()` is
+/// draining. Uncontended reads and releases only perform shared-clean loads of `waiting` and
+/// `draining` without writing this cache line or taking `waiters`.
 #[repr(align(128))]
-struct PaddedCount(AtomicUsize, AtomicUsize);
+struct WaitState {
+    /// Number of live read waiters queued in `waiters` (plus transient +1 during enqueue Dekker
+    /// re-check).
+    waiting: AtomicUsize,
+    /// Number of active `take_all()` drainers.
+    draining: AtomicUsize,
+    /// Global FIFO wait queue across all slots, plus `take_all()` drainer registrations.
+    waiters: Mutex<WaitQueue>,
+}
 
 struct WaiterSlot {
     thread: Option<Thread>,
@@ -100,24 +91,24 @@ struct WaiterSlot {
     prev: Option<usize>,
     next: Option<usize>,
     queued: bool,
-    was_woken: bool,
 }
 
 #[derive(Default)]
-struct SlotQueue {
+struct WaitQueue {
     /// Head and tail of the intrusive FIFO doubly-linked list inside `entries` so any waiter
     /// timing out at any position unlinks and recycles its slot in O(1) without growing the queue.
     head: Option<usize>,
     tail: Option<usize>,
-    /// Reusable waiter slots (bounded by peak concurrent live waiters on this slot).
+    /// Reusable waiter slots (bounded by peak concurrent live waiters).
     entries: Vec<WaiterSlot>,
     /// Free indices in `entries`.
     free: Vec<usize>,
-    /// Threads currently inside `take_all()` waiting for this slot to become free.
-    drain_waiters: Vec<Thread>,
+    /// Threads currently inside `take_all()` waiting for a specific slot index to become free,
+    /// deduplicated by `(slot_idx, ThreadId)`.
+    drain_waiters: Vec<(usize, Thread)>,
 }
 
-impl SlotQueue {
+impl WaitQueue {
     fn push_back(&mut self, thread: Thread) -> usize {
         let prev = self.tail;
         let id = match self.free.pop() {
@@ -128,7 +119,6 @@ impl SlotQueue {
                     entry.prev = prev;
                     entry.next = None;
                     entry.queued = true;
-                    entry.was_woken = false;
                 }
                 id
             }
@@ -140,7 +130,6 @@ impl SlotQueue {
                     prev,
                     next: None,
                     queued: true,
-                    was_woken: false,
                 });
                 id
             }
@@ -215,17 +204,44 @@ impl SlotQueue {
             entry.prev = None;
             entry.next = None;
             entry.queued = false;
-            entry.was_woken = false;
             self.free.push(id);
         }
     }
+
+    fn register_drainer(&mut self, slot_idx: usize, thread: &Thread, tid: ThreadId) {
+        if !self
+            .drain_waiters
+            .iter()
+            .any(|(idx, t)| *idx == slot_idx && t.id() == tid)
+        {
+            self.drain_waiters.push((slot_idx, thread.clone()));
+        }
+    }
+
+    fn unregister_drainer(&mut self, slot_idx: usize, tid: ThreadId) {
+        self.drain_waiters
+            .retain(|(idx, t)| !(*idx == slot_idx && t.id() == tid));
+    }
+
+    fn take_drainers_for(&mut self, slot_idx: usize) -> Vec<Thread> {
+        let mut wake = Vec::new();
+        let mut keep = Vec::with_capacity(self.drain_waiters.len());
+        for (idx, thread) in self.drain_waiters.drain(..) {
+            if idx == slot_idx {
+                wake.push(thread);
+            } else {
+                keep.push((idx, thread));
+            }
+        }
+        self.drain_waiters = keep;
+        wake
+    }
 }
 
-/// The slots and their per-slot eventual-fairness FIFO queues.
+/// The slots and their shared global FIFO wait queue.
 pub(super) struct Slots<R> {
     slots: Box<[Slot<R>]>,
-    /// `.0`: slots with queued read waiters; `.1`: active `take_all()` drainers.
-    waiting: PaddedCount,
+    wait: WaitState,
 }
 
 /// A slot taken: its index, its reader (None until one is opened in it), and the slots, to hand
@@ -245,8 +261,8 @@ impl<R> Taken<'_, R> {
 
 impl<R> Drop for Taken<'_, R> {
     fn drop(&mut self) {
-        // Unlock the reader mutex first while `state == SLOT_HELD`, then hand off directly to a
-        // queued waiter or mark `SLOT_FREE`.
+        // Unlock the reader mutex first while `state == SLOT_HELD`, then hand off directly to the
+        // globally oldest queued waiter or mark `SLOT_FREE`.
         drop(self.slot.take());
         self.slots.release_slot(self.idx);
     }
@@ -280,12 +296,14 @@ impl<R> Slots<R> {
             slots: (0..most.max(1))
                 .map(|_| Slot {
                     state: AtomicU8::new(SLOT_FREE),
-                    wait_flags: AtomicUsize::new(0),
                     reader: Mutex::new(None),
-                    queue: Mutex::new(SlotQueue::default()),
                 })
                 .collect(),
-            waiting: PaddedCount(AtomicUsize::new(0), AtomicUsize::new(0)),
+            wait: WaitState {
+                waiting: AtomicUsize::new(0),
+                draining: AtomicUsize::new(0),
+                waiters: Mutex::new(WaitQueue::default()),
+            },
         }
     }
 
@@ -293,54 +311,11 @@ impl<R> Slots<R> {
         slot.reader.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn lock_slot_queue(slot: &Slot<R>) -> MutexGuard<'_, SlotQueue> {
-        slot.queue.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    #[inline]
-    fn inc_local_waiting(&self, slot: &Slot<R>) {
-        let prev = slot.wait_flags.fetch_add(WAIT_INC, Ordering::SeqCst);
-        if (prev >> WAIT_SHIFT) == 0 {
-            self.waiting.0.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    #[inline]
-    fn dec_local_waiting(&self, slot: &Slot<R>) {
-        let mut emptied = false;
-        let _ = slot
-            .wait_flags
-            .try_update(Ordering::SeqCst, Ordering::SeqCst, |prev| {
-                let count = prev >> WAIT_SHIFT;
-                if count <= 1 {
-                    emptied = count == 1;
-                    Some(0)
-                } else {
-                    emptied = false;
-                    Some(prev.saturating_sub(WAIT_INC))
-                }
-            });
-        if emptied {
-            self.waiting.0.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-
-    #[inline]
-    fn clear_front_bits(slot: &Slot<R>) {
-        slot.wait_flags
-            .fetch_and(!(WOKEN_BIT | HANDOFF_BIT), Ordering::SeqCst);
-    }
-
-    #[inline]
-    fn wake_front_barging(slot: &Slot<R>, queue: &mut SlotQueue) -> Option<Thread> {
-        if (slot.wait_flags.load(Ordering::Relaxed) & WOKEN_BIT) != 0 {
-            return None;
-        }
-        let front_id = queue.head?;
-        slot.wait_flags.fetch_or(WOKEN_BIT, Ordering::SeqCst);
-        let entry = queue.entries.get_mut(front_id)?;
-        entry.was_woken = true;
-        entry.thread.clone()
+    fn lock_waiters(&self) -> MutexGuard<'_, WaitQueue> {
+        self.wait
+            .waiters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     #[inline]
@@ -349,37 +324,8 @@ impl<R> Slots<R> {
         thread_number().checked_rem(len).unwrap_or(0)
     }
 
-    /// Marks `slot` free and wakes any `take_all()` drainers registered on it.
-    ///
-    /// Every transition back to `SLOT_FREE` must go through this helper so a concurrent `take_all()`
-    /// that registered and parked on `slot` can never miss its wakeup.
-    #[inline]
-    fn free_and_wake_drainers(&self, slot: &Slot<R>) -> bool {
-        slot.state.store(SLOT_FREE, Ordering::Release);
-        fence(Ordering::SeqCst);
-        if self.waiting.1.load(Ordering::Acquire) > 0 {
-            let drainers = {
-                let mut queue = Self::lock_slot_queue(slot);
-                std::mem::take(&mut queue.drain_waiters)
-            };
-            for thread in drainers {
-                thread.unpark();
-            }
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Claims one free slot via atomic CAS before `until`, probing `first` first without writing
-    /// cache lines of already-held slots. When `respect_fairness` is true, avoids barging past a
-    /// slot whose front waiter already observed starvation (`HANDOFF_BIT`).
-    fn try_claim_free_before(
-        &self,
-        first: usize,
-        respect_fairness: bool,
-        until: Instant,
-    ) -> Option<usize> {
+    /// Claims one free slot via atomic CAS without writing cache lines of already-held slots.
+    fn try_claim_any_free(&self, first: usize) -> Option<usize> {
         let len = self.slots.len();
         for offset in 0..len {
             let idx = first.checked_add(offset).map_or(0, |sum| {
@@ -395,11 +341,33 @@ impl<R> Slots<R> {
             if slot.state.load(Ordering::Relaxed) != SLOT_FREE {
                 continue;
             }
-            if respect_fairness {
-                let flags = slot.wait_flags.load(Ordering::Relaxed);
-                if (flags & HANDOFF_BIT) != 0 && (flags >> WAIT_SHIFT) > 0 {
-                    continue;
+            if slot
+                .state
+                .compare_exchange(SLOT_FREE, SLOT_HELD, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    /// Claims one free slot via atomic CAS before `until`.
+    fn try_claim_free_before(&self, first: usize, until: Instant) -> Option<usize> {
+        let len = self.slots.len();
+        for offset in 0..len {
+            let idx = first.checked_add(offset).map_or(0, |sum| {
+                if sum < len {
+                    sum
+                } else {
+                    sum.saturating_sub(len)
                 }
+            });
+            let Some(slot) = self.slots.get(idx) else {
+                continue;
+            };
+            if slot.state.load(Ordering::Relaxed) != SLOT_FREE {
+                continue;
             }
             if until.saturating_duration_since(Instant::now()).is_zero() {
                 return None;
@@ -437,17 +405,10 @@ impl<R> Slots<R> {
         })
     }
 
-    /// Hands off held slot `assigned_idx` directly to the front live FIFO waiter queued on
-    /// `owner_slot`, clearing `WOKEN_BIT | HANDOFF_BIT` so the next waiter starts cleanly.
-    fn handoff_from_slot(
-        &self,
-        owner_slot: &Slot<R>,
-        queue: &mut SlotQueue,
-        assigned_idx: usize,
-    ) -> Option<Thread> {
+    /// Hands off held slot `assigned_idx` directly to the globally oldest live FIFO waiter.
+    fn handoff_front(&self, queue: &mut WaitQueue, assigned_idx: usize) -> Option<Thread> {
         let front_id = queue.pop_front()?;
-        self.dec_local_waiting(owner_slot);
-        Self::clear_front_bits(owner_slot);
+        self.wait.waiting.fetch_sub(1, Ordering::SeqCst);
         if let Some(entry) = queue.entries.get_mut(front_id) {
             entry.assigned = Some(assigned_idx);
             entry.thread.take()
@@ -456,207 +417,160 @@ impl<R> Slots<R> {
         }
     }
 
-    /// Attempts to hand off held slot `idx` directly to another slot's waiter (work-stealing) when
-    /// `idx` itself has no queued waiters.
-    fn try_steal_handoff(&self, idx: usize) -> Option<Thread> {
-        if self.waiting.0.load(Ordering::Acquire) == 0 || self.waiting.1.load(Ordering::Acquire) > 0
-        {
+    /// A slot: a free one at once when uncontended (zero shared locks or shared cache-line
+    /// writes), or handed off in global FIFO order as soon as ANY slot frees before `until`
+    /// (None past it).
+    pub(super) fn take(&self, until: Instant) -> Option<Taken<'_, R>> {
+        if until.saturating_duration_since(Instant::now()).is_zero() {
             return None;
         }
-        let len = self.slots.len();
-        for offset in 1..len {
-            let other_idx = idx.checked_add(offset).map_or(0, |sum| {
-                if sum < len {
-                    sum
-                } else {
-                    sum.saturating_sub(len)
-                }
-            });
-            let Some(other) = self.slots.get(other_idx) else {
-                continue;
-            };
-            if (other.wait_flags.load(Ordering::Acquire) >> WAIT_SHIFT) == 0 {
-                continue;
-            }
-            let (wake, wake_next) = {
-                let mut queue = Self::lock_slot_queue(other);
-                if self.waiting.1.load(Ordering::Acquire) == 0 {
-                    let handed = self.handoff_from_slot(other, &mut queue, idx);
-                    let next =
-                        if handed.is_some() && other.state.load(Ordering::Acquire) == SLOT_FREE {
-                            Self::wake_front_barging(other, &mut queue)
-                        } else {
-                            None
-                        };
-                    (handed, next)
-                } else {
-                    (None, None)
-                }
-            };
-            if let Some(next_thread) = wake_next {
-                next_thread.unpark();
-            }
-            if wake.is_some() {
-                return wake;
-            }
+        let home_idx = self.home_index();
+        let start_idx = LAST_SLOT.with(|last| {
+            let v = last.get();
+            if v < self.slots.len() { v } else { home_idx }
+        });
+        if self.wait.draining.load(Ordering::Acquire) == 0
+            && self.wait.waiting.load(Ordering::Acquire) == 0
+            && let Some(idx) = self.try_claim_free_before(start_idx, until)
+        {
+            return self.finish_claimed_before(idx, until);
         }
-        None
-    }
+        if until.saturating_duration_since(Instant::now()).is_zero() {
+            return None;
+        }
 
-    /// Attempts to claim currently-free slot `idx` and hand it directly to another slot's queued
-    /// waiter. Never transitions `slot` to `SLOT_HELD` unless a live waiter is confirmed under the
-    /// target queue lock, so a failed steal never leaves `slot` temporarily held and can never
-    /// cause a missed wakeup for a concurrently arriving local waiter or drainer.
-    fn try_steal_from_free(&self, idx: usize, slot: &Slot<R>) -> Option<Thread> {
-        if self.waiting.0.load(Ordering::Acquire) == 0 || self.waiting.1.load(Ordering::Acquire) > 0
-        {
-            return None;
-        }
-        let len = self.slots.len();
-        for offset in 1..len {
-            if slot.state.load(Ordering::Acquire) != SLOT_FREE
-                || self.waiting.1.load(Ordering::Acquire) > 0
-            {
+        let mut to_wake = Vec::new();
+        let waiter_id = {
+            let mut queue = self.lock_waiters();
+            if until.saturating_duration_since(Instant::now()).is_zero() {
                 return None;
             }
-            let other_idx = idx.checked_add(offset).map_or(0, |sum| {
-                if sum < len {
-                    sum
+            // Publish our intent to wait (SeqCst) BEFORE scanning slots so any concurrent
+            // `release_slot` either frees its slot before this scan sees it, or observes
+            // `waiting > 0` after its SeqCst fence and hands the slot off under this lock.
+            self.wait.waiting.fetch_add(1, Ordering::SeqCst);
+            while self.wait.draining.load(Ordering::SeqCst) == 0 && queue.head.is_some() {
+                let Some(idx) = self.try_claim_any_free(start_idx) else {
+                    break;
+                };
+                if let Some(thread) = self.handoff_front(&mut queue, idx) {
+                    to_wake.push(thread);
                 } else {
-                    sum.saturating_sub(len)
-                }
-            });
-            let Some(other) = self.slots.get(other_idx) else {
-                continue;
-            };
-            if (other.wait_flags.load(Ordering::Acquire) >> WAIT_SHIFT) == 0 {
-                continue;
-            }
-            let (wake, wake_next, still_free) = {
-                let mut queue = Self::lock_slot_queue(other);
-                if self.waiting.1.load(Ordering::Acquire) == 0 && queue.head.is_some() {
-                    if slot
-                        .state
-                        .compare_exchange(
-                            SLOT_FREE,
-                            SLOT_HELD,
-                            Ordering::Acquire,
-                            Ordering::Relaxed,
-                        )
-                        .is_ok()
-                    {
-                        let handed = self.handoff_from_slot(other, &mut queue, idx);
-                        let next = if handed.is_some()
-                            && other.state.load(Ordering::Acquire) == SLOT_FREE
-                        {
-                            Self::wake_front_barging(other, &mut queue)
-                        } else {
-                            None
-                        };
-                        (handed, next, true)
-                    } else {
-                        (None, None, false)
+                    drop(queue);
+                    for thread in to_wake {
+                        thread.unpark();
                     }
-                } else {
-                    (None, None, true)
+                    return self.finish_claimed_before(idx, until);
                 }
-            };
-            if let Some(next_thread) = wake_next {
-                next_thread.unpark();
             }
-            if wake.is_some() {
-                return wake;
+            if self.wait.draining.load(Ordering::SeqCst) == 0
+                && queue.head.is_none()
+                && let Some(idx) = self.try_claim_free_before(start_idx, until)
+            {
+                self.wait.waiting.fetch_sub(1, Ordering::SeqCst);
+                drop(queue);
+                for thread in to_wake {
+                    thread.unpark();
+                }
+                return self.finish_claimed_before(idx, until);
             }
-            if !still_free {
+            queue.push_back(std::thread::current())
+        };
+        for thread in to_wake {
+            thread.unpark();
+        }
+
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            if !left.is_zero() {
+                std::thread::park_timeout(left);
+            }
+            let mut queue = self.lock_waiters();
+            // Sample expiry AFTER acquiring the queue lock so we never accept a slot that became
+            // available after our deadline while we waited for the mutex.
+            let expired = until.saturating_duration_since(Instant::now()).is_zero();
+            let assigned = queue
+                .entries
+                .get_mut(waiter_id)
+                .and_then(|entry| entry.assigned.take());
+            if let Some(idx) = assigned {
+                queue.recycle(waiter_id);
+                drop(queue);
+                if expired {
+                    self.release_slot(idx);
+                    return None;
+                }
+                return self.finish_claimed_before(idx, until);
+            }
+            if expired {
+                if queue.unlink(waiter_id) {
+                    self.wait.waiting.fetch_sub(1, Ordering::SeqCst);
+                }
+                queue.recycle(waiter_id);
                 return None;
             }
+            if queue.head == Some(waiter_id)
+                && self.wait.draining.load(Ordering::SeqCst) == 0
+                && let Some(idx) = self.try_claim_free_before(start_idx, until)
+            {
+                if queue.unlink(waiter_id) {
+                    self.wait.waiting.fetch_sub(1, Ordering::SeqCst);
+                }
+                queue.recycle(waiter_id);
+                drop(queue);
+                return self.finish_claimed_before(idx, until);
+            }
+            if let Some(entry) = queue.entries.get_mut(waiter_id)
+                && entry.thread.is_none()
+            {
+                entry.thread = Some(std::thread::current());
+            }
         }
-        None
     }
 
-    /// Wakes a local waiter after `slot` has been stored `SLOT_FREE` (with `fence(SeqCst)`
-    /// already executed):
-    /// - When no local waiter is queued, attempts to steal `slot` for another slot's waiter without
-    ///   temporarily marking `slot` held on failure, then re-checks for a newly arrived local
-    ///   waiter.
-    /// - When a local waiter is queued and `slot` is still `SLOT_FREE`, either hands `slot` off
-    ///   directly (`HANDOFF_BIT`) or wakes the front waiter (`WOKEN_BIT`).
-    /// - When a local waiter is queued and a barger already stole `slot` before we could wake the
-    ///   queue head, sets `HANDOFF_BIT` with a Dekker re-check of `SLOT_FREE` so continuous
-    ///   barging can never prevent the queue head from receiving a slot.
-    fn wake_local_after_free(&self, idx: usize, slot: &Slot<R>) {
-        let mut flags = slot.wait_flags.load(Ordering::Acquire);
-        if (flags >> WAIT_SHIFT) == 0 {
-            if self.waiting.0.load(Ordering::Acquire) > 0
-                && self.waiting.1.load(Ordering::Acquire) == 0
-                && let Some(thread) = self.try_steal_from_free(idx, slot)
-            {
+    /// Releases held slot `idx`. When waiters are queued and no `take_all()` drainer is active,
+    /// hands `idx` directly to the globally oldest FIFO waiter; otherwise marks `SLOT_FREE` and
+    /// performs a Dekker re-check for racing drainers or newly queued waiters.
+    fn release_slot(&self, idx: usize) {
+        let Some(slot) = self.slots.get(idx) else {
+            return;
+        };
+        if self.wait.draining.load(Ordering::Acquire) == 0
+            && self.wait.waiting.load(Ordering::Acquire) > 0
+        {
+            let wake = {
+                let mut queue = self.lock_waiters();
+                if self.wait.draining.load(Ordering::Acquire) == 0 {
+                    self.handoff_front(&mut queue, idx)
+                } else {
+                    None
+                }
+            };
+            if let Some(thread) = wake {
                 thread.unpark();
                 return;
             }
-            flags = slot.wait_flags.load(Ordering::Acquire);
-            if (flags >> WAIT_SHIFT) == 0 {
-                return;
-            }
         }
-        if slot.state.load(Ordering::Acquire) != SLOT_FREE {
-            // A barger already claimed the slot we just freed while a local waiter was queued:
-            // arm direct FIFO handoff lock-free (only while waiters remain), then Dekker re-check
-            // in case the barger already released before seeing `HANDOFF_BIT`. No queue lock is
-            // taken on this common barged path.
-            if (flags & HANDOFF_BIT) == 0 {
-                let _ = slot
-                    .wait_flags
-                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |f| {
-                        if (f >> WAIT_SHIFT) > 0 && (f & HANDOFF_BIT) == 0 {
-                            Some(f | HANDOFF_BIT)
-                        } else {
-                            None
-                        }
-                    });
+
+        slot.state.store(SLOT_FREE, Ordering::Release);
+        fence(Ordering::SeqCst);
+
+        if self.wait.draining.load(Ordering::Acquire) > 0 {
+            let drainers = {
+                let mut queue = self.lock_waiters();
+                queue.take_drainers_for(idx)
+            };
+            for thread in drainers {
+                thread.unpark();
             }
-            if self.waiting.1.load(Ordering::SeqCst) > 0
-                || slot.state.load(Ordering::SeqCst) != SLOT_FREE
-            {
-                return;
-            }
-            flags = slot.wait_flags.load(Ordering::Acquire);
-            if (flags >> WAIT_SHIFT) == 0 {
-                return;
-            }
-        }
-        if (flags & HANDOFF_BIT) == 0 && (flags & WOKEN_BIT) != 0 {
             return;
         }
-        let wake = {
-            let mut queue = Self::lock_slot_queue(slot);
-            if self.waiting.1.load(Ordering::Acquire) > 0 || queue.head.is_none() {
-                None
-            } else if slot.state.load(Ordering::Acquire) == SLOT_FREE {
-                let cur = slot.wait_flags.load(Ordering::Relaxed);
-                if (cur & HANDOFF_BIT) != 0 {
-                    if slot
-                        .state
-                        .compare_exchange(
-                            SLOT_FREE,
-                            SLOT_HELD,
-                            Ordering::Acquire,
-                            Ordering::Relaxed,
-                        )
-                        .is_ok()
-                    {
-                        self.handoff_from_slot(slot, &mut queue, idx)
-                    } else {
-                        None
-                    }
-                } else {
-                    Self::wake_front_barging(slot, &mut queue)
-                }
-            } else {
-                // Another barger arrived while we waited for the queue lock: arm `HANDOFF_BIT`
-                // and Dekker re-check `SLOT_FREE`.
-                slot.wait_flags.fetch_or(HANDOFF_BIT, Ordering::SeqCst);
-                if self.waiting.1.load(Ordering::SeqCst) == 0
+
+        if self.wait.waiting.load(Ordering::Acquire) > 0 {
+            let wake = {
+                let mut queue = self.lock_waiters();
+                if self.wait.draining.load(Ordering::Acquire) == 0
+                    && queue.head.is_some()
                     && slot
                         .state
                         .compare_exchange(
@@ -667,238 +581,21 @@ impl<R> Slots<R> {
                         )
                         .is_ok()
                 {
-                    self.handoff_from_slot(slot, &mut queue, idx)
+                    self.handoff_front(&mut queue, idx)
                 } else {
                     None
                 }
-            }
-        };
-        if let Some(thread) = wake {
-            thread.unpark();
-        }
-    }
-
-    /// After a front waiter leaves `home` (by expiry, steal, or claim) and the queue lock has been
-    /// dropped, unpark the next local front waiter if any, or if `home` is now free with an empty
-    /// local queue while another slot has queued waiters, hand `home` to one of those waiters.
-    fn wake_after_front_exit(
-        &self,
-        home_idx: usize,
-        home: &Slot<R>,
-        wake_next_front: Option<Thread>,
-        check_other_slots: bool,
-    ) {
-        if let Some(thread) = wake_next_front {
-            thread.unpark();
-        } else if check_other_slots
-            && self.waiting.0.load(Ordering::Acquire) > 0
-            && self.waiting.1.load(Ordering::Acquire) == 0
-            && home.state.load(Ordering::Acquire) == SLOT_FREE
-            && let Some(thread) = self.try_steal_from_free(home_idx, home)
-        {
-            thread.unpark();
-        }
-    }
-
-    /// A slot: a free one at once when uncontended or not starving, or woken/handed off in FIFO
-    /// order on this thread's home slot before `until` (None past it).
-    pub(super) fn take(&self, until: Instant) -> Option<Taken<'_, R>> {
-        if until.saturating_duration_since(Instant::now()).is_zero() {
-            return None;
-        }
-        let home_idx = self.home_index();
-        let start_idx = LAST_SLOT.with(|last| {
-            let v = last.get();
-            if v < self.slots.len() { v } else { home_idx }
-        });
-        if self.waiting.1.load(Ordering::Acquire) == 0
-            && let Some(idx) = self.try_claim_free_before(start_idx, true, until)
-        {
-            return self.finish_claimed_before(idx, until);
-        }
-        if until.saturating_duration_since(Instant::now()).is_zero() {
-            return None;
-        }
-
-        let home = self.slots.get(home_idx)?;
-        let waiter_id = {
-            let mut queue = Self::lock_slot_queue(home);
-            if until.saturating_duration_since(Instant::now()).is_zero() {
-                return None;
-            }
-            self.inc_local_waiting(home);
-            let front_empty = queue.head.is_none();
-            if self.waiting.1.load(Ordering::SeqCst) == 0
-                && front_empty
-                && let Some(idx) = self.try_claim_free_before(home_idx, false, until)
-            {
-                self.dec_local_waiting(home);
-                let check_other =
-                    idx != home_idx && home.state.load(Ordering::Acquire) == SLOT_FREE;
-                drop(queue);
-                self.wake_after_front_exit(home_idx, home, None, check_other);
-                return self.finish_claimed_before(idx, until);
-            }
-            queue.push_back(std::thread::current())
-        };
-
-        loop {
-            let left = until.saturating_duration_since(Instant::now());
-            if !left.is_zero() {
-                std::thread::park_timeout(left);
-            }
-            let mut wake_next_front = None;
-            let mut queue = Self::lock_slot_queue(home);
-            // Sample expiry AFTER acquiring the queue lock so we never accept a slot that became
-            // available after our deadline while we waited for the mutex.
-            let expired = until.saturating_duration_since(Instant::now()).is_zero();
-            let assigned = queue
-                .entries
-                .get_mut(waiter_id)
-                .and_then(|entry| entry.assigned.take());
-            if let Some(idx) = assigned {
-                queue.recycle(waiter_id);
-                let home_free_no_drain = self.waiting.1.load(Ordering::Acquire) == 0
-                    && home.state.load(Ordering::Acquire) == SLOT_FREE;
-                if home_free_no_drain {
-                    wake_next_front = Self::wake_front_barging(home, &mut queue);
-                }
-                let check_other = home_free_no_drain && queue.head.is_none();
-                drop(queue);
-                self.wake_after_front_exit(home_idx, home, wake_next_front, check_other);
-                if expired {
-                    self.release_slot(idx);
-                    return None;
-                }
-                return self.finish_claimed_before(idx, until);
-            }
-            let is_front = queue.head == Some(waiter_id);
-            if !expired
-                && self.waiting.1.load(Ordering::Acquire) == 0
-                && let Some(idx) = self.try_claim_free_before(home_idx, !is_front, until)
-            {
-                if queue.unlink(waiter_id) {
-                    self.dec_local_waiting(home);
-                }
-                queue.recycle(waiter_id);
-                let mut check_other = false;
-                if is_front {
-                    Self::clear_front_bits(home);
-                    if home.state.load(Ordering::Acquire) == SLOT_FREE {
-                        wake_next_front = Self::wake_front_barging(home, &mut queue);
-                        check_other = queue.head.is_none();
-                    }
-                }
-                drop(queue);
-                self.wake_after_front_exit(home_idx, home, wake_next_front, check_other);
-                return self.finish_claimed_before(idx, until);
-            }
-            if expired {
-                if queue.unlink(waiter_id) {
-                    self.dec_local_waiting(home);
-                }
-                queue.recycle(waiter_id);
-                let mut check_other = false;
-                if is_front {
-                    Self::clear_front_bits(home);
-                    if self.waiting.1.load(Ordering::Acquire) == 0
-                        && home.state.load(Ordering::Acquire) == SLOT_FREE
-                    {
-                        wake_next_front = Self::wake_front_barging(home, &mut queue);
-                        check_other = queue.head.is_none();
-                    }
-                }
-                drop(queue);
-                self.wake_after_front_exit(home_idx, home, wake_next_front, check_other);
-                return None;
-            }
-            if is_front {
-                let was_woken = queue
-                    .entries
-                    .get(waiter_id)
-                    .is_some_and(|entry| entry.was_woken);
-                if was_woken && self.waiting.1.load(Ordering::Acquire) == 0 {
-                    // We woke for a free slot and lost it to a barger: request direct FIFO handoff
-                    // on the next release so no waiter can starve, without any arbitrary timer.
-                    let _ = home
-                        .wait_flags
-                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |f| {
-                            Some((f & !WOKEN_BIT) | HANDOFF_BIT)
-                        });
-                } else {
-                    home.wait_flags.fetch_and(!WOKEN_BIT, Ordering::SeqCst);
-                }
-                // Dekker re-check after clearing WOKEN_BIT (and possibly setting HANDOFF_BIT).
-                if self.waiting.1.load(Ordering::SeqCst) == 0
-                    && let Some(idx) = self.try_claim_free_before(home_idx, false, until)
-                {
-                    if queue.unlink(waiter_id) {
-                        self.dec_local_waiting(home);
-                    }
-                    queue.recycle(waiter_id);
-                    Self::clear_front_bits(home);
-                    let mut check_other = false;
-                    if home.state.load(Ordering::Acquire) == SLOT_FREE {
-                        wake_next_front = Self::wake_front_barging(home, &mut queue);
-                        check_other = queue.head.is_none();
-                    }
-                    drop(queue);
-                    self.wake_after_front_exit(home_idx, home, wake_next_front, check_other);
-                    return self.finish_claimed_before(idx, until);
-                }
-            }
-            if let Some(entry) = queue.entries.get_mut(waiter_id)
-                && entry.thread.is_none()
-            {
-                entry.thread = Some(std::thread::current());
-            }
-        }
-    }
-
-    /// Releases held slot `idx`. When the front waiter observed starvation (`HANDOFF_BIT`), hands
-    /// `idx` directly in FIFO order; otherwise releases to `SLOT_FREE` and immediately wakes one
-    /// local waiter (if not already woken) or steals for another slot's waiter.
-    fn release_slot(&self, idx: usize) {
-        let Some(slot) = self.slots.get(idx) else {
-            return;
-        };
-        let draining = self.waiting.1.load(Ordering::Acquire) > 0;
-        let flags = slot.wait_flags.load(Ordering::Acquire);
-
-        if !draining {
-            if (flags & HANDOFF_BIT) != 0 && (flags >> WAIT_SHIFT) > 0 {
-                let wake = {
-                    let mut queue = Self::lock_slot_queue(slot);
-                    if self.waiting.1.load(Ordering::Acquire) == 0 {
-                        self.handoff_from_slot(slot, &mut queue, idx)
-                    } else {
-                        None
-                    }
-                };
-                if let Some(thread) = wake {
-                    thread.unpark();
-                    return;
-                }
-            } else if (flags >> WAIT_SHIFT) == 0
-                && self.waiting.0.load(Ordering::Acquire) > 0
-                && let Some(thread) = self.try_steal_handoff(idx)
-            {
+            };
+            if let Some(thread) = wake {
                 thread.unpark();
-                return;
             }
         }
-
-        if self.free_and_wake_drainers(slot) {
-            return;
-        }
-
-        self.wake_local_after_free(idx, slot);
     }
 
     /// Every slot, each once no read holds it: no read is under way while they are held, and the
-    /// reads that came meanwhile are handed slots in FIFO order when they are given back.
+    /// reads that came meanwhile are handed slots in global FIFO order when they are given back.
     pub(super) fn take_all(&self) -> All<'_, R> {
-        self.waiting.1.fetch_add(1, Ordering::SeqCst);
+        self.wait.draining.fetch_add(1, Ordering::SeqCst);
         let me = std::thread::current();
         let me_id = me.id();
         let mut held = Vec::with_capacity(self.slots.len());
@@ -911,13 +608,12 @@ impl<R> Slots<R> {
                     .is_ok()
                 {
                     if registered {
-                        let mut queue = Self::lock_slot_queue(slot);
-                        queue.drain_waiters.retain(|t| t.id() != me_id);
+                        self.lock_waiters().unregister_drainer(idx, me_id);
                     }
                     break;
                 }
                 {
-                    let mut queue = Self::lock_slot_queue(slot);
+                    let mut queue = self.lock_waiters();
                     if slot
                         .state
                         .compare_exchange(
@@ -929,13 +625,11 @@ impl<R> Slots<R> {
                         .is_ok()
                     {
                         if registered {
-                            queue.drain_waiters.retain(|t| t.id() != me_id);
+                            queue.unregister_drainer(idx, me_id);
                         }
                         break;
                     }
-                    if !queue.drain_waiters.iter().any(|t| t.id() == me_id) {
-                        queue.drain_waiters.push(me.clone());
-                    }
+                    queue.register_drainer(idx, &me, me_id);
                     registered = true;
                 }
                 std::thread::park();
@@ -947,7 +641,8 @@ impl<R> Slots<R> {
 }
 
 /// Every slot held (`Slots::take_all`, by the log's restart and the readers' release). A read that
-/// found them all held queues in FIFO order, and giving them back hands slots to waiting reads.
+/// found them all held queues in global FIFO order, and giving them back hands slots to waiting
+/// reads.
 pub(super) struct All<'a, R> {
     held: Vec<(usize, MutexGuard<'a, Option<R>>)>,
     slots: &'a Slots<R>,
@@ -963,35 +658,9 @@ impl<R> All<'_, R> {
 impl<R> Drop for All<'_, R> {
     fn drop(&mut self) {
         let indices: Vec<usize> = self.held.drain(..).map(|(idx, _)| idx).collect();
-        let _ = self.slots.waiting.1.fetch_sub(1, Ordering::SeqCst);
-        let mut to_wake = Vec::new();
+        let _ = self.slots.wait.draining.fetch_sub(1, Ordering::SeqCst);
         for idx in indices {
-            if self.slots.waiting.1.load(Ordering::Acquire) == 0 {
-                let handed = if let Some(home) = self.slots.slots.get(idx)
-                    && (home.wait_flags.load(Ordering::Acquire) >> WAIT_SHIFT) > 0
-                {
-                    let mut queue = Slots::<R>::lock_slot_queue(home);
-                    if self.slots.waiting.1.load(Ordering::Acquire) == 0 {
-                        self.slots.handoff_from_slot(home, &mut queue, idx)
-                    } else {
-                        None
-                    }
-                } else {
-                    self.slots.try_steal_handoff(idx)
-                };
-                if let Some(thread) = handed {
-                    to_wake.push(thread);
-                    continue;
-                }
-            }
-            if let Some(slot) = self.slots.slots.get(idx)
-                && !self.slots.free_and_wake_drainers(slot)
-            {
-                self.slots.wake_local_after_free(idx, slot);
-            }
-        }
-        for thread in to_wake {
-            thread.unpark();
+            self.slots.release_slot(idx);
         }
     }
 }
@@ -1036,6 +705,16 @@ mod tests {
 
     fn far() -> Instant {
         Instant::now() + Duration::from_secs(600)
+    }
+
+    fn park_for(duration: Duration) {
+        let target = Instant::now() + duration;
+        while Instant::now() < target {
+            let remaining = target.saturating_duration_since(Instant::now());
+            if !remaining.is_zero() {
+                std::thread::park_timeout(remaining);
+            }
+        }
     }
 
     /// G3 step 6 (prototype F, T-G3.6.3). Do: 16 threads read 500 times each through 4 slots. Expect: every
@@ -1101,8 +780,8 @@ mod tests {
             .slots
             .as_ref()
             .unwrap()
+            .wait
             .waiting
-            .0
             .load(Ordering::SeqCst)
             == 0
         {
@@ -1124,7 +803,7 @@ mod tests {
             let all = slots.take_all();
             let waiter =
                 s.spawn(|| readers.with(Instant::now() + Duration::from_secs(60), |_| Ok(7)));
-            while slots.waiting.0.load(Ordering::SeqCst) == 0 {
+            while slots.wait.waiting.load(Ordering::SeqCst) == 0 {
                 std::thread::yield_now();
             }
             drop(all);
@@ -1191,8 +870,7 @@ mod tests {
                     .unwrap()
                     .unwrap();
                 }));
-                while (slots.slots[0].wait_flags.load(Ordering::Acquire) >> super::WAIT_SHIFT) < id
-                {
+                while slots.wait.waiting.load(Ordering::Acquire) < id {
                     std::thread::yield_now();
                 }
             }
@@ -1206,8 +884,75 @@ mod tests {
         assert_eq!(*order.lock().unwrap(), vec![1, 2, 3, 4]);
     }
 
-    /// P1 regression: racing `take_all()` against returning readers attempting cross-slot steal
-    /// handoffs must never leave the drainer parked on a free slot.
+    /// Blocker 4 regression: with 4 slots and 64 concurrent clients where 1 client holds a slot
+    /// for a long read (350 ms), none of the other 63 short readers may get stuck behind that
+    /// slot; all 63 complete via the remaining 3 slots with zero refusals under a 250 ms deadline.
+    #[test]
+    fn blocker_short_reads_never_stall_behind_one_long_read() {
+        let (readers, _, _) = readers(4);
+        let (long_held_tx, long_held_rx) = mpsc::channel::<()>();
+        let (long_done_tx, long_done_rx) = mpsc::channel::<()>();
+
+        let refused = AtomicUsize::new(0);
+        let max_wait = std::sync::Mutex::new(Duration::ZERO);
+
+        std::thread::scope(|s| {
+            let r_long = readers.clone();
+            let long_reader = s.spawn(move || {
+                r_long
+                    .with(far(), |_| {
+                        long_held_tx.send(()).unwrap();
+                        let _ = long_done_rx.recv_timeout(Duration::from_millis(350));
+                        Ok(())
+                    })
+                    .unwrap()
+                    .unwrap();
+            });
+            long_held_rx.recv().unwrap();
+
+            let short_handles: Vec<_> = (0..63)
+                .map(|_| {
+                    let r = readers.clone();
+                    let refused = &refused;
+                    let max_wait = &max_wait;
+                    s.spawn(move || {
+                        for _ in 0..8 {
+                            let start = Instant::now();
+                            let res = r.with(start + Duration::from_millis(250), |_| {
+                                park_for(Duration::from_micros(200));
+                                Ok(())
+                            });
+                            let elapsed = start.elapsed();
+                            let mut best = max_wait.lock().unwrap();
+                            if elapsed > *best {
+                                *best = elapsed;
+                            }
+                            drop(best);
+                            if !matches!(res, Some(Ok(()))) {
+                                refused.fetch_add(1, Ordering::SeqCst);
+                            }
+                        }
+                    })
+                })
+                .collect();
+
+            for handle in short_handles {
+                handle.join().unwrap();
+            }
+            let _ = long_done_tx.send(());
+            long_reader.join().unwrap();
+        });
+
+        let refusals = refused.load(Ordering::SeqCst);
+        let worst = *max_wait.lock().unwrap();
+        assert_eq!(
+            refusals, 0,
+            "short readers stalled behind long reader on another slot: {refusals} refused, worst wait {worst:?}"
+        );
+    }
+
+    /// P1 regression: racing `take_all()` against returning readers must never leave the drainer
+    /// parked on a free slot.
     #[test]
     fn p1_take_all_never_parks_forever_when_racing_release_steal_backout() {
         let (readers, _, _) = readers(2);
@@ -1256,7 +1001,7 @@ mod tests {
 
             let r_head = readers.clone();
             let head_waiter = s.spawn(move || r_head.with(far(), |_| Ok(99)).unwrap().unwrap());
-            while (slots.slots[0].wait_flags.load(Ordering::Acquire) >> super::WAIT_SHIFT) < 1 {
+            while slots.wait.waiting.load(Ordering::Acquire) < 1 {
                 std::thread::yield_now();
             }
 
@@ -1270,9 +1015,9 @@ mod tests {
             }
 
             {
-                let queue = super::Slots::lock_slot_queue(&slots.slots[0]);
+                let queue = slots.lock_waiters();
                 assert_eq!(
-                    slots.slots[0].wait_flags.load(Ordering::Acquire) >> super::WAIT_SHIFT,
+                    slots.wait.waiting.load(Ordering::Acquire),
                     1,
                     "only the head waiter may remain queued"
                 );
@@ -1298,8 +1043,6 @@ mod tests {
         let mut min_latency = Duration::MAX;
         let mut max_latency = Duration::ZERO;
 
-        // Run several rounds and check the minimum wake latency so isolated OS scheduling jitter
-        // does not flake, while a 3 ms timer-based wake stalls every single round.
         for _ in 0..8 {
             let (hold_tx, hold_rx) = mpsc::channel::<Instant>();
             let (held_tx, held_rx) = mpsc::channel::<()>();
@@ -1321,7 +1064,7 @@ mod tests {
                 let r_wait = readers.clone();
                 let waiter =
                     s.spawn(move || r_wait.with(far(), |_| Ok(Instant::now())).unwrap().unwrap());
-                while (slots.slots[0].wait_flags.load(Ordering::Acquire) >> super::WAIT_SHIFT) < 1 {
+                while slots.wait.waiting.load(Ordering::Acquire) < 1 {
                     std::thread::yield_now();
                 }
                 let release_start = Instant::now();
@@ -1340,8 +1083,8 @@ mod tests {
         );
     }
 
-    /// Review blocker 3b & fairness regression: adaptive observed-starvation handoff must ensure
-    /// queued waiters make progress even under continuous barging, without arbitrary timer constants.
+    /// Review blocker 3b & fairness regression: direct FIFO handoff must ensure queued waiters
+    /// make progress even under continuous barging, without arbitrary timer constants.
     #[test]
     fn review_bargers_cannot_starve_queued_waiter_under_adaptive_handoff() {
         struct StopOnDrop<'a>(&'a AtomicBool);
@@ -1375,13 +1118,10 @@ mod tests {
     }
 
     /// Review P1/P2 regression: a waiter that wakes at its expired deadline must return `Timeout`
-    /// without claiming a slot or running its callback past the deadline (without hanging the test
-    /// if the waiter expires before the coordinator observes its queue count), and on a multi-slot
-    /// pool releasing a slot with no local waiter wakes a waiter queued on another slot while a
-    /// local waiter also wakes on a free slot.
+    /// without claiming a slot or running its callback past the deadline, and releasing one of two
+    /// slots wakes a waiting reader immediately.
     #[test]
     fn review_expired_waiter_never_runs_past_deadline_and_local_waiter_wakes_on_free_slot() {
-        // Part 1: expired waiter never runs its callback even when a slot is held across expiry.
         let (readers_one, _, _) = readers(1);
         let slots_one = readers_one.slots.as_ref().unwrap();
         let (held_tx, held_rx) = mpsc::channel();
@@ -1415,11 +1155,10 @@ mod tests {
                 res
             });
             while !waiter_done.load(Ordering::Acquire)
-                && (slots_one.slots[0].wait_flags.load(Ordering::Acquire) >> super::WAIT_SHIFT) < 1
+                && slots_one.wait.waiting.load(Ordering::Acquire) < 1
             {
                 std::thread::yield_now();
             }
-            // Wait until the waiter finishes timing out while the holder still owns the slot.
             while !waiter_done.load(Ordering::Acquire) {
                 std::thread::park_timeout(Duration::from_millis(5));
             }
@@ -1439,7 +1178,6 @@ mod tests {
             );
         });
 
-        // Part 2: two-slot cross-slot handoff and local-slot wakeup.
         let (readers_two, _, _) = readers(2);
         let slots_two = readers_two.slots.as_ref().unwrap();
         let (h0_held_tx, h0_held_rx) = mpsc::channel();
@@ -1472,8 +1210,6 @@ mod tests {
             });
             h1_held_rx.recv().unwrap();
 
-            // Queue two waiters on separate threads (likely spanning both slots, or both on one
-            // slot so releasing the other exercises cross-slot handoff).
             let mut waiters = Vec::new();
             for i in 0..2 {
                 let rw = readers_two.clone();
@@ -1483,10 +1219,9 @@ mod tests {
                         .unwrap()
                 }));
             }
-            while slots_two.waiting.0.load(Ordering::Acquire) == 0 {
+            while slots_two.wait.waiting.load(Ordering::Acquire) < 2 {
                 std::thread::yield_now();
             }
-            // Releasing just one holder must promptly wake a waiter (locally or cross-slot).
             h0_rel_tx.send(()).unwrap();
             holder0.join().unwrap();
             h1_rel_tx.send(()).unwrap();
@@ -1529,19 +1264,14 @@ mod tests {
             });
             let drainer_thread = drainer_tid_rx.recv().unwrap();
 
-            while super::Slots::lock_slot_queue(&slots.slots[0])
-                .drain_waiters
-                .is_empty()
-            {
+            while slots.lock_waiters().drain_waiters.is_empty() {
                 std::thread::yield_now();
             }
             for _ in 0..50 {
                 drainer_thread.unpark();
                 std::thread::yield_now();
             }
-            let count = super::Slots::lock_slot_queue(&slots.slots[0])
-                .drain_waiters
-                .len();
+            let count = slots.lock_waiters().drain_waiters.len();
 
             rel_tx.send(()).unwrap();
             holder.join().unwrap();
@@ -1559,7 +1289,6 @@ mod tests {
     #[test]
     fn p1_expired_deadline_never_claims_idle_slot() {
         let (readers, _, _) = readers(2);
-        // Warm an idle slot first.
         assert_eq!(readers.with(far(), |_| Ok(1)).unwrap().unwrap(), 1);
         let ran = AtomicBool::new(false);
         let past = Instant::now()
@@ -1582,11 +1311,13 @@ mod tests {
         );
     }
 
-    /// Spec P1-3 regression: with waiters on slots A and B, if B releases while its local waiter
-    /// is still queued and that waiter resumes expired, B must be handed to A's waiter while A
-    /// remains held, and B's expired waiter must return `None` (never executed).
+    /// Spec P1-3 & Standards P2-6 regression: if a front waiter is handed a freed slot after its
+    /// deadline expires, it must reject the slot without running its callback and immediately hand
+    /// the slot onward to the next queued waiter while the other slot remains pinned. The deadline
+    /// is computed inside the waiter right before entering checkout and the coordinator observes
+    /// completion as well as registration so scheduler delay can never hang the test.
     #[test]
-    fn p1_expired_local_waiter_hands_free_slot_to_waiter_on_other_slot() {
+    fn p1_expired_front_waiter_hands_slot_to_next_waiter_while_other_slot_held() {
         let (readers, _, _) = readers(2);
         let slots = readers.slots.as_ref().unwrap();
         let (h0_held_tx, h0_held_rx) = mpsc::channel();
@@ -1594,7 +1325,7 @@ mod tests {
         let (h0_rel_tx, h0_rel_rx) = mpsc::channel();
         let (h1_rel_tx, h1_rel_rx) = mpsc::channel();
 
-        let (wa_res, wb_res, wb_ran) = std::thread::scope(|s| {
+        let (w_live_res, w_exp_res, w_exp_ran) = std::thread::scope(|s| {
             let r0 = readers.clone();
             let holder0 = s.spawn(move || {
                 r0.with(far(), |_| {
@@ -1606,8 +1337,6 @@ mod tests {
                 .unwrap();
             });
             h0_held_rx.recv().unwrap();
-            let h0_slot =
-                usize::from(slots.slots[1].state.load(Ordering::Acquire) == super::SLOT_HELD);
 
             let r1 = readers.clone();
             let holder1 = s.spawn(move || {
@@ -1621,222 +1350,79 @@ mod tests {
             });
             h1_held_rx.recv().unwrap();
 
-            // Place one long-lived waiter on `a_slot` and one short-deadline waiter on `b_slot`.
-            let r_a = readers.clone();
-            let waiter_a =
-                s.spawn(move || r_a.with(Instant::now() + Duration::from_secs(2), |_| Ok(42)));
-            while slots.waiting.0.load(Ordering::Acquire) < 1 {
-                std::thread::yield_now();
-            }
-            let a_slot = usize::from(
-                (slots.slots[1].wait_flags.load(Ordering::Acquire) >> super::WAIT_SHIFT) > 0,
-            );
-            let b_slot = 1 - a_slot;
-
-            // Parallel tests also increment `thread_number()`, so pick a fresh thread whose
-            // `home_index()` maps to `b_slot` before invoking `with(...)`.
-            let wb_ran = Arc::new(AtomicBool::new(false));
-            let wb_deadline = Instant::now() + Duration::from_millis(25);
-            let waiter_b = loop {
-                let (ok_tx, ok_rx) = mpsc::channel();
-                let r_b = readers.clone();
-                let ran = wb_ran.clone();
-                let handle = s.spawn(move || {
-                    if r_b.slots.as_ref().unwrap().home_index() != b_slot {
-                        let _ = ok_tx.send(false);
-                        return None;
-                    }
-                    let _ = ok_tx.send(true);
-                    r_b.with(wb_deadline, |_| {
-                        ran.store(true, Ordering::SeqCst);
-                        Ok(99)
-                    })
+            let exp_ran = Arc::new(AtomicBool::new(false));
+            let exp_done = Arc::new(AtomicBool::new(false));
+            let (exp_deadline_tx, exp_deadline_rx) = mpsc::channel();
+            let r_exp = readers.clone();
+            let ran_flag = exp_ran.clone();
+            let done_flag = exp_done.clone();
+            let waiter_exp = s.spawn(move || {
+                // Compute deadline right before entering checkout so thread spawn jitter never
+                // expires it before queuing.
+                let deadline = Instant::now() + Duration::from_millis(80);
+                exp_deadline_tx.send(deadline).unwrap();
+                let res = r_exp.with(deadline, |_| {
+                    ran_flag.store(true, Ordering::SeqCst);
+                    Ok(99)
                 });
-                if ok_rx.recv().unwrap() {
-                    break handle;
-                }
-                let _ = handle.join();
-            };
-            while (slots.slots[b_slot].wait_flags.load(Ordering::Acquire) >> super::WAIT_SHIFT) < 1
+                done_flag.store(true, Ordering::Release);
+                res
+            });
+            let exp_deadline = exp_deadline_rx.recv().unwrap();
+            while !exp_done.load(Ordering::Acquire)
+                && slots.wait.waiting.load(Ordering::Acquire) < 1
             {
                 std::thread::yield_now();
             }
 
-            // Hold `b_slot`'s queue lock until `wb_deadline` has definitely passed (looping around
-            // `park_timeout` so any stray unpark token cannot exit early) so `waiter_b` stays
-            // queued when `holder_b` releases `b_slot`, then resumes expired and hands free
-            // `b_slot` over to `waiter_a` while `a_slot` remains pinned.
-            let b_queue_guard = slots.slots[b_slot].queue.lock().unwrap();
-            let target_time = wb_deadline.checked_add(Duration::from_millis(5)).unwrap();
-            while Instant::now() < target_time {
-                let remaining = target_time.saturating_duration_since(Instant::now());
-                if !remaining.is_zero() {
-                    std::thread::park_timeout(remaining);
-                }
-            }
-            let (b_tx, b_holder, a_tx, a_holder) = if h0_slot == b_slot {
-                (h0_rel_tx, holder0, h1_rel_tx, holder1)
-            } else {
-                (h1_rel_tx, holder1, h0_rel_tx, holder0)
-            };
-            b_tx.send(()).unwrap();
-            while slots.slots[b_slot].state.load(Ordering::Acquire) != super::SLOT_FREE {
+            let r_live = readers.clone();
+            let waiter_live =
+                s.spawn(move || r_live.with(Instant::now() + Duration::from_secs(5), |_| Ok(42)));
+            while !exp_done.load(Ordering::Acquire)
+                && slots.wait.waiting.load(Ordering::Acquire) < 2
+            {
                 std::thread::yield_now();
             }
-            drop(b_queue_guard);
 
-            b_holder.join().unwrap();
-            let wa = waiter_a.join().unwrap();
-            let wb = waiter_b.join().unwrap();
-            a_tx.send(()).unwrap();
-            a_holder.join().unwrap();
-            (wa, wb, wb_ran.load(Ordering::SeqCst))
+            // Hold the waiters mutex past `exp_deadline` so `waiter_exp` stays queued as the front
+            // waiter when it expires, then release `holder0` (which will hand slot 0 to
+            // `waiter_exp` as soon as we drop the mutex, or directly to `waiter_live` if
+            // `waiter_exp` already unlinked itself). Either way, `waiter_live` MUST complete while
+            // `holder1` stays pinned.
+            let queue_guard = slots.lock_waiters();
+            let past_deadline = exp_deadline + Duration::from_millis(10);
+            while Instant::now() < past_deadline {
+                let rem = past_deadline.saturating_duration_since(Instant::now());
+                if !rem.is_zero() {
+                    std::thread::park_timeout(rem);
+                }
+            }
+            drop(queue_guard);
+
+            h0_rel_tx.send(()).unwrap();
+            holder0.join().unwrap();
+
+            // Waiter 2 must finish while holder 1 is STILL holding its slot!
+            let live_res = waiter_live.join().unwrap();
+            let exp_res = waiter_exp.join().unwrap();
+
+            h1_rel_tx.send(()).unwrap();
+            holder1.join().unwrap();
+            (live_res, exp_res, exp_ran.load(Ordering::SeqCst))
         });
 
-        let (wa_res, wb_res, wb_ran) = (wa_res, wb_res, wb_ran);
-        assert!(
-            !wb_ran,
-            "expired waiter on slot B must not execute its callback"
-        );
+        assert!(!w_exp_ran, "expired waiter must not execute its callback");
         assert!(
             matches!(
-                wb_res.unwrap().unwrap_err().downcast_ref::<Refused>(),
+                w_exp_res.unwrap().unwrap_err().downcast_ref::<Refused>(),
                 Some(Refused::Timeout)
             ),
-            "expired waiter on slot B must return Refused::Timeout"
+            "expired waiter must return Refused::Timeout"
         );
         assert_eq!(
-            wa_res.unwrap().unwrap(),
+            w_live_res.unwrap().unwrap(),
             42,
-            "waiter on slot A must wake via cross-slot handoff while holder A stays pinned"
-        );
-    }
-
-    /// Standards P1-1 regression: if a front waiter on slot A claims slot B on its final Dekker
-    /// retry while slot A is free and A's queue becomes empty, it must still hand slot A to a
-    /// waiter queued on slot B instead of stranding that waiter beside an idle slot.
-    #[test]
-    fn p1_final_retry_claiming_other_slot_wakes_waiter_on_other_slot() {
-        let (readers, _, _) = readers(2);
-        let slots = readers.slots.as_ref().unwrap();
-        for _ in 0..16 {
-            let (h0_held_tx, h0_held_rx) = mpsc::channel();
-            let (h1_held_tx, h1_held_rx) = mpsc::channel();
-            let (h0_rel_tx, h0_rel_rx) = mpsc::channel();
-            let (h1_rel_tx, h1_rel_rx) = mpsc::channel();
-
-            let (wa_res, wb_res) = std::thread::scope(|s| {
-                let r0 = readers.clone();
-                let holder0 = s.spawn(move || {
-                    r0.with(far(), |_| {
-                        h0_held_tx.send(()).unwrap();
-                        h0_rel_rx.recv().unwrap();
-                        Ok(())
-                    })
-                    .unwrap()
-                    .unwrap();
-                });
-                h0_held_rx.recv().unwrap();
-
-                let r1 = readers.clone();
-                let holder1 = s.spawn(move || {
-                    r1.with(far(), |_| {
-                        h1_held_tx.send(()).unwrap();
-                        h1_rel_rx.recv().unwrap();
-                        Ok(())
-                    })
-                    .unwrap()
-                    .unwrap();
-                });
-                h1_held_rx.recv().unwrap();
-
-                let r_a = readers.clone();
-                let waiter_a =
-                    s.spawn(move || r_a.with(Instant::now() + Duration::from_secs(1), |_| Ok(1)));
-                while slots.waiting.0.load(Ordering::Acquire) < 1 {
-                    std::thread::yield_now();
-                }
-                let a_slot = usize::from(
-                    (slots.slots[1].wait_flags.load(Ordering::Acquire) >> super::WAIT_SHIFT) > 0,
-                );
-                let b_slot = 1 - a_slot;
-
-                let waiter_b = loop {
-                    let (ok_tx, ok_rx) = mpsc::channel();
-                    let r_b = readers.clone();
-                    let handle = s.spawn(move || {
-                        if r_b.slots.as_ref().unwrap().home_index() != b_slot {
-                            let _ = ok_tx.send(false);
-                            return None;
-                        }
-                        let _ = ok_tx.send(true);
-                        r_b.with(Instant::now() + Duration::from_secs(1), |_| Ok(2))
-                    });
-                    if ok_rx.recv().unwrap() {
-                        break handle;
-                    }
-                    let _ = handle.join();
-                };
-                while (slots.slots[b_slot].wait_flags.load(Ordering::Acquire) >> super::WAIT_SHIFT)
-                    < 1
-                {
-                    std::thread::yield_now();
-                }
-
-                // Deterministic check: keep `b_slot` held, free `a_slot` by releasing `holder0`
-                // only after `waiter_a` exits `a_slot`'s queue onto `b_slot`, verifying
-                // `wake_after_front_exit(a_slot, true)` wakes `waiter_b` even while `b_slot` stays
-                // busy.
-                waiter_a.thread().unpark();
-                h1_rel_tx.send(()).unwrap();
-                h0_rel_tx.send(()).unwrap();
-                holder0.join().unwrap();
-                holder1.join().unwrap();
-                (waiter_a.join().unwrap(), waiter_b.join().unwrap())
-            });
-            assert_eq!(wa_res.unwrap().unwrap(), 1);
-            assert_eq!(wb_res.unwrap().unwrap(), 2);
-        }
-
-        // Deterministic proof of the exact Standards P1-1 handoff: both slots are held directly,
-        // `waiter_b` parks on `queued_slot`, and `free_slot = 1 - queued_slot` (empty queue) is
-        // flipped directly to `SLOT_FREE` without invoking `release_slot`. Calling
-        // `wake_after_front_exit(free_slot, &slots.slots[free_slot], None, true)` (the exact call
-        // made when a front waiter on `free_slot` claims `queued_slot` on its final retry) MUST
-        // wake `waiter_b` so it claims `free_slot` while `queued_slot` stays pinned BUSY.
-        let s0 = slots
-            .try_claim_free_before(0, false, far())
-            .expect("slot 0 free");
-        let s1 = slots
-            .try_claim_free_before(0, false, far())
-            .expect("slot 1 free");
-        assert_ne!(s0, s1);
-
-        let wb_only = std::thread::scope(|s| {
-            let r_b = readers.clone();
-            let waiter_b =
-                s.spawn(move || r_b.with(Instant::now() + Duration::from_millis(500), |_| Ok(77)));
-            while slots.waiting.0.load(Ordering::Acquire) < 1 {
-                std::thread::yield_now();
-            }
-            let queued_slot = usize::from(
-                (slots.slots[1].wait_flags.load(Ordering::Acquire) >> super::WAIT_SHIFT) > 0,
-            );
-            let free_slot = 1 - queued_slot;
-
-            slots.slots[free_slot]
-                .state
-                .store(super::SLOT_FREE, Ordering::Release);
-            slots.wake_after_front_exit(free_slot, &slots.slots[free_slot], None, true);
-
-            let res = waiter_b.join().unwrap();
-            slots.release_slot(queued_slot);
-            res
-        });
-        assert_eq!(
-            wb_only.unwrap().unwrap(),
-            77,
-            "wake_after_front_exit must wake the waiter on the other slot while its home slot stays held"
+            "live waiter must receive the freed slot while the other slot stays pinned"
         );
     }
 
@@ -1849,11 +1435,9 @@ mod tests {
         let past = Instant::now()
             .checked_sub(Duration::from_millis(1))
             .unwrap_or_else(Instant::now);
-        // Even if a CAS raced with expiry, `finish_claimed_before` must release the slot and return
-        // `None` rather than letting expired work run.
-        assert!(slots.try_claim_free_before(0, false, past).is_none());
+        assert!(slots.try_claim_free_before(0, past).is_none());
         let claimed = slots
-            .try_claim_free_before(0, false, far())
+            .try_claim_free_before(0, far())
             .expect("slot 0 is free");
         assert!(
             slots.finish_claimed_before(claimed, past).is_none(),

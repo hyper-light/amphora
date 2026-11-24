@@ -54,7 +54,7 @@ const MIN_PROCESS_PAGES: usize = 4096;
 
 /// Whose shared pages a database's connections read through (docs/design/store.md, decisions 20
 /// and 26): a page one connection read in, the others read from memory. [`Db::open`] defaults to
-/// [`Sharing::Process`] unless `AMPHORA_SHARE_PAGES=off` is set.
+/// [`Sharing::Off`]; callers opt in with [`Db::open_sharing`] or [`Db::share_pages`].
 #[derive(Clone)]
 pub enum Sharing {
     /// The process's pool ([`process_pages`]), which every database opened so joins.
@@ -89,20 +89,8 @@ fn connect_opts() -> ConnectOpts {
 /// ends, by its end or by its request's deadline ([`Db::deadline`]), which releases the lock (lane
 /// constants-22, goal "no picked constants": the 1 ms retried 10,000 times is gone). The busy
 /// timeout isn't set per request: the engine's setter makes every cached statement prepare again.
-fn default_page_path() -> PagePath {
-    static PATH: OnceLock<PagePath> = OnceLock::new();
-    *PATH.get_or_init(|| {
-        if std::env::var_os("AMPHORA_PAGE_PATH").is_some_and(|v| v == "today") {
-            PagePath::Today
-        } else {
-            PagePath::Plain
-        }
-    })
-}
-
 fn connect(db: &Arc<Database>) -> Result<Arc<Connection>, LimboError> {
     let conn = db.connect(connect_opts())?;
-    conn.get_pager().set_page_path(default_page_path());
     conn.set_busy_timeout(Duration::MAX);
     Ok(conn)
 }
@@ -326,6 +314,11 @@ impl Db {
     /// Bound SQL VM work by the request's absolute deadline without `Arc` reference-count traffic.
     /// The owning caller drops this guard before COMMIT/ROLLBACK cleanup, so cancellation cannot
     /// interrupt recovery of its session.
+    ///
+    /// MERGE NOTE (`origin/main`): `origin/main` also ends reads when `conn.get_pager().read_ended()`
+    /// becomes true (`Db::end_closing_reads`). When merging `origin/main`, wire `pager.read_ended()`
+    /// directly into `ProgramState::check_progress_handler` alongside the fast deadline check so
+    /// closing reads still end without reintroducing per-query `Arc`/closure allocations.
     pub(crate) fn deadline(&self, until: Instant) -> Deadline<'_> {
         // An administrative cancellation quantum, not a throughput tuning claim. A SQL VM can
         // execute at most 1024 further instructions between deadline checks.
@@ -368,7 +361,7 @@ impl Db {
     /// journal: a transaction ([`Db::transaction`]) is committed whole or rolled back whole, so one
     /// that fails is never undone alone (docs/design/store.md, decision 7).
     pub fn open(path: &Path) -> anyhow::Result<Self> {
-        Self::open_sharing(path, &Sharing::Process)
+        Self::open_sharing(path, &Sharing::Off)
     }
 
     /// [`Db::open`], its connections reading through `sharing`'s pages.
@@ -388,7 +381,7 @@ impl Db {
 
     /// [`Db::open`] on `io`: the system's files, or a simulator's disk.
     pub fn open_with(path: &Path, io: Arc<dyn IO>) -> anyhow::Result<Self> {
-        Self::open_with_sharing(path, io, &Sharing::Process)
+        Self::open_with_sharing(path, io, &Sharing::Off)
     }
 
     /// [`Db::open_with`], its connections reading through `sharing`'s pages. A pool the caller

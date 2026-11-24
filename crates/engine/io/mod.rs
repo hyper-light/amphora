@@ -331,6 +331,10 @@ pub struct TempFile {
 }
 
 impl TempFile {
+    pub(crate) fn is_disk_backed(&self) -> bool {
+        self.temp_dir.is_some()
+    }
+
     pub fn new(io: &Arc<dyn IO>) -> Result<Self> {
         #[cfg(not(target_family = "wasm"))]
         {

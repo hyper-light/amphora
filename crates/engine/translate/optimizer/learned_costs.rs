@@ -877,20 +877,25 @@ impl AtomicWeightsSlot {
 }
 
 /// Lock-free, `Arc`-free generation-tagged ring buffer holding derived planner weights, cost
-/// margin, and row nanos, backed by two alternating low-churn calibrated anchor slots.
+/// margin, and row nanos, backed by two alternating low-churn calibrated anchor slots and a
+/// write-once initial calibrated anchor.
 ///
 /// Writers (serialized by `LearnedCosts::rates`) write `next_gen = published_gen + 1` into
-/// `slots[next_gen & 7]` and advance `published_gen` ONLY after that slot's sequence is even.
-/// On the first calibrated publication (and periodically thereafter), writers also alternate
-/// writing the calibrated snapshot into `anchors[anchor_gen & 1]`. Because at most one anchor
-/// slot can ever be mid-write at a time, even under sustained writer lapping a reader can always
-/// fall back to a valid calibrated snapshot without blocking, spinning, or degrading to static
-/// defaults.
+/// `slots[next_gen & 7]` and advance `published_gen` FIRST (Release) before updating `anchors` or
+/// `first_calibrated`. Consequently:
+/// - No fallback reader can ever observe a generation newer than `published_gen` (preventing
+///   sequential reads from observing publications out of order).
+/// - Once any calibrated publication completes, `first_calibrated` is set permanently and never
+///   mutated again, so fallback reads never degrade to static defaults (`weights: None`) under
+///   any adversarial thread interleaving without blocking or spinning.
 #[derive(Debug)]
 struct WeightsRing {
     slots: [AtomicWeightsSlot; 8],
-    /// Two alternating sticky calibrated anchor slots (never both mid-write at once).
+    /// Two alternating sticky calibrated anchor slots (updated only after `published_gen`).
     anchors: [AtomicWeightsSlot; 2],
+    /// Permanent write-once calibrated fallback set on the first calibrated publication so even
+    /// an adversarial schedule lapping both `slots` and `anchors` never loses calibration.
+    first_calibrated: std::sync::OnceLock<WeightsSnapshot>,
     /// Monotonic generation of the most recently completed ring publication.
     published_gen: AtomicU64,
     /// Monotonic generation of the most recently completed calibrated anchor publication.
@@ -903,6 +908,7 @@ impl WeightsRing {
         let ring = Self {
             slots: std::array::from_fn(|_| AtomicWeightsSlot::new()),
             anchors: std::array::from_fn(|_| AtomicWeightsSlot::new()),
+            first_calibrated: std::sync::OnceLock::new(),
             published_gen: AtomicU64::new(0),
             anchor_gen: AtomicU64::new(0),
         };
@@ -924,12 +930,15 @@ impl WeightsRing {
         self.anchors.get(idx).unwrap_or(first)
     }
 
-    /// Publishes `snap` into the next ring slot (and an alternating anchor slot when calibrated)
-    /// and advances `published_gen` once complete. Caller must hold `LearnedCosts::rates`.
+    /// Publishes `snap` into the next ring slot, advances `published_gen` FIRST so fast readers
+    /// can already see `next_gen`, and only then refreshes the alternating calibrated anchors and
+    /// permanent `first_calibrated` fallback. Caller must hold `LearnedCosts::rates`.
     fn store(&self, snap: WeightsSnapshot) {
         let next_gen = self.published_gen.load(Ordering::Relaxed).wrapping_add(1);
         self.slot(next_gen).write(next_gen, snap);
+        self.published_gen.store(next_gen, Ordering::Release);
         if snap.weights.is_some() {
+            let _ = self.first_calibrated.set(snap);
             let cur_anchor = self.anchor_gen.load(Ordering::Relaxed);
             // Always capture the first two calibrated publications into both anchor slots so a
             // complete quiet backup exists immediately, then refresh at most every 64 publishes.
@@ -939,7 +948,6 @@ impl WeightsRing {
                 self.anchor_gen.store(next_anchor, Ordering::Release);
             }
         }
-        self.published_gen.store(next_gen, Ordering::Release);
     }
 
     /// Reads the latest published `WeightsSnapshot` with bounded non-spinning attempts (one pass
@@ -958,7 +966,9 @@ impl WeightsRing {
 
     /// Non-blocking fallback when every generation-matched attempt was lapped by an active writer:
     /// picks the newest coherent ring slot `<= published_gen`, or else one of the two alternating
-    /// calibrated anchor slots (at least one of which is always quiet and even once calibrated).
+    /// calibrated anchor slots, or else the wait-free write-once `first_calibrated` snapshot.
+    /// Every source here is only written AFTER `published_gen` advances past its generation, so a
+    /// subsequent fast read can never observe an older generation.
     #[cold]
     fn try_load_fallback(&self) -> Option<WeightsSnapshot> {
         let max_gen = self.published_gen.load(Ordering::Acquire);
@@ -990,7 +1000,7 @@ impl WeightsRing {
                 }
             }
         }
-        None
+        self.first_calibrated.get().copied()
     }
 }
 
@@ -3173,6 +3183,37 @@ mod ab_tests {
             fallback.weights.is_some(),
             "contended snapshot fallback must preserve valid calibration rather than static defaults"
         );
+
+        // Standards P2-4 regression: even when ALL 8 ring slots AND BOTH alternating anchor slots
+        // are simultaneously marked in-flight (odd) while `rates` is held, `load_snapshot_slow()`
+        // must still return calibrated weights from `first_calibrated` (never `weights: None`),
+        // and `try_load_fallback()` must never return a generation newer than `published_gen`.
+        let other_anchor = costs.snapshot.anchor(active_anchor.wrapping_add(1));
+        let other_seq = other_anchor.seq.load(Ordering::Relaxed);
+        other_anchor.seq.store(other_seq | 1, Ordering::Release);
+        let fallback_all_busy = costs.load_snapshot_slow();
+        assert!(
+            fallback_all_busy.weights.is_some(),
+            "all slots and anchors busy must still preserve calibration via first_calibrated"
+        );
+        // Restore slots and verify `published_gen` precedes anchor update across 64 publications.
+        other_anchor.seq.store(other_seq & !1, Ordering::Release);
+        busy_anchor.seq.store(anchor_seq & !1, Ordering::Release);
+        for slot in &costs.snapshot.slots {
+            let s = slot.seq.load(Ordering::Relaxed);
+            slot.seq.store(s & !1, Ordering::Release);
+        }
         drop(_held_again);
+
+        for i in 0..70u64 {
+            costs.observe(Work::Seek, EPOCH, EPOCH * (150.0 + (i as f64)));
+            let g = costs.snapshot.published_gen.load(Ordering::Acquire);
+            let anchor_g = costs.snapshot.anchor_gen.load(Ordering::Acquire);
+            assert!(
+                anchor_g <= g,
+                "anchor generation {anchor_g} must never precede published_gen {g}"
+            );
+            assert!(costs.weights().is_some());
+        }
     }
 }

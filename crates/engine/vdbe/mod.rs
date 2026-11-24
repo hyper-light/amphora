@@ -1141,34 +1141,6 @@ impl RegisterSpares {
         Some(blob)
     }
 
-    #[inline(always)]
-    pub(crate) fn push_text(&mut self, mut text: String, max_count: usize) {
-        let cap = text.capacity();
-        if cap > 0
-            && cap <= crate::storage::buffer_pool::BufferPool::DEFAULT_PAGE_SIZE
-            && self.texts.len() < max_count
-            && self.total_bytes.saturating_add(cap) <= KEPT_EPHEMERAL_BYTES
-        {
-            text.clear();
-            self.total_bytes = self.total_bytes.saturating_add(cap);
-            self.texts.push(text);
-        }
-    }
-
-    #[inline(always)]
-    pub(crate) fn push_blob(&mut self, mut blob: crate::types::ValueBlob, max_count: usize) {
-        let cap = blob.capacity();
-        if cap > 0
-            && cap <= crate::storage::buffer_pool::BufferPool::DEFAULT_PAGE_SIZE
-            && self.blobs.len() < max_count
-            && self.total_bytes.saturating_add(cap) <= KEPT_EPHEMERAL_BYTES
-        {
-            blob.clear();
-            self.total_bytes = self.total_bytes.saturating_add(cap);
-            self.blobs.push(blob);
-        }
-    }
-
     pub(crate) fn clear(&mut self) {
         self.texts.clear();
         self.blobs.clear();
@@ -1365,14 +1337,15 @@ impl ProgramState {
             self.registers = registers.into_boxed_slice();
         }
         // Amphora: a statement prepared again has other cursors; the same one runs again on what
-        // it kept.
+        // it kept. Never retain idle sorters, hash tables, group tables, or register spares across
+        // `reset()` so idle cached statements hold zero uncharged working memory (Worth-Fixing 2).
         let keep_ephemeral = max_cursors.is_none();
         if !keep_ephemeral {
             self.ephemeral_kept.clear();
-            self.spare_sorters.clear();
-            self.spare_hash_tables.clear();
-            self.spare_group_tables.clear();
         }
+        self.spare_sorters.clear();
+        self.spare_hash_tables.clear();
+        self.spare_group_tables.clear();
         // reset cursors as they can have cached information which will be no longer relevant on next program execution
         for (cursor_id, (cursor, context)) in self
             .cursors
@@ -1398,10 +1371,6 @@ impl ProgramState {
                     crate::storage::btree::CursorTrait::recycle(cursor)
                 }
                 Some(Cursor::Dyn(cursor, ..)) => cursor.recycle(),
-                Some(Cursor::Sorter(mut sorter)) if keep_ephemeral && sorter.can_reuse() => {
-                    sorter.clear_for_reuse();
-                    self.spare_sorters.insert(cursor_id, sorter);
-                }
                 _ => {}
             }
             *context = None;
@@ -1416,35 +1385,10 @@ impl ProgramState {
         self.index_method_finalize_subprogram_keys = None;
         self.index_method_finalize_subprogram = 0;
         self.index_methods_finalized = false;
-        let keep_register_spares = max_registers.is_none();
-        if !keep_register_spares {
-            self.register_spares.clear();
-        }
-        let max_spares = self.registers.len();
+        self.register_spares.clear();
         for r in self.registers.iter_mut() {
             match r {
-                Register::Value(v) => {
-                    if keep_register_spares {
-                        match v {
-                            Value::Text(_) => {
-                                if let Value::Text(text) = std::mem::replace(v, Value::Null) {
-                                    if let std::borrow::Cow::Owned(s) = text.value {
-                                        self.register_spares.push_text(s, max_spares);
-                                    }
-                                }
-                                continue;
-                            }
-                            Value::Blob(_) => {
-                                if let Value::Blob(blob) = std::mem::replace(v, Value::Null) {
-                                    self.register_spares.push_blob(blob, max_spares);
-                                }
-                                continue;
-                            }
-                            _ => {}
-                        }
-                    }
-                    *v = Value::Null;
-                }
+                Register::Value(v) => *v = Value::Null,
                 _ => r.set_null(),
             }
         }
@@ -1492,14 +1436,7 @@ impl ProgramState {
             self.bloom_filters.clear();
         }
         if !self.hash_tables.is_empty() {
-            if keep_ephemeral {
-                self.hash_tables
-                    .move_into(&mut self.spare_hash_tables, |ht| {
-                        ht.can_reuse() && ht.clear().is_ok()
-                    });
-            } else {
-                self.hash_tables.clear();
-            }
+            self.hash_tables.clear();
         }
         if !self.join_switches.is_empty() {
             self.join_switches.clear();
@@ -1510,19 +1447,7 @@ impl ProgramState {
         self.handoff_open = false;
         self.handoff_asked = false;
         if !self.group_tables.is_empty() {
-            if keep_ephemeral {
-                self.group_tables
-                    .move_into(&mut self.spare_group_tables, |gt| {
-                        if gt.can_reuse() {
-                            gt.clear_entries();
-                            true
-                        } else {
-                            false
-                        }
-                    });
-            } else {
-                self.group_tables.clear();
-            }
+            self.group_tables.clear();
         }
         self.morsel_rows = None;
         self.rows_timed = None;
@@ -2265,6 +2190,9 @@ pub struct PrepareContext {
     /// External-restore epoch at prepare time so statements prepared before a quiescent external
     /// restore always reprepare even when the restored database shares the same `schema_cookie`.
     pub(crate) restore_epoch: u64,
+    /// `(db_id, restore_epoch)` snapshots for attached databases at prepare time (empty, zero
+    /// heap allocation when no databases are attached).
+    pub(crate) attached_restore_epochs: Vec<(usize, u64)>,
 }
 
 impl PrepareContext {
@@ -2273,6 +2201,7 @@ impl PrepareContext {
             database_ptr: connection.database_ptr(),
             generation: connection.prepare_context_generation(),
             restore_epoch: connection.db.shared_wal.restore_epoch(),
+            attached_restore_epochs: connection.attached_restore_epochs_snapshot(),
         }
     }
 
@@ -2281,6 +2210,19 @@ impl PrepareContext {
         self.database_ptr == connection.database_ptr()
             && self.generation == connection.prepare_context_generation()
             && self.restore_epoch == connection.db.shared_wal.restore_epoch()
+            && (self.attached_restore_epochs.is_empty()
+                || self.attached_restore_epochs_match(connection))
+    }
+
+    #[inline(never)]
+    fn attached_restore_epochs_match(&self, connection: &Connection) -> bool {
+        let attached = connection.attached_databases().read();
+        self.attached_restore_epochs.iter().all(|&(db_id, epoch)| {
+            attached
+                .index_to_data
+                .get(&db_id)
+                .is_some_and(|entry| entry.db.shared_wal.restore_epoch() == epoch)
+        })
     }
 }
 
@@ -5504,5 +5446,57 @@ mod shuttle_tests {
             },
             1000,
         );
+    }
+
+    /// Worth-Fixing 2 regression: resetting finished statements must drop all spare sorters, hash
+    /// tables, group tables, and register string/blob spares so 100 idle cached statements do not
+    /// retain tens of megabytes of uncharged working memory.
+    #[test]
+    fn worth_fixing_idle_reset_statements_retain_zero_spares() {
+        let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
+        let opts = crate::OpenOptions::new(Arc::new(crate::SqliteDialect));
+        let db = crate::Database::open(io, ":memory:", opts).unwrap();
+        let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, payload TEXT)")
+            .unwrap();
+        conn.execute("BEGIN").unwrap();
+        let pad = "p".repeat(1024);
+        for i in 1..=200i64 {
+            conn.execute(format!("INSERT INTO t VALUES ({i}, {}, '{pad}')", i % 20))
+                .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+
+        let queries = [
+            "SELECT id, payload FROM t ORDER BY g DESC, id",
+            "SELECT g, COUNT(*), MAX(payload) FROM t GROUP BY g",
+            "SELECT DISTINCT payload FROM t",
+            "SELECT a.id, b.payload FROM t a JOIN t b ON a.g = b.g LIMIT 50",
+        ];
+        let mut stmts = Vec::new();
+        for i in 0..100usize {
+            let mut stmt = conn.prepare(queries[i % queries.len()]).unwrap();
+            let _ = stmt.run_collect_rows().unwrap();
+            stmt.reset().unwrap();
+            assert!(
+                stmt.state.spare_sorters.is_empty(),
+                "idle reset statement {i} retained spare_sorters"
+            );
+            assert!(
+                stmt.state.spare_hash_tables.is_empty(),
+                "idle reset statement {i} retained spare_hash_tables"
+            );
+            assert!(
+                stmt.state.spare_group_tables.is_empty(),
+                "idle reset statement {i} retained spare_group_tables"
+            );
+            assert!(
+                stmt.state.register_spares.texts.is_empty()
+                    && stmt.state.register_spares.blobs.is_empty(),
+                "idle reset statement {i} retained register_spares"
+            );
+            stmts.push(stmt);
+        }
+        assert_eq!(stmts.len(), 100);
     }
 }

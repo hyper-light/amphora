@@ -1130,8 +1130,6 @@ impl PagePath {
     }
 
     /// The process's switch, read once: `AMPHORA_PAGE_PATH=plain`.
-    /// (`crates/amphora` opts its own connections into `Plain` by default unless
-    /// `AMPHORA_PAGE_PATH=today`.)
     pub fn switched() -> Self {
         static PATH: crate::sync::LazyLock<PagePath> = crate::sync::LazyLock::new(|| {
             if std::env::var_os("AMPHORA_PAGE_PATH").is_some_and(|value| value == "plain") {
@@ -1957,7 +1955,13 @@ impl SharedPagerState {
     }
 
     #[cfg(feature = "conn_raw_api")]
-    pub(crate) fn set_restored_page_info(&self, page_size: PageSize, reserved_space: Option<u8>) {
+    pub(crate) fn set_restored_page_info(
+        &self,
+        page_size: PageSize,
+        reserved_space: Option<u8>,
+        init_page_1: Option<PageRef>,
+    ) {
+        self.init_page_1.store(init_page_1);
         self.page_size.store(page_size.get(), Ordering::SeqCst);
         let encoded = reserved_space.map_or(RESERVED_SPACE_NOT_SET, u16::from);
         self.restored_reserved_space
@@ -3804,31 +3808,40 @@ impl Pager {
                 self.clear_page_cache(false);
                 // Invalidate cached schema cookie to force re-read on next access
                 self.set_schema_cookie(None);
-                // After a quiescent external restore, the database may have switched page size or
-                // reserved-space/checksum layout: align this pager's encryption/checksum context
-                // with `SharedPagerState`.
-                if let Some(size) = PageSize::new(self.shared.page_size.load(Ordering::Acquire)) {
-                    self.reset_page_size_in_encryption_ctx(size);
-                }
-                if let Some(reserved) = self.shared.restored_reserved_space() {
-                    self.set_reserved_space(reserved);
-                    if !self.is_encryption_ctx_set() && !self.has_external_page_codec() {
-                        if reserved != crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES {
-                            self.reset_checksum_context();
-                        } else {
-                            {
-                                let mut io_ctx = self.io_ctx.write();
-                                io_ctx.restore_checksum();
-                            }
-                            if let Some(wal) = self.wal.as_ref() {
-                                wal.set_io_context(self.io_ctx.read().clone());
-                            }
-                        }
+                self.sync_restored_pager_state();
+            }
+        }
+        Ok(())
+    }
+
+    /// Aligns connection-local pager geometry, checksum/encryption context, and page-1 allocation
+    /// state with `SharedPagerState` after a full cache invalidation (such as a quiescent external
+    /// restore that changed page size, reserved space, or crossed the empty-database boundary).
+    fn sync_restored_pager_state(&self) {
+        *self.allocate_page1_state.write() = if self.shared.init_page_1.load().is_some() {
+            AllocatePage1State::Start
+        } else {
+            AllocatePage1State::Done
+        };
+        if let Some(size) = PageSize::new(self.shared.page_size.load(Ordering::Acquire)) {
+            self.reset_page_size_in_encryption_ctx(size);
+        }
+        if let Some(reserved) = self.shared.restored_reserved_space() {
+            self.set_reserved_space(reserved);
+            if !self.is_encryption_ctx_set() && !self.has_external_page_codec() {
+                if reserved != crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES {
+                    self.reset_checksum_context();
+                } else {
+                    {
+                        let mut io_ctx = self.io_ctx.write();
+                        io_ctx.restore_checksum();
+                    }
+                    if let Some(wal) = self.wal.as_ref() {
+                        wal.set_io_context(self.io_ctx.read().clone());
                     }
                 }
             }
         }
-        Ok(())
     }
 
     /// The pages the cache holds: how large an ephemeral table is (`ProgramState::reset`), and what
@@ -3872,6 +3885,7 @@ impl Pager {
             // Prevents stale page cache reads after MVCC checkpoints update the DB file.
             self.clear_page_cache(false);
             self.set_schema_cookie(None);
+            self.sync_restored_pager_state();
         }
     }
 
@@ -3879,7 +3893,15 @@ impl Pager {
     pub fn maybe_allocate_page1(&self) -> IOResultOr<()> {
         if !self.db_initialized() {
             if let Some(_lock) = self.shared.init_lock.try_lock() {
-                return Ok(self.allocate_page1()?.map(|_| ()));
+                if !self.db_initialized() {
+                    let mut state = self.allocate_page1_state.write();
+                    if matches!(*state, AllocatePage1State::Done) {
+                        *state = AllocatePage1State::Start;
+                    }
+                    drop(state);
+                    return Ok(self.allocate_page1()?.map(|_| ()));
+                }
+                return Ok(IOResult::Done(()));
             }
             // Give a chance for the allocation to happen elsewhere
             io_yield_one!(Completion::new_yield());

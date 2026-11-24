@@ -18,8 +18,9 @@ use crate::{
 };
 use amphora_engine_macros::{turso_assert_eq, AtomicEnum};
 use branches::{mark_unlikely, unlikely};
-use rapidhash::fast::RapidHasher;
 use smallvec::SmallVec;
+use std::collections::hash_map::RandomState;
+use std::hash::BuildHasher;
 use std::{cell::RefCell, cmp::Ordering, hash::Hasher};
 
 /// Inline storage for hash join key values (1 key inline avoids heap allocs for single-key joins).
@@ -32,15 +33,21 @@ pub(crate) type HashPayloadValues = Vec<Value>;
 /// Sentinel index for the end of an intrusive hash bucket chain in `HashTable::heads` / `next`.
 const EMPTY_ENTRY: u32 = u32::MAX;
 
-/// Per-process CSPRNG hash seeds derived once from `std::collections::hash_map::RandomState` so
-/// chosen SQL keys cannot invert the single-key mixer or collide into one bucket chain.
+/// Per-process OS-seeded `RandomState` (SipHash-1-3) for text, blob, and multi-column keys so
+/// crafted inputs cannot trigger O(N^2) hash bucket collisions in `DISTINCT`, `GROUP BY`, or joins.
+#[inline]
+fn keyed_hash_state() -> &'static RandomState {
+    static STATE: std::sync::OnceLock<RandomState> = std::sync::OnceLock::new();
+    STATE.get_or_init(RandomState::new)
+}
+
+/// Per-process CSPRNG hash seeds derived once from [`keyed_hash_state`] for single-key numeric
+/// hashing.
 #[inline]
 fn hash_seeds() -> (u64, u64) {
     static SEEDS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *SEEDS.get_or_init(|| {
-        use std::collections::hash_map::RandomState;
-        use std::hash::BuildHasher;
-        let state = RandomState::new();
+        let state = keyed_hash_state();
         let s0 = state.hash_one(0x9e37_79b9_7f4a_7c15u64) | 1;
         let s1 = state.hash_one(0x517c_c1b7_2722_0a95u64);
         (s0, s1)
@@ -88,7 +95,8 @@ const fn mix64(mut x: u64) -> u64 {
 
 /// Fast single-key hash for `GROUP BY`, `DISTINCT`, and single-key hash joins: mixes exact-f64
 /// integers and floats with a per-process CSPRNG-seeded SplitMix64 finalizer (preserving SQLite's
-/// `10 == 10.0` and `0.0 == -0.0` equivalence) without initializing `RapidHasher`.
+/// `10 == 10.0` and `0.0 == -0.0` equivalence), and hashes text/blobs with per-process OS-seeded
+/// SipHash-1-3 (`RandomState`) for HashDoS resistance.
 #[inline]
 pub(crate) fn hash_single_key_ref(value: &ValueRef, collation: CollationSeq) -> u64 {
     let (s0, s1) = hash_seeds();
@@ -106,22 +114,21 @@ pub(crate) fn hash_single_key_ref(value: &ValueRef, collation: CollationSeq) -> 
             mix64(normalized_f64_bits(f64::from(*f)).wrapping_mul(s0) ^ s1)
         }
         ValueRef::Text(_) | ValueRef::Blob(_) => {
-            let mut hasher = RapidHasher::new(s0);
+            let mut hasher = keyed_hash_state().build_hasher();
             hash_key_part(&mut hasher, 0, value, &[collation]);
             hasher.finish()
         }
     }
 }
 
-/// Hash function for join keys using rapidhash
-/// Takes collation into account when hashing text values
+/// Hash function for join, group, and distinct keys using per-process OS-seeded SipHash-1-3
+/// (or CSPRNG-seeded numeric mixing for single numeric keys). Takes collation into account for text.
 pub(crate) fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
     if let [only] = key_values {
         let collation = collations.first().copied().unwrap_or(CollationSeq::Binary);
         return hash_single_key_ref(only, collation);
     }
-    let (s0, _) = hash_seeds();
-    let mut hasher = RapidHasher::new(s0);
+    let mut hasher = keyed_hash_state().build_hasher();
     for (idx, value) in key_values.iter().enumerate() {
         hash_key_part(&mut hasher, idx, value, collations);
     }
@@ -134,8 +141,7 @@ fn hash_join_values(key_values: &[Value], collations: &[CollationSeq]) -> u64 {
         let collation = collations.first().copied().unwrap_or(CollationSeq::Binary);
         return hash_single_key_ref(&only.as_ref(), collation);
     }
-    let (s0, _) = hash_seeds();
-    let mut hasher = RapidHasher::new(s0);
+    let mut hasher = keyed_hash_state().build_hasher();
     for (idx, value) in key_values.iter().enumerate() {
         hash_key_part(&mut hasher, idx, &value.as_ref(), collations);
     }
@@ -144,7 +150,7 @@ fn hash_join_values(key_values: &[Value], collations: &[CollationSeq]) -> u64 {
 
 #[inline]
 fn hash_key_part(
-    hasher: &mut RapidHasher,
+    hasher: &mut impl Hasher,
     idx: usize,
     value: &ValueRef,
     collations: &[CollationSeq],
@@ -180,13 +186,18 @@ fn hash_key_part(
                 }
                 CollationSeq::Rtrim => {
                     let trimmed = text.as_str().trim_end_matches(' ');
+                    hasher.write_usize(trimmed.len());
                     hasher.write(trimmed.as_bytes());
                 }
                 CollationSeq::Binary | CollationSeq::Unset => {
-                    hasher.write(text.as_bytes());
+                    let bytes = text.as_bytes();
+                    hasher.write_usize(bytes.len());
+                    hasher.write(bytes);
                 }
                 CollationSeq::Locale(_) => {
-                    hasher.write(&collation.hash_key(text.as_str()));
+                    let key = collation.hash_key(text.as_str());
+                    hasher.write_usize(key.len());
+                    hasher.write(&key);
                 }
                 CollationSeq::Custom(_) => {
                     unreachable!("custom collations are rejected before hash table construction")
@@ -195,6 +206,7 @@ fn hash_key_part(
         }
         ValueRef::Blob(blob) => {
             hasher.write_u8(BLOB_HASH);
+            hasher.write_usize(blob.len());
             hasher.write(blob);
         }
     }
@@ -6197,6 +6209,43 @@ mod hashtests {
         assert!(
             ht.entries.is_empty(),
             "clear() must not skip clearing non-empty slab vectors when num_entries == 0"
+        );
+    }
+
+    /// Worth-Fixing 3 regression: per-process OS-seeded SipHash-1-3 must distribute crafted text
+    /// and blob keys evenly across hash buckets so `DISTINCT`, `GROUP BY`, and hash joins cannot
+    /// degrade into O(N^2) single-bucket chains.
+    #[test]
+    fn worth_fixing_text_and_blob_hash_resists_crafted_collisions() {
+        const BUCKETS: usize = 4096;
+        let mut text_counts = vec![0usize; BUCKETS];
+        let mut blob_counts = vec![0usize; BUCKETS];
+        let prefix = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        for i in 0..BUCKETS {
+            let s = format!("{prefix}{i:08x}{prefix}");
+            let h_text = hash_single_key_ref(
+                &ValueRef::Text(crate::types::TextRef::new(
+                    &s,
+                    crate::types::TextSubtype::Text,
+                )),
+                CollationSeq::Binary,
+            );
+            text_counts[(h_text as usize) & (BUCKETS - 1)] += 1;
+
+            let mut b = vec![0x5Au8; 64];
+            b[16..24].copy_from_slice(&(i as u64).to_le_bytes());
+            let h_blob = hash_single_key_ref(&ValueRef::Blob(&b), CollationSeq::Binary);
+            blob_counts[(h_blob as usize) & (BUCKETS - 1)] += 1;
+        }
+        let max_text = text_counts.iter().copied().max().unwrap_or(0);
+        let max_blob = blob_counts.iter().copied().max().unwrap_or(0);
+        assert!(
+            max_text <= 32,
+            "text hashing must distribute crafted keys; max chain = {max_text}"
+        );
+        assert!(
+            max_blob <= 32,
+            "blob hashing must distribute crafted keys; max chain = {max_blob}"
         );
     }
 }

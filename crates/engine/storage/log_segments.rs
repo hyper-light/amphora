@@ -515,36 +515,12 @@ impl SegmentsCell {
             return None;
         }
         let (after_first, after_second) = Self::reads_by_segment(&segments);
-        if after_first != passed_first || after_second != passed_second {
-            if let Some(slot0) = self.shards.first() {
-                // Synthetic read-count adjustment (used by tests): apply ONLY the delta that
-                // `step` itself made relative to `(passed_first, passed_second)`.
-                let mut cur = slot0.load(Ordering::SeqCst);
-                loop {
-                    let sr = SlotReads(cur);
-                    let f = if after_first >= passed_first {
-                        sr.on(SegmentId::First)
-                            .saturating_add(after_first.saturating_sub(passed_first))
-                    } else {
-                        sr.on(SegmentId::First)
-                            .saturating_sub(passed_first.saturating_sub(after_first))
-                    };
-                    let s = if after_second >= passed_second {
-                        sr.on(SegmentId::Second)
-                            .saturating_add(after_second.saturating_sub(passed_second))
-                    } else {
-                        sr.on(SegmentId::Second)
-                            .saturating_sub(passed_second.saturating_sub(after_second))
-                    };
-                    let next = (f & SlotReads::COUNT)
-                        | (s & SlotReads::COUNT).wrapping_shl(SlotReads::SECOND_SHIFT);
-                    match slot0.compare_exchange_weak(cur, next, Ordering::SeqCst, Ordering::SeqCst)
-                    {
-                        Ok(_) => break,
-                        Err(seen) => cur = seen,
-                    }
-                }
-            }
+        // Production `update()` transitions (`switch`, `copied`, `shipped`) never mutate active
+        // reader counts across shards; only `begin_read`/`end_read` modify shard counters.
+        // Keeping shard writes out of `update()` prevents concurrent readers from losing decrements
+        // and sticking a closing segment.
+        if (after_first, after_second) != (passed_first, passed_second) {
+            return None;
         }
         // If `step` cleared a previously uncopied closing segment using the pre-publication read
         // count, publish `COPIED | SHIPPED` first (SeqCst) and recount all shards (SeqCst) before
@@ -612,6 +588,31 @@ impl SegmentsCell {
         let word = self.state.load(Ordering::SeqCst);
         let next_ver = word.wrapping_add(1) & VERSION_MASK;
         let next_word = segments.pack() | next_ver;
+        self.state.store(next_word, Ordering::SeqCst);
+    }
+
+    /// Test-only helper to seed a synthetic read count on the current segment's shard 0 without
+    /// running shard adjustments in production `update()`.
+    #[cfg(test)]
+    pub(crate) fn set_current_reads_for_test(&self, reads: u64) {
+        let _guard = self.transition.lock();
+        let word = self.state.load(Ordering::SeqCst);
+        let current = Segments::unpack(word).current();
+        if let Some(slot0) = self.shards.first() {
+            let cur = slot0.load(Ordering::SeqCst);
+            let sr = SlotReads(cur);
+            let (f, s) = match current {
+                SegmentId::First => (reads, sr.on(SegmentId::Second)),
+                SegmentId::Second => (sr.on(SegmentId::First), reads),
+            };
+            let packed = (f & SlotReads::COUNT)
+                | (s & SlotReads::COUNT).wrapping_shl(SlotReads::SECOND_SHIFT);
+            slot0.store(packed, Ordering::SeqCst);
+        }
+        let next_ver = word.wrapping_add(1) & VERSION_MASK;
+        let next_word = (word & !SATURATED & !VERSION_MASK)
+            | if reads >= READS { SATURATED } else { 0 }
+            | next_ver;
         self.state.store(next_word, Ordering::SeqCst);
     }
 
@@ -914,7 +915,7 @@ mod tests {
     #[test]
     fn q3_a_read_past_what_the_word_counts_is_refused() {
         let cell = SegmentsCell::new(Segments::new(SegmentId::First));
-        cell.update(|s| s.reads = READS).unwrap();
+        cell.set_current_reads_for_test(READS);
         let before = cell.load();
         assert_eq!(
             before.state(SegmentId::First),
@@ -1362,5 +1363,62 @@ mod tests {
         // Closing segment (`First`) must still reset cleanly once copied.
         assert_eq!(cell.copied(), Some(SegmentId::First));
         assert_eq!(cell.load().closing(), None);
+    }
+
+    /// Blocker 1 regression: stress-test `SegmentsCell` across 25 back-to-back no-pause runs with
+    /// 4 concurrent readers and rapid segment switches/copies. Removing the synthetic shard-0
+    /// read-count adjustment ensures 0/25 runs stick with leaked closing-segment read counts.
+    #[test]
+    fn blocker_no_pause_stress_four_readers_never_sticks_log() {
+        use std::sync::atomic::AtomicBool;
+
+        for round in 0..25usize {
+            let cell = SegmentsCell::new(Segments::new(SegmentId::First));
+            let stop = AtomicBool::new(false);
+            std::thread::scope(|scope| {
+                for _ in 0..4 {
+                    scope.spawn(|| {
+                        while !stop.load(Ordering::Relaxed) {
+                            if let Some(span) = cell.begin_read() {
+                                cell.end_read(span);
+                            }
+                        }
+                    });
+                }
+                for _ in 0..200 {
+                    // Wait for any closing segment to finish copying and draining, then switch.
+                    if cell.load().closing().is_some() {
+                        let _ = cell.copied();
+                        let _ = cell.shipped();
+                    }
+                    let mut spins = 0usize;
+                    while cell.update(|s| s.switch(false)).flatten().is_none() {
+                        let _ = cell.copied();
+                        let _ = cell.shipped();
+                        spins += 1;
+                        assert!(
+                            spins < 1_000_000,
+                            "round {round}: log stuck waiting for closing segment to reset: {:?}",
+                            cell.load()
+                        );
+                        std::thread::yield_now();
+                    }
+                }
+                stop.store(true, Ordering::Relaxed);
+            });
+            let _ = cell.copied();
+            let _ = cell.shipped();
+            let final_state = cell.load();
+            assert_eq!(
+                final_state.closing(),
+                None,
+                "round {round}: closing segment stuck after all readers exited: {final_state:?}"
+            );
+            assert_eq!(
+                cell.sum_reads(),
+                (0, 0),
+                "round {round}: read counts leaked after all readers exited"
+            );
+        }
     }
 }

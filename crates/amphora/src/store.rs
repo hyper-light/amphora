@@ -1487,8 +1487,26 @@ impl<R: Send + 'static> Readers<R> {
                     .0;
             }
         };
+        struct ReturnOnDrop<'a, R: Send + 'static> {
+            readers: &'a Readers<R>,
+            reader: Option<R>,
+            generation: u64,
+        }
+        impl<R: Send + 'static> Drop for ReturnOnDrop<'_, R> {
+            fn drop(&mut self) {
+                self.readers.give_back(self.reader.take(), self.generation);
+            }
+        }
+        // Hold `reader` outside `ReturnOnDrop` across `f`: if `f` panics mid-transaction, `reader`
+        // drops during unwind (closing any stale snapshot) while `ReturnOnDrop` still decrements
+        // `pool.out` and wakes waiters without returning the poisoned connection to `pool.idle`.
+        let mut guard = ReturnOnDrop {
+            readers: self,
+            reader: None,
+            generation,
+        };
         let answer = f(&mut reader);
-        self.give_back(Some(reader), generation);
+        guard.reader = Some(reader);
         Some(answer)
     }
 
@@ -1504,14 +1522,22 @@ impl<R: Send + 'static> Readers<R> {
             return Some(Err(Refused::Timeout.into()));
         };
         let slot = taken.reader()?;
-        if slot.is_none() {
-            let open = locked(&self.open).clone()?;
-            match open() {
-                Ok(r) => *slot = Some(r),
-                Err(e) => return Some(Err(e)),
+        let mut reader = match slot.take() {
+            Some(r) => r,
+            None => {
+                let open = locked(&self.open).clone()?;
+                match open() {
+                    Ok(r) => r,
+                    Err(e) => return Some(Err(e)),
+                }
             }
-        }
-        slot.as_mut().map(f)
+        };
+        // Take the reader out of the slot across `f`: if `f` panics while a read transaction is
+        // open, `reader` drops during unwind (closing its stale snapshot) instead of staying in
+        // the slot for subsequent reads.
+        let answer = f(&mut reader);
+        *slot = Some(reader);
+        Some(answer)
     }
 
     fn give_back(&self, reader: Option<R>, generation: u64) {

@@ -3118,6 +3118,9 @@ impl Connection {
         let db_epoch = self.db.schema_epoch.load(Ordering::Acquire);
         let db_restore_epoch = self.db.shared_wal.restore_epoch();
         let restore_changed = self.last_restore_epoch.load(Ordering::Acquire) != db_restore_epoch;
+        if self.has_non_main_pagers.load(Ordering::Acquire) {
+            self.sync_attached_restore_epochs();
+        }
         if !restore_changed && self.local_schema_epoch.load(Ordering::Relaxed) == db_epoch {
             return;
         }
@@ -4157,18 +4160,115 @@ impl Connection {
         self.schema.read().clone()
     }
 
+    /// Lock-free check whether any attached database's external-restore epoch has advanced since
+    /// this connection last synced it. Zero lock overhead when no databases are attached.
+    #[inline]
+    pub(crate) fn has_stale_attached_restore_epoch(&self) -> bool {
+        if !self.has_non_main_pagers.load(Ordering::Acquire) {
+            return false;
+        }
+        self.has_stale_attached_restore_epoch_cold()
+    }
+
+    #[inline(never)]
+    fn has_stale_attached_restore_epoch_cold(&self) -> bool {
+        let attached = self.attached_databases.read();
+        attached.index_to_data.values().any(|entry| {
+            entry.last_restore_epoch.load(Ordering::Acquire) != entry.db.shared_wal.restore_epoch()
+        })
+    }
+
+    /// Evicts stale connection-local schemas for any attached database whose external-restore
+    /// epoch advanced and bumps `prepare_context_generation` so statements compiled against the
+    /// pre-restore attached catalog reprepare cleanly.
+    pub(crate) fn sync_attached_restore_epochs(&self) -> bool {
+        if !self.has_non_main_pagers.load(Ordering::Acquire) {
+            return false;
+        }
+        self.sync_attached_restore_epochs_cold()
+    }
+
+    #[inline(never)]
+    fn sync_attached_restore_epochs_cold(&self) -> bool {
+        let mut changed_ids = Vec::new();
+        {
+            let attached = self.attached_databases.read();
+            for (&db_id, entry) in &attached.index_to_data {
+                let live_epoch = entry.db.shared_wal.restore_epoch();
+                if entry.last_restore_epoch.load(Ordering::Acquire) != live_epoch {
+                    entry
+                        .last_restore_epoch
+                        .store(live_epoch, Ordering::Release);
+                    changed_ids.push(db_id);
+                }
+            }
+        }
+        if changed_ids.is_empty() {
+            return false;
+        }
+        // Maintain consistent lock ordering (`attached_databases` released before `database_schemas`).
+        {
+            let mut schemas = self.database_schemas.write();
+            for db_id in changed_ids {
+                schemas.remove(&db_id);
+            }
+        }
+        self.bump_prepare_context_generation();
+        true
+    }
+
+    /// Snapshots `(db_id, restore_epoch)` for every currently attached database (zero allocation
+    /// on connections without attached databases).
+    #[inline]
+    pub(crate) fn attached_restore_epochs_snapshot(&self) -> Vec<(usize, u64)> {
+        if !self.has_non_main_pagers.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        self.attached_restore_epochs_snapshot_cold()
+    }
+
+    #[inline(never)]
+    fn attached_restore_epochs_snapshot_cold(&self) -> Vec<(usize, u64)> {
+        let attached = self.attached_databases.read();
+        attached
+            .index_to_data
+            .iter()
+            .map(|(&db_id, entry)| (db_id, entry.db.shared_wal.restore_epoch()))
+            .collect()
+    }
+
     /// Monotonic connection-local identity that advances whenever this connection's schema is
     /// replaced or mutated in place. Lock-free and avoids cloning the shared `Arc<Schema>`.
     #[inline]
     pub fn schema_identity(&self) -> u64 {
         let restore_epoch = self.db.shared_wal.restore_epoch();
-        if restore_epoch == 0 {
+        let mut id = if restore_epoch == 0 {
             self.schema.identity()
         } else {
             self.schema
                 .identity()
                 .wrapping_add(restore_epoch.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+        };
+        if self.has_non_main_pagers.load(Ordering::Acquire) {
+            id = self.fold_attached_restore_epochs(id);
         }
+        id
+    }
+
+    #[inline(never)]
+    fn fold_attached_restore_epochs(&self, mut id: u64) -> u64 {
+        let attached = self.attached_databases.read();
+        for (&db_id, entry) in &attached.index_to_data {
+            let epoch = entry.db.shared_wal.restore_epoch();
+            if epoch != 0 {
+                let mix = (db_id as u64)
+                    .wrapping_add(1)
+                    .wrapping_mul(0x517c_c1b7_2722_0a95)
+                    ^ epoch.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                id = id.wrapping_add(mix);
+            }
+        }
+        id
     }
 
     pub fn attached_database_names(&self) -> Vec<String> {

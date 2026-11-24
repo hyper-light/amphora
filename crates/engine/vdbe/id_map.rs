@@ -62,25 +62,6 @@ impl<T> IdMap<T> {
         self.len = 0;
     }
 
-    /// Moves every occupied value into `dst` at the same dense slot when `keep` returns `true`,
-    /// dropping the rest, and leaves `self` empty while preserving backing slot capacity.
-    pub(crate) fn move_into(&mut self, dst: &mut Self, mut keep: impl FnMut(&mut T) -> bool) {
-        if self.len == 0 {
-            return;
-        }
-        if dst.slots.len() < self.slots.len() {
-            dst.slots.resize_with(self.slots.len(), || None);
-        }
-        for (src_slot, dst_slot) in self.slots.iter_mut().zip(dst.slots.iter_mut()) {
-            if let Some(mut val) = src_slot.take() {
-                if keep(&mut val) && dst_slot.replace(val).is_none() {
-                    dst.len = dst.len.saturating_add(1);
-                }
-            }
-        }
-        self.len = 0;
-    }
-
     pub(crate) fn get<K: Id>(&self, id: &K) -> Option<&T> {
         self.slots.get(id.slot()).and_then(Option::as_ref)
     }

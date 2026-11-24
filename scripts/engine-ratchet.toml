@@ -6,15 +6,15 @@
 [left.x86_64-unknown-linux-gnu]
 "clippy::panic" = 197
 "clippy::unwrap_used" = 433
-"clippy::expect_used" = 859
+"clippy::expect_used" = 853
 "clippy::unreachable" = 458
 "clippy::todo" = 11
 "clippy::unimplemented" = 0
-"clippy::indexing_slicing" = 3054
-"clippy::arithmetic_side_effects" = 3281
+"clippy::indexing_slicing" = 3035
+"clippy::arithmetic_side_effects" = 3260
 "clippy::string_slice" = 101
-"clippy::cast_possible_truncation" = 519
-"clippy::cast_sign_loss" = 234
+"clippy::cast_possible_truncation" = 508
+"clippy::cast_sign_loss" = 225
 "clippy::cast_possible_wrap" = 674
 "clippy::disallowed_macros" = 756
 "clippy::disallowed_methods" = 40

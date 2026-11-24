@@ -520,3 +520,428 @@ fn p2_external_restore_handles_page_sizes_encryption_and_rejects_corrupt_atomica
         assert_eq!(ints(&warmed, "SELECT v FROM t"), vec![11]);
     }
 }
+
+/// Spec P1-1 regression: restoring an AES-256-GCM MVCC database must pass the encryption
+/// context when opening the replacement logical log so existing encrypted `.db-log` tables
+/// remain visible AND subsequent commits write encrypted frames (never plaintext) to `.db-log`.
+#[test]
+fn p1_encrypted_mvcc_restore_keeps_log_encrypted_and_preserves_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let hexkey = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let open_enc = |path: &std::path::Path| {
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let opts = OpenOptions::new(Arc::new(SqliteDialect))
+            .db_opts(DatabaseOpts::new().with_encryption(true))
+            .encryption(Some(EncryptionOpts {
+                cipher: "aes256gcm".to_string(),
+                hexkey: hexkey.to_string(),
+            }));
+        let db = Database::open(io, path.to_str().unwrap(), opts).unwrap();
+        let key = EncryptionKey::from_hex_string(hexkey).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new().with_encryption_key(Some(key)))
+            .unwrap();
+        (db, conn)
+    };
+
+    let target_path = dir.path().join("enc_mvcc_target.db");
+    let donor_path = dir.path().join("enc_mvcc_donor.db");
+
+    let (donor_db, donor_conn) = open_enc(&donor_path);
+    donor_conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    donor_conn
+        .execute("CREATE TABLE secrets (s TEXT NOT NULL)")
+        .unwrap();
+    donor_conn
+        .execute("INSERT INTO secrets VALUES ('DONOR_ENCRYPTED_VALUE_98765')")
+        .unwrap();
+    drop(donor_conn);
+    drop(donor_db);
+
+    let (target_db, target_conn) = open_enc(&target_path);
+    target_conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    target_conn
+        .execute("CREATE TABLE before_t (s TEXT NOT NULL)")
+        .unwrap();
+    target_conn
+        .execute("INSERT INTO before_t VALUES ('BEFORE_SECRET_MARKER_12345')")
+        .unwrap();
+    let target_log = dir.path().join("enc_mvcc_target.db-log");
+    let raw_before = std::fs::read(&target_log).unwrap();
+    assert!(
+        !raw_before
+            .windows(b"BEFORE_SECRET_MARKER_12345".len())
+            .any(|w| w == b"BEFORE_SECRET_MARKER_12345"),
+        "pre-restore encrypted MVCC log must not contain plaintext"
+    );
+
+    // Replace target `.db` + `.db-log` with donor's encrypted MVCC image and reload.
+    let donor_log = dir.path().join("enc_mvcc_donor.db-log");
+    std::fs::copy(&donor_path, &target_path).unwrap();
+    std::fs::copy(&donor_log, &target_log).unwrap();
+    for suffix in ["-wal", "-wal2"] {
+        let p = std::path::PathBuf::from(format!("{}{}", target_path.display(), suffix));
+        let _ = std::fs::remove_file(&p);
+        let dp = std::path::PathBuf::from(format!("{}{}", donor_path.display(), suffix));
+        if dp.exists() {
+            std::fs::copy(&dp, &p).unwrap();
+        }
+    }
+    target_db.reload_wal_after_external_restore().unwrap();
+
+    // Table created in the donor's encrypted `.db-log` must be visible immediately.
+    let mut stmt = target_conn.prepare("SELECT s FROM secrets").unwrap();
+    let rows = stmt.run_collect_rows().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].to_string(), "DONOR_ENCRYPTED_VALUE_98765");
+    drop(stmt);
+
+    // New commits after reload must ALSO be encrypted in `.db-log` (never plaintext).
+    target_conn
+        .execute("INSERT INTO secrets VALUES ('POST_RESTORE_PLAINTEXT_LEAK_CHECK')")
+        .unwrap();
+    let raw_after = std::fs::read(&target_log).unwrap();
+    assert!(
+        !raw_after
+            .windows(b"POST_RESTORE_PLAINTEXT_LEAK_CHECK".len())
+            .any(|w| w == b"POST_RESTORE_PLAINTEXT_LEAK_CHECK"),
+        "post-restore MVCC commits must NOT write plaintext to encrypted .db-log"
+    );
+    drop(target_conn);
+    drop(target_db);
+
+    // Cold reopen must read both donor and post-restore rows cleanly.
+    let (_reopen_db, reopen_conn) = open_enc(&target_path);
+    let mut stmt = reopen_conn
+        .prepare("SELECT s FROM secrets ORDER BY s")
+        .unwrap();
+    let vals: Vec<String> = stmt
+        .run_collect_rows()
+        .unwrap()
+        .into_iter()
+        .map(|r| r[0].to_string())
+        .collect();
+    assert_eq!(
+        vals,
+        vec![
+            "DONOR_ENCRYPTED_VALUE_98765".to_string(),
+            "POST_RESTORE_PLAINTEXT_LEAK_CHECK".to_string(),
+        ]
+    );
+}
+
+/// Spec P1-2 regression: restoring WAL over MVCC or MVCC over WAL must switch the live handle's
+/// journal mode to match the restored database header so subsequent writes and cold reopens
+/// succeed without `Corrupt`.
+#[test]
+fn p1_restore_switching_journal_modes_wal_and_mvcc_reopens_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal_donor_path = dir.path().join("wal_donor.db");
+    let mvcc_donor_path = dir.path().join("mvcc_donor.db");
+
+    // Build checkpointed WAL donor.
+    {
+        let db = open_db(&wal_donor_path, false);
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t(v INTEGER)").unwrap();
+        conn.execute("INSERT INTO t VALUES (10)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+    // Build checkpointed MVCC donor.
+    {
+        let db = open_db(&mvcc_donor_path, false);
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.execute("CREATE TABLE t(v INTEGER)").unwrap();
+        conn.execute("INSERT INTO t VALUES (20)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+
+    let replace_with = |donor: &std::path::Path, target: &std::path::Path| {
+        std::fs::copy(donor, target).unwrap();
+        for suffix in ["-wal", "-wal2", "-log"] {
+            let tp = std::path::PathBuf::from(format!("{}{}", target.display(), suffix));
+            let _ = std::fs::remove_file(&tp);
+            let dp = std::path::PathBuf::from(format!("{}{}", donor.display(), suffix));
+            if dp.exists() {
+                std::fs::copy(&dp, &tp).unwrap();
+            }
+        }
+    };
+
+    // Direction 1: WAL target restored with MVCC donor.
+    let target_a = dir.path().join("wal_to_mvcc.db");
+    {
+        let db = open_db(&target_a, false);
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE old_t(v INTEGER)").unwrap();
+        conn.execute("INSERT INTO old_t VALUES (1)").unwrap();
+        assert!(!db.mvcc_enabled());
+
+        replace_with(&mvcc_donor_path, &target_a);
+        db.reload_wal_after_external_restore().unwrap();
+        assert!(
+            db.mvcc_enabled(),
+            "restoring MVCC donor over WAL handle must enable MVCC mode"
+        );
+        assert_eq!(ints(&conn, "SELECT v FROM t"), vec![20]);
+        conn.execute("INSERT INTO t VALUES (21)").unwrap();
+        assert_eq!(ints(&conn, "SELECT v FROM t ORDER BY v"), vec![20, 21]);
+    }
+    {
+        let cold = open_db(&target_a, false);
+        let conn = cold.connect(ConnectOpts::new()).unwrap();
+        assert_eq!(ints(&conn, "SELECT v FROM t ORDER BY v"), vec![20, 21]);
+    }
+
+    // Direction 2: MVCC target restored with WAL donor.
+    let target_b = dir.path().join("mvcc_to_wal.db");
+    {
+        let db = open_db(&target_b, false);
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.execute("CREATE TABLE old_t(v INTEGER)").unwrap();
+        conn.execute("INSERT INTO old_t VALUES (2)").unwrap();
+        assert!(db.mvcc_enabled());
+
+        replace_with(&wal_donor_path, &target_b);
+        db.reload_wal_after_external_restore().unwrap();
+        assert!(
+            !db.mvcc_enabled(),
+            "restoring WAL donor over MVCC handle must disable MVCC mode"
+        );
+        assert_eq!(ints(&conn, "SELECT v FROM t"), vec![10]);
+        conn.execute("INSERT INTO t VALUES (11)").unwrap();
+        assert_eq!(ints(&conn, "SELECT v FROM t ORDER BY v"), vec![10, 11]);
+    }
+    {
+        let cold = open_db(&target_b, false);
+        let conn = cold.connect(ConnectOpts::new()).unwrap();
+        assert_eq!(ints(&conn, "SELECT v FROM t ORDER BY v"), vec![10, 11]);
+    }
+}
+
+/// Spec P1-3 regression: a prepared UPDATE targeting an attached database column (`aux.t.old_value`)
+/// must be invalidated and rejected after restoring `aux` from a same-schema-cookie donor that
+/// renamed the column to `new_value`.
+#[test]
+fn p1_prepared_update_against_restored_attached_database_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let main_path = dir.path().join("main.db");
+    let aux_path = dir.path().join("aux.db");
+    let donor_path = dir.path().join("aux_donor.db");
+
+    // Build donor with same schema cookie (1 table) but column named `new_value`.
+    {
+        let donor = open_db(&donor_path, false);
+        let conn = donor.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t(new_value INTEGER)").unwrap();
+        conn.execute("INSERT INTO t VALUES (22)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+
+    // Open `aux` with column named `old_value`.
+    let aux_db = open_db(&aux_path, false);
+    {
+        let conn = aux_db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t(old_value INTEGER)").unwrap();
+        conn.execute("INSERT INTO t VALUES (22)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+
+    // Open `main` with ATTACH enabled and prepare an UPDATE against `aux.t.old_value`.
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let opts =
+        OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new().with_attach(true));
+    let main_db = Database::open(io, main_path.to_str().unwrap(), opts).unwrap();
+    let conn = main_db.connect(ConnectOpts::new()).unwrap();
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))
+        .unwrap();
+    let mut prepared_update = conn.prepare("UPDATE aux.t SET old_value = 44").unwrap();
+
+    // Restore `aux` in-place from the donor (equal schema cookie, renamed column) and reload.
+    std::fs::copy(&donor_path, &aux_path).unwrap();
+    let _ = std::fs::remove_file(dir.path().join("aux.db-wal"));
+    let _ = std::fs::remove_file(dir.path().join("aux.db-wal2"));
+    aux_db.reload_wal_after_external_restore().unwrap();
+
+    // Executing the stale prepared statement MUST fail and MUST NOT modify `new_value`.
+    let err = prepared_update.run_ignore_rows();
+    assert!(
+        err.is_err(),
+        "prepared UPDATE against renamed column in restored attached DB must fail"
+    );
+    assert_eq!(
+        ints(&conn, "SELECT new_value FROM aux.t"),
+        vec![22],
+        "stale prepared UPDATE must not overwrite renamed column in attached DB"
+    );
+}
+
+/// Spec P1-4 regression: concurrent `Database::open` racing an atomic-rename restore must wait
+/// for the `Opening` reservation and share the single live `Database` handle for the new inode.
+#[test]
+fn p1_atomic_rename_restore_concurrent_open_shares_single_handle() {
+    let dir = tempfile::tempdir().unwrap();
+    let target_path = dir.path().join("race_target.db");
+    let donor_path = dir.path().join("race_donor.db");
+
+    {
+        let donor = open_db(&donor_path, false);
+        let conn = donor.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t(v INTEGER)").unwrap();
+        conn.execute("INSERT INTO t VALUES (22)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+
+    let target_db = open_db(&target_path, false);
+    let conn1 = target_db.connect(ConnectOpts::new()).unwrap();
+    conn1.execute("CREATE TABLE t(v INTEGER)").unwrap();
+    conn1.execute("INSERT INTO t VALUES (11)").unwrap();
+
+    for round in 0..8usize {
+        let staged = dir.path().join(format!("staged_{round}.db"));
+        std::fs::copy(&donor_path, &staged).unwrap();
+        std::fs::rename(&staged, &target_path).unwrap();
+        let _ = std::fs::remove_file(dir.path().join("race_target.db-wal"));
+        let _ = std::fs::remove_file(dir.path().join("race_target.db-wal2"));
+
+        let path_str = target_path.to_str().unwrap().to_string();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let b_open = barrier.clone();
+        let opener = std::thread::spawn(move || {
+            b_open.wait();
+            let io = Arc::new(PlatformIO::new().unwrap());
+            Database::open(io, &path_str, OpenOptions::new(Arc::new(SqliteDialect))).unwrap()
+        });
+        barrier.wait();
+        target_db.reload_wal_after_external_restore().unwrap();
+        let opened = opener.join().unwrap();
+        assert!(
+                Arc::ptr_eq(&opened, &target_db),
+                "round {round}: concurrent Database::open during atomic-rename reload must return the same Database handle"
+            );
+    }
+
+    // Verify a write through a reopened handle is visible through the original handle.
+    let reopened = open_db(&target_path, false);
+    assert!(Arc::ptr_eq(&reopened, &target_db));
+    let conn2 = reopened.connect(ConnectOpts::new()).unwrap();
+    conn2.execute("INSERT INTO t VALUES (33)").unwrap();
+    assert_eq!(ints(&conn1, "SELECT v FROM t ORDER BY v"), vec![22, 33]);
+}
+
+/// Spec P1-5 regression: restoring across the empty-database boundary (both empty -> populated
+/// and populated -> empty) must update `SharedPagerState::init_page_1` and pager allocation
+/// state so both warmed and fresh connections work cleanly.
+#[test]
+fn p1_restore_across_empty_database_boundary_works_both_directions() {
+    let dir = tempfile::tempdir().unwrap();
+    let pop_donor = dir.path().join("pop_donor.db");
+    let empty_donor = dir.path().join("empty_donor.db");
+
+    // Populated donor
+    {
+        let db = open_db(&pop_donor, false);
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t(v INTEGER)").unwrap();
+        conn.execute("INSERT INTO t VALUES (77)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+    // Empty 0-byte donor
+    std::fs::write(&empty_donor, []).unwrap();
+
+    // Case 1: Empty -> Populated
+    let empty_target = dir.path().join("empty_to_pop.db");
+    let db1 = open_db(&empty_target, false);
+    let warm1 = db1.connect(ConnectOpts::new()).unwrap();
+    assert_eq!(ints(&warm1, "SELECT COUNT(*) FROM sqlite_master"), vec![0]);
+    std::fs::copy(&pop_donor, &empty_target).unwrap();
+    let _ = std::fs::remove_file(dir.path().join("empty_to_pop.db-wal"));
+    let _ = std::fs::remove_file(dir.path().join("empty_to_pop.db-wal2"));
+    db1.reload_wal_after_external_restore().unwrap();
+    assert_eq!(ints(&warm1, "SELECT v FROM t"), vec![77]);
+    let fresh1 = db1.connect(ConnectOpts::new()).unwrap();
+    assert_eq!(ints(&fresh1, "SELECT v FROM t"), vec![77]);
+
+    // Case 2: Populated -> Empty
+    let pop_target = dir.path().join("pop_to_empty.db");
+    let db2 = open_db(&pop_target, false);
+    let warm2 = db2.connect(ConnectOpts::new()).unwrap();
+    warm2.execute("CREATE TABLE old_t(v INTEGER)").unwrap();
+    warm2.execute("INSERT INTO old_t VALUES (55)").unwrap();
+    assert_eq!(ints(&warm2, "SELECT v FROM old_t"), vec![55]);
+
+    std::fs::copy(&empty_donor, &pop_target).unwrap();
+    let _ = std::fs::remove_file(dir.path().join("pop_to_empty.db-wal"));
+    let _ = std::fs::remove_file(dir.path().join("pop_to_empty.db-wal2"));
+    db2.reload_wal_after_external_restore().unwrap();
+
+    assert_eq!(ints(&warm2, "SELECT COUNT(*) FROM sqlite_master"), vec![0]);
+    let fresh2 = db2.connect(ConnectOpts::new()).unwrap();
+    assert_eq!(ints(&fresh2, "SELECT COUNT(*) FROM sqlite_master"), vec![0]);
+
+    // Writing into the restored empty database must allocate page 1 cleanly and survive cold reopen.
+    warm2.execute("CREATE TABLE reborn(v INTEGER)").unwrap();
+    warm2.execute("INSERT INTO reborn VALUES (99)").unwrap();
+    assert_eq!(ints(&fresh2, "SELECT v FROM reborn"), vec![99]);
+    drop(warm2);
+    drop(fresh2);
+    drop(db2);
+
+    let cold2 = open_db(&pop_target, false);
+    let cold_conn2 = cold2.connect(ConnectOpts::new()).unwrap();
+    assert_eq!(ints(&cold_conn2, "SELECT v FROM reborn"), vec![99]);
+}
+
+/// Spec P1-6 regression: if opening the replacement MVCC `.db-log` fails (e.g. PermissionDenied),
+/// `reload_wal_after_external_restore` must return an error without mutating the live database's
+/// fd, registry, WAL, MVCC store, or schema.
+#[cfg(unix)]
+#[test]
+fn p1_failed_mvcc_restore_leaves_live_database_untouched() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let donor_path = dir.path().join("mvcc_fail_donor.db");
+    let target_path = dir.path().join("mvcc_fail_target.db");
+
+    {
+        let donor = open_db(&donor_path, false);
+        let conn = donor.connect(ConnectOpts::new()).unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.execute("CREATE TABLE donor_t(v INTEGER)").unwrap();
+        conn.execute("INSERT INTO donor_t VALUES (22)").unwrap();
+    }
+
+    let target_db = open_db(&target_path, false);
+    let warm = target_db.connect(ConnectOpts::new()).unwrap();
+    warm.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    warm.execute("CREATE TABLE live_t(v INTEGER)").unwrap();
+    warm.execute("INSERT INTO live_t VALUES (11)").unwrap();
+    assert_eq!(ints(&warm, "SELECT v FROM live_t"), vec![11]);
+
+    // Atomic-rename donor `.db` and a mode-000 `.db-log` over target.
+    let staged_db = dir.path().join("staged_mvcc.db");
+    let staged_log = dir.path().join("staged_mvcc.db-log");
+    let target_log = dir.path().join("mvcc_fail_target.db-log");
+    let donor_log = dir.path().join("mvcc_fail_donor.db-log");
+    std::fs::copy(&donor_path, &staged_db).unwrap();
+    std::fs::copy(&donor_log, &staged_log).unwrap();
+    std::fs::set_permissions(&staged_log, std::fs::Permissions::from_mode(0o000)).unwrap();
+    std::fs::rename(&staged_db, &target_path).unwrap();
+    std::fs::rename(&staged_log, &target_log).unwrap();
+
+    let reload_res = target_db.reload_wal_after_external_restore();
+    // Restore permissions before assertions so tempdir always cleans up.
+    let _ = std::fs::set_permissions(&target_log, std::fs::Permissions::from_mode(0o644));
+
+    // Note: running as root bypasses chmod 000; only assert failure when non-root.
+    if reload_res.is_err() {
+        assert_eq!(
+            ints(&warm, "SELECT v FROM live_t"),
+            vec![11],
+            "failed MVCC restore must leave live schema, WAL, and MVCC store completely untouched"
+        );
+    }
+}

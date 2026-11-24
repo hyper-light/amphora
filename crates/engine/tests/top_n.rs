@@ -259,3 +259,66 @@ fn spilled_top_n_respects_desc_nulls_last_with_custom_array_comparator() {
         );
     }
 }
+
+/// Blocker 2 regression: paging through 3,000 wide rows with ties in the sort column using
+/// `LIMIT 300 OFFSET (page * 300)` across spilled sorts must return every single row exactly once
+/// with zero duplicates and zero lost rows, matching the complete ordering.
+#[test]
+fn blocker_paging_3000_wide_rows_with_ties_has_no_duplicates_or_missing_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = open(dir.path());
+    conn.execute(
+        "CREATE TABLE wide_page (id INTEGER PRIMARY KEY, k INTEGER, payload TEXT NOT NULL)",
+    )
+    .unwrap();
+    let pad = "p".repeat(4096);
+    conn.execute("BEGIN").unwrap();
+    let mut ins = conn
+        .prepare("INSERT INTO wide_page (id, k, payload) VALUES (?1, ?2, ?3)")
+        .unwrap();
+    for id in 1..=3_000i64 {
+        ins.reset().unwrap();
+        ins.bind_at(NonZero::new(1).unwrap(), Value::from_i64(id))
+            .unwrap();
+        // 10 distinct sort keys => 300 tied rows per key across 3,000 rows (~12 MiB total).
+        ins.bind_at(NonZero::new(2).unwrap(), Value::from_i64(id % 10))
+            .unwrap();
+        ins.bind_at(NonZero::new(3).unwrap(), Value::build_text(pad.clone()))
+            .unwrap();
+        ins.run_ignore_rows().unwrap();
+    }
+    drop(ins);
+    conn.execute("COMMIT").unwrap();
+
+    conn.execute("PRAGMA cache_size = 200").unwrap();
+    let full_ids: Vec<i64> = rows(&conn, "SELECT id, payload FROM wide_page ORDER BY k")
+        .into_iter()
+        .map(|r| r[0].as_int().unwrap())
+        .collect();
+    assert_eq!(full_ids.len(), 3_000);
+
+    let mut paged_ids = Vec::with_capacity(3_000);
+    for page in 0..10usize {
+        let offset = page * 300;
+        let page_rows = rows(
+            &conn,
+            &format!("SELECT id, payload FROM wide_page ORDER BY k LIMIT 300 OFFSET {offset}"),
+        );
+        assert_eq!(page_rows.len(), 300, "page {page} row count");
+        for r in page_rows {
+            paged_ids.push(r[0].as_int().unwrap());
+        }
+    }
+    assert_eq!(paged_ids.len(), 3_000);
+    let unique: std::collections::HashSet<i64> = paged_ids.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        3_000,
+        "paging with ties duplicated or dropped rows (unique = {})",
+        unique.len()
+    );
+    assert_eq!(
+        paged_ids, full_ids,
+        "paged ORDER BY k LIMIT/OFFSET must exactly match full ordering"
+    );
+}
