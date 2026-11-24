@@ -13,7 +13,7 @@ use std::num::NonZeroUsize;
 use strum::EnumString;
 use tracing::{instrument, Level};
 
-use crate::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use crate::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use crate::sync::RwLock;
 use crate::sync::Weak;
 use bitflags::bitflags;
@@ -570,6 +570,8 @@ struct RecordRead {
     frame_len: usize,
     file: Arc<dyn File>,
     records: Arc<RwLock<Records>>,
+    /// The read it is asked in: its records are kept, and its pages given, while that one stands.
+    asked: Asked,
     readers: Vec<PageReader>,
     state: SpinLock<ReadState>,
     /// What the read's callers wait on, finished (and taken) once every record is in.
@@ -644,7 +646,7 @@ impl RecordRead {
                     return;
                 };
                 match failed {
-                    Some(err) => done.error(err),
+                    Some(err) => done.error(self.asked.or_ended(err)),
                     None => done.complete(0),
                 }
                 return;
@@ -761,11 +763,7 @@ impl RecordRead {
                     .map(|decoded| Held::Record(Arc::new(decoded)))
                     .map_err(|e| {
                         mark_unlikely();
-                        tracing::error!("packed log record at frame {frame}: {e}");
-                        CompletionError::PackedRecordCorrupt {
-                            frame_id: frame,
-                            page_idx: 0,
-                        }
+                        self.record_fault(frame, 0, &format_args!("record at frame {frame}: {e}"))
                     })
             }
             Ok((_, read)) => Err(CompletionError::ShortReadWalFrame {
@@ -774,11 +772,22 @@ impl RecordRead {
                 actual: usize::try_from(read).unwrap_or(0),
             }),
         };
-        if let Ok(Held::Record(decoded)) = &held {
-            self.records
-                .write()
-                .keep(self.generation, frame, decoded.clone(), self.page_size);
-        }
+        // Kept for other reads only while this one's segment is its own (decision 45).
+        let held = match held {
+            Ok(Held::Record(decoded)) => self
+                .asked
+                .admit(|| {
+                    self.records.write().keep(
+                        self.generation,
+                        frame,
+                        decoded.clone(),
+                        self.page_size,
+                    );
+                })
+                .map(|()| Held::Record(decoded))
+                .ok_or(CompletionError::SnapshotTooOld),
+            other => other,
+        };
         let last = {
             let mut st = self.state.lock();
             match held {
@@ -793,6 +802,22 @@ impl RecordRead {
         if last {
             self.drive();
         }
+    }
+
+    /// What a record or a chain that doesn't hold is: the log's, said and refused as corrupt, or,
+    /// where the log's owner ended the read it was asked in, whose frames may be another
+    /// generation's since, that (decision 45).
+    fn record_fault(
+        &self,
+        frame_id: u64,
+        page_idx: usize,
+        why: &dyn fmt::Display,
+    ) -> CompletionError {
+        if self.asked.is_ended() {
+            return CompletionError::SnapshotTooOld;
+        }
+        tracing::error!("packed log at frame {}: {why}", self.head);
+        CompletionError::PackedRecordCorrupt { frame_id, page_idx }
     }
 
     /// Where `reader`'s chain stands in `have`: a page frame is an image it begins at.
@@ -858,12 +883,14 @@ impl RecordRead {
                     }
                     rebuilt => {
                         mark_unlikely();
-                        if let Err(e) = rebuilt {
-                            tracing::error!("packed log at frame {}: {e}", self.head);
-                        }
-                        let err = CompletionError::PackedRecordCorrupt {
-                            frame_id: self.head,
-                            page_idx: usize::try_from(reader.page).unwrap_or(usize::MAX),
+                        let page_idx = usize::try_from(reader.page).unwrap_or(usize::MAX);
+                        let err = match rebuilt {
+                            Err(e) => self.record_fault(self.head, page_idx, &e),
+                            Ok(page) => self.record_fault(
+                                self.head,
+                                page_idx,
+                                &format_args!("a page of {} bytes", page.len()),
+                            ),
                         };
                         (reader.complete)(Err(err));
                         Some(err)
@@ -1180,9 +1207,9 @@ pub trait Wal: Debug + Send + Sync {
     fn frame_generation(&self, frame: FrameRef) -> u32;
 
     /// Amphora: what this connection's read under way holds of the log, which the log's owner can
-    /// end (decision 45): a page read from the file is used only while it isn't. None for a log that
-    /// can't be ended so.
-    fn read_hold(&self) -> Option<Arc<ReadHold>> {
+    /// end (decision 45): what a read of the log, the file or the shared pages brings is taken in
+    /// only while it isn't. None for a log that can't be ended so.
+    fn read_hold(&self) -> Option<&Arc<ReadHold>> {
         None
     }
 
@@ -4194,43 +4221,97 @@ pub struct SharedLog {
 
 /// A connection's read under way, as the log's owner can end it (decision 45): its read mark and
 /// the segments it counts on, given back once, by the read's own end or by
-/// [`SharedLog::end_closing_reads`]. One to a connection, empty between its reads.
+/// [`SharedLog::end_closing_reads`]. One to a connection, empty between its reads. The numbers
+/// change under `held`'s lock alone.
 #[derive(Debug, Default)]
 pub struct ReadHold {
     held: Mutex<Option<(ReadGuardKind, ReadSpan)>>,
-    /// The read under way was ended here: set with its hold taken, before its marks and counts are
-    /// given back, and cleared as it ends.
-    ended: AtomicBool,
-    /// The last read was ended so, until the next begins.
-    was_ended: AtomicBool,
+    /// The reads this connection has begun: the last one's number, the first's 1.
+    begun: AtomicU64,
+    /// The number of the read under way, 0 between reads.
+    under_way: AtomicU64,
+    /// The number of the last read the log's owner ended, 0 for none.
+    ended: AtomicU64,
 }
 
 impl ReadHold {
     fn begin(&self, guard: ReadGuardKind, span: ReadSpan) {
         let mut held = self.held.lock();
-        self.ended.store(false, Ordering::Release);
-        self.was_ended.store(false, Ordering::Release);
+        let number = self.begun.load(Ordering::Relaxed).wrapping_add(1);
+        self.begun.store(number, Ordering::Release);
+        self.under_way.store(number, Ordering::Release);
         *held = Some((guard, span));
     }
 
     /// The read's own end, its hold given back already or not.
     fn end(&self) -> Option<(ReadGuardKind, ReadSpan)> {
         let mut held = self.held.lock();
-        self.ended.store(false, Ordering::Release);
+        self.under_way.store(0, Ordering::Release);
         held.take()
     }
 
-    /// Whether the read under way was ended: what it reads of the log or the file from here on may
-    /// be another generation's. Asked after a page's bytes arrive, so a page it lets through was
-    /// read before its segment was given back.
+    /// Whether the read under way was ended: what it looks up from here on may be another
+    /// generation's. What memory shared with other reads gave is asked after it was given, under
+    /// the lock whoever wrote it there held since the end.
     pub(crate) fn is_ended(&self) -> bool {
-        fence(Ordering::SeqCst);
-        self.ended.load(Ordering::Acquire)
+        let read = self.under_way.load(Ordering::Acquire);
+        read != 0 && self.ended.load(Ordering::Acquire) == read
     }
 
     /// Whether the last read was ended so: asked once it ended, until the next begins.
     pub(crate) fn was_ended(&self) -> bool {
-        self.was_ended.load(Ordering::Acquire)
+        let read = self.begun.load(Ordering::Acquire);
+        read != 0 && self.ended.load(Ordering::Acquire) == read
+    }
+
+    /// Runs `f`, which takes in the bytes a read of the log or the file brought for the read
+    /// `asked`: not run, and None, once the log's owner ended that read. The owner ends a read
+    /// under the same lock, so its end comes wholly before `f`, which then isn't run, or wholly
+    /// after it: the bytes were read, and what `f` gave other reads of them (the shared pages, the
+    /// records kept decoded) was given, before the read's segments were. A page asked for outside
+    /// a read (`asked` 0) is always taken in.
+    fn admit<T>(&self, asked: u64, f: impl FnOnce() -> T) -> Option<T> {
+        let _held = self.held.lock();
+        let ended = asked != 0 && self.ended.load(Ordering::Acquire) >= asked;
+        (!ended).then(f)
+    }
+}
+
+/// The read a page was asked for in, kept with its I/O, so that its bytes, whenever they arrive, are
+/// taken in only while that read's segments are its own (decision 45). A page read in flight as its
+/// read ends is checked against its own read, not the connection's next.
+#[derive(Debug, Clone)]
+pub(crate) struct Asked {
+    hold: Arc<ReadHold>,
+    read: u64,
+}
+
+impl Asked {
+    /// Asked before the bytes are.
+    pub(crate) fn now(hold: &Arc<ReadHold>) -> Self {
+        Self {
+            hold: hold.clone(),
+            read: hold.under_way.load(Ordering::Acquire),
+        }
+    }
+
+    /// [`ReadHold::admit`] for this read.
+    pub(crate) fn admit<T>(&self, f: impl FnOnce() -> T) -> Option<T> {
+        self.hold.admit(self.read, f)
+    }
+
+    /// Whether the log's owner ended this read: what failed as it was read may have failed for that.
+    pub(crate) fn is_ended(&self) -> bool {
+        self.admit(|| ()).is_none()
+    }
+
+    /// `err`, or, where the read was ended, that.
+    fn or_ended(&self, err: CompletionError) -> CompletionError {
+        if self.is_ended() {
+            CompletionError::SnapshotTooOld
+        } else {
+            err
+        }
     }
 }
 
@@ -4336,9 +4417,10 @@ impl SharedLog {
             let Some((guard, span)) = held.take() else {
                 continue;
             };
-            // Before anything is given back: whoever sees the segment free sees this.
-            hold.was_ended.store(true, Ordering::Release);
-            hold.ended.store(true, Ordering::SeqCst);
+            // Before anything is given back, and under the lock a page is taken in under
+            // ([`ReadHold::admit`]): whoever sees the segment free sees this.
+            hold.ended
+                .store(hold.under_way.load(Ordering::Relaxed), Ordering::Release);
             if let Some((segment, slot)) = guard.read_mark() {
                 if let Some(mark) = self.segment(segment).read().runtime.read_locks.get(slot) {
                     mark.unlock();
@@ -5395,6 +5477,7 @@ impl WalFile {
         header: &WalHeader,
         buffer_pool: &Arc<BufferPool>,
         group: Option<&mut CompletionGroup>,
+        asked: Asked,
     ) -> Result<Completion> {
         let page_size =
             usize::try_from(header.page_size).map_err(|_| LimboError::IntegerOverflow)?;
@@ -5430,6 +5513,7 @@ impl WalFile {
             frame_len,
             file: self.coordination.segment_file(segment)?,
             records: self.segment_records(segment),
+            asked,
             readers,
             state: SpinLock::new(ReadState::default()),
             done: SpinLock::new(None),
@@ -5619,6 +5703,7 @@ impl WalFile {
             header,
             &self.buffer_pool,
             Some(group),
+            Asked::now(&self.hold),
         )?;
         Ok(slots
             .into_iter()
@@ -6189,8 +6274,8 @@ impl Wal for WalFile {
         Ok(self.find_closing_frame(segment, page_id))
     }
 
-    fn read_hold(&self) -> Option<Arc<ReadHold>> {
-        Some(self.hold.clone())
+    fn read_hold(&self) -> Option<&Arc<ReadHold>> {
+        Some(&self.hold)
     }
 
     fn frame_generation(&self, frame: FrameRef) -> u32 {
@@ -6226,7 +6311,8 @@ impl Wal for WalFile {
             at.segment,
             label
         );
-        let hold = self.hold.clone();
+        let asked = Asked::now(&self.hold);
+        let admitted = asked.clone();
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
             let Ok((buf, bytes_read)) = res else {
                 tracing::debug!(err = ?res.unwrap_err());
@@ -6234,12 +6320,6 @@ impl Wal for WalFile {
                 page.clear_wal_tag();
                 return None; // IO error already captured in completion
             };
-            // The segment may have been given to another generation since: asked after the bytes.
-            if hold.is_ended() {
-                page.clear_locked();
-                page.clear_wal_tag();
-                return Some(CompletionError::SnapshotTooOld);
-            }
             let buf_len = buf.len();
             if bytes_read != buf_len as i32 {
                 tracing::debug!(
@@ -6247,17 +6327,24 @@ impl Wal for WalFile {
                 );
                 page.clear_locked();
                 page.clear_wal_tag();
-                return Some(CompletionError::ShortReadWalFrame {
+                return Some(admitted.or_ended(CompletionError::ShortReadWalFrame {
                     offset,
                     expected: buf_len,
                     actual: bytes_read as usize,
-                });
+                }));
             }
-            let cloned = frame.clone();
-            finish_read_page(page.get().id(), buf, cloned);
-            match label {
-                Some(epoch) => frame.set_wal_tag(frame_id, epoch),
-                None => frame.clear_wal_tag(),
+            // The segment may have been given to another generation since (decision 45).
+            let taken = admitted.admit(|| {
+                finish_read_page(page.get().id(), buf, frame.clone());
+                match label {
+                    Some(epoch) => frame.set_wal_tag(frame_id, epoch),
+                    None => frame.clear_wal_tag(),
+                }
+            });
+            if taken.is_none() {
+                page.clear_locked();
+                page.clear_wal_tag();
+                return Some(CompletionError::SnapshotTooOld);
             }
             None
         });
@@ -6284,6 +6371,7 @@ impl Wal for WalFile {
                 &header,
                 &buffer_pool,
                 group,
+                asked,
             );
         }
         // important not to hold shared state locks beyond this point to avoid deadlock with
@@ -12187,6 +12275,125 @@ pub mod test {
         writer.execute("update t set v = 'B' where id = 1").unwrap();
         copy_everything_keeping_the_cache(&db, &reader);
         assert_eq!(rows_in_the_file(dir.path(), "B"), 1);
+    }
+
+    /// Do (decision 45): a read that counts on the closing segment; a page asked for in it taken
+    /// in, held there by the test, while the log's owner ends the closing segment's reads on another
+    /// thread; then that page's bytes given again once the read ended, once it rolled back, and in
+    /// the connection's next read; a page asked for in that next read. Expect: the owner gives the
+    /// segment back only once the page was taken in whole; the bytes given after refused, whichever
+    /// read the connection is in by then; the next read's taken in.
+    #[test]
+    fn d45_a_page_is_taken_in_wholly_before_its_read_ends_or_not_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = two_segment_database(dir.path());
+        let reader = db.connect(ConnectOpts::new()).unwrap();
+        reader.execute("begin").unwrap();
+        assert_eq!(count_test_table(&reader), 30);
+        let hold = {
+            let pager = reader.pager.load();
+            pager.wal.as_ref().unwrap().read_hold().unwrap().clone()
+        };
+        assert_eq!(db.closing_reads(), 1);
+        let asked = super::Asked::now(&hold);
+        let (ending, owner_is) = std::sync::mpsc::channel();
+        let (counted, owner) = asked
+            .admit(|| {
+                let owner = {
+                    let db = db.clone();
+                    std::thread::spawn(move || {
+                        ending.send(()).unwrap();
+                        db.end_closing_reads()
+                    })
+                };
+                owner_is.recv().unwrap();
+                // It is at its end from here on: it has every chance to give the segment back.
+                for _ in 0..10_000 {
+                    std::thread::yield_now();
+                }
+                (db.closing_reads(), owner)
+            })
+            .unwrap();
+        assert_eq!(counted, 1, "the segment was given back under its page");
+        assert_eq!(owner.join().unwrap(), 1);
+        assert_eq!(db.closing_reads(), 0);
+        assert!(hold.is_ended());
+        assert!(asked.admit(|| ()).is_none(), "once the read was ended");
+        reader.execute("rollback").unwrap();
+        assert!(!hold.is_ended() && hold.was_ended());
+        assert!(asked.admit(|| ()).is_none(), "once the read rolled back");
+        reader.execute("begin").unwrap();
+        assert_eq!(count_test_table(&reader), 30);
+        assert!(!hold.is_ended() && !hold.was_ended());
+        assert!(asked.admit(|| ()).is_none(), "in the next read");
+        assert!(super::Asked::now(&hold).admit(|| ()).is_some());
+    }
+
+    /// Do (decisions 20 and 45): pages shared among the connections; row 1 'file', its page in the
+    /// file alone; a read begun, that page not read yet; the log switched, so the segment it counts
+    /// on closes; row 1 set to 'new' in the segment now current; the page read, and between its
+    /// lookup in the log, which says the file, and its lookup in the shared pages: the read ended by
+    /// the log's owner, both segments copied into the file, and the row read by another connection,
+    /// which shares the file's page as it now is. On each page path. Expect: the read refused as a
+    /// snapshot too old, the shared page not its snapshot's; 'new' once it is asked again.
+    #[test]
+    fn d45_a_shared_page_found_as_its_read_ends_is_never_taken_in() {
+        use crate::storage::pager::PagePath;
+        for path in [PagePath::Today, PagePath::Plain] {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("shared.db");
+            let io = shared_wal_test_io();
+            let db =
+                Database::open_file(io, file.to_str().unwrap(), Arc::new(SqliteDialect)).unwrap();
+            db.share_pages(4096).unwrap();
+            let writer = db.connect(ConnectOpts::new()).unwrap();
+            for sql in [
+                "pragma wal_autocheckpoint=0",
+                "create table a(x)",
+                "insert into a values(0)",
+                "create table t(id integer primary key, v text)",
+                "insert into t values(1, 'file')",
+                "pragma wal_checkpoint(TRUNCATE)",
+                "update a set x = 1",
+            ] {
+                writer.execute(sql).unwrap();
+            }
+            let reader = db.connect(ConnectOpts::new()).unwrap();
+            reader.pager.load().set_page_path(path);
+            reader.execute("begin").unwrap();
+            assert_eq!(count_rows(&reader, "a"), 1);
+            assert!(db.switch_log(None).unwrap());
+            writer.execute("update t set v = 'new'").unwrap();
+            let owner = db.clone();
+            *reader.pager.load().within_shared_lookup.lock() = Some(Box::new(move || {
+                assert_eq!(owner.end_closing_reads(), 1);
+                let copier = owner.connect(ConnectOpts::new()).unwrap();
+                for _ in 0..2 {
+                    run_checkpoint_until_done(
+                        &copier.pager.load(),
+                        CheckpointMode::Passive {
+                            upper_bound_inclusive: None,
+                        },
+                    );
+                }
+                let other = owner.connect(ConnectOpts::new()).unwrap();
+                other.pager.load().set_page_path(path);
+                assert_eq!(count_rows(&other, "t where v = 'new'"), 1);
+            }));
+            let mut read = reader.prepare("select v from t where id = 1").unwrap();
+            let answer = read.run_collect_rows();
+            assert!(
+                reader.pager.load().within_shared_lookup.lock().is_none(),
+                "the page was not looked up among the shared ones: {path:?}"
+            );
+            assert!(
+                matches!(answer, Err(LimboError::SnapshotTooOld)),
+                "{path:?}: {answer:?}"
+            );
+            drop(read);
+            reader.execute("rollback").unwrap();
+            assert_eq!(count_rows(&reader, "t where v = 'new'"), 1, "{path:?}");
+        }
     }
 
     #[test]

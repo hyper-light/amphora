@@ -568,7 +568,7 @@ pub(crate) fn begin_read_page(
     io_ctx: &IOContext,
     group: Option<&mut CompletionGroup>,
     learned: Option<Arc<crate::translate::optimizer::learned_costs::LearnedCosts>>,
-    hold: Option<Arc<super::wal::ReadHold>>,
+    asked: Option<super::wal::Asked>,
 ) -> Result<Completion> {
     tracing::trace!("begin_read_btree_page(page_idx = {})", page_idx);
     let timer = learned
@@ -582,34 +582,24 @@ pub(crate) fn begin_read_page(
             page.clear_locked();
             return None; // IO error already captured in completion
         };
-        // Amphora: the file may hold another generation's page of it since (decision 45): asked
-        // after the bytes.
-        if hold.as_ref().is_some_and(|hold| hold.is_ended()) {
-            page.clear_locked();
-            return Some(CompletionError::SnapshotTooOld);
-        }
         let buf_len = buf.len();
         // Handle truncated database files: if we read fewer bytes than expected
         // (and it's not an intentional empty read), return a ShortRead error.
-        if bytes_read == 0 {
-            if !allow_empty_read {
-                tracing::error!("short read on page {page_idx}: expected {buf_len} bytes, got 0");
-                page.clear_locked();
-                return Some(CompletionError::ShortRead {
-                    page_idx,
-                    expected: buf_len,
-                    actual: 0,
-                });
+        if (bytes_read == 0 && !allow_empty_read)
+            || (bytes_read != 0 && bytes_read != buf_len as i32)
+        {
+            page.clear_locked();
+            // Amphora: an ended read's page may be past a file cut since (decision 45).
+            if asked.as_ref().is_some_and(super::wal::Asked::is_ended) {
+                return Some(CompletionError::SnapshotTooOld);
             }
-        } else if bytes_read != buf_len as i32 {
             tracing::error!(
                 "short read on page {page_idx}: expected {buf_len} bytes, got {bytes_read}"
             );
-            page.clear_locked();
             return Some(CompletionError::ShortRead {
                 page_idx,
                 expected: buf_len,
-                actual: bytes_read as usize,
+                actual: usize::try_from(bytes_read).unwrap_or(0),
             });
         }
         if let (Some(learned), Some(timer)) = (learned.as_ref().filter(|_| bytes_read != 0), timer)
@@ -622,7 +612,16 @@ pub(crate) fn begin_read_page(
         } else {
             buf
         };
-        finish_read_page(page_idx, buffer, page);
+        // Amphora: the file may hold another generation's page of it since (decision 45).
+        let Some(asked) = &asked else {
+            finish_read_page(page_idx, buffer, page);
+            return None;
+        };
+        let taken = asked.admit(|| finish_read_page(page_idx, buffer, page.clone()));
+        if taken.is_none() {
+            page.clear_locked();
+            return Some(CompletionError::SnapshotTooOld);
+        }
         None
     });
     let c = Completion::new_read(buf, complete);

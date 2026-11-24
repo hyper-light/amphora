@@ -57,7 +57,7 @@ use super::sqlite3_ondisk::{
     FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR,
 };
 use super::sqlite3_ondisk::{read_varint, read_varint_len, split_varint};
-use super::wal::{CheckpointMode, WalAutoActions};
+use super::wal::{Asked, CheckpointMode, WalAutoActions};
 use crate::storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
 
 /// SQLite's default maximum page count
@@ -1929,6 +1929,10 @@ pub struct Pager {
     /// Test-only: yields once in `cache_insert` for an armed page, as a spill in flight makes it.
     #[cfg(test)]
     insert_yield: SpillYieldHook,
+    /// Test-only: run once in `read_shared`, between a page's lookup in the log and in the shared
+    /// pages.
+    #[cfg(test)]
+    pub(crate) within_shared_lookup: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Dirty pages as a bitmap, naturally sorted by page number.
     dirty_pages: Arc<RwLock<RoaringBitmap>>,
     /// An owned transaction's hard dirty-page admission limit; zero disables the fence.
@@ -2310,6 +2314,8 @@ impl Pager {
             spill_yield: SpillYieldHook::new(),
             #[cfg(test)]
             insert_yield: SpillYieldHook::new(),
+            #[cfg(test)]
+            within_shared_lookup: Mutex::new(None),
             dirty_pages: Arc::new(RwLock::new(RoaringBitmap::new())),
             transaction_page_limit: AtomicUsize::new(0),
             access: RwLock::new(None),
@@ -4119,22 +4125,27 @@ impl Pager {
             Some(buffer) => buffer,
             None => Arc::new(self.buffer_pool.get_page()),
         };
+        let asked = self.asked();
         let read = {
             let io_ctx = self.io_ctx.read();
             self.db_file
-                .read_page_inline(page_idx, &io_ctx, buffer.as_mut_slice())?
+                .read_page_inline(page_idx, &io_ctx, buffer.as_mut_slice())
+        };
+        let read = match read {
+            // A page written over as it was read fails its checksum (decision 45).
+            Err(_) if asked.as_ref().is_some_and(Asked::is_ended) => {
+                return Err(LimboError::SnapshotTooOld);
+            }
+            read => read?,
         };
         let Some(read) = read else {
             return Ok(false);
         };
-        // The file may hold another generation's page since (decision 45): asked after the bytes.
-        if let Some(wal) = self.wal.as_ref() {
-            if wal.read_hold().is_some_and(|hold| hold.is_ended()) {
-                return Err(LimboError::SnapshotTooOld);
-            }
-        }
         let expected = buffer.len();
         if (read == 0 && !allow_empty) || (read != 0 && read != expected) {
+            if asked.as_ref().is_some_and(Asked::is_ended) {
+                return Err(LimboError::SnapshotTooOld);
+            }
             return Err(LimboError::CompletionError(CompletionError::ShortRead {
                 page_idx,
                 expected,
@@ -4147,8 +4158,21 @@ impl Pager {
         } else {
             buffer
         };
-        sqlite3_ondisk::finish_read_page(page_idx, buffer, page.clone());
+        // The file may hold another generation's page of it since (decision 45).
+        let finish = || sqlite3_ondisk::finish_read_page(page_idx, buffer, page.clone());
+        match &asked {
+            None => finish(),
+            Some(asked) => asked.admit(finish).ok_or(LimboError::SnapshotTooOld)?,
+        }
         Ok(true)
+    }
+
+    /// Amphora: the read under way, as a page is asked for in it (decision 45).
+    fn asked(&self) -> Option<Asked> {
+        self.wal
+            .as_ref()
+            .and_then(|wal| wal.read_hold())
+            .map(Asked::now)
     }
 
     /// Amphora (decision 42): a plain page to read page `page_idx` into: the spare the cache's
@@ -4424,7 +4448,7 @@ impl Pager {
             io_ctx,
             group,
             self.learned_costs.get().cloned(),
-            self.wal.as_ref().and_then(|wal| wal.read_hold()),
+            self.asked(),
         )
     }
 
@@ -4850,6 +4874,10 @@ impl Pager {
             None => Version::File,
         };
         let key = shared.key(page_no, version);
+        #[cfg(test)]
+        if let Some(hook) = self.within_shared_lookup.lock().take() {
+            hook();
+        }
         let (page, spare) = match self.page_path() {
             PagePath::Plain => self.plain_page(page_idx)?,
             PagePath::Today => (Arc::new(Page::new(page_idx)), None),
@@ -4861,6 +4889,11 @@ impl Pager {
         let plain = self.page_path() == PagePath::Plain;
         if plain {
             if let Some(buffer) = shared.pages().take_count(&key) {
+                // What the pool keeps may be another generation's since the lookup above, where the
+                // log's owner ended this read between (decision 45).
+                if self.read_ended() {
+                    return Err(LimboError::SnapshotTooOld);
+                }
                 page.get().set_buffer(buffer);
                 page.set_loaded();
                 page.set_shared();
@@ -4880,6 +4913,9 @@ impl Pager {
                 _ => shared.pages().copy_into(&key, copy.as_mut_slice()),
             };
             if found {
+                if self.read_ended() {
+                    return Err(LimboError::SnapshotTooOld);
+                }
                 #[allow(clippy::arc_with_non_send_sync)]
                 page.get().set_buffer(Arc::new(copy));
                 page.set_loaded();
