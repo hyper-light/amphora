@@ -1,0 +1,1581 @@
+AH	diff-0cc9104abb66435b	Wrong	default,parallel,statistics,parallel, statistics	SELECT 0 FROM t0 AS a0 LEFT JOIN t0 AS a1 ON (a1.c0 LIKE 'a%');	0 rows | 1 rows / 0
+AH	diff-f11008fec1e37f9c	Wrong	default,parallel,statistics,parallel, statistics	SELECT '{"a":1,"b":[2,3]}' FROM t0 AS a0 FULL JOIN t0 AS a1 ON (a1.c1 LIKE 'A%');	0 rows | 2 rows / '{"a":1,"b":[2,3]}' / '{"a":1,"b":[2,3]}'
+AH	diff-e984f6de9a3cc6b4	Wrong	default,parallel,statistics,parallel, statistics	WITH RECURSIVE w0(c0) AS MATERIALIZED (SELECT 0) SELECT 1, NULL FROM w0 AS a0 LEFT JOIN t1 AS a1 ON (a1.c1 LIKE 'A%') GROUP BY 1;	0 rows | 1 rows / 1, NULL
+AH	diff-9b117d07eea67a3f	Wrong	default,parallel,statistics,parallel, statistics	SELECT NULL FROM t0 AS a0 FULL JOIN t1 AS a2 ON (a2.c0 LIKE 'A%');	0 rows | 1 rows / NULL
+AH	diff-65bff94d801c236d	Wrong	default,parallel,statistics,parallel, statistics	SELECT NULL FROM t0 AS a0 LEFT JOIN t0 AS a1 ON (a1.c0 LIKE 'a%');	0 rows | 1 rows / NULL
+AH	diff-3bb3c717c35600bf	Wrong	default,parallel,statistics,parallel, statistics	SELECT 7 FROM (SELECT x'41' AS c0 FROM t0 AS b50x0) AS a0 LEFT JOIN t0 AS a1 ON (a1.c0 LIKE 'A%');	0 rows | 1 rows / 7
+AH	diff-6047fa0c264a18fe	Wrong	default,parallel,statistics,parallel, statistics	WITH w0(c0, c1) AS NOT MATERIALIZED (SELECT NULL, x'' FROM t0 AS b49x0 FULL JOIN t0 AS b49x1 ON (b49x1.c0 LIKE 'A%')) SELECT NULL FROM w0 AS a0;	0 rows | 2 rows / NULL / NULL
+AH	diff-11e7a6b4b1862a5b	Wrong	default,parallel,statistics,parallel, statistics	SELECT ' a', NULL, 9223372036854775807 FROM (SELECT NULL AS c0, NULL AS c1 FROM t0 AS b21x0 RIGHT JOIN t0 AS b21x1 ON (b21x1.c0 LIKE 'a%')) AS a0 GROUP BY ' a';	0 rows | 1 rows / ' a', NULL, 9223372036854775807
+AH	diff-62ea6c357d3e54d2	Wrong	default,parallel,statistics,parallel, statistics	SELECT a1.c0, count(*) FROM t0 AS a0, t0 AS a1 LEFT JOIN t0 AS a2 ON ((a2.c0 LIKE 'A%') AND ('é' GLOB 'a%')) GROUP BY a1.c0;	0 rows | 1 rows / 3, 1
+AH	diff-7c37591ac96a9e75	Wrong	default,parallel,statistics,parallel, statistics	WITH w0(c0) AS (SELECT NULL FROM t0 AS b89x0) SELECT NULL FROM w0 AS a0 LEFT JOIN t1 AS a1 ON (a1.c0 LIKE 'a%');	0 rows | 1 rows / NULL
+AH	diff-1c5c7efc36212f00	Wrong	default,parallel,statistics,parallel, statistics	SELECT NULL, NULL FROM (SELECT NULL AS c0 FROM t2 AS b68x0 WHERE (b68x0.c1 LIKE 'a%')) AS a0 RIGHT JOIN t0 AS a1 ON NULL GROUP BY NULL;	0 rows | 1 rows / NULL, NULL
+AH	diff-d266114adc073742	Wrong	default,parallel,statistics,parallel, statistics	WITH w0(c0, c1, c2) AS NOT MATERIALIZED (SELECT -2.5, NULL, NULL FROM t0 AS b25x0 WHERE (b25x0.c1 LIKE 'a%')) SELECT NULL FROM w0 AS a0 RIGHT JOIN t0 AS a1 ON NULL;	0 rows | 1 rows / NULL
+AH	diff-cb965b9e87372302	Wrong	default,parallel,statistics,parallel, statistics	SELECT 'a ', 3, NULL, 'a ' FROM (SELECT NULL AS c0, NULL AS c1, '1' AS c2 FROM t1 AS b35x0) AS a0 FULL JOIN t1 AS a1 ON (a1.c1 LIKE 'a%') GROUP BY 'a ', 3;	0 rows | 1 rows / 'a ', 3, NULL, 'a '
+AH	diff-4019b809de0b299c	Wrong	default,parallel,statistics,parallel, statistics	SELECT NULL FROM v0 AS a0 FULL JOIN t1 AS a1 ON (a1.c1 LIKE 'a%');	0 rows | 1 rows / NULL
+AH	diff-3d54378f7ada46f2	Wrong	default,parallel,statistics,parallel, statistics	SELECT 9007199254740993, NULL FROM t0 AS a0 FULL JOIN t2 AS a1 ON (a1.c2 LIKE 'A%') GROUP BY 9007199254740993;	0 rows | 1 rows / 9007199254740993, NULL
+AH	diff-ba80fd7b680af311	Wrong	default,parallel,statistics,parallel, statistics	WITH w0(c0) AS MATERIALIZED (SELECT NULL FROM t1 AS b13x0 INTERSECT SELECT NULL FROM t2 AS b15x0 UNION ALL SELECT NULL FROM t2 AS b96x0 FULL JOIN t1 AS b96x1 ON (b96x1.c2 LIKE 'a%')) SELECT 'a', NULL 	0 rows | 1 rows / 'a', NULL
+AH	diff-e8d67616e2f758ed	Wrong	default,parallel,statistics,parallel, statistics	SELECT (CASE (-1 & a1.c0) WHEN (a1.c3 >= '%') THEN json_pretty('abc') WHEN ('-1' BETWEEN a2.c0 AND a2.c0) THEN a1.c3 END) FROM t0 AS a0, t0 AS a1 RIGHT JOIN t2 AS a2 ON ((a2.c1 LIKE 'a%') AND (a0.c0 I	0 rows | 1 rows / NULL
+AH	diff-aca8d0c22f9f4984	Wrong	default,parallel,statistics,parallel, statistics	SELECT sum((CAST(a1.c0 AS INTEGER) % 1000)) FILTER (WHERE ((a2.c0 == a1.c0) AND (a0.c0 IS a1.c0))) OVER (ORDER BY strftime(a0.c0, a2.c0), (0.5 IN (a0.c0, 1, x'0102')) DESC, a0.rowid DESC, a1.rowid, a2	0 rows | 2 rows / NULL / NULL
+C11's CM	error-002e997e0fe554f3	Error	default,parallel,statistics,parallel, statistics	SELECT 1 FROM lg AS a0, t0 AS a1 WHERE ((json_error_position((+ '0x10')), (a1.c1 = a1.c0), ('%' NOT IN (a0.c1, a1.c1, 0.1))) BETWEEN (((CASE WHEN (a0.c2 <= NULL) THEN 'true' WHEN (a0.c1 == a0.c0) THEN	0 rows | error: Parse error: insufficient registers allocated for expression vector write (start=4, count=3, next_free=
+C11's CM	error-a1bc72a0baa7dcc8	Error	default,parallel,statistics,parallel, statistics	SELECT 3 FROM (SELECT char((0.1 == b81x0.c2)) AS c0, CAST((b81x0.c1 IS NOT NULL) AS INTEGER) AS c1, instr(NULL, trim('1e3', b81x0.c2)) AS c2 FROM lg AS b81x0 WHERE ((b81x0.c0 BETWEEN 3.0 AND 1e308) NO	0 rows | error: Parse error: insufficient registers allocated for expression vector write (start=24, count=2, next_free
+C11's CN	error-2b6ca64d483d7683	Error	default,parallel,statistics,parallel, statistics	SELECT ' a', NULL FROM t2 AS a0 WHERE ((NULL, NULL, '1') NOT IN (SELECT s496.c0, s496.c2, s496.c0 FROM t2 AS s496 WHERE (s496.c2 < (CASE WHEN (s496.c2 ISNULL) THEN 0 WHEN (s496.c0 NOTNULL) THEN '0' EL	0 rows | error: Parse error: row value misused
+CI	diff-1252b1f394ca19ac	Wrong	default,parallel,statistics,parallel, statistics	SELECT json_pretty('{"a":null}', 1000000000000000.0) FROM (SELECT NULL AS c0, NULL AS c1 FROM t1 AS b16x0 GROUP BY NULL) AS a0;	1 rows / '{ / 1000000000000000.0"a": null / }' | 1 rows / '{ / 1000000000000000"a": null / }'
+CI	diff-71847ced44e4eab1	Wrong	default,parallel,statistics,parallel, statistics	SELECT json_pretty(json_extract('{"a":1,"b":[2,3]}', '$'), a2.c3) FROM t0 AS a0, t0 AS a1, t0 AS a2;	1 rows / '{ / -1.0e-308"a": 1, / -1.0e-308"b": [ / -1.0e-308-1.0e-3082, / -1.0e-308-1.0e-3083 / -1.0e-308] / } | 1 rows / '{ / -0.000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+CJ	error-9c5ff875d92402a3	Error	default,parallel,statistics,parallel, statistics	SELECT ((SELECT min(s455.c1) FROM t2 AS s455 WHERE (atanh(a0.c1) BETWEEN jsonb_set(a0.c1, 1.5) AND (s455.c0 COLLATE NOCASE)))) IS TRUE, ((SELECT min(s455.c1) FROM t2 AS s455 WHERE (atanh(a0.c1) BETWEE	1 rows / 0, 0 | error: json_set() needs an odd number of arguments
+CJ	error-327aa6bdaaacbc20	Error	default,parallel,statistics,parallel, statistics	SELECT ((NULL IN (SELECT s106.c0 FROM t0 AS s106 WHERE (json_set(a0.c1, a0.c1, x'c3bf') BETWEEN CAST(2.0 AS REAL) AND s106.c0)))) IS TRUE, ((NULL IN (SELECT s106.c0 FROM t0 AS s106 WHERE (json_set(a0.	1 rows / 0, 1 | error: JSON path error near: "2"
+CK (JSONB)	diff-96f0facb089ae91d	Wrong	default,parallel,statistics,parallel, statistics	SELECT jsonb_object('_', asinh(1)) FROM t2 AS a0;	1 rows / x'cc17175fc513302e3838313337333538373031393534333035' | 1 rows / x'cc15175fc511302e383831333733353837303139353433'
+CK (JSONB)	diff-c78889d0656637d4	Wrong	default,parallel,statistics,parallel, statistics	SELECT jsonb_array(sin(a0.c0)) FROM t2 AS a0;	1 rows / x'cb15c513302e3437393432353533383630343230333031' | 1 rows / x'cb13c511302e343739343235353338363034323033'
+CK (JSONB)	diff-ef2cc99cc77f9c6c	Wrong	default,parallel,statistics,parallel, statistics	SELECT jsonb_array(asinh('1'), NULL) FROM t0 AS a0;	1 rows / x'cb16c513302e383831333733353837303139353433303500' | 1 rows / x'cb14c511302e38383133373335383730313935343300'
+CK (JSONB)	diff-e7e7985eba970ef2	Wrong	default,parallel,statistics,parallel, statistics	SELECT jsonb_array(sin(a0.c1), 'é') FROM t1 AS a0;	1 rows / x'cb19c5142d302e383438393235393634383134363534393927c3a9' | 1 rows / x'cb17c5122d302e38343839323539363438313436353527c3a9'
+CK (JSONB)	diff-611394fdef75a701	Wrong	default,parallel,statistics,parallel, statistics	SELECT jsonb_array(NULL, (a0.c3 / -2.5), NULL) FROM t0 AS a0;	1 rows / x'cb1b00c517332e39393939393939393939393939393737652d33303900' | 1 rows / x'bb0085342e30652d33303900'
+CK (JSONB)	diff-5f209d11c1462106	Wrong	default,parallel,statistics,parallel, statistics	SELECT jsonb_array(radians(a0.c1), NULL) FROM t0 AS a0;	1 rows / x'cb1ac5172d312e373435333239323531393934333533652d33313000' | 1 rows / x'cb19c5162d312e3734353332393235313939343335652d33313000'
+CK (JSONB)	diff-0f7d39b8b708f682	Wrong	default,parallel,statistics,parallel, statistics	SELECT jsonb_array(asinh('10')) FROM t0 AS a0;	1 rows / x'cb14c512322e39393832323239353032393739363938' | 1 rows / x'cb12c510322e3939383232323935303239373937'
+CK (JSONB)	diff-d1105089b15a1100	Wrong	default,parallel,statistics,parallel, statistics	SELECT jsonb_array(upper('1.5'), tan(0), mod(a1.c0, -1e-308)) FROM v1 AS a0, t0 AS a1;	1 rows / x'cb2137312e3535302e30c517392e38373636363039353237373935363832652d333039' | 1 rows / x'cb1f37312e3535302e30c515392e3837363636303935323737393537652d333039'
+CK (JSONB)	diff-db3b1a5901bcf0eb	Wrong	default,parallel,statistics,parallel, statistics	SELECT jsonb_array(-2.5, asinh(1)) FROM (SELECT NULL AS c0, NULL AS c1, x'0102' AS c2, NULL AS c3 FROM t0 AS b63x0) AS a0 NATURAL FULL JOIN t1 AS a1;	1 rows / x'cb1a452d322e35c513302e3838313337333538373031393534333035' | 1 rows / x'cb18452d322e35c511302e383831333733353837303139353433'
+CK (JSONB)	diff-007d8887c3e50eed	Wrong	default,parallel,statistics,parallel, statistics	SELECT (CASE WHEN (a0.c2 != a0.c2) THEN coalesce(a0.c1, a0.c0) ELSE jsonb_array(a0.c2, a1.c1) END) FROM lg AS a0, lg AS a1;	1 rows / x'cb16c512372e333839303536303938393330363530341332' | 1 rows / x'cb14c510372e33383930353630393839333036351332'
+CK (inside)	diff-7a2b6407355a588d	Wrong	default,parallel,statistics,parallel, statistics	WITH RECURSIVE w0(c0) AS (SELECT CAST(1 AS INTEGER) UNION SELECT CAST((w0.c0 * 3) AS INTEGER) FROM w0 AS w0) SELECT replace(sqrt(a0.c0), 0, a0.c0) FROM w0 AS a0;	41 rows / '1.1' / '1.7323538375688772' / '3.9' / '5.1961524227276632' / '9.81' / '15.588457268119896' / '27.72 | 41 rows / '1.1' / '1.7323538375688772' / '3.9' / '5.1961524227276632' / '9.81' / '15.588457268119896' / '27.72
+CK (inside)	diff-2c0ec46d7d1440a8	Wrong	default,parallel,statistics,parallel, statistics	WITH w1(c0, c1, c2) AS (SELECT NULL, quote(asinh(1)), 9007199254740993 FROM t0 AS b13x0) SELECT octet_length(a0.c1) FROM w1 AS a0;	1 rows / 19 | 1 rows / 17
+CK (inside)	diff-7caeba803aa4356c	Wrong	default,parallel,statistics,parallel, statistics	SELECT (1e308 || (a0.c2 / a1.c1)) FROM t0 AS a0, t0 AS a1;	4 rows / '1.0e+3080' / '1.0e+3080.0' / '1.0e+308-0.1' / '1.0e+3081.0000000000000019e-309' | 4 rows / '1.0e+3080' / '1.0e+3080.0' / '1.0e+308-0.1' / '1.0e+3081.0e-309'
+CK (inside)	diff-80c64c18005be8bd	Wrong	default,parallel,statistics,parallel, statistics	WITH RECURSIVE w0(c0, c1) AS (SELECT ln(b0.c0), 0 FROM t1 AS b0) SELECT cume_dist() OVER (PARTITION BY '"x"', octet_length(a0.c0) ORDER BY a0.c0) FROM w0 AS a0;	2 rows / 0.5 / 1.0 | 2 rows / 1.0 / 1.0
+CK (inside)	diff-737aff88b15f053c	Wrong	default,parallel,statistics,parallel, statistics	SELECT NULL FROM (SELECT NULL AS c0 FROM t1 AS b69x0 UNION ALL SELECT quote(length((b17x0.c2 / b17x1.c2))) FROM t0 AS b17x0 JOIN t0 AS b17x1 UNION SELECT NULL FROM t1 AS b30x0) AS a0;	5 rows / NULL / NULL / NULL / NULL / NULL | 4 rows / NULL / NULL / NULL / NULL
+CK (inside)	diff-7fc0c267578d993a	Wrong	default,parallel,statistics,parallel, statistics	SELECT ((- a0.c0) % a1.c1) FROM (SELECT quote(json_extract('"x"', '$.b[1]')) AS c0, CAST(((b70x0.c0 >= b70x0.c0) OR (b70x0.c1 ISNULL)) AS INTEGER) AS c1, CAST((b70x0.c0 - b70x0.c1) AS INTEGER) AS c2 F	2 rows / -1.0 / 0 | 4 rows / -1.0 / -1.0 / 0 / 0
+CL cert	cert-59d480199578adbc	Estimate	none	SELECT x'' FROM lg AS a0 RIGHT JOIN lg AS a1 ON (a1.c1 IS NULL) WHERE (a1.c2 IS DISTINCT FROM 3); SELECT x'' FROM lg AS a0 JOIN lg AS a1 ON (a1.c1 IS NULL) WHERE (a1.c2 IS DISTINCT FROM 3);	 | 
+CL cert	cert-d2f74e2fb1009c18	Estimate	none	SELECT NULL FROM t0 AS a0 RIGHT JOIN t0 AS a1 ON ('1e3' <> a1.c0) WHERE (a1.c0 != '1e3'); SELECT NULL FROM t0 AS a0 JOIN t0 AS a1 ON ('1e3' <> a1.c0) WHERE (a1.c0 != '1e3');	 | 
+CL cert	cert-0124e862935b30ca	Estimate	none	SELECT NULL FROM t0 AS a0 RIGHT JOIN t0 AS a1 ON (a1.c0 NOT GLOB 'abc') WHERE (a1.c0 NOTNULL); SELECT NULL FROM t0 AS a0 JOIN t0 AS a1 ON (a1.c0 NOT GLOB 'abc') WHERE (a1.c0 NOTNULL);	 | 
+CL cert	cert-2a66fb64cc4f1f4e	Estimate	none	SELECT ' a' FROM t1 AS a0 LEFT JOIN t1 AS a1 ON (a0.c1 NOT LIKE 'abc') WHERE ('A' <= a0.c1); SELECT ' a' FROM t1 AS a0 JOIN t1 AS a1 ON (a0.c1 NOT LIKE 'abc') WHERE ('A' <= a0.c1);	 | 
+CL cert	cert-73ac740994329483	Estimate	none	SELECT 'A' FROM lg AS a0 LEFT JOIN t0 AS a1 ON (3 <> a0.c1) WHERE (a0.c1 GLOB 'a%'); SELECT 'A' FROM lg AS a0 JOIN t0 AS a1 ON (3 <> a0.c1) WHERE (a0.c1 GLOB 'a%');	 | 
+CL cert	cert-bd645a7fa38c9731	Estimate	none	SELECT NULL FROM t0 AS a0 LEFT JOIN lg AS a1 ON (a0.c0 NOTNULL) WHERE (a0.c0 NOTNULL); SELECT NULL FROM t0 AS a0 JOIN lg AS a1 ON (a0.c0 NOTNULL) WHERE (a0.c0 NOTNULL);	 | 
+CL cert	cert-8a6bdadbb343e484	Estimate	none	SELECT NULL FROM t1 AS a0 LEFT JOIN t1 AS a1 ON (a0.c0 IS NOT 0.5) WHERE (a0.c0 < 1000000000000000.0); SELECT NULL FROM t1 AS a0 JOIN t1 AS a1 ON (a0.c0 IS NOT 0.5) WHERE (a0.c0 < 1000000000000000.0);	 | 
+CL cert	cert-33cbdd19f444e910	Estimate	none	SELECT 'ABC' FROM t0 AS a0 LEFT JOIN t0 AS a1 ON (9007199254740993 <= a0.c0) WHERE ((a0.c0 % -1) ISNULL); SELECT 'ABC' FROM t0 AS a0 JOIN t0 AS a1 ON (9007199254740993 <= a0.c0) WHERE ((a0.c0 % -1) IS	 | 
+CL cert	cert-691efb52c58b2da2	Estimate	none	SELECT NULL FROM t1 AS a0 LEFT JOIN t1 AS a1 ON (0 BETWEEN a0.c0 AND x'') WHERE (a0.c0 NOT GLOB 'A%'); SELECT NULL FROM t1 AS a0 JOIN t1 AS a1 ON (0 BETWEEN a0.c0 AND x'') WHERE (a0.c0 NOT GLOB 'A%');	 | 
+CL cert	cert-301510ff20512eef	Estimate	none	SELECT NULL FROM t0 AS a0 LEFT JOIN t0 AS a1 ON (a0.c1 != '1') WHERE (1e308 <> a0.c2); SELECT NULL FROM t0 AS a0 JOIN t0 AS a1 ON (a0.c1 != '1') WHERE (1e308 <> a0.c2);	 | 
+CL cert	cert-a47ed3eb02bdae02	Estimate	none	SELECT -100 FROM t0 AS a0 FULL JOIN t1 AS a1 ON (a0.c0 NOTNULL) JOIN t1 AS a2 ON (0 >= a0.c0); SELECT -100 FROM t0 AS a0 JOIN t1 AS a1 ON (a0.c0 NOTNULL) JOIN t1 AS a2 ON (0 >= a0.c0);	 | 
+CL cert	cert-b7d78436489e0d75	Estimate	none	SELECT NULL FROM lg AS a0 RIGHT JOIN lg AS a1 ON (a1.c1 <= x'c3bf') JOIN lg AS a2 ON (0.5 BETWEEN (a1.c1 + 10) AND 0); SELECT NULL FROM lg AS a0 JOIN lg AS a1 ON (a1.c1 <= x'c3bf') JOIN lg AS a2 ON (0	 | 
+CL cert	cert-14aa6d9bae12b2e4	Estimate	none	SELECT NULL FROM lg AS a0 JOIN t0 AS a1 ON (a1.c1 >= 'x') FULL JOIN lg AS a2 ON (a1.c2 NOTNULL); SELECT NULL FROM lg AS a0 JOIN t0 AS a1 ON (a1.c1 >= 'x') JOIN lg AS a2 ON (a1.c2 NOTNULL);	 | 
+CL cert	cert-4a85084c1b45936c	Estimate	none	SELECT 1 FROM t0 AS a0 FULL JOIN t1 AS a1 ON (a1.c0 BETWEEN 0 AND '{"a":1,"b":[2,3]}') WHERE (a1.c0 < -2.5); SELECT 1 FROM t0 AS a0 JOIN t1 AS a1 ON (a1.c0 BETWEEN 0 AND '{"a":1,"b":[2,3]}') WHERE (a1	 | 
+CL cert	cert-daee03c7d73928f8	Estimate	none	SELECT '_' FROM t0 AS a0 FULL JOIN t0 AS a1 ON (1.5 >= a1.c0) WHERE ((a1.c0 IN (NULL, x'0102')) >= '{"a":1,"b":[2,3]}'); SELECT '_' FROM t0 AS a0 JOIN t0 AS a1 ON (1.5 >= a1.c0) WHERE ((a1.c0 IN (NULL	 | 
+CL cert	cert-89fd47d258145db1	Estimate	none	SELECT a0.c0 FROM t0 AS a0, t0 AS a1 LEFT JOIN t0 AS a2 ON (a1.c0 LIKE 'abc') WHERE (NULL IS DISTINCT FROM (1 > a1.c0)); SELECT a0.c0 FROM t0 AS a0, t0 AS a1 JOIN t0 AS a2 ON (a1.c0 LIKE 'abc') WHERE 	 | 
+CL cert	cert-384377b7555e5eec	Estimate	none	SELECT a1.c0 FROM t0 AS a0, t0 AS a1 LEFT JOIN t0 AS a2 ON ((~ a1.c0) NOTNULL) WHERE ((NOT (a1.c0 NOT LIKE 'a%')) ISNULL); SELECT a1.c0 FROM t0 AS a0, t0 AS a1 JOIN t0 AS a2 ON ((~ a1.c0) NOTNULL) WHE	 | 
+CL cert	cert-cb3fc93ec6b81b32	Estimate	none	SELECT NULL FROM t0 AS a0 JOIN t0 AS a1 ON (' ' BETWEEN a0.c0 AND 0) FULL JOIN t0 AS a2 ON (a0.c0 NOTNULL); SELECT NULL FROM t0 AS a0 JOIN t0 AS a1 ON (' ' BETWEEN a0.c0 AND 0) JOIN t0 AS a2 ON (a0.c0	 | 
+CL cert	cert-8fc2739f5406cb93	Estimate	none	SELECT 7 FROM t0 AS a0 FULL JOIN lg AS a1 ON (2.0 IS DISTINCT FROM a0.c0) JOIN t0 AS a2 ON (a0.c0 IS NULL); SELECT 7 FROM t0 AS a0 FULL JOIN lg AS a1 ON (2.0 IS DISTINCT FROM a0.c0) JOIN t0 AS a2 ON (	 | 
+CL cert	cert-ae56e5c17c1bb6f1	Estimate	none	SELECT NULL FROM t0 AS a0 LEFT JOIN t0 AS a1 ON (a0.c2 NOT GLOB '_') WHERE (-1e-308 BETWEEN a0.c1 AND '0'); SELECT NULL FROM t0 AS a0 JOIN t0 AS a1 ON (a0.c2 NOT GLOB '_') WHERE (-1e-308 BETWEEN a0.c1	 | 
+CL cert	cert-3bebc3aa263019d7	Estimate	none	SELECT NULL FROM t1 AS a0 JOIN t1 AS a1 ON (a0.c2 NOT GLOB '_') LEFT JOIN t1 AS a2 ON (a0.c0 NOT GLOB 'a*'); SELECT NULL FROM t1 AS a0 JOIN t1 AS a1 ON (a0.c2 NOT GLOB '_') JOIN t1 AS a2 ON (a0.c0 NOT	 | 
+CL cert	cert-304c9a053ca6576b	Estimate	none	SELECT ' a' FROM t0 AS a0 LEFT JOIN t0 AS a1 ON (-2.5 <= a0.c2) WHERE (a0.c2 IS DISTINCT FROM '{"a":1,"b":[2,3]}'); SELECT ' a' FROM t0 AS a0 JOIN t0 AS a1 ON (-2.5 <= a0.c2) WHERE (a0.c2 IS DISTINCT 	 | 
+CL cert	cert-ccc1d5bfb514d616	Estimate	none	SELECT NULL FROM t0 AS a0 JOIN t0 AS a1 ON ('x' <= a1.c2) LEFT JOIN t0 AS a2 ON (a1.c2 IS NOT DISTINCT FROM NULL); SELECT NULL FROM t0 AS a0 JOIN t0 AS a1 ON ('x' <= a1.c2) JOIN t0 AS a2 ON (a1.c2 IS 	 | 
+CL cert	cert-69a1fdc2d9de2860	Estimate	none	SELECT NULL FROM t2 AS a0 RIGHT JOIN t0 AS a1 ON ((a1.c1 == 0.5) ISNULL) WHERE (a1.c1 != ' '); SELECT NULL FROM t2 AS a0 JOIN t0 AS a1 ON ((a1.c1 == 0.5) ISNULL) WHERE (a1.c1 != ' ');	 | 
+CL cert	cert-ed16db069a8c54ff	Estimate	none	SELECT NULL FROM t1 AS a0 LEFT JOIN t0 AS a1 ON (0 BETWEEN a0.c0 AND 'abc') JOIN t0 AS a2 ON (2.0 > trunc(a0.c0)); SELECT NULL FROM t1 AS a0 JOIN t0 AS a1 ON (0 BETWEEN a0.c0 AND 'abc') JOIN t0 AS a2 	 | 
+CL cert	cert-ff439c255d2830b4	Estimate	none	SELECT -1e-308 FROM t0 AS a0 JOIN t0 AS a1 ON (a1.c0 IS DISTINCT FROM -9223372036854775808) LEFT JOIN t0 AS a2 ON (CAST(a1.c0 AS BLOB) ISNULL); SELECT -1e-308 FROM t0 AS a0 JOIN t0 AS a1 ON (a1.c0 IS 	 | 
+CL cert	cert-a467ae82109eca30	Estimate	none	SELECT NULL FROM t1 AS a0 LEFT JOIN t0 AS a1 ON (x'c3bf' < a0.c0) WHERE (10 >= a0.c3); SELECT NULL FROM t1 AS a0 JOIN t0 AS a1 ON (x'c3bf' < a0.c0) WHERE (10 >= a0.c3);	 | 
+CL cert	cert-73069ced9d415582	Estimate	none	SELECT NULL FROM t1 AS a0 LEFT JOIN t0 AS a1 ON (a0.c0 < 9007199254740993) JOIN t0 AS a2 ON (a0.c0 NOT GLOB '_'); SELECT NULL FROM t1 AS a0 JOIN t0 AS a1 ON (a0.c0 < 9007199254740993) JOIN t0 AS a2 ON	 | 
+CL cert	cert-973bc3ea97556c45	Estimate	none	SELECT NULL FROM t1 AS a0 LEFT JOIN t1 AS a1 ON ('10' IS NOT a0.c0) WHERE (a0.c0 IS NOT DISTINCT FROM ('A' COLLATE BINARY)) GROUP BY a1.c0; SELECT NULL FROM t1 AS a0 JOIN t1 AS a1 ON ('10' IS NOT a0.c	 | 
+CL cert	cert-b7cf5242ab964a35	Estimate	none	SELECT NULL FROM t0 AS a0 LEFT JOIN t0 AS a1 ON (0 BETWEEN 'a' AND a0.c2) WHERE (a0.c0 > '{"a":1,"b":[2,3]}'); SELECT NULL FROM t0 AS a0 LEFT JOIN t0 AS a1 ON (0 BETWEEN 'a' AND a0.c2) WHERE ((a0.c0 >	 | 
+CL cert	cert-5bf1c9acbe474c3c	Estimate	none	SELECT NULL FROM t1 AS a0 LEFT JOIN t0 AS a1 ON (a0.c1 GLOB 'a*') WHERE (a0.c2 NOT GLOB '%'); SELECT NULL FROM t1 AS a0 JOIN t0 AS a1 ON (a0.c1 GLOB 'a*') WHERE (a0.c2 NOT GLOB '%');	 | 
+CL cert	cert-b0421888349785ec	Estimate	none	SELECT a2.c1 FROM lg AS a0 RIGHT JOIN lg AS a1 ON (a1.c1 NOT LIKE 'A%'), lg AS a2 WHERE (CAST(('0x10' LIKE 'abc') AS NUMERIC) >= (a1.c2 COLLATE RTRIM)); SELECT a2.c1 FROM lg AS a0 JOIN lg AS a1 ON (a1	 | 
+CL cert	cert-57a963dbda797a0b	Estimate	none	SELECT '{"a":null}' FROM t0 AS a0 RIGHT JOIN t1 AS a1 ON (a1.c0 NOTNULL) WHERE (a1.c0 ISNULL); SELECT '{"a":null}' FROM t0 AS a0 JOIN t1 AS a1 ON (a1.c0 NOTNULL) WHERE (a1.c0 ISNULL);	 | 
+CL cert	cert-8421040edf3447c1	Estimate	none	SELECT x'' FROM t0 AS a0 RIGHT JOIN lg AS a1 ON (a1.c0 ISNULL) WHERE (a1.c1 <= x'c3bf'); SELECT x'' FROM t0 AS a0 JOIN lg AS a1 ON (a1.c0 ISNULL) WHERE (a1.c1 <= x'c3bf');	 | 
+CL cert	cert-85f51d38cee3505f	Estimate	none	SELECT NULL FROM t0 AS a0 LEFT JOIN t0 AS a2 ON (a0.c1 LIKE 'abc') WHERE (NULL IS DISTINCT FROM a0.c2); SELECT NULL FROM t0 AS a0 LEFT JOIN t0 AS a2 ON (a0.c1 LIKE 'abc') WHERE ((NULL IS DISTINCT FROM	 | 
+CL cert	cert-21298f8e51e6a1e3	Estimate	none	SELECT unhex(CAST(0.1 AS NUMERIC), x'') FROM t0 AS a0, t0 AS a1 FULL JOIN t0 AS a2 ON (a0.c0 ISNULL) WHERE (exp(a0.c0) ISNULL); SELECT unhex(CAST(0.1 AS NUMERIC), x'') FROM t0 AS a0, t0 AS a1 JOIN t0 	 | 
+CL cert	cert-a7aabb520e277c58	Estimate	none	SELECT NULL FROM t0 AS a0 LEFT JOIN t2 AS a1 ON (a0.c0 GLOB 'a%') JOIN t0 AS a2 ON (a0.c0 LIKE 'a*'); SELECT NULL FROM t0 AS a0 JOIN t2 AS a1 ON (a0.c0 GLOB 'a%') JOIN t0 AS a2 ON (a0.c0 LIKE 'a*');	 | 
+CL cert	cert-ab1172b25d64e3f6	Estimate	none	SELECT NULL FROM t1 AS a0 JOIN lg AS a1 ON (a0.c1 NOT GLOB '*') LEFT JOIN t1 AS a2 ON (a0.c1 BETWEEN -9223372036854775808 AND 0); SELECT NULL FROM t1 AS a0 JOIN lg AS a1 ON (a0.c1 NOT GLOB '*') JOIN t	 | 
+CL cert	cert-8ef5aa105086c094	Estimate	none	SELECT NULL FROM t2 AS a0 LEFT JOIN t2 AS a1 ON (1.5 IS NOT a0.c0) WHERE (json_extract('{"a":1,"b":[2,3]}', '$.b[1]') IS NOT DISTINCT FROM a0.c0); SELECT NULL FROM t2 AS a0 JOIN t2 AS a1 ON (1.5 IS NO	 | 
+CL cert	cert-da99aef0712bc0ae	Estimate	none	SELECT NULL FROM t1 AS a0 LEFT JOIN lg AS a1 ON (x'00' IS NOT a1.c2) RIGHT JOIN lg AS a2 ON ('A' BETWEEN '{"a":1,"b":[2,3]}' AND a1.c0); SELECT NULL FROM t1 AS a0 LEFT JOIN lg AS a1 ON (x'00' IS NOT a	 | 
+CL cert	cert-519d10bac81561c1	Estimate	none	SELECT '"x"', NULL, NULL FROM lg AS a0 RIGHT JOIN t0 AS a1 ON (NULL IS a1.c0) WHERE (a1.c0 NOT GLOB '%a') GROUP BY '"x"', (a0.c2 IS NOT a1.c0); SELECT '"x"', NULL, NULL FROM lg AS a0 JOIN t0 AS a1 ON 	 | 
+CL cert	cert-1e93bb9b7d83ab0a	Estimate	none	SELECT NULL FROM t0 AS a0 LEFT JOIN t1 AS a1 ON (a0.c1 BETWEEN 0 AND -100) WHERE (a0.c0 BETWEEN 2 AND 'ABC'); SELECT NULL FROM t0 AS a0 JOIN t1 AS a1 ON (a0.c1 BETWEEN 0 AND -100) WHERE (a0.c0 BETWEEN	 | 
+CL cert	cert-56b773c1e0550a88	Estimate	none	SELECT NULL FROM t0 AS a0 RIGHT JOIN lg AS a1 ON (a1.c1 IS DISTINCT FROM '{"a":1,"b":[2,3]}') WHERE (a1.c0 NOTNULL); SELECT NULL FROM t0 AS a0 JOIN lg AS a1 ON (a1.c1 IS DISTINCT FROM '{"a":1,"b":[2,3	 | 
+CL cert	cert-0d4d200bbedd5791	Estimate	none	SELECT 2 FROM t1 AS a0 RIGHT JOIN t0 AS a1 ON (a1.c2 LIKE '%') WHERE (0 BETWEEN a1.c0 AND x'c3bf'); SELECT 2 FROM t1 AS a0 JOIN t0 AS a1 ON (a1.c2 LIKE '%') WHERE (0 BETWEEN a1.c0 AND x'c3bf');	 | 
+CL cert	cert-9fb58193ab05b548	Estimate	none	SELECT 1.5 FROM t0 AS a0 LEFT JOIN t1 AS a1 ON (a0.c0 NOT LIKE '*') WHERE (a0.c0 IS json_extract('[1,2,3]', '$[0]')); SELECT 1.5 FROM t0 AS a0 JOIN t1 AS a1 ON (a0.c0 NOT LIKE '*') WHERE (a0.c0 IS jso	 | 
+CL cert	cert-a1cd14bae753e7e6	Estimate	none	SELECT -100 FROM t1 AS a0 JOIN t1 AS a1 ON (a0.c2 NOTNULL) FULL JOIN t2 AS a2 ON (3 > a0.c1); SELECT -100 FROM t1 AS a0 JOIN t1 AS a1 ON (a0.c2 NOTNULL) JOIN t2 AS a2 ON (3 > a0.c1);	 | 
+CL cert	cert-49d29ace4546a0bf	Estimate	none	SELECT NULL FROM t0 AS a0 JOIN t1 AS a1 ON (9007199254740993 IS NOT a0.c0) RIGHT JOIN t0 AS a2 ON (-2.5 IS a0.c2); SELECT NULL FROM t0 AS a0 JOIN t1 AS a1 ON (9007199254740993 IS NOT a0.c0) JOIN t0 AS	 | 
+CL cert	cert-68a44e0bea14de53	Estimate	none	SELECT NULL FROM t0 AS a0 LEFT JOIN t1 AS a1 ON (a0.c0 NOT GLOB '[a-z]*') JOIN t1 AS a2 ON ('[1,2,3]' IS NOT a0.c0); SELECT NULL FROM t0 AS a0 JOIN t1 AS a1 ON (a0.c0 NOT GLOB '[a-z]*') JOIN t1 AS a2 	 | 
+CL cert	cert-11d6accc5603ba5e	Estimate	none	SELECT '_' FROM t0 AS a0, t2 AS a1 LEFT JOIN t2 AS a2 ON ((a1.c1 & 2.0) < ('1e3' NOT GLOB 'a*')) WHERE (typeof(a1.c1) NOTNULL); SELECT '_' FROM t0 AS a0, t2 AS a1 JOIN t2 AS a2 ON ((a1.c1 & 2.0) < ('1	 | 
+CL cert	cert-eedc30ac8caec915	Estimate	none	SELECT (-2.5 BETWEEN a2.c0 AND a0.c1) FROM t0 AS a0 FULL JOIN t0 AS a1 ON (a0.c1 IS NOT (2.0 IS 1)), t0 AS a2 WHERE ((SELECT count(s890.c0) FROM t0 AS s890) > a0.c0); SELECT (-2.5 BETWEEN a2.c0 AND a0	 | 
+CL cert	cert-eb9f88268819de93	Estimate	none	SELECT 9007199254740993 FROM t0 AS a0 FULL JOIN t1 AS a1 ON (a0.c3 ISNULL) WHERE (-1 IS DISTINCT FROM a0.c1); SELECT 9007199254740993 FROM t0 AS a0 JOIN t1 AS a1 ON (a0.c3 ISNULL) WHERE (-1 IS DISTINC	 | 
+CL cert	cert-377cd00a5623695b	Estimate	none	SELECT NULL FROM t1 AS a0 LEFT JOIN t0 AS a1 ON (a0.c0 > ' ') WHERE (9007199254740993 <> a0.c1); SELECT NULL FROM t1 AS a0 JOIN t0 AS a1 ON (a0.c0 > ' ') WHERE (9007199254740993 <> a0.c1);	 | 
+CL cert	cert-8fda263d090331a4	Estimate	none	SELECT NULL, NULL FROM t0 AS a0 RIGHT JOIN t0 AS a1 ON ((CASE WHEN 'a' THEN -1e-308 ELSE a1.c0 END) ISNULL) WHERE a1.c0 GROUP BY a0.c0; SELECT NULL, NULL FROM t0 AS a0 JOIN t0 AS a1 ON ((CASE WHEN 'a'	 | 
+CL cert	cert-647935e9828a7e7f	Estimate	none	SELECT NULL, NULL, NULL FROM t0 AS a0 LEFT JOIN t0 AS a1 ON (jsonb_patch(-1e-308, 1e308) BETWEEN 0 AND a0.c0) WHERE a0.c1 GROUP BY NULL, a1.c0; SELECT NULL, NULL, NULL FROM t0 AS a0 JOIN t0 AS a1 ON (	 | 
+CL cert	cert-48d01daf52f9b322	Estimate	none	SELECT NULL FROM t2 AS a0 RIGHT JOIN t0 AS a1 ON (a1.c1 < 255) WHERE (9223372036854775807 IS DISTINCT FROM a1.c1); SELECT NULL FROM t2 AS a0 JOIN t0 AS a1 ON (a1.c1 < 255) WHERE (9223372036854775807 I	 | 
+CL cert	cert-822c2de8984354c0	Estimate	none	SELECT NULL, NULL FROM t0 AS a0 LEFT JOIN t0 AS a1 ON (a0.c2 NOTNULL) WHERE (a0.c2 ISNULL) GROUP BY (CASE NULL WHEN 'ABC' THEN a0.c2 WHEN 'é' THEN 'x' ELSE a1.c0 END); SELECT NULL, NULL FROM t0 AS a0 	 | 
+CL cert	cert-3f7f182592e734ff	Estimate	none	SELECT x'00' FROM t2 AS a0 RIGHT JOIN t0 AS a1 ON (a1.c0 LIKE '%a') JOIN t1 AS a2 ON (' ' > a1.c2); SELECT x'00' FROM t2 AS a0 JOIN t0 AS a1 ON (a1.c0 LIKE '%a') JOIN t1 AS a2 ON (' ' > a1.c2);	 | 
+CL cert	cert-3d16821ac8100851	Estimate	none	SELECT NULL FROM t1 AS a0 JOIN t0 AS a1 ON (-9223372036854775808 >= a0.c1) LEFT JOIN t2 AS a2 ON (a0.c1 NOTNULL); SELECT NULL FROM t1 AS a0 JOIN t0 AS a1 ON (-9223372036854775808 >= a0.c1) JOIN t2 AS 	 | 
+CL cert	cert-c2bbba93b726d0f4	Estimate	none	SELECT NULL FROM t0 AS a0 FULL JOIN t0 AS a1 ON (NULL IS NOT DISTINCT FROM (2 | a0.c1)) JOIN t0 AS a2 ON (a0.c1 IS NOT DISTINCT FROM json_extract('[1,2,3]', '$')); SELECT NULL FROM t0 AS a0 JOIN t0 AS	 | 
+CL cert	cert-4b882188b5545f14	Estimate	none	SELECT NULL, NULL, NULL FROM t0 AS a0 RIGHT JOIN t0 AS a1 ON (a1.c0 NOT IN (100, 9007199254740993)) WHERE ('{"a":null}' != a1.c1) GROUP BY NULL, (a0.c2 % a1.c0); SELECT NULL, NULL, NULL FROM t0 AS a0 	 | 
+CL cert	cert-894e0cd7ac5b61bc	Estimate	none	SELECT 'x' FROM t0 AS a0, lg AS a1 FULL JOIN t0 AS a2 ON ((2 == a1.c1) NOT GLOB 'A%') WHERE ((a1.c2 == (CASE WHEN (NOT (100 <= a2.c0)) THEN NULL END)) AND ((+ a1.c2) NOT LIKE '_')); SELECT 'x' FROM t0	 | 
+CL cert	cert-c9bcabf29d90abad	Estimate	none	SELECT 3 FROM lg AS a0 RIGHT JOIN lg AS a1 ON (a1.c0 IS -9223372036854775808) WHERE ((SELECT count(s450.c3) FROM t0 AS s450 WHERE a1.c2) ISNULL); SELECT 3 FROM lg AS a0 JOIN lg AS a1 ON (a1.c0 IS -922	 | 
+CL cert	cert-ba6083eb26463485	Estimate	none	SELECT NULL FROM t2 AS a0 JOIN t1 AS a1 ON (0 BETWEEN a0.c3 AND 'a') LEFT JOIN t2 AS a2 ON (a0.c2 NOTNULL); SELECT NULL FROM t2 AS a0 JOIN t1 AS a1 ON (0 BETWEEN a0.c3 AND 'a') JOIN t2 AS a2 ON (a0.c2	 | 
+CL cert	cert-648d5543bee67b9f	Estimate	none	SELECT '_' FROM t0 AS a0, t0 AS a1 RIGHT JOIN t0 AS a2 ON ((3 IN (x'c3bf')) AND (a1.c1 BETWEEN 9223372036854775807 AND a2.c1)) WHERE (CAST(CAST(a1.c0 AS INTEGER) AS NUMERIC) NOTNULL); SELECT '_' FROM 	 | 
+CL cert	cert-92940e06dd2e4731	Estimate	none	SELECT NULL FROM t0 AS a0 LEFT JOIN t1 AS a1 ON (json_extract('{"a":null}', '$.b[1]') > a0.c0) WHERE a0.c0 GROUP BY a1.c2; SELECT NULL FROM t0 AS a0 JOIN t1 AS a1 ON (json_extract('{"a":null}', '$.b[1	 | 
+CL cert	cert-e3a2734007b75aaf	Estimate	none	SELECT x'0102' FROM t0 AS a0 RIGHT JOIN t1 AS a1 ON (a1.c3 NOTNULL) FULL JOIN t1 AS a2 ON (a1.c0 NOTNULL); SELECT x'0102' FROM t0 AS a0 JOIN t1 AS a1 ON (a1.c3 NOTNULL) FULL JOIN t1 AS a2 ON (a1.c0 NO	 | 
+CL cert	cert-8eff201e563e02e7	Estimate	none	SELECT NULL FROM t1 AS a0 FULL JOIN t1 AS a1 ON (jsonb_array_insert(NULL, 0.0) IS NOT DISTINCT FROM a0.c0) WHERE (a0.c0 AND ('a ' IN (a0.c0))); SELECT NULL FROM t1 AS a0 JOIN t1 AS a1 ON (jsonb_array_	 | 
+CL cert	cert-d0fbcd09950c1553	Estimate	none	SELECT NULL, NULL, NULL FROM lg AS a0 LEFT JOIN t1 AS a1 ON (a0.c1 NOT LIKE 'a%') WHERE (a0.c1 NOTNULL) GROUP BY NULL, (CASE WHEN NULL THEN a1.c0 WHEN 0.1 THEN '1' ELSE a0.c2 END); SELECT NULL, NULL, 	 | 
+CL cert	cert-78d1a5a137139fe5	Estimate	none	SELECT json_extract('"x"', '$.a') FROM t0 AS a0, t0 AS a1 FULL JOIN t0 AS a2 ON ('0x10' BETWEEN a0.c0 AND a0.c0) WHERE (a0.c0 BETWEEN json_extract('{"a":null}', '$.b[1]') AND (json_extract('{"a":1,"b"	 | 
+CL cert	cert-288ea9e79a2fed8b	Estimate	none	SELECT CAST((a2.c0 COLLATE NOCASE) AS INTEGER) FROM t0 AS a0 LEFT JOIN t1 AS a1 ON ((100 >= 'a') AND ('1.5' IS DISTINCT FROM a0.c0)), t1 AS a2 WHERE (((a0.c0 || -100) + x'41') NOTNULL); SELECT CAST((a	 | 
+CL cert	cert-2c85bf885918c8f4	Estimate	none	SELECT (CASE WHEN (a0.c1 > a0.c1) THEN (x'41' BETWEEN a1.c1 AND a2.c1) ELSE (a0.c0 >> a1.c0) END) FROM t0 AS a0 LEFT JOIN t0 AS a1 ON ((a1.c1 <> a1.c0) AND (a0.c0 BETWEEN 10 AND a0.c1)), t0 AS a2 WHER	 | 
+CL cert	cert-7bbd5ec7ed0b090a	Estimate	none	SELECT NULL FROM t1 AS a0 LEFT JOIN t0 AS a1 ON (a0.c2 NOTNULL) WHERE (a0.c0 NOT IN (SELECT s200.c0 FROM t0 AS s200 WHERE ((1e308 <= 9223372036854775807) IS DISTINCT FROM (NULL ISNULL)))); SELECT NULL	 | 
+CL cert	cert-ab85fa6079680d0d	Estimate	none	SELECT (a0.c0 >= x'41') FROM t1 AS a0, t0 AS a1 FULL JOIN t1 AS a2 ON ((1000000000000000.0 <= a1.c1) AND ('abc' <> a0.c2)) WHERE (date((- a0.c1)) BETWEEN quote(-1e-308) AND json_patch(a1.c0, unicode(a	 | 
+CL cert	cert-9845410be5cb1425	Estimate	none	SELECT '10' FROM t0 AS a0 LEFT JOIN t1 AS a1 ON (a0.c3 BETWEEN 0 AND '1') WHERE (a0.c3 NOT IN (SELECT s776.c3 FROM t0 AS s776 WHERE ('0' <= iif(' ', s776.c3)))); SELECT '10' FROM t0 AS a0 JOIN t1 AS a	 | 
+CL cert	cert-a1da5d93412678b0	Estimate	none	SELECT a2.c2 FROM t0 AS a0, t0 AS a1 LEFT JOIN lg AS a2 ON ((a0.c1 << -2.5) IS DISTINCT FROM CAST(-1e-308 AS BLOB)) WHERE ((glob(2, a0.c1) COLLATE NOCASE) IS NOT DISTINCT FROM asinh(json_extract('{"a"	 | 
+CL cert	cert-33b7274b026372cc	Estimate	none	SELECT CAST((CASE a0.c0 WHEN '0x10' THEN a1.c0 WHEN (a1.c0 <> a1.c2) THEN a0.c0 ELSE 2 END) AS BLOB) FROM t2 AS a0, t2 AS a1 FULL JOIN t2 AS a2 ON (json_remove('_', a1.c1) GLOB '[a-z]*') WHERE (a1.c0 	 | 
+CL cert	cert-1706d39eb9a9358e	Estimate	none	SELECT ((-1e-308 NOT BETWEEN a2.c2 AND a0.c1) AND a1.c0) FROM t0 AS a0, t1 AS a1 LEFT JOIN t0 AS a2 ON ((NOT (NOT (x'' <> NULL))) < a1.c1) WHERE ((NOT EXISTS (SELECT 1 FROM t0 AS s332 WHERE (a1.c1 ISN	 | 
+CL cert	cert-ef280b7e51b4600f	Estimate	none	SELECT NULL, NULL, NULL FROM t0 AS a0 JOIN t1 AS a1 ON (a0.c3 <> 'abc') RIGHT JOIN t1 AS a2 ON ((x'41' >= a0.c3) AND (a0.c2 IN (NULL, NULL, NULL))) WHERE (0 < a2.c1) GROUP BY a0.c2, a1.c1; SELECT NULL	 | 
+CL cert	cert-b6dce1647f5ddd5e	Estimate	none	SELECT pi() FROM t0 AS a0, t0 AS a1 LEFT JOIN t0 AS a2 ON ((NOT (a0.c1 NOTNULL)) IS NOT (+ -2.5)) WHERE ((~ x'0102') BETWEEN (a0.c0 COLLATE RTRIM) AND (CASE 'a ' WHEN (a0.c1 <> a1.c0) THEN (a2.c2 <> a	 | 
+CL cert	cert-289de57359eed222	Estimate	none	SELECT mod((CASE WHEN (a1.c0 NOT IN (a2.c0, NULL, 'é')) THEN x'' WHEN (a1.c2 == a1.c2) THEN a2.c0 ELSE '10' END), a1.c0) FROM t0 AS a0 LEFT JOIN t0 AS a1 ON (a0.c3 != ('1' NOT GLOB '%')), t1 AS a2 WHE	 | 
+CL cert	cert-f8af39be56aee800	Estimate	none	SELECT (a2.c2 IN (SELECT s719.c0 FROM t0 AS s719 WHERE ('1' NOT IN (a1.c0, x'00', 0.0)))) FROM t0 AS a0, t0 AS a1 LEFT JOIN t0 AS a2 ON ((NOT (a0.c0 NOT LIKE 'A%')) NOT LIKE '*') WHERE ((format(a0.c0,	 | 
+CL cert	cert-8ef71094d1596a6a	Estimate	none	SELECT (CAST(a1.c3 AS NUMERIC) / (CASE WHEN -9223372036854775808 THEN 3 WHEN x'c3bf' THEN a0.c0 END)) FROM t0 AS a0 LEFT JOIN t1 AS a1 ON (CAST('A' AS BLOB) < (a0.c0 NOT IN (a0.c0))), t0 AS a2 WHERE (	 | 
+CL cert	cert-af3b4a1371ce6e95	Estimate	none	SELECT (CASE 1000000000000000.0 WHEN ((a1.c2 NOT GLOB '[a-z]*') AND (x'41' IS NOT DISTINCT FROM a2.c0)) THEN (CASE WHEN ('-1' <> a0.c1) THEN -9223372036854775808 ELSE a2.c2 END) WHEN (0.5 AND (a1.c2 I	 | 
+CL order	order-9acef48ec158a02f	Estimate	none	SELECT NULL FROM t2 AS a0 JOIN t2 AS a1 ON ((a1.c0 BETWEEN 2 AND a0.c0) OR a1.c0); SELECT NULL FROM t2 AS a0, t2 AS a1 WHERE ((a1.c0 BETWEEN 2 AND a0.c0) OR a1.c0);	 | 
+CL order	order-a0d39d5849620a86	Estimate	none	SELECT NULL FROM t0 AS a0 JOIN t0 AS a1 ON ((NULL AND a1.c0) OR a1.c1); SELECT NULL FROM t0 AS a0, t0 AS a1 WHERE ((NULL AND a1.c0) OR a1.c1);	 | 
+CL order	order-a402df5573feb8f1	Estimate	none	SELECT 'true' FROM t1 AS a0 JOIN t1 AS a1 ON ((2.0 BETWEEN a1.c0 AND 0.5) OR a1.c0); SELECT 'true' FROM t1 AS a0, t1 AS a1 WHERE ((2.0 BETWEEN a1.c0 AND 0.5) OR a1.c0);	 | 
+CL order	order-ff203c89177ce441	Estimate	none	SELECT x'' FROM t0 AS a0 JOIN t0 AS a1 ON ((NULL AND a0.c0) OR (0 IS a0.c0)); SELECT x'' FROM t0 AS a0, t0 AS a1 WHERE ((NULL AND a0.c0) OR (0 IS a0.c0));	 | 
+CL order	order-e5e2bee9b1da6cfc	Estimate	none	SELECT NULL FROM t0 AS a0 JOIN t0 AS a1 ON (a0.c1 OR (a0.c1 BETWEEN a1.c0 AND 2)); SELECT NULL FROM t0 AS a0, t0 AS a1 WHERE (a0.c1 OR (a0.c1 BETWEEN a1.c0 AND 2));	 | 
+CL order	order-6dec55ea17ddfa89	Estimate	none	SELECT ' ' FROM t0 AS a0 JOIN t0 AS a1 ON ((a0.c0 BETWEEN -1e-308 AND NULL) OR (NULL AND (-100 IS a0.c0))); SELECT ' ' FROM t0 AS a0, t0 AS a1 WHERE ((a0.c0 BETWEEN -1e-308 AND NULL) OR (NULL AND (-10	 | 
+CL order	order-07ec3b3bf16a4e41	Estimate	none	SELECT -2.5 FROM lg AS a0 JOIN t0 AS a1 ON ((NULL BETWEEN NULL AND a1.c0) OR a1.c0); SELECT -2.5 FROM lg AS a0, t0 AS a1 WHERE ((NULL BETWEEN NULL AND a1.c0) OR a1.c0);	 | 
+CL order	order-e6e5e5208adad0d5	Estimate	none	SELECT NULL FROM t0 AS a0 JOIN t0 AS a1 ON (('-1' BETWEEN a1.c1 AND 'abc') OR a1.c1); SELECT NULL FROM t0 AS a0, t0 AS a1 WHERE (('-1' BETWEEN a1.c1 AND 'abc') OR a1.c1);	 | 
+CL order	order-8b1113aa72bb3199	Estimate	none	SELECT NULL FROM t0 AS a0 JOIN t0 AS a1 ON ((a1.c1 AND '1') OR (a1.c1 IN (1e308, 'true'))); SELECT NULL FROM t0 AS a0, t0 AS a1 WHERE ((a1.c1 AND '1') OR (a1.c1 IN (1e308, 'true')));	 | 
+CL order	order-719337a6a46da3bf	Estimate	none	SELECT NULL FROM t1 AS a0 JOIN t0 AS a2 ON (a0.c0 OR (NULL BETWEEN NULL AND a0.c0)); SELECT NULL FROM t1 AS a0, t0 AS a2 WHERE (a0.c0 OR (NULL BETWEEN NULL AND a0.c0));	 | 
+CL order	order-1e6bf6d511be43fe	Estimate	none	SELECT NULL FROM lg AS a0 JOIN t0 AS a2 ON (a2.c1 OR (NULL AND a2.c0)); SELECT NULL FROM lg AS a0, t0 AS a2 WHERE (a2.c1 OR (NULL AND a2.c0));	 | 
+CL order	order-ef2ad10955e59ea6	Estimate	none	SELECT '_' FROM t1 AS a0 JOIN t0 AS a1 ON (a1.c0 OR (NULL AND (NULL >= a1.c0))); SELECT '_' FROM t1 AS a0, t0 AS a1 WHERE (a1.c0 OR (NULL AND (NULL >= a1.c0)));	 | 
+CL order	order-7071cbad5a7855a3	Estimate	none	SELECT -1 FROM t0 AS a0 JOIN t2 AS a1 ON ((a0.c1 >= NULL) OR ('10' AND a0.c1)); SELECT -1 FROM t0 AS a0, t2 AS a1 WHERE ((a0.c1 >= NULL) OR ('10' AND a0.c1));	 | 
+CL order	order-be4c1f20f7978680	Estimate	none	SELECT (a1.c0 << a0.c0) FROM t0 AS a0, t0 AS a1 JOIN t0 AS a2 ON (('ABC' IN (a2.c0, ' a')) OR (1 BETWEEN a2.c0 AND 255)); SELECT (a1.c0 << a0.c0) FROM t0 AS a0, t0 AS a1, t0 AS a2 WHERE (('ABC' IN (a2	 | 
+CL order	order-b0f022dda77d88f5	Estimate	none	SELECT NULL FROM t0 AS a0 JOIN t0 AS a1 ON ((a1.c1 GLOB 'A%') OR ('-1' BETWEEN 'a ' AND a1.c0)); SELECT NULL FROM t0 AS a0, t0 AS a1 WHERE ((a1.c1 GLOB 'A%') OR ('-1' BETWEEN 'a ' AND a1.c0));	 | 
+CL order	order-3a9efc86c52c533e	Estimate	none	SELECT -100 FROM t0 AS a0 JOIN t0 AS a1 ON ((a1.c1 == 9007199254740993) OR (a1.c0 AND '10')); SELECT -100 FROM t0 AS a0, t0 AS a1 WHERE ((a1.c1 == 9007199254740993) OR (a1.c0 AND '10'));	 | 
+CL order	order-dbd9ce988b56cdd3	Estimate	none	SELECT NULL FROM lg AS a0 JOIN t2 AS a2 ON ((2.0 BETWEEN a2.c0 AND NULL) OR a2.c0); SELECT NULL FROM lg AS a0, t2 AS a2 WHERE ((2.0 BETWEEN a2.c0 AND NULL) OR a2.c0);	 | 
+CL order	order-8dca60deb4600405	Estimate	none	SELECT NULL FROM t0 AS a0 JOIN t0 AS a1 ON ((NOT a1.c1) OR (9007199254740993 BETWEEN a1.c0 AND NULL)); SELECT NULL FROM t0 AS a0, t0 AS a1 WHERE ((NOT a1.c1) OR (9007199254740993 BETWEEN a1.c0 AND NUL	 | 
+CL order	order-52842274e80f72e4	Estimate	none	SELECT '{"a":null}' FROM t0 AS a0 JOIN t0 AS a1 ON (a1.c0 OR ((a1.c0 NOT LIKE 'a%') AND -9223372036854775808)); SELECT '{"a":null}' FROM t0 AS a0, t0 AS a1 WHERE (a1.c0 OR ((a1.c0 NOT LIKE 'a%') AND -	 | 
+CL order	order-f754ccbceeec6122	Estimate	none	SELECT 2 FROM t0 AS a0 JOIN t1 AS a1 ON ((a0.c2 >= NULL) OR (NULL AND a0.c1)); SELECT 2 FROM t0 AS a0, t1 AS a1 WHERE ((a0.c2 >= NULL) OR (NULL AND a0.c1));	 | 
+CL order	order-41f629b808ba5ea8	Estimate	none	SELECT a1.c0 FROM lg AS a0, t0 AS a1 JOIN t0 AS a2 ON (((a1.c0 == '0x10') AND (a0.c2 <= a1.c0)) OR (a1.c0 LIKE '_')); SELECT a1.c0 FROM lg AS a0, t0 AS a1, t0 AS a2 WHERE (((a1.c0 == '0x10') AND (a0.c	 | 
+CL order	order-de38fc3b981f9020	Estimate	none	SELECT NULL FROM t0 AS a0 JOIN t1 AS a1 ON (('1' AND (a1.c1 IS NOT a1.c1)) OR (NOT a1.c1)); SELECT NULL FROM t0 AS a0, t1 AS a1 WHERE (('1' AND (a1.c1 IS NOT a1.c1)) OR (NOT a1.c1));	 | 
+CL order	order-a605094ab522e18d	Estimate	none	SELECT NULL FROM t1 AS a0 JOIN t0 AS a1 ON ((10 BETWEEN 100 AND a1.c1) OR a1.c1); SELECT NULL FROM t1 AS a0, t0 AS a1 WHERE ((10 BETWEEN 100 AND a1.c1) OR a1.c1);	 | 
+CL order	order-9c463d19df063d82	Estimate	none	SELECT NULL FROM t1 AS a0 JOIN t2 AS a1 ON ((NOT a0.c1) OR (NULL AND a0.c3)); SELECT NULL FROM t1 AS a0, t2 AS a1 WHERE ((NOT a0.c1) OR (NULL AND a0.c3));	 | 
+CL order	order-90a4ca6fb43e24eb	Estimate	none	SELECT 'A' FROM t0 AS a0 JOIN t2 AS a1 ON ((NULL NOT IN (a1.c0)) OR (a1.c1 AND '%')); SELECT 'A' FROM t0 AS a0, t2 AS a1 WHERE ((NULL NOT IN (a1.c0)) OR (a1.c1 AND '%'));	 | 
+CL order	order-27fdf399eff6b510	Estimate	none	SELECT 'A' FROM t2 AS a0, t1 AS a1 JOIN t1 AS a2 ON (((a2.c0 BETWEEN NULL AND a1.c0) OR a2.c0) AND (a1.c0 BETWEEN 7 AND x'41')); SELECT 'A' FROM t2 AS a0, t1 AS a1, t1 AS a2 WHERE (((a2.c0 BETWEEN NUL	 | 
+CL order	order-4f59d7f012d79444	Estimate	none	SELECT NULL FROM t1 AS a0 JOIN t0 AS a1 ON ((NULL AND a0.c2) OR (3 IN (a0.c2))); SELECT NULL FROM t1 AS a0, t0 AS a1 WHERE ((NULL AND a0.c2) OR (3 IN (a0.c2)));	 | 
+CL order	order-80be1ce2173dce0e	Estimate	none	SELECT 1.5 FROM t0 AS a0 JOIN t1 AS a1 ON ((NULL BETWEEN NULL AND a1.c3) OR a1.c3); SELECT 1.5 FROM t0 AS a0, t1 AS a1 WHERE ((NULL BETWEEN NULL AND a1.c3) OR a1.c3);	 | 
+CL order	order-d4fd8eda0885271f	Estimate	none	SELECT NULL FROM lg AS a0 JOIN t0 AS a1 ON ((9223372036854775807 BETWEEN NULL AND a1.c0) OR a1.c0); SELECT NULL FROM lg AS a0, t0 AS a1 WHERE ((9223372036854775807 BETWEEN NULL AND a1.c0) OR a1.c0);	 | 
+CL order	order-a1b753860d639ff0	Estimate	none	SELECT NULL FROM t0 AS a0 JOIN t1 AS a1 ON (a1.c1 OR (a1.c0 BETWEEN a0.c1 AND '-1')); SELECT NULL FROM t0 AS a0, t1 AS a1 WHERE (a1.c1 OR (a1.c0 BETWEEN a0.c1 AND '-1'));	 | 
+CL order	order-73be840cf84e66e2	Estimate	none	SELECT 'a ' FROM t1 AS a0 JOIN t0 AS a1 ON ((-1e-308 BETWEEN NULL AND a0.c0) OR a0.c0); SELECT 'a ' FROM t1 AS a0, t0 AS a1 WHERE ((-1e-308 BETWEEN NULL AND a0.c0) OR a0.c0);	 | 
+CL order	order-913d8c5e1de75a3b	Estimate	none	SELECT '10' FROM t0 AS a0, t1 AS a1 JOIN t1 AS a2 ON ((a2.c2 NOTNULL) OR ((a2.c2 IS 10) AND a1.c1)); SELECT '10' FROM t0 AS a0, t1 AS a1, t1 AS a2 WHERE ((a2.c2 NOTNULL) OR ((a2.c2 IS 10) AND a1.c1));	 | 
+CL order	order-ecce949594c067c6	Estimate	none	SELECT log10((a0.c1 NOT BETWEEN a3.c0 AND -2.5)) FROM t0 AS a0 JOIN t0 AS a1 ON (('1e3' BETWEEN x'41' AND a1.c2) OR (9223372036854775807 < a1.c1)), t0 AS a2, t0 AS a3; SELECT log10((a0.c1 NOT BETWEEN 	 | 
+CL order	order-3e2db6849ec3976a	Estimate	none	SELECT x'' FROM t1 AS a0 JOIN lg AS a1 ON (a1.c0 OR (NULL AND (a1.c2 = '1'))); SELECT x'' FROM t1 AS a0, lg AS a1 WHERE (a1.c0 OR (NULL AND (a1.c2 = '1')));	 | 
+CL order	order-1697c3968844aa2d	Estimate	none	SELECT NULL FROM t0 AS a0 JOIN t1 AS a1 ON (a0.c0 OR (a0.c2 AND NULL)); SELECT NULL FROM t0 AS a0, t1 AS a1 WHERE (a0.c0 OR (a0.c2 AND NULL));	 | 
+CL order	order-98d1593061adddba	Estimate	none	SELECT a3.c1 FROM t2 AS a0, t0 AS a1 JOIN t0 AS a3 ON ((('0' GLOB '_') AND a1.c1) OR (0.0 IS NOT a1.c1)); SELECT a3.c1 FROM t2 AS a0, t0 AS a1, t0 AS a3 WHERE ((('0' GLOB '_') AND a1.c1) OR (0.0 IS NO	 | 
+CL order	order-5cfd08fc979f910c	Estimate	none	SELECT (atanh(1.5) | concat_ws(a0.c1, 2.0, a2.c1, a1.c0)) FROM t0 AS a0 JOIN t0 AS a1 ON (((a0.c2 LIKE 'abc') AND (a0.c2 IS a1.c0)) OR (a0.c1 NOT GLOB 'a*')), t0 AS a2; SELECT (atanh(1.5) | concat_ws(	 | 
+CL order	order-86172b79aa2f0b95	Estimate	none	SELECT (a0.c1 NOT BETWEEN 9223372036854775807 AND a0.c0) FROM t0 AS a0, t0 AS a1 JOIN t0 AS a2 ON ((a1.c2 ISNULL) OR (a1.c1 BETWEEN ' a' AND a0.c0)); SELECT (a0.c1 NOT BETWEEN 9223372036854775807 AND 	 | 
+CL order	order-648498c3415b451c	Estimate	none	SELECT (a1.c0 COLLATE NOCASE) FROM t1 AS a0, t1 AS a1 JOIN t2 AS a2 ON ((a0.c0 IS 9223372036854775807) OR ((' a' NOT BETWEEN a0.c0 AND 'ABC') AND (1 < a2.c1))); SELECT (a1.c0 COLLATE NOCASE) FROM t1 A	 | 
+CL order	order-6980fc7c7d295016	Estimate	none	SELECT acosh(a1.c1) FROM lg AS a0, lg AS a1 JOIN lg AS a2 ON ((a0.c2 != a0.c2) OR (a0.c0 BETWEEN a2.c2 AND a0.c2)); SELECT acosh(a1.c1) FROM lg AS a0, lg AS a1, lg AS a2 WHERE ((a0.c2 != a0.c2) OR (a0	 | 
+CL order	order-54b3d61eb13946aa	Estimate	none	SELECT NULL FROM t0 AS a0 JOIN t1 AS a1 ON ((a0.c3 LIKE '*') OR (a0.c0 AND NULL)); SELECT NULL FROM t0 AS a0, t1 AS a1 WHERE ((a0.c3 LIKE '*') OR (a0.c0 AND NULL));	 | 
+CL order	order-76301f18e16e2d17	Estimate	none	SELECT a2.c2 FROM t0 AS a0 JOIN t2 AS a1 ON (((a1.c1 NOTNULL) AND (a0.c0 = 3)) OR (NULL <= a0.c1)), t0 AS a2; SELECT a2.c2 FROM t0 AS a0, t2 AS a1, t0 AS a2 WHERE (((a1.c1 NOTNULL) AND (a0.c0 = 3)) OR	 | 
+CL order	order-792ed604e5b5fc7e	Estimate	none	SELECT NULL FROM t0 AS a0 JOIN lg AS a1 ON ((NULL AND a1.c0) OR a1.c1); SELECT NULL FROM t0 AS a0, lg AS a1 WHERE ((NULL AND a1.c0) OR a1.c1);	 | 
+CL order	order-c3af68979343ad9c	Estimate	none	SELECT (CASE 'a' WHEN (a1.c1 == a0.c0) THEN datetime(NULL, a1.c0, a1.c0) END) FROM t0 AS a0, t0 AS a1 JOIN lg AS a2 ON ((a0.c0 BETWEEN a1.c0 AND -1) OR (a0.c1 LIKE 'a%')); SELECT (CASE 'a' WHEN (a1.c1	 | 
+CL order	order-747c03fde30160e0	Estimate	none	SELECT atan((CASE WHEN a1.c0 THEN a1.c1 WHEN ('A' IS -100) THEN a1.c1 ELSE a1.c1 END)) FROM t0 AS a0, t0 AS a1 JOIN t0 AS a2 ON ((a2.c1 BETWEEN '_' AND a1.c1) OR (a2.c0 GLOB '_')); SELECT atan((CASE W	 | 
+CL order	order-1714514554abb076	Estimate	default,parallel,statistics,parallel, statistics	SELECT jsonb_array(a1.c0) FROM t0 AS a0 JOIN t0 AS a1 ON (CAST(NULL AS BLOB) >= jsonb_extract(a0.c1, x'')), t0 AS a2 JOIN t0 AS a3 ON (((a1.c0 >= 9007199254740993) AND (NOT a2.c1)) OR (a1.c0 ISNULL));	error: bad JSON path: '' | 0 rows
+CL order	order-1b5ea939e1df7437	Estimate	none	SELECT (CASE (+ a1.c0) WHEN (a0.c2 IS DISTINCT FROM a0.c1) THEN (a0.c0 NOT IN (x'00')) ELSE (a2.c0 < '') END) FROM t1 AS a0, t0 AS a1 JOIN t1 AS a2 ON ((10 AND (a0.c1 >= a0.c2)) OR (a0.c1 ISNULL)); SE	 | 
+CL order	order-4927a3e39d707b85	Estimate	none	SELECT 'abc' FROM lg AS a0 JOIN t0 AS a1 ON (a0.c2 OR (a0.c0 AND NULL)); SELECT 'abc' FROM lg AS a0, t0 AS a1 WHERE (a0.c2 OR (a0.c0 AND NULL));	 | 
+CL order	order-75553daebbd5b981	Estimate	none	SELECT (NOT (a0.c0 NOT IN (NULL, a3.c0))) FROM t0 AS a0 JOIN t0 AS a1 ON ((0.1 BETWEEN a1.c0 AND 100) OR (10 BETWEEN 0.0 AND a1.c1)) JOIN t0 AS a2 ON (a1.c1 ISNULL), t1 AS a3; SELECT (NOT (a0.c0 NOT I	 | 
+CL order	order-264ab814450565c9	Estimate	none	SELECT (NOT (a3.c2 IS NOT DISTINCT FROM a1.c2)) FROM t0 AS a0 JOIN t0 AS a1 ON ((a0.c3 < a0.c2) AND (a0.c2 NOT IN (a0.c1, a0.c0, a1.c1))) JOIN t1 AS a2 ON ((1e308 AND a1.c2) OR (NOT (2.0 IS DISTINCT F	 | 
+CL order	order-3c4a99fe7b769044	Estimate	none	SELECT (a0.c0 <> a3.c0) FROM t1 AS a0 JOIN lg AS a1 ON (((a1.c1 IS '0') OR (NULL BETWEEN a0.c0 AND a1.c2)) AND (a1.c2 NOT GLOB 'a*')) JOIN lg AS a2 ON (likely(a0.c0) LIKE '%a'), t1 AS a3; SELECT (a0.c	 | 
+CL order	order-971b8133f121a741	Estimate	none	SELECT NULL FROM t2 AS a0 JOIN lg AS a1 ON (a1.c0 OR ((a1.c0 IN (2.0)) AND NULL)); SELECT NULL FROM t2 AS a0, lg AS a1 WHERE (a1.c0 OR ((a1.c0 IN (2.0)) AND NULL));	 | 
+CL order	order-98ce51e8f4cc98c1	Estimate	none	SELECT 2.0 FROM lg AS a0 JOIN t2 AS a1 ON (acos(-9223372036854775808) >= CAST('1.5' AS NUMERIC)), t0 AS a2 JOIN t1 AS a3 ON (((255 NOTNULL) AND (-1 IN (a2.c0, ' a'))) OR (a2.c2 IN (3))); SELECT 2.0 FR	 | 
+CL order	order-50944f649e1f3165	Estimate	none	SELECT (CASE 'é' WHEN ('1.5' IS a3.c0) THEN x'0102' WHEN (SELECT min(s667.c1) FROM t2 AS s667) THEN instr('abc', a2.c1) ELSE (- -1) END) FROM t2 AS a0, t1 AS a1 JOIN t1 AS a2 ON (('a ' BETWEEN a2.c2 A	 | 
+CW	error-493c667725cb13ff	Error	default,parallel,statistics,parallel, statistics	SELECT ((SELECT sum(s818.c0) FROM v0 AS s818 WHERE (s818.c0 ISNULL))) IS TRUE, ((SELECT sum(s818.c0) FROM v0 AS s818 WHERE (s818.c0 ISNULL))) IS FALSE FROM t0 AS a0 WHERE a0.rowid = 5; SELECT a0.rowid	1 rows / 0, 0 | error: Parse error: malformed JSON
+CW	error-dcaca8f9a487ab22	Error	default,parallel,statistics,parallel, statistics	SELECT ((NULL IN (SELECT s540.c1 FROM v0 AS s540 WHERE (s540.c2 IN (s540.c1))))) IS TRUE, ((NULL IN (SELECT s540.c1 FROM v0 AS s540 WHERE (s540.c2 IN (s540.c1))))) IS FALSE FROM t0 AS a0 WHERE a0.rowi	1 rows / 0, 1 | error: json_array_insert() needs an odd number of arguments
+CW	error-b2316c9d3fc07dcc	Error	default,parallel,statistics,parallel, statistics	SELECT ((SELECT min(s755.c0) FROM v0 AS s755 WHERE ('1e3' IS CAST(s755.c1 AS BLOB)))) IS TRUE, ((SELECT min(s755.c0) FROM v0 AS s755 WHERE ('1e3' IS CAST(s755.c1 AS BLOB)))) IS FALSE FROM t0 AS a0 WHE	1 rows / 0, 0 | error: Parse error: bad JSON path: '1'
+CW	error-dfd3551986fdeacf	Error	default,parallel,statistics,parallel, statistics	SELECT ((SELECT count(s180.c1) FROM v0 AS s180 WHERE (like('10', NULL) < unixepoch(s180.c0, a0.c0, ' a')))) IS TRUE, ((SELECT count(s180.c1) FROM v0 AS s180 WHERE (like('10', NULL) < unixepoch(s180.c0	1 rows / 0, 1 | error: json_object() requires an even number of arguments
+CW	error-f35ddee3bc1a8dac	Error	default,parallel,statistics,parallel, statistics	SELECT ((SELECT max(s208.c0) FROM v0 AS s208 WHERE (s208.c2 <> s208.c2))) IS TRUE, ((SELECT max(s208.c0) FROM v0 AS s208 WHERE (s208.c2 <> s208.c2))) IS FALSE FROM t0 AS a0 WHERE a0.rowid = -1; SELECT	1 rows / 0, 0 | error: json_insert() needs an odd number of arguments
+CW	error-de7d431aa073eb3e	Error	default,parallel,statistics,parallel, statistics	SELECT ((NULL IN (SELECT s382.c0 FROM v0 AS s382 WHERE (s382.c0 NOT BETWEEN (+ s382.c0) AND x'41')))) IS TRUE, ((NULL IN (SELECT s382.c0 FROM v0 AS s382 WHERE (s382.c0 NOT BETWEEN (+ s382.c0) AND x'41	1 rows / 0, 1 | error: JSON path error near: "255"
+CW	error-05d7b3eda026e716	Error	default,parallel,statistics,parallel, statistics	SELECT ((7 IN (SELECT s106.c2 FROM v0 AS s106))) IS TRUE, ((7 IN (SELECT s106.c2 FROM v0 AS s106))) IS FALSE FROM t1 AS a0 WHERE a0.rowid = 1; SELECT a0.rowid FROM t1 AS a0 WHERE (NOT (7 IN (SELECT s1	1 rows / 0, 1 | error: JSON path error near: "0.0"
+CW	error-15c526dd5edf1a96	Error	default,parallel,statistics,parallel, statistics	SELECT ((2.0 NOT IN (SELECT s528.c1 FROM v0 AS s528 WHERE ((a0.c0 <> s528.c2) OR ('1' IS DISTINCT FROM a0.c0))))) IS TRUE, ((2.0 NOT IN (SELECT s528.c1 FROM v0 AS s528 WHERE ((a0.c0 <> s528.c2) OR ('1	1 rows / 1, 0 | error: JSON cannot hold BLOB values
+CY	diff-3abcd6fca7a36ef7	Wrong	default,parallel,statistics,parallel, statistics	SELECT ('' COLLATE NOCASE) FROM t0 AS a0 UNION SELECT a0.c0 FROM t0 AS a0 UNION SELECT 255 FROM t0 AS a0;	3 rows / 255 / '' / ' ' | 2 rows / 255 / ' '
+CY	diff-316dbb3cda9cdbda	Wrong	default,parallel,statistics,parallel, statistics	SELECT a0.c0, NULL FROM t0 AS a0 GROUP BY a0.c0 UNION SELECT (NULL COLLATE NOCASE), 1000000000000000.0 FROM t0 AS a0;	3 rows / NULL, 1000000000000000.0 / 'ABC', NULL / 'abc', NULL | 2 rows / NULL, 1000000000000000.0 / 'abc', NULL
+CY	diff-214e803cb9456b65	Wrong	default,parallel,statistics,parallel, statistics	SELECT a0.c0 FROM t0 AS a0 UNION ALL SELECT 1.5 FROM t0 AS a0 UNION SELECT 'é' FROM (SELECT NULL AS c0, NULL AS c1 FROM t0 AS b94x0 GROUP BY NULL) AS a0 GROUP BY 'é';	3 rows / 1.5 / '' / 'é' | 4 rows / 1.5 / '' / ' ' / 'é'
+CY	diff-eeecb33c08c8a33b	Wrong	default,parallel,statistics,parallel, statistics	SELECT NULL, a0.c1, NULL FROM t0 AS a0 GROUP BY NULL, a0.c1 UNION SELECT -1e-308, (NULL COLLATE NOCASE), -1 FROM t0 AS a0;	3 rows / NULL, 'A', NULL / NULL, 'a', NULL / -1e-308, NULL, -1 | 2 rows / NULL, 'a', NULL / -1e-308, NULL, -1
+CY	diff-c76001b97b27bb77	Wrong	default,parallel,statistics,parallel, statistics	WITH w0(c0) AS (SELECT (b93x0.c0 COLLATE NOCASE) FROM t0 AS b93x0) SELECT a0.c2 FROM t0 AS a0 UNION SELECT a0.c0 FROM w0 AS a0;	4 rows / NULL / 3 / 'A' / 'a' | 3 rows / NULL / 3 / 'a'
+CY	diff-ad12c4954d4f550b	Wrong	default,parallel,statistics,parallel, statistics	SELECT a0.c0 FROM t0 AS a0 UNION SELECT NULL FROM (SELECT NULL AS c0, NULL AS c1 FROM t0 AS b41x0 GROUP BY NULL) AS a0 UNION SELECT NULL FROM t0 AS a0;	2 rows / NULL / '' | 3 rows / NULL / '' / ' '
+CY	diff-d1ed79931ffee518	Wrong	default,parallel,statistics,parallel, statistics	SELECT a0.c3 FROM t0 AS a0 UNION SELECT (a0.c1 COLLATE RTRIM) FROM t1 AS a0;	2 rows / 'a' / 'a ' | 1 rows / 'a '
+CY	diff-1346324c3e9ae24b	Wrong	default,parallel,statistics,parallel, statistics	SELECT a0.c0, 9007199254740993, NULL FROM t1 AS a0 GROUP BY a0.c0, 9007199254740993 UNION SELECT a0.c0, ' a', -100 FROM t0 AS a0;	2 rows / 'a', 9007199254740993, NULL / 'a ', 9007199254740993, NULL | 1 rows / 'a ', 9007199254740993, NULL
+CY	diff-fc0ea0c78358e243	Wrong	default,parallel,statistics,parallel, statistics	SELECT a0.c0 FROM t2 AS a0 UNION SELECT a1.c1 FROM t0 AS a0 CROSS JOIN t0 AS a1;	2 rows / 'a' / 'a ' | 1 rows / 'a '
+CY	diff-9f736055d7077da5	Wrong	default,parallel,statistics,parallel, statistics	SELECT a0.c2, 0.0, -9223372036854775808 FROM t0 AS a0 UNION SELECT (NULL COLLATE RTRIM), NULL, -2.5 FROM t0 AS a0 GROUP BY NULL;	3 rows / NULL, NULL, -2.5 / 'a', 0.0, -9223372036854775808 / 'a ', 0.0, -9223372036854775808 | 2 rows / NULL, NULL, -2.5 / 'a ', 0.0, -9223372036854775808
+CY	diff-9d5d72844cb49037	Wrong	default,parallel,statistics,parallel, statistics	SELECT a0.c0 FROM t1 AS a0 UNION SELECT ('1.5' COLLATE RTRIM) FROM t0 AS a0;	2 rows / '' / ' ' | 1 rows / ' '
+CY	diff-5d8c92a9c11f324f	Wrong	default,parallel,statistics,parallel, statistics	SELECT NULL FROM (SELECT NULL AS c0, quote((NULL COLLATE NOCASE)) AS c1 FROM t0 AS b7x0 UNION SELECT NULL, NULL FROM t0 AS b5x0 UNION SELECT NULL, quote(b68x1.c0) FROM t0 AS b68x0 JOIN t0 AS b68x1 ON 	3 rows / NULL / NULL / NULL | 4 rows / NULL / NULL / NULL / NULL
+CY	diff-994c6e1bceeddddd	Wrong	default,parallel,statistics,parallel, statistics	WITH w0(c0, c1, c2) AS NOT MATERIALIZED (SELECT NULL, NULL, NULL FROM t1 AS b45x0) SELECT (a0.c0 COLLATE RTRIM) FROM t1 AS a0 UNION ALL SELECT NULL FROM w0 AS a0 UNION SELECT 7 FROM w0 AS a0;	3 rows / NULL / 7 / ' ' | 4 rows / NULL / 7 / '' / ' '
+CY	diff-dee4d510f905f34f	Wrong	default,parallel,statistics,parallel, statistics	SELECT 'a ', a0.c2, x'c3bf' FROM t0 AS a0 UNION SELECT 1000000000000000.0, a0.c1, NULL FROM t1 AS a0 GROUP BY 1000000000000000.0, a0.c1;	2 rows / 'a ', 'a', x'c3bf' / 'a ', 'a ', x'c3bf' | 1 rows / 'a ', 'a', x'c3bf'
+CY	diff-e800e1e939499138	Wrong	default,parallel,statistics,parallel, statistics	SELECT (NULL COLLATE NOCASE) FROM t1 AS a0 UNION SELECT a1.c1 FROM t0 AS a0 FULL JOIN t0 AS a1 USING (c0) UNION SELECT NULL FROM t1 AS a0;	1 rows / 'A' | 2 rows / 'A' / 'a'
+CY	diff-01e99a270fdcee96	Wrong	default,parallel,statistics,parallel, statistics	SELECT NULL FROM t0 AS a0 FULL JOIN (SELECT quote((b60x0.c0 COLLATE NOCASE)) AS c0 FROM t1 AS b60x0 UNION ALL SELECT NULL FROM t1 AS b75x0 EXCEPT SELECT NULL FROM t0 AS b67x0) AS a1;	2 rows / NULL / NULL | 3 rows / NULL / NULL / NULL
+CY	diff-92045932b332e3cd	Wrong	default,parallel,statistics,parallel, statistics	SELECT a0.c2 FROM t2 AS a0 EXCEPT SELECT NULL FROM t0 AS a0 UNION SELECT NULL FROM t0 AS a0;	1 rows / 'A' | 2 rows / 'A' / 'a'
+CY	diff-12b612c266450bf6	Wrong	default,parallel,statistics,parallel, statistics	SELECT (a0.c0 COLLATE NOCASE) FROM t1 AS a0 UNION ALL SELECT '{"a":null}' FROM (SELECT NULL AS c0, NULL AS c1 FROM t1 AS b87x0 GROUP BY NULL) AS a0 EXCEPT SELECT NULL FROM t0 AS a0 GROUP BY NULL, x'c3	2 rows / 'ABC' / '{"a":null}' | 3 rows / 'ABC' / 'abc' / '{"a":null}'
+CY	diff-b4d642abb2fe1c6c	Wrong	default,parallel,statistics,parallel, statistics	SELECT (3 COLLATE NOCASE), NULL FROM (SELECT NULL AS c0, NULL AS c1, NULL AS c2 FROM t0 AS b58x0) AS a0 GROUP BY NULL UNION SELECT CAST(a0.c0 AS TEXT), '0' FROM (SELECT b96x0.c0 AS c0 FROM t0 AS b96x0	3 rows / NULL, NULL / 3, NULL / 'A', '0' | 4 rows / NULL, NULL / 3, NULL / 'A', '0' / 'a', '0'
+CY	diff-f2b028aaa183ebd3	Wrong	default,parallel,statistics,parallel, statistics	SELECT NULL FROM (SELECT NULL AS c0, quote((b39x1.c0 COLLATE NOCASE)) AS c1, NULL AS c2 FROM t1 AS b39x0 JOIN t0 AS b39x1 ON 1 UNION ALL SELECT NULL, NULL, NULL FROM t1 AS b70x0 EXCEPT SELECT NULL, NU	1 rows / NULL | 2 rows / NULL / NULL
+CY	diff-142e32906def4e9e	Wrong	default,parallel,statistics,parallel, statistics	SELECT a0.c0 FROM (SELECT (b9x1.c2 COLLATE RTRIM) AS c0, 'a ' AS c1, NULL AS c2 FROM t0 AS b9x0, t0 AS b9x1) AS a0 UNION SELECT 9223372036854775807 FROM t0 AS a0 UNION SELECT '1e3' FROM (SELECT NULL A	3 rows / 9223372036854775807 / '1e3' / 'a' | 4 rows / 9223372036854775807 / '1e3' / 'a' / 'a '
+CY	diff-7e7786d268e1262b	Wrong	default,parallel,statistics,parallel, statistics	WITH w0(c0, c1) AS (SELECT NULL, NULL FROM t2 AS b71x0 GROUP BY NULL) SELECT NULL, NULL, NULL FROM w0 AS a0 UNION ALL SELECT a1.c0, 2.0, -2.5 FROM w0 AS a0 FULL JOIN t0 AS a1 ON 'a ' EXCEPT SELECT ('A	2 rows / '', 2.0, -2.5 / ' ', 2.0, -2.5 | 1 rows / ' ', 2.0, -2.5
+CY	diff-c25205102bc0008a	Wrong	default,parallel,statistics,parallel, statistics	SELECT 0.0, NULL, a0.c0 FROM t0 AS a0 UNION ALL SELECT ' ', NULL, NULL FROM (SELECT NULL AS c0 FROM t1 AS b77x0) AS a0 GROUP BY ' ', NULL EXCEPT SELECT NULL, 2.0, -2.5 FROM t2 AS a0;	1 rows / 0.0, NULL, 'abc' | 2 rows / 0.0, NULL, 'ABC' / 0.0, NULL, 'abc'
+CY	diff-f8ba5645b08059be	Wrong	default,parallel,statistics,parallel, statistics	SELECT a0.c0, a2.c0 FROM t0 AS a0 NATURAL FULL JOIN t1 AS a1, t0 AS a2 UNION SELECT (a1.c0 NOTNULL), 0.1 FROM t0 AS a0, t0 AS a1 UNION SELECT (-2.5 >> a0.c0), asin(a0.c1) FROM t1 AS a0, t1 AS a1 WHERE	2 rows / 1, 0.1 / 'a ', 'a ' | 5 rows / 1, 0.1 / 'a', 'a' / 'a', 'a ' / 'a ', 'a' / 'a ', 'a '
+CY	diff-4fee190b088a5dae	Wrong	default,parallel,statistics,parallel, statistics	SELECT a1.c1 FROM t0 AS a0, t0 AS a1 EXCEPT SELECT (CASE (1 COLLATE NOCASE) WHEN (NOT (NOT (a1.c0 BETWEEN a0.c1 AND a0.c1))) THEN a0.c0 WHEN ('0x10' == a0.c1) THEN ltrim(100) ELSE a1.c0 END) FROM t0 A	2 rows / 'A' / 'a' | 1 rows / 'a'
+CY	diff-ad12bba012d81dec	Wrong	default,parallel,statistics,parallel, statistics	SELECT '1e3', a0.c0, 'é', 10 FROM t0 AS a0 UNION ALL SELECT 9223372036854775807, (CASE WHEN (NOT (a0.c2 NOT IN (a0.c2, -1e-308))) THEN a0.c2 ELSE a0.c0 END), NULL, 'a' FROM t0 AS a0 GROUP BY 922337203	3 rows / 9223372036854775807, 'ABC', NULL, 'a' / '1e3', 10, 'é', 10 / '1e3', 'é', 'é', 10 | 4 rows / 9223372036854775807, 'ABC', NULL, 'a' / 9223372036854775807, 'abc', NULL, 'a' / '1e3', 10, 'é', 10 / 
+CY	diff-b39491499497974d	Wrong	default,parallel,statistics,parallel, statistics	SELECT a0.c0 FROM (SELECT (0.1 COLLATE NOCASE) AS c0 FROM t0 AS b24x0) AS a0 UNION SELECT x'c3bf' FROM v0 AS a0 GROUP BY x'c3bf', NULL UNION SELECT a0.c0 FROM t0 AS a0 GROUP BY a0.c0, 0.1;	2 rows / 0.1 / 'A' | 3 rows / 0.1 / 'A' / 'a'
+CY	diff-44fcad368b659a71	Wrong	default,parallel,statistics,parallel, statistics	SELECT (3.0 < a1.c0), a0.c0 FROM t0 AS a0, t0 AS a1 EXCEPT SELECT CAST(1.5 AS BLOB), (a0.c0 BETWEEN a1.c0 AND 3.0) FROM (SELECT DISTINCT quote((b32x0.c0 BETWEEN 0.0 AND -2.5)) AS c0 FROM t0 AS b32x0 J	1 rows / 1, 'A' | 2 rows / 1, 'A' / 1, 'a'
+CY	diff-d786be079e2eec4f	Wrong	default,parallel,statistics,parallel, statistics	SELECT date((a0.c0 % 0.5)), (SELECT count(s944.c0) FROM t1 AS s944 WHERE (a1.c2 IS NOT DISTINCT FROM a1.c1)), a0.c3 FROM t0 AS a0, t0 AS a1 UNION ALL SELECT a0.c0, cos(x'00'), count(*) FROM t1 AS a0 G	1 rows / NULL, 0, 'A' | 2 rows / NULL, 0, 'A' / NULL, 0, 'a'
+CY	diff-6db4bd816a8b8000	Wrong	default,parallel,statistics,parallel, statistics	SELECT jsonb_array((a0.c2 COLLATE RTRIM), a1.c2, (a0.c1 BETWEEN a1.c1 AND a1.c2)) FROM t0 AS a0, t2 AS a1 UNION SELECT (a2.c0 ISNULL) FROM t0 AS a0 JOIN lg AS a1 ON (a0.c2 ISNULL) CROSS JOIN lg AS a2 	3 rows / NULL / ' ' / x'0102' | 4 rows / NULL / '' / ' ' / x'0102'
+CY	diff-b9c71bbf0ba78831	Wrong	default,parallel,statistics,parallel, statistics	SELECT (a1.c0 IS DISTINCT FROM a0.c1), count(*) FROM v1 AS a0, t0 AS a1 GROUP BY (a1.c0 IS DISTINCT FROM a0.c1) UNION ALL SELECT (a1.c0 < x'41'), a1.c2 FROM v0 AS a0, t0 AS a1 UNION SELECT a0.c0, a0.c	3 rows / 1, 4 / 'A', 'A' / 'a', 'a' | 2 rows / 1, 4 / 'a', 'a'
+CY	diff-f3f4c9df43eba319	Wrong	default,parallel,statistics,parallel, statistics	SELECT a1.c1 FROM (SELECT 1.5 AS c0 FROM t0 AS b32x0 LEFT JOIN t0 AS b32x1 ON ((b32x0.c2 >= NULL) <> b32x1.c0) WHERE ((NOT (b32x0.c1 IS NOT 3)) NOT IN ((b32x1.c1 || b32x0.c0), 7, json_extract('{"a":1,	1 rows / '' | 2 rows / '' / ' '
+CY	diff-f9cdfd94079244f7	Wrong	default,parallel,statistics,parallel, statistics	SELECT (~ (a0.c0 <= '0')) FROM t1 AS a0, (SELECT quote((b36x0.c1 COLLATE NOCASE)) AS c0, CAST(((CASE WHEN (b36x0.c0 <= b36x0.c2) THEN b36x0.c1 ELSE b36x0.c1 END) COLLATE NOCASE) AS INTEGER) AS c1 FROM	2 rows / -2 / -1 | 4 rows / -2 / -1 / -2 / -1
+CY	diff-e36b40e21c258878	Wrong	default,parallel,statistics,parallel, statistics	SELECT a0.c3, a1.c2, count(datetime(x'00')) FILTER (WHERE (x'' <> ' ')) OVER (PARTITION BY a1.c1, a0.c1 ORDER BY ('a ' IN (a0.c3, a0.c3))), percent_rank() OVER (ORDER BY (CASE a1.c0 WHEN (0 = a1.c1) T	4 rows / 7, NULL, 1, 'a ' / 10, NULL, 1, 'a ' / 'ABC', 1, 10, '1.5' / 'abc', 1, 10, '1.5' | 3 rows / 7, NULL, 1, 'a ' / 10, NULL, 1, 'a ' / 'abc', 1, 10, '1.5'
+CY	diff-1f4eb7593fa8a653	Wrong	default,parallel,statistics,parallel, statistics	SELECT 100, a0.c0, ((NOT a1.c0) OR ('10' IS NOT DISTINCT FROM a1.c0)) FROM (SELECT unixepoch((- b63x0.c1), (b63x0.c1 COLLATE NOCASE), CAST('_' AS INTEGER)) AS c0 FROM t0 AS b63x0 WHERE ((7 + b63x0.c1)	2 rows / 0.5, 'ABC', NULL / 10, 2, -9223372036854775808 | 3 rows / 0.5, 'ABC', NULL / 0.5, 'abc', NULL / 10, 2, -9223372036854775808
+CY	diff-1d15833b44b0df13	Wrong	default,parallel,statistics,parallel, statistics	SELECT ((a1.c1 != a0.c1) COLLATE RTRIM), a1.c1, json_array_insert((CASE WHEN a0.c2 THEN -1 END)) FROM (SELECT (~ (b55x0.c0 | 255)) AS c0, b55x0.c0 AS c1, (b55x0.c2 == 3) AS c2 FROM lg AS b55x0 WHERE (	2 rows / '%', -1, 1 / '0', 'abc', -1e-308 | 3 rows / '%', -1, 1 / '0', 'abc', -1e-308 / '0 ', 'abc', -1e-308
+CY rowid	diff-b36a3ed9f05d6c81	Wrong	default,parallel,statistics,parallel, statistics	SELECT a0.c0, 7, NULL FROM t0 AS a0 UNION SELECT a0.c0, NULL, NULL FROM t1 AS a0 GROUP BY a0.c0;	2 rows / 'A', NULL, NULL / 'a', NULL, NULL | 1 rows / 'a', NULL, NULL
+CY rowid	diff-7a39ef6d7ff9f2ff	Wrong	default,parallel,statistics,parallel, statistics	SELECT NULL, NULL FROM lg AS a0 UNION SELECT (CASE a0.c1 WHEN a0.c1 THEN a0.c0 WHEN NULL THEN 10 END), NULL FROM t1 AS a0 GROUP BY a0.c1, a0.c0 UNION SELECT a0.c2, NULL FROM t0 AS a0;	2 rows / 'a', NULL / 'a ', NULL | 1 rows / 'a ', NULL
+DU	diff-201c6ed49e96e679	Wrong	default,parallel,statistics,parallel, statistics	WITH w0(c0, c1) AS (SELECT NULL, min(quote((b15x0.c2 COLLATE NOCASE))) FROM t0 AS b15x0 GROUP BY NULL) SELECT a0.c1 FROM w0 AS a0;	1 rows / '''a ''' | 1 rows / '''ABC'''
+DV	diff-9723879614d3a7dc	Wrong	default,parallel,statistics,parallel, statistics	SELECT NULL, NULL, NULL FROM (SELECT '[1,2,3]' AS c0, CAST((-9223372036854775808 || b1x0.c0) AS NUMERIC) AS c1, NULL AS c2 FROM t1 AS b1x0) AS a0 GROUP BY NULL, a0.c1;	1 rows / NULL, NULL, NULL | 2 rows / NULL, NULL, NULL / NULL, NULL, NULL
+DW	diff-ac7bcc8bafa372f3	Wrong	default,parallel,statistics,parallel, statistics	SELECT NULL, NULL, NULL FROM t0 AS a0 GROUP BY a0.c0 HAVING (NULL NOT IN (SELECT s410.c1 FROM t1 AS s410 WHERE (SELECT min(s840.c3) FROM t1 AS s840 WHERE (a0.c0 IS NOT s410.c0))));	0 rows | 1 rows / NULL, NULL, NULL
+DX	diff-281431e9a598ad4c	Wrong	default,parallel,statistics,parallel, statistics	SELECT jsonb_set(a0.c0) FROM v0 AS a0;	1 rows / x'a97b2261223a6e756c6c7d' | 1 rows / x'a77b2261223a6e756c6c7d'
+JP	diff-13f9ccb207d36fb8	Wrong	default,parallel,statistics,parallel, statistics	SELECT jsonb_replace(json_patch(100, '0x10')) FROM t0 AS a0;	1 rows / x'4430783130' | 1 rows / x'233136'
+RW	diff-9296a16e5d2b7316	Wrong	default,parallel,statistics,parallel, statistics	SELECT 1, (a0.c0 NOTNULL), NULL, dense_rank() OVER (ORDER BY NULL) FROM t0 AS a0 GROUP BY 1, (a0.c0 NOTNULL);	2 rows / 1, 1, NULL, 1 / 1, 1, NULL, 1 | 1 rows / 1, 1, NULL, 1
+RW	diff-9e6a0864bd4c2c8a	Wrong	default,parallel,statistics,parallel, statistics	SELECT 1, (7 IS a0.c0), NULL, count(NULL) OVER (ORDER BY NULL DESC) FROM t0 AS a0 GROUP BY 1, (7 IS a0.c0);	2 rows / 1, 0, NULL, 0 / 1, 0, NULL, 0 | 1 rows / 1, 0, NULL, 0
+RW	diff-359d5ed1acacb852	Wrong	default,parallel,statistics,parallel, statistics	SELECT 1, concat(a0.c0), NULL, dense_rank() OVER (ORDER BY x'') FROM t0 AS a0 GROUP BY 1, concat(a0.c0);	2 rows / 1, '', NULL, 1 / 1, '', NULL, 1 | 1 rows / 1, '', NULL, 1
+RW	diff-2dad32cf551ffb5e	Wrong	default,parallel,statistics,parallel, statistics	SELECT 1, (a0.c0 != a0.c1), NULL, rank() OVER (ORDER BY '1.5') FROM t0 AS a0 GROUP BY 1, (a0.c0 != a0.c1);	2 rows / 1, NULL, NULL, 1 / 1, NULL, NULL, 1 | 1 rows / 1, NULL, NULL, 1
+RW	diff-ea22cd160143dbc4	Wrong	default,parallel,statistics,parallel, statistics	SELECT 1, (a0.c0 >> a0.c1), NULL, count(*) OVER (ORDER BY NULL DESC) FROM t1 AS a0 GROUP BY 1, (a0.c0 >> a0.c1);	2 rows / 1, 0, NULL, 2 / 1, 0, NULL, 2 | 1 rows / 1, 0, NULL, 1
+RW	diff-058eba6d91de3fc5	Wrong	default,parallel,statistics,parallel, statistics	SELECT 1, ifnull('a', a0.c2), NULL, dense_rank() OVER (ORDER BY NULL DESC) FROM t2 AS a0 GROUP BY 1, ifnull('a', a0.c2);	2 rows / 1, 'a', NULL, 1 / 1, 'a', NULL, 1 | 1 rows / 1, 'a', NULL, 1
+RW	diff-9037b97d99cfba76	Wrong	default,parallel,statistics,parallel, statistics	SELECT 1, unixepoch(a0.c1), NULL, count(*) OVER (ORDER BY NULL DESC) FROM t2 AS a0 GROUP BY 1, unixepoch(a0.c1);	2 rows / 1, NULL, NULL, 2 / 1, NULL, NULL, 2 | 1 rows / 1, NULL, NULL, 1
+RW	diff-39aa8d1c431dbf91	Wrong	default,parallel,statistics,parallel, statistics	SELECT 1, (a0.c0 BETWEEN a0.c1 AND a0.c1), NULL, count(*) OVER (ORDER BY NULL) FROM t0 AS a0 GROUP BY 1, (a0.c0 BETWEEN a0.c1 AND a0.c1);	2 rows / 1, 0, NULL, 2 / 1, 0, NULL, 2 | 1 rows / 1, 0, NULL, 1
+RW	diff-dbe8cd245bc5b393	Wrong	default,parallel,statistics,parallel, statistics	SELECT 1, (a0.c3 BETWEEN 0 AND a0.c3), NULL, rank() OVER (ORDER BY -1) FROM t1 AS a0 GROUP BY 1, (a0.c3 BETWEEN 0 AND a0.c3);	2 rows / 1, 1, NULL, 1 / 1, 1, NULL, 1 | 1 rows / 1, 1, NULL, 1
+RW	diff-d37121c2e03fbabd	Wrong	default,parallel,statistics,parallel, statistics	SELECT 1, (a0.c3 NOTNULL), NULL, dense_rank() OVER (ORDER BY NULL) FROM t0 AS a0 GROUP BY 1, (a0.c3 NOTNULL);	2 rows / 1, 1, NULL, 1 / 1, 1, NULL, 1 | 1 rows / 1, 1, NULL, 1
+RW	diff-177079a3b6af4b49	Wrong	default,parallel,statistics,parallel, statistics	SELECT (7 NOTNULL), (a1.c1 % a0.c0), count(*), dense_rank() OVER (ORDER BY count(*)) FROM t2 AS a0, t1 AS a1 GROUP BY (7 NOTNULL), (a1.c1 % a0.c0);	2 rows / 1, 0.0, 1, 1 / 1, 0, 1, 1 | 1 rows / 1, 0.0, 2, 1
+RW	diff-62a892f8a0515362	Wrong	default,parallel,statistics,parallel, statistics	WITH w0(c0) AS (SELECT DISTINCT quote(jsonb_array(('1e3' * 2.0))) FROM t0 AS b88x0 JOIN t0 AS b88x1 ON (CAST(7 AS TEXT) NOT GLOB '_') WHERE (log2(2) > (NOT (NOT b88x0.c0)))) SELECT ('0x10' NOTNULL), (	2 rows / 1, -1, 1, 1 / 1, -1, 1, 1 | 1 rows / 1, -1, 2, 1
+RW	diff-57a2d475f450b189	Wrong	default,parallel,statistics,parallel, statistics	SELECT (0.0 NOTNULL), (CASE WHEN (3.0 <= a0.c2) THEN a1.c2 ELSE a1.c0 END), count(*), dense_rank() OVER (ORDER BY (0.0 NOTNULL)) FROM t0 AS a0, t0 AS a1 GROUP BY (0.0 NOTNULL), (CASE WHEN (3.0 <= a0.c	4 rows / 1, -1, 1, 1 / 1, 1000, 1, 1 / 1, -1, 1, 1 / 1, '', 1, 1 | 3 rows / 1, -1, 2, 1 / 1, 1000, 1, 1 / 1, '', 1, 1
+RW	diff-1560c9cd0af7945e	Wrong	default,parallel,statistics,parallel, statistics	WITH w1(c0) AS (SELECT CAST(NULL AS INTEGER) FROM t0 AS b50x0 INTERSECT SELECT CAST(1 AS INTEGER) FROM t0 AS b96x0 UNION SELECT CAST(b88x0.c0 AS INTEGER) FROM t0 AS b88x0) SELECT a0.c0, NULL, count(*)	2 rows / -2, NULL, 1 / 0, NULL, 2 | 2 rows / 0, NULL, 1 / -2, NULL, 2
+RW	diff-f76ea44fabd27644	Wrong	default,parallel,statistics,parallel, statistics	SELECT (' a' NOTNULL), mod(a1.c1, 'é'), count(*), count(*) OVER (ORDER BY (' a' NOTNULL) DESC) FROM v0 AS a0, t0 AS a1 GROUP BY (' a' NOTNULL), mod(a1.c1, 'é');	2 rows / 1, NULL, 2, 2 / 1, NULL, 2, 2 | 1 rows / 1, NULL, 4, 1
+RW	diff-d6d9a85cb201daf3	Wrong	default,parallel,statistics,parallel, statistics	SELECT a0.c0, NULL, count(0) OVER (ORDER BY a0.c0 DESC) FROM v0 AS a0 GROUP BY a0.c0;	2 rows / -100, NULL, 1 / 5, NULL, 2 | 2 rows / 5, NULL, 1 / -100, NULL, 2
+RW	diff-d8ad6cad1ed9b0ec	Wrong	default,parallel,statistics,parallel, statistics	SELECT a0.c0, NULL, rank() OVER (ORDER BY a0.c0 DESC) FROM (SELECT CAST(NULL AS INTEGER) AS c0, CAST(NULL AS INTEGER) AS c1, CAST(NULL AS INTEGER) AS c2 FROM t1 AS b25x0 UNION ALL SELECT CAST(0 AS INT	2 rows / NULL, NULL, 1 / 0, NULL, 2 | 2 rows / 0, NULL, 1 / NULL, NULL, 2
+RW	diff-6e7efcd2ed08ca5b	Wrong	default,parallel,statistics,parallel, statistics	SELECT a0.c0, NULL, rank() OVER (ORDER BY a0.c0 DESC) FROM v0 AS a0 GROUP BY a0.c0;	3 rows / '-1', NULL, 1 / '0.0', NULL, 2 / 'NULL', NULL, 3 | 3 rows / 'NULL', NULL, 1 / '0.0', NULL, 2 / '-1', NULL, 3
+RX	diff-ddbf5baac88f80e7	Wrong	default,parallel,statistics,parallel, statistics	SELECT -2.5, 2 FROM t0 AS a0 UNION SELECT NULL, count(*) FROM t0 AS a0 GROUP BY NULL ORDER BY (1 COLLATE NOCASE);	1 rows / NULL, 0 | 0 rows
+RX	diff-370c4cc388c644b0	Wrong	default,parallel,statistics,parallel, statistics	SELECT '1.5', 10 FROM lg AS a0 UNION SELECT 0.5, count(*) FROM lg AS a0 GROUP BY 0.5 ORDER BY (1 COLLATE NOCASE);	1 rows / 0.5, 0 | 0 rows
+RX	diff-7f6948985af6e9dd	Wrong	default,parallel,statistics,parallel, statistics	SELECT 'a ', NULL FROM lg AS a0 UNION SELECT NULL, count(*) FROM lg AS a0 GROUP BY NULL ORDER BY 1, (2 COLLATE BINARY) DESC;	1 rows / NULL, 0 | 0 rows
+RX	diff-334ec4c8f70b209f	Wrong	default,parallel,statistics,parallel, statistics	SELECT 0, NULL FROM t1 AS a0 UNION SELECT NULL, count(*) FROM t1 AS a0 GROUP BY NULL ORDER BY (1 COLLATE BINARY);	1 rows / NULL, 0 | 0 rows
+RX	diff-cc5246dc31546afe	Wrong	default,parallel,statistics,parallel, statistics	SELECT count(*) FROM lg AS a0 EXCEPT SELECT '0' FROM lg AS a0 GROUP BY '0', 'abc' HAVING NULL ORDER BY (1 COLLATE RTRIM) DESC;	0 rows | 1 rows / 0
+RX	diff-14426d4fa8c5cfce	Wrong	default,parallel,statistics,parallel, statistics	SELECT '{"a":null}', NULL FROM t0 AS a0 UNION SELECT '-1', count(*) FROM t0 AS a0 GROUP BY '-1' ORDER BY (1 COLLATE NOCASE) DESC, 	1 rows / '-1', 0 | 0 rows
+RX	diff-ee096cc6867fb729
+RX	diff-0861fd7dfa660f76
+RX	diff-668bac121375f608
+RX	diff-8c04b09d779c4514
+RX	diff-4b163aab62596f44
+RX	diff-d74c5d62cdcc8a96
+RX	diff-b266df6f61011c95
+RX	diff-e3a89a5da97ed8ff
+RX	diff-eee9dd10719a1b5d
+RX	diff-88b82aad53248a5d
+RX	diff-283b7efac95cf0f0
+RX	diff-7a4d3ec11f53544e
+RX	diff-e45175c559abbae3
+RX	diff-ef5d1140d41cca43
+RX	diff-75d157645be117a4
+RX	diff-a7921d26dbccd816
+RX	diff-4feddacb275b142e
+RX	diff-c78117518b1eb5f5
+RX	diff-680c373d93c8b629
+RX	diff-dcadb5592af0bd38
+RX	diff-dff7324a08674bd1
+RX	diff-c388eff79de02f3a
+RX	diff-a5252ada4dac570b
+RX	diff-3908402271a09d4f
+RX	diff-8b8ddc4b337cfa42
+RX	diff-22bfec95584053ee
+RX	diff-29fcc89fdf311f74
+RX	diff-51d93efc62acbd4a
+RX	diff-0559bd116b21cf72
+RX	diff-a3d4f6dc97c696ce
+RX	diff-63a14a01981fdd9f
+RX	diff-83501291bc5f0026
+RX	diff-4fcb20e956c85d65
+RX	diff-c8890abad9bc7e60
+RX	diff-ce4889462ae78300
+RX	diff-a803b26f4f1f7b6f
+RX	diff-96e68754902c9634
+RX	diff-84e2cccb3b9bf8dd
+RX	diff-c73490e17d8a944b
+RX	diff-e594c3935588b391
+RX	diff-c1840eb8e3fae986
+RX	diff-271c9c91f6e13e6b
+RX	diff-2269d4a08a83ad93
+RX	diff-799368d7b5449c2a
+RX	diff-73e7f88889a1882c
+RX	diff-89bd78f4c604af5d
+RX	diff-a5d866ac001ad2fe
+RX	diff-de7be65982fab7e8
+RX	diff-89c696cbefda9092
+RX	diff-2fc5408f2aa2beb7
+RX	diff-20b9b13ffa52afe3
+RX	diff-356f279f955090ef
+RX	diff-20dabb20225e932d
+RX	diff-051097ad53d6d3b3
+RX	diff-d28fa0c728120966
+RX	diff-6be1daa58ca9a615
+RX	diff-aa9afe5960583f4b
+RX	diff-679eccde3f854eea
+RX	diff-969ed99f932e2690
+RX	diff-451070cd94e942ec
+RX	diff-d135de8041a83b08
+RX	diff-54a8b00b1b09bf73
+RX	diff-3397934f99fdfc01
+RX	diff-48452e3a0083c019
+RX	diff-8f1ef7b4bb67743f
+RX	diff-835cb0547cabbe82
+RX	diff-b904426d4f2c1983
+RX	diff-67878dfb65d992b3
+RX	diff-2c07b5ea63ea1726
+RX	diff-5a0971b5f21a0842
+RX	diff-fc997fd35cf3800e
+RX	diff-961250df4a8fbd3e
+RX	diff-ff362f996fb2e948
+RX	diff-c183fd38341b531e
+RX	diff-2b30ab6d5245746a
+RX	diff-8e086d3be48bba03
+RX	diff-171cdae4dfc4f279
+RX	diff-c46d9a024afffdc5
+RX	diff-70fe43f86f040342
+RX	diff-868347d39cb580f8
+RX	diff-f1d727c7a290be52
+RX	diff-eb48c592a438defa
+RX	diff-12d421999c9470fa
+RX	diff-bc9465b6ba4c51b7
+RX	diff-7274728bd0117bed
+RX	diff-bcbb0f02b077828c
+RX	diff-c03e24c8e87ec6fa
+RX	diff-31b0ae95366fe59e
+RX	diff-e166cd4f9f347b3b
+RX	diff-93e2fff4332abebc
+RX	diff-1f63b42e2bf828b2
+RX	diff-86d76e9f79368b63
+RX	diff-e0f55f3621f1e9b8
+RX	diff-3ec035c5100a983b
+RX	diff-c162ea3d4818c645
+RX	diff-abe6d7a0c8af35fc
+RX	diff-7fdff00334cadcac
+RX	diff-fbe911da74e3cff5
+RX	diff-b29d9caa27f1a9d4
+RX	diff-5f273e3865004604
+RX	diff-ffdc2905f8bfb39b
+RX	diff-03655731799ff216
+RX	diff-a6181f97fcc8f286
+RX	diff-f26392bbe5c55f78
+RX	diff-fc5101eae7a91ede
+RX	diff-313f9a3a091a46f7
+RX	diff-50e378a4ac929886
+RX	diff-eb9588330edc104f
+RX	diff-bc21540c72a1588a
+RX	diff-e02d8e4647b1e087
+RX	diff-b15847f5f4685e60
+RX	diff-88b5ce9843ee0f1e
+RX	diff-2ccc43ddf24bee29
+RX	diff-c02427da2a0fa52c
+RX	diff-e10f51766dbf10b4
+RX	diff-1292538ff93733da
+RX	diff-e8c26dd53a723861
+RX	diff-297ab25092e751ae
+RX	diff-73ef5ca4bb78d643
+RX	diff-c8a86e4dd86a3887
+RX	diff-26984afec8f24770
+RX	diff-afd3825bef77aec8
+RX	diff-4bb73c91a267a73a
+RX	diff-c6373e3dfd7ad20f
+RX	diff-f21e042489c9642e
+RX	diff-b8768789f4dee06f
+RX	diff-66201914cdc9bb33
+RX	diff-999b766dcb13eb3e
+RX	diff-d2eec833206de23b
+RX	diff-69b0e5714f34e029
+RX	diff-be5875fedd695570
+RX	diff-da52830e3264c753
+RX	diff-ccabf07309273b8d
+RX	diff-e5b0d9d66b545c00
+RX	diff-0d22925bd8c2c34b
+RX	diff-5a5b144313219274
+RX	diff-2d1d72eb0a909c57
+RX	diff-7f4854833397d38a
+RX	diff-fe3bec12b5f7798a
+RX	diff-a0fe0132486bbae1
+RX	diff-89f792a350d638f8
+RX	diff-9b553da352059141
+RX	diff-0b4cc84f1daf1d0f
+RX	diff-fa65563f8de868ee
+RX	diff-e1acff2358be02d7
+RX	diff-32e4406034d7fcb3
+RX	diff-d52c8d7af4fc671d
+RX	diff-9a2a66f9ecc39971
+RX	diff-ba879b8ac07bba70
+RX	diff-e99a8b960d6baa89
+RX	diff-6545ff88129d1e35
+RX	diff-9d6a12340a2eeac0
+RX	diff-f6d33058786cbde2
+RX	diff-bc58c8c354b5e3e9
+RX	diff-4c061e63f88da4f6
+RX	diff-b18472338db54944
+RX	diff-2d3f454155ea3bfe
+RX	diff-3701a38afe692cc6
+RX	diff-f9d69db2d29832c3
+RX	diff-922d6a3ad2c803a5
+RX	diff-9afa515632012069
+RX	diff-a31dd7f45db81aae
+RX	diff-b66f94b8ec9b63f0
+RX	diff-05a4dffb06c94cde
+RX	diff-1d064467fef4f14f
+RX	diff-20f8881c81bbea83
+RX	diff-569aaabe48202816
+RX	diff-88d8a376fa319989
+RX	diff-853897a7ca49e636
+RX	diff-31046a6c14954be1
+RX	diff-ab1a475e91ddab52
+RX	diff-381bf8a91e99e9d8
+RX	diff-8c29394803e4cb85
+RX	diff-97cd517d61de7933
+RX	diff-11c1f49839796e62
+RX	diff-229a61023589b5e5
+RX	diff-a7c5e16355352462
+RX	diff-d15bfd44aedea47f
+RX	diff-81bde5f87b765a99
+RX	diff-6e75cbe63335cca2
+RX	diff-435508c85294f7a1
+RX	diff-5db51c8e65b107ce
+RX	diff-8889820ff0ed9f04
+RX	diff-3081abe3e2680087
+RX	diff-b91abd19ac2c700c
+RX	diff-0fd75a5f2b9c269f
+RX	diff-251546d95436ad61
+RX	diff-2b091f8565700933
+RX	diff-9b7e84f3b93d5e96
+RX	diff-ab9a9a7f643eba1f
+RX	diff-ef92144f25c31f76
+RX	diff-e6391991b280efa9
+RX	diff-325b9abe21c57107
+RX	diff-458331668e233789
+RX	diff-4f2e23f327ceaf1d
+RX	diff-ae49cdbab191ee13
+RX	diff-f5b495d9a1d7df79
+RX	diff-60e6356a2d269910
+RX	diff-fd03bb58aca6341f
+RX	diff-0c106ec9bcb1ac38
+RX	diff-247283e8079c6ffd
+RX	diff-335140ac486593c5
+RX	diff-2267e332e64454e0
+RX	diff-de9e2e39561b9d25
+RX	diff-22c326f591328ef7
+RX	diff-3e4cee7e2396dd14
+RX	diff-8c94b2d9f0afb641
+RX	diff-163412ff6291311c
+RX	diff-254ade71f2311e8c
+RX	diff-35315c86db5b1b4a
+RX	diff-cf910916cee9abe9
+RX	diff-c247d3e0dad64efe
+RX	diff-13d81ad19236b24a
+RX	diff-00dbb5250c168c1b
+RX	diff-efa1d99ae19eef64
+RX	diff-05ac3efb7f8d7170
+RX	diff-484f8573effa0dee
+RX	diff-aba6876a334d150e
+RX	diff-8a40b33ecf6c9522
+RX	diff-46e2ad6a5012e3d2
+RX	diff-3d1a5570a560e34b
+RX	diff-2ccabe48afd2d758
+RX	diff-e1de9abd68d498e1
+RX	diff-648d8b7ea0285275
+RX	diff-a249a82aab19d9dc
+RX	diff-92b1184757c5c33f
+RX	diff-f24e165542edd466
+RX	diff-ffc1fe2280031e17
+RX	diff-171d6a47fd8604c4
+RX	diff-40e8f5deb7a7ab3d
+RX	diff-f99f02b0383d1f97
+RX	diff-fb882d10f6b95915
+RX	diff-e27615732c539433
+RX	diff-dcfc1649af1ac31d
+RX	diff-4308dadcf2a21691
+RX	diff-c483e86d0b868fbd
+RX	diff-fc9217837acdd556
+RX	diff-4a852fbc050b52af
+RX	diff-bf41c1252812b4cc
+RX	diff-65eff8398654cbf7
+RX	diff-ca2c9276a3e98379
+RX	diff-ea8703d8a08922a6
+RX	diff-569ed3e2cf033026
+RX	diff-dcb9b3d0223ceeff
+RX	diff-88690b50a7a8cf26
+RX	diff-f8f6dd8e2e7e525a
+RX	diff-3e45ad86199eea49
+RX	diff-f7f35cfc63419d0e
+RX	diff-bc3d22c9b9990754
+RX	diff-3bd4a2b4287a504d
+RX	diff-410dd087d57b9a3c
+RX	diff-437a6deea3a9012a
+RX	diff-551f784325f3d961
+RX	diff-d3535413b8a4ed91
+RX	diff-540f0dd5f919f1cd
+RX	diff-3d5f0b610e8d34c5
+RX	diff-193542ebd0d5b564
+RX	diff-4614a865d460bfdf
+RX	diff-66e72e351442986f
+RX	diff-a778ae23937e4699
+RX	diff-2816a2b260a5a42c
+RX	diff-0c8d38963ef88669
+RX	diff-b53fdf55cc6b987d
+RX	diff-423aea04f960c44c
+RX	diff-d38be288037bff3e
+RX	diff-043bcb3945e94b9f
+RX	diff-6c564729f5b35a1e
+RX	diff-27e5ebcaed0a2bbc
+RX	diff-b9e94a2ae8f1210b
+RX	diff-8ec2b1e87b69804e
+RX	diff-4e6c232dcd0406b3
+RX	diff-861045b49c4c3ed5
+RX	diff-59aed57555f435a2
+RX	diff-5389b03965225687
+RX	diff-5d3012c355f8363c
+RX	diff-7073067b76c0929b
+RX	diff-97ffbc2b3ae89fed
+RX	diff-ddef37eabcffaea0
+RX	diff-aab2b6c5447b8d8f
+RX	diff-053421a5a11f6a7a
+RX	diff-9ae16bf05fdad699
+RX	diff-e892df50fed479a6
+RX	diff-e8f707dfda2dd61e
+RX	diff-07a8c44424ca5406
+RX	diff-9cb71fdaa6efdc5a
+RX	diff-02c31e3eaac99fa5
+RX	diff-0337730be0adfc7d
+RX	diff-ace88f2ecfdabce2
+RX	diff-8e935ac93a59def5
+RX	diff-91c1a0862ebacdfc
+RX	diff-23d24d81c4f6dec4
+RX	diff-a48990efef9d486b
+RX	diff-ca57b7278785d64f
+RX	diff-86d3434822f663dc
+RX	diff-1e89bfcd1b3b671c
+RX	diff-c989cf1ffe695729
+RX	diff-fc065f913ae00960
+RX	diff-e78a47633612ddc7
+RX	diff-8eb18146098ccfa6
+RX	diff-ec51ac789752a755
+RX	diff-8dcdbf474afdbb6b
+RX	diff-574c7b567aee9ef3
+RX	diff-cd345b19c15b7223
+RX	diff-ccf8b97853038711
+RX	diff-0502847b64140232
+RX	diff-2f6c41e3ba0cdc7a
+RX	diff-8993c5e4ff80e8ab
+RX	diff-cbd90d7765e41acc
+RX	diff-51ed19eb91864cf1
+RX	diff-f3cbe42f61caa005
+RX	diff-b52913b2401efd86
+RX	diff-cf8a48e659bfcb25
+RX	diff-37873663c84c4663
+RX	diff-f464cf55ec78fe50
+RX	diff-10115d41e5558a86
+RX	diff-6a697929408d8d12
+RX	diff-d9fd36a546cf2a3b
+RX	diff-b7c3ffbfa04aa072
+RX	diff-33e9e48b7628158f
+RX	diff-bb18b6d01026db91
+RX	diff-81d4fe769ccf7007
+RX	diff-dd132516b5070238
+RX	diff-01b4ff73f2e2ca18
+RX	diff-f2079a7c432cecf5
+RX	diff-85d2f2fe5c7a7ffa
+RX	diff-63268ba30ae6054e
+RX	diff-62ef40789ecaf02b
+RX	diff-5b14d3d87725e757
+RX	diff-64ba57a63ada6b56
+RX	diff-b8bb2e5a024a2dcc
+RX	diff-a72c094d7c654d62
+RX	diff-a0e0202cdceb2df5
+RX	diff-52864370931754a5
+RX	diff-7d7791badac4e12d
+RX	diff-13d63025c1cd070a
+RX	diff-9199677cabbe3bc8
+RX	diff-f0760607a739f412
+RX	diff-aefbfbd9b2e63b94
+RX	diff-928c015e79f8934d
+RX	diff-7567ecf4991b6043
+RX	diff-8954e90d402f18e8
+RX	diff-227b7abfad2790e6
+RX	diff-629cd1c3a953a61f
+RX	diff-3b16283addfb6df6
+RX	diff-deec5a8efd6284f7
+RX	diff-4d7807818e3b9696
+RX	diff-dfbfc7656eb34db9
+RX	diff-4def47df869d417c
+RX	diff-ac321d0222631e9f
+RX	diff-5572b26b17be5a39
+RX	diff-cacee0c16f5ec85b
+RX	diff-1f4dc9a527f8e7b1
+RX	diff-a53e4ee27660d7d7
+RX	diff-f8833991fb684b0b
+RX	diff-94fead35d2d3e09f
+RX	diff-5ccd6c561bee195b
+RX	diff-018aa7ecb8e90d75
+RX	diff-bf6065e75ad991bf
+RX	diff-b53b16f3b688a60a
+RX	diff-173be849121044a8
+RX	diff-8fe3870a36c92ae7
+RX	diff-c24462903c6820c9
+RX	diff-c142772cf5db5b65
+RX	diff-d9a56551cf5146e5
+RX	diff-9fb066472915e162
+RX	diff-887c7f1c02b5f537
+RX	diff-92037a283fb966ce
+RX	diff-b0bfa44e4e377698
+RX	diff-74e643781e9a979b
+RX	diff-63e4c4158755bb6c
+RX	diff-ea6f8fec343fbf04
+RX	diff-82cde2c98bc8497a
+RX	diff-52f833751fc8779d
+RX	diff-e80029b31c19068c
+RX	diff-b82303ab813dc512
+RX	diff-988479c832232327
+RX	diff-1554404a3c2e1f8f
+RX	diff-f15420b105f5c4ac
+RX	diff-2c4b9d5ce9c98ffa
+RX	diff-a93771a26e44f33e
+RX	diff-4da313c847f4e16e
+RX	diff-cdc322d822cca802
+RX	diff-cf35a41fbf0a97ce
+RX	diff-47ee1930c03379e6
+RX	diff-60edd1d2cd2e787e
+RX	diff-1469b16257a77e42
+RX	diff-d8550b6fdef0702e
+RX	diff-1cc4e2cb3fd7b361
+RX	diff-aa08e068414b2737
+RX	diff-85e5bef2766f33d3
+RX	diff-4072679e40d8f390
+RX	diff-c77f336133a67957
+RX	diff-efd82c64c4615c41
+RX	diff-db1daf876bda70fb
+RX	diff-03dc7fc409fa7c25
+RX	diff-d74218568ecb1a93
+RX	diff-02950212ff28c997
+RX	diff-14435e53742bf36d
+RX	diff-dd4b3868ee6edbb9
+RX	diff-ba1aaae8e082b546
+RX	diff-541f892e3d643c29
+RX	diff-d51d81ec3b09fe5f
+RX	diff-af1bf43fa22a3fe3
+RX	diff-2576495355a3d521
+RX	diff-d8ff3950ee2c460d
+RX	diff-4a72d3f932ab047e
+RX	diff-1698ccbbc0b55e36
+RX	diff-bda1c9246b25fefc
+RX	diff-494f340f7a944c36
+RX	diff-c779aa761abbe0ba
+RX	diff-ce80ddbf79568abb
+RX	diff-6ca06020a084e4b9
+RX	diff-21798f45dcb59943
+RX	diff-a0003b379e3d5788
+RX	diff-5f5159a996973df9
+RX	diff-b6eec3efb3b926fb
+RX	diff-c9f9f2dd7ee83080
+RX	diff-1bc68fee57658e90
+RX	diff-0a99d8a35ec087d3
+RX	diff-a9a6efae48aa5d20
+RX	diff-ceda96d81ae8d90c
+RX	diff-08c7ded775c029d7
+RX	diff-c19daadc5178529b
+RX	diff-04a4ed7ed9256789
+RX	diff-06da38b2b4048511
+RX	diff-17feab7d2a73d2b6
+RX	diff-31028b0e2b34160d
+RX	diff-6e62bd4b783762ed
+RX	diff-18073b2ed5ee6f62
+RX	diff-40cd453c613c94f8
+RX	diff-8889dcd443514cff
+RX	diff-724e017fcb8a12ae
+RX	diff-96d1e04d0c945ecd
+RX	diff-4527e910ca5d52b7
+RX	diff-0aef7d487cb06afe
+RX	diff-6a3312067b764295
+RX	diff-d8359fc5d3b2e1da
+RX	diff-5da7dcd303c94427
+RX	diff-ea5cdd1076c66d17
+RX	diff-c27acc8903fe3ca5
+RX	diff-0789a8e51d4118be
+RX	diff-03edf94eb956d1bb
+RX	diff-91b6a29b9787b3d2
+RX	diff-4e4188115ce0c5fa
+RX	diff-54fa49823c11e70e
+RX	diff-b9bfb0bd6f412053
+RX	diff-7c79e7a0d38f8cd1
+RX	diff-8faba598054bae77
+RX	diff-093bcadeac676c8f
+RX	diff-9f143f537314c81e
+RX	diff-ae89e26f5031e6be
+RX	diff-22853c7892bd5bef
+RX	diff-ade1c8c06a5f3131
+RX	diff-ed8898c44cb58ee8
+RX	diff-c2bf89b6cea2f017
+RX	diff-ad3e01504c21dfb6
+RX	diff-285aca239331be50
+RX	diff-3b89dd65915064a6
+RX	diff-4483ee2d9911c6ad
+RX	diff-8ec201789e1d5d50
+RX	diff-d125d33363094313
+RX	diff-4030f0a809350085
+RX	diff-b9751ce061f2f0ff
+RX	diff-ad0849f425b38c39
+RX	diff-52566a10f7ea0711
+RX	diff-7b4fce18c38f3ee1
+RX	diff-9bc64a6c909b18f8
+RX	diff-aff2d95785984fd7
+RX	diff-e836d04df0413d9b
+RX	diff-fd2563903cc7da68
+RX	diff-5dc2c0c9fc0d7224
+RX	diff-aa3a598ef9ccad64
+RX	diff-3fb5011e296100fc
+RX	diff-645f7f7f8e4e0b9d
+RX	diff-586b330a871b3119
+RX	diff-edfd8a36f4cea462
+RX	diff-a0327d77cfe744e8
+RX	diff-f16f6862272197b6
+RX	diff-0857361fd3726bb1
+RX	diff-08b892ba6e03d266
+RX	diff-fd53b95130cfc5e8
+RX	diff-a15cdee79a87fb79
+RX	diff-0791e97233da4365
+RX	diff-7721617ef55aa2c0
+RX	diff-4dc511131232e93e
+RX	diff-eb820a72792c8340
+RX	diff-7f73a7c47a239cfa
+RX	diff-2faf4fe6e7f18862
+RX	diff-30aa7bfe86de02e0
+RX	diff-ce6396e076155f75
+RX	diff-e20c7b07574e85d4
+RX	diff-927d4bcb3da8d6a6
+RX	diff-034f0dee31e06ced
+RX	diff-6c35abca206d84f2
+RX	diff-2f490ed845914fb5
+RX	diff-f886f11c703a1da2
+RX	diff-caad18c0ddc64599
+RX	diff-425e57e198292cd4
+RX	diff-c9552ac150a16073
+RX	diff-4a32c70b4b12df67
+RX	diff-7fd5dcb716d0c101
+RX	diff-56a8dbdde3b6122f
+RX	diff-39f7e108a40f665c
+RX	diff-d424833dccfd2783
+RX	diff-e770bc6a1a273652
+RX	diff-919b98a2558d5a47
+RX	diff-729d95aec59c1973
+RX	diff-b6937aa5300f045d
+RX	diff-d4253a4ce5af67a4
+RX	diff-0e15fce51f7ec882
+RX	diff-270c0cb18fb068e8
+RX	diff-e131dde1f06c0d2b
+RX	diff-c9d896ca885ff370
+RX	diff-e3d4fdaf92e00d95
+RX	diff-d0d78e0090b61eb9
+RX	diff-b068e7918822f79c
+RX	diff-44a61a33936dbe7b
+RX	diff-c8c4118eb299c096
+RX	diff-3f91627a33a935df
+RX	diff-fbfeecb400e20cd5
+RX	diff-45a41ee536a733bc
+RX	diff-c60e8e23b67d76c0
+RX	diff-ac6855f9240f477f
+RX	diff-4f4f8c9e29002b1b
+RX	diff-dc859a83f69ff85a
+RX	diff-8a88b3454152c74f
+RX	diff-579771f373c5ccd3
+RX	diff-13c8644fac932654
+RX	diff-2d8e1a2d506dc29c
+RX	diff-cd59e630c57e3c02
+RX	diff-1986bdf210e18ae6
+RX	diff-22f1da1f1d85a348
+RX	diff-fa7b8d662e9a7898
+RX	diff-3143cfdf3e56aff9
+RX	diff-09dfc2d7cdbcc3bb
+RX	diff-da2344d46daef09e
+RX	diff-eac3ad3cb303d0aa
+RX	diff-d6c4e41f047c5f9e
+RX	diff-1f3512ffa7b826da
+RX	diff-4869f95175cecbbc
+RX	diff-b3154ae9cbb3b099
+RX	diff-6905325f04ce9fdd
+RX	diff-41ea8f7b16780c55
+RX	diff-7ca40a27085b1a7d
+RX	diff-828609af5b576b2d
+RX	diff-0d81e84078e10aa8
+RX	diff-a42356686808f107
+RX	diff-8cbb4d6ed1fb4416
+RX	diff-577be910e6d59180
+RX	diff-a9c8ed165db369f4
+RX	diff-ed833ae610d558a3
+RX	diff-6102684731f92f9a
+RX	diff-e772a8be9cdbe05d
+RX	diff-230f037fa02543cd
+RX	diff-b1b1c23b7377da8b
+RX	diff-0b806ed2c5745790
+RX	diff-ae27a3ccfe3fcf4c
+RX	diff-4623950f4bbde870
+RX	diff-ab9441d9fb3af808
+RX	diff-6ad98bf47b2aeb83
+RX	diff-ffc8d707196c20dd
+RX	diff-a6af5d4691f6fbc5
+RX	diff-76a23edd0ed0d372
+RX	diff-a2b65c8487e324bb
+RX	diff-4c20a8e635d12d70
+RX	diff-dd36467076b9c44d
+RX	diff-20baedbd14368d76
+RX	diff-c4e12db3ae33e6a6
+RX	diff-9166b4fa9e07bc0c
+RX	diff-1750ff96302ff16a
+RX	diff-748e4b2ec4533be1
+RX	diff-92a1edb7853660ac
+RX	diff-3f59e56a59822776
+RX	diff-aff445f67b10ed07
+RX	diff-c6a57515d253c8f2
+RX	diff-845a2c0bf7ae74f0
+RX	diff-d9d919d00ad6f147
+RX	diff-731381040b09cb0d
+RX	diff-f0aa1e227c22fe01
+RX	diff-fcb9156bfce23e0d
+RX	diff-dc8fc0a7993bdc22
+RX	diff-cdc31d571a7fe693
+RX	diff-d5182c45ce9fc38d
+RX	diff-f3001ef326029116
+RX	diff-7f93f2462ed6fc38
+RX	diff-c870ce0fba61e253
+RX	diff-9f8c4882c91ae49c
+RX	diff-d6ded601236404e9
+RX	diff-382c6071231e5a7a
+RX	diff-c4c17e12ab906b72
+RX	diff-be51206b1504199b
+RX	diff-c34affb9647fd704
+RX	diff-db876bb25cba34fc
+RX	diff-05ace4474664b3dc
+RX	diff-b560bdeb60f3cfd3
+RX	diff-a6c303ae5bac7624
+RX	diff-acaeef283eb07ade
+RX	diff-dbb6ec861469cfe8
+RX	diff-7c7b20261e0669fd
+RX	diff-9106299e6cae91c7
+RX	diff-68913d324f2a05d6
+RX	diff-f0612ed14f47e3d8
+RX	diff-ff938aca66f504ff
+RX	diff-592530e89692fe78
+RX	diff-8622c7636f4a8439
+RX	diff-d16f0733abb7fff4
+RX	diff-a564a216a86da615
+RX	diff-afece1342b186df4
+RX	diff-57cd3335346b7583
+RX	diff-835a5fc7db4153cd
+RX	diff-cc8730a6a08cf621
+RX	diff-0b4afa7f2dde33a6
+RX	diff-79f61d43e7a7200f
+RX	diff-22ce36f3eef68e9e
+RX	diff-ccc01eb587d90940
+RX	diff-c90c733785c5ddea
+RX	diff-d42f84d41ebd5b18
+RX	diff-1aeb869745c40b1d
+RX	diff-e4df1e3a1b5a9956
+RX	diff-c650115b748d9929
+RX	diff-c3f9a308d5209ee8
+RX	diff-9539e0a918bbd2f5
+RX	diff-48802a01f3a896d5
+RX	diff-e5badb4a417a753a
+RX	diff-9cf723e858d09d49
+RX	diff-19b6e45aaff64743
+RX	diff-b8111174fea31e04
+RX	diff-307ab9719b35ca28
+RX	diff-2d5d8af8255bed19
+RX	diff-4412f3b09704c8c9
+RX	diff-84d8803e99d9c691
+RX	diff-ee159eee70135627
+RX	diff-822a19c91f89933b
+RX	diff-860ee0cbb748a5f8
+RX	diff-976e610b197d7661
+RX	diff-b1c09b178b4f2bc6
+RX	diff-de018e8e937cbb2a
+RX	diff-a846b6154fd3ea24
+RX	diff-5f196f9945e7df5d
+RX	diff-cc8e14417a3744a2
+RX	diff-0961ecc8bbe003f7
+RX	diff-bb5087b54c90f317
+RX	diff-0dfbd2a49c11a3c5
+RX	diff-bf4e0e8749e9f0d1
+RX	diff-6cc4f7b993710e1c
+RX	diff-e16ec1a13213a8ee
+RX	diff-6d068857cca1518a
+RX	diff-774ba6093aec2d4b
+RX	diff-d07fc8256b27fc9f
+RX	diff-dfdc3eeeae5a411f
+RX	diff-c4f8ab992ed55c22
+RX	diff-95c4cedd696ac540
+RX	diff-587f2ebdd1fbc80b
+RX	diff-8df7883375cea980
+RX	diff-fb360db2fc5838ed
+RX	diff-d3c26ceab54e10b5
+RX	diff-d0faa9fc509acb8b
+RX	diff-357c0c8192ad2282
+RX	diff-155c594e30c500f2
+RX	diff-0313132b25d869ce
+RX	diff-925f5678c5a470d6
+RX	diff-b32298dbfe7ece5f
+RX	diff-e862a568a616608d
+RX	diff-595a1473f0cb0a9e
+RX	diff-e3ab7535fc0961cf
+RX	diff-c5b8bd67ff7a57b8
+RX	diff-4ac26bdba5428ebe
+RX	diff-55b293f63ebfa4bf
+RX	diff-bbb55d849b1fa7d7
+RX	diff-d1e91e54cf13a79c
+RX	diff-c6b3c7bea9056659
+RX	diff-4d78c3be476cfe48
+RX	diff-6cc048e32d4ec786
+RX	diff-0b4ff0a16e3bc939
+RX	diff-2e8a097023679ad3
+RX	diff-5a5d466bd80f1fdf
+RX	diff-b656e73a7078c49d
+RX	diff-2d4556eb8413085d
+RX	diff-da64c49669d643bc
+RX	diff-6547d3e2cd5ead04
+RX	diff-f1b185fb8b9e2ade
+RX	diff-ddf1b7832ab186c1
+RX	diff-00b0dc87330bf483
+RX	diff-fdfefd65fcbd2631
+RX	diff-f467b5539abae9d4
+RX	diff-eed92bb1bade8b8a
+RX	diff-d95b19ff72ba1a4a
+RX	diff-24b8186cfedc4899
+RX	diff-8ebd286f7bf81a88
+RX	diff-7ae1840a5b13b48a
+RX	diff-fb753538484d4441
+RX	diff-10aa75cc65965896
+RX	diff-009a7292660a573f
+RX	diff-501f76f4dab95c07
+RX	diff-e97a8740f00a8598
+RX	diff-ac8a85d80d5dedaf
+RX	diff-f546fd1fddb32a79
+RX	diff-56e2f3e71f784d1d
+RX	diff-8cf57c50a17f8cdd
+RX	diff-3c170a03efbdda4a
+RX	diff-9f290823536bab13
+RX	diff-61bf3cd68c431ccf
+RX	diff-7adf27ff845e66d2
+RX	diff-56ab68892d40329f
+RX	diff-6c311e62c11af4ca
+RX	diff-8f9fdad4685c045a
+RX	diff-91b8afe8902e0204
+RX	diff-f1060908d4ab55dd
+RX	diff-e5ceb19a89552fdd
+RX	diff-b6b02d68a6bcb20d
+RX	diff-1ff0603e8a78b71f
+RX	diff-48afee60e4cddbc1
+RX	diff-f0c5c1ccdd53d1da
+RX	diff-18b66ccf446ae4b6
+RX	diff-7f3b0c003ea7279d
+RX	diff-11389bd9a1806b83
+RX	diff-6538d9681de36cce
+RX	diff-1227c411011258fe
+RX	diff-117af357092ceaa7
+RX	diff-7ae1423bf0d50a0e
+RX	diff-f9f95396812a1d7b
+RX	diff-80283679b5ecde32
+RX	diff-d9073975ce079f80
+RX	diff-7d79b2ab3a656c99
+RX	diff-e62ad76ebf0da6dd
+RX	diff-70e059f1511f5b5f
+RX	diff-c0d30fe8c359eaf3
+RX	diff-3ec0b434269cf2e6
+RX	diff-337274b0415536e0
+RX	diff-aca2b569bf2507db
+RX	diff-2a61b5ecee137573
+RX	diff-6144c7f737b1f3ee
+RX	diff-8daa9a7350a56fbf
+RX	diff-0ae158413753ab5e
+RX	diff-3ab46ca83076b40d
+RX	diff-ff47f897ced717ab
+RX	diff-294dbc447d82a5af
+RX	diff-d8b89681c177ea3c
+RX	diff-9f7359cc462a71b6
+RX	diff-c5212be0b9619f9f
+RX	diff-0c5c171f3876f2a6
+RX	diff-edeef3a8ab0b762c
+RX	diff-d6b574533f0a2381
+RX	diff-98a657fe5b6a9972
+RX	diff-6001df9dfa34d551
+RX	diff-e2537bf1306060c8
+RX	diff-dee093c8f239a035
+RX	diff-7c3fb123a4b81201
+RX	diff-49ece2f4044a77a5
+RX	diff-7d850390056af41a
+RX	diff-13453f218e961377
+RX	diff-6fa1130a046adbb3
+RX	diff-935230c83dffe86a
+RX	diff-85f9bed99d00b3ab
+RX	diff-6bc7c3404d011bd7
+RX	diff-2ee49ea36d80d47f
+RX	diff-1d621953354fafe3
+RX	diff-eb9c0b6c6322eb80
+RX	diff-d81d070f6510412b
+RX	diff-417a3047a5a4c164
+RX	diff-e6618f6402249408
+RX	diff-1377345771f55a95
+RX	diff-d746cedf88de4f59
+RX	diff-af15f3d1d61eb565
+RX	diff-4734a1bf45d4dbf7
+RX	diff-14f3179ed2bd201b
+RX	diff-5c6ef383d4652aa1
+RX	diff-bcf4705069660e95
+RX	diff-39b18ad32506c7c1
+RX	diff-9646f399ca591d77
+RX	diff-9ffbe04a4c171b21
+RX	diff-daff2a5bcea4e768
+RX	diff-2b0a5b30c94d2cbb
+RX	diff-b984d4fe9d863197
+RX	diff-af05fb3597ca757b
+RX	diff-e2d4bd68ac392069
+RX	diff-665f6d15464f6a17
+RX	diff-035c7cf3a007a12e
+RX	diff-d2f2b2c4cf4e6ad1
+RX	diff-9b0a4528921875b7
+RX	diff-085a6691d74bf69d
+RX	diff-f160ba6b55dbc7a1
+RX	diff-fd8fdcbc55e7a9c8
+RX	diff-e71a2393baee0e34
+RX	diff-257a8a175c9beb28
+RX	diff-cf18af16f1c32780
+RX	diff-4d2e80b875981ec8
+RX	diff-e62d57ed8f908c5b
+RX	diff-5ec871bcd7f97e7c
+RX	diff-43eabd892fa31fdc
+RX	diff-a36a7ce2a57ad786
+RX	diff-5ea273cb893d7c41
+RX	diff-13ff6d83bc030f09
+RX	diff-9f8637ee689f8599
+RX	diff-63957c3258709b2b
+RX	diff-7ebec3a7a1c1a60b
+RX	diff-b4156c6ee1f969ae
+RX	diff-67a8371f692144bc
+RX	diff-fc892a767fc2e26a
+RX	diff-ca013c68847068ac
+RX	diff-9bb60db52f75ea82
+RX	diff-7968cd2ae8690aea
+RX	diff-452f4086b24f0117
+RX	diff-5f91166d8e500514
+RX	diff-c3f0b48a842b597d
+RX	diff-1d766dd9b1df29a4
+RX	diff-af118e3819105fd1
+RX	diff-b015f4075b66b040
+RX	diff-5e1f0868f8e4ff7e
+RX	diff-6f500e6881516795
+RX	diff-22fc2beb4502b745
+RX	diff-41d7809d99ace6b0
+RX	diff-dbb68da061724286
+RX	diff-721b7223ea3fde4e
+RX	diff-cec7a39c43222657
+RX	diff-d6c4341dd56a057a
+RX	diff-fa91b1a102e16349
+RX	diff-54a186d539339ec4
+RX	diff-67acbe25ee9240d5
+RX	diff-21ae43c738043f4c
+RX	diff-60b1f6145d52121f
+RX	diff-39fd6d822c73810f
+RX	diff-001195e33b28ce54
+RX	diff-3e003f0bfaf7f026
+RX	diff-7041584ca88c4e5f
+RX	diff-e63702497fcd19bb
+RX	diff-14de88c05c2e1a4c
+RX	diff-13973a9611e34287
+RX	diff-a84bffa5dd3a6de4
+RX	diff-8a561c11037e36fe
+RX	diff-9dad179f7bcf1fff
+RX	diff-84ecc185186beac8
+RX	diff-d6d13c6fb98fe90d
+RX	diff-576f8dcc73f89009
+RX	diff-66bdb7f766c7de0a
+RX	diff-13038887ff42f99b
+RX	diff-bc01f863e6e9b149
+RX	diff-09791eac8849dba8
+RX	diff-03e0f234828823b0
+RX	diff-54a14b4d6abdf6f2
+RX	diff-c1fa48d75b3ceddf
+RX	diff-9687ee0fc84ddbe8
+RX	diff-6db956c7eac03e0d
+RX	diff-a8d0f7cf77a03797
+RX	diff-30513df23be8eec9
+RX	diff-e13ead1368898de6
+RX	diff-816043c9943bf0d4
+RX	diff-c868ff021a5340da
+RX	diff-7f072a5b43dadee9
+RX	diff-50836ed4e71118bf
+RX	diff-9a7f2810d14531ab
+RX	diff-876478c9d676233a
+RX	diff-c10ffb06d1bf6237
+RX	diff-df95655741589872
+RX	diff-b46bd2be53c1c225
+RX	diff-89f2ec2a1db7fbd0
+RX	diff-e36dc748a44f20ba
+RX	diff-8923bf672f4e670c
+RX	diff-c584e5039bbbbe04
+RX	diff-e7f48ec76df28f09
+RX	diff-d6f4508d37401355
+RX	diff-595acf9396873d4f
+RX	diff-045b11ef36dccfe4
+RX	diff-9ee817143f960bd3
+RX	diff-91416dae5b16b031
+RX	diff-b57894533a2bb735
+RX	diff-244f02ab04cad321
+RX	diff-e416ab44f30d1797
+RX	diff-10febc4c22737bdf
+RX	diff-d8b9c88b6250570c
+RX	diff-da5eb4a0345ec3a0
+RX	diff-2cd714201b37c8f9
+RX	diff-8339c5ea53fa9560
+RX	diff-0a6ce59bdde358b0
+RX	diff-a04ec9db59082713
+RX	diff-c440171d5ac8206f
+RX	diff-05cb88c1194c169d
+RX	diff-1076ae955afc6f23
+RX	diff-9ed4ea639fcb42e0
+RX	diff-15eea598bfc35454
+RX	diff-f5a5b7b467d8ee28
+RX	diff-d4b9beba43ac3bf9
+RX	diff-fb08d7279546214a
+RX	diff-59c6353e3364d98e
+RX	diff-75c2d47b91fbcecc
+RX	diff-66d8db19a9331198
+RX	diff-e9e998809ade376d
+RX	diff-fd2d09761f026427
+RX	diff-9461ba5e5fd02b9e
+RX	diff-2dceb5ef7f9237c5
+RX	diff-98a5a8706c7b8bce
+RX	diff-ed96dd83627bbfe8
+RX	diff-afdd6cf1bd1aa231
+RX	diff-15e968cf25d1ea6e
+RX	diff-f2fb0477faf01401
+RX	diff-1ab219d1aa27ca5c
+RX	diff-4f36e94a23a7a810
+RX	diff-62d8c797e8991396
+RX	diff-3f4516ef7dc8903c
+RX	diff-ce133b32d71c38a2
+RX	diff-8a12259fc78fe3ad
+RX	diff-e0629f24f3849780
+RX	diff-4cb56c9e2369416b
+RX	diff-65e39978a7f53b98
+RX	diff-415d90f0613ab495
+RX	diff-c56c13655b1bf0ad
+RX	diff-e86611882251f154
+RX	diff-2a53fbaebddd4816
+RX	diff-1b6a7bc085db5bb5
+RX	diff-d90f437616db05b8
+RX	diff-0dc3823352d83307
+RX	diff-9f3411579c2d55aa
+RX	diff-5da95e505b484e4c
+RX	diff-39c0816eed831df1
+RX	diff-89efb877ef90505d
+RX	diff-1b1f9dd8c683a829
+RX	diff-1bc7065ee1eb38df
+RX	diff-2f170b8f34133f2a
+RX	diff-441761b43a94660e
+RX	diff-e2f4c79bab74319c
+RX	diff-6e3c2fc0a9e1534f
+RX	diff-9147138c0f5db058
+RX	diff-616338390a52e194
+RX	diff-aa9316484eb973b6
+RX	diff-29d3ae51159b21ad
+RX	diff-e282b9437ee304f5
+RX	diff-99f7c5c7fb767f5c
+RX	diff-edde333d50f8f50b
+RX	diff-763c0f55d0799d76
+RX	diff-070464c57ad91315
+RX	diff-395b88748f1505e5
+RX	diff-1e2cd2bd5ddeb1ee
+RX	diff-d2eeb46e534bd59d
+RX	diff-96cf0b8e10bfa8f0
+RX	diff-c9ca61e265528e9e
+RX	diff-937c9e752c5b2d9c
+RX	diff-9dfeb6dc7ca26bbf
+RX	diff-13443398031ccb1d
+RX	diff-e1a58028df46fde3
+RX	diff-22fea4aa72c51429
+RX	diff-9c44a645b0e080cc
+RX	diff-1913817c67e256b7
+RX	diff-3d37f0bf03f6f56a
+RX	diff-9be0f69afa478411
+RX	diff-6e2c723eed0801c0
+RX	diff-d2ddc04194fcf4d5
+RX	diff-d4f800eac296bed2
+RX	diff-e1634aa5e338aa26
+RX	diff-8219bc6b3d5cc646
+RX	diff-7b7d39ee7c605920
+RX	diff-56998e50bb8b65d7
+RX	diff-12f257dd9884fc70
+RX	diff-426434c3847889be
+RX	diff-1b262772e600e01f
+RX	diff-59130c88fbc5070d
+RX	diff-624c44154e5c0b5c
+RX	diff-656c06890601cd7d
+RX	diff-9ce3e84c8020a480
+RX	diff-1ea85e289d3fb879
+RX	diff-4edc0fe03f88d137
+RX	diff-96f56d1476c0ca22
+RX	diff-c3112f48ceaf8846
+RX	diff-6eb585eee9e77391
+RX	diff-792bdf0ef0904e35
+RX	diff-21998f6df03ed776
+RX	diff-38bb9014debce91e
+RX	diff-6518178c217128e8
+RX	diff-fe089ce221962143
+RX	diff-f05548f7a5d483af
+RX	diff-10d896528099a728
+RX	diff-28ac361ef063c49e
+RX	diff-fcce1a48e325511b
+RX	diff-2fb7cdced5763c0c
+RX	diff-daf5e2ffdb118d33
+RX	diff-b981f6038862fa99
+RX	diff-b9671f73981ee0f7
+RX	diff-8aa244688b87792c
+RX	diff-1f86ff84101c043f
+RX	diff-fbad210dbb914f26
+RX	diff-7fbf9586bc3692dc
+RX	diff-c9afc0e79f262ddc
+RX	diff-b50c54f464913f29
+RX	diff-2bccedb358e83fe3
+RX	diff-465aca7043a8d122
+RX	diff-fe29b405b82a02b4
+RX	diff-3cf82e0134dcb0f6
+RX	diff-20491cf23fe70e6a
+RX	diff-688bb9de6b8fb419
+RX	diff-2f08ffa0564d779c
+RX	diff-054e3612945b108d
+RX	diff-07aeb7e415d9c0f5
+RX	diff-30bd0a2dd1a4d5a6
+RX	diff-6a52ca2724765b7a
+RX	diff-3149efa37fcd1a24
+RX	diff-84717af8440084a0
+RX	diff-2725d0dce03f1be7
+RX	diff-4619ee3dd35d8369
+RX	diff-3f4a5c9d936e2ee8
+RX	diff-f50f35afbddf8664
+RX	diff-8ac96f8516bb0bbb
+RX	diff-4a467c1136648387
+RX	diff-6811a8e3629f78fe
+RX	diff-5c2067720ceb2072
+RX	diff-ad334397963a4b6c
+RX	diff-4ffe5bc0a6c51030
+RX	diff-0b9915947487add8
+RX	diff-405b04fb7e07cb2a
+RX	diff-93f31fb6abb7ff6b
+RX	diff-e3b61b23856a1662
+RX	diff-3381538f11340541
+RX	diff-927dd44441f0351d
+RX	diff-02c71a42ca03d219
+RX	diff-4119be1c1ecf0ff6
+RX	diff-3cc1a1b54196f2b0
+RX	diff-1b70d8bcd921663d
+RX	diff-0198c6f49c07d7e2
+RX	diff-740a711f600e70a9
+RX	diff-a76d4ef7a4ec2cab
+RX	diff-9cdf0fa81dbab106
+RX	diff-c0adec764dff0b38
+RX	diff-8994df282bebb982
+RX	diff-fa67db3f500aaf2c
+RX	diff-3fb9e7f996e28e49
+RX	diff-4a2c350daa022aa1
+RX	diff-99d20bbbe8c1435e
+RX	diff-ce93b3249f322252
+RX	diff-ddceb3ac8a529253
+RX	diff-f7af79f0451f0f6a
+RX	diff-6d7644d667c082b4
+RX	diff-5a85647facf5f9bd
+RX	diff-91eca2daedd210c8
+RX	diff-4bacb6bcd37f20c5
+RX	diff-173b223ef383126d
+RX	diff-3528f36f44cdf2af
+RX	diff-2bccdb0d294f3dac
+RX	diff-74bc365194026e37
+RX	diff-7fb24fb1d75cd5a3
+RX	diff-76f035e5f520404e
+RX	diff-79f65a9f3821d05d
+RX	diff-cf226123c2accc03
+RX	diff-1a35ffd47675441a
+RX	diff-c4f8d5a9925c6849
+RX	diff-f75615dd5b385725
+RX	diff-81e80491e7ad232d
+RX	diff-6077b6dd48560d67
+RX	diff-94b3d2303ba4c2fe
+RX	diff-e0ec0db0bea18659
+RX	diff-6b381a853dd6217e
+RX	diff-27003006d47d548e
+RX	diff-e62bf5da95f9adfb
+RX	diff-ec90095aabb4ab59
+RX	diff-c00d761045a4f032
+RX	diff-49f459d8cffeb099
+RX	diff-fe9bb723a69ba29a
+RX	diff-7710ef63dd47622d
+RX	diff-7a2d9f8641e6c0ea
+RX	diff-4f44c51664c3e6cb
+RX	diff-3f3146023420684d
+RX	diff-0b6c9d586865f8b6
+RX	diff-2de928b7aa642734
+RX	diff-412063b8d1c0285d
+RX	diff-a14bc2cba72b4798
+RX	diff-cd5bed76a97c222a
+RX	diff-29a3c3236e2967d4
+RX	diff-e795695ac7ff4218
+RX	diff-65d76bc191ba5f0d
+RX	diff-557dd71318a4a0ac
+RX	diff-1044ebc01ad3b356
+RX	diff-d15a211cd0f8ea64
+RX	diff-7b4f7e5a8d79c99b
+RX	diff-87a4b6861c0af685
+RX	diff-1aedb25818b8c8d0
+RX	diff-aa9105a0e9c14cf8
+RX	diff-c44d11ab0604b9db
+RX	diff-b69d94c751a2bd97
+RX	diff-3ef46b92b6969f2b
+RX	diff-93ab862ed473a99a
+RX	diff-e5207713b9c7254d
+RX	diff-5235bee61c4db73e
+RX	diff-fe0a7760eb57eb60
+RX	diff-4f01327c17391657
+RX	diff-1107887189463b97
+RX	diff-06b6a2718e92a5d6
+RX	diff-b73a830b7591258e
+RX	diff-223b370a90d85eba
+RX	diff-98f80fee43758a5b
+RX	diff-1470a3b54aa9ea0f
+RX	diff-741052bdd869b72e
+RX	diff-de126480d2ad9b8d
+RX	diff-12c914730bdbabe7
+RX	diff-ee34247035df51c9
+RX	diff-19cbe77fd512f18e
+RX	diff-5a5c1a4b2cfb4751
+RX	diff-1255b66477864e0e
+RX	diff-f91250ccb9c4501d
+RX	diff-82f6f995628d31ca
+RX	diff-7bc248652d04b87c
+RX	diff-7eb9259ea84a9ebe
+RX	diff-3ce95ae13599f5d2
+RX	diff-508695548df39055
+RX	diff-cf23dd1aa1cb6edc
+RX	diff-c28f237405c49673
+RX	diff-6e42560073149453
+RX	diff-8b07cfaf15c80f19
+RX	diff-b77009d17ae76dfd
+RX	diff-0b5f78e6344c2866
+RX	diff-00582486ad270c11
+RX	diff-0849ded78aca8e6d
+RX	diff-44fa1a58c775355f
+RX	diff-675e7a8174f13eff
+RX	diff-c8c9837b0309885f
+RX	diff-f25eb11df369fb6d
+RX	diff-7d1bd36a4cd23fb0
+RX	diff-120dfd93093b5fb6
+RX	diff-214af26f6d1e1d09
+RX	diff-c0fb593b7b717833
+RX	diff-498e8fe943c561cb
+RX	diff-edf07bb38c60fb6b
+RX	diff-891f91634e3b73b2
+RX	diff-f37d2e2a1bc0098f
+RX	diff-e9eb1c86f8208f8a
+RX	diff-d17a14130f94ea5b
+RX	diff-60797b7bd9fdd3cb
+RX	diff-70fe0f83d366fe9f
+RX	diff-a7ba7da1061747c8
+RX	diff-687c829341ca3126
+RX	diff-791d00c63bcda42b
+RX	diff-120c1d38c95ced3d
+RX	diff-233fbd4010ca511d
+RX	diff-737140901cbbf44e
+RX	diff-7c93a28763e8be76
+RX	diff-13b7d166065a2008
+RX	diff-a21eb559360dba4c
+RX	diff-cf171090d7aa2f77
+RX	diff-9b1d35b839cd7b7c
+RX	diff-04d7593446b1a132
+RX	diff-3fbd5d6ba89267e9
+RX	diff-40d43d2101fdc13b
+RX	diff-15803b19bb5d253d
+RX	diff-b38e52ea6fc4e962
+RX	diff-7b529eb4a9622fe5
+RX	diff-25403996fab3aaff
+RX	diff-09f60dcef87e8424
+RX	diff-21218efe19250414
+RX	diff-d93b7d3372c4d8bd
+RX	diff-82e473aa0978b73b
+RX	diff-935d4c1d1ce78b58
+RX	diff-d95f1800bd6da763
+RX	diff-206f35beccb07c74
+RX	diff-34b0491c5e3d862a
+RX	diff-7ba3364de406613f
+RX	diff-1260f0ff16bca15e
+RX	diff-2552ab055e98ba6e
+RX	diff-af60e3d272f549c3
+RX	diff-7efb86f9015591f5
+RX	diff-58d9912c90082430
+RX	diff-c404618353c9b1cc
+RX	diff-b66d0e8fde1da925
+RX	diff-8f2c365f8262b19d
+RX	diff-4ccea01ab4b73b33
+RX	diff-3cced3f56123de51
+RX	diff-01c1266b64548265
+RX	diff-fc831398ec7dd225
+RX	diff-d0f52d4c8220a0cf
+RX	diff-3fe25e4e053d58c5
+RX	diff-2473b3009915967a
+RX	diff-3f58d1c4df9099a9
+RX	diff-a3177729553827f7
+RX	diff-f193eb6660a8bb78
+RX	diff-38553096e31a301e
+RX	diff-be0af2a40ccfa32e
+RX	diff-e023d5fff0fc838c
+RX	diff-ab9523cf1a5767f1
+RX	diff-526397f7ca4e9fcf
+RX	diff-4bc8e9afd22af57f
+RX	diff-00f0caeb96b1ad4b
+RX	diff-ed43687ee846f9a5
+RX	diff-edccf2ab64871aa6
+RX	diff-27e91ce4f563b62a
+RX	diff-8c8ea55871669d37
+RX	diff-a64b687f85625826
+RX	diff-9c33b723acf73425
+RX	diff-ebde0465668049e5
+RX	diff-98f90c6311f32b0b
+RX	diff-4494292fd6ef1121
+RX	diff-dd36b881e05dc304
+RX	diff-8da8e39c271b9e0c
+RX	diff-78f9c5590f1edacb
+RX	diff-4b9cbfcf017b59f6
+RX	diff-81593daae3208885
+RX	diff-b47f06bf2924e22d
+RX	diff-2df17e28d7447e36
+RX	diff-3af30a6c287c44a7
+RX	diff-1889fc99199cd505
+RX	diff-f9f63d8c21d8e28b
+RX	diff-29f66635cf9aed57
+RX	diff-2adda191d519bdfe
+RX	diff-8664ad760f840f57
+RX	diff-707b446e1d8b9e63
+RX	diff-2c79e124b36de5df
+RX	diff-9569a43543887619
+RX	diff-3c72c2e7dfc8de8b
+RX	diff-481f62ab04e2c54b
+RX	diff-d206d921fe411efe
+RX	diff-cbfb83a96aa2505f
+RX	diff-933ce165afd8637b
+RX	diff-d5263ac319751ed6
+RX	diff-e06e8d6b0c0c9357
+RX	diff-30ec69b67a41f9bb
+RX	diff-84031bcf27bf5f37
+RX	diff-9aafc17e2ea3b021
+RX	diff-5534a96a5cff3790
+RX	diff-8a719533c4670f58
+RX	diff-c4c2189f6d8b9947
+RX	diff-6e1aa2840000291d
+RX	diff-8387dc5bf4fca555
+RX	diff-259377cd31434f3d
+RX	diff-6085c7a23e38677a
+RX	diff-c7f7ad852b1a8940
+RX	diff-07685d0cec9195c4
+RX	diff-1e39cb360efcce95
+RX	diff-1ef9c02bdc1d5413
+RX	diff-9495d085b7f5ffbe
+RX	diff-c3e8f3eba664e6db
+RX	diff-a97ae6bac3e0d769
+RX	diff-bfd5643ca7f6c558
+RX	diff-162aac850133c7ea
+RX	diff-791d28a8d5cc12a1
+RX	diff-930d98bd0d8e0b0e
+RX	diff-05e7ccb58637c4aa
+RX	diff-c5731c74574df210
+RX	diff-4cbe1080234eb1c0
+RX	diff-400efb75f6d7366c
+RX	diff-cd5d3b3cb2a9e395
+RX	diff-426dad91a9e3efaa
+RX	diff-1a8232be95ddfaf7
+RX	diff-869a0d9e96edba2d
+RX	diff-301cb57418baee8f
+RX	diff-840760cc0a160267
+RX	diff-73dffc4811a312d7
+RX	diff-c7d87cc32658ee79
+RX	diff-eaee53e77ed7ce38
+RX	diff-62574fff134a5656
+RX	diff-39c505f09f9b3db5
+RX	diff-3237660b7ce04a4e
+RX	diff-28c6d2f080cb4864
+RX	diff-675346c6a2619d9e
+RX	diff-485ed644413b6492
+RX	diff-8f8882dc56775924
+RX	diff-b7f992ad9c689282
+RX	diff-72d6d54390861d49
+RX	diff-a44907e65984f237
+RX	diff-7194f3221610efe2
+RX	diff-565b36f976b05c65
+RX	diff-60b2c9e99029073f
+RX	diff-89e96615521d7b13
+RX	diff-8019d4b3e0b65208
+RX	diff-a5d48d3723d4b1e8
+RX	diff-c510dc890b7513fe
+RX	diff-5c3bbbf2bd87e84e
+RX	diff-86603257530c4383
+RX	diff-64469fed02e6ee47
+RX	diff-3ea68359a3682c39
+RX	diff-486496f499abfd43
+RX	diff-eea25dc67767a489
+RX	diff-82d912788dc831f9
+RX	diff-cccf4dd86a2900ef
+RX	diff-b81478ac2d84fa3d
+RX	diff-f1dda06be133d731
+RX	diff-8a48a0b40239f30b
+RX	diff-0497e0e4c6c7987d
+RX	diff-76c205aa919460bf
+RX	diff-f5eb7574a5d78b87
+RX	diff-0299b27e99f66c51
+RX	diff-f584eddc3d9d6529
+RX	diff-75d4521d6fb31d36
+RX	diff-04be996b4f3be14b
+RX	diff-a425a06e5f1da630
+RX	diff-3f055d8ad226ea99
+RX	diff-967eac16478c80a6
+RX	diff-52f733a287e5f480
+RX	diff-1b8ba08f1a661393
+RX	diff-ea0ea7ed1cca549d
+RX	diff-062964cd5be9be43
+RX	diff-8f350ebc8c273037
+RX	diff-5d1dd90fb6669450
+RX	diff-03315e4d580f649b
+RX	diff-6af21769a538c8b0
+RX	diff-59a1174468080e28
+RX	diff-a65a627a755308da
+RX	diff-c5885b7ad63cecbf
+RX	diff-f1dcb9ce68dc73ee
+RX	diff-f6edc5b057bb4e10
+RX	diff-dd0cb849febf13d9
+RX	diff-47209a1da7701ed5
+RX	diff-ac09456165070539
+RX	diff-f6087be0d277966a
+RX	diff-6cb9d9cc9618bb81
+RX	diff-b5d1d873d772b0ce
+RX	diff-f56ea65ceb512d07
+RX	diff-d42a16b4db37337b
+RX	diff-bb51b05bf53cc2b7
+RX	diff-81e60a28cdc8dba3
+RX	diff-474f61ac692521c6
+RX	diff-f66fc2587eea0575
+RX	diff-b2503aed468ea708
+RX	diff-331798335645807f
+RX	diff-0edefebebeced00b
+RX	diff-221598362f89f0b9
+RX	diff-7eade130e4a7c2ef
+RX	diff-023000e1a4fadb43
+RX	diff-ece39e89ab050e50
+RX	diff-3707c9e720e1f84f
+RX	diff-0db0c20583dc1a3d
+RX	diff-b4ba00ed21b40a31
+RX	diff-61367a4efc0ffcc4
+RX	diff-8d828c62a0ae5a1a
+RX	diff-cd6e1cd82651301d
+RX	diff-7be4969821f55008
+RX	diff-4d7f7771c3b29630
+RX	diff-acfb79f82543dee5
+RX	diff-d75f2ca3e6ab562c
+RX	diff-c4870189b98956d6
+RX	diff-d3600700205fb386
+RX	diff-046aa3b605faf955
+RX	diff-3d37ad05f79ab9e8
+RX	diff-ebe7e1886b7c841a
+RX	diff-467518e2311c595f
