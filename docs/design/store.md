@@ -2496,7 +2496,10 @@ closing: a switch writes the other's sequence plus one, and the sequence is a u3
 `restart_wal_header` handles its wrap), so "the higher" is wrong at the wrap. A pair neither of which follows the
 other is no switch's, and is refused as corrupt (`storage::log_segments`, `Segments::recover`, on branch
 `perf/pagepath-d45`). Each segment's frames are recovered as one log's are today (salts and checksums, up to the last valid commit frame), the
-closing one's first. A recovered database has copied nothing of either segment, as one log's recovery does today, so
+closing one's first. Frames in a second segment beside a database file with no pages are a removed database's, as in the
+first (a switch comes after a commit, and a database's first commit after its page 1 is on disk): the open throws that
+segment away as it does the first, else the first pass of the checkpointer would copy the removed database's pages into
+the new one (lane B25). A recovered database has copied nothing of either segment, as one log's recovery does today, so
 the checkpointer copies the closing segment and then the current one. A crash at each step of a switch leaves:
 
 1. Before the other segment's header is synced: that segment holds its old header (two sequences back) or a torn

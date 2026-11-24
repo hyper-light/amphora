@@ -720,6 +720,12 @@ impl Db {
             .filter(|header| header.len() == len))
     }
 
+    /// How the log's generation before the current one ended, where the segment the last switch left
+    /// still holds it (decision 45): that segment, its generation and its last committed frame.
+    pub(crate) fn log_before(&self) -> Option<(SegmentId, u32, u64)> {
+        self.db.wal_before()
+    }
+
     /// Whether the file holds every frame committed before the log's current segment (decision
     /// 45): what a copy of the file needs before it begins in the current generation.
     pub(crate) fn closing_copied(&self) -> bool {
