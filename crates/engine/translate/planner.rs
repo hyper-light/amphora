@@ -2080,7 +2080,7 @@ fn parse_table(
             let cte_select_syntax = definition.cte_select.clone();
             let cte_explicit_columns = definition.cte_explicit_columns.clone();
             let cte_id = outer_ref.cte_id;
-            let outer_table = outer_ref.table.clone();
+            let outer_table = definition.table.clone();
             let materialize_hint = match &outer_table {
                 Table::FromClauseSubquery(subquery) => subquery.materialize_hint(),
                 _ => false,

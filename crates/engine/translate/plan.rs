@@ -2181,9 +2181,9 @@ impl TableReferences {
             .find(|t| t.identifier == identifier && t.is_cte_name_in_scope())
     }
 
-    /// The entry that holds the syntax of the CTE `cte_ref` names, from which each use of it is
-    /// planned: a FROM clause's use of a CTE holds the plan it reads alone, and the entry its WITH
-    /// clause made, the syntax.
+    /// The entry the WITH clause made for the CTE `cte_ref` names, which each further use of the CTE
+    /// is planned from: its syntax, or a plan of its own where the syntax is kept back. A FROM
+    /// clause's use of a CTE holds the plan that use reads, and no other use may read it.
     pub fn cte_definition<'a>(
         &'a self,
         cte_ref: &'a OuterQueryReference,
@@ -2191,9 +2191,14 @@ impl TableReferences {
         if cte_ref.cte_select.is_some() || cte_ref.cte_id.is_none() {
             return cte_ref;
         }
-        self.outer_query_refs
-            .iter()
-            .find(|other| other.cte_id == cte_ref.cte_id && other.cte_select.is_some())
+        let entries = || {
+            self.outer_query_refs
+                .iter()
+                .filter(|other| other.cte_id == cte_ref.cte_id)
+        };
+        entries()
+            .find(|entry| entry.cte_select.is_some())
+            .or_else(|| entries().find(|entry| entry.cte_definition_only))
             .unwrap_or(cte_ref)
     }
 
