@@ -148,10 +148,11 @@ impl<'a> PortableLogicalBuilder<'a> {
             ]
         )?;
         self.object_maps.try_push(object)?;
-        assert!(
-            self.object_map_ids.insert(mv_table_id),
-            "portable object map id changed while building its payload"
-        );
+        if !self.object_map_ids.insert(mv_table_id) {
+            return Err(LimboError::InternalError(
+                "portable object map id changed while building its payload".to_string(),
+            ));
+        }
         Ok(true)
     }
 

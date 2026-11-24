@@ -1415,7 +1415,7 @@ impl InProcessWalCoordination {
         frame_watermark: Option<u64>,
     ) -> Option<u64> {
         let shared = self.log.segment(segment).read();
-        let frame_cache = shared.runtime.frame_cache.lock();
+        let frame_cache = shared.runtime.frame_cache.read();
         let range = frame_watermark
             .map(|x| 0..=x)
             .unwrap_or(min_frame..=max_frame);
@@ -1676,7 +1676,7 @@ impl WalCoordination for InProcessWalCoordination {
             let (low, high) = frame_watermark.map_or((min_frame, max_frame), |x| (0, x));
             let index = |build: &mut super::log_index::FromIndex<'_>| {
                 let shared = self.log.segment(segment).read();
-                build(&shared.runtime.frame_cache.lock());
+                build(&shared.runtime.frame_cache.read());
             };
             match read_index.find(page_id, low, high, &index) {
                 Lookup::Absent => return None,
@@ -2048,7 +2048,22 @@ impl WalCoordination for InProcessWalCoordination {
 
     fn cache_frame(&self, page_id: u64, frame_id: u64) {
         let shared = self.log.current().read();
-        let mut frame_cache = shared.runtime.frame_cache.lock();
+        // Amphora: the registry before the frame cache, as every holder of both takes them
+        // (`cache_record`). Only a rewind needs it: it is taken first where the frame looks like
+        // one, and again, the frame cache let go for its wait, where only the lock shows it to be.
+        let mut registry = None;
+        let (mut frame_cache, high_water) = loop {
+            let frame_cache = shared.runtime.frame_cache.write();
+            let high_water = shared
+                .runtime
+                .frame_cache_high_water
+                .load(Ordering::Acquire);
+            if frame_id > high_water || registry.is_some() {
+                break (frame_cache, high_water);
+            }
+            drop(frame_cache);
+            registry = Some(shared.runtime.records.write());
+        };
         // Frame-slot reuse / append-position rewind guard. Within a WAL
         // generation frames are appended with strictly increasing numbers, so
         // a `frame_id` that does not exceed the current high-water means the
@@ -2060,16 +2075,15 @@ impl WalCoordination for InProcessWalCoordination {
         // frame slot that now physically holds a different page (corruption).
         // (Per-page frame lists are kept ascending, so popping the tail
         // `>= frame_id` removes exactly the overwritten suffix.)
-        let high_water = shared
-            .runtime
-            .frame_cache_high_water
-            .load(Ordering::Acquire);
         // Amphora: in a mixed generation the slots written again can cut into a record, which then
         // goes from the cache, the record registry and the list of changes whole, from its first
         // slot, as `cache_record`'s guard has it (decision 37).
         let mut cut = None;
         if frame_id <= high_water {
-            let mut records = shared.runtime.records.write();
+            let mut records = match registry.take() {
+                Some(records) => records,
+                None => shared.runtime.records.write(),
+            };
             let from = records.covering(frame_id).unwrap_or(frame_id);
             records.drop_after(from.saturating_sub(1));
             drop(records);
@@ -2109,8 +2123,11 @@ impl WalCoordination for InProcessWalCoordination {
 
     fn cache_record(&self, head: u64, slots: u32, pages: &mut dyn Iterator<Item = u64>) {
         let shared = self.log.current().read();
-        let mut frame_cache = shared.runtime.frame_cache.lock();
+        // The registry before the frame cache, as every holder of both takes them: its write waits
+        // for the readers that hold it, and a writer that waits while it holds the frame cache
+        // holds up every reader of the log.
         let mut records = shared.runtime.records.write();
+        let mut frame_cache = shared.runtime.frame_cache.write();
         let high_water = shared
             .runtime
             .frame_cache_high_water
@@ -2166,7 +2183,7 @@ impl WalCoordination for InProcessWalCoordination {
 
     fn latest_frame(&self, page_id: u64, upto: u64) -> Option<u64> {
         let shared = self.log.current().read();
-        let frame_cache = shared.runtime.frame_cache.lock();
+        let frame_cache = shared.runtime.frame_cache.read();
         let frames = frame_cache.get(&page_id)?;
         let end = frames.partition_point(|&frame| frame <= upto);
         frames.get(..end)?.last().copied()
@@ -2174,7 +2191,7 @@ impl WalCoordination for InProcessWalCoordination {
 
     fn page_frames(&self, segment: SegmentId, page_id: u64, upto: u64, most: usize) -> Vec<u64> {
         let shared = self.log.segment(segment).read();
-        let frame_cache = shared.runtime.frame_cache.lock();
+        let frame_cache = shared.runtime.frame_cache.read();
         let Some(frames) = frame_cache.get(&page_id) else {
             return Vec::new();
         };
@@ -2187,7 +2204,9 @@ impl WalCoordination for InProcessWalCoordination {
 
     fn rollback_cache(&self, max_frame: u64) {
         let shared = self.log.current().read();
-        let mut frame_cache = shared.runtime.frame_cache.lock();
+        // The registry before the frame cache, as every holder of both takes them (`cache_record`).
+        let mut records = shared.runtime.records.write();
+        let mut frame_cache = shared.runtime.frame_cache.write();
         Self::index_changed(&shared);
         frame_cache.retain(|_page_id, frames| {
             while frames.last().is_some_and(|&frame| frame > max_frame) {
@@ -2196,7 +2215,8 @@ impl WalCoordination for InProcessWalCoordination {
             !frames.is_empty()
         });
         // Amphora: and the packed records past it, and its listed changes.
-        shared.runtime.records.write().drop_after(max_frame);
+        records.drop_after(max_frame);
+        drop(records);
         shared
             .runtime
             .changes
@@ -2478,7 +2498,7 @@ impl ShmWalCoordination {
         Self::install_local_snapshot(&mut shared, snapshot, true);
         shared.metadata.initialized.store(false, Ordering::Release);
         shared.runtime.read_index.invalidate();
-        shared.runtime.frame_cache.lock().clear();
+        shared.runtime.frame_cache.write().clear();
         shared
             .runtime
             .frame_cache_high_water
@@ -2489,7 +2509,7 @@ impl ShmWalCoordination {
     fn sync_authority_frames_from_local(&self) {
         let entries = {
             let shared = self.log.current().read();
-            let frame_cache = shared.runtime.frame_cache.lock();
+            let frame_cache = shared.runtime.frame_cache.read();
             let mut entries = Vec::new();
             for (&page_id, frames) in frame_cache.iter() {
                 for &frame_id in frames {
@@ -2797,7 +2817,7 @@ impl ShmWalCoordination {
             Self::install_local_snapshot(&mut shared, restarted, true);
             shared.metadata.initialized.store(false, Ordering::Release);
             shared.runtime.read_index.invalidate();
-            shared.runtime.frame_cache.lock().clear();
+            shared.runtime.frame_cache.write().clear();
             shared
                 .runtime
                 .frame_cache_high_water
@@ -4015,7 +4035,7 @@ pub struct WalSharedRuntime {
     // One difference between SQLite and limbo is that we will never support multi process, meaning
     // we don't need WAL's index file. So we can do stuff like this without shared memory.
     // TODO: this will need refactoring because this is incredible memory inefficient.
-    pub frame_cache: Arc<SpinLock<FxHashMap<u64, Vec<u64>>>>,
+    pub frame_cache: Arc<RwLock<FxHashMap<u64, Vec<u64>>>>,
     /// Highest frame number currently recorded in `frame_cache` for the active
     /// WAL generation. Used to detect frame-slot reuse / append-position
     /// rewinds: within a generation frames are appended with strictly
@@ -4051,7 +4071,8 @@ pub struct WalSharedRuntime {
     /// decisions 16 and 37).
     pub(crate) format: AtomicU32,
     /// Amphora: the packed records of the log's generation, and those decoded (`packed::Records`).
-    /// A leaf lock: nothing else is locked while it is held, and it is never held across IO.
+    /// Never held across IO; while it is held for a write, the frame cache may be locked (after
+    /// it, as `cache_record` takes them), and nothing else of the shared state's.
     pub(crate) records: Arc<RwLock<Records>>,
     /// Amphora: the pages the generation's recent frames hold, in frame order, for readers to
     /// forget only those (`changes::ChangeLog`, decision 18). Taken after `frame_cache`'s lock
@@ -4068,7 +4089,7 @@ impl WalSharedRuntime {
     /// Each page with a frame in `min_frame ..= max_frame`, and the latest such frame, by page:
     /// found among every page the log holds.
     fn scan_latest_frames(&self, min_frame: u64, max_frame: u64) -> Vec<(u64, u64)> {
-        let frame_cache = self.frame_cache.lock();
+        let frame_cache = self.frame_cache.read();
         let mut list = Vec::with_capacity(frame_cache.len());
         let range = min_frame..=max_frame;
         for (&page_id, frames) in frame_cache.iter() {
@@ -4278,8 +4299,15 @@ impl SharedLog {
     /// next commit before any frame. It takes no read mark and waits for no read: the segment
     /// switched to is free, so no read counts on it. The caller holds `write_lock`. The segment
     /// now current, or None while the other one is still closing (the writer appends on and asks
-    /// again at its next turn). A free segment's file longer than `cut_past` bytes is cut to
-    /// nothing first: nothing in it is needed (decision 31's bound, kept at each segment's reuse).
+    /// again at its next turn) or while the current one holds no frame. A free segment's file
+    /// longer than `cut_past` bytes is cut to nothing first: nothing in it is needed (decision
+    /// 31's bound, kept at each segment's reuse).
+    ///
+    /// A segment with no frame has no header of its own on disk: its first commit writes it. A
+    /// switch from it would give the other segment a sequence two past the header its file still
+    /// holds, three past once that one's first commit lands, a pair recovery refuses as corrupt
+    /// (lane B19: tests/crash.rs's power cut at seed 45 reopened to sequences 4 and 1). Its log is
+    /// at its start already, so there is nothing to switch from.
     pub fn switch(&self, io: &dyn IO, cut_past: Option<u64>) -> Result<Option<SegmentId>> {
         let segments = self.segments.load();
         if segments.closing().is_some() {
@@ -4289,6 +4317,9 @@ impl SharedLog {
         let to = from.other();
         let (header, epoch, transaction_count) = {
             let closing = self.segment(from).read();
+            if closing.metadata.max_frame.load(Ordering::Acquire) == 0 {
+                return Ok(None);
+            }
             let header = *closing.metadata.wal_header.lock();
             (
                 header,
@@ -5513,6 +5544,21 @@ impl WalFile {
         )
     }
 
+    /// The epoch a page read from `segment`'s frames is labelled with for the checkpoint's cache
+    /// lookup, or None: the cache keys a page by its frame in the current segment (decision 45),
+    /// and frame numbers start again in each, so a page read from a closing segment is not
+    /// labelled (lane B20). The epoch is read first: a switch stores the free segment's epoch,
+    /// one past, before it makes that segment current, so a read that sees `segment` current
+    /// after it labels with an epoch no frame of the next segment is copied under.
+    fn label_epoch(&self, segment: SegmentId) -> Option<u32> {
+        let epoch = self.coordination.checkpoint_epoch();
+        if segment == self.coordination.current_segment() {
+            Some(epoch)
+        } else {
+            None
+        }
+    }
+
     /// A page the read's own segment lacks, in the closing segment the read counts on (decision
     /// 45): the file lacks that segment's frames until its copy. Every frame of it was committed
     /// before any of the read's own segment, so the newest there is the read's version.
@@ -6046,16 +6092,18 @@ impl Wal for WalFile {
         group: Option<&mut CompletionGroup>,
     ) -> Result<Completion> {
         let frame_id = at.frame;
-        tracing::debug!(
-            "read_frame(page_idx = {}, frame_id = {})",
-            page.get().id(),
-            frame_id
-        );
         let offset = self.frame_offset(frame_id);
         page.set_locked();
         let frame = page.clone();
         let page_idx = page.get().id();
-        let epoch_at_issue = self.coordination.checkpoint_epoch();
+        let label = self.label_epoch(at.segment);
+        tracing::debug!(
+            "read_frame(page_idx = {}, frame_id = {}, segment = {:?}, label epoch = {:?})",
+            page_idx,
+            frame_id,
+            at.segment,
+            label
+        );
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
             let Ok((buf, bytes_read)) = res else {
                 tracing::debug!(err = ?res.unwrap_err());
@@ -6078,7 +6126,10 @@ impl Wal for WalFile {
             }
             let cloned = frame.clone();
             finish_read_page(page.get().id(), buf, cloned);
-            frame.set_wal_tag(frame_id, epoch_at_issue);
+            match label {
+                Some(epoch) => frame.set_wal_tag(frame_id, epoch),
+                None => frame.clear_wal_tag(),
+            }
             None
         });
         // Amphora: a page a record holds is read from the record, in the frame's own segment
@@ -6173,7 +6224,7 @@ impl Wal for WalFile {
             slots.push((page.clone(), Arc::new(buffer_pool.get_page())));
         }
 
-        let epoch = self.coordination.checkpoint_epoch();
+        let label = self.label_epoch(start.segment);
         let page_transform = self.io_ctx.read().page_transform().clone();
         let raw_buf = scratch_buf.unwrap_or_else(|| Arc::new(Buffer::new_temporary(total)));
 
@@ -6267,7 +6318,10 @@ impl Wal for WalFile {
             for (i, (page, page_buf)) in slots.iter().enumerate() {
                 let page_id = page.get().id();
                 finish_read_page(page_id, page_buf.clone(), page.clone());
-                page.set_wal_tag(start_frame + i as u64, epoch);
+                match label {
+                    Some(epoch) => page.set_wal_tag(start_frame + i as u64, epoch),
+                    None => page.clear_wal_tag(),
+                }
             }
             None
         });
@@ -8687,7 +8741,7 @@ impl WalFileShared {
                 initialized: AtomicBool::new(wal_is_initialized),
             },
             runtime: WalSharedRuntime {
-                frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
+                frame_cache: Arc::new(RwLock::new(FxHashMap::default())),
                 frame_cache_high_water: AtomicU64::new(0),
                 file: Some(file),
                 read_locks,
@@ -8784,7 +8838,7 @@ impl WalFileShared {
                 initialized: AtomicBool::new(false),
             },
             runtime: WalSharedRuntime {
-                frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
+                frame_cache: Arc::new(RwLock::new(FxHashMap::default())),
                 frame_cache_high_water: AtomicU64::new(0),
                 file: None,
                 read_locks,
@@ -8831,7 +8885,7 @@ impl WalFileShared {
                 initialized: AtomicBool::new(false),
             },
             runtime: WalSharedRuntime {
-                frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
+                frame_cache: Arc::new(RwLock::new(FxHashMap::default())),
                 frame_cache_high_water: AtomicU64::new(0),
                 file: Some(file),
                 read_locks,
@@ -8873,15 +8927,19 @@ impl WalFileShared {
     /// writing frames into the start of the log file.
     /// Make this free segment the one that follows `closing`'s header (decision 45): the same
     /// format and page size, its sequence one past and its salts new ([`Self::restart_wal_header`]),
-    /// the epoch and transaction count carried on so that neither comes back to a value a
-    /// connection took from the closing segment.
+    /// the transaction count carried on so that it never comes back to a value a connection took
+    /// from the closing segment, and the epoch one past the closing one's `epoch`, as a restart
+    /// bumps it: frame numbers start again here, so no page labelled from the closing segment's
+    /// frames passes for this one's (lane B20).
     fn start_after(&mut self, io: &dyn IO, closing: WalHeader, epoch: u32, transaction_count: u64) {
         *self.metadata.wal_header.lock() = closing;
         self.metadata.loaded.store(true, Ordering::Release);
         self.metadata
             .transaction_count
             .store(transaction_count, Ordering::Release);
-        self.runtime.epoch.store(epoch, Ordering::Release);
+        self.runtime
+            .epoch
+            .store(epoch.wrapping_add(1), Ordering::Release);
         self.restart_wal_header(io);
     }
 
@@ -8914,7 +8972,7 @@ impl WalFileShared {
             .read_index
             .set_header(self.metadata.wal_header.clone());
         self.runtime.read_index.invalidate();
-        self.runtime.frame_cache.lock().clear();
+        self.runtime.frame_cache.write().clear();
         self.runtime
             .frame_cache_high_water
             .store(0, Ordering::Release);
@@ -10781,6 +10839,45 @@ pub mod test {
         );
     }
 
+    /// Do: one reader holds the frame cache, as a read of a packed record's pages holds it while it
+    /// copies a page's frames, while another reader asks for the page's frames and its latest one.
+    /// Expect: both answer while the first still holds the cache, so a reader taken off its CPU
+    /// mid-lookup holds up no other read, and the frames a writer appends once the first lets go are
+    /// in the next answer (`docs/design/store.md`, decision of lane perf-Q8). The wait on the answer
+    /// is a hang guard, not a measure.
+    #[test]
+    fn q8_reads_of_the_frame_cache_do_not_wait_for_each_other() {
+        let shared = SharedLog::new(WalFileShared::new_noop());
+        let coordination = Arc::new(make_test_coordination(&shared));
+        coordination.cache_frame(7, 3);
+        coordination.cache_frame(7, 5);
+        let log = shared.current().read();
+        let held = log.runtime.frame_cache.read();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let other = Arc::clone(&coordination);
+        let reader = std::thread::spawn(move || {
+            let frames = other.page_frames(SegmentId::First, 7, 5, 4);
+            let latest = other.latest_frame(7, 4);
+            tx.send((frames, latest)).unwrap();
+        });
+        let answer = rx.recv_timeout(std::time::Duration::from_secs(600));
+        assert_eq!(held.get(&7), Some(&vec![3, 5]));
+        drop(held);
+        drop(log);
+        reader.join().unwrap();
+        assert_eq!(
+            answer,
+            Ok((vec![3, 5], Some(3))),
+            "a read of the frame cache waited for another read"
+        );
+        coordination.cache_frame(7, 9);
+        assert_eq!(
+            coordination.page_frames(SegmentId::First, 7, 9, 2),
+            vec![5, 9],
+            "a read after an append misses its frame"
+        );
+    }
+
     /// Do: random appends of frames and of packed records, rewinds into frames and records,
     /// rollbacks and restarts, and after each the latest frames of random ranges. Expect: what a
     /// scan of every page the log holds finds, the frames' own list answering most of the ranges
@@ -10834,7 +10931,7 @@ pub mod test {
                     }
                     9 if rng.next_u64() % 8 == 0 => {
                         shared.current().read().runtime.read_index.invalidate();
-                        shared.current().write().runtime.frame_cache.lock().clear();
+                        shared.current().write().runtime.frame_cache.write().clear();
                         shared
                             .current()
                             .read()
@@ -10929,7 +11026,7 @@ pub mod test {
                         // The log restarted: its frames gone, the next one frame 1.
                         let guard = shared.current().write();
                         guard.runtime.read_index.invalidate();
-                        guard.runtime.frame_cache.lock().clear();
+                        guard.runtime.frame_cache.write().clear();
                         guard
                             .runtime
                             .frame_cache_high_water
@@ -10956,7 +11053,7 @@ pub mod test {
                         );
                         let index = |build: &mut super::super::log_index::FromIndex<'_>| {
                             let guard = shared.current().read();
-                            build(&guard.runtime.frame_cache.lock());
+                            build(&guard.runtime.frame_cache.read());
                         };
                         reads += 1;
                         match read_index.find(page, min_frame, max_frame, &index) {
@@ -11011,7 +11108,7 @@ pub mod test {
         let read_index = shared.current().read().runtime.read_index.clone();
         let index = |build: &mut super::super::log_index::FromIndex<'_>| {
             let guard = shared.current().read();
-            build(&guard.runtime.frame_cache.lock());
+            build(&guard.runtime.frame_cache.read());
         };
         for page in [101, 128, 4096, 1 << 40] {
             assert_eq!(
@@ -11207,7 +11304,7 @@ pub mod test {
         {
             let guard = shared.current().write();
             guard.runtime.epoch.store(5, Ordering::Release);
-            guard.runtime.frame_cache.lock().extend([
+            guard.runtime.frame_cache.write().extend([
                 (1, vec![1, 4, 8]),
                 (2, vec![2, 6]),
                 (3, vec![3]),
@@ -11263,7 +11360,7 @@ pub mod test {
             guard
                 .runtime
                 .frame_cache
-                .lock()
+                .write()
                 .extend([(1, vec![1, 4, 8]), (2, vec![2, 6])]);
         }
 
@@ -11289,7 +11386,7 @@ pub mod test {
         for lock in &guard.runtime.read_locks[2..] {
             assert_eq!(lock.get_value(), READMARK_NOT_USED);
         }
-        assert!(guard.runtime.frame_cache.lock().is_empty());
+        assert!(guard.runtime.frame_cache.read().is_empty());
         assert!(!guard.metadata.initialized.load(Ordering::Acquire));
     }
 
@@ -11318,7 +11415,7 @@ pub mod test {
         );
         assert_eq!(coordination.iter_latest_frames(0, 5), vec![(7, 2), (9, 4)]);
         assert_eq!(
-            shared.current().read().runtime.frame_cache.lock().get(&7),
+            shared.current().read().runtime.frame_cache.read().get(&7),
             Some(&vec![2])
         );
     }
@@ -11751,6 +11848,215 @@ pub mod test {
             0,
             "nothing of the closing segment was copied"
         );
+    }
+
+    /// Do (lane B19, tests/crash.rs's power cut at seed 45): write, switch, write, copy the closing
+    /// segment, switch, copy it again, ask for a third switch with nothing written since the
+    /// second, write; open a copy of the database and both log files. Expect: the copy opens and
+    /// holds every row; the third switch was refused, its segment holding no frame (so no header
+    /// of its own on disk), and the log's two headers are one sequence apart.
+    #[test]
+    fn d45_a_switch_never_leaves_two_headers_recovery_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let io = shared_wal_test_io();
+        let source = dir.path().join("source.db");
+        let copy = dir.path().join("copy.db");
+        let (source_path, copy_path) = (source.to_str().unwrap(), copy.to_str().unwrap());
+        let db = Database::open_file(io.clone(), source_path, Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("pragma wal_autocheckpoint=0").unwrap();
+        conn.execute("create table t(id integer primary key, v text)")
+            .unwrap();
+        conn.execute("insert into t values(1, 'first segment')")
+            .unwrap();
+        let pager = conn.pager.load();
+        let passive = CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        };
+        assert!(db.switch_log(None).unwrap());
+        conn.execute("insert into t values(2, 'second segment')")
+            .unwrap();
+        run_checkpoint_until_done(&pager, passive);
+        assert_eq!(db.shared_wal.segments.load().closing(), None);
+        assert!(db.switch_log(None).unwrap());
+        run_checkpoint_until_done(&pager, passive);
+        assert_eq!(db.shared_wal.segments.load().closing(), None);
+        let third = db.switch_log(None).unwrap();
+        conn.execute("insert into t values(3, 'after the third ask')")
+            .unwrap();
+
+        std::fs::copy(&source, &copy).unwrap();
+        for suffix in ["-wal", "-wal2"] {
+            std::fs::copy(
+                format!("{source_path}{suffix}"),
+                format!("{copy_path}{suffix}"),
+            )
+            .unwrap();
+        }
+        let reopened = Database::open_file(io, copy_path, Arc::new(SqliteDialect));
+        let reopened = match reopened {
+            Ok(db) => db,
+            Err(e) => panic!("the copy doesn't open (third switch made: {third}): {e}"),
+        };
+        let conn = reopened.connect(ConnectOpts::new()).unwrap();
+        assert_eq!(count_rows(&conn, "t"), 3);
+        assert!(!third, "a segment with no frame is not switched from");
+        let sequence = |id| {
+            reopened
+                .shared_wal
+                .segment(id)
+                .read()
+                .metadata
+                .wal_header
+                .lock()
+                .checkpoint_seq
+        };
+        assert_eq!(
+            sequence(SegmentId::First),
+            sequence(SegmentId::Second).wrapping_add(1)
+        );
+    }
+
+    /// A database holding `t` (row 1, 'base'), its log's frames copied into the file, then
+    /// switched to its second segment, the first reset: the next commit is the second segment's
+    /// frame 1. The connection that wrote it, autocheckpoint off.
+    fn switched_database(dir: &std::path::Path) -> (Arc<Database>, Arc<Connection>) {
+        let path = dir.join("cached.db");
+        let db = Database::open_file(
+            shared_wal_test_io(),
+            path.to_str().unwrap(),
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let writer = db.connect(ConnectOpts::new()).unwrap();
+        writer.execute("pragma wal_autocheckpoint=0").unwrap();
+        writer
+            .execute("create table t(id integer primary key, v text)")
+            .unwrap();
+        writer.execute("insert into t values(1, 'base')").unwrap();
+        assert!(db.switch_log(None).unwrap());
+        run_checkpoint_until_done(
+            &writer.pager.load(),
+            CheckpointMode::Passive {
+                upper_bound_inclusive: None,
+            },
+        );
+        assert_eq!(db.shared_wal.segments.load().closing(), None);
+        assert_eq!(db.shared_wal.current_id(), SegmentId::Second);
+        (db, writer)
+    }
+
+    /// `t`'s rows whose `v` is `value`, in a copy of `db`'s file alone: what its checkpoints put
+    /// there.
+    fn rows_in_the_file(dir: &std::path::Path, value: &str) -> i64 {
+        let alone = dir.join("alone.db");
+        std::fs::copy(dir.join("cached.db"), &alone).unwrap();
+        let db = Database::open_file(
+            shared_wal_test_io(),
+            alone.to_str().unwrap(),
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        count_rows(&conn, &format!("t where v = '{value}'"))
+    }
+
+    /// Passes on `conn` that keep its page cache, as a checkpoint after a commit does, until the
+    /// closing segment is reset and the current one copied whole.
+    fn copy_everything_keeping_the_cache(db: &Database, conn: &Arc<Connection>) {
+        let pager = conn.pager.load();
+        let passive = CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        };
+        for _ in 0..4 {
+            let pass = pager
+                .io
+                .block(|| pager.checkpoint(passive, crate::SyncMode::Full, false))
+                .unwrap();
+            if pass.closing.is_none() && pass.everything_backfilled() {
+                break;
+            }
+        }
+        let (log, copied) = db.wal_backfill();
+        assert_eq!(db.shared_wal.segments.load().closing(), None);
+        assert!(log > 0 && copied == log, "{copied} of {log} frames copied");
+    }
+
+    /// Do (decision 45, lane B19): row 1 set to 'A' as the second segment's frame 1, copied; a
+    /// switch to the first segment; a new connection reads row 1, its page from the closing
+    /// segment; row 1 set to 'B' as the first segment's frame 1 by the writer; the reader's
+    /// connection checkpoints both segments, its page cache kept; the file read alone. Expect:
+    /// the file holds 'B': the page the reader cached from the closing segment's frame 1 never
+    /// passes for the current segment's frame 1.
+    #[test_log::test]
+    fn d45_a_page_cached_from_the_closing_segment_never_passes_for_the_current_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, writer) = switched_database(dir.path());
+        let checkpointer = db.connect(ConnectOpts::new()).unwrap();
+        writer.execute("update t set v = 'A' where id = 1").unwrap();
+        let frames = |id| {
+            db.shared_wal
+                .segment(id)
+                .read()
+                .metadata
+                .max_frame
+                .load(Ordering::Acquire)
+        };
+        let a_frames = frames(SegmentId::Second);
+        run_checkpoint_until_done(
+            &checkpointer.pager.load(),
+            CheckpointMode::Passive {
+                upper_bound_inclusive: None,
+            },
+        );
+        assert!(db.switch_log(None).unwrap());
+
+        let reader = db.connect(ConnectOpts::new()).unwrap();
+        assert_eq!(count_rows(&reader, "t where v = 'A'"), 1);
+        writer.execute("update t set v = 'B' where id = 1").unwrap();
+        assert_eq!(
+            frames(SegmentId::First),
+            a_frames,
+            "the two commits' frames line up"
+        );
+        copy_everything_keeping_the_cache(&db, &reader);
+        assert_eq!(rows_in_the_file(dir.path(), "B"), 1);
+    }
+
+    /// Do (decision 45, lane B19): row 1 set to 'A' as the second segment's frame 1, copied; a
+    /// switch to the first segment; a new connection reads row 1 from the closing segment; that
+    /// segment reset; a switch asked with nothing written; then row 1 set to 'X' (the first
+    /// segment's frame 1), a switch back to the second segment, row 1 set to 'B' as its frame 1
+    /// again; the reader's connection checkpoints both segments, its page cache kept; the file
+    /// read alone. Expect: the empty segment isn't switched from; the file holds 'B': the page
+    /// the reader cached from the second segment's frame 1 never passes for that frame after the
+    /// segment's reuse.
+    #[test_log::test]
+    fn d45_a_page_cached_from_a_segment_never_passes_for_its_frames_after_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, writer) = switched_database(dir.path());
+        let checkpointer = db.connect(ConnectOpts::new()).unwrap();
+        let passive = CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        };
+        writer.execute("update t set v = 'A' where id = 1").unwrap();
+        run_checkpoint_until_done(&checkpointer.pager.load(), passive);
+        assert!(db.switch_log(None).unwrap());
+        let reader = db.connect(ConnectOpts::new()).unwrap();
+        assert_eq!(count_rows(&reader, "t where v = 'A'"), 1);
+        run_checkpoint_until_done(&checkpointer.pager.load(), passive);
+        assert_eq!(db.shared_wal.segments.load().closing(), None);
+        assert!(
+            !db.switch_log(None).unwrap(),
+            "no switch from an empty segment"
+        );
+
+        writer.execute("update t set v = 'X' where id = 1").unwrap();
+        assert!(db.switch_log(None).unwrap());
+        assert_eq!(db.shared_wal.current_id(), SegmentId::Second);
+        writer.execute("update t set v = 'B' where id = 1").unwrap();
+        copy_everything_keeping_the_cache(&db, &reader);
+        assert_eq!(rows_in_the_file(dir.path(), "B"), 1);
     }
 
     #[test]
@@ -12399,7 +12705,7 @@ pub mod test {
         );
         assert_eq!(shared.runtime.epoch.load(Ordering::Acquire), 5);
         assert!(!shared.metadata.initialized.load(Ordering::Acquire));
-        assert!(shared.runtime.frame_cache.lock().is_empty());
+        assert!(shared.runtime.frame_cache.read().is_empty());
     }
 
     #[cfg(host_shared_wal)]
@@ -12526,7 +12832,7 @@ pub mod test {
             .metadata
             .loaded_from_disk_scan
             .load(Ordering::Acquire));
-        assert!(shared.runtime.frame_cache.lock().is_empty());
+        assert!(shared.runtime.frame_cache.read().is_empty());
     }
 
     #[cfg(host_shared_wal)]
@@ -12558,7 +12864,7 @@ pub mod test {
             .read()
             .runtime
             .frame_cache
-            .lock()
+            .read()
             .is_empty());
 
         let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
@@ -12584,7 +12890,7 @@ pub mod test {
                 .read()
                 .runtime
                 .frame_cache
-                .lock()
+                .read()
                 .is_empty(),
             "refusing the overflow refresh must leave the local fallback cache untouched"
         );
@@ -12643,7 +12949,7 @@ pub mod test {
             .loaded_from_disk_scan
             .load(Ordering::Acquire));
         assert_eq!(
-            shared.runtime.frame_cache.lock().get(&7).cloned(),
+            shared.runtime.frame_cache.read().get(&7).cloned(),
             Some(vec![1])
         );
     }
@@ -12735,7 +13041,7 @@ pub mod test {
             .loaded_from_disk_scan
             .load(Ordering::Acquire));
         assert_eq!(
-            shared.runtime.frame_cache.lock().get(&7).cloned(),
+            shared.runtime.frame_cache.read().get(&7).cloned(),
             Some(vec![1])
         );
     }
@@ -12867,7 +13173,7 @@ pub mod test {
             "preserving a newer zero-frame generation must require the first append to rewrite the WAL header"
         );
         assert!(
-            shared.current().read().runtime.frame_cache.lock().is_empty(),
+            shared.current().read().runtime.frame_cache.read().is_empty(),
             "older WAL frames from a prior generation must not survive zero-frame authority recovery"
         );
     }
@@ -13296,7 +13602,7 @@ pub mod test {
             header.salt_2 = 23;
             header.checksum_1 = stale.last_checksum.0;
             header.checksum_2 = stale.last_checksum.1;
-            shared.runtime.frame_cache.lock().insert(7, vec![2]);
+            shared.runtime.frame_cache.write().insert(7, vec![2]);
         }
 
         let (_authority_b, coordination_b) = make_test_shm_coordination(&shared_b, &shm_path);
@@ -13364,7 +13670,7 @@ pub mod test {
             header.salt_2 = 23;
             header.checksum_1 = authoritative.last_checksum.0;
             header.checksum_2 = authoritative.last_checksum.1;
-            let mut frame_cache = shared.runtime.frame_cache.lock();
+            let mut frame_cache = shared.runtime.frame_cache.write();
             frame_cache.insert(7, vec![2]);
             frame_cache.insert(9, vec![5]);
         }
@@ -13440,8 +13746,8 @@ pub mod test {
             header.salt_2 = 23;
             header.checksum_1 = authoritative.last_checksum.0;
             header.checksum_2 = authoritative.last_checksum.1;
-            shared.runtime.frame_cache.lock().insert(7, vec![2]);
-            shared.runtime.frame_cache.lock().insert(9, vec![5]);
+            shared.runtime.frame_cache.write().insert(7, vec![2]);
+            shared.runtime.frame_cache.write().insert(9, vec![5]);
         }
 
         let (authority, coordination_b) = make_test_shm_coordination(&shared_b, &shm_path);

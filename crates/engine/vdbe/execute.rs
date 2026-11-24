@@ -16988,6 +16988,7 @@ pub fn op_read_cookie(
                 Cookie::LargestRootPageNumber => header.vacuum_mode_largest_root_page.get().into(),
                 Cookie::PageSize => header.page_size.get().into(),
                 Cookie::FreePageCount => header.freelist_pages.get().into(),
+                Cookie::PgNextOid => header.pg_next_oid.get().into(),
                 cookie => todo!("{cookie:?} is not yet implement for ReadCookie"),
             },
         ) {
@@ -17033,6 +17034,7 @@ pub fn op_set_cookie(
     match with_header_mut(&pager, mv_store.as_ref(), program, *db, |header| {
         match cookie {
             Cookie::ApplicationId => header.application_id = (*value).into(),
+            Cookie::PgNextOid => header.pg_next_oid = value.cast_unsigned().into(),
             Cookie::DatabaseFormat => header.schema_format = (*value as u32).into(),
             Cookie::DatabaseTextEncoding => {
                 header.text_encoding = match *value {
@@ -21960,7 +21962,8 @@ pub fn op_morsel_aggregate(
     use crate::vdbe::insn::MorselOuter;
     use crate::vdbe::morsel::HashProbe;
     use crate::vdbe::morsel::{
-        MachineCosts, MemoryBudget, MorselError, ParallelMode, Partitioner, ScanAggregate,
+        MachineCosts, MemoryBudget, MorselError, ParallelMode, Partitioner, Predicate,
+        ScanAggregate,
     };
     use crate::vdbe::morsel_scan::{
         no_real_outputs, JoinStage, SeekLink, TableAggregate, TableBodyAggregate, TableBodyRows,
@@ -21974,12 +21977,19 @@ pub fn op_morsel_aggregate(
     };
     let connection = &program.connection;
     // A term against a bound parameter takes the parameter's value now, for the column copy and
-    // the morsels alike (lane R9).
+    // the morsels alike (lane R9); and a scan's terms on its rowid's alias, a search by a rowid
+    // range among them, narrow the rowids it reads to those they admit (lane R11).
+    let on_rowid = |p: &Predicate| match (p, data.rowid_alias) {
+        (Predicate::Compare { column, .. } | Predicate::Parameter { column, .. }, Some(alias)) => {
+            *column == alias && data.joins.is_empty()
+        }
+        _ => false,
+    };
     let bound;
     let data: &crate::vdbe::insn::MorselAggregateData = if data
         .filter
         .iter()
-        .any(|p| matches!(p, crate::vdbe::morsel::Predicate::Parameter { .. }))
+        .any(|p| matches!(p, Predicate::Parameter { .. }) || on_rowid(p))
     {
         let mut filter = Vec::new();
         filter
@@ -21991,8 +22001,15 @@ pub fn op_morsel_aggregate(
                     .map_err(refused)?,
             );
         }
+        let rowid_range = match data.rowid_alias {
+            Some(alias) if data.joins.is_empty() => {
+                crate::vdbe::morsel::rowid_range(&filter, alias, data.rowid_range)
+            }
+            _ => data.rowid_range,
+        };
         bound = crate::vdbe::insn::MorselAggregateData {
             filter,
+            rowid_range,
             ..(**data).clone()
         };
         &bound

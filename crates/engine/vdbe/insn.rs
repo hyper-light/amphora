@@ -547,7 +547,9 @@ pub struct MorselAggregateData {
     /// as the serial loop's Column reads it; empty when every one is NULL (lane qs6-17).
     pub defaults: Vec<crate::types::Value>,
     /// The least and greatest rowid the scan reads, each inclusive; `(None, None)`: the whole
-    /// table. The morsels are cut from the leaves that hold them (lane qs6-17).
+    /// table. The morsels are cut from the leaves that hold them (lane qs6-17), and the column
+    /// copy reads the keys between them. A scan's terms on its rowid's alias narrow it when the
+    /// statement runs (lane R11: `morsel::rowid_range`).
     pub rowid_range: (Option<i64>, Option<i64>),
     pub filter: Vec<crate::vdbe::morsel::Predicate>,
     pub group_by: Vec<usize>,
@@ -2992,6 +2994,8 @@ pub enum Cookie {
     ApplicationId = 8,
     /// The page size, as read by the page_size pragma.
     PageSize = 9,
+    /// Amphora: the PostgreSQL dialect's next OID (`DatabaseHeader::pg_next_oid`).
+    PgNextOid = 10,
 }
 
 #[cfg(test)]

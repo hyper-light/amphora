@@ -1352,8 +1352,18 @@ pub fn translate_create_table(
     } else {
         connection
             .dialect()
-            .format_table_sql(input, &tbl_name, &body)?
+            .format_created_table_sql(connection, input, &tbl_name, &body)?
     };
+    // Amphora: a dialect with OIDs stores the next one in this transaction, beside the table
+    // (docs/design/postgres.md section 7), as PostgreSQL's XLOG_NEXTOID precedes every use of an OID.
+    if let Some(next_oid) = connection.dialect().next_oid_after(&sql)? {
+        program.emit_insn(Insn::SetCookie {
+            db: database_id,
+            cookie: Cookie::PgNextOid,
+            value: next_oid.cast_signed(),
+            p5: 0,
+        });
+    }
 
     let parse_schema_label = program.allocate_label();
 
