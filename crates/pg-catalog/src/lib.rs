@@ -57,7 +57,30 @@ pub struct Catalog {
     pub oid: u32,
     pub name: &'static str,
     pub columns: &'static [Column],
+    /// Its primary key's columns, as `attnum`s.
+    pub key: &'static [usize],
     pub rows: &'static [&'static [Datum<'static>]],
+}
+
+/// The catalogs served. Only those bootstrap writes itself have a row of `pg_class` in 19's own data, so a
+/// name is looked for among them first.
+pub static CATALOGS: [&Catalog; 6] = [
+    &data::PG_NAMESPACE,
+    &data::PG_TYPE,
+    &data::PG_CLASS,
+    &data::PG_ATTRIBUTE,
+    &data::PG_PARTITIONED_TABLE,
+    &data::PG_INHERITS,
+];
+
+/// The served catalog of that OID.
+pub fn catalog_by_oid(oid: u32) -> Option<&'static Catalog> {
+    CATALOGS.iter().copied().find(|c| c.oid == oid)
+}
+
+/// The served catalog of that name, in `pg_catalog`.
+pub fn catalog_named(name: &str) -> Option<&'static Catalog> {
+    CATALOGS.iter().copied().find(|c| c.name == name)
 }
 
 impl Catalog {
@@ -213,6 +236,8 @@ pub enum Kind {
 pub struct SearchPath {
     namespaces: Vec<u32>,
     temp: Option<u32>,
+    /// `activeCreationNamespace`: the first schema named, where one was.
+    creation: Option<u32>,
 }
 
 impl SearchPath {
@@ -244,6 +269,7 @@ impl SearchPath {
                 namespaces.push(oid);
             }
         }
+        let creation = namespaces.first().copied();
         if !namespaces.contains(&PG_CATALOG_NAMESPACE) {
             namespaces.insert(0, PG_CATALOG_NAMESPACE);
         }
@@ -252,7 +278,23 @@ impl SearchPath {
         {
             namespaces.insert(0, temp);
         }
-        Self { namespaces, temp }
+        Self {
+            namespaces,
+            temp,
+            creation,
+        }
+    }
+
+    /// `fetch_search_path` (namespace.c:4912): the whole path, or only from the first schema named on.
+    pub fn fetch(&self, implicit: bool) -> &[u32] {
+        if implicit {
+            return &self.namespaces;
+        }
+        let from = self
+            .creation
+            .and_then(|first| self.namespaces.iter().position(|ns| *ns == first))
+            .unwrap_or(self.namespaces.len());
+        self.namespaces.get(from..).unwrap_or(&[])
     }
 
     /// The schemas searched for a name of `kind`, in order: the temporary schema is skipped for

@@ -4,8 +4,9 @@
 use amphora_pg_catalog::data::PG_TYPE;
 use amphora_pg_catalog::{Datum, Proc, proc_by_oid};
 
+use crate::coerce::element_type;
 use crate::func::Value;
-use crate::{Error, datetime, format_type, sqlstate};
+use crate::{Error, array, datetime, format_type, sqlstate};
 
 /// The bytes a name has room for, its terminator with them (src/include/pg_config_manual.h:39).
 pub const NAMEDATALEN: usize = 64;
@@ -96,6 +97,20 @@ pub fn receivable(type_oid: u32) -> Result<(), Error> {
 /// A type's `typreceive` on a value's bytes, and how many of them it read. A type modifier is the
 /// statement's to apply: a Bind's parameter has none.
 pub fn receive(type_oid: u32, bytes: &[u8]) -> Result<(Value, usize), Error> {
+    match element_type(type_oid) {
+        0 => plain_receive(type_oid, bytes),
+        element => {
+            // get_type_io_data: an element with no receive function is refused 42883.
+            function(element, "typreceive", "input")?;
+            let (array, taken) =
+                array::receive(element, bytes, |bytes| plain_receive(element, bytes))?;
+            Ok((Value::Array(array), taken))
+        }
+    }
+}
+
+/// [`receive`] of a type that is no array.
+fn plain_receive(type_oid: u32, bytes: &[u8]) -> Result<(Value, usize), Error> {
     let function = function(type_oid, "typreceive", "input")?;
     Ok(match function.src {
         "boolrecv" => (Value::Bool(head::<1>(bytes)? != [0]), 1),
@@ -126,6 +141,14 @@ pub fn receive(type_oid: u32, bytes: &[u8]) -> Result<(Value, usize), Error> {
 
 /// A type's `typsend`.
 pub fn send(type_oid: u32, value: &Value) -> Result<Vec<u8>, Error> {
+    match value {
+        Value::Array(array) => array::send(array, |value| plain_send(array.element, value)),
+        value => plain_send(type_oid, value),
+    }
+}
+
+/// [`send`] of a value that is no array.
+fn plain_send(type_oid: u32, value: &Value) -> Result<Vec<u8>, Error> {
     let function = function(type_oid, "typsend", "output")?;
     Ok(match (function.src, value) {
         ("boolsend", Value::Bool(b)) => vec![u8::from(*b)],

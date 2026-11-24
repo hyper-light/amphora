@@ -3,7 +3,7 @@
 
 Runs PostgreSQL's own genbki.pl (vendored, REL_19_0) on the vendored catalog headers and .dat files,
 as PostgreSQL's build does, and lifts the rows its postgres.bki inserts into pg_type, pg_namespace,
-pg_class and pg_attribute, and what analysis reads of pg_type, pg_proc, pg_operator, pg_cast and
+pg_class, pg_attribute, pg_partitioned_table and pg_inherits (the last two none), and what analysis reads of pg_type, pg_proc, pg_operator, pg_cast and
 pg_range (section 11's unit 8), into crates/pg-catalog/src/data.rs. Nothing in that file is written by hand.
 
 usage: scripts/postgres-catalog.py <work dir under ~/.cache>
@@ -22,7 +22,7 @@ PG = ROOT / "vendor/postgres"
 OUT = ROOT / "crates/pg-catalog/src/data.rs"
 
 # The catalogs served whole, in the order data.rs lists them.
-SERVED = ["pg_namespace", "pg_type", "pg_class", "pg_attribute"]
+SERVED = ["pg_namespace", "pg_type", "pg_class", "pg_attribute", "pg_partitioned_table", "pg_inherits"]
 
 # How each bki column type is carried. Types not named here must be _null_ in every lifted row.
 KIND = {
@@ -265,6 +265,17 @@ def casts(rel: dict) -> list[str]:
     return out + ["];"]
 
 
+def key(rel: str, r: dict) -> list[int]:
+    """The columns of a catalog's primary key, as attnums: its header's DECLARE_UNIQUE_INDEX_PKEY, which
+    system_constraints.sql makes a primary key of (genbki.pl)."""
+    header = (PG / f"src/include/catalog/{rel}.h").read_text()
+    m = re.search(rf"^DECLARE_UNIQUE_INDEX_PKEY\(\w+, \d+, \w+, {rel}, btree\(([^)]*)\)\);$", header, re.M)
+    if not m:
+        sys.exit(f"{rel} declares no primary key")
+    names = [c for c, _ in r["columns"]]
+    return [names.index(part.split()[0]) + 1 for part in m.group(1).split(",")]
+
+
 def main() -> None:
     if len(sys.argv) != 2:
         sys.exit(__doc__)
@@ -280,7 +291,7 @@ def main() -> None:
     syms = symbols()
     types = {r[1]: int(r[0]) for r in rels["pg_type"]["rows"]}
     out = [
-        "//! PostgreSQL 19's built-in rows of pg_namespace, pg_type, pg_class and pg_attribute, and what analysis",
+        "//! PostgreSQL 19's built-in rows of pg_namespace, pg_type, pg_class, pg_attribute, pg_partitioned_table and pg_inherits, and what analysis",
         "//! reads of pg_type, pg_proc, pg_operator, pg_cast and pg_range: PostgreSQL's own genbki.pl run on the vendored",
         "//! catalog headers and .dat files (vendor/postgres, REL_19_0), its postgres.bki lifted by",
         "//! scripts/postgres-catalog.py. Generated; do not edit.",
@@ -300,7 +311,7 @@ def main() -> None:
             if ty not in types:
                 sys.exit(f"{rel}.{name}: type {ty} has no pg_type row")
             out.append(f"        Column {{ name: \"{name}\", type_oid: {types[ty]} }},")
-        out += ["    ],", "    rows: &["]
+        out += ["    ],", f"    key: &[{', '.join(str(n) for n in key(rel, r))}],", "    rows: &["]
         for row in r["rows"]:
             if len(row) != len(kinds):
                 sys.exit(f"{rel}: {len(row)} values for {len(kinds)} columns")

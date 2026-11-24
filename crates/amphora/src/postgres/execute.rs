@@ -24,7 +24,7 @@ use amphora_pg_analysis::{
     output, utility,
 };
 use amphora_pg_catalog::data::{PG_TYPE, type_oid};
-use amphora_pg_catalog::{Datum, SearchPath};
+use amphora_pg_catalog::{Datum, PG_CATALOG_NAMESPACE, SearchPath, catalog_by_oid, catalog_named};
 use amphora_pg_parser::gram;
 use amphora_pg_parser::tree::{Node, NodeId, TransactionStmtKind, Tree, Val};
 
@@ -165,6 +165,11 @@ impl Relations for Catalog {
     }
 
     fn relation(&self, namespace: u32, name: &str) -> Option<u32> {
+        if namespace == PG_CATALOG_NAMESPACE
+            && let Some(catalog) = catalog_named(name)
+        {
+            return Some(catalog.oid);
+        }
         let found = self.first(
             "SELECT oid FROM pg_class WHERE relname = ?1 AND relnamespace = ?2",
             &[Value::build_text(name.to_owned()), int(namespace)],
@@ -173,6 +178,9 @@ impl Relations for Catalog {
     }
 
     fn name(&self, oid: u32) -> Option<(u32, String)> {
+        if let Some(catalog) = catalog_by_oid(oid) {
+            return Some((PG_CATALOG_NAMESPACE, catalog.name.to_owned()));
+        }
         let found = self.first(
             "SELECT relnamespace, relname FROM pg_class WHERE oid = ?1",
             &[int(oid)],
@@ -189,6 +197,15 @@ impl Relations for Catalog {
     }
 
     fn columns(&self, oid: u32) -> Vec<Column> {
+        if let Some(catalog) = catalog_by_oid(oid) {
+            let column = |c: &amphora_pg_catalog::Column| Column {
+                name: c.name.to_owned(),
+                type_oid: c.type_oid,
+                typmod: -1,
+                not_null: false,
+            };
+            return catalog.columns.iter().map(column).collect();
+        }
         let rows = self
             .rows(
                 "SELECT attname, atttypid, atttypmod, attnotnull FROM pg_attribute WHERE attrelid = ?1 AND attnum > 0 AND attisdropped = 0 ORDER BY attnum",
@@ -213,6 +230,34 @@ impl Relations for Catalog {
             }
         }
         columns
+    }
+
+    fn primary_key(&self, relation: u32) -> Vec<usize> {
+        if let Some(catalog) = catalog_by_oid(relation) {
+            return catalog.key.to_vec();
+        }
+        let Some((_, table)) = self.name(relation) else {
+            return Vec::new();
+        };
+        // The key's index and its one column (amphora_pg_analysis's `utility`).
+        let found = self.first(
+            "SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = ?1 AND tbl_name = ?2",
+            &[
+                Value::build_text(format!("{table}_pkey")),
+                Value::build_text(table),
+            ],
+        );
+        let Some(sql) = found.as_ref().and_then(|row| text_of(row.first())) else {
+            return Vec::new();
+        };
+        let column = self.columns(relation).into_iter().position(|c| {
+            sql.ends_with(&format!("(\"{}\")", c.name.replace('"', "\"\"")))
+                || sql.ends_with(&format!("({})", c.name))
+        });
+        column
+            .and_then(|at| at.checked_add(1))
+            .into_iter()
+            .collect()
     }
 
     fn index(&self, relation: u32, name: &str) -> bool {

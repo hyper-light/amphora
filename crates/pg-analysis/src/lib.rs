@@ -2,7 +2,7 @@
 //! becomes a typed one, its names, operators, functions and casts resolved as 19's `parse_*.c` resolve
 //! them, over 19's own `pg_type`, `pg_operator`, `pg_proc` and `pg_cast` rows (amphora-pg-catalog). The
 //! values and functions are those of int4, int8, text, char(n), "char", timestamp, timestamptz and
-//! regclass, and name's input and output; a statement that needs another refuses with `0A000` naming
+//! regclass, name's input, output and comparisons, and those of arrays of them; a statement that needs another refuses with `0A000` naming
 //! it. Pure: no I/O, no clock. Source lines are REL_19_0's.
 #![cfg_attr(
     test,
@@ -16,6 +16,7 @@
     )
 )]
 
+pub mod array;
 pub mod binary;
 pub mod coerce;
 pub mod copy;
@@ -29,6 +30,7 @@ pub mod stmt;
 pub mod tz;
 pub mod utility;
 
+pub use array::Array;
 pub use expr::{Expr, ExprId, ExprKind, Exprs, Form};
 pub use func::{Value, call, eval, input, output};
 pub use lower::{Field, Lowered, fields, lower};
@@ -71,6 +73,16 @@ pub mod sqlstate {
     pub const UNDEFINED_PARAMETER: &str = "42P02";
     pub const AMBIGUOUS_PARAMETER: &str = "42P08";
     pub const INDETERMINATE_DATATYPE: &str = "42P18";
+    pub const INVALID_BINARY_REPRESENTATION: &str = "22P03";
+    pub const NULL_VALUE_NOT_ALLOWED: &str = "22004";
+    pub const ARRAY_SUBSCRIPT_ERROR: &str = "2202E";
+    pub const INVALID_ROW_COUNT_IN_LIMIT_CLAUSE: &str = "2201W";
+    pub const PROGRAM_LIMIT_EXCEEDED: &str = "54000";
+    pub const AMBIGUOUS_COLUMN: &str = "42702";
+    pub const DUPLICATE_ALIAS: &str = "42712";
+    pub const GROUPING_ERROR: &str = "42803";
+    pub const AMBIGUOUS_ALIAS: &str = "42P09";
+    pub const INVALID_COLUMN_REFERENCE: &str = "42P10";
     pub const INTERNAL_ERROR: &str = "XX000";
 }
 
@@ -159,6 +171,10 @@ pub trait Relations {
     /// Whether a relation has an index of that name.
     fn index(&self, _relation: u32, _name: &str) -> bool {
         false
+    }
+    /// A relation's primary key's columns, as `attnum`s: none where it has none.
+    fn primary_key(&self, _relation: u32) -> Vec<usize> {
+        Vec::new()
     }
 }
 
