@@ -147,12 +147,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   second, `delete_range_insert` 2,800 → 1,011 (fedora, 2026-10-22, checks); single-row writes as
   before.
 - **Page reads without the log's shared locks** (G3 step 2, docs/design/store.md decision 40,
-  `crates/engine/storage/log_index.rs`), a prototype behind `AMPHORA_LOG_READ_INDEX`, off by
-  default: the log's header read from a seqlocked copy; a page the log doesn't hold answered from an
-  exact bitmap; the frame index read from a copy published per generation (`published`) or from
-  sharded latest-frame tables under version checks (`optimistic`). Built and tested (a model against
-  the locked index, crashes at every write of a checkpoint and restart); not yet measured, nor a way
-  chosen.
+  `crates/engine/storage/log_index.rs`), on, the one way: the log's header read from a seqlocked
+  copy; a page the log doesn't hold answered from an exact bitmap; a page it holds from a sharded
+  table of each page's latest frame read under version checks. Chosen over the lock, the bitmap
+  alone and a copy of the index published per generation by K0's mixed phase (writers committing
+  while readers read the newest pages), where the lookup took 0.9% of the CPU at 32 clients and
+  1.9% at 128 against the others' 14-34% (bench/records/2026-11-24-adacachy2-perf-reads-q5.md).
+  Tested by a model against the locked index, readers beside a writer, and crashes at every write
+  of a checkpoint and restart.
 - **The page path SQLite takes** (G3 step 3, docs/design/store.md decision 42), a prototype behind
   `AMPHORA_PAGE_PATH=plain`, off by default: plain pin counts on a connection's own pages, a shared
   page's buffer counted once as it enters a connection, file misses read in line with no completion
