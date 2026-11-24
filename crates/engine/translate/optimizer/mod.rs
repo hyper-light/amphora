@@ -5278,6 +5278,180 @@ pub(crate) mod bushy_search_tests {
             }
         }
 
+        /// One database of `tests/fixtures/outer_joins.tsv`: the statements that fill it, and its
+        /// queries with SQLite's answers.
+        struct OuterJoins {
+            name: &'static str,
+            fill: Vec<&'static str>,
+            queries: Vec<(&'static str, &'static str)>,
+        }
+
+        fn outer_joins() -> Vec<OuterJoins> {
+            let mut out: Vec<OuterJoins> = Vec::new();
+            for line in include_str!("../../tests/fixtures/outer_joins.tsv").lines() {
+                let mut fields = line.split('\t');
+                match (fields.next(), fields.next(), fields.next()) {
+                    (Some("db"), Some(name), None) => out.push(OuterJoins {
+                        name,
+                        fill: Vec::new(),
+                        queries: Vec::new(),
+                    }),
+                    (Some("sql"), Some(sql), None) => out.last_mut().unwrap().fill.push(sql),
+                    (Some("q"), Some(sql), Some(answer)) => {
+                        out.last_mut().unwrap().queries.push((sql, answer));
+                    }
+                    _ => assert!(line.starts_with('#'), "{line}"),
+                }
+            }
+            out
+        }
+
+        fn c3_outcome(conn: &Arc<crate::Connection>, sql: &str) -> String {
+            let got = conn
+                .prepare(sql)
+                .and_then(|mut stmt| stmt.run_collect_rows());
+            match got {
+                Ok(rows) => rows
+                    .into_iter()
+                    .map(|row| {
+                        row.iter()
+                            .map(|value| value.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(";"),
+                Err(e) => format!("ERROR {e}"),
+            }
+        }
+
+        /// Lane C3's sweep, not for main as it is: every query of the fixture under every setting.
+        #[test]
+        fn c3_sweep() {
+            use super::super::bushy_test_hook::{APPLIED, PIN, SPLIT};
+            use crate::translate::optimizer::learned_costs::LearnedWeights;
+            use crate::vdbe::morsel::ParallelMode;
+            use std::collections::BTreeMap;
+            let mut wrong: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            let mut counts: BTreeMap<String, [usize; 5]> = BTreeMap::new();
+            for db in outer_joins() {
+                for analyzed in [true, false] {
+                    let began = std::time::Instant::now();
+                    let io = Arc::new(MemoryIO::new());
+                    let database =
+                        Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+                    let conn = database.connect(ConnectOpts::new()).unwrap();
+                    for sql in &db.fill {
+                        conn.execute(*sql).unwrap();
+                    }
+                    if analyzed {
+                        conn.execute("ANALYZE").unwrap();
+                    }
+                    let large = db.name == "facts";
+                    for (n, (sql, want)) in db.queries.iter().enumerate() {
+                        let mut run = |setting: String| {
+                            BUSHY_PLANS.with(|plans| plans.set(0));
+                            LEFT_JOINS_IN_RUNS.with(|runs| runs.set(0));
+                            LEFT_JOIN_PROBES.with(|probes| probes.set(0));
+                            APPLIED.with(|applied| applied.set(0));
+                            let got = c3_outcome(&conn, sql);
+                            let key = format!("{} analyzed={analyzed} {setting}", db.name);
+                            let count = counts.entry(key.clone()).or_default();
+                            count[0] += 1;
+                            count[1] += usize::from(
+                                BUSHY_PLANS.with(Cell::get) + APPLIED.with(Cell::get) > 0,
+                            );
+                            count[2] += usize::from(LEFT_JOINS_IN_RUNS.with(Cell::get) > 0);
+                            count[3] += usize::from(LEFT_JOIN_PROBES.with(Cell::get) > 0);
+                            if got != *want {
+                                count[4] += 1;
+                                wrong.entry(key).or_default().push(format!(
+                                    "q{n}: got {got} want {want}: {sql}: {:?}",
+                                    c3_outcome(&conn, &format!("EXPLAIN QUERY PLAN {sql}"))
+                                ));
+                            }
+                        };
+                        conn.set_join_methods(JoinMethods::ByCost);
+                        run("by cost, first".to_string());
+                        run("by cost, second".to_string());
+                        conn.set_bushy_left_join_probes(BushyLeftJoinProbes::ByCost);
+                        run("left join probes".to_string());
+                        conn.set_bushy_left_join_probes(BushyLeftJoinProbes::Off);
+                        conn.set_parallel_mode(ParallelMode::On);
+                        for cores in [1, 8] {
+                            conn.set_parallel_cores(std::num::NonZeroUsize::new(cores));
+                            run(format!("parallel {cores}"));
+                        }
+                        conn.set_parallel_mode(ParallelMode::Off);
+                        conn.set_adaptive_joins(true);
+                        run("adaptive".to_string());
+                        conn.set_adaptive_joins(false);
+                        conn.set_join_methods(JoinMethods::HashJoinsOnly);
+                        run("hash joins only".to_string());
+                        conn.set_join_methods(JoinMethods::MergeJoinsOnly);
+                        run("merge joins only".to_string());
+                        if !large {
+                            conn.set_join_methods(JoinMethods::NestedLoopsOnly);
+                            run("nested loops only".to_string());
+                        }
+                        conn.set_join_methods(JoinMethods::ByCost);
+                        for (seek, build, probe) in [
+                            (2.0, 0.5, 0.5),
+                            (2.0, 50.0, 0.5),
+                            (2000.0, 0.5, 0.5),
+                            (2000.0, 50.0, 0.5),
+                            (2000.0, 0.5, 50.0),
+                            (200.0, 10.0, 10.0),
+                        ] {
+                            conn.pin_cost_weights(Some(LearnedWeights {
+                                row_in_pages: Some(0.003),
+                                seek,
+                                hash_build: build,
+                                hash_probe: probe,
+                                sort: 3.0,
+                                bloom_probe: 10.0,
+                                where_step: 1.0,
+                                page_miss: None,
+                            }));
+                            run(format!("pinned seek {seek} build {build} probe {probe}"));
+                            conn.set_bushy_left_join_probes(BushyLeftJoinProbes::ByCost);
+                            run(format!(
+                                "pinned seek {seek} build {build} probe {probe} left join probes"
+                            ));
+                            conn.set_bushy_left_join_probes(BushyLeftJoinProbes::Off);
+                        }
+                        conn.pin_cost_weights(None);
+                        if !large {
+                            for split in [1, 2, 3] {
+                                PIN.with(|pin| pin.set(true));
+                                SPLIT.with(|s| s.set(Some(split)));
+                                run(format!("hand-built split {split}"));
+                                PIN.with(|pin| pin.set(false));
+                                SPLIT.with(|s| s.set(None));
+                            }
+                        }
+                    }
+                    eprintln!(
+                        "C3S|{} analyzed={analyzed}: {} queries in {:?}",
+                        db.name,
+                        db.queries.len(),
+                        began.elapsed()
+                    );
+                }
+            }
+            for (key, [runs, bushy, in_runs, probes, bad]) in &counts {
+                eprintln!(
+                    "C3S|{key}: {runs} runs, {bushy} bushy, {in_runs} with a LEFT JOIN in a run, {probes} with a LEFT JOIN probe, {bad} WRONG"
+                );
+            }
+            for (key, list) in &wrong {
+                for text in list.iter().take(3) {
+                    eprintln!("C3S|WRONG|{key}|{text}");
+                }
+            }
+            eprintln!("C3S|wrong answers {}", wrong.values().map(Vec::len).sum::<usize>());
+        }
+
         /// The bushy tests' queries over `facts` (lanes pl8-14 to pl8-20): the fact queries, with
         /// LEFT JOINs after the core and inside it, with semi and anti joins, and (lane pl8-20) a
         /// LEFT JOIN of the second fact on the first fact and the outer dimension, followed by an
