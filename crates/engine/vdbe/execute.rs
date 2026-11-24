@@ -5577,6 +5577,10 @@ pub fn op_transaction_inner(
 
                 let is_top_level_statement = !program.connection.is_nested_stmt();
                 if statement_writes_db && is_top_level_statement {
+                    if state.fk_deferred_violations_at_start.is_none() {
+                        state.fk_deferred_violations_at_start =
+                            Some(program.connection.get_deferred_foreign_key_violations());
+                    }
                     if !state.is_active_write {
                         let previous = program
                             .connection

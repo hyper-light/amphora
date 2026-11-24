@@ -1028,6 +1028,9 @@ pub struct ProgramState {
     /// What the constraint that failed does to the statement: the clause of the Halt that met it, in
     /// this program or in one it runs (SQLite's `Vdbe.errorAction`). ABORT until one has.
     pub(crate) constraint_action: ResolveType,
+    /// The transaction's deferred violations when this statement began to write, which it is
+    /// refused back to whether or not a statement savepoint was opened for it.
+    pub(crate) fk_deferred_violations_at_start: Option<isize>,
     /// How many programs run this one: none for a statement's own.
     pub(crate) program_depth: usize,
     /// True once the Halt opcode has started finishing the statement. The
@@ -1184,6 +1187,7 @@ impl ProgramState {
             pending_fail_error: None,
             pending_fail_prepare_error: None,
             constraint_action: ResolveType::Abort,
+            fk_deferred_violations_at_start: None,
             program_depth: 0,
             halt_in_progress: false,
             pending_cdc_info: None,
@@ -1396,6 +1400,7 @@ impl ProgramState {
         self.pending_fail_error = None;
         self.pending_fail_prepare_error = None;
         self.constraint_action = ResolveType::Abort;
+        self.fk_deferred_violations_at_start = None;
         self.halt_in_progress = false;
         self.pending_cdc_info = None;
         self.subprogram_stmt_cache.clear();
@@ -3800,6 +3805,11 @@ impl Program {
                 // changes made before the error should persist.
                 // For all other resolve types (ABORT, ROLLBACK, etc.), rollback the statement.
                 if error_action != Some(ResolveType::Fail) {
+                    if let Some(violations) = state.fk_deferred_violations_at_start.take() {
+                        self.connection
+                            .fk_deferred_violations
+                            .store(violations, Ordering::Release);
+                    }
                     if let Err(end_stmt_err) = state.end_statement(
                         &self.connection,
                         pager,
