@@ -915,8 +915,7 @@ pub fn translate_insert(
     // deferring non-REPLACE indexes to the commit phase (skip_replace_indexes).
     // This mixed-mode detection is unnecessary when a statement override exists,
     // because the override applies uniformly to all constraints.
-    let has_ddl_replace = ctx.statement_on_conflict.is_none()
-        && upsert_actions.is_empty()
+    let constraint_replaces = ctx.statement_on_conflict.is_none()
         && resolver.with_schema(ctx.database_id, |schema| {
             any_index_or_ipk_has_replace(
                 ctx.table.rowid_alias_conflict_clause,
@@ -925,6 +924,7 @@ pub fn translate_insert(
                     .map(|idx| idx.on_conflict),
             )
         });
+    let has_ddl_replace = constraint_replaces && upsert_actions.is_empty();
     let on_replace = (matches!(ctx.on_conflict, ResolveType::Replace) && upsert_actions.is_empty())
         || has_ddl_replace;
     let mut preflight_ctx = PreflightCtx {
@@ -1015,10 +1015,10 @@ pub fn translate_insert(
 
     let mut insert_flags = InsertFlags::new();
 
-    // For REPLACE (statement-level or constraint-level), we need to force a seek on the
-    // insert, as we may have already deleted the conflicting row and the cursor is not
-    // guaranteed to be positioned.
-    if matches!(ctx.on_conflict, ResolveType::Replace) || has_ddl_replace {
+    // For REPLACE (statement-level or constraint-level, an upsert's other constraints
+    // among them), we need to force a seek on the insert, as we may have already deleted
+    // the conflicting row and the cursor is not guaranteed to be positioned.
+    if matches!(ctx.on_conflict, ResolveType::Replace) || constraint_replaces {
         insert_flags = insert_flags.require_seek();
     }
     if ctx.table.has_rowid {
