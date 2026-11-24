@@ -2915,6 +2915,11 @@ fn a_right_or_full_join_over_nested_subqueries_returns_sqlites_rows() {
                     "SELECT a.x, b.x FROM e AS a FULL JOIN o AS b ON a.x = b.x WHERE b.x IN (SELECT l.x FROM r JOIN l ON r.x = l.y) AND EXISTS (SELECT 1 FROM r JOIN l ON r.x = l.y)".into(),
                     &["NULL|2"],
                 ),
+                // Nothing is put in the inner list or looked up in it: the table was emptied with no panic.
+                (
+                    "SELECT a.x, b.x FROM o AS a FULL JOIN o AS b ON NULL WHERE (SELECT count(*) FROM e WHERE e.x IN (SELECT s.x FROM e AS s WHERE b.x <= s.x)) = 0".into(),
+                    &["1|NULL", "2|NULL", "NULL|1", "NULL|2"],
+                ),
                 // The unmatched rows are found by the list the WHERE clause tests each of them against.
                 (
                     "SELECT a.x, d.id FROM o AS a FULL JOIN d ON d.id = a.x + 5 WHERE d.k IN (SELECT l.y FROM l)".into(),
