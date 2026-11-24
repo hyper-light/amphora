@@ -869,6 +869,14 @@ fn load_all(target: &Arc<dyn Target>, d: Dialect, shape: &Shape, cedardb: bool) 
 
 pub fn main() -> anyhow::Result<()> {
     let o = opts()?;
+    // AMPHORA_PLAN_TRACE (lane R6): each column copy choice with its two costs and the path taken
+    // (`amphora::column_path`), to stderr, so a run says which path each statement took.
+    if std::env::var_os("AMPHORA_PLAN_TRACE").is_some() {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        let only = tracing_subscriber::filter::Targets::new().with_target("amphora::column_path", tracing_subscriber::filter::LevelFilter::DEBUG);
+        tracing_subscriber::registry().with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_ansi(false)).with(only).try_init()?;
+    }
     let shape = Arc::new(Shape::new(o.items));
     let readers = o.clients.iter().copied().max().unwrap_or(1);
     let target: Arc<dyn Target> = suite_db::open(&o.target, &o.dir, o.dsn.as_deref(), readers, o.reuse)?;
