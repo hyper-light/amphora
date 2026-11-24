@@ -13,13 +13,14 @@ use crate::function::Func;
 use crate::pg_catalog_vtab::{PgCatalog, PgCatalogTable};
 use crate::schema::{BTreeTable, Schema};
 use crate::sync::atomic::{AtomicU32, Ordering};
-use crate::sync::Arc;
+use crate::sync::{Arc, Mutex};
 use crate::{Connection, LimboError, Numeric, Value};
 use amphora_engine_parser::ast;
 use amphora_pg_analysis::datetime::TimeZone;
 use amphora_pg_analysis::{lower, Column, Relations, Session, Value as PgValue};
 use amphora_pg_catalog::data::type_oid;
 use amphora_pg_catalog::{Proc, SearchPath};
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 /// What follows the prefix in a stored definition: `/* pg_class.oid <oid> */ `.
@@ -35,6 +36,10 @@ pub struct PostgresDialect {
     /// and an open loads ([`super::Dialect::load_next_oid`]): a reopen continues from it, never
     /// from the OIDs live tables hold (section 7).
     next_oid: AtomicU32,
+    /// The last rowid given in each table, by its root page, once one was asked for since the database
+    /// was opened. PostgreSQL's rows have no rowid, so two sessions' inserts never meet on one: each is
+    /// given once, a rolled-back transaction's too.
+    rowids: Mutex<HashMap<i64, i64>>,
 }
 
 impl Default for PostgresDialect {
@@ -47,6 +52,7 @@ impl PostgresDialect {
     pub fn new() -> Self {
         Self {
             next_oid: AtomicU32::new(amphora_pg_catalog::FIRST_NORMAL_OBJECT_ID),
+            rowids: Mutex::new(HashMap::new()),
         }
     }
 
@@ -255,6 +261,21 @@ impl super::Dialect for PostgresDialect {
             return Ok(definition);
         }
         Ok(stored(self.allocate_oid(&live_oids(conn)?)?, &definition))
+    }
+
+    fn next_rowid(
+        &self,
+        root_page: i64,
+        largest: &mut dyn FnMut() -> crate::Result<Option<i64>>,
+    ) -> crate::Result<Option<i64>> {
+        let mut rowids = self.rowids.lock();
+        let last = match rowids.get(&root_page) {
+            Some(last) => *last,
+            None => largest()?.unwrap_or_default(),
+        };
+        let next = last.checked_add(1).ok_or(LimboError::DatabaseFull)?;
+        rowids.insert(root_page, next);
+        Ok(Some(next))
     }
 
     fn load_next_oid(&self, stored: u32) {
@@ -504,6 +525,42 @@ mod tests {
 
     /// T-PG.7.3: a database of the PostgreSQL dialect serves pg_namespace, pg_type, pg_class and
     /// pg_attribute, each with exactly PostgreSQL 19's built-in rows while it has no tables.
+    /// T-PG.9.3: two transactions that insert into one table beside each other both commit, as 19's do,
+    /// and rows inserted after a rollback and a reopen are kept apart from the ones there.
+    #[test]
+    fn t_pg_9_3_transactions_that_insert_beside_each_other_both_commit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("history.db");
+        let path = path.to_str().unwrap();
+        let connect = |db: &Arc<Database>| {
+            db.connect(ConnectOpts::new().with_versioned_storage())
+                .unwrap()
+        };
+        {
+            let (db, _) = open(path);
+            let (first, second) = (connect(&db), connect(&db));
+            first.execute("CREATE TABLE history (tid int4)").unwrap();
+            for conn in [&first, &second] {
+                conn.execute("BEGIN").unwrap();
+            }
+            first.execute("INSERT INTO history VALUES (1)").unwrap();
+            second.execute("INSERT INTO history VALUES (2)").unwrap();
+            first.execute("INSERT INTO history VALUES (3)").unwrap();
+            second.execute("COMMIT").unwrap();
+            first.execute("ROLLBACK").unwrap();
+            first.execute("INSERT INTO history VALUES (4)").unwrap();
+        }
+        let (db, _) = open(path);
+        let conn = connect(&db);
+        conn.execute("INSERT INTO history VALUES (5)").unwrap();
+        let mut tids: Vec<i64> = query(&conn, "SELECT tid FROM history")
+            .iter()
+            .map(|row| int(&row[0]))
+            .collect();
+        tids.sort_unstable();
+        assert_eq!(tids, [2, 4, 5]);
+    }
+
     #[test]
     fn t_pg_7_3_each_catalog_serves_19s_built_in_rows() {
         let dir = tempfile::TempDir::new().unwrap();

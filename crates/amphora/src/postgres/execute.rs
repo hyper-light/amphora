@@ -7,21 +7,67 @@ use std::num::NonZero;
 use std::sync::Arc;
 
 use amphora_engine::dialect::postgres::{from_engine, to_engine};
-use amphora_engine::{Connection, LimboError, Statement, Value};
+use amphora_engine::storage::versioned::memory::Source;
+use amphora_engine::{
+    ConnectOpts, Connection, LimboError, PlatformIO, PostgresDialect, Statement, Value,
+};
 use amphora_pg_analysis::datetime::TimeZone;
 use amphora_pg_analysis::stmt::Command;
-use amphora_pg_analysis::{Column, Error, Field, Relations, analyze, lower, output};
+use amphora_pg_analysis::{Column, Error, Field, Relations, analyze, lower, output, utility};
 use amphora_pg_catalog::data::{PG_TYPE, type_oid};
 use amphora_pg_catalog::{Datum, SearchPath};
 use amphora_pg_parser::gram;
 use amphora_pg_parser::tree::{Node, NodeId, TransactionStmtKind, Tree};
 
 use super::session::{Statements, TxStatus};
-use super::wire::{self, PgError, SqlState};
+use super::wire::{self, PgError, Severity, SqlState};
 
 /// Microseconds from PostgreSQL's epoch, 2000-01-01 UTC, to Unix's (`src/include/datatype/timestamp.h`,
 /// `POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE` days).
 const UNIX_EPOCH_MICROS: i64 = -946_684_800_000_000;
+
+/// A database of the PostgreSQL dialect on the engine's versioned storage, where a transaction's writes
+/// are row versions of its own: one open across its client's round trips holds no writer (section 2).
+pub struct Database {
+    engine: Arc<amphora_engine::Database>,
+    memory: Arc<dyn Source>,
+}
+
+impl Database {
+    /// The database at `path`, made as needed, its storage's memory taken from `memory`.
+    pub fn open(path: &str, memory: Arc<dyn Source>) -> Result<Self, LimboError> {
+        let engine = amphora_engine::Database::open_file(
+            Arc::new(PlatformIO::new()?),
+            path,
+            Arc::new(PostgresDialect::new()),
+        )?;
+        let database = Self { engine, memory };
+        // The connection that makes the storage: one it refuses is refused here, not at a login.
+        database.connect()?;
+        Ok(database)
+    }
+
+    fn connect(&self) -> Result<Arc<Connection>, LimboError> {
+        self.engine.connect(
+            ConnectOpts::new()
+                .with_versioned_storage()
+                .with_memory(Arc::clone(&self.memory)),
+        )
+    }
+
+    /// A session of `role`: an executor on a connection of its own. A refusal ends the session, as
+    /// PostgreSQL's does one it can't open a database for.
+    pub fn session(&self, role: &str, time_zone: &str) -> Result<Executor, PgError> {
+        let fatal = |error: PgError| PgError {
+            severity: Severity::Fatal,
+            ..error
+        };
+        let zone = amphora_pg_analysis::tz::time_zone(time_zone)
+            .map_err(|error| fatal(refusal(error, "")))?;
+        let conn = self.connect().map_err(|error| fatal(engine(error)))?;
+        Ok(Executor::new(conn, role, zone, Box::new(system_clock)))
+    }
+}
 
 /// The session's `search_path` (its role's schema, then `public`), its catalogs read from the engine's
 /// schema through `pg_class` and `pg_attribute` (section 9).
@@ -99,7 +145,7 @@ impl Relations for Catalog {
     fn columns(&self, oid: u32) -> Vec<Column> {
         let rows = self
             .rows(
-                "SELECT attname, atttypid, atttypmod FROM pg_attribute WHERE attrelid = ?1 AND attnum > 0 AND attisdropped = 0 ORDER BY attnum",
+                "SELECT attname, atttypid, atttypmod, attnotnull FROM pg_attribute WHERE attrelid = ?1 AND attnum > 0 AND attisdropped = 0 ORDER BY attnum",
                 &[int(oid)],
             )
             .unwrap_or_default();
@@ -116,11 +162,27 @@ impl Relations for Catalog {
                     name,
                     type_oid,
                     typmod,
+                    not_null: oid_of(row.get(3)) == Some(1),
                 });
             }
         }
         columns
     }
+}
+
+/// The transaction block a session is in between two statements, as far as xact.c's `TBlockState` tells
+/// them apart (REL_19_0 src/backend/access/transam/xact.c:141-165).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Block {
+    /// Each statement is its own transaction.
+    None,
+    /// A Query of several statements is one transaction (`TBLOCK_IMPLICIT_INPROGRESS`): it ends with the
+    /// Query, unless BEGIN makes it the client's.
+    Implicit,
+    /// The client's, from BEGIN.
+    Explicit,
+    /// The client's, refused (`25P02`) but for what ends it.
+    Failed,
 }
 
 /// A session's statements run on `conn`, in the search path of `role`, under `time_zone`. `clock` gives
@@ -131,11 +193,9 @@ pub struct Executor {
     path: SearchPath,
     time_zone: TimeZone,
     clock: Box<dyn Fn() -> i64>,
-    status: TxStatus,
+    block: Block,
     /// The open transaction's start (`GetCurrentTransactionStartTimestamp`).
     began: i64,
-    /// A transaction a Query of several statements began for itself.
-    implicit: bool,
 }
 
 /// `now` as [`Executor`]'s clock gives it, from the system's.
@@ -169,17 +229,16 @@ impl Executor {
             path,
             time_zone,
             clock,
-            status: TxStatus::Idle,
+            block: Block::None,
             began: 0,
-            implicit: false,
         }
     }
 
     fn statement(
         &mut self,
+        sql: &str,
         tree: &Tree,
         id: NodeId,
-        several: bool,
         out: &mut Vec<u8>,
     ) -> Result<(), PgError> {
         let Node::RawStmt {
@@ -201,26 +260,18 @@ impl Executor {
             .get(*stmt)
             .map_err(|_| internal("a parse tree node is missing"))?
         {
-            if several {
-                return Err(unsupported(
-                    "transaction control in a Query of several statements",
-                ));
-            }
             if !options.is_empty() || *chain {
                 return Err(unsupported("this transaction command"));
             }
             return self.transaction(*kind, out);
         }
-        if self.status == TxStatus::Failed {
-            return Err(PgError::error(
-                SqlState::new("25P02"),
-                "current transaction is aborted, commands ignored until end of transaction block",
-            ));
+        if self.block == Block::Failed {
+            return Err(aborted());
         }
-        let now = if self.status == TxStatus::InTransaction || self.implicit {
-            self.began
-        } else {
+        let now = if self.block == Block::None {
             (self.clock)()
+        } else {
+            self.began
         };
         let lowered = {
             let session = amphora_pg_analysis::Session {
@@ -229,14 +280,18 @@ impl Executor {
                 time_zone: &self.time_zone,
                 now: Some(now),
             };
-            let query = analyze(tree, id, &session, &[]).map_err(refusal)?;
+            if let Some(utility) = utility(tree, id, &session).map_err(|e| refusal(e, sql))? {
+                self.conn.execute(&utility.sql).map_err(engine)?;
+                return complete(out, utility.tag);
+            }
+            let query = analyze(tree, id, &session, &[]).map_err(|e| refusal(e, sql))?;
             if !query.params.is_empty() {
                 return Err(PgError::error(
                     SqlState::new("42P02"),
                     "there is no parameter $1",
                 ));
             }
-            let lowered = lower(&query, &session).map_err(refusal)?;
+            let lowered = lower(&query, &session).map_err(|e| refusal(e, sql))?;
             (query.command, lowered)
         };
         let (command, lowered) = lowered;
@@ -304,7 +359,8 @@ impl Executor {
             let text = match value {
                 None => None,
                 Some(value) => {
-                    let mut text = output(field.type_oid, &value, &session).map_err(refusal)?;
+                    let mut text =
+                        output(field.type_oid, &value, &session).map_err(|e| refusal(e, ""))?;
                     if field.type_oid == type_oid::BPCHAR {
                         pad(&mut text, field.typmod);
                     }
@@ -316,50 +372,53 @@ impl Executor {
         Ok(texts)
     }
 
+    /// BEGIN, COMMIT and ROLLBACK, each in each block (xact.c's `BeginTransactionBlock`,
+    /// `EndTransactionBlock` and `UserAbortTransactionBlock`).
     fn transaction(&mut self, kind: TransactionStmtKind, out: &mut Vec<u8>) -> Result<(), PgError> {
-        match (kind, self.status) {
-            (TransactionStmtKind::Begin, TxStatus::Idle) => {
+        match (kind, self.block) {
+            (TransactionStmtKind::Begin, Block::None) => {
                 self.begin()?;
-                self.status = TxStatus::InTransaction;
+                self.block = Block::Explicit;
                 complete(out, "BEGIN")
             }
-            (TransactionStmtKind::Begin, TxStatus::InTransaction) => {
-                wire::notice_response(
-                    out,
-                    "WARNING",
-                    "25001",
-                    "there is already a transaction in progress",
-                )?;
+            (TransactionStmtKind::Begin, Block::Implicit) => {
+                self.block = Block::Explicit;
                 complete(out, "BEGIN")
             }
-            (TransactionStmtKind::Begin, TxStatus::Failed) => Err(PgError::error(
-                SqlState::new("25P02"),
-                "current transaction is aborted, commands ignored until end of transaction block",
-            )),
-            (TransactionStmtKind::Commit, TxStatus::InTransaction) => {
-                let result = self.conn.execute("COMMIT").map_err(engine);
-                self.status = TxStatus::Idle;
-                if let Err(error) = result {
-                    self.undo();
-                    return Err(error);
-                }
+            (TransactionStmtKind::Begin, Block::Explicit) => {
+                let text = "there is already a transaction in progress";
+                wire::notice_response(out, "WARNING", "25001", text)?;
+                complete(out, "BEGIN")
+            }
+            (TransactionStmtKind::Begin, Block::Failed) => Err(aborted()),
+            (TransactionStmtKind::Commit, Block::Explicit) => self.commit(out),
+            (TransactionStmtKind::Commit, Block::Implicit) => {
+                no_transaction(out)?;
+                self.commit(out)
+            }
+            (TransactionStmtKind::Commit, Block::None) => {
+                no_transaction(out)?;
                 complete(out, "COMMIT")
             }
-            (TransactionStmtKind::Commit, TxStatus::Failed) => {
-                self.status = TxStatus::Idle;
-                self.undo();
+            (TransactionStmtKind::Rollback, Block::None | Block::Implicit) => {
+                no_transaction(out)?;
+                self.end();
                 complete(out, "ROLLBACK")
             }
-            (TransactionStmtKind::Commit, TxStatus::Idle) => {
-                wire::notice_response(
-                    out,
-                    "WARNING",
-                    "25P01",
-                    "there is no transaction in progress",
-                )?;
-                complete(out, "COMMIT")
+            (TransactionStmtKind::Commit, Block::Failed)
+            | (TransactionStmtKind::Rollback, Block::Explicit | Block::Failed) => {
+                self.end();
+                complete(out, "ROLLBACK")
             }
         }
+    }
+
+    /// Commits the block's transaction: one the engine refuses ends without its writes.
+    fn commit(&mut self, out: &mut Vec<u8>) -> Result<(), PgError> {
+        let result = self.conn.execute("COMMIT").map_err(engine);
+        self.end();
+        result?;
+        complete(out, "COMMIT")
     }
 
     fn begin(&mut self) -> Result<(), PgError> {
@@ -367,8 +426,9 @@ impl Executor {
         self.conn.execute("BEGIN").map_err(engine)
     }
 
-    /// Ends the engine's transaction without its writes, if one is open.
-    fn undo(&self) {
+    /// Leaves the block, without the writes of the engine's transaction if one is open.
+    fn end(&mut self) {
+        self.block = Block::None;
         if !self.conn.get_auto_commit() {
             // A refused ROLLBACK has nothing more to undo: the engine's own refusal is logged.
             if let Err(error) = self.conn.execute("ROLLBACK") {
@@ -377,54 +437,69 @@ impl Executor {
         }
     }
 
-    /// Answers with `error`, and ends what it ends: an implicit transaction, or the block's writes.
+    /// Answers with `error`, and ends what it ends: an implicit transaction, or the block but for END.
+    /// The statement's own writes are the engine's to undo, the block's are END's.
     fn refuse(&mut self, error: &PgError, out: &mut Vec<u8>) -> Result<(), PgError> {
-        if self.implicit {
-            self.implicit = false;
-            self.undo();
-        } else if self.status == TxStatus::InTransaction {
-            self.status = TxStatus::Failed;
-            // Nothing of the block may stay: the statement's own effects are the engine's to undo at
-            // the statement, the block's at END.
+        match self.block {
+            Block::None | Block::Implicit => self.end(),
+            Block::Explicit | Block::Failed => self.block = Block::Failed,
         }
         wire::error_response(out, error)
+    }
+
+    /// A Query's statements in order (`exec_simple_query`, REL_19_0 src/backend/tcop/postgres.c): several
+    /// run in an implicit block, begun again after one that ends it.
+    fn statements(
+        &mut self,
+        sql: &str,
+        tree: &Tree,
+        statements: &[NodeId],
+        out: &mut Vec<u8>,
+    ) -> Result<(), PgError> {
+        for id in statements {
+            if statements.len() > 1 && self.block == Block::None {
+                self.begin()?;
+                self.block = Block::Implicit;
+            }
+            self.statement(sql, tree, *id, out)?;
+        }
+        if self.block == Block::Implicit {
+            let result = self.conn.execute("COMMIT").map_err(engine);
+            self.end();
+            result?;
+        }
+        Ok(())
+    }
+}
+
+/// A client that goes away mid-transaction leaves none of its writes (`AbortOutOfAnyTransaction` as a
+/// backend exits, REL_19_0 src/backend/access/transam/xact.c).
+impl Drop for Executor {
+    fn drop(&mut self) {
+        self.end();
     }
 }
 
 impl Statements for Executor {
     fn status(&self) -> TxStatus {
-        self.status
+        match self.block {
+            Block::None | Block::Implicit => TxStatus::Idle,
+            Block::Explicit => TxStatus::InTransaction,
+            Block::Failed => TxStatus::Failed,
+        }
     }
 
     fn simple_query(&mut self, sql: &str, out: &mut Vec<u8>) -> Result<(), PgError> {
-        let (tree, statements) = match gram::parse(sql.as_bytes()) {
-            Ok(parsed) => parsed,
-            Err(refused) => {
-                let error = PgError::error(SqlState::new(refused.sqlstate), refused.message);
-                return self.refuse(&error, out);
-            }
-        };
-        let several = statements.len() > 1;
-        if several && self.status == TxStatus::Idle {
-            self.implicit = true;
-            if let Err(error) = self.begin() {
-                self.implicit = false;
-                return self.refuse(&error, out);
-            }
+        let ran = gram::parse(sql.as_bytes())
+            .map_err(|refused| {
+                PgError::error(SqlState::new(refused.sqlstate), refused.message)
+                    .with_position((refused.cursor > 0).then_some(refused.cursor))
+            })
+            .and_then(|(tree, statements)| self.statements(sql, &tree, &statements, out));
+        match ran {
+            Ok(()) => Ok(()),
+            Err(error) => self.refuse(&error, out),
         }
-        for id in statements {
-            if let Err(error) = self.statement(&tree, id, several, out) {
-                return self.refuse(&error, out);
-            }
-        }
-        if self.implicit {
-            self.implicit = false;
-            if let Err(error) = self.conn.execute("COMMIT").map_err(engine) {
-                self.undo();
-                return self.refuse(&error, out);
-            }
-        }
-        Ok(())
     }
 }
 
@@ -441,13 +516,32 @@ fn internal(message: &str) -> PgError {
     PgError::error(SqlState::INTERNAL_ERROR, message)
 }
 
-fn unsupported(what: &str) -> PgError {
-    refusal(Error::unsupported(what))
+/// A statement of a block that a refusal ended.
+fn aborted() -> PgError {
+    PgError::error(
+        SqlState::new("25P02"),
+        "current transaction is aborted, commands ignored until end of transaction block",
+    )
 }
 
-/// Analysis's refusal, as it is.
-fn refusal(error: Error) -> PgError {
-    PgError::error(SqlState::new(error.sqlstate), error.message)
+/// The warning COMMIT and ROLLBACK give outside the client's block.
+fn no_transaction(out: &mut Vec<u8>) -> Result<(), PgError> {
+    let text = "there is no transaction in progress";
+    wire::notice_response(out, "WARNING", "25P01", text)
+}
+
+fn unsupported(what: &str) -> PgError {
+    refusal(Error::unsupported(what), "")
+}
+
+/// Analysis's refusal of a statement of `sql`: its place there as `parser_errposition` counts it
+/// (REL_19_0 src/backend/parser/parse_node.c), in characters from 1.
+fn refusal(error: Error, sql: &str) -> PgError {
+    let position = usize::try_from(error.location)
+        .ok()
+        .and_then(|at| sql.get(..at))
+        .map(|before| before.chars().count().saturating_add(1));
+    PgError::error(SqlState::new(error.sqlstate), error.message).with_position(position)
 }
 
 /// What the engine refused.

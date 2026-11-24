@@ -150,6 +150,10 @@ pub trait Statements {
     fn simple_query(&mut self, sql: &str, out: &mut Vec<u8>) -> Result<(), PgError>;
 }
 
+/// What opens a session's database once its role is authenticated, as PostgreSQL's InitPostgres opens
+/// it (`src/backend/utils/init/postinit.c`): a refusal ends the connection (FATAL).
+pub type Open = Box<dyn FnOnce(&Startup) -> Result<Box<dyn Statements>, PgError>>;
+
 /// One connection.
 pub struct Session {
     config: Config,
@@ -157,6 +161,7 @@ pub struct Session {
     phase: Phase,
     /// Why the server can't take this session, answered once its StartupMessage is read.
     refused: Option<PgError>,
+    open: Option<Open>,
     /// What runs its statements: none refuses each with `0A000`.
     statements: Option<Box<dyn Statements>>,
 }
@@ -400,14 +405,15 @@ impl Session {
                 gss_done: false,
             },
             refused: None,
+            open: None,
             statements: None,
         }
     }
 
-    /// The session whose statements `statements` runs.
+    /// The session whose statements run on what `open` gives it once its role is authenticated.
     #[must_use]
-    pub fn with_statements(mut self, statements: Box<dyn Statements>) -> Self {
-        self.statements = Some(statements);
+    pub fn with_database(mut self, open: Open) -> Self {
+        self.open = Some(open);
         self
     }
 
@@ -740,6 +746,12 @@ impl Session {
         };
         authentication(out, 12, server_final.as_bytes())?;
         authentication(out, 0, &[])?;
+        if let Some(open) = self.open.take() {
+            match open(&startup) {
+                Ok(statements) => self.statements = Some(statements),
+                Err(error) => return fatal(out, len, &error),
+            }
+        }
         self.report(&startup, superuser, out)?;
         let key_len = if startup.version >= PROTOCOL_3_2 {
             self.seed.cancel_key.len()

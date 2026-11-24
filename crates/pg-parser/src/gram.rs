@@ -6,6 +6,8 @@
 //! ([`ported`]), which builds 19's raw parse tree (crate::tree). A statement that reduces a rule
 //! whose action isn't ported yet is answered 0A000.
 
+use std::borrow::Cow;
+
 use crate::gram_tables::{
     ACTION_HASH, CHECK, DEFACT, DEFGOTO, FINAL, LAST, MAXUTOK, NTOKENS, PACT, PACT_DEFAULT, PGOTO,
     R1, R2, TABLE, TABLE_ERROR, TRANSLATE,
@@ -33,7 +35,7 @@ const INVALID_PARAMETER_VALUE: &str = "22023";
 pub struct Refusal {
     pub sqlstate: &'static str,
     pub cursor: usize,
-    pub message: &'static str,
+    pub message: Cow<'static, str>,
 }
 
 impl From<ScanError> for Refusal {
@@ -41,7 +43,7 @@ impl From<ScanError> for Refusal {
         Self {
             sqlstate: e.sqlstate,
             cursor: e.cursor,
-            message: e.message,
+            message: e.message.into(),
         }
     }
 }
@@ -56,7 +58,7 @@ fn fault() -> Refusal {
     Refusal {
         sqlstate: "XX000",
         cursor: 0,
-        message: "parser tables fault",
+        message: "parser tables fault".into(),
     }
 }
 
@@ -65,7 +67,7 @@ fn not_utf8() -> Refusal {
     Refusal {
         sqlstate: "22021",
         cursor: 0,
-        message: "invalid byte sequence for encoding \"UTF8\"",
+        message: "invalid byte sequence for encoding \"UTF8\"".into(),
     }
 }
 
@@ -89,11 +91,11 @@ fn symbol(token: i32) -> Result<i32, Refusal> {
 
 /// scanner_yyerror at the last token read (yylloc): 19 says "at end of input" there, else
 /// "at or near" the token.
-fn syntax_error(sql: &[u8], at: usize, message: &'static str) -> Refusal {
+fn syntax_error(sql: &[u8], at: usize, message: impl Into<Cow<'static, str>>) -> Refusal {
     Refusal {
         sqlstate: SYNTAX_ERROR,
         cursor: cursor(sql, at),
-        message,
+        message: message.into(),
     }
 }
 
@@ -235,7 +237,7 @@ impl Reduce<'_> {
         Refusal {
             sqlstate,
             cursor,
-            message,
+            message: message.into(),
         }
     }
 
@@ -484,8 +486,12 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         1145 => (0x0b11_90e3_6dba_5283, |_| Ok(Value::Int(0))),
         // opt_definition: /* EMPTY */
         1233 => (0x1e2a_fd0a_a524_9ce8, nil),
+        // TransactionStmt: ABORT_P opt_transaction opt_transaction_chain
+        1489 => (0xd07f_6118_1eda_3390, rollback),
         // TransactionStmt: COMMIT opt_transaction opt_transaction_chain
         1491 => (0x88ca_638c_a2a9_d9bb, end),
+        // TransactionStmt: ROLLBACK opt_transaction opt_transaction_chain
+        1492 => (0xd07f_6118_1eda_3390, rollback),
         // VacuumStmt: VACUUM opt_full opt_freeze opt_verbose opt_analyze opt_vacuum_relation_list
         1590 => (0x250c_65d1_45e2_42d6, vacuum_stmt),
         // opt_analyze: analyze_keyword
@@ -676,8 +682,18 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         2056 => (0x94b8_110d_a054_53de, |r| a_expr_op(r, "-")),
         // a_expr: a_expr '/' a_expr
         2058 => (0x25dc_16de_5219_d95c, |r| a_expr_op(r, "/")),
+        // a_expr: a_expr '<' a_expr
+        2061 => (0x40e8_d732_92b6_8e93, |r| a_expr_op(r, "<")),
+        // a_expr: a_expr '>' a_expr
+        2062 => (0x03a0_38c5_bbe4_2bc1, |r| a_expr_op(r, ">")),
         // a_expr: a_expr '=' a_expr
         2063 => (0x8a20_32d0_a75b_2e2e, |r| a_expr_op(r, "=")),
+        // a_expr: a_expr LESS_EQUALS a_expr
+        2064 => (0x49ff_5b50_583e_4358, |r| a_expr_op(r, "<=")),
+        // a_expr: a_expr GREATER_EQUALS a_expr
+        2065 => (0x0dfb_6c26_8c24_8fa2, |r| a_expr_op(r, ">=")),
+        // a_expr: a_expr NOT_EQUALS a_expr
+        2066 => (0x9ded_22b4_57b1_9aff, |r| a_expr_op(r, "<>")),
         // a_expr: a_expr AND a_expr
         2069 => (0x9b8b_3cb2_7846_ac2b, and_expr),
         // a_expr: a_expr IS NOT NULL_P
@@ -867,6 +883,11 @@ fn begin(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
 fn end(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
     let chain = r.boolean(3)?;
     transaction(r, TransactionStmtKind::Commit, Vec::new(), chain)
+}
+
+fn rollback(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let chain = r.boolean(3)?;
+    transaction(r, TransactionStmtKind::Rollback, Vec::new(), chain)
 }
 
 /// `$$ = $n` of the rule's last symbol: gram.c reads it as `yyvsp[0]` whatever `n` is, so every
@@ -2208,12 +2229,18 @@ pub fn accepts(sql: &[u8]) -> Result<(), Refusal> {
     parse_tree(sql).map(|_| ())
 }
 
+/// scanner_yyerror's message (src/backend/parser/scan.l): the token's own text, which is what the
+/// scanner holds from the token's start to where it stopped.
 fn error_at(sql: &[u8], at: usize, lookahead: Option<i32>) -> Refusal {
     if lookahead == Some(END) {
-        syntax_error(sql, at, "syntax error at end of input")
-    } else {
-        syntax_error(sql, at, "syntax error at or near a token")
+        return syntax_error(sql, at, "syntax error at end of input");
     }
+    let token = sql
+        .get(at..)
+        .and_then(|rest| rest.get(..lex::token_len(rest)))
+        .map(String::from_utf8_lossy)
+        .unwrap_or_default();
+    syntax_error(sql, at, format!("syntax error at or near \"{token}\""))
 }
 
 /// A query string's answer: 19's tree, 19's refusal where 19 refuses, and 0A000 for a string 19's
@@ -2224,7 +2251,7 @@ pub fn parse(sql: &[u8]) -> Result<(Tree, Vec<NodeId>), Refusal> {
         Parsed::Unported => Err(Refusal {
             sqlstate: FEATURE_NOT_SUPPORTED,
             cursor: 0,
-            message: "a rule this statement needs has no ported action yet",
+            message: "a rule this statement needs has no ported action yet".into(),
         }),
     }
 }
@@ -2301,7 +2328,7 @@ mod tests {
                 n += 1;
             }
         }
-        assert_eq!(n, 265);
+        assert_eq!(n, 272);
     }
 
     /// T-PG.5.1: a syntax error is 42601 at the token 19 names (1-based characters), the end of
@@ -2313,6 +2340,23 @@ mod tests {
         assert_eq!(refused("NOTIFY ch, $1"), ("42601", 12));
         assert_eq!(refused("SELEC 1"), ("42601", 1));
         assert_eq!(refused("select 'é' from from"), ("42601", 17));
+    }
+
+    /// T-PG.5.1: a syntax error names the token as scanner_yyerror (scan.l) does, and a transaction
+    /// command or a comparison ported from its rule prints as 19's does.
+    #[test]
+    fn t_pg_5_1_syntax_errors_name_the_token_19_names() {
+        let message = |sql: &str| accepts(sql.as_bytes()).unwrap_err().message.into_owned();
+        assert_eq!(
+            message("SELECT FROM WHERE"),
+            "syntax error at or near \"WHERE\""
+        );
+        assert_eq!(message("SELEC 1"), "syntax error at or near \"SELEC\"");
+        assert_eq!(
+            message("select 1 from 'é' where"),
+            "syntax error at or near \"'é'\""
+        );
+        assert_eq!(message("SELECT 1 +"), "syntax error at end of input");
     }
 
     /// T-PG.5.1: the scanner's refusals come through before the grammar sees the token.
@@ -2327,6 +2371,9 @@ mod tests {
     fn t_pg_5_1_deep_nesting_is_refused_memory_exhausted() {
         let sql = format!("SELECT {}1{}", "(".repeat(20_000), ")".repeat(20_000));
         let e = accepts(sql.as_bytes()).unwrap_err();
-        assert_eq!((e.sqlstate, e.message), ("42601", "memory exhausted"));
+        assert_eq!(
+            (e.sqlstate, e.message.as_ref()),
+            ("42601", "memory exhausted")
+        );
     }
 }

@@ -1,0 +1,102 @@
+s1|create table pgbench_history(tid int,bid int,aid    int,delta int,mtime timestamp,filler char(22))
+s1|create table pgbench_tellers(tid int not null,bid int,tbalance int,filler char(84)) with (fillfactor=100)
+s1|create table pgbench_accounts(aid    int not null,bid int,abalance int,filler char(84)) with (fillfactor=100)
+s1|create table pgbench_branches(bid int not null,bbalance int,filler char(88)) with (fillfactor=100)
+s1|create table pgbench_branches(bid int)
+s1|create table other(a int, a int)
+s1|create table other(a nosuch)
+s1|begin
+s1|insert into pgbench_branches(bid,bbalance) values(1, 0)
+s1|insert into pgbench_branches(bid,bbalance) values(2, 0)
+s1|insert into pgbench_tellers(tid,bid,tbalance) values (1, 1, 0)
+s1|insert into pgbench_tellers(tid,bid,tbalance) values (11, 2, 0)
+s1|insert into pgbench_accounts(aid,bid,abalance,filler) values (1, 1, 0, '')
+s1|insert into pgbench_accounts(aid,bid,abalance,filler) values (2, 1, 2147483640, 'a''b')
+s1|insert into pgbench_accounts(aid,bid,abalance,filler) values (100001, 2, 0, '')
+s1|commit
+s1|alter table pgbench_branches add primary key (bid)
+s1|alter table pgbench_tellers add primary key (tid)
+s1|alter table pgbench_accounts add primary key (aid)
+s1|alter table pgbench_account add primary key (aid)
+s1|alter table pgbench_accounts add primary key (nope)
+s2|SELECT aid, bid, abalance, filler FROM pgbench_accounts WHERE aid = 2
+s2|SELECT bid, bbalance, filler FROM pgbench_branches WHERE bid = 1
+s2|SELECT aid FROM pgbench_accounts WHERE aid < 2
+s2|SELECT aid FROM pgbench_accounts WHERE aid > 100000
+s2|SELECT aid FROM pgbench_accounts WHERE aid <= 1
+s2|SELECT aid FROM pgbench_accounts WHERE aid >= 100001
+s2|SELECT tid FROM pgbench_tellers WHERE tid <> 1
+s2|SELECT tid FROM pgbench_tellers WHERE tid != 11
+s2|SELECT aid FROM pgbench_accounts WHERE aid > 1 AND aid < 100001
+s2|SELECT aid FROM pgbench_accounts WHERE aid > abalance AND bid = 2
+s2|SELECT abalance > 0, abalance <= 2147483640, abalance <> 5 FROM pgbench_accounts WHERE aid = 2
+s2|SELECT bid FROM pgbench_branches WHERE filler <> 'x'
+s2|SELECT 1 < 2, 2 <= 1, 3 > 2, 2 >= 3, 1 <> 1, 1 != 2
+s1|BEGIN
+s1|UPDATE pgbench_accounts SET abalance = abalance + 1500 WHERE aid = 1
+s2|SELECT abalance FROM pgbench_accounts WHERE aid = 1
+s2|BEGIN
+s2|UPDATE pgbench_accounts SET abalance = abalance + -300 WHERE aid = 100001
+s1|SELECT abalance FROM pgbench_accounts WHERE aid = 1
+s2|SELECT abalance FROM pgbench_accounts WHERE aid = 100001
+s1|UPDATE pgbench_tellers SET tbalance = tbalance + 1500 WHERE tid = 1
+s2|UPDATE pgbench_tellers SET tbalance = tbalance + -300 WHERE tid = 11
+s1|UPDATE pgbench_branches SET bbalance = bbalance + 1500 WHERE bid = 1
+s2|UPDATE pgbench_branches SET bbalance = bbalance + -300 WHERE bid = 2
+s1|INSERT INTO pgbench_history (tid, bid, aid, delta, mtime) VALUES (1, 1, 1, 1500, CURRENT_TIMESTAMP)
+s2|INSERT INTO pgbench_history (tid, bid, aid, delta, mtime) VALUES (11, 2, 100001, -300, CURRENT_TIMESTAMP)
+s1|END
+s2|END
+s1|SELECT abalance FROM pgbench_accounts WHERE aid = 100001
+s2|SELECT abalance FROM pgbench_accounts WHERE aid = 1
+s1|SELECT tid, bid, aid, delta, mtime FROM pgbench_history WHERE tid = 11
+s1|SELECT tbalance FROM pgbench_tellers WHERE tid = 1
+s1|SELECT bbalance FROM pgbench_branches WHERE bid = 2
+s1|BEGIN
+s1|UPDATE pgbench_accounts SET abalance = abalance + 7 WHERE aid = 1
+s1|SELECT abalance FROM pgbench_accounts WHERE aid = 1
+s1|ROLLBACK
+s1|SELECT abalance FROM pgbench_accounts WHERE aid = 1
+s1|BEGIN
+s1|UPDATE pgbench_accounts SET abalance = abalance + 1 WHERE aid = 1
+s1|ABORT
+s1|SELECT abalance FROM pgbench_accounts WHERE aid = 1
+s1|BEGIN
+s1|UPDATE pgbench_accounts SET abalance = abalance + 1 WHERE aid = 1
+s1|UPDATE pgbench_accounts SET abalance = abalance + 100 WHERE aid = 2
+s1|SELECT abalance FROM pgbench_accounts WHERE aid = 1
+s1|BEGIN
+s1|ROLLBACK
+s1|SELECT abalance FROM pgbench_accounts WHERE aid = 1
+s1|ROLLBACK
+s1|COMMIT
+s1|BEGIN
+s1|BEGIN
+s1|COMMIT
+s1|SELECT abalance FROM pgbench_account WHERE aid = 1
+s1|SELECT balance FROM pgbench_accounts WHERE aid = 1
+s1|SELECT abalance FROM pgbench_accounts WHERE aid = 'x'
+s1|SELECT abalance FROM pgbench_accounts WHERE filler > 1
+s1|INSERT INTO pgbench_accounts(aid, nope) VALUES (1, 2)
+s1|UPDATE pgbench_accounts SET nope = 1 WHERE aid = 1
+s1|SELEC 1
+s1|SELECT 1 +
+s1|SELECT abalance FRO pgbench_accounts
+s1|SELECT 1 / 0
+s1|SELECT 2147483647 + 1
+s1|SELECT 5000000000, -2147483648
+s1|SELECT 1;
+s1|;
+s1|SELECT 1; SELECT 2
+s1|INSERT INTO pgbench_branches(bid,bbalance) VALUES (3, 5); SELECT bbalance FROM pgbench_branches WHERE bid = 3
+s1|INSERT INTO pgbench_branches(bid,bbalance) VALUES (4, 5); SELECT 1 / 0; SELECT 3
+s2|SELECT bbalance FROM pgbench_branches WHERE bid = 4
+s1|BEGIN; UPDATE pgbench_branches SET bbalance = bbalance + 1 WHERE bid = 3; SELECT bbalance FROM pgbench_branches WHERE bid = 3; END
+s1|INSERT INTO pgbench_branches(bid,bbalance) VALUES (5, 5); BEGIN
+s2|SELECT bbalance FROM pgbench_branches WHERE bid = 5
+s1|ROLLBACK
+s2|SELECT bbalance FROM pgbench_branches WHERE bid = 5
+s1|INSERT INTO pgbench_branches(bid,bbalance) VALUES (6, 5); COMMIT; SELECT 1 / 0
+s2|SELECT bbalance FROM pgbench_branches WHERE bid = 6
+s1|INSERT INTO pgbench_branches(bid,bbalance) VALUES (7, 5); ROLLBACK; SELECT bbalance FROM pgbench_branches WHERE bid = 7
+s1|SELECT 1; SELEC 2
