@@ -740,5 +740,6 @@ Main moved inside `crates/engine` twice more before the push, so each merge was 
 |---|---|---|
 | r1922 | ffe2fa35 (72d62e76 + main a48b29f2: R6's column copy choice) | needs cpus=4: clippy clean; `store::` 6/6, `database::` 254/254 (6 ignored), `xgroup::` 34/34, tests/store.rs 14/14, tests/crash.rs 10/10 (3 ignored); load 65-105 |
 | r1940 | 473b207e (ffe2fa35 + this record + main 90c1ff8d: B16's checkpointer segment) | needs cpus=4: the same, all green; load 28-81 |
+| r1944 | c1c0e531 (473b207e + these rows + main b1a92917: V13's database/replicated.rs and slot.rs) | needs cpus=4: clippy clean; `store::` 6/6, `database::` 256/256 (6 ignored), `xgroup::` 34/34, tests/store.rs 14/14, tests/crash.rs 10/10 (3 ignored); load 17-26 |
 
-Pushed to main as 473b207e plus this record: unit 4 (14e6d081) and the wait (bdfb19ff, f4e87ed0) land together. Unit 4 alone was not pushed first: its own check had `xgroup::` 33/34, and the tree with the wait was green three times.
+Unit 4 (14e6d081) and the wait (bdfb19ff, f4e87ed0) land together. Unit 4 alone was not pushed first: its own check had `xgroup::` 33/34, and the tree with the wait was green on every check.
