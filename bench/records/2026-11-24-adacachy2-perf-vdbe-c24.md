@@ -11,9 +11,10 @@ Runs named (r...) are in kiln's output log.
 - **DS was five defects, not one**, all at default settings: rowid 0 NULL; a NULL row's rowid the last row's; json_each's and json_tree's rowids other numbers than SQLite's; a LEFT or FULL JOIN to
   generate_series that never ended; a rowid read past a materialized hash build (section 3). 870 of the 1,400 queries drawn differed at default, and 3 more never ended.
 - json_each's and json_tree's `id` and `parent` are other numbers than SQLite's (its are offsets in the JSONB): left. json1.html 4.10 promises only that id differs row by row.
-- The sweep does not draw: generate_series' value or rowid beside text or a real (SQLite reads either as an integer by plan: `json_each('{"a": {"b": 1}}') AS t0 LEFT JOIN generate_series(2, 0, -1) AS t1 ON t1.rowid = t0.value`
+- The sweep does not draw: generate_series' value or rowid beside text or a real (SQLite reads either as an integer by plan: `json_each('{"a": {"b": 1}, "c": [2]}') AS t0 LEFT JOIN generate_series(2, 0, -1) AS t1 ON t1.rowid = t0.value`
   matches the text '{"b":1}' with 0 in SQLite, not in Amphora); an argument that reads a table to its right or is given in WHERE; a virtual table that an extension writes.
-- The sweeps hold five settings. Merge joins only and nested loops only were asked of the hand cases alone (0 differ). Statistics hide most of DT's 36: ANALYZE moves the order.
+- The sweeps hold five settings. Merge joins only and nested loops only were asked of the hand cases alone (0 differ).
+- The fix moves plans. The smallest DT's default plan now joins the grouped table before s1 (EXPLAIN QUERY PLAN); with statistics it was never wrong, both EXISTS staying subqueries there.
 - Not run: macOS, the whole workspace's tests, `planner`, the corpus subset, a benchmark. What a subquery no longer put off costs was not measured: wrong rows came of it.
 - Lost time: a probe over 300-row tables in a debug build held a run 5 minutes and answered one class; kiln's server gave no answer four times and lost two runs (r2060, r2075); a first run's script came in a mistyped base64.
 
@@ -27,7 +28,7 @@ Runs named (r...) are in kiln's output log.
 | DS | a(k): 1, 2: `a AS x RIGHT JOIN json_tree('[7,1]') AS je ON 1` | 6 rows | 7, the root again unmatched (all) | SQLite's |
 | DS | `SELECT x.k, je.rowid FROM a AS x LEFT JOIN json_each('[7,1]') AS je ON je.value = x.k` | `1,1; 2,NULL` | `1,2; 2,4` (all) | SQLite's |
 | DS | `SELECT rowid, atom FROM json_tree('[[1,2],3]')` | 0, 1, 2, 3, 4 | NULL, 1, 2, 3, 5 (all) | SQLite's |
-| DS | a(k, v) with a NULL k: `a AS t0 FULL JOIN generate_series(0, t0.k) AS t1 ON 1` | 11 rows | never ends (default, parallel, hash joins only) | SQLite's |
+| DS | a(k, v) with a NULL k: `a AS t0 FULL JOIN generate_series(0, t0.k) AS t1 ON 1` | 11 rows | never ends (default) | SQLite's |
 | DS | `a AS t0 JOIN b AS t1 ON t1.k = t0.k RIGHT JOIN generate_series(-2, 4, 2) AS t2 ON t2.rowid <= t1.k WHERE t0.k = t2.rowid` | 2 rows | 0 | SQLite's |
 
 ## 3. Traced: the first wrong place of each
@@ -52,8 +53,8 @@ Runs named (r...) are in kiln's output log.
 
 `bench/sqlite_joined_rows.py` (seed C24; its head names every exception), `tests/fixtures/joined_rows.tsv`, `tests/joined_rows.rs`: 2,900 queries SQLite answered, 14,500 answers.
 
-- DS: 1,400 queries in two databases (with and without indexes): json_each (174), json_tree (344), generate_series (737) and pragma_table_info, index_info and index_list (644), 399 LEFT, 389 RIGHT and 402 FULL JOINs of up to three tables, 90 correlated
-  arguments, rowid, oid and _rowid_ read in select lists, ON, WHERE, IN, EXISTS, scalar subqueries, aggregates, GROUP BY, DISTINCT, windows, CTEs, derived tables and UNION.
+- DS: 1,400 queries in two databases (with and without indexes): json_each (174), json_tree (344), generate_series (737) and pragma_table_info, index_info and index_list (644), queries with a LEFT (399), RIGHT (389) and FULL JOIN (402), of up to three tables,
+  at least 90 with a correlated argument, rowid, oid and _rowid_ read in select lists, ON, WHERE, IN, EXISTS, scalar subqueries, aggregates, GROUP BY, DISTINCT, windows, CTEs, derived tables and UNION.
 - DT: 1,500 queries in 30 databases (seven tables, empty or of 3 to 40 rows, NULLs and duplicates, half indexed): an EXISTS, NOT EXISTS (1,148), IN (866) or NOT IN (560) holding one that reads its table, under OR (708), CASE (197) and =, beside LEFT JOINs (885),
   a second subquery, an aggregate's value (260).
 
