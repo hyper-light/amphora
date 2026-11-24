@@ -81,7 +81,11 @@ No panic in any of these runs, and every table held its rows after each query. C
 ## Checks (Linux, adacachy2)
 
 - On the merged tree (869a4f62, main b549489e; the landing merge dea76613 has its code): `cargo fmt --all --check` 0; clippy `-p amphora-engine --all-targets`
-  0 ("Checking amphora-engine"); outer_join_subqueries 3 passed (13,500 answers), oracle_findings 92; check-production @PROD@; @REST@.
+  0 ("Checking amphora-engine"); outer_join_subqueries 3 passed (13,500 answers), oracle_findings 92; check-production counted 10,610,
+  below the ratchet in four lints, which this lowers; on_terms 5, in_subquery 4, join_methods 4 (1 ignored), adaptive_joins 23, unnesting 2 (simulator),
+  hash_semi_join 1, planner 14 of 14.
+- On the tree landed (77aed100, main 7d9fcb6b, lane C16's landing in): fmt 0, clippy `-p amphora-engine --all-targets` 0
+  ("Checking amphora-engine"), check-production 0 (10,600, as the ratchet holds); outer_join_subqueries 3 (13,500 answers), oracle_findings 92.
 - On e9ffdc42 (the fix before lane C13's landing, the tree of 7e9e52b1): clippy 0, outer_join_subqueries 2, oracle_findings 87, C6's four small shards 4
   passed (26,880 runs), lib `optimizer::` 185 of 208 passed and none failed when I stopped it for the merged tree's run (the machine's load was 149).
 - On 7779647f (causes 1, 2 and 4): in_subquery 4, join_methods 4 (1 ignored), adaptive_joins 23, unnesting 2 (simulator), hash_semi_join 1; planner 13 of 14
