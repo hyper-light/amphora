@@ -1250,6 +1250,12 @@ On the branch only, once (round 1): `every_falsifier_of_the_floor_holds_under_a_
   (`a_local_read_open_across_an_image_install_sees_one_side_whole`, `past_its_room_a_replica_refuses_submits_...`,
   `a_replicas_database_log_stays_within_its_room`) 3 of 3. Main moved three times during the landing, so the whole suites were
   not rerun at the last merge (rule 6: the touched tests and clippy); r428 ran them whole on 1dc7e894, three merges earlier.
+- r516 (e429f661, main 219603df merged: lane Q8's read-write lock on the log's frame cache in storage/wal.rs, read before the
+  run: it changes neither the label nor the epoch; needs `linux/amd64,cpus=4,mem=12g`, 05:49Z to 05:52Z): workspace clippy
+  exit 0 in 43 s (amphora-engine re-checked); `d45_` 23 passed; the three replicated tests this branch touches passed. The
+  last merge on top (main c205dd7d: lane A21's memory-budget charge in replicated.rs, 250 lines, with its own tests, and
+  records) wasn't re-run at the hour's end: A21's own landing checks (its record, r497) cover it, and this branch's
+  replicated.rs change is one test's expectation and doc lines. Main moved four times during the landing.
 
 **Commands.** `~/.cache/amphora-perf/pagepath-b21/` on this machine holds `check.sh` and the run commands (`cmd-r1.sh` r307,
 `cmd-r3.sh` r364, `cmd-r4.sh` r401) and runs on adacachy2 in the lane's clone `~/.cache/amphora-perf/pagepath-remote`, target
