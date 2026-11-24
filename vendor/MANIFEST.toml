@@ -35,6 +35,8 @@ own = ["UPSTREAM.md"]
 # PostgreSQL 19.0's parser sources and its regression SQL (docs/design/postgres.md section 3): the
 # grammar and scanner the Rust parser's tables are generated from, the node definitions its actions
 # build, the SQLSTATEs its refusals carry, and the corpus its checks run against the oracle.
+# The catalog headers and .dat files, with genbki.pl and Catalog.pm that read them, are what
+# scripts/postgres-catalog.sh generates the built-in catalog rows from (section 9).
 [projects.postgres]
 kind = "git"
 repository = "https://github.com/postgres/postgres"
@@ -42,14 +44,20 @@ commit = "5c839a2a08b9b87a349be97371fac6c5a2873b10"
 path = "vendor/postgres"
 take = [
   "COPYRIGHT",
+  "src/backend/catalog/Catalog.pm",
+  "src/backend/catalog/genbki.pl",
   "src/backend/parser/gram.y",
   "src/backend/parser/parser.c",
   "src/backend/parser/scan.l",
   "src/backend/parser/scansup.c",
   "src/backend/utils/errcodes.txt",
+  "src/include/access/transam.h",
+  "src/include/catalog",
+  "src/include/mb/pg_wchar.h",
   "src/include/nodes/parsenodes.h",
   "src/include/nodes/primnodes.h",
   "src/include/parser/kwlist.h",
+  "src/include/pg_config_manual.h",
   "src/test/regress/sql",
 ]
 own = ["UPSTREAM.md"]
