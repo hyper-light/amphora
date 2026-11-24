@@ -4,6 +4,7 @@
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 gate() { printf '::: %s\n' "$*" >&2; "$@"; }
+gate python3 scripts/test_requirements.py
 gate cargo fmt --all --check
 gate cargo clippy --workspace --all-targets --locked -- -D warnings
 # The same lints for macOS and Windows (rust-toolchain.toml installs their targets; checking needs

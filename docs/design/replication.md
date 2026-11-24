@@ -2828,7 +2828,7 @@ ends, not on a flush of the owner's own.
 ## Decision (lane ryw-1): read-your-writes by session tokens (2026-11-22, kiln goal 8119f25d)
 
 Ada's order (2026-11-22): read-your-writes on any replica, built behind a switch with today's read as the control,
-decided from live runs. Requirements AC-T1.10.R1 to R4, tests T-T1.10.R1 to R4 (docs/requirements.toml, lanes ryw-1
+decided from live runs. Requirements AC-T1.10.R1 to R4, tests T-T1.10.R5 to R8 (docs/requirements.toml, lanes ryw-1
 and ryw-3).
 
 ### What was already there
@@ -2940,15 +2940,15 @@ differs from the one published only in its fence wakes the waiters; one that dif
 
 ### Evidence
 
-- T-T1.10.R1 `t_t1_10_r1_a_session_reads_its_write_on_a_lagging_follower`: records to one follower are lost while 2 is
+- T-T1.10.R5 `t_t1_10_r5_a_session_reads_its_write_on_a_lagging_follower`: records to one follower are lost while 2 is
   written. Its token read waits (counted, non-vacuity asserted: the follower was behind), and once the follower
   rejoins it answers 1 and 2, never 1 alone. A read with no token answers at once.
-- T-T1.10.R2 `t_t1_10_r2_a_behind_replica_with_no_lag_learned_redirects`: a follower that has applied nothing stamped
+- T-T1.10.R6 `t_t1_10_r6_a_behind_replica_with_no_lag_learned_redirects`: a follower that has applied nothing stamped
   redirects at once, counted. Once caught up, every member serves the same token with the write.
-- T-T1.10.R3 `t_t1_10_r3_a_session_reads_its_writes_across_leader_changes`: clocks an hour apart and the lead passed
+- T-T1.10.R7 `t_t1_10_r7_a_session_reads_its_writes_across_leader_changes`: clocks an hour apart and the lead passed
   1, 2, 3, 1. Each new write's token orders after the last, every token read served sees all of the session's writes,
   and once caught up every member's answer equals the leader's state (the control's answer).
-- T-T1.10.R4 `t_t1_10_r4_each_session_waits_only_for_its_own_writes`: sessions A and B write at once through the
+- T-T1.10.R8 `t_t1_10_r8_each_session_waits_only_for_its_own_writes`: sessions A and B write at once through the
   leader, and each answer names its own write (A's before B's). With a follower cut off after it holds A's write, B
   writes again. A's read on that follower is served at once, with no wait or redirect, though B wrote since. B's read
   is answered with its newer write once the follower rejoins.
