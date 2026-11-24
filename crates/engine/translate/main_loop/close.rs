@@ -12,13 +12,12 @@ use crate::translate::subquery::emit_non_from_clause_subquery;
 pub struct CloseLoop;
 
 impl CloseLoop {
-    pub fn emit<'a>(
+    pub fn emit(
         program: &mut ProgramBuilder,
-        t_ctx: &mut TranslateCtx<'a>,
+        t_ctx: &mut TranslateCtx<'_>,
         tables: &TableReferences,
         join_order: &[JoinOrderMember],
         mode: OperationMode,
-        select_plan: Option<&'a SelectPlan>,
     ) -> Result<()> {
         // We close the loops for all tables in reverse order, i.e. innermost first.
         // OPEN t1
@@ -90,16 +89,10 @@ impl CloseLoop {
                         .cloned()
                     {
                         // Emit the close-loop teardown for a hash-join probe table.
-                        semi_anti_next_anchor = HashProbeCloseEmitter::new(
-                            program,
-                            t_ctx,
-                            hash_join_op,
-                            hash_ctx,
-                            select_plan,
-                            table_index,
-                        )
-                        .emit()?
-                        .semi_anti_next_anchor;
+                        semi_anti_next_anchor =
+                            HashProbeCloseEmitter::new(program, t_ctx, hash_join_op, hash_ctx)
+                                .emit()?
+                                .semi_anti_next_anchor;
                     }
 
                     // Advance probe cursor.
@@ -122,11 +115,8 @@ impl CloseLoop {
                         {
                             emit_hash_join_unmatched_build_rows(
                                 program,
-                                t_ctx,
                                 hash_join_op,
                                 &hash_ctx,
-                                select_plan,
-                                table_index,
                                 probe_cursor_id,
                             )?;
                         }
@@ -144,8 +134,6 @@ impl CloseLoop {
                             t_ctx,
                             hash_join_op,
                             &hash_ctx,
-                            select_plan,
-                            table_index,
                             probe_cursor_id,
                         )?;
                     }

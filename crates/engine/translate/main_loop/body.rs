@@ -38,7 +38,6 @@ struct LoopBody<'prog, 'ctx, 'plan> {
     program: &'prog mut ProgramBuilder,
     t_ctx: &'ctx mut TranslateCtx<'plan>,
     plan: &'plan SelectPlan,
-    row_continue_label: Option<BranchOffset>,
 }
 
 impl LoopBodyEmitter {
@@ -47,16 +46,7 @@ impl LoopBodyEmitter {
         t_ctx: &mut TranslateCtx<'a>,
         plan: &'a SelectPlan,
     ) -> Result<()> {
-        LoopBody::new(program, t_ctx, plan, None).emit()
-    }
-
-    fn emit_with_row_continue_label<'a>(
-        program: &mut ProgramBuilder,
-        t_ctx: &mut TranslateCtx<'a>,
-        plan: &'a SelectPlan,
-        row_continue_label: BranchOffset,
-    ) -> Result<()> {
-        LoopBody::new(program, t_ctx, plan, Some(row_continue_label)).emit()
+        LoopBody::new(program, t_ctx, plan).emit()
     }
 }
 
@@ -65,13 +55,11 @@ impl<'prog, 'ctx, 'plan> LoopBody<'prog, 'ctx, 'plan> {
         program: &'prog mut ProgramBuilder,
         t_ctx: &'ctx mut TranslateCtx<'plan>,
         plan: &'plan SelectPlan,
-        row_continue_label: Option<BranchOffset>,
     ) -> Self {
         Self {
             program,
             t_ctx,
             plan,
-            row_continue_label,
         }
     }
 
@@ -141,7 +129,6 @@ impl<'prog, 'ctx, 'plan> LoopBody<'prog, 'ctx, 'plan> {
             self.t_ctx,
             self.plan,
             self.select_emit_target(),
-            self.row_continue_label,
         )
     }
 }
@@ -238,7 +225,6 @@ fn emit_loop_source<'a>(
     t_ctx: &mut TranslateCtx<'a>,
     plan: &'a SelectPlan,
     emit_target: LoopEmitTarget,
-    row_continue_label: Option<BranchOffset>,
 ) -> Result<()> {
     match emit_target {
         LoopEmitTarget::GroupBy => {
@@ -583,9 +569,7 @@ fn emit_loop_source<'a>(
                 plan.aggregates.is_empty(),
                 "QueryResult target should not have aggregates"
             );
-            let offset_jump_to = row_continue_label
-                .or_else(|| offset_continue_label(t_ctx, plan))
-                .or(t_ctx.label_main_loop_end);
+            let offset_jump_to = offset_continue_label(t_ctx, plan).or(t_ctx.label_main_loop_end);
 
             emit_select_result(
                 program,
@@ -651,174 +635,4 @@ fn offset_continue_label(t_ctx: &TranslateCtx<'_>, plan: &SelectPlan) -> Option<
         .labels_main_loop
         .get(join.original_idx)
         .map(|labels| labels.next)
-}
-
-/// Whether every column a condition reads holds the right value at the
-/// unmatched-row scan point.
-///
-/// A column is readable if its table's cursor is one of `allowed` and so still
-/// positioned, or if it lives in `payload_regs` — this hash join's payload,
-/// which the unmatched scan reloads for each row it produces. Registers cached
-/// by anything else are stale here: nothing refills them once the probe loop has
-/// exited. Skipping a condition whose columns are all readable silently drops it
-/// from the null-extended rows, letting through rows the query filtered out.
-///
-/// A correlated subquery result is readable only if every table the subquery
-/// reads is one of `allowed`. Otherwise the subquery runs inside the inner
-/// loop, and its result register still holds the value from an earlier row.
-fn condition_operands_are_available(
-    expr: &Expr,
-    table_references: &TableReferences,
-    subqueries: &[NonFromClauseSubquery],
-    allowed: &TableMask,
-    resolver: &Resolver,
-    payload_regs: Range<usize>,
-) -> Result<bool> {
-    let mut ok = true;
-    walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
-        if let Expr::SubqueryResult { .. } = e {
-            if !allowed.contains_all_set_bits_of(&table_mask_from_expr(
-                e,
-                table_references,
-                subqueries,
-            )?) {
-                ok = false;
-            }
-            return Ok(WalkControl::SkipChildren);
-        }
-        let (Expr::Column { table, .. } | Expr::RowId { table, .. }) = e else {
-            return Ok(WalkControl::Continue);
-        };
-        if resolver
-            .resolve_cached_expr_reg(e)
-            .is_some_and(|(reg, ..)| payload_regs.contains(&reg))
-        {
-            return Ok(WalkControl::SkipChildren);
-        }
-        if let Some(idx) = table_references
-            .joined_tables()
-            .iter()
-            .position(|t| t.internal_id == *table)
-        {
-            if !allowed.get(idx) {
-                ok = false;
-                return Ok(WalkControl::SkipChildren);
-            }
-        }
-        // Outer query references are already in scope — allow them.
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(ok)
-}
-
-/// Emit WHERE conditions and inner-loop entry for an unmatched hash build row.
-///
-/// Filters applicable WHERE terms (non-ON, non-consumed), optionally restricted to
-/// the ones whose columns are readable here when a Gosub wraps inner tables. Then
-/// either enters the inner-loop subroutine via Gosub or calls `emit_loop` directly.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
-    program: &mut ProgramBuilder,
-    t_ctx: &mut TranslateCtx<'a>,
-    plan: &'a SelectPlan,
-    build_table_idx: usize,
-    probe_table_idx: usize,
-    join_type: HashJoinType,
-    skip_label: BranchOffset,
-    gosub: Option<(usize, BranchOffset)>,
-    payload_regs: Range<usize>,
-) -> Result<()> {
-    let has_gosub = gosub.is_some();
-    let allowed_tables = {
-        let mut m = TableMask::default();
-        m.set(build_table_idx)?;
-        m.set(probe_table_idx)?;
-        // When there's a gosub wrapping inner tables, we must also allow
-        // conditions that reference outer tables (those appearing before the
-        // hash join probe in the join order), since their cursors are valid
-        // at the unmatched-scan point.
-        if has_gosub {
-            let probe_pos = plan
-                .join_order
-                .iter()
-                .position(|j| j.original_idx == probe_table_idx)
-                .expect("probe table must be in join order");
-            for join in &plan.join_order[..probe_pos] {
-                m.set(join.original_idx)?;
-                // An earlier hash join's build table is also accessible.
-                if let HashJoin(hj) = &plan.table_references.joined_tables()[join.original_idx].op {
-                    m.set(hj.build_table_idx)?;
-                }
-            }
-        }
-        m
-    };
-    let probe_join_index = plan
-        .join_order
-        .iter()
-        .position(|member| member.original_idx == probe_table_idx)
-        .expect("probe table must be in join order");
-    // Terms the hash build already applied hold for every row in the hash
-    // table, so the unmatched scan does not repeat them.
-    let prefiltered_terms = super::conditions::hash_build_prefilter_where_terms(
-        t_ctx,
-        &plan.table_references,
-        &plan.join_order,
-        &plan.where_clause,
-        &plan.non_from_clause_subqueries,
-        probe_join_index,
-    )?;
-    let mut conditions = Vec::new();
-    for (condition_idx, condition) in plan
-        .where_clause
-        .iter()
-        .enumerate()
-        .filter(|(_, condition)| !condition.consumed && !condition.origin.is_outer_join())
-    {
-        if prefiltered_terms.contains(&condition_idx) {
-            continue;
-        }
-        if join_type == HashJoinType::LeftAnti
-            && table_mask_from_expr(
-                &condition.expr,
-                &plan.table_references,
-                &plan.non_from_clause_subqueries,
-            )?
-            .get(probe_table_idx)
-        {
-            continue;
-        }
-        if has_gosub
-            && !condition_operands_are_available(
-                &condition.expr,
-                &plan.table_references,
-                &plan.non_from_clause_subqueries,
-                &allowed_tables,
-                &t_ctx.resolver,
-                payload_regs.clone(),
-            )?
-        {
-            continue;
-        }
-        conditions.push(condition);
-    }
-    for cond in conditions {
-        super::conditions::emit_where_term(
-            program,
-            &plan.table_references,
-            cond,
-            skip_label,
-            &t_ctx.resolver,
-        )?;
-    }
-
-    if let Some((reg, label)) = gosub {
-        program.emit_insn(Insn::Gosub {
-            target_pc: label,
-            return_reg: reg,
-        });
-    } else {
-        LoopBodyEmitter::emit_with_row_continue_label(program, t_ctx, plan, skip_label)?;
-    }
-    Ok(())
 }

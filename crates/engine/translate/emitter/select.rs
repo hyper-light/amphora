@@ -19,14 +19,14 @@ use crate::{
         order_by::EmitOrderBy,
         plan::{
             BitSet, Distinctness, EphemeralRowidMode, EvalAt, IndexMethodQuery, JoinOrderMember,
-            NonFromClauseSubquery, Operation, QueryDestination, Scan, Search, SeekKeyComponent,
-            SelectPlan, SimpleAggregate, SubqueryEvalPhase, SubqueryState, TableReferences,
+            Operation, QueryDestination, Scan, Search, SeekKeyComponent, SelectPlan,
+            SimpleAggregate, SubqueryEvalPhase,
         },
         planner::table_mask_from_expr,
         select::emit_simple_count,
         subquery::{
             emit_from_clause_subqueries, emit_non_from_clause_subqueries_for_eval_at,
-            emit_non_from_clause_subqueries_for_phase,
+            emit_non_from_clause_subqueries_for_phase, subquery_result,
         },
         values::emit_values,
         window::{emit_window_flush, EmitWindow},
@@ -304,7 +304,6 @@ pub fn emit_query<'a>(
         &plan.table_references,
         &plan.join_order,
         OperationMode::SELECT,
-        Some(plan),
     )?;
 
     program.preassign_label_to_next_insn(after_main_loop_label);
@@ -621,6 +620,17 @@ pub(crate) fn emit_materialized_build_inputs(
             program.clear_hash_tables_to_keep_open();
             Ok(())
         })?;
+        // The subplan coded the uncorrelated subqueries: each a subroutine that every read calls and
+        // that runs once, for the first. Coded again, its hash joins would probe the hash tables of
+        // the first copy, which no read may have run.
+        for subquery in plan.non_from_clause_subqueries.iter_mut() {
+            if !subquery.has_been_evaluated()
+                && program
+                    .has_once_subquery(subquery.internal_id, subquery_result(&subquery.query_type))
+            {
+                subquery.consume_plan(EvalAt::BeforeLoop);
+            }
+        }
         // PL.13 (lane replan-11: a build fed by a materialized input): the prefix's rows, all in,
         // counted against the rows the plan noted for it.
         let check = match spec.checked_prefix.as_ref() {
@@ -1229,14 +1239,12 @@ fn build_materialized_build_input_plan(
         }
     };
 
-    // The WHERE terms that use a subquery reading tables outside the prefix are
-    // consumed above, so the subquery must not be emitted in this subplan either.
+    // A correlated subquery runs in the main plan: the planner takes no materialized input whose
+    // tables one reads, nor one whose terms read an outer query (`join::join_lhs_and_rhs`).
     let non_from_clause_subqueries = plan
         .non_from_clause_subqueries
         .iter()
-        .filter(|subquery| {
-            subquery_reads_only_tables_in(subquery, &plan.table_references, &included_tables)
-        })
+        .filter(|subquery| !subquery.correlated)
         .cloned()
         .collect();
 
@@ -1275,27 +1283,4 @@ fn build_materialized_build_input_plan(
     prune_join_order_for_materialized_inputs(&mut materialize_plan, materialized_build_inputs)?;
 
     Ok(materialize_plan)
-}
-
-fn subquery_reads_only_tables_in(
-    subquery: &NonFromClauseSubquery,
-    table_references: &TableReferences,
-    tables: &TableMask,
-) -> bool {
-    let SubqueryState::Unevaluated {
-        plan: Some(subquery_plan),
-    } = &subquery.state
-    else {
-        return true;
-    };
-    subquery_plan
-        .used_outer_query_ref_ids()
-        .iter()
-        .all(|outer_ref_id| {
-            table_references
-                .joined_tables()
-                .iter()
-                .position(|table| table.internal_id == *outer_ref_id)
-                .is_none_or(|table_idx| tables.get(table_idx))
-        })
 }
