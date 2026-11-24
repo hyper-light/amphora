@@ -49,6 +49,8 @@ pub enum Unrestorable {
         /// The last the replay recovered.
         replayed: u64,
     },
+    #[error("base {base} can't be shown to restore: {lack}")]
+    Unproven { base: u64, lack: BaseLack },
     #[error("archive object {key}: {why}")]
     Malformed { key: String, why: String },
     #[error(
@@ -59,6 +61,39 @@ pub enum Unrestorable {
         "log segment {key} can't be fetched: this restore has no room for a part of it (its share of the memory budget's room for chunks, or the store's objects)"
     )]
     SegmentPastRoom { key: String },
+}
+
+/// What a base's manifest doesn't show its file holds of the log before the generation it began in,
+/// which a restore replays from its first frame (decision 45; docs/design/backup.md, "A base says
+/// what its file holds").
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BaseLack {
+    #[error(
+        "its manifest, of an earlier format, doesn't say its file holds the log before generation {generation}, the one it began in"
+    )]
+    Unsaid { generation: u64 },
+    #[error(
+        "its file held {copied} of the {frames} frames of {segment}, the segment closing as it began (the log's generation {seq}): frames {first} to {frames} are missing",
+        first = .copied.saturating_add(1)
+    )]
+    Uncopied {
+        segment: &'static str,
+        seq: u32,
+        frames: u64,
+        copied: u64,
+    },
+    #[error(
+        "the archive's log before the generation it began in ended at frame {archived}, and its file held {held} frames of it"
+    )]
+    Before { archived: u64, held: u64 },
+    #[error(
+        "it began in the log's generation {began}, and what the archive holds as generation {generation} is the log's {archived}"
+    )]
+    Own {
+        generation: u64,
+        began: u32,
+        archived: u32,
+    },
 }
 
 /// Whether the generation before a segment's was shipped whole.

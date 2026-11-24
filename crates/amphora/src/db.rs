@@ -182,6 +182,11 @@ pub(crate) fn log_paths(path: &Path) -> [PathBuf; 2] {
     })
 }
 
+/// Named by the tests alone here: nothing raises it.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{}", .0.display())]
+pub struct Unrestored(pub PathBuf);
+
 /// The file of one segment of the log beside the database at `path` (decision 45): `-wal` or
 /// `-wal2`.
 fn segment_path(path: &Path, segment: SegmentId) -> String {

@@ -19,9 +19,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use amphora::backup::{self, Archive, BaseCopy, Hooks, SECOND_NS, Shipper, plan::Unrestorable};
+use amphora::backup::plan::{BaseLack, Unrestorable};
+use amphora::backup::{self, Archive, BaseCopy, Hooks, SECOND_NS, Shipper};
 use amphora::database::{AnswerMax, Database};
-use amphora::db::Db;
+use amphora::db::{Db, Unrestored};
 use amphora::memory::Use;
 use amphora_api::blobs::{Blobs, SimBlobs};
 use amphora_engine::Value;
@@ -499,13 +500,17 @@ fn d45_a_check_clears_the_segments_left_at_its_scratch_path() {
     left.put(10..20, "left");
     let dir = tempfile::tempdir().unwrap();
     let scratch = dir.path().join("check.db");
-    for suffix in ["", "-wal", "-wal2"] {
-        let beside = |path: &std::path::Path| {
-            let mut file = path.as_os_str().to_owned();
-            file.push(suffix);
-            file
-        };
-        std::fs::copy(beside(&left.path), beside(&scratch)).unwrap();
+    // And where a check's restore ended midway (its process killed), under its own name.
+    for (suffix, at) in [("", ""), ("-wal", "-wal"), ("-wal2", "-wal2")]
+        .into_iter()
+        .flat_map(|(suffix, log)| {
+            [
+                (suffix, log.to_owned()),
+                (suffix, format!(".restoring{log}")),
+            ]
+        })
+    {
+        std::fs::copy(beside(&left.path, suffix), beside(&scratch, &at)).unwrap();
     }
     let blobs =
         Arc::new(backup::FolderBlobs::open(&dir.path().join("archive"), 64 * 1024).unwrap());
@@ -1634,17 +1639,19 @@ fn a_short_restore_leaves_no_database() {
     assert_eq!(rows(&Db::open(&target).unwrap()), rows_then);
 }
 
+/// The file beside `path` whose name is its name with `suffix` after it.
+fn beside(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    let mut file = path.as_os_str().to_owned();
+    file.push(suffix);
+    std::path::PathBuf::from(file)
+}
+
 /// Ends the process here (its database's files as they stand) and opens them a second later, backed up
 /// to the same archive by a shipper of its own.
 fn reopened(s: &mut Source) {
     let ended = s.dir.path().join("ended.db");
     for suffix in ["", "-wal", "-wal2"] {
-        let beside = |path: &std::path::Path| {
-            let mut file = path.as_os_str().to_owned();
-            file.push(suffix);
-            std::path::PathBuf::from(file)
-        };
-        std::fs::copy(beside(&s.path), beside(&ended)).unwrap();
+        std::fs::copy(beside(&s.path, suffix), beside(&ended, suffix)).unwrap();
     }
     s.now.fetch_add(SECOND_NS, Ordering::SeqCst);
     let now = Arc::clone(&s.now);
@@ -1796,6 +1803,765 @@ fn a_base_begun_before_a_break_is_refused_its_end() {
     s.now.fetch_add(SECOND_NS, Ordering::SeqCst);
     s.ship().unwrap();
     s.restores_every_second_from(based);
+}
+
+/// A base's manifest (`backup/object.rs`, format 3), as these tests read and make one.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct ManifestBody {
+    format: u8,
+    id: u64,
+    start_gen: u64,
+    end: (u64, u64),
+    file_bytes: u64,
+    chunk_bytes: u64,
+    chunks: u64,
+    from: Vec<(u64, u64)>,
+    held: HeldBody,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct HeldBody {
+    own: (u32, u32, u32),
+    closed: Option<ClosedBody>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct ClosedBody {
+    /// The file by its place: 0, `-wal`; 1, `-wal2`.
+    file: u32,
+    seq: u32,
+    frames: u64,
+    copied: u64,
+}
+
+fn sealed<T: serde::Serialize>(body: &T) -> Vec<u8> {
+    use sha2::Digest as _;
+    let plain = postcard::to_allocvec(body).unwrap();
+    let mut out = sha2::Sha256::digest(&plain).to_vec();
+    out.extend_from_slice(&plain);
+    out
+}
+
+/// A base of a shipper before lane B22's fix, made as it made one: the file copied as it stands, in
+/// chunks, and a manifest of format 2, which says nothing of what the file holds.
+fn base_before_b22(s: &Source, start_gen: u64) -> u64 {
+    let chunk_bytes = 32 * 1024;
+    let id = s.now.load(Ordering::SeqCst) + 1;
+    let file = std::fs::read(&s.path).unwrap();
+    let chunks: Vec<&[u8]> = file.chunks(chunk_bytes).collect();
+    for (chunk, bytes) in (0u64..).zip(&chunks) {
+        use sha2::Digest as _;
+        let mut object = sha2::Sha256::digest(bytes).to_vec();
+        object.extend_from_slice(bytes);
+        s.blobs
+            .create(&backup::plan::chunk_key("db", id, chunk), &object, until())
+            .unwrap();
+    }
+    let key = backup::plan::BaseKey {
+        end: (start_gen, s.shipper.frames_in_generation()),
+        start_gen,
+        id,
+    };
+    let chunks = u64::try_from(chunks.len()).unwrap();
+    let manifest = (
+        (2u8, id, start_gen, key.end),
+        (
+            u64::try_from(file.len()).unwrap(),
+            u64::try_from(chunk_bytes).unwrap(),
+            chunks,
+        ),
+        vec![(id, chunks)],
+    );
+    s.blobs
+        .create(&key.key("db"), &sealed(&manifest), until())
+        .unwrap();
+    id
+}
+
+/// AC-T1.12.4 (lane B26): a base made by a shipper before lane B22's fix is refused, as nothing says what its
+/// file held, and a whole new one restores. Do: as in
+/// `d45_a_base_begun_while_a_read_holds_the_closing_segment_restores_every_commit`, a read keeping 20 of 41
+/// rows out of the file; put in the archive the base that shipper made then, and restore the last
+/// second; open a shipper on the archive, end the read, end a base, let go of what it makes needless,
+/// and restore again. Expect: the first is refused, typed, naming the base and the generation it can't
+/// show it holds the log before; a base is needed, keeps no chunk, and every row restores.
+#[test]
+fn a_base_that_does_not_say_what_its_file_holds_is_refused() {
+    let mut s = Source::new();
+    s.put(0..20, "a");
+    s.ship().unwrap();
+    let slow = s.db.reader().unwrap();
+    slow.exec("BEGIN").unwrap();
+    assert_eq!(rows(&slow).len(), 20);
+    s.put(20..40, "b");
+    s.ship().unwrap();
+    assert!(s.db.restart_log().unwrap(), "shipped, so it starts again");
+    s.put(40..41, "c");
+    s.ship().unwrap();
+    let id = base_before_b22(&s, 2);
+    s.now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    s.ship().unwrap();
+    let last = s.history.last().unwrap().0.div_ceil(SECOND_NS);
+    match s.restored(last) {
+        Ok(restored) => panic!(
+            "the base of a shipper before lane B22 restored with no error, {} of {} rows",
+            restored.len(),
+            s.model.len()
+        ),
+        Err(e) => assert!(
+            matches!(
+                e.downcast_ref(),
+                Some(Unrestorable::Unproven {
+                    base,
+                    lack: BaseLack::Unsaid { generation: 2 },
+                }) if *base == id
+            ),
+            "refused otherwise: {e:#}"
+        ),
+    }
+
+    let now = Arc::clone(&s.now);
+    s.hooks = Hooks::new(Arc::new(move || now.load(Ordering::SeqCst)), 1 << 16);
+    s.db.back_up(Arc::clone(&s.hooks));
+    s.shipper = Shipper::open("db", Arc::clone(&s.hooks), &s.blobs, &s.db, until()).unwrap();
+    assert!(s.shipper.base_needed(), "no base restores the log");
+    slow.exec("COMMIT").unwrap();
+    let _copied = s.db.checkpoint().unwrap();
+    s.put(41..42, "d");
+    s.ship().unwrap();
+    let mut base = s.begin_base().unwrap();
+    s.copy_base(&mut base);
+    assert_eq!(base.reused(), 0, "a whole base");
+    s.end_base(base).unwrap();
+    assert!(!s.shipper.base_needed());
+    let based = s.second();
+    s.put(42..45, "e");
+    s.now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    s.ship().unwrap();
+    s.restores_every_second_from(based);
+    let let_go = backup::expire(
+        &s.blobs,
+        "db",
+        s.now.load(Ordering::SeqCst),
+        SECOND_NS,
+        until(),
+    )
+    .unwrap();
+    assert!(let_go > 0, "the base that restores nothing among them");
+    s.restores_every_second_from(s.history.last().unwrap().0.div_ceil(SECOND_NS));
+}
+
+/// The manifest of the newest base, and its key.
+fn newest_manifest(blobs: &dyn Blobs) -> (String, ManifestBody) {
+    let key = newest_base(blobs).key("db");
+    let body = postcard::from_bytes(&blobs.get(&key, until()).unwrap()[32..]).unwrap();
+    (key, body)
+}
+
+/// AC-T1.12.4 (lane B26): a restore compares what a base's manifest says its file held with the log it
+/// replays. Do: end a base begun after a switch, its manifest then made to say, in turn, that its file
+/// held all but 5 of the closing segment's frames; that the segment had 5 fewer; that there was none;
+/// and that it began in another generation of the log; restore the last second with each, and with the
+/// manifest as it was. Expect: each refused, typed, naming what is missing, no file left; as it was,
+/// every row.
+#[test]
+fn a_base_whose_manifest_and_log_disagree_is_refused() {
+    let mut s = Source::new();
+    s.put(0..20, "a");
+    s.ship().unwrap();
+    assert!(s.db.restart_log().unwrap(), "shipped, so it starts again");
+    s.put(20..25, "b");
+    s.ship().unwrap();
+    let _copied = s.db.checkpoint().unwrap();
+    let mut base = s.begin_base().unwrap();
+    s.copy_base(&mut base);
+    s.end_base(base).unwrap();
+    s.put(25..30, "c");
+    s.now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    s.ship().unwrap();
+    let last = s.history.last().unwrap().0.div_ceil(SECOND_NS);
+    let (key, whole) = newest_manifest(&s.blobs);
+    let closed = whole.held.closed.clone().unwrap();
+    let ended = generation_segments(&s.blobs, 1).pop().unwrap().0.last;
+    assert_eq!(
+        (closed.file, closed.frames, closed.copied),
+        (0, ended, ended),
+        "`-wal` closed, whole in the file"
+    );
+    assert_eq!(whole.held.own.0, closed.seq + 1, "its own generation");
+
+    let with = |change: &dyn Fn(&mut ManifestBody)| {
+        let mut body = whole.clone();
+        change(&mut body);
+        s.blobs.delete(&key, until()).unwrap();
+        s.blobs.create(&key, &sealed(&body), until()).unwrap();
+        let dir = tempfile::tempdir_in(s.dir.path()).unwrap();
+        let target = dir.path().join("restored.db");
+        let restored = backup::restore(&s.blobs, "db", last, &target, until());
+        let left = std::fs::read_dir(dir.path()).unwrap().count();
+        match restored {
+            Ok(_) => Ok(rows(&Db::open(&target).unwrap())),
+            Err(e) => Err((
+                match e.downcast_ref() {
+                    Some(Unrestorable::Unproven { lack, .. }) => Some(lack.clone()),
+                    _ => None,
+                },
+                format!("{e:#}"),
+                left,
+            )),
+        }
+    };
+    let refused = |answer: Result<Rows, (Option<BaseLack>, String, usize)>| match answer {
+        Ok(rows) => panic!(
+            "restored with no error, {} of {} rows",
+            rows.len(),
+            s.model.len()
+        ),
+        Err((lack, why, left)) => {
+            assert_eq!(left, 0, "files are left: {why}");
+            lack.unwrap_or_else(|| panic!("refused otherwise: {why}"))
+        }
+    };
+    let edit = |frames: u64, copied: u64| {
+        refused(with(&|m| {
+            m.held.closed = Some(ClosedBody {
+                frames,
+                copied,
+                ..closed.clone()
+            });
+        }))
+    };
+    assert_eq!(
+        edit(ended, ended - 5),
+        BaseLack::Uncopied {
+            segment: "-wal",
+            seq: closed.seq,
+            frames: ended,
+            copied: ended - 5,
+        }
+    );
+    assert_eq!(
+        edit(ended - 5, ended - 5),
+        BaseLack::Before {
+            archived: ended,
+            held: ended - 5,
+        }
+    );
+    assert_eq!(
+        refused(with(&|m| m.held.closed = None)),
+        BaseLack::Before {
+            archived: ended,
+            held: 0,
+        }
+    );
+    assert_eq!(
+        refused(with(&|m| m.held.own.0 += 1)),
+        BaseLack::Own {
+            generation: 2,
+            began: whole.held.own.0 + 1,
+            archived: whole.held.own.0,
+        }
+    );
+    assert_eq!(with(&|_| {}).unwrap(), s.model, "as it was");
+}
+
+/// What opening a copy of each file a restore left in `dir` answers, the ones it isn't refused and
+/// that hold a table: none, where nothing left opens as a database.
+fn opens_as_a_database(dir: &std::path::Path) -> Vec<String> {
+    let mut opened = Vec::new();
+    let names: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    for name in &names {
+        let aside = tempfile::tempdir().unwrap();
+        for file in &names {
+            std::fs::copy(dir.join(file), aside.path().join(file)).unwrap();
+        }
+        let Ok(db) = Db::open(&aside.path().join(name)) else {
+            continue;
+        };
+        let Ok(tables) = tables(&db) else { continue };
+        if !tables.is_empty() {
+            opened.push(format!(
+                "{} opens, {} rows",
+                name.display(),
+                rows(&db).len()
+            ));
+        }
+    }
+    opened
+}
+
+/// An archive a restore takes many steps of: a base, the generation it began in, and two after it.
+fn several_generations() -> (Source, u64) {
+    let mut s = Source::new();
+    s.put(0..10, "a");
+    s.ship().unwrap();
+    let mut base = s.begin_base().unwrap();
+    s.copy_base(&mut base);
+    s.end_base(base).unwrap();
+    for from in [10, 20, 30] {
+        s.put(from..from + 10, "b");
+        s.ship().unwrap();
+        assert!(s.db.restart_log().unwrap(), "shipped, so it starts again");
+    }
+    s.put(40..50, "c");
+    s.ship().unwrap();
+    s.now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    s.ship().unwrap();
+    let last = s.history.last().unwrap().0.div_ceil(SECOND_NS);
+    (s, last)
+}
+
+/// A pace whose `at`th step fails, or a store whose `at`th read does ([`FailsRead`]).
+struct Fails {
+    at: usize,
+    steps: usize,
+}
+
+impl Fails {
+    fn step(&mut self) -> anyhow::Result<()> {
+        let step = self.steps;
+        self.steps += 1;
+        if step == self.at {
+            anyhow::bail!("step {step} fails");
+        }
+        Ok(())
+    }
+}
+
+impl backup::Pace for Fails {
+    fn ready(&mut self) -> anyhow::Result<()> {
+        self.step()
+    }
+    fn done(&mut self, _: Option<&std::fs::File>, _: u64) -> anyhow::Result<()> {
+        self.step()
+    }
+}
+
+/// A store whose `at`th ranged read is refused.
+struct FailsRead<'a> {
+    inner: &'a dyn Blobs,
+    at: u64,
+    reads: AtomicU64,
+}
+
+impl Blobs for FailsRead<'_> {
+    fn object_max(&self) -> usize {
+        self.inner.object_max()
+    }
+    fn create(
+        &self,
+        key: &str,
+        bytes: &[u8],
+        until: Instant,
+    ) -> Result<(), amphora_api::blobs::BlobRefusal> {
+        self.inner.create(key, bytes, until)
+    }
+    fn get(&self, key: &str, until: Instant) -> Result<Vec<u8>, amphora_api::blobs::BlobRefusal> {
+        self.inner.get(key, until)
+    }
+    fn get_range(
+        &self,
+        key: &str,
+        offset: u64,
+        len: usize,
+        until: Instant,
+    ) -> Result<Vec<u8>, amphora_api::blobs::BlobRefusal> {
+        if self.reads.fetch_add(1, Ordering::SeqCst) == self.at {
+            return Err(amphora_api::blobs::BlobRefusal::Timeout);
+        }
+        self.inner.get_range(key, offset, len, until)
+    }
+    fn list(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+        until: Instant,
+    ) -> Result<amphora_api::blobs::Listing, amphora_api::blobs::BlobRefusal> {
+        self.inner.list(prefix, after, limit, until)
+    }
+    fn delete(&self, key: &str, until: Instant) -> Result<(), amphora_api::blobs::BlobRefusal> {
+        self.inner.delete(key, until)
+    }
+}
+
+/// AC-T1.12.4 (lane B26): a restore that fails partway leaves no file that opens as a database, whatever it
+/// fails for. Do: restore an archive of a base and four generations, failing at each step of it in
+/// turn, then at each read of the store, then with the last generation's last frame gone; each time
+/// open every file it left and what stands at its path, and restore again at the same path, whole.
+/// Expect: each refused, no file left, and the second restore holds every row.
+#[test]
+fn a_restore_that_fails_leaves_no_database() {
+    let (s, last) = several_generations();
+    let failed = |what: String, restore: &dyn Fn(&std::path::Path) -> anyhow::Result<()>| {
+        let dir = tempfile::tempdir_in(s.dir.path()).unwrap();
+        let target = dir.path().join("restored.db");
+        let Err(why) = restore(&target) else {
+            assert_eq!(rows(&Db::open(&target).unwrap()), s.model, "{what}");
+            return false;
+        };
+        let opened = opens_as_a_database(dir.path());
+        assert_eq!(opened, Vec::<String>::new(), "{what}: {why:#}; of 50 rows");
+        let left = std::fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(left, 0, "{what}: files are left");
+        backup::restore(&s.blobs, "db", last, &target, until())
+            .unwrap_or_else(|e| panic!("{what}: restored again at its path: {e:#}"));
+        assert_eq!(rows(&Db::open(&target).unwrap()), s.model, "{what}");
+        true
+    };
+    let mut steps = 0;
+    while failed(format!("step {steps}"), &|target| {
+        let mut pace = Fails {
+            at: steps,
+            steps: 0,
+        };
+        backup::restore_paced(&s.blobs, "db", last, target, &mut pace, until()).map(|_| ())
+    }) {
+        steps += 1;
+    }
+    assert!(steps > 20, "non-vacuous: {steps} steps");
+    let mut reads = 0;
+    while failed(format!("read {reads}"), &|target| {
+        let blobs = FailsRead {
+            inner: &s.blobs,
+            at: reads,
+            reads: AtomicU64::new(0),
+        };
+        backup::restore(&blobs, "db", last, target, until()).map(|_| ())
+    }) {
+        reads += 1;
+    }
+    assert!(reads > 10, "non-vacuous: {reads} reads");
+
+    let newest = segment_keys(&s.blobs).last().unwrap().0.generation;
+    let (key, name, whole) = generation_segments(&s.blobs, newest).pop().unwrap();
+    let frames = usize::try_from(key.last - key.first + 1).unwrap();
+    let mut body = whole.clone();
+    let tail = body.frames.len() - body.frames.len() / frames;
+    body.frames[tail..].fill(0);
+    let short = std::cell::Cell::new(true);
+    assert!(failed("a missing frame".into(), &|target| {
+        // Gone for this restore alone: the one after it, at the same path, finds it whole.
+        replace_segment(&s.blobs, &name, if short.get() { &body } else { &whole });
+        let restored = backup::restore(&s.blobs, "db", last, target, until()).map(|_| ());
+        replace_segment(&s.blobs, &name, &whole);
+        restored
+    }));
+}
+
+/// The process a killed or cut-short restore runs in: it restores to `restored.db` in a folder the
+/// test gives, saying each step it is at and waiting to go on.
+#[test]
+fn restore_child() {
+    use std::io::BufRead as _;
+    let Some(dir) = std::env::var_os("AMPHORA_RESTORE_CHILD") else {
+        return;
+    };
+    struct Asks(bool);
+    impl Asks {
+        fn step(&self) -> anyhow::Result<()> {
+            if self.0 {
+                println!("step");
+                let mut line = String::new();
+                std::io::stdin().lock().read_line(&mut line)?;
+            }
+            Ok(())
+        }
+    }
+    impl backup::Pace for Asks {
+        fn ready(&mut self) -> anyhow::Result<()> {
+            self.step()
+        }
+        fn done(&mut self, _: Option<&std::fs::File>, _: u64) -> anyhow::Result<()> {
+            self.step()
+        }
+    }
+    let dir = std::path::PathBuf::from(dir);
+    let second = std::env::var("AMPHORA_RESTORE_SECOND").unwrap();
+    let blobs = backup::FolderBlobs::open(
+        std::path::Path::new(&std::env::var_os("AMPHORA_RESTORE_ARCHIVE").unwrap()),
+        64 * 1024,
+    )
+    .unwrap();
+    let mut pace = Asks(std::env::var_os("AMPHORA_RESTORE_ASKS").is_some());
+    let restored = backup::restore_paced(
+        &blobs,
+        "db",
+        second.parse().unwrap(),
+        &dir.join("restored.db"),
+        &mut pace,
+        until(),
+    );
+    match restored {
+        Ok(_) => println!("restored"),
+        Err(e) => println!("refused: {e:#}"),
+    }
+}
+
+/// [`restore_child`] in a process of its own, by `program` and its arguments before the test's.
+fn restore_child_by(
+    program: &str,
+    before: &[&str],
+    s: &Source,
+    second: u64,
+    dir: &std::path::Path,
+) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    command
+        .args(before)
+        .args(["--exact", "restore_child", "--nocapture"])
+        .env("AMPHORA_RESTORE_CHILD", dir)
+        .env("AMPHORA_RESTORE_ARCHIVE", s.dir.path().join("archive"))
+        .env("AMPHORA_RESTORE_SECOND", second.to_string())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    command
+}
+
+/// AC-T1.12.4 (lane B26): a restore killed between two writes leaves no file that opens as a database. Do:
+/// in a process of its own, restore an archive of a base and four generations, and kill it at each step
+/// in turn; open every file it left and what stands at its path; restore there again, then with what
+/// was left removed. Expect: nothing left opens, the path is refused, typed, while the restore's file
+/// is there, and a restore to it too; with it removed the restore holds every row; the process left to
+/// end makes the whole database.
+#[test]
+fn a_killed_restore_leaves_no_database() {
+    use std::io::{BufRead as _, Write as _};
+    let (s, last) = several_generations();
+    let this = std::env::current_exe().unwrap();
+    let this = this.to_str().unwrap();
+    let (mut killed, mut left_some) = (0, 0);
+    loop {
+        let dir = tempfile::tempdir_in(s.dir.path()).unwrap();
+        let target = dir.path().join("restored.db");
+        let mut child = restore_child_by(this, &[], &s, last, dir.path())
+            .env("AMPHORA_RESTORE_ASKS", "1")
+            .spawn()
+            .unwrap();
+        let mut go = child.stdin.take().unwrap();
+        let mut said = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        let mut steps = 0;
+        let ended = loop {
+            let Some(line) = said.next() else {
+                break true;
+            };
+            if line.unwrap() != "step" {
+                continue;
+            }
+            if steps == killed {
+                child.kill().unwrap();
+                break false;
+            }
+            steps += 1;
+            writeln!(go).unwrap();
+        };
+        child.wait().unwrap();
+        if ended {
+            assert_eq!(rows(&Db::open(&target).unwrap()), s.model);
+            break;
+        }
+        let opened = opens_as_a_database(dir.path());
+        assert_eq!(
+            opened,
+            Vec::<String>::new(),
+            "killed at step {killed}: of 50 rows"
+        );
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        if !left.is_empty() {
+            left_some += 1;
+            let refused = Db::open(&target).map(|_| ()).unwrap_err();
+            assert!(
+                refused.downcast_ref::<Unrestored>().is_some(),
+                "killed at step {killed}, its path opened: {refused:#}"
+            );
+            let refused = Database::open(&target, until()).map(|_| ()).unwrap_err();
+            assert!(
+                refused.to_string().contains("hasn't ended"),
+                "killed at step {killed}, its path opened: {refused}"
+            );
+            backup::restore(&s.blobs, "db", last, &target, until()).unwrap_err();
+            for file in left {
+                std::fs::remove_file(file).unwrap();
+            }
+        }
+        backup::restore(&s.blobs, "db", last, &target, until())
+            .unwrap_or_else(|e| panic!("killed at step {killed}, then restored: {e:#}"));
+        assert_eq!(rows(&Db::open(&target).unwrap()), s.model);
+        killed += 1;
+    }
+    assert!(
+        killed > 20 && left_some > 10,
+        "non-vacuous: killed at {killed} steps, files left at {left_some}"
+    );
+}
+
+/// AC-T1.12.4 (lane B26): a restore the disk cuts short leaves no file that opens as a database. Do: in a
+/// process of its own whose files may grow to so many bytes and no further (`ulimit -f`, the signal
+/// ignored, so a write past it fails as on a full disk), restore the archive at limits from one page
+/// up; open every file it left and what stands at its path. Expect: each refused and no file left,
+/// until one is enough and the restore holds every row.
+#[cfg(unix)]
+#[test]
+fn a_restore_a_full_disk_cuts_short_leaves_no_database() {
+    let (s, last) = several_generations();
+    let this = std::env::current_exe().unwrap();
+    let mut refused = 0;
+    for blocks in (8u64..).step_by(24) {
+        let dir = tempfile::tempdir_in(s.dir.path()).unwrap();
+        let target = dir.path().join("restored.db");
+        let limited = format!("trap '' XFSZ; ulimit -f {blocks}; exec \"$0\" \"$@\"");
+        let said = restore_child_by(
+            "/bin/sh",
+            &["-c", &limited, this.to_str().unwrap()],
+            &s,
+            last,
+            dir.path(),
+        )
+        .output()
+        .unwrap();
+        let said = String::from_utf8_lossy(&said.stdout).into_owned();
+        if said.lines().any(|l| l.ends_with("restored")) {
+            assert_eq!(rows(&Db::open(&target).unwrap()), s.model);
+            break;
+        }
+        let why = said
+            .lines()
+            .find(|l| l.contains("refused: "))
+            .unwrap_or_else(|| panic!("at {blocks} blocks: {said}"));
+        let opened = opens_as_a_database(dir.path());
+        assert_eq!(opened, Vec::<String>::new(), "at {blocks} blocks: {why}");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "at {blocks} blocks, files are left: {why}"
+        );
+        refused += 1;
+        assert!(blocks < 1 << 14, "no limit was enough: {why}");
+    }
+    assert!(refused > 3, "non-vacuous: {refused} limits cut it short");
+}
+
+/// AC-T1.12.4 (lane B26): a cut across groups one of which can't be restored leaves no group's database. Do:
+/// restore a group whose archive holds the second and one whose archive is empty. Expect: refused, no
+/// file at either path.
+#[test]
+fn a_cut_one_group_fails_leaves_no_database() {
+    let (s, last) = several_generations();
+    let dir = tempfile::tempdir_in(s.dir.path()).unwrap();
+    let groups = [
+        ("db".to_owned(), dir.path().join("first.db")),
+        ("none".to_owned(), dir.path().join("second.db")),
+    ];
+    let cut = backup::restore_cut(
+        &s.blobs,
+        &groups,
+        last,
+        1,
+        amphora::xgroup::Protocol::TwoPhase,
+        until(),
+    );
+    assert!(cut.is_err());
+    assert_eq!(opens_as_a_database(dir.path()), Vec::<String>::new());
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+/// AC-T1.12.4 (lane B26): a check that finds the archive short begins a base, in the next round, with no
+/// commit to wait for. Do: back a database up that checks itself; once a check passed, zero the last
+/// frame of the log's generation in the archive, sealed again (frames a store lost); write a row a
+/// second until a check fails, and commit nothing after it; wait for a base begun after the short
+/// generation; commit a row and restore its second, and the seconds before it. Expect: the base
+/// begins and ends with no commit, the second restores with every row, and each before it restores
+/// its own or is refused.
+#[test]
+fn a_failed_check_of_a_short_archive_begins_a_base() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("source.db");
+    let blobs =
+        Arc::new(backup::FolderBlobs::open(&dir.path().join("archive"), 64 * 1024).unwrap());
+    let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS + 1));
+    let read = Arc::clone(&now);
+    let archive = Archive {
+        blobs: Arc::clone(&blobs) as Arc<dyn Blobs>,
+        prefix: "db".into(),
+        clock: Arc::new(move || read.load(Ordering::SeqCst)),
+        memory: 32 * 1024,
+        patience: Duration::from_secs(60),
+        chunks: backup::ChunkGrowth::Keep,
+        check: backup::CheckPolicy::Scratch(Some(dir.path().join("check.db"))),
+    };
+    let (database, shipping) = Database::open_backed_up(&path, archive, until()).unwrap();
+    database
+        .call(until(), AnswerMax::fixed(), |c| {
+            c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
+            Ok(())
+        })
+        .unwrap();
+    let (mut model, mut history) = (Rows::new(), Vec::new());
+    shipping.wait(until(), |s| s.bases >= 1).unwrap();
+    let mut id = 1;
+    let mut write = |model: &mut Rows, history: &mut Vec<(u64, Rows)>| {
+        write_seconds(&database, &now, id..id + 1, model, history);
+        id += 1;
+        assert!(id < 400, "no check ran: {:?}", shipping.status());
+        shipping.status().unwrap().last_check
+    };
+    while !matches!(
+        write(&mut model, &mut history),
+        Some(backup::Check::Passed { .. })
+    ) {}
+
+    let (key, name, mut body) = generation_segments(blobs.as_ref(), 1).pop().unwrap();
+    let frames = usize::try_from(key.last - key.first + 1).unwrap();
+    let tail = body.frames.len() - body.frames.len() / frames;
+    body.frames[tail..].fill(0);
+    replace_segment(blobs.as_ref(), &name, &body);
+    let failed = loop {
+        if let Some(backup::Check::Failed { why, .. }) = write(&mut model, &mut history) {
+            break why;
+        }
+    };
+    assert!(format!("{failed:?}").contains("don't replay"), "{failed:?}");
+
+    // No commit from here on: the failed check alone begins it.
+    let status = shipping.wait(until(), |_| newest_base(blobs.as_ref()).start_gen > 1);
+    assert!(
+        status.is_ok(),
+        "no base begun after the short generation: {status:?}; the newest base is {:?}; {:?}",
+        newest_base(blobs.as_ref()),
+        shipping.status()
+    );
+    let based = now.load(Ordering::SeqCst).div_ceil(SECOND_NS) + 1;
+    write(&mut model, &mut history);
+    now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    drop(database);
+    shipping.wait(until(), |s| s.ended).unwrap();
+    let last = history.last().unwrap().0.div_ceil(SECOND_NS);
+    let mut whole = 0;
+    for second in 1_001..=last {
+        let target = dir.path().join(format!("at-{second}.db"));
+        match backup::restore(blobs.as_ref(), "db", second, &target, until()) {
+            Ok(_) => {
+                let expected = at(&history, second).cloned().unwrap_or_default();
+                assert_eq!(
+                    rows(&Db::open(&target).unwrap()),
+                    expected,
+                    "second {second}"
+                );
+                whole += 1;
+            }
+            Err(e) => assert!(
+                second < based && e.downcast_ref::<Unrestorable>().is_some(),
+                "second {second} of {based}..={last} refused: {e:#}"
+            ),
+        }
+    }
+    assert!(whole > 0);
 }
 
 /// A folder where a database was removed and its `-wal2` left: 20 rows, the log started again (the
