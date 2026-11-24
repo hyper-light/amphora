@@ -1,6 +1,9 @@
 use super::*;
 use crate::translate::main_loop::adaptive::AdaptiveSeek;
-use crate::translate::main_loop::{conditions::LoopConditionEmitter, hash::HashProbeSetupEmitter};
+use crate::translate::main_loop::{
+    conditions::{LoopConditionEmitter, LoopTerms},
+    hash::HashProbeSetupEmitter,
+};
 use crate::translate::{
     main_loop::close::AutoIndexBuild,
     plan::{self, SubqueryEvalPhase},
@@ -259,6 +262,7 @@ impl OpenLoop {
                 join_index,
                 condition_fail_target,
                 true,
+                LoopTerms::All,
                 subqueries,
             )
             .emit()?;
@@ -318,6 +322,43 @@ impl OpenLoop {
                 program.preassign_label_to_next_insn(right_join.body_label);
             }
 
+            // A hash join that keeps unmatched build rows gives its later loops two kinds of row: the
+            // pairs the probe matches, and, after the probe, the build rows it did not match, with
+            // the probe's columns NULL. Both enter this level's other terms, with the subqueries
+            // they read, and the later loops by one subroutine. An anti join's own terms, which
+            // read its probe table, come first: a build row they pass is matched, so not kept.
+            let mut row_fail_target = condition_fail_target;
+            let mut row_terms = LoopTerms::All;
+            if let Operation::HashJoin(hash_join_op) = &table.op {
+                if hash_join_op.join_type.keeps_unmatched_build_rows() {
+                    if hash_join_op.join_type == HashJoinType::LeftAnti {
+                        LoopConditionEmitter::new(
+                            program,
+                            t_ctx,
+                            table_references,
+                            join_order,
+                            predicates,
+                            join_index,
+                            condition_fail_target,
+                            false,
+                            LoopTerms::Reading(joined_table_index),
+                            subqueries,
+                        )
+                        .emit()?;
+                        let build_table =
+                            &table_references.joined_tables()[hash_join_op.build_table_idx];
+                        let hash_table_id: usize = build_table.internal_id.into();
+                        program.emit_insn(Insn::HashMarkMatched { hash_table_id });
+                        program.emit_insn(Insn::Goto {
+                            target_pc: condition_fail_target,
+                        });
+                        row_terms = LoopTerms::NotReading(joined_table_index);
+                    }
+                    row_fail_target =
+                        begin_hash_join_rows(program, t_ctx, hash_join_op.build_table_idx)?;
+                }
+            }
+
             // Emit non-OUTER JOIN conditions.
             let from_outer_join = false;
             LoopConditionEmitter::new(
@@ -327,8 +368,9 @@ impl OpenLoop {
                 join_order,
                 predicates,
                 join_index,
-                condition_fail_target,
+                row_fail_target,
                 from_outer_join,
+                row_terms,
                 subqueries,
             )
             .emit()?;
@@ -338,7 +380,7 @@ impl OpenLoop {
                 table_references,
                 predicates,
                 &star_probes,
-                condition_fail_target,
+                row_fail_target,
             )?;
 
             // HASH SEMI-JOIN (G6 step 5): all conditions passed means the build row matched; it
@@ -358,54 +400,16 @@ impl OpenLoop {
             // ANTI-JOIN: all conditions passed means a match was found.
             // Skip the outer row by jumping to the outer loop's Next.
             // label_body is resolved later in emit_loop, right before the body is emitted.
-            if let Some(join_info) = table.join_info.as_ref() {
-                if join_info.is_anti() {
-                    if let Operation::HashJoin(hj) = &table.op {
-                        if hj.join_type != HashJoinType::LeftAnti {
-                            unreachable!("anti hash join must use left anti semantics");
-                        }
-                        let build_table = &table_references.joined_tables()[hj.build_table_idx];
-                        let hash_table_id: usize = build_table.internal_id.into();
-                        program.emit_insn(Insn::HashMarkMatched { hash_table_id });
-                        program.emit_insn(Insn::Goto {
-                            target_pc: condition_fail_target,
-                        });
-                    } else {
-                        let sa_meta = t_ctx.meta_semi_anti_joins[joined_table_index]
-                            .as_ref()
-                            .expect("anti-join must have SemiAntiJoinMetadata");
-                        program.emit_insn(Insn::Goto {
-                            target_pc: sa_meta.label_next_outer,
-                        });
-                    }
-                }
-            }
-
-            // Unmatched build rows use this subroutine to enter later loops.
-            if let Operation::HashJoin(ref hj) = table.op {
-                if hj.join_type.keeps_unmatched_build_rows() {
-                    let return_reg = program.alloc_register();
-                    let gosub_label = program.allocate_label();
-                    let return_label = program.allocate_label();
-                    let skip_label = program.allocate_label();
-
-                    program.emit_insn(Insn::Gosub {
-                        target_pc: gosub_label,
-                        return_reg,
-                    });
-                    program.emit_insn(Insn::Goto {
-                        target_pc: skip_label,
-                    });
-                    // Subroutine body starts here (inner loops follow)
-                    program.preassign_label_to_next_insn(gosub_label);
-
-                    if let Some(hash_ctx) = t_ctx.hash_table_contexts.get_mut(&hj.build_table_idx) {
-                        hash_ctx.inner_loop_gosub_reg = Some(return_reg);
-                        hash_ctx.labels.inner_loop_gosub = Some(gosub_label);
-                        hash_ctx.labels.inner_loop_return = Some(return_label);
-                        hash_ctx.labels.inner_loop_skip = Some(skip_label);
-                    }
-                }
+            // A hash anti join's matches are marked above.
+            if table.join_info.as_ref().is_some_and(|info| info.is_anti())
+                && !matches!(table.op, Operation::HashJoin(_))
+            {
+                let sa_meta = t_ctx.meta_semi_anti_joins[joined_table_index]
+                    .as_ref()
+                    .expect("anti-join must have SemiAntiJoinMetadata");
+                program.emit_insn(Insn::Goto {
+                    target_pc: sa_meta.label_next_outer,
+                });
             }
         }
 
@@ -426,6 +430,41 @@ impl OpenLoop {
 
         Ok(())
     }
+}
+
+/// Begin the subroutine the rows of a hash join that keeps unmatched build rows enter: the matched
+/// ones here, the unmatched ones after the probe (`hash::emit_unmatched_row`). Returns the label a
+/// row that fails a term goes to, the subroutine's Return (`HashProbeCloseEmitter`).
+fn begin_hash_join_rows(
+    program: &mut ProgramBuilder,
+    t_ctx: &mut TranslateCtx,
+    build_table_idx: usize,
+) -> Result<BranchOffset> {
+    let hash_ctx = t_ctx
+        .hash_table_contexts
+        .get_mut(&build_table_idx)
+        .ok_or_else(|| {
+            crate::LimboError::InternalError(
+                "a hash join that keeps unmatched rows has no hash table context".to_string(),
+            )
+        })?;
+    let return_reg = program.alloc_register();
+    let gosub_label = program.allocate_label();
+    let return_label = program.allocate_label();
+    let skip_label = program.allocate_label();
+    program.emit_insn(Insn::Gosub {
+        target_pc: gosub_label,
+        return_reg,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: skip_label,
+    });
+    program.preassign_label_to_next_insn(gosub_label);
+    hash_ctx.inner_loop_gosub_reg = Some(return_reg);
+    hash_ctx.labels.inner_loop_gosub = Some(gosub_label);
+    hash_ctx.labels.inner_loop_return = Some(return_label);
+    hash_ctx.labels.inner_loop_skip = Some(skip_label);
+    Ok(return_label)
 }
 
 /// The cursors one table read uses.

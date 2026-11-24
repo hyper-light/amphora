@@ -10,7 +10,10 @@ Losses first.
     `WITH d AS (SELECT k FROM q) SELECT t.k FROM t WHERE EXISTS (WITH d AS (SELECT k FROM t WHERE k = 1) SELECT 1 FROM d AS s WHERE t.k IN
     (SELECT e.k FROM d AS e))`: SQLite 1, Amphora 2 (main and here). Where the outer CTE is unaliased in FROM and the inner query reads its
     columns, main answers "no such column" (DG); with DG fixed that shape (the fix's own `d.k IN (SELECT e.k FROM d AS e)` form) answers 3 rows for
-    SQLite's 2. A candidate is on branch perf/planner-c13-dh (7f48e226, eight statements as its test): not built, not run (adacachy2 had no idle core).
+    SQLite's 2. DH's fix is on branch
+    perf/planner-c13-dh-land, not on main: on fedc9015 (b549489e, its test and fix) clippy 0, check-production 0 (10,616), oracle_findings 92,
+    outer_join_subqueries 2 (8,000 answers), in_subquery 4, join_methods 4, adaptive_joins 23, on_terms 5, planner 13 of 14 (182, a cost, as lanes C4, C9 and C10 recorded of
+    main). Main then moved in the same functions (lane C16) and adacachy2 had no idle core: the merge with it (108d3dbb, no conflict) was not run.
   - DI: a CTE that only an unread CTE of an inner WITH names is planned, and its error raised: SQLite 1 row, Amphora "no such table".
 - The drawn fixture that lands (1,000 queries, 5,000 answers) holds neither; seed w1 of 300 queries a database holds both (2 queries of 1,500).
 - DF and DG are fixed beyond CO and CM: the sweep of CO's queries could not answer without them.

@@ -553,7 +553,7 @@ pub(super) fn build_prefilter_where_terms(
     let build_only_mask: TableMask = [hash_join_op.build_table_idx].into_iter().try_collect()?;
     let mut term_indices = Vec::new();
     for (cond_idx, cond) in predicates.iter().enumerate() {
-        if cond.origin.is_outer_join() {
+        if cond.origin.is_outer_join() || !reads_only_subqueries_of(&cond.expr, subqueries)? {
             continue;
         }
         let mask = table_mask_from_expr(&cond.expr, table_references, subqueries)?;
@@ -568,6 +568,21 @@ pub(super) fn build_prefilter_where_terms(
         term_indices.push(cond_idx);
     }
     Ok(term_indices)
+}
+
+/// Whether `subqueries`, a plan's, holds every subquery `expr` reads. A materialized build input's
+/// plan has its query's terms, but not the subqueries of the terms that read tables it does not join.
+fn reads_only_subqueries_of(expr: &Expr, subqueries: &[NonFromClauseSubquery]) -> Result<bool> {
+    let mut held = true;
+    walk_expr(expr, &mut |expr: &Expr| -> Result<WalkControl> {
+        if let Expr::SubqueryResult { subquery_id, .. } = expr {
+            held &= subqueries
+                .iter()
+                .any(|subquery| subquery.internal_id == *subquery_id);
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(held)
 }
 
 struct PreparedProbeBuild {
@@ -962,8 +977,6 @@ pub(super) struct HashProbeCloseEmitter<'a, 'plan> {
     t_ctx: &'a mut TranslateCtx<'plan>,
     hash_join_op: &'a HashJoinOp,
     hash_ctx: HashCtx,
-    select_plan: Option<&'plan SelectPlan>,
-    table_index: usize,
 }
 
 impl<'a, 'plan> HashProbeCloseEmitter<'a, 'plan> {
@@ -973,16 +986,12 @@ impl<'a, 'plan> HashProbeCloseEmitter<'a, 'plan> {
         t_ctx: &'a mut TranslateCtx<'plan>,
         hash_join_op: &'a HashJoinOp,
         hash_ctx: HashCtx,
-        select_plan: Option<&'plan SelectPlan>,
-        table_index: usize,
     ) -> Self {
         Self {
             program,
             t_ctx,
             hash_join_op,
             hash_ctx,
-            select_plan,
-            table_index,
         }
     }
 
@@ -1101,24 +1110,7 @@ impl<'a, 'plan> HashProbeCloseEmitter<'a, 'plan> {
                 }
             }
 
-            if let Some(plan) = self.select_plan {
-                emit_unmatched_row_conditions_and_loop(
-                    self.program,
-                    self.t_ctx,
-                    plan,
-                    self.hash_join_op.build_table_idx,
-                    self.table_index,
-                    self.hash_join_op.join_type,
-                    label_next_probe_row,
-                    self.hash_ctx
-                        .inner_loop_gosub_reg
-                        .zip(self.hash_ctx.labels.inner_loop_gosub),
-                    payload_regs(
-                        self.hash_ctx.payload_start_reg,
-                        self.hash_ctx.payload_columns.len(),
-                    ),
-                )?;
-            }
+            emit_unmatched_row(self.program, &self.hash_ctx)?;
         }
 
         Ok(ProbeCloseState {
@@ -1149,22 +1141,34 @@ impl<'a, 'plan> HashProbeCloseEmitter<'a, 'plan> {
     }
 }
 
+/// Give the unmatched row in hand, the other side's columns NULL, to the subroutine the matched rows
+/// enter (`open::begin_hash_join_rows`): the terms of this level and the later loops.
+fn emit_unmatched_row(program: &mut ProgramBuilder, hash_ctx: &HashCtx) -> Result<()> {
+    let (Some(return_reg), Some(target_pc)) = (
+        hash_ctx.inner_loop_gosub_reg,
+        hash_ctx.labels.inner_loop_gosub,
+    ) else {
+        return Err(crate::LimboError::InternalError(
+            "a hash join that keeps unmatched rows has no subroutine for its rows".to_string(),
+        ));
+    };
+    program.emit_insn(Insn::Gosub {
+        target_pc,
+        return_reg,
+    });
+    Ok(())
+}
+
 /// Emit unmatched build rows after the probe cursor has been exhausted.
-pub(super) fn emit_hash_join_unmatched_build_rows<'a>(
+pub(super) fn emit_hash_join_unmatched_build_rows(
     program: &mut ProgramBuilder,
-    t_ctx: &mut TranslateCtx<'a>,
     hash_join_op: &HashJoinOp,
     hash_ctx: &HashCtx,
-    select_plan: Option<&'a SelectPlan>,
-    table_index: usize,
     probe_cursor_id: CursorID,
 ) -> Result<()> {
     if !hash_join_op.join_type.keeps_unmatched_build_rows() {
         return Ok(());
     }
-    let Some(plan) = select_plan else {
-        return Ok(());
-    };
 
     let hash_table_reg = hash_ctx.hash_table_reg;
     let match_reg = hash_ctx.match_reg;
@@ -1186,7 +1190,6 @@ pub(super) fn emit_hash_join_unmatched_build_rows<'a>(
     });
 
     let unmatched_loop = program.allocate_label();
-    let label_next_unmatched = program.allocate_label();
     program.preassign_label_to_next_insn(unmatched_loop);
 
     if let Some(cursor_id) = build_table_cursor_id {
@@ -1197,21 +1200,8 @@ pub(super) fn emit_hash_join_unmatched_build_rows<'a>(
         });
     }
 
-    emit_unmatched_row_conditions_and_loop(
-        program,
-        t_ctx,
-        plan,
-        hash_join_op.build_table_idx,
-        table_index,
-        hash_join_op.join_type,
-        label_next_unmatched,
-        hash_ctx
-            .inner_loop_gosub_reg
-            .zip(hash_ctx.labels.inner_loop_gosub),
-        payload_regs(payload_dest_reg, num_payload),
-    )?;
+    emit_unmatched_row(program, hash_ctx)?;
 
-    program.preassign_label_to_next_insn(label_next_unmatched);
     program.emit_insn(Insn::HashNextUnmatched {
         hash_table_id: hash_table_reg,
         dest_reg: match_reg,
@@ -1226,15 +1216,6 @@ pub(super) fn emit_hash_join_unmatched_build_rows<'a>(
     Ok(())
 }
 
-/// The registers holding this hash join's payload, which the unmatched-row paths
-/// refill for every row they emit. Empty when the join carries no payload.
-fn payload_regs(start_reg: Option<usize>, num_payload: usize) -> Range<usize> {
-    match start_reg {
-        Some(start) => start..start + num_payload,
-        None => 0..0,
-    }
-}
-
 /// Grace Hash Join processing loop after the probe cursor is exhausted.
 pub(crate) struct GraceHashLoop;
 
@@ -1243,13 +1224,11 @@ impl GraceHashLoop {
     /// Uses the shared inner body via `Goto match_found_label` and `grace_flag_reg`
     /// dispatch so that aggregates, LIMIT, ORDER BY, etc. all work naturally.
     /// At runtime, HashGraceInit is a no-op if the build side didn't spill.
-    pub fn emit<'a>(
+    pub fn emit(
         program: &mut ProgramBuilder,
-        t_ctx: &mut TranslateCtx<'a>,
+        t_ctx: &TranslateCtx,
         hash_join_op: &HashJoinOp,
         hash_ctx: &HashCtx,
-        select_plan: Option<&'a SelectPlan>,
-        table_index: usize,
         probe_cursor_id: CursorID,
     ) -> Result<()> {
         // Need grace_flag_reg + probe_rowid_reg for grace processing
@@ -1400,21 +1379,7 @@ impl GraceHashLoop {
             }
 
             // Emit the unmatched row through the shared body
-            if let Some(plan) = select_plan {
-                emit_unmatched_row_conditions_and_loop(
-                    program,
-                    t_ctx,
-                    plan,
-                    hash_join_op.build_table_idx,
-                    table_index,
-                    hash_join_op.join_type,
-                    grace_probe_top,
-                    hash_ctx
-                        .inner_loop_gosub_reg
-                        .zip(hash_ctx.labels.inner_loop_gosub),
-                    payload_regs(payload_dest_reg, num_payload),
-                )?;
-            }
+            emit_unmatched_row(program, hash_ctx)?;
 
             // Advance to next probe entry
             program.emit_insn(Insn::Goto {
@@ -1427,61 +1392,45 @@ impl GraceHashLoop {
 
         // Scan unmatched build rows before eviction removes their match bits.
         if hash_join_op.join_type.keeps_unmatched_build_rows() {
-            if let Some(plan) = select_plan {
-                let done_grace_unmatched = program.allocate_label();
-                let grace_unmatched_loop = program.allocate_label();
-                let grace_next_unmatched = program.allocate_label();
+            let done_grace_unmatched = program.allocate_label();
+            let grace_unmatched_loop = program.allocate_label();
 
-                // Set probe cursor to NULL row (unmatched build rows have no probe match)
-                program.emit_insn(Insn::NullRow {
-                    cursor_id: probe_cursor_id,
-                });
+            // Set probe cursor to NULL row (unmatched build rows have no probe match)
+            program.emit_insn(Insn::NullRow {
+                cursor_id: probe_cursor_id,
+            });
 
-                program.emit_insn(Insn::HashScanUnmatched {
-                    hash_table_id: hash_table_reg,
-                    dest_reg: match_reg,
+            program.emit_insn(Insn::HashScanUnmatched {
+                hash_table_id: hash_table_reg,
+                dest_reg: match_reg,
+                target_pc: done_grace_unmatched,
+                payload_dest_reg,
+                num_payload,
+            });
+
+            program.preassign_label_to_next_insn(grace_unmatched_loop);
+
+            if let Some(cursor_id) = hash_ctx.build_table_cursor_id {
+                program.emit_insn(Insn::SeekRowid {
+                    cursor_id,
+                    src_reg: match_reg,
                     target_pc: done_grace_unmatched,
-                    payload_dest_reg,
-                    num_payload,
                 });
-
-                program.preassign_label_to_next_insn(grace_unmatched_loop);
-
-                if let Some(cursor_id) = hash_ctx.build_table_cursor_id {
-                    program.emit_insn(Insn::SeekRowid {
-                        cursor_id,
-                        src_reg: match_reg,
-                        target_pc: done_grace_unmatched,
-                    });
-                }
-
-                emit_unmatched_row_conditions_and_loop(
-                    program,
-                    t_ctx,
-                    plan,
-                    hash_join_op.build_table_idx,
-                    table_index,
-                    hash_join_op.join_type,
-                    grace_next_unmatched,
-                    hash_ctx
-                        .inner_loop_gosub_reg
-                        .zip(hash_ctx.labels.inner_loop_gosub),
-                    payload_regs(payload_dest_reg, num_payload),
-                )?;
-
-                program.preassign_label_to_next_insn(grace_next_unmatched);
-                program.emit_insn(Insn::HashNextUnmatched {
-                    hash_table_id: hash_table_reg,
-                    dest_reg: match_reg,
-                    target_pc: done_grace_unmatched,
-                    payload_dest_reg,
-                    num_payload,
-                });
-                program.emit_insn(Insn::Goto {
-                    target_pc: grace_unmatched_loop,
-                });
-                program.preassign_label_to_next_insn(done_grace_unmatched);
             }
+
+            emit_unmatched_row(program, hash_ctx)?;
+
+            program.emit_insn(Insn::HashNextUnmatched {
+                hash_table_id: hash_table_reg,
+                dest_reg: match_reg,
+                target_pc: done_grace_unmatched,
+                payload_dest_reg,
+                num_payload,
+            });
+            program.emit_insn(Insn::Goto {
+                target_pc: grace_unmatched_loop,
+            });
+            program.preassign_label_to_next_insn(done_grace_unmatched);
         }
 
         // Evict current partition, advance to next
