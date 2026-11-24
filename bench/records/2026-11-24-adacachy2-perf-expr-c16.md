@@ -1,4 +1,4 @@
-# Lane C16 (expr), 2026-11-24 09:42:02Z to 10:42:02Z: a recursive CTE's columns are typed by every arm, and its own arms read them so (the oracles' finding CU)
+# Lane C16 (expr), 2026-11-24 09:42:02Z to 10:42:02Z: a recursive CTE's columns are typed by every arm, and its own arms read them so (the oracles' finding CU); two numbers under TEXT affinity compare as numbers (CZ)
 
 Machine: adacachy2 (runner 00aad8da, Linux, 32 cores, 0 to 21 of them idle all hour). Every build debug, `nice -n 10`, under `timeout`. Base main 70f6712b.
 SQLite 3.54.0, check-in be8d059e9a49 (adacachy's library, through Python and the shell; the oracles' own build adds only SQLITE_LIKE_DOESNT_MATCH_BLOBS, no LIKE is here).
@@ -6,7 +6,8 @@ Runs named (r...) are in kiln's output log.
 
 ## 1. Losses first
 
-- **CZ, DE and CX are not touched.** None of them has CU's first wrong place. What I saw of CZ and CX is in section 6; DE was not looked at.
+- **DE and CX are not touched.** Neither has CU's first wrong place, nor has CZ, which is fixed at its own (section 4). What I saw of CX is in section 6; DE was not looked at.
+- CZ is held by one hand test (5 statements, 4 settings), not by a sweep: the columns of USING and NATURAL joins are in no shape of this lane's sweep. Its other readers of a merged column (`IN (SELECT ..)`, a join key, the hash join's probe) were not looked at.
 - **Where SQLite's own answer to a mixed compound depends on how it reads it, Amphora is not held to it.** 261 of the 9,643 queries drawn are left out, each by a rule
   in the generator's head: 3.3.1's mixed affinities where SQLite pushes the WHERE into the arms, or where one arm alone is REAL (SQLite then makes the column's integers REALs as it
   reads them, `typeof(a)` real for integer; Amphora leaves them integers). On the fixed engine 23 of those 261 differ from SQLite's answer (r1652, default): 10 a REAL arm's, 3 a pushed WHERE's, 10 a mixed arm made of a scalar subquery. I did not look for more.
@@ -57,6 +58,9 @@ The same at the four settings for the finding's own form (`r(n, d) .. WHERE r.d 
 - The removed indexing and arithmetic lowered the ratchet: indexing_slicing 3054 to 3048, arithmetic_side_effects 3281 to 3277.
 - e89b0e9a, found by the sweep: a row value's comparison took the right column's NOCASE where its left column declares no collation (`(w.a, w.id) = (o.tn, o.id)`: 2 rows for SQLite's 1); datatype3.html 7.1 gives the left column's BINARY.
 
+- CZ: both engines give a FULL or RIGHT JOIN's merged column its first column's affinity (the document says nothing of it), TEXT here, and it may hold the other column's number. `comparison_slow` (vdbe/execute.rs), under TEXT affinity,
+  made both operands texts, so `0 == k` over a 0.0 compared '0' with '0.0'. SQLite's OP_Eq (vdbe.c) converts under TEXT affinity only where one side is a text; its EXPLAIN compares by TEXT (p5 82) and answers 1. So does Amphora now (a6de608f).
+
 ## 5. Held
 
 `tests/cte_columns.rs`, `bench/sqlite_cte_columns.py` (the generator, SQLite's answers), `tests/fixtures/cte_columns.tsv`:
@@ -64,7 +68,7 @@ The same at the four settings for the finding's own form (`r(n, d) .. WHERE r.d 
 - 9,382 queries, 40 sources (a column of each of INTEGER, REAL, TEXT, NUMERIC, BLOB, none, NOCASE and RTRIM and their COLLATEs, 6 CASTs, literals, expressions, scalar subqueries), 61 shapes (recursive CTE arms and outers, CTEs plain, MATERIALIZED and not,
   a CTE of a CTE, derived tables, UNION, UNION ALL, EXCEPT, INTERSECT, mixed arms), 303 tails (=, <, >=, IS, BETWEEN, IN a list, IN a subquery either way, row values, join keys with and without an index, LEFT JOIN, WHERE, EXISTS, ORDER BY, GROUP BY, HAVING, DISTINCT,
   windows), over a column of every type, rows of NULL, integers, REALs, texts that are numbers and not, and BLOBs. Each at default, parallel, statistics and both: 37,528 runs.
-- Two tests by hand: the statements of section 2 and their neighbours (18 at four settings), and 24 nested CTEs.
+- Three tests by hand: the statements of section 2 and their neighbours (18 at four settings), 24 nested CTEs, and CZ's (5 at four settings).
 
 | `cte_columns`, wrong of 5,656 recursive / 3,726 other queries | default | parallel | statistics | both |
 |---|---:|---:|---:|---:|
@@ -79,8 +83,6 @@ The documented exceptions, each in the generator's head: a scalar subquery's col
 
 ## 6. Seen on the way, left
 
-- CZ: both engines give the merged column the left column's affinity (TEXT over INTEGER: `k = 2` finds the right table's 2 on both). The finding's form is a TEXT left and a REAL right: 0.0 compared with 0 by TEXT.
-  SQLite's OP_Eq converts under TEXT affinity only where one side is a text, so 0 = 0.0 (1 row); Amphora's rows say it converts both ('0' and '0.0', no row). From the finding and SQLite's source as I know it; Amphora's opcode not read.
 - CX, run on the fixed build: a trigger's `new.name = 'admin'`, NOCASE, 'ADMIN': the WHEN never fires, the body's comparison is 0, `new.name IN ('admin')` 0, `new.r = 'x'` (RTRIM, 'x  ') 0; SQLite 1, 1, 1, 1. `new.c` becomes an `Expr::Variable`
   that carries a type name and no collation. Its affinity is right as it is: SQLite's `new.n = '1'` (INTEGER n) is 0 too.
 - DE: not looked at.
@@ -92,6 +94,9 @@ The documented exceptions, each in the generator's head: a scalar subquery's col
 Linux, adacachy2. On the merged tree 1bf89d26 (main b549489e in it, lane C13's changes to the same functions): `cargo fmt --all --check` 0; clippy `-p amphora-engine --all-targets --locked -D warnings` 0 ("Checking amphora-engine", 42 s);
 check-production 0 ("engine-ratchet: 10606 left .. as the ratchet holds", 10,616 before); `cte_columns` 10 passed (37,528 runs, 94 s at 2 threads), `oracle_findings` 91, `on_terms` 5, `outer_join_subqueries` 2, `in_subquery` 4 (r1770, r1774).
 On 8565db4f, before lanes C13's, B26's and A28's landings (`simulator` feature, r1725): `lib translate::` 299 passed, 22 ignored; `unnesting` 2, `join_methods` 4 (1 ignored), `adaptive_joins` 23, `row_value_seek` 5, `nested_loops` 7, `planner` 13 of 14 (main's own), clippy 0.
+CU landed as main 7d9fcb6b (10:21:28Z). On a6de608f, CZ on top of it (main has moved only in crates/amphora and records since): fmt 0, clippy 0 ("Checking amphora-engine", 40 s), check-production 0 (10,606), `cte_columns` 11 (37,528 runs, 92 s at 3 threads), `oracle_findings` 91, `on_terms` 5, `outer_join_subqueries` 2, `in_subquery` 4, `floating_point_doc` 47, `hash_group_by` 5, `top_n` 3 (r1793, r1802).
+Red for CZ: `cte_columns merged` on 7d9fcb6b's execute.rs, `b0,0,1,0,1,1,0,0,1` for SQLite's `b0,1,1,0,1,1,0,1,1` and `b10,0,0,0,0,0,0,0,0` for `b10,0,0,0,0,0,1,0,0` (r1793).
+One check-production run was made on a stale tree (its fetch lost a race with the other run's, r1795) and is not counted.
 Not run: macOS (r1653 and r1772 never found room), the whole workspace's tests, the corpus subset, a benchmark.
 
 ## Reproduce
