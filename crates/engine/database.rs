@@ -3478,7 +3478,10 @@ impl Database {
         }
         let generation = shared.metadata.wal_header.lock().checkpoint_seq;
         let frame = shared.metadata.max_frame.load(Ordering::Acquire);
-        (frame > 0 && generation.wrapping_add(1) == current).then_some((before, generation, frame))
+        if frame == 0 || generation.wrapping_add(1) != current {
+            return None;
+        }
+        Some((before, generation, frame))
     }
 
     /// Amphora: the log's last committed frame and how many of its frames are copied into the
