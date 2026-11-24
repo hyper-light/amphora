@@ -2692,6 +2692,7 @@ impl<S: Storage> Raft<S> {
     /// delay unless one is elected or the restarted member's own campaign
     /// reaches it first; a leader tells it who leads.
     pub fn restarted(&mut self, member: NodeId) -> Result<()> {
+        eprintln!("P19 raft restarted id={} member={member}", self.id);
         self.watch_mut()?.trust(member);
         if member == self.id {
             return Ok(());
@@ -2755,6 +2756,7 @@ impl<S: Storage> Raft<S> {
     /// to hold, and a probe that was out is sent again (raft's
     /// `MsgUnreachable`). A snapshot on its way waits for its report.
     fn unreachable(&mut self, member: NodeId) {
+        eprintln!("P19 raft unreachable id={} member={member} transferee={:?}", self.id, self.lead_transferee);
         let position = self.config.heartbeat_answers == HeartbeatAnswers::Position;
         if let Some(progress) = self.tracker.get_mut(member) {
             match progress.state {
@@ -4059,6 +4061,12 @@ impl<S: Storage> Raft<S> {
         }
         self.lead_transferee = Some(target);
         let last = self.log.last_index()?;
+        eprintln!(
+            "P19 raft transfer id={} target={target} matched={:?} last={last} msgs_before={}",
+            self.id,
+            self.tracker.get(target).map(|p| (p.matched, p.state)),
+            self.msgs.len()
+        );
         if self
             .tracker
             .get(target)

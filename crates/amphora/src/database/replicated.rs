@@ -4560,6 +4560,8 @@ impl<F: BlockFile + 'static> Actor<F> {
     /// The host's detector's verdict, for the held count alone (hyper-raft R-8): Amphora elects on
     /// ticks, and its elections take no detector's word.
     fn heard(&mut self, verdict: Verdict) -> Result<(), Refusal> {
+        #[cfg(test)]
+        eprintln!("P19 verdict m={} {verdict:?}", self.replica.id());
         let member = match verdict {
             Verdict::Suspected(member) | Verdict::Trusted(member) => member,
         };
@@ -4870,6 +4872,8 @@ impl<F: BlockFile + 'static> Actor<F> {
         self.control.sent.notify_all();
         drop(outgoing);
         for member in unreachable {
+            #[cfg(test)]
+            eprintln!("P19 shed-unreachable m={} member={member}", self.replica.id());
             // A report the core refuses short of a fence changes nothing: the beat the host's
             // drain prompts (`Outgoing::owed`) finds what the member lacks all the same.
             if let Err(error) = self.replica.report_unreachable(member) {
