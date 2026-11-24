@@ -4,14 +4,15 @@
 
 - A compound SELECT's ORDER BY terms: a position, a name or an expression, under any parentheses, signs and COLLATEs.
 - A window function's arguments, its FILTER, PARTITION BY and ORDER BY that hold subqueries, correlated or not.
-- A view's, a derived table's or a CTE's columns that fail on some row and that nothing reads.
+- A view's and a derived table's columns that fail on some row and that nothing reads.
 
 usage: bench/sqlite_refused_queries.py COUNT SEED > crates/engine/tests/fixtures/refused_queries.tsv   (SQLite 3.54.0)
 
 A compound's values are distinct under every collation, so that the order is one; its columns declare no collation (which
 arm's collation sorts is CY). No correlated subquery is a compound (refused anywhere), no query has two of lag, lead,
 first_value, last_value and nth_value (CO), and no `SELECT *` is over two windows (it has a column too few). No view is
-DISTINCT or grouped: each of its columns counts, and which rows reach it is the push-down's.
+DISTINCT or grouped: each of its columns counts, and which rows reach it is the push-down's. No CTE holds such a column:
+Amphora evaluates it still.
 """
 import random
 import sqlite3
@@ -112,7 +113,7 @@ def window(rng):
 
 
 def derived(rng):
-    """A view's, a derived table's or a CTE's columns that fail on some row, most of them read by nothing."""
+    """A view's or a derived table's columns that fail on some row, most of them read by nothing."""
     bodies = rng.sample(["'{\"a\":1}'", "'{\"a\":\"x\"}'", "'not json'", "'[1,2]'", "NULL", "'{'"], rng.randint(2, 4))
     setup = ["CREATE TABLE doc(id INTEGER PRIMARY KEY, body TEXT, k INT)", "CREATE TABLE o(id INTEGER PRIMARY KEY, j INT)",
              "INSERT INTO doc VALUES " + ", ".join(f"({i}, {b}, {rng.choice(['1', '2', '3', 'NULL'])})" for i, b in enumerate(bodies, 1)),
@@ -137,13 +138,11 @@ def derived(rng):
         names = rng.choice([names, names, [c for c in names if c == "id" or rng.random() < 0.8]])
         body = f"SELECT {'*' if rng.random() < 0.3 and len(names) == len(cols) else ', '.join(names)} FROM {inner}" + rng.choice(["", "", " WHERE id < 9"])
     how = rng.random()
-    if how < 0.5:
+    if how < 0.6:
         setup.append(f"CREATE VIEW v AS {body}")
-        src, head = "v", ""
-    elif how < 0.8:
-        src, head = f"({body}) AS v", ""
+        src = "v"
     else:
-        src, head = "v", f"WITH v AS ({body}) "
+        src = f"({body}) AS v"
     reads = [c for c in names if c not in bad] or ["id"]
     c, d = rng.choice(reads), rng.choice(reads)
     if rng.random() < 0.08:
@@ -161,7 +160,7 @@ def derived(rng):
         f"SELECT * FROM o WHERE j = (SELECT max(v.id) FROM {src} WHERE v.{c} IS NOT (SELECT v.{d}))", f"SELECT count(*) FILTER (WHERE v.{c} IS NOT NULL), sum(v.{d} IS NULL) FROM {src}", f"SELECT max(v.id) OVER (PARTITION BY (SELECT v.{c})) FROM {src}",
         f"SELECT {c} FROM {src} LIMIT 2", f"SELECT id FROM {src} GROUP BY id HAVING max({c}) IS NOT NULL", f"SELECT CASE WHEN {c} IS NULL THEN {d} ELSE id END FROM {src}", f"SELECT rowid FROM o WHERE j NOT IN (SELECT {c} FROM {src} WHERE {c} IS NOT NULL)",
     ]
-    return setup, [("rows" if c not in bad else "reads a failing column", head + rng.choice(once))]
+    return setup, [("rows" if c not in bad else "reads a failing column", rng.choice(once))]
 
 
 def cell(v):
