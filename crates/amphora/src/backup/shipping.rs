@@ -29,7 +29,7 @@ use super::{
     Hooks, RowDigest, Shipped, Shipper, Stopped, admit, check_due, digest_paced, newest_second,
     next_random, plan, restore_and_check_at,
 };
-use crate::db::Db;
+use crate::db::{Db, PAGE_BYTES, log_paths};
 use crate::store::Watcher;
 
 /// Where and how a database is backed up ([`crate::database::Database::open_backed_up`]).
@@ -570,17 +570,26 @@ impl Checker {
         Ok(check)
     }
 
-    /// What a check's restore takes of the scratch disk, and what the disk has ([`admit`]).
+    /// What a check's restore takes of the scratch disk, and what the disk has ([`admit`]): the
+    /// database's pages, those only its log holds yet among them, and beside them the generation of
+    /// the log being replayed, in either of the source's two segments (decision 45).
     fn budget(&self) -> anyhow::Result<Budget> {
         let disk = match self.scratch.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => parent,
             _ => Path::new("."),
         };
+        let pages = self.reader.pages()?.saturating_mul(PAGE_BYTES);
+        let mut restore = file_len(&self.source)?.max(pages);
+        let mut log_headroom = 0u64;
+        for segment in log_paths(&self.source) {
+            restore = restore.saturating_add(file_len(&segment)?);
+            log_headroom = log_headroom
+                .saturating_add(self.reader.log_kept_frames().saturating_mul(FRAME_BYTES));
+        }
         Ok(Budget {
             free: fs4::available_space(disk)?,
-            restore: file_len(&self.source)?
-                .saturating_add(file_len(&suffixed(&self.source, "-wal"))?),
-            log_headroom: self.reader.log_kept_frames().saturating_mul(FRAME_BYTES),
+            restore,
+            log_headroom,
         })
     }
 
@@ -714,8 +723,9 @@ impl Checker {
 
 /// Removes a check's scratch database and its log, if there.
 fn remove_scratch(scratch: &Path) -> anyhow::Result<()> {
-    for suffix in ["", "-wal", "-shm"] {
-        match std::fs::remove_file(suffixed(scratch, suffix)) {
+    let [first, second] = log_paths(scratch);
+    for file in [scratch, &first, &second, &suffixed(scratch, "-shm")] {
+        match std::fs::remove_file(file) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
             _ => {}
         }
@@ -860,8 +870,8 @@ mod tests {
         assert_eq!(ids(&Db::open(&target).unwrap()), ids(&db));
     }
 
-    /// Decision 45 (lane B24): a round between the writer's switch and the fence's word of it ends
-    /// the base under way. Do: begin a first base; write 5 rows and ship them; start the log again,
+    /// Decision 45, AC-T1.12.3 (lane B24): a round between the writer's switch and the fence's word
+    /// of it ends the base under way. Do: begin a first base; write 5 rows and ship them; start the log again,
     /// and in the writer's restart, the switch made and the fence not told of it yet, run the round
     /// that copies the base's last chunk, as the shipping thread may; restore the last commit's
     /// second. Expect: the base ended, so the second restores with every row.
@@ -948,7 +958,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("source.db");
         let blobs = Arc::new(SimBlobs::new(64 * 1024, 1_000_000, 1 << 30));
-        let kept = 400;
+        let kept = 800;
         let (mut db, mut prepared, now) =
             backed_up(&path, &blobs, Some(kept), CheckPolicy::Continuous);
         write(&db, &now, 0, 10);

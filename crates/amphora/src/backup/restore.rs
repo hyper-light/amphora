@@ -14,7 +14,7 @@ use super::drill::{Pace, Unpaced};
 use super::object::{self, SegmentHead};
 use super::plan::{self, BaseKey, SegmentKey, ThroughKey, Unrestorable};
 use super::ship::{FRAME_BYTES, fetch_charge, frame_offset, list_all};
-use crate::db::Db;
+use crate::db::{Db, log_paths};
 use crate::memory::{Budget as Memory, Charge, Use};
 
 /// What a restore did.
@@ -26,12 +26,6 @@ pub struct Restored {
     pub bytes: u64,
     /// The bytes of log it fetched ([`super::check_due`]'s measure).
     pub log_bytes: u64,
-}
-
-fn wal_path(path: &Path) -> std::path::PathBuf {
-    let mut wal = path.as_os_str().to_owned();
-    wal.push("-wal");
-    std::path::PathBuf::from(wal)
 }
 
 /// The through marks under `prefix` ([`plan::ThroughKey`]).
@@ -188,8 +182,13 @@ pub fn restore_within(
     memory: &Arc<Memory>,
     until: Instant,
 ) -> anyhow::Result<Restored> {
-    if path.try_exists()? || wal_path(path).try_exists()? {
-        anyhow::bail!("{} exists: a restore makes a new database", path.display());
+    // Nor a segment of a log left there (decision 45): the engine would recover it as the restored
+    // log's own.
+    let [log_path, second_path] = log_paths(path);
+    for file in [path, &log_path, &second_path] {
+        if file.try_exists()? {
+            anyhow::bail!("{} exists: a restore makes a new database", file.display());
+        }
     }
     let mut listed = Vec::new();
     for (key, size) in list_all(blobs, &format!("{prefix}/log/"), until)? {
@@ -304,9 +303,9 @@ pub fn restore_within(
             .write(true)
             .create(true)
             .truncate(true)
-            .open(wal_path(path))?;
+            .open(&log_path)?;
         // The log as written, read back where a segment overlaps the one before it.
-        let mut written_log = std::fs::File::open(wal_path(path))?;
+        let mut written_log = std::fs::File::open(&log_path)?;
         let mut written = 0u64;
         let mut header_written = false;
         while let Some(i) = plan.segments.get(index) {

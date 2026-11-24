@@ -26,6 +26,17 @@ point ("Continuous Archiving and Point-in-Time Recovery", postgresql.org/docs/cu
   the last connection's close, as SQLite's) are off for a backed-up writer: they skipped the wait.
   The fence follows restarts one by one (each raises the header's checkpoint sequence by one), so a
   log started again twice with no write between, its middle generation empty, stays linked whole.
+  It is told how a generation ends before the switch that ends it is made (`Fence::restart`, lane
+  B24): a round on another thread sees the generation after at once, and would find the fence not
+  told of it, so its base under way was refused its end and started over.
+- **A send reads its generation's own segment** (decision 45, lane B24). A log past what a restart
+  keeps starts again with a send of its frames under way (the store's put may take long). They stay
+  in the segment that closed, so a send reads the segment its generation's header was in, not the
+  current one, and ends. A log started again a second time meanwhile writes over that segment: a
+  generation's header is durable before any frame of it, so the segment's header, read after each
+  part's frames and the generation's own still, says the frames are too; else the send is refused
+  and the log is broken there. No sum catches frames of another generation: a restore's recovery
+  would end at the first of them, with no error.
 - **A segment with no header yet** (decision 45, lane B22). The store switches the log's segments once
   a batch is committed, and a segment's header is written by its first commit. Until then, which is
   as long as the writer is idle, the current segment's file is empty (a switch made it, or cut it),
@@ -35,6 +46,9 @@ point ("Continuous Archiving and Point-in-Time Recovery", postgresql.org/docs/cu
   a small sealed object (`p/through/...`) saying the archive is whole through now, once that is in
   a later second than it was: a database that stops committing, or closes, restores up to the
   second it stopped in. A later mark or segment lets the earlier mark go.
+- **A restore makes a new database** (lane B24). It is refused where the file or either of its log's
+  segments is there already: the engine recovers a segment left at the path (`-wal2`) as the
+  restored log's own, commits after the asked second with it.
 - **Bases.** A copy of the file, chunk by chunk, with no reader held (a reader held for a 100 GB copy
   would hold the log's restarts and the store's readers back), made consistent by replaying the log
   from the first frame of the generation it began in through where the log stood when it ended, as
@@ -389,9 +403,10 @@ checks restore into `<database>.check` beside the database (the same disk), and:
   once the thread has waited for commits, since the last check ended, at least as long as that
   check took, so checks spend only time the foreground leaves idle and none while it keeps the
   thread busy; the first runs at once, nothing being measured yet. It runs only if the disk's free
-  bytes hold the restore (the source's file and log as they stand) and still leave the source's
-  log room to grow to the most it keeps. No number is picked: each side is measured where the
-  database runs.
+  bytes hold the restore (the source's pages, those only its log holds yet among them, and its log's
+  two segments as they stand: the replay's log is beside the file it folds into) and still leave the
+  source's log room to grow to the most it keeps in each segment (decision 45, lane B24). No number
+  is picked: each side is measured where the database runs.
 - **At random seconds** (`backup::Drills`, T-T1.12.C6). Each quiet snapshot's second and rows join
   a uniform sample of every snapshot taken (Vitter's Algorithm R, "Random sampling with a
   reservoir", ACM TOMS 11(1), 1985), as many as `Archive::memory` holds; each check restores one

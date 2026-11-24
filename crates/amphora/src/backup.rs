@@ -338,14 +338,15 @@ struct FenceState {
     /// The last frame shipped, of generation `.0`.
     shipped: Option<(u32, u64)>,
     ended: Option<Ended>,
+    /// The restart the writer is making: what `ended` is once it is made.
+    ending: Option<Ended>,
 }
 
 /// What a log restart asks of the backup: whether all the log holds is shipped.
 #[derive(Default)]
 pub struct Fence {
     state: Mutex<FenceState>,
-    /// A test's round, run once in the writer's restart between its switch and the fence's word of
-    /// it ([`Fence::at_switch`]).
+    /// A test's round, run once within the writer's restart, its switch just made.
     #[cfg(test)]
     during_switch: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
@@ -371,42 +372,65 @@ impl Fence {
                 .is_some_and(|(s, f)| s == seq && f >= frame))
     }
 
-    /// The writer switched and hasn't told the fence yet: runs what a test put there.
+    /// The writer's restart of the log, by `switch` (whether it made it), from the end of
+    /// generation `seq` at `frame`. The fence is told how the generation ends before `switch` is
+    /// made: a round may see the next one the moment it is, before `switch` even returns, and asks
+    /// the fence how this one ended ([`Fence::ended_whole`]).
+    pub(crate) fn restart(
+        &self,
+        seq: u32,
+        frame: u64,
+        forced: bool,
+        switch: impl FnOnce() -> anyhow::Result<bool>,
+    ) -> anyhow::Result<bool> {
+        {
+            let mut state = self.state()?;
+            state.ending = match state.ended {
+                Some(mut e) if frame == 0 && e.next() == seq => {
+                    e.empties = e.empties.wrapping_add(1);
+                    Some(e)
+                }
+                _ => Some(Ended {
+                    seq,
+                    frame,
+                    forced,
+                    empties: 0,
+                }),
+            };
+        }
+        let switched = switch();
+        #[cfg(test)]
+        if matches!(switched, Ok(true)) {
+            self.at_switch();
+        }
+        let mut state = self.state()?;
+        let ending = state.ending.take();
+        if matches!(switched, Ok(true)) {
+            state.ended = ending;
+        }
+        switched
+    }
+
+    /// The writer switched and its restart hasn't ended: runs what a test put there.
     #[cfg(test)]
-    pub(crate) fn at_switch(&self) {
+    fn at_switch(&self) {
         let during = self.during_switch.lock().unwrap().take();
         if let Some(during) = during {
             during();
         }
     }
 
-    pub(crate) fn ended(&self, seq: u32, frame: u64, forced: bool) -> anyhow::Result<()> {
-        let mut state = self.state()?;
-        state.ended = match state.ended {
-            Some(mut e) if frame == 0 && e.next() == seq => {
-                e.empties = e.empties.wrapping_add(1);
-                Some(e)
-            }
-            _ => Some(Ended {
-                seq,
-                frame,
-                forced,
-                empties: 0,
-            }),
-        };
-        Ok(())
-    }
-
     /// Whether the log ran unbroken from frame `frame` of generation `old`, as it ended, to the start
     /// of generation `new`: every restart between them was through [`crate::db::Db::restart_log`]
     /// and none of them forced (T-T1.12.D1).
     pub(crate) fn ended_whole(&self, old: u32, frame: u64, new: u32) -> anyhow::Result<bool> {
-        let Some(e) = self.state()?.ended else {
+        let state = *self.state()?;
+        // A log at the generation the restart under way begins says it was made; a log at the one
+        // it ends was begun by the restart before.
+        let told = [state.ending, state.ended];
+        let Some(e) = told.into_iter().flatten().find(|e| e.next() == new) else {
             return Ok(false);
         };
-        if e.next() != new {
-            return Ok(false);
-        }
         if old == e.seq {
             return Ok(frame == e.frame && !e.forced);
         }
@@ -593,24 +617,24 @@ mod tests {
         let fence = Fence::default();
         assert!(!fence.ended_whole(4, 9, 5).unwrap(), "no restart seen");
         fence.shipped(4, 9).unwrap();
-        fence.ended(4, 9, false).unwrap();
+        fence.restart(4, 9, false, || Ok(true)).unwrap();
         assert!(fence.ended_whole(4, 9, 5).unwrap());
         assert!(
             !fence.ended_whole(4, 8, 5).unwrap(),
             "ended past what was shipped"
         );
         // Generation 5 holds nothing and starts again: 4 still reaches 6 whole, and so does 5.
-        fence.ended(5, 0, false).unwrap();
+        fence.restart(5, 0, false, || Ok(true)).unwrap();
         assert!(fence.ended_whole(4, 9, 6).unwrap());
         assert!(fence.ended_whole(5, 0, 6).unwrap());
         assert!(!fence.ended_whole(4, 9, 5).unwrap(), "the log is past 5");
         assert!(!fence.ended_whole(4, 9, 7).unwrap(), "6 ended untold");
         // A forced restart breaks the link from it on.
-        fence.ended(6, 3, true).unwrap();
+        fence.restart(6, 3, true, || Ok(true)).unwrap();
         assert!(!fence.ended_whole(6, 3, 7).unwrap());
         assert!(!fence.ended_whole(4, 9, 7).unwrap());
         // An empty generation that doesn't follow on starts afresh.
-        fence.ended(9, 0, false).unwrap();
+        fence.restart(9, 0, false, || Ok(true)).unwrap();
         assert!(fence.ended_whole(9, 0, 10).unwrap());
         assert!(!fence.ended_whole(6, 3, 10).unwrap());
     }

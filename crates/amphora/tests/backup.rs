@@ -483,6 +483,68 @@ fn t_t1_12_c3_the_shipping_thread_checks_itself() {
     );
 }
 
+/// Decision 45, T-T1.12.C3 (lane B24): a check's scratch files are its own, both of the log's
+/// segments among them. Do: leave at the scratch path a database whose writer switched, frames in
+/// both segments (a failed check's is kept to look into, and may be written to); back a database up
+/// with that scratch path and write a row a second until a check has run. Expect: it passes.
+#[test]
+fn d45_a_check_clears_the_segments_left_at_its_scratch_path() {
+    let mut left = Source::new();
+    left.put(0..10, "left");
+    left.ship().unwrap();
+    assert!(
+        left.db.restart_log().unwrap(),
+        "shipped, so it starts again"
+    );
+    left.put(10..20, "left");
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = dir.path().join("check.db");
+    for suffix in ["", "-wal", "-wal2"] {
+        let beside = |path: &std::path::Path| {
+            let mut file = path.as_os_str().to_owned();
+            file.push(suffix);
+            file
+        };
+        std::fs::copy(beside(&left.path), beside(&scratch)).unwrap();
+    }
+    let blobs =
+        Arc::new(backup::FolderBlobs::open(&dir.path().join("archive"), 64 * 1024).unwrap());
+    let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS + 1));
+    let read = Arc::clone(&now);
+    let archive = Archive {
+        blobs: Arc::clone(&blobs) as Arc<dyn Blobs>,
+        prefix: "db".into(),
+        clock: Arc::new(move || read.load(Ordering::SeqCst)),
+        memory: 32 * 1024,
+        patience: Duration::from_secs(60),
+        chunks: backup::ChunkGrowth::Keep,
+        check: backup::CheckPolicy::Scratch(Some(scratch)),
+    };
+    let path = dir.path().join("source.db");
+    let (database, shipping) = Database::open_backed_up(&path, archive, until()).unwrap();
+    database
+        .call(until(), AnswerMax::fixed(), |c| {
+            c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
+            Ok(())
+        })
+        .unwrap();
+    let (mut model, mut history) = (Rows::new(), Vec::new());
+    shipping.wait(until(), |s| s.bases >= 1).unwrap();
+    let mut id = 1;
+    let check = loop {
+        write_seconds(&database, &now, id..id + 1, &mut model, &mut history);
+        id += 1;
+        if let Some(check) = shipping.status().unwrap().last_check {
+            break check;
+        }
+        assert!(id < 400, "no check ran: {:?}", shipping.status());
+    };
+    assert!(
+        matches!(check, backup::Check::Passed { .. }),
+        "a check of a whole archive, segments left at its scratch path: {check:?}"
+    );
+}
+
 /// T-T1.12.C1 (AC-T1.12.4): restore-and-check on the folder store. Do: back a database up to a
 /// folder (AMPHORA-BLOBS-8), write a row a second, close it; restore-and-check the newest second
 /// against the model's rows, then against rows that differ. Expect: the newest second is the last
@@ -1127,7 +1189,7 @@ fn restored_beside_a_segment_left(pace: &mut dyn backup::Pace) {
     drop(dir);
 }
 
-/// Decision 45 (lane B24): a restore never takes a log segment left at its path. Do:
+/// Decision 45, AC-T1.12.4 (lane B24): a restore never takes a log segment left at its path. Do:
 /// [`restored_beside_a_segment_left`], as an operator's restore replays. Expect: it is refused and
 /// nothing is written, as where a `-wal` is left; with the segment removed, the second's 20 rows.
 #[test]
@@ -1135,7 +1197,8 @@ fn d45_a_restore_never_takes_a_log_segment_left_at_its_path() {
     restored_beside_a_segment_left(&mut backup::Unpaced);
 }
 
-/// Decision 45 (lane B24): nor does a paced one, as a check's, whose replay folds in parts.
+/// Decision 45, AC-T1.12.4 (lane B24): nor does a paced one, as a check's, whose replay folds in
+/// parts.
 #[test]
 fn d45_a_paced_restore_never_takes_a_log_segment_left_at_its_path() {
     restored_beside_a_segment_left(&mut Steps);
@@ -1313,8 +1376,8 @@ fn restarts_forced_mid_send(restarts: i64) -> (Option<String>, Vec<u64>) {
     (sent.err().map(|e| format!("{e:#}")), refused)
 }
 
-/// Decision 45 (lane B24): a log started again past what it keeps while a send of its frames is
-/// under way leaves them in the segment that closed, and the send ships them from there. Do: commit
+/// Decision 45, AC-T1.12.4 (lane B24): a log started again past what it keeps while a send of its
+/// frames is under way leaves them in the segment that closed, and the send ships them from there. Do: commit
 /// 60 rows with no round, ship them in parts, and as the first is stored have the writer switch,
 /// those commits unshipped, and commit 80 rows more; end a base after the break; restore every
 /// second. Expect: the send ends, every second of its commits restores with its rows, and no second
@@ -1326,8 +1389,8 @@ fn d45_a_send_ships_its_own_generation_when_the_log_starts_again_under_it() {
     assert_eq!(refused, Vec::<u64>::new(), "its commits are in the archive");
 }
 
-/// Decision 45 (lane B24): a log started again twice in one send writes over the segment the send
-/// reads. Do: as above, the writer switching twice, 80 rows after each. Expect: the send is refused,
+/// Decision 45, AC-T1.12.4 (lane B24): a log started again twice in one send writes over the segment
+/// the send reads. Do: as above, the writer switching twice, 80 rows after each. Expect: the send is refused,
 /// never the second generation's frames shipped as the first's, and no second restores with other
 /// rows than its own.
 #[test]

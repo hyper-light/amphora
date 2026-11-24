@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use amphora_api::blobs::{BlobRefusal, Blobs};
+use amphora_engine::storage::log_segments::SegmentId;
 
 use super::object::{
     self, FORMAT, Identity, MANIFEST_FORMAT, Manifest, Segment, StoredMark, Through,
@@ -451,7 +452,7 @@ impl Shipper {
             )?;
             shipper.generation = last.generation;
             shipper.archived_through = last.through;
-            if let Some(head) = db.log_header()?
+            if let Some((_, head)) = db.log_header()?
                 && identity_of(&head)? == body.identity
             {
                 shipper.identity = Some(body.identity);
@@ -624,7 +625,7 @@ impl Shipper {
         let durable = db.durable_frame().unwrap_or(0).min(end);
         // A generation's first commit writes its header (decision 45): until then its segment's
         // file holds none, or the one of the generation it held before, and nothing to ship.
-        let Some(head) = db.log_header()? else {
+        let Some((segment, head)) = db.log_header()? else {
             return Ok((Shipped::default(), false));
         };
         let identity = identity_of(&head)?;
@@ -680,7 +681,7 @@ impl Shipper {
             }
             (None, None) => self.through,
         };
-        let shipped = self.send(db, blobs, &marks, last, through, until)?;
+        let shipped = self.send(db, segment, blobs, &marks, last, through, until)?;
         self.pending.drain(..ready);
         self.shipped = last;
         self.hooks.fence.shipped(identity.seq, last)?;
@@ -795,9 +796,15 @@ impl Shipper {
     /// [`Use::Chunks`], and a part takes at most that stream's share of the room, its frames read,
     /// encoded and sealed ([`ship_charge`]), charged while the send is held, before any part is
     /// put: refused, typed, where the room is gone, and sent again at the next round.
+    ///
+    /// The frames are read from `segment`, the one their generation is in (decision 45): a log past
+    /// its bound switches away while the send is under way, its frames left there, until the writer
+    /// comes back to it and writes over them. Then the send is refused: the log broke there.
+    #[allow(clippy::too_many_arguments)]
     fn send(
         &mut self,
         db: &Db,
+        segment: SegmentId,
         blobs: &dyn Blobs,
         marks: &[Mark],
         last: u64,
@@ -867,10 +874,21 @@ impl Shipper {
             body.first = from.saturating_add(1);
             body.frames = db
                 .read_log(
+                    segment,
                     frame_offset(from)?,
                     usize::try_from(to.saturating_sub(from).saturating_mul(FRAME_BYTES))?,
                 )?
                 .ok_or_else(|| anyhow::anyhow!("the log's file is gone"))?;
+            // A generation's header is written, and durable, before any frame of it (decision 13):
+            // the file's header read after the frames, the generation's own still, says they are.
+            let held = db.segment_header(segment)?;
+            if held.as_deref().map(identity_of).transpose()? != Some(identity) {
+                anyhow::bail!(
+                    "the log started again over frames {}..={to} of generation {} before they were shipped",
+                    body.first,
+                    self.generation
+                );
+            }
             self.current.mark_frames(&body.frames)?;
             let key = SegmentKey {
                 generation: self.generation,
