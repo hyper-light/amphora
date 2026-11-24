@@ -225,12 +225,23 @@ pub trait Readings: Send + Sync {
 /// Every caller receives a fresh reading whose `R::read()` **started after** the caller entered
 /// `SingleFlight::read()` and **finished before** it returned. When a reading is already in flight,
 /// arriving callers never reuse the previous completed sample (which could predate a memory limit
-/// reduction); instead they coalesce onto the next flight, which one leader executes once the
-/// current flight finishes.
+/// reduction); instead they coalesce onto the next flight, which one designated leader executes
+/// once the current flight finishes.
+///
+/// Fast path: uncontended callers transition `fast_busy` `0 -> 1 -> 0` with zero mutex locks or
+/// condvar notifications. Contended callers escalate `fast_busy` to `2` under `state`, designate a
+/// single next-generation leader on `next_leader_cv`, and park all other batch followers on a
+/// generation-parity condvar (`done_even` / `done_odd`) so followers never wake up until their
+/// target generation has actually completed (zero thundering herd).
 struct FlightState {
     in_flight: bool,
     active_gen: u64,
     completed_gen: u64,
+    next_leader_gen: Option<u64>,
+    leader_waiters_even: usize,
+    leader_waiters_odd: usize,
+    batch_waiters_even: usize,
+    batch_waiters_odd: usize,
     last: Reading,
     #[cfg(test)]
     waiters: usize,
@@ -242,6 +253,11 @@ impl Default for FlightState {
             in_flight: false,
             active_gen: 0,
             completed_gen: 0,
+            next_leader_gen: None,
+            leader_waiters_even: 0,
+            leader_waiters_odd: 0,
+            batch_waiters_even: 0,
+            batch_waiters_odd: 0,
             last: Reading {
                 limit: None,
                 resident: None,
@@ -252,56 +268,319 @@ impl Default for FlightState {
     }
 }
 
+impl FlightState {
+    #[inline]
+    fn leader_waiters(&self, generation: u64) -> usize {
+        if generation & 1 == 0 {
+            self.leader_waiters_even
+        } else {
+            self.leader_waiters_odd
+        }
+    }
+
+    #[inline]
+    fn leader_waiters_mut(&mut self, generation: u64) -> &mut usize {
+        if generation & 1 == 0 {
+            &mut self.leader_waiters_even
+        } else {
+            &mut self.leader_waiters_odd
+        }
+    }
+
+    #[inline]
+    fn batch_waiters(&self, generation: u64) -> usize {
+        if generation & 1 == 0 {
+            self.batch_waiters_even
+        } else {
+            self.batch_waiters_odd
+        }
+    }
+
+    #[inline]
+    fn batch_waiters_mut(&mut self, generation: u64) -> &mut usize {
+        if generation & 1 == 0 {
+            &mut self.batch_waiters_even
+        } else {
+            &mut self.batch_waiters_odd
+        }
+    }
+
+    #[inline]
+    fn is_idle(&self) -> bool {
+        !self.in_flight
+            && self.leader_waiters_even == 0
+            && self.leader_waiters_odd == 0
+            && self.batch_waiters_even == 0
+            && self.batch_waiters_odd == 0
+    }
+}
+
 #[inline]
 fn gen_reached(completed: u64, target: u64) -> bool {
     completed.wrapping_sub(target) < (1u64 << 63)
 }
 
+const FAST_IDLE: u64 = 0;
+const FAST_IN_FLIGHT: u64 = 1;
+const FAST_SLOW_PATH: u64 = 2;
+
 struct SingleFlight<R> {
     inner: R,
+    fast_busy: AtomicU64,
     state: Mutex<FlightState>,
-    done: Condvar,
+    leader_even: Condvar,
+    leader_odd: Condvar,
+    done_even: Condvar,
+    done_odd: Condvar,
 }
 
 impl<R> SingleFlight<R> {
     fn new(inner: R) -> Self {
         Self {
             inner,
+            fast_busy: AtomicU64::new(FAST_IDLE),
             state: Mutex::new(FlightState::default()),
-            done: Condvar::new(),
+            leader_even: Condvar::new(),
+            leader_odd: Condvar::new(),
+            done_even: Condvar::new(),
+            done_odd: Condvar::new(),
         }
+    }
+
+    #[inline]
+    fn leader_cv(&self, generation: u64) -> &Condvar {
+        if generation & 1 == 0 {
+            &self.leader_even
+        } else {
+            &self.leader_odd
+        }
+    }
+
+    #[inline]
+    fn done_cv(&self, generation: u64) -> &Condvar {
+        if generation & 1 == 0 {
+            &self.done_even
+        } else {
+            &self.done_odd
+        }
+    }
+
+    #[inline]
+    fn maybe_reset_fast(&self, state: &FlightState) {
+        if state.is_idle() {
+            self.fast_busy.store(FAST_IDLE, Ordering::Release);
+        }
+    }
+
+    fn finish_flight(&self, my_gen: Option<u64>, reading: Reading) {
+        let (completed_gen, wake_cur, wake_cur_leader, wake_next_leader, wake_orphan_next) = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let completed_gen = my_gen.unwrap_or(state.active_gen);
+            let next_gen = completed_gen.wrapping_add(1);
+            state.last = reading;
+            state.completed_gen = completed_gen;
+            state.in_flight = false;
+            let wake_cur = state.batch_waiters(completed_gen) > 0;
+            let wake_cur_leader = state.leader_waiters(completed_gen) > 0;
+            let wake_next_leader = state.leader_waiters(next_gen) > 0;
+            if wake_next_leader && state.next_leader_gen == Some(next_gen) {
+                state.next_leader_gen = None;
+            }
+            let wake_orphan_next = !wake_next_leader && state.batch_waiters(next_gen) > 0;
+            self.maybe_reset_fast(&state);
+            (
+                completed_gen,
+                wake_cur,
+                wake_cur_leader,
+                wake_next_leader,
+                wake_orphan_next,
+            )
+        };
+        let next_gen = completed_gen.wrapping_add(1);
+        if wake_cur {
+            self.done_cv(completed_gen).notify_all();
+        }
+        if wake_cur_leader {
+            self.leader_cv(completed_gen).notify_all();
+        }
+        if wake_next_leader {
+            self.leader_cv(next_gen).notify_all();
+        } else if wake_orphan_next {
+            self.done_cv(next_gen).notify_all();
+        }
+    }
+
+    fn finish_panic(&self) {
+        {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.in_flight = false;
+            state.next_leader_gen = None;
+            self.maybe_reset_fast(&state);
+        }
+        self.leader_even.notify_all();
+        self.leader_odd.notify_all();
+        self.done_even.notify_all();
+        self.done_odd.notify_all();
     }
 }
 
 impl<R: Readings> Readings for SingleFlight<R> {
     fn read(&self) -> Reading {
+        // Zero-mutex uncontended fast path.
+        if self
+            .fast_busy
+            .compare_exchange(
+                FAST_IDLE,
+                FAST_IN_FLIGHT,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            struct FastGuard<'a, R> {
+                sf: &'a SingleFlight<R>,
+                finished: bool,
+            }
+            impl<R> Drop for FastGuard<'_, R> {
+                fn drop(&mut self) {
+                    if !self.finished
+                        && self
+                            .sf
+                            .fast_busy
+                            .compare_exchange(
+                                FAST_IN_FLIGHT,
+                                FAST_IDLE,
+                                Ordering::Release,
+                                Ordering::Acquire,
+                            )
+                            .is_err()
+                    {
+                        self.sf.finish_panic();
+                    }
+                }
+            }
+            let mut guard = FastGuard {
+                sf: self,
+                finished: false,
+            };
+            let reading = self.inner.read();
+            guard.finished = true;
+            if self
+                .fast_busy
+                .compare_exchange(
+                    FAST_IN_FLIGHT,
+                    FAST_IDLE,
+                    Ordering::Release,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                self.finish_flight(None, reading);
+            }
+            return reading;
+        }
+
         let my_gen = {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            // Escalate `fast_busy` to `FAST_SLOW_PATH` while holding `state` so no new caller
+            // enters the fast path until `state` drains idle, and any in-flight fast caller is
+            // guaranteed to hand off through `finish_flight`.
+            loop {
+                match self.fast_busy.load(Ordering::Acquire) {
+                    FAST_SLOW_PATH => break,
+                    FAST_IDLE => {
+                        if self
+                            .fast_busy
+                            .compare_exchange(
+                                FAST_IDLE,
+                                FAST_SLOW_PATH,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                        {
+                            break;
+                        }
+                    }
+                    _ => {
+                        if self
+                            .fast_busy
+                            .compare_exchange(
+                                FAST_IN_FLIGHT,
+                                FAST_SLOW_PATH,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                        {
+                            let fast_gen = state.completed_gen.wrapping_add(1);
+                            state.in_flight = true;
+                            state.active_gen = fast_gen;
+                            break;
+                        }
+                    }
+                }
+            }
+
             if state.in_flight {
                 let target_gen = state.active_gen.wrapping_add(1);
                 loop {
-                    while state.in_flight && !gen_reached(state.completed_gen, target_gen) {
-                        #[cfg(test)]
-                        {
-                            state.waiters = state.waiters.saturating_add(1);
-                        }
-                        state = self
-                            .done
-                            .wait(state)
-                            .unwrap_or_else(PoisonError::into_inner);
-                        #[cfg(test)]
-                        {
-                            state.waiters = state.waiters.saturating_sub(1);
-                        }
-                    }
                     if gen_reached(state.completed_gen, target_gen) {
-                        return state.last;
+                        let reading = state.last;
+                        self.maybe_reset_fast(&state);
+                        return reading;
                     }
                     if !state.in_flight {
                         let next_gen = state.completed_gen.wrapping_add(1);
                         state.in_flight = true;
                         state.active_gen = next_gen;
                         break next_gen;
+                    }
+                    if state.active_gen != target_gen && state.next_leader_gen != Some(target_gen) {
+                        state.next_leader_gen = Some(target_gen);
+                        let leaders = state.leader_waiters_mut(target_gen);
+                        *leaders = leaders.saturating_add(1);
+                        #[cfg(test)]
+                        {
+                            state.waiters = state.waiters.saturating_add(1);
+                        }
+                        while state.in_flight
+                            && state.active_gen != target_gen
+                            && !gen_reached(state.completed_gen, target_gen)
+                        {
+                            state = self
+                                .leader_cv(target_gen)
+                                .wait(state)
+                                .unwrap_or_else(PoisonError::into_inner);
+                        }
+                        let leaders = state.leader_waiters_mut(target_gen);
+                        *leaders = leaders.saturating_sub(1);
+                        #[cfg(test)]
+                        {
+                            state.waiters = state.waiters.saturating_sub(1);
+                        }
+                        if state.next_leader_gen == Some(target_gen) {
+                            state.next_leader_gen = None;
+                        }
+                    } else {
+                        let slot = state.batch_waiters_mut(target_gen);
+                        *slot = slot.saturating_add(1);
+                        #[cfg(test)]
+                        {
+                            state.waiters = state.waiters.saturating_add(1);
+                        }
+                        while state.in_flight && !gen_reached(state.completed_gen, target_gen) {
+                            state = self
+                                .done_cv(target_gen)
+                                .wait(state)
+                                .unwrap_or_else(PoisonError::into_inner);
+                        }
+                        let slot = state.batch_waiters_mut(target_gen);
+                        *slot = slot.saturating_sub(1);
+                        #[cfg(test)]
+                        {
+                            state.waiters = state.waiters.saturating_sub(1);
+                        }
                     }
                 }
             } else {
@@ -312,35 +591,24 @@ impl<R: Readings> Readings for SingleFlight<R> {
             }
         };
 
-        struct FlightGuard<'a> {
-            state: &'a Mutex<FlightState>,
-            done: &'a Condvar,
+        struct FlightGuard<'a, R> {
+            sf: &'a SingleFlight<R>,
             finished: bool,
         }
-        impl Drop for FlightGuard<'_> {
+        impl<R> Drop for FlightGuard<'_, R> {
             fn drop(&mut self) {
                 if !self.finished {
-                    let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-                    state.in_flight = false;
-                    drop(state);
-                    self.done.notify_all();
+                    self.sf.finish_panic();
                 }
             }
         }
         let mut guard = FlightGuard {
-            state: &self.state,
-            done: &self.done,
+            sf: self,
             finished: false,
         };
         let reading = self.inner.read();
-        {
-            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            state.last = reading;
-            state.completed_gen = my_gen;
-            state.in_flight = false;
-            guard.finished = true;
-        }
-        self.done.notify_all();
+        guard.finished = true;
+        self.finish_flight(Some(my_gen), reading);
         reading
     }
 }
@@ -1335,5 +1603,92 @@ pub(crate) mod tests {
         }
         // Initial read + t1 + exactly 1 coalesced fresh read shared by all 4 followers.
         assert_eq!(sf.inner.calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// Stress test (AC-MB.1.1): 32 concurrent callers hammering `SingleFlight::read()` across
+    /// thousands of overlapping generations, verifying strict linearizability (every returned
+    /// sequence >= sequence observed before calling `read()`), clean recovery after an inner
+    /// panic, and return to `FAST_IDLE` with zero stranded waiters.
+    #[test]
+    fn single_flight_concurrent_waves_and_panic_recovery() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct MonotonicReadings {
+            seq: AtomicU64,
+            panic_on_seq: AtomicU64,
+            calls: AtomicUsize,
+        }
+
+        impl Readings for MonotonicReadings {
+            fn read(&self) -> Reading {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                let v = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+                if v == self.panic_on_seq.load(Ordering::Relaxed) {
+                    panic!("injected readings panic at seq {v}");
+                }
+                // Brief work so threads overlap across fast->slow escalation and parity flips.
+                std::hint::black_box(v);
+                if v.is_multiple_of(7) {
+                    std::thread::yield_now();
+                }
+                Reading {
+                    limit: Some(v),
+                    resident: Some(0),
+                }
+            }
+        }
+
+        let sf = Arc::new(SingleFlight::new(MonotonicReadings {
+            seq: AtomicU64::new(0),
+            panic_on_seq: AtomicU64::new(0),
+            calls: AtomicUsize::new(0),
+        }));
+
+        // Wave 1: 32 threads x 400 reads each (12,800 reads across fast + slow + parity shifts).
+        std::thread::scope(|s| {
+            for _ in 0..32 {
+                let sf = Arc::clone(&sf);
+                s.spawn(move || {
+                    for _ in 0..400 {
+                        let before = sf.inner.seq.load(Ordering::SeqCst);
+                        let got = sf.read().limit.unwrap();
+                        assert!(
+                            got > before,
+                            "AC-MB.1.1 violation: read started after seq {before} returned stale {got}"
+                        );
+                    }
+                });
+            }
+        });
+        assert_eq!(sf.fast_busy.load(Ordering::Acquire), FAST_IDLE);
+        assert!(sf.state.lock().unwrap().is_idle());
+
+        // Wave 2: inject a panic mid-flight while 16 threads are contending; surviving threads
+        // must never deadlock and must observe strictly fresh readings.
+        let panic_target = sf.inner.seq.load(Ordering::SeqCst) + 10;
+        sf.inner.panic_on_seq.store(panic_target, Ordering::SeqCst);
+        let mut panicked = 0usize;
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..16)
+                .map(|_| {
+                    let sf = Arc::clone(&sf);
+                    s.spawn(move || {
+                        for _ in 0..50 {
+                            let before = sf.inner.seq.load(Ordering::SeqCst);
+                            let got = sf.read().limit.unwrap();
+                            assert!(got > before);
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                if h.join().is_err() {
+                    panicked += 1;
+                }
+            }
+        });
+        assert!(panicked <= 1, "at most the one panicking leader fails");
+        assert_eq!(sf.fast_busy.load(Ordering::Acquire), FAST_IDLE);
+        assert!(sf.state.lock().unwrap().is_idle());
     }
 }

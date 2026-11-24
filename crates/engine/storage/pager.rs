@@ -2092,6 +2092,9 @@ pub struct Pager {
     /// their recent share (`page_miss_ratio`).
     page_fetches: AtomicU64,
     page_file_reads: AtomicU64,
+    /// Amphora (QT.5): fetches that missed this connection's `PageCache` (served by `SharedPages`
+    /// or disk), so `timed_run` excludes shared-pool lookup/eviction overhead from pure CPU rates.
+    page_cache_misses: AtomicU64,
     page_miss_window: Mutex<PageMissWindow>,
 }
 
@@ -2392,6 +2395,7 @@ impl Pager {
             learned_costs: std::sync::OnceLock::new(),
             page_fetches: AtomicU64::new(0),
             page_file_reads: AtomicU64::new(0),
+            page_cache_misses: AtomicU64::new(0),
             page_miss_window: Mutex::new(PageMissWindow::default()),
             pending_reads: RwLock::new(HashMap::new()),
             has_pending_reads: AtomicBool::new(false),
@@ -4437,6 +4441,7 @@ impl Pager {
                 }
             }
 
+            self.page_cache_misses.fetch_add(1, Ordering::Relaxed);
             tracing::debug!("read_page(page_idx = {page_idx}) = reading page from disk");
             // Amphora: a version another connection read in is shared, and one read now is
             // shared once read (decision 20).
@@ -4571,6 +4576,18 @@ impl Pager {
     /// cost model (`cost_fit`).
     pub(crate) fn page_file_reads(&self) -> u64 {
         self.page_file_reads.load(Ordering::Relaxed)
+    }
+
+    /// Amphora (QT.5): fetches that missed this connection's `PageCache`.
+    pub(crate) fn page_cache_misses(&self) -> u64 {
+        self.page_cache_misses.load(Ordering::Relaxed)
+    }
+
+    /// Approximate count of concurrent WAL transactions active on this database.
+    /// Used only on sampled cost-learning runs so multi-core contention cannot skew one
+    /// operator's rate while unobserved operators remain on uncontended calibration.
+    pub(crate) fn concurrent_readers(&self) -> u64 {
+        self.wal.as_ref().map_or(1, |wal| wal.concurrent_readers())
     }
 
     /// Lane T13: the standing share once an epoch has closed; before that, the share so far.

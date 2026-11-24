@@ -434,6 +434,14 @@ impl ShardedRwLock {
             .is_some_and(|s| (s.load(Ordering::Acquire) & Self::EXCLUSIVE) != 0)
     }
 
+    /// Approximate count of active shared holders across all per-core shards.
+    #[inline]
+    pub fn reader_count(&self) -> u64 {
+        self.shards.iter().fold(0u64, |acc, s| {
+            acc.saturating_add((s.load(Ordering::Relaxed) & Self::READER_MASK) >> 1)
+        })
+    }
+
     /// Upgrade a held shared read lock to exclusive iff there is exactly one reader across all
     /// shards. Records the upgraded shard so [`Self::downgrade`] restores the read lock to the
     /// exact same shard.
@@ -1558,6 +1566,11 @@ pub trait Wal: Debug + Send + Sync {
 
     /// Returns true if this WAL instance currently holds a read lock.
     fn holds_read_lock(&self) -> bool;
+
+    /// Approximate count of concurrent transactions active on this WAL.
+    fn concurrent_readers(&self) -> u64 {
+        1
+    }
 
     /// Returns true if this WAL instance currently holds the write lock.
     fn holds_write_lock(&self) -> bool;
@@ -6507,6 +6520,10 @@ impl Wal for WalFile {
     /// Returns true if this WAL instance currently holds a read lock.
     fn holds_read_lock(&self) -> bool {
         self.max_frame_read_lock_index.load(Ordering::Acquire) != NO_LOCK_HELD
+    }
+
+    fn concurrent_readers(&self) -> u64 {
+        self.coordination.shared_log().vacuum_lock.reader_count()
     }
 
     /// Returns true if this WAL instance currently holds the write lock.

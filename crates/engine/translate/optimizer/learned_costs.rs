@@ -499,6 +499,7 @@ impl Rate {
 struct Rates {
     row: Rate,
     seek: Rate,
+    rowid_seek: Rate,
     hash_build: Rate,
     hash_probe: Rate,
     sort: Rate,
@@ -522,6 +523,7 @@ impl Rates {
         let kind = [
             &self.row,
             &self.seek,
+            &self.rowid_seek,
             &self.hash_build,
             &self.hash_probe,
             &self.sort,
@@ -544,6 +546,7 @@ impl Rates {
         for rate in [
             &mut self.row,
             &mut self.seek,
+            &mut self.rowid_seek,
             &mut self.hash_build,
             &mut self.hash_probe,
             &mut self.sort,
@@ -553,6 +556,11 @@ impl Rates {
         ] {
             rate.switch(rule);
         }
+    }
+
+    fn rowid_seek_weight(&self) -> Option<f64> {
+        let row = self.row.nanos_per_unit()?;
+        Some(self.rowid_seek.nanos_per_unit()? / row)
     }
 
     fn rate_mut(&mut self, work: Work) -> &mut Rate {
@@ -612,6 +620,7 @@ pub struct LearnedWeights {
 #[derive(Debug, Default)]
 pub(crate) struct RunCounts {
     seek: RunCount,
+    rowid_seek: RunCount,
     hash_build: RunCount,
     hash_probe: RunCount,
 }
@@ -623,6 +632,7 @@ impl RunCounts {
         let base = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         Self {
             seek: RunCount(AtomicU64::new(base)),
+            rowid_seek: RunCount(AtomicU64::new(base.rotate_left(7))),
             hash_build: RunCount(AtomicU64::new(base.rotate_left(17))),
             hash_probe: RunCount(AtomicU64::new(base.rotate_left(37))),
         }
@@ -635,6 +645,10 @@ impl RunCounts {
             Work::HashProbe => Some(&self.hash_probe),
             Work::Row | Work::Sort | Work::BloomProbe | Work::WhereStep | Work::PageRead => None,
         }
+    }
+
+    const fn rowid_seek_count(&self) -> &RunCount {
+        &self.rowid_seek
     }
 }
 
@@ -658,6 +672,7 @@ impl RunCount {
 #[derive(Debug, Clone, Copy)]
 struct WeightsSnapshot {
     weights: Option<LearnedWeights>,
+    rowid_seek_weight: Option<f64>,
     cost_margin: f64,
     row_nanos: Option<f64>,
 }
@@ -666,6 +681,7 @@ impl WeightsSnapshot {
     fn from_rates(rates: &Rates) -> Self {
         Self {
             weights: rates.weights(None),
+            rowid_seek_weight: rates.rowid_seek_weight(),
             cost_margin: rates.cost_margin(),
             row_nanos: rates.row.nanos_per_unit(),
         }
@@ -682,9 +698,11 @@ struct AtomicWeightsSlot {
     generation: AtomicU64,
     has_weights: AtomicBool,
     has_row_in_pages: AtomicBool,
+    has_rowid_seek: AtomicBool,
     has_row_nanos: AtomicBool,
     row_in_pages: AtomicU64,
     seek: AtomicU64,
+    rowid_seek: AtomicU64,
     hash_build: AtomicU64,
     hash_probe: AtomicU64,
     sort: AtomicU64,
@@ -701,9 +719,11 @@ impl AtomicWeightsSlot {
             generation: AtomicU64::new(0),
             has_weights: AtomicBool::new(false),
             has_row_in_pages: AtomicBool::new(false),
+            has_rowid_seek: AtomicBool::new(false),
             has_row_nanos: AtomicBool::new(false),
             row_in_pages: AtomicU64::new(0),
             seek: AtomicU64::new(0),
+            rowid_seek: AtomicU64::new(0),
             hash_build: AtomicU64::new(0),
             hash_probe: AtomicU64::new(0),
             sort: AtomicU64::new(0),
@@ -749,6 +769,15 @@ impl AtomicWeightsSlot {
                 self.has_row_in_pages.store(false, Ordering::Relaxed);
             }
         }
+        match snap.rowid_seek_weight {
+            Some(v) => {
+                self.has_rowid_seek.store(true, Ordering::Relaxed);
+                self.rowid_seek.store(v.to_bits(), Ordering::Relaxed);
+            }
+            None => {
+                self.has_rowid_seek.store(false, Ordering::Relaxed);
+            }
+        }
         self.cost_margin
             .store(snap.cost_margin.to_bits(), Ordering::Relaxed);
         match snap.row_nanos {
@@ -775,9 +804,11 @@ impl AtomicWeightsSlot {
         }
         let has_weights = self.has_weights.load(Ordering::Relaxed);
         let has_row_in_pages = self.has_row_in_pages.load(Ordering::Relaxed);
+        let has_rowid_seek = self.has_rowid_seek.load(Ordering::Relaxed);
         let has_row_nanos = self.has_row_nanos.load(Ordering::Relaxed);
         let row_in_pages = f64::from_bits(self.row_in_pages.load(Ordering::Relaxed));
         let seek = f64::from_bits(self.seek.load(Ordering::Relaxed));
+        let rowid_seek = f64::from_bits(self.rowid_seek.load(Ordering::Relaxed));
         let hash_build = f64::from_bits(self.hash_build.load(Ordering::Relaxed));
         let hash_probe = f64::from_bits(self.hash_probe.load(Ordering::Relaxed));
         let sort = f64::from_bits(self.sort.load(Ordering::Relaxed));
@@ -809,6 +840,11 @@ impl AtomicWeightsSlot {
         };
         Some(WeightsSnapshot {
             weights,
+            rowid_seek_weight: if has_rowid_seek {
+                Some(rowid_seek)
+            } else {
+                None
+            },
             cost_margin,
             row_nanos: if has_row_nanos {
                 Some(row_nanos_val)
@@ -829,9 +865,11 @@ impl AtomicWeightsSlot {
         }
         let has_weights = self.has_weights.load(Ordering::Relaxed);
         let has_row_in_pages = self.has_row_in_pages.load(Ordering::Relaxed);
+        let has_rowid_seek = self.has_rowid_seek.load(Ordering::Relaxed);
         let has_row_nanos = self.has_row_nanos.load(Ordering::Relaxed);
         let row_in_pages = f64::from_bits(self.row_in_pages.load(Ordering::Relaxed));
         let seek = f64::from_bits(self.seek.load(Ordering::Relaxed));
+        let rowid_seek = f64::from_bits(self.rowid_seek.load(Ordering::Relaxed));
         let hash_build = f64::from_bits(self.hash_build.load(Ordering::Relaxed));
         let hash_probe = f64::from_bits(self.hash_probe.load(Ordering::Relaxed));
         let sort = f64::from_bits(self.sort.load(Ordering::Relaxed));
@@ -865,6 +903,11 @@ impl AtomicWeightsSlot {
             slot_gen,
             WeightsSnapshot {
                 weights,
+                rowid_seek_weight: if has_rowid_seek {
+                    Some(rowid_seek)
+                } else {
+                    None
+                },
                 cost_margin,
                 row_nanos: if has_row_nanos {
                     Some(row_nanos_val)
@@ -1013,8 +1056,10 @@ pub(crate) struct LearnedCosts {
     snapshot: WeightsRing,
     /// True when the active weight rule is `WeightRule::BatchMeans`.
     batch_means: AtomicBool,
-    /// Which runs of the seek, the hash build and the hash probe are timed (step 3a).
+    /// Which runs of the seek, the rowid seek, the hash build and the hash probe are timed
+    /// (step 3a).
     seek: Sampling,
+    rowid_seek: Sampling,
     hash_build: Sampling,
     hash_probe: Sampling,
     /// What timing one run costs: two clock reads, as calibration timed them.
@@ -1164,11 +1209,17 @@ impl LearnedCosts {
     }
 
     fn from_rates(rates: &Rates) -> Self {
+        let rowid_epoch = if rates.rowid_seek.epoch > 0.0 {
+            rates.rowid_seek.epoch
+        } else {
+            rates.seek.epoch
+        };
         Self {
             rates: Mutex::new(*rates),
             snapshot: WeightsRing::from_rates(rates),
             batch_means: AtomicBool::new(rates.seek.rule == WeightRule::BatchMeans),
             seek: Sampling::new(rates.seek.epoch),
+            rowid_seek: Sampling::new(rowid_epoch),
             hash_build: Sampling::new(rates.hash_build.epoch),
             hash_probe: Sampling::new(rates.hash_probe.epoch),
             timing_nanos: rates.timing_nanos,
@@ -1329,6 +1380,41 @@ impl LearnedCosts {
         }
     }
 
+    /// Whether to time this table-rowid (`INTEGER PRIMARY KEY`) seek, counted per connection.
+    pub(crate) fn sampled_rowid_seek(&self, runs: &RunCounts) -> bool {
+        self.rowid_seek.sampled(runs.rowid_seek_count().next())
+    }
+
+    /// Records a timed table-rowid (`INTEGER PRIMARY KEY`) seek, kept separate from secondary-index
+    /// record seeks so index key decoding and collations do not inflate rowid point/join seeks.
+    pub(crate) fn observe_sampled_rowid_seek(&self, nanos: f64) {
+        if !(nanos.is_finite() && nanos >= 0.0) {
+            return;
+        }
+        if self.batch_means.load(Ordering::Relaxed) {
+            if let Some(mut closed) = self.rowid_seek.try_push_batch(nanos) {
+                self.rowid_seek
+                    .update_every_from_batch(&closed, self.timing_nanos);
+                if let Some(med) = median(&mut closed) {
+                    let mut rates = self.rates.lock();
+                    if rates.rowid_seek.rule == WeightRule::BatchMeans {
+                        rates.rowid_seek.close_runs(med);
+                        self.publish_snapshot(&rates);
+                    }
+                }
+            }
+            return;
+        }
+        let epoch = {
+            let mut rates = self.rates.lock();
+            rates.rowid_seek.observe(1.0, nanos);
+            let epoch = rates.rowid_seek.epoch;
+            self.publish_snapshot(&rates);
+            epoch
+        };
+        self.rowid_seek.add(nanos, epoch, self.timing_nanos);
+    }
+
     /// Records that `units` of `work` took `nanos`, as an operator timed it.
     pub(crate) fn observe(&self, work: Work, units: f64, nanos: f64) {
         let mut rates = self.rates.lock();
@@ -1363,6 +1449,7 @@ impl LearnedCosts {
         }
         WeightsSnapshot {
             weights: None,
+            rowid_seek_weight: None,
             cost_margin: 0.0,
             row_nanos: None,
         }
@@ -1393,6 +1480,11 @@ impl LearnedCosts {
         Some(weights)
     }
 
+    /// Learned table-rowid (`INTEGER PRIMARY KEY`) seek weight, in rows' visits.
+    pub(crate) fn rowid_seek_weight(&self) -> Option<f64> {
+        self.load_snapshot().rowid_seek_weight
+    }
+
     /// Anchors the page read's rate to `reads` page reads timed at open in `nanos`
     /// (`time_page_read`), before the database has read a page of its own. They count beside the
     /// database's own reads, and the first epoch of those replaces them.
@@ -1419,7 +1511,13 @@ impl LearnedCosts {
         rates.switch(rule);
         self.batch_means
             .store(rule == WeightRule::BatchMeans, Ordering::Relaxed);
-        for sampling in [&self.seek, &self.hash_build, &self.hash_probe, &self.page] {
+        for sampling in [
+            &self.seek,
+            &self.rowid_seek,
+            &self.hash_build,
+            &self.hash_probe,
+            &self.page,
+        ] {
             sampling.batch.lock().clear();
         }
         self.publish_snapshot(&rates);
@@ -1503,6 +1601,7 @@ impl Calibration {
         for (kind, (units, nanos)) in CALIBRATED.iter().zip(self.kinds) {
             *rates.rate_mut(*kind) = Rate::measured(units, nanos);
         }
+        rates.rowid_seek = rates.seek;
         // A page read can't be timed here: there's no file yet. Each database anchors it at open
         // (`time_page_read`, `LearnedCosts::anchor_page_read`), then its own reads move it
         // (`LearnedCosts::observe`), its epoch the pages whose rows calibration visited.
@@ -2318,6 +2417,7 @@ mod tests {
         Rates {
             row: Rate::measured(100.0, 100.0 * row),
             seek: Rate::measured(100.0, 100.0 * seek),
+            rowid_seek: Rate::measured(100.0, 100.0 * seek),
             hash_build: Rate::measured(100.0, 100.0 * build),
             hash_probe: Rate::measured(100.0, 100.0 * probe),
             sort: Rate::measured(100.0, 100.0 * sort),

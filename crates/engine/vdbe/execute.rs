@@ -6790,7 +6790,9 @@ pub fn op_seek_rowid(
     pager: &Arc<Pager>,
 ) -> InsnResult {
     let traced = seek_trace_start(insn);
-    let result = seek_rowid_run(program, state, insn, pager);
+    let result = timed_run_rowid_seek(program, pager, || {
+        seek_rowid_run(program, state, insn, pager)
+    });
     seek_trace_end(state, traced, &result);
     result
 }
@@ -6985,12 +6987,32 @@ pub fn op_seek(
     pager: &Arc<Pager>,
 ) -> InsnResult {
     let traced = seek_trace_start(insn);
-    let result = timed_run(
-        program,
-        pager,
-        crate::translate::optimizer::learned_costs::Work::Seek,
-        || seek_run(program, state, insn, pager),
+    let is_rowid = matches!(
+        insn,
+        Insn::SeekGE {
+            is_index: false,
+            ..
+        } | Insn::SeekLE {
+            is_index: false,
+            ..
+        } | Insn::SeekGT {
+            is_index: false,
+            ..
+        } | Insn::SeekLT {
+            is_index: false,
+            ..
+        }
     );
+    let result = if is_rowid {
+        timed_run_rowid_seek(program, pager, || seek_run(program, state, insn, pager))
+    } else {
+        timed_run(
+            program,
+            pager,
+            crate::translate::optimizer::learned_costs::Work::Seek,
+            || seek_run(program, state, insn, pager),
+        )
+    };
     seek_trace_end(state, traced, &result);
     result
 }
@@ -7097,10 +7119,10 @@ fn star_trace_write(program: &Program, state: &mut ProgramState) {
 }
 
 /// Amphora (QT.5, step 3a): runs `run`, one run of `work`, timing it when the database's
-/// estimator samples this one (`LearnedCosts::sampled`). A run that reads from disk (either
-/// yielding `IO` or completing an inline file read on `PagePath::Plain`) is not timed:
-/// its time is its page reads', which the pager times (`Work::PageRead`), and its resumption's
-/// would be part of the work.
+/// estimator samples this one (`LearnedCosts::sampled`). Excludes runs that touch disk
+/// (`page_file_reads`), miss the connection's `PageCache` into `SharedPages` (`page_cache_misses`),
+/// or overlap concurrent WAL transactions (`concurrent_readers() > 1`), so shared-pool copy/evict
+/// overhead and multi-core contention cannot skew one operator's CPU rate relative to others.
 fn timed_run(
     program: &Program,
     pager: &Pager,
@@ -7108,15 +7130,51 @@ fn timed_run(
     run: impl FnOnce() -> InsnResult,
 ) -> InsnResult {
     let costs = &program.connection.db.learned_costs;
-    if !costs.sampled(work, &program.connection.cost_runs) {
+    let sampled = costs.sampled(work, &program.connection.cost_runs);
+    timed_run_with(
+        pager,
+        sampled,
+        |nanos| costs.observe_sampled(work, nanos),
+        run,
+    )
+}
+
+/// Amphora (QT.5): runs `run`, one table-rowid (`INTEGER PRIMARY KEY`) seek, timing it separately
+/// from secondary-index record seeks (`LearnedCosts::observe_sampled_rowid_seek`).
+fn timed_run_rowid_seek(
+    program: &Program,
+    pager: &Pager,
+    run: impl FnOnce() -> InsnResult,
+) -> InsnResult {
+    let costs = &program.connection.db.learned_costs;
+    let sampled = costs.sampled_rowid_seek(&program.connection.cost_runs);
+    timed_run_with(
+        pager,
+        sampled,
+        |nanos| costs.observe_sampled_rowid_seek(nanos),
+        run,
+    )
+}
+
+fn timed_run_with(
+    pager: &Pager,
+    sampled: bool,
+    observe: impl FnOnce(f64),
+    run: impl FnOnce() -> InsnResult,
+) -> InsnResult {
+    if !sampled || pager.concurrent_readers() > 1 {
         return run();
     }
     let reads_before = pager.page_file_reads();
+    let misses_before = pager.page_cache_misses();
     let started = std::time::Instant::now();
     let result = run();
-    if matches!(result, Ok(InsnFunctionStepResult::Step)) && pager.page_file_reads() == reads_before
+    if matches!(result, Ok(InsnFunctionStepResult::Step))
+        && pager.page_file_reads() == reads_before
+        && pager.page_cache_misses() == misses_before
+        && pager.concurrent_readers() <= 1
     {
-        costs.observe_sampled(work, started.elapsed().as_nanos() as f64);
+        observe(started.elapsed().as_nanos() as f64);
     }
     result
 }

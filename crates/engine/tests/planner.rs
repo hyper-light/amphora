@@ -781,3 +781,178 @@ fn an_added_term_never_raises_a_joins_estimate() {
     assert_eq!(checked, 600);
     assert!(lowered > 200, "{lowered} of {checked} lowered");
 }
+
+/// Regression (Blocker #7): when every fetched page hits memory (`page_miss == 0.0`, e.g. under
+/// `SharedPages`), `SELECT COUNT(*) FROM items` must still choose a narrow covering index instead
+/// of scanning the entire wide table.
+#[test]
+fn warm_shared_table_count_keeps_covering_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let db_path = dir.path().join("count_shared.db");
+    let options = OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new());
+    let db = Database::open(io, db_path.to_str().unwrap(), options).unwrap();
+    db.share_pages(16_384).unwrap();
+
+    // Build a wide table (~400B/row so the table spans far more pages than its narrow index).
+    let loader = db.connect(ConnectOpts::new()).unwrap();
+    loader
+        .execute("CREATE TABLE items (id INTEGER PRIMARY KEY, owner INTEGER NOT NULL, body TEXT NOT NULL)")
+        .unwrap();
+    loader.execute("BEGIN").unwrap();
+    let pad = "x".repeat(400);
+    for first in (1..=4_000i64).step_by(200) {
+        let rows: Vec<String> = (first..first + 200)
+            .map(|id| format!("({id}, {}, '{pad}')", id % 50 + 1))
+            .collect();
+        loader
+            .execute(format!("INSERT INTO items VALUES {}", rows.join(", ")))
+            .unwrap();
+    }
+    loader.execute("COMMIT").unwrap();
+    loader
+        .execute("CREATE INDEX items_owner ON items (owner)")
+        .unwrap();
+    loader.execute("ANALYZE").unwrap();
+    loader.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    // Reader 1 populates SharedPages from disk.
+    let r1 = db.connect(ConnectOpts::new()).unwrap();
+    let _ = r1
+        .prepare("SELECT SUM(LENGTH(body)) FROM items")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    let _ = r1
+        .prepare("SELECT COUNT(owner) FROM items")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+
+    // Reader 2 serves every page from SharedPages (page_miss == 0.0) and must still plan
+    // COUNT(*) via the covering index.
+    let r2 = db.connect(ConnectOpts::new()).unwrap();
+    let _ = r2
+        .prepare("SELECT COUNT(owner) FROM items")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    let steps = plan(&r2, "SELECT COUNT(*) FROM items");
+    assert!(
+        steps
+            .iter()
+            .any(|s| s.contains("USING COVERING INDEX items_owner")),
+        "warm shared-page COUNT(*) regressed away from covering index: {steps:?}"
+    );
+}
+
+/// Regression (join_three plan stability): running secondary-index text/composite seeks and
+/// concurrent queries must not inflate `INTEGER PRIMARY KEY` rowid seek costs and flip a
+/// three-table primary-key join into a hash join.
+#[test]
+fn three_table_rowid_join_survives_secondary_index_and_concurrent_warmup() {
+    let dir = tempfile::tempdir().unwrap();
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let db_path = dir.path().join("join_three_warm.db");
+    let options = OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new());
+    let db = Database::open(io, db_path.to_str().unwrap(), options).unwrap();
+    db.share_pages(16_384).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE regions (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+        .unwrap();
+    conn.execute("CREATE TABLE owners (id INTEGER PRIMARY KEY, name TEXT NOT NULL, region INTEGER NOT NULL, score REAL NOT NULL)").unwrap();
+    conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, grp INTEGER NOT NULL, owner INTEGER NOT NULL, price REAL NOT NULL, created INTEGER NOT NULL, name TEXT NOT NULL)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    let regions: Vec<String> = (1..=20)
+        .map(|id| format!("({id}, 'region-{id}')"))
+        .collect();
+    conn.execute(format!("INSERT INTO regions VALUES {}", regions.join(", ")))
+        .unwrap();
+    let owners: Vec<String> = (1..=OWNERS)
+        .map(|id| format!("({id}, 'owner-{id}', {}, {}.5)", id % 20 + 1, id % 97))
+        .collect();
+    conn.execute(format!("INSERT INTO owners VALUES {}", owners.join(", ")))
+        .unwrap();
+    for first in (1..=ITEMS).step_by(500) {
+        let rows: Vec<String> = (first..first + 500)
+            .map(|id| {
+                format!(
+                    "({id}, {}, {}, {}.25, {}, 'name-{:08x}')",
+                    mix(id) % 100,
+                    mix(id ^ 0x5555) % OWNERS + 1,
+                    mix(id) % 10_000,
+                    1_700_000_000 + id * 60,
+                    mix(id)
+                )
+            })
+            .collect();
+        conn.execute(format!("INSERT INTO items VALUES {}", rows.join(", ")))
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    for index in [
+        "CREATE INDEX items_name ON items (name)",
+        "CREATE INDEX items_grp_created ON items (grp, created)",
+        "CREATE INDEX items_owner ON items (owner)",
+        "CREATE INDEX owners_region ON owners (region)",
+        "ANALYZE",
+        "PRAGMA wal_checkpoint(TRUNCATE)",
+    ] {
+        conn.execute(index).unwrap();
+    }
+
+    // Exercise many secondary-index text lookups and concurrent primary-key seeks to drive
+    // runtime cost-learning epochs before re-planning join_three.
+    std::thread::scope(|s| {
+        for t in 0..4i64 {
+            let db = Arc::clone(&db);
+            s.spawn(move || {
+                let c = db.connect(ConnectOpts::new()).unwrap();
+                let mut by_name = c
+                    .prepare("SELECT id, price FROM items WHERE name = ?")
+                    .unwrap();
+                let mut by_pk = c
+                    .prepare("SELECT id, owner FROM items WHERE id = ?")
+                    .unwrap();
+                for i in 0..800i64 {
+                    let id = 1 + ((t * 997 + i * 31) % ITEMS);
+                    by_name.reset().unwrap();
+                    by_name
+                        .bind_at(
+                            std::num::NonZero::new(1).unwrap(),
+                            amphora_engine::Value::from_text(format!("name-{:08x}", mix(id))),
+                        )
+                        .unwrap();
+                    let _ = by_name.run_collect_rows().unwrap();
+
+                    by_pk.reset().unwrap();
+                    by_pk
+                        .bind_at(
+                            std::num::NonZero::new(1).unwrap(),
+                            amphora_engine::Value::from_i64(id),
+                        )
+                        .unwrap();
+                    let _ = by_pk.run_collect_rows().unwrap();
+                }
+            });
+        }
+    });
+
+    let fresh = db.connect(ConnectOpts::new()).unwrap();
+    let steps = plan(
+        &fresh,
+        "SELECT r.name, COUNT(*), AVG(i.price) FROM items i JOIN owners o ON o.id = i.owner JOIN regions r ON r.id = o.region WHERE i.id BETWEEN ? AND ? GROUP BY r.name",
+    );
+    assert!(
+        steps[0].starts_with("SEARCH i USING INTEGER PRIMARY KEY (rowid>"),
+        "expected PK range on items, got: {steps:?}"
+    );
+    assert_eq!(
+        steps[1], "SEARCH o USING INTEGER PRIMARY KEY (rowid=?)",
+        "expected PK seek on owners (not hash join), got: {steps:?}"
+    );
+    assert_eq!(
+        steps[2], "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)",
+        "expected PK seek on regions (not hash join), got: {steps:?}"
+    );
+}
