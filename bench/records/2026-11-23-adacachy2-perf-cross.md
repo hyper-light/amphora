@@ -691,3 +691,45 @@ Seen on the way, not changed:
 - `Budget::hold` refuses `Unavailable` where the memory limit can't be read. `Store::charge` treats every refusal as no room, so on such a platform a batch with a nonzero `row_bytes` is refused `Full` at once, as `Admission::charge` already refuses a database's requests there.
 - r1740 (the first try of the 10/10 runs) ended and was collected before its output was read: the kiln server did not answer in time.
 - Unit 4's push of 99b67668 (3c9425d3 + records-only main) was rejected: main had moved inside `crates/` (B15's engine WAL, d0660c11). Its merge ff71d6f8 (on perf/cross-a13) is unchecked. adacachy2 refused its check at cpus=8 (r1781) and at cpus=4 (r1784): 0 of 32 cores idle, 23:54Z. Next lane: run check17.sh at ff71d6f8 (or a fresh merge) with `JOBS=4 STORE=1 BENCH=0` and `store:: database:: xgroup::`; if green and main moved only outside amphora's build, merge and push HEAD:main.
+
+## Unit 4 and a wait for room woken by any charge given back (perf-A18)
+
+**Where the checks ran.** macOS first: r1795 (unit 4's landing) and r1841 (the wait, then the red run) waited 26 and
+20 minutes for a Mac with 8 idle cores (no Mac answered the balancer's probes; at 00:26Z the kiln server could not be
+reached from adacachy) and were stopped before they started once r1892 ran the same checks. adacachy2 refused
+cpus=8 (4 of 32 cores idle) and cpus=4 (0 of 32 idle) at 00:16Z, then admitted cpus=4 at 00:27Z. Script
+`~/.cache/amphora-perf/cross-a18-scripts/check18.sh` (check17.sh with `CRASH=1` for tests/crash.rs and `CLIPPY=0`).
+
+| run | commit | result |
+|---|---|---|
+| r1892, first part | 14e6d081 (unit 4: ff71d6f8 + main a34b83b1, then main 2f29b288: engine page cache, on-disk format, learned costs) | needs cpus=4: clippy -p amphora --all-targets clean; lib `store::` 5/5, `database::` 254/254 (6 ignored), `xgroup::` 33/34; tests/store.rs 14/14; load 54-113 |
+| r1892, second part | 72d62e76 (the wait on 14e6d081) | clippy clean; `store::` 6/6, `database::` 254/254 (6 ignored), `xgroup::` 34/34, tests/store.rs 14/14, tests/crash.rs 10/10 (3 ignored); load 103-140 |
+| r1892, third part | dbeb960a (14e6d081's unit 4 + the new test alone) | red: the new test fails in 0.06 s at store.rs:1849 (`waiter.join().unwrap().unwrap()`: store B's `put_wait` refused `Full` at once) |
+
+r1892's one `xgroup::` failure on 14e6d081: `xgroup::lan::tests::t_t1_9_r18_the_lan_harness_runs_over_network_endpoints`
+panicked at lan.rs:720 (`measure(..).unwrap()`; its error was not captured). The `xgroup::` run took 17.95 s against
+the measurement's 120 s deadline (`transport::HANG`), so it was not the deadline. It passed on 72d62e76, which holds
+all of 14e6d081. Not run alone: adacachy2 refused cpus=2 at 00:34Z (0 of 32 idle). Whether unit 4's refusal at once
+refused one of the harness's writes, which the wait now makes wait, is not shown.
+
+**The wait (bdfb19ff, f4e87ed0).** A sender whose store held no charge was refused `Full` at once, since only its own
+store's commits woke the wait. Now the budget wakes its waiters:
+- `memory::Budget::take_until` looks for room and, finding none, waits until its holder's deadline, woken only by
+  charges given back anywhere in the budget (`Budget::give`: every `Charge`'s drop and the caches' give-back), never by a
+  timer. A refusal other than no room (`Unavailable`) returns at once.
+- A give with no holder waiting takes no lock. Holders waiting are counted. The waiter counts itself, then a SeqCst
+  fence, then looks. The giver's give-back and its read of the count are SeqCst. So the look sees the bytes given back
+  or the giver sees the waiter (C++ [atomics.order]'s single total order; Linux's `waitqueue_active`).
+- store.rs's `Queued` and `Sends::room` are gone: a batch's charge is a `memory::Charge`, and `Store::charge` asks the
+  budget to wait (`room_waits` counts each wait, under the budget's lock).
+- The rule is in docs/design/store.md, "Decision (lane perf-A18): a wait for room is woken by any charge given back".
+- Test: `store::tests::mb1_a_wait_for_room_is_woken_by_another_stores_charge_given_back` (store B, holding no charge,
+  waits with a deadline an hour off; store A's commit gives its charge back; B's row is taken, one wait counted).
+
+Seen on the way, not changed:
+- A batch past the whole limit waits out its deadline: no give can make room for it. Resident bytes that fall wake no one.
+- A give wakes every waiter, and each looks again.
+- `Budget::give`'s give-back and read are SeqCst where they were AcqRel and absent: the same instructions on x86-64
+  (a locked `cmpxchg`, a plain `mov`), an `ldar` for an `ldr` on aarch64. Not measured: the A/B runs after the merge (rule 5b).
+- Requests admitted to a database (`Admission`, serve.rs's frames) still refuse at once; only a store's `put_wait` and
+  `put_then` wait.
