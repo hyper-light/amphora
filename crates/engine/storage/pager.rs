@@ -5872,6 +5872,21 @@ impl Pager {
                     wal.commit_prepared_frames(&commit_info.prepared_frames);
                     wal.finalize_committed_pages(&commit_info.prepared_frames);
                     wal.finish_append_frames_commit()?;
+                    if let Some(shared) = self.db_file.shared_pages() {
+                        if shared.pages().has_frames() {
+                            for batch in &commit_info.prepared_frames {
+                                for (page_ref, frame_id, _) in &batch.metadata {
+                                    if let Ok(page_no) = u64::try_from(page_ref.get().id()) {
+                                        shared.supersede_frame(
+                                            page_no,
+                                            batch.generation,
+                                            *frame_id,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
                     self.dirty_pages.write().clear();
                     commit_info.prepared_frames.clear();
 

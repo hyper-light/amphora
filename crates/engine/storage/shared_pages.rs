@@ -62,6 +62,11 @@ struct Entry {
 struct Shard {
     /// Each image under its key, found by one lookup.
     map: FxHashMap<Key, Entry>,
+    /// Latest committed WAL `(generation, frame)` seen for each `(file, page)` in this shard:
+    /// allows O(1) eviction of superseded WAL frame versions when a newer frame is committed or
+    /// published, preventing unbounded historical frame accumulation under concurrent writes.
+    /// Empty for read-only (`Version::File`) workloads.
+    latest_frame: FxHashMap<(u64, u64), (u32, u64)>,
     /// The keys in the order the hand passes them; `None` where an image was dropped.
     ring: Vec<Option<Key>>,
     hand: usize,
@@ -123,6 +128,9 @@ pub struct SharedPages {
     files: AtomicU64,
     /// Pages charged to this pool's budget by memory kept outside it ([`SharedPages::charge`]).
     charged: AtomicUsize,
+    /// Cached `Version::Frame` images across all shards: lets writers skip shard locking on
+    /// commit when no reader has cached any WAL frames (e.g., write-only bulk loads).
+    frame_entries: AtomicUsize,
     /// G3 step 6 (prototype F, `SharedPageReads::Optimistic`): frames read without a lock, in
     /// front of the shards (`optimistic_pages.rs`), made with the first image offered them; None
     /// in it when their pages couldn't be charged to the budget. Unset under `Locked`.
@@ -164,8 +172,15 @@ impl SharedPages {
             per_shard,
             files: AtomicU64::new(0),
             charged: AtomicUsize::new(0),
+            frame_entries: AtomicUsize::new(0),
             front: (reads == SharedPageReads::Optimistic).then(OnceLock::new),
         }
+    }
+
+    /// True if any WAL frame image is currently cached across shards.
+    #[inline]
+    pub fn has_frames(&self) -> bool {
+        self.frame_entries.load(Ordering::Acquire) > 0
     }
 
     #[inline]
@@ -317,7 +332,7 @@ impl SharedPages {
             shard.ring.push(None);
             shard.ring.len().checked_sub(1)
         } else {
-            let freed = Self::victim(&mut shard);
+            let freed = self.victim(&mut shard);
             // A shard over its limit (a charge taken since it filled) evicts and keeps nothing
             // new, so it shrinks to the limit as pages come.
             if shard.map.len() >= limit {
@@ -338,13 +353,172 @@ impl SharedPages {
                     at,
                 },
             );
+            if matches!(key.version, Version::Frame { .. }) {
+                self.frame_entries.fetch_add(1, Ordering::Release);
+            }
             shard.added = shard.added.wrapping_add(1);
+        }
+    }
+
+    /// Publishes a reader-loaded committed image of `key` into the pool, evicting any older
+    /// superseded WAL frame or file image of the same `(file, page)` in O(1) and refusing to
+    /// cache a historical WAL frame already superseded by a newer committed frame. Returns `true`
+    /// if the image is kept in the pool.
+    pub fn publish(&self, key: Key, buffer: Arc<Buffer>) -> bool {
+        let Version::Frame { generation, frame } = key.version else {
+            self.insert(key, buffer);
+            return true;
+        };
+        let Some(cell) = self.shard(key.file, key.page) else {
+            return false;
+        };
+        let limit = self
+            .per_shard
+            .saturating_sub(self.charged().div_ceil(SHARDS))
+            .max(1);
+        let mut shard = cell.shard.write();
+        if let Some(entry) = shard.map.get(&key) {
+            entry.visited.store(true, Ordering::Relaxed);
+            return true;
+        }
+        let mut reuse_slot = None;
+        if let Some(&(old_gen, old_frame)) = shard.latest_frame.get(&(key.file, key.page)) {
+            if old_gen == generation && frame < old_frame {
+                // Historical snapshot already superseded by a newer commit: do not retain dead
+                // frame history in the shared pool.
+                return false;
+            }
+            if (old_gen, old_frame) != (generation, frame) {
+                let old_key = Key {
+                    file: key.file,
+                    page: key.page,
+                    version: Version::Frame {
+                        generation: old_gen,
+                        frame: old_frame,
+                    },
+                };
+                if let Some(entry) = shard.map.remove(&old_key) {
+                    if let Some(place) = shard.ring.get_mut(entry.at) {
+                        *place = None;
+                    }
+                    self.frame_entries.fetch_sub(1, Ordering::Release);
+                    if let Some(front) = self.front_made() {
+                        front.forget(&old_key);
+                    }
+                    reuse_slot = Some(entry.at);
+                }
+            }
+        }
+        // Once a page has a WAL frame, its older database-file image is also superseded for new
+        // readers; drop it and reuse its ring slot if we don't already have one.
+        let file_key = Key {
+            file: key.file,
+            page: key.page,
+            version: Version::File,
+        };
+        if let Some(entry) = shard.map.remove(&file_key) {
+            if let Some(place) = shard.ring.get_mut(entry.at) {
+                *place = None;
+            }
+            if let Some(front) = self.front_made() {
+                front.forget(&file_key);
+            }
+            if reuse_slot.is_none() {
+                reuse_slot = Some(entry.at);
+            }
+        }
+        let at = if let Some(slot) = reuse_slot {
+            if shard.map.len() < limit {
+                Some(slot)
+            } else {
+                None
+            }
+        } else if shard.map.len() < limit && shard.ring.len() < self.per_shard {
+            shard.ring.push(None);
+            shard.ring.len().checked_sub(1)
+        } else {
+            let freed = self.victim(&mut shard);
+            if shard.map.len() >= limit {
+                return false;
+            }
+            freed
+        };
+        let Some(at) = at else {
+            return false;
+        };
+        if let Some(place) = shard.ring.get_mut(at) {
+            *place = Some(key);
+            shard.map.insert(
+                key,
+                Entry {
+                    buffer,
+                    visited: AtomicBool::new(false),
+                    at,
+                },
+            );
+            shard
+                .latest_frame
+                .insert((key.file, key.page), (generation, frame));
+            self.frame_entries.fetch_add(1, Ordering::Release);
+            shard.added = shard.added.wrapping_add(1);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Drops any cached WAL frame (or stale file image) of `(file, page)` superseded by a commit
+    /// at `(generation, new_frame)`, and advances its watermark so lagging readers do not
+    /// re-insert the evicted frame.
+    pub fn supersede_frame(&self, file: u64, page: u64, generation: u32, new_frame: u64) {
+        if self.frame_entries.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let Some(cell) = self.shard(file, page) else {
+            return;
+        };
+        let mut shard = cell.shard.write();
+        if let Some(slot) = shard.latest_frame.get_mut(&(file, page)) {
+            let (old_gen, old_frame) = *slot;
+            if old_gen != generation || old_frame < new_frame {
+                *slot = (generation, new_frame);
+                let old_key = Key {
+                    file,
+                    page,
+                    version: Version::Frame {
+                        generation: old_gen,
+                        frame: old_frame,
+                    },
+                };
+                if let Some(entry) = shard.map.remove(&old_key) {
+                    if let Some(place) = shard.ring.get_mut(entry.at) {
+                        *place = None;
+                    }
+                    self.frame_entries.fetch_sub(1, Ordering::Release);
+                    if let Some(front) = self.front_made() {
+                        front.forget(&old_key);
+                    }
+                }
+            }
+        }
+        let file_key = Key {
+            file,
+            page,
+            version: Version::File,
+        };
+        if let Some(entry) = shard.map.remove(&file_key) {
+            if let Some(place) = shard.ring.get_mut(entry.at) {
+                *place = None;
+            }
+            if let Some(front) = self.front_made() {
+                front.forget(&file_key);
+            }
         }
     }
 
     /// The slot CLOCK frees in a full shard: the first empty one the hand meets, or the first
     /// not read since the hand last passed, its image dropped (two turns at most).
-    fn victim(shard: &mut Shard) -> Option<usize> {
+    fn victim(&self, shard: &mut Shard) -> Option<usize> {
         let len = shard.ring.len();
         for _ in 0..len.saturating_mul(2) {
             let at = shard.hand;
@@ -362,7 +536,16 @@ impl SharedPages {
                     entry.visited.store(false, Ordering::Relaxed);
                 }
                 _ => {
-                    shard.map.remove(&key);
+                    if shard.map.remove(&key).is_some() {
+                        if let Version::Frame { generation, frame } = key.version {
+                            self.frame_entries.fetch_sub(1, Ordering::Release);
+                            if shard.latest_frame.get(&(key.file, key.page))
+                                == Some(&(generation, frame))
+                            {
+                                shard.latest_frame.remove(&(key.file, key.page));
+                            }
+                        }
+                    }
                     if let Some(place) = shard.ring.get_mut(at) {
                         *place = None;
                     }
@@ -402,6 +585,12 @@ impl SharedPages {
     /// (its database closed), so a pool that outlives its databases keeps none of theirs.
     pub fn forget_all(&self, file: u64) {
         self.forget_where(|key| key.file == file);
+        for cell in self.shards.iter() {
+            cell.shard
+                .write()
+                .latest_frame
+                .retain(|&(f, _), _| f != file);
+        }
     }
 
     /// Drops every image whose key `matches`, a shard at a time.
@@ -415,7 +604,16 @@ impl SharedPages {
                 .map(|(key, entry)| (*key, entry.at))
                 .collect();
             for (key, at) in gone {
-                shard.map.remove(&key);
+                if shard.map.remove(&key).is_some() {
+                    if let Version::Frame { generation, frame } = key.version {
+                        self.frame_entries.fetch_sub(1, Ordering::Release);
+                        if shard.latest_frame.get(&(key.file, key.page))
+                            == Some(&(generation, frame))
+                        {
+                            shard.latest_frame.remove(&(key.file, key.page));
+                        }
+                    }
+                }
                 if let Some(place) = shard.ring.get_mut(at) {
                     *place = None;
                 }
@@ -513,6 +711,14 @@ impl SharedFile {
     /// Drops every database file version of this file's pages.
     pub fn forget_file(&self) {
         self.member.pages.forget_file(self.member.file);
+    }
+
+    /// Drops any cached WAL frame or stale file version of `page` superseded by a commit at
+    /// `(generation, new_frame)`.
+    pub fn supersede_frame(&self, page: u64, generation: u32, new_frame: u64) {
+        self.member
+            .pages
+            .supersede_frame(self.member.file, page, generation, new_frame);
     }
 }
 
@@ -744,5 +950,81 @@ mod tests {
             pool.insert(file(page), buffer(2));
         }
         assert_eq!(pool.len(), 256);
+    }
+
+    #[test]
+    fn publish_and_supersede_evict_dead_wal_frame_history() {
+        let pool = Arc::new(SharedPages::new(1024));
+        let f = SharedFile::join(pool.clone());
+        pool.insert(f.key(7, Version::File), buffer(1));
+        assert!(pool.publish(
+            f.key(
+                7,
+                Version::Frame {
+                    generation: 1,
+                    frame: 10
+                }
+            ),
+            buffer(2)
+        ));
+        assert!(pool.get(&f.key(7, Version::File)).is_none());
+        assert_eq!(
+            pool.get(&f.key(
+                7,
+                Version::Frame {
+                    generation: 1,
+                    frame: 10
+                }
+            ))
+            .unwrap()
+            .as_slice()[0],
+            2
+        );
+        // Newer publish evicts frame 10 in place.
+        assert!(pool.publish(
+            f.key(
+                7,
+                Version::Frame {
+                    generation: 1,
+                    frame: 20
+                }
+            ),
+            buffer(3)
+        ));
+        assert!(pool
+            .get(&f.key(
+                7,
+                Version::Frame {
+                    generation: 1,
+                    frame: 10
+                }
+            ))
+            .is_none());
+        assert_eq!(pool.len(), 1);
+        // Commit superseding frame 20 at frame 30 drops frame 20 and rejects lagging re-publish.
+        f.supersede_frame(7, 1, 30);
+        assert_eq!(pool.len(), 0);
+        assert!(!pool.publish(
+            f.key(
+                7,
+                Version::Frame {
+                    generation: 1,
+                    frame: 20
+                }
+            ),
+            buffer(4)
+        ));
+        assert_eq!(pool.len(), 0);
+        assert!(pool.publish(
+            f.key(
+                7,
+                Version::Frame {
+                    generation: 1,
+                    frame: 30
+                }
+            ),
+            buffer(5)
+        ));
+        assert_eq!(pool.len(), 1);
     }
 }

@@ -632,14 +632,16 @@ pub fn finish_read_page(page_idx: usize, buffer: Arc<Buffer>, page: PageRef) {
         // Amphora: a version other connections may read is theirs too once read (decision 20);
         // an empty read (a page past the file's end) is no one's.
         let publish = page.take_publish().filter(|_| !buffer.is_empty());
-        if let Some(publish) = &publish {
+        let kept_shared = if let Some(publish) = &publish {
             let (shared, key) = &**publish;
-            shared.insert(*key, buffer.clone());
-        }
+            shared.publish(*key, buffer.clone())
+        } else {
+            false
+        };
         inner.set_buffer(buffer);
         page.clear_locked();
         page.set_loaded();
-        if publish.is_some() {
+        if kept_shared {
             page.set_shared();
         }
         // we set the wal tag only when reading page from log, or in allocate_page,
