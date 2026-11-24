@@ -6429,10 +6429,11 @@ mod tests {
     }
 
     /// AUDIT 2026-11-23 §1, lane perf-A21: a replicated write's charge is given back when a term
-    /// change ends it. Do: in a group of three voters, queue a write that writes a table at the
-    /// leader until it is proposed, lose what the proposal's round hadn't sent, then move the other
-    /// two members' clocks until they elect one of them. Expect: the write charged while under
-    /// way; refused once the term moved, its charge given back.
+    /// change ends it. Do: in a group of three voters, every append lost (a proposal's append goes
+    /// out in the step that proposes it: replication.md, "Decision (lane P9)", part 3), queue a
+    /// write that writes a table at the leader until it is proposed, then move the other two
+    /// members' clocks until they elect one of them. Expect: the write charged while under way;
+    /// refused once the term moved, its charge given back.
     #[test]
     fn a21_a_replicated_writes_charge_is_given_back_on_a_term_change() {
         let dir = tempfile::tempdir().unwrap();
@@ -6457,6 +6458,7 @@ mod tests {
                 .unwrap()
         };
         let before = last(&driven);
+        pump.appends_lost = true;
         let asked = on_budget(&budget, || {
             submit(&clients[leader], driven.until(), |db| {
                 db.exec("CREATE TABLE a21(x)")?;
@@ -6466,7 +6468,6 @@ mod tests {
         reach(&mut driven, &mut pump, "the write proposed", |driven| {
             last(driven) > before
         });
-        handle.drain(usize::MAX).unwrap();
         assert!(matches!(asked.try_recv(), Err(mpsc::TryRecvError::Empty)));
         // The driven `submit` charges `REQUEST_MAX` for its call, beside its envelope.
         assert_eq!(
