@@ -441,8 +441,51 @@ not PostgreSQL's rule. The engine resolves unqualified names through a search pa
 (`crates/engine/connection.rs:178`), with `public` mapped to `main` (`emitter/mod.rs:1072-1074`); PostgreSQL schemas
 are engine schemas, and `pg_temp` is the connection's temp schema, so temporary tables end with the
 session as in PostgreSQL. User object OIDs start at `FirstNormalObjectId` (16384, PostgreSQL's
-`src/include/access/transam.h`) from a durable counter outside the caller's transaction. A prepared
-statement's cache key holds the search path and the catalog version.
+`src/include/access/transam.h:197`) from a durable counter. A prepared statement's cache key holds
+the search path and the catalog version.
+
+**Where the next OID lives** (Ada's decision, built by lane PG14). The counter is PostgreSQL's
+`nextOid` (REL_19_0 `src/backend/access/transam/varsup.c:554-613`). In memory it is outside every
+transaction, as `nextOid` is, so a rolled-back CREATE TABLE spends its OID while the database is
+open. Its durable copy is the database header's `pg_next_oid` (`crates/engine/storage/sqlite3_ondisk.rs`),
+four of the twenty bytes at offset 72 that SQLite reserves and keeps zero, so a SQLite dialect's
+file is unchanged. It is the analogue of PostgreSQL's control file.
+
+- **Written in the CREATE TABLE's own transaction.** Each CREATE TABLE of a PostgreSQL table sets
+  it to the OID after its table's (`Cookie::PgNextOid`, `Dialect::next_oid_after`). The same
+  transaction already writes the header for the schema cookie, so the counter adds no page and no
+  sync, and it commits or rolls back with the table.
+- **Read at open.** An open loads it (`Dialect::load_next_oid`, from the pager's header and from
+  MVCC recovery's). A reopen continues from it, never from the OIDs live tables hold, so a dropped
+  table's OID is not given again until the counter wraps.
+- **Why the header.** CREATE TABLE writes it anyway, and nothing drops it. A row in an internal table
+  would add a b-tree page to every CREATE TABLE and a table to keep out of `pg_class`. A value kept
+  in the tables' own definitions would be dropped with the newest table.
+- **The engine's own tables take none.** A table the engine makes for itself under a reserved name
+  (`schema::is_system_table`, as `PRAGMA journal_mode = mvcc` makes `__turso_internal_mvcc_meta`)
+  stores no OID, so it has no `pg_class` row and spends none. The first table a client creates
+  takes `FirstNormalObjectId`, as PostgreSQL's first CREATE TABLE does after initdb (varsup.c:578-605).
+  T-PG.7.10.
+- **The wrap.** As GetNewObjectId (varsup.c:578-596) inside GetNewOidWithIndex's loop
+  (`src/backend/catalog/catalog.c:489-535`, which GetNewRelFileNumber runs on `pg_class` for a new
+  relation, catalog.c:598-645 and `src/backend/catalog/heap.c:1578`). Past 4294967295 the counter
+  wraps through zero. Below `FirstNormalObjectId` it starts again there. An OID a live table holds is
+  spent and passed over: the CREATE TABLE reads its transaction's tables' OIDs from `sqlite_schema`,
+  where `pg_class` is served from, as PostgreSQL probes `pg_class`'s OID index.
+
+**A rolled-back CREATE TABLE.** In PostgreSQL its OID stays spent. GetNewObjectId advanced
+`nextOid` in shared memory. The XLOG_NEXTOID record covering it was logged up to `VAR_OID_PREFETCH`
+(8192) OIDs ahead (varsup.c:598-603), outside the transaction (XLogPutNextOid, `xlog.c:8196-8221`),
+so the abort doesn't take it back. A shutdown checkpoint stores `nextOid` exactly (`xlog.c:7280-7282`)
+and replay believes a NEXTOID record exactly (`xlog.c:8444-8460`). A rolled-back OID comes back
+only when a crash loses that record before anything flushed it, since an abort doesn't flush
+(`src/backend/access/transam/xact.c:1836`). Amphora matches this while the database is open: the
+next CREATE TABLE takes the OID after the rolled-back one (T-PG.7.9). Across a reopen it does not.
+The rollback takes back the header write, so a rolled-back OID with no committed CREATE TABLE after
+it is given again after the reopen. No object holds it, so OIDs stay unique among live objects,
+which is all PostgreSQL promises, but a client comparing OIDs across a restart can tell. Closing the
+gap needs a write outside the caller's transaction, at the rollback or at close as PostgreSQL's
+shutdown checkpoint does: a choice for Ada (Choices for Ada).
 
 **Falsified by.** A name that resolves to a different object than PostgreSQL 19 resolves it to under
 the same `search_path`.
@@ -525,11 +568,9 @@ the engine's schema and the tables' stored PostgreSQL definitions, never copied:
 `POSTGRES_TABLE_SQL_PREFIX`: `/* pg_class.oid 16384 */ CREATE TABLE ...`. That text is the table's
 one durable copy (section 5), so the OID is written, renamed and dropped in the same `sqlite_schema`
 row as the table, with no second structure to keep in step, and is the same after a reopen. The
-dialect's counter is section 7's, outside the caller's transaction (a rolled-back CREATE TABLE
-spends its OID, as in PostgreSQL); it starts at `FirstNormalObjectId` and passes every OID a loaded
-definition holds, so a reopened database never gives a live table's OID to a new table. A dropped
-table's OID can come back after a reopen; PostgreSQL promises unique OIDs among live objects only
-(its counter wraps). Every engine path that rewrites a table's text goes through the dialect:
+dialect's counter is section 7's: durable in the database header, written by each CREATE TABLE's
+own transaction, so a reopen continues from it and a dropped table's OID doesn't come back until
+the counter wraps, where it passes over the OIDs live tables hold. Every engine path that rewrites a table's text goes through the dialect:
 `Dialect::format_rewritten_table_sql` receives the stored text and carries the OID (RENAME TABLE,
 RENAME COLUMN, ALTER's rewrites); ADD COLUMN and DROP COLUMN (`Dialect::format_altered_table_sql`)
 and VACUUM's replay (`Dialect::table_sql_for_replay`) refuse a PostgreSQL table with a typed error
@@ -693,3 +734,12 @@ Ada answered all four on 2026-11-23. Her answers bind.
    specs pass byte for byte.
 4. **Logins.** Decided: SCRAM-SHA-256, with channel binding (SCRAM-SHA-256-PLUS), and OAuth
    (OAUTHBEARER, section 11's OAuth unit). MD5 is refused.
+
+Open:
+
+5. **A rolled-back CREATE TABLE's OID after a reopen** (section 7, lane PG14). Today a rolled-back
+   CREATE TABLE's OID comes back after a reopen when no CREATE TABLE committed after it; PostgreSQL
+   doesn't give it again. Matching PostgreSQL means writing the counter outside the caller's
+   transaction: at the rollback (one more sync, only for a rolled-back CREATE TABLE), or at a clean
+   close (as PostgreSQL's shutdown checkpoint stores `nextOid`, but a crash would still bring it
+   back). Leaving it as it is costs nothing and keeps OIDs unique among live objects.

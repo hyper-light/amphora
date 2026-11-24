@@ -3263,6 +3263,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                                 header.schema_cookie = checkpoint_header.schema_cookie;
                                 header.user_version = checkpoint_header.user_version;
                                 header.application_id = checkpoint_header.application_id;
+                                header.pg_next_oid = checkpoint_header.pg_next_oid;
                                 header.vacuum_mode_largest_root_page =
                                     checkpoint_header.vacuum_mode_largest_root_page;
                                 header.incremental_vacuum_enabled =

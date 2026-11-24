@@ -214,6 +214,7 @@ pub(crate) struct VacuumDbHeaderMeta {
     text_encoding: TextEncoding,
     user_version: i32,
     application_id: i32,
+    pg_next_oid: u32,
 }
 
 impl VacuumDbHeaderMeta {
@@ -226,6 +227,7 @@ impl VacuumDbHeaderMeta {
             text_encoding: source.text_encoding,
             user_version: source.user_version.get(),
             application_id: source.application_id.get(),
+            pg_next_oid: source.pg_next_oid.get(),
         }
     }
 
@@ -237,6 +239,7 @@ impl VacuumDbHeaderMeta {
         header.text_encoding = self.text_encoding;
         header.user_version = self.user_version.into();
         header.application_id = self.application_id.into();
+        header.pg_next_oid = self.pg_next_oid.into();
     }
 }
 
@@ -2731,6 +2734,7 @@ mod tests {
         source.text_encoding = TextEncoding::Utf8;
         source.user_version = 7.into();
         source.application_id = 12.into();
+        source.pg_next_oid = 16390.into();
 
         let VacuumDbHeaderMeta {
             read_version,
@@ -2740,7 +2744,12 @@ mod tests {
             text_encoding,
             user_version,
             application_id,
+            pg_next_oid,
         } = VacuumDbHeaderMeta::from_source_header(&source);
+        assert_eq!(
+            pg_next_oid, 16390,
+            "VACUUM keeps the PostgreSQL dialect's next OID"
+        );
 
         assert_eq!(read_version, source.read_version);
         assert_eq!(write_version, source.write_version);
@@ -2894,6 +2903,7 @@ mod tests {
             text_encoding: TextEncoding::Utf8,
             user_version: 17,
             application_id: 29,
+            pg_next_oid: 0,
         };
         match finalize_vacuum_target_header(&temp.conn, &header_meta)? {
             crate::IOResult::Done(()) => {}
