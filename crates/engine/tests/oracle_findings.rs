@@ -3419,3 +3419,48 @@ fn an_outer_tables_columns_stay_in_reach_under_a_cte_of_its_name() {
         ],
     );
 }
+
+/// Do: a WITH clause inside another defines a CTE of the same name, and a subquery below it reads
+/// the name; and the body of a CTE outside reads the name it was written under. Expect: SQLite's
+/// rows: each reads the CTE its own place in the statement sees. Amphora read the outermost in both
+/// (finding DH).
+#[test]
+fn a_cte_name_is_the_innermost_with_clauses_that_defines_it() {
+    answer_in_every_setting(
+        &CTE_TABLES,
+        &[
+            (
+                "WITH d AS (SELECT k FROM q) SELECT t.k FROM t WHERE EXISTS (WITH d AS (SELECT k FROM t WHERE k = 1) SELECT 1 FROM d AS s WHERE t.k IN (SELECT e.k FROM d AS e))",
+                &["1"],
+            ),
+            (
+                "WITH d AS (SELECT k FROM q) SELECT d.k FROM d WHERE EXISTS (WITH d AS (SELECT k FROM t) SELECT 1 FROM d AS s WHERE d.k IN (SELECT e.k FROM d AS e))",
+                &["2", "2"],
+            ),
+            (
+                "WITH d AS (SELECT k FROM q) SELECT a.k FROM d AS a WHERE EXISTS (WITH d AS (SELECT k FROM t) SELECT 1 FROM d AS s WHERE a.k IN (SELECT e.k FROM d AS e))",
+                &["2", "2"],
+            ),
+            (
+                "WITH d AS (SELECT k FROM q) SELECT t.k, d.k FROM t LEFT JOIN d ON EXISTS (WITH d AS (SELECT k FROM t WHERE k = 1) SELECT 1 FROM d AS s WHERE t.k IN (SELECT e.k FROM d AS e))",
+                &["1|2", "1|2", "1|3", "2|NULL"],
+            ),
+            (
+                "WITH RECURSIVE d(k) AS (SELECT 5 UNION ALL SELECT k + 1 FROM d WHERE k < 7) SELECT t.k, d.k FROM t LEFT JOIN d ON t.k IN (WITH RECURSIVE d(k) AS (SELECT 0 UNION ALL SELECT k + 1 FROM d WHERE k < 1) SELECT s.k FROM d AS s WHERE s.k IN (SELECT e.k FROM d AS e))",
+                &["1|5", "1|6", "1|7", "2|NULL"],
+            ),
+            (
+                "WITH c AS (SELECT k FROM q), d AS (SELECT k FROM c) SELECT t.k FROM t WHERE t.k IN (WITH c AS (SELECT 1 AS k) SELECT c.k FROM c WHERE c.k IN (SELECT k FROM c) AND EXISTS (SELECT 1 FROM d WHERE d.k = 3))",
+                &["1"],
+            ),
+            (
+                "WITH c AS (SELECT k FROM q), d AS (SELECT k FROM c) SELECT * FROM (WITH c AS (SELECT 1 AS k) SELECT t.k FROM t WHERE t.k IN (SELECT k FROM d) OR t.k IN (SELECT k FROM c))",
+                &["1", "2"],
+            ),
+            (
+                "WITH d AS (SELECT k FROM c), c AS (SELECT k FROM q) SELECT * FROM (WITH c AS (SELECT 1 AS k) SELECT t.k FROM t WHERE t.k IN (SELECT k FROM d) OR t.k IN (SELECT k FROM c))",
+                &["1", "2"],
+            ),
+        ],
+    );
+}

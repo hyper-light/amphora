@@ -1870,6 +1870,13 @@ impl OuterQueryReference {
         self.table.columns()
     }
 
+    /// Whether a WITH clause made this entry, rather than a FROM clause's use of the CTE.
+    pub fn defines_cte_name(&self) -> bool {
+        self.cte_definition_only
+            || self.cte_select.is_some()
+            || matches!(self.table, Table::RecursiveCteInput(_))
+    }
+
     pub fn is_cte_name_in_scope(&self) -> bool {
         (self.cte_id.is_some() || matches!(self.table, Table::RecursiveCteInput(_)))
             && self.identifier == self.table.get_name()
@@ -2177,13 +2184,50 @@ impl TableReferences {
             .find(|t| t.identifier == identifier)
     }
 
+    /// The entry of the CTE `identifier` names here: the innermost WITH clause's that defines it, the
+    /// last one added. A FROM clause's use of a CTE defines no name, and stands in for the entry only
+    /// where there is none.
     pub fn find_cte_outer_query_ref_by_identifier(
         &self,
         identifier: &str,
     ) -> Option<&OuterQueryReference> {
-        self.outer_query_refs
-            .iter()
-            .find(|t| t.identifier == identifier && t.is_cte_name_in_scope())
+        let named = || {
+            self.outer_query_refs
+                .iter()
+                .filter(|t| t.identifier == identifier && t.is_cte_name_in_scope())
+        };
+        named()
+            .rev()
+            .filter(|t| t.defines_cte_name())
+            .min_by_key(|t| t.scope_depth)
+            .or_else(|| named().next())
+    }
+
+    /// What the body of the CTE of `definition`, one of these entries, may read by name: its own WITH
+    /// clause's CTEs and the queries around that clause, and nothing of the queries between the clause
+    /// and this use, whose WITH clauses may define the same names.
+    pub fn cte_body_refs(&self, definition: &OuterQueryReference) -> Vec<OuterQueryReference> {
+        let entries = || self.outer_query_refs.iter().enumerate();
+        let Some((at, _)) = entries().find(|(_, entry)| std::ptr::eq(*entry, definition)) else {
+            return self.outer_query_refs.clone();
+        };
+        // A FROM clause's subquery has its own CTEs at the depth of those around it, added after them:
+        // of two entries of one name, the body's is the one added nearer to its own.
+        let distance = |index: usize| (index.abs_diff(at), index);
+        entries()
+            .filter(|(index, entry)| {
+                entry.scope_depth > definition.scope_depth
+                    || entry.scope_depth == definition.scope_depth
+                        && !(entry.defines_cte_name()
+                            && entries().any(|(other_index, other)| {
+                                other.defines_cte_name()
+                                    && other.scope_depth == entry.scope_depth
+                                    && other.identifier == entry.identifier
+                                    && distance(other_index) < distance(*index)
+                            }))
+            })
+            .map(|(_, entry)| entry.clone())
+            .collect()
     }
 
     /// The entry the WITH clause made for the CTE `cte_ref` names, which each further use of the CTE
