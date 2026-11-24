@@ -39,6 +39,10 @@ pub(super) const VERSION_MIN: u32 = 8;
 /// The first version whose peers take [`Answer::SteppedClosed`]; an owner answers a step at an
 /// older agreed version with [`Answer::Stepped`].
 pub(super) const VERSION_STEPPED_CLOSED: u32 = 9;
+/// The first version whose peers take the steps that finish a transaction across groups at its one
+/// commit stamp ([`Step`](crate::xgroup::Step)'s ResolveAt, DecideAt, RecoverAt and PreventAt;
+/// T-T1.9.R28, R30): no lock is taken where they can't follow.
+pub(super) const VERSION_FINISHES: u32 = 9;
 /// The first version whose peers take [`Refusal::Serialization`]; an owner answers it at an older
 /// agreed version as the `Invalid` it was.
 pub(super) const VERSION_SERIALIZATION: u32 = 10;
@@ -163,11 +167,13 @@ impl Request {
             Request::Step { envelope, .. } => match envelope.step {
                 crate::xgroup::Step::Begin
                 | crate::xgroup::Step::Scan { .. }
-                | crate::xgroup::Step::Lock { .. }
                 | crate::xgroup::Step::Decide { .. }
                 | crate::xgroup::Step::Recover { .. }
                 | crate::xgroup::Step::Prevent { .. }
                 | crate::xgroup::Step::Resolve { .. } => 8,
+                // Version 8 has it, but what it locks is finished by the steps below: it goes only
+                // where they can follow (xgroup.md, "Over the transport").
+                crate::xgroup::Step::Lock { .. } => VERSION_FINISHES,
                 // Steps of version 9: a version-8 owner can't decode them, so a coordinator's
                 // step to one is refused before it goes out (nothing was done).
                 crate::xgroup::Step::LockIf { .. }

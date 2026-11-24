@@ -1901,8 +1901,18 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
         HashMap::with_capacity_and_hasher(subsets.iter().map(Vec::len).sum(), Default::default());
 
     // Dynamic programming base case: calculate the best way to access each single table, as if
-    // there were no other tables.
+    // there were no other tables. A table that must follow another (a LEFT JOIN's right table and
+    // the tables its ON reads) is the first table of no order, so it is no set of its own: the
+    // bushy pairs below take any set as their outer loops, and a LEFT JOIN's right table alone there
+    // would be read before the tables its ON reads, its NULL rows lost (T-PL.8.13, lane C6).
     for i in 0..num_tables {
+        let must_follow = required_lhs_by_table
+            .as_deref()
+            .and_then(|required| required.get(i))
+            .is_some_and(|required| !required.is_empty());
+        if must_follow {
+            continue;
+        }
         let mut mask = TableMask::default();
         mask.set(i)?;
         let table_ref = &joined_tables[i];
@@ -2626,8 +2636,8 @@ pub(crate) fn is_movable_left_join(table: &JoinedTable) -> bool {
 /// ON's test, where it would turn a NULL row into none. The right table is never the probe (an
 /// inner hash join's probe makes no NULL row), and an ON term holding a subquery keeps it out of
 /// the run (the emitter can't place the subquery's tables there). A LEFT JOIN outside the pair is
-/// one of the outer loops, where the subsets the search builds already hold its ON's tables before
-/// it.
+/// one of the outer loops, where the subsets the search builds hold its ON's tables before it: those
+/// grown past one table, and those of one table only where it must follow none (lane C6).
 ///
 /// Lane pl8-20 (T-PL.8.14), with `left_join_probes` (`Connection::set_bushy_left_join_probes`):
 /// the right table may be the probe, read by an outer hash join (`HashJoinType::LeftOuter`) whose
