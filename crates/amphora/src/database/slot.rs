@@ -17,6 +17,13 @@ use std::time::{Duration, Instant};
 
 use crate::meter::SlotEnd;
 
+#[cfg(test)]
+pub(super) fn p19(at: Instant) -> u128 {
+    static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    at.saturating_duration_since(*T0.get_or_init(|| at))
+        .as_millis()
+}
+
 /// What a slot's length is learned against: the core's election timeout, a member's slot before
 /// any of its retries is measured and its shortest after (lane V13). A learned gap is believed
 /// for one to two of its member's generations, each as long as the member went between its last
@@ -131,6 +138,8 @@ impl<T> Slots<T> {
         if term == self.term {
             return None;
         }
+        #[cfg(test)]
+        eprintln!("P19 slot lead t={} term={term:?}", p19(at));
         self.term = term;
         let ended = self.end(at, SlotEnd::Released);
         self.ready
@@ -182,6 +191,8 @@ impl<T> Slots<T> {
     /// unless it is queued already.
     pub(super) fn refused(&mut self, member: u64) {
         if self.term.is_some() && !self.queue.contains(&member) {
+            #[cfg(test)]
+            eprintln!("P19 slot queued m={member}");
             self.queue.push_back(member);
         }
     }
@@ -194,6 +205,11 @@ impl<T> Slots<T> {
             .as_ref()
             .is_some_and(|holding| holding.member == member)
         {
+            #[cfg(test)]
+            eprintln!(
+                "P19 slot ask-skip m={member} holder={:?}",
+                self.holding.as_ref().map(|h| h.member)
+            );
             return;
         }
         self.refused(member);
@@ -228,6 +244,13 @@ impl<T> Slots<T> {
                 self.ready.push_back((older, barrier));
             }
             let deadline = stated.and_then(|stated| at.checked_add(stated));
+            #[cfg(test)]
+            eprintln!(
+                "P19 slot wait t={} m={member} stated={stated:?} holder={:?} waiting={}",
+                p19(at),
+                self.holding.as_ref().map(|h| h.member),
+                self.waiting.len()
+            );
             self.waiting.push_back((member, message, deadline));
             return Taken {
                 step: None,
@@ -236,6 +259,12 @@ impl<T> Slots<T> {
             };
         }
         let ended = self.released(member, at);
+        #[cfg(test)]
+        eprintln!(
+            "P19 slot read-step t={} m={member} ended={:?}",
+            p19(at),
+            ended.map(|e| e.how)
+        );
         Taken {
             step: Some(message),
             ended,
@@ -255,6 +284,12 @@ impl<T> Slots<T> {
             self.ready.push_back((older, barrier));
         }
         let ended = self.released(member, at);
+        #[cfg(test)]
+        eprintln!(
+            "P19 slot pass t={} m={member} ended={:?}",
+            p19(at),
+            ended.map(|e| e.how)
+        );
         Taken {
             step: Some(message),
             ended,
@@ -296,6 +331,13 @@ impl<T> Slots<T> {
             self.waiting.push_front((member, barrier, deadline));
             return None;
         };
+        #[cfg(test)]
+        eprintln!(
+            "P19 slot start t={} m={member} len_ms={} stated={} last={last} commit={commit}",
+            p19(at),
+            until.saturating_duration_since(at).as_millis(),
+            deadline.is_some()
+        );
         self.holding = Some(Holding {
             member,
             since: at,
@@ -404,6 +446,14 @@ impl<T> Slots<T> {
     /// stepping the first would append an entry before the holder's retry, or the leader's turn,
     /// and refuse it, so the slot or the turn ends, and both are ready, in order.
     pub(super) fn forward(&mut self, member: u64, at: Instant, message: T) -> Taken<T> {
+        #[cfg(test)]
+        eprintln!(
+            "P19 slot fwd t={} m={member} holder={:?} turn={} held={}",
+            p19(at),
+            self.holding.as_ref().map(|h| h.member),
+            self.turn,
+            self.forwards.len()
+        );
         let unmeasured = self.learn(member, at).err();
         let Some(holder) = self.holding.as_ref().map(|holding| holding.member) else {
             if !self.turn {
@@ -520,6 +570,14 @@ impl<T> Slots<T> {
         }
         self.ready.extend(self.forwards.drain(..));
         let holding = self.holding.take()?;
+        #[cfg(test)]
+        eprintln!(
+            "P19 slot end t={} m={} how={how:?} held_ms={} past_until_ms={}",
+            p19(at),
+            holding.member,
+            at.saturating_duration_since(holding.since).as_millis(),
+            at.saturating_duration_since(holding.until).as_millis()
+        );
         self.turn = true;
         Some(Ended {
             member: holding.member,

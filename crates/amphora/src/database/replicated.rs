@@ -921,6 +921,16 @@ enum Phase {
         index: u64,
     },
 }
+#[cfg(test)]
+fn p19_phase(phase: &Phase) -> &'static str {
+    match phase {
+        Phase::Barrier(Some(_)) => "barrier",
+        Phase::Barrier(None) => "barrier-none",
+        Phase::Proposed(_) => "proposed",
+        Phase::Bootstrap(_) => "bootstrap",
+        Phase::Answered { .. } => "answered",
+    }
+}
 struct Actor<F: BlockFile + 'static = LogDevice> {
     replica: Durable<F>,
     // Keep the log owner and its exclusive lease until the replica has drained/dropped.
@@ -3480,6 +3490,13 @@ impl<F: BlockFile + 'static> Actor<F> {
         // surviving requests retain their FIFO order.
         for envelope in self.waiting.expire(self.at) {
             if let Input::Submit { response, .. } = envelope.command {
+                #[cfg(test)]
+                eprintln!(
+                    "P19 timeout queued t={} m={} pending={:?}",
+                    super::slot::p19(self.at),
+                    self.replica.id(),
+                    self.pending.as_ref().map(|p| p19_phase(&p.phase))
+                );
                 answer(response, Err(Refusal::Timeout));
             }
         }
@@ -3508,6 +3525,16 @@ impl<F: BlockFile + 'static> Actor<F> {
         match &pending.phase {
             Phase::Barrier(operation) => {
                 if expired {
+                    #[cfg(test)]
+                    eprintln!(
+                        "P19 timeout barrier t={} m={} leader={} tail={:?} applied={} write={}",
+                        super::slot::p19(self.at),
+                        self.replica.id(),
+                        self.replica.leader(),
+                        self.tail,
+                        self.replica.applied().index,
+                        operation.as_ref().is_some_and(Operation::writes)
+                    );
                     // A follower's write barrier asked for a slot its forward would end: its
                     // close ends it now (CP-T1.8, lane V14).
                     if !changed_term
@@ -4272,6 +4299,29 @@ impl<F: BlockFile + 'static> Actor<F> {
             if let Ok(Err(Refusal::Serialization { .. })) =
                 crate::replication::verdict(&entry.data, before)
             {
+                #[cfg(test)]
+                {
+                    let base = crate::replication::readsets::Write::decode(&entry.data)
+                        .map(|w| (w.base.index, w.base.term));
+                    let log = self.replica.core().raft.log();
+                    let prev = log
+                        .slice(before.index, before.index.saturating_add(1), u64::MAX)
+                        .ok()
+                        .and_then(|e| e.first().cloned())
+                        .map(|e| {
+                            e.context
+                                .get(..8)
+                                .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                                .map(u64::from_le_bytes)
+                        });
+                    eprintln!(
+                        "P19 stale t={} m={from} base={base:?} before=({},{}) prev_author={prev:?} leader={}",
+                        super::slot::p19(self.at),
+                        before.index,
+                        before.term,
+                        self.replica.id()
+                    );
+                }
                 refused = true;
             }
             let Some(index) = before.index.checked_add(1) else {
@@ -5248,6 +5298,20 @@ impl<F: BlockFile + 'static> Actor<F> {
             .pending
             .as_ref()
             .is_some_and(|pending| matches!(pending.phase, Phase::Barrier(_)));
+        #[cfg(test)]
+        {
+            if write && ended {
+                eprintln!(
+                    "P19 close t={} m={} sent={} pending={:?} now=({},{})",
+                    super::slot::p19(self.at),
+                    self.replica.id(),
+                    self.pending.is_none() && !self.replica.is_leader(),
+                    self.pending.as_ref().map(|p| p19_phase(&p.phase)),
+                    self.replica.term(),
+                    self.replica.leader()
+                );
+            }
+        }
         if write && ended && self.pending.is_none() && !self.replica.is_leader() {
             let context = self.read_context()?;
             self.replica.read(context).map_err(raft_error)?;
@@ -5264,6 +5328,12 @@ impl<F: BlockFile + 'static> Actor<F> {
             return Ok(());
         }
         if self.at >= pending.until {
+            #[cfg(test)]
+            eprintln!(
+                "P19 timeout prepare t={} m={}",
+                super::slot::p19(self.at),
+                self.replica.id()
+            );
             if let Some(response) = pending.response.take() {
                 answer(response, Err(Refusal::Timeout));
             }
@@ -5452,6 +5522,15 @@ impl<F: BlockFile + 'static> Actor<F> {
         // The preparation ran the caller's work, which takes time of its own: its deadline is
         // judged at the clock's reading after it, never at the step's start.
         self.at = (self.clock)();
+        #[cfg(test)]
+        eprintln!(
+            "P19 back t={} m={} leader={} writes={writes} entry={:?} late={}",
+            super::slot::p19(self.at),
+            self.replica.id(),
+            self.replica.leader(),
+            prepared.as_ref().map(|(prepared, _)| !prepared.is_empty()),
+            self.at >= pending.until
+        );
         // A failed whole rollback poisons this machine. Stop its existing owner instead of
         // accepting another request against an unverified speculative base.
         if bounded && let Err(Refusal::Fenced(reason)) = &prepared {
@@ -6851,8 +6930,36 @@ mod tests {
         fn transfer(&mut self, pump: &mut Pump<'_>, clients: &[Client], from: usize, to: usize) {
             let id = u64::try_from(to + 1).unwrap();
             self.owner_mut(from).replica.transfer(id).unwrap();
-            for _ in 0..ROUNDS {
+            let mut seen = String::new();
+            for round in 0..ROUNDS {
                 self.round(pump);
+                let now: String = self
+                    .owners
+                    .iter()
+                    .flatten()
+                    .map(|(a, _)| {
+                        let log = a.replica.core().raft.log();
+                        format!(
+                            "[m{} lead{} term{} applied{} commit{} last{:?} xferee{:?} transferring{} pending{:?} held{} waiting{} changing{}] ",
+                            a.replica.id(),
+                            a.replica.leader(),
+                            a.replica.term(),
+                            a.replica.applied().index,
+                            log.committed(),
+                            log.last_index().ok(),
+                            a.replica.core().raft.lead_transferee(),
+                            a.transferring.is_some(),
+                            a.pending.as_ref().map(|p| p19_phase(&p.phase)),
+                            a.replica.apply_held(),
+                            a.waiting.len(),
+                            a.changing.is_some()
+                        )
+                    })
+                    .collect();
+                if now != seen {
+                    eprintln!("P19 xfer to={id} round={round} {now}");
+                    seen = now;
+                }
                 if clients
                     .iter()
                     .all(|c| c.handle().status().unwrap().leader == id)
