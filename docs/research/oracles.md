@@ -75,3 +75,24 @@ on the inventory (bench/corpus/features.json): its operators, its functions with
 own `pragma_function_list` gives, its collations and type affinities. Every query generated is also
 compared with SQLite's answer, which is the reference the step asks for; TLP, NoREC, DQP and EET hold
 within Amphora alone, PQS through SQLite's evaluation, and CERT on Amphora's estimates.
+
+What it generates beyond single SELECTs over tables (lane C11): compounds (UNION, UNION ALL, INTERSECT,
+EXCEPT), WITH and WITH RECURSIVE, derived tables, window functions, USING and NATURAL joins, row values,
+UPSERT, views, triggers, STRICT and WITHOUT ROWID tables. Each is made so its answer is certain, and a cut
+that would leave it uncertain is no case (`Sel::certain`): a window function that tells tied rows apart has
+an ORDER BY that leaves none (every table's rowid); a frame that slides sums small integers; a source
+another query reads that keeps one of several equal values (DISTINCT, GROUP BY, UNION) has columns whose
+equal values are the same value; a compound's column has one affinity in every arm, since which arm's it
+takes is indeterminate (datatype3.html 3.3); a trigger whose rows may come in any order only writes to a
+table compared by its rows alone. A query past 4,000,000 of SQLite's instructions is left before Amphora
+begins it. `summary.json` counts checks, passes, failures, skips and refusals by feature, and keeps one
+example of each refusal, cut down (`refusals/`; a statement's, `setup_examples`).
+
+A REAL's text has 15 digits when they convert back, else 17 (floatingpoint.html 1.3.1), and Amphora writes
+it so; SQLite 3.54.0 writes 17 for some doubles whose 15 convert back (`crates/engine/numeric/fp.rs`;
+bench/records/2026-11-23-adacachy2-perf-numeric-g10.md). The differential check puts both sides' texts in
+the page's digits before it compares them (`bench/src/oracle/digits.rs`), alone, inside another text and
+against other digits. Where a REAL's text is inside a function's value (a length, hex, JSONB), the value may
+be the one SQLite gives with its texts at 15 digits (SQLITE_DBCONFIG_FP_DIGITS). Any other difference stays
+a finding: 16 digits, another double's, 15 that don't convert back, other notation. `summary.json` counts
+the passes that needed it (`digits`).

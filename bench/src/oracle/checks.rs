@@ -4,7 +4,10 @@
 //! (Diff), and PQS rectifies its predicate by SQLite's evaluation; TLP, NoREC, DQP and EET hold
 //! within Amphora alone, and CERT on Amphora's estimates.
 
-use super::engines::{Amphora, Engine, ILL_FORMED, Rows, Sqlite, V, same_rows_by, show};
+use super::digits;
+use super::engines::{
+    Amphora, Engine, ILL_FORMED, INTERRUPTED, Rows, Sqlite, V, same_rows_by, show,
+};
 use super::synth::{self, E, Func, Hint, Join, Rng, Schema, Scope, Sel};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -142,7 +145,7 @@ impl CertQuery {
 
 #[derive(Clone, Debug)]
 pub enum Case {
-    /// The tables whose rows both engines must hold alike.
+    /// The queries of the tables' and views' rows, which both engines must hold alike.
     Same(Vec<String>),
     Diff(Sel),
     TlpWhere(Sel, E),
@@ -153,7 +156,7 @@ pub enum Case {
     Norec(Sel, E),
     Pqs(Sel, i64, E),
     Dqp(Sel, Variant),
-    Eet(Sel, Sel),
+    Eet(Sel, Box<Sel>),
     Cert(CertQuery, More),
     /// An inner join of two to four tables.
     Order(Sel),
@@ -190,7 +193,7 @@ impl Case {
             | Case::TlpAgg(q, p, _)
             | Case::Norec(q, p)
             | Case::Pqs(q, _, p) => (vec![q], vec![p]),
-            Case::Eet(q, t) => (vec![q, t], vec![]),
+            Case::Eet(q, t) => (vec![q, &mut **t], vec![]),
             Case::Cert(q, More::Conjunct(p)) => (q.arms.iter_mut().collect(), vec![p]),
             Case::Cert(q, More::Inner(_)) => (q.arms.iter_mut().collect(), vec![]),
         }
@@ -210,6 +213,26 @@ pub enum Kind {
     Estimate,
 }
 
+impl Case {
+    /// What of the language its queries show, for the summary's counts.
+    pub fn features(&self, schema: &Schema) -> std::collections::BTreeSet<&'static str> {
+        let mut out = std::collections::BTreeSet::new();
+        let mut c = self.clone();
+        let (sels, exprs) = c.parts_mut();
+        for q in sels {
+            q.features(schema, &mut out);
+        }
+        for e in exprs {
+            Sel {
+                cols: vec![e.clone()],
+                ..Sel::default()
+            }
+            .features(schema, &mut out);
+        }
+        out
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Failure {
     pub kind: Kind,
@@ -223,12 +246,16 @@ pub enum Outcome {
     Pass {
         plan_changed: bool,
     },
+    /// The answers agree but for the digits of a REAL's text, the difference by design (digits.rs).
+    Digits,
     /// Not checkable (why): SQLite refused the query, or Amphora refused its base form.
     Skip(&'static str),
     /// Amphora refused what SQLite answers: a missing feature, not a wrong answer (counted).
     Refused(String),
     Fail(Failure),
 }
+
+const TOO_LONG: &str = "over the instructions a query may take on SQLite";
 
 fn fail(kind: Kind, detail: String, queries: Vec<String>) -> Outcome {
     Outcome::Fail(Failure {
@@ -252,7 +279,7 @@ fn error(detail: String, cause: &str, queries: Vec<String>) -> Outcome {
 /// too big, an overflow, a function's argument count checked as it runs): which plan evaluates it
 /// on which rows is the engine's choice, so a query derived from another may meet it where its base
 /// didn't, in SQLite as in Amphora.
-fn value_error(e: &str) -> bool {
+pub fn value_error(e: &str) -> bool {
     [
         "too big",
         "malformed JSON",
@@ -323,9 +350,14 @@ fn sqlite_call_meets(
         }
         // A subquery whole, its tables read in rowid order (NOT INDEXED): an error its rows' values
         // raise in that order, which the plan's order skipped (an aggregate's overflow), counts too.
-        if matches!(e, E::Exists(..) | E::Scalar(_) | E::InSel(..)) {
+        if matches!(
+            e,
+            E::Exists(..) | E::Scalar(_) | E::InSel(..) | E::RowSel(..)
+        ) {
             let mut plain = e.clone();
-            if let E::Exists(q, _) | E::Scalar(q) | E::InSel(_, q, _) = &mut plain {
+            if let E::Exists(q, _) | E::Scalar(q) | E::InSel(_, q, _) | E::RowSel(_, _, q) =
+                &mut plain
+            {
                 for f in q.from.iter_mut() {
                     f.hint = Hint::NotIndexed;
                 }
@@ -347,6 +379,10 @@ fn sqlite_call_meets(
             E::Exists(q, _) | E::Scalar(q) => subquery(&mut todo, q, &scope),
             E::InSel(x, q, _) => {
                 todo.push((x, scope.clone()));
+                subquery(&mut todo, q, &scope);
+            }
+            E::RowSel(_, xs, q) => {
+                todo.extend(xs.iter().map(|x| (x, scope.clone())));
                 subquery(&mut todo, q, &scope);
             }
             _ => todo.extend(e.children().into_iter().map(|c| (c, scope.clone()))),
@@ -397,7 +433,14 @@ fn constant(e: &E) -> bool {
     e.walk(&mut |x| {
         reads |= matches!(
             x,
-            E::Col(..) | E::Exists(..) | E::Scalar(_) | E::InSel(..) | E::Agg(..)
+            E::Col(..)
+                | E::Exists(..)
+                | E::Scalar(_)
+                | E::InSel(..)
+                | E::RowSel(..)
+                | E::Win(_)
+                | E::Star
+                | E::Agg(..)
         )
     });
     !reads
@@ -455,7 +498,18 @@ fn derived(s: &mut Sqlite, sql: &str, what: &str, e: &str, queries: Vec<String>)
 }
 
 fn loose(q: &Sel) -> bool {
-    q.distinct || q.aggregates()
+    q.loose()
+}
+
+/// Whether two answers differ only in what a REAL's text is worth inside a function (its length, its
+/// hex, its place in a BLOB): SQLite asked again with its texts at 15 digits.
+pub fn digits_inside(s: &mut Sqlite, sql: &str, got: &Rows, want: &Rows, loose: bool) -> bool {
+    if s.fp_digits(15).is_err() {
+        return false;
+    }
+    let fifteen = s.run(sql);
+    let back = s.fp_digits(17);
+    back.is_ok() && fifteen.is_ok_and(|rows| digits::same_inside(got, want, &rows, loose))
 }
 
 fn wrong(
@@ -483,10 +537,7 @@ pub fn sqls(case: &Case) -> Vec<String> {
             .collect()
     };
     match case {
-        Case::Same(tables) => tables
-            .iter()
-            .map(|t| format!("SELECT rowid, * FROM {t}"))
-            .collect(),
+        Case::Same(queries) => queries.clone(),
         Case::Diff(q) | Case::Dqp(q, _) => vec![q.sql()],
         Case::TlpWhere(q, p)
         | Case::TlpDistinct(q, p)
@@ -527,14 +578,55 @@ pub fn check(case: &Case, a: &mut Amphora, s: &mut Sqlite) -> Outcome {
     {
         return Outcome::Skip("a LIMIT no longer keeps certain rows");
     }
+    // A query too long for SQLite is left before Amphora begins it.
+    if let Case::TlpWhere(q, _)
+    | Case::TlpDistinct(q, _)
+    | Case::TlpGroup(q, _)
+    | Case::TlpHaving(q, _)
+    | Case::TlpAgg(q, ..)
+    | Case::Norec(q, _)
+    | Case::Dqp(q, _)
+    | Case::Eet(q, _) = case
+    {
+        // (NoREC's two forms read the rows its WHERE would leave out)
+        let mut whole = q.clone();
+        if matches!(case, Case::Norec(..)) {
+            whole.wh = None;
+        }
+        if s.run(&whole.sql()).is_err_and(|e| e == INTERRUPTED) {
+            return Outcome::Skip(TOO_LONG);
+        }
+    }
     match case {
-        Case::Same(tables) => {
-            for t in tables {
-                let sql = format!("SELECT rowid, * FROM {t}");
-                let (got, want) = (a.run(&sql), s.run(&sql));
+        Case::Same(queries) => {
+            for sql in queries {
+                let (got, want) = (a.run(sql), s.run(sql));
                 match (&got, &want) {
                     (Ok(g), Ok(w)) if same_rows_by(g, w, false) => {}
+                    (Ok(g), Ok(w))
+                        if digits::same_rows(g, w, false) || digits_inside(s, sql, g, w, false) =>
+                    {
+                        return Outcome::Digits;
+                    }
                     (Err(_), Err(_)) => {}
+                    // a view's rows: a value's error either engine's order of evaluation meets
+                    (Err(e), Ok(_)) if value_error(e) => {
+                        return Outcome::Skip(
+                            "a derived query meets a value's error (evaluation order)",
+                        );
+                    }
+                    (Ok(_), Err(e)) if value_error(e) => return Outcome::Skip("sqlite refused"),
+                    // a view Amphora doesn't read: refused, as the differential check counts a query
+                    (Err(_), Ok(_)) if !sql.starts_with("SELECT * FROM v") => {
+                        return wrong(
+                            &format!("the statements leave other rows to {sql}"),
+                            &got,
+                            &want,
+                            vec![sql.clone()],
+                        );
+                    }
+                    (Err(e), Ok(_)) => return Outcome::Refused(e.clone()),
+                    (_, Err(e)) if e == INTERRUPTED => return Outcome::Skip(TOO_LONG),
                     (_, Err(e)) if e == ILL_FORMED => {
                         return Outcome::Skip(
                             "SQLite's rows hold ill-formed UTF-8 (garbage in, garbage out)",
@@ -542,10 +634,10 @@ pub fn check(case: &Case, a: &mut Amphora, s: &mut Sqlite) -> Outcome {
                     }
                     _ => {
                         return wrong(
-                            &format!("the statements leave {t} with other rows"),
+                            &format!("the statements leave other rows to {sql}"),
                             &got,
                             &want,
-                            vec![sql],
+                            vec![sql.clone()],
                         );
                     }
                 }
@@ -563,6 +655,7 @@ pub fn check(case: &Case, a: &mut Amphora, s: &mut Sqlite) -> Outcome {
                         "SQLite's answer holds ill-formed UTF-8 (garbage in, garbage out)",
                     );
                 }
+                Err(e) if e == INTERRUPTED => return Outcome::Skip(TOO_LONG),
                 Err(_) => return Outcome::Skip("sqlite refused"),
             };
             match a.run(&sql) {
@@ -570,6 +663,10 @@ pub fn check(case: &Case, a: &mut Amphora, s: &mut Sqlite) -> Outcome {
                 Ok(got) if same_rows_by(&got, &want, loose(q)) => Outcome::Pass {
                     plan_changed: false,
                 },
+                Ok(got) if digits::same_rows(&got, &want, loose(q)) => Outcome::Digits,
+                Ok(got) if digits_inside(s, &sql, &got, &want, loose(q)) => {
+                    Outcome::Skip("a REAL's text digits, inside a function")
+                }
                 Ok(got) => wrong(
                     "Amphora's answer isn't SQLite's",
                     &Ok(got),
@@ -1185,10 +1282,10 @@ pub fn build(
     s: &mut Sqlite,
 ) -> Option<Case> {
     Some(match o {
-        Oracle::Same => Case::Same(schema.tables.iter().map(|t| t.name.clone()).collect()),
+        Oracle::Same => Case::Same(schema.tables.iter().map(synth::Table::rows_query).collect()),
         Oracle::Diff => Case::Diff(synth::query(r, schema, funcs)),
         Oracle::Tlp => {
-            let mut q = synth::plain(r, schema, funcs);
+            let mut q = synth::plain(r, schema, funcs, true);
             q.distinct = false;
             let sc = synth::scope(schema, &q.from, funcs, false);
             let p = sc.pred(r, 3);
@@ -1234,35 +1331,31 @@ pub fn build(
             }
         }
         Oracle::Norec => {
-            let q = synth::plain(r, schema, funcs);
+            let q = synth::plain(r, schema, funcs, true);
             let p = synth::scope(schema, &q.from, funcs, false).pred(r, 3);
             Case::Norec(q, p)
         }
         Oracle::Pqs => {
-            let t = r.pick(&schema.tables).name.clone();
-            let rowids = s.run(&format!("SELECT rowid FROM {t}")).ok()?;
+            let tables: Vec<&synth::Table> = schema
+                .tables
+                .iter()
+                .filter(|t| t.kind == synth::Kind::Rowid)
+                .collect();
+            if tables.is_empty() {
+                return None;
+            }
+            let t = *r.pick(&tables);
+            let rowids = s.run(&format!("SELECT rowid FROM {}", t.name)).ok()?;
             let pivot = match rowids.get(r.below(rowids.len()))?.first()? {
                 V::Int(i) => *i,
                 _ => return None,
             };
-            let from = vec![synth::From {
-                table: t,
-                alias: "a0".into(),
-                join: Join::First,
-                on: None,
-                hint: Hint::None,
-            }];
+            let from = vec![synth::From::table(t, "a0".into())];
             let p = synth::scope(schema, &from, funcs, false).pred(r, 3);
             Case::Pqs(
                 Sel {
-                    distinct: false,
-                    cols: vec![],
                     from,
-                    wh: None,
-                    group: vec![],
-                    having: None,
-                    order: vec![],
-                    limit: None,
+                    ..Sel::default()
                 },
                 pivot,
                 p,
@@ -1272,6 +1365,9 @@ pub fn build(
             let q = synth::query(r, schema, funcs);
             let mut vs = vec![];
             for (i, f) in q.from.iter().enumerate() {
+                if !f.is_table(schema) {
+                    continue;
+                }
                 vs.push(Variant::NotIndexed(i));
                 for (ix, t) in &schema.indexes {
                     if *t == f.table {
@@ -1290,20 +1386,23 @@ pub fn build(
                 vs.push(Variant::Likely);
                 vs.push(Variant::Unlikely);
             }
+            if vs.is_empty() {
+                return None;
+            }
             let v = r.pick(&vs).clone();
             Case::Dqp(q, v)
         }
         Oracle::Eet => {
             let q = synth::query(r, schema, funcs);
             let t = transform(&q, r, schema, funcs);
-            Case::Eet(q, t)
+            Case::Eet(q, Box::new(t))
         }
         Oracle::Cert => {
             // Any shape the generator makes, grouped, aggregated, DISTINCT, ordered and limited,
             // but with no HAVING: fewer rows in a group can pass a HAVING more rows fail
             // (`count(*) < 2`), so a restriction there is none.
             let arm = |r: &mut Rng| {
-                let mut q = synth::query(r, schema, funcs);
+                let mut q = synth::classic(r, schema, funcs);
                 q.having = None;
                 q
             };
