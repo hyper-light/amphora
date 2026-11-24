@@ -938,6 +938,9 @@ struct WalCommitState {
 enum CoordinationCheckpointGuardKind {
     Read0,
     Writer,
+    /// The writer's lock without read mark 0: reads of the file alone go on beside a checkpoint
+    /// with nothing to copy under them.
+    WriterBesideFileReads,
 }
 
 /// Coordination operations that back the WAL's authoritative state.
@@ -1865,33 +1868,23 @@ impl WalCoordination for InProcessWalCoordination {
                 }
                 Ok(CoordinationCheckpointGuardKind::Read0)
             }
-            CheckpointMode::Full => {
-                if !self.try_segment_read_mark_exclusive(segment, 0) {
-                    self.unlock_checkpoint_lock();
-                    tracing::trace!("CheckpointGuard: read0 lock failed (Full), Busy");
-                    return Err(LimboError::Busy);
-                }
-                if !self.try_write_lock() {
-                    self.unlock_segment_read_mark(segment, 0);
-                    self.unlock_checkpoint_lock();
-                    tracing::trace!("CheckpointGuard: write lock failed (Full), Busy");
-                    return Err(LimboError::Busy);
-                }
-                Ok(CoordinationCheckpointGuardKind::Writer)
-            }
-            CheckpointMode::Restart | CheckpointMode::Truncate { .. } => {
-                if !self.try_segment_read_mark_exclusive(segment, 0) {
-                    self.unlock_checkpoint_lock();
-                    tracing::trace!("CheckpointGuard: read0 lock failed, returning Busy");
-                    return Err(LimboError::Busy);
-                }
+            CheckpointMode::Full | CheckpointMode::Restart | CheckpointMode::Truncate { .. } => {
                 if !self.try_write_lock() {
                     self.unlock_checkpoint_lock();
-                    self.unlock_segment_read_mark(segment, 0);
                     tracing::trace!("CheckpointGuard: write lock failed, returning Busy");
                     return Err(LimboError::Busy);
                 }
-                Ok(CoordinationCheckpointGuardKind::Writer)
+                if self.try_segment_read_mark_exclusive(segment, 0) {
+                    return Ok(CoordinationCheckpointGuardKind::Writer);
+                }
+                let held = self.segment_snapshot(segment);
+                if held.max_frame == held.nbackfills {
+                    return Ok(CoordinationCheckpointGuardKind::WriterBesideFileReads);
+                }
+                self.unlock_write_lock();
+                self.unlock_checkpoint_lock();
+                tracing::trace!("CheckpointGuard: read0 lock failed, returning Busy");
+                Err(LimboError::Busy)
             }
         }
     }
@@ -1919,6 +1912,10 @@ impl WalCoordination for InProcessWalCoordination {
             CoordinationCheckpointGuardKind::Writer => {
                 self.unlock_write_lock();
                 self.unlock_segment_read_mark(segment, 0);
+                self.unlock_checkpoint_lock();
+            }
+            CoordinationCheckpointGuardKind::WriterBesideFileReads => {
+                self.unlock_write_lock();
                 self.unlock_checkpoint_lock();
             }
             CoordinationCheckpointGuardKind::Read0 => {
@@ -3177,20 +3174,24 @@ impl WalCoordination for ShmWalCoordination {
                 Ok(CoordinationCheckpointGuardKind::Read0)
             }
             CheckpointMode::Full | CheckpointMode::Restart | CheckpointMode::Truncate { .. } => {
-                if !self.fallback.try_segment_read_mark_exclusive(segment, 0) {
-                    self.fallback.unlock_checkpoint_lock();
-                    self.authority.release_writer(self.owner);
-                    self.authority.release_checkpoint(self.owner);
-                    return Err(LimboError::Busy);
-                }
                 if !self.fallback.try_write_lock() {
-                    self.fallback.unlock_segment_read_mark(segment, 0);
                     self.fallback.unlock_checkpoint_lock();
                     self.authority.release_writer(self.owner);
                     self.authority.release_checkpoint(self.owner);
                     return Err(LimboError::Busy);
                 }
-                Ok(CoordinationCheckpointGuardKind::Writer)
+                if self.fallback.try_segment_read_mark_exclusive(segment, 0) {
+                    return Ok(CoordinationCheckpointGuardKind::Writer);
+                }
+                let held = self.segment_snapshot(segment);
+                if held.max_frame == held.nbackfills {
+                    return Ok(CoordinationCheckpointGuardKind::WriterBesideFileReads);
+                }
+                self.fallback.unlock_write_lock();
+                self.fallback.unlock_checkpoint_lock();
+                self.authority.release_writer(self.owner);
+                self.authority.release_checkpoint(self.owner);
+                Err(LimboError::Busy)
             }
         }
     }
@@ -3229,6 +3230,12 @@ impl WalCoordination for ShmWalCoordination {
             CoordinationCheckpointGuardKind::Writer => {
                 self.fallback.unlock_write_lock();
                 self.fallback.unlock_segment_read_mark(segment, 0);
+                self.fallback.unlock_checkpoint_lock();
+                self.authority.release_writer(self.owner);
+                self.authority.release_checkpoint(self.owner);
+            }
+            CoordinationCheckpointGuardKind::WriterBesideFileReads => {
+                self.fallback.unlock_write_lock();
                 self.fallback.unlock_checkpoint_lock();
                 self.authority.release_writer(self.owner);
                 self.authority.release_checkpoint(self.owner);
@@ -4757,15 +4764,11 @@ impl Drop for VacuumLockGuard {
 /// To manage and ensure that no locks are leaked during checkpointing in
 /// the case of errors. It is held by the WalFile while checkpoint is ongoing
 /// then transferred to the CheckpointResult if necessary.
-enum CheckpointLocks {
-    Writer {
-        coordination: Arc<dyn WalCoordination>,
-        segment: SegmentId,
-    },
-    Read0 {
-        coordination: Arc<dyn WalCoordination>,
-        segment: SegmentId,
-    },
+struct CheckpointLocks {
+    coordination: Arc<dyn WalCoordination>,
+    kind: CoordinationCheckpointGuardKind,
+    /// The segment whose read mark 0 is held: its checkpoint pass's (decision 45).
+    segment: SegmentId,
 }
 
 /// CheckpointLockSource says whether the checkpoint state machine should acquire checkpoint_lock
@@ -4791,42 +4794,29 @@ impl CheckpointLocks {
         mode: CheckpointMode,
         segment: SegmentId,
     ) -> Result<Self> {
-        let guard = coordination.acquire_checkpoint_guard(mode, segment)?;
-        Ok(match guard {
-            CoordinationCheckpointGuardKind::Read0 => Self::Read0 {
-                coordination,
-                segment,
-            },
-            CoordinationCheckpointGuardKind::Writer => Self::Writer {
-                coordination,
-                segment,
-            },
+        let kind = coordination.acquire_checkpoint_guard(mode, segment)?;
+        Ok(Self {
+            coordination,
+            kind,
+            segment,
         })
     }
 
-    /// The segment whose read mark 0 this guard holds: its checkpoint pass's (decision 45).
-    fn segment(&self) -> SegmentId {
-        match self {
-            Self::Writer { segment, .. } | Self::Read0 { segment, .. } => *segment,
+    /// Whether these locks keep every writer out.
+    const fn holds_writer(&self) -> bool {
+        match self.kind {
+            CoordinationCheckpointGuardKind::Writer
+            | CoordinationCheckpointGuardKind::WriterBesideFileReads => true,
+            CoordinationCheckpointGuardKind::Read0 => false,
         }
     }
 
-    /// This guard's read mark 0 moved to `to`, the segment the checkpoint's next pass copies, its
-    /// other locks kept: no writer and no other checkpoint comes between the two passes.
+    /// The read mark 0 moved to `to`, the segment the checkpoint's next pass copies, the other locks
+    /// kept: no writer and no other checkpoint comes between the two passes. Asked after a pass that
+    /// copied, which held the mark.
     fn move_to(&mut self, to: SegmentId) -> Result<()> {
-        match self {
-            Self::Writer {
-                coordination,
-                segment,
-            }
-            | Self::Read0 {
-                coordination,
-                segment,
-            } => {
-                coordination.move_checkpoint_guard(*segment, to)?;
-                *segment = to;
-            }
-        }
+        self.coordination.move_checkpoint_guard(self.segment, to)?;
+        self.segment = to;
         Ok(())
     }
 
@@ -4839,38 +4829,19 @@ impl CheckpointLocks {
         coordination: Arc<dyn WalCoordination>,
         segment: SegmentId,
     ) -> Result<Self> {
-        let guard = coordination.acquire_vacuum_checkpoint_guard_from_held_lock(segment)?;
-        Ok(match guard {
-            CoordinationCheckpointGuardKind::Read0 => Self::Read0 {
-                coordination,
-                segment,
-            },
-            CoordinationCheckpointGuardKind::Writer => Self::Writer {
-                coordination,
-                segment,
-            },
+        let kind = coordination.acquire_vacuum_checkpoint_guard_from_held_lock(segment)?;
+        Ok(Self {
+            coordination,
+            kind,
+            segment,
         })
     }
 }
 
 impl Drop for CheckpointLocks {
     fn drop(&mut self) {
-        match self {
-            CheckpointLocks::Writer {
-                coordination,
-                segment,
-            } => {
-                coordination
-                    .release_checkpoint_guard(CoordinationCheckpointGuardKind::Writer, *segment);
-            }
-            CheckpointLocks::Read0 {
-                coordination,
-                segment,
-            } => {
-                coordination
-                    .release_checkpoint_guard(CoordinationCheckpointGuardKind::Read0, *segment);
-            }
-        }
+        self.coordination
+            .release_checkpoint_guard(self.kind, self.segment);
     }
 }
 
@@ -8338,10 +8309,10 @@ impl WalFile {
                     }
                     if mode.should_restart_log() {
                         turso_assert!(
-                            matches!(
-                                *self.checkpoint_guard.read(),
-                                Some(CheckpointLocks::Writer { .. })
-                            ),
+                            self.checkpoint_guard
+                                .read()
+                                .as_ref()
+                                .is_some_and(CheckpointLocks::holds_writer),
                             "We must hold writer and checkpoint locks to restart the log",
                             { "checkpoint_guard": *self.checkpoint_guard.read() }
                         );
@@ -8642,20 +8613,11 @@ impl WalFile {
     ) -> Result<()> {
         let needs_new_guard = {
             let mut guard = self.checkpoint_guard.write();
-            let fits = matches!(
-                (&*guard, mode),
-                (
-                    Some(CheckpointLocks::Read0 { .. }),
-                    CheckpointMode::Passive { .. },
-                ) | (
-                    Some(CheckpointLocks::Writer { .. }),
-                    CheckpointMode::Full
-                        | CheckpointMode::Restart
-                        | CheckpointMode::Truncate { .. },
-                ),
-            );
+            let fits = guard
+                .as_ref()
+                .is_some_and(|held| held.holds_writer() == mode.require_all_backfilled());
             match &mut *guard {
-                Some(held) if fits && held.segment() != segment => {
+                Some(held) if fits && held.segment != segment => {
                     held.move_to(segment)?;
                     false
                 }
@@ -14674,7 +14636,7 @@ pub mod test {
         coordination.unlock_write_lock();
 
         assert!(coordination.try_read_mark_exclusive(1));
-        coordination.set_read_mark_value_exclusive(1, 42);
+        shared.current().read().runtime.read_locks[1].set_value_exclusive(42);
         assert_eq!(coordination.read_mark_value(1), 42);
         coordination.unlock_read_mark(1);
 
