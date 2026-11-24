@@ -1634,27 +1634,9 @@ fn a_short_restore_leaves_no_database() {
     assert_eq!(rows(&Db::open(&target).unwrap()), rows_then);
 }
 
-/// AC-T1.12.3, decision 45 (lane B25): a shipper opened after a switch carries on from the segment the
-/// switch closed, which the archive holds whole. Do: end a base; write 20 rows and ship them; start
-/// the log again (the writer switches) and commit 5 rows no round ships; end the process there (its
-/// files as they stand), open them backed up to the same archive, and commit 10 rows more, shipped;
-/// restore every second from the opening on. Expect: each one restores with its rows, no base
-/// ended since.
-#[test]
-fn d45_a_shipper_opened_after_a_switch_carries_on_from_the_closed_segment() {
-    let mut s = Source::new();
-    s.put(0..20, "a");
-    s.ship().unwrap();
-    let mut base = s.begin_base().unwrap();
-    s.copy_base(&mut base);
-    s.end_base(base).unwrap();
-    s.put(20..40, "b");
-    s.ship().unwrap();
-    s.put(40..45, "c");
-    s.ship().unwrap();
-    assert!(s.db.restart_log().unwrap(), "shipped, so it starts again");
-    s.put(45..50, "d");
-    let state = log_files(&s.path);
+/// Ends the process here (its database's files as they stand) and opens them a second later, backed up
+/// to the same archive by a shipper of its own.
+fn reopened(s: &mut Source) {
     let ended = s.dir.path().join("ended.db");
     for suffix in ["", "-wal", "-wal2"] {
         let beside = |path: &std::path::Path| {
@@ -1664,7 +1646,6 @@ fn d45_a_shipper_opened_after_a_switch_carries_on_from_the_closed_segment() {
         };
         std::fs::copy(beside(&s.path), beside(&ended)).unwrap();
     }
-
     s.now.fetch_add(SECOND_NS, Ordering::SeqCst);
     let now = Arc::clone(&s.now);
     s.hooks = Hooks::new(Arc::new(move || now.load(Ordering::SeqCst)), 1 << 16);
@@ -1673,32 +1654,109 @@ fn d45_a_shipper_opened_after_a_switch_carries_on_from_the_closed_segment() {
     s.db.back_up(Arc::clone(&s.hooks));
     s.path = ended;
     s.shipper = Shipper::open("db", Arc::clone(&s.hooks), &s.blobs, &s.db, until()).unwrap();
-    let opened = s.second();
-    let due = s.shipper.base_needed();
     s.history
         .push((s.now.load(Ordering::SeqCst), s.model.clone()));
-    s.put(50..60, "e");
-    s.ship().unwrap();
-    s.now.fetch_add(SECOND_NS, Ordering::SeqCst);
-    s.ship().unwrap();
+}
+
+/// The seconds from `first` to the last commit's a restore refuses, each other one's rows compared.
+fn refused_from(s: &Source, first: u64) -> Vec<(u64, anyhow::Error)> {
     let last = s.history.last().unwrap().0.div_ceil(SECOND_NS);
     let mut refused = Vec::new();
-    for second in opened..=last {
+    for second in first..=last {
         match s.restored(second) {
             Ok(restored) => {
                 let expected = at(&s.history, second).cloned().unwrap_or_default();
                 assert_eq!(restored, expected, "the rows of second {second}");
             }
-            Err(e) => refused.push((second, format!("{e:#}"))),
+            Err(e) => refused.push((second, e)),
         }
     }
+    refused
+}
+
+/// AC-T1.12.3, decision 45 (lane B25): a shipper opened after a switch carries on from the segment the
+/// switch closed, which the archive holds whole. Do: end a base; write 20 rows and ship them; start
+/// the log again (the writer switches) and commit 5 rows no round ships; end the process there, open
+/// it again backed up to the same archive, and commit 10 rows more, shipped; restore every second
+/// from the opening on. Expect: each one restores with its rows, no base ended since.
+#[test]
+fn d45_a_shipper_opened_after_a_switch_carries_on_from_the_closed_segment() {
+    let mut s = Source::new();
+    s.put(0..20, "a");
+    s.ship().unwrap();
+    let mut base = s.begin_base().unwrap();
+    s.copy_base(&mut base);
+    s.end_base(base).unwrap();
+    s.put(20..45, "b");
+    s.ship().unwrap();
+    assert!(s.db.restart_log().unwrap(), "shipped, so it starts again");
+    s.put(45..50, "c");
+    let state = log_files(&s.path);
+    reopened(&mut s);
+    let opened = s.second();
+    let due = s.shipper.base_needed();
+    s.put(50..60, "d");
+    s.ship().unwrap();
+    s.now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    s.ship().unwrap();
+    let refused = refused_from(&s, opened);
     assert!(
         refused.is_empty(),
         "{} of {} seconds refused, the first {:?}; a base was needed at the opening: {due}; the log \
          as the process ended: {state}",
         refused.len(),
-        last - opened + 1,
+        s.second() - opened,
         refused.first()
+    );
+}
+
+/// AC-T1.12.4, decision 45 (lane B25): a shipper opened after a switch forced with commits unshipped
+/// finds the archive short of the segment it closed: the log broke there. Do: as above, the log past
+/// what a restart keeps and 25 rows unshipped as it starts again; then end a base, and write more.
+/// Expect: every second from the opening to the base's end is refused, as across a break, and each one
+/// after it restores with its rows; none with others.
+#[test]
+fn d45_a_shipper_opened_after_a_forced_switch_is_past_a_break() {
+    let mut s = Source::new();
+    s.db.keep_log(20);
+    s.put(0..20, "a");
+    s.ship().unwrap();
+    let mut base = s.begin_base().unwrap();
+    s.copy_base(&mut base);
+    s.end_base(base).unwrap();
+    s.put(20..45, "b");
+    assert!(
+        s.db.restart_log().unwrap(),
+        "past what a restart keeps, it starts again unshipped"
+    );
+    s.put(45..50, "c");
+    reopened(&mut s);
+    let opened = s.second();
+    s.put(50..55, "d");
+    s.ship().unwrap();
+    let _copied = s.db.checkpoint().unwrap();
+    let mut base = s.begin_base().unwrap();
+    s.copy_base(&mut base);
+    s.end_base(base).unwrap();
+    let based = s.second();
+    s.put(55..60, "e");
+    s.now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    s.ship().unwrap();
+    let refused = refused_from(&s, opened);
+    for (second, e) in &refused {
+        assert!(
+            matches!(
+                e.downcast_ref::<Unrestorable>(),
+                Some(Unrestorable::NoBase(_) | Unrestorable::Inexact { .. })
+            ),
+            "second {second} refused for another reason than the break: {e:#}"
+        );
+    }
+    let refused: Vec<u64> = refused.into_iter().map(|(second, _)| second).collect();
+    assert_eq!(
+        refused,
+        (opened..based).collect::<Vec<u64>>(),
+        "the seconds before the base's end alone"
     );
 }
 
