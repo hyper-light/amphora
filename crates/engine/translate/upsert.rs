@@ -1807,9 +1807,14 @@ pub(crate) fn rewrite_expr_to_registers(
                             if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&c)) {
                                 *expr = Expr::Register(ins.key_register());
                             } else if let Some(cm) = ins.get_col_mapping_by_name(&c) {
-                                // Use decoded excluded registers when available
-                                // to prevent double-encoding of custom type values
-                                if let Some(decoded_start) = excluded_decoded_start {
+                                if cm.column.is_rowid_alias() {
+                                    // Amphora: the alias's value is the key the row would take,
+                                    // listed in the INSERT or not. Its own register, and the
+                                    // decoded copy of it, hold the NULL its record stores (DA).
+                                    *expr = Expr::Register(ins.key_register());
+                                } else if let Some(decoded_start) = excluded_decoded_start {
+                                    // Use decoded excluded registers when available
+                                    // to prevent double-encoding of custom type values
                                     let (col_idx, _) =
                                         table.get_column_by_name(&c).expect("column exists");
                                     *expr = Expr::Register(
