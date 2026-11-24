@@ -150,9 +150,9 @@ a `cfg(test)` file.
 ## Decisions for the coordinator
 
 1. T-QT.6.35's text. Either add a statement whose probe the planner reads by a range (a joined table
-   found by a seek, with `set_parallel_searched_links`, gives one: the hook's probe is then the outer
-   loop's table), or take "a probe" out of the text and the test's comment. Nothing else in the tree runs
-   a ranged probe in a join: T-QT.6.27's statements have no range.
+   found by a seek, with `set_parallel_searched_links`, gives one by the code, which I did not run: the hook's
+   probe is then the outer loop's table), or take "a probe" out of the text and the test's comment. T-QT.6.27, the searched links'
+   test, has no range in its statements. I checked no other test for one.
 2. planner.rs:182 (T22). Either pin the test's cost weights (`Connection::pin_cost_weights`, lane T9) so it
    holds decision 5's page count and not a dev build's sort price, or the planner decides the sort's weight
    some other way before enough batches gather (decision pl8-15's "Not yet built").
