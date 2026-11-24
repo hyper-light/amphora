@@ -2504,8 +2504,13 @@ as the store's does, in a log of one process; nothing restarts a segment in plac
   blocks it no more than in SQLite.
 - *TRUNCATE.* "It also truncates the log file to zero bytes just prior to a successful return", and answers 0, 0: both
   files are cut. The file with the older header goes first and its cut is synced before the other is asked, since
-  recovery takes a lone valid header for the log and the older one's frames are older than the file's pages. The log is
-  then a new database's, as recovery takes two empty files: its first segment is current. A clean close is this.
+  recovery takes a lone valid header for the log and the older one's frames are older than the file's pages. It is cut and
+  synced whatever it reads as (lane B30): a switch cuts the file it goes to (decision 31) and syncs no cut, as the header
+  its next commit writes and syncs there says the same, so a file that reads as empty, in this process or in one opened
+  after a kill, may hold its older generation on disk yet. Skipped as "cut already", it came back alone after the other
+  file's cut, and the database opened at that generation; or, the next commits made in the first segment, beside a header
+  two past its own, a pair refused as corrupt. The log is then a new database's, as recovery takes two empty files: its
+  first segment is current. A clean close is this.
 - *Busy* (the pragma's first column 1) means what it does in SQLite: a writer is at work, another checkpoint is, a read of
   an older snapshot holds frames back, or, for RESTART and TRUNCATE, a read is in the log (either segment). "The checkpoint
   operation proceeds from that point in the same way as SQLITE_CHECKPOINT_PASSIVE", and the row counts the log's frames and
