@@ -1,0 +1,41 @@
+diff --git a/crates/engine/translate/optimizer/cost.rs b/crates/engine/translate/optimizer/cost.rs
+index 75773cd7..f8670902 100644
+--- a/crates/engine/translate/optimizer/cost.rs
++++ b/crates/engine/translate/optimizer/cost.rs
+@@ -222,8 +222,9 @@ pub(super) fn rescan_reads(pages: f64, scans: f64, cache_pages: f64) -> f64 {
+ 
+ /// Estimate the work to add every row to a new in-memory index.
+ ///
+-/// Each insert searches the part of the index that was already built. A
+-/// balanced index needs about log2(rows) comparisons per insert.
++/// Each insert searches the part of the index that was already built for the row's place, which is
++/// a seek (its price, `cpu_cost_per_seek`, is a whole search, its key comparisons in it), and
++/// writes the row's entry there, a row's visit.
+ ///
+ /// Amphora (QT.5): and the pages it moves once it outgrows its cache. A statement's ephemeral
+ /// index has a pager of its own, given the default page cache (`vdbe/execute.rs`, `OpenEphemeral`:
+@@ -237,13 +238,13 @@ pub(super) fn estimate_ephemeral_index_build_cost(
+     rows_per_leaf_page: f64,
+     params: &CostModelParams,
+ ) -> Cost {
+-    let comparisons_per_row = row_count.max(2.0).log2();
+     let cache = ephemeral_cache_pages();
+     let leaves = (row_count / rows_per_leaf_page.max(1.0)).max(1.0);
+     let fetched = table_pages_fetched(row_count, leaves, cache);
+     let reads = (fetched - leaves).max(0.0);
+     let writes = (fetched - cache).max(0.0);
+-    Cost(row_count * comparisons_per_row * params.cpu_cost_per_seek + reads + writes)
++    let cpu_per_row = params.cpu_cost_per_seek + params.cpu_cost_per_row;
++    Cost(row_count * cpu_per_row + reads + writes)
+ }
+ 
+ /// Amphora (QT.5): `probes` searches of an ephemeral index of `row_count` rows built just before,
+@@ -1000,7 +1001,7 @@ mod tests {
+     #[test]
+     fn t_qt_5_5_an_ephemeral_index_past_its_cache_reads_and_writes_its_leaves() {
+         let params = &DEFAULT_PARAMS;
+-        let cpu_build = |rows: f64| rows * rows.log2() * params.cpu_cost_per_seek;
++        let cpu_build = |rows: f64| rows * (params.cpu_cost_per_seek + params.cpu_cost_per_row);
+         let small = estimate_ephemeral_index_build_cost(1_000.0, 10.0, params);
+         assert!((small.0 - cpu_build(1_000.0)).abs() < 1e-9);
+         let cpu_probe = 1e6 * (params.cpu_cost_per_seek + params.cpu_cost_per_row);
