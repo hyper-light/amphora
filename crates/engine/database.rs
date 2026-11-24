@@ -3433,6 +3433,10 @@ impl Database {
     }
 
     /// Amphora: the segment of the log the writer appends to (decision 45).
+    pub fn v19_segments(&self) -> String {
+        format!("{:?}", self.shared_wal.segments.load())
+    }
+
     pub fn wal_segment(&self) -> storage::log_segments::SegmentId {
         self.shared_wal.current_id()
     }
