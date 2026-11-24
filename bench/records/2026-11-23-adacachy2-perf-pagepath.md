@@ -1012,3 +1012,46 @@ with an error (its shared memory doesn't publish a switch). No A/B ran (rule 0).
   restating for two segments before it is run again.
 - The store's checkpointer decides a pass by the current segment's uncopied frames (`Db::uncopied`): a closing
   segment's frames wait until the current segment passes its bound, so the log can hold up to about twice its bound.
+
+## perf-B19 (2026-11-24, 02:53-03:53Z; main's red after B18 put first by the coordinator at 02:58Z)
+
+**Losses first.** Nothing merged. Decision 45's switch is not finished: RESTART, TRUNCATE and the writer's restart
+before a write don't switch, and the in-place restart is not deleted. The wrong-read test is red one way (below), not
+fixed. Two failures on the branch are unexplained: `session_reads::t_t1_10_r1_a_session_reads_its_write_on_a_lagging_
+follower` (session_reads.rs:122, `at_once` 1 where 0) and backup's `t_t1_12_d1_restore_drills_at_random_seconds`
+("source.db-wal2 held 0 bytes at 0, not 32"); neither is known to fail on main. Checks ran only from 03:45Z: the Mac
+run (r98, MacBook Pro 2 at load 57-97) took 19.6 min to build the engine's tests and gave nothing else in the hour.
+
+**Seed 45: the cause.** A switched-to segment's header is written by its first commit. B18's switch also left a
+segment no commit had written since the switch to it: its file still held its previous life's header, two sequences
+back, and the other segment took the unwritten sequence plus one, so the headers on disk were three apart, a pair
+`Segments::recover` refuses. Seed 45's pair is that: `-wal` 4, `-wal2` 1 (its life at 3 never written). An in-place
+restart after a switch leaves two apart, not three, and is refused once `-wal2` is open, so deleting it is not the fix.
+What asks for the second switch (store.rs 1044-1064, from the code): the checkpointer's pass copies the closing segment
+first and reports its frames as `c.log`; past the bound it asks a restart, and the writer's next turn switches before a
+commit reached the new segment.
+- *Fix (94d01e88):* `SharedLog::switch` answers None while the current segment holds no frame.
+- *Test:* `d45_a_switch_never_leaves_two_headers_recovery_refuses` (switch, write, copy, switch, copy, a third switch
+  asked with nothing written, write, reopen a copy of the three files).
+
+**The four replicated tests.** `a_local_read_open_across_an_image_install_sees_one_side_whole` asserted the
+one-segment restart's Ok(false) under an open read; restated to decision 45's Ok(true) (64e77079, replication.md's
+paragraph with it). `Db::log_frames_in_use` read the writer connection's own max frame, which a switch leaves on the
+closed segment until its next transaction: now the shared current segment's count (e44b8868).
+
+**Wrong reads across segments (the brief's condition 1).** Red closing-to-current:
+`d45_a_page_cached_from_the_closing_segment_never_passes_for_the_current_ones` fails at its last check (the file alone
+holds 0 rows of 'B'). A reader's page read from the closing segment's frame 1 after the switch gets the tag (1, epoch)
+(`read_frame` tags a page read from any segment); that segment, copied before the switch, is reset with no Finalize and
+so no epoch bump, and the pass over the current segment takes the cached page for its own frame 1. Green after reuse
+(`..._for_its_frames_after_reuse`): the pass copying the other segment between bumps the epoch, and with 94d01e88 no
+switch skips that copy. Fix for the next lane: tag only pages read from the current segment (the checkpoint's own
+comment says the cache keys by the current segment's frames), then rerun both.
+
+**Checks** (r146, adacachy2, needs `linux/amd64,cpus=8,mem=24g`, 64e77079, load 22-48).
+- `d45_`: 22 passed, 1 failed (the red test above).
+- tests/crash.rs power cut, 200 seeds: passed.
+- `database::replicated::`: 148 passed, 1 failed (`t_t1_10_r1`, above); A20's four pass.
+- tests/store.rs 17/17. tests/backup.rs 20 passed, 1 failed (`t_t1_12_d1`, above).
+- Pending at the hour's end (r146 runs on): workspace clippy, the fix taken out (the seed-45 test expected red), and
+  main before B18 (46773985) on the four tests and the power cut.
