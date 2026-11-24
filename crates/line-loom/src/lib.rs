@@ -17,10 +17,6 @@ use std::time::Duration;
 #[allow(dead_code)]
 mod line;
 
-/// An input's envelope and a record without entries, in the bytes of the model's small queues.
-const ENVELOPE_BYTES: usize = 1;
-const RECORD_BYTES: usize = 1;
-
 fn unavailable(e: impl std::fmt::Display) -> Refusal {
     Refusal::Unavailable(e.to_string())
 }
