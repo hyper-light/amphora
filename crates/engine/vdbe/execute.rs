@@ -4625,6 +4625,7 @@ pub fn op_halt(
         description.to_string()
     };
     seek_trace_write(program, state);
+    star_trace_write(program, state);
     halt(program, state, pager, *err_code, &desc, *on_error)
 }
 
@@ -6997,6 +6998,40 @@ fn seek_trace_write(program: &Program, state: &mut ProgramState) {
         };
         tracing::debug!(target: "amphora::seek_time", cursor_id, name, seeks, nanos, row_nanos = ?row_nanos, "T18: a cursor's seeks this run");
     }
+}
+
+/// Lane T19: with `amphora::seek_time` on at DEBUG, the fact rows the star filters checked this
+/// run (`probes`) and dropped (`rejects`), beside the tables read into the run's Bloom filters.
+fn star_trace_write(program: &Program, state: &mut ProgramState) {
+    if !tracing::enabled!(target: "amphora::seek_time", tracing::Level::DEBUG) {
+        return;
+    }
+    let now = (
+        state.metrics.star_filter_probes,
+        state.metrics.star_filter_rejects,
+    );
+    let before = if now.0 >= state.star_trace_base.0 {
+        state.star_trace_base
+    } else {
+        (0, 0)
+    };
+    state.star_trace_base = now;
+    let probes = now.0.saturating_sub(before.0);
+    let rejects = now.1.saturating_sub(before.1);
+    if probes == 0 {
+        return;
+    }
+    let filters: Vec<&str> = program
+        .cursor_ref
+        .iter()
+        .enumerate()
+        .filter(|(cursor_id, _)| state.bloom_filters.contains_key(cursor_id))
+        .filter_map(|(_, (_, kind))| match kind {
+            CursorType::BTreeTable(table) => Some(table.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    tracing::debug!(target: "amphora::seek_time", probes, rejects, passed = probes.saturating_sub(rejects), filters = ?filters, "T19: the star filters' rows this run");
 }
 
 /// Amphora (QT.5, step 3a): runs `run`, one run of `work`, timing it when the database's
