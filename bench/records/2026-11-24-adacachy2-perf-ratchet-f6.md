@@ -145,6 +145,9 @@ left and the 13 this lane fixed). The old gate compiled none of those 13 (`conn_
 - The last tree, 4a9a668e (main 219603df merged: lane Q8's database.rs, sqlite3_ondisk.rs, wal.rs): check-production
   exit 0 in 62 s, 10617, the engine compiled in both passes. This lane's delta over main there is this record and a
   comment in scripts/check-production.sh.
+- The landed tree, 1a502992 (main c205dd7d merged: lane A21's replicated.rs, landed by lane A23): check-production
+  exit 0 in 71 s, 10617, the engine compiled in both passes. Clippy `--all-targets` and the engine tests were not
+  re-run on this last merge; main's only code in it is crates/amphora/src/database/replicated.rs.
 - macOS run r351 (portable checks, no `on`) queued and never started; stopped at 05:36Z, unneeded. Its last
   candidate was runner 2768d0d5, which RULES rule 6 forbids: a macOS run without `on` can be placed there.
 
