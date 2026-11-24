@@ -150,20 +150,25 @@ fn pause(d: Duration) {
     }
 }
 
-/// The log beside the database at `path`.
-fn wal_path(path: &Path) -> PathBuf {
-    let mut wal = path.as_os_str().to_owned();
-    wal.push("-wal");
-    PathBuf::from(wal)
+/// The files of the log beside the database at `path`, its two segments' (decision 45): `-wal`,
+/// then `-wal2`.
+pub(crate) fn log_paths(path: &Path) -> [PathBuf; 2] {
+    ["-wal", "-wal2"].map(|suffix| {
+        let mut file = path.as_os_str().to_owned();
+        file.push(suffix);
+        PathBuf::from(file)
+    })
 }
 
 /// The file of one segment of the log beside the database at `path` (decision 45): `-wal` or
 /// `-wal2`.
 fn segment_path(path: &Path, segment: SegmentId) -> String {
-    match segment {
-        SegmentId::First => format!("{}-wal", path.display()),
-        SegmentId::Second => format!("{}-wal2", path.display()),
-    }
+    let [first, second] = log_paths(path);
+    let file = match segment {
+        SegmentId::First => first,
+        SegmentId::Second => second,
+    };
+    file.display().to_string()
 }
 
 /// Makes `path`, if it doesn't exist yet, an empty file that a copy-on-write file system writes in
@@ -323,7 +328,8 @@ impl Db {
     /// [`Db::open_sharing`] in a directory that exists: it makes none.
     pub(crate) fn open_made(path: &Path, sharing: &Sharing) -> anyhow::Result<Self> {
         in_place(path);
-        in_place(&wal_path(path));
+        let [first, _] = log_paths(path);
+        in_place(&first);
         Self::open_with_sharing(path, Arc::new(PlatformIO::new().map_err(fail)?), sharing)
     }
 
@@ -578,13 +584,11 @@ impl Db {
             let _closing = self.checkpoint()?;
             let _current = self.checkpoint()?;
         }
-        if !self.db.switch_log(cut_past).map_err(fail)? {
-            return Ok(false);
+        let switch = || self.db.switch_log(cut_past).map_err(fail);
+        match &self.backup {
+            Some(hooks) => hooks.fence.restart(seq, frame, !shipped, switch),
+            None => switch(),
         }
-        if let Some(hooks) = &self.backup {
-            hooks.fence.ended(seq, frame, !shipped)?;
-        }
-        Ok(true)
     }
 
     /// Backs this database up through `hooks` (docs/design/backup.md): each commit made on this
@@ -652,25 +656,35 @@ impl Db {
         self.db.wal_end()
     }
 
-    /// `len` bytes of the current segment's file of the log from `offset` (decision 45); None
-    /// when there is no such file.
-    pub(crate) fn read_log(&self, offset: u64, len: usize) -> anyhow::Result<Option<Vec<u8>>> {
-        self.read_at(
-            &segment_path(&self.path, self.db.wal_segment()),
-            offset,
-            len,
-        )
+    /// `len` bytes of `segment`'s file of the log from `offset` (decision 45); None when there is
+    /// no such file. The writer may switch at any moment, so a caller that reads a generation's
+    /// frames names the segment its header was in ([`Db::log_header`]), never the one current now.
+    pub(crate) fn read_log(
+        &self,
+        segment: SegmentId,
+        offset: u64,
+        len: usize,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        self.read_at(&segment_path(&self.path, segment), offset, len)
     }
 
-    /// The header the current segment's file of the log holds (decision 45): its own, or that of
-    /// the generation the file held before, until its first commit writes its own. None while the
-    /// file holds none, which is no failure: a switch makes the file, or cuts it to nothing, and
-    /// the segment's first commit writes its header; a log folded whole is emptied too.
-    pub(crate) fn log_header(&self) -> anyhow::Result<Option<Vec<u8>>> {
-        let len = usize::try_from(LOG_HEADER_BYTES)?;
-        let wal = segment_path(&self.path, self.db.wal_segment());
+    /// The segment current now and the header its file of the log holds ([`Db::segment_header`]):
+    /// its own, or that of the generation the file held before, until its first commit writes its
+    /// own.
+    pub(crate) fn log_header(&self) -> anyhow::Result<Option<(SegmentId, Vec<u8>)>> {
+        let segment = self.db.wal_segment();
         Ok(self
-            .read_to(&wal, 0, len)?
+            .segment_header(segment)?
+            .map(|header| (segment, header)))
+    }
+
+    /// The header `segment`'s file of the log holds (decision 45). None while the file holds none,
+    /// which is no failure: a switch makes the file, or cuts it to nothing, and the segment's first
+    /// commit writes its header; a log folded whole is emptied too.
+    pub(crate) fn segment_header(&self, segment: SegmentId) -> anyhow::Result<Option<Vec<u8>>> {
+        let len = usize::try_from(LOG_HEADER_BYTES)?;
+        Ok(self
+            .read_to(&segment_path(&self.path, segment), 0, len)?
             .filter(|header| header.len() == len))
     }
 
@@ -684,6 +698,18 @@ impl Db {
     pub(crate) fn read_file(&self, offset: u64, len: usize) -> anyhow::Result<Vec<u8>> {
         self.read_at(&self.path.display().to_string(), offset, len)?
             .ok_or_else(|| anyhow::anyhow!("{} is gone", self.path.display()))
+    }
+
+    /// The pages of the database now, those only its log holds yet among them: the file a restore
+    /// of it makes.
+    pub(crate) fn pages(&self) -> anyhow::Result<u64> {
+        let mut pages = None;
+        self.query("PRAGMA page_count", [], |row| {
+            pages = Some(row.get::<i64>(0).map_err(fail)?);
+            Ok(false)
+        })?;
+        let pages = pages.ok_or_else(|| anyhow::anyhow!("PRAGMA page_count answered no row"))?;
+        Ok(u64::try_from(pages)?)
     }
 
     /// The bytes the database's file holds.
@@ -1208,25 +1234,21 @@ impl Db {
 
     /// The bytes an image of this database would hold now, as `image_pages` counts them.
     pub(crate) fn image_bytes(&mut self) -> anyhow::Result<usize> {
-        self.exec("BEGIN")?;
-        let result = self.image_extent().map(|(_, size)| size);
-        self.exec("ROLLBACK")?;
-        result
+        self.on_snapshot(|db| db.image_extent().map(|(_, size)| size))
     }
 
     pub(crate) fn image_pages(&mut self, max_bytes: usize) -> anyhow::Result<Pages> {
-        self.exec("BEGIN")?;
-        let result = (|| {
-            let (count, size) = self.image_extent()?;
+        self.on_snapshot(|db| {
+            let (count, size) = db.image_extent()?;
             if size > max_bytes {
                 anyhow::bail!("snapshot exceeds its byte budget");
             }
-            let pager = self.conn.get_pager();
+            let pager = db.conn.get_pager();
             let mut pages = Vec::with_capacity(usize::try_from(count)?);
             for id in 1..=count {
-                let (page, completion) = self.io.block(|| pager.read_page(i64::from(id)))?;
+                let (page, completion) = db.io.block(|| pager.read_page(i64::from(id)))?;
                 if let Some(completion) = completion {
-                    self.io.wait_for_completion(completion).map_err(fail)?;
+                    db.io.wait_for_completion(completion).map_err(fail)?;
                 }
                 if !page.is_loaded() {
                     anyhow::bail!("snapshot page was not loaded");
@@ -1234,7 +1256,22 @@ impl Db {
                 pages.push((id, page.get_contents().as_ptr().to_vec()));
             }
             Ok(pages)
-        })();
+        })
+    }
+
+    /// `f` in a read transaction on one snapshot of what was committed when it began. `BEGIN` is
+    /// deferred: it takes no snapshot until a statement reads, and a raw page read is no statement.
+    /// Without one the connection looks a page up in the log as its last transaction left it, and
+    /// that view knows no segment a switch has closed since (store.md, decision 45): its pages
+    /// would be read from the file, stale or not there yet.
+    fn on_snapshot<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        self.exec("BEGIN")?;
+        let result = self
+            .query("SELECT 1 FROM sqlite_schema LIMIT 1", [], |_| Ok(false))
+            .and_then(|()| f(self));
         self.exec("ROLLBACK")?;
         result
     }
@@ -1881,6 +1918,50 @@ mod tests {
             matches!(&refusal, amphora_api::Refusal::Fenced(reason) if reason == "a floor not proven by this group's members; raise it again once joins are tracked"),
             "{refusal:?}"
         );
+    }
+
+    /// AC-T1.8.D1, T-T1.10.L4 (store.md, decision 45): an image is the database as of when it is
+    /// taken, whichever segment of the log holds its pages. Do: a database whose file holds one
+    /// table; a second table, of more pages than the file holds, committed and not copied; the log
+    /// switched, so that the segment holding it closes uncopied; an image taken on the writer's own
+    /// connection, after a write to it, and applied to a new database. Expect: its bytes are its
+    /// pages', and every row of both tables is there.
+    #[test]
+    fn an_image_holds_the_pages_of_a_closing_segment_not_yet_copied() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut source = Db::open(&dir.path().join("source.db")).unwrap();
+        source.exec("CREATE TABLE kept(value)").unwrap();
+        source.flusher()().unwrap();
+        source.checkpoint().unwrap();
+        source.exec("CREATE TABLE spread(data)").unwrap();
+        source
+            .exec("INSERT INTO spread SELECT zeroblob(3000) FROM (WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<200) SELECT x FROM n)")
+            .unwrap();
+        assert!(source.switch_log().unwrap(), "the log didn't switch");
+        assert!(!source.closing_copied(), "the closing segment was copied");
+        source.exec("INSERT INTO kept VALUES (7)").unwrap();
+        let bytes = source.image_bytes().unwrap();
+        let image = source.image_pages(1 << 30).unwrap();
+        assert_eq!(
+            bytes,
+            image.iter().map(|(_, page)| page.len()).sum::<usize>()
+        );
+        let mut target = Db::open(&dir.path().join("target.db")).unwrap();
+        target
+            .apply_pages(&image, |db| db.exec("CREATE TABLE applied(n)"))
+            .unwrap();
+        let count = |sql: &'static str| {
+            let mut count = 0;
+            target
+                .query(sql, [], |row| {
+                    count = row.get::<i64>(0).unwrap();
+                    Ok(false)
+                })
+                .unwrap();
+            count
+        };
+        assert_eq!(count("SELECT count(*) FROM spread"), 200);
+        assert_eq!(count("SELECT value FROM kept"), 7);
     }
 
     /// U05/U15, bug 68a308b7: Db::exec of a statement its deadline interrupts reports the
