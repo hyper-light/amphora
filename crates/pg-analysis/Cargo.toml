@@ -1,0 +1,16 @@
+[package]
+name = "amphora-pg-analysis"
+description = "PostgreSQL 19's analysis (docs/design/postgres.md section 4): names, operators, functions and casts resolved as 19 resolves them, into a typed tree"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+amphora-pg-catalog.workspace = true
+amphora-pg-parser = { path = "../pg-parser" }
+
+[lints]
+workspace = true

@@ -1619,7 +1619,7 @@ fn random_body_chain(rng: &mut ChaCha8Rng, tables: &[&str]) -> (String, bool) {
             5 => format!("CASE WHEN {t}.a > 0 THEN 1 ELSE 0 END = {}", k % 2),
             6 => format!("{t}.a % 3 = {k}"),
             7 => format!("{t}.a < {u}.a"),
-            _ => format!("{t}.b IS NULL OR {t}.a > {n}"),
+            _ => format!("({t}.b IS NULL OR {t}.a > {n})"),
         });
     }
     let rows = rng.random_bool(0.4);
@@ -1694,6 +1694,39 @@ fn random_body_chain(rng: &mut ChaCha8Rng, tables: &[&str]) -> (String, bool) {
         sql.push_str(&format!(" ORDER BY {} -- keys {keys}", order.join(", ")));
     }
     (sql, rows)
+}
+
+/// T-QT.6.18: an OR filter generated for an equijoin must still require matching keys.
+#[test]
+fn t_qt_6_18_a_generated_disjunction_keeps_the_join_keys() {
+    let conn = open(":memory:qt-6-18-or");
+    conn.set_parallel_mode(ParallelMode::Off);
+    for table in ["t", "u"] {
+        conn.execute(format!(
+            "CREATE TABLE {table}(a INTEGER, b INTEGER, c TEXT)"
+        ))
+        .unwrap();
+    }
+    conn.execute("INSERT INTO t VALUES (1, 10, 'x')").unwrap();
+    conn.execute("INSERT INTO u VALUES (2, 20, 'x')").unwrap();
+    // Seed 66 generates a row query whose right-hand disjunct accepts both rows of u.
+    let (sql, returns_rows) = random_body_chain(&mut ChaCha8Rng::seed_from_u64(66), &["t", "u"]);
+    assert!(returns_rows && sql.contains(" IS NULL OR "), "{sql}");
+    let disjoint = sql_rows(&conn, &sql);
+    assert!(
+        disjoint.is_empty(),
+        "{sql} joined unequal keys: {disjoint:?}"
+    );
+
+    // A top-level OR is a different SQL shape and can intentionally join unequal keys.
+    let top_level = "SELECT u.a FROM t, u WHERE t.a = u.a AND u.b IS NULL OR u.a > 0";
+    for mode in [ParallelMode::Off, ParallelMode::On] {
+        conn.set_parallel_mode(mode);
+        assert_eq!(sql_rows(&conn, top_level), vec![vec![Value::from_i64(2)]]);
+    }
+
+    conn.execute("INSERT INTO u VALUES (1, 30, 'x')").unwrap();
+    assert_eq!(sql_rows(&conn, &sql).len(), 1, "{sql}");
 }
 
 /// Compares a parallel answer with the serial one: row for row with aggregates; with rows, in
