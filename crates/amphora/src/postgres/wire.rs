@@ -82,8 +82,8 @@ pub struct PgError {
     pub code: SqlState,
     pub message: String,
     pub detail: Option<String>,
-    pub hint: Option<String>,
-    pub context: Option<String>,
+    pub hint: Option<Box<str>>,
+    pub context: Option<Box<str>>,
     pub position: Option<usize>,
 }
 
@@ -123,13 +123,13 @@ impl PgError {
     }
 
     #[must_use]
-    pub fn with_context(mut self, context: impl Into<String>) -> Self {
+    pub fn with_context(mut self, context: impl Into<Box<str>>) -> Self {
         self.context = Some(context.into());
         self
     }
 
     #[must_use]
-    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
+    pub fn with_hint(mut self, hint: impl Into<Box<str>>) -> Self {
         self.hint = Some(hint.into());
         self
     }
