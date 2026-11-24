@@ -1,0 +1,16 @@
+CREATE TABLE p(id INTEGER PRIMARY KEY, k INT, v INT, s TEXT);
+CREATE TABLE q(id INTEGER PRIMARY KEY, k INT, v INT, s TEXT COLLATE NOCASE);
+CREATE TABLE n(k INT, v INT, s TEXT);
+CREATE TABLE f(k INT, v INT, s TEXT);
+CREATE TABLE g(k INT, v INT, s TEXT);
+CREATE TABLE e(k INT, v INT, s TEXT);
+INSERT INTO p VALUES (1, 1, 2, '1'), (2, 2, 3, 'b'), (3, NULL, 1, 'B'), (4, 4, NULL, NULL), (5, 1, 0, '2');
+INSERT INTO q VALUES (1, 2, 2, 'B'), (2, 2, 0, 'a'), (3, 5, 1, '1'), (4, NULL, 4, NULL), (5, 1, 1, 'c');
+INSERT INTO n VALUES (1, 2, '2'), (NULL, 1, 'b'), (2, 2, NULL), (3, 0, 'A'), (1, NULL, '1');
+INSERT INTO f VALUES (1, 2, '2'), (2, 1, 'b'), (2, 5, NULL);
+INSERT INTO g VALUES (0, 1, '0'), (1, 1, 'a'), (2, 3, 'b'), (2, 0, 'B'), (3, 4, NULL), (4, 2, '4'), (5, NULL, 'c'), (NULL, 2, '2');
+SELECT o.k, o.v FROM p AS o WHERE o.k IN (SELECT a1.k FROM n AS a0 JOIN p AS a1 ON a0.k = a1.k LEFT JOIN q AS a2 ON a1.k = a2.k LEFT JOIN g AS a3 ON a2.k = a3.v WHERE coalesce((SELECT count(s1.k) FROM n AS s1 WHERE s1.k IS a3.v), a1.k) = a0.k);
+SELECT a1.k, a3.v FROM n AS a0 JOIN p AS a1 ON a0.k = a1.k LEFT JOIN q AS a2 ON a1.k = a2.k LEFT JOIN g AS a3 ON a2.k = a3.v WHERE coalesce((SELECT count(s1.k) FROM n AS s1 WHERE s1.k IS a3.v), a1.k) = a0.k;
+SELECT a1.k, a2.k FROM p AS a1 LEFT JOIN q AS a2 ON a1.k = a2.k WHERE (SELECT count(s1.k) FROM n AS s1 WHERE s1.k IS a2.k) = 0;
+EXPLAIN QUERY PLAN SELECT o.k, o.v FROM p AS o WHERE o.k IN (SELECT a1.k FROM n AS a0 JOIN p AS a1 ON a0.k = a1.k LEFT JOIN q AS a2 ON a1.k = a2.k LEFT JOIN g AS a3 ON a2.k = a3.v WHERE coalesce((SELECT count(s1.k) FROM n AS s1 WHERE s1.k IS a3.v), a1.k) = a0.k);
+EXPLAIN SELECT o.k, o.v FROM p AS o WHERE o.k IN (SELECT a1.k FROM n AS a0 JOIN p AS a1 ON a0.k = a1.k LEFT JOIN q AS a2 ON a1.k = a2.k LEFT JOIN g AS a3 ON a2.k = a3.v WHERE coalesce((SELECT count(s1.k) FROM n AS s1 WHERE s1.k IS a3.v), a1.k) = a0.k);
