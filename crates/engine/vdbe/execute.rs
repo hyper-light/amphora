@@ -2007,12 +2007,13 @@ fn skip_walk_for(
     };
     let span = [(bounds.lo, bounds.hi)];
     let spans: &[(i64, i64)] = values.as_deref().unwrap_or(&span);
-    let (reader_pos, committed) = conn.skipping_positions()?;
     // Lane skip-3 (T-SKU.2): a measured summary's scan is timed from here to its end (lane
     // skip-11: every probe of an IN list's values included).
     let mut started = std::time::Instant::now();
     let (candidates, method) = registry
-        .candidates_spans(root, conn.skipping_id(), reader_pos, committed, spans)
+        .probe(root, conn.skipping_id(), Some(column), spans, || {
+            conn.skipping_positions()
+        })
         .ok()?;
     // Lane skip-8 (T-SKU.10): a method dropped for its upkeep whose trial is due is built again
     // off this scan's path, one build per summary at a time; this scan goes on with the leader.
@@ -2025,14 +2026,14 @@ fn skip_walk_for(
         match registry.build_mode(root) {
             Some(crate::skipping::BuildMode::Inline) => {
                 let building = std::time::Instant::now();
-                if crate::skipping::build_inline(conn, root, column, columns).is_some() {
+                if crate::skipping::build_inline(conn, root, columns).is_some() {
                     started = started
                         .checked_add(building.elapsed())
                         .unwrap_or_else(std::time::Instant::now);
                 }
             }
             Some(_) => {
-                let _detached = crate::skipping::start_build(conn, root, column, columns);
+                let _detached = crate::skipping::start_build(conn, root, columns);
             }
             None => {}
         }
@@ -13432,22 +13433,17 @@ fn skipping_integer(value: Option<&Value>) -> Option<i64> {
 
 /// Hands the write hook the summarized column's value of the written row and, if it overwrote one,
 /// of the old row (captured before the write).
-fn skipping_hand(program: &Program, root: i64, write: crate::skipping::RowWrite) {
+fn skipping_hand(program: &Program, root: i64, column: usize, write: crate::skipping::RowWrite) {
     let registry = &program.connection.db.skipping;
-    match program.connection.skipping_write_base() {
-        Some((committed, told)) => {
-            // Lane skip-5 (T-SKU.5): each measured summary's write upkeep is timed.
-            let origin = std::time::Instant::now();
-            let mut now = || crate::skipping::nanos_since(origin);
-            let writer = program.connection.skipping_id();
-            if told {
-                registry.on_write_told(root, writer, committed, write, &mut now)
-            } else {
-                registry.on_write(root, writer, committed, write, &mut now)
-            }
-        }
-        None => registry.mark_stale(root),
-    }
+    let origin = std::time::Instant::now();
+    registry.write_checked(
+        root,
+        program.connection.skipping_id(),
+        Some(column),
+        write,
+        &mut || crate::skipping::nanos_since(origin),
+        || program.connection.skipping_write_base(),
+    );
 }
 
 fn skipping_on_insert(
@@ -13486,7 +13482,7 @@ fn skipping_on_insert(
         Some(old) => crate::skipping::RowWrite::Update { rowid, old, new },
         None => crate::skipping::RowWrite::Insert { rowid, value: new },
     };
-    skipping_hand(program, root, write);
+    skipping_hand(program, root, column, write);
 }
 
 /// Amphora (G7 step 2, `AC-NS.2.1`): a write that found no summary of its table before its row
@@ -13531,7 +13527,7 @@ fn skipping_on_delete(
             return;
         }
     };
-    skipping_hand(program, root, write);
+    skipping_hand(program, root, column, write);
 }
 
 pub fn op_insert(
@@ -22119,6 +22115,7 @@ pub fn op_morsel_aggregate(
                     .run_mode(connection.parallel_mode(), &mut costs, &budget)
                     .map(|(rows, _)| (rows, false));
             }
+            table.read_reals(&data.reals)?;
             let shape = ScanAggregate {
                 rows: &[],
                 filter: &data.filter,

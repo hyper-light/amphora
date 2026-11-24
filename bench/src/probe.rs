@@ -23,10 +23,22 @@ struct Opts {
 }
 
 fn opts() -> anyhow::Result<Opts> {
-    let mut o = Opts { target: String::new(), probes: String::new(), out: String::new(), dir: format!("{}/.cache/amphora-probe", std::env::var("HOME").unwrap_or_default()), label: String::new() };
+    let mut o = Opts {
+        target: String::new(),
+        probes: String::new(),
+        out: String::new(),
+        dir: format!(
+            "{}/.cache/amphora-probe",
+            std::env::var("HOME").unwrap_or_default()
+        ),
+        label: String::new(),
+    };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
-        let mut v = || args.next().ok_or_else(|| anyhow::anyhow!("{a} takes a value"));
+        let mut v = || {
+            args.next()
+                .ok_or_else(|| anyhow::anyhow!("{a} takes a value"))
+        };
         match a.as_str() {
             "--probe" => {}
             "--target" => o.target = v()?,
@@ -34,10 +46,15 @@ fn opts() -> anyhow::Result<Opts> {
             "--out" => o.out = v()?,
             "--dir" => o.dir = v()?,
             "--label" => o.label = v()?,
-            other => anyhow::bail!("unknown argument {other} (--probe takes --target, --probes, --out, --dir, --label)"),
+            other => anyhow::bail!(
+                "unknown argument {other} (--probe takes --target, --probes, --out, --dir, --label)"
+            ),
         }
     }
-    anyhow::ensure!(!o.probes.is_empty() && !o.out.is_empty(), "--probe needs --probes and --out");
+    anyhow::ensure!(
+        !o.probes.is_empty() && !o.out.is_empty(),
+        "--probe needs --probes and --out"
+    );
     Ok(o)
 }
 
@@ -66,7 +83,10 @@ fn amphora_param(v: &J) -> amphora_engine::Value {
     match v {
         J::Null => Value::Null,
         J::Bool(b) => Value::from_i64(i64::from(*b)),
-        J::Number(n) => n.as_i64().map(Value::from_i64).unwrap_or_else(|| Value::from_f64(n.as_f64().unwrap_or(0.0))),
+        J::Number(n) => n
+            .as_i64()
+            .map(Value::from_i64)
+            .unwrap_or_else(|| Value::from_f64(n.as_f64().unwrap_or(0.0))),
         J::String(s) => Value::from_text(s.clone()),
         _ => Value::Null,
     }
@@ -79,7 +99,14 @@ fn amphora_json(v: &amphora_engine::Value) -> J {
         Value::Numeric(Numeric::Integer(i)) => json!(i),
         Value::Numeric(Numeric::Float(f)) => json!(f64::from(*f)),
         Value::Text(_) => json!(v.to_text().unwrap_or_default()),
-        Value::Blob(_) => json!(format!("x'{}'", v.to_blob().unwrap_or_default().iter().map(|b| format!("{b:02x}")).collect::<String>())),
+        Value::Blob(_) => json!(format!(
+            "x'{}'",
+            v.to_blob()
+                .unwrap_or_default()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        )),
     }
 }
 
@@ -108,7 +135,10 @@ fn turso_param(v: &J) -> turso_core::Value {
     match v {
         J::Null => Value::Null,
         J::Bool(b) => Value::from_i64(i64::from(*b)),
-        J::Number(n) => n.as_i64().map(Value::from_i64).unwrap_or_else(|| Value::from_f64(n.as_f64().unwrap_or(0.0))),
+        J::Number(n) => n
+            .as_i64()
+            .map(Value::from_i64)
+            .unwrap_or_else(|| Value::from_f64(n.as_f64().unwrap_or(0.0))),
         J::String(s) => Value::from_text(s.clone()),
         _ => Value::Null,
     }
@@ -121,7 +151,14 @@ fn turso_json(v: &turso_core::Value) -> J {
         Value::Numeric(Numeric::Integer(i)) => json!(i),
         Value::Numeric(Numeric::Float(f)) => json!(f64::from(*f)),
         Value::Text(_) => json!(v.to_text().unwrap_or_default()),
-        Value::Blob(_) => json!(format!("x'{}'", v.to_blob().unwrap_or_default().iter().map(|b| format!("{b:02x}")).collect::<String>())),
+        Value::Blob(_) => json!(format!(
+            "x'{}'",
+            v.to_blob()
+                .unwrap_or_default()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        )),
     }
 }
 
@@ -129,7 +166,11 @@ impl Engine for Turso {
     fn run(&mut self, sql: &str, params: &[J]) -> anyhow::Result<Vec<Vec<J>>> {
         let mut stmt = self.conn.prepare(sql).map_err(|e| anyhow::anyhow!("{e}"))?;
         for (i, p) in params.iter().enumerate() {
-            stmt.bind_at(NonZero::new(i + 1).ok_or_else(|| anyhow::anyhow!("parameter 0"))?, turso_param(p)).map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+            stmt.bind_at(
+                NonZero::new(i + 1).ok_or_else(|| anyhow::anyhow!("parameter 0"))?,
+                turso_param(p),
+            )
+            .map_err(|e| anyhow::anyhow!("bind: {e}"))?;
         }
         let mut rows = Vec::new();
         loop {
@@ -149,16 +190,30 @@ impl Engine for Turso {
 
 fn fresh(target: &str, path: &Path) -> anyhow::Result<Box<dyn Engine>> {
     Ok(match target {
-        "amphora" => Box::new(Amphora { db: amphora::db::Db::open(path)? }),
+        "amphora" => Box::new(Amphora {
+            db: amphora::db::Db::open(path)?,
+        }),
         "turso" => {
-            let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().map_err(|e| anyhow::anyhow!("{e}"))?);
-            let name = path.to_str().ok_or_else(|| anyhow::anyhow!("a path that isn't UTF-8"))?;
-            let db = turso_core::Database::open(io.clone(), name, turso_core::OpenOptions::new(Arc::new(turso_core::SqliteDialect)).db_opts(turso_core::DatabaseOpts::new()))
+            let io: Arc<dyn turso_core::IO> =
+                Arc::new(turso_core::PlatformIO::new().map_err(|e| anyhow::anyhow!("{e}"))?);
+            let name = path
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("a path that isn't UTF-8"))?;
+            let db = turso_core::Database::open(
+                io.clone(),
+                name,
+                turso_core::OpenOptions::new(Arc::new(turso_core::SqliteDialect))
+                    .db_opts(turso_core::DatabaseOpts::new()),
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let conn = db
+                .connect(turso_core::ConnectOpts::new())
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let conn = db.connect(turso_core::ConnectOpts::new()).map_err(|e| anyhow::anyhow!("{e}"))?;
             Box::new(Turso { io, conn })
         }
-        t => anyhow::bail!("--probe runs amphora or turso, not {t} (bench/corpus/probe.py runs the rest)"),
+        t => anyhow::bail!(
+            "--probe runs amphora or turso, not {t} (bench/corpus/probe.py runs the rest)"
+        ),
     })
 }
 
@@ -166,10 +221,20 @@ fn run_probe(target: &str, dir: &Path, n: usize, p: &J) -> anyhow::Result<Vec<Ve
     let path: PathBuf = dir.join(format!("{n}.db"));
     let mut e = fresh(target, &path)?;
     // What SQLite's dialect needs first to behave as the other engines do by default (foreign keys).
-    for s in p["sqlite_setup"].as_array().into_iter().flatten().chain(p["setup"].as_array().into_iter().flatten()) {
+    for s in p["sqlite_setup"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(p["setup"].as_array().into_iter().flatten())
+    {
         e.run(s.as_str().unwrap_or_default(), &[])?;
     }
-    let parts: Vec<&str> = p["parts"].as_array().into_iter().flatten().filter_map(J::as_str).collect();
+    let parts: Vec<&str> = p["parts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(J::as_str)
+        .collect();
     let params = param_values(&p["params"]);
     let mut rows = Vec::new();
     for (i, part) in parts.iter().enumerate() {
@@ -186,14 +251,25 @@ pub fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&dir)?;
     let began = std::time::Instant::now();
     let mut results = Vec::new();
-    for (n, p) in probes["probes"].as_array().into_iter().flatten().enumerate() {
+    for (n, p) in probes["probes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
         let id = p["id"].clone();
         let got = std::panic::catch_unwind(AssertUnwindSafe(|| run_probe(&o.target, &dir, n, p)));
         let mut r = match got {
             Ok(Ok(rows)) => json!({ "id": id, "status": "ok", "rows": rows }),
-            Ok(Err(e)) => json!({ "id": id, "status": "error", "error": format!("{e:#}").chars().take(300).collect::<String>() }),
+            Ok(Err(e)) => {
+                json!({ "id": id, "status": "error", "error": format!("{e:#}").chars().take(300).collect::<String>() })
+            }
             Err(panic) => {
-                let msg = panic.downcast_ref::<String>().cloned().or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_owned())).unwrap_or_default();
+                let msg = panic
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                    .unwrap_or_default();
                 json!({ "id": id, "status": "panic", "error": msg.chars().take(300).collect::<String>() })
             }
         };
@@ -204,7 +280,12 @@ pub fn main() -> anyhow::Result<()> {
     }
     let _ = std::fs::remove_dir_all(&dir);
     let ok = results.iter().filter(|r| r["status"] == "ok").count();
-    std::fs::write(&o.out, serde_json::to_string_pretty(&json!({ "engine": o.target, "version": o.label, "seconds": began.elapsed().as_secs_f64(), "results": results }))?)?;
+    std::fs::write(
+        &o.out,
+        serde_json::to_string_pretty(
+            &json!({ "engine": o.target, "version": o.label, "seconds": began.elapsed().as_secs_f64(), "results": results }),
+        )?,
+    )?;
     eprintln!("{}: {ok} of {} probes ran", o.target, results.len());
     Ok(())
 }

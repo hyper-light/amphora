@@ -378,7 +378,7 @@ pub(super) fn request(
     dial: &Dial,
     address: SocketAddr,
     name: &ServerName<'static>,
-    request: &Request,
+    request: Request,
     until: Instant,
 ) -> Result<Answer, Error> {
     remaining(until)?;
@@ -494,6 +494,104 @@ mod tests {
         assert_eq!(served.load(Ordering::SeqCst), 3);
     }
 
+    /// T-T1.9.R18, T-T1.12.X2: an 8 client over mutual TLS carries nanoseconds
+    /// into a backed-up 9 owner and reads its nanosecond stamp in the v8 reply.
+    #[test]
+    fn a_version_8_network_step_keeps_its_clock_units() {
+        use super::super::{auth, wire::*};
+        use crate::backup::{Archive, CheckPolicy, ChunkGrowth, FolderBlobs};
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive = Archive {
+            blobs: Arc::new(FolderBlobs::open(&dir.path().join("archive"), 64 * 1024).unwrap()),
+            prefix: "group".into(),
+            clock: Arc::new(|| 1_000),
+            memory: 32 * 1024,
+            patience: HANG,
+            check: CheckPolicy::Off,
+            chunks: ChunkGrowth::Keep,
+        };
+        let (db, _sink) =
+            crate::database::Database::open_backed_up(&dir.path().join("db"), archive, until())
+                .unwrap();
+        crate::xgroup::sql::prepare(&db, until()).unwrap();
+        let pki = Pki::new();
+        let owner = db.listen(any(), &pki.credentials("owner")).unwrap();
+        let socket = Stream::connect(owner.address().unwrap()).unwrap();
+        let dialer = pki.credentials("client").dialer(ALPN).unwrap();
+        let mut stream = dialer.connect(socket, "owner", until()).unwrap();
+        let token = stream
+            .conn
+            .export_keying_material([0; 32], EXPORTER, None)
+            .unwrap();
+        let hello = Hello {
+            version: 8,
+            nonce: [1; 32],
+            millis: SESSION_MAX.as_millis().try_into().unwrap(),
+        };
+        common::send(
+            &mut stream,
+            &common::encode(&hello, GREETING_FRAME_MAX).unwrap(),
+            until(),
+        )
+        .unwrap();
+        let challenge: Challenge = common::read(&mut stream, until()).unwrap();
+        auth::verify(
+            &token,
+            true,
+            &hello,
+            &challenge.nonce,
+            None,
+            &challenge.proof,
+        )
+        .unwrap();
+        let proof = auth::proof(&token, false, &hello, &challenge.nonce, None).unwrap();
+        common::send(
+            &mut stream,
+            &common::encode(&proof, GREETING_FRAME_MAX).unwrap(),
+            until(),
+        )
+        .unwrap();
+        assert!(matches!(
+            common::read::<Response, _>(&mut stream, until()).unwrap(),
+            Ok(Answer::Ready)
+        ));
+
+        let ns = 301_001;
+        let request = Request::Step {
+            here: 0,
+            carried: ns,
+            envelope: crate::xgroup::Envelope {
+                coordinator: 1,
+                epoch: 0,
+                floor: None,
+                step: crate::xgroup::Step::Begin,
+            },
+        };
+        common::send(
+            &mut stream,
+            &common::encode(&request, FRAME_MAX).unwrap(),
+            until(),
+        )
+        .unwrap();
+        let Ok(Answer::Stepped {
+            reply: crate::xgroup::Reply::Epoch(1),
+            latest: Some(latest),
+        }) = common::read::<Response, _>(&mut stream, until()).unwrap()
+        else {
+            panic!("expected a version-8 step answer");
+        };
+        let micros = db.cross_clock(until()).unwrap().unwrap();
+        assert!(
+            micros >= ns.div_ceil(1_000) && micros < ns,
+            "owner read {ns} ns as {micros} us"
+        );
+        assert!(
+            latest >= ns && latest <= micros * 1_000,
+            "v8 reply carried {latest} ns"
+        );
+    }
+
     /// T-T1.9.R18: a client from another authority, a server from another authority, and a
     /// server whose certificate names another node are each refused before any request is served.
     #[test]
@@ -600,15 +698,15 @@ mod tests {
         let address = node.address().unwrap();
         let named = name("node-1").unwrap();
         assert!(matches!(
-            request(&dial, address, &named, &Request::Probe, until()),
+            request(&dial, address, &named, Request::Probe, until()),
             Ok(Answer::Done)
         ));
         assert!(matches!(
-            request(&dial, address, &named, &Request::Identity, until()),
+            request(&dial, address, &named, Request::Identity, until()),
             Err(Error::Refused(_))
         ));
         assert!(matches!(
-            request(&dial, address, &named, &Request::Session, until()),
+            request(&dial, address, &named, Request::Session, until()),
             Err(Error::Refused(_))
         ));
     }

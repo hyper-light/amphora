@@ -46,7 +46,7 @@ use amphora::database::{AnswerMax, Database, ReadMode};
 use amphora_api::Refusal;
 use amphora_api::replication::ReplicaConfig;
 
-use crate::{Hist, Rng, NONE, RARE, schema, summary};
+use crate::{Hist, NONE, RARE, Rng, schema, summary};
 
 /// The deadline of one call or read: a hang guard, never a verdict.
 const WAIT: Duration = Duration::from_secs(60);
@@ -87,7 +87,10 @@ fn opts() -> anyhow::Result<Opts> {
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
-        let mut v = || args.next().ok_or_else(|| anyhow::anyhow!("{a} takes a value"));
+        let mut v = || {
+            args.next()
+                .ok_or_else(|| anyhow::anyhow!("{a} takes a value"))
+        };
         match a.as_str() {
             "--cluster" => {}
             "--dir" => o.dir = PathBuf::from(v()?),
@@ -120,8 +123,14 @@ fn opts() -> anyhow::Result<Opts> {
     if o.ladder.is_empty() || o.ladder.contains(&0) {
         anyhow::bail!("--ladder is counts of sessions, each at least 1");
     }
-    anyhow::ensure!(!o.dir.as_os_str().is_empty(), "--dir names where the members' files go");
-    anyhow::ensure!(o.partitions > 0 && o.batch > 0 && o.sessions > 0, "--partitions, --batch and --sessions take at least 1");
+    anyhow::ensure!(
+        !o.dir.as_os_str().is_empty(),
+        "--dir names where the members' files go"
+    );
+    anyhow::ensure!(
+        o.partitions > 0 && o.batch > 0 && o.sessions > 0,
+        "--partitions, --batch and --sessions take at least 1"
+    );
     Ok(o)
 }
 
@@ -135,16 +144,28 @@ impl Partition {
         std::fs::create_dir_all(dir)?;
         let mut members = Vec::new();
         for node_id in MEMBERS {
-            let config = ReplicaConfig { node_id, voters: MEMBERS.to_vec(), learners: Vec::new(), bootstrap: None };
-            let db = Database::open_replicated(&dir.join(format!("state-{node_id}.db")), &dir.join(format!("raft-{node_id}.log")), config, Instant::now() + WAIT)
-                .map_err(|e| anyhow::anyhow!("member {node_id}: {e:?}"))?;
+            let config = ReplicaConfig {
+                node_id,
+                voters: MEMBERS.to_vec(),
+                learners: Vec::new(),
+                bootstrap: None,
+            };
+            let db = Database::open_replicated(
+                &dir.join(format!("state-{node_id}.db")),
+                &dir.join(format!("raft-{node_id}.log")),
+                config,
+                Instant::now() + WAIT,
+            )
+            .map_err(|e| anyhow::anyhow!("member {node_id}: {e:?}"))?;
             members.push(db);
         }
         Ok(Self { members })
     }
 
     fn member(&self, node_id: u64) -> anyhow::Result<&Database> {
-        self.members.get(usize::try_from(node_id)?.saturating_sub(1)).ok_or_else(|| anyhow::anyhow!("no member {node_id}"))
+        self.members
+            .get(usize::try_from(node_id)?.saturating_sub(1))
+            .ok_or_else(|| anyhow::anyhow!("no member {node_id}"))
     }
 }
 
@@ -178,7 +199,9 @@ impl Bell {
     /// it is held does that): the relay then ends, and the calls it no longer serves meet their
     /// deadlines.
     fn wait(&self) -> bool {
-        let Ok(rung) = self.rung.lock() else { return false };
+        let Ok(rung) = self.rung.lock() else {
+            return false;
+        };
         match self.ringing.wait_while(rung, |rung| !*rung) {
             Ok(mut rung) => {
                 *rung = false;
@@ -215,15 +238,24 @@ struct RelayCounts {
 
 impl RelayCounts {
     fn snapshot(&self) -> [u64; 4] {
-        [&self.passes, &self.moved, &self.waits, &self.idle_wakes].map(|c| c.load(Ordering::Relaxed))
+        [&self.passes, &self.moved, &self.waits, &self.idle_wakes]
+            .map(|c| c.load(Ordering::Relaxed))
     }
 }
 
 /// The host's relay: every member's outgoing messages to the member they name, until `stop`
 /// (which rings `bell` once set). When a pass moved nothing it waits as `wait` says.
-fn relay(partitions: &[Partition], stop: &AtomicBool, bell: &Arc<Bell>, wait: RelayWait, counts: &RelayCounts) {
-    let handles: Vec<Vec<amphora::replication::ReplicaHandle>> =
-        partitions.iter().map(|p| p.members.iter().filter_map(Database::replica).collect()).collect();
+fn relay(
+    partitions: &[Partition],
+    stop: &AtomicBool,
+    bell: &Arc<Bell>,
+    wait: RelayWait,
+    counts: &RelayCounts,
+) {
+    let handles: Vec<Vec<amphora::replication::ReplicaHandle>> = partitions
+        .iter()
+        .map(|p| p.members.iter().filter_map(Database::replica).collect())
+        .collect();
     if wait == RelayWait::Bell {
         for handle in handles.iter().flatten() {
             // Refused only for a member already fenced: its calls are refused, and the bench
@@ -236,12 +268,8 @@ fn relay(partitions: &[Partition], stop: &AtomicBool, bell: &Arc<Bell>, wait: Re
         let mut moved = 0u64;
         for group in &handles {
             for (from, handle) in MEMBERS.iter().zip(group) {
-                // The member's whole queue each pass: its own bound, no count picked here.
-                for record in handle
-                    .outgoing_bound()
-                    .and_then(|bound| handle.drain(bound))
-                    .unwrap_or_default()
-                {
+                // Take the queue under one lock, even if its learned limit just shrank.
+                for record in handle.drain_all().unwrap_or_default() {
                     let to = usize::try_from(record.to).unwrap_or(0).saturating_sub(1);
                     if let Some(target) = group.get(to) {
                         let _ = target.receive(*from, record.bytes, Instant::now() + WAIT);
@@ -279,12 +307,16 @@ fn relay(partitions: &[Partition], stop: &AtomicBool, bell: &Arc<Bell>, wait: Re
 fn schema_on(partition: &Partition) -> anyhow::Result<()> {
     let until = Instant::now() + WAIT;
     let member = partition.member(1)?;
-    let handle = member.replica().ok_or_else(|| anyhow::anyhow!("member 1 isn't a replica"))?;
+    let handle = member
+        .replica()
+        .ok_or_else(|| anyhow::anyhow!("member 1 isn't a replica"))?;
     let (mut past, mut refused): (u64, Option<Refusal>) = (0, None);
     loop {
-        let led = handle
-            .wait_leader(past, until)
-            .map_err(|e| anyhow::anyhow!("no leader past term {past} for the schema: {e:?} (last refusal: {refused:?})"))?;
+        let led = handle.wait_leader(past, until).map_err(|e| {
+            anyhow::anyhow!(
+                "no leader past term {past} for the schema: {e:?} (last refusal: {refused:?})"
+            )
+        })?;
         match member.call(until, AnswerMax::fixed(), |c| {
             for s in schema::SCHEMA {
                 c.execute_batch(s)?;
@@ -292,7 +324,9 @@ fn schema_on(partition: &Partition) -> anyhow::Result<()> {
             Ok(())
         }) {
             Ok(()) => return Ok(()),
-            Err(e @ (Refusal::NotLeader { .. } | Refusal::UnknownOutcome | Refusal::Unavailable(_))) => {
+            Err(
+                e @ (Refusal::NotLeader { .. } | Refusal::UnknownOutcome | Refusal::Unavailable(_)),
+            ) => {
                 past = led.term;
                 refused = Some(e);
             }
@@ -302,7 +336,10 @@ fn schema_on(partition: &Partition) -> anyhow::Result<()> {
 }
 
 /// `events` written through member 1 in one call, answered with the call's own session token.
-fn write(partition: &Partition, events: Vec<crate::Event>) -> anyhow::Result<Option<amphora::database::Token>> {
+fn write(
+    partition: &Partition,
+    events: Vec<crate::Event>,
+) -> anyhow::Result<Option<amphora::database::Token>> {
     partition
         .member(1)?
         .call_session(Instant::now() + WAIT, AnswerMax::fixed(), move |c| {
@@ -357,7 +394,8 @@ fn load(partitions: &[Partition], o: &Opts) -> anyhow::Result<()> {
             }));
         }
         for l in loading {
-            l.join().map_err(|_| anyhow::anyhow!("a loader panicked"))??;
+            l.join()
+                .map_err(|_| anyhow::anyhow!("a loader panicked"))??;
         }
         Ok(())
     })
@@ -365,15 +403,30 @@ fn load(partitions: &[Partition], o: &Opts) -> anyhow::Result<()> {
 
 /// The newest `limit` events of partition `partition`'s replica on node 3 whose text holds `word`,
 /// at its closed time: (at, session, id), newest first.
-fn search_one(partition: &Partition, word: &str, limit: usize) -> anyhow::Result<Vec<(i64, (String, String))>> {
+fn search_one(
+    partition: &Partition,
+    word: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<(i64, (String, String))>> {
     let pattern = format!("%{word}%");
     let read = partition
         .member(3)?
         .query_closed(0, Instant::now() + WAIT, move |c| {
-            let mut s = c.prepare_cached("SELECT at, session, id FROM events WHERE text LIKE ?1 ORDER BY at DESC LIMIT ?2")?;
-            let rows = s.query_map(vec![amphora_api::Value::Text(pattern), amphora_api::Value::Integer(i64::try_from(limit)?)], |r| {
-                Ok((r.get::<_, i64>(0usize)?, (r.get::<_, String>(1usize)?, r.get::<_, String>(2usize)?)))
-            })?;
+            let mut s = c.prepare_cached(
+                "SELECT at, session, id FROM events WHERE text LIKE ?1 ORDER BY at DESC LIMIT ?2",
+            )?;
+            let rows = s.query_map(
+                vec![
+                    amphora_api::Value::Text(pattern),
+                    amphora_api::Value::Integer(i64::try_from(limit)?),
+                ],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0usize)?,
+                        (r.get::<_, String>(1usize)?, r.get::<_, String>(2usize)?),
+                    ))
+                },
+            )?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
         .map_err(|e| anyhow::anyhow!("a search was refused: {e:?}"))?;
@@ -383,71 +436,99 @@ fn search_one(partition: &Partition, word: &str, limit: usize) -> anyhow::Result
 /// This process's CPU seconds (user and system) and peak resident kilobytes, from /proc on Linux;
 /// none elsewhere.
 fn process_use() -> (Option<f64>, Option<u64>) {
-    let cpu = std::fs::read_to_string("/proc/self/stat").ok().and_then(|stat| {
-        // Fields after the command's closing parenthesis: utime and stime are the 12th and 13th.
-        let rest = stat.rsplit_once(')')?.1.to_owned();
-        let f: Vec<&str> = rest.split_whitespace().collect();
-        let ticks = f.get(11)?.parse::<u64>().ok()? + f.get(12)?.parse::<u64>().ok()?;
-        // Linux's USER_HZ, a format value: 100 on every architecture it ships (times(2)).
-        Some(ticks as f64 / 100.0)
-    });
+    let cpu = std::fs::read_to_string("/proc/self/stat")
+        .ok()
+        .and_then(|stat| {
+            // Fields after the command's closing parenthesis: utime and stime are the 12th and 13th.
+            let rest = stat.rsplit_once(')')?.1.to_owned();
+            let f: Vec<&str> = rest.split_whitespace().collect();
+            let ticks = f.get(11)?.parse::<u64>().ok()? + f.get(12)?.parse::<u64>().ok()?;
+            // Linux's USER_HZ, a format value: 100 on every architecture it ships (times(2)).
+            Some(ticks as f64 / 100.0)
+        });
     let hwm = std::fs::read_to_string("/proc/self/status")
         .ok()
-        .and_then(|s| s.lines().find(|l| l.starts_with("VmHWM:"))?.split_whitespace().nth(1)?.parse().ok());
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmHWM:"))?
+                .split_whitespace()
+                .nth(1)?
+                .parse()
+                .ok()
+        });
     (cpu, hwm)
 }
 
 /// The `ryw` shape at one count of sessions: each session writes one event through member 1, keeps
 /// the token the write's answer carries, and reads the event back on a follower in `o.read_mode`.
-fn ryw(partition: &Partition, o: &Opts, relayed: &RelayCounts, sessions: usize, base: u64) -> anyhow::Result<serde_json::Value> {
+fn ryw(
+    partition: &Partition,
+    o: &Opts,
+    relayed: &RelayCounts,
+    sessions: usize,
+    base: u64,
+) -> anyhow::Result<serde_json::Value> {
     let rounds = o.reads.div_ceil(sessions).max(1);
     let relayed0 = relayed.snapshot();
     let (cpu0, _) = process_use();
     let began = Instant::now();
-    let (writes, reads, missed) = std::thread::scope(|scope| -> anyhow::Result<(Hist, Hist, u64)> {
-        let mut running = Vec::new();
-        for s in 0..sessions {
-            running.push(scope.spawn(move || -> anyhow::Result<(Hist, Hist, u64)> {
-                let (mut w, mut r, mut missed) = (Hist::new(), Hist::new(), 0u64);
-                let mut rng = Rng(0x7279_7731 ^ (u64::try_from(s)? + 1));
-                let reader = partition.member(2 + u64::try_from(s % 2)?)?;
-                let mut token: Option<amphora::database::Token> = None;
-                for i in 0..rounds {
-                    let seq = base + u64::try_from(s * rounds + i)?;
-                    let event = crate::event(&mut rng, 1_000_000 + s, seq, o.text_bytes);
-                    let id = event.id.clone();
-                    let t = Instant::now();
-                    let mine = write(partition, vec![event])?;
-                    w.record(us(t));
-                    token = match (token, mine) {
-                        (Some(held), Some(mine)) => Some(held.after(mine)),
-                        (held, mine) => mine.or(held),
-                    };
-                    let t = Instant::now();
-                    let found = reader
-                        .query_session(o.read_mode, token, Instant::now() + WAIT, AnswerMax::fixed(), move |c| {
-                            let mut q = c.prepare_cached("SELECT id FROM events WHERE id = ?1")?;
-                            let rows = q.query_map(vec![amphora_api::Value::Text(id)], |row| row.get::<_, String>(0usize))?;
-                            Ok(rows.count())
-                        })
-                        .map_err(|e| anyhow::anyhow!("a read was refused: {e:?}"))?;
-                    r.record(us(t));
-                    if found == 0 {
-                        missed += 1;
+    let (writes, reads, missed) =
+        std::thread::scope(|scope| -> anyhow::Result<(Hist, Hist, u64)> {
+            let mut running = Vec::new();
+            for s in 0..sessions {
+                running.push(scope.spawn(move || -> anyhow::Result<(Hist, Hist, u64)> {
+                    let (mut w, mut r, mut missed) = (Hist::new(), Hist::new(), 0u64);
+                    let mut rng = Rng(0x7279_7731 ^ (u64::try_from(s)? + 1));
+                    let reader = partition.member(2 + u64::try_from(s % 2)?)?;
+                    let mut token: Option<amphora::database::Token> = None;
+                    for i in 0..rounds {
+                        let seq = base + u64::try_from(s * rounds + i)?;
+                        let event = crate::event(&mut rng, 1_000_000 + s, seq, o.text_bytes);
+                        let id = event.id.clone();
+                        let t = Instant::now();
+                        let mine = write(partition, vec![event])?;
+                        w.record(us(t));
+                        token = match (token, mine) {
+                            (Some(held), Some(mine)) => Some(held.after(mine)),
+                            (held, mine) => mine.or(held),
+                        };
+                        let t = Instant::now();
+                        let found = reader
+                            .query_session(
+                                o.read_mode,
+                                token,
+                                Instant::now() + WAIT,
+                                AnswerMax::fixed(),
+                                move |c| {
+                                    let mut q =
+                                        c.prepare_cached("SELECT id FROM events WHERE id = ?1")?;
+                                    let rows = q
+                                        .query_map(vec![amphora_api::Value::Text(id)], |row| {
+                                            row.get::<_, String>(0usize)
+                                        })?;
+                                    Ok(rows.count())
+                                },
+                            )
+                            .map_err(|e| anyhow::anyhow!("a read was refused: {e:?}"))?;
+                        r.record(us(t));
+                        if found == 0 {
+                            missed += 1;
+                        }
                     }
-                }
-                Ok((w, r, missed))
-            }));
-        }
-        let (mut w, mut r, mut missed) = (Hist::new(), Hist::new(), 0u64);
-        for run in running {
-            let (wi, ri, mi) = run.join().map_err(|_| anyhow::anyhow!("a session panicked"))??;
-            w.merge(&wi);
-            r.merge(&ri);
-            missed += mi;
-        }
-        Ok((w, r, missed))
-    })?;
+                    Ok((w, r, missed))
+                }));
+            }
+            let (mut w, mut r, mut missed) = (Hist::new(), Hist::new(), 0u64);
+            for run in running {
+                let (wi, ri, mi) = run
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("a session panicked"))??;
+                w.merge(&wi);
+                r.merge(&ri);
+                missed += mi;
+            }
+            Ok((w, r, missed))
+        })?;
     let took = began.elapsed().as_secs_f64();
     let (cpu1, hwm) = process_use();
     let [passes, moved, waits, idle_wakes] = relayed.snapshot();
@@ -462,7 +543,10 @@ fn ryw(partition: &Partition, o: &Opts, relayed: &RelayCounts, sessions: usize, 
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
     let mut followers = Vec::new();
     for node in [2u64, 3] {
-        let c = partition.member(node)?.session_counters(Instant::now() + WAIT).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let c = partition
+            .member(node)?
+            .session_counters(Instant::now() + WAIT)
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
         followers.push(c.map(|c| serde_json::json!({
             "node": node, "at_once": c.at_once, "waited": c.waited, "wait_ms": c.wait_nanos as f64 / 1e6,
             "redirects": c.redirects, "apply_lag_us": c.apply_lag_micros,
@@ -486,7 +570,9 @@ fn us(t: Instant) -> u64 {
 pub fn main() -> anyhow::Result<()> {
     let o = opts()?;
     let _ = std::fs::remove_dir_all(&o.dir);
-    let partitions: Vec<Partition> = (0..o.partitions).map(|p| Partition::open(&o.dir.join(format!("p{p}")))).collect::<anyhow::Result<_>>()?;
+    let partitions: Vec<Partition> = (0..o.partitions)
+        .map(|p| Partition::open(&o.dir.join(format!("p{p}"))))
+        .collect::<anyhow::Result<_>>()?;
     let stop = AtomicBool::new(false);
     let bell = Arc::new(Bell::default());
     let relayed = RelayCounts::default();
@@ -500,13 +586,18 @@ pub fn main() -> anyhow::Result<()> {
             load(&partitions, &o)?;
             let load_s = loaded.elapsed().as_secs_f64();
             let report = |shape: &str, h: Hist| {
-                println!("{}", serde_json::json!({
-                    "bench": format!("amphora_{shape}"), "partitions": o.partitions, "events": o.events, "sessions": o.sessions,
-                    "members": MEMBERS.len(), "load_s": load_s, "latency_ms": summary(h),
-                }));
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "bench": format!("amphora_{shape}"), "partitions": o.partitions, "events": o.events, "sessions": o.sessions,
+                        "members": MEMBERS.len(), "load_s": load_s, "latency_ms": summary(h),
+                    })
+                );
             };
             if o.shapes.iter().any(|s| s == "read") {
-                let first = partitions.first().ok_or_else(|| anyhow::anyhow!("no partition"))?;
+                let first = partitions
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("no partition"))?;
                 let writing = AtomicBool::new(true);
                 let written = std::thread::scope(|inner| -> anyhow::Result<Hist> {
                     let writer = inner.spawn(|| -> anyhow::Result<()> {
@@ -524,24 +615,36 @@ pub fn main() -> anyhow::Result<()> {
                     for _ in 0..o.reads {
                         let s = session.clone();
                         let t = Instant::now();
-                        let at = follower.follower_read_micros(Instant::now() + WAIT).unwrap_or(0);
+                        let at = follower
+                            .follower_read_micros(Instant::now() + WAIT)
+                            .unwrap_or(0);
                         follower
                             .query_closed(at, Instant::now() + WAIT, move |c| {
                                 let mut q = c.prepare_cached(schema::EVENTS_LAST)?;
-                                let rows = q.query_map(vec![amphora_api::Value::Text(s), amphora_api::Value::Integer(50)], |r| r.get::<_, String>(1usize))?;
+                                let rows = q.query_map(
+                                    vec![
+                                        amphora_api::Value::Text(s),
+                                        amphora_api::Value::Integer(50),
+                                    ],
+                                    |r| r.get::<_, String>(1usize),
+                                )?;
                                 Ok(rows.count())
                             })
                             .map_err(|e| anyhow::anyhow!("a follower read was refused: {e:?}"))?;
                         h.record(us(t));
                     }
                     writing.store(false, Ordering::Relaxed);
-                    writer.join().map_err(|_| anyhow::anyhow!("the writer panicked"))??;
+                    writer
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("the writer panicked"))??;
                     Ok(h)
                 })?;
                 report("read", written);
             }
             if o.shapes.iter().any(|s| s == "ryw") {
-                let first = partitions.first().ok_or_else(|| anyhow::anyhow!("no partition"))?;
+                let first = partitions
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("no partition"))?;
                 let mut base = u64::try_from(o.events)? + 1_000_000_000;
                 for &sessions in &o.ladder {
                     println!("{}", ryw(first, &o, &relayed, sessions, base)?);
@@ -567,7 +670,9 @@ pub fn main() -> anyhow::Result<()> {
         })();
         stop.store(true, Ordering::Relaxed);
         bell.ring();
-        relaying.join().map_err(|_| anyhow::anyhow!("the relay panicked"))?;
+        relaying
+            .join()
+            .map_err(|_| anyhow::anyhow!("the relay panicked"))?;
         ran
     })?;
     Ok(())

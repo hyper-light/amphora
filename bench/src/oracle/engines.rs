@@ -37,7 +37,12 @@ impl V {
         match (self, o) {
             (V::Null, V::Null) => true,
             (V::Int(a), V::Int(b)) => a == b,
-            (V::Real(a), V::Real(b)) => a == b || (a.is_finite() && b.is_finite() && (a - b).abs() <= 1e-9 * a.abs().max(b.abs()).max(1.0)),
+            (V::Real(a), V::Real(b)) => {
+                a == b
+                    || (a.is_finite()
+                        && b.is_finite()
+                        && (a - b).abs() <= 1e-9 * a.abs().max(b.abs()).max(1.0))
+            }
             (V::Text(a), V::Text(b)) => a == b,
             (V::Blob(a), V::Blob(b)) => a == b,
             _ => false,
@@ -51,11 +56,26 @@ impl V {
             V::Int(i) => i.to_string(),
             V::Real(f) if f.is_finite() => {
                 let s = format!("{f:?}");
-                if s.contains(['e', 'E', '.']) { s } else { format!("{s}.0") }
+                if s.contains(['e', 'E', '.']) {
+                    s
+                } else {
+                    format!("{s}.0")
+                }
             }
-            V::Real(f) => if *f > 0.0 { "1e999".into() } else if *f < 0.0 { "-1e999".into() } else { "NULL".into() },
+            V::Real(f) => {
+                if *f > 0.0 {
+                    "1e999".into()
+                } else if *f < 0.0 {
+                    "-1e999".into()
+                } else {
+                    "NULL".into()
+                }
+            }
             V::Text(s) => format!("'{}'", s.replace('\'', "''")),
-            V::Blob(b) => format!("x'{}'", b.iter().map(|x| format!("{x:02x}")).collect::<String>()),
+            V::Blob(b) => format!(
+                "x'{}'",
+                b.iter().map(|x| format!("{x:02x}")).collect::<String>()
+            ),
         }
     }
 }
@@ -79,7 +99,11 @@ fn order(a: &V, b: &V) -> std::cmp::Ordering {
 }
 
 fn row_order(a: &[V], b: &[V]) -> std::cmp::Ordering {
-    a.iter().zip(b).map(|(x, y)| order(x, y)).find(|o| o.is_ne()).unwrap_or(a.len().cmp(&b.len()))
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| order(x, y))
+        .find(|o| o.is_ne())
+        .unwrap_or(a.len().cmp(&b.len()))
 }
 
 /// A value as a class of equal ones: numbers by value whatever their class, text folded as NOCASE
@@ -106,12 +130,20 @@ pub fn same_rows_by(a: &Rows, b: &Rows, loose: bool) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    let key = |r: &Vec<V>| -> Vec<V> { if loose { r.iter().map(folded).collect() } else { r.clone() } };
+    let key = |r: &Vec<V>| -> Vec<V> {
+        if loose {
+            r.iter().map(folded).collect()
+        } else {
+            r.clone()
+        }
+    };
     let mut x: Vec<Vec<V>> = a.iter().map(key).collect();
     let mut y: Vec<Vec<V>> = b.iter().map(key).collect();
     x.sort_by(|p, q| row_order(p, q));
     y.sort_by(|p, q| row_order(p, q));
-    x.iter().zip(&y).all(|(p, q)| p.len() == q.len() && p.iter().zip(q.iter()).all(|(u, v)| u.same(v)))
+    x.iter()
+        .zip(&y)
+        .all(|(p, q)| p.len() == q.len() && p.iter().zip(q.iter()).all(|(u, v)| u.same(v)))
 }
 
 /// A short view of an answer, for a finding: its row count and first rows.
@@ -153,11 +185,19 @@ pub struct Amphora {
 impl Amphora {
     /// A new in-memory database; `n` names it apart from every other the process opens.
     pub fn new(n: u64) -> anyhow::Result<Self> {
-        use amphora_engine::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenOptions, SqliteDialect};
+        use amphora_engine::{
+            ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenOptions, SqliteDialect,
+        };
         let io: Arc<dyn amphora_engine::IO> = Arc::new(MemoryIO::new());
-        let db = Database::open(io.clone(), &format!("oracle-{}-{n}.db", std::process::id()), OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new()))
+        let db = Database::open(
+            io.clone(),
+            &format!("oracle-{}-{n}.db", std::process::id()),
+            OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new()),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let conn = db
+            .connect(ConnectOpts::new())
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let conn = db.connect(ConnectOpts::new()).map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(Self { io, conn, _db: db })
     }
 }
@@ -185,7 +225,9 @@ impl Engine for Amphora {
                     }
                 }
                 amphora_engine::StepResult::Done => return Ok(rows),
-                amphora_engine::StepResult::IO | amphora_engine::StepResult::Yield => self.io.step().map_err(|e| e.to_string())?,
+                amphora_engine::StepResult::IO | amphora_engine::StepResult::Yield => {
+                    self.io.step().map_err(|e| e.to_string())?
+                }
                 other => return Err(format!("step: {other:?}")),
             }
         }
@@ -206,7 +248,13 @@ mod ffi {
 
     pub type Open = unsafe extern "C" fn(*const c_char, *mut *mut c_void) -> c_int;
     pub type Close = unsafe extern "C" fn(*mut c_void) -> c_int;
-    pub type Prepare = unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut *mut c_void, *mut *const c_char) -> c_int;
+    pub type Prepare = unsafe extern "C" fn(
+        *mut c_void,
+        *const c_char,
+        c_int,
+        *mut *mut c_void,
+        *mut *const c_char,
+    ) -> c_int;
     pub type Stmt = unsafe extern "C" fn(*mut c_void) -> c_int;
     pub type Col = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
     pub type ColI64 = unsafe extern "C" fn(*mut c_void, c_int) -> i64;
@@ -234,20 +282,37 @@ mod ffi {
         // SAFETY: loading a SQLite library runs its initializers, which only set up its own state;
         // each symbol is SQLite's documented C API with the signature its type above gives.
         unsafe {
-            let lib = libloading::Library::new(path).map_err(|e| format!("loading SQLite from {path}: {e}"))?;
+            let lib = libloading::Library::new(path)
+                .map_err(|e| format!("loading SQLite from {path}: {e}"))?;
             let api = Api {
                 open: *lib.get(b"sqlite3_open\0").map_err(|e| e.to_string())?,
                 close: *lib.get(b"sqlite3_close_v2\0").map_err(|e| e.to_string())?,
-                prepare: *lib.get(b"sqlite3_prepare_v2\0").map_err(|e| e.to_string())?,
+                prepare: *lib
+                    .get(b"sqlite3_prepare_v2\0")
+                    .map_err(|e| e.to_string())?,
                 step: *lib.get(b"sqlite3_step\0").map_err(|e| e.to_string())?,
                 finalize: *lib.get(b"sqlite3_finalize\0").map_err(|e| e.to_string())?,
-                count: *lib.get(b"sqlite3_column_count\0").map_err(|e| e.to_string())?,
-                kind: *lib.get(b"sqlite3_column_type\0").map_err(|e| e.to_string())?,
-                int64: *lib.get(b"sqlite3_column_int64\0").map_err(|e| e.to_string())?,
-                double: *lib.get(b"sqlite3_column_double\0").map_err(|e| e.to_string())?,
-                blob: *lib.get(b"sqlite3_column_blob\0").map_err(|e| e.to_string())?,
-                text: *lib.get(b"sqlite3_column_text\0").map_err(|e| e.to_string())?,
-                bytes: *lib.get(b"sqlite3_column_bytes\0").map_err(|e| e.to_string())?,
+                count: *lib
+                    .get(b"sqlite3_column_count\0")
+                    .map_err(|e| e.to_string())?,
+                kind: *lib
+                    .get(b"sqlite3_column_type\0")
+                    .map_err(|e| e.to_string())?,
+                int64: *lib
+                    .get(b"sqlite3_column_int64\0")
+                    .map_err(|e| e.to_string())?,
+                double: *lib
+                    .get(b"sqlite3_column_double\0")
+                    .map_err(|e| e.to_string())?,
+                blob: *lib
+                    .get(b"sqlite3_column_blob\0")
+                    .map_err(|e| e.to_string())?,
+                text: *lib
+                    .get(b"sqlite3_column_text\0")
+                    .map_err(|e| e.to_string())?,
+                bytes: *lib
+                    .get(b"sqlite3_column_bytes\0")
+                    .map_err(|e| e.to_string())?,
                 errmsg: *lib.get(b"sqlite3_errmsg\0").map_err(|e| e.to_string())?,
             };
             Ok((lib, api))
@@ -255,16 +320,20 @@ mod ffi {
     }
 }
 
-static SQLITE: std::sync::OnceLock<Result<(libloading::Library, ffi::Api), String>> = std::sync::OnceLock::new();
+static SQLITE: std::sync::OnceLock<Result<(libloading::Library, ffi::Api), String>> =
+    std::sync::OnceLock::new();
 static LIBRARY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// The SQLite library to load in place of the system's; set before the first `Sqlite::new`.
 pub fn use_library(path: String) -> Result<(), String> {
-    LIBRARY.set(path).map_err(|p| format!("the SQLite library is already chosen; not {p}"))
+    LIBRARY
+        .set(path)
+        .map_err(|p| format!("the SQLite library is already chosen; not {p}"))
 }
 
 fn api() -> Result<&'static ffi::Api, String> {
-    match SQLITE.get_or_init(|| ffi::load(LIBRARY.get().map_or("libsqlite3.so.0", String::as_str))) {
+    match SQLITE.get_or_init(|| ffi::load(LIBRARY.get().map_or("libsqlite3.so.0", String::as_str)))
+    {
         Ok((_, api)) => Ok(api),
         Err(e) => Err(e.clone()),
     }
@@ -280,13 +349,20 @@ impl Sqlite {
         let mut db = std::ptr::null_mut();
         // SAFETY: a NUL-terminated name and a place for the handle, as sqlite3_open takes them.
         let rc = unsafe { (api.open)(c":memory:".as_ptr(), &mut db) };
-        anyhow::ensure!(rc == 0 && !db.is_null(), "opening the system's SQLite: code {rc}");
+        anyhow::ensure!(
+            rc == 0 && !db.is_null(),
+            "opening the system's SQLite: code {rc}"
+        );
         Ok(Self { db })
     }
 
     fn error(&self, api: &ffi::Api) -> String {
         // SAFETY: errmsg on an open handle returns a NUL-terminated string SQLite owns.
-        unsafe { std::ffi::CStr::from_ptr((api.errmsg)(self.db)).to_string_lossy().into_owned() }
+        unsafe {
+            std::ffi::CStr::from_ptr((api.errmsg)(self.db))
+                .to_string_lossy()
+                .into_owned()
+        }
     }
 }
 
@@ -334,7 +410,9 @@ impl Engine for Sqlite {
                                     if p.is_null() {
                                         V::Text(String::new())
                                     } else {
-                                        match std::str::from_utf8(std::slice::from_raw_parts(p, len)) {
+                                        match std::str::from_utf8(std::slice::from_raw_parts(
+                                            p, len,
+                                        )) {
                                             Ok(t) => V::Text(t.to_owned()),
                                             Err(_) => {
                                                 (api.finalize)(stmt);
@@ -346,7 +424,11 @@ impl Engine for Sqlite {
                                 4 => {
                                     let p = (api.blob)(stmt, i) as *const u8;
                                     let len = (api.bytes)(stmt, i) as usize;
-                                    V::Blob(if p.is_null() { Vec::new() } else { std::slice::from_raw_parts(p, len).to_vec() })
+                                    V::Blob(if p.is_null() {
+                                        Vec::new()
+                                    } else {
+                                        std::slice::from_raw_parts(p, len).to_vec()
+                                    })
                                 }
                                 _ => V::Null,
                             }

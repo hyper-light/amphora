@@ -155,15 +155,20 @@ fn stepped_answer(
     reply: crate::xgroup::Reply,
     latest: Option<u64>,
     closed: Option<u64>,
-) -> Answer {
+) -> Response {
     if version >= VERSION_STEPPED_CLOSED {
-        Answer::SteppedClosed {
+        Ok(Answer::SteppedClosed {
             reply,
             latest,
             closed,
-        }
+        })
     } else {
-        Answer::Stepped { reply, latest }
+        // The step has already run: a stamp too large to return leaves its outcome unknown.
+        let latest = latest
+            .map(legacy_nanos)
+            .transpose()
+            .map_err(|_| Refusal::UnknownOutcome)?;
+        Ok(Answer::Stepped { reply, latest })
     }
 }
 /// `response` as a peer that agreed on `version` decodes it: [`Refusal::Serialization`] only from
@@ -174,6 +179,14 @@ fn spoken(version: u32, response: Response) -> Response {
     } else {
         response.map_err(Refusal::without_serialization)
     }
+}
+
+/// Version 8 carries the backup clock's nanoseconds (T-T1.12.X2); the coordinator
+/// and version 9 use the closed clock's microseconds (T-T1.9.R28).
+fn legacy_nanos(micros: u64) -> Result<u64, Refusal> {
+    micros
+        .checked_mul(crate::backup::MICRO_NS)
+        .ok_or_else(|| api::invalid("step stamp", "outside the version-8 nanosecond range"))
 }
 /// The version both ends use (local-owner-transport.md, "Negotiated versions"): the newest both
 /// speak, a peer speaking `oldest` to `newest` and this side [`VERSION_MIN`] to [`VERSION`]. None
@@ -474,7 +487,7 @@ impl Nodes {
             }
             .request(request, until),
             (Some(Endpoint::Network { address, name }), Some(dial)) => {
-                super::network::request(dial, *address, name, &request, until)
+                super::network::request(dial, *address, name, request, until)
             }
             _ => Err(unavailable(format_args!("no endpoint known for node {}", node.0)).into()),
         }
@@ -503,7 +516,11 @@ impl Nodes {
         match self.request(node, request, until)? {
             // A version-8 owner's answer carries no closed time: its group adds none to the
             // token until its node speaks 9 (local-owner-transport.md, "Negotiated versions").
-            Answer::Stepped { reply, latest } => Ok((reply, latest, None)),
+            Answer::Stepped { reply, latest } => Ok((
+                reply,
+                latest.map(|ns| ns.div_ceil(crate::backup::MICRO_NS)),
+                None,
+            )),
             Answer::SteppedClosed {
                 reply,
                 latest,
@@ -682,7 +699,7 @@ fn wake_address(listening: SocketAddr) -> SocketAddr {
     let ip = match listening.ip() {
         IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
         IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
-        ip => ip,
+        _ => return listening,
     };
     SocketAddr::new(ip, listening.port())
 }
@@ -783,7 +800,7 @@ impl Client {
         // Encoded before connecting: a request too large for a frame never opens a connection.
         encode(&request, FRAME_MAX)?;
         let (mut stream, version) = self.greet(until)?;
-        exchange(&mut stream, &request, version, until)
+        exchange(&mut stream, request, version, until)
     }
     fn compact_step(
         &self,
@@ -1214,8 +1231,14 @@ pub(super) fn stepped(
     version: u32,
     until: Instant,
 ) -> Response {
+    let carried = if version < VERSION_STEPPED_CLOSED {
+        // Round up so the receiving clock covers every nanosecond the peer saw.
+        carried.div_ceil(crate::backup::MICRO_NS)
+    } else {
+        carried
+    };
     crate::xgroup::sql::serve(database, here, carried, envelope, until)
-        .map(|(reply, latest, closed)| stepped_answer(version, reply, latest, closed))
+        .and_then(|(reply, latest, closed)| stepped_answer(version, reply, latest, closed))
 }
 
 /// The client's half of the greeting: its hello asking for the time to `until`, saying it speaks
@@ -1279,11 +1302,10 @@ pub(super) fn greet_client<S: Wire>(
 /// after it went out, is [`Error::UnknownOutcome`]: it may have landed.
 pub(super) fn exchange<S: Wire>(
     stream: &mut S,
-    request: &Request,
+    mut request: Request,
     version: u32,
     until: Instant,
 ) -> Result<Answer, Error> {
-    let encoded = encode(request, FRAME_MAX)?;
     let since = request.since();
     if version < since {
         return Err(api::invalid(
@@ -1292,6 +1314,12 @@ pub(super) fn exchange<S: Wire>(
         )
         .into());
     }
+    if version < VERSION_STEPPED_CLOSED
+        && let Request::Step { carried, .. } = &mut request
+    {
+        *carried = legacy_nanos(*carried)?;
+    }
+    let encoded = encode(&request, FRAME_MAX)?;
     send(stream, &encoded, until).map_err(|_| Error::UnknownOutcome)?;
     read::<Response, S>(stream, until)
         .map_err(|_| Error::UnknownOutcome)?
@@ -1664,6 +1692,18 @@ mod tests {
     }
     fn until() -> Instant {
         Instant::now() + HANG
+    }
+
+    /// AC-FD.1.2. The stop connection uses the same interface as a scoped IPv6 listener.
+    #[test]
+    fn review_wake_address_preserves_the_bound_ipv6_scope() {
+        let address = SocketAddr::V6(std::net::SocketAddrV6::new(
+            "fe80::1".parse().unwrap(),
+            1234,
+            0,
+            7,
+        ));
+        assert_eq!(wake_address(address), address);
     }
 
     /// An owner answering each connection with one byte, at the loopback.
@@ -2327,14 +2367,14 @@ mod tests {
         // A step's answer: version 8's shape at 8, the closed time from 9.
         let reply = crate::xgroup::Reply::Resolved;
         assert!(matches!(
-            stepped_answer(VERSION_MIN, reply.clone(), Some(3), Some(5)),
+            stepped_answer(VERSION_MIN, reply.clone(), Some(3), Some(5)).unwrap(),
             Answer::Stepped {
-                latest: Some(3),
+                latest: Some(3_000),
                 ..
             }
         ));
         assert!(matches!(
-            stepped_answer(VERSION_STEPPED_CLOSED, reply, Some(3), Some(5)),
+            stepped_answer(VERSION_STEPPED_CLOSED, reply, Some(3), Some(5)).unwrap(),
             Answer::SteppedClosed {
                 latest: Some(3),
                 closed: Some(5),
@@ -2427,7 +2467,7 @@ mod tests {
             .name_port(listener.local_addr().unwrap().port())
             .unwrap();
         let v8 = thread::spawn(move || {
-            for _ in 0..2 {
+            for connection in 0..5 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let hello: Hello = read_limit(&mut stream, until(), 256).unwrap();
                 assert_eq!(hello.version, 8, "a version-8 owner takes only 8");
@@ -2444,9 +2484,34 @@ mod tests {
                 let proof: [u8; 32] = read_limit(&mut stream, until(), 256).unwrap();
                 auth::verify(&token, false, &hello, &nonce, None, &proof).unwrap();
                 write(&mut stream, &Ok::<_, Refusal>(Answer::Ready), until()).unwrap();
-                let request: Request = read(&mut stream, until()).unwrap();
-                assert!(matches!(request, Request::Probe));
-                write(&mut stream, &Ok::<_, Refusal>(Answer::Done), until()).unwrap();
+                if connection >= 3 {
+                    // The v9-only request was refused after greeting, before its frame.
+                    assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+                } else if connection == 2 {
+                    let request: Request = read(&mut stream, until()).unwrap();
+                    assert!(matches!(
+                        request,
+                        Request::Step {
+                            carried: 17_000,
+                            ..
+                        }
+                    ));
+                    write(
+                        &mut stream,
+                        &Ok::<_, Refusal>(Answer::Stepped {
+                            reply: crate::xgroup::Reply::Epoch(1),
+                            latest: Some(19_001),
+                        }),
+                        until(),
+                    )
+                    .unwrap();
+                } else {
+                    assert!(matches!(
+                        read::<Request, _>(&mut stream, until()).unwrap(),
+                        Request::Probe
+                    ));
+                    write(&mut stream, &Ok::<_, Refusal>(Answer::Done), until()).unwrap();
+                }
             }
         });
         let client = Client::connect(&path, until()).unwrap();
@@ -2458,6 +2523,39 @@ mod tests {
             Answer::Done
         ));
         drop(stream);
+        // CP-T1.8, T-T1.12.X2: a3e2f808 sends and receives backup stamps in ns.
+        let node = crate::reshard::NodeId(0);
+        let nodes = Nodes::new([(node, path)]);
+        let envelope = crate::xgroup::Envelope {
+            coordinator: 1,
+            epoch: 0,
+            floor: None,
+            step: crate::xgroup::Step::Begin,
+        };
+        let (reply, latest, closed) = nodes.step(node, 0, 17, envelope.clone(), until()).unwrap();
+        assert_eq!(
+            (reply, latest, closed),
+            (crate::xgroup::Reply::Epoch(1), Some(20), None)
+        );
+        let txn = crate::xgroup::TxnId {
+            coordinator: 1,
+            epoch: 1,
+            seq: 1,
+        };
+        for request in [
+            Request::Step {
+                here: 0,
+                carried: 0,
+                envelope: crate::xgroup::Envelope {
+                    step: crate::xgroup::Step::RecoverAt { txn },
+                    ..envelope
+                },
+            },
+            Request::Blob(BlobOp::ObjectMax),
+        ] {
+            assert!(matches!(client.request(request, until()),
+                Err(Error::Refused(Refusal::Invalid { what, .. })) if what == "owner request"));
+        }
         v8.join().unwrap();
         drop(owner);
     }

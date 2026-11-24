@@ -152,8 +152,9 @@ fn run(
         io.step()
             .map_err(|err| LimboError::InternalError(err.to_string()))
     };
+    let waker = crate::unpark_waker();
     loop {
-        match stmt.step()? {
+        match stmt.step_with_waker(&waker)? {
             StepResult::Row => {
                 if let Some(r) = stmt.row() {
                     let values: Vec<Value> = r.get_values().cloned().collect();
@@ -163,7 +164,9 @@ fn run(
             StepResult::Done => return Ok(()),
             StepResult::IO | StepResult::Yield => step_io()?,
             StepResult::Sleep { duration } => {
-                std::thread::sleep(duration);
+                // Busy: until the engine wakes this thread (the lock released) or its deadline; a wake for
+                // no reason only steps again.
+                std::thread::park_timeout(duration);
                 step_io()?;
             }
             StepResult::Busy => return Err(LimboError::Busy),

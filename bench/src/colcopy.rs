@@ -50,7 +50,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use amphora_engine::storage::versioned::columns_ab::{
-    QUERIES, Scenario, Traces, scenarios, schema,
+    Handoffs, QUERIES, Scenario, Traces, scenarios, schema,
 };
 use amphora_engine::storage::versioned::columns_sql::{Dropped, Rebuy};
 use amphora_engine::storage::versioned::memory::{Capped, Source};
@@ -160,6 +160,21 @@ impl Amphora {
         }
         out.sort_unstable();
         Ok(out)
+    }
+
+    /// Leave this round's room for the copies, accounting for bytes already granted.
+    fn press(&self, room: &Capped, other: &mut u64, free: u64) -> anyhow::Result<()> {
+        let want = free.saturating_sub(self.storage.copy_meter().held);
+        let now = room.room().map_err(e)?;
+        if now > want {
+            room.take("the driver's other use", now - want).map_err(e)?;
+            *other = other.saturating_add(now - want);
+        } else {
+            let back = (want - now).min(*other);
+            room.give(back);
+            *other = other.saturating_sub(back);
+        }
+        Ok(())
     }
 
     /// The copies' resident and granted bytes.
@@ -274,6 +289,8 @@ fn reach(rows: i64) -> anyhow::Result<Vec<Option<&'static str>>> {
             None
         } else if after.handed == before.handed {
             Some("not_handed")
+        } else if after.skipped_defaults > before.skipped_defaults {
+            Some("defaults")
         } else if after.skipped_rows > before.skipped_rows {
             Some("rows")
         } else if after.skipped_body > before.skipped_body {
@@ -371,6 +388,7 @@ fn run(
             d.conn.execute_batch(&fill(true, i, 1, s.rows))?;
         }
     }
+    let mut handoffs = Handoffs::default();
     let mut t = Tally {
         equal: true,
         ..Tally::default()
@@ -383,17 +401,23 @@ fn run(
         if s.grow > 0 {
             let from = next.get(i).copied().unwrap_or(s.rows + 1);
             let to = from + s.grow - 1;
-            // The engine's write first. The scenario's room is the analytic work's (lane
-            // colcopy-8): each engine's cap is lifted while its rows grow (Amphora's other use
-            // gives its bytes back, DuckDB's limit is reset to its default) and set again after,
-            // so a copy that must grow with its table meets the cap, not the table's rows. A write
-            // still refused is counted and left out of the reference too, so the answers still
-            // compare.
+            // The row growth has room on both engines. Amphora publishes its changes to the
+            // copies at COMMIT, where the copies must already face this round's limit.
             let wrote = match (&amphora, &duck) {
                 (Some(a), _) => {
                     room.give(other);
                     other = 0;
-                    a.exec(&fill(false, i, from, to))
+                    a.exec("BEGIN")?;
+                    let written = a.exec(&fill(false, i, from, to)).and_then(|()| {
+                        if let Some(free) = s.free_at(k, need) {
+                            a.press(&room, &mut other, free)?;
+                        }
+                        a.exec("COMMIT")
+                    });
+                    if written.is_err() && !a.conn.get_auto_commit() {
+                        a.exec("ROLLBACK")?;
+                    }
+                    written
                 }
                 (_, Some(d)) => d
                     .conn
@@ -417,16 +441,7 @@ fn run(
         let free = s.free_at(k, need);
         // The cap: the engine's bytes for its rows now, and the free bytes on top.
         if let (Some(a), Some(f)) = (&amphora, free) {
-            let want = f.saturating_sub(a.storage.copy_meter().held);
-            let now = room.room().map_err(e)?;
-            if now > want {
-                room.take("the driver's other use", now - want).map_err(e)?;
-                other = other.saturating_add(now - want);
-            } else {
-                let back = (want - now).min(other);
-                room.give(back);
-                other = other.saturating_sub(back);
-            }
+            a.press(&room, &mut other, f)?;
             let rows_bytes = room
                 .held()
                 .saturating_sub(other)
@@ -440,6 +455,7 @@ fn run(
             t.cap_peak = t.cap_peak.max(cap);
         }
         let q = s.query(k);
+        let before = amphora.as_ref().map(|a| a.storage.copy_counts());
         let clock = Instant::now();
         let got = match (&amphora, &duck) {
             (Some(a), _) => a.rows(&q),
@@ -447,6 +463,9 @@ fn run(
             _ => anyhow::bail!("no engine"),
         };
         let took = u64::try_from(clock.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        if let (Some(a), Some(before)) = (&amphora, before) {
+            handoffs.record(&before, &a.storage.copy_counts());
+        }
         match got {
             Ok(got) => {
                 t.all.push(took);
@@ -482,9 +501,8 @@ fn run(
     let copies = amphora.as_ref().map(|a| {
         let c = a.storage.copy_counts();
         // The statements its own counts left out: skipped, or never handed over.
-        let own = c
-            .skipped()
-            .saturating_add((s.statements as u64).saturating_sub(c.handed));
+        let skipped = handoffs.skipped.values().copied().fold(0u64, u64::saturating_add);
+        let own = skipped.saturating_add((s.statements as u64).saturating_sub(handoffs.handed));
         let waiting = a.storage.copy_waiting();
         let last = a.storage.copy_dropped().map(
             |Dropped::Memory {
@@ -507,8 +525,8 @@ fn run(
             "waiting_bytes_end": waiting.iter().fold(0u64, |b, w| b.saturating_add(w.bytes)),
             "longest_wait_end_ns": waiting.iter().map(|w| w.nanos).max().unwrap_or(0),
             "last_dropped": last,
-            "handed": c.handed,
-            "skipped": {"rows": c.skipped_rows, "body": c.skipped_body, "join": c.skipped_join, "transaction": c.skipped_transaction},
+            "handed": handoffs.handed,
+            "skipped": handoffs.skipped,
             "unserved": c.unserved,
             "probe_agrees": own == left_out,
         })
@@ -779,10 +797,9 @@ fn ladder_step(
     // Every statement's answer, from the row loop, before the step.
     let mut answers: HashMap<String, Answer> = HashMap::new();
     for k in 0..s.statements {
-        let q = s.query(k);
-        if !answers.contains_key(&q) {
-            let a = reference.rows(&q)?;
-            answers.insert(q, a);
+        if let std::collections::hash_map::Entry::Vacant(slot) = answers.entry(s.query(k)) {
+            let a = reference.rows(slot.key())?;
+            slot.insert(a);
         }
     }
     let mut openers = Vec::with_capacity(clients);
