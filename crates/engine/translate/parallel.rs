@@ -6,12 +6,13 @@
 //! value, so the answer never depends on the switch.
 //!
 //! Only the shapes whose answers equal the serial loop's value for value qualify: one rowid
-//! table read whole, no index, every column it reads stored as written (INTEGER, TEXT or BLOB
-//! affinity, BINARY collation, no generated column, a short row padded with its defaults); terms
-//! comparing a column with an integer or text literal of its own kind, or testing it for NULL;
-//! plain-column GROUP BY keys; COUNT, SUM over INTEGER columns, MIN and MAX (and in the loop
-//! body's copy, AVG and TOTAL over integers); no HAVING, ORDER
-//! BY, LIMIT, DISTINCT, window or subquery.
+//! table read whole or by a rowid range between integer literals or bound parameters (lane R11),
+//! no index, every column it reads stored as written (INTEGER, TEXT or BLOB affinity, BINARY
+//! collation, no generated column, a short row padded with its defaults); terms comparing a
+//! column with an integer or text literal of its own kind, or testing it for NULL; plain-column
+//! GROUP BY keys; COUNT, SUM and AVG over INTEGER or REAL columns (lane R11), MIN and MAX (and in
+//! the loop body's copy, AVG and TOTAL over integers); no HAVING, ORDER BY, LIMIT, DISTINCT,
+//! window or subquery.
 //!
 //! A join's probe with its aggregates qualifies too (`shape_join`): two or more rowid tables the
 //! planner joins inner, by hash joins and scans, keyed by equalities of columns of one affinity;
@@ -34,9 +35,9 @@ use crate::translate::expr::{
 };
 use crate::translate::plan::{
     Distinctness, HashJoinType, IterationDirection, JoinType, JoinedTable, Operation,
-    QueryDestination, Scan, Search, SeekKeyComponent, SelectPlan, WhereTermOrigin,
+    QueryDestination, Scan, Search, SeekDef, SeekKeyComponent, SelectPlan, WhereTermOrigin,
 };
-use crate::types::Value;
+use crate::types::{SeekOp, Value};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::ProgramBuilder;
 use crate::vdbe::insn::{
@@ -668,6 +669,65 @@ fn scanned_rowids(op: &Operation) -> Option<(Option<i64>, Option<i64>)> {
     }
 }
 
+/// A forward search of the table b-tree by a rowid range (lane R11), as the terms on the rowid's
+/// alias column the serial loop reads its rows by: `alias >= x` or `alias > x` from its start,
+/// `alias <= y` or `alias < y` from its end (an end `GT` stops past `y`), each bound an integer
+/// literal or a bound parameter. SQLite seeks the start with OP_SeekGE or OP_SeekGT on the table
+/// b-tree and stops at the end by comparing each rowid with it under NUMERIC affinity (wherecode.c,
+/// `sqlite3WhereCodeOneLoopStart`, case 3; here `seek_internal` and `main_loop/seek.rs`), the
+/// comparison [`Predicate::bind`] and [`Predicate::holds`] make: a NULL bound leaves no row, and
+/// a text or a blob no number reads as is above every rowid. The pipelines test the terms on each
+/// row and read only the rowids they admit (`op_morsel_aggregate`). None: another search, the
+/// serial loop's.
+fn rowid_bounds(seek_def: &SeekDef, alias: usize) -> Option<Vec<Predicate>> {
+    if !seek_def.prefix.is_empty()
+        || seek_def.skip != 0
+        || seek_def.iter_dir != IterationDirection::Forwards
+    {
+        return None;
+    }
+    let mut terms = Vec::new();
+    for (key, op) in [
+        (
+            &seek_def.start,
+            match seek_def.start.op {
+                SeekOp::GE { eq_only: false } => Some(CmpOp::Ge),
+                SeekOp::GT => Some(CmpOp::Gt),
+                _ => None,
+            },
+        ),
+        (
+            &seek_def.end,
+            match seek_def.end.op {
+                SeekOp::GT => Some(CmpOp::Le),
+                SeekOp::GE { eq_only: false } => Some(CmpOp::Lt),
+                _ => None,
+            },
+        ),
+    ] {
+        match &key.last_component {
+            SeekKeyComponent::None => {}
+            SeekKeyComponent::Expr(Expr::Variable(variable)) => {
+                terms.push(Predicate::Parameter {
+                    column: alias,
+                    op: op?,
+                    index: std::num::NonZeroUsize::new(
+                        usize::try_from(variable.index.get()).ok()?,
+                    )?,
+                    affinity: Affinity::Numeric,
+                });
+            }
+            SeekKeyComponent::Expr(expr) => terms.push(Predicate::Compare {
+                column: alias,
+                op: op?,
+                value: Value::from_i64(integer(expr)?),
+            }),
+            SeekKeyComponent::Row(_) | SeekKeyComponent::Null => return None,
+        }
+    }
+    Some(terms)
+}
+
 /// A GROUP BY's HAVING terms as the hook's row loop tests them (lane qs6-17): each aggregate in
 /// them rewritten to the register its value is loaded into, `first + i` for the plan's aggregate
 /// `i`. Only terms over the aggregates and
@@ -954,10 +1014,15 @@ fn shape(plan: &SelectPlan) -> Option<MorselAggregateData> {
     let [joined] = plan.table_references.joined_tables() else {
         return None;
     };
-    let Operation::Scan(Scan::BTreeTable { index: None, .. }) = &joined.op else {
-        return None;
-    };
     let table = stored(joined)?;
+    let mut filter = match &joined.op {
+        Operation::Scan(Scan::BTreeTable { index: None, .. }) => Vec::new(),
+        Operation::Search(Search::Seek {
+            index: None,
+            seek_def,
+        }) => rowid_bounds(seek_def, rowid_alias(table)?)?,
+        _ => return None,
+    };
     let columns = table.columns();
     let id = joined.internal_id;
     // A column the hook reads: of this table, stored as written, compared bytewise.
@@ -1001,7 +1066,6 @@ fn shape(plan: &SelectPlan) -> Option<MorselAggregateData> {
             None
         }
     };
-    let mut filter = Vec::new();
     for term in &plan.where_clause {
         if term.consumed {
             continue;
@@ -1011,12 +1075,24 @@ fn shape(plan: &SelectPlan) -> Option<MorselAggregateData> {
                 .or_else(|| parameter(&term.expr, &compared, &plan.table_references))?,
         );
     }
-    let integer = |at: usize| {
-        columns
-            .get(at)
-            .is_some_and(|c| c.affinity() == Affinity::Integer)
+    // A column SUM and AVG take: INTEGER or REAL (lane R11), each value read as the serial loop
+    // reads it; a REAL met is the serial loop's under `RealSums::Serial`, which the copy and the
+    // morsels hand back.
+    let summed = |expr: &Expr| -> Option<usize> {
+        let Expr::Column {
+            table: t, column, ..
+        } = expr
+        else {
+            return None;
+        };
+        let col = columns.get(*column)?;
+        if *t == id && matches!(col.affinity(), Affinity::Integer | Affinity::Real) {
+            Some(*column)
+        } else {
+            None
+        }
     };
-    let (group_by, aggregates, result_map) = outputs(plan, &column, &integer)?;
+    let (group_by, aggregates, result_map) = outputs(plan, &column, &summed)?;
     Some(MorselAggregateData {
         root_page: table.root_page,
         columns: columns.len(),
@@ -1273,12 +1349,12 @@ fn defaults(table: &BTreeTable) -> Vec<Value> {
 }
 
 /// The GROUP BY keys, the aggregates and each result column's place in the pipeline's row (the
-/// keys, then the aggregates), the columns read through `column`; `integer` says whether a column
-/// is one SUM may take (INTEGER affinity).
+/// keys, then the aggregates), the columns read through `column`, and those SUM and AVG take
+/// through `summed`.
 fn outputs(
     plan: &SelectPlan,
     column: &impl Fn(&Expr) -> Option<usize>,
-    integer: &impl Fn(usize) -> bool,
+    summed: &impl Fn(&Expr) -> Option<usize>,
 ) -> Option<(Vec<usize>, Vec<Aggregate>, Vec<usize>)> {
     let mut group_by = Vec::new();
     if let Some(group) = &plan.group_by {
@@ -1299,13 +1375,8 @@ fn outputs(
         aggregates.push(match (&aggregate.func, aggregate.args.as_slice()) {
             (AggFunc::Count0, []) => Aggregate::CountStar,
             (AggFunc::Count, [arg]) => Aggregate::Count(column(arg)?),
-            (AggFunc::Sum, [arg]) => {
-                let at = column(arg)?;
-                if !integer(at) {
-                    return None;
-                }
-                Aggregate::Sum(at)
-            }
+            (AggFunc::Sum, [arg]) => Aggregate::Sum(summed(arg)?),
+            (AggFunc::Avg, [arg]) => Aggregate::Avg(summed(arg)?),
             (AggFunc::Min, [arg]) => Aggregate::Min(column(arg)?),
             (AggFunc::Max, [arg]) => Aggregate::Max(column(arg)?),
             _ => return None,

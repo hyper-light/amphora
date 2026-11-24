@@ -942,6 +942,91 @@ impl Predicate {
     }
 }
 
+/// The rowids a scan reads (lane R11): those every term of `filter` on the rowid's alias column
+/// `alias` admits, within `range` (each end inclusive, None unbounded). A term admits the rowids
+/// [`Predicate::holds`] passes, comparing the rowid with its bound value as SQLite compares an
+/// INTEGER with the value after NUMERIC affinity: a real by its value (SQLite 3.54's OP_SeekGE
+/// on a table b-tree seeks `rowid >= 4.5` as `rowid > 4`, vdbe.c), a text or a blob above every
+/// integer, NULL true of none. It may admit rowids the terms don't, never fewer: the terms still
+/// decide each row. When none is admitted, `(Some(i64::MAX), Some(i64::MIN))`, which no rowid
+/// is between.
+pub(crate) fn rowid_range(
+    filter: &[Predicate],
+    alias: usize,
+    range: (Option<i64>, Option<i64>),
+) -> (Option<i64>, Option<i64>) {
+    let mut lo = range.0.unwrap_or(i64::MIN);
+    let mut hi = range.1.unwrap_or(i64::MAX);
+    for term in filter {
+        let Predicate::Compare { column, op, value } = term else {
+            continue;
+        };
+        if *column != alias {
+            continue;
+        }
+        match admitted(*op, value) {
+            Some((least, greatest)) => {
+                lo = lo.max(least);
+                hi = hi.min(greatest);
+            }
+            None => return (Some(i64::MAX), Some(i64::MIN)),
+        }
+    }
+    if lo > hi {
+        return (Some(i64::MAX), Some(i64::MIN));
+    }
+    (Some(lo), Some(hi))
+}
+
+/// The least and greatest rowid `rowid op value` holds for; None: none.
+fn admitted(op: CmpOp, value: &Value) -> Option<(i64, i64)> {
+    let all = Some((i64::MIN, i64::MAX));
+    // The least rowid at or above the value, and the greatest at or below it (None: no rowid is).
+    let (up, down) = match value {
+        Value::Null => return None,
+        Value::Text(_) | Value::Blob(_) => {
+            return match op {
+                CmpOp::Lt | CmpOp::Le | CmpOp::Ne => all,
+                CmpOp::Eq | CmpOp::Gt | CmpOp::Ge => None,
+            }
+        }
+        Value::Numeric(Numeric::Integer(i)) => (Some(*i), Some(*i)),
+        Value::Numeric(Numeric::Float(f)) => {
+            let f = f64::from(*f);
+            // Strictly between the ends a double's ceiling and floor are integers in range.
+            let (Some(ceiling), Some(floor)) = (integral(f.ceil()), integral(f.floor())) else {
+                return if f.is_nan() {
+                    all
+                } else if f >= I64_HIGH {
+                    match op {
+                        CmpOp::Lt | CmpOp::Le | CmpOp::Ne => all,
+                        CmpOp::Eq | CmpOp::Gt | CmpOp::Ge => None,
+                    }
+                } else if f < I64_LOW {
+                    match op {
+                        CmpOp::Gt | CmpOp::Ge | CmpOp::Ne => all,
+                        CmpOp::Eq | CmpOp::Lt | CmpOp::Le => None,
+                    }
+                } else {
+                    all
+                };
+            };
+            (Some(ceiling), Some(floor))
+        }
+    };
+    match op {
+        CmpOp::Ge => Some((up?, i64::MAX)),
+        CmpOp::Gt => Some((down.map_or(Some(i64::MIN), |d| d.checked_add(1))?, i64::MAX)),
+        CmpOp::Le => Some((i64::MIN, down?)),
+        CmpOp::Lt => Some((i64::MIN, up.map_or(Some(i64::MAX), |u| u.checked_sub(1))?)),
+        CmpOp::Eq => match (up, down) {
+            (Some(u), Some(d)) if u == d => Some((u, u)),
+            _ => None,
+        },
+        CmpOp::Ne => all,
+    }
+}
+
 /// An aggregate a scan computes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Aggregate {
@@ -959,7 +1044,7 @@ pub enum Aggregate {
 /// Integers a double holds exactly: below 2^53, its significand's 53 bits (IEEE 754 binary64).
 /// While the magnitudes of AVG's or TOTAL's integers sum below it, every partial sum the serial
 /// loop's compensated double sum takes, in any order, is exact, and so equals the exact sum.
-const DOUBLE_EXACT: u128 = 1 << 53;
+pub(crate) const DOUBLE_EXACT: u128 = 1 << 53;
 
 #[derive(Clone, Debug)]
 enum Accumulator {
