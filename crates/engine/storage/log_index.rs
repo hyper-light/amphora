@@ -386,8 +386,8 @@ impl ReadIndex {
         }
     }
 
-    /// Builds the bitmap and the table of latest frames from `index`, under its lock, for `generation`; at
-    /// twice their size where an append outgrew them (`grow_bits`, `grow_latest`).
+    /// Builds the bitmap and the table of latest frames from `index`, under its lock, for
+    /// `generation`; at twice their size where an append outgrew them (`grow_bits`, `grow_latest`).
     fn build(
         &self,
         index: &FxHashMap<u64, Vec<u64>>,
