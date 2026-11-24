@@ -1142,6 +1142,11 @@ impl AggContext {
         if let Self::Builtin(payload) = self {
             return Ok(payload);
         }
+        if matches!(self, Self::External(_) | Self::Native(_)) {
+            return Err(crate::LimboError::InternalError(
+                "materialize_builtin called on extension aggregate".to_string(),
+            ));
+        }
         let mut payload = spare.pop().unwrap_or_default();
         payload.clear();
         match std::mem::replace(self, Self::Count(0)) {
@@ -1180,8 +1185,12 @@ impl AggContext {
                 payload.try_reserve_exact(1)?;
                 payload.push(val);
             }
-            Self::Builtin(_) => unreachable!(),
+            Self::Builtin(existing) => {
+                spare.push(payload);
+                payload = existing;
+            }
             other @ (Self::External(_) | Self::Native(_)) => {
+                spare.push(payload);
                 *self = other;
                 return Err(crate::LimboError::InternalError(
                     "materialize_builtin called on extension aggregate".to_string(),
@@ -1189,21 +1198,25 @@ impl AggContext {
             }
         }
         *self = Self::Builtin(payload);
-        match self {
-            Self::Builtin(payload) => Ok(payload),
-            _ => unreachable!(),
+        if let Self::Builtin(payload) = self {
+            return Ok(payload);
         }
+        Err(crate::LimboError::InternalError(
+            "materialize_builtin failed to store builtin aggregate".to_string(),
+        ))
     }
 
     /// Get a mutable reference to the builtin payload as a slice
     pub fn payload_mut(&mut self) -> &mut [Value] {
         match self {
             Self::Builtin(payload) => payload,
-            Self::Count(_) | Self::SumInt { .. } | Self::Avg { .. } | Self::MinMax(_) => {
-                panic!("payload_mut() called on unmaterialized inline aggregate")
-            }
-            Self::External(_) | Self::Native(_) => {
-                panic!("payload_mut() called on extension aggregate")
+            Self::Count(_)
+            | Self::SumInt { .. }
+            | Self::Avg { .. }
+            | Self::MinMax(_)
+            | Self::External(_)
+            | Self::Native(_) => {
+                panic!("payload_mut() called on non-materialized or extension aggregate")
             }
         }
     }
@@ -1213,11 +1226,13 @@ impl AggContext {
     pub fn payload_vec_mut(&mut self) -> &mut Vec<Value> {
         match self {
             Self::Builtin(payload) => payload,
-            Self::Count(_) | Self::SumInt { .. } | Self::Avg { .. } | Self::MinMax(_) => {
-                panic!("payload_vec_mut() called on unmaterialized inline aggregate")
-            }
-            Self::External(_) | Self::Native(_) => {
-                panic!("payload_vec_mut() called on extension aggregate")
+            Self::Count(_)
+            | Self::SumInt { .. }
+            | Self::Avg { .. }
+            | Self::MinMax(_)
+            | Self::External(_)
+            | Self::Native(_) => {
+                panic!("payload_vec_mut() called on non-materialized or extension aggregate")
             }
         }
     }
@@ -1226,11 +1241,13 @@ impl AggContext {
     pub fn payload(&self) -> &[Value] {
         match self {
             Self::Builtin(payload) => payload,
-            Self::Count(_) | Self::SumInt { .. } | Self::Avg { .. } | Self::MinMax(_) => {
-                panic!("payload() called on unmaterialized inline aggregate")
-            }
-            Self::External(_) | Self::Native(_) => {
-                panic!("payload() called on extension aggregate")
+            Self::Count(_)
+            | Self::SumInt { .. }
+            | Self::Avg { .. }
+            | Self::MinMax(_)
+            | Self::External(_)
+            | Self::Native(_) => {
+                panic!("payload() called on non-materialized or extension aggregate")
             }
         }
     }

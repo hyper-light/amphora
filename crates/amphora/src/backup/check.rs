@@ -301,7 +301,8 @@ fn check_second(
             });
         }
     };
-    let db = Db::open(scratch)?;
+    let db = Db::open_sharing(scratch, &crate::db::Sharing::Off)?;
+    db.disable_inline_reads();
     let mut integrity = Vec::new();
     // The engine's check runs as one statement; each of its waits on the device is a step's end,
     // so it pauses inside the statement as the pace says (T-T1.12.C8).

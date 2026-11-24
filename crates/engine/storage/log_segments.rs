@@ -531,12 +531,8 @@ impl SegmentsCell {
                     };
                     let next = (f & SlotReads::COUNT)
                         | (s & SlotReads::COUNT).wrapping_shl(SlotReads::SECOND_SHIFT);
-                    match slot0.compare_exchange_weak(
-                        cur,
-                        next,
-                        Ordering::SeqCst,
-                        Ordering::SeqCst,
-                    ) {
+                    match slot0.compare_exchange_weak(cur, next, Ordering::SeqCst, Ordering::SeqCst)
+                    {
                         Ok(_) => break,
                         Err(seen) => cur = seen,
                     }
@@ -595,8 +591,8 @@ impl SegmentsCell {
             current == SegmentId::Second || closing == Some(SegmentId::Second),
         ));
         if new_first < READS && new_second < READS && (word & SATURATED) != 0 {
-            let next_word = (word & !SATURATED & !VERSION_MASK)
-                | (word.wrapping_add(1) & VERSION_MASK);
+            let next_word =
+                (word & !SATURATED & !VERSION_MASK) | (word.wrapping_add(1) & VERSION_MASK);
             self.state.store(next_word, Ordering::SeqCst);
         }
         Some(ReadSpan {
@@ -613,8 +609,8 @@ impl SegmentsCell {
         let word = self.state.load(Ordering::SeqCst);
         let (first, second) = self.sum_reads();
         if (word & SATURATED) != 0 && first < READS && second < READS {
-            let cleared = (word & !SATURATED & !VERSION_MASK)
-                | (word.wrapping_add(1) & VERSION_MASK);
+            let cleared =
+                (word & !SATURATED & !VERSION_MASK) | (word.wrapping_add(1) & VERSION_MASK);
             self.state.store(cleared, Ordering::SeqCst);
         }
         let word = self.state.load(Ordering::SeqCst);

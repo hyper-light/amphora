@@ -225,7 +225,9 @@ pub fn refresh_analyze_stats_on_connect_nonblock(
     conn: &Arc<Connection>,
     st: &mut RefreshAnalyzeStatsState,
 ) -> IOResultOr<()> {
-    if matches!(st, RefreshAnalyzeStatsState::Start) {
+    // MVCC transactions can have preparing/concurrent updates to `sqlite_stat1` without bumping
+    // `schema_version`, and `connect_async` must surface commit-dependency waits on those writes.
+    if matches!(st, RefreshAnalyzeStatsState::Start) && conn.mv_store().as_ref().is_none() {
         let schema_version = conn.schema.read().schema_version;
         if conn
             .db

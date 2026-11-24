@@ -840,6 +840,12 @@ impl Db {
             .map_err(fail)
     }
 
+    /// Switches this connection off inline synchronous page reads so each disk read yields to
+    /// callers that pace I/O between steps (such as backup restore drills, T-T1.12.C8).
+    pub(crate) fn disable_inline_reads(&self) {
+        self.conn.get_pager().set_page_path(PagePath::Today);
+    }
+
     /// [`Db::query`] uncached, `between` called each time the statement waits on the device: a long
     /// statement (`PRAGMA integrity_check`) a paced check can pause inside (T-T1.12.C8).
     pub(crate) fn query_between(

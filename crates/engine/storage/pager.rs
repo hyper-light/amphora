@@ -5980,6 +5980,9 @@ impl Pager {
             self.get_sync_type(),
         )?;
         if let Some(page) = self.cache_get(header.page_number as usize)? {
+            if page.is_shared() {
+                self.unshare(&page)?;
+            }
             let content = page.get_contents();
             // Amphora: written over in place, never made dirty: its key heads go (PR.4).
             content.key_heads.changed();

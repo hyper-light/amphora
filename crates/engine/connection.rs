@@ -6211,7 +6211,9 @@ impl Connection {
                 ));
             }
             let count = current & ROOT_STATEMENT_COUNT_MASK;
-            let next = count.checked_add(1).filter(|&n| n < EXPLICIT_CHECKPOINT_BIT);
+            let next = count
+                .checked_add(1)
+                .filter(|&n| n < EXPLICIT_CHECKPOINT_BIT);
             let Some(next) = next else {
                 return Err(LimboError::InternalError(
                     "active root statement count overflow".to_string(),

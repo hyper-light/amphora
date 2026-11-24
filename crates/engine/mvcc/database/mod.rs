@@ -4642,7 +4642,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         connection.with_schema_mut(|schema| {
             Self::rehydrate_table_valued_functions(schema, table_valued_functions);
         })?;
-        connection.db.replace_schema(connection.schema.read().clone());
+        connection
+            .db
+            .replace_schema(connection.schema.read().clone());
         Ok(())
     }
 
@@ -9740,7 +9742,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             .dialect()
                             .load_next_oid(header.pg_next_oid.get());
                     }
-                    connection.db.replace_schema(connection.schema.read().clone());
+                    connection
+                        .db
+                        .replace_schema(connection.schema.read().clone());
                     self.clock.reset(max_commit_ts_seen + 1);
                     self.last_committed_tx_ts
                         .store(max_commit_ts_seen, Ordering::SeqCst);

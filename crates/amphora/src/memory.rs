@@ -361,8 +361,7 @@ impl Readings for System {
                 let reading = self.read_fresh();
                 self.slot(state >> 1).store(reading);
                 guard.done = true;
-                self.flight
-                    .store(state.wrapping_add(2), Ordering::Release);
+                self.flight.store(state.wrapping_add(2), Ordering::Release);
                 return reading;
             }
         }

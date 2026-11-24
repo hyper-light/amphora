@@ -1837,6 +1837,9 @@ impl Database {
                     match result {
                         Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
                         Ok(IOResult::Done(())) => {
+                            if let Some(db) = state.db.as_ref() {
+                                db.bump_schema_epoch();
+                            }
                             // Release the schema lock
                             state.schema_guard = None;
                         }
