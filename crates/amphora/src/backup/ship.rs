@@ -240,8 +240,11 @@ pub struct Shipper {
     archived_through: u64,
     next_link: Option<Link>,
     unknown: Option<u64>,
-    /// Since the latest base: whether the log broke, the bytes shipped, and that base's bytes.
-    broken: bool,
+    /// The generation the log last began in on a gap (0: none): a base begun before it restores
+    /// nothing after it. And the generation the latest base began in.
+    gap: u64,
+    base_start: Option<u64>,
+    /// Since the latest base: the bytes shipped, and that base's bytes.
     since_base: u64,
     base_bytes: Option<u64>,
     /// Pages the frames shipped wrote: in generations before the one shipped now (since the latest
@@ -406,7 +409,8 @@ impl Shipper {
             archived_through: 0,
             next_link: None,
             unknown: None,
-            broken: true,
+            gap: 0,
+            base_start: None,
             since_base: 0,
             base_bytes: None,
             older: Touched::default(),
@@ -452,12 +456,26 @@ impl Shipper {
             )?;
             shipper.generation = last.generation;
             shipper.archived_through = last.through;
-            if let Some((_, head)) = db.log_header()?
-                && identity_of(&head)? == body.identity
-            {
+            // The log is in that generation still, or in the one after it, the writer having
+            // switched since (decision 45) and the segment it closed shipped to its end.
+            let closed = db.log_before().filter(|(_, _, frame)| *frame == last.last);
+            let closed_head = match closed {
+                Some((segment, _, _)) => db.segment_header(segment)?,
+                None => None,
+            };
+            let current_head = db.log_header()?.map(|(_, head)| head);
+            for (head, ended) in [(current_head, None), (closed_head, closed)] {
+                let Some(head) = head else { continue };
+                if identity_of(&head)? != body.identity {
+                    continue;
+                }
+                if let Some((_, seq, frame)) = ended {
+                    shipper.hooks.fence.opened(seq, frame)?;
+                }
                 shipper.identity = Some(body.identity);
                 shipper.header = head;
                 shipper.shipped = last.last;
+                break;
             }
             // A through mark after the last segment says how long the log stayed as it left it;
             // any other is one a later segment outdid, let go.
@@ -486,20 +504,20 @@ impl Shipper {
         if let Some((base, key)) = latest {
             let manifest = object::manifest(key, &blobs.get(key, until)?)?;
             shipper.base_bytes = Some(manifest.file_bytes);
-            shipper.broken = false;
+            shipper.base_start = Some(manifest.start_gen);
             for (key, bytes) in &segments {
                 let s = SegmentKey::parse(prefix, key)?;
                 if (s.generation, s.last) > base.end {
                     shipper.since_base = shipper.since_base.saturating_add(*bytes);
                 }
-                if s.link == Some(Link::Gap) && s.generation > base.end.0 {
-                    shipper.broken = true;
+                if s.link == Some(Link::Gap) {
+                    shipper.gap = shipper.gap.max(s.generation);
                 }
             }
             // The pages the archived log wrote since the latest base began, read back from its
             // segments (what the log since a base holds is bounded by `base_due`), so the next base
             // is incremental after an open too. A gap since leaves it whole.
-            if !shipper.broken {
+            if !shipper.base_needed() {
                 for (key, size) in &segments {
                     let s = SegmentKey::parse(prefix, key)?;
                     if s.generation < manifest.start_gen {
@@ -532,7 +550,11 @@ impl Shipper {
             }
         }
         let (seq, end) = db.log_end();
-        if end > shipper.shipped {
+        let shipped = match shipper.identity {
+            Some(i) if i.seq == seq => shipper.shipped,
+            _ => 0,
+        };
+        if end > shipped {
             // Commits the archive doesn't hold, made while nothing stamped them: when, since the
             // archive's last through, isn't known. A log shipped whole leaves no such commits, and
             // the seconds after a clean close stay exact (T-T1.12.D2).
@@ -769,7 +791,6 @@ impl Shipper {
         self.older.merge(&self.current);
         self.current = Touched::default();
         if link == Link::Gap {
-            self.broken = true;
             // Frames that never reached the archive changed pages no one saw.
             self.traced_from = None;
             if self.generation > 0 {
@@ -783,6 +804,9 @@ impl Shipper {
             .generation
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("the archive's generations overflow"))?;
+        if link == Link::Gap {
+            self.gap = self.generation;
+        }
         self.identity = Some(identity);
         self.header = head;
         self.shipped = 0;
@@ -940,7 +964,7 @@ impl Shipper {
     pub fn base_due(&self, rates: Option<Rates>) -> bool {
         plan::base_due(
             self.base_bytes,
-            self.broken,
+            self.base_needed(),
             self.since_base,
             self.incremental_copy(),
             rates,
@@ -973,10 +997,18 @@ impl Shipper {
         self.generation
     }
 
-    /// Whether no base restores the log shipped now: none yet, or the log broke since the latest.
+    /// Whether no base restores the log shipped now: none yet, or the log broke since the latest
+    /// began.
     #[must_use]
     pub fn base_needed(&self) -> bool {
-        self.base_bytes.is_none() || self.broken
+        self.base_start.is_none_or(|start| start < self.gap)
+    }
+
+    /// Whether the log broke since `copy` began: no restore takes it then ([`plan::chain`]), and
+    /// [`Shipper::end_base`] refuses it.
+    #[must_use]
+    pub fn broke_since(&self, copy: &BaseCopy) -> bool {
+        copy.start_gen < self.gap
     }
 
     /// The frames of the log's generation now shipped so far.
@@ -1159,7 +1191,8 @@ impl Shipper {
     }
 
     /// Ends a base whose chunks are all copied: its manifest names where the log stood once the
-    /// copy ended, which a restore replays through at least.
+    /// copy ended, which a restore replays through at least. Refused where the log broke since it
+    /// began ([`Shipper::broke_since`]).
     pub fn end_base(
         &mut self,
         db: &Db,
@@ -1171,6 +1204,13 @@ impl Shipper {
             anyhow::bail!("the base's chunks aren't all copied");
         }
         self.ship(db, blobs, until)?;
+        if self.broke_since(&copy) {
+            anyhow::bail!(
+                "the log broke in generation {}, after the base began in generation {}: no restore takes it",
+                self.gap,
+                copy.start_gen
+            );
+        }
         let (seq, end) = db.log_end();
         let end = match self.identity {
             Some(i) if i.seq == seq => end,
@@ -1201,7 +1241,7 @@ impl Shipper {
         create(blobs, &key.key(&self.prefix), &bytes, bytes.len(), until)?;
         self.base_bytes = Some(copy.file_bytes);
         self.since_base = 0;
-        self.broken = false;
+        self.base_start = Some(copy.start_gen);
         self.last_base = Some(LastBase {
             id: copy.id,
             start_gen: copy.start_gen,

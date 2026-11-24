@@ -341,7 +341,7 @@ impl Marks {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Ended {
     /// The generation that ended with frames in it, its last frame, and whether it was started
-    /// again before all of it was shipped.
+    /// again before all of it was shipped (a send under way then may ship the rest).
     seq: u32,
     frame: u64,
     forced: bool,
@@ -443,9 +443,26 @@ impl Fence {
         }
     }
 
+    /// The generation `seq` ended at `frame`, as the segment it was in says where a log is opened
+    /// (decision 45), the one after it current: what a fence is told where no restart was made
+    /// through it yet.
+    pub(crate) fn opened(&self, seq: u32, frame: u64) -> anyhow::Result<()> {
+        let mut state = self.state()?;
+        if state.ended.is_none() && state.ending.is_none() {
+            state.ended = Some(Ended {
+                seq,
+                frame,
+                forced: false,
+                empties: 0,
+            });
+        }
+        Ok(())
+    }
+
     /// Whether the log ran unbroken from frame `frame` of generation `old`, as it ended, to the start
     /// of generation `new`: every restart between them was through [`crate::db::Db::restart_log`]
-    /// and none of them forced (T-T1.12.D1).
+    /// (or is what the log was opened with, [`Fence::opened`]) and none of them forced, or all the
+    /// forced one left unshipped was shipped since (T-T1.12.D1).
     pub(crate) fn ended_whole(&self, old: u32, frame: u64, new: u32) -> anyhow::Result<bool> {
         let state = *self.state()?;
         // A log at the generation the restart under way begins says it was made; a log at the one
@@ -455,7 +472,10 @@ impl Fence {
             return Ok(false);
         };
         if old == e.seq {
-            return Ok(frame == e.frame && !e.forced);
+            let shipped = state
+                .shipped
+                .is_some_and(|(s, f)| s == e.seq && f >= e.frame);
+            return Ok(frame == e.frame && (!e.forced || shipped));
         }
         // One of the empty generations after it: it ended at frame 0.
         let after = old.wrapping_sub(e.seq);

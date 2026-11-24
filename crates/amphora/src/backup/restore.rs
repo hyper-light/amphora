@@ -403,7 +403,13 @@ pub fn restore_within(
         }
         log.sync_all()?;
         drop(log);
-        replay(path, written, super::check::step_bytes(blobs), pace)?;
+        replay(
+            path,
+            generation,
+            written,
+            super::check::step_bytes(blobs),
+            pace,
+        )?;
         if generation == plan.cut.0 {
             if written != plan.cut.1 {
                 anyhow::bail!(
@@ -423,12 +429,41 @@ pub fn restore_within(
     })
 }
 
-/// Folds the restored log's `frames` into the file. Unpaced, in one step, as the engine folds a log.
-/// Paced, in parts of as many frames as one of the store's objects holds (`step` bytes, the size a
-/// restore's other steps move), each part a step made durable as it ends, so a paced check pauses
-/// inside the replay (T-T1.12.C8); the last fold empties the log.
-fn replay(path: &Path, frames: u64, step: u64, pace: &mut dyn Pace) -> anyhow::Result<()> {
+/// Folds the restored log's `frames`, those of `generation`, into the file. Unpaced, in one step, as
+/// the engine folds a log. Paced, in parts of as many frames as one of the store's objects holds
+/// (`step` bytes, the size a restore's other steps move), each part a step made durable as it ends,
+/// so a paced check pauses inside the replay (T-T1.12.C8); the last fold empties the log.
+///
+/// The engine's recovery keeps the frames up to the last commit of those that follow one another
+/// from the log's header (their salts and running sums), and drops the rest as a crash's tail. A
+/// segment's own sum says its bytes are those sent, not that they are its generation's, so what it
+/// kept is compared with what was written: short of it, the restore is refused and the files it
+/// made, which would open as a whole database, are removed (AC-T1.12.4).
+fn replay(
+    path: &Path,
+    generation: u64,
+    frames: u64,
+    step: u64,
+    pace: &mut dyn Pace,
+) -> anyhow::Result<()> {
     let mut db = Db::open(path)?;
+    let (_, replayed) = db.log_end();
+    if replayed != frames {
+        drop(db);
+        let [first, second] = log_paths(path);
+        for file in [path, &first, &second] {
+            match std::fs::remove_file(file) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            }
+        }
+        return Err(Unrestorable::Short {
+            generation,
+            archived: frames,
+            replayed,
+        }
+        .into());
+    }
     if pace.paced() {
         let file = std::fs::OpenOptions::new().write(true).open(path)?;
         let per_step = step.checked_div(FRAME_BYTES).unwrap_or(0).max(1);
