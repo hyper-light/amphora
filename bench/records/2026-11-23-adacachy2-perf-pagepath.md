@@ -1977,15 +1977,20 @@ Every recovery that opened passed its integrity check: the loss is silent. The r
 flush or upkeep. `Store::close` and `Database::close` let a handle go and wait for it. Tests (not run): crates/amphora/tests/shutdown.rs (three lives ended in order, sqlite3 refused while open and reading all after;
 a handle held elsewhere; an owner killed in a process of its own), the drill's clean close at every change, and half the 200 seeds' stores ended in order.
 
-**Where it is.** `perf/pagepath-b30-land` on main aef6fc8a: 21c21a24 (red test), 8d1a4ae8 (the fix; the two can land alone), f0e36f56 (the format), cffeb944 (the orderly end), then the versioned storage's close; `perf/pagepath-b30` holds the same tree on fa4117c0 as WIP, `perf/pagepath-b30-wip` (128d4ca2) the red run's.
+**Where it is.** `perf/pagepath-b30-land` on main aef6fc8a: 21c21a24 (red test), 8d1a4ae8 (the fix; the two can land alone), f0e36f56 (the format), cffeb944 (the orderly end), a19f4794 and 10ebc322 (the versioned storage's close), records between; `perf/pagepath-b30` holds the same tree on fa4117c0 as WIP, `perf/pagepath-b30-wip` (128d4ca2) the red run's.
 fmt 0 at each commit; main's crates/engine and crates/amphora files this changes are the same at fa4117c0 and aef6fc8a.
 
-**Runs.** | r2278, r2280 (adacachy2, cpus=8) | main fa4117c0 | the pass set's baseline: r2278 ended with no exit code and no output; r2280 accepted, nothing back |
-r2282, r2289 (adacachy2, cpus=1, an `ls`) | | nothing back; r2282 stopped |
-r2286 (MacBook Pro 2) | 785d7e5f | "disk low" (20 GB free), by the guard |
-r2292, r2297 (Mac Studio 2) | 785d7e5f | r2292 stopped (its sync may have taken an edit of mine); r2297 didn't compile (a test's borrowed SQL) |
-r2301 (Mac Studio 2, cpus=8) | 128d4ca2 | the red above |
-r2302 (macOS, cpus=8) | 48aac3ab | queued 4th to 7th, stopped unstarted at the coordinator's word |
+**Runs.**
+
+| run | tree | result |
+|---|---|---|
+| r2278, r2280 (adacachy2, cpus=8) | main fa4117c0 | the pass set's baseline: r2278 ended with no exit code and no output; r2280 accepted at 13:06Z, nothing back by 13:51Z, stopped at the hour's end |
+| r2282, r2289 (adacachy2, cpus=1, an `ls`) | | nothing back, stopped |
+| r2286 (MacBook Pro 2) | 785d7e5f | "disk low" (20 GB free), by the guard |
+| r2292, r2297 (Mac Studio 2) | 785d7e5f | r2292 stopped (its sync may have taken an edit of mine); r2297 didn't compile (a test's borrowed SQL) |
+| r2301 (Mac Studio 2, cpus=8) | 128d4ca2 | the red above |
+| r2302 (macOS, cpus=8) | 48aac3ab | queued 4th to 7th, stopped unstarted at the coordinator's word |
+| r2303 (macOS, cpus=3, no `on`) | 3976ad7c | crash and shutdown, then plain_sqlite and log_restart: asked once at 13:28Z, queued 4th to 7th and then 2nd to 3rd, not started by 13:55Z, stopped |
 
 **For the next lane.** First the loss, alone if the rest is in its way: `perf/pagepath-b30-land` through 8d1a4ae8 (the red test and the fix). Then the rest, then the server. On Linux (`on` adacachy2, sync false, cwd
 `~/.cache/amphora-perf/pagepath-remote`, `git fetch -q origin && git checkout -q <sha>`; CARGO_HOME, CARGO_TARGET_DIR and the rest as RULES rule 6 with area `pagepath`, CARGO_INCREMENTAL=0):
