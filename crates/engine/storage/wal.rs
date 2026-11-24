@@ -1415,7 +1415,7 @@ impl InProcessWalCoordination {
         frame_watermark: Option<u64>,
     ) -> Option<u64> {
         let shared = self.log.segment(segment).read();
-        let frame_cache = shared.runtime.frame_cache.lock();
+        let frame_cache = shared.runtime.frame_cache.read();
         let range = frame_watermark
             .map(|x| 0..=x)
             .unwrap_or(min_frame..=max_frame);
@@ -1676,7 +1676,7 @@ impl WalCoordination for InProcessWalCoordination {
             let (low, high) = frame_watermark.map_or((min_frame, max_frame), |x| (0, x));
             let index = |build: &mut super::log_index::FromIndex<'_>| {
                 let shared = self.log.segment(segment).read();
-                build(&shared.runtime.frame_cache.lock());
+                build(&shared.runtime.frame_cache.read());
             };
             match read_index.find(page_id, low, high, &index) {
                 Lookup::Absent => return None,
@@ -2048,7 +2048,22 @@ impl WalCoordination for InProcessWalCoordination {
 
     fn cache_frame(&self, page_id: u64, frame_id: u64) {
         let shared = self.log.current().read();
-        let mut frame_cache = shared.runtime.frame_cache.lock();
+        // Amphora: the registry before the frame cache, as every holder of both takes them
+        // (`cache_record`). Only a rewind needs it: it is taken first where the frame looks like
+        // one, and again, the frame cache let go for its wait, where only the lock shows it to be.
+        let mut registry = None;
+        let (mut frame_cache, high_water) = loop {
+            let frame_cache = shared.runtime.frame_cache.write();
+            let high_water = shared
+                .runtime
+                .frame_cache_high_water
+                .load(Ordering::Acquire);
+            if frame_id > high_water || registry.is_some() {
+                break (frame_cache, high_water);
+            }
+            drop(frame_cache);
+            registry = Some(shared.runtime.records.write());
+        };
         // Frame-slot reuse / append-position rewind guard. Within a WAL
         // generation frames are appended with strictly increasing numbers, so
         // a `frame_id` that does not exceed the current high-water means the
@@ -2060,16 +2075,15 @@ impl WalCoordination for InProcessWalCoordination {
         // frame slot that now physically holds a different page (corruption).
         // (Per-page frame lists are kept ascending, so popping the tail
         // `>= frame_id` removes exactly the overwritten suffix.)
-        let high_water = shared
-            .runtime
-            .frame_cache_high_water
-            .load(Ordering::Acquire);
         // Amphora: in a mixed generation the slots written again can cut into a record, which then
         // goes from the cache, the record registry and the list of changes whole, from its first
         // slot, as `cache_record`'s guard has it (decision 37).
         let mut cut = None;
         if frame_id <= high_water {
-            let mut records = shared.runtime.records.write();
+            let mut records = match registry.take() {
+                Some(records) => records,
+                None => shared.runtime.records.write(),
+            };
             let from = records.covering(frame_id).unwrap_or(frame_id);
             records.drop_after(from.saturating_sub(1));
             drop(records);
@@ -2109,8 +2123,11 @@ impl WalCoordination for InProcessWalCoordination {
 
     fn cache_record(&self, head: u64, slots: u32, pages: &mut dyn Iterator<Item = u64>) {
         let shared = self.log.current().read();
-        let mut frame_cache = shared.runtime.frame_cache.lock();
+        // The registry before the frame cache, as every holder of both takes them: its write waits
+        // for the readers that hold it, and a writer that waits while it holds the frame cache
+        // holds up every reader of the log.
         let mut records = shared.runtime.records.write();
+        let mut frame_cache = shared.runtime.frame_cache.write();
         let high_water = shared
             .runtime
             .frame_cache_high_water
@@ -2166,7 +2183,7 @@ impl WalCoordination for InProcessWalCoordination {
 
     fn latest_frame(&self, page_id: u64, upto: u64) -> Option<u64> {
         let shared = self.log.current().read();
-        let frame_cache = shared.runtime.frame_cache.lock();
+        let frame_cache = shared.runtime.frame_cache.read();
         let frames = frame_cache.get(&page_id)?;
         let end = frames.partition_point(|&frame| frame <= upto);
         frames.get(..end)?.last().copied()
@@ -2174,7 +2191,7 @@ impl WalCoordination for InProcessWalCoordination {
 
     fn page_frames(&self, segment: SegmentId, page_id: u64, upto: u64, most: usize) -> Vec<u64> {
         let shared = self.log.segment(segment).read();
-        let frame_cache = shared.runtime.frame_cache.lock();
+        let frame_cache = shared.runtime.frame_cache.read();
         let Some(frames) = frame_cache.get(&page_id) else {
             return Vec::new();
         };
@@ -2187,7 +2204,9 @@ impl WalCoordination for InProcessWalCoordination {
 
     fn rollback_cache(&self, max_frame: u64) {
         let shared = self.log.current().read();
-        let mut frame_cache = shared.runtime.frame_cache.lock();
+        // The registry before the frame cache, as every holder of both takes them (`cache_record`).
+        let mut records = shared.runtime.records.write();
+        let mut frame_cache = shared.runtime.frame_cache.write();
         Self::index_changed(&shared);
         frame_cache.retain(|_page_id, frames| {
             while frames.last().is_some_and(|&frame| frame > max_frame) {
@@ -2196,7 +2215,8 @@ impl WalCoordination for InProcessWalCoordination {
             !frames.is_empty()
         });
         // Amphora: and the packed records past it, and its listed changes.
-        shared.runtime.records.write().drop_after(max_frame);
+        records.drop_after(max_frame);
+        drop(records);
         shared
             .runtime
             .changes
@@ -2478,7 +2498,7 @@ impl ShmWalCoordination {
         Self::install_local_snapshot(&mut shared, snapshot, true);
         shared.metadata.initialized.store(false, Ordering::Release);
         shared.runtime.read_index.invalidate();
-        shared.runtime.frame_cache.lock().clear();
+        shared.runtime.frame_cache.write().clear();
         shared
             .runtime
             .frame_cache_high_water
@@ -2489,7 +2509,7 @@ impl ShmWalCoordination {
     fn sync_authority_frames_from_local(&self) {
         let entries = {
             let shared = self.log.current().read();
-            let frame_cache = shared.runtime.frame_cache.lock();
+            let frame_cache = shared.runtime.frame_cache.read();
             let mut entries = Vec::new();
             for (&page_id, frames) in frame_cache.iter() {
                 for &frame_id in frames {
@@ -2797,7 +2817,7 @@ impl ShmWalCoordination {
             Self::install_local_snapshot(&mut shared, restarted, true);
             shared.metadata.initialized.store(false, Ordering::Release);
             shared.runtime.read_index.invalidate();
-            shared.runtime.frame_cache.lock().clear();
+            shared.runtime.frame_cache.write().clear();
             shared
                 .runtime
                 .frame_cache_high_water
@@ -4015,7 +4035,7 @@ pub struct WalSharedRuntime {
     // One difference between SQLite and limbo is that we will never support multi process, meaning
     // we don't need WAL's index file. So we can do stuff like this without shared memory.
     // TODO: this will need refactoring because this is incredible memory inefficient.
-    pub frame_cache: Arc<SpinLock<FxHashMap<u64, Vec<u64>>>>,
+    pub frame_cache: Arc<RwLock<FxHashMap<u64, Vec<u64>>>>,
     /// Highest frame number currently recorded in `frame_cache` for the active
     /// WAL generation. Used to detect frame-slot reuse / append-position
     /// rewinds: within a generation frames are appended with strictly
@@ -4051,7 +4071,8 @@ pub struct WalSharedRuntime {
     /// decisions 16 and 37).
     pub(crate) format: AtomicU32,
     /// Amphora: the packed records of the log's generation, and those decoded (`packed::Records`).
-    /// A leaf lock: nothing else is locked while it is held, and it is never held across IO.
+    /// Never held across IO; while it is held for a write, the frame cache may be locked (after
+    /// it, as `cache_record` takes them), and nothing else of the shared state's.
     pub(crate) records: Arc<RwLock<Records>>,
     /// Amphora: the pages the generation's recent frames hold, in frame order, for readers to
     /// forget only those (`changes::ChangeLog`, decision 18). Taken after `frame_cache`'s lock
@@ -4068,7 +4089,7 @@ impl WalSharedRuntime {
     /// Each page with a frame in `min_frame ..= max_frame`, and the latest such frame, by page:
     /// found among every page the log holds.
     fn scan_latest_frames(&self, min_frame: u64, max_frame: u64) -> Vec<(u64, u64)> {
-        let frame_cache = self.frame_cache.lock();
+        let frame_cache = self.frame_cache.read();
         let mut list = Vec::with_capacity(frame_cache.len());
         let range = min_frame..=max_frame;
         for (&page_id, frames) in frame_cache.iter() {
@@ -8687,7 +8708,7 @@ impl WalFileShared {
                 initialized: AtomicBool::new(wal_is_initialized),
             },
             runtime: WalSharedRuntime {
-                frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
+                frame_cache: Arc::new(RwLock::new(FxHashMap::default())),
                 frame_cache_high_water: AtomicU64::new(0),
                 file: Some(file),
                 read_locks,
@@ -8784,7 +8805,7 @@ impl WalFileShared {
                 initialized: AtomicBool::new(false),
             },
             runtime: WalSharedRuntime {
-                frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
+                frame_cache: Arc::new(RwLock::new(FxHashMap::default())),
                 frame_cache_high_water: AtomicU64::new(0),
                 file: None,
                 read_locks,
@@ -8831,7 +8852,7 @@ impl WalFileShared {
                 initialized: AtomicBool::new(false),
             },
             runtime: WalSharedRuntime {
-                frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
+                frame_cache: Arc::new(RwLock::new(FxHashMap::default())),
                 frame_cache_high_water: AtomicU64::new(0),
                 file: Some(file),
                 read_locks,
@@ -8914,7 +8935,7 @@ impl WalFileShared {
             .read_index
             .set_header(self.metadata.wal_header.clone());
         self.runtime.read_index.invalidate();
-        self.runtime.frame_cache.lock().clear();
+        self.runtime.frame_cache.write().clear();
         self.runtime
             .frame_cache_high_water
             .store(0, Ordering::Release);
@@ -10781,6 +10802,45 @@ pub mod test {
         );
     }
 
+    /// Do: one reader holds the frame cache, as a read of a packed record's pages holds it while it
+    /// copies a page's frames, while another reader asks for the page's frames and its latest one.
+    /// Expect: both answer while the first still holds the cache, so a reader taken off its CPU
+    /// mid-lookup holds up no other read, and the frames a writer appends once the first lets go are
+    /// in the next answer (`docs/design/store.md`, decision of lane perf-Q8). The wait on the answer
+    /// is a hang guard, not a measure.
+    #[test]
+    fn q8_reads_of_the_frame_cache_do_not_wait_for_each_other() {
+        let shared = SharedLog::new(WalFileShared::new_noop());
+        let coordination = Arc::new(make_test_coordination(&shared));
+        coordination.cache_frame(7, 3);
+        coordination.cache_frame(7, 5);
+        let log = shared.current().read();
+        let held = log.runtime.frame_cache.read();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let other = Arc::clone(&coordination);
+        let reader = std::thread::spawn(move || {
+            let frames = other.page_frames(SegmentId::First, 7, 5, 4);
+            let latest = other.latest_frame(7, 4);
+            tx.send((frames, latest)).unwrap();
+        });
+        let answer = rx.recv_timeout(std::time::Duration::from_secs(600));
+        assert_eq!(held.get(&7), Some(&vec![3, 5]));
+        drop(held);
+        drop(log);
+        reader.join().unwrap();
+        assert_eq!(
+            answer,
+            Ok((vec![3, 5], Some(3))),
+            "a read of the frame cache waited for another read"
+        );
+        coordination.cache_frame(7, 9);
+        assert_eq!(
+            coordination.page_frames(SegmentId::First, 7, 9, 2),
+            vec![5, 9],
+            "a read after an append misses its frame"
+        );
+    }
+
     /// Do: random appends of frames and of packed records, rewinds into frames and records,
     /// rollbacks and restarts, and after each the latest frames of random ranges. Expect: what a
     /// scan of every page the log holds finds, the frames' own list answering most of the ranges
@@ -10834,7 +10894,7 @@ pub mod test {
                     }
                     9 if rng.next_u64() % 8 == 0 => {
                         shared.current().read().runtime.read_index.invalidate();
-                        shared.current().write().runtime.frame_cache.lock().clear();
+                        shared.current().write().runtime.frame_cache.write().clear();
                         shared
                             .current()
                             .read()
@@ -10929,7 +10989,7 @@ pub mod test {
                         // The log restarted: its frames gone, the next one frame 1.
                         let guard = shared.current().write();
                         guard.runtime.read_index.invalidate();
-                        guard.runtime.frame_cache.lock().clear();
+                        guard.runtime.frame_cache.write().clear();
                         guard
                             .runtime
                             .frame_cache_high_water
@@ -10956,7 +11016,7 @@ pub mod test {
                         );
                         let index = |build: &mut super::super::log_index::FromIndex<'_>| {
                             let guard = shared.current().read();
-                            build(&guard.runtime.frame_cache.lock());
+                            build(&guard.runtime.frame_cache.read());
                         };
                         reads += 1;
                         match read_index.find(page, min_frame, max_frame, &index) {
@@ -11011,7 +11071,7 @@ pub mod test {
         let read_index = shared.current().read().runtime.read_index.clone();
         let index = |build: &mut super::super::log_index::FromIndex<'_>| {
             let guard = shared.current().read();
-            build(&guard.runtime.frame_cache.lock());
+            build(&guard.runtime.frame_cache.read());
         };
         for page in [101, 128, 4096, 1 << 40] {
             assert_eq!(
@@ -11207,7 +11267,7 @@ pub mod test {
         {
             let guard = shared.current().write();
             guard.runtime.epoch.store(5, Ordering::Release);
-            guard.runtime.frame_cache.lock().extend([
+            guard.runtime.frame_cache.write().extend([
                 (1, vec![1, 4, 8]),
                 (2, vec![2, 6]),
                 (3, vec![3]),
@@ -11263,7 +11323,7 @@ pub mod test {
             guard
                 .runtime
                 .frame_cache
-                .lock()
+                .write()
                 .extend([(1, vec![1, 4, 8]), (2, vec![2, 6])]);
         }
 
@@ -11289,7 +11349,7 @@ pub mod test {
         for lock in &guard.runtime.read_locks[2..] {
             assert_eq!(lock.get_value(), READMARK_NOT_USED);
         }
-        assert!(guard.runtime.frame_cache.lock().is_empty());
+        assert!(guard.runtime.frame_cache.read().is_empty());
         assert!(!guard.metadata.initialized.load(Ordering::Acquire));
     }
 
@@ -11318,7 +11378,7 @@ pub mod test {
         );
         assert_eq!(coordination.iter_latest_frames(0, 5), vec![(7, 2), (9, 4)]);
         assert_eq!(
-            shared.current().read().runtime.frame_cache.lock().get(&7),
+            shared.current().read().runtime.frame_cache.read().get(&7),
             Some(&vec![2])
         );
     }
@@ -12399,7 +12459,7 @@ pub mod test {
         );
         assert_eq!(shared.runtime.epoch.load(Ordering::Acquire), 5);
         assert!(!shared.metadata.initialized.load(Ordering::Acquire));
-        assert!(shared.runtime.frame_cache.lock().is_empty());
+        assert!(shared.runtime.frame_cache.read().is_empty());
     }
 
     #[cfg(host_shared_wal)]
@@ -12526,7 +12586,7 @@ pub mod test {
             .metadata
             .loaded_from_disk_scan
             .load(Ordering::Acquire));
-        assert!(shared.runtime.frame_cache.lock().is_empty());
+        assert!(shared.runtime.frame_cache.read().is_empty());
     }
 
     #[cfg(host_shared_wal)]
@@ -12558,7 +12618,7 @@ pub mod test {
             .read()
             .runtime
             .frame_cache
-            .lock()
+            .read()
             .is_empty());
 
         let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
@@ -12584,7 +12644,7 @@ pub mod test {
                 .read()
                 .runtime
                 .frame_cache
-                .lock()
+                .read()
                 .is_empty(),
             "refusing the overflow refresh must leave the local fallback cache untouched"
         );
@@ -12643,7 +12703,7 @@ pub mod test {
             .loaded_from_disk_scan
             .load(Ordering::Acquire));
         assert_eq!(
-            shared.runtime.frame_cache.lock().get(&7).cloned(),
+            shared.runtime.frame_cache.read().get(&7).cloned(),
             Some(vec![1])
         );
     }
@@ -12735,7 +12795,7 @@ pub mod test {
             .loaded_from_disk_scan
             .load(Ordering::Acquire));
         assert_eq!(
-            shared.runtime.frame_cache.lock().get(&7).cloned(),
+            shared.runtime.frame_cache.read().get(&7).cloned(),
             Some(vec![1])
         );
     }
@@ -12867,7 +12927,7 @@ pub mod test {
             "preserving a newer zero-frame generation must require the first append to rewrite the WAL header"
         );
         assert!(
-            shared.current().read().runtime.frame_cache.lock().is_empty(),
+            shared.current().read().runtime.frame_cache.read().is_empty(),
             "older WAL frames from a prior generation must not survive zero-frame authority recovery"
         );
     }
@@ -13296,7 +13356,7 @@ pub mod test {
             header.salt_2 = 23;
             header.checksum_1 = stale.last_checksum.0;
             header.checksum_2 = stale.last_checksum.1;
-            shared.runtime.frame_cache.lock().insert(7, vec![2]);
+            shared.runtime.frame_cache.write().insert(7, vec![2]);
         }
 
         let (_authority_b, coordination_b) = make_test_shm_coordination(&shared_b, &shm_path);
@@ -13364,7 +13424,7 @@ pub mod test {
             header.salt_2 = 23;
             header.checksum_1 = authoritative.last_checksum.0;
             header.checksum_2 = authoritative.last_checksum.1;
-            let mut frame_cache = shared.runtime.frame_cache.lock();
+            let mut frame_cache = shared.runtime.frame_cache.write();
             frame_cache.insert(7, vec![2]);
             frame_cache.insert(9, vec![5]);
         }
@@ -13440,8 +13500,8 @@ pub mod test {
             header.salt_2 = 23;
             header.checksum_1 = authoritative.last_checksum.0;
             header.checksum_2 = authoritative.last_checksum.1;
-            shared.runtime.frame_cache.lock().insert(7, vec![2]);
-            shared.runtime.frame_cache.lock().insert(9, vec![5]);
+            shared.runtime.frame_cache.write().insert(7, vec![2]);
+            shared.runtime.frame_cache.write().insert(9, vec![5]);
         }
 
         let (authority, coordination_b) = make_test_shm_coordination(&shared_b, &shm_path);
