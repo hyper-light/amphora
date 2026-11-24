@@ -4629,16 +4629,18 @@ impl WalFile {
             LogFormat::Pages => false,
             LogFormat::Packed => true,
             LogFormat::Mixed => self
-                .coordination
-                .shared_wal_state()
-                .segment(segment)
-                .read()
-                .runtime
-                .records
+                .segment_records(segment)
                 .lock()
                 .slots_of(frame)
                 .is_some(),
         }
+    }
+
+    /// `segment`'s record registry, the segment's lock not held past the clone.
+    fn segment_records(&self, segment: SegmentId) -> Arc<SpinLock<Records>> {
+        let log = self.coordination.shared_wal_state();
+        let shared = log.segment(segment).read();
+        shared.runtime.records.clone()
     }
 
     /// Amphora: refuses what reads or writes `frame` as a page frame where it is a record's slot:
@@ -5182,14 +5184,7 @@ impl WalFile {
             page_len,
             frame_len,
             file: self.coordination.segment_file(segment)?,
-            records: self
-                .coordination
-                .shared_wal_state()
-                .segment(segment)
-                .read()
-                .runtime
-                .records
-                .clone(),
+            records: self.segment_records(segment),
             readers,
             state: SpinLock::new(ReadState::default()),
             done: SpinLock::new(None),
