@@ -2191,6 +2191,38 @@ with one reader holding the registry, another reads a published record's slots a
 down, or reads a second at 32 and 128 clients no higher; any answer of K0's mixed phase differing
 from SQLite's on the same rows.
 
+## Decision (lane perf-Q8): the frame cache is read under a read lock, the record registry locked before it (2026-11-24)
+
+**The decision.** The shared log's frame cache (`WalSharedRuntime::frame_cache`, each page's frames in the
+log) is the engine's `sync::RwLock` (parking_lot's), no longer the spin lock (`fast_lock::SpinLock`). What
+only reads it (`page_frames`, `latest_frame`, `find_frame`'s locked path and the index it builds,
+`scan_latest_frames`) takes it shared; what changes it (`cache_frame`, `cache_record`, `rollback_cache`,
+recovery) takes it exclusive. A writer that needs the record registry too (`cache_record`, `cache_frame`'s
+rewind, `rollback_cache`, recovery) takes the registry first, so it never waits for the registry's readers
+while it holds the frame cache.
+
+**Why.** K0's mixed phase on main 2a4ccaa4 (adacachy2, load 48-51, AMPHORA_PROFILE at 997 Hz) had 11.5% and
+14.0% of samples at 32 and 128 clients waiting at the frame cache's spin lock, all of them page reads'
+`page_frames` (`begin_read_record` < `read_frame` < `read_page_no_cache`), and its holders on a CPU 1.2 and
+0.6%. A lock timed at each call site of a diagnostic build (record below) shows why a holder is
+long: of the 16.4 s of `page_frames` waits in one run, 9.0 s ended behind `cache_record`, whose hold was
+98 us on average and 4.2 ms at most, 43 us of it waiting for the record registry's write lock, and
+6.1 s behind another reader in `page_frames`, off its CPU. A spin lock that every reader takes alone has every
+reader wait for each of them.
+
+**Sources.** Ousterhout (ICDCS 1982) and Karlin, Li, Manasse and Owicki (SOSP 1991), as in the decision
+above (lane perf-Q6), and parking_lot's `RwLock` documentation: readers share; a waiter spins a few rounds, then
+parks; eventually fair.
+
+**Evidence.** `storage::wal::test::q8_reads_of_the_frame_cache_do_not_wait_for_each_other`: while one reader
+holds the frame cache, another reads a page's frames and its latest frame, and a writer's append after the first lets go is in the next answer.
+After the change the same profile has 0.0% of samples at the frame cache's lock (record
+`bench/records/2026-11-24-adacachy2-perf-reads-q8.md`, which also has the A/B on reads a second: no measurable difference
+at 1, 32 and 128 clients).
+
+**Falsified by.** A profile of the same phase after the change in which the frame cache's lock still waits; any
+answer of K0's mixed phase differing from SQLite's on the same rows.
+
 ## Decision (lane perf-A18): a wait for room is woken by any charge given back (2026-11-24)
 
 A store's batch is charged its rows' bytes (`Engine::row_bytes`) to the budget's room for queues until its commit
@@ -2389,7 +2421,10 @@ before any frame of the current one.
   checkpointer's pass that copies its last frame and flushes the file, or, for a backed-up database, the backup's
   word that it shipped the segment. Each already happens, so the reset needs no timer and no poll. It writes nothing.
   The segment's frames stay until the next switch writes a new header over them (decision 13). Decision 31's cut of
-  a log past twice its bound applies to a segment at its reset.
+  a segment file past its bound comes when the writer next switches into that segment, never at the restart that
+  closed it or at its reset, because reads may still be reading it then; so the log's peak on disk is two segment
+  files (Ada, 2026-11-24, on lane B18's question). The writer never switches from a segment that holds no frame:
+  its header is written by its first commit, so a switch from it would leave two headers recovery refuses (lane B19).
 - **Bounded.** A read holds a segment for at most its request's deadline D. Reads begun before the switch end by D
   after it. Reads begun before the closing segment's copy finished end by D after that, and no read begun after
   it counts on the segment (The shape). So a closing segment is free

@@ -3648,7 +3648,7 @@ impl Database {
     pub fn local_wal_find_frame_for_testing(&self, page_id: u64) -> Result<Option<u64>> {
         let shared = self.shared_wal.current().read();
         let max_frame = shared.metadata.max_frame.load(Ordering::Acquire);
-        let frame_cache = shared.runtime.frame_cache.lock();
+        let frame_cache = shared.runtime.frame_cache.read();
         Ok(frame_cache.get(&page_id).and_then(|frames| {
             frames
                 .iter()

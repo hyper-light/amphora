@@ -1942,3 +1942,175 @@ AB_SECTION
     #   bash scripts/check-production.sh
     # part 2: each arm's binary --exact database::replicated::tests::a_local_read_holds_off_the_logs_restart_and_one_after_waits_for_it
     # part 3: (cd bench && cargo build --release); ladder16.sh <that amphora-bench> <out>/ladder <rounds>
+
+# Lane V18 (commits) on adacachy2: a lost forward is bounded by the close behind it; V17's checks stand as recorded (2026-11-24, 04:59Z to 05:5xZ)
+
+Ada's goal is replicated commits about 10x faster than rqlite and dqlite, with no write refused under load. This
+lane's deliverable: lane V17's checks finished (its record, committed here as it was left), and lane V15's gap 2, a
+forward lost on the way, bounded by an event, with the cost of the bound on the normal path measured and stated.
+
+## Losses first
+
+1. **Done-when 3 is not met: the replicated suites' three rounds and the ladder did not run.** adacachy2 had 0 or 1 idle
+   core (32) from 05:13Z on: cpus=8 at 05:13Z, cpus=4 at 05:13Z (accepted, r363) and at 05:17Z, 05:18Z (refused: 0 to
+   1 idle), cpus=2 at 05:17Z and 05:18Z (refused: 1 idle) and 05:25Z (accepted, r403), and at 05:26Z (suites, refused:
+   0 idle) and 05:26Z (release bench and ladder, refused: 0 idle). The suites and the ladder ran after the landing, from
+   05:31Z (the runs table and "After landing" below state what finished); before it, the touched tests passed on the
+   merged tree and clippy and check-production were clean. Done-when 3 was not met before landing as the brief asked.
+2. **`a_local_read_holds_off_the_logs_restart_and_one_after_waits_for_it` failed once in the one focused run on the
+   landed change** (r403, b7c93867, 60.8 s: the Timeout of `read_local`'s unwrap at replicated.rs:17488:14). V17's alone runs
+   (r188) had it fail 5 in 16 on main fac69083 and 5 in 16 on the merge alike, so it is main's own; not traced here, and
+   nor was the alone run repeated with the change. It passed once on ee640f36 (r363).
+3. **The normal path's cost is measured in the driven harness, in records a write (no loss), not as latency or CPU, and
+   not on a real network**; the 10 ms-tick stage run measures the lost forward only, and the owner now drives again at
+   once behind a follower's forward (V16's rule for a close), which is not timed. Latency and CPU of the normal path:
+   not measured.
+4. **The second design (b) was not built**; its cost is stated from the size of what it would keep (4,133 entry bytes of
+   the forward, a write in flight) and from its not adding records, not from a run. It also needs the host transport's
+   report of a reset or a refused record, which no host gives today (the API between an owner and its host drains and
+   receives records; nothing reports a loss).
+5. **A loss that takes both a forward and its close is not bounded by an event** (a link reset between them, a whole
+   `Ready` lost): the deadline the holder's barrier stated, or the host's detector, ends the slot as before.
+6. The bound assumes the link delivers in order (the design's own premise, replication.md): a close that overtook its
+   forward would end the slot `released` early, and that forward would append on a passed base (refused stale and
+   asked again), as any early end would.
+
+## V17's checks
+
+V17's own record is above (committed here as it was left, its LADDER_LOSS and AB_SECTION placeholders included). V17's
+checks 2 and 3 did run: the alone test, 16 pairs on main fac69083 and the merge 1e07a639, 5 failed in 16 on each (r188);
+the ladder on main c39adf56, 12 runs, no refusal, and 28 writes past their 10 s deadline at 128 writers (r268: persisted
+9, replicated 19, at cpus=2 and load 37 to 46, where V14's runs at cpus=4 and load 39 to 77 had none). Neither is traced
+here: no A/B of that ladder against the tree without the fix was run.
+
+## Gap 2: a lost forward is bounded by the close behind it
+
+A follower forwards its write inside its write slot (V8); the leader holds its own and the other members' writes while
+the slot holds. A forward lost on the way left the slot to end by the write's stated deadline (V14) or the detector,
+which suspects no member a live link loses one record of. V15 measured that on real time: the other writes waited the
+holder's whole 10 s (10,027.9 ms, r65). Built: design (a). The follower sends a close, a barrier marked a read's, right
+behind the forward, in the same drive and so on the same ordered link (`Actor::close_behind`). The leader steps a
+marked barrier at once and ends the slot its member holds `released` (`Slots::pass`). A close behind a forward that
+arrived has nothing to end, and its read's answer is read by nothing, so the leader consumes it unstepped (`follows`:
+the identity of the last forward it took from the member, the next serial in the same term and incarnation, a read's
+mark), so the close costs its one record and no read round.
+
+Red and green (driven, no clock moved; in each class): `replicated::v18_a_lost_forward_is_bounded_by_the_close_behind_it`.
+The red arm is the same tree with the close not sent (df0bfe01, r363): "the leader's write, with member 3's forward lost
+(1 lost) and 0 closes seen", its answer none, `None` after ROUNDS. Green on ee640f36 and b7c93867 (r363, r403), with
+`v18_a_close_behind_a_stepped_forward_costs_no_read_round` and the pure `v18_a_close_follows_its_own_forward_only`.
+
+**Stages on real time (V15's diagnostic, its teardown's drain fixed here; three members in one process, the pump's
+`losing` hook losing member 3's first forward to the leader, 10 ms ticks; times from member 3's call; both classes).**
+
+| class | stage | main 6d8e7dcd + diagnostic (r308, 05:03:41Z, cpus=8, load 24 to 37) | the close, not consumed (r363, 05:15:05Z, cpus=4, load 30) | the close, consumed (r403, 05:27:56Z, cpus=2, load 50) |
+|---|---|---|---|---|
+| persisted | forward lost at | 2.46 | 2.84 | 13.67 |
+| persisted | slot ends | 10,003.78 (expired) | 2.92 (released) | 13.75 (released) |
+| persisted | the leader's other write answered | 10,021.16 | 12.29 | 29.59 |
+| persisted | member 2's write answered | 10,051.83 | 35.98 | 69.53 |
+| persisted | member 3's own write (its entry never reached the leader) | 10,000.03 UnknownOutcome | 10,000.03 UnknownOutcome | 10,000.02 UnknownOutcome |
+| replicated | forward lost at | 4.10 | 2.63 | 6.45 |
+| replicated | slot ends | 10,003.63 (expired) | 2.75 (released) | 6.70 (released) |
+| replicated | the leader's other write answered | 10,017.28 | 17.94 | 30.40 |
+| replicated | member 2's write answered | 10,077.74 | 57.92 | 100.02 |
+
+The wait of the others after the loss is the close's delivery (0.1 ms after the loss) then the rest of their own path, where it
+was the holder's whole 10 s. Slot ends counted over the run (forwarded, expired, released): 1, 1, 0 on main and 1, 0, 1
+with the close in each class (one other slot forwarded).
+
+**What each design costs the normal path** (driven harness, no loss, clocks still: 20 writes one at a time at member 3,
+counts by record type through the pump, main's behaviour against the close; records a write, both classes):
+
+| arm | persisted | replicated |
+|---|---|---|
+| main (the close not sent) | 15.00 | 16.90 |
+| the close, the leader stepping it (a read round) | 24.40 | 26.00 |
+| the close, consumed at the leader | 16.00 | 17.90 |
+
+- The close is 1 record a write (the follower's MsgReadIndex to the leader: 2.00 a write against main's 1.00; its
+  context's entry, 33 bytes). Stepped, it cost 9.4 records a write: the read's heartbeats and their answers, its
+  response, and 0.8 to 0.9 more MsgAppend a write (a read round's effect, not traced).
+- Design (b) (a forward sent again when its transport reports a reset or refused record) adds no record on the normal
+  path but keeps the forward's entries for each write in flight: 4,133 entry bytes a write here (the MsgPropose counted),
+  measured as a size, not a run, and needs the host's report (no host gives one) and a typed drop of a copy at the leader.
+- Why (a): it needs nothing of a host, no wire change (a leader of any version, or one that missed the forward, steps
+  the close as the read it is), and its cost is 1 small record a write; (b)'s cost is bytes held and a host API. (b) bounds a
+  loss of a whole Ready, which (a) doesn't.
+
+## Runs
+
+All on adacachy2 (00aad8daff2fa3c9daa65d53c425d450), sync false, GitHub clone ~/.cache/amphora-perf/commits-remote (a second
+worktree, -b and -c, for runs that overlap), CARGO_TARGET_DIR ~/.cache/amphora-perf-target/commits, CARGO_INCREMENTAL=0,
+CARGO_BUILD_JOBS = the needs' cpus.
+
+| run | needs, load, time | tree | result |
+|---|---|---|---|
+| r308 | cpus=8, 05:02:45Z to 05:04:03Z, load 14 to 37 | 01b45d40 (main 6d8e7dcd + V15's stages, teardown drained) | built 56 s; the stage runs (before) |
+| r357, r370, r372, r376 | 05:13Z to 05:18Z | none | refused: 0 to 2 of 32 cores idle |
+| r363 | cpus=4, 05:14:02Z to 05:16:16Z, load 32 to 50 | ee640f36; red df0bfe01; stages 1b76bdeb | 20 of 20 focused passed (v18, v15, slot, v14, holder, a_local_read); red: v18 failed; stages after; clippy of amphora finished |
+| r379 | cpus=1, 05:18:47Z to 05:20:46Z | 3807c7c7 and e27752f9 | the cost arms (the close not consumed, and not sent) |
+| r403 | cpus=2, 05:25:00Z to 05:28:30Z, load 54 to 58 | b7c93867; cost e6ed7152; stages cfdae334 | focused: 23 passed, 1 failed (a_local_read_holds_off, main's own flake); cost (consumed); stages; clippy exit 0 |
+| r404, r406 | 05:26Z | suites (3a58a13f and b7c93867); release bench and ladder | refused: 0 of 32 cores idle |
+| r422 | cpus=2, 05:31:06Z to 05:35:05Z, load 37 to 45 | b9e45555 (origin/main 1f4a8e88 merged) | built 73 s; focused 23 passed; clippy 0; check-production 0 (10,903) |
+| r441 | cpus=2, 05:35:25Z to 05:37:29Z | 731240ed (main 15dd57d8 merged) | built 83 s; focused 23 passed; clippy 0; pushed to main at 05:37:40Z |
+| r427 | cpus=2, 05:31:46Z to 05:47:11Z | main 1f4a8e88 and b9e45555 | the suites' 3 rounds, above |
+| r430 | cpus=2, 05:31:58Z to 05:38:27Z | b9e45555 | the ladder, above |
+| r488 | cpus=2, 05:44:38Z to 05:48:26Z | b9e45555 and 1f4a8e88 | a_restart_due alone in pairs |
+
+## After landing (main 731240ed, pushed 05:37:40Z)
+
+The merged tree's checks, before the push: r422 on b9e45555 (origin/main 1f4a8e88 merged; cpus=2, 05:31:06Z to 05:35:05Z, load 45
+to 37): built 73 s; focused 23 passed, 0 failed (v18's three tests, V15's, slot::, v14, a_slot_holder..., a_read_barrier);
+clippy exit 0; check-production exit 0, the engine's ratchet holds (10,903). Main then moved in crates/engine (lane F6's
+ratchet): r441 on 731240ed (main 15dd57d8 merged; cpus=2, 05:35:25Z to 05:37:29Z): built 83 s; focused 23 passed, 0
+failed; clippy exit 0. check-production was not run again on 731240ed. Pushed at 05:37:40Z, fast-forward.
+
+**The ladder on the landed change's product (r430, b9e45555, 05:31:58Z to 05:38:27Z, cpus=2; release bench built in 253 s;
+load 42 to 57 on 32 cores).** V16's ladder16.sh (cell13.py), V12's flags, Amphora alone, 32 and 128 spread writers, both
+classes, 3 rounds, cell order reversed in round 2. Refusals by node, commits a second and p50 (ms) by round, misses:
+
+| class | writers | refusals by node, r1; r2; r3 | commits/s per round | p50 ms per round | misses per round |
+|---|---|---|---|---|---|
+| persisted | 32 | 0 0 0; 0 0 0; 0 0 0 | 36.2, 9.2, 17.8 | 926, 3,670, 2,097 | 0, 0, 0 |
+| replicated | 32 | 0 0 0; 0 0 0; 0 0 0 | 32.4, 13.6, 18.8 | 705, 1,982, 1,327 | 0, 0, 0 |
+| persisted | 128 | 0 0 0; 0 0 0; 0 0 0 | 27.0, 31.0, 20.8 | 4,653, 5,505, 8,913 | 0, 0, 0 |
+| replicated | 128 | 0 0 0; 0 0 0; 0 0 0 | 30.4, 36.4, 7.2 | 2,851, 2,458, 9,568 | 0, 0, 5 |
+
+No write was refused in 12 runs (no node refused any). Five writes missed their 10 s deadline in round 3's replicated 128 at load
+57. Rates and p50s are in the range of V17's ladder on c39adf56 (r268: 5.2 to 23.0 commits/s and p50 1,229 to 9,699 ms) and below V14's r1987
+(37.2 to 60.8); this machine carried other lanes' runs throughout (load 42 to 57), so no rate comparison is made between
+this and those. An A/B of the ladder against the tree without the close was not run.
+
+**The replicated suites, 3 rounds, after the landing** (r427, 05:31:46Z to 05:47:11Z, cpus=2, `--test-threads=2 database::replicated:: replication::`,
+arms alternated; main's arm is 1f4a8e88, the origin/main the landed tree's first merge held, so its difference from main 731240ed
+is lane F6's crates/engine change; the landed arm is b9e45555, which has three more tests in this filter, the v18_*):
+
+| round | landed b9e45555 | main 1f4a8e88 |
+|---|---|---|
+| 1 | 178 passed, 4 failed (144 s) | 174 passed, 5 failed (120 s) |
+| 2 | 177 passed, 5 failed (152 s) | 177 passed, 2 failed (125 s) |
+| 3 | 176 passed, 6 failed (154 s) | 175 passed, 4 failed (111 s) |
+
+- Failing on both arms over the rounds: `a_local_read_open_across_an_image_install_sees_one_side_whole` (every round, both),
+  `past_its_room_a_replica_refuses_submits_and_restarts_whatever_its_share` (every round, both),
+  `a_checkpoint_pass_copies_no_frame_past_the_last_finished_flush` (landed r1, r3; main r1, r3),
+  `a_replicas_database_log_stays_within_its_room` (landed r2; main r1, r3),
+  `every_falsifier_of_the_floor_holds_under_a_nemesis` (landed r2, r3; main r1).
+- On the landed arm only in these rounds: `a_local_read_holds_off_the_logs_restart_and_one_after_waits_for_it` (r3; V17's
+  alone runs had main fail it 5 in 16) and `a_restart_due_waits_for_a_reads_deadline_and_no_longer` (3 of 3 rounds;
+  main's arm passed it in all 3). Run alone with a 45 s limit, pairs alternated, at load 29 to 43 (r488, 05:44:38Z to
+  05:48:26Z): landed b9e45555 failed 3 of 4 (1, 3, 4), main 1f4a8e88 failed 2 of 4 (2, 3): each failure timed out (its
+  first assertion, `local_readers_in_use` of 1, never reached within the test's hang guard's poll: `left: 0 right: 1` in r1 and
+  r2's logs, at replicated.rs:17676:13). It is main's own by that run, not traced, and the suites' 3 rounds do not show a
+  failure only the change has; the sample is small (4 pairs), and the machine was at load 29 to 62 through it all.
+
+## Commands
+
+    # every build: cd <clone>; git checkout <sha>; cargo test -p amphora --lib --locked --no-run
+    v18-tests-<sha> --test-threads=N v18_ v15_a_write_its_deadline database::slot:: v14_a_slow a_slot_holder_whose_write_fails a_read_barrier a_local_read_holds_off
+    v18-tests-<sha> --ignored --nocapture --test-threads=1 v18_normal_path_cost        # cost.py inserts the test into replicated.rs
+    v18-tests-<sha> --ignored --nocapture --test-threads=1 v15_stages                   # the stages
+    cargo clippy -p amphora --all-targets --locked -- -D warnings
+    # owed, not run: three rounds of v18-tests-<sha> --test-threads=2 database::replicated:: replication:: on main 3a58a13f and on the landed change,
+    # and (cd bench && cargo build --release); ladder16.sh <that amphora-bench> <out> 3 (V16's script, 32 and 128 spread writers, both classes)

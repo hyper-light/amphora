@@ -1306,14 +1306,14 @@ This holds whether or not anything copies the log back into the file while the r
 nothing doing so. The open reader holds a read mark at its snapshot's last frame. A checkpoint copies no frame past the
 oldest read mark held (`determine_max_safe_checkpoint_frame`, crates/engine/storage/wal.rs: a mark it can't take
 exclusively caps what it copies), so the file never holds a page newer than the reader's snapshot where the reader
-would read it from the file. A restart of the log takes every read mark exclusively first, and returns `Busy` while any
-is held (`begin_restart`, the same file), so it never pulls a reader's frames away. These are SQLite's rules for
-checkpoints under readers (sqlite.org/wal.html, "Checkpoint Starvation": a checkpoint stops at the oldest reader, and
-the log starts over only once no reader uses it). Today nothing checkpoints a replica's database at all
+would read it from the file. A restart of the log switches the writer to the log's free segment and waits for no read
+(store.md, decision 45): the open reader reads on in the segment it began on, which is reset only once no read counts
+on it, so a restart never pulls a reader's frames away. The copy's rule is SQLite's for checkpoints under readers
+(sqlite.org/wal.html, "Checkpoint Starvation": a checkpoint stops at the oldest reader). Today nothing checkpoints a replica's database at all
 (`wal_autocheckpoint = 0`, and no checkpointer runs there). That is a gap of its own, not this decision's (below).
 Falsified by: a local read whose statements see two states, part from before an image and part from it; a read begun
 after the install that sees any of the state before it; a checkpoint during an open read that changes what it sees,
-or a log restart that goes through while it is open. The test:
+or a log restart that takes away frames it reads. The test:
 `a_local_read_open_across_an_image_install_sees_one_side_whole` (T-T1.10.L4). A learner's read transaction is held open
 while the leader's image installs under it, and in a second leg a passive checkpoint and a log restart run on the
 learner's database during it.
@@ -1887,8 +1887,13 @@ registry, not a second budget beside it. One image is kept back per filesystem, 
 installing at once (a node rejoining behind on all its groups) can still meet a full disk mid-image, and fence
 typed. `SNAPSHOT_BYTES` (256 MiB, "until streaming snapshots") is itself picked, noted to amphora-constants.
 
-**D. The bound, stated.** A replica's database log holds at most min(H, what its group commits between restarts
-due by their share + what it commits while the local reads out at the due point finish). Each of those reads is
+**D. The bound, stated.** A replica's database log is two segment files (store.md, decision 45), each within the
+room: each holds at most min(H, what its group commits between restarts due by their share + what it commits while
+the local reads out at the due point finish). The room counts the current segment's frames, read from the log's shared
+state (`Db::log_frames_in_use`), not the writer connection's own view, which a switch leaves on the closed segment
+until its next transaction. The closing segment holds what it held when the writer switched from it, within the room
+then, and grows no more. So the log's peak disk is two segment files, each within the room (Ada, 2026-11-24, on lane
+B19's question; lane B20). Each of those reads is
 bounded by its caller's deadline (`run_query`'s progress handler), and no new one begins. Past H no new submit is
 taken on that member. Restarts spend at most 1 - q of the entries, net of the owner's base tail.
 
@@ -2038,19 +2043,27 @@ pure core is `database/slot.rs`, driven by the owner (`Actor::keep_slots`, `star
   with that drive's `Ready` (lane V16). Before lane V16 it waited in the core (`Raft::msgs`) for the owner's next
   wake: on a real clock its next tick, unless an input came first (read from `run_loop`'s wait, not measured),
   and never in the driven harness, whose clocks stand still (`replicated::v15_a_write_its_deadline_ends_at_its_barrier_closes_its_slot`).
-- *What bounds a lost forward* (CP-T1.8, lane V15, measured; not yet an event). A holder's forward lost on the way
-  is bounded only by its stated end: the holder sends no barrier or forward after it (its write waits, proposed,
-  for its entry), and a live holder is not suspected. Lane V15's run on real time (three members in one process,
-  relayed by the test pump, which lost member 3's forward; the persisted class; 10 ms ticks; member 3's write with
-  the bench driver's 10 s deadline) timed each stage from member 3's call: its slot began at 0.7 ms, its forward was
-  lost at 2.7 ms, and the leader's own write and member 2's were called at 2.8 ms; member 3 was answered
-  `UnknownOutcome` at 10,000.2 ms, the slot ended `expired` at 10,006.7 ms, and the leader's write was answered at
-  10,030.6 ms and member 2's at 10,064.8 ms: each waited the holder's whole deadline. A bound by an event the
-  leader can see needs a message from the holder that follows its forward on the same ordered link, so that its
-  arrival with no forward before it shows the forward lost: a close sent right behind every forward (one more message per follower write,
-  and a ReadIndex round at the leader unless it consumes the close unstepped), or the holder's forward sent again
-  when its transport reports the link reset or the record refused (with the leader dropping, typed, a copy it
-  already appended). Neither is built; each is a design for the next lane, with its cost to be measured.
+- *What bounds a lost forward* (CP-T1.8, lanes V15 and V18; an event since V18). A holder's forward lost on the way
+  leaves the slot without its event: nothing after the forward reaches the leader for it, and the holder is live, so
+  nobody suspects it. Lane V15 measured that wait on real time (three members in one process, relayed by the test
+  pump, which lost member 3's forward): the leader's other writes waited the holder's whole 10 s deadline. Since lane
+  V18 a follower's forward is followed, in the same drive and so on the same ordered link, by a close: a barrier marked
+  a read's (`Actor::close_behind`, the second barrier a write that forwarded nothing already sent). The leader steps a
+  marked barrier at once and ends a slot its member holds `released` (`Slots::pass`), so a forward lost on the way
+  holds the slot only until that close arrives. A close behind a forward that arrived has nothing to end and its
+  answer is read by nothing (the member's own read state for it matches no request and is dropped), so the leader
+  consumes it unstepped: it knows it as that member's close by the request identity of the last forward it took from
+  the member, whose serial it follows by one (`follows`), in the same term and incarnation. No other barrier has that
+  serial, since an owner names each request once and makes none between its forward and its close. The wire is
+  unchanged: a leader of any version, and a leader that missed the forward, steps the close as the read it is.
+  Two designs were named by lane V15, and lane V18 measured what each costs a follower's write on the normal path, on
+  the driven harness with no loss (records a write, both classes). The close behind every forward: 1 more record a
+  write (the close; before the leader consumed it, 9.4 more, a read round's). A forward sent again when the
+  transport reports the link reset or the record refused: no more records, but a copy of the forward's entries kept
+  for each write in flight (4,133 bytes here), a report from each host's transport, and a typed drop of a copy at the
+  leader. The close was built: it needs nothing from a host, adds one small record, and its bound is the close's
+  arrival at the leader. What it does not bound: a loss of the whole `Ready` that held both (a link reset between
+  them), which the deadline or the detector still bounds. Numbers: bench/records, lane V18.
 - *What a slot holds* (Q1). Everything the leader would append between the holder's base and its retry: its own
   writes and floor sessions (`prepare` defers them, `slot_deferred`), its class entry (`propose_class`), and other
   members' forwarded proposals, held after the sender and origin checks. A change of members or a hand-off ends the
