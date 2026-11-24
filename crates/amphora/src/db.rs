@@ -391,6 +391,16 @@ impl Db {
         self.exec(&format!("PRAGMA cache_size = {pages}"))
     }
 
+    /// This connection's page cache as `PRAGMA cache_size` states it: pages, or KiB when negative.
+    pub(crate) fn cache_pages(&self) -> anyhow::Result<i64> {
+        let mut pages = None;
+        self.query("PRAGMA cache_size", [], |row| {
+            pages = Some(row.get::<i64>(0).map_err(fail)?);
+            Ok(false)
+        })?;
+        pages.ok_or_else(|| anyhow::anyhow!("PRAGMA cache_size answered no row"))
+    }
+
     /// Another connection on the same database, for reading or checkpointing: each read sees what
     /// was committed before it; its checkpoints flush.
     pub fn reader(&self) -> anyhow::Result<Self> {

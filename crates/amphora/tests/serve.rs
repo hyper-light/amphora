@@ -786,3 +786,52 @@ fn cp_t1_13_sql_takes_bound_parameters_and_answers_typed_rows_with_their_names()
     let wrong = Keys::plain(b"not-the-cluster-secret-not-the-cluster-secret".to_vec());
     assert!(SqlClient::connect(&leader, &wrong, c.deadline).is_err());
 }
+
+#[test]
+fn cp_t1_13_a_replicated_write_past_an_election_timeout_commits_and_keeps_its_leader() {
+    let dir = tempfile::tempdir().unwrap();
+    let configs = three(dir.path());
+    start(&configs);
+    let c = &configs[0];
+    healthy(c);
+    let keys = c.keys().unwrap();
+    let (_, leader) = Client::connect(&c.members[0].addr, &keys, c.deadline)
+        .unwrap()
+        .leader(Duration::from_secs(60))
+        .unwrap();
+    let mut sql = SqlClient::connect(&leader, &keys, c.deadline).unwrap();
+    let st = |text: &str, params: Vec<Value>| Statement {
+        sql: text.to_owned(),
+        params,
+    };
+    sql.write(vec![st(
+        "CREATE TABLE big (id INTEGER PRIMARY KEY, v BLOB)",
+        vec![],
+    )])
+    .unwrap();
+    let term = |addr: &str| {
+        let status = Client::connect(addr, &keys, c.deadline)
+            .unwrap()
+            .ask("status")
+            .unwrap();
+        status
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("term="))
+            .unwrap()
+            .to_owned()
+    };
+    let before = term(&leader);
+    let rows = (1..=16i64)
+        .map(|n| {
+            st(
+                "INSERT INTO big VALUES (?1, ?2)",
+                vec![Value::Integer(n), Value::Blob(vec![9; 1 << 20])],
+            )
+        })
+        .collect();
+    let wrote = sql.write(rows);
+    assert!(wrote.is_ok(), "{:#}", wrote.unwrap_err());
+    assert_eq!(term(&leader), before, "the write deposed its leader");
+    let count = sql.read(st("SELECT count(*) FROM big", vec![])).unwrap();
+    assert_eq!(count.rows, vec![vec![Value::Integer(16)]]);
+}
