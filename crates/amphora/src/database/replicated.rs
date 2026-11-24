@@ -1603,6 +1603,12 @@ fn answer<T>(response: Response<T>, result: Result<T, Refusal>) {
 }
 
 impl ReplicaHandle {
+    /// This member's owner's end, which those that wait for the memory budget's room for its work
+    /// hear ([`crate::memory::Budget::take_until`], lane perf-A28).
+    pub(crate) fn ending(&self) -> &crate::memory::Ending {
+        &self.shared.room.line.ending
+    }
+
     /// Queues `command`, charged `bytes` for what it carries and its envelope beside them
     /// (`ENVELOPE_BYTES`). A call waits for the queue's room until its deadline, in line
     /// ([`Room::place_by`]); any other input is refused at once without it, and its sender sends
@@ -6511,6 +6517,7 @@ mod tests {
         ] {
             assert_eq!(held.load(Ordering::Acquire), 0, "{what}");
         }
+        assert_eq!(control.room.line.ending.waits(), 0, "waits told of the end");
         assert_eq!(budget.held(crate::memory::Use::Queues), 0);
     }
 
@@ -7179,6 +7186,222 @@ mod tests {
             holds_nothing(&handle, &budget);
             assert_eq!(evaluated.load(Ordering::Relaxed), 0);
         }
+    }
+
+    /// Waits until a holder waits for `budget`'s room; `write`, which was to wait, finished instead.
+    fn waits_for(budget: &crate::memory::Budget, finished: impl Fn() -> bool) {
+        let began = Instant::now();
+        while budget.waiting() == 0 {
+            assert!(!finished(), "a write to wait for the budget was answered");
+            assert!(began.elapsed() < crate::transport::HANG, "a hang");
+            std::thread::yield_now();
+        }
+    }
+
+    /// QB.1 (T-QB.1.23, lane perf-A28): a write that waits for the memory budget's room when its
+    /// owner ends hears the owner's reason and holds nothing, whichever way the owner ends. Do: on a
+    /// leaderless member, another use holding the whole budget, a write waits for room on a thread;
+    /// the owner is dropped, as a crash drops it, or its loop ends, as an owner with no handle left
+    /// ends. Expect: the write refused `Fenced`, none waiting, nothing held.
+    #[test]
+    fn a28_a_write_waiting_for_the_budget_hears_its_owners_end_holding_nothing() {
+        for dropped in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut driven = Driven::new();
+            let client = driven.open(dir.path(), 1, vec![1, 2, 3], None);
+            let handle = client.handle().clone();
+            let evaluated = Arc::new(AtomicUsize::new(0));
+            let budget = budget_of(64 << 20);
+            let other = budget.take(crate::memory::Use::Images, 64 << 20).unwrap();
+            let began = Instant::now();
+            let write = {
+                let (handle, budget) = (handle.clone(), Arc::clone(&budget));
+                let evaluated = Arc::clone(&evaluated);
+                std::thread::spawn(move || {
+                    on_budget(&budget, || {
+                        waiting_call(&handle, 0, began + crate::transport::HANG, &evaluated)
+                    })
+                    .map(drop)
+                })
+            };
+            waits_for(&budget, || write.is_finished());
+            if dropped {
+                drop(driven);
+            } else {
+                // Its channel has no sender left, as once every handle is gone.
+                let (mut owner, inputs) = driven.owners.first_mut().unwrap().take().unwrap();
+                drop(inputs);
+                let (sender, none) = mpsc::channel();
+                drop(sender);
+                owner.run(none);
+            }
+            let refused = finished(write).err();
+            assert!(
+                matches!(refused, Some(Refusal::Fenced(_))),
+                "{refused:?} after {:?}, dropped: {dropped}",
+                began.elapsed()
+            );
+            assert_eq!(budget.waiting(), 0);
+            assert_eq!(budget.held(crate::memory::Use::Queues), 0);
+            drop(other);
+            holds_nothing(&handle, &budget);
+            assert_eq!(evaluated.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    /// QB.1 (T-QB.1.23, lane perf-A28): a term change is no owner's end: a write that waits for the
+    /// memory budget's room across one is answered once the room comes, by the owner it was asked of.
+    /// Do: in a group of three, every append lost, another use holding the whole budget, a write
+    /// waits for room at the leader; move the other members' clocks until they elect one of them;
+    /// then the other use gives its room back and the group goes on. Expect: the write still waiting
+    /// after the election, answered after, and nothing held.
+    #[test]
+    fn a28_a_write_waiting_for_the_budget_across_a_term_change_is_answered_once_room_comes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        driven
+            .call(&mut pump, &clients[leader], |db| {
+                db.exec("CREATE TABLE a28(x)")?;
+                Ok(Vec::new())
+            })
+            .unwrap();
+        driven.quiet(&mut pump);
+        let handle = clients[leader].handle().clone();
+        let term = handle.status().unwrap().term;
+        let budget = budget_of(64 << 20);
+        let other = budget.take(crate::memory::Use::Images, 64 << 20).unwrap();
+        let until = driven.until();
+        pump.appends_lost = true;
+        let write = {
+            let (handle, budget) = (handle.clone(), Arc::clone(&budget));
+            std::thread::spawn(move || {
+                let operation = Operation::Call(
+                    Mutex::new(Some(Box::new(move |db: &mut Db| {
+                        db.exec("INSERT INTO a28 VALUES (1)")?;
+                        Ok(Box::new(()) as Box<dyn Any + Send>)
+                    }))),
+                    AnswerMax::<()>::fixed().get(),
+                );
+                on_budget(&budget, || {
+                    handle
+                        .submit(String::new(), operation, None, until)
+                        .map(|_| ())
+                })
+            })
+        };
+        waits_for(&budget, || write.is_finished());
+        let others: Vec<usize> = (0..3).filter(|owner| *owner != leader).collect();
+        let began = Instant::now();
+        while clients[others[0]].handle().status().unwrap().term == term
+            || clients[others[0]].handle().status().unwrap().leader == 0
+        {
+            assert!(
+                began.elapsed() < crate::transport::HANG,
+                "no other member was elected"
+            );
+            for owner in &others {
+                driven.advance_tick(*owner);
+            }
+            driven.round(&mut pump);
+        }
+        assert_eq!(budget.waiting(), 1, "the write ended with the term");
+        assert!(!write.is_finished());
+        pump.appends_lost = false;
+        drop(other);
+        while !write.is_finished() {
+            assert!(
+                began.elapsed() < crate::transport::HANG,
+                "the write was never answered"
+            );
+            driven.round(&mut pump);
+            if !driven.session_out() {
+                for owner in 0..3 {
+                    driven.advance_tick(owner);
+                }
+            }
+        }
+        assert_eq!(write.join().unwrap(), Ok(()));
+        driven.quiet(&mut pump);
+        driven.drain(&mut pump);
+        pump.finish();
+        assert_eq!(budget.waiting(), 0);
+        holds_nothing(&handle, &budget);
+    }
+
+    /// QB.1 (T-QB.1.24, lane perf-A28): a record that has no room beside a call the queue holds, as an
+    /// image has none beside the largest, is refused at once and sent again, and what it waits for is
+    /// that call's end, which its deadline is at the latest. Do: on a leaderless member, queue the
+    /// largest call it holds alone, then a second in line; send a record that fits the queue but not
+    /// beside the call; move the clock past the first call's deadline, then past the second's. Expect:
+    /// the record refused at once while either is held, admitted once both ended, at their deadlines.
+    #[test]
+    fn a28_a_record_with_no_room_beside_a_held_call_enters_once_the_call_ended() {
+        let dir = tempfile::tempdir().unwrap();
+        // The owner's bounds come of a small budget; what the calls charge, of one that holds them all.
+        let (small, budget) = (budget_of(128 << 20), budget_of(1 << 50));
+        let mut driven = Driven::new();
+        let client = on_budget(&small, || driven.open(dir.path(), 1, vec![1, 2, 3], None));
+        let handle = client.handle().clone();
+        let evaluated = Arc::new(AtomicUsize::new(0));
+        let whole = usize::try_from(written(0)).unwrap();
+        let alone = handle.alone_bound();
+        let until = driven.until();
+        let held = on_budget(&budget, || {
+            waiting_call(&handle, alone - whole, until, &evaluated)
+        });
+        let held = held.unwrap();
+        on_budget(&small, || driven.step());
+        assert_eq!(driven.owner(0).waiting.len(), 1);
+        // Waits past the first, on the first's room, its deadline a second after the first's.
+        let later = until + Duration::from_secs(1);
+        let beyond = until + Duration::from_secs(60);
+        let second = {
+            let (handle, budget) = (handle.clone(), Arc::clone(&budget));
+            let evaluated = Arc::clone(&evaluated);
+            std::thread::spawn(move || {
+                on_budget(&budget, || {
+                    waiting_call(&handle, alone - whole, later, &evaluated)
+                })
+            })
+        };
+        in_line(&handle, 1, || second.is_finished());
+        // It fits the queue's bytes, not those beside the call.
+        let record = vec![0xff; handle.queue_bound() - alone];
+        let refused = |what: &str| {
+            let refused = handle.admit_receive(2, record.clone(), beyond).err();
+            assert!(
+                matches!(
+                    refused,
+                    Some(Refusal::Full { .. } | Refusal::TooLarge { .. })
+                ),
+                "{what}: {refused:?}"
+            );
+        };
+        refused("the first held");
+        on_budget(&small, || {
+            driven.advance(0, Duration::from_secs(6));
+            driven.step();
+        });
+        assert!(matches!(held.try_recv(), Ok(Err(Refusal::Timeout))));
+        let second = finished(second).unwrap();
+        refused("the second in its place");
+        on_budget(&small, || {
+            driven.advance(0, Duration::from_secs(2));
+            driven.step();
+            driven.step();
+        });
+        assert!(matches!(second.try_recv(), Ok(Err(Refusal::Timeout))));
+        let admitted = handle.admit_receive(2, record.clone(), beyond);
+        assert!(admitted.is_ok(), "{:?}", admitted.err());
+        drop(admitted);
+        drop(driven);
+        holds_nothing(&handle, &budget);
+        assert_eq!(evaluated.load(Ordering::Relaxed), 0);
     }
 
     /// QB.1 (T-QB.1.22, lane perf-A27; run under ThreadSanitizer too): calls from every thread, with
