@@ -141,3 +141,55 @@ fn only_an_ordering_with_a_limit_tells_its_sorter_how_many_rows() {
     ));
     assert!(!told("SELECT id FROM t ORDER BY w"));
 }
+
+/// Spec P1 regression: spilling a wide-payload `ORDER BY k NULLS LAST LIMIT 2` / `LIMIT 1 OFFSET 2`
+/// across low `cache_size = 200` vs high `cache_size = 2048` must preserve the exact same tied
+/// arrival order (`[1, 2]` and `[3]`).
+#[test]
+fn spilled_top_n_matches_in_memory_arrival_order_on_tied_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = open(dir.path());
+    conn.execute("CREATE TABLE wide (id INTEGER PRIMARY KEY, k INTEGER, payload TEXT NOT NULL)")
+        .unwrap();
+    let pad = "x".repeat(520_000);
+    let mut ins = conn
+        .prepare("INSERT INTO wide (id, k, payload) VALUES (?1, ?2, ?3)")
+        .unwrap();
+    for id in 1..=3i64 {
+        ins.reset().unwrap();
+        ins.bind_at(NonZero::new(1).unwrap(), Value::from_i64(id))
+            .unwrap();
+        ins.bind_at(NonZero::new(2).unwrap(), Value::from_i64(7))
+            .unwrap();
+        ins.bind_at(NonZero::new(3).unwrap(), Value::build_text(pad.clone()))
+            .unwrap();
+        ins.run_ignore_rows().unwrap();
+    }
+    drop(ins);
+
+    for cache_pages in [2048, 200] {
+        conn.execute(format!("PRAGMA cache_size = {cache_pages}"))
+            .unwrap();
+        let top2 = rows(
+            &conn,
+            "SELECT id, length(payload) FROM wide ORDER BY k NULLS LAST LIMIT 2",
+        );
+        assert_eq!(
+            top2,
+            vec![
+                vec![Value::from_i64(1), Value::from_i64(520_000)],
+                vec![Value::from_i64(2), Value::from_i64(520_000)],
+            ],
+            "cache_size={cache_pages} LIMIT 2"
+        );
+        let third = rows(
+            &conn,
+            "SELECT id, length(payload) FROM wide ORDER BY k NULLS LAST LIMIT 1 OFFSET 2",
+        );
+        assert_eq!(
+            third,
+            vec![vec![Value::from_i64(3), Value::from_i64(520_000)]],
+            "cache_size={cache_pages} LIMIT 1 OFFSET 2"
+        );
+    }
+}

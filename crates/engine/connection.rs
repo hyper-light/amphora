@@ -695,6 +695,9 @@ pub struct Connection {
     /// Epoch of `db.schema_epoch` last synchronized into `self.schema` (`u64::MAX` when mutated
     /// locally): allows `maybe_update_schema()` to skip locking `db.schema` when unchanged.
     pub(crate) local_schema_epoch: AtomicU64,
+    /// Last `SharedLog::restore_epoch` adopted into `self.schema`: mismatch forces unconditional
+    /// adoption of `db.schema` in `maybe_update_schema()` even when `schema_version` matches.
+    pub(crate) last_restore_epoch: AtomicU64,
     /// Per-database schema cache (database_index -> schema)
     /// Loaded lazily to avoid copying all schemas on connection open
     pub(super) database_schemas: RwLock<HashMap<usize, Arc<Schema>>>,
@@ -3113,17 +3116,22 @@ impl Connection {
             return;
         }
         let db_epoch = self.db.schema_epoch.load(Ordering::Acquire);
-        if self.local_schema_epoch.load(Ordering::Relaxed) == db_epoch {
+        let db_restore_epoch = self.db.shared_wal.restore_epoch();
+        let restore_changed = self.last_restore_epoch.load(Ordering::Acquire) != db_restore_epoch;
+        if !restore_changed && self.local_schema_epoch.load(Ordering::Relaxed) == db_epoch {
             return;
         }
         let current_schema = self.schema.read().clone();
         let schema = self.db.schema.lock();
         let locked_epoch = self.db.schema_epoch.load(Ordering::Acquire);
+        let locked_restore_epoch = self.db.shared_wal.restore_epoch();
         // MVCC checkpoint can publish physical btree roots into the shared
-        // schema without changing SQLite's schema cookie. If this connection
-        // still has the older schema snapshot, prepared statements must be
-        // invalidated and recompiled with the published roots.
-        if current_schema.schema_version != schema.schema_version
+        // schema without changing SQLite's schema cookie, and an external raw
+        // restore can replace the catalog at an equal schema cookie. If this
+        // connection still has the older schema snapshot, prepared statements
+        // must be invalidated and recompiled with the published catalog.
+        if restore_changed
+            || current_schema.schema_version != schema.schema_version
             || self.has_mvcc_schema_snapshot_changed_with_same_version(&current_schema, &schema)
         {
             let mut adopted = schema.clone();
@@ -3140,6 +3148,8 @@ impl Connection {
         }
         self.local_schema_epoch
             .store(locked_epoch, Ordering::Relaxed);
+        self.last_restore_epoch
+            .store(locked_restore_epoch, Ordering::Release);
     }
 
     fn has_no_open_transaction_state(&self) -> bool {
@@ -4143,7 +4153,14 @@ impl Connection {
     /// replaced or mutated in place. Lock-free and avoids cloning the shared `Arc<Schema>`.
     #[inline]
     pub fn schema_identity(&self) -> u64 {
-        self.schema.identity()
+        let restore_epoch = self.db.shared_wal.restore_epoch();
+        if restore_epoch == 0 {
+            self.schema.identity()
+        } else {
+            self.schema
+                .identity()
+                .wrapping_add(restore_epoch.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+        }
     }
 
     pub fn attached_database_names(&self) -> Vec<String> {

@@ -505,31 +505,36 @@ impl SegmentsCell {
         let prev_current = Segments::unpack(word).current();
         let (before_first, before_second) = self.sum_reads();
         let mut segments = Self::assemble(word, before_first, before_second);
+        // Track what `step` actually received (not speculative counts on an inactive segment
+        // omitted by `assemble`), so non-read transitions like `switch()` never misread a delayed
+        // reader's speculative increment as a decrement to apply to shard 0.
+        let (passed_first, passed_second) = Self::reads_by_segment(&segments);
         let mut out = step(&mut segments);
         let closing_reads = segments.other.map_or(0, |c| c.reads);
         if segments.reads > READS || closing_reads > READS {
             return None;
         }
         let (after_first, after_second) = Self::reads_by_segment(&segments);
-        if after_first != before_first || after_second != before_second {
+        if after_first != passed_first || after_second != passed_second {
             if let Some(slot0) = self.shards.first() {
-                // Synthetic read-count adjustment (used by tests): apply delta on shard 0.
+                // Synthetic read-count adjustment (used by tests): apply ONLY the delta that
+                // `step` itself made relative to `(passed_first, passed_second)`.
                 let mut cur = slot0.load(Ordering::SeqCst);
                 loop {
                     let sr = SlotReads(cur);
-                    let f = if after_first >= before_first {
+                    let f = if after_first >= passed_first {
                         sr.on(SegmentId::First)
-                            .saturating_add(after_first.saturating_sub(before_first))
+                            .saturating_add(after_first.saturating_sub(passed_first))
                     } else {
                         sr.on(SegmentId::First)
-                            .saturating_sub(before_first.saturating_sub(after_first))
+                            .saturating_sub(passed_first.saturating_sub(after_first))
                     };
-                    let s = if after_second >= before_second {
+                    let s = if after_second >= passed_second {
                         sr.on(SegmentId::Second)
-                            .saturating_add(after_second.saturating_sub(before_second))
+                            .saturating_add(after_second.saturating_sub(passed_second))
                     } else {
                         sr.on(SegmentId::Second)
-                            .saturating_sub(before_second.saturating_sub(after_second))
+                            .saturating_sub(passed_second.saturating_sub(after_second))
                     };
                     let next = (f & SlotReads::COUNT)
                         | (s & SlotReads::COUNT).wrapping_shl(SlotReads::SECOND_SHIFT);
@@ -597,6 +602,17 @@ impl SegmentsCell {
             }
         }
         Some(out)
+    }
+
+    /// Replaces the segment state after a quiescent external restore of `-wal` / `-wal2`, bumping
+    /// the version counter so any concurrent observer sees the transition.
+    #[cfg(feature = "conn_raw_api")]
+    pub fn reset_after_restore(&self, segments: Segments) {
+        let _guard = self.transition.lock();
+        let word = self.state.load(Ordering::SeqCst);
+        let next_ver = word.wrapping_add(1) & VERSION_MASK;
+        let next_word = segments.pack() | next_ver;
+        self.state.store(next_word, Ordering::SeqCst);
     }
 
     /// Publishes `COPIED` on the closing segment before counting active readers across shards
@@ -1314,5 +1330,37 @@ mod tests {
             final_state.state(final_state.current()),
             Segment::Current { reads: 0 }
         ));
+    }
+
+    /// Spec P1-5 regression: a delayed reader's speculative increment on the inactive segment must
+    /// never be subtracted during `switch()`'s shard reconciliation, so the reader's subsequent
+    /// rollback leaves `(0, 0)` instead of underflowing `SegmentId::Second` to `0xffff_ffff`.
+    #[test]
+    fn p1_switch_never_double_subtracts_delayed_reader_speculative_count() {
+        let cell = SegmentsCell::new(Segments::new(SegmentId::First));
+        // Simulate a delayed reader on shard 0 that speculatively added `Second: 1` (e.g. from an
+        // earlier state before `other` was cleared) while `current == First, other == None`.
+        let delta = SlotReads::one(SegmentId::Second);
+        cell.shards[0].fetch_add(delta, Ordering::SeqCst);
+
+        // Writer switches First -> Second. Must NOT subtract the speculative `Second: 1` from
+        // shard 0 during shard reconciliation.
+        assert_eq!(
+            cell.update(|s| s.switch(false)),
+            Some(Some(SegmentId::Second))
+        );
+
+        // Delayed reader detects the generation change and rolls back its speculative `Second: 1`.
+        cell.shards[0].fetch_sub(delta, Ordering::SeqCst);
+
+        let (first_reads, second_reads) = cell.sum_reads();
+        assert_eq!(
+            (first_reads, second_reads),
+            (0, 0),
+            "delayed reader rollback must return exact (0, 0), not underflow to 0xffffffff"
+        );
+        // Closing segment (`First`) must still reset cleanly once copied.
+        assert_eq!(cell.copied(), Some(SegmentId::First));
+        assert_eq!(cell.load().closing(), None);
     }
 }

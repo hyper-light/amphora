@@ -713,6 +713,13 @@ impl SharedFile {
         self.member.pages.forget_file(self.member.file);
     }
 
+    /// Drops every cached image (both database file pages and WAL frames) of this file: used
+    /// after an external raw restore replaces files on disk so neither warmed nor fresh
+    /// connections can observe pre-restore pages or schema.
+    pub fn forget_all(&self) {
+        self.member.pages.forget_all(self.member.file);
+    }
+
     /// Drops any cached WAL frame or stale file version of `page` superseded by a commit at
     /// `(generation, new_frame)`.
     pub fn supersede_frame(&self, page: u64, generation: u32, new_frame: u64) {

@@ -2573,12 +2573,25 @@ impl Database {
             ));
         }
         let flags = self.open_flags;
+        // Drop every cached file page AND WAL frame for this database from any shared page pool
+        // BEFORE reopening or reparsing so neither warmed nor fresh connections can read stale
+        // pre-restore images under reused `(file_id, page, version)` keys.
+        if let Some(shared) = self.db_file.shared_pages() {
+            shared.forget_all();
+        }
+        // Reopen the main database file descriptor so atomic-rename restores to a new inode are
+        // observed immediately rather than reading the unlinked pre-restore file.
+        if !self.is_in_memory_db() {
+            let reopened = self.io.open_file(&self.path, flags, false)?;
+            self.db_file.reopen_after_external_restore(reopened);
+        }
+
         #[cfg(host_shared_wal)]
         let shared_authority = self.open_shared_wal_coordination_for_open()?;
         #[cfg(not(host_shared_wal))]
         let shared_authority: Option<()> = None;
 
-        let new_shared_wal = {
+        let new_first_wal = {
             #[cfg(host_shared_wal)]
             {
                 if let Some(authority) = shared_authority.as_ref() {
@@ -2602,15 +2615,51 @@ impl Database {
                 WalFileShared::open_shared_if_exists(&self.io, &self.wal_path, flags)?
             }
         };
-        let new_shared_wal = Arc::try_unwrap(new_shared_wal).map_err(|_| {
+        // Decision 45: recover `-wal2` alongside `-wal`, matching cold `Database::open`.
+        let new_second_wal = WalFileShared::open_second_segment_if_exists(
+            &self.io,
+            &storage::wal::second_segment_path(&self.wal_path),
+            flags,
+        )?;
+        let segment_seq = |segment: &Arc<RwLock<WalFileShared>>| {
+            let shared = segment.read();
+            shared
+                .metadata
+                .initialized
+                .load(Ordering::Acquire)
+                .then(|| shared.metadata.wal_header.lock().checkpoint_seq)
+        };
+        let (first_seq, second_seq) = (segment_seq(&new_first_wal), segment_seq(&new_second_wal));
+        let segments = crate::storage::log_segments::Segments::recover(first_seq, second_seq, true)
+            .ok_or_else(|| {
+                LimboError::Corrupt(format!(
+                    "restored WAL segments have checkpoint sequences {first_seq:?} and {second_seq:?}, neither one past the other"
+                ))
+            })?;
+        let new_first_wal = Arc::try_unwrap(new_first_wal).map_err(|_| {
             LimboError::InternalError(
-                "new WAL state unexpectedly shared during external restore reload".to_string(),
+                "new WAL first segment unexpectedly shared during external restore reload"
+                    .to_string(),
             )
         })?;
-        self.shared_wal
-            .current()
-            .write()
-            .replace_after_external_restore(new_shared_wal.into_inner());
+        let new_second_wal = Arc::try_unwrap(new_second_wal).map_err(|_| {
+            LimboError::InternalError(
+                "new WAL second segment unexpectedly shared during external restore reload"
+                    .to_string(),
+            )
+        })?;
+        self.shared_wal.replace_after_external_restore(
+            new_first_wal.into_inner(),
+            new_second_wal.into_inner(),
+            segments,
+        );
+        // Reparse and unconditionally publish the restored catalog so both warmed and newly
+        // opened connections immediately observe restored tables/columns even when `schema_cookie`
+        // equals the pre-restore value.
+        let refresh_conn = self._connect(true, None, None, None, None, StatsRefresh::Blocking)?;
+        refresh_conn.force_reparse_schema_without_publish()?;
+        refresh_conn.publish_schema_after_external_restore()?;
+        drop(refresh_conn);
         if self.mvcc_enabled() || journal_mode::logical_log_exists(std::path::Path::new(&self.path))
         {
             let mv_store = journal_mode::open_mv_store(
@@ -2833,9 +2882,13 @@ impl Database {
                 None,
             )?
             .map(|s| Arc::new(crate::storage::versioned::switch::Switch::new(s)));
-        let (initial_schema, initial_schema_epoch) = {
+        let (initial_schema, initial_schema_epoch, initial_restore_epoch) = {
             let shared = self.schema.lock();
-            (shared.clone(), self.schema_epoch.load(Ordering::Acquire))
+            (
+                shared.clone(),
+                self.schema_epoch.load(Ordering::Acquire),
+                self.shared_wal.restore_epoch(),
+            )
         };
         let conn = Arc::new(Connection {
             cost_runs: crate::translate::optimizer::learned_costs::RunCounts::staggered(
@@ -2848,6 +2901,7 @@ impl Database {
             pager: ArcSwap::new(pager),
             schema: crate::connection::SchemaCell::new(initial_schema),
             local_schema_epoch: AtomicU64::new(initial_schema_epoch),
+            last_restore_epoch: AtomicU64::new(initial_restore_epoch),
             database_schemas: RwLock::new(HashMap::default()),
             auto_commit: AtomicBool::new(true),
             transaction_state: AtomicTransactionState::new(TransactionState::None),

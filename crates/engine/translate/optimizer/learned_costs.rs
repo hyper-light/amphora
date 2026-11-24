@@ -9,7 +9,7 @@
 
 use std::cell::Cell;
 use std::hint::black_box;
-use std::sync::atomic::{fence, AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -672,11 +672,14 @@ impl WeightsSnapshot {
     }
 }
 
-/// One atomic slot of [`WeightsDoubleBuffer`], guarded by its own seqlock counter.
+/// One atomic slot of [`WeightsRing`], guarded by its own seqlock counter and publication
+/// generation so readers never observe torn or unpublished rewrites.
 #[derive(Debug)]
 struct AtomicWeightsSlot {
-    /// Even when stable; odd while the serialized writer updates this inactive slot.
+    /// Even when stable; odd while the serialized writer updates this slot.
     seq: AtomicU64,
+    /// Monotonic publication generation written into this slot.
+    generation: AtomicU64,
     has_weights: AtomicBool,
     has_row_in_pages: AtomicBool,
     has_row_nanos: AtomicBool,
@@ -695,6 +698,7 @@ impl AtomicWeightsSlot {
     fn new() -> Self {
         Self {
             seq: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
             has_weights: AtomicBool::new(false),
             has_row_in_pages: AtomicBool::new(false),
             has_row_nanos: AtomicBool::new(false),
@@ -710,12 +714,13 @@ impl AtomicWeightsSlot {
         }
     }
 
-    fn write(&self, snap: WeightsSnapshot) {
+    fn write(&self, generation: u64, snap: WeightsSnapshot) {
         let s = self.seq.load(Ordering::Relaxed);
         // Release ensures readers that observe an odd `seq` also observe the writer's prior
-        // `latest` flip pointing to the other (stable, even) slot.
+        // `published_gen` store pointing to an earlier stable slot.
         self.seq.store(s.wrapping_add(1), Ordering::Release);
         fence(Ordering::Release);
+        self.generation.store(generation, Ordering::Relaxed);
         match snap.weights {
             Some(w) => {
                 self.has_weights.store(true, Ordering::Relaxed);
@@ -759,9 +764,13 @@ impl AtomicWeightsSlot {
     }
 
     #[inline]
-    fn try_read(&self) -> Option<WeightsSnapshot> {
+    fn try_read_generation(&self, expected_gen: u64) -> Option<WeightsSnapshot> {
         let s1 = self.seq.load(Ordering::Acquire);
         if (s1 & 1) != 0 {
+            return None;
+        }
+        let slot_gen = self.generation.load(Ordering::Relaxed);
+        if slot_gen != expected_gen {
             return None;
         }
         let has_weights = self.has_weights.load(Ordering::Relaxed);
@@ -798,57 +807,66 @@ impl AtomicWeightsSlot {
     }
 }
 
-/// Lock-free, `Arc`-free double-buffered snapshot holding derived planner weights, cost margin,
-/// and row nanos. Writers (serialized by `LearnedCosts::rates`) always write into the inactive
-/// slot (`1 - latest`) and publish `latest` only after that slot's sequence is even again. Thus
-/// a descheduled publisher leaves `slot(latest)` untouched and even, so SQL preparation reads the
-/// last published weights without spinning, locks, `Arc` refcounts, or heap allocation.
+/// Lock-free, `Arc`-free 4-slot generation-tagged ring buffer holding derived planner weights,
+/// cost margin, and row nanos.
+///
+/// Writers (serialized by `LearnedCosts::rates`) write `next_gen = published_gen + 1` into
+/// `slot(next_gen & 3)` and advance `published_gen` ONLY after that slot's sequence is even.
+/// Readers load `g = published_gen` and accept `slot(g & 3)` ONLY if `slot.generation == g` and
+/// `slot.seq` is even and unchanged, guaranteeing:
+/// 1. A descheduled publisher leaves `slot(published_gen)` untouched and even (zero spinning).
+/// 2. Readers never observe an unpublished rewrite or reverse publication order (strict
+///    linearizability).
 #[derive(Debug)]
-struct WeightsDoubleBuffer {
-    slot_a: AtomicWeightsSlot,
-    slot_b: AtomicWeightsSlot,
-    /// Index (`0` or `1`) of the most recently completed slot.
-    latest: AtomicUsize,
+struct WeightsRing {
+    slot_0: AtomicWeightsSlot,
+    slot_1: AtomicWeightsSlot,
+    slot_2: AtomicWeightsSlot,
+    slot_3: AtomicWeightsSlot,
+    /// Monotonic generation of the most recently completed publication.
+    published_gen: AtomicU64,
 }
 
-impl WeightsDoubleBuffer {
+impl WeightsRing {
     fn from_rates(rates: &Rates) -> Self {
         let snap = WeightsSnapshot::from_rates(rates);
-        let buf = Self {
-            slot_a: AtomicWeightsSlot::new(),
-            slot_b: AtomicWeightsSlot::new(),
-            latest: AtomicUsize::new(0),
+        let ring = Self {
+            slot_0: AtomicWeightsSlot::new(),
+            slot_1: AtomicWeightsSlot::new(),
+            slot_2: AtomicWeightsSlot::new(),
+            slot_3: AtomicWeightsSlot::new(),
+            published_gen: AtomicU64::new(0),
         };
-        buf.slot_a.write(snap);
-        buf.slot_b.write(snap);
-        buf
+        ring.store(snap);
+        ring
     }
 
     #[inline]
-    fn slot(&self, idx: usize) -> &AtomicWeightsSlot {
-        if (idx & 1) == 0 {
-            &self.slot_a
-        } else {
-            &self.slot_b
+    fn slot(&self, generation: u64) -> &AtomicWeightsSlot {
+        match generation & 3 {
+            0 => &self.slot_0,
+            1 => &self.slot_1,
+            2 => &self.slot_2,
+            _ => &self.slot_3,
         }
     }
 
-    /// Publishes `snap` into the inactive slot and flips `latest` once complete. Caller must hold
-    /// `LearnedCosts::rates` so writers are strictly serialized.
+    /// Publishes `snap` into the next ring slot and advances `published_gen` once complete.
+    /// Caller must hold `LearnedCosts::rates` so writers are strictly serialized.
     fn store(&self, snap: WeightsSnapshot) {
-        let next = 1 - (self.latest.load(Ordering::Relaxed) & 1);
-        self.slot(next).write(snap);
-        self.latest.store(next, Ordering::Release);
+        let next_gen = self.published_gen.load(Ordering::Relaxed).wrapping_add(1);
+        self.slot(next_gen).write(next_gen, snap);
+        self.published_gen.store(next_gen, Ordering::Release);
     }
 
-    /// Reads a consistent `WeightsSnapshot` with bounded non-spinning attempts (at most two passes
-    /// over the two slots). Returns `None` only if a continuously-advancing publisher lapped this
-    /// reader across every attempt, never when a publisher is descheduled mid-write.
+    /// Reads the latest published `WeightsSnapshot` with bounded non-spinning attempts (one pass
+    /// per ring slot). Returns `None` only if an actively-progressing publisher lapped all 4 slots
+    /// across every attempt, never when a publisher is paused mid-write.
     #[inline]
     fn try_load(&self) -> Option<WeightsSnapshot> {
         for _ in 0..4 {
-            let idx = self.latest.load(Ordering::Acquire);
-            if let Some(snap) = self.slot(idx).try_read() {
+            let g = self.published_gen.load(Ordering::Acquire);
+            if let Some(snap) = self.slot(g).try_read_generation(g) {
                 return Some(snap);
             }
         }
@@ -860,9 +878,9 @@ impl WeightsDoubleBuffer {
 #[derive(Debug)]
 pub(crate) struct LearnedCosts {
     rates: Mutex<Rates>,
-    /// Lock-free, `Arc`-free double-buffered snapshot for `prepare()` (`weights_at`, `cost_margin`,
-    /// `nanos_per(Row)`).
-    snapshot: WeightsDoubleBuffer,
+    /// Lock-free, `Arc`-free generation-tagged ring snapshot for `prepare()` (`weights_at`,
+    /// `cost_margin`, `nanos_per(Row)`).
+    snapshot: WeightsRing,
     /// True when the active weight rule is `WeightRule::BatchMeans`.
     batch_means: AtomicBool,
     /// Which runs of the seek, the hash build and the hash probe are timed (step 3a).
@@ -1018,7 +1036,7 @@ impl LearnedCosts {
     fn from_rates(rates: &Rates) -> Self {
         Self {
             rates: Mutex::new(*rates),
-            snapshot: WeightsDoubleBuffer::from_rates(rates),
+            snapshot: WeightsRing::from_rates(rates),
             batch_means: AtomicBool::new(rates.seek.rule == WeightRule::BatchMeans),
             seek: Sampling::new(rates.seek.epoch),
             hash_build: Sampling::new(rates.hash_build.epoch),
@@ -1199,14 +1217,22 @@ impl LearnedCosts {
     #[cold]
     #[inline(never)]
     fn load_snapshot_slow(&self) -> WeightsSnapshot {
-        if let Some(rates) = self.rates.try_lock() {
-            return WeightsSnapshot::from_rates(&rates);
+        // Strictly non-blocking fallback: never acquires blocking `self.rates.lock()`, so SQL
+        // preparation can never stall behind a paused publisher even under bursty updates.
+        for _ in 0..4 {
+            if let Some(rates) = self.rates.try_lock() {
+                return WeightsSnapshot::from_rates(&rates);
+            }
+            std::thread::yield_now();
+            if let Some(snap) = self.snapshot.try_load() {
+                return snap;
+            }
         }
-        std::thread::yield_now();
-        if let Some(snap) = self.snapshot.try_load() {
-            return snap;
+        WeightsSnapshot {
+            weights: None,
+            cost_margin: 0.0,
+            row_nanos: None,
         }
-        WeightsSnapshot::from_rates(&self.rates.lock())
     }
 
     /// Nanoseconds a unit of `work` takes as the rate stands, None before any time was seen: what
@@ -2932,9 +2958,10 @@ mod ab_tests {
         assert_eq!(blend.nanos_per_unit(), stood);
     }
 
-    /// Review P2 regression: a publisher descheduled mid-write (with the inactive slot's sequence
-    /// left odd) must never cause snapshot readers to spin; they must immediately read the last
-    /// published weights from the active slot.
+    /// Review P2 regression: a publisher descheduled mid-write (with the next ring slot's sequence
+    /// left odd) must never cause snapshot readers to spin or block; a reader that sampled an
+    /// earlier generation must never observe an unpublished rewrite (no reverse publication order);
+    /// and the slow fallback must never block on a held `rates` lock.
     #[test]
     fn p2_descheduled_publisher_never_spins_snapshot_readers() {
         let initial = Rates {
@@ -2951,24 +2978,56 @@ mod ab_tests {
         let costs = LearnedCosts::from_rates(&initial);
         let expected = costs.weights().unwrap();
 
-        // Simulate a publisher descheduled after marking the inactive slot odd.
-        let inactive = 1 - (costs.snapshot.latest.load(Ordering::Relaxed) & 1);
-        let slot = costs.snapshot.slot(inactive);
+        // Simulate a publisher descheduled after marking the next ring slot odd.
+        let cur_gen = costs.snapshot.published_gen.load(Ordering::Relaxed);
+        let next_gen = cur_gen.wrapping_add(1);
+        let slot = costs.snapshot.slot(next_gen);
         let prev_seq = slot.seq.load(Ordering::Relaxed);
         slot.seq.store(prev_seq.wrapping_add(1), Ordering::Release);
 
-        // Even while the publisher is stalled with `rates` held and the inactive slot odd,
-        // `try_load()` succeeds immediately with the last published snapshot without spinning.
+        // Even while the publisher is stalled with `rates` held and the next slot odd,
+        // `try_load()` and `load_snapshot_slow()` return immediately without spinning or blocking.
         let _held = costs.rates.lock();
         let snap = costs.snapshot.try_load().expect("active slot stays stable");
         assert_eq!(snap.weights, Some(expected));
         assert_eq!(costs.weights(), Some(expected));
+        let slow = costs.load_snapshot_slow();
+        assert_eq!(slow.weights, Some(expected));
         drop(_held);
 
-        // Completing the stalled slot and publishing a new rate flips `latest` cleanly.
+        // Spec P2 regression: if a reader sampled `old_gen` (slot 1), then the writer published
+        // `cur_gen = old_gen + 1` (slot 2) and overwrote slot 1 with an UNPUBLISHED `old_gen + 4`,
+        // reading slot 1 against `old_gen` MUST reject the newer unpublished write instead of
+        // observing publications out of order.
         slot.seq.store(prev_seq.wrapping_add(2), Ordering::Release);
         costs.set_rule(WeightRule::Blend);
         costs.observe(Work::Seek, EPOCH, EPOCH * 400.0);
-        assert_ne!(costs.weights(), Some(expected));
+        let pub_gen = costs.snapshot.published_gen.load(Ordering::Relaxed);
+        let pub_weights = costs.weights().unwrap();
+        assert_ne!(pub_weights, expected);
+
+        // Rewrite `cur_gen`'s slot with an unpublished future generation `cur_gen + 4`.
+        let future_rates = Rates {
+            seek: Rate::measured(EPOCH, EPOCH * 900.0),
+            ..initial
+        };
+        costs.snapshot.slot(cur_gen).write(
+            cur_gen.wrapping_add(4),
+            WeightsSnapshot::from_rates(&future_rates),
+        );
+        assert!(
+            costs
+                .snapshot
+                .slot(cur_gen)
+                .try_read_generation(cur_gen)
+                .is_none(),
+            "reader must reject an unpublished future generation written into its sampled slot"
+        );
+        // Meanwhile the published generation remains readable in strict publication order.
+        assert_eq!(
+            costs.snapshot.published_gen.load(Ordering::Acquire),
+            pub_gen
+        );
+        assert_eq!(costs.weights(), Some(pub_weights));
     }
 }

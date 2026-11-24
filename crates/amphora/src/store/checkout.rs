@@ -658,9 +658,34 @@ impl<R> Slots<R> {
         }
     }
 
+    /// After a front waiter leaves `home` (by expiry, steal, or claim) and the queue lock has been
+    /// dropped, unpark the next local front waiter if any, or if `home` is now free with an empty
+    /// local queue while another slot has queued waiters, hand `home` to one of those waiters.
+    fn wake_after_front_exit(
+        &self,
+        home_idx: usize,
+        home: &Slot<R>,
+        wake_next_front: Option<Thread>,
+        check_other_slots: bool,
+    ) {
+        if let Some(thread) = wake_next_front {
+            thread.unpark();
+        } else if check_other_slots
+            && self.waiting.0.load(Ordering::Acquire) > 0
+            && self.waiting.1.load(Ordering::Acquire) == 0
+            && home.state.load(Ordering::Acquire) == SLOT_FREE
+            && let Some(thread) = self.try_steal_from_free(home_idx, home)
+        {
+            thread.unpark();
+        }
+    }
+
     /// A slot: a free one at once when uncontended or not starving, or woken/handed off in FIFO
     /// order on this thread's home slot before `until` (None past it).
     pub(super) fn take(&self, until: Instant) -> Option<Taken<'_, R>> {
+        if until.saturating_duration_since(Instant::now()).is_zero() {
+            return None;
+        }
         let home_idx = self.home_index();
         let start_idx = LAST_SLOT.with(|last| {
             let v = last.get();
@@ -672,17 +697,15 @@ impl<R> Slots<R> {
             return self.wrap_claimed(idx);
         }
         if until.saturating_duration_since(Instant::now()).is_zero() {
-            if self.waiting.1.load(Ordering::Acquire) == 0
-                && let Some(idx) = self.try_claim_free_from(start_idx, true)
-            {
-                return self.wrap_claimed(idx);
-            }
             return None;
         }
 
         let home = self.slots.get(home_idx)?;
         let waiter_id = {
             let mut queue = Self::lock_slot_queue(home);
+            if until.saturating_duration_since(Instant::now()).is_zero() {
+                return None;
+            }
             self.inc_local_waiting(home);
             let front_empty = queue.head.is_none();
             if self.waiting.1.load(Ordering::SeqCst) == 0
@@ -701,24 +724,25 @@ impl<R> Slots<R> {
             if !left.is_zero() {
                 std::thread::park_timeout(left);
             }
-            let expired = until.saturating_duration_since(Instant::now()).is_zero();
             let mut wake_next_front = None;
             let mut queue = Self::lock_slot_queue(home);
+            // Sample expiry AFTER acquiring the queue lock so we never accept a slot that became
+            // available after our deadline while we waited for the mutex.
+            let expired = until.saturating_duration_since(Instant::now()).is_zero();
             let assigned = queue
                 .entries
                 .get_mut(waiter_id)
                 .and_then(|entry| entry.assigned.take());
             if let Some(idx) = assigned {
                 queue.recycle(waiter_id);
-                if self.waiting.1.load(Ordering::Acquire) == 0
-                    && home.state.load(Ordering::Acquire) == SLOT_FREE
-                {
+                let home_free_no_drain = self.waiting.1.load(Ordering::Acquire) == 0
+                    && home.state.load(Ordering::Acquire) == SLOT_FREE;
+                if home_free_no_drain {
                     wake_next_front = Self::wake_front_barging(home, &mut queue);
                 }
+                let check_other = home_free_no_drain && queue.head.is_none();
                 drop(queue);
-                if let Some(thread) = wake_next_front {
-                    thread.unpark();
-                }
+                self.wake_after_front_exit(home_idx, home, wake_next_front, check_other);
                 if expired {
                     self.release_slot(idx);
                     return None;
@@ -734,16 +758,16 @@ impl<R> Slots<R> {
                     self.dec_local_waiting(home);
                 }
                 queue.recycle(waiter_id);
+                let mut check_other = false;
                 if is_front {
                     Self::clear_front_bits(home);
                     if home.state.load(Ordering::Acquire) == SLOT_FREE {
                         wake_next_front = Self::wake_front_barging(home, &mut queue);
+                        check_other = queue.head.is_none();
                     }
                 }
                 drop(queue);
-                if let Some(thread) = wake_next_front {
-                    thread.unpark();
-                }
+                self.wake_after_front_exit(home_idx, home, wake_next_front, check_other);
                 return self.wrap_claimed(idx);
             }
             if expired {
@@ -751,18 +775,18 @@ impl<R> Slots<R> {
                     self.dec_local_waiting(home);
                 }
                 queue.recycle(waiter_id);
+                let mut check_other = false;
                 if is_front {
                     Self::clear_front_bits(home);
                     if self.waiting.1.load(Ordering::Acquire) == 0
                         && home.state.load(Ordering::Acquire) == SLOT_FREE
                     {
                         wake_next_front = Self::wake_front_barging(home, &mut queue);
+                        check_other = queue.head.is_none();
                     }
                 }
                 drop(queue);
-                if let Some(thread) = wake_next_front {
-                    thread.unpark();
-                }
+                self.wake_after_front_exit(home_idx, home, wake_next_front, check_other);
                 return None;
             }
             if is_front {
@@ -863,6 +887,10 @@ impl<R> Slots<R> {
                     .compare_exchange(SLOT_FREE, SLOT_HELD, Ordering::Acquire, Ordering::Relaxed)
                     .is_ok()
                 {
+                    if registered {
+                        let mut queue = Self::lock_slot_queue(slot);
+                        queue.drain_waiters.retain(|t| t.id() != me_id);
+                    }
                     break;
                 }
                 {
@@ -1447,7 +1475,8 @@ mod tests {
     }
 
     /// Review P2 regression: spurious unparks while `take_all()` waits on a held slot must not
-    /// append duplicate drainer registrations onto `drain_waiters`.
+    /// append duplicate drainer registrations onto `drain_waiters`, and the test releases its
+    /// holder before asserting so any failure cannot hang the thread scope.
     #[test]
     fn p2_spurious_unparks_do_not_duplicate_drainer_registration() {
         let (readers, _, _) = readers(1);
@@ -1456,7 +1485,7 @@ mod tests {
         let (rel_tx, rel_rx) = mpsc::channel();
         let (drainer_tid_tx, drainer_tid_rx) = mpsc::channel();
 
-        std::thread::scope(|s| {
+        let registered = std::thread::scope(|s| {
             let r_hold = readers.clone();
             let holder = s.spawn(move || {
                 r_hold
@@ -1487,18 +1516,138 @@ mod tests {
                 drainer_thread.unpark();
                 std::thread::yield_now();
             }
-            let registered = super::Slots::lock_slot_queue(&slots.slots[0])
+            let count = super::Slots::lock_slot_queue(&slots.slots[0])
                 .drain_waiters
                 .len();
-            assert_eq!(
-                registered, 1,
-                "spurious unparks must not duplicate drainer registrations; got {registered}"
-            );
 
             rel_tx.send(()).unwrap();
             holder.join().unwrap();
             drainer.join().unwrap();
+            count
         });
+        assert_eq!(
+            registered, 1,
+            "spurious unparks must not duplicate drainer registrations; got {registered}"
+        );
+    }
+
+    /// Spec P1-2 regression: an already-expired deadline must return `Timeout` immediately even on
+    /// a warmed, idle store without running the callback.
+    #[test]
+    fn p1_expired_deadline_never_claims_idle_slot() {
+        let (readers, _, _) = readers(2);
+        // Warm an idle slot first.
+        assert_eq!(readers.with(far(), |_| Ok(1)).unwrap().unwrap(), 1);
+        let ran = AtomicBool::new(false);
+        let past = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+        let res = readers.with(past, |_| {
+            ran.store(true, Ordering::SeqCst);
+            Ok(17)
+        });
+        assert!(
+            matches!(
+                res,
+                Some(Err(ref err)) if err.downcast_ref::<Refused>() == Some(&Refused::Timeout)
+            ),
+            "already-expired deadline on idle store must return Timeout: {res:?}"
+        );
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "expired deadline must not execute callback"
+        );
+    }
+
+    /// Spec P1-3 regression: with waiters on slots A and B, if B releases and its woken local
+    /// waiter resumes expired, B must still be handed to A's waiter while A remains held.
+    #[test]
+    fn p1_expired_local_waiter_hands_free_slot_to_waiter_on_other_slot() {
+        let (readers, _, _) = readers(2);
+        let slots = readers.slots.as_ref().unwrap();
+        let (h0_held_tx, h0_held_rx) = mpsc::channel();
+        let (h1_held_tx, h1_held_rx) = mpsc::channel();
+        let (h0_rel_tx, h0_rel_rx) = mpsc::channel();
+        let (h1_rel_tx, h1_rel_rx) = mpsc::channel();
+        let wb_done = AtomicBool::new(false);
+
+        let (wa_res, wb_res) = std::thread::scope(|s| {
+            let r0 = readers.clone();
+            let holder0 = s.spawn(move || {
+                r0.with(far(), |_| {
+                    h0_held_tx.send(()).unwrap();
+                    h0_rel_rx.recv().unwrap();
+                    Ok(())
+                })
+                .unwrap()
+                .unwrap();
+            });
+            h0_held_rx.recv().unwrap();
+            let h0_slot =
+                usize::from(slots.slots[1].state.load(Ordering::Acquire) == super::SLOT_HELD);
+
+            let r1 = readers.clone();
+            let holder1 = s.spawn(move || {
+                r1.with(far(), |_| {
+                    h1_held_tx.send(()).unwrap();
+                    h1_rel_rx.recv().unwrap();
+                    Ok(())
+                })
+                .unwrap()
+                .unwrap();
+            });
+            h1_held_rx.recv().unwrap();
+
+            // Place one long-lived waiter on `a_slot` and one short-deadline waiter on `b_slot`.
+            let r_a = readers.clone();
+            let waiter_a =
+                s.spawn(move || r_a.with(Instant::now() + Duration::from_secs(2), |_| Ok(42)));
+            while slots.waiting.0.load(Ordering::Acquire) < 1 {
+                std::thread::yield_now();
+            }
+            let a_slot = usize::from(
+                (slots.slots[1].wait_flags.load(Ordering::Acquire) >> super::WAIT_SHIFT) > 0,
+            );
+            let b_slot = 1 - a_slot;
+
+            let r_b = readers.clone();
+            let wb_done_ref = &wb_done;
+            let waiter_b = s.spawn(move || {
+                // `NEXT_HOME` advances by 1 per new thread, so this thread homes on `b_slot`.
+                let res = r_b.with(Instant::now() + Duration::from_millis(25), |_| Ok(99));
+                wb_done_ref.store(true, Ordering::Release);
+                res
+            });
+            while !wb_done.load(Ordering::Acquire)
+                && (slots.slots[b_slot].wait_flags.load(Ordering::Acquire) >> super::WAIT_SHIFT) < 1
+            {
+                std::thread::yield_now();
+            }
+            // Release ONLY the holder of `b_slot` right as `waiter_b` expires, keeping the holder
+            // of `a_slot` pinned until `waiter_a` completes so `waiter_a` MUST receive `b_slot`
+            // via cross-slot expiry handoff.
+            std::thread::park_timeout(Duration::from_millis(25));
+            let (b_tx, b_holder, a_tx, a_holder) = if h0_slot == b_slot {
+                (h0_rel_tx, holder0, h1_rel_tx, holder1)
+            } else {
+                (h1_rel_tx, holder1, h0_rel_tx, holder0)
+            };
+            b_tx.send(()).unwrap();
+            b_holder.join().unwrap();
+
+            let wa = waiter_a.join().unwrap();
+            let wb = waiter_b.join().unwrap();
+            a_tx.send(()).unwrap();
+            a_holder.join().unwrap();
+            (wa, wb)
+        });
+
+        assert_eq!(
+            wa_res.unwrap().unwrap(),
+            42,
+            "waiter on slot A must wake via cross-slot handoff while holder A stays pinned"
+        );
+        let _ = wb_res;
     }
 
     /// Review smaller finding: explicit `Config.readers` must not be silently capped at the core

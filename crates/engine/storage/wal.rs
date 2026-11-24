@@ -4211,6 +4211,9 @@ pub struct WalFile {
     last_checksum: AtomicU64,
     checkpoint_seq: AtomicU32,
     transaction_count: AtomicU64,
+    /// Last `SharedLog::restore_epoch` observed by this connection; mismatch forces full private
+    /// page-cache invalidation (`ReadChange::Everything`) on the next read transaction.
+    last_restore_epoch: AtomicU64,
 
     /// Manages locks needed for checkpointing
     checkpoint_guard: RwLock<Option<CheckpointLocks>>,
@@ -4602,6 +4605,10 @@ pub struct SharedLog {
     /// Each segment's checkpoint epoch, kept here so `checkpoint_epoch` takes no lock.
     epochs: [Arc<AtomicU32>; 2],
     pub(crate) segments: SegmentsCell,
+    /// Monotonic counter bumped whenever an external restore replaces the database/WAL files on
+    /// disk, so every warmed connection clears its private page cache and re-adopts the restored
+    /// schema even when numeric WAL fields or schema_cookie happen to match the pre-restore state.
+    restore_epoch: AtomicU64,
     /// Whether `segments` says the second segment is current, published so that every access to
     /// the current segment's state reads it without unpacking that word. Written only with
     /// `segments`.
@@ -4699,12 +4706,36 @@ impl SharedLog {
             epochs,
             second_current: AtomicBool::new(segments.current() == SegmentId::Second),
             segments: SegmentsCell::new(segments),
+            restore_epoch: AtomicU64::new(0),
             second_path,
             vacuum_lock: ShardedRwLock::new(),
             write_lock: PaddedLock::new(TursoRwLock::new()),
             checkpoint_lock: PaddedLock::new(TursoRwLock::new()),
             released: Arc::default(),
         })
+    }
+
+    pub(crate) fn restore_epoch(&self) -> u64 {
+        self.restore_epoch.load(Ordering::Acquire)
+    }
+
+    /// Replaces both WAL segments and the recovered dual-segment state in place after a quiescent
+    /// external restore, preserving `SnapshotCell`, `ReadIndex`, `ShardedRwLock`, and `epoch` `Arc`
+    /// identities on both segments while bumping `restore_epoch` so warmed connections drop stale
+    /// private page caches and schemas.
+    #[cfg(feature = "conn_raw_api")]
+    pub fn replace_after_external_restore(
+        &self,
+        first: WalFileShared,
+        second: WalFileShared,
+        segments: Segments,
+    ) {
+        self.first.write().replace_after_external_restore(first);
+        self.second.write().replace_after_external_restore(second);
+        self.segments.reset_after_restore(segments);
+        self.second_current
+            .store(segments.current() == SegmentId::Second, Ordering::Release);
+        self.restore_epoch.fetch_add(1, Ordering::SeqCst);
     }
 
     pub(crate) fn snapshot(&self, id: SegmentId) -> &SnapshotCell {
@@ -6213,7 +6244,12 @@ impl WalFile {
 
         // What changed since this connection's last read transaction, for its page cache to
         // forget (Amphora: the pages written since, where the log can say; decision 18).
-        let change = self.read_change(shared_snapshot, self.connection_state().snapshot, most);
+        let shared_restore_epoch = log.restore_epoch();
+        let change = if shared_restore_epoch != self.last_restore_epoch.load(Ordering::Acquire) {
+            ReadChange::Everything
+        } else {
+            self.read_change(shared_snapshot, self.connection_state().snapshot, most)
+        };
 
         tracing::debug!("try_begin_read_tx: change={:?}", change);
 
@@ -6239,6 +6275,8 @@ impl WalFile {
         self.read_span.store(span.pack_u32(), Ordering::Release);
         let held_shard = vacuum_rollback.disarm();
         self.vacuum_read_shard.store(held_shard, Ordering::Release);
+        self.last_restore_epoch
+            .store(shared_restore_epoch, Ordering::Release);
         self.install_connection_state(WalConnectionState::new(shared_snapshot, read_guard));
         tracing::debug!(
             "begin_read_tx(min={}, max={}, slot={}, max_frame_in_wal={})",
@@ -7996,6 +8034,7 @@ impl WalFile {
         buffer_pool: Arc<BufferPool>,
     ) -> Self {
         let now = io.current_time_monotonic();
+        let restore_epoch = coordination.shared_log().restore_epoch();
         Self {
             io,
             coordination,
@@ -8023,6 +8062,7 @@ impl WalFile {
             vacuum_lock_guard: RwLock::new(None),
             min_frame: AtomicU64::new(0),
             transaction_count: AtomicU64::new(0),
+            last_restore_epoch: AtomicU64::new(restore_epoch),
             max_frame_read_lock_index: AtomicUsize::new(NO_LOCK_HELD),
             read_span: AtomicU32::new(ReadSpan::PACKED_NONE),
             closing_max_frame: AtomicU64::new(0),
