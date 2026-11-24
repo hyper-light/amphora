@@ -4,17 +4,14 @@
 //! Every page read took the read side of the `RwLock` over the log's shared state, then the frame
 //! index's lock (`find_frame`) or the header's (`wal_header`): at 32 point readers those were the
 //! three hottest leaves (`find_frame` 26.9%, `wal_header` 23.4%, `lock_shared_slow` 13.2%). This is
-//! the prototype the step asks for, behind a switch ([`LogReadIndex`]), its two ways compared:
+//! the way decision 40 kept, measured against the lock and two others (bench/records/
+//! 2026-11-24-adacachy2-perf-reads-q5.md):
 //!
-//! - `Published`: a read-only copy of the index, published whole and read through an `ArcSwap`;
-//!   a reader whose snapshot reaches past the copy publishes a new one (paying the copy, once per
-//!   published generation) or, when another reader is already doing so, reads under the lock.
-//! - `Optimistic`: the latest frame of each page in a table sharded by the page's hash, read under
-//!   each shard's version (LeanStore's validate-after-read: a read whose version moved, or that
-//!   finds a frame newer than its snapshot, is answered under the lock instead, never retried).
-//!
-//! Both answer a page with no frame in the log from an exact bitmap of the pages the log holds,
-//! which `Filtered` also does in front of the index read under its lock.
+//! - A page with no frame in the log is answered from an exact bitmap of the pages the log holds.
+//! - A page the log holds is answered from the latest frame of each page in a table sharded by the
+//!   page's hash, read under each shard's version (LeanStore's validate-after-read: a read whose
+//!   version moved, or that finds a frame newer than its snapshot, is answered under the lock
+//!   instead, never retried).
 //!
 //! What the structures hold is stamped with the index's generation. Appends (the only change made
 //! often) update them in place, under the frame index's lock that every change already takes; any
@@ -26,69 +23,13 @@
 
 use crate::storage::sqlite3_ondisk::WalHeader;
 use crate::storage::wal::HeaderCell;
-use crate::sync::atomic::{fence, AtomicU32, AtomicU64, AtomicU8, Ordering};
-use crate::sync::Mutex;
+use crate::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
-use std::sync::OnceLock;
 
-/// How a page read finds its frame in the log (the prototype's switch; `AMPHORA_LOG_READ_INDEX`
-/// sets it for a process: `locked`, `filtered`, `published` or `optimistic`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum LogReadIndex {
-    /// Today's path: the frame index read under the shared state's `RwLock` and its own lock.
-    Locked = 0,
-    /// The page-presence bitmap first; a page it may hold is looked up as `Locked` does.
-    Filtered = 1,
-    /// The bitmap, then a read-only index published per generation (way (a)).
-    Published = 2,
-    /// The bitmap, then a sharded table of latest frames read under version checks (way (b)).
-    Optimistic = 3,
-}
-
-impl LogReadIndex {
-    fn from_u8(value: u8) -> Self {
-        match value {
-            1 => Self::Filtered,
-            2 => Self::Published,
-            3 => Self::Optimistic,
-            _ => Self::Locked,
-        }
-    }
-
-    /// The way logs opened from now on take: `set_process_default`'s if called, else
-    /// `AMPHORA_LOG_READ_INDEX` (read once), else `Locked`.
-    pub fn process_default() -> Self {
-        static FROM_ENV: OnceLock<LogReadIndex> = OnceLock::new();
-        match PROCESS_DEFAULT.load(Ordering::Relaxed) {
-            UNSET => {
-                *FROM_ENV.get_or_init(
-                    || match std::env::var("AMPHORA_LOG_READ_INDEX").as_deref() {
-                        Ok("filtered") => Self::Filtered,
-                        Ok("published") => Self::Published,
-                        Ok("optimistic") => Self::Optimistic,
-                        _ => Self::Locked,
-                    },
-                )
-            }
-            set => Self::from_u8(set),
-        }
-    }
-
-    /// Sets the way logs opened from now on in this process take (a bench's or a test's switch).
-    pub fn set_process_default(mode: Self) {
-        PROCESS_DEFAULT.store(mode as u8, Ordering::Relaxed);
-    }
-}
-
-/// `set_process_default`'s choice; `UNSET` until it is called.
-static PROCESS_DEFAULT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(UNSET);
-const UNSET: u8 = u8::MAX;
-
-/// Called with the frame index and its high-water frame, under the index's lock.
-pub(crate) type FromIndex<'a> = dyn FnMut(&FxHashMap<u64, Vec<u64>>, u64) + 'a;
+/// Called with the frame index, under the index's lock.
+pub(crate) type FromIndex<'a> = dyn FnMut(&FxHashMap<u64, Vec<u64>>) + 'a;
 /// Takes the index's lock and calls what it is given with it.
 pub(crate) type IndexUnderLock<'a> = dyn Fn(&mut FromIndex<'_>) + 'a;
 
@@ -233,15 +174,7 @@ impl PageBits {
     }
 }
 
-/// Way (a): the whole index as it was when published, frames up to `upto`.
-#[derive(Debug, Default)]
-struct Published {
-    generation: u64,
-    upto: u64,
-    pages: FxHashMap<u64, Box<[u64]>>,
-}
-
-/// Way (b): each page's latest frame, in shards that each carry a version. A shard's slots are
+/// Each page's latest frame, in shards that each carry a version. A shard's slots are
 /// open-addressed with linear probing, kept at most half full (Knuth, TAOCP vol. 3 §6.4: at load
 /// 1/2 a search that misses probes 2.5 slots expected, one that hits 1.5).
 #[derive(Debug)]
@@ -392,38 +325,27 @@ impl Latest {
 /// it without the shared state's lock.
 #[derive(Debug)]
 pub(crate) struct ReadIndex {
-    mode: AtomicU8,
     /// Moved on by every change to the index other than an append.
     generation: AtomicU64,
     bits: ArcSwap<PageBits>,
-    published: ArcSwap<Published>,
     latest: ArcSwap<Latest>,
-    /// Held by the reader publishing a new copy (way (a)); others read under the lock meanwhile.
-    publishing: Mutex<()>,
     /// The log's header as the shared state holds it, set wherever that `Arc` is replaced.
     header: ArcSwapOption<HeaderCell>,
 }
 
 impl Default for ReadIndex {
     fn default() -> Self {
-        Self::new(LogReadIndex::process_default())
+        // Generation 1: nothing is built for it until a reader builds it from the index.
+        Self {
+            generation: AtomicU64::new(1),
+            bits: ArcSwap::from_pointee(PageBits::with_words(0, 0)),
+            latest: ArcSwap::from_pointee(Latest::sized(0, 0)),
+            header: ArcSwapOption::empty(),
+        }
     }
 }
 
 impl ReadIndex {
-    pub(crate) fn new(mode: LogReadIndex) -> Self {
-        // Generation 1: nothing is built for it until a reader builds it from the index.
-        Self {
-            mode: AtomicU8::new(mode as u8),
-            generation: AtomicU64::new(1),
-            bits: ArcSwap::from_pointee(PageBits::with_words(0, 0)),
-            published: ArcSwap::from_pointee(Published::default()),
-            latest: ArcSwap::from_pointee(Latest::sized(0, 0)),
-            publishing: Mutex::new(()),
-            header: ArcSwapOption::empty(),
-        }
-    }
-
     /// Called wherever the shared state's header `Arc` is set or replaced.
     pub(crate) fn set_header(&self, header: Arc<HeaderCell>) {
         self.header.store(Some(header));
@@ -431,21 +353,7 @@ impl ReadIndex {
 
     /// The header without the shared state's lock or the header's, or None (then read it there).
     pub(crate) fn header(&self) -> Option<WalHeader> {
-        if self.mode() == LogReadIndex::Locked {
-            return None;
-        }
         self.header.load().as_ref()?.copy().load()
-    }
-
-    pub(crate) fn mode(&self) -> LogReadIndex {
-        LogReadIndex::from_u8(self.mode.load(Ordering::Relaxed))
-    }
-
-    /// Switches the way; what was built is built again by the next reader.
-    #[cfg(test)]
-    pub(crate) fn set_mode(&self, mode: LogReadIndex) {
-        self.mode.store(mode as u8, Ordering::Relaxed);
-        self.invalidate();
     }
 
     /// Any change to the index but an append: what was built is stale.
@@ -460,17 +368,12 @@ impl ReadIndex {
         pages: &mut dyn Iterator<Item = u64>,
         frame: u64,
     ) {
-        let mode = self.mode();
-        if mode == LogReadIndex::Locked {
-            return;
-        }
         let generation = self.generation.load(Ordering::Acquire);
         let bits = self.bits.load();
         if bits.generation != generation {
             return;
         }
-        let latest = (mode == LogReadIndex::Optimistic).then(|| self.latest.load());
-        let latest = latest.filter(|latest| latest.generation == generation);
+        let latest = Some(self.latest.load()).filter(|latest| latest.generation == generation);
         let (mut grow_bits, mut grow_latest) = (false, false);
         for page in pages {
             grow_bits |= !bits.set(page);
@@ -483,8 +386,8 @@ impl ReadIndex {
         }
     }
 
-    /// Builds the bitmap and the mode's index from `index`, under its lock, for `generation`; at
-    /// twice their size where an append outgrew them (`grow_bits`, `grow_latest`).
+    /// Builds the bitmap and the table of latest frames from `index`, under its lock, for
+    /// `generation`; at twice their size where an append outgrew them (`grow_bits`, `grow_latest`).
     fn build(
         &self,
         index: &FxHashMap<u64, Vec<u64>>,
@@ -504,29 +407,27 @@ impl ReadIndex {
         for &page in index.keys() {
             bits.set(page);
         }
-        if self.mode() == LogReadIndex::Optimistic {
-            let previous = self.latest.load();
-            let slots: usize = previous.shards.iter().map(|shard| shard.keys.len()).sum();
-            let mut pages = index
-                .len()
-                .max(if grow_latest && previous.generation == generation {
-                    slots
-                } else {
-                    0
-                });
-            // A shard the hash fills past half takes the table to twice its size: at most one
-            // doubling a shard (every page in one shard), so the loop ends.
-            for _ in 0..=previous.shards.len().max(1).ilog2().saturating_add(1) {
-                let latest = Latest::sized(generation, pages);
-                let whole = index.iter().all(|(&page, frames)| {
-                    frames.last().is_none_or(|&frame| latest.put(page, frame))
-                });
-                if whole {
-                    self.latest.store(Arc::new(latest));
-                    break;
-                }
-                pages = pages.saturating_mul(2).max(1);
+        let previous = self.latest.load();
+        let slots: usize = previous.shards.iter().map(|shard| shard.keys.len()).sum();
+        let mut pages = index
+            .len()
+            .max(if grow_latest && previous.generation == generation {
+                slots
+            } else {
+                0
+            });
+        // A shard the hash fills past half takes the table to twice its size: at most one
+        // doubling a shard (every page in one shard), so the loop ends.
+        for _ in 0..=previous.shards.len().max(1).ilog2().saturating_add(1) {
+            let latest = Latest::sized(generation, pages);
+            let whole = index
+                .iter()
+                .all(|(&page, frames)| frames.last().is_none_or(|&frame| latest.put(page, frame)));
+            if whole {
+                self.latest.store(Arc::new(latest));
+                break;
             }
+            pages = pages.saturating_mul(2).max(1);
         }
         // The bitmap last: a reader that finds it current finds the table current too.
         self.bits.store(Arc::new(bits));
@@ -541,13 +442,9 @@ impl ReadIndex {
         max_frame: u64,
         index: &IndexUnderLock<'_>,
     ) -> Lookup {
-        let mode = self.mode();
-        if mode == LogReadIndex::Locked {
-            return Lookup::Ask;
-        }
         let generation = self.generation.load(Ordering::Acquire);
         if self.bits.load().generation != generation {
-            index(&mut |held, _high_water| {
+            index(&mut |held| {
                 let generation = self.generation.load(Ordering::Acquire);
                 if self.bits.load().generation != generation {
                     self.build(held, generation, false, false);
@@ -563,69 +460,16 @@ impl ReadIndex {
             None => return Lookup::Ask,
             Some(true) => {}
         }
-        match mode {
-            LogReadIndex::Locked | LogReadIndex::Filtered => Lookup::Ask,
-            LogReadIndex::Published => {
-                self.find_published(page, min_frame, max_frame, generation, index)
-            }
-            LogReadIndex::Optimistic => {
-                let latest = self.latest.load();
-                if latest.generation != generation {
-                    return Lookup::Ask;
-                }
-                match latest.get(page) {
-                    None => Lookup::Ask,
-                    Some(None) => Lookup::Absent,
-                    Some(Some(frame)) if frame > max_frame => Lookup::Ask,
-                    Some(Some(frame)) if frame < min_frame => Lookup::Absent,
-                    Some(Some(frame)) => Lookup::Frame(frame),
-                }
-            }
+        let latest = self.latest.load();
+        if latest.generation != generation {
+            return Lookup::Ask;
         }
-    }
-
-    fn find_published(
-        &self,
-        page: u64,
-        min_frame: u64,
-        max_frame: u64,
-        generation: u64,
-        index: &IndexUnderLock<'_>,
-    ) -> Lookup {
-        let mut published = self.published.load();
-        if published.generation != generation || published.upto < max_frame {
-            // One reader publishes; the rest read under the lock until it has.
-            let Some(_publishing) = self.publishing.try_lock() else {
-                return Lookup::Ask;
-            };
-            index(&mut |held, high_water| {
-                let generation = self.generation.load(Ordering::Acquire);
-                let current = self.published.load();
-                if current.generation == generation && current.upto >= high_water {
-                    return;
-                }
-                let pages = held
-                    .iter()
-                    .map(|(&page, frames)| (page, frames.as_slice().into()))
-                    .collect();
-                self.published.store(Arc::new(Published {
-                    generation,
-                    upto: high_water,
-                    pages,
-                }));
-            });
-            published = self.published.load();
-            if published.generation != generation || published.upto < max_frame {
-                return Lookup::Ask;
-            }
-        }
-        let Some(frames) = published.pages.get(&page) else {
-            return Lookup::Absent;
-        };
-        let end = frames.partition_point(|&frame| frame <= max_frame);
-        match end.checked_sub(1).and_then(|last| frames.get(last)) {
-            Some(&frame) if frame >= min_frame => Lookup::Frame(frame),
-            _ => Lookup::Absent,
+        match latest.get(page) {
+            None => Lookup::Ask,
+            Some(None) => Lookup::Absent,
+            Some(Some(frame)) if frame > max_frame => Lookup::Ask,
+            Some(Some(frame)) if frame < min_frame => Lookup::Absent,
+            Some(Some(frame)) => Lookup::Frame(frame),
         }
     }
 }
