@@ -287,3 +287,27 @@ fails on both builds alike, so none is the seek's:
 |---|---:|---|---|
 | AH. Not Amphora's (above): a LEFT, RIGHT or FULL JOIN's LIKE ON term on an INTEGER PRIMARY KEY, a NOCASE-indexed or a UNIQUE NOCASE column, where the reference SQLite answers no rows; the system's SQLite 3.54.0, built without the option, answers as Amphora | 3 | — (SQLite's) | — |
 | CE. An IN subquery's NULL check (a miss told from a NULL in the list) compared by the builder's current collation, what the expression translated last left there: a WHERE whose CASE ends on `c0 != ('a ' COLLATE RTRIM)`, or a vector's first column, so `'' IN (SELECT c0 FROM t2)` with t2 holding ' ' answered NULL for 0. SQLite compares each column as `x = y` does (`sqlite3ExprCodeIN`, step 6), the collation the list's index has | 1 (eet-5d073f0af8f98282) | `translate/expr/translator.rs` (the check reads the list index's collations) | `an_in_lists_null_check_compares_each_column_as_equality_does` |
+
+## Main's wide run: seeds 911, 912, 1001, 1011, 1012 and 1015, 2026-11-24 (lane C8)
+
+adacachy2, against the oracles' SQLite 3.54.0 (`sqlite.sh`), release builds of this module on the engine
+alone (`bench/src/oracle`, no competitor linked): main 67cc7e69 for the seeds from 1001, and lane
+S7's bench binary (0101aa38 by its record, twelve files of `translate` and `vdbe` before it) for 911 and 912. Seed 1001 runs every oracle; 911, 912, 1011 and 1012 every
+one but CERT and the order check; 1015 those less the differential check. 268,876 databases, 10,848,439
+checks in the runs that ended (CPU, user and system: 5,138 s timed for seeds 1001, 1011, 1012 and 1015 on main; the other runs were not timed, and by their wall time at the 0.84 of a core the process list showed (9 min 10 s in 11 min for three of them at 08:22Z) they make it about 2.5 hours in all (inferred)); the ones cut short for room (901 to 904, 1002, 1013, 1014) left
+findings but no summary. Every wrong answer, error and panic was replayed on main's build as a user
+meets it, under four settings (`--replay`: as the database opens, the parallel mode on, with statistics,
+both), and against the system's SQLite 3.54.0 as well. The summaries, every finding's cause and its
+query (`findings.tsv`) and the files of those that are Amphora's are in
+`bench/records/2026-11-24-adacachy2-oracle-c8/`.
+
+| cause | findings | fix | test |
+|---|---:|---|---|
+| CF. A NOT EXISTS or NOT IN whose condition is an OR with terms on the outer table in its branches lost the outer rows no branch names (at defaults, with no statistics: `NOT EXISTS (SELECT 1 FROM r WHERE r.k = o.k AND ((o.st = 'open' AND r.kind = 1) OR (o.st = 'closed' AND r.kind = 2)))` answered no row for SQLite's 2). The subquery becomes an anti join whose condition stays a WHERE term; the OR pass took terms out of it (an IN list its branches imply, the table's share of it, a term all branches hold) as WHERE terms on the outer table, filters on the rows the anti join must keep | 6 | `translate/optimizer/lift_common_subexpressions.rs` (`rewrite_or_terms`: a term taken from an OR that reads an anti-joined table must read it too) | `a_not_exists_keeps_the_rows_no_branch_of_its_or_names` |
+| CG, open. A LEFT JOIN drops left rows: a multi-index AND on the left table takes the join's ON term (`ON a0.c2 <= 100`, or `ON a0.c0 < 1e15`) as a filter of that table, its branch seeking by the ON term's bound (bytecode of diff-3fcb32b9317ecd43: `SeekGT` and `IdxGE` on that index), so the rows it should null-extend are gone. `multi_index_can_consume_term` (`optimizer/multi_index.rs`) lets any term through for a table no outer join null-extends | 3 | — | — |
+| CH, open. Panic ("indexbtree_seek_unpacked: index_info required", `storage/btree.rs`): a RIGHT or FULL JOIN's unmatched-row pass runs a copy of a subquery that holds an IN subquery the main pass unnested, and the copy opens that list's ephemeral index on cursor 0, the outer table's own cursor (bytecode: `OpenEphemeral 0`) | 4 | — | — |
+| CI, open. json_pretty's indent from a REAL is written `100`, not `100.0`, SQLite's text of it | 1 | — | — |
+| CJ, open. `json_object(7, a0.c3, 255)`'s odd argument count raised where SQLite answers: in a correlated min() over an empty table, the side of a BETWEEN that reads no inner column is computed ahead of the rows (inferred, not traced) | 1 | — | — |
+| CK, by design. A REAL's text where SQLite 3.54.0 writes 17 digits and floatingpoint.html 1.3.1 says 15 (`7.3890560989306504` for 7.38905609893065): Amphora follows the page (`numeric/fp.rs`, lane G10). Seen through text, hex(), CAST AS BLOB, JSONB, length(), instr(), replace() and concat_ws() | 245 | — | — |
+| CL, open, estimates and no answer. CERT: an outer join estimated below its inner join when both an ON and a WHERE term filter one table (0.4 x 0.9 in the outer form, 0.4 x the square root of 0.9 in the inner; inferred from those numbers, not traced: decision 21's backoff combines a table's filters in one form and not in the other). The order check: `ON (x OR y)` and the same as a WHERE term differ (0.5 for 0.35). None failed on 2026-11-06 (8567e7b, 540,848 checks of each) | 372 | — | — |
+| AH. Not Amphora's (above): the reference SQLite's LIKE optimization in an outer join; the system's SQLite answers as Amphora | 13 | — (SQLite's) | — |

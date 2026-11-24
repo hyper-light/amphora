@@ -1286,7 +1286,7 @@ tests = [
   # lane replicated-K6
   { id = "T-QB.1.17", text = "A leader whose change waits at its barrier takes a record at one reading of its clock, then the clock moves a second, three times: passes when it then admits a burst of three records, past the least its command queue carries, as a member whose clock stands still does" },
   # lane perf-A26
-  { id = "T-QB.1.18", text = "Sixty-four writers at once at a leader whose queue counts eight inputs; calls past the count and past the calls' bytes on a leaderless member, beside wire records; a call in line past its deadline; calls in line as their owner ends, and as the term moves; a call larger than the calls' room: passes when every write of the burst is answered, calls wait in the order they came and wire records enter, a call past its deadline is refused Full and the next goes on, the owner's end refuses those in line with its reason, the large call is admitted alone, and nothing is held after" },
+  { id = "T-QB.1.18", text = "Sixty-four writers at once at a leader whose queue counts eight inputs; calls past the count and past the calls' bytes on a leaderless member, beside wire records; a call in line past its deadline; calls in line as their owner ends, and as the term moves; a call larger than the calls' room: passes when every write of the burst is answered, calls wait in the order they came and wire records enter, a call past its deadline is refused Full and the next goes on, the owner's end refuses those in line with its reason, the large call is admitted alone, a heartbeat enters beside the largest a queue takes and one past it is refused TooLarge, and nothing is held after" },
 ]
 
 # lane many-writers
