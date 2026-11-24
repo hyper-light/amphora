@@ -1678,6 +1678,77 @@ mod envelope_tests {
         );
     }
 
+    /// T-T1.9.R30: an entry's encoding only grows (reshard.md, "Publication and recovery"). Do: encode
+    /// a write with and without a declared baseline, and each again holding locks. Expect: the
+    /// first two byte for byte what they were, `BASELINE_DELTA` before a declaration and a plain
+    /// page list without one; a lock's as that after its own prefix and the transaction, taken back
+    /// off by the decoder; and an unlocked entry never read as a lock's.
+    #[test]
+    fn t_t1_9_r30_a_lock_only_puts_a_prefix_before_an_entry() {
+        #[derive(Serialize)]
+        struct Plain {
+            base_index: u64,
+            base_term: u64,
+            pages: Vec<(u32, Vec<u8>)>,
+        }
+        let txn = crate::xgroup::TxnId {
+            coordinator: 7,
+            epoch: 300,
+            seq: 2,
+        };
+        let pages = vec![(3u32, vec![9; PAGE_BYTES])];
+        let plain = postcard::to_allocvec(&Plain {
+            base_index: 7,
+            base_term: 3,
+            pages: pages.clone(),
+        })
+        .unwrap();
+        for baseline in [None, Some(widest_declaration())] {
+            let before: Vec<u8> = match &baseline {
+                None => plain.clone(),
+                Some(declared) => {
+                    let declared = postcard::to_allocvec(declared).unwrap();
+                    [BASELINE_DELTA, declared.as_slice(), plain.as_slice()].concat()
+                }
+            };
+            let mut prepared = Prepared {
+                base_index: 7,
+                base_term: 3,
+                pages: pages.clone(),
+                baseline,
+                lock: None,
+                reads: None,
+            };
+            assert_eq!(prepared.encode().unwrap(), before);
+            assert_eq!(Prepared::decode(&before).unwrap().lock, None);
+            assert_eq!(open_lock_delta(&before).unwrap(), (None, before.as_slice()));
+            prepared.lock = Some(txn);
+            let bytes = prepared.encode().unwrap();
+            assert_eq!(
+                bytes,
+                [
+                    LOCK_DELTA,
+                    [7u8, 0xac, 0x02, 2].as_slice(),
+                    before.as_slice()
+                ]
+                .concat()
+            );
+            let read = Prepared::decode(&bytes).unwrap();
+            assert_eq!((read.lock, read.pages), (Some(txn), pages.clone()));
+            assert_eq!(
+                verdict(&bytes, Point { index: 7, term: 3 }).unwrap(),
+                Ok(())
+            );
+            assert!(matches!(
+                verdict(&bytes, Point { index: 8, term: 3 }).unwrap(),
+                Err(Refusal::Serialization { .. })
+            ));
+            // A member from before this prefix finds no valid page list in the entry.
+            let old = postcard::from_bytes::<Prepared>(&bytes);
+            assert!(!old.is_ok_and(|old| validate_pages(&old.pages, COMMAND_BYTES).is_ok()));
+        }
+    }
+
     /// T-EN.1.2: the widest image of a lowered budget, and of the full one's arithmetic — passes when
     /// it encodes within its bound, short only by the list length's unused varint bytes.
     #[test]

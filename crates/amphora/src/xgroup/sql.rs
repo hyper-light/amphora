@@ -1185,7 +1185,13 @@ impl Cluster {
     pub fn transact(&self, txn: Txn, until: Instant) -> Result<Answer, Refusal> {
         conditioned(&txn)?;
         let began = Instant::now();
-        let _touched = self.touched(&txn);
+        // Every participant speaks the version that finishes it, or nothing is locked anywhere.
+        for group in self.touched(&txn) {
+            let member = usize::try_from(group).ok().and_then(|i| self.groups.get(i));
+            if let Some(Member::Node { nodes, node }) = member {
+                nodes.finishes(*node, until)?;
+            }
+        }
         let (answer, answered) = mpsc::sync_channel(1);
         self.inputs
             .send(Input::Begin { txn, until, answer })
