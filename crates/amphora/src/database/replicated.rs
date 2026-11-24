@@ -644,6 +644,9 @@ impl Local {
                 }
             }
             let left = until.saturating_duration_since(Instant::now());
+            if std::env::var_os("P21DIAG").is_some() {
+                eprintln!("P21DIAG read-waits id={} held={} out={} bound={} idle={}", self.id, held, ledger.out.get(&self.id).copied().unwrap_or(0), self.descriptors.bound(), ledger.idle.len());
+            }
             if left.is_zero() {
                 self.meter.local_refused(LocalRefusal::Timeout);
                 return Err(Refusal::Timeout);
@@ -718,12 +721,14 @@ impl Local {
     /// The owner is to start the database's log again: no read of this replica begins until it
     /// has.
     fn hold_reads(&self) -> Result<(), Refusal> {
+        if std::env::var_os("P21DIAG").is_some() { eprintln!("P21DIAG hold_reads id={}", self.id); }
         locked(&self.account.ledger)?.restarting.insert(self.id);
         Ok(())
     }
     /// Reads begin again with no restart run: none runs while a session holds the write lock
     /// (`Actor::hand_off`), so none is held for one meanwhile.
     fn unhold_reads(&self) -> Result<(), Refusal> {
+        if std::env::var_os("P21DIAG").is_some() { eprintln!("P21DIAG unhold_reads id={}", self.id); }
         if locked(&self.account.ledger)?.restarting.remove(&self.id) {
             self.account.free();
         }
@@ -736,10 +741,12 @@ impl Local {
         restart: impl FnOnce() -> anyhow::Result<bool>,
     ) -> Result<Option<bool>, Refusal> {
         if locked(&self.account.ledger)?.out.contains_key(&self.id) {
+            if std::env::var_os("P21DIAG").is_some() { eprintln!("P21DIAG restart_unread id={} skipped: a read is out", self.id); }
             return Ok(None);
         }
         // No read of this replica begins while it is restarting, so none is out meanwhile.
         let restarted = restart().map_err(|error| refused(&error))?;
+        if std::env::var_os("P21DIAG").is_some() { eprintln!("P21DIAG restart_unread id={} restarted={}", self.id, restarted); }
         if restarted {
             locked(&self.account.ledger)?.restarting.remove(&self.id);
             self.account.free();
@@ -3487,6 +3494,9 @@ impl<F: BlockFile + 'static> Actor<F> {
                     .log_limit_bytes(pass.room.saturating_mul(log_bound::FRAME_BYTES));
                 let past = frames > pass.room;
                 let due = past || (frames > 0 && self.spacing.due()?);
+                if std::env::var_os("P21DIAG").is_some() && due {
+                    eprintln!("P21DIAG flush local={} frames={} room={} past={} due={} caught_up={} busy={} out={} lent={}", self.control.local.id, frames, pass.room, past, due, pass.caught_up, pass.busy, *out, lent);
+                }
                 if hold_due(pass, due, past) && !lent {
                     self.control.local.hold_reads()?;
                 }
