@@ -96,6 +96,8 @@ check-production 0 ("engine-ratchet: 10606 left .. as the ratchet holds", 10,616
 On 8565db4f, before lanes C13's, B26's and A28's landings (`simulator` feature, r1725): `lib translate::` 299 passed, 22 ignored; `unnesting` 2, `join_methods` 4 (1 ignored), `adaptive_joins` 23, `row_value_seek` 5, `nested_loops` 7, `planner` 13 of 14 (main's own), clippy 0.
 CU landed as main 7d9fcb6b (10:21:28Z). On a6de608f, CZ on top of it (main has moved only in crates/amphora and records since): fmt 0, clippy 0 ("Checking amphora-engine", 40 s), check-production 0 (10,606), `cte_columns` 11 (37,528 runs, 92 s at 3 threads), `oracle_findings` 91, `on_terms` 5, `outer_join_subqueries` 2, `in_subquery` 4, `floating_point_doc` 47, `hash_group_by` 5, `top_n` 3 (r1793, r1802).
 Red for CZ: `cte_columns merged` on 7d9fcb6b's execute.rs, `b0,0,1,0,1,1,0,0,1` for SQLite's `b0,1,1,0,1,1,0,1,1` and `b10,0,0,0,0,0,0,0,0` for `b10,0,0,0,0,0,1,0,0` (r1793).
+Merged again as main moved inside the engine (lanes C12, PG22 and C14): on 43cf3b89 (main b5584c1e in it) fmt 0, clippy 0 (35 s, checked), check-production 0 (10,600, C12's lowering with mine), `cte_columns` 11, `oracle_findings` 92 (r1819, r1820);
+FINAL_LINE
 One check-production run was made on a stale tree (its fetch lost a race with the other run's, r1795) and is not counted.
 Not run: macOS (r1653 and r1772 never found room), the whole workspace's tests, the corpus subset, a benchmark.
 
