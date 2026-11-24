@@ -109,7 +109,20 @@ fn t_t1_10_r5_a_session_reads_its_write_on_a_lagging_follower() {
         .unwrap();
     assert!(local == vec![1] || local == vec![1, 2], "{local:?}");
     let reader = clients.get(follower).unwrap().clone();
-    let waiting = std::thread::spawn(move || read_token(&reader, second));
+    let spawned = Instant::now();
+    let late = std::env::var("A24_READER_DELAY_US")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let waiting = std::thread::spawn(move || {
+        if late > 0 {
+            std::thread::sleep(Duration::from_micros(late));
+        }
+        let started = Instant::now();
+        let at_start = reader.closed_token();
+        let served = read_token(&reader, second);
+        (started, at_start, served, Instant::now())
+    });
     // The follower's records come back only once the read waits there.
     let begun = clients
         .get(follower)
@@ -118,10 +131,22 @@ fn t_t1_10_r5_a_session_reads_its_write_on_a_lagging_follower() {
         .unwrap();
     assert_eq!(begun, 1, "the token read has not waited");
     rejoin(&mut driven, &mut pump, &clients, leader, follower);
+    let rejoined = Instant::now();
     for owner in 0..clients.len() {
         catch_up(&mut driven, &mut pump, &clients, leader, owner);
     }
-    let served = waiting.join().unwrap().unwrap();
+    let caught = Instant::now();
+    let (started, at_start, served, answered) = waiting.join().unwrap();
+    let us = |at: Instant| at.saturating_duration_since(spawned).as_micros();
+    eprintln!(
+        "a24-r5 started_us={} rejoined_us={} caught_us={} answered_us={} second={second:?} at_start={at_start:?} counters={:?}",
+        us(started),
+        us(rejoined),
+        us(caught),
+        us(answered),
+        clients.get(follower).unwrap().session_counters().unwrap(),
+    );
+    let served = served.unwrap();
     assert_eq!(served, Served::Here(vec![1, 2]));
     let counters = clients.get(follower).unwrap().session_counters().unwrap();
     assert!(counters.apply_lag_micros.is_some_and(|lag| lag >= HOUR / 2));
