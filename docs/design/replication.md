@@ -2028,9 +2028,9 @@ pure core is `database/slot.rs`, driven by the owner (`Actor::keep_slots`, `star
   ends it at its barrier (waiting for the read's answer, or for its own log's tail) is to send its close at its
   next step that isn't paused, while the barrier's term and leader hold (lane V14). An open defect (lane V15): when
   that barrier's answer was lost, the member takes the close (`Actor::close` asks its replica for the read, which
-  accepts it) but no close reaches the leader, so the slot holds until its stated end, as before lane V14. The red
-  test is `replicated::v15_a_write_its_deadline_ends_at_its_barrier_closes_its_slot` on branch perf/commits-v15;
-  where the close stops is not yet traced.
+  accepts it) but member 3 sends nothing after it, so the slot holds until its stated end, as before lane V14. The
+  red test is `replicated::v15_a_write_its_deadline_ends_at_its_barrier_closes_its_slot` on branch perf/commits-v15;
+  where inside the member the close stops is not yet traced.
 - *What bounds a lost forward* (CP-T1.8, lane V15, measured; not yet an event). A holder's forward lost on the way
   is bounded only by its stated end: the holder sends no barrier or forward after it (its write waits, proposed,
   for its entry), and a live holder is not suspected. Lane V15's run on real time (three members in one process,
@@ -2038,9 +2038,9 @@ pure core is `database/slot.rs`, driven by the owner (`Actor::keep_slots`, `star
   the bench driver's 10 s deadline) timed each stage from member 3's call: its slot began at 0.7 ms, its forward was
   lost at 2.7 ms, and the leader's own write and member 2's were called at 2.8 ms; member 3 was answered
   `UnknownOutcome` at 10,000.2 ms, the slot ended `expired` at 10,006.7 ms, and the leader's write was answered at
-  10,030.6 ms and member 2's at 10,064.8 ms: each waited the holder's whole deadline. A bound by an event the leader can see needs a
-  message from the holder that follows its forward on the same ordered link, so that its arrival with no forward
-  before it shows the forward lost: a close sent right behind every forward (one more message per follower write,
+  10,030.6 ms and member 2's at 10,064.8 ms: each waited the holder's whole deadline. A bound by an event the
+  leader can see needs a message from the holder that follows its forward on the same ordered link, so that its
+  arrival with no forward before it shows the forward lost: a close sent right behind every forward (one more message per follower write,
   and a ReadIndex round at the leader unless it consumes the close unstepped), or the holder's forward sent again
   when its transport reports the link reset or the record refused (with the leader dropping, typed, a copy it
   already appended). Neither is built; each is a design for the next lane, with its cost to be measured.
