@@ -1599,7 +1599,7 @@ impl BuildSharedWal {
                 initialized: AtomicBool::new(false),
             },
             runtime: WalSharedRuntime {
-                frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
+                frame_cache: Arc::new(RwLock::new(FxHashMap::default())),
                 frame_cache_high_water: AtomicU64::new(0),
                 file: Some(file.clone()),
                 read_locks,
@@ -2108,16 +2108,17 @@ impl StreamingWalReader {
             return;
         }
         let wfs = self.wal_shared.read();
-        let mut frame_cache = wfs.runtime.frame_cache.lock();
-        // Amphora: the lock-free lookups are built again from the index (decision 40).
-        wfs.runtime.read_index.invalidate();
-        // Amphora: a packed generation's records, known before their pages map to them.
+        // Amphora: a packed generation's records, known before their pages map to them; the registry
+        // is locked before the frame cache, as every holder of both takes them.
         if !state.pending_records.is_empty() {
             let mut records = wfs.runtime.records.write();
             for (head, slots) in state.pending_records.drain(..) {
                 records.publish(head, slots);
             }
         }
+        let mut frame_cache = wfs.runtime.frame_cache.write();
+        // Amphora: the lock-free lookups are built again from the index (decision 40).
+        wfs.runtime.read_index.invalidate();
         for (page, mut frames) in state.pending_frames.drain() {
             // Only include frames up to last valid commit
             frames.retain(|&f| f <= state.last_valid_frame);
@@ -2149,13 +2150,14 @@ impl StreamingWalReader {
 
         let max_frame = st.last_valid_frame;
         if max_frame > 0 {
-            let mut frame_cache = wfs.runtime.frame_cache.lock();
+            // The registry before the frame cache, as every holder of both takes them.
+            wfs.runtime.records.write().drop_after(max_frame);
+            let mut frame_cache = wfs.runtime.frame_cache.write();
             wfs.runtime.read_index.invalidate();
             for frames in frame_cache.values_mut() {
                 frames.retain(|&f| f <= max_frame);
             }
             frame_cache.retain(|_, frames| !frames.is_empty());
-            wfs.runtime.records.write().drop_after(max_frame);
             let header = wfs.metadata.wal_header.lock();
             wfs.runtime.overflow_fallback_coverage.lock().record(
                 header.checkpoint_seq,
@@ -2999,7 +3001,7 @@ mod tests {
         // checksum should only include committed frame.
         assert_ne!(guard.metadata.last_checksum, after_frame3_checksum);
 
-        let frame_cache = guard.runtime.frame_cache.lock();
+        let frame_cache = guard.runtime.frame_cache.read();
         assert_eq!(frame_cache.get(&1), Some(&vec![1u64]));
         assert!(frame_cache.get(&2).is_none());
     }
