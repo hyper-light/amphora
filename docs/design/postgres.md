@@ -126,8 +126,8 @@ path stays unless the numbers say otherwise.
 storage (`execute::Database`) and gives each session a connection of its own. A transaction's writes are row
 versions of that connection, so one open across its client's round trips holds no writer (T-PG.9.3's two sessions
 write in two open transactions at once). A transaction that changes the schema holds the pager's header lock until
-it ends, and a second one is refused `40001`. A row another open transaction wrote is refused `40001` at once, where
-19 waits (section 8's units 14 and 15). Rowids: PostgreSQL's rows have none, so the dialect numbers a table's rows
+it ends, and a second one is refused `40001`. A row another open transaction wrote keeps the statement that changes
+it waiting for that transaction's end (section 8, lane PG21). Rowids: PostgreSQL's rows have none, so the dialect numbers a table's rows
 apart from any snapshot (`Dialect::next_rowid`), or two sessions' inserts would meet on one. Statements run on the
 listener's one thread, each to its end with its answer held whole: the next subsection and an event loop per core
 are not built.
@@ -577,6 +577,27 @@ work every level below needs.
   Until it lands, `BEGIN ISOLATION LEVEL READ COMMITTED` and the default run as REPEATABLE READ and
   say so in `SHOW transaction_isolation`; any `40001` this causes that PostgreSQL wouldn't is counted
   as a failure of section 10's pgbench measure.
+
+**What is built** (lane PG21, unit 14). The level is the session's: BEGIN and START TRANSACTION ISOLATION
+LEVEL and SET TRANSACTION ISOLATION LEVEL choose it (`Level`, `crates/engine/storage/versioned/switch.rs`), SHOW
+transaction_isolation names it (READ UNCOMMITTED by its own name, run as READ COMMITTED, as 19 does), and READ
+COMMITTED is the default. Each transaction has its validation and whether it waits (`Rules`,
+`crates/engine/storage/versioned/version.rs`): READ COMMITTED and REPEATABLE READ are `Snapshot`, and SERIALIZABLE
+keeps the storage's `Precision` until SSI is ported. READ COMMITTED's snapshot moves to every commit published when a
+statement starts (`Clock::renew`), under the open snapshots' lock. A statement that changes a row another open
+transaction changed is undone to the savepoint the session put before it and its transaction kept
+(`LimboError::RowTaken`); the session then waits for that transaction's end, told of it by a waker
+(`Clock::wait_for`, called as it ends by `Clock::forget`), with no timer, and runs the statement again on a new
+snapshot (READ COMMITTED) or has it refused `40001` where its row was changed by a commit after the snapshot. The listener's
+other sessions run meanwhile. What differs from 19's recheck, EvalPlanQual (unit 15's): the statement is run again
+whole, so a row it changed before the wait is undone and can be changed by another session in the interval, and a WHERE
+is judged by the newer snapshot on every row, not on the waited-for row alone; a single row by its key answers as
+19's does (T-PG.14.1). A wait that would close a ring of waits is refused `40P01` at once, the session that closes it
+being the victim, where 19 waits out `deadlock_timeout` and refuses whichever session's check runs first. A statement
+that changes the catalog (CREATE TABLE, ALTER TABLE) is validated by the storage's own validation at any level
+(`Txn::validate_fully`), since an index it built beside a commit that added rows would lack them (19 locks the table
+against the writers); and a transaction that wrote rows and stayed open while another session's schema change
+committed is refused at COMMIT, as before (PG20).
 
 An error inside a transaction block puts the session in PostgreSQL's aborted state (`25P02` until
 ROLLBACK); SAVEPOINT and ROLLBACK TO map to the engine's savepoints (`crates/engine/translate/rollback.rs`).

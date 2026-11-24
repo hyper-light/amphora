@@ -798,23 +798,31 @@ fn evaluate_multi_index_branches(
 /// Whether a multi-index scan on `table` may be driven by `term`.
 ///
 /// The scan *is* the term's evaluation: rows failing it are never visited, and
-/// the term is marked consumed so nothing checks it again. For a table that an
-/// outer join can null-extend (the right table of a LEFT/FULL JOIN, or any table
-/// on the left side of a RIGHT/FULL JOIN) that only holds for the join's
-/// own ON clause, which defines what counts as a match. Any other term must
-/// also reject the null-extended row the join emits when nothing matched, and
-/// that row is produced by jumping straight past the scan — so consuming such
-/// a term silently drops it.
+/// the term is marked consumed so nothing checks it again.
+///
+/// The join's own ON clause defines what counts as a match, so it may always
+/// drive the scan of the join's right table. Any other outer join's ON term may
+/// not: the row of `table` it refuses is a left row of that join, which keeps
+/// it and null-extends its own right table (`constraints_from_where_clause`
+/// sets such terms aside as `on_elsewhere`).
+///
+/// For a table that an outer join can null-extend (the right table of a
+/// LEFT/FULL JOIN, or any table on the left side of a RIGHT/FULL JOIN), any
+/// other term must also reject the null-extended row the join emits when
+/// nothing matched, and that row is produced by jumping straight past the scan,
+/// so consuming such a term silently drops it.
 fn multi_index_can_consume_term(
     table: &JoinedTable,
     term: &WhereTerm,
     table_references: &TableReferences,
 ) -> bool {
-    !table_references.outer_join_may_null_extend(table.internal_id)
-        || term
-            .origin
-            .join_origin()
-            .is_some_and(|origin| origin.right_table() == table.internal_id)
+    match term.origin.join_origin() {
+        Some(origin) if origin.right_table() == table.internal_id => true,
+        Some(JoinOrigin::Outer(_)) => false,
+        Some(JoinOrigin::Inner(_)) | None => {
+            !table_references.outer_join_may_null_extend(table.internal_id)
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1359,8 +1367,8 @@ mod tests {
                 AvailableIndexes,
             },
             plan::{
-                ColumnUsedMask, JoinInfo, JoinType, JoinedTable, Operation, TableReferences,
-                WhereTerm, WhereTermOrigin,
+                ColumnUsedMask, JoinInfo, JoinOrigin, JoinType, JoinedTable, Operation,
+                TableReferences, WhereTerm, WhereTermOrigin,
             },
             planner::TableMask,
         },
@@ -1737,6 +1745,147 @@ mod tests {
                     == Some("idx_item_a")),
             "expected one secondary-index branch"
         );
+    }
+
+    /// AC-T1.8.6 (the oracles' finding CG): whose scan a term may drive. Do: offer `item`, joined with
+    /// `other`, a term on each of its two indexed columns, one a WHERE term and one of each origin,
+    /// for `item` as the left table and as the right one. Expect: an intersection of the two where both
+    /// filter `item` (a WHERE's, an inner join's ON, its own LEFT JOIN's ON), and none where one is
+    /// the ON of the LEFT JOIN that keeps `item`'s rows, or a WHERE's on a table it null-extends.
+    #[test]
+    fn test_multi_index_intersection_takes_the_terms_that_filter_its_table() {
+        let joined = |join_type| {
+            Some(JoinInfo {
+                join_type,
+                using: vec![],
+                no_reorder: false,
+                lateral: false,
+            })
+        };
+        let columns = || {
+            vec![
+                create_column_of_type("a", Type::Integer),
+                create_column_of_type("b", Type::Integer),
+            ]
+        };
+        let index = |name: &str, column: &str, position| {
+            Arc::new(Index {
+                name: name.to_string(),
+                table_name: "item".to_string(),
+                where_clause: None,
+                columns: crate::alloc::vec![IndexColumn::new(column, position)],
+                unique: false,
+                ephemeral: false,
+                root_page: 2,
+                has_rowid: true,
+                index_method: None,
+                on_conflict: None,
+                state: crate::schema::IndexState::Public,
+            })
+        };
+        let above = |table, column, value| {
+            Expr::Binary(
+                Box::new(create_column_expr(table, column, false)),
+                Operator::Greater,
+                Box::new(create_numeric_literal(value)),
+            )
+        };
+        for (item_first, join_type, origin_of, expected) in [
+            (true, JoinType::Inner, "where", true),
+            (true, JoinType::Inner, "on", true),
+            (true, JoinType::LeftOuter, "where", true),
+            (true, JoinType::LeftOuter, "on", false),
+            (false, JoinType::Inner, "where", true),
+            (false, JoinType::Inner, "on", true),
+            (false, JoinType::LeftOuter, "where", false),
+        ] {
+            let mut table_id_counter = TableRefIdCounter::new();
+            let names = if item_first {
+                ["item", "other"]
+            } else {
+                ["other", "item"]
+            };
+            let joined_tables: Vec<JoinedTable> = names
+                .iter()
+                .enumerate()
+                .map(|(position, name)| {
+                    create_table_reference(
+                        create_btree_table(name, columns()),
+                        if position == 0 {
+                            None
+                        } else {
+                            joined(join_type)
+                        },
+                        table_id_counter.next(),
+                    )
+                })
+                .collect();
+            let item = usize::from(!item_first);
+            let (item_id, right_id) = (
+                joined_tables[item].internal_id,
+                joined_tables[1].internal_id,
+            );
+            let mut available_indexes = AvailableIndexes::default();
+            available_indexes.insert_for_table_name(
+                &joined_tables,
+                "item",
+                VecDeque::from([index("idx_item_a", "a", 0), index("idx_item_b", "b", 1)]),
+            );
+            let origin = match origin_of {
+                "on" => WhereTermOrigin::Join(JoinOrigin::new(
+                    right_id,
+                    join_type == JoinType::LeftOuter,
+                )),
+                _ => WhereTermOrigin::Where,
+            };
+            let table_references = TableReferences::new(joined_tables, vec![]);
+            // Beside it, a term that filters `item` whatever the join: its own LEFT JOIN's ON, or a
+            // WHERE's.
+            let beside = if !item_first && join_type == JoinType::LeftOuter {
+                WhereTermOrigin::Join(JoinOrigin::Outer(item_id))
+            } else {
+                WhereTermOrigin::Where
+            };
+            let intersection = |origin| {
+                let where_clause = vec![
+                    WhereTerm {
+                        expr: above(item_id, 0, "10"),
+                        origin,
+                        consumed: false,
+                    },
+                    WhereTerm {
+                        expr: above(item_id, 1, "7"),
+                        origin: beside,
+                        consumed: false,
+                    },
+                ];
+                consider_multi_index_intersection(
+                    &table_references.joined_tables()[item],
+                    &where_clause,
+                    &available_indexes,
+                    &table_references,
+                    &[],
+                    &empty_schema(),
+                    1.0,
+                    RowCountEstimate::hardcoded_fallback(&DEFAULT_PARAMS),
+                    &DEFAULT_PARAMS,
+                    Cost(f64::INFINITY),
+                    &TableMask::default(),
+                    &AnalyzeStats::default(),
+                )
+                .unwrap()
+            };
+            let case = format!("item first: {item_first}, {join_type:?}, {origin_of}");
+            let planned = intersection(origin);
+            assert_eq!(planned.is_some(), expected, "{case}");
+            if let Some(planned) = planned {
+                assert_eq!(assert_is_multi_index(&planned).len(), 2, "{case}");
+            }
+            if !item_first && join_type == JoinType::LeftOuter {
+                let own = intersection(beside).expect("a table's own ON filters it");
+                assert_eq!(assert_is_multi_index(&own).len(), 2, "{case}: its own ON");
+            }
+        }
     }
 
     #[test]

@@ -12,11 +12,12 @@
 //! failures, and how often DQP's other plan was a different plan) and `<out>/findings/<id>.md`.
 
 pub mod checks;
+pub mod digits;
 pub mod engines;
 pub mod reduce;
 pub mod synth;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::panic::AssertUnwindSafe;
 use std::time::{Duration, Instant};
 
@@ -87,13 +88,20 @@ fn opts() -> anyhow::Result<Opts> {
     Ok(o)
 }
 
+/// A statement Amphora refused that SQLite took, with its error.
+#[derive(Debug)]
+pub struct Refused {
+    pub error: String,
+    pub statement: String,
+}
+
 /// Both engines with the same database: each statement on SQLite first, inside a savepoint, then on
 /// Amphora; one SQLite refuses is left out, one Amphora refuses is undone on SQLite, so the two
 /// always hold the same rows. Returns the statements both took.
 pub fn setup(
     stmts: &[String],
     n: u64,
-) -> anyhow::Result<(Amphora, Sqlite, Vec<String>, Vec<String>)> {
+) -> anyhow::Result<(Amphora, Sqlite, Vec<String>, Vec<Refused>)> {
     let mut a = Amphora::new(n)?;
     let mut s = Sqlite::new()?;
     let mut kept = Vec::new();
@@ -118,7 +126,10 @@ pub fn setup(
             Err(e) => {
                 on_sqlite(&mut s, "ROLLBACK TO oracle")?;
                 on_sqlite(&mut s, "RELEASE oracle")?;
-                refused.push(e);
+                refused.push(Refused {
+                    error: e,
+                    statement: st.clone(),
+                });
             }
         }
     }
@@ -130,6 +141,24 @@ fn panic_text(p: Box<dyn std::any::Any + Send>) -> String {
         .cloned()
         .or_else(|| p.downcast_ref::<&str>().map(|s| (*s).to_owned()))
         .unwrap_or_else(|| "a panic".into())
+}
+
+/// Runs the case on fresh databases made from its statements: whether Amphora still refuses it with an
+/// error of this shape.
+fn refuses_again(r: &Repro, n: u64, refusal: &str) -> Option<Failure> {
+    let got = std::panic::catch_unwind(AssertUnwindSafe(|| -> Option<Failure> {
+        let (mut a, mut s, _, _) = setup(&r.stmts, n).ok()?;
+        match checks::check(&r.case, &mut a, &mut s) {
+            Outcome::Refused(e) if message(&e) == refusal => Some(Failure {
+                kind: Kind::Error,
+                detail: format!("Amphora refuses what SQLite answers: {e}"),
+                queries: checks::sqls(&r.case),
+                cause: Some(e),
+            }),
+            _ => None,
+        }
+    }));
+    got.ok().flatten()
 }
 
 /// Runs the case on fresh databases made from its statements.
@@ -161,19 +190,43 @@ fn shape(e: &str) -> String {
         .collect()
 }
 
+/// An error's message with each of its numbers as one mark, however many digits it has.
+fn message(e: &str) -> String {
+    let mut out = String::new();
+    for c in shape(e).chars() {
+        if !(c == '#' && out.ends_with('#')) {
+            out.push(c);
+        }
+    }
+    out
+}
+
 #[derive(Default)]
 struct Tally {
     checks: u64,
     passed: u64,
+    /// Of those passed: the answers differ by the digits of a REAL's text alone (digits.rs).
+    digits: u64,
     plans_changed: u64,
     failed: u64,
     skipped: BTreeMap<String, u64>,
     refused: BTreeMap<String, u64>,
 }
 
+/// What the checks whose queries (a `same` check's statements) show a feature came to.
+#[derive(Default)]
+struct Feature {
+    databases: u64,
+    checks: u64,
+    passed: u64,
+    failed: u64,
+    skipped: u64,
+    refused: BTreeMap<String, u64>,
+}
+
 /// A finding's name: an error by its cause (Amphora's message, whichever oracle met it: one cause
 /// reaches every oracle), anything else by its case cut down.
-fn finding_id(case: &Case, f: &Failure) -> String {
+fn finding_id(stmts: &[String], case: &Case, f: &Failure) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     if let (Kind::Error, Some(cause)) = (f.kind, &f.cause) {
@@ -183,7 +236,19 @@ fn finding_id(case: &Case, f: &Failure) -> String {
     case.oracle().name().hash(&mut h);
     format!("{:?}", f.kind).hash(&mut h);
     f.queries.join("\n").hash(&mut h);
+    // what differs after the statements is theirs: the query only shows it
+    if matches!(case, Case::Same(_)) {
+        stmts.join("\n").hash(&mut h);
+    }
     format!("{}-{:016x}", case.oracle().name(), h.finish())
+}
+
+/// A panic's name as the statements made the database: by its text.
+fn panic_id(detail: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    message(detail).hash(&mut h);
+    format!("setup-panic-{:016x}", h.finish())
 }
 
 fn write_finding(
@@ -261,7 +326,11 @@ fn replay(path: &str) -> anyhow::Result<()> {
         for q in &queries {
             let (want, got) = (s.run(q), a.run(q));
             let same = match (&want, &got) {
-                (Ok(x), Ok(y)) => engines::same_rows_by(x, y, false),
+                (Ok(x), Ok(y)) => {
+                    engines::same_rows_by(x, y, false)
+                        || digits::same_rows(y, x, false)
+                        || checks::digits_inside(&mut s, q, y, x, false)
+                }
                 (Err(_), Err(_)) => true,
                 _ => false,
             };
@@ -271,7 +340,8 @@ fn replay(path: &str) -> anyhow::Result<()> {
                 engines::show_up_to(&want, usize::MAX),
                 engines::show_up_to(&got, usize::MAX)
             );
-            if q.trim_start().to_ascii_uppercase().starts_with("SELECT") {
+            let head = q.trim_start().to_ascii_uppercase();
+            if head.starts_with("SELECT") || head.starts_with("WITH") {
                 println!(
                     "-- Amphora's plan: {}",
                     engines::show(&a.run(&format!("EXPLAIN QUERY PLAN {q}")))
@@ -353,7 +423,7 @@ fn replay_check(path: &str) -> anyhow::Result<()> {
     }
     for q in &queries {
         let same = match (a.run(q), s.run(q)) {
-            (Ok(x), Ok(y)) => engines::same_rows_by(&x, &y, true),
+            (Ok(x), Ok(y)) => digits::same_rows(&x, &y, true),
             (Err(_), Err(_)) => true,
             _ => false,
         };
@@ -413,6 +483,8 @@ pub fn main() -> anyhow::Result<()> {
     let out = std::path::Path::new(&o.out);
     let fdir = out.join("findings");
     std::fs::create_dir_all(&fdir)?;
+    let rdir = out.join("refusals");
+    std::fs::create_dir_all(&rdir)?;
     let began = Instant::now();
     let until = began + Duration::from_secs(o.seconds);
     let mut tally: BTreeMap<Oracle, Tally> = std::iter::once(Oracle::Same)
@@ -423,21 +495,64 @@ pub fn main() -> anyhow::Result<()> {
     let mut duplicates = 0u64;
     let mut states = 0u64;
     let mut setup_refused: BTreeMap<String, u64> = BTreeMap::new();
+    let mut setup_examples: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut refusals: BTreeSet<String> = BTreeSet::new();
+    let mut causes: BTreeSet<String> = BTreeSet::new();
+    let mut features_seen: BTreeMap<&'static str, Feature> = BTreeMap::new();
     let mut db_n = 0u64;
     if let Some(n) = o.state {
         states = n.saturating_sub(1);
     }
+    // written as the run goes too, so one that is stopped leaves its counts
+    macro_rules! write_summary {
+        () => {{
+        let features: BTreeMap<&str, serde_json::Value> = features_seen.iter().map(|(k, f)| (*k, json!({
+            "databases": f.databases, "checks": f.checks, "passed": f.passed, "failed": f.failed, "skipped": f.skipped, "refused": f.refused,
+        }))).collect();
+            let per: serde_json::Map<String, serde_json::Value> = tally.iter().map(|(k, t)| (k.name().to_owned(), json!({
+                "checks": t.checks, "passed": t.passed, "failed": t.failed, "digits": t.digits, "plans_changed": t.plans_changed,
+                "skipped": t.skipped, "refused": t.refused,
+            }))).collect();
+            let summary = json!({
+                "label": o.label, "seed": o.seed, "seconds": began.elapsed().as_secs_f64(), "states": states, "sqlite": sqlite_version,
+                "sqlite_options": sqlite_options,
+                "functions": funcs.len(), "oracles": per, "setup_refused": setup_refused, "setup_examples": setup_examples, "features": features,
+                "findings": findings, "duplicates": duplicates,
+            });
+            std::fs::write(
+                out.join("summary.json"),
+                serde_json::to_string_pretty(&summary)?,
+            )?;
+        }};
+    }
     while Instant::now() < until && o.state.is_none_or(|n| states < n) {
         states += 1;
+        if states.is_multiple_of(500) {
+            write_summary!();
+        }
         let state_seed = o.seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ states;
         let mut rng = synth::Rng::new(state_seed);
-        let (stmts, schema) = synth::database(&mut rng);
+        let (stmts, schema) = synth::database(&mut rng, &funcs);
         db_n += 1;
         let built = std::panic::catch_unwind(AssertUnwindSafe(|| setup(&stmts, db_n)));
         let (mut a, mut s, kept) = match built {
             Ok(Ok((a, s, kept, refused))) => {
                 for e in refused {
-                    *setup_refused.entry(shape(&e)).or_default() += 1;
+                    let refusal = message(&e.error);
+                    if !setup_examples.contains_key(&refusal) {
+                        // the statements it takes are those before it
+                        let before = stmts.iter().position(|x| *x == e.statement).unwrap_or(0);
+                        setup_examples.insert(
+                            refusal.clone(),
+                            stmts[..before]
+                                .iter()
+                                .filter(|x| kept.contains(x))
+                                .chain([&e.statement])
+                                .cloned()
+                                .collect(),
+                        );
+                    }
+                    *setup_refused.entry(refusal).or_default() += 1;
                 }
                 (a, s, kept)
             }
@@ -453,17 +568,29 @@ pub fn main() -> anyhow::Result<()> {
                     stmts: stmts.clone(),
                     case: Case::Diff(synth::query(&mut rng, &schema, &funcs)),
                 };
-                let id = format!("setup-panic-{:016x}", state_seed);
+                // named by the panic, which many databases meet
+                let id = panic_id(&f.detail);
+                if findings.contains_key(&id) {
+                    duplicates += 1;
+                    continue;
+                }
                 write_finding(&fdir, &id, &r, &f, o.seed, states)?;
+                let mut of = BTreeSet::new();
+                synth::statement_features(&stmts, &mut of);
                 findings.insert(
                     id,
-                    json!({ "oracle": "setup", "kind": "Panic", "detail": f.detail }),
+                    json!({ "features": of, "oracle": "setup", "kind": "Panic", "detail": f.detail }),
                 );
                 continue;
             }
         };
         // first, that both engines hold the same rows: nothing differential means anything otherwise
-        let same = Case::Same(schema.tables.iter().map(|t| t.name.clone()).collect());
+        let same = Case::Same(schema.tables.iter().map(synth::Table::rows_query).collect());
+        let mut held = BTreeSet::new();
+        synth::statement_features(&kept, &mut held);
+        for f in held.iter().copied() {
+            features_seen.entry(f).or_default().databases += 1;
+        }
         let mut cases: Vec<Case> = vec![same];
         for i in 0..o.per_state {
             let oracle = o.oracles[(states as usize * o.per_state + i) % o.oracles.len()];
@@ -480,20 +607,77 @@ pub fn main() -> anyhow::Result<()> {
                 .get_mut(&oracle)
                 .ok_or_else(|| anyhow::anyhow!("an oracle not asked for"))?;
             t.checks += 1;
+            let shown = match &case {
+                Case::Same(_) => held.clone(),
+                _ => case.features(&schema),
+            };
+            for f in shown.iter().copied() {
+                features_seen.entry(f).or_default().checks += 1;
+            }
+            let checked = Instant::now();
             let outcome =
                 std::panic::catch_unwind(AssertUnwindSafe(|| checks::check(&case, &mut a, &mut s)));
+            if checked.elapsed() > Duration::from_secs(1) {
+                eprintln!(
+                    "slow: {:.1} s, seed {} state {states}: {}",
+                    checked.elapsed().as_secs_f64(),
+                    o.seed,
+                    checks::sqls(&case).first().map_or("", String::as_str)
+                );
+            }
             let failure = match outcome {
                 Ok(Outcome::Pass { plan_changed }) => {
                     t.passed += 1;
                     t.plans_changed += u64::from(plan_changed);
+                    for f in shown.iter().copied() {
+                        features_seen.entry(f).or_default().passed += 1;
+                    }
+                    None
+                }
+                Ok(Outcome::Digits) => {
+                    t.passed += 1;
+                    t.digits += 1;
+                    for f in shown.iter().copied() {
+                        features_seen.entry(f).or_default().passed += 1;
+                    }
                     None
                 }
                 Ok(Outcome::Skip(why)) => {
                     *t.skipped.entry(why.into()).or_default() += 1;
+                    for f in shown.iter().copied() {
+                        features_seen.entry(f).or_default().skipped += 1;
+                    }
                     None
                 }
                 Ok(Outcome::Refused(e)) => {
-                    *t.refused.entry(shape(&e)).or_default() += 1;
+                    let value = checks::value_error(&e);
+                    let e = message(&e);
+                    // the first of each message, cut down: an example, not a finding
+                    if !value && refusals.insert(e.clone()) {
+                        let deadline = Instant::now() + Duration::from_secs(o.reduce_seconds);
+                        let start = Repro {
+                            stmts: kept.clone(),
+                            case: case.clone(),
+                        };
+                        let small = reduce::reduce(start, Kind::Error, deadline, |r| {
+                            db_n += 1;
+                            refuses_again(r, db_n, &e)
+                        });
+                        db_n += 1;
+                        if let Some(f) = refuses_again(&small, db_n, &e) {
+                            let id = format!("refusal-{}", refusals.len());
+                            write_finding(&rdir, &id, &small, &f, o.seed, states)?;
+                        }
+                    }
+                    for f in shown.iter().copied() {
+                        *features_seen
+                            .entry(f)
+                            .or_default()
+                            .refused
+                            .entry(e.clone())
+                            .or_default() += 1;
+                    }
+                    *t.refused.entry(e).or_default() += 1;
                     None
                 }
                 Ok(Outcome::Fail(f)) => Some(f),
@@ -506,6 +690,16 @@ pub fn main() -> anyhow::Result<()> {
             };
             let Some(f) = failure else { continue };
             t.failed += 1;
+            for f in shown.iter().copied() {
+                features_seen.entry(f).or_default().failed += 1;
+            }
+            // an error is named by its cause, so one met before needs no cutting down
+            if let (Kind::Error, Some(cause)) = (f.kind, &f.cause)
+                && !causes.insert(message(cause))
+            {
+                duplicates += 1;
+                continue;
+            }
             let start = Repro {
                 stmts: kept.clone(),
                 case: case.clone(),
@@ -518,12 +712,14 @@ pub fn main() -> anyhow::Result<()> {
             });
             db_n += 1;
             let final_f = rerun(&small, db_n).unwrap_or(f);
-            let id = finding_id(&small.case, &final_f);
+            let id = finding_id(&small.stmts, &small.case, &final_f);
             if findings.contains_key(&id) {
                 duplicates += 1;
             } else {
                 write_finding(&fdir, &id, &small, &final_f, o.seed, states)?;
-                findings.insert(id.clone(), json!({ "oracle": oracle.name(), "kind": format!("{:?}", final_f.kind), "detail": final_f.detail.lines().next().unwrap_or_default(), "statements": small.stmts.len(), "at_seconds": began.elapsed().as_secs_f64() }));
+                let mut of = small.case.features(&schema);
+                synth::statement_features(&small.stmts, &mut of);
+                findings.insert(id.clone(), json!({ "features": of, "oracle": oracle.name(), "kind": format!("{:?}", final_f.kind), "detail": final_f.detail.lines().next().unwrap_or_default(), "statements": small.stmts.len(), "at_seconds": began.elapsed().as_secs_f64() }));
                 eprintln!(
                     "finding {id}: {}",
                     final_f.detail.lines().next().unwrap_or_default()
@@ -534,20 +730,7 @@ pub fn main() -> anyhow::Result<()> {
             }
         }
     }
-    let per: serde_json::Map<String, serde_json::Value> = tally.iter().map(|(k, t)| (k.name().to_owned(), json!({
-        "checks": t.checks, "passed": t.passed, "failed": t.failed, "plans_changed": t.plans_changed,
-        "skipped": t.skipped, "refused": t.refused,
-    }))).collect();
-    let summary = json!({
-        "label": o.label, "seed": o.seed, "seconds": began.elapsed().as_secs_f64(), "states": states, "sqlite": sqlite_version,
-        "sqlite_options": sqlite_options,
-        "functions": funcs.len(), "oracles": per, "setup_refused": setup_refused,
-        "findings": findings, "duplicates": duplicates,
-    });
-    std::fs::write(
-        out.join("summary.json"),
-        serde_json::to_string_pretty(&summary)?,
-    )?;
+    write_summary!();
     eprintln!(
         "{states} databases, {} checks, {} findings ({duplicates} more of the same), in {:.0} s",
         tally.values().map(|t| t.checks).sum::<u64>(),

@@ -12,6 +12,7 @@ pub struct NodeId(u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransactionStmtKind {
     Begin = 0,
+    Start = 1,
     Commit = 2,
     Rollback = 3,
 }

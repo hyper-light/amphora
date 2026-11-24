@@ -1,0 +1,252 @@
+##### compound_collation
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT NULL COLLATE NOCASE UNION ALL SELECT 'A' UNION SELECT 'a'
+      SQLite  2 rows / NULL / 'a'
+      Amphora 3 rows / NULL / 'A' / 'a'
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT lower('A') COLLATE NOCASE UNION ALL SELECT 'A' UNION SELECT 'a'
+      SQLite  1 rows / 'a'
+      Amphora 2 rows / 'A' / 'a'
+   rc 0 same 4 
+##### compound_order_collate
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT a FROM t UNION SELECT 'C' ORDER BY (1 COLLATE NOCASE)
+      SQLite  3 rows / 'A' / 'b' / 'C'
+      Amphora error: Parse error: 1st ORDER BY term does not match any column in the result set
+   rc 0 same 4 
+##### cursor_none
+   rc 101 same 0 PANIC perf/oracle-c8-remote/crates/engine/vdbe/execute.rs:7390:42: cursor id 1 is None
+##### full_join_without_rowid
+   rc 0 same 12 
+##### insert_or_ignore_not_null
+   rc 0 same 4 
+##### insert_or_ignore_not_null_trigger
+   rc 0 same 8 
+##### insert_or_ignore_not_null_wr
+   rc 0 same 4 
+##### recursive_text_join
+   rc 0 same 20 
+##### row_compare_call
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT c FROM t WHERE (a, b) > (lower('X'), json_extract('["a"]', '$[0]'))
+      SQLite  2 rows / 1 / 2
+      Amphora error: Parse error: insufficient registers allocated for expression vector write (start=7, count=2, next_free=8)
+   rc 0 same 16 
+##### row_in_null_inner
+   rc 0 same 8 
+##### row_misused
+   rc 0 same 12 
+##### row_not_in_null
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT id FROM o WHERE (region, code) NOT IN (SELECT region, code FROM closed)
+      SQLite  2 rows / 2 / 3
+      Amphora 2 rows / 3 / 4
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT id, (region, code) IN (SELECT region, code FROM closed) FROM o
+      SQLite  4 rows / 1, 1 / 2, 0 / 3, 0 / 4, NULL
+      Amphora 4 rows / 1, 1 / 2, NULL / 3, 0 / 4, 0
+   rc 0 same 4 
+##### strict_without_rowid_order
+   refused: [Refused { error: "near \"STRICT\": syntax error", statement: "CREATE TABLE a(k INT PRIMARY KEY) WITHOUT ROWID, STRICT" }, Refused { error: "near \"STRICT\": syntax error", statement: "CREATE TABLE b(k INT PRIMARY KEY) STRICT, WITHOUT ROWID" }]
+   rc 0 same 8 
+##### trigger_collation_body
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT * FROM lg
+      SQLite  1 rows / 'ADMIN', 1
+      Amphora 1 rows / 'ADMIN', 0
+   rc 0 same 0 
+##### trigger_collation
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT * FROM lg
+      SQLite  1 rows / 'ADMIN'
+      Amphora 0 rows
+   rc 0 same 0 
+##### trigger_strict_before
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT amount, typeof(amount) FROM audit
+      SQLite  1 rows / 100.0, 'real'
+      Amphora 1 rows / 100, 'integer'
+   rc 0 same 0 
+##### trigger_strict_before_update
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT v, typeof(v) FROM audit
+      SQLite  1 rows / 7, 'integer'
+      Amphora 1 rows / '7', 'text'
+   rc 0 same 4 
+##### trigger_update_of_without_rowid
+   rc 101 same 0 PANIC le-c8-remote/crates/engine/translate/trigger_exec.rs:708:44: UPDATE should contain some updated columns
+##### trigger_update_without_rowid
+   refused: [Refused { error: "Parse error: triggered mutations of WITHOUT ROWID tables are not supported", statement: "UPDATE t SET v = 'y' WHERE k = 'a'" }]
+   rc 0 same 8 
+##### upsert_plain_pk
+   rc 0 same 4 
+##### upsert_set_twice
+   rc 0 same 4 
+##### upsert_set_twice_strict
+   rc 0 same 4 
+##### upsert_strict_pk
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT * FROM item
+      SQLite  1 rows / 10, 6, 10
+      Amphora 1 rows / 10, 6, NULL
+   rc 0 same 0 
+##### upsert_strict_real
+   rc 0 same 4 
+##### upsert_strict_where
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT * FROM item
+      SQLite  1 rows / 10, 5
+      Amphora 1 rows / 10, 1
+   rc 0 same 0 
+##### view_unread_column
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT count(*) FROM v
+      SQLite  1 rows / 2
+      Amphora error: Parse error: malformed JSON
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT id FROM v
+      SQLite  2 rows / 1 / 2
+      Amphora error: Parse error: malformed JSON
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT id FROM doc WHERE EXISTS (SELECT 1 FROM v WHERE v.id = doc.id)
+      SQLite  2 rows / 1 / 2
+      Amphora error: Parse error: malformed JSON
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT id FROM doc WHERE id IN (SELECT id FROM v)
+      SQLite  2 rows / 1 / 2
+      Amphora error: Parse error: malformed JSON
+   rc 0 same 4 
+##### window_in_order_by
+   rc 0 same 4 
+##### window_in_order_by_once
+   rc 0 same 8 
+##### window_subquery_arg
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT a, sum(CASE WHEN a IN (SELECT b FROM s) THEN 1 ELSE 0 END) OVER (ORDER BY a) FROM t
+      SQLite  2 rows / 1, 0 / 2, 1
+      Amphora error: Parse error: InSelect is not supported in this position
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT a, sum((SELECT max(b) FROM s)) OVER (ORDER BY a) FROM t
+      SQLite  2 rows / 1, 2 / 2, 4
+      Amphora error: Parse error: Scalar subquery is not supported in this context
+   rc 0 same 0 
+##### full_join_without_rowid2
+   DIFFERS default,parallel :: SELECT count(*) FROM o FULL JOIN w
+      SQLite  1 rows / 4
+      Amphora error: Internal error: secondary index lacks primary key locator
+   DIFFERS default,parallel :: SELECT count(*) FROM o FULL JOIN w ON 1
+      SQLite  1 rows / 4
+      Amphora error: Internal error: secondary index lacks primary key locator
+   DIFFERS default,parallel :: SELECT o.k, w.u FROM o FULL JOIN w ON w.u > 1
+      SQLite  3 rows / 'a', 2 / 'c', 2 / NULL, 1
+      Amphora error: Internal error: secondary index lacks primary key locator
+   DIFFERS default,parallel :: SELECT count(*) FROM w AS a FULL JOIN w AS b
+      SQLite  1 rows / 4
+      Amphora error: Internal error: secondary index lacks primary key locator
+   rc 0 same 16 
+##### recursive_text_join2
+   DIFFERS default,parallel,statistics,parallel, statistics :: WITH RECURSIVE r(n, d) AS (SELECT 1, 0 UNION ALL SELECT r.n + 1, r.d + 1 FROM r JOIN edge ON edge.src = r.n WHERE r.d < 5) SELECT n, d FROM r
+      SQLite  3 rows / 1, 0 / 2, 1 / 3, 2
+      Amphora 1 rows / 1, 0
+   DIFFERS default,parallel,statistics,parallel, statistics :: WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT r.n + 1 FROM edge JOIN r ON edge.src = r.n) SELECT n FROM r
+      SQLite  3 rows / 1 / 2 / 3
+      Amphora 1 rows / 1
+   rc 0 same 8 
+##### row_misused2
+   rc 0 same 24 
+##### trigger_collation_old
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT * FROM lg
+      SQLite  1 rows / 'ADMIN'
+      Amphora 0 rows
+   rc 0 same 0 
+##### trigger_plain_before
+   rc 0 same 4 
+##### trigger_strict_after
+   rc 0 same 4 
+##### upsert_collation
+   rc 0 same 4 
+##### upsert_strict_rowid
+   rc 0 same 4 
+##### upsert_strict_text_pk
+   refused: [Refused { error: "datatype mismatch", statement: "INSERT INTO kv VALUES (7, 'a', 5) ON CONFLICT(name) DO UPDATE SET id = excluded.id, n = excluded.n" }]
+   rc 0 same 4 
+##### view_affinity
+   rc 0 same 8 
+##### window_order_by2
+   rc 0 same 4 
+##### window_order_by3
+   rc 0 same 4 
+##### window_order_by4
+   rc 0 same 4 
+##### window_order_by5
+   rc 0 same 4 
+##### window_order_by6
+   rc 0 same 4 
+##### row_call
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT * FROM t WHERE (a, b) = ('x', json_extract('["y"]', '$[0]'))
+      SQLite  1 rows / 'x', 'y'
+      Amphora error: Parse error: insufficient registers allocated for expression vector write (start=8, count=2, next_free=9)
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT ('a', 1) BETWEEN ('a', 0) AND ('a', 2)
+      SQLite  1 rows / 1
+      Amphora error: Parse error: insufficient registers allocated for expression vector write (start=2, count=2, next_free=3)
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT (a, 1) BETWEEN (a, 0) AND (a, 2) FROM t
+      SQLite  1 rows / 1
+      Amphora error: Parse error: insufficient registers allocated for expression vector write (start=2, count=2, next_free=3)
+   rc 0 same 24 
+##### trigger_update_of_other_wr
+   rc 101 same 0 PANIC le-c8-remote/crates/engine/translate/trigger_exec.rs:708:44: UPDATE should contain some updated columns
+##### trigger_update_of_rowid
+   rc 0 same 8 
+##### trigger_update_of_v_wr
+   rc 101 same 0 PANIC le-c8-remote/crates/engine/translate/trigger_exec.rs:708:44: UPDATE should contain some updated columns
+##### window_date1
+   rc 0 same 4 
+##### window_date2
+   rc 0 same 4 
+##### window_date3
+   rc 101 same 0 PANIC /oracle-c8-remote/crates/engine/translate/window.rs:3457:22: internal error: entered unreachable code: lag/lead arg[0] must be a buffer column reference after planner rewrite, got Some(Binary(Column { database: None, table: TableInternalId(1), column: 2, is_row
+##### window_date4
+   rc 0 same 4 
+##### window_date5
+   rc 101 same 0 PANIC /oracle-c8-remote/crates/engine/translate/window.rs:3457:22: internal error: entered unreachable code: lag/lead arg[0] must be a buffer column reference after planner rewrite, got Some(Binary(Column { database: None, table: TableInternalId(1), column: 2, is_row
+##### window_date6
+   rc 0 same 4 
+##### window_date7
+   rc 101 same 0 PANIC /oracle-c8-remote/crates/engine/translate/window.rs:3457:22: internal error: entered unreachable code: lag/lead arg[0] must be a buffer column reference after planner rewrite, got Some(Literal(String("'x'")))
+##### window_date8
+   rc 0 same 4 
+##### window_date9
+   rc 0 same 4 
+##### compound_collation2
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT a FROM t UNION SELECT a FROM u
+      SQLite  2 rows / 'abc' / 'x'
+      Amphora 2 rows / 'ABC' / 'x'
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT a FROM t GROUP BY a UNION SELECT a FROM u UNION SELECT 'z'
+      SQLite  3 rows / 'abc' / 'x' / 'z'
+      Amphora 4 rows / 'ABC' / 'abc' / 'x' / 'z'
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT a FROM u EXCEPT SELECT a FROM t
+      SQLite  2 rows / 'ABC' / 'abc'
+      Amphora 1 rows / 'ABC'
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT a FROM u UNION SELECT a FROM t
+      SQLite  3 rows / 'ABC' / 'abc' / 'x'
+      Amphora 2 rows / 'ABC' / 'x'
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT a FROM u EXCEPT SELECT 'q' COLLATE NOCASE
+      SQLite  2 rows / 'ABC' / 'abc'
+      Amphora 1 rows / 'ABC'
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT a FROM t UNION ALL SELECT a FROM u UNION SELECT 'ABC'
+      SQLite  2 rows / 'ABC' / 'x'
+      Amphora 3 rows / 'ABC' / 'abc' / 'x'
+   rc 0 same 0 
+##### correlated_full_join_panic
+   rc 101 same 0 PANIC ora-perf/oracle-c8-remote/crates/engine/vdbe/mod.rs:1607:32: cursor id 1 is None
+##### or_ignore_strict_pk
+   refused: [Refused { error: "NOT NULL constraint failed: t.k (19)", statement: "INSERT OR IGNORE INTO t VALUES ('a', 1), (NULL, 2), ('b', 3)" }]
+   rc 0 same 4 
+##### or_ignore_wr_composite
+   rc 0 same 4 
+##### or_ignore_wr_pk
+   rc 0 same 4 
+##### or_replace_wr_pk
+   rc 0 same 4 
+##### row_between2
+   DIFFERS default,parallel :: SELECT e.day, f.hour FROM ev e JOIN ev f ON ((e.day, f.hour) BETWEEN (1, 10) AND (2, 4))
+      SQLite  4 rows / 1, 20 / 1, 20 / 2, 3 / 2, 1
+      Amphora 0 rows
+   rc 0 same 14 
+##### row_between
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT a, b, (a, b) BETWEEN (1, 1) AND (10, 20) FROM t
+      SQLite  3 rows / 10, 10, 1 / 10, 'a', 0 / 'a', 10, 0
+      Amphora error: Parse error: insufficient registers allocated for expression vector write (start=4, count=2, next_free=5)
+   rc 0 same 16 
+##### using_full_affinity
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT y FROM a FULL JOIN b USING (k) WHERE k = 2
+      SQLite  1 rows / 2
+      Amphora 0 rows
+   DIFFERS default,parallel,statistics,parallel, statistics :: SELECT y FROM a NATURAL FULL JOIN b WHERE k = 2
+      SQLite  1 rows / 2
+      Amphora 0 rows
+   rc 0 same 12 
+##### using_full_int_text
+   rc 0 same 12 

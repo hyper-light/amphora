@@ -2462,6 +2462,23 @@ before any frame of the current one.
   Each segment then holds at most its bound plus what the writer appends in 2D plus one copy. The A/B below measures
   that against today's twice-the-bound.
 
+- **A read ended for a write that needs the room (Ada, 2026-11-24; lane V21).** A read holds a segment for at most
+  its request's deadline D, or until a writer needs the room: the owner of the log ends the reads that count on the
+  closing segment, at once and all of them, when the room's end is near (replication.md, B). Each is told it is over
+  before its mark and its counts are given back, under the lock its pages are taken in under (`ReadHold::admit`, lane
+  V22): what a read of the log or the file brings is taken in (the page's buffer, the image among the shared pages, the
+  record kept decoded) wholly before its read is ended, or not at all, so its bytes were read before its segments were
+  given back. Lane V21's check of a flag once the bytes had arrived refused the bytes, but left a window before they were
+  shared: a read ended between the two would have put the file's old page among the shared pages after the copy had
+  forgotten it there, for every later read. A page is checked against the read it was asked in, by that read's number
+  (`Asked`), whenever its bytes arrive: one in flight as its read rolls back, or past the connection's next begin, is
+  refused too. A page found among the shared pages is checked once found: between its lookup in the log and that one,
+  the file's version may have become another's. What an ended read finds broken (a short read, a record or a chain that
+  doesn't hold) is the end, not corruption. `Segments` and the multi-process word are unchanged: the read is counted until
+  it is given back, whoever gives it. Multi-process logs, which switch nothing, end none. Tests: crates/engine/tests/
+  read_ended.rs and `d45_a_page_is_taken_in_wholly_before_its_read_ends_or_not_at_all`, `d45_a_shared_page_found_as_its_
+  read_ends_is_never_taken_in` (wal.rs).
+
 **A replica's owner (the coordinator, 2026-11-24; lane V20).** The restart a replica's owner makes is this switch and
 waits for no local read (replication.md, "A replica's database log bounded by what it measures", B and D, which had it
 wait until no read was out and held reads for it). It calls the switch alone (`Db::switch_log`), never

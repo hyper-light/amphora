@@ -1,0 +1,29 @@
+# same Wrong: the statements leave other rows to SELECT rowid, * FROM t1
+
+seed 8002, state 592
+
+## Statements
+
+```sql
+CREATE TABLE t1(c0 BOOLEAN COLLATE RTRIM, c1 INTEGER COLLATE NOCASE PRIMARY KEY, c2 REAL COLLATE RTRIM);
+INSERT INTO t1 VALUES ('é', NULL, 9223372036854775807), ('0x10', 1, 1.5) ON CONFLICT(c1) DO UPDATE SET c1 = (9223372036854775807 COLLATE BINARY), c2 = -100;
+INSERT OR IGNORE INTO t1 VALUES (x'c3bf', NULL, -1e-308);
+```
+
+## Queries
+
+```sql
+SELECT rowid, * FROM t1;
+```
+
+## What differed
+
+```
+the statements leave other rows to SELECT rowid, * FROM t1
+  expected: 2 rows
+    3874338766634630003, x'c3bf', 3874338766634630003, -1e-308
+    9223372036854775807, 'é', 9223372036854775807, -100.0
+  Amphora:  2 rows
+    3799185251526053762, x'c3bf', 3799185251526053762, -1e-308
+    9223372036854775807, 'é', 9223372036854775807, -100.0
+```

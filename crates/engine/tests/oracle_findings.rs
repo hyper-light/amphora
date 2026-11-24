@@ -2972,3 +2972,98 @@ fn a_right_or_full_join_over_nested_subqueries_returns_sqlites_rows() {
         }
     }
 }
+
+/// Do: a LEFT JOIN whose ON holds a term on the left table alone, over a column with an index, under
+/// WHERE terms on that table: beside a join key or not, the index unique or not, one ON term or two;
+/// the same join written as a RIGHT JOIN and as a FULL JOIN whose WHERE drops the right table's
+/// unmatched rows; and the oracles' own queries. Each as the database opens, with the parallel mode
+/// on, and with statistics.
+/// Expect: SQLite's rows: the left row its ON refuses stands, NULL-extended. A multi-index AND on the
+/// left table sought its index by the ON term's bound, as if it were a WHERE term, and the row was gone
+/// (findings tlp-0026d1343cdbadae, tlp-6c50fd752555f572 and diff-3fcb32b9317ecd43, seeds 1011, 1015 and
+/// 904: cause CG).
+#[test]
+fn a_left_join_keeps_the_left_rows_an_on_term_of_theirs_refuses() {
+    let both = "WHERE a.total > 100 AND a.note IS NULL";
+    let statements: &[(String, &[&str])] = &[
+        (
+            format!("SELECT a.id, b.id FROM a LEFT JOIN b ON a.code = '255' AND b.id = a.id {both}"),
+            &["1|1", "3|NULL"],
+        ),
+        (
+            format!("SELECT a.id, b.id FROM a LEFT JOIN b ON a.code = '255' {both}"),
+            &["1|1", "1|2", "1|3", "3|NULL"],
+        ),
+        (
+            format!("SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = 1 {both}"),
+            &["1|1", "1|2", "1|3", "3|NULL"],
+        ),
+        (
+            format!("SELECT a.id, b.id FROM a LEFT JOIN b ON a.code = '255' AND a.k = 1 {both}"),
+            &["1|1", "1|2", "1|3", "3|NULL"],
+        ),
+        (
+            format!("SELECT a.id, b.id FROM b RIGHT JOIN a ON a.code = '255' AND b.id = a.id {both}"),
+            &["1|1", "3|NULL"],
+        ),
+        (
+            format!("SELECT a.id, b.id FROM a FULL JOIN b ON a.code = '255' AND b.id = a.id {both}"),
+            &["1|1", "3|NULL"],
+        ),
+        (
+            "SELECT 0.0 FROM t0 AS a0 LEFT JOIN t0 AS a1 ON (a0.c2 <= 100) \
+             WHERE ((100 < a0.c0) AND ((NULL = a0.c1) ISNULL))"
+                .into(),
+            &["0.0"],
+        ),
+        (
+            "SELECT NULL FROM t1 AS a0 LEFT JOIN t1 AS a1 ON (1e308 <= a0.c2) \
+             WHERE ((9223372036854775807 <= a0.c1) AND (((NOT a0.c2) OR NULL) ISNULL))"
+                .into(),
+            &["NULL"],
+        ),
+        (
+            "SELECT -9223372036854775808 FROM t2 AS a0 LEFT JOIN t3 AS a1 ON (a0.c0 < 1000000000000000.0) \
+             RIGHT JOIN t2 AS a2 ON (a0.c0 NOTNULL) WHERE (concat(7) > a0.c1)"
+                .into(),
+            &["-9223372036854775808"],
+        ),
+    ];
+    for (setting, parallel, statistics) in [
+        ("default", false, false),
+        ("parallel", true, false),
+        ("statistics", false, true),
+        ("parallel, statistics", true, true),
+    ] {
+        let (io, conn) = open();
+        for statement in [
+            "CREATE TABLE a(id INTEGER PRIMARY KEY, total REAL, code TEXT UNIQUE, note TEXT, k INT)",
+            "CREATE INDEX a_total ON a(total)",
+            "CREATE INDEX a_k ON a(k)",
+            "CREATE TABLE b(id INTEGER PRIMARY KEY)",
+            "INSERT INTO a VALUES (1, 255, '255', NULL, 1), (2, 50, '050', NULL, 1), (3, 300, '099', NULL, 2)",
+            "INSERT INTO b VALUES (1), (2), (3)",
+            "CREATE TABLE t0(c0 REAL COLLATE RTRIM, c1 INTEGER PRIMARY KEY NOT NULL, c2 VARCHAR(10) UNIQUE)",
+            "INSERT OR IGNORE INTO t0 VALUES (255, NULL, 255)",
+            "CREATE INDEX i0 ON t0(c0 DESC)",
+            "CREATE TABLE t1(c0 INT UNIQUE, c1 BLOB PRIMARY KEY, c2 BOOLEAN UNIQUE NOT NULL)",
+            "INSERT INTO t1 VALUES (9007199254740993, 'x', '1')",
+            "CREATE TABLE t2(c0 DECIMAL(10,2) PRIMARY KEY, c1 UNIQUE)",
+            "INSERT INTO t2 VALUES ('', 255)",
+            "CREATE TABLE t3(c0, c1 DOUBLE, c2 INT UNIQUE, c3)",
+        ] {
+            conn.execute(statement).unwrap();
+        }
+        if parallel {
+            conn.set_parallel_mode(amphora_engine::morsel::ParallelMode::On);
+        }
+        if statistics {
+            conn.execute("ANALYZE").unwrap();
+        }
+        for (sql, expected) in statements {
+            let mut got = rows(&io, &conn, sql);
+            got.sort();
+            assert_eq!(got, *expected, "{setting}: {sql}");
+        }
+    }
+}

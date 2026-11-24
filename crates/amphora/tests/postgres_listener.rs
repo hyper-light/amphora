@@ -461,3 +461,46 @@ fn t_pg_9_3_a_session_that_ends_in_a_transaction_leaves_nothing_of_it() {
         assert_eq!(answer[1], (b'D', b"\x00\x01\x00\x00\x00\x0211".to_vec()));
     });
 }
+
+/// T-PG.14.3: over sockets, a session whose statement waits for a row another session's open
+/// transaction changed is answered when that transaction commits, and stops no other: a third
+/// session's statement is answered meanwhile.
+#[test]
+fn t_pg_14_3_a_waiting_session_holds_no_other_and_is_answered_when_its_holder_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    run(listener(&dir, u64::MAX, 4), |addr| async move {
+        let mut clients = Vec::new();
+        for _ in 0..3 {
+            let mut client = Client::connect(addr).await;
+            client.log_in().await;
+            clients.push(client);
+        }
+        let [holder, waiter, other] = clients.as_mut_slice() else {
+            panic!("three clients");
+        };
+        for sql in [
+            "create table t(a int not null, b int)",
+            "insert into t(a, b) values (1, 10)",
+            "begin",
+            "update t set b = b + 1 where a = 1",
+        ] {
+            let answer = holder.query(sql).await;
+            assert_eq!(answer[0].0, b'C', "{sql}: {answer:?}");
+        }
+        let mut body = b"update t set b = b + 100 where a = 1".to_vec();
+        body.push(0);
+        waiter.send(&frontend(b'Q', &body)).await;
+        let answer = other.query("select b from t where a = 1").await;
+        assert_eq!(answer[1], (b'D', b"\x00\x01\x00\x00\x00\x0210".to_vec()));
+        let answer = holder.query("commit").await;
+        assert_eq!(answer[0], (b'C', b"COMMIT\0".to_vec()));
+        assert_eq!(
+            waiter.recv().await,
+            Some((b'C', b"UPDATE 1\0".to_vec())),
+            "the statement that waited applies to the committed value"
+        );
+        assert_eq!(waiter.recv().await, Some((b'Z', b"I".to_vec())));
+        let answer = other.query("select b from t where a = 1").await;
+        assert_eq!(answer[1], (b'D', b"\x00\x01\x00\x00\x00\x03111".to_vec()));
+    });
+}
