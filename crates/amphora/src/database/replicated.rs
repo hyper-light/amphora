@@ -18916,6 +18916,11 @@ mod tests {
                 })
                 .unwrap();
             driven.quiet(&mut pump);
+            assert_eq!(
+                driven.owner(leader).slots.holder(),
+                None,
+                "{durability:?}: a slot was held before member 3 wrote"
+            );
             let ended = |how| clients[leader].handle().counters().write_slot_ended(how);
             let (released, expired) = (ended(SlotEnd::Released), ended(SlotEnd::Expired));
             let holder = 2;
@@ -18931,8 +18936,12 @@ mod tests {
                 Ok(Vec::new())
             });
             let mut rounds = 0;
-            while !driven.owner(leader).slots.holds() {
-                assert!(rounds < ROUNDS, "{durability:?}: member 3's write held no slot");
+            while driven.owner(leader).slots.holder() != Some(3) {
+                assert!(
+                    rounds < ROUNDS,
+                    "{durability:?}: member 3's write held no slot, {:?} did",
+                    driven.owner(leader).slots.holder()
+                );
                 driven.round(&mut pump);
                 rounds += 1;
             }
@@ -18969,14 +18978,11 @@ mod tests {
             assert_eq!(
                 (
                     ended(SlotEnd::Released) - released,
-                    ended(SlotEnd::Expired) - expired
+                    ended(SlotEnd::Expired) - expired,
+                    driven.lapses
                 ),
-                (1, 0),
-                "{durability:?}: member 3's slot ended (released, expired)"
-            );
-            assert_eq!(
-                driven.lapses, 0,
-                "{durability:?}: a slot ended by its length"
+                (1, 0, 0),
+                "{durability:?}: member 3's slot ended (released, expired) and the clock moves for a slot's end"
             );
             driven.quiet(&mut pump);
             driven.drain(&mut pump);
