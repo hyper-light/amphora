@@ -1,3 +1,4 @@
+use crate::alloc::TryClone;
 use crate::sync::Arc;
 use crate::{turso_assert, turso_assert_greater_than_or_equal};
 
