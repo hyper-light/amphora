@@ -35,6 +35,10 @@ fn c12_sql() {
         ("stats", false, true, JoinMethods::ByCost),
         ("stats+parallel", true, true, JoinMethods::ByCost),
         ("hash", false, false, JoinMethods::HashJoinsOnly),
+        ("stats+hash", false, true, JoinMethods::HashJoinsOnly),
+        ("stats+hash+parallel", true, true, JoinMethods::HashJoinsOnly),
+        ("stats+merge", false, true, JoinMethods::MergeJoinsOnly),
+        ("stats+loops", false, true, JoinMethods::NestedLoopsOnly),
         ("loops", false, false, JoinMethods::NestedLoopsOnly),
     ] {
         if only.as_ref().is_some_and(|o| o != name) { continue; }
