@@ -5278,6 +5278,64 @@ pub(crate) mod bushy_search_tests {
             }
         }
 
+        /// Lane C3's probe, not for main: what an automatic index's build takes against what it is
+        /// priced at, beside a whole scan's, at three sizes.
+        #[test]
+        fn c3_probe_autoindex() {
+            use super::super::bushy_test_hook::{PIN, PIN_HASH_JOINS, SPLIT};
+            let nanos = |conn: &Arc<crate::Connection>, sql: &str| -> (f64, f64, String) {
+                let mut times = Vec::new();
+                LAST_JOIN_COST.with(|cost| cost.set(0.0));
+                for _ in 0..11 {
+                    let mut stmt = conn.prepare(sql).unwrap();
+                    let began = std::time::Instant::now();
+                    stmt.run_collect_rows().unwrap();
+                    times.push(began.elapsed().as_nanos() as f64);
+                }
+                times.sort_by(f64::total_cmp);
+                let cost = LAST_JOIN_COST.with(Cell::get);
+                let plan = rows(conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+                (times[5], cost, format!("{plan:?}"))
+            };
+            for n in [1500, 3000, 12000, 48000] {
+                let io = Arc::new(MemoryIO::new());
+                let db =
+                    Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+                let conn = db.connect(ConnectOpts::new()).unwrap();
+                for sql in [
+                    "CREATE TABLE d1(id INTEGER PRIMARY KEY, cat INT)".to_string(),
+                    "CREATE TABLE d2(id INTEGER PRIMARY KEY, cat INT)".to_string(),
+                    "CREATE TABLE f1(id INTEGER PRIMARY KEY, d1 INT, k INT)".to_string(),
+                    "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 50) \
+                     INSERT INTO d1 SELECT x, x % 25 FROM n".to_string(),
+                    "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 50) \
+                     INSERT INTO d2 SELECT x, x % 25 FROM n".to_string(),
+                    format!("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < {n}) \
+                     INSERT INTO f1 SELECT x, x % 50 + 1, x % 2 FROM n"),
+                    "ANALYZE".to_string(),
+                ] {
+                    conn.execute(sql).unwrap();
+                }
+                let weights = db.learned_costs.weights();
+                let (scan, _, _) = nanos(&conn, "SELECT sum(f1.k) FROM f1");
+                // f1 read by the automatic index under two rows of d1, d2's join after it empty.
+                let sql = "SELECT count(*) FROM d1 JOIN f1 ON f1.d1 = d1.id JOIN d2 ON d2.id = f1.k + 100 \
+                           WHERE d1.id < 3";
+                PIN.with(|pin| pin.set(true));
+                PIN_HASH_JOINS.with(|positions| positions.set(1 << 2));
+                SPLIT.with(|s| s.set(None));
+                let (index, cost, plan) = nanos(&conn, sql);
+                PIN.with(|pin| pin.set(false));
+                PIN_HASH_JOINS.with(|positions| positions.set(0));
+                let row = scan / f64::from(n);
+                eprintln!(
+                    "C3I|n={n}|scan {scan:.0} ns, {row:.1} ns a row|automatic index plan {index:.0} ns = {:.2} rows' visits a row indexed (scan taken off: {:.2})|estimated cost {cost}|weights={weights:?}|{plan}",
+                    index / row / f64::from(n),
+                    (index - scan) / row / f64::from(n),
+                );
+            }
+        }
+
         /// One database of `tests/fixtures/outer_joins.tsv`: the statements that fill it, and its
         /// queries with SQLite's answers.
         struct OuterJoins {
