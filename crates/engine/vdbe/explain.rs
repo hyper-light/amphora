@@ -1259,9 +1259,9 @@ pub fn insn_to_row(
                 gone,
             } => (
                 "LockRow",
-                *cursor_id as i64,
-                held.as_debug_int() as i64,
-                gone.as_debug_int() as i64,
+                i64::try_from(*cursor_id).unwrap_or(i64::MAX),
+                i64::from(held.as_debug_int()),
+                i64::from(gone.as_debug_int()),
                 Value::build_text(""),
                 0,
                 "".to_string(),
