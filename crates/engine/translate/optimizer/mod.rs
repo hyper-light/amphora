@@ -6985,7 +6985,6 @@ fn ephemeral_index_build(
         root_page: 0,
         where_clause: autoindex_prefilter(
             table_reference,
-            table_references,
             constraints,
             constraint_refs,
             where_clause,
@@ -7028,7 +7027,6 @@ fn ephemeral_index_build(
 /// value, so rows before that date can be left out of the index entirely.
 fn autoindex_prefilter(
     table_reference: &JoinedTable,
-    table_references: &TableReferences,
     constraints: &[Constraint],
     constraint_refs: &[RangeConstraintRef],
     where_clause: &[WhereTerm],
