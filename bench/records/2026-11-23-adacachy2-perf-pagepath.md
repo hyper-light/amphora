@@ -1070,3 +1070,173 @@ comment says the cache keys by the current segment's frames), then rerun both.
 - The fix taken out (64e77079 less its three lines): the seed-45 test fails as seed 45 did, "the copy doesn't open
   (third switch made: true): ... checkpoint sequences Some(0) and Some(3), neither one past the other".
 - Main before B18 (46773985) on the four tests and the power cut: still running at the hour's end (r146).
+
+## perf-B20 (2026-11-24, 03:53-05:00Z; the wrong read across segments fixed, B19's branch landed)
+
+**Losses first.** Three failures stand on main itself, and this lane fixes none of them (not its deliverable):
+- `database::replicated::tests::a_checkpoint_pass_copies_no_frame_past_the_last_finished_flush` fails 3 of 3 on main
+  5bd0f46e ("left: 77, right: 17" and "76, 18": the pass reports more frames than `log_frames`), 3 of 3 on the branch
+  merged with it (a671b8f2), and 3 of 3 on that tree with this lane's fix reverted (r282, diag.sh). B19 saw it pass
+  at r146 on an older main.
+- backup's `t_t1_12_d1_restore_drills_at_random_seconds` fails 28 of 28 on main fac69083 and 28 of 28 on the branch
+  (below).
+- `window_slow_flooded_fast_starved` failed once ("Fenced: the state machine failed") in r221's
+  `database::replicated::` run on 284e4806, passed in r282's on a671b8f2, and passed 3 of 3 alone on the merged
+  tree, the tree less the fix, and main: a flake under load, not run on main inside the suite.
+
+Decision 45's switch is still not made by RESTART, TRUNCATE and the writer's restart before a write, and the five
+in-place restart functions are not deleted: the next lane's.
+
+**The wrong read: what labelled the page (traced).** The checkpoint's pass over the current segment takes a cached page
+in place of a frame when the page's label, (frame, epoch), is that frame and the current epoch
+(`cache_get_for_checkpoint`). Frame numbers start again in each segment (decision 45). Two things let a label from one
+segment pass for the other's frame:
+- `read_frame` and `read_frames_batch` labelled a page read from the closing segment with that segment's frame number
+  and the current segment's epoch;
+- a switch carried the closing segment's epoch over unchanged (`start_after`), so a label taken while the closing
+  segment was current also matched the new segment's frames until the next pass's bump. A closing segment copied
+  whole before the switch gets no bump at all: its pass returns at once.
+
+`d45_a_page_cached_from_the_closing_segment_never_passes_for_the_current_ones` under `RUST_LOG=amphora_engine::storage::wal=debug,amphora_engine::storage::pager=trace`
+(r201, adacachy2, needs `linux/amd64,cpus=4,mem=12g`), before the fix (32a1adc5, the log line only), red at
+wal.rs:11909 (the file held 0 rows of 'B'):
+```
+read_frame(page_idx = 2, frame_id = 1, segment = Second)
+read_frame(page_idx = 2, frame_id = 1, segment = Second)
+cache_get_for_checkpoint: page 2 frame 1 is valid
+```
+After it (73cbafdc), green:
+```
+read_frame(page_idx = 2, frame_id = 1, segment = Second, label epoch = None)
+read_frame(page_idx = 2, frame_id = 1, segment = Second, label epoch = None)
+cache_get_for_checkpoint: page 2 has frame/tag (17592186044415, 1048575): (dirty=false), need frame 1 and seq 4
+```
+The reader's page from the closing segment carries no label (the unset tag), so the pass reads the current segment's
+frame 1 ('B') from the log. `..._for_its_frames_after_reuse` passes before and after (its trace shows a page read
+from the first segment while it was closing, unlabelled).
+
+**The fix (73cbafdc, 6c28b81c).** At both causes:
+- `WalFile::label_epoch`: a page is labelled only when its frame is in the current segment, the epoch read before
+  the segment, so a switch between the two reads leaves the page unlabelled. Both read paths use it.
+- `WalFileShared::start_after`: the free segment starts one epoch past the closing one's, as a restart bumps it; its
+  doc said the epoch was carried "so that it never comes back to a value a connection took from the closing
+  segment", and carrying it unchanged did exactly that.
+- A closing pass reads its own frames (the checkpoint's comment), so the closing segment's pages lose nothing.
+- 6c28b81c: `bool::then_some` is a disallowed method; check-production's engine ratchet counted 41 against 40 (r221).
+- The two tests run under `test_log` (32a1adc5), and `read_frame`'s debug line names the segment and the label: the
+  signal that would have shown this at first look.
+
+**The two failures B19 couldn't explain (r189, adacachy2, needs `linux/amd64,cpus=4,mem=12g`, load 55-62).** Main
+fac69083 and the branch merged with it (b4811aca), both test binaries built once and run side by side, 28 rounds
+each (the 29th stopped):
+- backup's `t_t1_12_d1_restore_drills_at_random_seconds`: fails 28 of 28 on main and 28 of 28 on the branch, at
+  backup.rs:172 (`end_base`), "source.db-wal2 held 0 bytes at 0, not 32" on both. Main's own, from before this
+  branch (main lacks 94d01e88, so not its refusal). Not fixed here: not this lane's deliverable.
+- `session_reads::t_t1_10_r1_a_session_reads_its_write_on_a_lagging_follower`: passes 28 of 28 on main and 28 of 28
+  on the branch. Main has since renamed it `t_t1_10_r5_...` (358fbde2), body unchanged; it passed in r221's
+  `database::replicated::` run on the merged tree.
+
+**Ada's decisions applied.** replication.md section D restated (c50e0709): a replica's log is two segment files, each
+within the room; the room counts the current segment's frames from the log's shared state. The image-install test
+keeps B19's Ok(true) (64e77079).
+
+**Checks.**
+- r201 (73cbafdc): `d45_` 23 passed (B19: 22 and the red one); workspace clippy exit 0 in 53 s.
+- r221 (284e4806, the branch with main 39ecf1df merged; needs `linux/amd64,cpus=3,mem=10g`, load 38-89): workspace
+  clippy exit 0 in 61 s ("Checking amphora-engine" in its log); `d45_` 23 passed, the store and backup `d45_` 1 and
+  1; the 200-seed power cut passed; `database::replicated::` 149 passed, 2 failed (below); tests/store.rs 17/17;
+  tests/backup.rs 20 passed, 1 failed (`t_t1_12_d1`, main's own, above); `storage:: vdbe::vacuum` 750 passed,
+  0 failed, 14 ignored in 291 s; check-production exit 1 (the ratchet, fixed in 6c28b81c).
+- The final checks of a1c3dc95 (the third merge, main 0c13cf68) that this lane ran and didn't record before it was
+  interrupted, from the logs it left on adacachy2 (`~/.cache/amphora-perf/pagepath-b20/*.log`, written 04:34Z to
+  04:44Z after its checkout of a1c3dc95 at 04:33Z; the kiln run id wasn't read; filled in by lane B21): workspace
+  clippy Finished in 44 s ("Checking amphora-engine" in its log, no error); check-production exit 0 ("10903 left ...,
+  as the ratchet holds"); `d45_` 23 passed, the store and backup `d45_` 1 and 1; the 200-seed power cut passed;
+  `database::replicated::` 151 passed, 1 failed (`window_slow_flooded_fast_starved`, "Fenced: the state machine failed",
+  load high enough that the suite took 100 s); tests/store.rs 17/17; tests/backup.rs 20 passed, 1 failed (`t_t1_12_d1`,
+  main's own); `storage:: vdbe::vacuum` 752 passed, 0 failed, 14 ignored in 249 s.
+
+## perf-B21 (2026-11-24, 04:58-05:58Z; lane B20's branch landed on main)
+
+**Losses first.** Failures that stand on main itself, which this lane doesn't fix:
+- backup's `t_t1_12_d1_restore_drills_at_random_seconds` fails 5 of 5 on main a64549cc and 5 of 5 on the merged tree
+  999fa608 (r307's `cmp`), and 28 of 28 each in B20's r189: at backup.rs:172, the drill's `end_base`, "source.db-wal2 held 0
+  bytes at 0, not 32" (a base that ends while the log's current segment holds no frame finds no header in its file).
+  It came with lane B18's switch (main a5ae048c, decision 45). A restore drill that fails every time is a real hole in
+  the backup path.
+- `a_checkpoint_pass_copies_no_frame_past_the_last_finished_flush` fails 5 of 5 alone on main a64549cc and 4 of 5 alone on
+  the branch (r307 `cmp`, 'left: 1 right: 18' to 'left: 77 right: 17'), in every loaded suite round on both arms (r364:
+  4 of 4), and passed in the quieter suites (r307's 152 of 152; B20's at a1c3dc95, 151 of 152). Main's own, as B20
+  found (5bd0f46e): a pass whose count of frames and the test's disagree, not traced here.
+- Under load (r364, below) `v13_thirty_two_spread_writers_on_moving_time_are_each_answered_with_no_stale_base` failed in
+  every round on both arms at main a64549cc; on main 3a58a13f (a1edd3e2, lane P22's slot changes merged) it passed (r401).
+- Still not done (decision 45, the next lane's): RESTART, TRUNCATE and the writer's restart switching, and the five
+  in-place restart functions' deletion. A multi-process log refuses to switch (`Database::switch_log`). When one switches,
+  the authority's shared epoch must move with it: the label reads that counter (`WalFile::label_epoch`, through
+  `coordination.checkpoint_epoch`) while the switch moves only the segment's.
+
+**What landed.** B19's and B20's commits (94d01e88, e44b8868, ba6ee7d8, 64e77079, 32a1adc5, 73cbafdc, 92fd292e, c50e0709,
+6c28b81c) on main: 286 lines in five files (`crates/engine/storage/wal.rs`, `crates/amphora/src/db.rs`,
+`crates/amphora/src/database/replicated.rs`, docs/design/replication.md and docs/design/store.md), merged with main up to 3a58a13f
+(a1edd3e2; lane P22's replicated, slot and serve changes and hyper-raft 0009 came in clean, the branch's net diff against
+main unchanged). The landing fixes what B18's switch (main a5ae048c) broke: a committed write lost to later readers (a page
+cached from the closing segment passing for the current segment's frame, copied into the file by the next pass), and a
+database a power cut left unopenable (seed 45, a segment with no frame switched from). The fix read in full before landing,
+three facts checked in the code: a switch stores the free segment's epoch, one past the closing one's, before it makes that
+segment current (`SharedLog::switch`, then `segments.update`); `checkpoint_epoch` reads the current segment's epoch
+(in process); the switch has one caller, `Database::switch_log`, which refuses in multi-process mode.
+
+**The wrong-read tests and their log** (r307, 999fa608, adacachy2, needs `linux/amd64,cpus=8,mem=24g`, load 11,
+`RUST_LOG=amphora_engine::storage::wal=debug,amphora_engine::storage::pager=trace`): both pass, and every read from a
+closing segment is unlabelled:
+```
+d45_a_page_cached_from_the_closing_segment_never_passes_for_the_current_ones
+  read_frame(page_idx = 2, frame_id = 1, segment = Second, label epoch = None)   (twice)
+  cache_get_for_checkpoint: page 2 has frame/tag (17592186044415, 1048575): (dirty=false), need frame 1 and seq 4
+d45_a_page_cached_from_a_segment_never_passes_for_its_frames_after_reuse
+  read_frame(page_idx = 2, frame_id = 1, segment = Second, label epoch = None)
+  read_frame(page_idx = 2, frame_id = 1, segment = First, label epoch = None)
+  cache_get_for_checkpoint: page 2 has frame/tag (17592186044415, 1048575): (dirty=false), need frame 1 and seq 6
+```
+(17592186044415, 1048575) is the unset tag (2^44 - 1, 2^20 - 1): the pass takes the frame from the log, not the page cached
+from the other segment. B20's trace before the fix showed "page 2 frame 1 is valid".
+
+**The two unknown failures, the same number of runs on each arm** (r307 `cmp`, 5 rounds, both arms side by side on the same
+machine, main a64549cc and the merged tree 999fa608, load 43): `t_t1_10_r5_a_session_reads_its_write_on_a_lagging_follower`
+(main renamed B19's `t_t1_10_r1`, 358fbde2) fails 0 of 5 on each; backup's `t_t1_12_d1` fails 5 of 5 on each with the same
+panic. No failure is the branch's alone, as B20's r189 (28 of 28 each) found.
+
+**The replicated suite on both arms under load** (r364, adacachy2, needs `linux/amd64,cpus=4,mem=12g`, load 45 to 58,
+`database::replicated:: --test-threads=4`, main a64549cc and 999fa608, each two rounds, alternated):
+| arm | round 1 | round 2 |
+|---|---|---|
+| main a64549cc | 147 passed, 5 failed (124 s) | 147 passed, 5 failed (153 s) |
+| branch 999fa608 | 149 passed, 3 failed (118 s) | 150 passed, 2 failed (158 s) |
+
+On both arms: `a_checkpoint_pass_copies_no_frame...` and `v13_thirty_two_spread_writers_on_moving_time...`. On main only, as
+before (B18's reds, which B19's e44b8868 and 64e77079 fix on the branch): `a_local_read_open_across_an_image_install_sees_one_side_whole`,
+`past_its_room_a_replica_refuses_submits_and_restarts_whatever_its_share`, `a_replicas_database_log_stays_within_its_room`.
+On the branch only, once (round 1): `every_falsifier_of_the_floor_holds_under_a_nemesis` (its pump's settle; lane W4
+(perf-persisted) measured it alone at 1 of 16 on main and 1 of 16 with its change reverted, so it predates this branch).
+`window_slow_flooded_fast_starved`, which failed twice in B20's suites, failed in neither arm here.
+
+**Checks** (tree 999fa608, main a64549cc merged; then a1edd3e2, main 3a58a13f merged):
+- r307: `cargo fmt --all --check` exit 0; workspace clippy exit 0, and with the engine re-checked exit 0 in 37 s (r364:
+  "Checking amphora-engine v0.1.0" in its log, by touching its lib.rs); check-production on Linux exit 0 ("Checking
+  amphora-engine" in its log, "10903 left ... as the ratchet holds"); `d45_` 23 passed (engine) and 1 and 1 (tests/store.rs,
+  tests/backup.rs); the 200-seed power cut (`seeds(200, 1)`, seed 45 in it) passed; `database::replicated::` 152 passed,
+  0 failed, 5 ignored in 38 s (`--test-threads=8`, load 24); tests/store.rs 17 of 17; tests/backup.rs 20 passed, 1 failed
+  (`t_t1_12_d1`, main's own, above); `storage:: vdbe::vacuum` 752 passed, 0 failed, 14 ignored in 279 s.
+- The crates, Cargo and vendor files of a1c3dc95 and 999fa608 are identical (`git diff` empty), so B20's checks at a1c3dc95
+  (above) are this tree's as well: 752, 0, 14.
+- r401 (a1edd3e2, needs `linux/amd64,cpus=4,mem=12g`, load 54 to 65, 05:24Z to 05:30Z): `cargo fmt --all --check` exit 0;
+  workspace clippy exit 0 in 15 s (amphora, amphora-api and hyper-durable re-checked; amphora-engine is the source r364
+  re-checked); check-production exit 0 on Linux (amphora-engine re-checked, "10903 left ... as the ratchet holds"); `d45_`
+  23 passed, the store and backup `d45_` 1 and 1; `database::replicated::` 154 passed, 1 failed (`a_checkpoint_pass...`,
+  main's own) in 73 s; tests/store.rs 17 of 17; tests/backup.rs 20 passed, 1 failed (`t_t1_12_d1`, main's own); the
+  200-seed power cut passed. The engine's `storage:: vdbe::vacuum` was not rerun: P22's merge changes nothing in
+  `crates/engine` (r307's 752, 0, 14 at the same engine source).
+
+**Commands.** `~/.cache/amphora-perf/pagepath-b21/` on this machine holds `check.sh` and the run commands (`cmd-r1.sh` r307,
+`cmd-r3.sh` r364, `cmd-r4.sh` r401) and runs on adacachy2 in the lane's clone `~/.cache/amphora-perf/pagepath-remote`, target
+`~/.cache/amphora-perf-target/pagepath`, CARGO_INCREMENTAL=0, nice 10, `JOBS` = the needs' cpus.
