@@ -18964,7 +18964,10 @@ mod tests {
             pump.losing = Some(Box::new(move |from, message: &Message| {
                 if from == 3
                     && message.msg_type == hyper_raft::proto::MessageType::MsgReadIndex
-                    && message.entries.first().is_some_and(|entry| reads(&entry.data))
+                    && message
+                        .entries
+                        .first()
+                        .is_some_and(|entry| reads(&entry.data))
                 {
                     counted.fetch_add(1, Ordering::AcqRel);
                 }
@@ -19031,7 +19034,10 @@ mod tests {
             driven.quiet(&mut pump);
             pump.losing = None;
             assert_eq!(
-                (closes.load(Ordering::Acquire) > 0, driven.owner(leader).slots.holder()),
+                (
+                    closes.load(Ordering::Acquire) > 0,
+                    driven.owner(leader).slots.holder()
+                ),
                 (true, None),
                 "{durability:?}: member 3 closed, and the slot's holder after"
             );
