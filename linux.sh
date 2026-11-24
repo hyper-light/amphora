@@ -4,7 +4,7 @@ set -uo pipefail
 SHA=$1; shift
 export CARGO_HOME=$HOME/.cache/cargo-home-perf-oracle-c27 CARGO_NET_OFFLINE=true CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=${JOBS:-8}
 export CARGO_TARGET_DIR=$HOME/.cache/amphora-perf-target/oracle-c27
-O=$HOME/.cache/amphora-perf/oracle-c27-out; R=$HOME/.cache/amphora-perf/oracle-c27-remote; S=$HOME/.cache/amphora-perf/oracle-c27-scripts
+O=$HOME/.cache/amphora-perf/oracle-c27-out; R=$HOME/.cache/amphora-perf/${CLONE:-oracle-c27-remote}; S=$HOME/.cache/amphora-perf/oracle-c27-scripts
 LIB=$HOME/.cache/sqlite-oracle/libsqlite3-oracle-3540000.so
 mkdir -p "$O" "$CARGO_HOME" "$CARGO_TARGET_DIR" "$HOME/.cache/amphora-perf-bin/oracle-c27"
 for d in registry git bin; do [ -e "$CARGO_HOME/$d" ] || ln -s "$HOME/.cargo/$d" "$CARGO_HOME/$d"; done
