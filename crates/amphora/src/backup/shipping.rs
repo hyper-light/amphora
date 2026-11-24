@@ -1172,7 +1172,8 @@ mod tests {
     /// AC-T1.12.4 (lane B26): a check that fails wakes the shipping thread for the base it asks for: no
     /// commit does. Do: end a first base, commit and ship; zero the last frame of the log's
     /// generation in the archive, sealed again; start the threads, whose wakes are the test's to make; once
-    /// the check thread holds its snapshot, make one, so the round after it checks the snapshot's second; make no other.
+    /// the check thread took its snapshot, make one, so the round after it checks that second; make no
+    /// other.
     /// Expect: the check fails, and a base begun after the short generation ends.
     #[test]
     fn a_check_that_fails_wakes_the_round_that_begins_a_base() {
@@ -1212,21 +1213,17 @@ mod tests {
             assert!(Instant::now() < deadline, "no snapshot was taken");
             std::thread::yield_now();
         }
-        assert!(wake.as_mut().unwrap()(), "the thread runs");
-        let status = shipping.wait(until(), |s| s.bases > 0).unwrap_or_else(|e| {
-            panic!("no base ended: {e:#}; {:?}", shipping.status());
-        });
-        assert!(
-            matches!(
-                &status.last_check,
-                Some(Check::Failed {
-                    why: CheckFailure::Lacking { lacks, .. },
-                    ..
-                }) if *lacks == Lacks::Frames { generation }
-            ),
-            "{:?}",
-            status.last_check
-        );
+        assert!(wake.as_ref().unwrap()(), "the thread runs");
+        let failed = |s: &Status| match &s.last_check {
+            Some(Check::Failed {
+                why: CheckFailure::Lacking { lacks, .. },
+                ..
+            }) => *lacks == Lacks::Frames { generation },
+            _ => false,
+        };
+        shipping
+            .wait(until(), |s| s.bases > 0 && failed(s))
+            .unwrap_or_else(|e| panic!("no base ended: {e:#}; {:?}", shipping.status()));
         let bases = blobs.list("db/base/", None, 10, until()).unwrap().objects;
         let (newest, _) = bases.last().unwrap();
         let newest = plan::BaseKey::parse("db", newest).unwrap();
