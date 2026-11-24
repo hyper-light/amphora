@@ -620,7 +620,9 @@ impl Db {
     /// to its free segment (docs/design/store.md, decision 45): whether it did. The current
     /// segment is flushed and closes; reads under way keep reading it. It waits for no read:
     /// false while another connection writes, or while a read still counts on the segment the
-    /// last switch closed, and the caller asks again at its next turn. A segment switched to is
+    /// last switch closed, and the caller asks again at its next turn. Past the room a restart
+    /// keeps ([`Db::keep_log`]), the reads that count on that segment are ended first, each
+    /// answered that its snapshot is too old ([`Db::end_closing_reads`]). A segment switched to is
     /// cut to nothing first if it holds room for more frames than [`Db::keep_log`] keeps
     /// (decision 31).
     ///
@@ -660,6 +662,12 @@ impl Db {
         // segment reset, which a read still on it holds off (the writer asks again at its next
         // turn).
         if copy {
+            // Past the room a restart keeps, the next one is needed, and the reads that hold the
+            // segment the last one closed keep it from the log: they end, all at once, and none
+            // while there is room (Ada, 2026-11-24: one slow read never holds up a write).
+            if over {
+                let _ended = self.end_closing_reads();
+            }
             let _closing = self.checkpoint()?;
             let _current = self.checkpoint()?;
         }
