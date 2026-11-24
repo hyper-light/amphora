@@ -937,11 +937,12 @@ fn flusher(sends: &Sends, flush: &Flush, meter: &Meter) {
                 if ending {
                     return;
                 }
+                // Every batch settled, the store stopping and a failed flush wake it (`Sends::wake`,
+                // `stop`, `disk_failed`, each under this lock).
                 committed = sends
                     .done
-                    .wait_timeout(committed, Duration::from_secs(1))
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .0;
+                    .wait(committed)
+                    .unwrap_or_else(PoisonError::into_inner);
             }
         };
         let began = Instant::now();
