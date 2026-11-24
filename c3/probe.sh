@@ -24,4 +24,6 @@ echo "--- forced shapes"
 nice -n 10 "$P" c3_probe_forced --nocapture --test-threads=1 2>&1 | cut -c1-1200
 echo "--- plans weighed"
 RUST_LOG=amphora::join_search=debug nice -n 10 "$P" c3_probe_weighed --nocapture --test-threads=1 >"$L/weighed.log" 2>&1; echo "rc=$?"; grep -c weighed "$L/weighed.log"; grep -E 'C3W' "$L/weighed.log" | cut -c1-900
+echo "--- an automatic index's build"
+nice -n 10 "$P" c3_probe_autoindex --nocapture --test-threads=1 2>&1 | grep -E 'C3I|panicked|test result' | cut -c1-900
 echo "== done $(date -u +%H:%M:%SZ)"
