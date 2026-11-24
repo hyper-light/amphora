@@ -17759,6 +17759,48 @@ mod tests {
         pump.finish();
     }
 
+    /// AC-T1.8.D1, T-T1.8.D1 (replication.md, "A replica's database log bounded by what it
+    /// measures", B and D; store.md, decision 45): a restart that went through is owed nothing more
+    /// and holds no read back, though nothing is written after it: the owner counts the segment it
+    /// switched to, not the one it closed. Do: a voter and its learner, the learner told it has
+    /// nothing free past one image, so its room is about half what its log's file holds; written
+    /// until the learner's log restarted; the learner's flushing thread's flushes held, so a pass
+    /// the owner asks for stays out; rounds; a local read on the learner. Expect: the read
+    /// answered, with every value written.
+    #[test]
+    fn a_read_after_the_logs_restart_is_not_held_though_nothing_is_written_after_it() {
+        own_account();
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = voter_and_learner(&mut driven, dir.path());
+        driven
+            .owner(1)
+            .replica
+            .machine()
+            .set_free_bytes(free_for(0, 2));
+        let mut pump = Pump::new(&clients);
+        let (voter, learner) = (&clients[0], &clients[1]);
+        let handle = learner.handle();
+        let restarts = handle.counters().database_log_restarts;
+        let mut written = 0;
+        while handle.counters().database_log_restarts == restarts {
+            written += 1;
+            assert!(written < 40, "no restart: {:?}", handle.counters());
+            write(&mut driven, &mut pump, voter, written);
+            settle_log(&mut driven, &mut pump, &clients);
+        }
+        let gate = driven.owner(1).replica.machine().flush_gate();
+        gate.hold();
+        for _ in 0..8 {
+            driven.round(&mut pump);
+        }
+        let read = learner.read_local(Instant::now() + HANG_READ, values);
+        gate.open();
+        assert_eq!(read, Ok((1..=written).collect::<Vec<u8>>()));
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
     /// AC-T1.8.D1, T-T1.8.D1 (replication.md, "A replica's database log"; store.md, decision 15):
     /// a checkpoint pass copies only what a finished flush made durable. Do: a voter and its
     /// learner, the learner's flushes held; 1 written and the learner's log flushed; 2 to 5
