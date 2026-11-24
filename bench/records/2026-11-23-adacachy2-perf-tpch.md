@@ -1649,3 +1649,6 @@ avg10 24 to 26%.
   failed once (`row_in_pages` None at a new database's open, load 54, CPU pressure avg10 40%; the first run of the new
   test binary). It passed at 36c11cb5 (r147), and its suite passed 36 of 36 three times on the same tree after (r166,
   load 58). This lane didn't touch it; one line for the calibration lane.
+- r173 (adacachy2, 52906367, merged a third time with main fac69083, which moved in crates/engine: the Postgres
+  dialect, pg_catalog_vtab, alter.rs, execute.rs): clippy clean (the log compiles amphora-engine, 55 s); the same tests
+  70 of 70, the new test and the learned-cost suite among them. Pushed to main from this tree.
