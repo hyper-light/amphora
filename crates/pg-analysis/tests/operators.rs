@@ -86,7 +86,7 @@ fn t_pg_8_1_each_operator_resolves_as_19_resolves_it() {
 /// T-PG.8.1, functions: 19's function for each name and its one or two arguments' types (`coercion` for a
 /// cast written as a call), or its SQLSTATE. A call the answers don't list is `42883`, and one that 19
 /// refuses only once it has chosen the function (an aggregate with no OVER, a polymorphic argument of no
-/// known type) is one it chose a function for.
+/// known type, a column of type unknown or of a pseudo-type) is one it chose a function for.
 #[test]
 fn t_pg_8_1_each_function_resolves_as_19_resolves_it() {
     let answers: BTreeMap<(&str, &str, &str), &str> = FUNCTIONS
@@ -134,7 +134,7 @@ fn t_pg_8_1_each_function_resolves_as_19_resolves_it() {
                 let chosen = !matches!(got.as_str(), "42883" | "42725");
                 let right = match answer {
                     None => got == "42883",
-                    Some("0A000" | "42804" | "42809" | "42P16") => chosen,
+                    Some("0A000" | "42804" | "42809" | "42P16" | "XX000") => chosen,
                     Some(answer) => got == answer,
                 };
                 if !right {
@@ -144,7 +144,7 @@ fn t_pg_8_1_each_function_resolves_as_19_resolves_it() {
         }
     }
     assert_eq!(wrong, Vec::<String>::new(), "{} of {asked}", wrong.len());
-    assert_eq!((asked, answered), (14382, answers.len()));
+    assert_eq!((asked, answered), (14355, answers.len()));
 }
 
 /// T-PG.8.1, casts: how each of the unit's types becomes another, as an explicit cast (19's node: `F`

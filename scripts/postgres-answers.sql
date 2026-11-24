@@ -84,6 +84,8 @@ end $$;
 
 -- Each function of one argument of the unit's types, by name, and of two where several of one name take
 -- two: the function's OID (`coercion` for a cast written as a call), or the SQLSTATE where none is chosen.
+-- The functions are pg_proc.dat's: one from FirstUnpinnedObjectId (12000, src/include/access/transam.h) on
+-- is an extension's that initdb installs (plpgsql) or one of its scripts' (snowball's).
 create table sw.functions (f text, l text, r text, a text);
 do $$
 declare
@@ -91,7 +93,7 @@ declare
   ts text[] := array['int4', 'int8', 'text', 'bpchar', '"char"', 'timestamp', 'timestamptz', 'regclass', 'unknown'];
 begin
   for p in select proname, bool_or(n > 1 and pronargs = 2) as two, bool_or(pronargs - pronargdefaults <= 1 and pronargs >= 1) as one
-      from (select *, count(*) over (partition by proname, pronargs) as n from pg_proc where pronamespace = 11 and proname !~ '^RI_') x group by 1 order by 1 loop
+      from (select *, count(*) over (partition by proname, pronargs) as n from pg_proc where pronamespace = 11 and oid < 12000 and proname !~ '^RI_') x group by 1 order by 1 loop
     foreach l in array (case when p.one or p.two then ts else '{}' end) loop
       lt := case when l = 'unknown' then 'NULL' else 'NULL::' || l end;
       foreach r in array (case when p.one and p.two then array['-'] || ts when p.two then ts else array['-'] end) loop

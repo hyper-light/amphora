@@ -184,6 +184,18 @@ def char(value: str | None) -> str:
     return f"b'{value}'"
 
 
+def argument_defaults(row: dict[str, str | None]) -> int:
+    """pronargdefaults: genbki.pl leaves it 0, and bootstrap sets it to how many entries proargdefaults has
+    (`InsertOneProargdefaultsValue`, src/backend/bootstrap/bootstrap.c at REL_19_0)."""
+    value = row["proargdefaults"]
+    if value is None:
+        return int(row["pronargdefaults"] or 0)
+    entry = r'(?:"[^"\\]*"|[^"\\,{}\s]+)'
+    if not re.fullmatch(rf"\{{{entry}(?:,{entry})*\}}", value):
+        sys.exit(f"proargdefaults {value!r}")
+    return len(re.findall(entry, value))
+
+
 def types_table(rel: dict) -> list[str]:
     """What analysis reads of pg_type, by OID (its syscache key TYPEOID)."""
     out = ["", "pub static TYPES: &[Type] = &["]
@@ -219,7 +231,7 @@ def procs(rel: dict, types: dict[str, int]) -> list[str]:
         out.append(
             f"    Proc {{ oid: {oid(r['oid'])}, name: {rust_str(r['proname'] or '')}, namespace: {oid(r['pronamespace'])}, "
             f"kind: {char(r['prokind'])}, strict: {flag(r['proisstrict'])}, retset: {flag(r['proretset'])}, "
-            f"volatile: {char(r['provolatile'])}, variadic: {oid(r['provariadic'])}, defaults: {int(r['pronargdefaults'] or 0)}, "
+            f"volatile: {char(r['provolatile'])}, variadic: {oid(r['provariadic'])}, defaults: {argument_defaults(r)}, "
             f"result: {oid(r['prorettype'])}, args: &[{args}], src: {rust_str(r['prosrc'] or '')} }},"
         )
     out += ["];", "", "pub static PG_PROC_BY_NAME: &[u16] = &["]

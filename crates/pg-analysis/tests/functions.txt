@@ -2564,10 +2564,6 @@ plainto_tsquery "char" - 3751
 plainto_tsquery bpchar - 3751
 plainto_tsquery text - 3751
 plainto_tsquery unknown - 3751
-plpgsql_validator int4 - 42P16
-plpgsql_validator int8 - 42P16
-plpgsql_validator regclass - 42P16
-plpgsql_validator unknown - 42P16
 point bpchar - coercion
 point text - coercion
 point unknown - coercion
