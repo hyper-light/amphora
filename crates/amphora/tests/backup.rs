@@ -721,6 +721,56 @@ fn put(
     }
 }
 
+/// Decision 45 (lane B18): the backup ships from the segment the writer appends to. Do: write
+/// 20 rows, ship them and copy a base, start the log again (the writer switches to `-wal2`), write
+/// 20 more and ship, then restore the last second. Expect: the switch made `-wal2`, and the
+/// restore holds the 20 rows written after it as well as the 20 before.
+#[test]
+fn d45_a_backup_after_a_switch_holds_the_writes_made_after_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("source.db");
+    let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS));
+    let read = Arc::clone(&now);
+    let hooks = Hooks::new(Arc::new(move || read.load(Ordering::SeqCst)), 1 << 16);
+    let mut db = Db::open(&path).unwrap();
+    db.back_up(Arc::clone(&hooks));
+    let blobs = backup::FolderBlobs::open(&dir.path().join("archive"), 64 * 1024).unwrap();
+    db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+        .unwrap();
+    let mut model = Rows::new();
+    let mut history: Vec<(u64, Rows)> = vec![(now.load(Ordering::SeqCst), model.clone())];
+    let mut shipper = Shipper::open("db", Arc::clone(&hooks), &blobs, &db, until()).unwrap();
+    put(&mut db, &now, 0..20, "a", &mut model, &mut history);
+    shipper.ship(&db, &blobs, until()).unwrap();
+    let mut base = shipper
+        .begin_base(&db, &blobs, &amphora::memory::process(), 32 * 1024)
+        .unwrap();
+    while shipper.copy_base(&db, &blobs, &mut base, until()).unwrap() {}
+    shipper.end_base(&db, &blobs, base, until()).unwrap();
+    assert!(
+        db.restart_log().unwrap(),
+        "the log starts again once shipped"
+    );
+    let mut second = path.clone().into_os_string();
+    second.push("-wal2");
+    assert!(
+        std::path::Path::new(&second).exists(),
+        "the switch made the log's second segment"
+    );
+    put(&mut db, &now, 20..40, "b", &mut model, &mut history);
+    now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    shipper.ship(&db, &blobs, until()).unwrap();
+    shipper.ship(&db, &blobs, until()).unwrap();
+
+    let last = history.last().unwrap().0.div_ceil(SECOND_NS);
+    let target = dir.path().join("restored.db");
+    backup::restore(&blobs, "db", last, &target, until())
+        .unwrap_or_else(|e| panic!("second {last} refused: {e:#}"));
+    let restored = rows(&Db::open(&target).unwrap());
+    assert_eq!(restored.len(), 40, "every row, the 20 after the switch too");
+    assert_eq!(restored, model);
+}
+
 /// T-T1.12.I1 (AC-T1.12.3, AC-T1.12.4): an incremental base. Do: write 400 rows, start the log
 /// again and copy a base;
 /// change 5 rows over two generations of the log, the shipper opened again between; copy a

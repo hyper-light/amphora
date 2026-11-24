@@ -570,7 +570,11 @@ pub fn main() -> anyhow::Result<()> {
     if std::env::var_os("AMPHORA_PLAN_TRACE").is_some() {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
-        let only = tracing_subscriber::filter::Targets::new().with_target("amphora::join_search", tracing_subscriber::filter::LevelFilter::DEBUG);
+        let mut only = tracing_subscriber::filter::Targets::new().with_target("amphora::join_search", tracing_subscriber::filter::LevelFilter::DEBUG);
+        // AMPHORA_SEEK_TRACE (lane T18): each cursor's seeks and their time, at each statement's end.
+        if std::env::var_os("AMPHORA_SEEK_TRACE").is_some() {
+            only = only.with_target("amphora::seek_time", tracing_subscriber::filter::LevelFilter::DEBUG);
+        }
         tracing_subscriber::registry().with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_ansi(false)).with(only).try_init()?;
     }
     for (name, sql) in &b.queries {

@@ -4624,6 +4624,7 @@ pub fn op_halt(
     } else {
         description.to_string()
     };
+    seek_trace_write(program, state);
     halt(program, state, pager, *err_code, &desc, *on_error)
 }
 
@@ -6721,6 +6722,18 @@ fn seek_rowid_key(key: &Value) -> Option<i64> {
 }
 
 pub fn op_seek_rowid(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> InsnResult {
+    let traced = seek_trace_start(insn);
+    let result = seek_rowid_run(program, state, insn, pager);
+    seek_trace_end(state, traced, &result);
+    result
+}
+
+fn seek_rowid_run(
     _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
@@ -6909,11 +6922,81 @@ pub fn op_seek(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> InsnResult {
-    timed_run(
+    let traced = seek_trace_start(insn);
+    let result = timed_run(
         program,
         crate::translate::optimizer::learned_costs::Work::Seek,
         || seek_run(program, state, insn, pager),
-    )
+    );
+    seek_trace_end(state, traced, &result);
+    result
+}
+
+/// Lane T18 (PL.13): a seek's cursor and its start when `amphora::seek_time` is on at DEBUG. Every
+/// seek is timed and none is learned from: the profile of a plan's seeks by how their keys arrive,
+/// written at the statement's halt (`seek_trace_write`).
+fn seek_trace_start(insn: &Insn) -> Option<(usize, std::time::Instant)> {
+    if !tracing::enabled!(target: "amphora::seek_time", tracing::Level::DEBUG) {
+        return None;
+    }
+    let cursor_id = match insn {
+        Insn::SeekGE { cursor_id, .. }
+        | Insn::SeekLE { cursor_id, .. }
+        | Insn::SeekGT { cursor_id, .. }
+        | Insn::SeekLT { cursor_id, .. }
+        | Insn::SeekRowid { cursor_id, .. } => *cursor_id,
+        _ => return None,
+    };
+    Some((cursor_id, std::time::Instant::now()))
+}
+
+/// Lane T18 (PL.13): adds a seek's time to its cursor's (`seek_trace_start`); a seek that waits
+/// on IO counts once, when it ends, and its runs before the wait add their time.
+fn seek_trace_end(
+    state: &mut ProgramState,
+    traced: Option<(usize, std::time::Instant)>,
+    result: &InsnResult,
+) {
+    let Some((cursor_id, started)) = traced else {
+        return;
+    };
+    let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    if state.seek_times.len() <= cursor_id {
+        state.seek_times.resize(cursor_id.saturating_add(1), (0, 0));
+    }
+    if let Some((seeks, total)) = state.seek_times.get_mut(cursor_id) {
+        if matches!(result, Ok(InsnFunctionStepResult::Step)) {
+            *seeks = seeks.saturating_add(1);
+        }
+        *total = total.saturating_add(nanos);
+    }
+}
+
+/// Lane T18 (PL.13): each cursor's seeks this run (`seek_trace_end`), with the row visit's learned
+/// time to weigh them against.
+fn seek_trace_write(program: &Program, state: &mut ProgramState) {
+    if state.seek_times.is_empty() {
+        return;
+    }
+    let row_nanos = program
+        .connection
+        .db
+        .learned_costs
+        .nanos_per(crate::translate::optimizer::learned_costs::Work::Row);
+    for (cursor_id, (seeks, nanos)) in std::mem::take(&mut state.seek_times)
+        .into_iter()
+        .enumerate()
+    {
+        if seeks == 0 && nanos == 0 {
+            continue;
+        }
+        let name = match program.cursor_ref.get(cursor_id).map(|(_, kind)| kind) {
+            Some(CursorType::BTreeTable(table)) => table.name.as_str(),
+            Some(CursorType::BTreeIndex(index)) => index.name.as_str(),
+            _ => "",
+        };
+        tracing::debug!(target: "amphora::seek_time", cursor_id, name, seeks, nanos, row_nanos = ?row_nanos, "T18: a cursor's seeks this run");
+    }
 }
 
 /// Amphora (QT.5, step 3a): runs `run`, one run of `work`, timing it when the database's
