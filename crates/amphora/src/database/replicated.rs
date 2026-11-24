@@ -18698,7 +18698,10 @@ mod tests {
                             *slot = Some((k, submit(&clients[w % 3], driven.until(), write(id))));
                         }
                         Ok(Err(refusal)) => {
-                            panic!("{durability:?}: row {id} at member {}: {refusal:?}", w % 3 + 1)
+                            panic!(
+                                "{durability:?}: row {id} at member {}: {refusal:?}",
+                                w % 3 + 1
+                            )
                         }
                     }
                 }
@@ -18735,7 +18738,10 @@ mod tests {
             pump.finish();
             stale.push((refused, format!("{durability:?}: in {rounds} rounds")));
         }
-        assert!(stale.iter().all(|(n, _)| *n == 0), "stale-base refusals: {stale:?}");
+        assert!(
+            stale.iter().all(|(n, _)| *n == 0),
+            "stale-base refusals: {stale:?}"
+        );
     }
 
     /// T-T1.8.W1, the stale-base refusal's type (PostgreSQL's 40001): a write refused because
