@@ -10,8 +10,8 @@ perf/planner-c3-ab 69dc0668 (main's engine with the probes, and the candidate as
 
 - **Not merged, and t_pl_8_13 was not reproduced here.** Its only round to run (r570, main's engine, debug, fresh calibration)
   took 2 min 51 s of CPU in 24 minutes and neither failed nor ended before my limit: no expected-against-got rows.
-- **The candidate fix has never been run.** Its build (r647) did not end either.
-- The sweep was not run. Its test has not been compiled.
+- **The candidate fix is refuted by its first measurement (section 4). Do not land it.** No fix is known.
+- The sweep was not run (the probe's form of it compiled, r647; the form for main has not been compiled).
 - The forced shapes (r636's second half) met my 10 minute limit inside the first shape: no time for either plan.
 - r554, r565, r596 and r609, without `on`, were still queued behind other lanes at 06:46Z (I then stopped r565 and r609, which repeat
   r596); r592's sync timed out (60 s).
@@ -55,17 +55,26 @@ Query 0 at the weights the test starts with: seek 12.79 rows' visits, hash build
   12,000 x 13.55 x 12.79 x 0.005736 = 11,930, which is 85% of the plan's 14,095. I computed it; the trace does not log it.
 - The formula is the Turso import's (f2e07044); its comment counts comparisons ("about log2(rows) comparisons per insert").
   Since 2996f99c `cpu_cost_per_seek` is the learned price of a whole search (calibration times a binary search of a page's 512
-  keys), so each insert is priced at 13.55 searches. **Inferred from the code, not measured: that an insert takes about one.**
+  keys), so each insert is priced at 13.55 searches. I inferred from the code that an insert takes about one search. **The measurement in section 4 refutes it.**
 - Computed: with an insert at one search and one visit of its row, the index is 949 and the plan 3,114, under the mirror's 5,300.
 - The query's first run moved the hash probe's weight from 5.87 to 88.0 (then 312.9 after query 1). At 88.0 the mirror costs
   51,705 and the test's plan 19,749, so the second run has the LEFT JOIN in the run. The test passes where that weight moves
   far enough and fails where it does not. Why one run moves it 15 times is not traced.
 
-## 4. The candidate (perf/planner-c3-candidate d564a2f0, never run)
+## 4. The candidate (perf/planner-c3-candidate d564a2f0): refuted
 
-A row's insert into an ephemeral index costs a seek and a row's visit. `t_qt_5_5_an_ephemeral_index_past_its_cache_reads_and_writes_its_leaves`
-restated the old formula and is changed with it; its page counts are not. The price reaches every automatic index, so TPC-H's 22 plans have to
-be listed before and after.
+It prices a row's insert into an ephemeral index at a seek and a row's visit, 13.5 rows' visits. `c3_probe_autoindex` (r647, 06:50Z, debug, MacBook
+Pro 2, load 62 to 95) timed a plan that is an automatic index's build, 2 searches of it and an empty join, median of 11 runs, beside `SELECT sum(f1.k)`:
+
+| rows indexed | index plan | scan, a row | rows' visits a row indexed, wall time | the same at the process's 10% of a core | the old price | the candidate's |
+|---|---|---|---|---|---|---|
+| 1,500 | 3.01 s | 871 ns | 2,304 | about 230 | 132 | 13.5 |
+| 3,000 | 5.01 s | 892 ns | 1,869 | about 190 | 145 | 13.5 |
+
+The 10% is the process's CPU time over its elapsed time (19.4 s in 3 min 17 s); the short scan meets no preemption and the long plan does, so the
+wall-time column overstates and the next one is an estimate. Either way an insert costs at least the old price, an order of magnitude above the candidate's.
+So on a debug build the old price is not too high, the test's plan (14,095) may really cost more than the mirror (5,300), and the first wrong decision is not found.
+Not measured: 12,000 rows, a release build, and the two shapes' real times (`c3_probe_forced`), which are what decide whether the search chose wrongly.
 
 ## 5. What is ready to run
 
