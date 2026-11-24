@@ -3691,9 +3691,10 @@ fn a_triggers_new_and_old_keep_their_columns_collations() {
 }
 
 /// Do: a NOT EXISTS (an EXISTS, a NOT IN) whose subquery holds an IN, its left side a column of the
-/// subquery's table and its own subquery correlated with the outer table, where every join is a hash
-/// join. Expect: SQLite's rows (finding CR). The outer subquery became an anti join, and the IN a semi
-/// join beside it, where a row the anti join keeps must match it too: no row came out.
+/// subquery's table and its own subquery correlated with the outer table: over few rows, where every
+/// join is a hash join, and over hundreds, at defaults too. Expect: SQLite's rows (finding CR). The
+/// outer subquery became an anti join, and the IN a semi join beside it, where a row the anti join
+/// keeps must match it too: no row came out.
 #[test]
 fn an_in_beside_an_anti_joined_table_stays_in_its_subquery() {
     answers_under_five_settings(
@@ -3726,6 +3727,34 @@ fn an_in_beside_an_anti_joined_table_stays_in_its_subquery() {
             (
                 "SELECT o.k FROM o WHERE o.k NOT IN (SELECT f.k FROM f WHERE f.k IN (SELECT p.k FROM p WHERE o.v = p.v))",
                 &["1", "2", "6"],
+            ),
+        ],
+    );
+    answers_under_five_settings(
+        &[
+            "CREATE TABLE o(k INT, v INT)",
+            "CREATE TABLE e(k INT, v INT)",
+            "CREATE TABLE p(k INT, v INT)",
+            "INSERT INTO o WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 300) SELECT i, i % 100 FROM c",
+            "INSERT INTO e WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 60) SELECT i * 7, i % 90 FROM c",
+            "INSERT INTO p WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 400) SELECT i * 3, i % 170 FROM c",
+        ],
+        &[
+            (
+                "SELECT count(*) FROM o WHERE NOT EXISTS (SELECT 1 FROM e WHERE e.v = o.v AND e.k IN (SELECT p.k FROM p WHERE o.v = p.v))",
+                &["300"],
+            ),
+            (
+                "SELECT count(*) FROM o WHERE NOT EXISTS (SELECT 1 FROM e WHERE e.k IN (SELECT p.k FROM p WHERE o.v = p.v))",
+                &["258"],
+            ),
+            (
+                "SELECT count(*) FROM o WHERE EXISTS (SELECT 1 FROM e WHERE e.k IN (SELECT p.k FROM p WHERE o.v = p.v))",
+                &["42"],
+            ),
+            (
+                "SELECT count(*) FROM o WHERE o.k NOT IN (SELECT e.k FROM e WHERE e.v IN (SELECT p.k FROM p WHERE o.v = p.v))",
+                &["298"],
             ),
         ],
     );
