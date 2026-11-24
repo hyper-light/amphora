@@ -7047,6 +7047,15 @@ mod tests {
         }
     }
 
+    /// `thread`'s answer, which comes before the transport tests' hang guard: a hang, never a verdict.
+    fn joined<T>(thread: std::thread::JoinHandle<T>) -> T {
+        let began = Instant::now();
+        while !thread.is_finished() {
+            assert!(began.elapsed() < crate::transport::HANG, "a hang");
+            std::thread::yield_now();
+        }
+        thread.join().unwrap()
+    }
     /// The first member's owner takes the next input from its channel and steps with it, and no more.
     fn take_one(driven: &mut Driven) {
         let (owner, inputs) = driven.owners.first_mut().unwrap().as_mut().unwrap();
@@ -7100,11 +7109,11 @@ mod tests {
                 assert!(began.elapsed() < crate::transport::HANG, "a hang");
                 std::thread::yield_now();
             }
-            let small = small.join().unwrap();
+            let small = joined(small);
             assert!(small.is_ok(), "{:?}", small.err());
             assert_eq!(handle.shared.room.commands.load(Ordering::SeqCst), 1);
             if !given_back {
-                let refused = large.join().unwrap().err();
+                let refused = joined(large).err();
                 assert!(matches!(refused, Some(Refusal::Full { .. })), "{refused:?}");
                 assert_eq!(budget.held(Use::Queues), 2 * written(0));
                 assert_eq!(budget.waiting(), 0);
@@ -7124,7 +7133,7 @@ mod tests {
             in_line(&handle, 1, || large.is_finished());
             assert_eq!(budget.held(Use::Queues), 2 * written(0), "a charge in line");
             take_one(&mut driven);
-            let large = large.join().unwrap();
+            let large = joined(large);
             assert!(large.is_ok(), "{:?}", large.err());
             assert_eq!(budget.held(Use::Queues), 2 * written(0) + written(32 << 20));
             assert_eq!(
