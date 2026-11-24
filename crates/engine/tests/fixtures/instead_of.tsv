@@ -486,6 +486,63 @@ q	SELECT changes(), total_changes(), last_insert_rowid()	1:0,8,3
 q	DELETE FROM v WHERE k < 3	0:
 q	SELECT rowid, quote(ev), quote(x), quote(y), quote(z) FROM lg	8:1,'v',1,0,NULL;2,'w',1,0,NULL;3,'d',1,NULL,NULL;4,'v',10,3,NULL;5,'w',10,0,NULL;6,'d',2,NULL,NULL;7,'v',20,6,NULL;8,'w',20,0,NULL
 q	PRAGMA integrity_check	1:ok
+db	recursive triggers
+sql	CREATE TABLE t(k INTEGER PRIMARY KEY, a INT, b TEXT, c REAL)
+sql	CREATE TABLE u(k TEXT PRIMARY KEY, n INT UNIQUE)
+sql	CREATE TABLE lg(ev, x, y, z)
+sql	INSERT INTO t VALUES (1, 10, 'x', 1.5), (2, 20, 'y', 2.5), (3, 30, 'x', NULL)
+sql	INSERT INTO u VALUES ('a', 1), ('b', 2), ('z', 7)
+sql	CREATE VIEW v AS SELECT k, a, b FROM t
+sql	CREATE VIEW o AS SELECT k, a FROM t
+sql	CREATE TRIGGER g INSTEAD OF INSERT ON v WHEN new.k < 6 BEGIN INSERT INTO lg VALUES ('v', new.k, (SELECT count(*) FROM lg), changes()); INSERT INTO v VALUES (new.k + 1, new.a, new.b); INSERT INTO lg VALUES ('w', new.k, NULL, changes()); END
+sql	CREATE TRIGGER h INSTEAD OF UPDATE ON v WHEN new.a < 14 BEGIN UPDATE t SET a = new.a WHERE k = old.k; UPDATE v SET a = new.a + 1 WHERE k = old.k; INSERT INTO lg VALUES ('h', old.a, new.a, NULL); END
+sql	CREATE TRIGGER i INSTEAD OF DELETE ON v BEGIN INSERT INTO lg VALUES ('i', old.k, NULL, NULL); DELETE FROM t WHERE k = old.k; DELETE FROM o WHERE k > old.k; END
+sql	CREATE TRIGGER j INSTEAD OF DELETE ON o BEGIN INSERT INTO lg VALUES ('j', old.k, NULL, NULL); DELETE FROM v WHERE k = old.k; END
+q	PRAGMA recursive_triggers = OFF	0:
+q	BEGIN	0:
+q	INSERT INTO v VALUES (1, 0, 0), (4, 0, 0)	0:
+q	UPDATE v SET a = a + 1 WHERE k = 1 RETURNING a	1:11
+q	SELECT 't', quote(k), quote(a), quote(b), quote(c) FROM t UNION ALL SELECT 'u', quote(k), quote(n), '', '' FROM u UNION ALL SELECT 'lg', quote(ev), quote(x), quote(y), quote(z) FROM lg	11:lg,'h',10,11,NULL;lg,'v',1,0,3;lg,'v',4,2,3;lg,'w',1,NULL,0;lg,'w',4,NULL,0;t,1,11,'x',1.5;t,2,20,'y',2.5;t,3,30,'x',NULL;u,'a',1,,;u,'b',2,,;u,'z',7,,
+q	SELECT changes(), total_changes(), last_insert_rowid()	1:0,12,3
+q	DELETE FROM v WHERE k = 1 RETURNING k	1:1
+q	SELECT 't', quote(k), quote(a), quote(b), quote(c) FROM t UNION ALL SELECT 'u', quote(k), quote(n), '', '' FROM u UNION ALL SELECT 'lg', quote(ev), quote(x), quote(y), quote(z) FROM lg	13:lg,'h',10,11,NULL;lg,'i',1,NULL,NULL;lg,'j',2,NULL,NULL;lg,'j',3,NULL,NULL;lg,'v',1,0,3;lg,'v',4,2,3;lg,'w',1,NULL,0;lg,'w',4,NULL,0;t,2,20,'y',2.5;t,3,30,'x',NULL;u,'a',1,,;u,'b',2,,;u,'z',7,,
+q	ROLLBACK	0:
+q	PRAGMA recursive_triggers = ON	0:
+q	BEGIN	0:
+q	INSERT INTO v VALUES (1, 0, 0), (4, 0, 0)	0:
+q	UPDATE v SET a = a + 1 WHERE k = 1 RETURNING a	1:11
+q	SELECT 't', quote(k), quote(a), quote(b), quote(c) FROM t UNION ALL SELECT 'u', quote(k), quote(n), '', '' FROM u UNION ALL SELECT 'lg', quote(ev), quote(x), quote(y), quote(z) FROM lg	23:lg,'h',10,11,NULL;lg,'h',11,12,NULL;lg,'h',12,13,NULL;lg,'v',1,0,0;lg,'v',2,1,1;lg,'v',3,2,1;lg,'v',4,10,0;lg,'v',4,3,1;lg,'v',5,11,1;lg,'v',5,4,1;lg,'w',1,NULL,0;lg,'w',2,NULL,0;lg,'w',3,NULL,0;lg,'w',4,NULL,0;lg,'w',4,NULL,0;lg,'w',5,NULL,0;lg,'w',5,NULL,0;t,1,13,'x',1.5;t,2,20,'y',2.5;t,3,30,'x',NULL;u,'a',1,,;u,'b',2,,;u,'z',7,,
+q	SELECT changes(), total_changes(), last_insert_rowid()	1:0,36,3
+q	DELETE FROM v WHERE k = 1 RETURNING k	1:1
+q	SELECT 't', quote(k), quote(a), quote(b), quote(c) FROM t UNION ALL SELECT 'u', quote(k), quote(n), '', '' FROM u UNION ALL SELECT 'lg', quote(ev), quote(x), quote(y), quote(z) FROM lg	26:lg,'h',10,11,NULL;lg,'h',11,12,NULL;lg,'h',12,13,NULL;lg,'i',1,NULL,NULL;lg,'i',2,NULL,NULL;lg,'i',3,NULL,NULL;lg,'j',2,NULL,NULL;lg,'j',3,NULL,NULL;lg,'j',3,NULL,NULL;lg,'v',1,0,0;lg,'v',2,1,1;lg,'v',3,2,1;lg,'v',4,10,0;lg,'v',4,3,1;lg,'v',5,11,1;lg,'v',5,4,1;lg,'w',1,NULL,0;lg,'w',2,NULL,0;lg,'w',3,NULL,0;lg,'w',4,NULL,0;lg,'w',4,NULL,0;lg,'w',5,NULL,0;lg,'w',5,NULL,0;u,'a',1,,;u,'b',2,,;u,'z',7,,
+q	ROLLBACK	0:
+q	PRAGMA recursive_triggers = OFF	0:
+q	BEGIN	0:
+q	INSERT INTO v VALUES (1, 0, 0), (4, 0, 0)	0:
+q	UPDATE v SET a = a + 1 WHERE k = 1 RETURNING a	1:11
+q	SELECT 't', quote(k), quote(a), quote(b), quote(c) FROM t UNION ALL SELECT 'u', quote(k), quote(n), '', '' FROM u UNION ALL SELECT 'lg', quote(ev), quote(x), quote(y), quote(z) FROM lg	11:lg,'h',10,11,NULL;lg,'v',1,0,0;lg,'v',4,2,0;lg,'w',1,NULL,0;lg,'w',4,NULL,0;t,1,11,'x',1.5;t,2,20,'y',2.5;t,3,30,'x',NULL;u,'a',1,,;u,'b',2,,;u,'z',7,,
+q	SELECT changes(), total_changes(), last_insert_rowid()	1:0,51,3
+q	DELETE FROM v WHERE k = 1 RETURNING k	1:1
+q	SELECT 't', quote(k), quote(a), quote(b), quote(c) FROM t UNION ALL SELECT 'u', quote(k), quote(n), '', '' FROM u UNION ALL SELECT 'lg', quote(ev), quote(x), quote(y), quote(z) FROM lg	13:lg,'h',10,11,NULL;lg,'i',1,NULL,NULL;lg,'j',2,NULL,NULL;lg,'j',3,NULL,NULL;lg,'v',1,0,0;lg,'v',4,2,0;lg,'w',1,NULL,0;lg,'w',4,NULL,0;t,2,20,'y',2.5;t,3,30,'x',NULL;u,'a',1,,;u,'b',2,,;u,'z',7,,
+q	ROLLBACK	0:
+q	PRAGMA integrity_check	1:ok
+db	recursive triggers without end
+sql	CREATE TABLE t(k INTEGER PRIMARY KEY, a INT, b TEXT, c REAL)
+sql	CREATE TABLE u(k TEXT PRIMARY KEY, n INT UNIQUE)
+sql	CREATE TABLE lg(ev, x, y, z)
+sql	INSERT INTO t VALUES (1, 10, 'x', 1.5), (2, 20, 'y', 2.5), (3, 30, 'x', NULL)
+sql	INSERT INTO u VALUES ('a', 1), ('b', 2), ('z', 7)
+sql	CREATE VIEW e AS SELECT k FROM t
+sql	CREATE TRIGGER ei INSTEAD OF INSERT ON e BEGIN INSERT INTO u VALUES (new.k, new.k); INSERT INTO e VALUES (new.k + 1); END
+q	INSERT INTO e VALUES (100)	0:
+q	SELECT count(*) FROM u	1:4
+q	PRAGMA recursive_triggers = ON	0:
+q	INSERT INTO e VALUES (200)	ERROR~triggers nested too deep
+q	SELECT count(*) FROM u	1:4
+q	PRAGMA recursive_triggers = OFF	0:
+q	INSERT INTO e VALUES (200)	0:
+q	SELECT count(*) FROM u	1:5
+q	PRAGMA integrity_check	1:ok
 db	views over views, each with its triggers
 sql	CREATE TABLE t(k INTEGER PRIMARY KEY, a INT, b TEXT, c REAL)
 sql	CREATE TABLE u(k TEXT PRIMARY KEY, n INT UNIQUE)
