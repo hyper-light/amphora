@@ -62,6 +62,7 @@ impl PostgresDialect {
                 Ok(previous) | Err(previous) => normal(previous),
             };
             if live.binary_search(&oid).is_err() {
+                std::eprintln!("PG15-PROBE allocate_oid -> {oid} live={live:?}\n{}", std::backtrace::Backtrace::force_capture());
                 return Ok(oid);
             }
         }
