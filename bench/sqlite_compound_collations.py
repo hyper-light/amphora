@@ -106,6 +106,17 @@ for _ in range(three):
     else:
         # an IN's own collation is the left side's: a NOCASE one finds whichever of the equal texts is kept
         add(ctx, f"SELECT a, (a COLLATE NOCASE) {ctx.upper()} ({c}) FROM u")
+# what a window query's result column is, though its layers hand it on: a column, an aggregate, a COLLATE or a literal
+WINDOWED = ["SELECT a, count(*) OVER () FROM u", "SELECT a, 3 + count(*) OVER () FROM t", "SELECT lower(a), count(*) OVER () FROM t", "SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u", "SELECT max(a), count(*) OVER () FROM t GROUP BY a",
+            "SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a", "SELECT 'abc', count(*) OVER () FROM u", "SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r", "SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b",
+            "SELECT a, rank() OVER (ORDER BY a), 0 * count(*) OVER () FROM u", "SELECT a, 3 FROM t", "SELECT a, 5 FROM u", "SELECT 'abc', 1", "SELECT max(a), 4 FROM k", "SELECT 'ABC' COLLATE NOCASE, 2"]
+for x, y in itertools.product(WINDOWED, repeat=2):
+    for op in OPS:
+        if (x.count(",") > 3) == (y.count(",") > 3) and x.startswith("SELECT a, rank() OVER (ORDER BY a), 0") == y.startswith("SELECT a, rank() OVER (ORDER BY a), 0"):
+            add("windowed", f"{x} {op} {y}")
+for x in ("u", "t", "r"):
+    add("windowed", f"SELECT '', count(*), count(*) OVER (ORDER BY NULL DESC) FROM u GROUP BY '' UNION SELECT 'z', a, 2 FROM {x}")
+    add("windowed", f"SELECT 'z', a, 2 FROM {x} UNION SELECT '', count(*), count(*) OVER (ORDER BY NULL DESC) FROM u GROUP BY ''")
 # an IN's own collation, its left side's, is not the compound's
 for x, y in itertools.permutations("utr", 2):
     for op in OPS:

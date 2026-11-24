@@ -5,17 +5,18 @@ use std::{
     str::FromStr as _,
 };
 
-use amphora_engine_parser::ast::{Expr, TriggerColumn, Variable};
+use amphora_engine_parser::ast::{Expr, TableInternalId, TriggerColumn, Variable};
 use icu_collator::{options::CollatorOptions, Collator, CollatorBorrowed};
 use icu_locale::Locale;
 
 use crate::{
     connection::SymbolTable,
+    schema::Table,
     sync::{LazyLock, Mutex, RwLock},
     translate::{
         emitter::Resolver,
         expr::{walk_expr, WalkControl},
-        plan::{SelectPlan, TableReferences},
+        plan::{Plan, SelectPlan, TableReferences},
     },
     Result,
 };
@@ -496,17 +497,78 @@ pub(crate) fn compound_column_collation<'a>(
                 None => continue,
             },
         };
-        let (explicit, _) =
-            get_collseq_parts_from_expr_with_symbols(expr, &arm.table_references, None, None)?;
-        let own = match explicit {
-            None => comparison_operand_column_collseq(expr, &arm.table_references)?,
-            explicit => explicit,
-        };
-        if let Some(collation) = own {
+        let (explicit, column) = result_column_collseq_parts(arm, expr)?;
+        if let Some(collation) = explicit.or(column) {
             return Ok(collation);
         }
     }
     Ok(CollationSeq::Binary)
+}
+
+/// `expr`'s explicit and column collation where it is (in) a result column of `arm`. What a window's layer
+/// reads of the layer below stands for the expression computed there, which is a column or not:
+/// `SELECT count(*), rank() OVER (ORDER BY a)` reads both its columns of one, and neither has a collation.
+fn result_column_collseq_parts(
+    arm: &SelectPlan,
+    expr: &Expr,
+) -> Result<(Option<CollationSeq>, Option<CollationSeq>)> {
+    let Some((layer, below)) = window_layer(arm) else {
+        let (explicit, _) =
+            get_collseq_parts_from_expr_with_symbols(expr, &arm.table_references, None, None)?;
+        return Ok((
+            explicit,
+            comparison_operand_column_collseq(expr, &arm.table_references)?,
+        ));
+    };
+    let computed = |expr: &Expr| match expr {
+        Expr::Column { table, column, .. } if *table == layer => below
+            .result_columns
+            .get(*column)
+            .map(|result| result_column_collseq_parts(below, &result.expr)),
+        _ => None,
+    };
+    let mut explicit = None;
+    walk_expr(expr, &mut |expr: &Expr| -> Result<WalkControl> {
+        if let Expr::Collate(_, name) = expr {
+            explicit = explicit
+                .or_else(|| Some(resolve_collation_name(name.as_str(), None).unwrap_or_default()));
+            return Ok(WalkControl::SkipChildren);
+        }
+        if let Some(parts) = computed(expr) {
+            explicit = explicit.or(parts?.0);
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    let mut operand = expr;
+    loop {
+        match operand {
+            Expr::Parenthesized(exprs) if exprs.len() == 1 => match exprs.first() {
+                Some(inner) => operand = inner,
+                None => return Ok((explicit, None)),
+            },
+            Expr::Unary(amphora_engine_parser::ast::UnaryOperator::Positive, inner)
+            | Expr::Cast { expr: inner, .. } => operand = inner,
+            operand => {
+                let column = computed(operand)
+                    .transpose()?
+                    .and_then(|(_, column)| column);
+                return Ok((explicit, column));
+            }
+        }
+    }
+}
+
+/// The table a window query's result columns read, and the query below that computes it.
+fn window_layer(arm: &SelectPlan) -> Option<(TableInternalId, &SelectPlan)> {
+    arm.window.as_ref()?;
+    let layer = arm.table_references.joined_tables().first()?;
+    match &layer.table {
+        Table::FromClauseSubquery(subquery) => match subquery.plan.as_ref() {
+            Plan::Select(below) => Some((layer.internal_id, below)),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Resolve the collation for a binary comparison (=, <, >, etc.) per SQLite rules:

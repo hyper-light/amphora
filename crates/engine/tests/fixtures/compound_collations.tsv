@@ -1494,6 +1494,603 @@ in	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT first_value(a) OVER (ORDER BY a)
 from	rows	SELECT * FROM (SELECT (a) FROM r INTERSECT SELECT lower(a) FROM r) AS s	2:abc;m
 insert	dml	INSERT INTO o SELECT a FROM f EXCEPT SELECT lower(a) FROM r	0:
 insert	dml	INSERT INTO o SELECT a FROM k UNION SELECT first_value(a) OVER (ORDER BY a) FROM t	3:abc;q;z
+windowed	rows	SELECT a, count(*) OVER () FROM u UNION SELECT a, count(*) OVER () FROM u	5:NULL,5;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT a, count(*) OVER () FROM u EXCEPT SELECT a, count(*) OVER () FROM u	0:
+windowed	rows	SELECT a, count(*) OVER () FROM u INTERSECT SELECT a, count(*) OVER () FROM u	5:NULL,5;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT a, count(*) OVER () FROM u UNION SELECT a, 3 + count(*) OVER () FROM t	9:NULL,5;abc,5;abc,5;abc,7;m,7;q,5;q,7;q,7;x,5
+windowed	rows	SELECT a, count(*) OVER () FROM u EXCEPT SELECT a, 3 + count(*) OVER () FROM t	5:NULL,5;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT a, count(*) OVER () FROM u INTERSECT SELECT a, 3 + count(*) OVER () FROM t	0:
+windowed	rows	SELECT a, count(*) OVER () FROM u UNION SELECT lower(a), count(*) OVER () FROM t	8:NULL,5;abc,4;abc,5;abc,5;m,4;q,4;q,5;x,5
+windowed	rows	SELECT a, count(*) OVER () FROM u EXCEPT SELECT lower(a), count(*) OVER () FROM t	5:NULL,5;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT a, count(*) OVER () FROM u INTERSECT SELECT lower(a), count(*) OVER () FROM t	0:
+windowed	rows	SELECT a, count(*) OVER () FROM u UNION SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	9:NULL,1;NULL,5;abc,2;abc,3;abc,5;abc,5;q,4;q,5;x,5
+windowed	rows	SELECT a, count(*) OVER () FROM u EXCEPT SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	4:NULL,5;abc,5;abc,5;q,5
+windowed	rows	SELECT a, count(*) OVER () FROM u INTERSECT SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	1:x,5
+windowed	rows	SELECT a, count(*) OVER () FROM u UNION SELECT max(a), count(*) OVER () FROM t GROUP BY a	8:NULL,5;abc,3;abc,5;abc,5;m,3;q,3;q,5;x,5
+windowed	rows	SELECT a, count(*) OVER () FROM u EXCEPT SELECT max(a), count(*) OVER () FROM t GROUP BY a	5:NULL,5;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT a, count(*) OVER () FROM u INTERSECT SELECT max(a), count(*) OVER () FROM t GROUP BY a	0:
+windowed	rows	SELECT a, count(*) OVER () FROM u UNION SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	9:NULL,1;NULL,5;abc,2;abc,3;abc,5;abc,5;q,4;q,5;x,5
+windowed	rows	SELECT a, count(*) OVER () FROM u EXCEPT SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	4:NULL,5;abc,5;abc,5;q,5
+windowed	rows	SELECT a, count(*) OVER () FROM u INTERSECT SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	1:x,5
+windowed	rows	SELECT a, count(*) OVER () FROM u UNION SELECT 'abc', count(*) OVER () FROM u	5:NULL,5;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT a, count(*) OVER () FROM u EXCEPT SELECT 'abc', count(*) OVER () FROM u	4:NULL,5;abc,5;q,5;x,5
+windowed	rows	SELECT a, count(*) OVER () FROM u INTERSECT SELECT 'abc', count(*) OVER () FROM u	1:abc,5
+windowed	rows	SELECT a, count(*) OVER () FROM u UNION SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	9:NULL,5;abc,1;abc,2;abc,5;abc,5;m,3;m,3;q,5;x,5
+windowed	rows	SELECT a, count(*) OVER () FROM u EXCEPT SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	5:NULL,5;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT a, count(*) OVER () FROM u INTERSECT SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	0:
+windowed	rows	SELECT a, count(*) OVER () FROM u UNION SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	8:NULL,5;abc,1;abc,5;abc,5;m,3;q,2;q,5;x,5
+windowed	rows	SELECT a, count(*) OVER () FROM u EXCEPT SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	5:NULL,5;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT a, count(*) OVER () FROM u INTERSECT SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	0:
+windowed	rows	SELECT a, count(*) OVER () FROM u UNION SELECT a, 3 FROM t	9:NULL,5;abc,3;abc,5;abc,5;m,3;q,3;q,3;q,5;x,5
+windowed	rows	SELECT a, count(*) OVER () FROM u EXCEPT SELECT a, 3 FROM t	5:NULL,5;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT a, count(*) OVER () FROM u INTERSECT SELECT a, 3 FROM t	0:
+windowed	rows	SELECT a, count(*) OVER () FROM u UNION SELECT a, 5 FROM u	5:NULL,5;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT a, count(*) OVER () FROM u EXCEPT SELECT a, 5 FROM u	0:
+windowed	rows	SELECT a, count(*) OVER () FROM u INTERSECT SELECT a, 5 FROM u	5:NULL,5;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT a, count(*) OVER () FROM u UNION SELECT 'abc', 1	6:NULL,5;abc,1;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT a, count(*) OVER () FROM u EXCEPT SELECT 'abc', 1	5:NULL,5;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT a, count(*) OVER () FROM u INTERSECT SELECT 'abc', 1	0:
+windowed	rows	SELECT a, count(*) OVER () FROM u UNION SELECT max(a), 4 FROM k	6:NULL,5;abc,5;abc,5;q,5;x,5;z,4
+windowed	rows	SELECT a, count(*) OVER () FROM u EXCEPT SELECT max(a), 4 FROM k	5:NULL,5;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT a, count(*) OVER () FROM u INTERSECT SELECT max(a), 4 FROM k	0:
+windowed	rows	SELECT a, count(*) OVER () FROM u UNION SELECT 'ABC' COLLATE NOCASE, 2	6:NULL,5;abc,2;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT a, count(*) OVER () FROM u EXCEPT SELECT 'ABC' COLLATE NOCASE, 2	5:NULL,5;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT a, count(*) OVER () FROM u INTERSECT SELECT 'ABC' COLLATE NOCASE, 2	0:
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t UNION SELECT a, count(*) OVER () FROM u	7:NULL,5;abc,5;abc,7;m,7;q,5;q,7;x,5
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t EXCEPT SELECT a, count(*) OVER () FROM u	3:abc,7;m,7;q,7
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t INTERSECT SELECT a, count(*) OVER () FROM u	0:
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t UNION SELECT a, 3 + count(*) OVER () FROM t	3:abc,7;m,7;q,7
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t EXCEPT SELECT a, 3 + count(*) OVER () FROM t	0:
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t INTERSECT SELECT a, 3 + count(*) OVER () FROM t	3:abc,7;m,7;q,7
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t UNION SELECT lower(a), count(*) OVER () FROM t	6:abc,4;abc,7;m,4;m,7;q,4;q,7
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t EXCEPT SELECT lower(a), count(*) OVER () FROM t	3:abc,7;m,7;q,7
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t INTERSECT SELECT lower(a), count(*) OVER () FROM t	0:
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t UNION SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	8:NULL,1;abc,2;abc,3;abc,7;m,7;q,4;q,7;x,5
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t EXCEPT SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	3:abc,7;m,7;q,7
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t INTERSECT SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	0:
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t UNION SELECT max(a), count(*) OVER () FROM t GROUP BY a	6:abc,3;abc,7;m,3;m,7;q,3;q,7
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t EXCEPT SELECT max(a), count(*) OVER () FROM t GROUP BY a	3:abc,7;m,7;q,7
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t INTERSECT SELECT max(a), count(*) OVER () FROM t GROUP BY a	0:
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t UNION SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	8:NULL,1;abc,2;abc,3;abc,7;m,7;q,4;q,7;x,5
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t EXCEPT SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	3:abc,7;m,7;q,7
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t INTERSECT SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	0:
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t UNION SELECT 'abc', count(*) OVER () FROM u	4:abc,5;abc,7;m,7;q,7
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t EXCEPT SELECT 'abc', count(*) OVER () FROM u	3:abc,7;m,7;q,7
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t INTERSECT SELECT 'abc', count(*) OVER () FROM u	0:
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t UNION SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	7:abc,1;abc,2;abc,7;m,3;m,3;m,7;q,7
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t EXCEPT SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	3:abc,7;m,7;q,7
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t INTERSECT SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	0:
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t UNION SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	6:abc,1;abc,7;m,3;m,7;q,2;q,7
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t EXCEPT SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	3:abc,7;m,7;q,7
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t INTERSECT SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	0:
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t UNION SELECT a, 3 FROM t	6:abc,3;abc,7;m,3;m,7;q,3;q,7
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t EXCEPT SELECT a, 3 FROM t	3:abc,7;m,7;q,7
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t INTERSECT SELECT a, 3 FROM t	0:
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t UNION SELECT a, 5 FROM u	7:NULL,5;abc,5;abc,7;m,7;q,5;q,7;x,5
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t EXCEPT SELECT a, 5 FROM u	3:abc,7;m,7;q,7
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t INTERSECT SELECT a, 5 FROM u	0:
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t UNION SELECT 'abc', 1	4:abc,1;abc,7;m,7;q,7
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t EXCEPT SELECT 'abc', 1	3:abc,7;m,7;q,7
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t INTERSECT SELECT 'abc', 1	0:
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t UNION SELECT max(a), 4 FROM k	4:abc,7;m,7;q,7;z,4
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t EXCEPT SELECT max(a), 4 FROM k	3:abc,7;m,7;q,7
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t INTERSECT SELECT max(a), 4 FROM k	0:
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t UNION SELECT 'ABC' COLLATE NOCASE, 2	4:abc,2;abc,7;m,7;q,7
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t EXCEPT SELECT 'ABC' COLLATE NOCASE, 2	3:abc,7;m,7;q,7
+windowed	rows	SELECT a, 3 + count(*) OVER () FROM t INTERSECT SELECT 'ABC' COLLATE NOCASE, 2	0:
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t UNION SELECT a, count(*) OVER () FROM u	8:NULL,5;abc,4;abc,5;abc,5;m,4;q,4;q,5;x,5
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t EXCEPT SELECT a, count(*) OVER () FROM u	3:abc,4;m,4;q,4
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t INTERSECT SELECT a, count(*) OVER () FROM u	0:
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t UNION SELECT a, 3 + count(*) OVER () FROM t	6:abc,4;abc,7;m,4;m,7;q,4;q,7
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t EXCEPT SELECT a, 3 + count(*) OVER () FROM t	3:abc,4;m,4;q,4
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t INTERSECT SELECT a, 3 + count(*) OVER () FROM t	0:
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t UNION SELECT lower(a), count(*) OVER () FROM t	3:abc,4;m,4;q,4
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t EXCEPT SELECT lower(a), count(*) OVER () FROM t	0:
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t INTERSECT SELECT lower(a), count(*) OVER () FROM t	3:abc,4;m,4;q,4
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t UNION SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	8:NULL,1;abc,2;abc,3;abc,4;m,4;q,4;q,4;x,5
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t EXCEPT SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	3:abc,4;m,4;q,4
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t INTERSECT SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	0:
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t UNION SELECT max(a), count(*) OVER () FROM t GROUP BY a	6:abc,3;abc,4;m,3;m,4;q,3;q,4
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t EXCEPT SELECT max(a), count(*) OVER () FROM t GROUP BY a	3:abc,4;m,4;q,4
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t INTERSECT SELECT max(a), count(*) OVER () FROM t GROUP BY a	0:
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t UNION SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	8:NULL,1;abc,2;abc,3;abc,4;m,4;q,4;q,4;x,5
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t EXCEPT SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	3:abc,4;m,4;q,4
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t INTERSECT SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	0:
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t UNION SELECT 'abc', count(*) OVER () FROM u	4:abc,4;abc,5;m,4;q,4
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t EXCEPT SELECT 'abc', count(*) OVER () FROM u	3:abc,4;m,4;q,4
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t INTERSECT SELECT 'abc', count(*) OVER () FROM u	0:
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t UNION SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	6:abc,1;abc,2;abc,4;m,3;m,4;q,4
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t EXCEPT SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	3:abc,4;m,4;q,4
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t INTERSECT SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	0:
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t UNION SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	6:abc,1;abc,4;m,3;m,4;q,2;q,4
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t EXCEPT SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	3:abc,4;m,4;q,4
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t INTERSECT SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	0:
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t UNION SELECT a, 3 FROM t	6:abc,3;abc,4;m,3;m,4;q,3;q,4
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t EXCEPT SELECT a, 3 FROM t	3:abc,4;m,4;q,4
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t INTERSECT SELECT a, 3 FROM t	0:
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t UNION SELECT a, 5 FROM u	8:NULL,5;abc,4;abc,5;abc,5;m,4;q,4;q,5;x,5
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t EXCEPT SELECT a, 5 FROM u	3:abc,4;m,4;q,4
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t INTERSECT SELECT a, 5 FROM u	0:
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t UNION SELECT 'abc', 1	4:abc,1;abc,4;m,4;q,4
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t EXCEPT SELECT 'abc', 1	3:abc,4;m,4;q,4
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t INTERSECT SELECT 'abc', 1	0:
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t UNION SELECT max(a), 4 FROM k	4:abc,4;m,4;q,4;z,4
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t EXCEPT SELECT max(a), 4 FROM k	3:abc,4;m,4;q,4
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t INTERSECT SELECT max(a), 4 FROM k	0:
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t UNION SELECT 'ABC' COLLATE NOCASE, 2	4:abc,2;abc,4;m,4;q,4
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t EXCEPT SELECT 'ABC' COLLATE NOCASE, 2	3:abc,4;m,4;q,4
+windowed	rows	SELECT lower(a), count(*) OVER () FROM t INTERSECT SELECT 'ABC' COLLATE NOCASE, 2	0:
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u UNION SELECT a, count(*) OVER () FROM u	8:NULL,1;NULL,5;abc,2;abc,3;abc,5;q,4;q,5;x,5
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u EXCEPT SELECT a, count(*) OVER () FROM u	4:NULL,1;abc,2;abc,3;q,4
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u INTERSECT SELECT a, count(*) OVER () FROM u	1:x,5
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u UNION SELECT a, 3 + count(*) OVER () FROM t	8:NULL,1;abc,2;abc,3;abc,7;m,7;q,4;q,7;x,5
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u EXCEPT SELECT a, 3 + count(*) OVER () FROM t	5:NULL,1;abc,2;abc,3;q,4;x,5
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u INTERSECT SELECT a, 3 + count(*) OVER () FROM t	0:
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u UNION SELECT lower(a), count(*) OVER () FROM t	8:NULL,1;abc,2;abc,3;abc,4;m,4;q,4;q,4;x,5
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u EXCEPT SELECT lower(a), count(*) OVER () FROM t	5:NULL,1;abc,2;abc,3;q,4;x,5
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u INTERSECT SELECT lower(a), count(*) OVER () FROM t	0:
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u UNION SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	5:NULL,1;abc,2;abc,3;q,4;x,5
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u EXCEPT SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	0:
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u INTERSECT SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	5:NULL,1;abc,2;abc,3;q,4;x,5
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u UNION SELECT max(a), count(*) OVER () FROM t GROUP BY a	7:NULL,1;abc,2;abc,3;m,3;q,3;q,4;x,5
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u EXCEPT SELECT max(a), count(*) OVER () FROM t GROUP BY a	4:NULL,1;abc,2;q,4;x,5
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u INTERSECT SELECT max(a), count(*) OVER () FROM t GROUP BY a	1:abc,3
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u UNION SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	5:NULL,1;abc,2;abc,3;q,4;x,5
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u EXCEPT SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	0:
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u INTERSECT SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	5:NULL,1;abc,2;abc,3;q,4;x,5
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u UNION SELECT 'abc', count(*) OVER () FROM u	6:NULL,1;abc,2;abc,3;abc,5;q,4;x,5
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u EXCEPT SELECT 'abc', count(*) OVER () FROM u	5:NULL,1;abc,2;abc,3;q,4;x,5
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u INTERSECT SELECT 'abc', count(*) OVER () FROM u	0:
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u UNION SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	8:NULL,1;abc,1;abc,2;abc,3;m,3;m,3;q,4;x,5
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u EXCEPT SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	4:NULL,1;abc,3;q,4;x,5
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u INTERSECT SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	1:abc,2
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u UNION SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	8:NULL,1;abc,1;abc,2;abc,3;m,3;q,2;q,4;x,5
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u EXCEPT SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	5:NULL,1;abc,2;abc,3;q,4;x,5
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u INTERSECT SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	0:
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u UNION SELECT a, 3 FROM t	7:NULL,1;abc,2;abc,3;m,3;q,3;q,4;x,5
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u EXCEPT SELECT a, 3 FROM t	4:NULL,1;abc,2;q,4;x,5
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u INTERSECT SELECT a, 3 FROM t	1:abc,3
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u UNION SELECT a, 5 FROM u	8:NULL,1;NULL,5;abc,2;abc,3;abc,5;q,4;q,5;x,5
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u EXCEPT SELECT a, 5 FROM u	4:NULL,1;abc,2;abc,3;q,4
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u INTERSECT SELECT a, 5 FROM u	1:x,5
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u UNION SELECT 'abc', 1	6:NULL,1;abc,1;abc,2;abc,3;q,4;x,5
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u EXCEPT SELECT 'abc', 1	5:NULL,1;abc,2;abc,3;q,4;x,5
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u INTERSECT SELECT 'abc', 1	0:
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u UNION SELECT max(a), 4 FROM k	6:NULL,1;abc,2;abc,3;q,4;x,5;z,4
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u EXCEPT SELECT max(a), 4 FROM k	5:NULL,1;abc,2;abc,3;q,4;x,5
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u INTERSECT SELECT max(a), 4 FROM k	0:
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u UNION SELECT 'ABC' COLLATE NOCASE, 2	5:NULL,1;abc,2;abc,3;q,4;x,5
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u EXCEPT SELECT 'ABC' COLLATE NOCASE, 2	4:NULL,1;abc,3;q,4;x,5
+windowed	rows	SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u INTERSECT SELECT 'ABC' COLLATE NOCASE, 2	1:abc,2
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a UNION SELECT a, count(*) OVER () FROM u	8:NULL,5;abc,3;abc,5;abc,5;m,3;q,3;q,5;x,5
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a EXCEPT SELECT a, count(*) OVER () FROM u	3:abc,3;m,3;q,3
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a INTERSECT SELECT a, count(*) OVER () FROM u	0:
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a UNION SELECT a, 3 + count(*) OVER () FROM t	6:abc,3;abc,7;m,3;m,7;q,3;q,7
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a EXCEPT SELECT a, 3 + count(*) OVER () FROM t	3:abc,3;m,3;q,3
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a INTERSECT SELECT a, 3 + count(*) OVER () FROM t	0:
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a UNION SELECT lower(a), count(*) OVER () FROM t	6:abc,3;abc,4;m,3;m,4;q,3;q,4
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a EXCEPT SELECT lower(a), count(*) OVER () FROM t	3:abc,3;m,3;q,3
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a INTERSECT SELECT lower(a), count(*) OVER () FROM t	0:
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a UNION SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	7:NULL,1;abc,2;abc,3;m,3;q,3;q,4;x,5
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a EXCEPT SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	2:m,3;q,3
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a INTERSECT SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	1:abc,3
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a UNION SELECT max(a), count(*) OVER () FROM t GROUP BY a	3:abc,3;m,3;q,3
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a EXCEPT SELECT max(a), count(*) OVER () FROM t GROUP BY a	0:
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a INTERSECT SELECT max(a), count(*) OVER () FROM t GROUP BY a	3:abc,3;m,3;q,3
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a UNION SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	8:NULL,1;abc,2;abc,3;abc,3;m,3;q,3;q,4;x,5
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a EXCEPT SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	3:abc,3;m,3;q,3
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a INTERSECT SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	0:
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a UNION SELECT 'abc', count(*) OVER () FROM u	4:abc,3;abc,5;m,3;q,3
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a EXCEPT SELECT 'abc', count(*) OVER () FROM u	3:abc,3;m,3;q,3
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a INTERSECT SELECT 'abc', count(*) OVER () FROM u	0:
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a UNION SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	5:abc,1;abc,2;abc,3;m,3;q,3
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a EXCEPT SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	2:abc,3;q,3
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a INTERSECT SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	1:m,3
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a UNION SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	6:abc,1;abc,3;m,3;m,3;q,2;q,3
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a EXCEPT SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	3:abc,3;m,3;q,3
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a INTERSECT SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	0:
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a UNION SELECT a, 3 FROM t	3:abc,3;m,3;q,3
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a EXCEPT SELECT a, 3 FROM t	0:
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a INTERSECT SELECT a, 3 FROM t	3:abc,3;m,3;q,3
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a UNION SELECT a, 5 FROM u	8:NULL,5;abc,3;abc,5;abc,5;m,3;q,3;q,5;x,5
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a EXCEPT SELECT a, 5 FROM u	3:abc,3;m,3;q,3
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a INTERSECT SELECT a, 5 FROM u	0:
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a UNION SELECT 'abc', 1	4:abc,1;abc,3;m,3;q,3
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a EXCEPT SELECT 'abc', 1	3:abc,3;m,3;q,3
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a INTERSECT SELECT 'abc', 1	0:
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a UNION SELECT max(a), 4 FROM k	4:abc,3;m,3;q,3;z,4
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a EXCEPT SELECT max(a), 4 FROM k	3:abc,3;m,3;q,3
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a INTERSECT SELECT max(a), 4 FROM k	0:
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a UNION SELECT 'ABC' COLLATE NOCASE, 2	4:abc,2;abc,3;m,3;q,3
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a EXCEPT SELECT 'ABC' COLLATE NOCASE, 2	3:abc,3;m,3;q,3
+windowed	rows	SELECT max(a), count(*) OVER () FROM t GROUP BY a INTERSECT SELECT 'ABC' COLLATE NOCASE, 2	0:
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a UNION SELECT a, count(*) OVER () FROM u	9:NULL,1;NULL,5;abc,2;abc,3;abc,5;abc,5;q,4;q,5;x,5
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a EXCEPT SELECT a, count(*) OVER () FROM u	4:NULL,1;abc,2;abc,3;q,4
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a INTERSECT SELECT a, count(*) OVER () FROM u	1:x,5
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a UNION SELECT a, 3 + count(*) OVER () FROM t	9:NULL,1;abc,2;abc,3;abc,7;m,7;q,4;q,7;q,7;x,5
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a EXCEPT SELECT a, 3 + count(*) OVER () FROM t	5:NULL,1;abc,2;abc,3;q,4;x,5
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a INTERSECT SELECT a, 3 + count(*) OVER () FROM t	0:
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a UNION SELECT lower(a), count(*) OVER () FROM t	8:NULL,1;abc,2;abc,3;abc,4;m,4;q,4;q,4;x,5
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a EXCEPT SELECT lower(a), count(*) OVER () FROM t	5:NULL,1;abc,2;abc,3;q,4;x,5
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a INTERSECT SELECT lower(a), count(*) OVER () FROM t	0:
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a UNION SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	5:NULL,1;abc,2;abc,3;q,4;x,5
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a EXCEPT SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	0:
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a INTERSECT SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	5:NULL,1;abc,2;abc,3;q,4;x,5
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a UNION SELECT max(a), count(*) OVER () FROM t GROUP BY a	8:NULL,1;abc,2;abc,3;abc,3;m,3;q,3;q,4;x,5
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a EXCEPT SELECT max(a), count(*) OVER () FROM t GROUP BY a	5:NULL,1;abc,2;abc,3;q,4;x,5
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a INTERSECT SELECT max(a), count(*) OVER () FROM t GROUP BY a	0:
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a UNION SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	5:NULL,1;abc,2;abc,3;q,4;x,5
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a EXCEPT SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	0:
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a INTERSECT SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	5:NULL,1;abc,2;abc,3;q,4;x,5
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a UNION SELECT 'abc', count(*) OVER () FROM u	6:NULL,1;abc,2;abc,3;abc,5;q,4;x,5
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a EXCEPT SELECT 'abc', count(*) OVER () FROM u	5:NULL,1;abc,2;abc,3;q,4;x,5
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a INTERSECT SELECT 'abc', count(*) OVER () FROM u	0:
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a UNION SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	9:NULL,1;abc,1;abc,2;abc,2;abc,3;m,3;m,3;q,4;x,5
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a EXCEPT SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	5:NULL,1;abc,2;abc,3;q,4;x,5
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a INTERSECT SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	0:
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a UNION SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	8:NULL,1;abc,1;abc,2;abc,3;m,3;q,2;q,4;x,5
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a EXCEPT SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	5:NULL,1;abc,2;abc,3;q,4;x,5
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a INTERSECT SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	0:
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a UNION SELECT a, 3 FROM t	9:NULL,1;abc,2;abc,3;abc,3;m,3;q,3;q,3;q,4;x,5
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a EXCEPT SELECT a, 3 FROM t	5:NULL,1;abc,2;abc,3;q,4;x,5
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a INTERSECT SELECT a, 3 FROM t	0:
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a UNION SELECT a, 5 FROM u	9:NULL,1;NULL,5;abc,2;abc,3;abc,5;abc,5;q,4;q,5;x,5
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a EXCEPT SELECT a, 5 FROM u	4:NULL,1;abc,2;abc,3;q,4
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a INTERSECT SELECT a, 5 FROM u	1:x,5
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a UNION SELECT 'abc', 1	6:NULL,1;abc,1;abc,2;abc,3;q,4;x,5
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a EXCEPT SELECT 'abc', 1	5:NULL,1;abc,2;abc,3;q,4;x,5
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a INTERSECT SELECT 'abc', 1	0:
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a UNION SELECT max(a), 4 FROM k	6:NULL,1;abc,2;abc,3;q,4;x,5;z,4
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a EXCEPT SELECT max(a), 4 FROM k	5:NULL,1;abc,2;abc,3;q,4;x,5
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a INTERSECT SELECT max(a), 4 FROM k	0:
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a UNION SELECT 'ABC' COLLATE NOCASE, 2	5:NULL,1;abc,2;abc,3;q,4;x,5
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a EXCEPT SELECT 'ABC' COLLATE NOCASE, 2	4:NULL,1;abc,3;q,4;x,5
+windowed	rows	SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a INTERSECT SELECT 'ABC' COLLATE NOCASE, 2	1:abc,2
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u UNION SELECT a, count(*) OVER () FROM u	5:NULL,5;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u EXCEPT SELECT a, count(*) OVER () FROM u	0:
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u INTERSECT SELECT a, count(*) OVER () FROM u	1:abc,5
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u UNION SELECT a, 3 + count(*) OVER () FROM t	4:abc,5;abc,7;m,7;q,7
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u EXCEPT SELECT a, 3 + count(*) OVER () FROM t	1:abc,5
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u INTERSECT SELECT a, 3 + count(*) OVER () FROM t	0:
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u UNION SELECT lower(a), count(*) OVER () FROM t	4:abc,4;abc,5;m,4;q,4
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u EXCEPT SELECT lower(a), count(*) OVER () FROM t	1:abc,5
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u INTERSECT SELECT lower(a), count(*) OVER () FROM t	0:
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u UNION SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	6:NULL,1;abc,2;abc,3;abc,5;q,4;x,5
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u EXCEPT SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	1:abc,5
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u INTERSECT SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	0:
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u UNION SELECT max(a), count(*) OVER () FROM t GROUP BY a	4:abc,3;abc,5;m,3;q,3
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u EXCEPT SELECT max(a), count(*) OVER () FROM t GROUP BY a	1:abc,5
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u INTERSECT SELECT max(a), count(*) OVER () FROM t GROUP BY a	0:
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u UNION SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	6:NULL,1;abc,2;abc,3;abc,5;q,4;x,5
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u EXCEPT SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	1:abc,5
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u INTERSECT SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	0:
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u UNION SELECT 'abc', count(*) OVER () FROM u	1:abc,5
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u EXCEPT SELECT 'abc', count(*) OVER () FROM u	0:
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u INTERSECT SELECT 'abc', count(*) OVER () FROM u	1:abc,5
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u UNION SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	4:abc,1;abc,2;abc,5;m,3
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u EXCEPT SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	1:abc,5
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u INTERSECT SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	0:
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u UNION SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	4:abc,1;abc,5;m,3;q,2
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u EXCEPT SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	1:abc,5
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u INTERSECT SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	0:
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u UNION SELECT a, 3 FROM t	4:abc,3;abc,5;m,3;q,3
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u EXCEPT SELECT a, 3 FROM t	1:abc,5
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u INTERSECT SELECT a, 3 FROM t	0:
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u UNION SELECT a, 5 FROM u	5:NULL,5;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u EXCEPT SELECT a, 5 FROM u	0:
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u INTERSECT SELECT a, 5 FROM u	1:abc,5
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u UNION SELECT 'abc', 1	2:abc,1;abc,5
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u EXCEPT SELECT 'abc', 1	1:abc,5
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u INTERSECT SELECT 'abc', 1	0:
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u UNION SELECT max(a), 4 FROM k	2:abc,5;z,4
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u EXCEPT SELECT max(a), 4 FROM k	1:abc,5
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u INTERSECT SELECT max(a), 4 FROM k	0:
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u UNION SELECT 'ABC' COLLATE NOCASE, 2	2:abc,2;abc,5
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u EXCEPT SELECT 'ABC' COLLATE NOCASE, 2	1:abc,5
+windowed	rows	SELECT 'abc', count(*) OVER () FROM u INTERSECT SELECT 'ABC' COLLATE NOCASE, 2	0:
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r UNION SELECT a, count(*) OVER () FROM u	8:NULL,5;abc,1;abc,2;abc,5;abc,5;m,3;q,5;x,5
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r EXCEPT SELECT a, count(*) OVER () FROM u	3:abc,1;abc,2;m,3
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r INTERSECT SELECT a, count(*) OVER () FROM u	0:
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r UNION SELECT a, 3 + count(*) OVER () FROM t	7:abc,1;abc,2;abc,7;m,3;m,7;q,7;q,7
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r EXCEPT SELECT a, 3 + count(*) OVER () FROM t	3:abc,1;abc,2;m,3
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r INTERSECT SELECT a, 3 + count(*) OVER () FROM t	0:
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r UNION SELECT lower(a), count(*) OVER () FROM t	6:abc,1;abc,2;abc,4;m,3;m,4;q,4
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r EXCEPT SELECT lower(a), count(*) OVER () FROM t	3:abc,1;abc,2;m,3
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r INTERSECT SELECT lower(a), count(*) OVER () FROM t	0:
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r UNION SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	8:NULL,1;abc,1;abc,2;abc,2;abc,3;m,3;q,4;x,5
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r EXCEPT SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	3:abc,1;abc,2;m,3
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r INTERSECT SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	0:
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r UNION SELECT max(a), count(*) OVER () FROM t GROUP BY a	5:abc,1;abc,2;abc,3;m,3;q,3
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r EXCEPT SELECT max(a), count(*) OVER () FROM t GROUP BY a	2:abc,1;abc,2
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r INTERSECT SELECT max(a), count(*) OVER () FROM t GROUP BY a	1:m,3
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r UNION SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	8:NULL,1;abc,1;abc,2;abc,2;abc,3;m,3;q,4;x,5
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r EXCEPT SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	3:abc,1;abc,2;m,3
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r INTERSECT SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	0:
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r UNION SELECT 'abc', count(*) OVER () FROM u	4:abc,1;abc,2;abc,5;m,3
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r EXCEPT SELECT 'abc', count(*) OVER () FROM u	3:abc,1;abc,2;m,3
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r INTERSECT SELECT 'abc', count(*) OVER () FROM u	0:
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r UNION SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	3:abc,1;abc,2;m,3
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r EXCEPT SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	0:
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r INTERSECT SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	3:abc,1;abc,2;m,3
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r UNION SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	5:abc,1;abc,1;abc,2;m,3;q,2
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r EXCEPT SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	2:abc,1;abc,2
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r INTERSECT SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	1:m,3
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r UNION SELECT a, 3 FROM t	6:abc,1;abc,2;abc,3;m,3;q,3;q,3
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r EXCEPT SELECT a, 3 FROM t	2:abc,1;abc,2
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r INTERSECT SELECT a, 3 FROM t	1:m,3
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r UNION SELECT a, 5 FROM u	8:NULL,5;abc,1;abc,2;abc,5;abc,5;m,3;q,5;x,5
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r EXCEPT SELECT a, 5 FROM u	3:abc,1;abc,2;m,3
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r INTERSECT SELECT a, 5 FROM u	0:
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r UNION SELECT 'abc', 1	4:abc,1;abc,1;abc,2;m,3
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r EXCEPT SELECT 'abc', 1	3:abc,1;abc,2;m,3
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r INTERSECT SELECT 'abc', 1	0:
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r UNION SELECT max(a), 4 FROM k	4:abc,1;abc,2;m,3;z,4
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r EXCEPT SELECT max(a), 4 FROM k	3:abc,1;abc,2;m,3
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r INTERSECT SELECT max(a), 4 FROM k	0:
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r UNION SELECT 'ABC' COLLATE NOCASE, 2	4:abc,1;abc,2;abc,2;m,3
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r EXCEPT SELECT 'ABC' COLLATE NOCASE, 2	3:abc,1;abc,2;m,3
+windowed	rows	SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r INTERSECT SELECT 'ABC' COLLATE NOCASE, 2	0:
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b UNION SELECT a, count(*) OVER () FROM u	7:NULL,5;abc,1;abc,5;m,3;q,2;q,5;x,5
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b EXCEPT SELECT a, count(*) OVER () FROM u	3:abc,1;m,3;q,2
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b INTERSECT SELECT a, count(*) OVER () FROM u	0:
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b UNION SELECT a, 3 + count(*) OVER () FROM t	6:abc,1;abc,7;m,3;m,7;q,2;q,7
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b EXCEPT SELECT a, 3 + count(*) OVER () FROM t	3:abc,1;m,3;q,2
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b INTERSECT SELECT a, 3 + count(*) OVER () FROM t	0:
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b UNION SELECT lower(a), count(*) OVER () FROM t	6:abc,1;abc,4;m,3;m,4;q,2;q,4
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b EXCEPT SELECT lower(a), count(*) OVER () FROM t	3:abc,1;m,3;q,2
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b INTERSECT SELECT lower(a), count(*) OVER () FROM t	0:
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b UNION SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	8:NULL,1;abc,1;abc,2;abc,3;m,3;q,2;q,4;x,5
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b EXCEPT SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	3:abc,1;m,3;q,2
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b INTERSECT SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	0:
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b UNION SELECT max(a), count(*) OVER () FROM t GROUP BY a	6:abc,1;abc,3;m,3;m,3;q,2;q,3
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b EXCEPT SELECT max(a), count(*) OVER () FROM t GROUP BY a	3:abc,1;m,3;q,2
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b INTERSECT SELECT max(a), count(*) OVER () FROM t GROUP BY a	0:
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b UNION SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	8:NULL,1;abc,1;abc,2;abc,3;m,3;q,2;q,4;x,5
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b EXCEPT SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	3:abc,1;m,3;q,2
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b INTERSECT SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	0:
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b UNION SELECT 'abc', count(*) OVER () FROM u	4:abc,1;abc,5;m,3;q,2
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b EXCEPT SELECT 'abc', count(*) OVER () FROM u	3:abc,1;m,3;q,2
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b INTERSECT SELECT 'abc', count(*) OVER () FROM u	0:
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b UNION SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	6:abc,1;abc,1;abc,2;m,3;m,3;q,2
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b EXCEPT SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	2:abc,1;q,2
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b INTERSECT SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	1:m,3
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b UNION SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	3:abc,1;m,3;q,2
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b EXCEPT SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	0:
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b INTERSECT SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	3:abc,1;m,3;q,2
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b UNION SELECT a, 3 FROM t	6:abc,1;abc,3;m,3;m,3;q,2;q,3
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b EXCEPT SELECT a, 3 FROM t	3:abc,1;m,3;q,2
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b INTERSECT SELECT a, 3 FROM t	0:
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b UNION SELECT a, 5 FROM u	7:NULL,5;abc,1;abc,5;m,3;q,2;q,5;x,5
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b EXCEPT SELECT a, 5 FROM u	3:abc,1;m,3;q,2
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b INTERSECT SELECT a, 5 FROM u	0:
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b UNION SELECT 'abc', 1	3:abc,1;m,3;q,2
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b EXCEPT SELECT 'abc', 1	2:m,3;q,2
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b INTERSECT SELECT 'abc', 1	1:abc,1
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b UNION SELECT max(a), 4 FROM k	4:abc,1;m,3;q,2;z,4
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b EXCEPT SELECT max(a), 4 FROM k	3:abc,1;m,3;q,2
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b INTERSECT SELECT max(a), 4 FROM k	0:
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b UNION SELECT 'ABC' COLLATE NOCASE, 2	4:abc,1;abc,2;m,3;q,2
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b EXCEPT SELECT 'ABC' COLLATE NOCASE, 2	3:abc,1;m,3;q,2
+windowed	rows	SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b INTERSECT SELECT 'ABC' COLLATE NOCASE, 2	0:
+windowed	rows	SELECT a, rank() OVER (ORDER BY a), 0 * count(*) OVER () FROM u UNION SELECT a, rank() OVER (ORDER BY a), 0 * count(*) OVER () FROM u	5:NULL,1,0;abc,2,0;abc,3,0;q,4,0;x,5,0
+windowed	rows	SELECT a, rank() OVER (ORDER BY a), 0 * count(*) OVER () FROM u EXCEPT SELECT a, rank() OVER (ORDER BY a), 0 * count(*) OVER () FROM u	0:
+windowed	rows	SELECT a, rank() OVER (ORDER BY a), 0 * count(*) OVER () FROM u INTERSECT SELECT a, rank() OVER (ORDER BY a), 0 * count(*) OVER () FROM u	5:NULL,1,0;abc,2,0;abc,3,0;q,4,0;x,5,0
+windowed	rows	SELECT a, 3 FROM t UNION SELECT a, count(*) OVER () FROM u	7:NULL,5;abc,3;abc,5;m,3;q,3;q,5;x,5
+windowed	rows	SELECT a, 3 FROM t EXCEPT SELECT a, count(*) OVER () FROM u	3:abc,3;m,3;q,3
+windowed	rows	SELECT a, 3 FROM t INTERSECT SELECT a, count(*) OVER () FROM u	0:
+windowed	rows	SELECT a, 3 FROM t UNION SELECT a, 3 + count(*) OVER () FROM t	6:abc,3;abc,7;m,3;m,7;q,3;q,7
+windowed	rows	SELECT a, 3 FROM t EXCEPT SELECT a, 3 + count(*) OVER () FROM t	3:abc,3;m,3;q,3
+windowed	rows	SELECT a, 3 FROM t INTERSECT SELECT a, 3 + count(*) OVER () FROM t	0:
+windowed	rows	SELECT a, 3 FROM t UNION SELECT lower(a), count(*) OVER () FROM t	6:abc,3;abc,4;m,3;m,4;q,3;q,4
+windowed	rows	SELECT a, 3 FROM t EXCEPT SELECT lower(a), count(*) OVER () FROM t	3:abc,3;m,3;q,3
+windowed	rows	SELECT a, 3 FROM t INTERSECT SELECT lower(a), count(*) OVER () FROM t	0:
+windowed	rows	SELECT a, 3 FROM t UNION SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	7:NULL,1;abc,2;abc,3;m,3;q,3;q,4;x,5
+windowed	rows	SELECT a, 3 FROM t EXCEPT SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	2:m,3;q,3
+windowed	rows	SELECT a, 3 FROM t INTERSECT SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	1:abc,3
+windowed	rows	SELECT a, 3 FROM t UNION SELECT max(a), count(*) OVER () FROM t GROUP BY a	3:abc,3;m,3;q,3
+windowed	rows	SELECT a, 3 FROM t EXCEPT SELECT max(a), count(*) OVER () FROM t GROUP BY a	0:
+windowed	rows	SELECT a, 3 FROM t INTERSECT SELECT max(a), count(*) OVER () FROM t GROUP BY a	3:abc,3;m,3;q,3
+windowed	rows	SELECT a, 3 FROM t UNION SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	7:NULL,1;abc,2;abc,3;m,3;q,3;q,4;x,5
+windowed	rows	SELECT a, 3 FROM t EXCEPT SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	2:m,3;q,3
+windowed	rows	SELECT a, 3 FROM t INTERSECT SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	1:abc,3
+windowed	rows	SELECT a, 3 FROM t UNION SELECT 'abc', count(*) OVER () FROM u	4:abc,3;abc,5;m,3;q,3
+windowed	rows	SELECT a, 3 FROM t EXCEPT SELECT 'abc', count(*) OVER () FROM u	3:abc,3;m,3;q,3
+windowed	rows	SELECT a, 3 FROM t INTERSECT SELECT 'abc', count(*) OVER () FROM u	0:
+windowed	rows	SELECT a, 3 FROM t UNION SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	6:abc,1;abc,2;abc,3;m,3;m,3;q,3
+windowed	rows	SELECT a, 3 FROM t EXCEPT SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	2:abc,3;q,3
+windowed	rows	SELECT a, 3 FROM t INTERSECT SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	1:m,3
+windowed	rows	SELECT a, 3 FROM t UNION SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	6:abc,1;abc,3;m,3;m,3;q,2;q,3
+windowed	rows	SELECT a, 3 FROM t EXCEPT SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	3:abc,3;m,3;q,3
+windowed	rows	SELECT a, 3 FROM t INTERSECT SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	0:
+windowed	rows	SELECT a, 3 FROM t UNION SELECT a, 3 FROM t	3:abc,3;m,3;q,3
+windowed	rows	SELECT a, 3 FROM t EXCEPT SELECT a, 3 FROM t	0:
+windowed	rows	SELECT a, 3 FROM t INTERSECT SELECT a, 3 FROM t	3:abc,3;m,3;q,3
+windowed	rows	SELECT a, 3 FROM t UNION SELECT a, 5 FROM u	7:NULL,5;abc,3;abc,5;m,3;q,3;q,5;x,5
+windowed	rows	SELECT a, 3 FROM t EXCEPT SELECT a, 5 FROM u	3:abc,3;m,3;q,3
+windowed	rows	SELECT a, 3 FROM t INTERSECT SELECT a, 5 FROM u	0:
+windowed	rows	SELECT a, 3 FROM t UNION SELECT 'abc', 1	4:abc,1;abc,3;m,3;q,3
+windowed	rows	SELECT a, 3 FROM t EXCEPT SELECT 'abc', 1	3:abc,3;m,3;q,3
+windowed	rows	SELECT a, 3 FROM t INTERSECT SELECT 'abc', 1	0:
+windowed	rows	SELECT a, 3 FROM t UNION SELECT max(a), 4 FROM k	4:abc,3;m,3;q,3;z,4
+windowed	rows	SELECT a, 3 FROM t EXCEPT SELECT max(a), 4 FROM k	3:abc,3;m,3;q,3
+windowed	rows	SELECT a, 3 FROM t INTERSECT SELECT max(a), 4 FROM k	0:
+windowed	rows	SELECT a, 3 FROM t UNION SELECT 'ABC' COLLATE NOCASE, 2	4:abc,2;abc,3;m,3;q,3
+windowed	rows	SELECT a, 3 FROM t EXCEPT SELECT 'ABC' COLLATE NOCASE, 2	3:abc,3;m,3;q,3
+windowed	rows	SELECT a, 3 FROM t INTERSECT SELECT 'ABC' COLLATE NOCASE, 2	0:
+windowed	rows	SELECT a, 5 FROM u UNION SELECT a, count(*) OVER () FROM u	5:NULL,5;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT a, 5 FROM u EXCEPT SELECT a, count(*) OVER () FROM u	0:
+windowed	rows	SELECT a, 5 FROM u INTERSECT SELECT a, count(*) OVER () FROM u	5:NULL,5;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT a, 5 FROM u UNION SELECT a, 3 + count(*) OVER () FROM t	9:NULL,5;abc,5;abc,5;abc,7;m,7;q,5;q,7;q,7;x,5
+windowed	rows	SELECT a, 5 FROM u EXCEPT SELECT a, 3 + count(*) OVER () FROM t	5:NULL,5;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT a, 5 FROM u INTERSECT SELECT a, 3 + count(*) OVER () FROM t	0:
+windowed	rows	SELECT a, 5 FROM u UNION SELECT lower(a), count(*) OVER () FROM t	8:NULL,5;abc,4;abc,5;abc,5;m,4;q,4;q,5;x,5
+windowed	rows	SELECT a, 5 FROM u EXCEPT SELECT lower(a), count(*) OVER () FROM t	5:NULL,5;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT a, 5 FROM u INTERSECT SELECT lower(a), count(*) OVER () FROM t	0:
+windowed	rows	SELECT a, 5 FROM u UNION SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	9:NULL,1;NULL,5;abc,2;abc,3;abc,5;abc,5;q,4;q,5;x,5
+windowed	rows	SELECT a, 5 FROM u EXCEPT SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	4:NULL,5;abc,5;abc,5;q,5
+windowed	rows	SELECT a, 5 FROM u INTERSECT SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	1:x,5
+windowed	rows	SELECT a, 5 FROM u UNION SELECT max(a), count(*) OVER () FROM t GROUP BY a	8:NULL,5;abc,3;abc,5;abc,5;m,3;q,3;q,5;x,5
+windowed	rows	SELECT a, 5 FROM u EXCEPT SELECT max(a), count(*) OVER () FROM t GROUP BY a	5:NULL,5;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT a, 5 FROM u INTERSECT SELECT max(a), count(*) OVER () FROM t GROUP BY a	0:
+windowed	rows	SELECT a, 5 FROM u UNION SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	9:NULL,1;NULL,5;abc,2;abc,3;abc,5;abc,5;q,4;q,5;x,5
+windowed	rows	SELECT a, 5 FROM u EXCEPT SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	4:NULL,5;abc,5;abc,5;q,5
+windowed	rows	SELECT a, 5 FROM u INTERSECT SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	1:x,5
+windowed	rows	SELECT a, 5 FROM u UNION SELECT 'abc', count(*) OVER () FROM u	5:NULL,5;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT a, 5 FROM u EXCEPT SELECT 'abc', count(*) OVER () FROM u	4:NULL,5;abc,5;q,5;x,5
+windowed	rows	SELECT a, 5 FROM u INTERSECT SELECT 'abc', count(*) OVER () FROM u	1:abc,5
+windowed	rows	SELECT a, 5 FROM u UNION SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	9:NULL,5;abc,1;abc,2;abc,5;abc,5;m,3;m,3;q,5;x,5
+windowed	rows	SELECT a, 5 FROM u EXCEPT SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	5:NULL,5;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT a, 5 FROM u INTERSECT SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	0:
+windowed	rows	SELECT a, 5 FROM u UNION SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	8:NULL,5;abc,1;abc,5;abc,5;m,3;q,2;q,5;x,5
+windowed	rows	SELECT a, 5 FROM u EXCEPT SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	5:NULL,5;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT a, 5 FROM u INTERSECT SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	0:
+windowed	rows	SELECT a, 5 FROM u UNION SELECT a, 3 FROM t	9:NULL,5;abc,3;abc,5;abc,5;m,3;q,3;q,3;q,5;x,5
+windowed	rows	SELECT a, 5 FROM u EXCEPT SELECT a, 3 FROM t	5:NULL,5;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT a, 5 FROM u INTERSECT SELECT a, 3 FROM t	0:
+windowed	rows	SELECT a, 5 FROM u UNION SELECT a, 5 FROM u	5:NULL,5;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT a, 5 FROM u EXCEPT SELECT a, 5 FROM u	0:
+windowed	rows	SELECT a, 5 FROM u INTERSECT SELECT a, 5 FROM u	5:NULL,5;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT a, 5 FROM u UNION SELECT 'abc', 1	6:NULL,5;abc,1;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT a, 5 FROM u EXCEPT SELECT 'abc', 1	5:NULL,5;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT a, 5 FROM u INTERSECT SELECT 'abc', 1	0:
+windowed	rows	SELECT a, 5 FROM u UNION SELECT max(a), 4 FROM k	6:NULL,5;abc,5;abc,5;q,5;x,5;z,4
+windowed	rows	SELECT a, 5 FROM u EXCEPT SELECT max(a), 4 FROM k	5:NULL,5;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT a, 5 FROM u INTERSECT SELECT max(a), 4 FROM k	0:
+windowed	rows	SELECT a, 5 FROM u UNION SELECT 'ABC' COLLATE NOCASE, 2	6:NULL,5;abc,2;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT a, 5 FROM u EXCEPT SELECT 'ABC' COLLATE NOCASE, 2	5:NULL,5;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT a, 5 FROM u INTERSECT SELECT 'ABC' COLLATE NOCASE, 2	0:
+windowed	rows	SELECT 'abc', 1 UNION SELECT a, count(*) OVER () FROM u	6:NULL,5;abc,1;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT 'abc', 1 EXCEPT SELECT a, count(*) OVER () FROM u	1:abc,1
+windowed	rows	SELECT 'abc', 1 INTERSECT SELECT a, count(*) OVER () FROM u	0:
+windowed	rows	SELECT 'abc', 1 UNION SELECT a, 3 + count(*) OVER () FROM t	4:abc,1;abc,7;m,7;q,7
+windowed	rows	SELECT 'abc', 1 EXCEPT SELECT a, 3 + count(*) OVER () FROM t	1:abc,1
+windowed	rows	SELECT 'abc', 1 INTERSECT SELECT a, 3 + count(*) OVER () FROM t	0:
+windowed	rows	SELECT 'abc', 1 UNION SELECT lower(a), count(*) OVER () FROM t	4:abc,1;abc,4;m,4;q,4
+windowed	rows	SELECT 'abc', 1 EXCEPT SELECT lower(a), count(*) OVER () FROM t	1:abc,1
+windowed	rows	SELECT 'abc', 1 INTERSECT SELECT lower(a), count(*) OVER () FROM t	0:
+windowed	rows	SELECT 'abc', 1 UNION SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	6:NULL,1;abc,1;abc,2;abc,3;q,4;x,5
+windowed	rows	SELECT 'abc', 1 EXCEPT SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	1:abc,1
+windowed	rows	SELECT 'abc', 1 INTERSECT SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	0:
+windowed	rows	SELECT 'abc', 1 UNION SELECT max(a), count(*) OVER () FROM t GROUP BY a	4:abc,1;abc,3;m,3;q,3
+windowed	rows	SELECT 'abc', 1 EXCEPT SELECT max(a), count(*) OVER () FROM t GROUP BY a	1:abc,1
+windowed	rows	SELECT 'abc', 1 INTERSECT SELECT max(a), count(*) OVER () FROM t GROUP BY a	0:
+windowed	rows	SELECT 'abc', 1 UNION SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	6:NULL,1;abc,1;abc,2;abc,3;q,4;x,5
+windowed	rows	SELECT 'abc', 1 EXCEPT SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	1:abc,1
+windowed	rows	SELECT 'abc', 1 INTERSECT SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	0:
+windowed	rows	SELECT 'abc', 1 UNION SELECT 'abc', count(*) OVER () FROM u	2:abc,1;abc,5
+windowed	rows	SELECT 'abc', 1 EXCEPT SELECT 'abc', count(*) OVER () FROM u	1:abc,1
+windowed	rows	SELECT 'abc', 1 INTERSECT SELECT 'abc', count(*) OVER () FROM u	0:
+windowed	rows	SELECT 'abc', 1 UNION SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	4:abc,1;abc,1;abc,2;m,3
+windowed	rows	SELECT 'abc', 1 EXCEPT SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	1:abc,1
+windowed	rows	SELECT 'abc', 1 INTERSECT SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	0:
+windowed	rows	SELECT 'abc', 1 UNION SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	3:abc,1;m,3;q,2
+windowed	rows	SELECT 'abc', 1 EXCEPT SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	0:
+windowed	rows	SELECT 'abc', 1 INTERSECT SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	1:abc,1
+windowed	rows	SELECT 'abc', 1 UNION SELECT a, 3 FROM t	4:abc,1;abc,3;m,3;q,3
+windowed	rows	SELECT 'abc', 1 EXCEPT SELECT a, 3 FROM t	1:abc,1
+windowed	rows	SELECT 'abc', 1 INTERSECT SELECT a, 3 FROM t	0:
+windowed	rows	SELECT 'abc', 1 UNION SELECT a, 5 FROM u	6:NULL,5;abc,1;abc,5;abc,5;q,5;x,5
+windowed	rows	SELECT 'abc', 1 EXCEPT SELECT a, 5 FROM u	1:abc,1
+windowed	rows	SELECT 'abc', 1 INTERSECT SELECT a, 5 FROM u	0:
+windowed	rows	SELECT 'abc', 1 UNION SELECT 'abc', 1	1:abc,1
+windowed	rows	SELECT 'abc', 1 EXCEPT SELECT 'abc', 1	0:
+windowed	rows	SELECT 'abc', 1 INTERSECT SELECT 'abc', 1	1:abc,1
+windowed	rows	SELECT 'abc', 1 UNION SELECT max(a), 4 FROM k	2:abc,1;z,4
+windowed	rows	SELECT 'abc', 1 EXCEPT SELECT max(a), 4 FROM k	1:abc,1
+windowed	rows	SELECT 'abc', 1 INTERSECT SELECT max(a), 4 FROM k	0:
+windowed	rows	SELECT 'abc', 1 UNION SELECT 'ABC' COLLATE NOCASE, 2	2:abc,1;abc,2
+windowed	rows	SELECT 'abc', 1 EXCEPT SELECT 'ABC' COLLATE NOCASE, 2	1:abc,1
+windowed	rows	SELECT 'abc', 1 INTERSECT SELECT 'ABC' COLLATE NOCASE, 2	0:
+windowed	rows	SELECT max(a), 4 FROM k UNION SELECT a, count(*) OVER () FROM u	6:NULL,5;abc,5;abc,5;q,5;x,5;z,4
+windowed	rows	SELECT max(a), 4 FROM k EXCEPT SELECT a, count(*) OVER () FROM u	1:z,4
+windowed	rows	SELECT max(a), 4 FROM k INTERSECT SELECT a, count(*) OVER () FROM u	0:
+windowed	rows	SELECT max(a), 4 FROM k UNION SELECT a, 3 + count(*) OVER () FROM t	4:abc,7;m,7;q,7;z,4
+windowed	rows	SELECT max(a), 4 FROM k EXCEPT SELECT a, 3 + count(*) OVER () FROM t	1:z,4
+windowed	rows	SELECT max(a), 4 FROM k INTERSECT SELECT a, 3 + count(*) OVER () FROM t	0:
+windowed	rows	SELECT max(a), 4 FROM k UNION SELECT lower(a), count(*) OVER () FROM t	4:abc,4;m,4;q,4;z,4
+windowed	rows	SELECT max(a), 4 FROM k EXCEPT SELECT lower(a), count(*) OVER () FROM t	1:z,4
+windowed	rows	SELECT max(a), 4 FROM k INTERSECT SELECT lower(a), count(*) OVER () FROM t	0:
+windowed	rows	SELECT max(a), 4 FROM k UNION SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	6:NULL,1;abc,2;abc,3;q,4;x,5;z,4
+windowed	rows	SELECT max(a), 4 FROM k EXCEPT SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	1:z,4
+windowed	rows	SELECT max(a), 4 FROM k INTERSECT SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	0:
+windowed	rows	SELECT max(a), 4 FROM k UNION SELECT max(a), count(*) OVER () FROM t GROUP BY a	4:abc,3;m,3;q,3;z,4
+windowed	rows	SELECT max(a), 4 FROM k EXCEPT SELECT max(a), count(*) OVER () FROM t GROUP BY a	1:z,4
+windowed	rows	SELECT max(a), 4 FROM k INTERSECT SELECT max(a), count(*) OVER () FROM t GROUP BY a	0:
+windowed	rows	SELECT max(a), 4 FROM k UNION SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	6:NULL,1;abc,2;abc,3;q,4;x,5;z,4
+windowed	rows	SELECT max(a), 4 FROM k EXCEPT SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	1:z,4
+windowed	rows	SELECT max(a), 4 FROM k INTERSECT SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	0:
+windowed	rows	SELECT max(a), 4 FROM k UNION SELECT 'abc', count(*) OVER () FROM u	2:abc,5;z,4
+windowed	rows	SELECT max(a), 4 FROM k EXCEPT SELECT 'abc', count(*) OVER () FROM u	1:z,4
+windowed	rows	SELECT max(a), 4 FROM k INTERSECT SELECT 'abc', count(*) OVER () FROM u	0:
+windowed	rows	SELECT max(a), 4 FROM k UNION SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	4:abc,1;abc,2;m,3;z,4
+windowed	rows	SELECT max(a), 4 FROM k EXCEPT SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	1:z,4
+windowed	rows	SELECT max(a), 4 FROM k INTERSECT SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	0:
+windowed	rows	SELECT max(a), 4 FROM k UNION SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	4:abc,1;m,3;q,2;z,4
+windowed	rows	SELECT max(a), 4 FROM k EXCEPT SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	1:z,4
+windowed	rows	SELECT max(a), 4 FROM k INTERSECT SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	0:
+windowed	rows	SELECT max(a), 4 FROM k UNION SELECT a, 3 FROM t	4:abc,3;m,3;q,3;z,4
+windowed	rows	SELECT max(a), 4 FROM k EXCEPT SELECT a, 3 FROM t	1:z,4
+windowed	rows	SELECT max(a), 4 FROM k INTERSECT SELECT a, 3 FROM t	0:
+windowed	rows	SELECT max(a), 4 FROM k UNION SELECT a, 5 FROM u	6:NULL,5;abc,5;abc,5;q,5;x,5;z,4
+windowed	rows	SELECT max(a), 4 FROM k EXCEPT SELECT a, 5 FROM u	1:z,4
+windowed	rows	SELECT max(a), 4 FROM k INTERSECT SELECT a, 5 FROM u	0:
+windowed	rows	SELECT max(a), 4 FROM k UNION SELECT 'abc', 1	2:abc,1;z,4
+windowed	rows	SELECT max(a), 4 FROM k EXCEPT SELECT 'abc', 1	1:z,4
+windowed	rows	SELECT max(a), 4 FROM k INTERSECT SELECT 'abc', 1	0:
+windowed	rows	SELECT max(a), 4 FROM k UNION SELECT max(a), 4 FROM k	1:z,4
+windowed	rows	SELECT max(a), 4 FROM k EXCEPT SELECT max(a), 4 FROM k	0:
+windowed	rows	SELECT max(a), 4 FROM k INTERSECT SELECT max(a), 4 FROM k	1:z,4
+windowed	rows	SELECT max(a), 4 FROM k UNION SELECT 'ABC' COLLATE NOCASE, 2	2:abc,2;z,4
+windowed	rows	SELECT max(a), 4 FROM k EXCEPT SELECT 'ABC' COLLATE NOCASE, 2	1:z,4
+windowed	rows	SELECT max(a), 4 FROM k INTERSECT SELECT 'ABC' COLLATE NOCASE, 2	0:
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 UNION SELECT a, count(*) OVER () FROM u	5:NULL,5;abc,2;abc,5;q,5;x,5
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 EXCEPT SELECT a, count(*) OVER () FROM u	1:abc,2
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 INTERSECT SELECT a, count(*) OVER () FROM u	0:
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 UNION SELECT a, 3 + count(*) OVER () FROM t	4:abc,2;abc,7;m,7;q,7
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 EXCEPT SELECT a, 3 + count(*) OVER () FROM t	1:abc,2
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 INTERSECT SELECT a, 3 + count(*) OVER () FROM t	0:
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 UNION SELECT lower(a), count(*) OVER () FROM t	4:abc,2;abc,4;m,4;q,4
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 EXCEPT SELECT lower(a), count(*) OVER () FROM t	1:abc,2
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 INTERSECT SELECT lower(a), count(*) OVER () FROM t	0:
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 UNION SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	5:NULL,1;abc,2;abc,3;q,4;x,5
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 EXCEPT SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	0:
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 INTERSECT SELECT a COLLATE NOCASE, rank() OVER (ORDER BY a) FROM u	1:abc,2
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 UNION SELECT max(a), count(*) OVER () FROM t GROUP BY a	4:abc,2;abc,3;m,3;q,3
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 EXCEPT SELECT max(a), count(*) OVER () FROM t GROUP BY a	1:abc,2
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 INTERSECT SELECT max(a), count(*) OVER () FROM t GROUP BY a	0:
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 UNION SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	5:NULL,1;abc,2;abc,3;q,4;x,5
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 EXCEPT SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	0:
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 INTERSECT SELECT a, count(*) OVER (ORDER BY a) FROM u GROUP BY a	1:abc,2
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 UNION SELECT 'abc', count(*) OVER () FROM u	2:abc,2;abc,5
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 EXCEPT SELECT 'abc', count(*) OVER () FROM u	1:abc,2
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 INTERSECT SELECT 'abc', count(*) OVER () FROM u	0:
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 UNION SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	4:abc,1;abc,2;m,3;m,3
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 EXCEPT SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	0:
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 INTERSECT SELECT CAST(a AS TEXT), rank() OVER (ORDER BY a) FROM r	1:abc,2
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 UNION SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	4:abc,1;abc,2;m,3;q,2
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 EXCEPT SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	1:abc,2
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 INTERSECT SELECT lower(a COLLATE NOCASE), rank() OVER (ORDER BY a DESC) FROM b	0:
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 UNION SELECT a, 3 FROM t	4:abc,2;abc,3;m,3;q,3
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 EXCEPT SELECT a, 3 FROM t	1:abc,2
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 INTERSECT SELECT a, 3 FROM t	0:
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 UNION SELECT a, 5 FROM u	5:NULL,5;abc,2;abc,5;q,5;x,5
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 EXCEPT SELECT a, 5 FROM u	1:abc,2
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 INTERSECT SELECT a, 5 FROM u	0:
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 UNION SELECT 'abc', 1	2:abc,1;abc,2
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 EXCEPT SELECT 'abc', 1	1:abc,2
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 INTERSECT SELECT 'abc', 1	0:
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 UNION SELECT max(a), 4 FROM k	2:abc,2;z,4
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 EXCEPT SELECT max(a), 4 FROM k	1:abc,2
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 INTERSECT SELECT max(a), 4 FROM k	0:
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 UNION SELECT 'ABC' COLLATE NOCASE, 2	1:abc,2
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 EXCEPT SELECT 'ABC' COLLATE NOCASE, 2	0:
+windowed	rows	SELECT 'ABC' COLLATE NOCASE, 2 INTERSECT SELECT 'ABC' COLLATE NOCASE, 2	1:abc,2
+windowed	rows	SELECT '', count(*), count(*) OVER (ORDER BY NULL DESC) FROM u GROUP BY '' UNION SELECT 'z', a, 2 FROM u	6:,5,1;z,NULL,2;z,abc,2;z,abc,2;z,q,2;z,x,2
+windowed	rows	SELECT 'z', a, 2 FROM u UNION SELECT '', count(*), count(*) OVER (ORDER BY NULL DESC) FROM u GROUP BY ''	6:,5,1;z,NULL,2;z,abc,2;z,abc,2;z,q,2;z,x,2
+windowed	rows	SELECT '', count(*), count(*) OVER (ORDER BY NULL DESC) FROM u GROUP BY '' UNION SELECT 'z', a, 2 FROM t	4:,5,1;z,abc,2;z,m,2;z,q,2
+windowed	rows	SELECT 'z', a, 2 FROM t UNION SELECT '', count(*), count(*) OVER (ORDER BY NULL DESC) FROM u GROUP BY ''	4:,5,1;z,abc,2;z,m,2;z,q,2
+windowed	rows	SELECT '', count(*), count(*) OVER (ORDER BY NULL DESC) FROM u GROUP BY '' UNION SELECT 'z', a, 2 FROM r	4:,5,1;z,abc,2;z,abc,2;z,m,2
+windowed	rows	SELECT 'z', a, 2 FROM r UNION SELECT '', count(*), count(*) OVER (ORDER BY NULL DESC) FROM u GROUP BY ''	4:,5,1;z,abc,2;z,abc,2;z,m,2
 in columns	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a FROM u UNION SELECT a FROM t) FROM n	3:7,NULL;abc,1;x,1
 in columns	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a FROM u EXCEPT SELECT a FROM t) FROM n	3:7,NULL;abc,1;x,1
 in columns	rows	SELECT a, (a COLLATE NOCASE) IN (SELECT a FROM u INTERSECT SELECT a FROM t) FROM n	3:7,0;abc,1;x,0
