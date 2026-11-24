@@ -68,9 +68,9 @@ fn rejoin(
 
 /// T-T1.10.R5 (AC-T1.10.R1): a lagging follower. Do: three voters, the follower's clock an hour
 /// ahead (an apply lag of about an hour measured); 1 written and caught up; 2 written, its token
-/// taken while the follower hasn't applied it; a token read on the follower, on a thread; then the
-/// follower caught up. Expect: the read waits (counted) and is answered with 1 and 2, never 1
-/// alone; a read with no token on the follower answers at once; the token orders after 1's.
+/// taken while the follower hasn't applied it; a token read on the follower, on a thread; once it
+/// waits, the follower caught up. Expect: the read waits (counted) and is answered with 1 and 2,
+/// never 1 alone; a read with no token on the follower answers at once; the token orders after 1's.
 #[test]
 fn t_t1_10_r5_a_session_reads_its_write_on_a_lagging_follower() {
     let dir = tempfile::tempdir().unwrap();
@@ -110,6 +110,13 @@ fn t_t1_10_r5_a_session_reads_its_write_on_a_lagging_follower() {
     assert!(local == vec![1] || local == vec![1, 2], "{local:?}");
     let reader = clients.get(follower).unwrap().clone();
     let waiting = std::thread::spawn(move || read_token(&reader, second));
+    // The follower's records come back only once the read waits there.
+    let begun = clients
+        .get(follower)
+        .unwrap()
+        .session_waits(Instant::now() + HANG_READ)
+        .unwrap();
+    assert_eq!(begun, 1, "the token read has not waited");
     rejoin(&mut driven, &mut pump, &clients, leader, follower);
     for owner in 0..clients.len() {
         catch_up(&mut driven, &mut pump, &clients, leader, owner);
