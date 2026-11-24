@@ -804,10 +804,16 @@ fn cp_t1_13_a_replicated_write_past_an_election_timeout_commits_and_keeps_its_le
         sql: text.to_owned(),
         params,
     };
-    sql.write(vec![st("CREATE TABLE big (id INTEGER PRIMARY KEY, v BLOB)", vec![])])
-        .unwrap();
+    sql.write(vec![st(
+        "CREATE TABLE big (id INTEGER PRIMARY KEY, v BLOB)",
+        vec![],
+    )])
+    .unwrap();
     let term = |addr: &str| {
-        let status = Client::connect(addr, &keys, c.deadline).unwrap().ask("status").unwrap();
+        let status = Client::connect(addr, &keys, c.deadline)
+            .unwrap()
+            .ask("status")
+            .unwrap();
         status
             .split_whitespace()
             .find_map(|field| field.strip_prefix("term="))
@@ -816,7 +822,12 @@ fn cp_t1_13_a_replicated_write_past_an_election_timeout_commits_and_keeps_its_le
     };
     let before = term(&leader);
     let rows = (1..=16i64)
-        .map(|n| st("INSERT INTO big VALUES (?1, ?2)", vec![Value::Integer(n), Value::Blob(vec![9; 1 << 20])]))
+        .map(|n| {
+            st(
+                "INSERT INTO big VALUES (?1, ?2)",
+                vec![Value::Integer(n), Value::Blob(vec![9; 1 << 20])],
+            )
+        })
         .collect();
     let wrote = sql.write(rows);
     assert!(wrote.is_ok(), "{:#}", wrote.unwrap_err());
