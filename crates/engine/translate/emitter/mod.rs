@@ -133,6 +133,19 @@ impl From<bool> for DoubleQuotedDml {
     }
 }
 
+/// Amphora: what the hook ahead of a qualifying scan (`translate::parallel`) is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MorselHookFor {
+    /// No hook: the serial loop alone.
+    Off,
+    /// The pager's leaf-page morsels (`Connection::set_parallel_mode`, QT.6), for every
+    /// qualifying statement.
+    Morsels,
+    /// The versioned storage's column copies (G11 step 5, CS.5), for a statement on a table
+    /// declared `COLUMNAR` (`docs/design/columnar.md`, decision 1, item 1).
+    Copies,
+}
+
 pub struct Resolver<'a> {
     schema: &'a Schema,
     database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
@@ -243,9 +256,8 @@ pub struct Resolver<'a> {
     /// Amphora: whether the planner may build an automatic index
     /// (`Connection::set_automatic_indexes`).
     automatic_indexes: bool,
-    /// Amphora: whether a qualifying scan's aggregates run in leaf-page morsels
-    /// (`Connection::set_parallel_mode`, QT.6).
-    parallel: bool,
+    /// Amphora: what the hook ahead of a qualifying scan is for, if anything.
+    morsel_hook: MorselHookFor,
     /// Cached flag: true when this connection has an active temp database.
     ///
     /// Computed once at Resolver construction to avoid repeated
@@ -389,7 +401,7 @@ impl<'a> Resolver<'a> {
             sorted_fetches: false,
             adaptive_joins: false,
             automatic_indexes: true,
-            parallel: false,
+            morsel_hook: MorselHookFor::Off,
             has_temp_schema,
             fk_action_compile_stack: FkActionCompileStack::default(),
             unqualified_database_search_path: unqualified_database_search_path.clone(),
@@ -600,12 +612,12 @@ impl<'a> Resolver<'a> {
         self.automatic_indexes = on;
     }
 
-    pub(crate) fn parallel(&self) -> bool {
-        self.parallel
+    pub(crate) fn morsel_hook(&self) -> MorselHookFor {
+        self.morsel_hook
     }
 
-    pub(crate) fn set_parallel(&mut self, on: bool) {
-        self.parallel = on;
+    pub(crate) fn set_morsel_hook(&mut self, hook: MorselHookFor) {
+        self.morsel_hook = hook;
     }
 
     pub fn fork(&self) -> Resolver<'a> {
@@ -649,7 +661,7 @@ impl<'a> Resolver<'a> {
             sorted_fetches: self.sorted_fetches,
             adaptive_joins: self.adaptive_joins,
             automatic_indexes: self.automatic_indexes,
-            parallel: self.parallel,
+            morsel_hook: self.morsel_hook,
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),
@@ -697,7 +709,7 @@ impl<'a> Resolver<'a> {
             sorted_fetches: self.sorted_fetches,
             adaptive_joins: self.adaptive_joins,
             automatic_indexes: self.automatic_indexes,
-            parallel: self.parallel,
+            morsel_hook: self.morsel_hook,
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),

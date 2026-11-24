@@ -65,7 +65,7 @@ fn emit_program_for_select_with_inputs(
 ) -> Result<()> {
     // Amphora (QT.6): a qualifying scan's aggregates run in leaf-page morsels first; the serial
     // loop below answers only when that run declines.
-    let morsel_hook = if resolver.parallel() {
+    let morsel_hook = if resolver.morsel_hook() != super::MorselHookFor::Off {
         crate::translate::parallel::emit_morsel_hook(program, &plan, resolver)?
     } else {
         None

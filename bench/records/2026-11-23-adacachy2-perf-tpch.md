@@ -1353,3 +1353,82 @@ asserted there).
   storage::pager::tests` 46 of 46, the three t15 tests among them. After it only a doc comment changed (6 to
   10%, from this record's table). check-production was not run: the change adds none of its counted lints
   (no indexing, integer arithmetic, truncating casts or disallowed methods in production code).
+
+# Lane T17 (tpch), 2026-11-24 01:05Z to 02:00Z: the bench pins every cost weight; both q03 plans traced; misprice not named, not fixed
+
+Losses first:
+- The deliverable is not done. Steps 1 (the lever) and most of step 2 are. Not done: each plan's estimated cost
+  under one set of weights (the trace logs only the cheapest whole plan for each last table, and both plans end at
+  lineitem), estimated cost against measured time per operator, the misprice named, the fix, its test, five
+  settled runs.
+- perf/tpch-t16 is not landed. Its own test failed in r1939 on the MacBook Pro 2 (`~/.cache/tpch-t16/test-c90f9f5e.log`
+  there): `t16_an_exact_seek_on_a_leaf_without_gaps_starts_on_its_cell` panicked at `storage/btree.rs:12217`, "the
+  leaf with the gap is halved". check-production never ran (`prod-c90f9f5e.log` does not exist). T16's record is
+  on that branch only (edcb2f5d).
+
+## 1. The lever (a23128b3)
+
+`amphora-bench --planner --pin-weights <file>`: a JSON object of `LearnedWeights`' eight fields (`row_in_pages` and
+`page_miss` may be null), pinned on both of each Amphora target's connections (`Connection::pin_cost_weights`). An
+unknown or missing field, or one that isn't a finite number, is refused. The run's header record keeps the pinned
+set (`pinned_weights`). The engine's `bench` feature now also exposes `pin_cost_weights` and `LearnedWeights`; the
+bench, a workspace of its own, turns it on.
+
+## 2. Both plans, pinned (r1983, adacachy2, 01:33:28Z to 01:34:19Z, load 23.5 to 20.6 on 32 cores, CPU pressure avg10 8 to 35%)
+
+`SHA=a23128b3 N=2 bash ~/.cache/tpch-t17/pin.sh` (in `~/.cache/amphora-perf/tpch-t17/`): q03 at SF1, target
+`amphora` (one thread), T11's `db-sf1`, `AMPHORA_PLAN_TRACE=1`, processes S F F S, each the counted run then 5 timed
+runs, every answer kept. Two sets from T16's r1894 process A-1 (its trace, `~/.cache/tpch-t16/ab/A-1.log`):
+
+| set | from | row_in_pages | seek | hash_build | hash_probe | page_miss |
+|---|---|---|---|---|---|---|
+| S | run 4's prepare (the settled plan) | 2.771e-4 | 1,274.07 | 399.51 | 1,393.33 | 0.2943 |
+| F | run 2's prepare (SCAN orders) | 2.243e-4 | 16.88 | 657.90 | 161.00 | 0.2943 |
+
+sort 0.7174, bloom_probe 6.3695, where_step 11.0479 in both.
+
+- Every prepare of each process read the pinned set (12 prepares, one distinct set, in all 4), and every run of
+  a set chose one plan: S, `HASH JOIN customer / SEARCH lineitem USING INDEX sqlite_autoindex_lineitem_1 / SCAN
+  orders` (orders scanned into the hash table, customer probing it, lineitem by index); F, `SCAN orders / SEARCH
+  customer USING INTEGER PRIMARY KEY / SEARCH lineitem USING INDEX sqlite_autoindex_lineitem_1`.
+- Answers: answers.py, each process against S-1 and S-1 against DuckDB: 5 of 5 compared, 0 differ.
+- Times, 10 timed runs a set: F median 965 ms (741 to 1,233); S median 2,512 ms (1,913 to 3,005). The ranges do
+  not overlap: F is faster by 2.6x at the median. Process CPU s (user + sys): S-1 15.9, F-1 5.9, F-2 6.1, S-2 14.9.
+  S-1's counted run took 10,244 ms, S-2's 2,277 ms (S-1 ran first after the build; not traced).
+- Estimated cost, each plan at its own set (the one whole plan logged): S 506,982, F 89,006.
+
+Rows by operator, the counted run (identical in both processes of a set):
+
+| plan | position | operator | est in | est out | actual rows |
+|---|---|---|---|---|---|
+| F | 0 | orders, scan | 1 | 707,520 | 147,665 |
+| F | 1 | customer, by rowid | 707,520 | 141,331 | 147,126 |
+| F | 2 | lineitem, by index | 141,331 | 298,733 | 30,519 |
+| S | 0 | orders, hash build | 1 | 707,520 | 727,305 |
+| S | 1 | customer, hash probe | 707,520 | 141,331 | 147,126 |
+| S | 2 | lineitem, by index | 141,331 | 298,733 | 30,519 |
+
+## 3. What the numbers point to (not yet settled by a trace)
+
+- In T16's r1894 (10 processes, 50 runs), every prepare that chose F's plan had seek 16.88 (9 runs), and every
+  prepare that chose the settled plan had seek 936 to 7,239 (9 runs: A-1 1,274; A-2 936; A-5 1,833 and 7,239; B-2
+  1,276; B-3 1,652; B-4 1,552 and 4,749; B-5 1,871). No prepare at seek 16.88 chose the settled plan. The learned
+  seek weight rose within 9 of the 10 processes; in A-3 it stayed 16.88 and all five runs chose SCAN lineitem.
+  Under F's set the planner chose the plan that measured 2.6x faster.
+- F's orders level returned 147,665 rows against 707,520 estimated (4.8x fewer): the seeks into customer are priced
+  on 707,520. S's orders level returned 727,305 against the same 707,520. So F's orders scan is filtered by
+  something its estimate does not count. An inference, not traced: 147,665 is about a fifth of 727,305, the share
+  of customers in one of TPC-H's five market segments, so customer's filter likely reaches the orders scan. The
+  EQP above was cut at 140 characters, so the operator is not shown.
+- lineitem's level: 298,733 estimated, 30,519 actual (9.8x fewer) in both plans, so it does not separate them.
+
+Next, in order: force F's plan at S's set (or log every whole plan weighed, not only the cheapest per last table)
+for its estimated cost there; time a seek against a row's visit in F's runs to test the 1,274 weight; then name
+the misprice from those and fix it.
+
+## 4. Checks
+
+- Build: r1980, adacachy2, `cargo build --release --bin amphora-bench` at a23128b3, 95 s.
+- Bench clippy (`cargo clippy --release --bin amphora-bench -- -D warnings`): 163 errors, none on a line this
+  change touched (in planner/: `engines.rs:227`, `mod.rs:109, 294, 501, 535, 550, 639, 688`, all older; elsewhere
+  `blink.rs`, `cc.rs`, `cluster.rs` and more). The bench crate is not clippy-clean on main.

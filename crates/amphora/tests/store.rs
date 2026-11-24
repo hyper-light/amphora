@@ -785,8 +785,15 @@ fn a_batch_handed_before_a_flush_begins_is_made_durable_by_it() {
     store.put(vec![row("p", 1)]).unwrap();
     held.first_began();
     let x = store.put(vec![row("x", 1)]).unwrap();
-    assert_eq!(count(store, "x"), 1, "x is committed during the first flush");
-    let job = Arc::new((std::sync::Mutex::new((false, false)), std::sync::Condvar::new()));
+    assert_eq!(
+        count(store, "x"),
+        1,
+        "x is committed during the first flush"
+    );
+    let job = Arc::new((
+        std::sync::Mutex::new((false, false)),
+        std::sync::Condvar::new(),
+    ));
     std::thread::scope(|s| {
         let busy = job.clone();
         s.spawn(move || {
@@ -816,7 +823,11 @@ fn a_batch_handed_before_a_flush_begins_is_made_durable_by_it() {
         store.durable(&y, soon()).unwrap();
     });
     store.durable(&x, soon()).unwrap();
-    assert_eq!(held.began(), 2, "x and y were made durable by one flush after the first");
+    assert_eq!(
+        held.began(),
+        2,
+        "x and y were made durable by one flush after the first"
+    );
 }
 
 /// A sender told its batch is durable that never sends again holds no flush: what was committed
@@ -832,7 +843,11 @@ fn a_sender_told_durable_that_sends_nothing_more_holds_no_flush() {
     std::thread::scope(|s| {
         let told = s.spawn(|| store.durable(&p, soon()));
         let x = store.put(vec![row("x", 1)]).unwrap();
-        assert_eq!(count(store, "x"), 1, "x is committed during the first flush");
+        assert_eq!(
+            count(store, "x"),
+            1,
+            "x is committed during the first flush"
+        );
         held.end_first();
         told.join().unwrap().unwrap();
         store.durable(&x, soon()).unwrap();
