@@ -647,6 +647,22 @@ impl VersionedCursor {
         Ok(found.is_some())
     }
 
+    /// The largest rowid of the table's rows, read as a reading cursor reads it: the transaction keeps
+    /// no read of it, so no insert past it refuses its commit (`Dialect::next_rowid`).
+    pub(crate) fn largest_rowid(&mut self) -> Result<Option<i64>> {
+        let txn = self.txn.take();
+        let rowid = match self.last_before(&Point::Last) {
+            Ok(true) => self.rowid_now(),
+            Ok(false) => Ok(None),
+            Err(error) => Err(error),
+        };
+        self.txn = txn;
+        // As an append leaves it: the insert that follows puts by key wherever the cursor is.
+        self.record_stale();
+        self.at = At::Nowhere;
+        rowid
+    }
+
     /// Keeps, for the transaction's commit's validation, that the cursor read the keys from
     /// `from` to `to` (none: from the least, to the greatest): `Versioned::keep_read`. A reading
     /// cursor keeps none (a snapshot never validates), nor one whose transaction has ended.

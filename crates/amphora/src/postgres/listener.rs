@@ -3,7 +3,8 @@
 //! event loop that wakes only when its socket is readable or writable. Each session's state and
 //! the frame it holds are charged to the process's memory budget ([`Use::Sessions`]). A session
 //! the server has no room for is refused `53300` after its startup packet, as PostgreSQL refuses
-//! one. A frame the budget can't hold is refused `53200`.
+//! one. A frame the budget can't hold is refused `53200`. A session's statements run on a connection of
+//! its own to the listener's database ([`Database`]), opened once its role is authenticated.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -18,10 +19,11 @@ use hyper_rt::machine::calibration::{Calibration, Policy};
 use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
 use hyper_rt::tcp::{TcpListener, TcpStream};
 
+use super::execute::{Database, Executor};
 use super::scram::{self, ScramSecret};
 use super::session::{Config, Next, Role, Roles, Seed, Session};
 use super::wire::{self, PgError, SqlState};
-use crate::memory::{Budget, Charge, Use};
+use crate::memory::{Budget, Charge, StorageMemory, Use};
 
 const TARGET: &str = "amphora.postgres.listener";
 
@@ -32,8 +34,7 @@ pub const MAX_CONNECTIONS_DEFAULT: usize = 100;
 /// (`vendor/hyper-raft/crates/hyper-rt/benches/calibration_drift.rs:7`).
 const PROBE_BUDGET: Duration = Duration::from_millis(40);
 
-pub const USAGE: &str =
-    "usage: amphora postgres --listen <addr> --roles <file> [--max-connections <n>]\n";
+pub const USAGE: &str = "usage: amphora postgres --listen <addr> --roles <file> --database <file> [--max-connections <n>]\n";
 
 /// The roles that may log in, given when the listener starts until the catalog keeps them: one a
 /// line, its name, its verifier in PostgreSQL's stored form (`pg_authid.rolpassword`,
@@ -76,11 +77,12 @@ impl Roles for StoredRoles {
     }
 }
 
-/// What the listener's sessions share: their configuration, the roles, the budget they're charged
-/// to, and how many of them may live at once.
+/// What the listener's sessions share: their configuration, the roles, the database, the budget
+/// they're charged to, and how many of them may live at once.
 pub struct Listener {
     config: Config,
     roles: StoredRoles,
+    database: Rc<Database>,
     budget: Arc<Budget>,
     max_connections: usize,
     live: Cell<usize>,
@@ -109,10 +111,11 @@ impl Drop for Live<'_> {
 }
 
 impl Listener {
-    /// A listener for `roles`, its sessions charged to `budget`, at most `max_connections` of them
-    /// live. TLS is a later unit: SSLRequest is answered `N`.
+    /// A listener for `roles` on `database`, its sessions charged to `budget`, at most
+    /// `max_connections` of them live. TLS is a later unit: SSLRequest is answered `N`.
     pub fn new(
         roles: StoredRoles,
+        database: Database,
         budget: Arc<Budget>,
         max_connections: usize,
     ) -> Result<Self, getrandom::Error> {
@@ -125,6 +128,7 @@ impl Listener {
                 mock_nonce,
             },
             roles,
+            database: Rc::new(database),
             budget,
             max_connections,
             live: Cell::new(0),
@@ -178,7 +182,11 @@ impl Listener {
             Ok(seed) => seed,
             Err(error) => return Ended::NoRandomness(error),
         };
-        let mut session = Session::new(self.config.clone(), seed);
+        let (database, time_zone) = (Rc::clone(&self.database), self.config.time_zone.clone());
+        let mut session =
+            Session::new(self.config.clone(), seed).with_database(Box::new(move |startup| {
+                Ok(Box::new(database.session(&startup.user, &time_zone)?))
+            }));
         let live = self.live.get();
         let admitted = if live < self.max_connections {
             self.budget.take(Use::Sessions, session_bytes()).ok()
@@ -257,9 +265,11 @@ impl Listener {
     }
 }
 
-/// What a session holds before it reads: its state machine and its socket.
+/// What a session holds before it reads: its state machine, its executor and its socket.
 fn session_bytes() -> u64 {
-    let bytes = std::mem::size_of::<Session>().saturating_add(std::mem::size_of::<TcpStream>());
+    let bytes = std::mem::size_of::<Session>()
+        .saturating_add(std::mem::size_of::<Executor>())
+        .saturating_add(std::mem::size_of::<TcpStream>());
     u64::try_from(bytes).unwrap_or(u64::MAX)
 }
 
@@ -339,6 +349,7 @@ fn listen(rest: &[String], ready: impl FnOnce(SocketAddr) + 'static) -> anyhow::
         .ok_or_else(|| anyhow!("--listen is required\n{USAGE}"))?
         .parse()?;
     let roles_file = flag("--roles").ok_or_else(|| anyhow!("--roles is required\n{USAGE}"))?;
+    let path = flag("--database").ok_or_else(|| anyhow!("--database is required\n{USAGE}"))?;
     let roles = StoredRoles::parse(
         &std::fs::read_to_string(roles_file).with_context(|| format!("reading {roles_file}"))?,
     )?;
@@ -351,11 +362,10 @@ fn listen(rest: &[String], ready: impl FnOnce(SocketAddr) + 'static) -> anyhow::
     // accept loop.
     let backlog = u32::try_from(max_connections.saturating_mul(2)).unwrap_or(u32::MAX);
     let tasks = max_connections.saturating_mul(2).saturating_add(1);
-    let listener = Rc::new(Listener::new(
-        roles,
-        crate::memory::process(),
-        max_connections,
-    )?);
+    let budget = crate::memory::process();
+    let database = Database::open(path, Arc::new(StorageMemory(Arc::clone(&budget))))
+        .with_context(|| format!("opening {path}"))?;
+    let listener = Rc::new(Listener::new(roles, database, budget, max_connections)?);
     let calibration = Calibration::measure(PROBE_BUDGET, 0)?;
     let constants = calibration
         .constants(&Policy {
