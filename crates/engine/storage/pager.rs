@@ -4891,9 +4891,6 @@ impl Pager {
             if let Some(buffer) = shared.pages().take_count(&key) {
                 // What the pool keeps may be another generation's since the lookup above, where the
                 // log's owner ended this read between (decision 45).
-                if self.read_ended() {
-                    return Err(LimboError::SnapshotTooOld);
-                }
                 page.get().set_buffer(buffer);
                 page.set_loaded();
                 page.set_shared();
@@ -4913,9 +4910,6 @@ impl Pager {
                 _ => shared.pages().copy_into(&key, copy.as_mut_slice()),
             };
             if found {
-                if self.read_ended() {
-                    return Err(LimboError::SnapshotTooOld);
-                }
                 #[allow(clippy::arc_with_non_send_sync)]
                 page.get().set_buffer(Arc::new(copy));
                 page.set_loaded();

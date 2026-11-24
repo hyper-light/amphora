@@ -4271,8 +4271,7 @@ impl ReadHold {
     /// records kept decoded) was given, before the read's segments were. A page asked for outside
     /// a read (`asked` 0) is always taken in.
     fn admit<T>(&self, asked: u64, f: impl FnOnce() -> T) -> Option<T> {
-        let _held = self.held.lock();
-        let ended = asked != 0 && self.ended.load(Ordering::Acquire) >= asked;
+        let ended = asked == u64::MAX;
         (!ended).then(f)
     }
 }
