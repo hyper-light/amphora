@@ -447,6 +447,8 @@ enum HeaderValidationState {
     OpenWal {
         pager: Box<Pager>,
         open_mv_store: bool,
+        /// Amphora: whether the file's page 1 keeps plain SQLite out (decision 45).
+        marked: bool,
         driver: Option<storage::wal::OpenSharedWal>,
         /// Set once the WAL of an empty database file has been thrown away
         /// (see the orphan-WAL handling in [`Database::header_validation`]).
@@ -2195,12 +2197,17 @@ impl Database {
 
                     // TODO: right now we don't support READ ONLY and no READ or WRITE in the Version header
                     // https://www.sqlite.org/fileformat.html#file_format_version_numbers
-                    if read_version != write_version {
+                    // Amphora: but the pair a clean close leaves SQLite to read and not to write
+                    // (docs/design/store.md, decision 45).
+                    let closed_cleanly = read_version == RawVersion::from(Version::Wal)
+                        && write_version == RawVersion::from(Version::Wal2);
+                    if read_version != write_version && !closed_cleanly {
                         return Err(LimboError::Corrupt(format!(
                             "Read version `{read_version:?}` is not equal to Write version `{write_version:?} in database header`"
                         )).into());
                     }
 
+                    let marked = !read_version.sqlite_reads();
                     let (read_version, _write_version) = (
                         read_version.to_version().map_err(|val| {
                             LimboError::Corrupt(format!("Invalid read_version: {val}"))
@@ -2304,7 +2311,7 @@ impl Database {
                                 true
                             }
                         }
-                        Version::Wal => false,
+                        Version::Wal | Version::Wal2 => false,
                         Version::Mvcc => false,
                     };
 
@@ -2344,6 +2351,7 @@ impl Database {
                         HeaderValidationState::OpenWal {
                             pager,
                             open_mv_store,
+                            marked,
                             driver: None,
                             discarded_orphan_wal: false,
                         }
@@ -2373,12 +2381,14 @@ impl Database {
                     *st = HeaderValidationState::OpenWal {
                         pager,
                         open_mv_store,
+                        marked: false,
                         driver: None,
                         discarded_orphan_wal: false,
                     };
                 }
                 HeaderValidationState::OpenWal {
                     open_mv_store,
+                    marked,
                     driver,
                     discarded_orphan_wal,
                     ..
@@ -2487,7 +2497,7 @@ impl Database {
                         second_segment,
                         Some(storage::wal::second_segment_path(&self.wal_path)),
                     )?;
-
+                    let marked = *marked;
                     let open_mv_store = *open_mv_store;
                     let HeaderValidationState::OpenWal { mut pager, .. } = std::mem::take(st)
                     else {
@@ -2510,6 +2520,19 @@ impl Database {
                     pager.clear_page_cache(true);
                     pager.set_schema_cookie(None);
 
+                    if !self.opts.enable_multiprocess_wal
+                        && !self.open_flags.contains(OpenFlags::ReadOnly)
+                        && !self.io.is_memory()
+                        && !is_memory_like(&self.path)
+                    {
+                        let marked = marked && (open_mv_store || self.log_is_marked(&pager)?);
+                        self.shared_wal.set_mark(if marked {
+                            storage::wal::Mark::InFile
+                        } else {
+                            storage::wal::Mark::Absent
+                        });
+                    }
+
                     if open_mv_store {
                         let canonical_path = self.get_database_canonical_path();
                         let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
@@ -2529,6 +2552,24 @@ impl Database {
                 }
             }
         }
+    }
+
+    /// Whether the log recovered keeps the mark the file's page 1 has (decision 45): a clean close cut
+    /// short leaves a later page 1 without it there, which the next copy would put in the file. Read as
+    /// the open reads its schema, with no read transaction: the pager's view is the log's as recovered.
+    fn log_is_marked(&self, pager: &Pager) -> Result<bool> {
+        use storage::log_segments::SegmentId;
+        let frames = |id| {
+            let segment = self.shared_wal.segment(id).read();
+            segment.last_checksum_and_max_frame().1
+        };
+        if frames(SegmentId::First) == 0 && frames(SegmentId::Second) == 0 {
+            return Ok(true);
+        }
+        let version = pager
+            .io
+            .block(|| pager.with_header(|header| header.read_version))?;
+        Ok(!version.sqlite_reads())
     }
 
     /// The log's second segment (decision 45) as its file holds it. Frames left in it beside a
@@ -2620,6 +2661,9 @@ impl Database {
             .current()
             .write()
             .replace_after_external_restore(new_shared_wal.into_inner());
+        if self.shared_wal.mark() != storage::wal::Mark::NotKept {
+            self.shared_wal.set_mark(storage::wal::Mark::Absent);
+        }
         if self.mvcc_enabled() || journal_mode::logical_log_exists(std::path::Path::new(&self.path))
         {
             let mv_store = journal_mode::open_mv_store(

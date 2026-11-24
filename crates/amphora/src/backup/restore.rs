@@ -575,6 +575,9 @@ fn make(
         }
     }
     drop(stream);
+    // Whole, with no log: plain SQLite reads it, as it reads any database closed cleanly
+    // (docs/design/store.md, decision 45).
+    Db::open_restoring(path)?.close()?;
     Ok(Restored {
         cut: plan.cut,
         base: plan.base.id,
