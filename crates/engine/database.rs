@@ -3457,6 +3457,18 @@ impl Database {
         )
     }
 
+    /// Amphora: whether the database's file holds every frame committed before the log's current
+    /// segment: no segment is closing, or a pass copied the closing one whole and flushed the file
+    /// (decision 45). A read under way on that segment holds its copy back; a copy of the file
+    /// begun once it is made is whole with the current segment's frames alone.
+    pub fn wal_closing_copied(&self) -> bool {
+        self.shared_wal.closing().is_none_or(|closing| {
+            let closing = closing.read();
+            closing.metadata.nbackfills.load(Ordering::Acquire)
+                >= closing.metadata.max_frame.load(Ordering::Acquire)
+        })
+    }
+
     /// Amphora: every frame up to `frame` of the log's generation `generation` is durable: a flush
     /// begun after [`Database::wal_end`] answered them has ended. A checkpoint of frames within it
     /// flushes no log of its own. A generation the log has since left is ignored (a restart holds
