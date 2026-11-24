@@ -23,7 +23,7 @@ use crate::{
     },
     translate::{
         expr::{
-            expr_references_any_subquery, expr_references_outer_query, expr_references_subquery_id,
+            expr_reads_another_table, expr_references_any_subquery, expr_references_subquery_id,
             expression_can_fail_on_input, walk_expr, WalkControl,
         },
         insert::ROWID_COLUMN,
@@ -7082,7 +7082,10 @@ fn autoindex_prefilter(
                 .join_origin()
                 .and_then(JoinOrigin::outer_table)
                 .is_some_and(|table_id| table_id != table_reference.internal_id);
-            let depends_on_outer_query = expr_references_outer_query(&term.expr, table_references);
+            // What the constraint reads is not all its term reads: a row-value range bounds its
+            // first column alone, and its other elements may be of any table.
+            let reads_another_table =
+                expr_reads_another_table(&term.expr, table_reference.internal_id);
             let contains_subquery = expr_references_any_subquery(&term.expr);
             // The build scans inner rows whose keys might never be searched.
             // Do not make a possibly failing expression run for those rows.
@@ -7090,7 +7093,7 @@ fn autoindex_prefilter(
             let was_already_added = term_positions.contains(&term_pos);
             if runs_before_outer_join_condition
                 || comes_from_another_outer_join
-                || depends_on_outer_query
+                || reads_another_table
                 || contains_subquery
                 || can_fail_for_unused_row
                 || was_already_added

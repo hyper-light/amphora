@@ -2742,10 +2742,10 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
         // select list, HAVING, ORDER BY: not an aggregate's arguments) runs in the output phase,
         // at each read, as SQLite runs one in an aggregate's output: its outer columns come from
         // what the output keeps of the rows (a group's carried columns; an ungrouped query's
-        // first row, as its bare columns). A RIGHT or FULL JOIN keeps its rule below.
+        // first row, as its bare columns), an unmatched right row's among them, which the loops a
+        // subquery would run in never see.
         if subquery.correlated
             && has_aggregate_output
-            && !has_unmatched_right_rows
             && matches!(
                 subquery.origin,
                 SubqueryOrigin::SelectList

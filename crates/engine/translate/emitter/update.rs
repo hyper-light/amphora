@@ -615,7 +615,7 @@ fn emit_notnull_constraint_check(
 /// trigger's own conflict resolution (except for the default `ABORT`, which
 /// is left unset so the trigger's own resolution applies). `after` selects
 /// between the BEFORE and AFTER constructors.
-fn update_trigger_context(
+pub(crate) fn update_trigger_context(
     program: &ProgramBuilder,
     btree_table: &Arc<BTreeTable>,
     new_registers: Option<Vec<usize>>,
