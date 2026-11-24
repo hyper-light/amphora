@@ -240,6 +240,9 @@ def main():
         out = answer(case, rng)
         if out is None or not any(x[0] == "do" and "ON CONFLICT" in x[1] and "DO UPDATE" in x[1] for x in out):
             continue
+        # no answer to hold Amphora to: a trigger that changes the row it fires for leaves SQLite's own rows out of order
+        if any(x[0] == "rows" and "integrity_check" in x[1] and x[2] != "'ok'" for x in out):
+            continue
         made += 1
         lines.append("case")
         lines.extend("\t".join(line) for line in out)
