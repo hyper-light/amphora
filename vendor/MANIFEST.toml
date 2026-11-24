@@ -59,5 +59,6 @@ take = [
   "src/include/parser/kwlist.h",
   "src/include/pg_config_manual.h",
   "src/test/regress/sql",
+  "src/timezone/data/tzdata.zi",
 ]
 own = ["UPSTREAM.md"]

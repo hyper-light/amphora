@@ -1,9 +1,10 @@
 //! PostgreSQL 19's catalog core (docs/design/postgres.md sections 7 and 9, section 11's unit 7).
 //!
-//! [`data`] holds the built-in rows of `pg_namespace`, `pg_type`, `pg_class` and `pg_attribute`,
-//! and `pg_proc`'s names and argument types, generated from 19's own `.dat` files by its own
-//! genbki.pl (scripts/postgres-catalog.py). [`SearchPath`] resolves an unqualified name the way
-//! 19's `namespace.c` does. Pure: no I/O, no clock.
+//! [`data`] holds the built-in rows of `pg_namespace`, `pg_type`, `pg_class` and `pg_attribute`, and
+//! what analysis reads of `pg_type`, `pg_proc`, `pg_operator` and `pg_cast` ([`type_by_oid`],
+//! [`proc_by_oid`], [`procs_named`], [`operators_named`], [`cast`]), generated from 19's own `.dat`
+//! files by its own genbki.pl (scripts/postgres-catalog.py). [`SearchPath`] resolves an unqualified
+//! name the way 19's `namespace.c` does. Pure: no I/O, no clock.
 #![cfg_attr(
     test,
     allow(
@@ -66,13 +67,137 @@ impl Catalog {
     }
 }
 
-/// A built-in function's name, schema and argument types (`pg_proc.proargtypes`).
-#[derive(Debug)]
+/// A function as analysis reads it (`pg_proc`).
+#[derive(Debug, PartialEq, Eq)]
 pub struct Proc {
     pub oid: u32,
     pub name: &'static str,
     pub namespace: u32,
+    /// `prokind`: `f` function, `p` procedure, `a` aggregate, `w` window function.
+    pub kind: u8,
+    pub strict: bool,
+    pub retset: bool,
+    /// `provolatile`: `i` immutable, `s` stable, `v` volatile.
+    pub volatile: u8,
+    /// `provariadic`: the element type of a variadic last argument, or 0.
+    pub variadic: u32,
+    /// `pronargdefaults`.
+    pub defaults: usize,
+    /// `prorettype`.
+    pub result: u32,
+    /// `proargtypes`.
     pub args: &'static [u32],
+    /// `prosrc`: for a built-in function, its C function's name.
+    pub src: &'static str,
+}
+
+/// A type as analysis reads it (`pg_type`).
+#[derive(Debug)]
+pub struct Type {
+    pub oid: u32,
+    pub name: &'static str,
+    pub namespace: u32,
+    /// `typtype`: `b` base, `c` composite, `d` domain, `e` enum, `m` multirange, `p` pseudo, `r` range.
+    pub kind: u8,
+    /// `typcategory`.
+    pub category: u8,
+    /// `typispreferred`.
+    pub preferred: bool,
+    pub relid: u32,
+    pub subscript: u32,
+    /// `typelem`.
+    pub elem: u32,
+    /// `typarray`.
+    pub array: u32,
+    /// `typbasetype`: a domain's base type, or 0.
+    pub base: u32,
+    pub typtypmod: i32,
+    pub input: u32,
+    pub output: u32,
+    pub modin: u32,
+    pub collation: u32,
+}
+
+/// An operator as analysis reads it (`pg_operator`).
+#[derive(Debug)]
+pub struct Operator {
+    pub oid: u32,
+    pub name: &'static str,
+    pub namespace: u32,
+    /// `oprkind`: `b` binary, `l` prefix.
+    pub kind: u8,
+    /// `oprleft`: 0 for a prefix operator.
+    pub left: u32,
+    pub right: u32,
+    pub result: u32,
+    /// `oprcode`: its function, or 0 for a shell operator.
+    pub code: u32,
+}
+
+/// A cast (`pg_cast`).
+#[derive(Debug)]
+pub struct Cast {
+    pub source: u32,
+    pub target: u32,
+    /// `castfunc`: 0 unless the method is `f`.
+    pub func: u32,
+    /// `castcontext`: `i` implicit, `a` assignment, `e` explicit.
+    pub context: u8,
+    /// `castmethod`: `f` function, `i` the types' I/O functions, `b` none (binary-coercible).
+    pub method: u8,
+}
+
+/// A range type (`pg_range`): its subtype and its multirange type.
+#[derive(Debug)]
+pub struct Range {
+    pub oid: u32,
+    pub subtype: u32,
+    pub multirange: u32,
+}
+
+/// The built-in type of that OID.
+pub fn type_by_oid(oid: u32) -> Option<&'static Type> {
+    let at = data::TYPES.binary_search_by_key(&oid, |t| t.oid).ok()?;
+    data::TYPES.get(at)
+}
+
+/// The built-in type of that name in that schema.
+pub fn type_named(namespace: u32, name: &str) -> Option<&'static Type> {
+    data::TYPES
+        .iter()
+        .find(|t| t.namespace == namespace && t.name == name)
+}
+
+/// The built-in function of that OID.
+pub fn proc_by_oid(oid: u32) -> Option<&'static Proc> {
+    let at = data::PG_PROC.binary_search_by_key(&oid, |p| p.oid).ok()?;
+    data::PG_PROC.get(at)
+}
+
+/// The built-in functions of that name.
+pub fn procs_named(name: &str) -> impl Iterator<Item = &'static Proc> + use<> {
+    let proc = |i: &u16| data::PG_PROC.get(usize::from(*i));
+    let before = |i: &u16| proc(i).is_some_and(|p| p.name.as_bytes() < name.as_bytes());
+    let start = data::PG_PROC_BY_NAME.partition_point(before);
+    let rest = data::PG_PROC_BY_NAME.get(start..).unwrap_or(&[]);
+    let len = rest.partition_point(|i| proc(i).is_some_and(|p| p.name == name));
+    rest.get(..len).unwrap_or(&[]).iter().filter_map(proc)
+}
+
+/// The built-in operators of that name, binary and prefix.
+pub fn operators_named(name: &str) -> &'static [Operator] {
+    let start = data::PG_OPERATOR.partition_point(|o| o.name.as_bytes() < name.as_bytes());
+    let rest = data::PG_OPERATOR.get(start..).unwrap_or(&[]);
+    let len = rest.partition_point(|o| o.name == name);
+    rest.get(..len).unwrap_or(&[])
+}
+
+/// The cast between two types, if `pg_cast` has one.
+pub fn cast(source: u32, target: u32) -> Option<&'static Cast> {
+    let at = data::PG_CAST
+        .binary_search_by_key(&(source, target), |c| (c.source, c.target))
+        .ok()?;
+    data::PG_CAST.get(at)
 }
 
 /// What a name names: 19 searches the temporary schema for relations and types only.
