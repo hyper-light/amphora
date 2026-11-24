@@ -1303,15 +1303,28 @@ mod tests {
             Some(Value::Numeric(Numeric::Integer(n))) => tree_of(*n).unwrap(),
             other => panic!("no root page for {t}: {other:?}"),
         };
-        for q in ["SELECT g, count(*), sum(v) FROM {t} GROUP BY g", "SELECT sum(v), max(g) FROM {t}"] {
+        for q in [
+            "SELECT g, count(*), sum(v) FROM {t} GROUP BY g",
+            "SELECT sum(v), max(g) FROM {t}",
+        ] {
             for _ in 0..3 {
-                assert_eq!(rows(&conn, &q.replace("{t}", "a")), rows(&conn, &q.replace("{t}", "b")), "{q}");
+                assert_eq!(
+                    rows(&conn, &q.replace("{t}", "a")),
+                    rows(&conn, &q.replace("{t}", "b")),
+                    "{q}"
+                );
             }
         }
         let seen = copies(&conn).counts();
         assert_eq!(seen.kept, 1, "{seen:?}");
-        assert!(copies(&conn).kept(root("a")).is_some(), "the declared table keeps a copy");
-        assert!(copies(&conn).kept(root("b")).is_none(), "the undeclared table keeps none");
+        assert!(
+            copies(&conn).kept(root("a")).is_some(),
+            "the declared table keeps a copy"
+        );
+        assert!(
+            copies(&conn).kept(root("b")).is_none(),
+            "the undeclared table keeps none"
+        );
         let sql = rows(&conn, "SELECT sql FROM sqlite_schema WHERE name = 'a'");
         assert!(
             matches!(sql.first().and_then(|r| r.first()), Some(Value::Text(t)) if t.as_str().ends_with("COLUMNAR")),
@@ -1362,7 +1375,8 @@ mod tests {
         let bound = |conn: &Arc<crate::Connection>, sql: &str, params: &[Value]| {
             let mut stmt = conn.prepare(sql).unwrap();
             for (i, v) in params.iter().enumerate() {
-                stmt.bind_at(std::num::NonZero::new(i + 1).unwrap(), v.clone()).unwrap();
+                stmt.bind_at(std::num::NonZero::new(i + 1).unwrap(), v.clone())
+                    .unwrap();
             }
             let mut out: Vec<Vec<Value>> = Vec::new();
             stmt.run_with_row_callback(|row| {
@@ -1374,7 +1388,10 @@ mod tests {
         };
         for (name, sql, params) in &statements {
             let program = rows(&on, &format!("EXPLAIN {sql}"));
-            let hooked = program.iter().any(|r| r.iter().any(|v| matches!(v, Value::Text(t) if t.as_str() == "MorselAggregate")));
+            let hooked = program.iter().any(|r| {
+                r.iter()
+                    .any(|v| matches!(v, Value::Text(t) if t.as_str() == "MorselAggregate"))
+            });
             let plan: Vec<String> = rows(&on, &format!("EXPLAIN QUERY PLAN {sql}"))
                 .iter()
                 .map(|r| format!("{:?}", r.last()))
