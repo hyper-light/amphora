@@ -10,7 +10,8 @@ usage: bench/sqlite_refused_queries.py COUNT SEED > crates/engine/tests/fixtures
 
 A compound's values are distinct under every collation, so that the order is one; its columns declare no collation (which
 arm's collation sorts is CY). No correlated subquery is a compound (refused anywhere), no query has two of lag, lead,
-first_value, last_value and nth_value (CO), and no `SELECT *` is over two windows (it has a column too few).
+first_value, last_value and nth_value (CO), and no `SELECT *` is over two windows (it has a column too few). No view is
+DISTINCT or grouped: each of its columns counts, and which rows reach it is the push-down's.
 """
 import random
 import sqlite3
@@ -127,10 +128,6 @@ def derived(rng):
     shape = rng.random()
     if shape < 0.15 and "ORDER" not in body:
         body += f" UNION ALL SELECT {', '.join(texts[c] for c in cols)} FROM doc WHERE id < 3"
-    elif shape < 0.2:
-        body = body.replace("SELECT", "SELECT DISTINCT", 1)
-    elif shape < 0.25 and "ORDER" not in body:
-        body += " GROUP BY id"
     names = [c for c in cols]
     for _ in range(rng.choice([0, 0, 0, 1, 2])):
         inner = f"({body})" if rng.random() < 0.5 else None
