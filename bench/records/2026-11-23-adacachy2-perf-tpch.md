@@ -1442,3 +1442,11 @@ counted run then 5 timed runs with `AMPHORA_PLAN_TRACE=1`, every answer kept; Du
 
 Verdict: inconclusive. What it needs: a quiet window, or the plan held fixed in both arms (the engine has
 `Connection::pin_cost_weights`; the bench has no switch for it).
+
+## 5. Checks
+
+adacachy2 refused every check ask from 00:34Z (0 to 2 of 32 cores idle). They ran on the MacBook Pro 2 (e30189ea,
+`cpus=6,mem=12g`, a fresh lane target dir, the tree fetched from GitHub at c90f9f5e, the branch merged with main):
+r1939, `SHA=c90f9f5e bash ~/.cache/tpch-t16/check-mbp.sh`. `cargo clippy -p amphora-engine --all-targets --locked --
+-D warnings` clean (639 s, cold). After it only rustfmt and the test's requirement citation changed (a0540efb; `rustfmt
+--check` clean on the file).
