@@ -551,7 +551,8 @@ pub fn collect_subquery_table_refs_in_expr(expr: &Expr, out: &mut Vec<String>) {
             }
             Expr::InSelect { rhs, .. } => {
                 collect_from_clause_table_refs(rhs, out);
-                Ok(WalkControl::SkipChildren)
+                // The walk goes on into the left-hand side alone.
+                Ok(WalkControl::Continue)
             }
             _ => Ok(WalkControl::Continue),
         }
@@ -1324,7 +1325,7 @@ fn plan_cte(
             let result_column_count = cte_query_plan.select_result_columns().len();
             if columns.len() != result_column_count {
                 crate::bail_parse_error!(
-                    "table {} has {} columns but {} column names were provided",
+                    "table {} has {} values for {} columns",
                     cte_definition.name,
                     result_column_count,
                     columns.len()
@@ -1504,7 +1505,6 @@ fn prepare_recursive_cte_plan(
     let recursive_arms = RecursiveArms {
         cte_name,
         select,
-        explicit_columns,
         first: first_recursive_query_index,
         input_table_id,
     };
@@ -1576,7 +1576,6 @@ fn prepare_recursive_cte_plan(
 struct RecursiveArms<'a> {
     cte_name: &'a str,
     select: &'a Select,
-    explicit_columns: Option<&'a [String]>,
     first: usize,
     input_table_id: TableInternalId,
 }
