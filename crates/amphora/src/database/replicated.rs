@@ -3722,7 +3722,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                     && (past || !*out)
                     && !lent
                     && machine.closing_reads() > 0
-                    && machine.end_closing_reads() > 0;
+                    && false;
                 let mut restarted = false;
                 if due && pass.ready && !*out && !lent {
                     // The queue as this step began, on the basis each later step reads it.
