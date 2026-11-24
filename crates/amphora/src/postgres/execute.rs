@@ -20,7 +20,7 @@ use amphora_pg_analysis::datetime::TimeZone;
 use amphora_pg_analysis::stmt::Command;
 use amphora_pg_analysis::utility::{Effect, Utility};
 use amphora_pg_analysis::{
-    Column, Error, Field, Lowered, Relations, Value as PgValue, analyze, binary, lower, output,
+    Column, Error, Field, Lowered, Relations, Value as PgValue, analyze, binary, fields, lower, output,
     utility,
 };
 use amphora_pg_catalog::data::{PG_TYPE, type_oid};
@@ -570,7 +570,16 @@ impl Executor {
                     PgError::error(SqlState::new("42P02"), "there is no parameter $1").into(),
                 );
             }
-            let lowered = lower(&query, &session, &[]).map_err(|e| refusal(e, sql))?;
+            let lowered = match lower(&query, &session, &[]) {
+                Ok(lowered) => lowered,
+                // Raised as the statement runs, behind its RowDescription.
+                Err(error) if error.runs && query.command == Command::Select => {
+                    let columns = fields(&query).map_err(|e| refusal(e, sql))?;
+                    row_description(out, &columns, &Formats::default())?;
+                    return Err(refusal(error, sql).into());
+                }
+                Err(error) => return Err(refusal(error, sql).into()),
+            };
             (query.command, lowered)
         };
         let (command, lowered) = lowered;

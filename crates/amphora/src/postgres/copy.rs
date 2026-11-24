@@ -143,9 +143,14 @@ impl Executor {
                     return Ok(Flow::CopyIn);
                 }
             }
+            // The line under way is the one after the last read.
             Copy::Fail(reason) => Err(PgError::error(
                 SqlState::new("57014"),
                 format!("COPY from stdin failed: {reason}"),
+            )
+            .with_context(
+                copy.spec
+                    .at_line(copy.lines.number().saturating_add(1)),
             )),
             Copy::Done => self.copy_done(&mut copy, out),
         };

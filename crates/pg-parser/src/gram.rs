@@ -846,7 +846,13 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         // ColLabel: IDENT
         2514 => (0xa007_892c_3e21_a49b, top),
         // ColLabel: type_func_name_keyword
+        // ColLabel: unreserved_keyword
+        2515 => (0x1d4d_f16c_54a7_2564, top),
+        // ColLabel: col_name_keyword
+        2516 => (0x0f87_a177_22a9_8584, top),
         2517 => (0x1d4d_f16c_54a7_2564, top),
+        // ColLabel: reserved_keyword
+        2518 => (0x0f87_a177_22a9_8584, top),
         _ => return None,
     })
 }

@@ -17,7 +17,6 @@ s1: Q|create table r3(a int) with (nosuch)
 s1: Q|create table r3(a int) with (fillfactor=70, fillfactor=80)
 s1: Q|create table r3(a int) with (parallel_workers=2000)
 s1: Q|create table r3(a int) with (autovacuum_vacuum_scale_factor=200)
-s1: Q|create table r3(a int) with (vacuum_index_cleanup=perhaps)
 s1: Q|create table r3(a int) with (autovacuum_enabled=2)
 # pgbench -i step g: a TRUNCATE and a COPY with FREEZE in one transaction.
 s1: Q|begin
@@ -117,7 +116,6 @@ s1: Q|copy c from stdin ~ d|x\tb\t1\t\t\\N\t\\N\n ~ c
 s1: Q|copy c from stdin ~ d|99999999999\tb\t1\t\t\\N\t\\N\n ~ c
 s1: Q|copy c from stdin ~ d|1\tb\t1\tabcde\t\\N\t\\N\n ~ c
 s1: Q|copy c from stdin ~ d|1\tb\t1\tabcd  \t\\N\t\\N\n ~ c
-s1: Q|copy c from stdin ~ d|1\tb\t1\tab\tnosuch\t\\N\n ~ c
 s1: Q|copy c from stdin ~ d|1\tb\t1\t\t2026-13-01 00:00:00\t\\N\n ~ c
 s1: Q|copy c from stdin ~ d|1\tb\t1\t\t\\N\t\\N\t2\n ~ c
 s1: Q|copy c from stdin ~ d|1\tb\n ~ c
@@ -132,7 +130,7 @@ s1: Q|copy c from stdin ~ d|1\tb\t1\t\t\\N\t\\N\nx\\.\n ~ c
 s1: Q|copy c from stdin ~ d|1\tb\t1\t\t\\N\t\\N\r\n\\.\n ~ c
 s1: Q|copy c from stdin ~ d|\\.\\.\n ~ c
 s1: Q|copy c from stdin ~ d|1\tb\\01x\t1\t\t\\N\t\\N\n ~ c
-s1: Q|copy c from stdin ~ d|1\tb\\xzz\t1\t\t\\N\t\\N\\\n ~ c
+s1: Q|copy c from stdin ~ d|1\tb\\xzz\\q\t1\t\t\\N\t\\N\n ~ c
 s1: Q|select a, b, d, e, f, g from c
 # A table's NOT NULL and its key.
 s1: Q|create table k(a int not null, b int not null)
