@@ -59,6 +59,17 @@ fn text(tree: &Tree, arg: Option<NodeId>) -> Result<String, Error> {
     match tree.get(arg)? {
         Node::Integer(i) => Ok(i.to_string()),
         Node::Float(text) | Node::String(text) => Ok(text.clone()),
+        // `TypeNameToString` of a bare word (src/backend/parser/parse_type.c).
+        Node::TypeName { names, .. } => {
+            let mut words = Vec::with_capacity(names.len());
+            for name in names {
+                match tree.get(*name)? {
+                    Node::String(word) => words.push(word.as_str()),
+                    _ => return Err(Error::unsupported("this storage parameter's value")),
+                }
+            }
+            Ok(words.join("."))
+        }
         _ => Err(Error::unsupported("this storage parameter's value")),
     }
 }

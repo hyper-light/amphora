@@ -252,19 +252,6 @@ impl Executor {
             Ok(Ran::Done(_)) => Ok(()),
             // COPY doesn't wait for another session's transaction here.
             Ok(Ran::Waits(_)) => Err(engine(LimboError::SerializationFailure)),
-            Err(LimboError::Constraint(message)) => {
-                if message.starts_with("UNIQUE constraint failed") {
-                    Err(PgError::error(
-                        SqlState::new("23505"),
-                        format!(
-                            "duplicate key value violates unique constraint \"{}_pkey\"",
-                            copy.spec.relname
-                        ),
-                    ))
-                } else {
-                    Err(engine(LimboError::Constraint(message)))
-                }
-            }
             Err(error) => Err(engine(error)),
         }
     }

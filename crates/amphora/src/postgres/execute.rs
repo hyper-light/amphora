@@ -605,7 +605,7 @@ impl Executor {
                 }
             }
             return Err(match &utility.effect {
-                Effect::Keyed(index) if error.code == SqlState::new("23000") => PgError::error(
+                Effect::Keyed(index) if error.code == SqlState::new("23505") => PgError::error(
                     SqlState::new("23505"),
                     format!("could not create unique index \"{index}\""),
                 ),
@@ -1442,7 +1442,8 @@ pub(super) fn engine(error: LimboError) -> PgError {
         LimboError::Postgres { sqlstate, message } => {
             PgError::error(SqlState::new(sqlstate), message)
         }
-        LimboError::Constraint(message) | LimboError::ForeignKeyConstraint(message) => {
+        LimboError::Constraint(message) => constraint(message),
+        LimboError::ForeignKeyConstraint(message) => {
             PgError::error(SqlState::new("23000"), message)
         }
         LimboError::Busy
@@ -1455,6 +1456,31 @@ pub(super) fn engine(error: LimboError) -> PgError {
         ),
         error => PgError::error(SqlState::INTERNAL_ERROR, error.to_string()),
     }
+}
+
+/// A constraint the engine refused: a key's is 19's of the table's `<table>_pkey` (its only index), and a NOT NULL's is
+/// 19's own (`_bt_check_unique`, src/backend/access/nbtree/nbtinsert.c; `ReportNotNullViolationError`,
+/// src/backend/executor/execMain.c).
+fn constraint(message: String) -> PgError {
+    let column = |prefix: &str| {
+        let (table, column) = message.strip_prefix(prefix)?.split_once('.')?;
+        Some((table.to_owned(), column.to_owned()))
+    };
+    if let Some((table, _)) = column("UNIQUE constraint failed: ") {
+        return PgError::error(
+            SqlState::new("23505"),
+            format!("duplicate key value violates unique constraint \"{table}_pkey\""),
+        );
+    }
+    if let Some((table, column)) = column("NOT NULL constraint failed: ") {
+        return PgError::error(
+            SqlState::new("23502"),
+            format!(
+                "null value in column \"{column}\" of relation \"{table}\" violates not-null constraint"
+            ),
+        );
+    }
+    PgError::error(SqlState::new("23000"), message)
 }
 
 /// `pg_type.typlen`.

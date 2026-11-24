@@ -66,7 +66,7 @@ s1: Q|select n from generate_series(1, 10, 4) as n
 s1: Q|select n + 1, n * 2 from generate_series(1, 2) as n
 s1: Q|select generate_series from generate_series(7, 8)
 s1: Q|select g.x from generate_series(1, 2) as g(x)
-s1: Q|select n from generate_series(1, 2147483648) as n where n > 2147483646
+s1: Q|select n from generate_series(2147483646, 2147483648) as n
 s1: Q|select n from generate_series(1, 2, 0) as n
 s1: Q|select n from generate_series(null, 2) as n
 s1: Q|select n from generate_series(1, null::int4) as n
