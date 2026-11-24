@@ -634,10 +634,9 @@ pub fn emit_upsert(
     // collation. Comparisons in the WHERE/SET expressions must still apply
     // them (`int_col < '2'` compares numerically, a NOCASE column compares
     // case-insensitively), so record both per register for the conflicting
-    // row image and its rowid. The excluded (insertion) registers are
-    // already recorded by the enclosing INSERT translation, except for the
-    // decoded copies made for STRICT custom-type tables. Cleared wholesale
-    // at the end of the enclosing INSERT translation.
+    // row image and its rowid. Amphora: not for the excluded registers, which
+    // SQLite compares with no affinity and no collation, STRICT or not.
+    // Cleared wholesale at the end of the enclosing INSERT translation.
     for (idx, col) in table.columns().iter().enumerate() {
         if col.is_rowid_alias() {
             // The rewrite maps rowid-alias references to conflict_rowid_reg;
@@ -647,15 +646,6 @@ pub fn emit_upsert(
         let reg = layout.to_register(expr_current_start, idx);
         resolver.register_affinities.insert(reg, col.affinity());
         resolver.register_collations.insert(reg, col.collation());
-        if let Some(decoded_start) = excluded_decoded_start {
-            let excluded_reg = layout.to_register(decoded_start, idx);
-            resolver
-                .register_affinities
-                .insert(excluded_reg, col.affinity());
-            resolver
-                .register_collations
-                .insert(excluded_reg, col.collation());
-        }
     }
     resolver
         .register_affinities
@@ -751,12 +741,32 @@ pub fn emit_upsert(
                 start_reg: new_start,
                 count: layout.num_non_virtual_cols(),
                 check_generated: false,
+                check_null_keys: true,
                 table_reference: BTreeTable::input_type_check_table_ref(
                     &bt,
                     resolver.schema(),
                     None,
                 )?,
             });
+        } else {
+            // For non-STRICT tables, apply column affinity to the values.
+            // This must happen early so that the virtual columns, the index records and the
+            // table record all use the converted values.
+            let affinity = bt
+                .columns()
+                .iter()
+                .filter(|c| !c.is_virtual_generated())
+                .map(|c| c.affinity());
+
+            if affinity.clone().any(|a| a != Affinity::Blob) {
+                if let Ok(count) = NonZeroUsize::try_from(layout.num_non_virtual_cols()) {
+                    program.emit_insn(Insn::Affinity {
+                        start_reg: new_start,
+                        count,
+                        affinities: affinity.map(|a| a.aff_mask()).collect(),
+                    });
+                }
+            }
         }
     }
 
@@ -791,27 +801,9 @@ pub fn emit_upsert(
                 start_reg: new_start,
                 count: bt.columns().len(),
                 check_generated: true,
+                check_null_keys: true,
                 table_reference: BTreeTable::type_check_table_ref(&bt, resolver.schema()),
             });
-        } else {
-            // For non-STRICT tables, apply column affinity to the values.
-            // This must happen early so that both index records and the table record
-            // use the converted values.
-            let affinity = bt
-                .columns()
-                .iter()
-                .filter(|c| !c.is_virtual_generated())
-                .map(|c| c.affinity());
-
-            if affinity.clone().any(|a| a != Affinity::Blob) {
-                if let Ok(count) = NonZeroUsize::try_from(layout.num_non_virtual_cols()) {
-                    program.emit_insn(Insn::Affinity {
-                        start_reg: new_start,
-                        count,
-                        affinities: affinity.map(|a| a.aff_mask()).collect(),
-                    });
-                }
-            }
         }
 
         // Evaluate CHECK constraints on the new values
@@ -1769,16 +1761,19 @@ pub(crate) fn rewrite_expr_to_registers(
     use ast::Expr;
     let table_name_norm = table_name.map(normalize_ident);
 
+    // Amphora: a column declared under one of the rowid's names is that column, and a table WITHOUT
+    // ROWID has no rowid to name.
+    let has_rowid = table.btree().is_none_or(|bt| bt.has_rowid);
+    let names_rowid =
+        |name: &str| has_rowid && ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(name));
+
     // Map a column name to a register within the row image at `base_start`.
     let col_reg_from_row_image = |name: &str| -> Option<usize> {
-        if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(name)) {
-            return Some(rowid_reg);
-        }
-        let (idx, c) = table.get_column_by_name(name)?;
-        if c.is_rowid_alias() {
-            Some(rowid_reg)
-        } else {
-            Some(base_start + layout.to_reg_offset(idx))
+        match table.get_column_by_name(name) {
+            Some((_, c)) if c.is_rowid_alias() => Some(rowid_reg),
+            Some((idx, _)) => Some(base_start + layout.to_reg_offset(idx)),
+            None if names_rowid(name) => Some(rowid_reg),
+            None => None,
         }
     };
 
@@ -1804,12 +1799,15 @@ pub(crate) fn rewrite_expr_to_registers(
                     if allow_excluded && ns.eq_ignore_ascii_case("excluded") && !is_target_namespace
                     {
                         if let Some(ins) = insertion {
-                            if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&c)) {
-                                *expr = Expr::Register(ins.key_register());
-                            } else if let Some(cm) = ins.get_col_mapping_by_name(&c) {
-                                // Use decoded excluded registers when available
-                                // to prevent double-encoding of custom type values
-                                if let Some(decoded_start) = excluded_decoded_start {
+                            if let Some(cm) = ins.get_col_mapping_by_name(&c) {
+                                if cm.column.is_rowid_alias() {
+                                    // Amphora: the alias's value is the key the row would take,
+                                    // listed in the INSERT or not. Its own register, and the
+                                    // decoded copy of it, hold the NULL its record stores (DA).
+                                    *expr = Expr::Register(ins.key_register());
+                                } else if let Some(decoded_start) = excluded_decoded_start {
+                                    // Use decoded excluded registers when available
+                                    // to prevent double-encoding of custom type values
                                     let (col_idx, _) =
                                         table.get_column_by_name(&c).expect("column exists");
                                     *expr = Expr::Register(
@@ -1818,6 +1816,8 @@ pub(crate) fn rewrite_expr_to_registers(
                                 } else {
                                     *expr = Expr::Register(cm.register);
                                 }
+                            } else if names_rowid(&c) {
+                                *expr = Expr::Register(ins.key_register());
                             } else {
                                 bail_parse_error!("no such column in EXCLUDED: {}", c);
                             }
@@ -1848,6 +1848,9 @@ pub(crate) fn rewrite_expr_to_registers(
                 Expr::Id(name) => {
                     if let Some(r) = col_reg_from_row_image(&normalize_ident(name.as_str())) {
                         *expr = Expr::Register(r);
+                    } else if allow_excluded && !name.quoted_with('"') {
+                        // Amphora: only a double-quoted name that is no column is a string.
+                        bail_parse_error!("no such column: {}", name.as_str());
                     }
                 }
                 _ => {}
