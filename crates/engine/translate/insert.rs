@@ -53,7 +53,9 @@ use crate::{
     vdbe::{
         affinity::Affinity,
         builder::{CursorKey, CursorType, DmlColumnContext, ProgramBuilder, ProgramBuilderOpts},
-        insn::{to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral},
+        insn::{
+            to_u32, CmpInsFlags, HaltAction, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral,
+        },
         BranchOffset,
     },
     CaptureDataChangesExt, Connection, LimboError, Result, VirtualTable,
@@ -919,13 +921,11 @@ pub fn translate_insert(
     // Build a list of upsert constraints/indexes we need to run preflight
     // checks against, in the proper order of evaluation,
     let constraints = build_constraints_to_check(
-        table_name.as_str(),
+        ctx.table,
         &upsert_actions,
-        ctx.table.has_rowid,
         has_user_provided_rowid,
         resolver,
         ctx.database_id,
-        ctx.table.rowid_alias_conflict_clause,
         ctx.statement_on_conflict.is_some(),
     );
 
@@ -2006,6 +2006,7 @@ fn emit_notnulls(
             program.emit_insn(Insn::HaltIfNull {
                 target_reg: check_reg,
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
+                on_error: HaltAction::of_constraint(effective),
                 description: {
                     let mut description = String::with_capacity(
                         ctx.table.name.as_str().len()
@@ -3075,15 +3076,10 @@ fn emit_pk_uniqueness_check(
                 .map(|(name, _)| format!("{}.{}", ctx.table.name, name))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let (description, on_error) = halt_desc_and_on_error(
-                &raw_desc,
-                preflight.effective_on_conflict,
-                program.flags.has_statement_conflict(),
-            );
             program.emit_insn(Insn::Halt {
                 err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-                description,
-                on_error,
+                description: raw_desc,
+                on_error: HaltAction::of_constraint(preflight.effective_on_conflict),
                 description_reg: None,
             });
         }
@@ -3141,16 +3137,10 @@ fn emit_pk_uniqueness_check(
             });
             break 'emit_halt;
         }
-        let raw_desc = format!("{}.{}", ctx.table.name, rowid_column_name);
-        let (description, on_error) = halt_desc_and_on_error(
-            &raw_desc,
-            preflight.effective_on_conflict,
-            program.flags.has_statement_conflict(),
-        );
         program.emit_insn(Insn::Halt {
             err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-            description,
-            on_error,
+            description: format!("{}.{}", ctx.table.name, rowid_column_name),
+            on_error: HaltAction::of_constraint(preflight.effective_on_conflict),
             description_reg: None,
         });
     }
@@ -3323,19 +3313,18 @@ fn emit_unique_index_check(
                 ctx,
                 preflight.table_references,
             )?;
+        } else if matches!(preflight.effective_on_conflict, ResolveType::Ignore) {
+            // No upsert covers this constraint and IGNORE settles it: skip this row.
+            program.emit_insn(Insn::Goto {
+                target_pc: ctx.loop_labels.row_done,
+            });
         } else {
             // No matching UPSERT handler so we emit constraint error
             // (if conflict clause matched - VM will jump to later instructions and skip halt)
-            let raw_desc = format_unique_violation_desc(ctx.table.name.as_str(), index);
-            let (description, on_error) = halt_desc_and_on_error(
-                &raw_desc,
-                preflight.effective_on_conflict,
-                program.flags.has_statement_conflict(),
-            );
             program.emit_insn(Insn::Halt {
                 err_code: SQLITE_CONSTRAINT_UNIQUE,
-                description,
-                on_error,
+                description: format_unique_violation_desc(ctx.table.name.as_str(), index),
+                on_error: HaltAction::of_constraint(preflight.effective_on_conflict),
                 description_reg: None,
             });
         }
@@ -3372,16 +3361,10 @@ fn emit_unique_index_check(
             });
         } else {
             // ABORT/FAIL/ROLLBACK: halt on conflict.
-            let raw_desc = format_unique_violation_desc(ctx.table.name.as_str(), index);
-            let (description, on_error) = halt_desc_and_on_error(
-                &raw_desc,
-                preflight.effective_on_conflict,
-                program.flags.has_statement_conflict(),
-            );
             program.emit_insn(Insn::Halt {
                 err_code: SQLITE_CONSTRAINT_UNIQUE,
-                description,
-                on_error,
+                description: format_unique_violation_desc(ctx.table.name.as_str(), index),
+                on_error: HaltAction::of_constraint(preflight.effective_on_conflict),
                 description_reg: None,
             });
         }
@@ -3691,50 +3674,14 @@ fn ensure_sequence_initialized(
 #[inline]
 /// Build the UNIQUE constraint error description to match sqlite
 /// single column: `t.c1`
-/// multi-column:  `t.(k, c1)`
-/// For constraint-level FAIL/ROLLBACK ON CONFLICT, pre-format the description
-/// and set on_error so the VM's halt() produces Raise(rt, msg) with correct semantics.
-/// `has_statement_conflict` should be true when the statement has its own OR clause
-/// (e.g. INSERT OR FAIL), in which case program.resolve_type already handles it.
-pub(crate) fn halt_desc_and_on_error(
-    raw_desc: &str,
-    effective: ResolveType,
-    has_statement_conflict: bool,
-) -> (String, Option<ResolveType>) {
-    if has_statement_conflict {
-        return (raw_desc.to_string(), None);
-    }
-    match effective {
-        ResolveType::Fail | ResolveType::Rollback => (
-            format!("UNIQUE constraint failed: {raw_desc}"),
-            Some(effective),
-        ),
-        _ => (raw_desc.to_string(), None),
-    }
-}
-
+/// multi-column:  `t.k, t.c1`
 pub fn format_unique_violation_desc(table_name: &str, index: &Index) -> String {
-    if index.columns.len() == 1 {
-        let mut s = String::with_capacity(table_name.len() + 1 + index.columns[0].name.len());
-        s.push_str(table_name);
-        s.push('.');
-        s.push_str(&index.columns[0].name);
-        s
-    } else {
-        let mut s = String::with_capacity(table_name.len() + 3 + 4 * index.columns.len());
-        s.push_str(table_name);
-        s.push_str(".(");
-        s.push_str(
-            &index
-                .columns
-                .iter()
-                .map(|c| c.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
-        s.push(')');
-        s
-    }
+    index
+        .columns
+        .iter()
+        .map(|column| format!("{table_name}.{}", column.name))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn emit_index_column_value_for_insert(
@@ -3824,34 +3771,40 @@ struct PreflightCtx<'a, 'b> {
     table_references: &'b mut TableReferences,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_constraints_to_check(
-    table_name: &str,
+    table: &BTreeTable,
     upsert_actions: &[(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)],
-    has_rowid: bool,
     has_user_provided_rowid: bool,
     resolver: &Resolver,
     database_id: usize,
-    rowid_alias_conflict_clause: Option<ResolveType>,
     has_statement_conflict: bool,
 ) -> ConstraintsToCheck {
+    let rowid_alias_conflict_clause = table.rowid_alias_conflict_clause;
     let mut constraints_to_check = Vec::new();
-    if !has_rowid || has_user_provided_rowid {
-        // Check uniqueness constraint for rowid if it was provided by user.
-        // When the DB allocates it there are no need for separate uniqueness checks.
-        let position = upsert_actions
-            .iter()
-            .position(|(target, ..)| matches!(target, ResolvedUpsertTarget::PrimaryKey));
-        constraints_to_check.push((ResolvedUpsertTarget::PrimaryKey, position));
-    }
     let indices: Vec<_> = resolver.with_schema(database_id, |s| {
-        s.get_indices(table_name).cloned().collect()
+        s.get_indices(&table.name).cloned().collect()
     });
     for index in &indices {
         let position = upsert_actions
             .iter()
             .position(|(target, ..)| matches!(target, ResolvedUpsertTarget::Index(x) if Arc::ptr_eq(x, index)));
         constraints_to_check.push((ResolvedUpsertTarget::Index(index.clone()), position));
+    }
+    if !table.has_rowid || has_user_provided_rowid {
+        // Check uniqueness constraint for rowid if it was provided by user.
+        // When the DB allocates it there are no need for separate uniqueness checks.
+        let position = upsert_actions
+            .iter()
+            .position(|(target, ..)| matches!(target, ResolvedUpsertTarget::PrimaryKey));
+        let place = if table.has_rowid {
+            0
+        } else {
+            indices
+                .iter()
+                .take_while(|index| table.checked_before_primary_key(index))
+                .count()
+        };
+        constraints_to_check.insert(place, (ResolvedUpsertTarget::PrimaryKey, position));
     }
 
     constraints_to_check.sort_by(|(_, p1), (_, p2)| match (p1, p2) {
@@ -3866,6 +3819,7 @@ fn build_constraints_to_check(
     // constraints exist with potentially different modes, the IPK check
     // runs last to avoid premature row deletion before FAIL/IGNORE fires.
     let defer_ipk_replace_after_other_checks = !has_statement_conflict
+        && table.has_rowid
         && rowid_alias_conflict_clause == Some(ResolveType::Replace)
         && constraints_to_check.len() > 1
         && !upsert_actions
@@ -4679,13 +4633,7 @@ fn without_rowid_preflight(
                     ctx.cursor_id,
                     replace_flag,
                 )?),
-                _ => wr::halt_constraint(
-                    program,
-                    ctx.table,
-                    index.map(|i| i.as_ref()),
-                    effective,
-                    false,
-                ),
+                _ => wr::halt_constraint(program, ctx.table, index.map(|i| i.as_ref()), effective),
             }
         }
         program.preassign_label_to_next_insn(ok);

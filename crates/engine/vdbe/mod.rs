@@ -1023,6 +1023,9 @@ pub struct ProgramState {
     /// Keep the error here while index-method writes from earlier rows finish
     /// through the normal resumable I/O path.
     pending_fail_prepare_error: Option<LimboError>,
+    /// What the constraint that failed does to the statement: the clause of the Halt that met it, in
+    /// this program or in one it runs (SQLite's `Vdbe.errorAction`). ABORT until one has.
+    pub(crate) constraint_action: ResolveType,
     /// True once the Halt opcode has started finishing the statement. The
     /// statement's outcome is decided at that point, so an interrupt request
     /// arriving during Halt's resumable work (staging index-method writes,
@@ -1175,6 +1178,7 @@ impl ProgramState {
             explain_state: RwLock::new(ExplainState::default()),
             pending_fail_error: None,
             pending_fail_prepare_error: None,
+            constraint_action: ResolveType::Abort,
             halt_in_progress: false,
             pending_cdc_info: None,
             subprogram_stmt_cache: HashMap::default(),
@@ -1384,9 +1388,21 @@ impl ProgramState {
         self.explain_state.get_mut().clear();
         self.pending_fail_error = None;
         self.pending_fail_prepare_error = None;
+        self.constraint_action = ResolveType::Abort;
         self.halt_in_progress = false;
         self.pending_cdc_info = None;
         self.subprogram_stmt_cache.clear();
+    }
+
+    /// What `err` does to the statement where that is the error's to say: RAISE names its action, and
+    /// a constraint has that of the conflict clause it was checked under. `None` for an error no
+    /// clause applies to.
+    fn error_action(&self, err: &LimboError) -> Option<ResolveType> {
+        match err {
+            LimboError::Raise(action, _) => Some(*action),
+            LimboError::Constraint(_) => Some(self.constraint_action),
+            _ => None,
+        }
     }
 
     pub(crate) fn record_statement_change(&self) {
@@ -2044,7 +2060,6 @@ pub struct PreparedProgram {
     pub trigger: Option<Arc<Trigger>>,
     /// Whether this program is a subprogram (trigger or FK action) that runs within a parent statement.
     pub is_subprogram: bool,
-    pub resolve_type: ResolveType,
     pub prepare_context: PrepareContext,
     /// Set of attached database indices that need write transactions.
     pub write_databases: BitSet,
@@ -2911,10 +2926,7 @@ impl Program {
                 // back, so auto-retrying can be useful.
                 Some(ProgramStep::Busy)
             }
-            err if (matches!(err, LimboError::Constraint(_))
-                && self.resolve_type == ResolveType::Fail)
-                || matches!(err, LimboError::Raise(ResolveType::Fail, _)) =>
-            {
+            err if state.error_action(&err) == Some(ResolveType::Fail) => {
                 state.pending_fail_prepare_error = Some(err);
                 None
             }
@@ -3684,12 +3696,9 @@ impl Program {
         // `program_step` before abort() was called (and, on the autocommit
         // path, already committed by halt()), so discarding cursor state here
         // would deliver a rollback outcome for work that commits below.
-        let keeps_prior_changes = match err {
-            Some(LimboError::RaiseIgnore) => true,
-            Some(LimboError::Raise(ResolveType::Fail, _)) => true,
-            Some(LimboError::Constraint(_)) => self.resolve_type == ResolveType::Fail,
-            _ => false,
-        };
+        let error_action = err.and_then(|err| state.error_action(err));
+        let keeps_prior_changes =
+            matches!(err, Some(LimboError::RaiseIgnore)) || error_action == Some(ResolveType::Fail);
         if (err.is_some() || state.execution_state.is_running()) && !keeps_prior_changes {
             execute::index_method_abort_statement_all(state);
         }
@@ -3775,10 +3784,7 @@ impl Program {
                 // For ON CONFLICT FAIL, do NOT rollback the statement savepoint —
                 // changes made before the error should persist.
                 // For all other resolve types (ABORT, ROLLBACK, etc.), rollback the statement.
-                let is_fail_constraint = (matches!(err, Some(LimboError::Constraint(_)))
-                    && self.resolve_type == ResolveType::Fail)
-                    || matches!(err, Some(LimboError::Raise(ResolveType::Fail, _)));
-                if !is_fail_constraint {
+                if error_action != Some(ResolveType::Fail) {
                     if let Err(end_stmt_err) = state.end_statement(
                         &self.connection,
                         pager,
@@ -3846,24 +3852,19 @@ impl Program {
                     }
                     self.connection.set_changes(0);
                 }
-                // Constraint and RAISE errors: behavior depends on the effective resolve type.
-                // For normal constraints, the resolve type comes from the statement (ON CONFLICT).
-                // For RAISE errors, the resolve type is embedded in the error variant itself.
+                // Constraint and RAISE errors: what the one that failed says
+                // (`ProgramState::error_action`).
                 // - ROLLBACK: rollback the entire transaction regardless of autocommit mode
                 // - FAIL: don't rollback anything - changes persist, transaction stays active
                 // - ABORT (default): rollback statement, rollback txn if autocommit
                 Some(LimboError::Constraint(_)) | Some(LimboError::Raise(_, _)) => {
-                    let effective_resolve = match err {
-                        Some(LimboError::Raise(rt, _)) => *rt,
-                        _ => self.resolve_type,
-                    };
-                    match effective_resolve {
-                        ResolveType::Rollback => {
+                    match error_action {
+                        Some(ResolveType::Rollback) => {
                             self.rollback_current_txn(pager);
                             // All deferred FK violations are undone by the full rollback.
                             self.connection.clear_deferred_foreign_key_violations();
                         }
-                        ResolveType::Fail => {
+                        Some(ResolveType::Fail) => {
                             // FAIL: Don't rollback the transaction.
                             // Changes made before the error persist.
                             if let Err(end_stmt_err) = state.end_statement(
@@ -3946,8 +3947,8 @@ impl Program {
                             }
                         }
                     }
-                    let last_change = match effective_resolve {
-                        ResolveType::Fail => state.n_change.load(Ordering::SeqCst),
+                    let last_change = match error_action {
+                        Some(ResolveType::Fail) => state.n_change.load(Ordering::SeqCst),
                         _ => 0,
                     };
                     self.connection.set_changes(last_change);

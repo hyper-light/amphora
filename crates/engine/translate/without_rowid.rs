@@ -14,7 +14,7 @@ use crate::translate::plan::{
 };
 use crate::translate::trigger_exec::{fire_trigger, get_triggers_including_temp, TriggerContext};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
-use crate::vdbe::insn::{to_u32, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral};
+use crate::vdbe::insn::{to_u32, HaltAction, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral};
 use crate::vdbe::BranchOffset;
 use crate::{Connection, LimboError, Result};
 use amphora_engine_parser::ast::{self, Expr, ResolveType};
@@ -228,7 +228,6 @@ pub(crate) fn halt_constraint(
     table: &BTreeTable,
     index: Option<&Index>,
     conflict: ResolveType,
-    force_abort: bool,
 ) {
     let names = if let Some(index) = index {
         index
@@ -245,27 +244,14 @@ pub(crate) fn halt_constraint(
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let (description, on_error) = crate::translate::insert::halt_desc_and_on_error(
-        &names,
-        conflict,
-        program.flags.has_statement_conflict(),
-    );
-    let (description, on_error) = if force_abort {
-        (
-            format!("UNIQUE constraint failed: {names}"),
-            Some(ResolveType::Abort),
-        )
-    } else {
-        (description, on_error)
-    };
     program.emit_insn(Insn::Halt {
         err_code: if index.is_some() {
             crate::error::SQLITE_CONSTRAINT_UNIQUE
         } else {
             crate::error::SQLITE_CONSTRAINT_PRIMARYKEY
         },
-        description,
-        on_error,
+        description: names,
+        on_error: HaltAction::of_constraint(conflict),
         description_reg: None,
     });
 }
@@ -340,55 +326,67 @@ pub(crate) fn check_constraints(
     force_abort: bool,
 ) -> Result<()> {
     let mut replacements = Vec::new();
-    let replace_flag = program.alloc_register();
-    program.emit_bool(false, replace_flag);
     let pk_count = table.primary_key_columns.len();
-    let key = pk_registers(program, table, image)?;
-    let ok = program.allocate_label();
-    program.emit_insn(Insn::NoConflict {
-        cursor_id: cursor,
-        target_pc: ok,
-        record_reg: key,
-        num_regs: pk_count,
-    });
-    if let Some(old) = old {
-        let old_key = pk_registers(program, table, old)?;
-        let different = program.allocate_label();
-        for (i, (name, _)) in table.primary_key_columns.iter().enumerate() {
-            let (_, col) = table
-                .get_column(name)
-                .ok_or_else(|| internal("primary key missing"))?;
-            program.emit_insn(Insn::Ne {
-                lhs: offset(key, i)?,
-                rhs: offset(old_key, i)?,
-                target_pc: different,
-                flags: Default::default(),
-                collation: Some(
-                    table
-                        .primary_key_constraint_collation(name)
-                        .unwrap_or_else(|| col.collation()),
-                ),
+    let (before, after): (Vec<_>, Vec<_>) = indexes
+        .iter()
+        .filter(|item| item.index.unique)
+        .partition(|item| table.checked_before_primary_key(&item.index));
+    let constraints = before
+        .into_iter()
+        .map(Some)
+        .chain([None])
+        .chain(after.into_iter().map(Some));
+    for constraint in constraints {
+        let Some(item) = constraint else {
+            let replace_flag = program.alloc_register();
+            program.emit_bool(false, replace_flag);
+            let key = pk_registers(program, table, image)?;
+            let ok = program.allocate_label();
+            program.emit_insn(Insn::NoConflict {
+                cursor_id: cursor,
+                target_pc: ok,
+                record_reg: key,
+                num_regs: pk_count,
             });
-        }
-        program.emit_insn(Insn::Goto { target_pc: ok });
-        program.preassign_label_to_next_insn(different);
-    }
-    let pk_conflict = if force_abort || program.flags.has_statement_conflict() {
-        conflict
-    } else {
-        primary_key_policy(table)
-    };
-    match pk_conflict {
-        ResolveType::Ignore => {
-            program.emit_insn(Insn::Goto { target_pc: skip });
-        }
-        ResolveType::Replace => {
-            replacements.push(queue_replace(program, table, cursor, replace_flag)?)
-        }
-        _ => halt_constraint(program, table, None, pk_conflict, force_abort),
-    }
-    program.preassign_label_to_next_insn(ok);
-    for item in indexes.iter().filter(|i| i.index.unique) {
+            if let Some(old) = old {
+                let old_key = pk_registers(program, table, old)?;
+                let different = program.allocate_label();
+                for (i, (name, _)) in table.primary_key_columns.iter().enumerate() {
+                    let (_, col) = table
+                        .get_column(name)
+                        .ok_or_else(|| internal("primary key missing"))?;
+                    program.emit_insn(Insn::Ne {
+                        lhs: offset(key, i)?,
+                        rhs: offset(old_key, i)?,
+                        target_pc: different,
+                        flags: Default::default(),
+                        collation: Some(
+                            table
+                                .primary_key_constraint_collation(name)
+                                .unwrap_or_else(|| col.collation()),
+                        ),
+                    });
+                }
+                program.emit_insn(Insn::Goto { target_pc: ok });
+                program.preassign_label_to_next_insn(different);
+            }
+            let pk_conflict = if force_abort || program.flags.has_statement_conflict() {
+                conflict
+            } else {
+                primary_key_policy(table)
+            };
+            match pk_conflict {
+                ResolveType::Ignore => {
+                    program.emit_insn(Insn::Goto { target_pc: skip });
+                }
+                ResolveType::Replace => {
+                    replacements.push(queue_replace(program, table, cursor, replace_flag)?)
+                }
+                _ => halt_constraint(program, table, None, pk_conflict),
+            }
+            program.preassign_label_to_next_insn(ok);
+            continue;
+        };
         let replace_flag = program.alloc_register();
         program.emit_bool(false, replace_flag);
         let ok = program.allocate_label();
@@ -460,7 +458,7 @@ pub(crate) fn check_constraints(
                 });
                 replacements.push(queue_replace(program, table, cursor, replace_flag)?);
             }
-            _ => halt_constraint(program, table, Some(&item.index), effective, force_abort),
+            _ => halt_constraint(program, table, Some(&item.index), effective),
         }
         program.preassign_label_to_next_insn(ok);
     }
@@ -793,34 +791,12 @@ pub(crate) fn validate_image(
                         program.preassign_label_to_next_insn(nonnull);
                     }
                 }
-                if force_abort {
-                    let nonnull = program.allocate_label();
-                    program.emit_insn(Insn::NotNull {
-                        reg,
-                        target_pc: nonnull,
-                    });
-                    program.emit_insn(Insn::Halt {
-                        err_code: crate::error::SQLITE_CONSTRAINT_NOTNULL,
-                        description: format!(
-                            "NOT NULL constraint failed: {}.{}",
-                            table.name,
-                            col.name.as_deref().unwrap_or("")
-                        ),
-                        on_error: Some(ResolveType::Abort),
-                        description_reg: None,
-                    });
-                    program.preassign_label_to_next_insn(nonnull);
-                } else {
-                    program.emit_insn(Insn::HaltIfNull {
-                        target_reg: reg,
-                        err_code: crate::error::SQLITE_CONSTRAINT_NOTNULL,
-                        description: format!(
-                            "{}.{}",
-                            table.name,
-                            col.name.as_deref().unwrap_or("")
-                        ),
-                    });
-                }
+                program.emit_insn(Insn::HaltIfNull {
+                    target_reg: reg,
+                    err_code: crate::error::SQLITE_CONSTRAINT_NOTNULL,
+                    description: format!("{}.{}", table.name, col.name.as_deref().unwrap_or("")),
+                    on_error: HaltAction::of_constraint(notnull_conflict),
+                });
             }
         }
     }
@@ -832,7 +808,6 @@ pub(crate) fn validate_image(
             table_reference: BTreeTable::type_check_table_ref(table, resolver.schema()),
         });
     }
-    let first_check_instruction = program.insns.len();
     emit_check_constraints(
         program,
         &table.check_constraints,
@@ -848,20 +823,7 @@ pub(crate) fn validate_image(
         conflict,
         skip,
         Some(refs),
-    )?;
-    if force_abort {
-        for (instruction, _) in program.insns.iter_mut().skip(first_check_instruction) {
-            if let Insn::Halt {
-                err_code, on_error, ..
-            } = instruction
-            {
-                if *err_code != 0 {
-                    *on_error = Some(ResolveType::Abort);
-                }
-            }
-        }
-    }
-    Ok(())
+    )
 }
 
 fn returning_buffer(

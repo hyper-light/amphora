@@ -315,8 +315,9 @@ pub struct ProgramBuilder {
     /// The mode in which the query is being executed.
     mode: BuilderQueryMode,
     pub flags: ProgramBuilderFlags,
-    /// True once any `Insn::Function` has been emitted. See [`Self::may_abort`].
-    emitted_function_call: bool,
+    /// True once an instruction that can refuse a value has been emitted: a function's call, or a
+    /// rowid's MustBeInt. See [`Self::may_abort`].
+    emitted_refusal: bool,
     next_free_register: usize,
     free_register_ranges: Vec<Range<usize>>,
     next_free_cursor_id: usize,
@@ -800,7 +801,7 @@ impl ProgramBuilder {
             planned_subqueries: Vec::new(),
             write_target: None,
             flags: ProgramBuilderFlags::new(is_subprogram),
-            emitted_function_call: false,
+            emitted_refusal: false,
             trigger,
             resolve_type: ResolveType::Abort,
             trigger_conflict_override: None,
@@ -1111,11 +1112,13 @@ impl ProgramBuilder {
     /// True if this statement may throw an ABORT exception. Combines the
     /// translate paths' constraint analysis with emission taint: any emitted
     /// function call can raise at runtime, like SQLite's
-    /// sqlite3VdbeAddFunctionCall() → sqlite3MayAbort(). The taint is a
-    /// separate monotonic bit (not folded into the flag) because the analysis
-    /// assigns the flag mid-translation and would clobber it.
+    /// sqlite3VdbeAddFunctionCall() → sqlite3MayAbort(), and a rowid that is
+    /// no integer is refused under no conflict clause but ABORT, whatever the
+    /// statement's. The taint is a separate monotonic bit (not folded into the
+    /// flag) because the analysis assigns the flag mid-translation and would
+    /// clobber it.
     pub const fn may_abort(&self) -> bool {
-        self.flags.may_abort() || self.emitted_function_call
+        self.flags.may_abort() || self.emitted_refusal
     }
 
     pub const fn capture_data_changes_info(&self) -> &Option<CaptureDataChangesInfo> {
@@ -1378,9 +1381,16 @@ impl ProgramBuilder {
         tracing::trace!("");
         self.flags
             .set_readonly(self.flags.readonly() & insn.is_readonly());
-        // Any function can raise at runtime; see Self::may_abort.
-        if matches!(insn, Insn::Function { .. }) {
-            self.emitted_function_call = true;
+        // See Self::may_abort.
+        if matches!(
+            insn,
+            Insn::Function { .. }
+                | Insn::MustBeInt {
+                    target_pc: None,
+                    ..
+                }
+        ) {
+            self.emitted_refusal = true;
         }
         if let Insn::Column {
             cursor_id,
@@ -2652,7 +2662,6 @@ impl ProgramBuilder {
             )),
             trigger: self.trigger.take(),
             is_subprogram: self.flags.is_subprogram(),
-            resolve_type: self.resolve_type,
             prepare_context,
             write_databases: self.write_databases,
             skip_hints: self.skip_hints,
