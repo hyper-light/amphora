@@ -259,6 +259,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "amphora-pg-analysis"
+version = "0.1.0"
+dependencies = [
+ "amphora-pg-catalog",
+ "amphora-pg-parser",
+]
+
+[[package]]
 name = "amphora-pg-catalog"
 version = "0.1.0"
 dependencies = [
