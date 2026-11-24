@@ -493,7 +493,7 @@ impl Statements for Executor {
         let ran = gram::parse(sql.as_bytes())
             .map_err(|refused| {
                 PgError::error(SqlState::new(refused.sqlstate), refused.message)
-                    .with_position((refused.cursor > 0).then_some(refused.cursor))
+                    .with_position((refused.cursor > 0).then(|| refused.cursor))
             })
             .and_then(|(tree, statements)| self.statements(sql, &tree, &statements, out));
         match ran {

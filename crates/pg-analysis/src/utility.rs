@@ -340,11 +340,11 @@ mod tests {
 
     impl Relations for Public {
         fn namespace(&self, name: &str) -> Option<u32> {
-            (name == "public").then_some(2200)
+            (name == "public").then(|| 2200)
         }
 
         fn relation(&self, namespace: u32, name: &str) -> Option<u32> {
-            (namespace == 2200 && name == "t").then_some(16384)
+            (namespace == 2200 && name == "t").then(|| 16384)
         }
 
         fn name(&self, oid: u32) -> Option<(u32, String)> {
