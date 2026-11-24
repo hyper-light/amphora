@@ -12,7 +12,8 @@ use crate::gram_tables::{
 };
 use crate::lex::{self, Lexer, ScanError, cursor};
 use crate::tree::{
-    BoolOp, FuncCall, Node, NodeId, SelectStmt, TransactionStmtKind, Tree, TreeFault, Val,
+    BoolOp, ColumnDef, Constraint, CreateStmt, FuncCall, Node, NodeId, SelectStmt,
+    TransactionStmtKind, Tree, TreeFault, Val,
 };
 
 /// yacc.c's YYMAXDEPTH, 10000 when the grammar doesn't define it (gram.y doesn't): a parse whose
@@ -114,6 +115,8 @@ pub enum Value {
     Bool(bool),
     /// An `int` an action made (`ival`).
     Int(i32),
+    /// A `char` an action made (OptTemp's relpersistence).
+    Char(char),
     /// func_alias_clause's `list_make2(alias, coldeflist)`.
     FuncAlias {
         alias: Option<NodeId>,
@@ -137,6 +140,7 @@ pub enum Value {
 /// One reduce: the rule's right-hand side values ($1 at index 0) and locations (@1), the arena, and
 /// raw_parser's answer (`pg_yyget_extra(yyscanner)->parsetree`).
 struct Reduce<'a> {
+    sql: &'a [u8],
     rhs: Vec<Value>,
     at: Vec<i32>,
     tree: &'a mut Tree,
@@ -200,6 +204,40 @@ impl Reduce<'_> {
         }
     }
 
+    /// `char *` that may be NULL: an empty rule's `$$ = NULL`, else a token's or an action's string.
+    fn opt_string(&mut self, n: usize) -> Result<Option<String>, Refusal> {
+        match self.take(n) {
+            Value::Node(None) => Ok(None),
+            Value::Token(lex::Value::Str(bytes)) => {
+                String::from_utf8(bytes).map(Some).map_err(|_| not_utf8())
+            }
+            Value::Token(lex::Value::Keyword(name)) => Ok(Some(name.to_owned())),
+            _ => Err(fault()),
+        }
+    }
+
+    fn char(&mut self, n: usize) -> Result<char, Refusal> {
+        match self.take(n) {
+            Value::Char(c) => Ok(c),
+            _ => Err(fault()),
+        }
+    }
+
+    /// An `ereport(ERROR, ..., parser_errposition(@n))` in an action: the cursor at `@n`, none
+    /// for an empty rule's -1.
+    fn refuse(&self, sqlstate: &'static str, n: usize, message: &'static str) -> Refusal {
+        let cursor = self
+            .at(n)
+            .ok()
+            .and_then(|at| usize::try_from(at).ok())
+            .map_or(0, |at| cursor(self.sql, at));
+        Refusal {
+            sqlstate,
+            cursor,
+            message,
+        }
+    }
+
     /// `int` from a token (ICONST, PARAM) or an action.
     fn int(&mut self, n: usize) -> Result<i32, Refusal> {
         match self.take(n) {
@@ -243,10 +281,174 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         1516 => (0xcafd_31ef_0f34_4799, |_| Ok(Value::Bool(true))),
         // opt_transaction_chain: AND NO CHAIN | /* EMPTY */
         1517 | 1518 => (0xc7dd_6751_cbba_2e22, |_| Ok(Value::Bool(false))),
+        // opt_drop_behavior: /* EMPTY */
+        148 => (0x784d_d6d1_0e75_e150, |_| Ok(Value::Int(0))),
+        // VariableSetStmt: SET set_rest
+        215 => (0x7e32_ef61_7adc_84a9, set_stmt),
+        // generic_set: var_name TO var_list
+        221 => (0x3133_3e60_3a82_cdfb, generic_set),
+        // set_rest_more: generic_set
+        227 => (0xb63c_8f94_4218_f133, top),
+        // var_name: ColId
+        238 => (0x2c4d_653c_2123_81fb, top),
+        // var_list: var_value
+        240 => (0x0fda_94aa_d7e7_3ffc, list1),
+        // var_value: opt_boolean_or_string
+        242 => (0x1721_9ff3_34b4_a393, string_const),
+        // opt_boolean_or_string: ON
+        250 => (0xbe4d_bf1d_d140_a8e1, |_| Ok(word("on"))),
+        // opt_boolean_or_string: NonReservedWord_or_Sconst
+        251 => (0x2c4d_653c_2123_81fb, top),
+        // NonReservedWord_or_Sconst: Sconst
+        263 => (0x6314_522d_4765_c4bb, top),
+        // VariableShowStmt: SHOW var_name
+        275 => (0xc00b_e3b1_de12_3e7b, show_stmt),
+        // AlterTableStmt: ALTER TABLE relation_expr alter_table_cmds
+        291 => (0xdc8a_b7d1_3e26_151c, alter_table),
+        // alter_table_cmds: alter_table_cmd
+        312 => (0x0fda_94aa_d7e7_3ffc, list1),
+        // alter_table_cmd: ADD_P TableConstraint
+        342 => (0x0079_2405_28f5_b05a, add_constraint),
+        // reloptions: '(' reloption_list ')'
+        390 => (0x1f11_a14d_e2c2_31b7, |r| Ok(r.take(2))),
+        // reloption_list: reloption_elem
+        393 => (0xeff5_8133_d35b_3656, list1),
+        // reloption_elem: ColLabel '=' def_arg
+        395 => (0x7594_b8cb_e382_1389, |r| def_elem(r, 3)),
+        // CopyStmt: COPY opt_binary qualified_name opt_column_list
+        425 => (0x14df_021f_ed0f_64e0, copy_stmt),
+        // copy_from: FROM
+        427 => (0xbecc_7a2e_167f_61d9, |_| Ok(Value::Bool(true))),
+        // copy_from: TO
+        428 => (0xf9a7_c703_e0b2_bd02, |_| Ok(Value::Bool(false))),
+        // opt_program: /* EMPTY */
+        430 => (0x1ee7_dacd_24a2_c362, |_| Ok(Value::Bool(false))),
+        // copy_file_name: STDIN
+        432 => (0x8ee1_1e76_ad01_e0db, null),
+        // copy_file_name: STDOUT
+        433 => (0x8ee1_1e76_ad01_e0db, null),
+        // copy_options: copy_opt_list
+        434 => (0xd863_0378_0bf9_2833, top),
+        // copy_options: '(' copy_generic_opt_list ')'
+        435 => (0xa34a_19b2_d9e6_9e97, |r| Ok(r.take(2))),
+        // copy_opt_list: /* EMPTY */
+        437 => (0x5195_4352_6e6c_0588, nil),
+        // opt_binary: /* EMPTY */
+        455 => (0x6f70_ddc5_f44b_ac02, null),
+        // copy_delimiter: /* EMPTY */
+        457 => (0x6f70_ddc5_f44b_ac02, null),
+        // copy_generic_opt_list: copy_generic_opt_elem
+        460 => (0x8674_90cb_f11d_4ff3, list1),
+        // copy_generic_opt_elem: ColLabel copy_generic_opt_arg
+        462 => (0x85bf_7c1b_879a_9e76, |r| def_elem(r, 2)),
+        // copy_generic_opt_arg: opt_boolean_or_string
+        464 => (0xdd4e_0b68_a2ec_ef61, make_string),
+        // CreateStmt: CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
+        473 => (0xb66d_16f9_b6f7_b41d, create_stmt),
+        // OptTemp: /* EMPTY */
+        486 => (0x7f78_a3e9_83b0_f1a8, |_| Ok(Value::Char('p'))),
+        // OptTableElementList: TableElementList
+        487 => (0xd863_0378_0bf9_2833, top),
+        // TableElementList: TableElement
+        491 => (0x57a1_7057_3bfa_0539, list1),
+        // TableElementList: TableElementList ',' TableElement
+        492 => (0x3f88_1f70_44bd_239a, append),
+        // TableElement: columnDef
+        495 => (0x9113_5026_c13a_e4a7, top),
+        // columnDef: ColId Typename opt_column_storage opt_column_compression create_generic_options ColQualList
+        500 => (0x08a1_38f2_aa0b_2a11, column_def),
+        // opt_column_compression: /* EMPTY */
+        506 => (0x8ee1_1e76_ad01_e0db, null),
+        // opt_column_storage: /* EMPTY */
+        510 => (0x8ee1_1e76_ad01_e0db, null),
+        // ColQualList: ColQualList ColConstraint
+        511 => (0xbcb1_c1ae_81cd_2000, qual_append),
+        // ColQualList: /* EMPTY */
+        512 => (0x1e2a_fd0a_a524_9ce8, nil),
+        // ColConstraint: ColConstraintElem
+        514 => (0x9113_5026_c13a_e4a7, top),
+        // ColConstraintElem: NOT NULL_P opt_no_inherit
+        517 => (0x580c_856a_167c_3fc2, not_null),
+        // TableConstraint: ConstraintElem
+        555 => (0x9113_5026_c13a_e4a7, top),
+        // ConstraintElem: PRIMARY KEY '(' columnList opt_without_overlaps ')' opt_c_include opt_definition OptConsTableSpace
+        560 => (0x5cb7_b4ab_11fe_3203, primary_key),
+        // opt_no_inherit: /* EMPTY */
+        569 => (0x0669_4456_7c57_3476, |_| Ok(Value::Bool(false))),
+        // opt_without_overlaps: /* EMPTY */
+        571 => (0xf9a7_c703_e0b2_bd02, |_| Ok(Value::Bool(false))),
+        // opt_column_list: /* EMPTY */
+        573 => (0x1e2a_fd0a_a524_9ce8, nil),
+        // columnList: columnElem
+        574 => (0x41fd_9d1b_bdab_ed5c, list1),
+        // columnElem: ColId
+        580 => (0x7baf_b980_ab5f_c89c, make_string),
+        // opt_c_include: /* EMPTY */
+        582 => (0x1e2a_fd0a_a524_9ce8, nil),
+        // OptInherit: /* EMPTY */
+        606 => (0x1e2a_fd0a_a524_9ce8, nil),
+        // OptPartitionSpec: /* EMPTY */
+        608 => (0x582e_440b_6ba4_80f6, null),
+        // table_access_method_clause: /* EMPTY */
+        616 => (0x9a64_6afd_218c_483b, null),
+        // OptWith: WITH reloptions
+        617 => (0xb179_ffe1_a274_6173, top),
+        // OptWith: /* EMPTY */
+        619 => (0xb2e2_4c4d_0c3a_b6c8, nil),
+        // OnCommitOption: /* EMPTY */
+        623 => (0x181b_b893_5641_aa52, |_| Ok(Value::Int(0))),
+        // OptTableSpace: /* EMPTY */
+        625 => (0x8ee1_1e76_ad01_e0db, null),
+        // OptConsTableSpace: /* EMPTY */
+        627 => (0x8ee1_1e76_ad01_e0db, null),
+        // NumericOnly: SignedIconst
+        681 => (0x699b_98a9_71ef_9ef1, integer),
+        // create_generic_options: /* EMPTY */
+        742 => (0xa50c_a63f_49f4_3a48, nil),
+        // ConstraintAttributeSpec: /* EMPTY */
+        845 => (0xcc31_e8d4_7f4c_796f, |_| Ok(Value::Int(0))),
+        // def_arg: NumericOnly
+        892 => (0x9396_22ca_37a3_3dd2, top),
+        // DropStmt: DROP object_type_any_name IF_P EXISTS any_name_list opt_drop_behavior
+        938 => (0x120f_6e9b_a03b_0c9a, drop_if_exists),
+        // object_type_any_name: TABLE
+        950 => (0x08cd_40da_a814_1242, |_| Ok(Value::Int(42))),
+        // any_name_list: any_name
+        979 => (0x1209_f60e_7c8e_69a8, any_name_list),
+        // any_name_list: any_name_list ',' any_name
+        980 => (0x721c_8e26_0e62_7609, any_name_append),
+        // any_name: ColId
+        981 => (0xad62_ca6c_ccde_7143, any_name),
+        // TruncateStmt: TRUNCATE opt_table relation_expr_list opt_restart_seqs opt_drop_behavior
+        987 => (0x1fdb_3a96_2e09_cf75, truncate_stmt),
+        // opt_restart_seqs: /* EMPTY */
+        990 => (0x2562_84d6_595c_3282, |_| Ok(Value::Bool(false))),
         // opt_asc_desc: ASC
         1140 => (0xe77c_326d_e6dc_6368, |_| Ok(Value::Int(1))),
         // opt_nulls_order: /* EMPTY */
         1145 => (0x0b11_90e3_6dba_5283, |_| Ok(Value::Int(0))),
+        // opt_definition: /* EMPTY */
+        1233 => (0x1e2a_fd0a_a524_9ce8, nil),
+        // TransactionStmt: COMMIT opt_transaction opt_transaction_chain
+        1491 => (0x88ca_638c_a2a9_d9bb, end),
+        // VacuumStmt: VACUUM opt_full opt_freeze opt_verbose opt_analyze opt_vacuum_relation_list
+        1590 => (0x250c_65d1_45e2_42d6, vacuum_stmt),
+        // opt_analyze: analyze_keyword
+        1596 => (0x4ab8_280b_bc3a_91b9, |_| Ok(Value::Bool(true))),
+        // opt_verbose: /* EMPTY */
+        1599 => (0xf9a7_c703_e0b2_bd02, |_| Ok(Value::Bool(false))),
+        // opt_full: /* EMPTY */
+        1601 => (0xf9a7_c703_e0b2_bd02, |_| Ok(Value::Bool(false))),
+        // opt_freeze: /* EMPTY */
+        1603 => (0xf9a7_c703_e0b2_bd02, |_| Ok(Value::Bool(false))),
+        // opt_name_list: /* EMPTY */
+        1605 => (0x1e2a_fd0a_a524_9ce8, nil),
+        // vacuum_relation: relation_expr opt_name_list
+        1606 => (0xcd1d_1c29_89b2_a1c9, vacuum_relation),
+        // vacuum_relation_list: vacuum_relation
+        1607 => (0x6a0d_9b4a_8e11_133c, list1),
+        // opt_vacuum_relation_list: vacuum_relation_list
+        1609 => (0xd863_0378_0bf9_2833, top),
         // InsertStmt: opt_with_clause INSERT INTO insert_target insert_rest
         1642 => (0x2105_41e7_4a78_96e0, insert_stmt),
         // insert_target: qualified_name
@@ -357,6 +559,10 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         1898 => (0x0daa_dfab_dabf_50ca, top),
         // relation_expr: qualified_name
         1899 => (0x0f6f_0ebf_dca7_954d, relation_expr),
+        // relation_expr_list: relation_expr
+        1904 => (0x90a5_ec2d_34a9_259b, list1),
+        // relation_expr_list: relation_expr_list ',' relation_expr
+        1905 => (0xfa14_5ca9_09c6_40c8, append),
         // relation_expr_opt_alias: relation_expr
         1906 => (0x85ed_2683_fbb2_8bba, top),
         // func_table: func_expr_windowless opt_ordinality
@@ -369,6 +575,32 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         1922 => (0x2ef6_8e2d_5a42_4abc, null),
         // where_or_current_clause: WHERE a_expr
         1923 => (0x9113_5026_c13a_e4a7, top),
+        // Typename: SimpleTypename opt_array_bounds
+        1964 => (0xc58b_b6eb_3ec8_28bf, typename),
+        // opt_array_bounds: /* EMPTY */
+        1972 => (0x5be7_5729_4b12_8d74, nil),
+        // SimpleTypename: Numeric
+        1974 => (0x0cb0_b34c_e5bd_f9f3, top),
+        // SimpleTypename: Character
+        1976 => (0x0cb0_b34c_e5bd_f9f3, top),
+        // SimpleTypename: ConstDatetime
+        1977 => (0x54ea_3776_f177_7e53, top),
+        // Numeric: INT_P
+        1990 => (0x7ebf_d128_317b_820d, |r| system_type_at(r, "int4")),
+        // Numeric: BIGINT
+        1993 => (0xc92a_6be6_f04b_95f1, |r| system_type_at(r, "int8")),
+        // Character: CharacterWithLength
+        2009 => (0x23a8_122b_16a8_44c6, top),
+        // CharacterWithLength: character '(' Iconst ')'
+        2013 => (0x6cd1_8050_a87f_85ea, character_with_length),
+        // character: CHAR_P opt_varying
+        2016 => (0xa771_08d3_389e_366e, character),
+        // opt_varying: /* EMPTY */
+        2022 => (0xf9a7_c703_e0b2_bd02, |_| Ok(Value::Bool(false))),
+        // ConstDatetime: TIMESTAMP opt_timezone
+        2024 => (0x4ef3_5933_9f92_c2dc, timestamp),
+        // opt_timezone: /* EMPTY */
+        2030 => (0xf9a7_c703_e0b2_bd02, |_| Ok(Value::Bool(false))),
         // a_expr: c_expr
         2048 => (0x9113_5026_c13a_e4a7, top),
         // a_expr: '-' a_expr
@@ -471,12 +703,16 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         2486 => (0x35a8_92e8_20e5_a06b, top),
         // Sconst: SCONST
         2487 => (0xa007_892c_3e21_a49b, top),
+        // SignedIconst: Iconst
+        2488 => (0xd710_1847_a287_d2cb, top),
         // ColId: IDENT
         2504 => (0xa007_892c_3e21_a49b, top),
         // type_function_name: IDENT
         2507 => (0x2c4d_653c_2123_81fb, top),
         // ColLabel: IDENT
         2514 => (0xa007_892c_3e21_a49b, top),
+        // ColLabel: type_func_name_keyword
+        2517 => (0x1d4d_f16c_54a7_2564, top),
         _ => return None,
     })
 }
@@ -1218,6 +1454,376 @@ fn int_const(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
     })
 }
 
+/// A C string constant an action returns (`$$ = "on"`).
+fn word(s: &'static str) -> Value {
+    Value::Token(lex::Value::Keyword(s))
+}
+
+/// `makeString($1)` of a rule's one symbol (columnElem, copy_generic_opt_arg).
+fn make_string(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let s = r.string(1)?;
+    r.make(Node::String(s))
+}
+
+/// `any_name: ColId`: list_make1(makeString($1)).
+fn any_name(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let name = r.string(1)?;
+    Ok(Value::List(vec![r.push(Node::String(name))?]))
+}
+
+/// `$n`, a List, as an element of another List.
+fn list_node(r: &mut Reduce<'_>, n: usize) -> Result<NodeId, Refusal> {
+    let items = r.list(n)?;
+    r.push(Node::List(items.into_iter().map(Some).collect()))
+}
+
+/// `any_name_list: any_name`: list_make1 of a name list.
+fn any_name_list(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    Ok(Value::List(vec![list_node(r, 1)?]))
+}
+
+/// `any_name_list: any_name_list ',' any_name`: lappend of a name list.
+fn any_name_append(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let mut list = r.list(1)?;
+    list.push(list_node(r, 3)?);
+    Ok(Value::List(list))
+}
+
+/// `ColQualList: ColQualList ColConstraint`: lappend($1, $2).
+fn qual_append(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let mut list = r.list(1)?;
+    list.push(r.node(2)?.ok_or_else(fault)?);
+    Ok(Value::List(list))
+}
+
+/// `DROP object_type_any_name IF_P EXISTS any_name_list opt_drop_behavior`.
+fn drop_if_exists(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let remove_type = r.int(2)?;
+    let objects = r.list(5)?;
+    let behavior = r.int(6)?;
+    r.make(Node::DropStmt {
+        objects,
+        remove_type,
+        behavior,
+        missing_ok: true,
+        concurrent: false,
+    })
+}
+
+/// `TRUNCATE opt_table relation_expr_list opt_restart_seqs opt_drop_behavior`.
+fn truncate_stmt(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let relations = r.list(3)?;
+    let restart_seqs = r.boolean(4)?;
+    let behavior = r.int(5)?;
+    r.make(Node::TruncateStmt {
+        relations,
+        restart_seqs,
+        behavior,
+    })
+}
+
+/// SystemTypeName (pg_catalog's type `name`) with its typmods, at `location`.
+fn system_type(
+    r: &mut Reduce<'_>,
+    name: String,
+    typmods: Vec<NodeId>,
+    location: i32,
+) -> Result<Value, Refusal> {
+    let names = vec![
+        r.push(Node::String("pg_catalog".to_owned()))?,
+        r.push(Node::String(name))?,
+    ];
+    r.make(Node::TypeName {
+        names,
+        type_oid: 0,
+        setof: false,
+        pct_type: false,
+        typmods,
+        typemod: -1,
+        array_bounds: Vec::new(),
+        location,
+    })
+}
+
+/// SystemTypeName at @1 (`Numeric: INT_P`, `BIGINT`, ConstDatetime).
+fn system_type_at(r: &mut Reduce<'_>, name: &str) -> Result<Value, Refusal> {
+    let location = r.at(1)?;
+    system_type(r, name.to_owned(), Vec::new(), location)
+}
+
+/// `ConstDatetime: TIMESTAMP opt_timezone`.
+fn timestamp(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let name = if r.boolean(2)? {
+        "timestamptz"
+    } else {
+        "timestamp"
+    };
+    system_type_at(r, name)
+}
+
+/// `character: CHAR_P opt_varying`.
+fn character(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    Ok(word(if r.boolean(2)? { "varchar" } else { "bpchar" }))
+}
+
+/// `CharacterWithLength: character '(' Iconst ')'`: the length a typmod, makeIntConst at @3.
+fn character_with_length(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let name = r.string(1)?;
+    let length = r.int(3)?;
+    let at = r.at(3)?;
+    let location = r.at(1)?;
+    let typmod = r.push(Node::AConst {
+        val: Val::Integer(length),
+        location: at,
+    })?;
+    system_type(r, name, vec![typmod], location)
+}
+
+/// `Typename: SimpleTypename opt_array_bounds`.
+fn typename(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let id = r.node(1)?.ok_or_else(fault)?;
+    let bounds = r.list(2)?;
+    let Node::TypeName { array_bounds, .. } = r.tree.get_mut(id)? else {
+        return Err(fault());
+    };
+    *array_bounds = bounds;
+    Ok(Value::Node(Some(id)))
+}
+
+/// `columnDef`. SplitColQualList keeps the Constraints and takes out a COLLATE clause; only
+/// ColConstraintElem's ported rules reach ColQualList, so every element is a Constraint.
+fn column_def(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let colname = r.string(1)?;
+    let type_name = r.node(2)?;
+    let storage_name = r.opt_string(3)?;
+    let compression = r.opt_string(4)?;
+    let fdwoptions = r.list(5)?;
+    let constraints = r.list(6)?;
+    let location = r.at(1)?;
+    r.make(Node::ColumnDef(Box::new(ColumnDef {
+        colname: Some(colname),
+        type_name,
+        compression,
+        is_local: true,
+        storage_name,
+        constraints,
+        fdwoptions,
+        location,
+        ..ColumnDef::default()
+    })))
+}
+
+/// `ColConstraintElem: NOT NULL_P opt_no_inherit`; parsenodes.h numbers CONSTR_NOTNULL 1.
+fn not_null(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let is_no_inherit = r.boolean(3)?;
+    let location = r.at(1)?;
+    r.make(Node::Constraint(Box::new(Constraint {
+        contype: 1,
+        is_no_inherit,
+        is_enforced: true,
+        initially_valid: true,
+        location,
+        ..Constraint::default()
+    })))
+}
+
+/// `ConstraintElem: PRIMARY KEY '(' columnList ...`; CONSTR_PRIMARY is 6. processCASbits with no
+/// bits only clears deferrable and initdeferred; any bits come from ConstraintAttributeSpec's
+/// unported rules, so a statement with them declines as unported.
+fn primary_key(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let location = r.at(1)?;
+    let keys = r.list(4)?;
+    let without_overlaps = r.boolean(5)?;
+    let including = r.list(7)?;
+    let options = r.list(8)?;
+    let indexspace = r.opt_string(9)?;
+    if r.int(10)? != 0 {
+        return Ok(Value::Unported);
+    }
+    r.make(Node::Constraint(Box::new(Constraint {
+        contype: 6,
+        keys,
+        without_overlaps,
+        including,
+        options,
+        indexspace,
+        location,
+        ..Constraint::default()
+    })))
+}
+
+/// `CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')' ...`.
+fn create_stmt(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let persistence = r.char(2)?;
+    let relation = r.node(4)?.ok_or_else(fault)?;
+    let table_elts = r.list(6)?;
+    let inh_relations = r.list(8)?;
+    let partspec = r.node(9)?;
+    let access_method = r.opt_string(10)?;
+    let options = r.list(11)?;
+    let oncommit = r.int(12)?;
+    let tablespacename = r.opt_string(13)?;
+    let Node::RangeVar { relpersistence, .. } = r.tree.get_mut(relation)? else {
+        return Err(fault());
+    };
+    *relpersistence = persistence;
+    r.make(Node::CreateStmt(Box::new(CreateStmt {
+        relation: Some(relation),
+        table_elts,
+        inh_relations,
+        partspec,
+        options,
+        oncommit,
+        tablespacename,
+        access_method,
+        ..CreateStmt::default()
+    })))
+}
+
+/// `NumericOnly: SignedIconst`: makeInteger.
+fn integer(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let v = r.int(1)?;
+    r.make(Node::Integer(v))
+}
+
+/// makeDefElem($1, $arg, @1) (reloption_elem, copy_generic_opt_elem).
+fn def_elem(r: &mut Reduce<'_>, arg: usize) -> Result<Value, Refusal> {
+    let defname = r.string(1)?;
+    let arg = r.node(arg)?;
+    let location = r.at(1)?;
+    r.make(Node::DefElem {
+        defnamespace: None,
+        defname,
+        arg,
+        defaction: 0,
+        location,
+    })
+}
+
+/// `vacuum_relation: relation_expr opt_name_list`: makeVacuumRelation($1, InvalidOid, $2).
+fn vacuum_relation(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let relation = r.node(1)?;
+    let va_cols = r.list(2)?;
+    r.make(Node::VacuumRelation {
+        relation,
+        oid: 0,
+        va_cols,
+    })
+}
+
+/// `VACUUM opt_full opt_freeze opt_verbose opt_analyze opt_vacuum_relation_list`.
+fn vacuum_stmt(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let mut options = Vec::new();
+    for (n, defname) in [(2, "full"), (3, "freeze"), (4, "verbose"), (5, "analyze")] {
+        if r.boolean(n)? {
+            let location = r.at(n)?;
+            options.push(r.push(Node::DefElem {
+                defnamespace: None,
+                defname: defname.to_owned(),
+                arg: None,
+                defaction: 0,
+                location,
+            })?);
+        }
+    }
+    let rels = r.list(6)?;
+    r.make(Node::VacuumStmt {
+        options,
+        rels,
+        is_vacuumcmd: true,
+    })
+}
+
+/// `alter_table_cmd: ADD_P TableConstraint`; AT_AddConstraint is 16.
+fn add_constraint(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let def = r.node(2)?;
+    r.make(Node::AlterTableCmd {
+        subtype: 16,
+        name: None,
+        num: 0,
+        newowner: None,
+        def,
+        behavior: 0,
+        missing_ok: false,
+        recurse: false,
+    })
+}
+
+/// `ALTER TABLE relation_expr alter_table_cmds`; OBJECT_TABLE is 42.
+fn alter_table(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let relation = r.node(3)?;
+    let cmds = r.list(4)?;
+    r.make(Node::AlterTableStmt {
+        relation,
+        cmds,
+        objtype: 42,
+        missing_ok: false,
+    })
+}
+
+/// `COPY opt_binary qualified_name opt_column_list copy_from opt_program copy_file_name
+/// copy_delimiter opt_with copy_options where_clause`, with its two refusals.
+fn copy_stmt(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let binary = r.node(2)?;
+    let relation = r.node(3)?;
+    let attlist = r.list(4)?;
+    let is_from = r.boolean(5)?;
+    let is_program = r.boolean(6)?;
+    let filename = r.opt_string(7)?;
+    let delimiter = r.node(8)?;
+    let user = r.list(10)?;
+    let where_clause = r.node(11)?;
+    if is_program && filename.is_none() {
+        return Err(r.refuse(SYNTAX_ERROR, 8, "STDIN/STDOUT not allowed with PROGRAM"));
+    }
+    if !is_from && where_clause.is_some() {
+        return Err(r.refuse(SYNTAX_ERROR, 11, "WHERE clause not allowed with COPY TO"));
+    }
+    let mut options: Vec<NodeId> = binary.into_iter().chain(delimiter).collect();
+    options.extend(user);
+    r.make(Node::CopyStmt {
+        relation,
+        query: None,
+        attlist,
+        is_from,
+        is_program,
+        filename,
+        options,
+        where_clause,
+    })
+}
+
+/// `generic_set: var_name TO var_list`; VAR_SET_VALUE is 0.
+fn generic_set(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let name = r.string(1)?;
+    let args = r.list(3)?;
+    let location = r.at(3)?;
+    r.make(Node::VariableSetStmt {
+        kind: 0,
+        name: Some(name),
+        args,
+        jumble_args: false,
+        is_local: false,
+        location,
+    })
+}
+
+/// `VariableSetStmt: SET set_rest`.
+fn set_stmt(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let stmt = r.node(2)?.ok_or_else(fault)?;
+    let Node::VariableSetStmt { is_local, .. } = r.tree.get_mut(stmt)? else {
+        return Err(fault());
+    };
+    *is_local = false;
+    Ok(Value::Node(Some(stmt)))
+}
+
+/// `VariableShowStmt: SHOW var_name`.
+fn show_stmt(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let name = r.string(2)?;
+    r.make(Node::VariableShowStmt { name: Some(name) })
+}
+
 /// The rule's `$$`: bison's default (`$$ = $1`, before any action) for a rule with no action, the
 /// ported action's otherwise, and [`Value::Unported`] when the action isn't ported (or was ported
 /// from a text that has since changed) or a value it reads came from such a rule.
@@ -1329,6 +1935,7 @@ pub fn parse_tree(sql: &[u8]) -> Result<Parsed, Refusal> {
         let value = act(
             rule,
             Reduce {
+                sql,
                 rhs,
                 at: rhs_at,
                 tree: &mut tree,
@@ -1446,7 +2053,7 @@ mod tests {
                 n += 1;
             }
         }
-        assert_eq!(n, 127);
+        assert_eq!(n, 226);
     }
 
     /// T-PG.5.1: a syntax error is 42601 at the token 19 names (1-based characters), the end of
