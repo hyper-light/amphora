@@ -918,7 +918,7 @@ mod tests {
         assert_eq!((expired.member, expired.how), (2, SlotEnd::Expired));
         let late = t + 300 * MS;
         slots.ask(2);
-        let close = slots.read(2, late, "close");
+        let close = slots.read(2, late, "close", None);
         assert_eq!(close.step, Some("close"));
         assert_eq!(close.ended, None, "its slot ended already");
         assert_eq!(slots.start(late, 1, 1, false).map(|(m, _)| m), Some(3));
@@ -954,7 +954,7 @@ mod tests {
         assert_eq!(close.ended, None, "its slot ended already");
         slots.ask(2);
         assert_eq!(
-            slots.read(2, late + MS, "next").step,
+            slots.read(2, late + MS, "next", None).step,
             None,
             "the next write stepped without a slot"
         );
