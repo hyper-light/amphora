@@ -2922,7 +2922,6 @@ pub fn op_type_check(
             start_reg,
             count,
             check_generated,
-            check_null_keys,
             table_reference,
         },
         insn
@@ -2936,24 +2935,9 @@ pub fn op_type_check(
             let offset = table_reference.logical_to_physical_column(column_idx);
             assert!(offset < *count);
             let reg = &mut state.registers[*start_reg + offset];
-            // INT PRIMARY KEY is not row_id_alias so we throw error if this col is NULL
-            if *check_null_keys
-                && !col.is_rowid_alias()
-                && col.primary_key()
-                && matches!(reg.get_value(), Value::Null)
-            {
-                bail_constraint_error!(
-                    "NOT NULL constraint failed: {}.{} ({})",
-                    &table_reference.name,
-                    col.name.as_deref().unwrap_or(""),
-                    SQLITE_CONSTRAINT
-                )
-            } else if col.is_rowid_alias() && matches!(reg.get_value(), Value::Null) {
-                // Handle INTEGER PRIMARY KEY for null as usual (Rowid will be auto-assigned)
-                return Ok(());
-            } else if matches!(reg.get_value(), Value::Null) {
-                // STRICT only enforces type affinity on non-NULL values.
-                // NULL is valid in any column without NOT NULL constraint.
+            if matches!(reg.get_value(), Value::Null) {
+                // A STRICT table's types are its values': a NULL is NOT NULL's to refuse, and a
+                // NULL in an INTEGER PRIMARY KEY is the next rowid.
                 return Ok(());
             }
             if let Some(expected_type) = col.strict_value_type() {

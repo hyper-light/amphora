@@ -732,12 +732,6 @@ fn subquery_resources(plan: &Plan) -> SubqueryResources {
             if let Table::FromClauseSubquery(subquery) = &table.table {
                 add_plan(&subquery.plan, resources);
             }
-            // A RIGHT or FULL JOIN's unmatched-row read runs its own copy of a correlated subquery
-            // in a table function's arguments, taken before it was planned: a copy still holds,
-            // and writes, what unnesting removed from the subquery the loops run.
-            if let Some(unmatched) = &table.unmatched_right_rows_plan {
-                add_subqueries(&unmatched.subqueries, resources);
-            }
         }
     }
 
@@ -1988,18 +1982,157 @@ fn update_from_set_result_columns(set_clauses: &[UpdateSetClause]) -> Vec<Result
         .collect()
 }
 
+/// Amphora: the columns of a view or a derived table that its query doesn't read are NULL, which
+/// nothing evaluates, as SQLite leaves them (disableUnusedSubqueryResultColumns, select.c; one it
+/// flattens has none): an expression that fails on a row fails no query that doesn't read it
+/// (finding CW). Every column counts where rows are made distinct, grouped or windowed, and a CTE's,
+/// whose rows one of its uses may store for the others. A parameter in one stays, to be bound.
+fn leave_out_unread_columns(
+    subquery: &mut crate::schema::FromClauseSubquery,
+    read: &crate::translate::plan::ColumnUsedMask,
+) -> Result<()> {
+    if subquery.cte_id().is_some() || subquery.parenthesized_join_columns.is_some() {
+        return Ok(());
+    }
+    let mut arms: Vec<&mut SelectPlan> = match subquery.plan.as_mut() {
+        Plan::Select(select) => vec![select],
+        Plan::CompoundSelect {
+            left,
+            right_most,
+            order_by: None,
+            ..
+        } if left
+            .iter()
+            .all(|(_, operator)| *operator == ast::CompoundOperator::UnionAll) =>
+        {
+            left.iter_mut()
+                .map(|(arm, _)| arm)
+                .chain(std::iter::once(right_most.as_mut()))
+                .collect()
+        }
+        _ => return Ok(()),
+    };
+    if arms.iter().any(|arm| {
+        arm.distinctness.is_distinct()
+            || arm.group_by.is_some()
+            || !arm.aggregates.is_empty()
+            || arm.window.is_some()
+            || !arm.values.is_empty()
+    }) {
+        return Ok(());
+    }
+    for arm in &mut arms {
+        let SelectPlan {
+            table_references,
+            result_columns,
+            ..
+        } = &mut **arm;
+        let mut left_out = false;
+        for (position, column) in result_columns.iter_mut().enumerate() {
+            // A stored column fails on nothing; one of a derived table may be what fails.
+            let stored = match &column.expr {
+                Expr::Literal(_) | Expr::RowId { .. } => true,
+                Expr::Column { table, .. } => {
+                    !table_references.joined_tables().iter().any(|joined| {
+                        joined.internal_id == *table
+                            && matches!(joined.table, Table::FromClauseSubquery(_))
+                    })
+                }
+                _ => false,
+            };
+            let mut bound = false;
+            walk_expr(&column.expr, &mut |expr| {
+                bound |= matches!(expr, Expr::Variable(_));
+                Ok(WalkControl::Continue)
+            })?;
+            if !read.get(position) && !stored && !bound {
+                column.expr = Expr::Literal(ast::Literal::Null);
+                left_out = true;
+            }
+        }
+        if left_out {
+            unmark_unread_columns(arm)?;
+        }
+    }
+    Ok(())
+}
+
+/// Amphora: drops a SELECT's subqueries that nothing reads once a column is left out, and takes back
+/// the marks of its reads of derived tables' columns, so that theirs are left out in turn. A subquery
+/// left may read any.
+fn unmark_unread_columns(plan: &mut SelectPlan) -> Result<()> {
+    let mut read: rustc_hash::FxHashSet<(TableInternalId, usize)> = Default::default();
+    let mut subqueries: rustc_hash::FxHashSet<TableInternalId> = Default::default();
+    let exprs = plan
+        .result_columns
+        .iter()
+        .map(|column| &column.expr)
+        .chain(plan.where_clause.iter().map(|term| &term.expr))
+        .chain(plan.order_by.iter().map(|(expr, _, _)| expr.as_ref()))
+        .chain(plan.limit.as_deref())
+        .chain(plan.offset.as_deref());
+    for expr in exprs {
+        walk_expr(expr, &mut |expr| {
+            match expr {
+                Expr::Column { table, column, .. } => {
+                    read.insert((*table, *column));
+                }
+                Expr::SubqueryResult { subquery_id, .. } => {
+                    subqueries.insert(*subquery_id);
+                }
+                _ => {}
+            }
+            Ok(WalkControl::Continue)
+        })?;
+    }
+    let shared: Vec<TableInternalId> = plan
+        .non_from_clause_subqueries
+        .iter()
+        .filter(|subquery| subqueries.contains(&subquery.internal_id))
+        .filter_map(|subquery| subquery.same_query)
+        .collect();
+    subqueries.extend(shared);
+    plan.non_from_clause_subqueries
+        .retain(|subquery| subqueries.contains(&subquery.internal_id));
+    let lateral = |table: &JoinedTable| {
+        matches!(&table.table, Table::FromClauseSubquery(subquery)
+            if crate::translate::plan::plan_has_outer_scope_dependency(&subquery.plan))
+    };
+    let tables = plan.table_references.joined_tables();
+    if !plan.non_from_clause_subqueries.is_empty() || tables.iter().any(lateral) {
+        return Ok(());
+    }
+    for table in plan.table_references.joined_tables_mut() {
+        if !matches!(table.table, Table::FromClauseSubquery(_)) {
+            continue;
+        }
+        let marked: Vec<usize> = table.col_used_mask.iter().collect();
+        for column in marked {
+            if !read.contains(&(table.internal_id, column)) {
+                table.col_used_mask.clear(column);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn optimize_subqueries(
     plan: &mut SelectPlan,
     resolver: &Resolver,
     cache: &mut SubqueryPlanCache,
     save_plans: bool,
 ) -> Result<()> {
+    // A window's layer reads its source by position, and marks no column as it does.
+    let marks_reads = plan.window.is_none();
     for table in plan.table_references.joined_tables_mut() {
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table.table {
             let from_clause_subquery = Arc::make_mut(from_clause_subquery);
             if let Some(cached) = cache.from_clause.remove(&table.internal_id) {
                 *from_clause_subquery.plan = cached;
                 continue;
+            }
+            if marks_reads {
+                leave_out_unread_columns(from_clause_subquery, &table.col_used_mask)?;
             }
             // Use match to handle both SelectPlan and CompoundSelect variants
             match from_clause_subquery.plan.as_mut() {
@@ -2078,14 +2211,14 @@ fn plan_correlated_subqueries(
             else {
                 continue;
             };
-            // The last such right table at or before the term, not the one whose ON the term is:
-            // the pass reads no ON of its own table.
-            let on_table = match term.origin {
-                WhereTermOrigin::Join(JoinOrigin::Inner(id) | JoinOrigin::Outer(id)) => {
-                    tables.iter().position(|table| table.internal_id == id)
-                }
-                _ => None,
-            };
+            // The last such right table at or before the term, not the one whose ON or argument the
+            // term is: the pass reads no ON of its own table, and a table function's argument is
+            // read before the function's own loop, by the loops and by the pass alike.
+            let on_table = term.origin.join_origin().and_then(|origin| {
+                tables
+                    .iter()
+                    .position(|table| table.internal_id == origin.right_table())
+            });
             let Some((region, region_table)) = tables.get(..=term_position).and_then(|before| {
                 before.iter().enumerate().rev().find(|(position, table)| {
                     Some(*position) != on_table
@@ -3586,20 +3719,6 @@ fn plan_unmatched_right_rows(
                 "the unmatched-row read found no access method".to_string(),
             ));
         };
-        // A correlated subquery left here is in a table function's arguments, which the read can't
-        // leave out. SQLite compiles it again: the new code must run after the left sources enter
-        // their NULL-row state. An uncorrelated one's result is the one the loops read.
-        let unmatched_rows_subqueries = subqueries
-            .iter()
-            .filter(|subquery| {
-                subquery.correlated
-                    && where_clause_for_unmatched_rows.iter().any(|term| {
-                        !term.consumed
-                            && expr_references_subquery_id(&term.expr, subquery.internal_id)
-                    })
-            })
-            .cloned()
-            .collect();
         let operation = operation_for_unmatched_right_rows(
             resolver,
             table_references,
@@ -3616,7 +3735,6 @@ fn plan_unmatched_right_rows(
             .collect();
         plans[table_index] = Some(UnmatchedRightRowsPlan {
             operation,
-            subqueries: unmatched_rows_subqueries,
             conditions,
         });
     }
@@ -6721,7 +6839,7 @@ impl Optimizable for ast::Expr {
             Expr::Subquery(..) => false,
             Expr::Unary(_, expr) => expr.is_nonnull(tables),
             Expr::Variable(..) => false,
-            Expr::Register(..) => false, // Register values can be null
+            Expr::Register(..) | Expr::TriggerRegister(..) => false, // Register values can be null
             Expr::Default => false,
             Expr::Array { .. } | Expr::Subscript { .. } => {
                 unreachable!("Array and Subscript are desugared into function calls by the parser")
@@ -6816,7 +6934,7 @@ impl Optimizable for ast::Expr {
             Expr::Subquery(_) => false,
             Expr::Unary(_, expr) => expr.is_constant(resolver),
             Expr::Variable(_) => true,
-            Expr::Register(_) => false,
+            Expr::Register(_) | Expr::TriggerRegister(..) => false,
             Expr::Default => true,
             Expr::Array { .. } | Expr::Subscript { .. } => {
                 unreachable!("Array and Subscript are desugared into function calls by the parser")

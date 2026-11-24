@@ -696,7 +696,6 @@ fn convert_image(
             start_reg: image,
             count: table.columns().len(),
             check_generated: true,
-            check_null_keys: false,
             table_reference: BTreeTable::type_check_table_ref(table, resolver.schema()),
         });
     }
@@ -806,7 +805,6 @@ pub(crate) fn validate_image(
             start_reg: image,
             count: table.columns().len(),
             check_generated: true,
-            check_null_keys: true,
             table_reference: BTreeTable::type_check_table_ref(table, resolver.schema()),
         });
     }
@@ -1381,6 +1379,7 @@ pub(crate) fn emit_upsert(
     connection: &Arc<Connection>,
     refs: &mut TableReferences,
     alias: Option<&str>,
+    subqueries: &mut crate::translate::upsert::DoUpdateSubqueries,
 ) -> Result<()> {
     let statement_conflict = program.flags.has_statement_conflict();
     program.flags.set_has_statement_conflict(true);
@@ -1414,7 +1413,9 @@ pub(crate) fn emit_upsert(
             &layout,
         )?;
         let value = program.alloc_register();
-        translate_expr(program, None, predicate, value, resolver)?;
+        subqueries.read_predicate(program, resolver, ctx, |program| {
+            translate_expr(program, None, predicate, value, resolver)
+        })?;
         program.emit_insn(Insn::IfNot {
             reg: value,
             target_pc: ctx.loop_labels.row_done,
@@ -1422,7 +1423,7 @@ pub(crate) fn emit_upsert(
         });
     }
     let mut updated = ColumnMask::default();
-    for (pos, expr) in sets {
+    for (pos, expr) in sets.iter_mut() {
         crate::translate::upsert::rewrite_expr_to_registers(
             expr,
             table,
@@ -1435,16 +1436,21 @@ pub(crate) fn emit_upsert(
             None,
             &layout,
         )?;
-        crate::translate::expr::translate_expr_no_constant_opt(
-            program,
-            None,
-            expr,
-            layout.to_register(new, *pos),
-            resolver,
-            crate::translate::expr::NoConstantOptReason::RegisterReuse,
-        )?;
         updated.set(*pos)?;
     }
+    subqueries.read_sets(program, resolver, ctx, |program| {
+        for (pos, expr) in sets.iter() {
+            crate::translate::expr::translate_expr_no_constant_opt(
+                program,
+                None,
+                expr,
+                layout.to_register(new, *pos),
+                resolver,
+                crate::translate::expr::NoConstantOptReason::RegisterReuse,
+            )?;
+        }
+        Ok(())
+    })?;
     let triggers = RowTriggers::of(
         resolver,
         ctx.database_id,
@@ -1731,7 +1737,7 @@ fn read_primary_key_image(
     Ok(image)
 }
 
-fn emit_write_subqueries(
+pub(crate) fn emit_write_subqueries(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     subqueries: &mut [crate::translate::plan::NonFromClauseSubquery],

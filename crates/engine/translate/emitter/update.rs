@@ -281,8 +281,7 @@ pub fn emit_program_for_update(
             table: target_table.table.clone(),
             join_info: None,
             col_used_mask: target_table.col_used_mask.try_clone()?,
-            cte_select: None,
-            cte_explicit_columns: vec![],
+            cte_scope: None,
             cte_id: None,
             cte_definition_only: false,
             rowid_referenced: false,
@@ -1557,7 +1556,6 @@ fn emit_update_insns<'a>(
                             start_reg: start,
                             count: layout.num_non_virtual_cols(),
                             check_generated: false,
-                            check_null_keys: false,
                             table_reference: BTreeTable::input_type_check_table_ref(
                                 btree,
                                 t_ctx.resolver.schema(),
@@ -1728,7 +1726,6 @@ fn emit_update_insns<'a>(
                 start_reg: start,
                 count: layout.num_non_virtual_cols(),
                 check_generated: false,
-                check_null_keys: true,
                 table_reference: BTreeTable::input_type_check_table_ref(
                     btree,
                     t_ctx.resolver.schema(),
@@ -1877,7 +1874,6 @@ fn emit_update_insns<'a>(
                 count: btree_table.columns().len(),
                 //TODO we should only type-check the generated columns whose dependencies were updated.
                 check_generated: true,
-                check_null_keys: true,
                 table_reference: BTreeTable::type_check_table_ref(
                     &btree_table,
                     t_ctx.resolver.schema(),

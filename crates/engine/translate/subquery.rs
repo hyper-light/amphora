@@ -375,8 +375,12 @@ pub fn plan_subqueries_from_select_plan(
         )?;
     }
 
-    // LIMIT and OFFSET cannot reference columns from the outer query
-    let get_outer_query_refs = |_: &TableReferences| Ok(crate::alloc::try_vec![]?);
+    // LIMIT and OFFSET cannot reference columns from the outer query, and read its CTEs.
+    let get_outer_query_refs = |tables: &TableReferences| {
+        let mut outer_query_refs = outer_query_refs_for_correlated_subquery(tables)?;
+        outer_query_refs.retain(|entry| entry.cte_scope.is_some());
+        Ok(outer_query_refs)
+    };
     {
         let mut subquery_parser = get_subquery_parser(
             program,
@@ -443,7 +447,7 @@ pub fn plan_subqueries_from_select_plan(
         recollect_aggregates(plan, resolver)?;
     }
 
-    assign_select_subquery_eval_phases(plan);
+    assign_select_subquery_eval_phases(plan)?;
     mark_shared_cte_materialization_requirements(
         &mut plan.table_references,
         &mut plan.non_from_clause_subqueries,
@@ -544,12 +548,33 @@ pub fn plan_subqueries_from_update_sets(
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<()> {
+    let mut exprs: Vec<&mut ast::Expr> = sets.iter_mut().map(|set| set.expr.as_mut()).collect();
+    plan_subqueries_from_row_writes(
+        program,
+        non_from_clause_subqueries,
+        table_references,
+        &mut exprs,
+        resolver,
+        connection,
+    )
+}
+
+/// Plan the subqueries of expressions evaluated for the row a statement is about to write: an
+/// UPDATE's SET, a DO UPDATE's SET and WHERE. They read that row as `table_references`' table.
+pub fn plan_subqueries_from_row_writes(
+    program: &mut ProgramBuilder,
+    non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
+    table_references: &mut TableReferences,
+    exprs: &mut [&mut ast::Expr],
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+) -> Result<()> {
     plan_subqueries_with_outer_query_access(
         program,
         non_from_clause_subqueries,
         table_references,
         resolver,
-        sets.iter_mut().map(|set| set.expr.as_mut()),
+        exprs.iter_mut().map(|expr| &mut **expr),
         connection,
         SubqueryPosition::ResultColumn,
         SubqueryOrigin::DmlSet,
@@ -559,7 +584,7 @@ pub fn plan_subqueries_from_update_sets(
         &[],
     )?;
     drop_settled_subqueries(
-        sets.iter_mut().map(|set| set.expr.as_mut()),
+        exprs.iter_mut().map(|expr| &mut **expr),
         Vec::new(),
         non_from_clause_subqueries,
         resolver,
@@ -617,7 +642,7 @@ pub fn plan_subqueries_from_returning(
 
 /// Plan subqueries in a trigger WHEN clause expression.
 /// The WHEN clause has no FROM clause, so there are no outer query references.
-/// NEW/OLD references should already be rewritten to Expr::Register before calling this.
+/// NEW/OLD references should already be rewritten to Expr::TriggerRegister before calling this.
 #[amphora_engine_macros::trace_stack]
 pub fn plan_subqueries_from_trigger_when_clause(
     program: &mut ProgramBuilder,
@@ -708,8 +733,7 @@ pub(crate) fn outer_query_refs_for_correlated_subquery(
                 internal_id: t.internal_id,
                 join_info: t.join_info.clone(),
                 col_used_mask: ColumnUsedMask::default(),
-                cte_select: None,
-                cte_explicit_columns: Vec::new(),
+                cte_scope: None,
                 cte_id,
                 cte_definition_only: false,
                 rowid_referenced: false,
@@ -726,8 +750,7 @@ pub(crate) fn outer_query_refs_for_correlated_subquery(
                 internal_id: t.internal_id,
                 join_info: t.join_info.clone(),
                 col_used_mask: ColumnUsedMask::default(),
-                cte_select: t.cte_select.clone(),
-                cte_explicit_columns: t.cte_explicit_columns.clone(),
+                cte_scope: t.cte_scope.clone(),
                 cte_id: t.cte_id, // Preserve CTE ID from outer query refs
                 cte_definition_only: t.cte_definition_only,
                 rowid_referenced: false,
@@ -2693,7 +2716,7 @@ pub fn emit_non_from_clause_subqueries_for_eval_at(
     )
 }
 
-fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
+fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) -> Result<()> {
     let has_grouped_output = plan
         .group_by
         .as_ref()
@@ -2721,8 +2744,26 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
                     aggregate_subquery_ids.push(*subquery_id);
                 }
                 Ok(WalkControl::Continue)
-            })
-            .expect("walking an expression with an infallible visitor cannot fail");
+            })?;
+        }
+    }
+
+    // A table function's arguments are read where the function's loop opens and, where a RIGHT or
+    // FULL JOIN keeps its rows, where the read of the unmatched ones does, the tables before it
+    // NULL (`optimizer::plan_unmatched_right_rows`). A correlated subquery in one is coded once and
+    // run at each of those reads, so both read the row in hand.
+    let mut argument_subquery_ids: Vec<ast::TableInternalId> = Vec::new();
+    if has_unmatched_right_rows {
+        for term in &plan.where_clause {
+            if term.origin.table_function_table().is_none() {
+                continue;
+            }
+            walk_expr(&term.expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+                if let ast::Expr::SubqueryResult { subquery_id, .. } = e {
+                    argument_subquery_ids.push(*subquery_id);
+                }
+                Ok(WalkControl::Continue)
+            })?;
         }
     }
 
@@ -2775,12 +2816,13 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
         // rows' pass enters past it. Write statements emit their own subqueries (update.rs,
         // delete.rs, insert.rs).
         subquery.runs_where_read = subquery.correlated
-            && has_direct_row_output
-            && match subquery.origin {
-                SubqueryOrigin::SelectWhere => !has_unmatched_right_rows,
-                SubqueryOrigin::SelectList | SubqueryOrigin::SelectOrderBy => true,
-                _ => false,
-            };
+            && (argument_subquery_ids.contains(&subquery.internal_id)
+                || has_direct_row_output
+                    && match subquery.origin {
+                        SubqueryOrigin::SelectWhere => !has_unmatched_right_rows,
+                        SubqueryOrigin::SelectList | SubqueryOrigin::SelectOrderBy => true,
+                        _ => false,
+                    });
         subquery.eval_phase = match subquery.origin {
             // The unmatched-rows pass of a RIGHT or FULL JOIN enters the row
             // body directly, skipping the loops where a correlated subquery
@@ -2836,6 +2878,7 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
     if let Some(group_by) = plan.group_by.as_mut() {
         group_by.carried = carried;
     }
+    Ok(())
 }
 
 /// True when `expr` reads one of the given subqueries.

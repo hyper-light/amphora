@@ -201,16 +201,17 @@ list and ORDER BY of a query whose rows go straight out, for its loop's row; in 
 GROUP BY's output (the select list, HAVING, ORDER BY), from what the output keeps of the rows (a
 group's carried columns; an ungrouped query's first row, as its bare columns); in a window query,
 inside the window's source query, which takes the whole expression holding it (`window.rs`); in a
-RIGHT or FULL JOIN's row body, which the unmatched rows' pass enters too; and in a write statement's
+RIGHT or FULL JOIN's row body, which the unmatched rows' pass enters too; in a table function's
+argument, read as the function's loop opens, and by that join's read of the unmatched rows; and in a write statement's
 SET, WHERE and RETURNING, for the row in hand (`update.rs`, `delete.rs`, `insert.rs`), but for a row
 value `SET (a, b) = (SELECT ...)`, read a register at a time, which runs once a row. Elsewhere (an
 aggregate's arguments, a GROUP BY key, a RIGHT or FULL JOIN's WHERE) it still runs at every row of
 its loop. The read that finds a RIGHT or FULL JOIN's unmatched rows codes no subquery again: a term on
 a correlated one is left to the row body, which decides every WHERE term for each of them, and an
-uncorrelated one's result is the one the loops read (`optimizer/mod.rs`, `plan_unmatched_right_rows`;
-only a table function's arguments may hold a correlated one, coded again). A second coding named the
-first's cursors, hash tables and inner results by the same tables, and shared them (the oracles'
-finding CH). A WHERE term holding a subquery is tested in the first loop,
+uncorrelated one's result is the one the loops read (`optimizer/mod.rs`, `plan_unmatched_right_rows`);
+a correlated one in a table function's argument is the loops' subroutine, called for the NULL row. A second
+coding named the first's cursors, hash tables and inner results by the same tables, and shared them
+(the oracles' findings CH and CQ). A WHERE term holding a subquery is tested in the first loop,
 after the terms that hold none, rather than before the loops (`planner.rs`,
 `determine_where_to_eval_term`), but where a RIGHT or FULL JOIN's unmatched rows would skip that loop.
 

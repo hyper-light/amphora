@@ -122,6 +122,15 @@ fn valid(t: i64) -> Option<i64> {
     }
 }
 
+/// `timestamp_recv` and `timestamptz_recv` (timestamp.c): the microseconds a binary value is.
+pub fn received(t: i64) -> Result<i64, Error> {
+    if finite(t) {
+        valid(t).ok_or_else(out_of_range)
+    } else {
+        Ok(t)
+    }
+}
+
 /// The local or UTC second a timestamp is in, from 1970-01-01.
 fn unix_second(t: i64) -> Option<i64> {
     t.div_euclid(USECS).checked_add(EPOCH_SECS)
