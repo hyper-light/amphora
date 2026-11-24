@@ -6540,6 +6540,109 @@ mod tests {
         assert_eq!(handle.shared.charged.load(Ordering::Acquire), 0);
     }
 
+    /// `handle`'s command queue holds nothing, nothing waits for its room and `budget` is whole.
+    fn holds_nothing(handle: &ReplicaHandle, budget: &crate::memory::Budget) {
+        let control = &handle.shared;
+        for (what, held) in [
+            ("bytes", &control.admitted),
+            ("calls' bytes", &control.called),
+            ("bytes charged", &control.charged),
+            ("inputs", &control.commands),
+        ] {
+            assert_eq!(held.load(Ordering::Acquire), 0, "{what}");
+        }
+        assert_eq!(budget.held(crate::memory::Use::Queues), 0);
+    }
+
+    /// QB.1 (T-QB.1.18, lane perf-A26): a burst of more writes than the command queue counts is
+    /// taken whole, none refused by the count. Do: in a group of three voters, the leader's queue
+    /// held to eight inputs, 64 writers on a thread each write a row at the leader at once, the
+    /// memory budget far from full. Expect: every write answered Ok and its row at every member;
+    /// more writes held by the owner at once than the queue counts; then nothing held.
+    #[test]
+    fn a26_a_burst_past_the_queues_count_is_taken_whole() {
+        const WRITERS: usize = 64;
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        driven
+            .call(&mut pump, &clients[leader], |db| {
+                db.exec("CREATE TABLE burst(id INTEGER NOT NULL)")?;
+                Ok(Vec::new())
+            })
+            .unwrap();
+        driven.quiet(&mut pump);
+        let budget = budget_of(1 << 40);
+        let handle = clients[leader].handle().clone();
+        handle.shared.command_bound.store(8, Ordering::SeqCst);
+        let until = driven.until();
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|id| {
+                let (handle, budget) = (handle.clone(), Arc::clone(&budget));
+                std::thread::spawn(move || {
+                    let operation = Operation::Call(
+                        Mutex::new(Some(Box::new(move |db: &mut Db| {
+                            db.exec(&format!("INSERT INTO burst VALUES ({id})"))?;
+                            Ok(Box::new(()) as Box<dyn Any + Send>)
+                        }))),
+                        AnswerMax::<()>::fixed().get(),
+                    );
+                    on_budget(&budget, || {
+                        handle
+                            .submit(String::new(), operation, None, until)
+                            .map(|_| ())
+                    })
+                })
+            })
+            .collect();
+        let (began, mut most) = (Instant::now(), 0);
+        while !writers.iter().all(std::thread::JoinHandle::is_finished) {
+            assert!(
+                began.elapsed() < crate::transport::HANG,
+                "unanswered: {}, held {}",
+                writers.iter().filter(|w| !w.is_finished()).count(),
+                driven.owner(leader).waiting.len(),
+            );
+            driven.round(&mut pump);
+            most = most.max(driven.owner(leader).waiting.len());
+        }
+        let refused: Vec<_> = writers
+            .into_iter()
+            .filter_map(|writer| writer.join().unwrap().err())
+            .collect();
+        assert!(
+            refused.is_empty(),
+            "{} of {WRITERS} refused: {refused:?}",
+            refused.len()
+        );
+        assert!(most > 8, "the owner held {most} calls at most");
+        driven.quiet(&mut pump);
+        driven.tick(&mut pump, leader);
+        for owner in 0..3 {
+            let rows = driven
+                .owner_mut(owner)
+                .replica
+                .machine_mut()
+                .read_db(|db| {
+                    let mut rows = 0usize;
+                    db.query_owned("SELECT id FROM burst", [], |_| {
+                        rows += 1;
+                        Ok(true)
+                    })?;
+                    Ok(rows)
+                })
+                .unwrap();
+            assert_eq!(rows, WRITERS, "owner {owner}");
+        }
+        driven.drain(&mut pump);
+        pump.finish();
+        holds_nothing(&handle, &budget);
+    }
+
     /// U15/CP-T1.8 on driven time: a real DeviceFile log, a product-driven election, a once-only
     /// capture and bounded GC by the same owner, all kept through a durable restart. Do: a single
     /// voter captures a random value, puts and deletes a record, compacts, then restarts. Expect:
