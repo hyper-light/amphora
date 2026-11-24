@@ -1053,5 +1053,7 @@ comment says the cache keys by the current segment's frames), then rerun both.
 - tests/crash.rs power cut, 200 seeds: passed.
 - `database::replicated::`: 148 passed, 1 failed (`t_t1_10_r1`, above); A20's four pass.
 - tests/store.rs 17/17. tests/backup.rs 20 passed, 1 failed (`t_t1_12_d1`, above).
-- Pending at the hour's end (r146 runs on): workspace clippy, the fix taken out (the seed-45 test expected red), and
-  main before B18 (46773985) on the four tests and the power cut.
+- Workspace clippy (`--all-targets -D warnings`): exit 0 in 59 s.
+- The fix taken out (64e77079 less its three lines): the seed-45 test fails as seed 45 did, "the copy doesn't open
+  (third switch made: true): ... checkpoint sequences Some(0) and Some(3), neither one past the other".
+- Main before B18 (46773985) on the four tests and the power cut: still running at the hour's end (r146).
