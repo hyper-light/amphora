@@ -757,6 +757,13 @@ holds A19's test of that module (`memory::tests::a19_…`, `database::admission_
 | r7 again, 02:02Z | 1a19ead8 | clippy clean; `memory::` 11/11, `store::` 6/6, `database::` 257/257 (6 ignored), `xgroup::` 34/34, `serve::` 12/12, tests/store.rs 14/14, tests/crash.rs 10/10 (3 ignored); load 30-49 |
 | r27, r40 (macOS, cpus=8 and 4) | 2912576e (1a19ead8 + 502375c9 + main 8738fcb9) | queued from 02:05Z and 02:10Z behind other lanes, then collected by kiln's restart on adacachy (~02:18Z) without starting. adacachy2 refused cpus=4 and cpus=2 meanwhile (1 of 32 cores idle); one cpus=2 admission (r34) ran nothing, its script not yet written there (exit 127, A20's slip) |
 | r10, 02:34Z | e7d493fc (2912576e + main 6d76681c) | needs cpus=4: clippy -p amphora --all-targets clean; `a19_` 3/3, `memory::` 11/11, `store::` 6/6, `database::` 260/260 (6 ignored), `xgroup::` 34/34, `serve::` 12/12, tests/store.rs 16/16, tests/crash.rs 10/10 (3 ignored); load 23-70 |
+| r31, 02:39Z | 78a9fe56 (ecec204b + main c10b1a09: Q5's wal.rs and log_index.rs) | needs cpus=4: clippy clean; `a19_` 3/3, `memory::` 11/11, `store::` 6/6, `database::` 260/260 (6 ignored), `serve::` 12/12, tests/store.rs 16/16, tests/crash.rs 10/10 (3 ignored); `xgroup::` 33/34: `xgroup::lan::tests::ac_t1_10_2_the_lan_harness_measures_both_protocols_over_two_endpoints` panicked at lan.rs:736 (`measure(..).unwrap()`; its error not captured); load 45-71 |
+| 02:44Z, foreground | 78a9fe56, r31's test binary | needs cpus=2: that test alone 5/5 (0.54 to 0.58 s each); `xgroup::` 36/36 (t_t1_10_w7 and t_t1_10_w11 included); load 53-59 |
+
+The LAN harness's `measure` failing once under load is not A19's: A19 changes nothing in xgroup, the test passed on
+e7d493fc (r10) and six times more on 78a9fe56's own binary, and A18's r1892 saw `t_t1_9_r18_…` fail the same way at
+lan.rs:720 before A19 existed. Landed on clippy and the tests of what A19 touched (rule 5b); the error text is the
+next thing to capture if it fails again.
 
 **rustfmt (502375c9).** Of the five call sites A19 fixed in 1a19ead8, two ran past 100 columns (serve.rs's
 `let SqlAnswer::Tables(tables) = answer(..)` at 2542 and 2583); rustfmt's two hunks are applied alone. At 2912576e `cargo
