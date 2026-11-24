@@ -956,8 +956,9 @@ fn to_close(disk: &Arc<Disk>, format: LogFormat, back: bool) -> Db {
     db
 }
 
-/// The files left by a process that opened `image` and wrote 30 rows on, its log started again as
-/// often as it lets it, the last rows in the log alone.
+/// The files left by a process that opened `image` and changed rows in place, its log started again
+/// between, the last changes in the log alone. No commit of its own writes page 1 but to mark it, so
+/// what a copy puts in the file of it is what the log was left holding.
 fn written_on(
     image: HashMap<String, Vec<u8>>,
     format: LogFormat,
@@ -967,15 +968,13 @@ fn written_on(
     let disk = Disk::new(at, image);
     let mut db = Db::open_with_sharing(path, disk.clone(), &Sharing::Off).unwrap();
     db.log_format(format).unwrap();
-    for part in 4..7 {
-        for row in part * 10..(part + 1) * 10 {
-            db.exec(&format!("INSERT INTO t VALUES ({row}, 'on')"))
-                .unwrap();
-        }
+    for (round, change) in ["upper", "lower"].into_iter().enumerate() {
+        db.exec(&format!("UPDATE t SET a = {change}(a) WHERE id < 5"))
+            .unwrap();
         db.flusher()().unwrap();
-        if part < 6 {
+        if round == 0 {
             db.checkpoint().unwrap();
-            assert!(db.restart_log().unwrap(), "{format:?}, part {part}");
+            assert!(db.restart_log().unwrap(), "{format:?}");
         }
     }
     drop(db);
@@ -1034,7 +1033,7 @@ fn d45_a_power_cut_at_any_change_of_a_clean_close_leaves_sqlite_all_of_it_or_non
                 let wrote_on = written_on(image.clone(), format, at);
                 assert_eq!(
                     rows_found(wrote_on.clone(), at),
-                    Ok(70),
+                    Ok(40),
                     "{said}: written on"
                 );
                 if let Err(e) = plain_sqlite(&wrote_on, CLOSE_PATH) {
