@@ -564,7 +564,9 @@ pub(crate) fn begin_read_page(
     learned: Option<Arc<crate::translate::optimizer::learned_costs::LearnedCosts>>,
 ) -> Result<Completion> {
     tracing::trace!("begin_read_btree_page(page_idx = {})", page_idx);
-    let submitted = std::time::Instant::now();
+    let timer = learned
+        .as_ref()
+        .and_then(|learned| learned.start_page_read());
     let buf = buffer_pool.get_page();
     #[allow(clippy::arc_with_non_send_sync)]
     let buf = Arc::new(buf);
@@ -597,12 +599,9 @@ pub(crate) fn begin_read_page(
                 actual: bytes_read as usize,
             });
         }
-        if let Some(learned) = learned.as_ref().filter(|_| bytes_read != 0) {
-            learned.observe(
-                crate::translate::optimizer::learned_costs::Work::PageRead,
-                1.0,
-                submitted.elapsed().as_nanos() as f64,
-            );
+        if let (Some(learned), Some(timer)) = (learned.as_ref().filter(|_| bytes_read != 0), timer)
+        {
+            learned.finish_page_read(timer);
         }
         let page = page.clone();
         let buffer = if bytes_read == 0 {
