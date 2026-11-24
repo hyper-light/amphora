@@ -1751,7 +1751,7 @@ answer was lost; found by a trace, fixed, robust over the suites and the ladder,
    load 64 to 140 on 18 cores when the hour ended; it was stopped. So the deliverable's robust
    half is shown only by the three suite rounds on b9dd342b (r73), not by the ladder.
 2. **The suites' comparison arm on Linux was the harness change alone (aedd6cef), not main's product.** Main's own
-   product was run only on the four tests both arms failed (r80, r81), not the whole suite; the fix's one failure
+   product was run only on the four tests both arms failed (the runs at 02:57:57Z and 02:58:25Z), not the whole suite; the fix's one failure
    that neither of those runs covers (`a_local_read_holds_off_the_logs_restart_and_one_after_waits_for_it`, once in
    three rounds, in the slowest round) is not shown to fail on main.
 3. **Four replicated tests fail on main itself** (lane B18's decision 45 is the only change in crates/ between a
@@ -1810,7 +1810,8 @@ kiln syncs to it timed out (r102, r107: "did not answer the sync in 60s"), from 
 | r113 | adas-macbook-pro-2, cpus=8, load 65 to 80 on 18 cores, 03:13Z to 03:41Z (cold build 1,510 s) | d7df6b30, the merged tree | focused: 18 passed |
 | r113 | | 6f3eafa1, the merged tree with the fix reverted | 17 passed, 1 failed: lane V15's test, `(false, Some(3))` at replicated.rs:19038 |
 | r121 | the same, cpus=4, from 03:23Z | d7df6b30, the release bench and the ladder | the cold release build had not finished at 03:45Z; stopped |
-| r124 | adacachy2, cpus=8, load 16, 03:45Z to 03:47Z | d7df6b30 | `cargo clippy -p amphora --all-targets --locked -- -D warnings` exit 0; `scripts/check-production.sh` exit 0, the ratchet holds (10,903) |
+| (id not read) | adacachy2, cpus=8, load 16, 03:45Z to 03:47Z | d7df6b30 | `cargo clippy -p amphora --all-targets --locked -- -D warnings` exit 0; `scripts/check-production.sh` exit 0, the ratchet holds (10,903) |
+| (id not read) | adacachy2, cpus=4, load 42, 03:47Z to 03:50Z | 4de6e2ff, with main 9fbfdbaf (lane R9's engine changes) merged | focused: 18 passed; clippy exit 0. Main then moved to fac69083 (lane PG13, crates/engine and pg-catalog): not landed |
 **The replicated suites, 3 rounds** (r73, adacachy2, cpus=4, `--test-threads=4 database::replicated:: replication::`,
 arm order alternated, load 24 to 37 on 32 cores):
 
@@ -1822,11 +1823,11 @@ arm order alternated, load 24 to 37 on 32 cores):
 
 - On both arms nearly every round: `a_local_read_open_across_an_image_install_sees_one_side_whole`,
   `a_replicas_database_log_stays_within_its_room`, `past_its_room_a_replica_refuses_submits_and_restarts_whatever_its_share`,
-  `a_checkpoint_pass_copies_no_frame_past_the_last_finished_flush`. Main's own product fails them too: r80 (02:58Z)
-  ran the four on cd720fde (main a5ae048c and lane V15's test, with the diagnostic's prints and neither change of
-  this lane): 2 failed (`past_its_room`, `a_local_read_open`); r81 ran the other two on all three trees: each
+  `a_checkpoint_pass_copies_no_frame_past_the_last_finished_flush`. Main's own product fails them too: a run at 02:57:57Z (its kiln id not
+  read) ran the four on cd720fde (main a5ae048c and lane V15's test, with the diagnostic's prints and neither change of
+  this lane): 2 failed (`past_its_room`, `a_local_read_open`); one at 02:58:25Z (id not read) ran the other two on all three trees: each
   failed both, with the same values (`left: 77, right: 17` at the checkpoint test). On lane V15's 6adfa5f8 (main
-  46773985) all four passed (r80). The only commits in crates/ between those mains are lane B18's (decision 45).
+  46773985) all four passed (the 02:57:57Z run). The only commits in crates/ between those mains are lane B18's (decision 45).
 - On the fix only, once (round 2, its slowest): `a_local_read_holds_off_the_logs_restart_and_one_after_waits_for_it`;
   and `a_restart_due_waits_for_a_reads_deadline_and_no_longer`, which the harness alone failed in round 3 too.
   Neither was run on main's product here.
