@@ -514,11 +514,13 @@ impl Db {
         }
     }
 
-    /// Starts the log again by switching the writer to its free segment (docs/design/store.md,
-    /// decision 45): whether it did. The current segment is flushed and closes; reads under way
-    /// keep reading it, and a pass copies it before the new one. It waits for no read: false
-    /// while another connection writes, or while a read still counts on the segment the last
-    /// switch closed, and the caller asks again at its next turn.
+    /// Copies what the reads under way let it, then starts the log again by switching the writer
+    /// to its free segment (docs/design/store.md, decision 45): whether it did. The current
+    /// segment is flushed and closes; reads under way keep reading it. It waits for no read:
+    /// false while another connection writes, or while a read still counts on the segment the
+    /// last switch closed, and the caller asks again at its next turn. A segment switched to is
+    /// cut to nothing first if it holds room for more frames than [`Db::keep_log`] keeps
+    /// (decision 31).
     ///
     /// A database backed up ([`Db::back_up`]) starts its log again only once the backup has shipped
     /// all of it, until the log is past what a restart keeps (decision 31): then it starts again
@@ -534,13 +536,20 @@ impl Db {
         if !shipped && !over {
             return Ok(false);
         }
-        // A closing segment left by the last switch is copied first: the switch needs it reset,
-        // which a read still on it holds off (the writer asks again at its next turn).
-        if !self.db.switch_log().map_err(fail)? {
-            let _copied = self.checkpoint()?;
-            if !self.db.switch_log().map_err(fail)? {
-                return Ok(false);
-            }
+        // The segment switched to is cut to nothing if it holds room for more frames than a
+        // restart keeps (decision 31, at each segment's reuse).
+        let cut_past = PAGE_BYTES
+            .checked_add(FRAME_HEADER_BYTES)
+            .and_then(|frame| frame.checked_mul(self.log_kept))
+            .and_then(|frames| frames.checked_add(LOG_HEADER_BYTES));
+        // What the reads let a pass copy, the closing segment's and then the current one's: with
+        // no read under way every frame is in the file, as before. The switch needs the closing
+        // segment reset, which a read still on it holds off (the writer asks again at its next
+        // turn).
+        let _closing = self.checkpoint()?;
+        let _current = self.checkpoint()?;
+        if !self.db.switch_log(cut_past).map_err(fail)? {
+            return Ok(false);
         }
         if let Some(hooks) = &self.backup {
             hooks.fence.ended(seq, frame, !shipped)?;

@@ -3387,10 +3387,11 @@ impl Database {
     /// committed frame). A flush of the log's file begun after this makes every frame up to it
     /// durable ([`Database::wal_durable`]).
     /// Amphora: the writer's switch to the log's free segment, between its transactions (decision
-    /// 45, [`SharedLog::switch`]): whether it switched. False while another connection writes or
+    /// 45, [`SharedLog::switch`]), the free segment's file cut to nothing first if longer than
+    /// `cut_past` bytes: whether it switched. False while another connection writes or
     /// the other segment is still closing: the caller asks again at its next turn. It waits for
     /// no read.
-    pub fn switch_log(&self) -> Result<bool> {
+    pub fn switch_log(&self, cut_past: Option<u64>) -> Result<bool> {
         if self.opts.enable_multiprocess_wal {
             return Err(LimboError::InvalidArgument(
                 "a multi-process log can't switch segments yet: its shared memory doesn't publish \
@@ -3401,7 +3402,7 @@ impl Database {
         if !self.shared_wal.write_lock.write() {
             return Ok(false);
         }
-        let switched = self.flush_and_switch();
+        let switched = self.flush_and_switch(cut_past);
         self.shared_wal.write_lock.unlock();
         self.shared_wal.released.notify();
         Ok(switched?.is_some())
@@ -3409,7 +3410,10 @@ impl Database {
 
     /// The current segment's file flushed, then the switch: every frame of a closing segment is
     /// durable, so a pass copies all of it, unbounded by the current segment's flushes.
-    fn flush_and_switch(&self) -> Result<Option<storage::log_segments::SegmentId>> {
+    fn flush_and_switch(
+        &self,
+        cut_past: Option<u64>,
+    ) -> Result<Option<storage::log_segments::SegmentId>> {
         if self.shared_wal.segments.load().closing().is_some() {
             return Ok(None);
         }
@@ -3421,7 +3425,7 @@ impl Database {
             )?;
             self.io.wait_for_completion(synced)?;
         }
-        self.shared_wal.switch(self.io.as_ref())
+        self.shared_wal.switch(self.io.as_ref(), cut_past)
     }
 
     /// Amphora: the segment of the log the writer appends to (decision 45).

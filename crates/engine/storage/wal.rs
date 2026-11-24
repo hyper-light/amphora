@@ -4269,8 +4269,9 @@ impl SharedLog {
     /// next commit before any frame. It takes no read mark and waits for no read: the segment
     /// switched to is free, so no read counts on it. The caller holds `write_lock`. The segment
     /// now current, or None while the other one is still closing (the writer appends on and asks
-    /// again at its next turn).
-    pub fn switch(&self, io: &dyn IO) -> Result<Option<SegmentId>> {
+    /// again at its next turn). A free segment's file longer than `cut_past` bytes is cut to
+    /// nothing first: nothing in it is needed (decision 31's bound, kept at each segment's reuse).
+    pub fn switch(&self, io: &dyn IO, cut_past: Option<u64>) -> Result<Option<SegmentId>> {
         let segments = self.segments.load();
         if segments.closing().is_some() {
             return Ok(None);
@@ -4295,6 +4296,12 @@ impl SharedLog {
                     )
                 })?;
                 free.runtime.file = Some(io.open_file(path, crate::OpenFlags::Create, false)?);
+            }
+            if let (Some(limit), Some(file)) = (cut_past, free.runtime.file.as_ref()) {
+                if file.size()? > limit {
+                    let cut = file.truncate(0, Completion::new_trunc(|_| {}))?;
+                    io.wait_for_completion(cut)?;
+                }
             }
             free.metadata.enabled.store(true, Ordering::Release);
             free.start_after(io, header, epoch, transaction_count);
