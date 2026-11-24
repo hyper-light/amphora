@@ -321,6 +321,23 @@ def main():
                 if not inside:
                     changed.append((t, op, c, ratio))
         w("")
+        w("### The largest changes beside S4's table (cells whose now median is outside S4's range), per target")
+        w("")
+        import math
+        w("| target | op | clients | S4 ops/s | now ops/s | now/S4 | verdict |")
+        w("|---|---|---|---|---|---|---|")
+        moved = {}
+        for t, op, c, ratio in changed:
+            moved.setdefault(t, []).append((op, c, ratio))
+        for t in TARGETS:
+            ch = [(op, c, r) for op, c, r in moved.get(t, []) if r not in (0, float("inf"))]
+            ch.sort(key=lambda x: abs(math.log(x[2])), reverse=True)
+            for op, c, r in ch[:5]:
+                a, b = stats_of(s4.d.get((op, c, t))), best_by[(op, c)].get(t)
+                ao = [x for x in a["ops"] if x is not None]
+                bo = [x for x in b["ops"] if x is not None]
+                w(f"| {t} | {op} | {c} | {mr(ao)} | {mr(bo)} | {r:.2f}x | {'up' if r > 1 else 'down'} |")
+        w("")
         for t in TARGETS:
             g = tally.get(t, {})
             w(f"- {t}: {len(g.get('inside', []))} cells no measured change, {len(g.get('up', []))} above S4's range, {len(g.get('down', []))} below.")

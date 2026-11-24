@@ -30,3 +30,10 @@ if "## 4." in t:
     print("- **Beside S4's table (per target, cells over the 17 statements x 3 client counts):**")
     for m in re.finditer(r"^- (\w+): (\d+ cells no measured change, \d+ above S4's range, \d+ below\.)", s4, re.M):
         print(f"  - {m.group(1)}: {m.group(2)}")
+    if "### The largest changes" in s4:
+        lc = s4[s4.index("### The largest changes"):]
+        rows = [l for l in lc.splitlines() if l.startswith("| ") and not l.startswith("| target") and "|---" not in l]
+        print("- **Largest changes outside S4's range (median of rounds; a Turso cell also changed engine wait, see below):**")
+        for l in rows:
+            c = [x.strip() for x in l.strip("|").split("|")]
+            print(f"  - {c[0]} {c[1]} at {c[2]} clients: {c[3]} -> {c[4]} ops/s ({c[5]}, {c[6]})")
