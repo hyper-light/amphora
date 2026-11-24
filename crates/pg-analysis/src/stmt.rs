@@ -192,7 +192,7 @@ impl Analysis<'_> {
         }
         let from = match s.from_clause.as_slice() {
             [] => None,
-            [item] => Some(self.from_item(*item)?),
+            [item] => Some(self.join_tree(*item)?),
             _ => return Err(Error::unsupported("a FROM of several items")),
         };
         let targets = self.target_list(&s.target_list)?;
@@ -256,7 +256,7 @@ impl Analysis<'_> {
 
     /// `transformFromClauseItem` (parse_clause.c:1056): the place in the join tree of what FROM names, and
     /// `transformFromClause`'s leave for names to mean it.
-    fn from_item(&mut self, root: NodeId) -> Result<usize, Error> {
+    fn join_tree(&mut self, root: NodeId) -> Result<usize, Error> {
         let mut steps = vec![Step::Enter(root)];
         let mut made: Vec<(usize, Vec<usize>)> = Vec::new();
         let missing = || Error::internal("a join has no side");
@@ -952,7 +952,7 @@ impl Analysis<'_> {
         let Node::RangeFunction { .. } = self.tree.get(*item)? else {
             return Err(Error::unsupported("INSERT of a SELECT from a table"));
         };
-        let from = self.from_item(*item)?;
+        let from = self.join_tree(*item)?;
         let values = self.placed(Place::InsertSelect, |a| {
             let mut values = Vec::with_capacity(select.target_list.len());
             for id in &select.target_list {

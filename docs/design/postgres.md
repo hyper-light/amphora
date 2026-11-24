@@ -383,7 +383,32 @@ portals (`portal.rs`), and each message does what REL_19_0's `src/backend/tcop/p
 - Checked by T-PG.11.1 (178 messages' steps, message by message) and T-PG.11.2, and by `scripts/postgres-clients.sh`, where
   `pgbench -i -s 1` of the postgres:19 image leaves the same rows on both, its keys refuse the same rows, and TPC-B at `-c 8`
   on its tables does the same transactions. `pg_index` and `pg_constraint` aren't served (the keys are checked by what they
-  refuse), and the built-in scripts' start-up query is unit 12's.
+  refuse). Unit 12 has the built-in scripts' start-up queries.
+
+**What the start-up queries have so far** (unit 12, lane PG25): pgbench's built-in scripts (`-b tpcb-like`,
+`simple-update`, `select-only`) start and run as on a 19.0 server. They ask `GetTableInfo`'s queries first
+(REL_19_0 src/bin/pgbench/pgbench.c:5411): the count of the branches and the partition query.
+
+- FROM is an item, or INNER, CROSS and LEFT joins of them with ON (`transformFromClauseItem`, parse_clause.c:1056), over
+  a range table whose names resolve by parse_relation.c's rules: a join's condition sees its two sides, a LATERAL item its
+  left ones, and what can't be referenced is refused as 19 refuses it. A FROM of several items, RIGHT, FULL, NATURAL, USING, an
+  aliased join and a join on the right of a join refuse `0A000`.
+- A LATERAL subquery is a SELECT of expressions alone, which the writer puts in its columns' place, as 19's planner does
+  (`pull_up_simple_subquery`). One of more, and one under an outer join, refuse `0A000`.
+- `count(*)` and `count(any)` are the only aggregates. Their levels, places and nesting, GROUP BY and ORDER BY by position, name or
+  expression, and the columns neither grouped by nor of a table whose primary key is (`check_functional_grouping`) are parse_agg.c's
+  and parse_clause.c's. HAVING, DISTINCT, FILTER, ORDER BY in a call, window functions and grouping sets refuse `0A000`, and
+  ORDER BY comes with a LIMIT: section 3's grammar has no other form of it yet.
+- The engine runs them: its joins, its `count`, GROUP BY, ORDER BY (NULLS LAST as 19 has them) and LIMIT.
+- An array (`crates/pg-analysis/src/array.rs`) is read and written in text and in binary as arrayfuncs.c does, and stored under section
+  5's key. Built: its element types are the unit's, but `char(n)`'s. Not built: a column of an array type, a cast from
+  one element type to another, `ARRAY[...]`, subscripts and the array operators.
+- `current_schemas` is the session's search path, computed once; `array_position` is a function of the engine's dialect,
+  its call named by its OID and its arguments' types (`pg_proc_3277_1003_19`), since its parameters are polymorphic
+  (`enforce_generic_type_consistency`, the anycompatible family only).
+- Checked by T-PG.12.1 (221 steps, message by message), T-PG.12.2, and by `scripts/postgres-clients.sh`, where the postgres:19 image's own
+  pgbench runs each built-in script at `-M simple`, `extended` and `prepared`, `-c 1` and `-c 8`, its start-up vacuum and truncate with it, on both servers.
+- Step `f` of `pgbench -i` (`ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY`) is refused `0A000`.
 
 **Against the 10x bar.** Arithmetic and comparison on the hot path lower to the engine's own
 instructions (integer add with an overflow check that raises `22003`; comparisons of stored keys,
@@ -731,8 +756,11 @@ RENAME COLUMN, ALTER's rewrites); ADD COLUMN and DROP COLUMN (`Dialect::format_a
 and VACUUM's replay (`Dialect::table_sql_for_replay`) refuse a PostgreSQL table with a typed error
 until they carry it.
 
-Served so far (`crates/engine/pg_catalog_vtab.rs`): `pg_namespace`, `pg_type`, `pg_class` and
-`pg_attribute`, each scan reading `sqlite_schema` through the connection's transaction. A user
+Served so far (`crates/engine/pg_catalog_vtab.rs`): `pg_namespace`, `pg_type`, `pg_class`,
+`pg_attribute`, `pg_partitioned_table` and `pg_inherits` (the last two empty), each scan reading
+`sqlite_schema` through the connection's transaction. A name in `pg_catalog` resolves against 19's own definitions of
+these (`amphora_pg_catalog::CATALOGS`), since only the catalogs bootstrap writes itself have a row of `pg_class` in 19's
+data; the others have none here yet. A user
 table's rows are 19's own rows for a plain heap table with the table's facts in place; not yet: its
 row type (`reltype` is 0), its TOAST table (`reltoastrelid` is 0), temporary tables and user schemas.
 
