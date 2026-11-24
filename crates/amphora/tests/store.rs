@@ -289,7 +289,10 @@ fn d45_a_slow_read_gives_way_when_the_logs_room_is_full() {
                         text = r.get::<i64>(0).map_err(|e| anyhow::anyhow!("{e}"))?;
                         Ok(true)
                     });
-                    r.exec(if read.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
+                    // A read the log's owner ended has ended its transaction too.
+                    if read.is_ok() {
+                        r.exec("COMMIT")?;
+                    }
                     Ok(read.map(|_| text))
                 },
                 |_| Err(anyhow::anyhow!("the writer read")),
