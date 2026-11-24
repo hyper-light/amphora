@@ -9719,6 +9719,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         connection.with_schema_mut(|schema| {
                             schema.schema_version = header.schema_cookie.get();
                         })?;
+                        connection
+                            .db
+                            .dialect()
+                            .load_next_oid(header.pg_next_oid.get());
                     }
                     *connection.db.schema.lock() = connection.schema.read().clone();
                     self.clock.reset(max_commit_ts_seen + 1);
