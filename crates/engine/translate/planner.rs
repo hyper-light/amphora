@@ -22,6 +22,7 @@ use crate::translate::{
         expr_contains_nondeterministic_scalar_function, expr_vector_size, folded_false_ands,
         has_subquery, unwrap_parens, BindingBehavior, WalkControl,
     },
+    insert::expr_contains_subquery,
     plan::{NonFromClauseSubquery, SubqueryState},
     subquery::outer_query_refs_for_correlated_subquery,
 };
@@ -831,7 +832,11 @@ fn link_with_window(
     if matches!(func, AccumulatorFunc::Window(_)) && filter_clause.is_some() {
         crate::bail_parse_error!("FILTER clause may only be used with aggregate window functions");
     }
-    expr_vector_size(expr)?;
+    // Amphora: a subquery in an argument is planned with the layer that reads it, which counts its
+    // columns then (`window::prepare_window_subquery`).
+    if !expr_contains_subquery(expr) {
+        expr_vector_size(expr)?;
+    }
     if let Some(windows) = windows {
         // An inline `OVER (base ...)` chains to a named window from the
         // SELECT's WINDOW clause (sqlite3WindowUpdate, window.c:676). Any
