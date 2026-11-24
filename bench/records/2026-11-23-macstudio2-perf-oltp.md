@@ -268,8 +268,8 @@ CPU each, load 9.0, the disk at 25,600 transfers a second (105 MB/s of 4 KB writ
 Studios have 14 cores and 0.3 and 6 GB free, short of the run's cpus=16; 2768d0d5 is excluded.
 W5's flush bound (5.40 ms) was named before the run as the fallback. At 01:07Z, when r1959 began,
 the `mantle-a148` were gone: load 2.1 on 32 cores, the disk at 160 to 355 transfers a second (2.5 to
-3.8 MB/s), one other process (`slates`, a release build of another lane's) at about one core
-throughout. Through the runs: load 2.28 to 5.24, CPU of all processes 13 to 945% (100 a core),
+3.8 MB/s), one other process (a `slates` release binary under `~/.cache/main-rounds`) at about
+one core throughout. Through the runs: load 2.28 to 5.24, CPU of all processes 13 to 945% (100 a core),
 every run's mean flush 4.14 to 5.34 ms. No run passed the bound, so the bounded table equals the
 one below. 0 errors, 0 retries in all 90 runs.
 
