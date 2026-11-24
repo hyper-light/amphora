@@ -516,9 +516,9 @@ impl Db {
 
     /// Starts the log again by switching the writer to its free segment (docs/design/store.md,
     /// decision 45): whether it did. The current segment is flushed and closes; reads under way
-    /// keep reading it, and the checkpointer copies it before the new one. It waits for no read:
-    /// false while another connection writes or the other segment is still closing, and the
-    /// caller asks again at its next turn.
+    /// keep reading it, and a pass copies it before the new one. It waits for no read: false
+    /// while another connection writes, or while a read still counts on the segment the last
+    /// switch closed, and the caller asks again at its next turn.
     ///
     /// A database backed up ([`Db::back_up`]) starts its log again only once the backup has shipped
     /// all of it, until the log is past what a restart keeps (decision 31): then it starts again
@@ -534,8 +534,13 @@ impl Db {
         if !shipped && !over {
             return Ok(false);
         }
+        // A closing segment left by the last switch is copied first: the switch needs it reset,
+        // which a read still on it holds off (the writer asks again at its next turn).
         if !self.db.switch_log().map_err(fail)? {
-            return Ok(false);
+            let _copied = self.checkpoint()?;
+            if !self.db.switch_log().map_err(fail)? {
+                return Ok(false);
+            }
         }
         if let Some(hooks) = &self.backup {
             hooks.fence.ended(seq, frame, !shipped)?;

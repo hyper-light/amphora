@@ -192,6 +192,46 @@ fn count(store: &Store<Events>, key: &str) -> i64 {
 
 /// What is put is read back by its key at once: a read waits for its key's writes handed over
 /// before it, and no longer.
+fn rows_in(db: &Db) -> i64 {
+    let mut n = 0;
+    db.query("SELECT count(*) FROM t", [], |r| {
+        n = r.get::<i64>(0).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(true)
+    })
+    .unwrap();
+    n
+}
+
+/// Decision 45 (lane B18): one slow reader never holds up a write. Do: commit 10 rows, open a
+/// read transaction on a reader and leave it open, start the log again on the writer, and commit
+/// 50 rows past it. Expect: the restart happens with the read still open (the writer switches to
+/// the log's free segment), a new reader reads all 60 rows, and the open read still reads the 10
+/// committed before it began.
+#[test]
+fn d45_a_reader_that_never_finishes_holds_up_no_restart_and_no_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("slow.db");
+    let mut writer = Db::open(&path).unwrap();
+    writer.exec("CREATE TABLE t (n INTEGER)").unwrap();
+    for n in 0..10 {
+        writer.exec(&format!("INSERT INTO t VALUES ({n})")).unwrap();
+    }
+    let slow = writer.reader().unwrap();
+    slow.exec("BEGIN").unwrap();
+    assert_eq!(rows_in(&slow), 10);
+    assert!(
+        writer.restart_log().unwrap(),
+        "the writer starts the log again with a read under way"
+    );
+    for n in 10..60 {
+        writer.exec(&format!("INSERT INTO t VALUES ({n})")).unwrap();
+    }
+    assert_eq!(rows_in(&writer.reader().unwrap()), 60, "a new read sees every commit");
+    assert_eq!(rows_in(&slow), 10, "the open read keeps its snapshot");
+    slow.exec("COMMIT").unwrap();
+    assert_eq!(rows_in(&slow), 60);
+}
+
 #[test]
 fn what_is_put_is_read_back_by_its_key_at_once() {
     let lab = lab(Config::default(), None);
