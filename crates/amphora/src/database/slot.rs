@@ -15,8 +15,9 @@ use std::time::{Duration, Instant};
 use crate::meter::SlotEnd;
 
 /// What a slot's length is learned against: the core's election timeout, a member's slot before
-/// any of its retries is measured. A learned gap is believed for one to two of its member's
-/// generations, each as long as the member went between its last two learned gaps, the first
+/// any of its retries is measured and its shortest after (lane V13). A learned gap is believed
+/// for one to two of its member's generations, each as long as the member went between its last
+/// two learned gaps, the first
 /// counted from its first slot (replication.md, "Decision (lane constants): generations learned
 /// where they run"). No ceiling bounds a gap by a number: a member is gone, not slow, when the
 /// host's detector suspects it while its retry is awaited (`keep`), a verdict learned where it
@@ -252,7 +253,10 @@ impl<T> Slots<T> {
     /// being `last` and its commit `commit`, unless a slot is held, or the leader's own turn is
     /// owed and `own` (it has a write to prepare). The barrier steps once the commit reaches
     /// `last`, so the member's retry prepares on every entry before the slot (amphora-seam-owner-
-    /// 2's ruling, Q2 b). Returns whose slot began and its length.
+    /// 2's ruling, Q2 b). A turn the leader has no write for passes only to a slot that begins:
+    /// with no barrier waiting it stays owed, so the leader's next write still prepares behind
+    /// the holder's entry, and only the forwards it held go (CP-T1.8, lane V13). Returns whose
+    /// slot began and its length.
     pub(super) fn start(
         &mut self,
         at: Instant,
@@ -265,6 +269,10 @@ impl<T> Slots<T> {
         }
         if self.turn {
             if own {
+                return None;
+            }
+            if self.waiting.is_empty() {
+                self.ready.extend(self.forwards.drain(..));
                 return None;
             }
             self.took_turn();
@@ -305,8 +313,12 @@ impl<T> Slots<T> {
         Some((member, length))
     }
 
-    /// The length of `member`'s next slot: the longest gap it took to retry in this generation
-    /// and the one before, or the election timeout while none is measured.
+    /// The length of `member`'s next slot: the core's election timeout, or the longest gap it
+    /// took to retry in this generation and the one before when that is longer. A slot ends by
+    /// time only once its holder is as late as the core takes a member for gone: a learned gap
+    /// is an estimate a live holder's next retry outruns, and the leader then appends first and
+    /// refuses it. At 32 spread writers that ended 37 to 47 slots a run, a stale refusal each
+    /// (CP-T1.8, lane V13's trace, r1814).
     pub(super) fn length(&self, member: u64) -> Duration {
         self.gaps
             .iter()
@@ -317,7 +329,9 @@ impl<T> Slots<T> {
                     Some(current.unwrap_or_default().max(before.unwrap_or_default()))
                 }
             })
-            .unwrap_or(self.bounds.election)
+            .map_or(self.bounds.election, |learned| {
+                learned.max(self.bounds.election)
+            })
     }
 
     /// Whether the leader appends nothing of its own now.
