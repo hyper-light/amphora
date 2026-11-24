@@ -763,14 +763,15 @@ fn main() -> anyhow::Result<()> {
     }
 
     // AMPHORA_ANSWERS=<path>: every session's latest page as the database answers it after the
-    // mixed phase, one JSON line a session, for a check against SQLite on the same files (lane Q5).
+    // mixed phase, with the events written to it (ids e-0 to e-<written - 1>, every write answered),
+    // one JSON line a session, for a check against SQLite's answer on the same rows (lane Q5).
     if let Ok(path) = std::env::var("AMPHORA_ANSWERS") {
         use std::io::Write;
         let mut out = std::io::BufWriter::new(std::fs::File::create(&path)?);
-        for session in 0..o.sessions {
+        for (session, written) in seqs.iter().enumerate() {
             let session = format!("s-{session:06}");
             let ids = driver.page(&session, 50)?;
-            writeln!(out, "{}", serde_json::json!({ "session": session, "ids": ids }))?;
+            writeln!(out, "{}", serde_json::json!({ "session": session, "written": written.load(Ordering::Relaxed), "ids": ids }))?;
         }
         out.flush()?;
     }
