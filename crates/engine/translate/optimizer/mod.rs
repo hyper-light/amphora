@@ -1988,18 +1988,160 @@ fn update_from_set_result_columns(set_clauses: &[UpdateSetClause]) -> Vec<Result
         .collect()
 }
 
+/// Amphora: the columns of a view or a derived table that its query doesn't read are NULL, which
+/// nothing evaluates, as SQLite leaves them (disableUnusedSubqueryResultColumns, select.c; one it
+/// flattens has none): an expression that fails on a row fails no query that doesn't read it
+/// (finding CW). Every column counts where rows are made distinct, grouped or windowed, or stored
+/// for several readers (a CTE), and a parameter in one stays, to be bound.
+fn leave_out_unread_columns(
+    subquery: &mut crate::schema::FromClauseSubquery,
+    read: &crate::translate::plan::ColumnUsedMask,
+) -> Result<()> {
+    if subquery.shared_materialization()
+        || subquery.materialize_hint()
+        || subquery.parenthesized_join_columns.is_some()
+    {
+        return Ok(());
+    }
+    let mut arms: Vec<&mut SelectPlan> = match subquery.plan.as_mut() {
+        Plan::Select(select) => vec![select],
+        Plan::CompoundSelect {
+            left,
+            right_most,
+            order_by: None,
+            ..
+        } if left
+            .iter()
+            .all(|(_, operator)| *operator == ast::CompoundOperator::UnionAll) =>
+        {
+            left.iter_mut()
+                .map(|(arm, _)| arm)
+                .chain(std::iter::once(right_most.as_mut()))
+                .collect()
+        }
+        _ => return Ok(()),
+    };
+    if arms.iter().any(|arm| {
+        arm.distinctness.is_distinct()
+            || arm.group_by.is_some()
+            || !arm.aggregates.is_empty()
+            || arm.window.is_some()
+            || !arm.values.is_empty()
+    }) {
+        return Ok(());
+    }
+    for arm in &mut arms {
+        let SelectPlan {
+            table_references,
+            result_columns,
+            ..
+        } = &mut **arm;
+        let mut left_out = false;
+        for (position, column) in result_columns.iter_mut().enumerate() {
+            // A stored column fails on nothing; one of a derived table may be what fails.
+            let stored = match &column.expr {
+                Expr::Literal(_) | Expr::RowId { .. } => true,
+                Expr::Column { table, .. } => {
+                    !table_references.joined_tables().iter().any(|joined| {
+                        joined.internal_id == *table
+                            && matches!(joined.table, Table::FromClauseSubquery(_))
+                    })
+                }
+                _ => false,
+            };
+            let mut bound = false;
+            walk_expr(&column.expr, &mut |expr| {
+                bound |= matches!(expr, Expr::Variable(_));
+                Ok(WalkControl::Continue)
+            })?;
+            if !read.get(position) && !stored && !bound {
+                column.expr = Expr::Literal(ast::Literal::Null);
+                left_out = true;
+            }
+        }
+        if left_out {
+            unmark_unread_columns(arm)?;
+        }
+    }
+    Ok(())
+}
+
+/// Amphora: drops a SELECT's subqueries that nothing reads once a column is left out, and takes back
+/// the marks of its reads of derived tables' columns, so that theirs are left out in turn. A subquery
+/// left may read any.
+fn unmark_unread_columns(plan: &mut SelectPlan) -> Result<()> {
+    let mut read: rustc_hash::FxHashSet<(TableInternalId, usize)> = Default::default();
+    let mut subqueries: rustc_hash::FxHashSet<TableInternalId> = Default::default();
+    let exprs = plan
+        .result_columns
+        .iter()
+        .map(|column| &column.expr)
+        .chain(plan.where_clause.iter().map(|term| &term.expr))
+        .chain(plan.order_by.iter().map(|(expr, _, _)| expr.as_ref()))
+        .chain(plan.limit.as_deref())
+        .chain(plan.offset.as_deref());
+    for expr in exprs {
+        walk_expr(expr, &mut |expr| {
+            match expr {
+                Expr::Column { table, column, .. } => {
+                    read.insert((*table, *column));
+                }
+                Expr::SubqueryResult { subquery_id, .. } => {
+                    subqueries.insert(*subquery_id);
+                }
+                _ => {}
+            }
+            Ok(WalkControl::Continue)
+        })?;
+    }
+    let shared: Vec<TableInternalId> = plan
+        .non_from_clause_subqueries
+        .iter()
+        .filter(|subquery| subqueries.contains(&subquery.internal_id))
+        .filter_map(|subquery| subquery.same_query)
+        .collect();
+    subqueries.extend(shared);
+    plan.non_from_clause_subqueries
+        .retain(|subquery| subqueries.contains(&subquery.internal_id));
+    let lateral = |table: &JoinedTable| {
+        matches!(&table.table, Table::FromClauseSubquery(subquery)
+            if crate::translate::plan::plan_has_outer_scope_dependency(&subquery.plan))
+    };
+    let tables = plan.table_references.joined_tables();
+    if !plan.non_from_clause_subqueries.is_empty() || tables.iter().any(lateral) {
+        return Ok(());
+    }
+    for table in plan.table_references.joined_tables_mut() {
+        if !matches!(table.table, Table::FromClauseSubquery(_)) {
+            continue;
+        }
+        let marked: Vec<usize> = table.col_used_mask.iter().collect();
+        for column in marked {
+            if !read.contains(&(table.internal_id, column)) {
+                table.col_used_mask.clear(column);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn optimize_subqueries(
     plan: &mut SelectPlan,
     resolver: &Resolver,
     cache: &mut SubqueryPlanCache,
     save_plans: bool,
 ) -> Result<()> {
+    // A window's layer reads its source by position, and marks no column as it does.
+    let marks_reads = plan.window.is_none();
     for table in plan.table_references.joined_tables_mut() {
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table.table {
             let from_clause_subquery = Arc::make_mut(from_clause_subquery);
             if let Some(cached) = cache.from_clause.remove(&table.internal_id) {
                 *from_clause_subquery.plan = cached;
                 continue;
+            }
+            if marks_reads {
+                leave_out_unread_columns(from_clause_subquery, &table.col_used_mask)?;
             }
             // Use match to handle both SelectPlan and CompoundSelect variants
             match from_clause_subquery.plan.as_mut() {
