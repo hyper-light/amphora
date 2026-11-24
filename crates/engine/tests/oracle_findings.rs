@@ -12,9 +12,14 @@ use std::sync::Arc;
 
 /// A database of its own: one opened by the same name is shared across a process's tests.
 fn open() -> (Arc<MemoryIO>, Arc<Connection>) {
+    open_with(DatabaseOpts::new())
+}
+
+/// As `open`, with the experimental features `options` turns on.
+fn open_with(options: DatabaseOpts) -> (Arc<MemoryIO>, Arc<Connection>) {
     static N: AtomicUsize = AtomicUsize::new(0);
     let io = Arc::new(MemoryIO::new());
-    let options = OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new());
+    let options = OpenOptions::new(Arc::new(SqliteDialect)).db_opts(options);
     let name = format!("oracle_findings_{}.db", N.fetch_add(1, Ordering::Relaxed));
     let db = Database::open(io.clone(), &name, options).unwrap();
     (io, db.connect(ConnectOpts::new()).unwrap())
@@ -2971,4 +2976,256 @@ fn a_right_or_full_join_over_nested_subqueries_returns_sqlites_rows() {
             }
         }
     }
+}
+
+/// Expects `statements` to answer with their rows, sorted, over a database `fill` makes, under each
+/// setting a user meets them under, WITHOUT ROWID tables on.
+fn answer_in_every_setting(fill: &[&str], statements: &[(&str, &[&str])]) {
+    for (setting, parallel, statistics, joins) in [
+        ("default", false, false, JoinMethods::ByCost),
+        ("parallel", true, false, JoinMethods::ByCost),
+        ("statistics", false, true, JoinMethods::ByCost),
+        ("parallel, statistics", true, true, JoinMethods::ByCost),
+        ("hash joins", false, false, JoinMethods::HashJoinsOnly),
+        ("nested loops", false, false, JoinMethods::NestedLoopsOnly),
+    ] {
+        let (io, conn) = open_with(DatabaseOpts::new().with_without_rowid(true));
+        for statement in fill {
+            conn.execute(*statement).unwrap();
+        }
+        if parallel {
+            conn.set_parallel_mode(amphora_engine::morsel::ParallelMode::On);
+        }
+        if statistics {
+            conn.execute("ANALYZE").unwrap();
+        }
+        conn.set_join_methods(joins);
+        for (sql, expected) in statements {
+            let mut got = rows(&io, &conn, sql);
+            got.sort();
+            assert_eq!(got, *expected, "{setting}: {sql}");
+        }
+    }
+}
+
+/// What fills the databases of finding CO's tests.
+const CO_TABLES: [&str; 7] = [
+    "CREATE TABLE o(x INT)",
+    "INSERT INTO o VALUES (1), (2)",
+    "CREATE TABLE r(x INT)",
+    "INSERT INTO r VALUES (1), (5)",
+    "CREATE TABLE l(x INT, y INT)",
+    "INSERT INTO l VALUES (2, 5), (3, 7)",
+    "CREATE TABLE t(x INT)",
+];
+
+/// Do: an ON clause (or a table function's argument) holds a subquery that reads a CTE, in every kind
+/// of join, the CTE plain, over another, recursive, of the subquery's own WITH, or with a table's name.
+/// Expect: SQLite's rows. Amphora found no such table, or read the table of the CTE's name: the CTEs
+/// that subqueries read were those of every clause but the FROM clause's own (finding CO).
+#[test]
+fn a_subquery_in_an_on_clause_reads_a_cte() {
+    answer_in_every_setting(
+        &CO_TABLES,
+        &[
+            (
+                "WITH c AS (SELECT x FROM r) SELECT a.x, b.x FROM o AS a JOIN o AS b ON a.x IN (SELECT c.x FROM c)",
+                &["1|1", "1|2"],
+            ),
+            (
+                "WITH c AS (SELECT x FROM r) SELECT a.x, b.x FROM o AS a LEFT JOIN o AS b ON a.x IN (SELECT c.x FROM c)",
+                &["1|1", "1|2", "2|NULL"],
+            ),
+            (
+                "WITH c AS (SELECT x FROM r) SELECT a.x, b.x FROM o AS a RIGHT JOIN o AS b ON a.x IN (SELECT c.x FROM c)",
+                &["1|1", "1|2"],
+            ),
+            (
+                "WITH c AS (SELECT x FROM r) SELECT a.x, b.x FROM o AS a FULL JOIN o AS b ON a.x IN (SELECT c.x FROM c)",
+                &["1|1", "1|2", "2|NULL"],
+            ),
+            (
+                "WITH c AS (SELECT x FROM r) SELECT a.x, b.x FROM o AS a CROSS JOIN o AS b ON EXISTS (SELECT 1 FROM c WHERE c.x = a.x)",
+                &["1|1", "1|2"],
+            ),
+            (
+                "WITH c AS (SELECT x FROM r) SELECT a.x, b.x FROM o AS a LEFT JOIN o AS b ON b.x = (SELECT min(x) FROM c)",
+                &["1|1", "2|1"],
+            ),
+            (
+                "WITH c AS (SELECT x FROM r) SELECT a.x, b.x FROM o AS a LEFT JOIN o AS b ON b.x NOT IN (SELECT x FROM c) AND a.x = b.x",
+                &["1|NULL", "2|2"],
+            ),
+            (
+                "WITH c AS (SELECT x FROM r) SELECT a.x, b.x FROM o AS a FULL JOIN o AS b ON b.x IN (SELECT l.x FROM l WHERE l.y IN (SELECT x FROM c))",
+                &["1|2", "2|2", "NULL|1"],
+            ),
+            (
+                "WITH c AS (SELECT x FROM r) SELECT a.x, b.x FROM o AS a LEFT JOIN o AS b ON b.x IN (WITH d AS (SELECT x + 1 AS x FROM c) SELECT x FROM d)",
+                &["1|2", "2|2"],
+            ),
+            (
+                "WITH c AS (SELECT x FROM r) SELECT a.x, b.x FROM o AS a LEFT JOIN o AS b ON b.x IN (WITH c AS (SELECT y - 4 AS x FROM l) SELECT x FROM c)",
+                &["1|1", "2|1"],
+            ),
+            (
+                "WITH c AS MATERIALIZED (SELECT x FROM r), d AS (SELECT x + 1 AS x FROM c) SELECT a.x, b.x FROM o AS a FULL JOIN o AS b ON b.x IN (SELECT x FROM d) AND a.x IN (SELECT x FROM c)",
+                &["1|2", "2|NULL", "NULL|1"],
+            ),
+            (
+                "WITH RECURSIVE c(x) AS (SELECT 2 UNION ALL SELECT x + 1 FROM c WHERE x < 4) SELECT a.x, b.x FROM o AS a LEFT JOIN o AS b ON b.x IN (SELECT x FROM c)",
+                &["1|2", "2|2"],
+            ),
+            (
+                "WITH c AS (SELECT x FROM r) SELECT a.x, c.x FROM o AS a LEFT JOIN c ON c.x IN (SELECT x FROM c WHERE c.x = a.x)",
+                &["1|1", "2|NULL"],
+            ),
+            (
+                "WITH c AS (SELECT x FROM r) SELECT * FROM (o AS a JOIN o AS b ON a.x IN (SELECT x FROM c)) JOIN l ON l.x IN (SELECT x + 1 FROM c)",
+                &["1|1|2|5", "1|2|2|5"],
+            ),
+            (
+                "WITH c AS (SELECT x FROM r) SELECT a.x, b.x FROM l AS a LEFT JOIN (o AS b JOIN o AS d ON b.x IN (SELECT x FROM c)) ON a.y IN (SELECT x FROM c)",
+                &["2|1", "2|1", "3|NULL"],
+            ),
+            (
+                "WITH c AS (SELECT x FROM r) SELECT x FROM o UNION ALL SELECT a.x FROM o AS a JOIN o AS b ON a.x IN (SELECT x FROM c)",
+                &["1", "1", "1", "2"],
+            ),
+            (
+                "SELECT * FROM (WITH c AS (SELECT x FROM r) SELECT a.x, b.x AS y FROM o AS a LEFT JOIN o AS b ON b.x IN (SELECT x FROM c))",
+                &["1|1", "2|1"],
+            ),
+            (
+                "SELECT o.x FROM o WHERE EXISTS (WITH c AS (SELECT x FROM r) SELECT 1 FROM o AS a JOIN l AS b ON a.x = o.x AND a.x IN (SELECT x FROM c))",
+                &["1"],
+            ),
+            (
+                "WITH c AS (SELECT x FROM r) SELECT j.value FROM json_each((SELECT json_group_array(x) FROM c)) AS j",
+                &["1", "5"],
+            ),
+            (
+                "WITH c AS (SELECT x FROM r) SELECT o.x, j.value FROM o JOIN json_each((SELECT json_group_array(x) FROM c)) AS j ON o.x IN (SELECT x FROM c)",
+                &["1|1", "1|5"],
+            ),
+            (
+                "WITH l AS (SELECT x FROM r) SELECT a.x, b.x FROM o AS a JOIN o AS b ON a.x IN (SELECT x FROM l)",
+                &["1|1", "1|2"],
+            ),
+            (
+                "WITH bad AS (SELECT x FROM nosuch), c AS (SELECT x FROM r) SELECT a.x, b.x FROM o AS a JOIN o AS b ON a.x IN (SELECT x FROM c)",
+                &["1|1", "1|2"],
+            ),
+        ],
+    );
+}
+
+/// Do: INSERT and UPDATE with a join whose ON clause holds a subquery that reads a CTE. Expect:
+/// SQLite's rows in the table after each (finding CO).
+#[test]
+fn a_write_whose_join_reads_a_cte_in_its_on_clause_writes_sqlites_rows() {
+    let (io, conn) = open();
+    for statement in CO_TABLES {
+        conn.execute(statement).unwrap();
+    }
+    conn.execute("WITH c AS (SELECT x FROM r) INSERT INTO t SELECT a.x FROM o AS a JOIN o AS b ON a.x IN (SELECT x FROM c)").unwrap();
+    assert_eq!(rows(&io, &conn, "SELECT x FROM t"), ["1", "1"]);
+    conn.execute("WITH c AS (SELECT x FROM r) UPDATE o SET x = l.y FROM l JOIN t AS n ON l.x IN (SELECT x + 2 FROM c) WHERE o.x = 2").unwrap();
+    assert_eq!(rows(&io, &conn, "SELECT x FROM o ORDER BY x"), ["1", "7"]);
+}
+
+/// Do: a RIGHT or FULL JOIN whose right table is WITHOUT ROWID with secondary indexes, the unmatched
+/// rows read through one: covering, with a seek, a list, or named by INDEXED BY. Expect: SQLite's
+/// rows. Amphora refused ("secondary index lacks primary key locator"): that read's cursor held the
+/// index's declared columns, without the primary key its entries end in (finding CM).
+#[test]
+fn a_right_or_full_join_reads_a_without_rowid_tables_secondary_index() {
+    answer_in_every_setting(
+        &[
+        "CREATE TABLE e(k INT)",
+        "INSERT INTO e VALUES (1), (2)",
+        "CREATE TABLE w(k INT PRIMARY KEY, v INT, s INT) WITHOUT ROWID",
+        "CREATE INDEX w_v ON w(v)",
+        "CREATE INDEX w_sv ON w(s DESC, v)",
+        "INSERT INTO w VALUES (1, 1, 4), (6, 7, 5), (3, 1, 5), (8, NULL, 4)",
+        "CREATE TABLE u(v INT, a TEXT COLLATE NOCASE, b INT, PRIMARY KEY (a, b DESC)) WITHOUT ROWID",
+        "CREATE INDEX u_v ON u(v)",
+        "CREATE UNIQUE INDEX u_va ON u(v, a COLLATE BINARY, b)",
+        "INSERT INTO u VALUES (1, 'x', 1), (3, 'X', 2), (NULL, 'y', 1), (3, 'y', 2)",
+        ],
+        &[
+            (
+                "SELECT count(*) FROM e AS a0 FULL JOIN w AS a2 ON a0.k = a2.v",
+                &["5"],
+            ),
+            (
+                "SELECT a0.k, a2.v FROM e AS a0 FULL JOIN w AS a2 ON a0.k = a2.v",
+                &["1|1", "1|1", "2|NULL", "NULL|7", "NULL|NULL"],
+            ),
+            (
+                "SELECT a2.v FROM e AS a0 JOIN e AS a1 ON a0.k = a1.k RIGHT JOIN w AS a2 ON a0.k = a2.v",
+                &["1", "1", "7", "NULL"],
+            ),
+            (
+                "SELECT a0.k, a2.v, a2.k FROM e AS a0 FULL JOIN w AS a2 ON a0.k = a2.v",
+                &["1|1|1", "1|1|3", "2|NULL|NULL", "NULL|7|6", "NULL|NULL|8"],
+            ),
+            (
+                "SELECT a0.k, a2.v, a2.s, a2.k FROM e AS a0 FULL JOIN w AS a2 ON a0.k = a2.v WHERE a2.v = 7",
+                &["NULL|7|5|6"],
+            ),
+            (
+                "SELECT a0.k, a2.v, a2.s FROM e AS a0 FULL JOIN w AS a2 ON a0.k = a2.v WHERE a2.s >= 5",
+                &["1|1|5", "NULL|7|5"],
+            ),
+            (
+                "SELECT a0.k, a2.v, a2.s FROM e AS a0 FULL JOIN w AS a2 ON a0.k = a2.v WHERE a2.s IN (4, 5) AND a2.v > 0",
+                &["1|1|4", "1|1|5", "NULL|7|5"],
+            ),
+            (
+                "SELECT a0.k, a2.v, a2.k FROM e AS a0 FULL JOIN w AS a2 ON a0.k = a2.v WHERE a2.v = 7 OR a2.s = 4",
+                &["1|1|1", "NULL|7|6", "NULL|NULL|8"],
+            ),
+            (
+                "SELECT a0.k, a2.v, a2.s FROM e AS a0 FULL JOIN w AS a2 INDEXED BY w_v ON a0.k = a2.v WHERE a2.v > 0",
+                &["1|1|4", "1|1|5", "NULL|7|5"],
+            ),
+            (
+                "SELECT a0.k, a2.v, a2.s FROM e AS a0 FULL JOIN w AS a2 INDEXED BY w_v ON a0.k = a2.v WHERE a2.v IN (SELECT k FROM e)",
+                &["1|1|4", "1|1|5"],
+            ),
+            (
+                "SELECT a0.k, a2.k, a2.v FROM e AS a0 FULL JOIN w AS a2 ON a0.k = a2.k WHERE a2.k > 2",
+                &["NULL|3|1", "NULL|6|7", "NULL|8|NULL"],
+            ),
+            (
+                "SELECT a0.k, a2.v FROM w AS a2 FULL JOIN e AS a0 ON a0.k = a2.v",
+                &["1|1", "1|1", "2|NULL", "NULL|7", "NULL|NULL"],
+            ),
+            (
+                "SELECT a0.v, a2.v FROM w AS a0 FULL JOIN w AS a2 ON a0.k = a2.v",
+                &["1|1", "1|1", "1|NULL", "7|NULL", "NULL|7", "NULL|NULL", "NULL|NULL"],
+            ),
+            (
+                "SELECT a0.k, a2.v FROM e AS a0 FULL JOIN w AS a2 ON a0.k = a2.v WHERE a0.k IS NULL OR a2.v IN (SELECT k FROM e WHERE e.k <> a2.v + 1)",
+                &["1|1", "1|1", "NULL|7", "NULL|NULL"],
+            ),
+            (
+                "SELECT a0.k, a2.v FROM e AS a0 FULL JOIN u AS a2 ON a0.k = a2.v",
+                &["1|1", "2|NULL", "NULL|3", "NULL|3", "NULL|NULL"],
+            ),
+            (
+                "SELECT a0.k, a2.v, a2.b FROM e AS a0 FULL JOIN u AS a2 ON a0.k = a2.b AND a0.k = 2",
+                &["1|NULL|NULL", "2|3|2", "2|3|2", "NULL|1|1", "NULL|NULL|1"],
+            ),
+            (
+                "SELECT a0.k, a2.v, a2.b FROM e AS a0 FULL JOIN u AS a2 ON a0.k = a2.b AND a0.k = 2 WHERE a2.v = 3",
+                &["2|3|2", "2|3|2"],
+            ),
+            (
+                "SELECT count(*), count(a2.v) FROM e AS a0 FULL JOIN u AS a2 ON a0.k = a2.v FULL JOIN w AS a3 ON a2.v = a3.v",
+                &["8|4"],
+            ),
+        ],
+    );
 }
