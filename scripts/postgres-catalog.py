@@ -216,7 +216,7 @@ def main() -> None:
     out.append("];")
     text = "\n".join(out) + "\n"
     used = sorted(v for v in ("Bool", "Char", "Float4", "Int2", "Int4", "Name", "Null", "Oid", "Text", "Xid") if re.search(rf"\b{v}\b", text.split("{USED}", 1)[1]))
-    OUT.write_text(text.replace("{USED}", ", ".join(used), 1))
+    OUT.write_text(text.replace("{USED}", "{" + ", ".join(used) + "}", 1))
     print(f"wrote {OUT.relative_to(ROOT)}")
 
 
