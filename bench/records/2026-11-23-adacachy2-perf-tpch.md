@@ -1243,3 +1243,113 @@ amphora-engine --lib --locked -- learned_costs t13_ storage::pager::tests`.
 - r1718 (79a9cde4, the lowered ratchet): check-production passed ("10908 left in the engine's production code
   across 17 lints, as the ratchet holds"), clippy clean, tests 43 of 43. Main then moved by bench records
   only (lane Q1), merged without a new run.
+
+# Lane T15 (tpch), 2026-11-23 23:19Z to 00:19Z: page reads timed less their thread's wait for a CPU (arm B), chosen over the median (arm A)
+
+Losses first:
+- Neither arm keeps q03's plans fully the same under the burner. Both chose the same plan as each other in
+  every run, quiet and busy. Under the burner run 2 changed in both arms (4 distinct plans busy, 3 quiet).
+  The page read's timing did not cause that, since both arms did it alike. Not traced; the next lane's
+  (calibration under load).
+- One trace per arm per side (the counted run and 5 runs each), not repeated. The busy traces ran in the
+  order B, then A, so A's ran at higher CPU pressure (avg10 86 to 88%) than B's start (5.8% rising to 86%).
+  q03's times differ between the arms on the same plans; that is this order, not a measured effect of the arm.
+- The switch build (ca01b8b2) failed clippy: `Work::PageRead` was no longer constructed. The final form reads
+  the rate through it.
+- A new thread's `/proc/thread-self/schedstat` read `0 0 1` (r1778's first line): the run time can be 0, so
+  "kept" is read from the third field (times given a CPU), not the first. Found in the A/B, fixed in the final form.
+
+Machine: adacachy2 (runner 00aad8da), named. r1770 asked `cpus=16,mem=24g`, then `cpus=8,mem=24g`; both were
+refused (9, then 5, of 32 cores idle). r1778 ran at `cpus=4,mem=12g`, JOBS=4, from `tpch-remote` (worktree
+`~/.cache/tpch-ab/t15`), the lane's one target dir. Scripts: local copies in `~/.cache/amphora-perf/tpch-t15/`
+(`run.sh`, `summ.py`, `check.sh`).
+
+## 1. The two arms (c006b1ec, ca01b8b2; trace 79174518, not for main)
+
+Both behind one switch, `AMPHORA_PAGE_READ_TIMING`, read once a process, so one binary served both arms and
+both read one calibration (T11's body, sha256 faba8ac5eb119381, copied under the binary's key as T14 did).
+- Arm A (`median`): every read's wall time; a batch of an epoch's reads (64) closes at its median, as the seeks'.
+- Arm B (`run_delay`): one read in `every` (the seeks' `Sampling`, its timing cost the measured cost of the
+  two schedstat reads); each timed read's wall time less the growth of the thread's `run_delay` (second field
+  of `/proc/thread-self/schedstat`, read with `pread` at offset 0 from a file kept open per thread), clamped
+  at 0; a batch closes at its mean. The wait is read before the clock starts and after it stops, so a
+  preemption on the way out of the first schedstat read falls inside the subtracted span.
+- The open's scratch reads (`time_page_read`) follow the switch, timed one at a time: A their median, B
+  their times less waits summed.
+- 79174518 adds a debug event at each page-read batch judged (its reads' mean wall time and mean wait) and
+  at the open's anchor.
+
+## 2. The A/B (r1778)
+
+`SHA=79174518 CHECK_SHA=ca01b8b2 JOBS=4 bash ~/.cache/tpch-t15/run.sh`: release build 121 s; q03 at SF1, target
+`amphora`, `--runs 5`, `AMPHORA_PLAN_TRACE=1`, T11's `db-sf1`. Quiet 23:54:08Z to 23:54:26Z (load 16 to 17, CPU
+pressure avg10 2.6 to 3.6%): A, then B. Then the lane's burner: 96 busy-loop shells at nice 10 (3 x 32 usable
+CPUs; cgroup `cpu.max` 'max 100000'), one process group, PID 3520836, started 23:54:26Z. Busy: B, then A, to
+23:55:54Z (load 25 rising to 106, CPU pressure avg10 to 88%). The burner's group was stopped by that PID at
+23:55:54Z, 0 processes left. No errors (rc 0 each).
+
+| | A quiet | B quiet | A busy | B busy |
+|---|---|---|---|---|
+| counted run, ms | 2,070 | 1,872 | 16,107 | 6,264 |
+| runs 0 to 4, ms | 1,151, 701, 1,805, 1,652, 1,642 | 1,126, 667, 1,608, 1,573, 1,602 | 8,001, 4,254, 5,356, 7,142, 10,230 | 4,532, 3,802, 4,303, 5,448, 7,645 |
+| p50 / p99 of 5 (nearest rank: the slowest) | 1,642 / 1,805 | 1,573 / 1,608 | 7,142 / 10,230 | 4,532 / 7,645 |
+| distinct plans, runs 0 to 4 | 3 | 3 | 4 | 4 |
+| page-read rate swing over the 12 prepares | 2.34x | 1.83x | 2.43x | 1.37x |
+| the same after the counted run (prepares 3 to 12) | 1.40x | 1.40x | 1.24x | 1.37x |
+| open's anchor | 621.5 ns | 2,108.8 ns | 741.5 ns | 2,147.7 ns |
+| standing at the end | 1,452 ns | 1,619 ns | 1,803.5 ns | 1,909 ns |
+| page-miss share: counted, run 0, run 1, runs 2 to 4 | 0.984 to 0.988, 0.984, 0.591, 0.197 | same, 0.592 at run 1 | same, 0.588 at run 1 | same, 0.590 at run 1 |
+| batches judged, moved | 8,396, 747 | 1,853, 149 | 8,396, 569 | 1,812, 92 |
+| batch value (what the rate is judged on) p50 / p90 / p99, ns | 1,147 / 1,578 / 2,570 | 1,284 / 1,851 / 3,569 | 1,478 / 1,588 / 1,949 | 1,686 / 2,016 / 2,843 |
+| the batches' mean wall time p90 / p99, ns | 2,060 / 8,555 | 1,853 / 3,620 | 23,723 / 63,648 | 12,582 / 41,514 |
+| timed reads whose thread waited for a CPU | (not read) | 22 of 118,592 | (not read) | 1,011 of 115,968 |
+| B's `every` at the end | | 3 | | 3 |
+
+Plans, both arms alike: quiet, run 0 SCAN lineitem / orders by rowid / customer by rowid, run 1 SCAN orders /
+customer by rowid / lineitem by index, runs 2 to 4 HASH JOIN customer / lineitem by index / SCAN orders. Busy,
+the same but run 2: HASH JOIN orders / lineitem by index / SCAN customer. Run 0, compared like for like, chose
+one plan in all four traces.
+
+Against lane T14's control (the mean, r1673): its busy swing was 37x and its busy runs 1 to 4 chose 4 other
+plans; its run-0 batches' p90 / p99 were 11,196 / 46,840 ns quiet and 25,738 / 64,312 busy.
+
+What decides it:
+- Plans: no difference between the arms. Both held 4 of 5 busy runs to the quiet plan, where the mean held 1.
+- The rate's swing: both are within 1.24x to 1.40x after the counted run. B's whole swing is lower (1.37x
+  busy against A's 2.43x): A's open anchor, a median, sat 2.3x under its own reads' later rate.
+- Disk and other slow reads: the page-miss shares are the same in both arms, so both priced file reads in the
+  same mix. What differs is a file read's price. A's median prices the reads' slow tail out: its standing
+  ended 10% (quiet) and 6% (busy) under B's, and its anchor 3.4x under B's from the same scratch reads.
+  B's batches keep every slow read that is not a wait for a CPU. Its quiet batch means and its subtracted
+  values agree (p90 1,853 and 1,851 ns): quiet, almost nothing was subtracted (22 reads).
+- Did B subtract? Busy, 1,011 timed reads waited. Its batches' mean wall time p90 was 12,582 ns, and the
+  values judged after the waits came out were 2,016 ns.
+- Whether the slow tail is the device or the OS cache was not traced.
+
+Decided: arm B on Linux. macOS and Windows take arm A's median, because neither has a thread's wait for a
+CPU this crate can read. Their thread times (`thread_info`, `GetThreadTimes`) count running, not waiting,
+and reading them takes a system call through unsafe code (CLAUDE.md, section 12). The same code does this
+with no platform branch: where `run_delay` reads None, every read is timed and the batch closes at its median.
+
+## 3. The code (perf/tpch-t15)
+
+The switch and arm A's separate path are deleted (a19c4ef0, 0b0997ed, 2fc0f008, bbc1d973). The open's anchor
+gets the same treatment. Tests:
+- `t15_a_preempted_read_does_not_move_the_page_rate`: a batch with one read preempted 2 ms, its wait read,
+  leaves the rate where it stood.
+- `t15_a_preempted_read_does_not_move_the_page_rate_without_its_wait`: the same with no wait read; the median
+  holds.
+- `t15_the_run_queue_wait_is_read_on_linux`.
+
+The red run is r1778's switch build: the same batch under the mean moved the rate 500-fold (ca01b8b2's test,
+asserted there).
+
+## 4. Checks
+
+- r1778 (ca01b8b2, the switch): clippy failed, `Work::PageRead` never constructed; fixed in 2fc0f008.
+- r1789 (76d96135, the final form merged with main, whose new commits touched `crates/`): `SHA=76d96135 JOBS=8
+  bash ~/.cache/tpch-t15/check.sh` at `cpus=8,mem=24g`: `cargo clippy -p amphora-engine --all-targets --locked
+  -- -D warnings` clean; `cargo test -p amphora-engine --lib --locked -- learned_costs t13_
+  storage::pager::tests` 46 of 46, the three t15 tests among them. After it only a doc comment changed (6 to
+  10%, from this record's table). check-production was not run: the change adds none of its counted lints
+  (no indexing, integer arithmetic, truncating casts or disallowed methods in production code).
