@@ -1353,3 +1353,92 @@ asserted there).
   storage::pager::tests` 46 of 46, the three t15 tests among them. After it only a doc comment changed (6 to
   10%, from this record's table). check-production was not run: the change adds none of its counted lints
   (no indexing, integer arithmetic, truncating casts or disallowed methods in production code).
+
+# Lane T16 (tpch), 2026-11-24 00:04Z to 01:04Z: q03 at one core profiled on main; one seek hotspot cut; A/B inconclusive
+
+Losses first:
+- No speedup is shown. The A/B ran at load 95 to 139 on 32 cores (CPU pressure avg10 33 to 60%), and the two arms
+  chose different plans in 17 of 25 run pairs, so there is no same-plan comparison worth the name: 8 pairs, 6 of them
+  on one plan, B/A 0.85, rank-sum p 0.34. A second A/B was refused: adacachy2 had 0 of 32 cores idle at 00:35Z.
+- The top entry by self time, `get<ParsedColumn>` (10.94%), is not fixed. It is not explained either (section 2), so
+  nothing was done to it.
+- The fix (a77241dc) is aimed at the second entry, `split_varint` (8.10%), under the table leaf's binary search.
+
+## 1. The profile (r1807, main b6ab0946)
+
+`SHA=b6ab0946 JOBS=4 bash ~/.cache/tpch-t16/prof.sh` on adacachy2 (runner 00aad8da, named; `cpus=8,mem=24g` refused with
+4 of 32 idle, run at `cpus=4,mem=12g`). q03 at SF1, target `amphora` (one thread), T11's `db-sf1`, T11's calibration
+body (sha256 faba8ac5eb119381) under the binary's key, `AMPHORA_PROFILE` (997 Hz timer signal), the counted run then
+12 timed runs, every run's answer kept. 00:11:46Z to 00:12:20Z, load 65 to 67, CPU pressure avg10 42 to 50%.
+
+| runs | ms | plan (EXPLAIN QUERY PLAN as the bench read it before the run) |
+|---|---|---|
+| 0, 1 | 3,641, 1,390 | SCAN lineitem / SEARCH orders by rowid / SEARCH customer by rowid |
+| 2 | 967 | SCAN orders / SEARCH customer by rowid / SEARCH lineitem USING INDEX sqlite_autoindex_lineitem_1 |
+| 3 | 1,793 | MATERIALIZE hash build input for orders / HASH JOIN orders / SCAN customer / HASH JOIN lineitem |
+| 4 to 11 | 2,081, 2,120, 2,107, 2,101, 2,366, 2,559, 3,459, 2,283 | HASH JOIN customer / SEARCH lineitem USING INDEX sqlite_autoindex_lineitem_1 / SCAN orders |
+
+DuckDB at one thread, the same process kind, right after: 117.1, 106.0, 106.0, 107.0, 103.6, 120.5, 103.7 ms.
+answers.py: every Amphora run and every DuckDB run, 0 differ.
+
+Samples: timed runs 18,399, counted run 2,579, other 23. Of the timed runs' samples (`fold16.py`, in
+`~/.cache/amphora-perf/tpch-t16/`):
+
+| by self | % | | by total | % |
+|---|---|---|---|---|
+| get<ParsedColumn> (RowHeader::locate, under op_column directly) | 10.94 | | op_column | 35.17 |
+| split_varint (6.98 under leaf_search, 1.12 under the current-leaf check) | 8.10 | | tablebtree_seek | 19.05 |
+| atomic_compare_exchange_weak (6.13: the page cache's read lock in cache_lookup) | 6.49 | | column_into_register | 18.03 |
+| dispatch_loop | 6.22 | | seek_deferred_row | 15.97 |
+| indexbtree_seek_impl | 5.86 | | locate (RowHeader) | 15.42 |
+| atomic_load (5.02: Weak::upgrade in get_shared, under cache_lookup) | 5.04 | | read_page | 14.18 |
+| insert_pending (hash build) | 4.79 | | op_hash_build | 12.83 |
+| non_null<Value> (a Vec<Value> dropped) | 4.21 | | op_seek | 12.83 |
+| as_ref | 4.16 | | cache_lookup | 12.36 |
+| read<HashEntry> | 3.41 | | cell_table_leaf_read_header | 8.57 |
+| read_varint | 2.97 | | leaf_search<true> | 6.98 |
+| swap_bytes | 0.31 | | | |
+
+By innermost opcode: Column 35.2 (op_column_fetch 18.96, op_column_deferred 16.21), HashBuild 12.83, Seek 12.83,
+HashNext 7.51, Next 5.26, HashClose 4.38, SeekRowid 3.50, HashProbe 2.26, StarProbes 2.13. T11's leaves have moved:
+read_varint 13.4% then, 2.97% now; swap_bytes 8.0% then, 0.31% now.
+
+## 2. The top entry, not explained
+
+`objdump -d -l --inlines` of op_column_fetch in `amphora-bench-b6ab0946`: the first instruction attributed to
+`get<ParsedColumn>` (`cmp 0x260(%r15),%rcx`, 0x5d16d2e, the column against the parsed columns' length) comes right
+after the load of the page buffer's base pointer in `payload_on_page` (`add 0x50(%rax),%rdx`, 0x5d16d2a), the last of
+the chain cursor, stack top, page, buffer. A timer signal is taken when an instruction retires, so a stalled load's
+samples can land on the instruction after it. The 10.94% may be that chain's stall, or a miss on the parsed columns
+themselves. adacachy2 has no instruction-level counter (`perf_event_paranoid` 2, no perf), so this is not settled.
+
+## 3. The change (a77241dc)
+
+`try_start_seek_on_current_table_leaf` already reads the leaf's first and last rowids. A leaf's rowids are distinct
+and ascending, so when its cells span exactly `last - first + 1` rowids, cell `i` holds `first + i`. The exact seek
+now starts and ends its binary search on that cell instead of halving the leaf: one cell read where it was about
+log2 of the cell count. A leaf with a gap is halved as before. lineitem's and customer's rowids have no gaps; orders'
+(TPC-H order keys) have them. Test: `t16_an_exact_seek_on_a_leaf_without_gaps_starts_on_its_cell` (every rowid of 800
+found from the one before it, narrowed on gapless leaves, halved on the one with a gap, the missing rowid not found).
+
+## 4. The A/B (r1894)
+
+`A=b6ab0946 B=a77241dc N=5 JOBS=8 bash ~/.cache/tpch-t16/ab.sh` at `cpus=8,mem=24g`: B built in 131 s, both binaries
+read T11's calibration body under their own keys, then 5 counterbalanced pairs (AB, BA, AB, BA, AB), each process the
+counted run then 5 timed runs with `AMPHORA_PLAN_TRACE=1`, every answer kept; DuckDB at one thread after each pair.
+00:30:53Z to 00:33:42Z, load 95 rising to 139 on 32 cores, CPU pressure avg10 35 to 60%. No errors.
+
+- Answers: answers.py, B's against A's in each pair and A's against DuckDB's: 10 of 10 compared, 0 differ.
+- Plans: different in 17 of 25 run pairs. The trace shows why in its first prepare: the same seek, hash and sort
+  weights in both arms, but `row_in_pages` 9.81e-5 in A and 5.16e-5 in B (the page read's rate, timed by each process
+  at its open, before any query), and from there the plans differ by run in both arms, A against A as well. That plan
+  change under load is a later lane's.
+- Same-plan pairs: SCAN lineitem / orders by rowid / customer by rowid, 6 a side, A median 2,453 ms (1,454 to 5,272),
+  B median 2,090 ms (1,250 to 3,652), B/A 0.852, rank-sum z 0.96, p 0.34: no measurable difference. One pair each on
+  two other plans.
+- Process CPU seconds (user + sys) by pair: A 11.24, 11.32, 12.11, 12.65, 15.76; B 10.66, 10.71, 13.88, 13.76,
+  16.72. They rise with the load in both arms and mix plans, so they show nothing either way.
+- DuckDB at one thread on the same machine, by pair: best 130.2, 116.0, 140.2, 205.6, 210.4 ms, rising with the load.
+
+Verdict: inconclusive. What it needs: a quiet window, or the plan held fixed in both arms (the engine has
+`Connection::pin_cost_weights`; the bench has no switch for it).
