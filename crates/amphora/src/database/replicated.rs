@@ -7325,7 +7325,13 @@ mod tests {
                 }
             }
         }
-        assert_eq!(write.join().unwrap(), Ok(()));
+        // The clocks that went on may move the term once more under it once it is proposed: its
+        // outcome is unknown then, an answer all the same, as A26's writes in line take it.
+        let answered = write.join().unwrap();
+        assert!(
+            matches!(answered, Ok(()) | Err(Refusal::UnknownOutcome)),
+            "{answered:?}"
+        );
         driven.quiet(&mut pump);
         driven.drain(&mut pump);
         pump.finish();
