@@ -5579,7 +5579,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                             }
                             pending.phase = Phase::Proposed(value);
                             self.pending = Some(pending);
-                            return if leads { Ok(()) } else { self.close_behind() };
+                            return if leads || true { Ok(()) } else { self.close_behind() };
                         }
                         Err(error) => Err(error),
                     }
