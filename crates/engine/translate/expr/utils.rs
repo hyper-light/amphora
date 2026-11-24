@@ -26,7 +26,8 @@ pub fn sanitize_string(input: &str) -> String {
 pub fn as_binary_components(
     expr: &ast::Expr,
 ) -> Result<Option<(&ast::Expr, ConstraintOperator, &ast::Expr)>> {
-    match unwrap_parens(expr)? {
+    let expr = unwrap_parens(expr)?;
+    match expr {
         ast::Expr::Binary(lhs, operator, rhs)
             if matches!(
                 operator,
@@ -52,6 +53,15 @@ pub fn as_binary_components(
             ConstraintOperator::Like { not: *not },
             rhs.as_ref(),
         ))),
+        ast::Expr::IsNull(lhs) | ast::Expr::NotNull(lhs) if expr_vector_size(lhs)? == 1 => {
+            static NULL: ast::Expr = ast::Expr::Literal(ast::Literal::Null);
+            let operator = if matches!(expr, ast::Expr::IsNull(_)) {
+                ast::Operator::Is
+            } else {
+                ast::Operator::IsNot
+            };
+            Ok(Some((lhs, operator.into(), &NULL)))
+        }
         _ => Ok(None),
     }
 }

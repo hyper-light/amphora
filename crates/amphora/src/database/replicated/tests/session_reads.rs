@@ -1,5 +1,5 @@
 //! Session tokens (replication.md, "Decision (lane ryw-1): read-your-writes by session tokens";
-//! kiln goal 8119f25d, AC-T1.10.R1, R2 and R4, T-T1.10.R1 to R4), on the driven shell: a session
+//! kiln goal 8119f25d, AC-T1.10.R1, R2 and R4, T-T1.10.R5 to R8), on the driven shell: a session
 //! reads its own writes on a lagging follower and across a change of leader, waits for its own
 //! writes and no one else's, and a read with no token never waits.
 
@@ -66,13 +66,13 @@ fn rejoin(
     panic!("owner {owner} did not rejoin in {ROUNDS} driven rounds");
 }
 
-/// T-T1.10.R1 (AC-T1.10.R1): a lagging follower. Do: three voters, the follower's clock an hour
+/// T-T1.10.R5 (AC-T1.10.R1): a lagging follower. Do: three voters, the follower's clock an hour
 /// ahead (an apply lag of about an hour measured); 1 written and caught up; 2 written, its token
 /// taken while the follower hasn't applied it; a token read on the follower, on a thread; then the
 /// follower caught up. Expect: the read waits (counted) and is answered with 1 and 2, never 1
 /// alone; a read with no token on the follower answers at once; the token orders after 1's.
 #[test]
-fn t_t1_10_r1_a_session_reads_its_write_on_a_lagging_follower() {
+fn t_t1_10_r5_a_session_reads_its_write_on_a_lagging_follower() {
     let dir = tempfile::tempdir().unwrap();
     let mut driven = Driven::new();
     let clients: Vec<Client> = (1..=3)
@@ -129,12 +129,12 @@ fn t_t1_10_r1_a_session_reads_its_write_on_a_lagging_follower() {
     pump.finish();
 }
 
-/// T-T1.10.R2 (AC-T1.10.R2): a replica behind its token that has measured no apply lag redirects
+/// T-T1.10.R6 (AC-T1.10.R2): a replica behind its token that has measured no apply lag redirects
 /// at once, and never answers without the write. Do: three voters; 1 written; a token read on a
 /// follower that has applied nothing stamped. Expect: Redirect, counted; after catching up, the
 /// same token is served there with 1.
 #[test]
-fn t_t1_10_r2_a_behind_replica_with_no_lag_learned_redirects() {
+fn t_t1_10_r6_a_behind_replica_with_no_lag_learned_redirects() {
     let dir = tempfile::tempdir().unwrap();
     let mut driven = Driven::new();
     let clients: Vec<Client> = (1..=3)
@@ -183,14 +183,14 @@ fn t_t1_10_r2_a_behind_replica_with_no_lag_learned_redirects() {
     pump.finish();
 }
 
-/// T-T1.10.R3 (AC-T1.10.R1, R3): a change of leader. Do: three voters, each clock an hour ahead
+/// T-T1.10.R7 (AC-T1.10.R1, R3): a change of leader. Do: three voters, each clock an hour ahead
 /// of the one before it; the lead passed 1, 2, 3, 1, each leader writing the next value; after
 /// each write the session (one token, the latest of its own) reads on every member, before and
 /// after catching up. Expect: every read served sees every value the session wrote (never fewer),
 /// and once caught up every member's answer equals the leader's state: the answer the control
 /// (the leader's latest) gives.
 #[test]
-fn t_t1_10_r3_a_session_reads_its_writes_across_leader_changes() {
+fn t_t1_10_r7_a_session_reads_its_writes_across_leader_changes() {
     let dir = tempfile::tempdir().unwrap();
     let mut driven = Driven::new();
     let clients: Vec<Client> = (1..=3)
@@ -259,7 +259,7 @@ fn t_t1_10_r3_a_session_reads_its_writes_across_leader_changes() {
     pump.finish();
 }
 
-/// T-T1.10.R4 (AC-T1.10.R4): concurrent writers, each session waiting only for its own writes.
+/// T-T1.10.R8 (AC-T1.10.R4): concurrent writers, each session waiting only for its own writes.
 /// Do: three voters, a follower's clock an hour ahead (so a read there waits rather than
 /// redirects); sessions A and B submit 1 and 2 through the leader at once, and every member
 /// catches up; the follower cut off, B writes 3. Expect: each answer carries its own write's
@@ -267,7 +267,7 @@ fn t_t1_10_r3_a_session_reads_its_writes_across_leader_changes() {
 /// last, A's read is served at once (counted at once, no wait, no redirect) though B wrote since;
 /// B's read is answered once the follower rejoins, with 3.
 #[test]
-fn t_t1_10_r4_each_session_waits_only_for_its_own_writes() {
+fn t_t1_10_r8_each_session_waits_only_for_its_own_writes() {
     let dir = tempfile::tempdir().unwrap();
     let mut driven = Driven::new();
     let clients: Vec<Client> = (1..=3)
