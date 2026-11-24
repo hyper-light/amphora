@@ -1,14 +1,14 @@
 use super::*;
-use line::{Reservation, Room, alone};
+use line::{Reservation, Room, Turn};
 use loom::thread;
 use std::sync::atomic::Ordering;
 
 /// A deadline no test's clock reaches, and one a test's clock passes.
 const FAR: Instant = Instant(u64::MAX);
 const SOON: Instant = Instant(1);
-/// The bytes of a call in these queues, and of the record that finds a leader with its envelope.
+/// The bytes of a call in these queues, and of the largest record a group needs, with its envelope.
 const CALL: usize = 10;
-const RECORD: usize = RECORD_BYTES + ENVELOPE_BYTES;
+const RECORD: usize = 2;
 
 /// `model` on every interleaving: all of them (none), or those of at most `preemptions` of one
 /// thread by another where all of them are too many to run.
@@ -27,7 +27,7 @@ fn every(preemptions: Option<usize>, model: impl Fn() + Send + Sync + 'static) {
 }
 /// A queue of a hundred bytes, fifty of them the calls', that holds `commands` inputs.
 fn queue(commands: usize) -> Arc<Room> {
-    Room::new(100, 50, commands)
+    Room::new(100, 50, 100 - RECORD, commands)
 }
 /// Until `calls` wait in line.
 fn in_line(room: &Arc<Room>, calls: usize) {
@@ -35,11 +35,13 @@ fn in_line(room: &Arc<Room>, calls: usize) {
         thread::yield_now();
     }
 }
+/// What a call comes away with: its place, and its turn if it stood in line.
+type Placed<'a> = Result<(Reservation, Option<Turn<'a>>), Refusal>;
 /// A call of `CALL` bytes on a thread, waiting for its place until `until`, handed to `then`.
 fn call<T: 'static>(
     room: &Arc<Room>,
     until: Instant,
-    then: impl FnOnce(Result<Reservation, Refusal>) -> T + 'static,
+    then: impl FnOnce(Placed<'_>) -> T + 'static,
 ) -> thread::JoinHandle<T> {
     let room = Arc::clone(room);
     thread::spawn(move || then(Room::place_by(&room, CALL, until)))
@@ -77,7 +79,7 @@ fn t_qb_1_19_a_place_given_back_reaches_the_call_that_waits_for_it() {
 #[test]
 fn t_qb_1_19_bytes_given_back_reach_the_call_that_waits_for_them() {
     every(None, || {
-        let room = Room::new(100, CALL + CALL / 2, 3);
+        let room = Room::new(100, CALL + CALL / 2, 100 - RECORD, 3);
         let mut held = Room::place(&room, CALL, true).unwrap();
         let waited = call(&room, FAR, |place| place.map(drop));
         held.taken();
@@ -118,12 +120,12 @@ fn t_qb_1_19_the_first_in_line_is_the_first_admitted_and_no_place_is_taken_twice
         );
         let admit = |id: usize| {
             let (order, holding) = (Arc::clone(&order), Arc::clone(&holding));
-            move |place: Result<Reservation, Refusal>| {
-                let place = place.unwrap();
+            move |placed: Placed<'_>| {
+                let placed = placed.unwrap();
                 assert_eq!(holding.fetch_add(1, Ordering::SeqCst), 0, "two hold one place");
                 order.lock().unwrap().push(id);
                 holding.fetch_sub(1, Ordering::SeqCst);
-                drop(place);
+                drop(placed);
             }
         };
         let first = call(&room, FAR, admit(1));
@@ -149,10 +151,10 @@ fn t_qb_1_19_a_call_that_comes_does_not_go_before_one_in_line() {
         let order = Arc::new(Mutex::new(Vec::new()));
         let admit = |id: usize| {
             let order = Arc::clone(&order);
-            move |place: Result<Reservation, Refusal>| {
-                let place = place.unwrap();
+            move |placed: Placed<'_>| {
+                let placed = placed.unwrap();
                 order.lock().unwrap().push(id);
-                drop(place);
+                drop(placed);
             }
         };
         let first = call(&room, FAR, admit(1));
@@ -162,6 +164,39 @@ fn t_qb_1_19_a_call_that_comes_does_not_go_before_one_in_line() {
         first.join().unwrap();
         second.join().unwrap();
         assert_eq!(*order.lock().unwrap(), vec![1, 2]);
+        holds_nothing(&room);
+    });
+}
+
+/// T-QB.1.19: calls come to the owner in the order they stood in line, however close their places
+/// come together. Do: two calls in line behind two held places, both given back at once; each, its
+/// place in hand, sends as its turn is still its own. Expect: the first sent first.
+#[test]
+fn t_qb_1_19_calls_are_sent_in_the_order_they_stood_in_line() {
+    every(Some(3), || {
+        let room = queue(3);
+        let held = [
+            Room::place(&room, CALL, true).unwrap(),
+            Room::place(&room, CALL, true).unwrap(),
+        ];
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let send = |id: usize| {
+            let sent = Arc::clone(&sent);
+            move |placed: Placed<'_>| {
+                let (place, turn) = placed.unwrap();
+                sent.lock().unwrap().push(id);
+                drop(turn);
+                drop(place);
+            }
+        };
+        let first = call(&room, FAR, send(1));
+        in_line(&room, 1);
+        let second = call(&room, FAR, send(2));
+        in_line(&room, 2);
+        drop(held);
+        first.join().unwrap();
+        second.join().unwrap();
+        assert_eq!(*sent.lock().unwrap(), vec![1, 2]);
         holds_nothing(&room);
     });
 }
@@ -263,7 +298,7 @@ fn t_qb_1_19_the_owners_end_wakes_every_call_in_line() {
 fn t_qb_1_19_a_record_is_admitted_at_once_whatever_the_calls_do() {
     every(Some(3), || {
         // Fifty bytes are the calls', and two inputs, of which a call takes one.
-        let room = Room::new(50 + RECORD, 50, 2);
+        let room = Room::new(50 + RECORD, 50, 50, 2);
         let held = Room::place(&room, 50, true).unwrap();
         let waited = call(&room, FAR, |place| place.map(drop));
         let record = {
@@ -277,19 +312,18 @@ fn t_qb_1_19_a_record_is_admitted_at_once_whatever_the_calls_do() {
     });
 }
 
-/// T-QB.1.19 (6c9ca0c0's hole): the largest call a queue holds alone, held or coming, never refuses
+/// T-QB.1.19 (caac3f19's hole): the largest call a queue holds alone, held or coming, never refuses
 /// the record that finds a leader, and waits for a call held before it. Do: a small call held; the
 /// largest comes, and a record, as the small one is given back. Expect: the record admitted at once
 /// on every interleaving, the call admitted, and nothing left.
 #[test]
 fn t_qb_1_19_the_largest_call_never_refuses_the_record_that_finds_a_leader() {
     every(Some(3), || {
-        let queued = 100;
-        let room = Room::new(queued, 50, 3);
+        let room = queue(3);
         let held = Room::place(&room, 5, true).unwrap();
         let largest = {
             let room = Arc::clone(&room);
-            thread::spawn(move || Room::place_by(&room, alone(queued), FAR).map(drop))
+            thread::spawn(move || Room::place_by(&room, 100 - RECORD, FAR).map(drop))
         };
         let record = {
             let room = Arc::clone(&room);
@@ -315,10 +349,10 @@ fn t_qb_1_19_a_granted_place_whose_budget_room_went_waits_for_it_again() {
         let write = {
             let (room, budget) = (Arc::clone(&room), budget.clone());
             thread::spawn(move || {
-                let place = Room::submit_by(&room, 5, FAR).unwrap();
+                let placed = Room::submit_by(&room, 5, FAR).unwrap();
                 assert_eq!(room.charged.load(Ordering::SeqCst), 5, "admitted uncharged");
                 assert_eq!(budget.held(), 5, "admitted without its charge");
-                drop(place);
+                drop(placed);
             })
         };
         let other = {

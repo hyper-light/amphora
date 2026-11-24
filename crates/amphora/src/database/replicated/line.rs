@@ -4,7 +4,7 @@
 //! every interleaving of the events that change it (T-QB.1.19).
 
 use super::sync::{Arc, AtomicUsize, Instant, Mutex, fence};
-use super::{Bell, ENVELOPE_BYTES, RECORD_BYTES, Refusal, api, locked, unavailable};
+use super::{Bell, Refusal, api, locked, unavailable};
 use std::sync::atomic::Ordering;
 
 /// The command queue's room: what its inputs hold of it, the bounds they are held to, and the calls
@@ -27,15 +27,21 @@ pub(super) struct Room {
     /// ([`Room::submit_by`], lane perf-A21): the queues' charge each tick takes leaves them out
     /// (`Actor::rebound`), so no byte is charged twice.
     pub(super) charged: AtomicUsize,
-    // The command queue's bound in bytes and the calls' share of it, as the owner last learned them
-    // (`queue_bounds`; QB.1).
+    // The command queue's bound in bytes, the calls' share of it and the most one call takes of it
+    // alone (`within`), as the owner last learned them (`queue_bounds`; QB.1).
     pub(super) queued: AtomicUsize,
     pub(super) applications: AtomicUsize,
+    pub(super) alone: AtomicUsize,
 }
 impl Room {
     /// The room of a queue that holds nothing, bound to `queued` bytes, `applications` of them the
-    /// calls', and `commands` inputs.
-    pub(super) fn new(queued: usize, applications: usize, commands: usize) -> Arc<Self> {
+    /// calls' and `alone` one call's alone, and `commands` inputs.
+    pub(super) fn new(
+        queued: usize,
+        applications: usize,
+        alone: usize,
+        commands: usize,
+    ) -> Arc<Self> {
         Arc::new(Self {
             admitted: AtomicUsize::new(0),
             commands: AtomicUsize::new(0),
@@ -45,6 +51,7 @@ impl Room {
             charged: AtomicUsize::new(0),
             queued: AtomicUsize::new(queued),
             applications: AtomicUsize::new(applications),
+            alone: AtomicUsize::new(alone),
         })
     }
 
@@ -58,7 +65,7 @@ impl Room {
         room: &Arc<Self>,
         bytes: usize,
         until: Instant,
-    ) -> Result<Reservation, Refusal> {
+    ) -> Result<(Reservation, Option<Turn<'_>>), Refusal> {
         let budget = crate::memory::process();
         let size = u64::try_from(bytes).unwrap_or(u64::MAX);
         loop {
@@ -66,14 +73,18 @@ impl Room {
             if room.line.waiting.load(Ordering::Acquire) == 0
                 && let Ok(place) = Self::place(room, bytes, true)
             {
-                return Ok(place.charged(charge, bytes));
+                return Ok((place.charged(charge, bytes), None));
             }
             drop(charge);
-            let place = Self::place_by(room, bytes, until)?;
+            let (place, turn) = Self::place_by(room, bytes, until)?;
             match budget.take(crate::memory::Use::Queues, size) {
-                Ok(charge) => return Ok(place.charged(charge, bytes)),
-                // The budget's room went meanwhile: it is waited for again, the place given back.
-                Err(Refusal::TooLarge { .. }) => drop(place),
+                Ok(charge) => return Ok((place.charged(charge, bytes), turn)),
+                // The budget's room went meanwhile: it is waited for again, the place given back
+                // and then the turn, so that the call behind finds the place.
+                Err(Refusal::TooLarge { .. }) => {
+                    drop(place);
+                    drop(turn);
+                }
                 Err(refusal) => return Err(refusal),
             }
         }
@@ -81,23 +92,25 @@ impl Room {
 
     /// A call's place in the command queue, waited for in line (`Line`) until `until`, holding
     /// nothing meanwhile: refused `Full` at the bound it is past once `until` has passed, with the
-    /// owner's reason once it ended, and `TooLarge` at once past what one call may hold (`alone`),
-    /// which no bytes given back make room for.
+    /// owner's reason once it ended, and `TooLarge` at once past what one call may hold (`Room::alone`),
+    /// which no bytes given back make room for. A call that stood in line keeps its turn until it
+    /// sends what it has the place for: a call behind it, let look as it left, would send first
+    /// (lane perf-A27).
     pub(super) fn place_by(
         room: &Arc<Self>,
         bytes: usize,
         until: Instant,
-    ) -> Result<Reservation, Refusal> {
+    ) -> Result<(Reservation, Option<Turn<'_>>), Refusal> {
         let line = &room.line;
         if line.waiting.load(Ordering::Acquire) == 0
             && let Ok(place) = Self::place(room, bytes, true)
         {
-            return Ok(place);
+            return Ok((place, None));
         }
         let turn = line.join()?;
         loop {
-            let queued = room.queued.load(Ordering::Acquire);
-            api::bound("replica command queue bytes", bytes, alone(queued))?;
+            let alone = room.alone.load(Ordering::Acquire);
+            api::bound("replica command queue bytes", bytes, alone)?;
             // Looked at before it is taken: a place taken in part and given back would ring this
             // call again, and it would look without end.
             let past = room.past(bytes);
@@ -105,7 +118,7 @@ impl Room {
                 && past.is_none()
                 && let Ok(place) = Self::place(room, bytes, true)
             {
-                return Ok(place);
+                return Ok((place, Some(turn)));
             }
             let left = until.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -125,8 +138,9 @@ impl Room {
         }
         let queued = self.queued.load(Ordering::Acquire);
         let applications = self.applications.load(Ordering::Acquire);
+        let alone = self.alone.load(Ordering::Acquire);
         let called = self.called.load(Ordering::Acquire);
-        if within(called, bytes, applications, alone(queued)).is_none() {
+        if within(called, bytes, applications, alone).is_none() {
             return Some(Refusal::Full {
                 limit: applications,
             });
@@ -148,6 +162,7 @@ impl Room {
     ) -> Result<Reservation, Refusal> {
         let limit = room.queued.load(Ordering::Acquire);
         let application_limit = room.applications.load(Ordering::Acquire);
+        let alone = room.alone.load(Ordering::Acquire);
         let command_limit = room.command_bound.load(Ordering::Acquire);
         // Built before any refusal below, so that dropping it gives back what it took.
         let mut reservation = Reservation::none(room);
@@ -171,7 +186,7 @@ impl Room {
         if call {
             room.called
                 .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
-                    within(held, bytes, application_limit, alone(limit))
+                    within(held, bytes, application_limit, alone)
                 })
                 .map_err(|_| Refusal::Full {
                     limit: application_limit,
@@ -314,8 +329,10 @@ impl Line {
         }
     }
 }
-/// A call's turn in the line; it leaves the line as this drops, and the first behind it looks.
-struct Turn<'a> {
+/// A call's turn in the line; it leaves the line as this drops, and the first behind it looks. Kept
+/// by a call with its place until it sent what the place is for, so that calls come to the owner in
+/// the order they stood in line.
+pub(super) struct Turn<'a> {
     line: &'a Line,
     turn: u64,
     bell: Arc<Bell>,
@@ -347,12 +364,4 @@ impl Drop for Turn<'_> {
 fn within(held: usize, bytes: usize, limit: usize, alone: usize) -> Option<usize> {
     let limit = if held == 0 { limit.max(alone) } else { limit };
     held.checked_add(bytes).filter(|next| *next <= limit)
-}
-/// The most bytes one call may hold of a command queue of `queued` bytes: all but a record without
-/// entries (`RECORD_BYTES`) and its envelope, so that a vote or a heartbeat, the record that finds
-/// a leader, enters beside it (QB.1).
-pub(super) fn alone(queued: usize) -> usize {
-    queued
-        .saturating_sub(RECORD_BYTES)
-        .saturating_sub(ENVELOPE_BYTES)
 }

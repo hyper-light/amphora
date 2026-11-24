@@ -1397,6 +1397,8 @@ struct Bounds {
     queued: usize,
     /// The bytes application calls may hold of them.
     applications: usize,
+    /// The bytes one call may hold of them, no other call holding any (`line`'s `within`).
+    alone: usize,
     /// The most inputs the command queue holds.
     commands: usize,
     /// A wire record's most bytes: an image's, held inside the command queue's bound.
@@ -1447,6 +1449,15 @@ fn queue_bounds(
     // block the record that finds a leader: its bytes and its envelope (lane constants-21).
     let envelope = u64::try_from(ENVELOPE_BYTES).unwrap_or(u64::MAX);
     let applications = queued.saturating_sub(wire).saturating_sub(envelope);
+    // One call alone takes more (lane perf-A26), but never the room of a record that carries a
+    // command whole (`MESSAGE_BYTES`), the largest of a group's records but an image. A call held
+    // needs its group's records to end: its read's round, which the leader's heartbeats and their
+    // answers carry, the read's answer, and the entries of its commit, each larger than a record
+    // without entries (lane perf-A27).
+    let message = u64::try_from(MESSAGE_BYTES).unwrap_or(u64::MAX);
+    let alone = queued
+        .saturating_sub(wire.min(message))
+        .saturating_sub(envelope);
     let commands = command_counts(intake, timeout, room);
     // The least the outgoing queue carries and still works: one broadcast, a record to each peer
     // (a leader's heartbeats, its appends), so that a queue held to it sheds no record of one.
@@ -1457,6 +1468,7 @@ fn queue_bounds(
     Ok(Bounds {
         queued: usize::try_from(queued).unwrap_or(usize::MAX),
         applications: usize::try_from(applications).unwrap_or(usize::MAX),
+        alone: usize::try_from(alone).unwrap_or(usize::MAX),
         commands: usize::try_from(commands).unwrap_or(usize::MAX),
         wire: usize::try_from(wire).unwrap_or(usize::MAX),
         outgoing: outgoing.bound(timeout, one, room),
@@ -1585,26 +1597,28 @@ impl ReplicaHandle {
     /// again.
     fn enqueue(&self, command: Input, bytes: usize) -> Result<(), Refusal> {
         let bytes = bytes.saturating_add(ENVELOPE_BYTES);
-        let reservation = match &command {
-            Input::Submit { until, .. } => Room::submit_by(&self.shared.room, bytes, *until)?,
+        let room = &self.shared.room;
+        let (reservation, turn) = match &command {
+            Input::Submit { until, .. } => Room::submit_by(room, bytes, *until)?,
             // They carry nothing past their envelope: a place free now is theirs without a turn, so
             // that no line of writes holds off the group's own changes.
             Input::Change { until, .. }
             | Input::Transfer { until, .. }
-            | Input::CatchUp { until, .. } => match Room::place(&self.shared.room, bytes, true) {
-                Ok(place) => place,
-                Err(_) => Room::place_by(&self.shared.room, bytes, *until)?,
+            | Input::CatchUp { until, .. } => match Room::place(room, bytes, true) {
+                Ok(place) => (place, None),
+                Err(_) => Room::place_by(room, bytes, *until)?,
             },
             Input::Receive { .. } | Input::Verdict { .. } | Input::Attest { .. } => {
-                Room::place(&self.shared.room, bytes, false)?
+                (Room::place(room, bytes, false)?, None)
             }
         };
-        self.sender
-            .send(Envelope {
-                command,
-                _reservation: reservation,
-            })
-            .map_err(|_| fenced("replica owner ended; reopen from durable state"))?;
+        let sent = self.sender.send(Envelope {
+            command,
+            _reservation: reservation,
+        });
+        // Out of line once it is sent, so that a call behind it is sent after it.
+        drop(turn);
+        sent.map_err(|_| fenced("replica owner ended; reopen from durable state"))?;
         self.shared.bell.ring();
         Ok(())
     }
@@ -1767,6 +1781,11 @@ impl ReplicaHandle {
     #[cfg(test)]
     fn application_bound(&self) -> usize {
         self.shared.room.applications.load(Ordering::Acquire)
+    }
+    /// The bytes one call may hold alone of the command queue in force (QB.1).
+    #[cfg(test)]
+    fn alone_bound(&self) -> usize {
+        self.shared.room.alone.load(Ordering::Acquire)
     }
     /// The most inputs the command queue holds in force (QB.1, lane constants-20).
     #[cfg(test)]
@@ -2503,7 +2522,12 @@ fn open_on<F: BlockFile + 'static>(
         replica.core().raft.config().limits.members,
     )?;
     let control = Arc::new(Control {
-        room: Room::new(first.queued, first.applications, first.commands),
+        room: Room::new(
+            first.queued,
+            first.applications,
+            first.alone,
+            first.commands,
+        ),
         wire: AtomicUsize::new(first.wire),
         attesting: Mutex::new(None),
         floor: Mutex::new(None),
@@ -3559,6 +3583,10 @@ impl<F: BlockFile + 'static> Actor<F> {
             .room
             .applications
             .store(bounds.applications, Ordering::SeqCst);
+        self.control
+            .room
+            .alone
+            .store(bounds.alone, Ordering::SeqCst);
         self.control
             .room
             .command_bound
@@ -6714,7 +6742,7 @@ mod tests {
             let client = driven.open(dir.path(), 1, vec![1, 2, 3], None);
             let handle = client.handle().clone();
             let until = driven.until();
-            let declared = line::alone(handle.queue_bound()) - usize::try_from(written(0)).unwrap();
+            let declared = handle.alone_bound() - usize::try_from(written(0)).unwrap();
             let call = on_budget(&budget, || {
                 waiting_call(&handle, declared + past, until, &evaluated)
             });
