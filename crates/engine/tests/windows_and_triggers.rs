@@ -104,7 +104,7 @@ fn answer(io: &MemoryIO, conn: &Arc<Connection>, sql: &str) -> Result<String, St
                 lines.push(values.join(","));
             }
             StepResult::Done => break,
-            StepResult::IO => io.step().map_err(|error| error.to_string())?,
+            StepResult::IO | StepResult::Yield => io.step().map_err(|error| error.to_string())?,
             other => return Err(format!("step: {other:?}")),
         }
     }
