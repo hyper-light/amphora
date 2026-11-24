@@ -295,7 +295,11 @@ impl VirtualTableCursor {
     }
 
     pub(crate) fn next(&mut self) -> IOResultOr<bool> {
-        self.null_flag = false;
+        // An outer join's NULL row has no row after it, and the scan it stands for may have none to
+        // move from (SQLite's OP_VNext breaks on nullRow): the next filter begins the next scan.
+        if self.null_flag {
+            return Ok(IOResult::Done(false));
+        }
         let result = match &mut self.inner {
             VirtualTableCursorInner::Pragma(cursor) => cursor.next(),
             VirtualTableCursorInner::External(cursor) => return cursor.next(),
@@ -304,12 +308,17 @@ impl VirtualTableCursor {
         result.map(IOResult::Done).map_err(Into::into)
     }
 
-    pub(crate) fn rowid(&self) -> i64 {
-        match &self.inner {
+    /// The rowid of the row in hand, 0 a rowid like any other; none on an outer join's NULL row
+    /// (SQLite's OP_Rowid asks nullRow before xRowid).
+    pub(crate) fn rowid(&self) -> Option<i64> {
+        if self.null_flag {
+            return None;
+        }
+        Some(match &self.inner {
             VirtualTableCursorInner::Pragma(cursor) => cursor.rowid(),
             VirtualTableCursorInner::External(cursor) => cursor.rowid(),
             VirtualTableCursorInner::Internal(cursor) => cursor.read().rowid(),
-        }
+        })
     }
 
     pub(crate) fn column(&mut self, column: usize) -> IOResultOr<Value> {

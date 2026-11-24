@@ -386,7 +386,7 @@ pub(super) fn count_subquery_calls_for_plan(
     plan: &JoinN,
     access_methods: &[AccessMethod],
     constraints: &[TableConstraints],
-    joined_tables: &[JoinedTable],
+    table_references: &TableReferences,
     where_clause: &[WhereTerm],
     subqueries: &[NonFromClauseSubquery],
     initial_input_cardinality: f64,
@@ -395,6 +395,7 @@ pub(super) fn count_subquery_calls_for_plan(
     if !subqueries.iter().any(|subquery| subquery.correlated) {
         return Ok(SmallVec::new());
     }
+    let joined_tables = table_references.joined_tables();
 
     let mut estimates = SmallVec::<[CorrelatedSubqueryEstimate; 2]>::new();
     let mut prior_tables = TableMask::default();
@@ -427,6 +428,13 @@ pub(super) fn count_subquery_calls_for_plan(
                 .find(|subquery| subquery.internal_id == subquery_id)
                 .is_some_and(|subquery| can_defer_where_subquery(subquery, where_clause))
             {
+                let condition_of = semi_or_anti_join_of_terms(
+                    plan,
+                    table_references,
+                    where_clause,
+                    subqueries,
+                    subquery_id,
+                )?;
                 for (later_loop, rows) in plan
                     .prefix_cardinalities
                     .iter()
@@ -434,6 +442,12 @@ pub(super) fn count_subquery_calls_for_plan(
                     .enumerate()
                     .skip(loop_index + 1)
                 {
+                    // A loop after a semi or anti join whose condition the filter is cannot host
+                    // it: the join's loop would take a row for its match with the filter not yet
+                    // read, and leave by its early out whatever the filter then says.
+                    if condition_of.is_some_and(|join_loop| later_loop > join_loop) {
+                        break;
+                    }
                     // A semi/anti join loop cannot host the filter: inside an
                     // anti join loop, a failed filter looks like a missing
                     // match, which emits the outer row instead of rejecting it.
@@ -488,6 +502,37 @@ pub(super) fn count_subquery_calls_for_plan(
         prior_tables.set(*table_number)?;
     }
     Ok(estimates)
+}
+
+/// The first loop whose semi or anti join is decided by a term holding the subquery: the term reads
+/// that join's table, so it is the join's condition, unnested from its EXISTS or IN, and not a
+/// filter of the rows it joins. None when no such term reads one.
+fn semi_or_anti_join_of_terms(
+    plan: &JoinN,
+    table_references: &TableReferences,
+    where_clause: &[WhereTerm],
+    subqueries: &[NonFromClauseSubquery],
+    subquery_id: TableInternalId,
+) -> Result<Option<usize>> {
+    let mut read = TableMask::default();
+    for term in where_clause
+        .iter()
+        .filter(|term| expr_references_subquery_id(&term.expr, subquery_id))
+    {
+        read.union_with(&table_mask_from_expr(
+            &term.expr,
+            table_references,
+            subqueries,
+        )?)?;
+    }
+    Ok(plan.data.iter().position(|(table, _)| {
+        read.get(*table)
+            && table_references
+                .joined_tables()
+                .get(*table)
+                .and_then(|table| table.join_info.as_ref())
+                .is_some_and(JoinInfo::is_semi_or_anti)
+    }))
 }
 
 fn can_defer_where_subquery(subquery: &NonFromClauseSubquery, where_clause: &[WhereTerm]) -> bool {
