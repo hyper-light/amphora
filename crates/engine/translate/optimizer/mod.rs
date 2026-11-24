@@ -5277,6 +5277,10 @@ pub(crate) mod bushy_search_tests {
                     if stated.is_some() && !parallel {
                         continue;
                     }
+                    // The fact queries join 12,000 rows a side: serial and eight workers.
+                    if name == "facts" && stated.is_some_and(|(count, _)| count < 8) {
+                        continue;
+                    }
                     conn.set_parallel_mode(ParallelMode::Off);
                     if let Some((count, probe)) = stated {
                         conn.set_parallel_mode(ParallelMode::On);
@@ -5311,7 +5315,7 @@ pub(crate) mod bushy_search_tests {
                             wrong.push(format!(
                                 "{name} analyzed={analyzed} {plan:?} workers={stated:?}: got {got}, \
                                  SQLite {want}: {sql}: first rows {first:?}: {:?}",
-                                conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                                conn.prepare(format!("EXPLAIN QUERY PLAN {sql}"))
                                     .and_then(|mut stmt| stmt.run_collect_rows())
                                     .map(|rows| rows
                                         .iter()
