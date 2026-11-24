@@ -144,29 +144,54 @@ impl Exprs {
         Ok(ExprId(id))
     }
 
-    /// For each expression, whether it is computed from constants alone: there is no column and no
-    /// parameter in it. Analysis makes an expression after its arguments.
+    /// For each expression, whether it is computed from constants and parameters alone: there is no
+    /// column in it. Analysis makes an expression after its arguments.
     pub(crate) fn constant(&self) -> Vec<bool> {
-        let mut constant: Vec<bool> = Vec::with_capacity(self.nodes.len());
+        self.each(|expr| !matches!(expr.kind, ExprKind::Var { .. }))
+    }
+
+    /// For each expression, whether 19's planner computes it (`eval_const_expressions`, REL_19_0
+    /// src/backend/optimizer/util/clauses.c): there is nothing in it but constants, a Bind's parameters
+    /// and immutable functions.
+    pub(crate) fn folded(&self) -> Vec<bool> {
+        let immutable = |function: &Proc| function.volatile == b'i';
+        let io = |oid: u32| proc_by_oid(oid).is_some_and(immutable);
+        self.each(|expr| match &expr.kind {
+            ExprKind::Var { .. } | ExprKind::CurrentTimestamp => false,
+            ExprKind::Op { function, .. } | ExprKind::Func { function, .. } => immutable(function),
+            ExprKind::ViaIo { arg, .. } => {
+                let output = self.get(*arg).ok().and_then(|e| type_by_oid(e.type_oid));
+                let input = type_by_oid(expr.type_oid);
+                output.is_some_and(|t| io(t.output)) && input.is_some_and(|t| io(t.input))
+            }
+            _ => true,
+        })
+    }
+
+    /// For each expression, whether `holds` is so of it and of each expression in it.
+    fn each(&self, holds: impl Fn(&Expr) -> bool) -> Vec<bool> {
+        let mut held: Vec<bool> = Vec::with_capacity(self.nodes.len());
         for expr in &self.nodes {
-            let at = constant.len();
-            let known = |ids: &[ExprId]| {
+            let at = held.len();
+            let all = |ids: &[ExprId]| {
                 ids.iter()
-                    .all(|id| id.index() < at && constant.get(id.index()) == Some(&true))
+                    .all(|id| id.index() < at && held.get(id.index()) == Some(&true))
             };
-            let one = match &expr.kind {
-                ExprKind::Const(_) | ExprKind::CurrentTimestamp => true,
-                ExprKind::Param(_) | ExprKind::Var { .. } => false,
+            let below = match &expr.kind {
+                ExprKind::Const(_)
+                | ExprKind::CurrentTimestamp
+                | ExprKind::Param(_)
+                | ExprKind::Var { .. } => true,
                 ExprKind::Op { args, .. }
                 | ExprKind::Func { args, .. }
-                | ExprKind::Bool { args, .. } => known(args),
+                | ExprKind::Bool { args, .. } => all(args),
                 ExprKind::Relabel { arg, .. }
                 | ExprKind::ViaIo { arg, .. }
-                | ExprKind::NullTest { arg, .. } => known(std::slice::from_ref(arg)),
+                | ExprKind::NullTest { arg, .. } => all(std::slice::from_ref(arg)),
             };
-            constant.push(one);
+            held.push(below && holds(expr));
         }
-        constant
+        held
     }
 
     /// Every expression, in the order analysis made them.

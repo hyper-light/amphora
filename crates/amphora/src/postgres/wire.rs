@@ -37,6 +37,13 @@ impl SqlState {
 
     pub const FEATURE_NOT_SUPPORTED: Self = Self("0A000");
     pub const PROTOCOL_VIOLATION: Self = Self("08P01");
+    pub const DUPLICATE_PREPARED_STATEMENT: Self = Self("42P05");
+    pub const DUPLICATE_CURSOR: Self = Self("42P03");
+    pub const UNDEFINED_PREPARED_STATEMENT: Self = Self("26000");
+    pub const UNDEFINED_CURSOR: Self = Self("34000");
+    pub const OBJECT_NOT_IN_PREREQUISITE_STATE: Self = Self("55000");
+    pub const INVALID_BINARY_REPRESENTATION: Self = Self("22P03");
+    pub const INVALID_PARAMETER_VALUE: Self = Self("22023");
     pub const INVALID_AUTHORIZATION_SPECIFICATION: Self = Self("28000");
     pub const INVALID_PASSWORD: Self = Self("28P01");
     pub const CHARACTER_NOT_IN_REPERTOIRE: Self = Self("22021");
@@ -67,15 +74,16 @@ impl Severity {
     }
 }
 
-/// What an ErrorResponse carries: severity, SQLSTATE, message, an optional detail, and the character
-/// of the Query it points at (1-based).
+/// What an ErrorResponse carries: severity, SQLSTATE, message, an optional detail, hint and context,
+/// and the character of the Query it points at (1-based).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PgError {
     pub severity: Severity,
     pub code: SqlState,
     pub message: String,
     pub detail: Option<String>,
-    pub hint: Option<String>,
+    pub hint: Option<Box<str>>,
+    pub context: Option<Box<str>>,
     pub position: Option<usize>,
 }
 
@@ -87,6 +95,7 @@ impl PgError {
             message: message.into(),
             detail: None,
             hint: None,
+            context: None,
             position: None,
         }
     }
@@ -98,12 +107,29 @@ impl PgError {
             message: message.into(),
             detail: None,
             hint: None,
+            context: None,
             position: None,
         }
     }
 
+    /// This refusal as one that ends its statement, not the connection: a message that was read whole
+    /// and is malformed inside (`src/backend/libpq/pqformat.c`).
     #[must_use]
-    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
+    pub fn of_statement(self) -> Self {
+        Self {
+            severity: Severity::Error,
+            ..self
+        }
+    }
+
+    #[must_use]
+    pub fn with_context(mut self, context: impl Into<Box<str>>) -> Self {
+        self.context = Some(context.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_hint(mut self, hint: impl Into<Box<str>>) -> Self {
         self.hint = Some(hint.into());
         self
     }
@@ -241,6 +267,21 @@ impl<'a> Reader<'a> {
         Ok(taken)
     }
 
+    pub fn byte(&mut self) -> Result<u8, PgError> {
+        match self.bytes(1) {
+            Ok([byte]) => Ok(*byte),
+            _ => Err(PgError::violation("no data left in message")),
+        }
+    }
+
+    pub fn u16(&mut self) -> Result<u16, PgError> {
+        let word: [u8; 2] = self
+            .bytes(2)?
+            .try_into()
+            .map_err(|_| PgError::violation("insufficient data left in message"))?;
+        Ok(u16::from_be_bytes(word))
+    }
+
     pub fn u32(&mut self) -> Result<u32, PgError> {
         let word: [u8; 4] = self
             .bytes(4)?
@@ -317,7 +358,7 @@ pub fn put_cstr(out: &mut Vec<u8>, text: &[u8]) {
     out.push(0);
 }
 
-/// ErrorResponse with the fields PostgreSQL sends a client: S, V, C, M, and D and P when there is one
+/// ErrorResponse with the fields PostgreSQL sends a client: S, V, C, M, and D, H, W and P when there is one
 /// (`doc/src/sgml/protocol.sgml`, "Error and Notice Message Fields"), in its order
 /// (`src/backend/utils/error/elog.c`, `send_message_to_frontend`).
 pub fn error_response(out: &mut Vec<u8>, error: &PgError) -> Result<(), PgError> {
@@ -338,6 +379,10 @@ pub fn error_response(out: &mut Vec<u8>, error: &PgError) -> Result<(), PgError>
         if let Some(hint) = &error.hint {
             out.push(b'H');
             put_cstr(out, hint.as_bytes());
+        }
+        if let Some(context) = &error.context {
+            out.push(b'W');
+            put_cstr(out, context.as_bytes());
         }
         if let Some(position) = error.position {
             out.push(b'P');

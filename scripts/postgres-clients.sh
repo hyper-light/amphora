@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # psql and pgbench of the postgres:19 image run the same statements on Amphora's listener and on a 19 server of that
-# image (docs/design/postgres.md, section 11's unit 9): pgbench's tables and rows, psql's statements with their
-# SQLSTATEs, and pgbench's TPC-B script at `-M simple`. psql's output is compared byte for byte, and the tables
-# pgbench leaves row for row; 32 clients that contend for the same rows leave balances that agree (unit 15). Linux,
-# with docker.
+# image (docs/design/postgres.md, section 11's units 9 and 10): pgbench's tables and rows, psql's statements with their
+# SQLSTATEs, its \bind, \parse and pipelines, and pgbench's TPC-B script at `-M simple`, `extended` and `prepared`.
+# psql's output is compared byte for byte, and the tables pgbench leaves row for row; 32 clients that contend for the
+# same rows leave balances that agree (unit 15). Linux, with docker.
 #
 # usage: scripts/postgres-clients.sh <amphora binary> <work folder>
 set -euo pipefail
@@ -85,6 +85,46 @@ cat > "$WORK/sql/tpcb-32.sql" <<SQL
 $(sed -n '/^BEGIN;/,$p' "$WORK/sql/tpcb-1.sql")
 SQL
 
+# libpq's extended protocol as psql 19 drives it: PQsendQueryParams (pgbench.c:868's relkind query with it), PQsendPrepare,
+# PQsendQueryPrepared, PQsendClosePrepared, and a pipeline with PQsendFlushRequest, PQpipelineSync and an error in it.
+cat > "$WORK/sql/extended.sql" <<'SQL'
+SELECT relkind FROM pg_catalog.pg_class WHERE oid=$1::pg_catalog.regclass \bind pgbench_accounts \g
+SELECT relkind FROM pg_catalog.pg_class WHERE oid=$1::pg_catalog.regclass \bind nosuch \g
+\echo :SQLSTATE :ROW_COUNT
+SELECT aid, bid, abalance, filler FROM pgbench_accounts WHERE aid = $1 AND bid = $2 \bind 3 1 \g
+SELECT $1::int4 + 1, $2::"text", $3::timestamptz \bind 41 'a b' '2026-11-24 01:02:03+04' \g
+SELECT $1::int4 + 1 \bind x \g
+SELECT 1 / $1 \bind 0 \g
+SELECT bbalance FROM pgbench_branches WHERE bid = $1 \parse branch
+\bind_named branch 1 \g
+\bind_named branch 2 \g
+\bind_named branch \g
+SELECT 1 \parse branch
+\close_prepared branch
+\bind_named branch 1 \g
+\startpipeline
+SELECT $1::int4 + 1 \bind 1 \sendpipeline
+SELECT $1::int4 + 2 \bind 2 \sendpipeline
+\flushrequest
+\getresults
+INSERT INTO pgbench_history (tid, bid, aid, delta) VALUES ($1, 99, 99, 99) \bind 99 \sendpipeline
+\syncpipeline
+SELECT tid FROM pgbench_history WHERE bid = $1 \bind 99 \sendpipeline
+INSERT INTO pgbench_history (tid, bid, aid, delta) VALUES ($1, 98, 98, 98) \bind 98 \sendpipeline
+SELECT 1 / $1 \bind 0 \sendpipeline
+SELECT 3 \bind \sendpipeline
+\syncpipeline
+SELECT tid FROM pgbench_history WHERE bid = $1 \bind 98 \sendpipeline
+\endpipeline
+SELECT tid FROM pgbench_history WHERE bid = $1 \bind 98 \g
+BEGIN \bind \g
+UPDATE pgbench_history SET tid = $1 WHERE bid = $2 \bind 97 99 \g
+SELECT 1 / $1 \bind 0 \g
+SELECT 1 \bind \g
+ROLLBACK \bind \g
+SELECT tid FROM pgbench_history WHERE bid = $1 \bind 99 \g
+SQL
+
 docker run -d --rm --name "$NAME" -e POSTGRES_USER=ada -e POSTGRES_PASSWORD=pencil -p 127.0.0.1:0:5432 postgres:19 > /dev/null
 THEIRS=$(docker port "$NAME" 5432/tcp | head -1 | sed 's/.*://')
 "$AMPHORA" postgres --listen 127.0.0.1:0 --roles "$WORK/roles" --database "$WORK/postgres.db" 2> "$WORK/amphora.err" &
@@ -114,25 +154,35 @@ both() { # <what> <command...> with PORT in it
   client "${@/PORT/$OURS}" > "$WORK/$what.ours" 2> "$WORK/$what.err.ours" || true
   client "${@/PORT/$THEIRS}" > "$WORK/$what.theirs" 2> "$WORK/$what.err.theirs" || true
 }
-for script in setup statements; do
+for script in setup statements extended; do
   both "$script" psql -h 127.0.0.1 -p PORT -U ada -d ada -X -a -f "/sql/$script.sql"
   compare "psql -f $script.sql, stdout" "$WORK/$script.ours" "$WORK/$script.theirs"
   compare "psql -f $script.sql, stderr" "$WORK/$script.err.ours" "$WORK/$script.err.theirs"
 done
 both one psql -h 127.0.0.1 -p PORT -U ada -d ada -X -c 'BEGIN; UPDATE pgbench_branches SET bbalance = bbalance + 0 WHERE bid = 1; SELECT bid FROM pgbench_branches WHERE bid = 1; END'
 compare "psql -c of four statements" "$WORK/one.ours" "$WORK/one.theirs"
-for clients in 1 2; do
-  both "pgbench-$clients" pgbench -h 127.0.0.1 -p PORT -U ada -n -f "/sql/tpcb-$clients.sql" -M simple -c "$clients" -j 1 -t 100 --random-seed=42 ada
+tpcb() { # <script> <mode> <clients>: pgbench on both, the transactions it commits and the tables it leaves
+  local what="pgbench -M $2 -c $3"
+  both tpcb pgbench -h 127.0.0.1 -p PORT -U ada -n -f "/sql/$1.sql" -M "$2" -c "$3" -j 1 -t 100 --random-seed=42 ada
   for side in ours theirs; do
-    cat "$WORK/pgbench-$clients.$side" "$WORK/pgbench-$clients.err.$side" | grep -E 'actually processed|failed|aborted|ERROR|error' > "$WORK/pgbench-$clients-counts.$side" || true
-    echo "pgbench -c $clients, $side: $(tr '\n' ';' < "$WORK/pgbench-$clients-counts.$side")"
+    cat "$WORK/tpcb.$side" "$WORK/tpcb.err.$side" | grep -E 'query mode|actually processed|failed|aborted|ERROR|error' > "$WORK/tpcb-counts.$side" || true
+    echo "$what, $side: $(tr '\n' ';' < "$WORK/tpcb-counts.$side")"
   done
-  compare "pgbench -c $clients's transactions" "$WORK/pgbench-$clients-counts.ours" "$WORK/pgbench-$clients-counts.theirs"
+  grep -q "actually processed: $((100 * $3))/$((100 * $3))" "$WORK/tpcb-counts.ours" || failed=1
+  compare "$what's transactions" "$WORK/tpcb-counts.ours" "$WORK/tpcb-counts.theirs"
   for query in "SELECT aid, bid, abalance, filler FROM pgbench_accounts" "SELECT tid, bid, tbalance, filler FROM pgbench_tellers" "SELECT bid, bbalance, filler FROM pgbench_branches" "SELECT tid, bid, aid, delta, filler FROM pgbench_history"; do
     both rows psql -h 127.0.0.1 -p PORT -U ada -d ada -X -At -c "$query"
     sort "$WORK/rows.ours" > "$WORK/rows.sorted.ours"
     sort "$WORK/rows.theirs" > "$WORK/rows.sorted.theirs"
-    compare "after pgbench -c $clients, sorted: $query" "$WORK/rows.sorted.ours" "$WORK/rows.sorted.theirs"
+    compare "after $what, sorted: $query" "$WORK/rows.sorted.ours" "$WORK/rows.sorted.theirs"
+  done
+}
+for clients in 1 2; do
+  tpcb "tpcb-$clients" simple "$clients"
+done
+for mode in extended prepared; do
+  for clients in 1 8; do
+    tpcb tpcb-32 "$mode" "$clients"
   done
 done
 
