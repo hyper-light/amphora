@@ -992,10 +992,14 @@ fn shape(plan: &SelectPlan) -> Option<MorselAggregateData> {
             return None;
         };
         let col = columns.get(*column)?;
-        (*t == id
+        if *t == id
             && matches!(col.affinity(), Affinity::Integer | Affinity::Real)
-            && matches!(col.collation(), CollationSeq::Binary | CollationSeq::Unset))
-        .then_some(*column)
+            && matches!(col.collation(), CollationSeq::Binary | CollationSeq::Unset)
+        {
+            Some(*column)
+        } else {
+            None
+        }
     };
     let mut filter = Vec::new();
     for term in &plan.where_clause {
