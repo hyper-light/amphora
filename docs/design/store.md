@@ -2514,8 +2514,11 @@ as the store's does, in a log of one process; nothing restarts a segment in plac
 - *Where it differs, counted only.* A RESTART that answered 0 leaves the log with no frame, so the next call counts none;
   SQLite's counts the old ones until a writer comes. A second RESTART or TRUNCATE beside one read of the file alone is
   busy: that read keeps the segment the first one closed.
-- *An owner's log.* A replica's writer turns its own restart off (`Db::own_restarts`): its owner starts the log again when
-  what it measures says so (replication.md, B), and a switch before the room is needed would end a local read sooner.
+- *An owner's log.* A replica's owner alone starts its log again, when what it measures says so (replication.md, B): a
+  switch before the room is needed would end a local read sooner. So each of the replica's two connections that write
+  turns its own restart off (`Db::own_restarts`): the owner's, and its session worker's
+  (`Machine::session_connection`), whose sessions are write transactions too, rolled back. Its local reads' connections
+  write nothing (`Db::query_only`), and the copier's passes start nothing again.
 - *A multi-process log* is its one segment, restarted in place as before: its shared memory publishes no switch
   (`ShmWalCoordination::switch_unread`). Not built.
 Tests: crates/engine/tests/log_restart.rs, its steps run in sqlite3 3.54.0 as they are.

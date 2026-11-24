@@ -1023,6 +1023,9 @@ impl Machine {
     pub(crate) fn session_connection(&self) -> anyhow::Result<Db> {
         let db = self.db.reader()?;
         db.keep_pages(self.db.cache_pages()?)?;
+        // A session is a write transaction too, rolled back ([`prepare_at`]): the owner alone starts
+        // the log again, as on its own connection.
+        db.own_restarts();
         Ok(db)
     }
 
