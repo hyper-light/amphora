@@ -100,8 +100,8 @@ fn t_pg_14_1_two_sessions_interleave_as_a_19_server_does() {
     assert!(compared.messages > 100, "{compared:?}");
 }
 
-/// T-PG.15.1: the interleavings of `recheck-steps.txt` (19's eval-plan-qual, deadlock-simple and
-/// deadlock-hard specs within the statements Amphora has, and more of their kind) are answered as a
+/// T-PG.15.1: the interleavings of `recheck-steps.txt` (permutations of 19's eval-plan-qual, deadlock-hard
+/// and timeouts specs put into the statements Amphora has, and more of their kind) are answered as a
 /// 19.0 server answered them: a row the holder committed a later version of is judged again and
 /// changed, or passed by and kept locked, on that version alone, and a statement keeps what it changed
 /// before it waited; the session whose deadlock check finds a ring is refused, whichever closed it, and

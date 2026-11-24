@@ -42,7 +42,7 @@ s1|rollback
 s2<
 s2|commit
 s3|select accountid, balance from accounts where accountid = 'checking'
-# eval-plan-qual: tocds1 wx2 c1 c2 read (tocds1 with wx2, the key it is found by changed)
+# the key a row is found by is changed (eval-plan-qual's steps tocds1 and wx2)
 s1|update accounts set balance = 600 where accountid = 'checking'
 s1|begin isolation level read committed
 s2|begin isolation level read committed
@@ -53,7 +53,7 @@ s2<
 s2|commit
 s3|select accountid, balance from accounts where accountid = 'checking'
 s3|select accountid, balance from accounts where accountid = 'cds'
-# eval-plan-qual: tocds1 tocds1 c1 c2 read (the key's index entry is the newest version's)
+# the key is changed from the newest version's (eval-plan-qual's step tocds1 as the waiter)
 s1|update accounts set accountid = 'checking' where accountid = 'cds'
 s1|begin isolation level read committed
 s2|begin isolation level read committed
@@ -238,7 +238,7 @@ s2|update q set v = v + 1 where id = 2
 s1|update q set v = v + 100 where id >= 1
 s1|rollback
 s1|select v from q where id = 1
-# deadlock-simple, by rows: two sessions, the second's check finds it
+# two sessions that wait for each other: the second's check finds the ring
 s1|update q set v = 10 where id = 1
 s1|update q set v = 20 where id = 2
 s1|begin
@@ -270,7 +270,7 @@ s1|commit
 s2|commit
 s1|select v from q where id = 1
 s1|select v from q where id = 2
-# deadlock-hard, by rows: eight sessions, the last's check finds it
+# deadlock-hard, rows for the spec's tables: eight sessions, the last's check finds the ring
 s1|create table dh(id int not null, v int)
 s1|insert into dh(id, v) values (1, 0)
 s1|insert into dh(id, v) values (2, 0)
