@@ -1803,8 +1803,6 @@ pub struct TablePlanEstimate {
     pub total_cost: f64,
     /// The access's place in the join order: the last one's `output_rows` are the join's.
     pub position: usize,
-    /// The star filter this access was priced with, if any (`lip::price_read`).
-    pub star_filter: Option<StarFilterPrice>,
 }
 
 #[derive(Debug, Clone)]
@@ -2817,19 +2815,6 @@ pub struct LipFilter {
     pub max_bytes: usize,
     /// The planner's estimate of the share of fact rows it passes.
     pub pass: f64,
-}
-
-/// Amphora (QT.5, T-QT.5.3; lane T19): the star filter a dimension's read was priced with in the
-/// join search: that read on the fact rows the filter passes, plus the filter's build and its
-/// check of each fact row. `lip::choose` keeps every filter the chosen plan was priced with.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct StarFilterPrice {
-    /// The fact table, whose scan checks the filter.
-    pub fact_idx: usize,
-    /// The filter's false-positive rate per distinct key (`bloom_filter_costs`).
-    pub fp_per_key: f64,
-    /// The share of the fact rows it checks that it passes, its false positives included.
-    pub passed: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
