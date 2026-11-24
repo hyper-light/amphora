@@ -1,11 +1,14 @@
-# Lane PG17 (postgres), 2026-11-24: unit 8's analysis, checked and landed
+# Lane PG17 (postgres), 2026-11-24: unit 8's analysis, checked on macOS and not merged
 
 Hour: 2026-11-24T06:01:31Z to 07:01:31Z (from the lane's first command). Branch `perf/postgres-pg17`
-from `perf/postgres-pg16` 801938d1, with main fab12d7e merged in. Not a speed change: no A/B, nothing
-timed.
+from `perf/postgres-pg16` 801938d1, with main fab12d7e merged in, then 8fc85651 (25538fc1). Not a speed
+change: no A/B, nothing timed.
 
 ## Losses first
 
+- Not merged. check-production has not run on this branch at all. It counts only on Linux, and Ada's
+  benchmark window closed adacachy2 for the whole hour. Nothing of unit 8's tests or clippy has run on
+  Linux since PG16's run at 05:54Z, which was before the sweep's fix.
 - PG16's function sweep found a defect in PG16's own data. `pg_proc.pronargdefaults` was 0 for every
   function, so 37 functions resolved only with all their arguments written: `SELECT is_normalized('x')`
   and `SELECT make_interval(1)` were `42883` where 19 resolves them. Fixed in 9c324607 (below).
@@ -14,6 +17,7 @@ timed.
   make (OIDs from 12000 on) and pg_proc.dat doesn't have: plpgsql_validator, and, inferred from the count
   and from 19's plpgsql and snowball scripts, plpgsql_inline_handler and dsnowball_init. Amphora has neither
   extension. A client that calls `plpgsql_validator` is told `42883`; a stock 19 resolves it.
+- amphora-engine's focused tests ran on 9c324607 (main fab12d7e merged), not on 25538fc1.
 - The sweep asks calls of one and two arguments only, as PG16 wrote it. A default is checked by it in 12
   of the 37 functions (those one or two arguments can call). The other 25 have the same source, and no
   server's answer.
@@ -35,6 +39,9 @@ timed.
   test's list of refusals that come after the choice.
 - Green (9c324607, run r601): 14,355 calls asked, 3,336 of them answered other than `42883`, all as 19 answers.
 
+- The elog is at the end of `coerce_type` at REL_19_0 (read from GitHub), and resolveTargetListUnknowns
+  (parse_target.c), which runs after the function is chosen, calls it.
+
 ## Runs
 
 macOS runs are on the MacBook Pro 2 (e30189ea, load average 42 to 77 of 18 cores, nice -n 10), named with `on`
@@ -51,6 +58,9 @@ macOS machine they were asked of, from 06:02Z to the end of the hour, and the fi
 | r613, 06:18Z, cpus=4,mem=8g | same | the two crates' clippy with check-production.sh's 17 lints forbidden (`--no-deps -- -D warnings -F ...`) | exit 0. It is not check-production. |
 | r602, 06:14Z, cpus=6,mem=16g | same | `cargo clippy -p amphora-engine --all-targets --locked -- -D warnings` | exit 0 in 7m40s, the log shows `Compiling amphora-engine` |
 | same | same | `cargo test -p amphora-engine --lib --locked --no-fail-fast -- dialect:: vtab alter` | 35 passed, 0 failed (06:39Z, 17m13s of it building) |
-| this machine | 5afb5452 | `cargo fmt --all --check`, `python3 scripts/test_requirements.py`, `python3 scripts/vendor.py check postgres` | pass |
+| r684, 06:40Z, cpus=4,mem=8g | 25538fc1 (main 8fc85651 merged) | the two crates' tests, clippy and `cargo fmt --all --check` as in r601 | 8 and 7 passed, exit 0 each |
+| r683, 06:40Z, cpus=6,mem=16g | same | `cargo clippy -p amphora-engine --all-targets --locked -- -D warnings` | exit 0 in 10m55s, the log shows `Checking amphora-engine` |
+| same | same | `cargo test -p amphora-engine --lib ... dialect:: vtab alter` | not finished: stopped at 06:52Z while it was building. It passed at 9c324607 (r602); main's change to crates/engine came in between. |
+| this machine | 25538fc1 | `cargo fmt --all --check`, `python3 scripts/test_requirements.py`, `python3 scripts/vendor.py check postgres` | pass |
 
-5afb5452 differs from 9c324607 in one test's comment.
+25538fc1 differs from 9c324607 in one test's comment, records, and main's change to crates/engine.
