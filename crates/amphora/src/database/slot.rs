@@ -94,6 +94,8 @@ pub(super) struct Slots<T> {
     holding: Option<Holding>,
     // The leader's own turn is owed: one preparation of its own between two slots.
     turn: bool,
+    // The leader's own write is out on the session worker: forwards are held until it is back.
+    out: bool,
     forwards: VecDeque<(u64, T)>,
     // The holder's barrier, until the leader's commit reaches the slot's start.
     read: Option<(u64, T)>,
@@ -114,6 +116,7 @@ impl<T> Slots<T> {
             waiting: VecDeque::new(),
             holding: None,
             turn: false,
+            out: false,
             forwards: VecDeque::new(),
             read: None,
             ready: VecDeque::new(),
@@ -354,6 +357,22 @@ impl<T> Slots<T> {
         self.ready.extend(self.forwards.drain(..));
     }
 
+    /// The leader's own write went out to the session worker, prepared on this member's applied
+    /// point: a forward stepped before it is back would be appended between that point and its
+    /// entry, and refuse it stale (CP-T1.13, lane P18).
+    pub(super) fn own_out(&mut self) {
+        self.out = true;
+    }
+
+    /// The leader's own write is back, its entry appended or none: the forwards held while it was
+    /// out are ready, unless its turn still holds them.
+    pub(super) fn own_back(&mut self) {
+        self.out = false;
+        if !self.turn {
+            self.ready.extend(self.forwards.drain(..));
+        }
+    }
+
     /// The leader ends the slot it holds at `at`, released, and lets the barriers waiting step and
     /// the queue go: a change of members or a hand-off of its lead waits on no member's retry.
     pub(super) fn release(&mut self, at: Instant) -> Option<Ended> {
@@ -387,8 +406,9 @@ impl<T> Slots<T> {
     }
 
     /// A forward from `member` at `at`, past its sender's checks. The holder's is stepped and ends
-    /// its slot; another member's is held while a slot is, and through the leader's turn after
-    /// it, so the leader's write in its turn follows the holder's entry and nothing else
+    /// its slot; another member's is held while a slot is, through the leader's turn after it,
+    /// and while the leader's own write is out (`own_out`), so the leader's write follows the
+    /// holder's entry and nothing else
     /// (amphora-owner-t1-g-slot-878285a-20261111). A second from a member already held is a new
     /// write (the first's caller was answered: each owner forwards one write at a time), and
     /// stepping the first would append an entry before the holder's retry, or the leader's turn,
@@ -396,7 +416,7 @@ impl<T> Slots<T> {
     pub(super) fn forward(&mut self, member: u64, at: Instant, message: T) -> Taken<T> {
         let unmeasured = self.learn(member, at).err();
         let Some(holder) = self.holding.as_ref().map(|holding| holding.member) else {
-            if !self.turn {
+            if !self.turn && !self.out {
                 return Taken {
                     step: Some(message),
                     ended: None,

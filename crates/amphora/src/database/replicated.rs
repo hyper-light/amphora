@@ -5676,6 +5676,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             (ran, operation)
         }))?;
         self.replica.hold_apply(true);
+        self.slots.own_out();
         pending.phase = Phase::Running;
         self.pending = Some(pending);
         Ok(())
@@ -5684,11 +5685,17 @@ impl<F: BlockFile + 'static> Actor<F> {
     /// what committed while it ran: proposed if this member keeps the lead it had in the write's
     /// term. If the lead moved, nothing was proposed for it: data waits for the next lead, as a
     /// write whose lead moved before its preparation does (`requeue`), and a call, its closure
-    /// spent, is refused `NotLeader`, a known outcome, never run again (CP-T1.13).
+    /// spent, is refused `NotLeader`, a known outcome, never run again (CP-T1.13). The forwards
+    /// held while it was out then go, after its entry if it appended one (`Slots::own_out`).
     fn decide(&mut self) -> Result<(), Refusal> {
         let Some((ran, operation)) = self.ran.take() else {
             return Ok(());
         };
+        let decided = self.decide_ran(ran, operation);
+        self.slots.own_back();
+        decided
+    }
+    fn decide_ran(&mut self, ran: Ran, operation: Operation) -> Result<(), Refusal> {
         let Some(mut pending) = self.pending.take() else {
             return Ok(());
         };
