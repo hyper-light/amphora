@@ -3505,6 +3505,8 @@ impl<F: BlockFile + 'static> Actor<F> {
         let Some(mut pending) = self.pending.take() else {
             return;
         };
+        #[cfg(test)]
+        eprintln!("V15DIAG expire id={} phase_barrier={} expired={expired} changed_term={changed_term} leader={} is_leader={} pterm={} term={} pleader={}", self.replica.id(), matches!(pending.phase, Phase::Barrier(_)), self.replica.leader(), self.replica.is_leader(), pending.term, self.replica.term(), pending.leader);
         match &pending.phase {
             Phase::Barrier(operation) => {
                 if expired {
@@ -4908,6 +4910,8 @@ impl<F: BlockFile + 'static> Actor<F> {
         let Some((term, leader)) = self.closing.take() else {
             return Ok(());
         };
+        #[cfg(test)]
+        eprintln!("V15DIAG close id={} term={term}/{} leader={leader}/{} is_leader={}", self.replica.id(), self.replica.term(), self.replica.leader(), self.replica.is_leader());
         if term != self.replica.term()
             || leader != self.replica.leader()
             || self.replica.is_leader()
@@ -5264,6 +5268,8 @@ impl<F: BlockFile + 'static> Actor<F> {
             return Ok(());
         }
         if self.at >= pending.until {
+            #[cfg(test)]
+            eprintln!("V15DIAG prepare_barrier timeout id={}", self.replica.id());
             if let Some(response) = pending.response.take() {
                 answer(response, Err(Refusal::Timeout));
             }
