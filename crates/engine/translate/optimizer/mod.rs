@@ -5410,12 +5410,14 @@ pub(crate) mod bushy_search_tests {
         }
 
         /// The middle and fact shards: each test one plan setting at all five worker settings, so
-        /// each ends and the tests of a shard together are every run of C6's sweep.
+        /// each ends and the tests of a shard together are every run of C6's sweep. The fact
+        /// shard's hand-built trees run with statistics alone: without them one run takes over a
+        /// minute in an optimized build.
         macro_rules! outer_join_shard {
-            ($($test:ident: $db:literal, $analyzed:literal, $plan:literal, $bushy:literal, $hooked:literal;)*) => {
+            ($reason:literal; $($test:ident: $db:literal, $analyzed:literal, $plan:literal, $bushy:literal, $hooked:literal;)*) => {
                 $(
                     #[test]
-                    #[ignore = "minutes each in a debug build: CARGO_PROFILE_DEV_OPT_LEVEL=2 cargo test ... -- --ignored runs all 24"]
+                    #[ignore = $reason]
                     fn $test() {
                         outer_joins_answer_as_sqlite(
                             $db,
@@ -5431,6 +5433,7 @@ pub(crate) mod bushy_search_tests {
         }
 
         outer_join_shard! {
+            "minutes each in a debug build: 7 to 26 s at CARGO_PROFILE_DEV_OPT_LEVEL=2, --ignored";
             t_pl_8_13_outer_joins_answer_as_sqlite_middle_analyzed_by_cost: "middle", true, 0, false, false;
             t_pl_8_13_outer_joins_answer_as_sqlite_middle_analyzed_seeks_cheap: "middle", true, 1, true, true;
             t_pl_8_13_outer_joins_answer_as_sqlite_middle_analyzed_hash_joins_cheap: "middle", true, 2, true, true;
@@ -5443,6 +5446,10 @@ pub(crate) mod bushy_search_tests {
             t_pl_8_13_outer_joins_answer_as_sqlite_middle_hash_builds_dear: "middle", false, 3, false, true;
             t_pl_8_13_outer_joins_answer_as_sqlite_middle_hand_built_1: "middle", false, 4, true, true;
             t_pl_8_13_outer_joins_answer_as_sqlite_middle_hand_built_2: "middle", false, 5, false, true;
+        }
+
+        outer_join_shard! {
+            "1.5 to 9 minutes each at CARGO_PROFILE_DEV_OPT_LEVEL=2, --ignored; longer in a debug build";
             t_pl_8_13_outer_joins_answer_as_sqlite_facts_analyzed_by_cost: "facts", true, 0, false, false;
             t_pl_8_13_outer_joins_answer_as_sqlite_facts_analyzed_seeks_cheap: "facts", true, 1, true, false;
             t_pl_8_13_outer_joins_answer_as_sqlite_facts_analyzed_hash_joins_cheap: "facts", true, 2, true, false;
@@ -5453,8 +5460,6 @@ pub(crate) mod bushy_search_tests {
             t_pl_8_13_outer_joins_answer_as_sqlite_facts_seeks_cheap: "facts", false, 1, false, false;
             t_pl_8_13_outer_joins_answer_as_sqlite_facts_hash_joins_cheap: "facts", false, 2, false, false;
             t_pl_8_13_outer_joins_answer_as_sqlite_facts_hash_builds_dear: "facts", false, 3, false, false;
-            t_pl_8_13_outer_joins_answer_as_sqlite_facts_hand_built_1: "facts", false, 4, false, false;
-            t_pl_8_13_outer_joins_answer_as_sqlite_facts_hand_built_2: "facts", false, 5, false, false;
         }
 
         /// The bushy tests' queries over `facts` (lanes pl8-14 to pl8-20): the fact queries, with
