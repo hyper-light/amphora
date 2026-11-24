@@ -1545,3 +1545,101 @@ run a cell a round on a loaded host, so no speed is claimed either way.
     # r1941: the merged tree a45edff6 (main 90c1ff8d), needs cpus=4: clippy exit 0, focused 15 of 15
     cargo clippy -p amphora --all-targets --locked -- -D warnings
     cargo test -p amphora --lib --locked -- --test-threads=4 database::slot:: v13_thirty_two v7_a_hundred_and_twenty_eight
+
+# Lane V14 (commits) on adacachy2: a live holder's slot ends by its forward or its close; by time only at the deadline its barrier states or on the detector's verdict (2026-11-24, 00:59Z to 01:54Z)
+
+Ada's goal is replicated commits about 10x faster than rqlite and dqlite, with no write refused under load. This
+lane's deliverable: V13's design for the replicated class's last stale-base refusals, built, with a test that fails
+first, zero refusals on the ladder at 32 and 128 spread writers in both classes, the suite at parity, merged to main.
+
+## Losses first
+
+1. **The kiln runs r1987 and r1993 were collected when the coordinator's session restarted (about 01:45Z).** r1987
+   had finished: its suite logs are read from disk (adacachy2, `~/.cache/amphora-perf/commits-v14-out/run-013537/`).
+   r1993's output (the merged tree's re-check) was lost, so that check was run again at 01:51Z.
+2. **What it costs (inferred from the code, not measured).** A holder whose forward is lost and whom the host's
+   detector never suspects holds the leader's own writes and the other members' forwards until its write's own
+   deadline (10 s with the ladder's driver), where V13's floor held them about an election timeout. A live holder
+   whose preparation is slow holds them as long as it prepares: that is the design (its write would otherwise be
+   refused), and the ladder's rates below show no fall, but no speed is claimed either way.
+3. **The ladder is Amphora alone, one run a cell a round, on a loaded host** (load 39 to 78 on 32 cores, CPU "some"
+   avg10 5 to 42%). It shows the refusals; it claims no speed.
+4. The merge commit 4656c99c's message names main's moves in crates/engine and crates/pg-parser; main also moved in
+   crates/amphora's store.rs and tests/store.rs (lanes A16/A18). The re-check below ran on that merged tree.
+5. P14's proposal (a close the leader decides by a mark) is already on main by V11's read mark: a marked close goes
+   through `Slots::pass`, which never queues or starts a slot, so a late close ends nothing new. Folded in from P14:
+   a member sends the close only while its barrier's leader leads its term.
+
+## The change (7d08d4ff, red test alone on main's product 8752f453)
+
+- **The wire, append-only.** A write's barrier context carries, past the 32-byte request identity, a mark
+  (`WRITE_DEADLINE`, 2) and the time its write has left as it was sent, in nanoseconds (`u64`, little-endian). A
+  leader before it reads the context as a write's (anything but a read's mark) and echoes it unread. The write's
+  entry carries the request identity alone (the context is cut back to it before the proposal), so nothing in the
+  log changes.
+- **The leader (`Slots::read`, `Slots::start`).** A waiting barrier keeps its stated end on the leader's clock
+  (arrival plus the time left: later than the holder's own end by the link's one-way time, never earlier). The slot
+  ends by time only at that end, which bounds a lost forward; before it, only the holder's forward, its close, or the
+  host's detector (`Slots::keep`, unchanged) ends it. A barrier stating no end (a member before this) keeps V13's
+  learned length and floor.
+- **The holder (`Actor::expire`, `Actor::close`).** A follower whose write's deadline ends it at its barrier (before
+  it prepared: waiting for the read, or for its own log's tail) now sends its close, a barrier marked a read's, as
+  V11's path does for a write that prepared nothing. It is sent at the next step that isn't paused, and only while
+  the barrier's term and leader hold.
+
+Tests, each "do X, expect Y" citing CP-T1.8:
+`replicated::v14_a_slow_live_holder_keeps_its_slot_past_the_election_timeout` (new, red on main's product):
+owner 2 leads, member 1 writes and its preparation moves the leader's clock two election timeouts on, the leader's
+own write waits on the slot; both answered Ok and both rows on every replica, in both classes.
+`slot::a_live_holders_slot_ends_by_its_forward_or_its_stated_deadline_not_the_election_timeout` (new): at a 30 ms
+election timeout (real time's pace) a slot stating 10 s holds through 6 election timeouts and ends forwarded; one
+stating 500 ms with no forward ends expired just past it. `slot::a_dead_holders_slot_ends_when_the_detector_suspects_it`
+(new): a slot stating 10 s holds 10 election timeouts with no verdict, then ends released on the detector's
+suspicion, the held forward ready and the leader's turn owed. The old slot tests pass `None` (no stated end) and keep
+testing V13's length.
+
+## Runs
+
+r1987 on adacachy2, needs cpus=4 (cpus=8 refused: 7 of 32 cores idle), 01:35Z to 01:45Z, `v14.sh` (in this
+record's folder): debug lib tests of 8752f453 and 7d08d4ff built in turn in the lane's one target dir (22 s, 23 s),
+the focused tests on each, clippy, the release bench (149 s), V13's ladder, then the replicated suites 3 rounds,
+arm order alternated.
+
+| check | 8752f453 (main's product + the red test) | 7d08d4ff (the change) |
+|---|---|---|
+| focused: `database::slot::`, the V14, V13 and V7 driven tests | 15 passed, 1 failed: the V14 test, `Persisted: [("the leader", Ok(())), ("member 1", Err(Serialization { what: "prepared transaction", why: "the database advanced since preparation" }))]` | 18 passed |
+| `cargo clippy -p amphora --all-targets --locked -- -D warnings` | | exit 0 |
+| `database::replicated:: replication::`, round 1 (the change first) | 172 passed, 1 failed: the V14 test (44 s) | 173 passed (45 s) |
+| round 2 (arm order reversed) | 172 passed, 1 failed: the V14 test (45 s) | 173 passed (44 s) |
+| round 3 | 172 passed, 1 failed: the V14 test (47 s) | 173 passed (45 s) |
+
+Over 3 rounds no test that main's product passes fails on the change; main's product fails only the new test, each round.
+
+**The ladder (r1987, the change's release bench).** V13's `ladder13.sh`: Amphora alone, V12's flags (`--batch 1
+--text-bytes 600 --deadline-s 10 --relay-records 128 --warmup-s 1 --seconds 5`, `--spanning 2` for the replicated
+class), 3 rounds, cell order reversed in round 2. Refusals are the driver's `Serialization` count by node (node 3
+led every run).
+
+| class | writers | refusals by node, r1; r2; r3 | commits/s per round | p50 ms per round | misses |
+|---|---|---|---|---|---|
+| persisted | 32 | 0 0 0; 0 0 0; 0 0 0 | 39.0, 54.0, 53.2 | 786, 606, 664 | 0 |
+| persisted | 128 | 0 0 0; 0 0 0; 0 0 0 | 42.4, 53.0, 54.4 | 3,146, 2,425, 2,490 | 0 |
+| replicated | 32 | 0 0 0; 0 0 0; 0 0 0 | 37.2, 42.2, 43.4 | 680, 877, 541 | 0 |
+| replicated | 128 | 0 0 0; 0 0 0; 0 0 0 | 40.4, 44.0, 60.8 | 2,228, 1,933, 1,589 | 0 |
+
+Against V13's r1896 (replicated class 0 to 5 refusals a run, its 128-writer runs in each round): none in 12 runs.
+The rates are inside or above V13's (36.6 to 48.0), one run a cell a round on a loaded host (load 77 in round 1, 39
+in round 3), so no speed is claimed.
+
+**The merged tree 4656c99c** (01:51Z, needs cpus=8, load 11): focused 18 of 18 passed, `cargo clippy -p amphora
+--all-targets --locked -- -D warnings` exit 0.
+
+## Commands
+
+    # r1987: kiln run on 00aad8daff2fa3c9daa65d53c425d450, needs linux/amd64,cpus=4,mem=12g, sync false,
+    # cwd ~/.cache/amphora-perf/commits-remote, CARGO_TARGET_DIR=~/.cache/amphora-perf-target/commits,
+    # CARGO_INCREMENTAL=0, CARGO_BUILD_JOBS=4, test threads 4
+    bash bench/records/2026-11-23-adacachy2-perf-commits-v14/v14.sh 8752f453 7d08d4ff 3 ~/.cache/amphora-perf/commits-v14-out/run-<hhmmss>
+    # r1993: the merged tree 4656c99c, the same runner and needs
+    cargo test -p amphora --lib --locked -- --test-threads=4 database::slot:: v14_a_slow v13_thirty_two v7_a_hundred_and_twenty_eight
+    cargo clippy -p amphora --all-targets --locked -- -D warnings

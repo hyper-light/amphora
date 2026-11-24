@@ -1304,7 +1304,7 @@ impl MappedSharedWalCoordination {
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |word| {
                 let mut log = Segments::unpack(word);
                 log.mark_copied();
-                Some(log.pack())
+                Some(log.shared_word(word))
             });
         self.reset_if_unread()
     }
@@ -1320,7 +1320,12 @@ impl MappedSharedWalCoordination {
         let mut log = self.segments_at(word);
         let reset = log.reset_if_done()?;
         shared
-            .compare_exchange(word, log.pack(), Ordering::SeqCst, Ordering::SeqCst)
+            .compare_exchange(
+                word,
+                log.shared_word(word),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
             .ok()?;
         Some(reset)
     }
@@ -1349,9 +1354,12 @@ impl MappedSharedWalCoordination {
     /// Publish which segment is current and the other's state, as this process
     /// recovered them at open. Reads are counted in the reader slots, not here.
     pub(crate) fn seed_segments(&self, recovered: Segments) {
-        self.header()
+        let _ = self
+            .header()
             .segments
-            .store(recovered.pack(), Ordering::Release);
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |word| {
+                Some(recovered.shared_word(word))
+            });
     }
 
     /// The header of the segment that is not current.
