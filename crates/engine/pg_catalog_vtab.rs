@@ -253,7 +253,7 @@ fn template(
         .rows
         .iter()
         .copied()
-        .find(|row| at.and_then(|i| row.get(i)) == Some(&key) && also(*row))
+        .find(|row| at.and_then(|i| row.get(i)) == Some(&key) && also(row))
         .ok_or_else(|| LimboError::InternalError(format!("{} has no template row", catalog.name)))
 }
 
@@ -326,10 +326,14 @@ fn attribute_rows(t: &UserTable) -> Result<Vec<Vec<Value>>> {
         .rows
         .iter()
         .filter(of_pg_class)
-        .filter(|row| negative(**row))
+        .filter(|row| negative(row))
         .map(|row| {
             derived(&PG_ATTRIBUTE, row, |c| {
-                (c == "attrelid").then(|| Datum::Oid(t.oid))
+                if c == "attrelid" {
+                    Some(Datum::Oid(t.oid))
+                } else {
+                    None
+                }
             })
         })
         .collect();
