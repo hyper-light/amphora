@@ -1887,8 +1887,13 @@ registry, not a second budget beside it. One image is kept back per filesystem, 
 installing at once (a node rejoining behind on all its groups) can still meet a full disk mid-image, and fence
 typed. `SNAPSHOT_BYTES` (256 MiB, "until streaming snapshots") is itself picked, noted to amphora-constants.
 
-**D. The bound, stated.** A replica's database log holds at most min(H, what its group commits between restarts
-due by their share + what it commits while the local reads out at the due point finish). Each of those reads is
+**D. The bound, stated.** A replica's database log is two segment files (store.md, decision 45), each within the
+room: each holds at most min(H, what its group commits between restarts due by their share + what it commits while
+the local reads out at the due point finish). The room counts the current segment's frames, read from the log's shared
+state (`Db::log_frames_in_use`), not the writer connection's own view, which a switch leaves on the closed segment
+until its next transaction. The closing segment holds what it held when the writer switched from it, within the room
+then, and grows no more. So the log's peak disk is two segment files, each within the room (Ada, 2026-11-24, on lane
+B19's question; lane B20). Each of those reads is
 bounded by its caller's deadline (`run_query`'s progress handler), and no new one begins. Past H no new submit is
 taken on that member. Restarts spend at most 1 - q of the entries, net of the owner's base tail.
 
