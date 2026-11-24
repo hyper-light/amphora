@@ -138,6 +138,7 @@ fn interleave(steps: &str, answers: &str) -> Compared {
         .collect();
     assert_eq!(answers.len(), steps.len());
     let mut compared = Compared::default();
+    let mut wrong = Vec::new();
     for ((step, sql, theirs), line) in answers.iter().zip(&steps) {
         let (name, kind) = step.split_at(2);
         let kind = match (kind, sql.as_str()) {
@@ -169,7 +170,6 @@ fn interleave(steps: &str, answers: &str) -> Compared {
             }
             Kind::Waits => {
                 session.stops(sql, line);
-                // Its check finds no ring while the wait closes none.
                 compared.waited += 1;
                 continue;
             }
@@ -208,11 +208,14 @@ fn interleave(steps: &str, answers: &str) -> Compared {
         }
         let mut theirs = theirs.clone();
         let (z, body) = theirs.pop().unwrap();
-        assert_eq!((z, body[0]), (b'Z', status(&session.executor)), "{line}");
-        let ours = messages(&out);
-        assert_eq!(told(sql, &ours), told(sql, &theirs), "{line}");
+        assert_eq!((z, body[0]), (b'Z', status(&session.executor)), "{line}\n{out:?}");
+        let (ours, theirs) = (told(sql, &messages(&out)), told(sql, &theirs));
+        if ours != theirs {
+            wrong.push(format!("{line}\n  19 {theirs:?}\n  is {ours:?}"));
+        }
         compared.messages += theirs.len();
     }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     compared
 }
 

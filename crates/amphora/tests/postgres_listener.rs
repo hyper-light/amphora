@@ -504,3 +504,63 @@ fn t_pg_14_3_a_waiting_session_holds_no_other_and_is_answered_when_its_holder_co
         assert_eq!(answer[1], (b'D', b"\x00\x01\x00\x00\x00\x03111".to_vec()));
     });
 }
+
+/// T-PG.15.3: over sockets, the two deadlines end a wait by themselves: of two sessions that wait for
+/// each other, the one whose `deadlock_timeout` passes is refused `40P01` and the other, whose own
+/// is far off, is answered; and a wait longer than its `lock_timeout` is refused `55P03`. A role that is
+/// no superuser may not set the first.
+#[test]
+fn t_pg_15_3_a_deadlock_and_a_lock_timeout_end_a_wait_by_themselves() {
+    let dir = tempfile::tempdir().unwrap();
+    run(listener(&dir, u64::MAX, 4), |addr| async move {
+        let mut clients = Vec::new();
+        for _ in 0..2 {
+            let mut client = Client::connect(addr).await;
+            client.log_in().await;
+            clients.push(client);
+        }
+        let [first, second] = clients.as_mut_slice() else {
+            panic!("two clients");
+        };
+        for sql in [
+            "create table t(a int not null, b int)",
+            "insert into t(a, b) values (1, 10)",
+            "insert into t(a, b) values (2, 20)",
+            "begin",
+            "set deadlock_timeout = '1h'",
+            "update t set b = b + 1 where a = 1",
+        ] {
+            let answer = first.query(sql).await;
+            assert_eq!(answer[0].0, b'C', "{sql}: {answer:?}");
+        }
+        for sql in [
+            "begin",
+            "set deadlock_timeout = '1ms'",
+            "update t set b = b + 1 where a = 2",
+        ] {
+            let answer = second.query(sql).await;
+            assert_eq!(answer[0].0, b'C', "{sql}: {answer:?}");
+        }
+        first
+            .send(&frontend(b'Q', b"update t set b = b + 1 where a = 2\0"))
+            .await;
+        let answer = second.query("update t set b = b + 1 where a = 1").await;
+        let refused = |answer: &[(u8, Vec<u8>)], code: &[u8]| {
+            answer[0].0 == b'E' && answer[0].1.windows(code.len()).any(|w| w == code)
+        };
+        assert!(refused(&answer, b"C40P01"), "{answer:?}");
+        assert_eq!(
+            first.recv().await,
+            Some((b'C', b"UPDATE 1\0".to_vec())),
+            "the victim's refusal lets the other go on before its ROLLBACK"
+        );
+        assert_eq!(first.recv().await, Some((b'Z', b"T".to_vec())));
+        second.query("rollback").await;
+        second.query("set lock_timeout = '1ms'").await;
+        let answer = second.query("update t set b = b + 1 where a = 1").await;
+        assert!(refused(&answer, b"C55P03"), "{answer:?}");
+        first.query("commit").await;
+        let answer = second.query("update t set b = b + 1 where a = 1").await;
+        assert_eq!(answer[0], (b'C', b"UPDATE 1\0".to_vec()));
+    });
+}

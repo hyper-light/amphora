@@ -1,5 +1,5 @@
 # eval-plan-qual: wx1 wx2 c1 c2 read
-s1|create table accounts(accountid text not null, balance int not null)
+s1|create table accounts(accountid char(8) not null, balance int not null)
 s1|alter table accounts add primary key (accountid)
 s1|insert into accounts(accountid, balance) values ('checking', 600)
 s1|insert into accounts(accountid, balance) values ('savings', 600)
@@ -10,8 +10,8 @@ s2>update accounts set balance = balance + 450 where accountid = 'checking'
 s1|commit
 s2<
 s2|commit
-s3|select * from accounts where accountid = 'checking'
-s3|select * from accounts where accountid = 'savings'
+s3|select accountid, balance from accounts where accountid = 'checking'
+s3|select accountid, balance from accounts where accountid = 'savings'
 # eval-plan-qual: wy1 wy2 c1 c2 read
 s1|update accounts set balance = 600 where accountid = 'checking'
 s1|begin isolation level read committed
@@ -21,7 +21,7 @@ s2>update accounts set balance = balance + 1000 where accountid = 'checking' and
 s1|commit
 s2<
 s2|commit
-s3|select * from accounts where accountid = 'checking'
+s3|select accountid, balance from accounts where accountid = 'checking'
 # eval-plan-qual: wx1 wx2 r1 c2 read
 s1|update accounts set balance = 600 where accountid = 'checking'
 s1|begin isolation level read committed
@@ -31,7 +31,7 @@ s2>update accounts set balance = balance + 450 where accountid = 'checking'
 s1|rollback
 s2<
 s2|commit
-s3|select * from accounts where accountid = 'checking'
+s3|select accountid, balance from accounts where accountid = 'checking'
 # eval-plan-qual: wy1 wy2 r1 c2 read
 s1|update accounts set balance = 600 where accountid = 'checking'
 s1|begin isolation level read committed
@@ -41,7 +41,7 @@ s2>update accounts set balance = balance + 1000 where accountid = 'checking' and
 s1|rollback
 s2<
 s2|commit
-s3|select * from accounts where accountid = 'checking'
+s3|select accountid, balance from accounts where accountid = 'checking'
 # eval-plan-qual: tocds1 wx2 c1 c2 read (tocds1 with wx2, the key it is found by changed)
 s1|update accounts set balance = 600 where accountid = 'checking'
 s1|begin isolation level read committed
@@ -51,8 +51,8 @@ s2>update accounts set balance = balance + 450 where accountid = 'checking'
 s1|commit
 s2<
 s2|commit
-s3|select * from accounts where accountid = 'checking'
-s3|select * from accounts where accountid = 'cds'
+s3|select accountid, balance from accounts where accountid = 'checking'
+s3|select accountid, balance from accounts where accountid = 'cds'
 # eval-plan-qual: tocds1 tocds1 c1 c2 read (the key's index entry is the newest version's)
 s1|update accounts set accountid = 'checking' where accountid = 'cds'
 s1|begin isolation level read committed
@@ -62,10 +62,10 @@ s2>update accounts set accountid = 'cds' where accountid = 'checking'
 s1|commit
 s2<
 s2|commit
-s3|select * from accounts where accountid = 'checking'
-s3|select * from accounts where accountid = 'cds'
+s3|select accountid, balance from accounts where accountid = 'checking'
+s3|select accountid, balance from accounts where accountid = 'cds'
 s1|update accounts set accountid = 'checking' where accountid = 'cds'
-s3|select * from accounts where accountid = 'checking'
+s3|select accountid, balance from accounts where accountid = 'checking'
 # eval-plan-qual: writep3a writep3b c1 c2 (one table for the spec's three)
 s1|create table p(id int not null, a int, b int, c int)
 s1|insert into p(id, a, b, c) values (1, 0, 1, 0)
@@ -104,8 +104,8 @@ s2>update parttbl set c = 0 - c where b < 10
 s1|commit
 s2<
 s2|commit
-s3|select * from parttbl where a = 1
-s3|select * from parttbl where a = 2
+s3|select a, b, c from parttbl where a = 1
+s3|select a, b, c from parttbl where a = 2
 # rows changed before the wait are kept: another session waits for one of them
 s1|create table q(id int not null, v int)
 s1|insert into q(id, v) values (1, 10)
@@ -365,7 +365,7 @@ s1|set lock_timeout = 1.5
 s1|show lock_timeout
 s1|set lock_timeout = 'abc'
 s1|set lock_timeout = '10 furlongs'
-s1|set lock_timeout = -1
+s1|set lock_timeout = '-1'
 s1|set lock_timeout = '9999999999'
 s1|set deadlock_timeout = 0
 s1|show lock_timeout

@@ -7,7 +7,6 @@ use std::collections::BTreeMap;
 use std::num::NonZero;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
-use std::time::Duration;
 
 use amphora_engine::dialect::postgres::{from_engine, to_engine};
 use amphora_engine::storage::versioned::memory::Source;
