@@ -447,6 +447,8 @@ enum HeaderValidationState {
     OpenWal {
         pager: Box<Pager>,
         open_mv_store: bool,
+        /// Amphora: whether the file's page 1 keeps plain SQLite out (decision 45).
+        marked: bool,
         driver: Option<storage::wal::OpenSharedWal>,
         /// Set once the WAL of an empty database file has been thrown away
         /// (see the orphan-WAL handling in [`Database::header_validation`]).
@@ -2201,6 +2203,7 @@ impl Database {
                         )).into());
                     }
 
+                    let marked = !read_version.sqlite_reads();
                     let (read_version, _write_version) = (
                         read_version.to_version().map_err(|val| {
                             LimboError::Corrupt(format!("Invalid read_version: {val}"))
@@ -2304,7 +2307,7 @@ impl Database {
                                 true
                             }
                         }
-                        Version::Wal => false,
+                        Version::Wal | Version::Wal2 => false,
                         Version::Mvcc => false,
                     };
 
@@ -2344,6 +2347,7 @@ impl Database {
                         HeaderValidationState::OpenWal {
                             pager,
                             open_mv_store,
+                            marked,
                             driver: None,
                             discarded_orphan_wal: false,
                         }
@@ -2373,12 +2377,14 @@ impl Database {
                     *st = HeaderValidationState::OpenWal {
                         pager,
                         open_mv_store,
+                        marked: false,
                         driver: None,
                         discarded_orphan_wal: false,
                     };
                 }
                 HeaderValidationState::OpenWal {
                     open_mv_store,
+                    marked,
                     driver,
                     discarded_orphan_wal,
                     ..
@@ -2487,6 +2493,16 @@ impl Database {
                         second_segment,
                         Some(storage::wal::second_segment_path(&self.wal_path)),
                     )?;
+                    if !self.opts.enable_multiprocess_wal
+                        && !self.io.is_memory()
+                        && !is_memory_like(&self.path)
+                    {
+                        shared_log.set_mark(if *marked {
+                            storage::wal::Mark::InFile
+                        } else {
+                            storage::wal::Mark::Absent
+                        });
+                    }
 
                     let open_mv_store = *open_mv_store;
                     let HeaderValidationState::OpenWal { mut pager, .. } = std::mem::take(st)
@@ -2620,6 +2636,9 @@ impl Database {
             .current()
             .write()
             .replace_after_external_restore(new_shared_wal.into_inner());
+        if self.shared_wal.mark() != storage::wal::Mark::NotKept {
+            self.shared_wal.set_mark(storage::wal::Mark::Absent);
+        }
         if self.mvcc_enabled() || journal_mode::logical_log_exists(std::path::Path::new(&self.path))
         {
             let mv_store = journal_mode::open_mv_store(

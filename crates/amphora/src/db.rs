@@ -880,6 +880,13 @@ impl Db {
             .map_err(fail)
     }
 
+    /// Closes the database cleanly, this its only connection: its log folded into the file, which
+    /// plain SQLite then reads (docs/design/store.md, decision 45).
+    pub fn close(self) -> anyhow::Result<()> {
+        self.ensure_unfenced()?;
+        self.conn.close().map_err(fail)
+    }
+
     /// Folds the log into the file through `frame` (inclusive), leaving the rest in the log and the
     /// log as it is: a replay in parts, each a step a paced check can pause after (T-T1.12.C8). The
     /// engine's passive checkpoint, bounded (`CheckpointMode::Passive`'s `upper_bound_inclusive`).

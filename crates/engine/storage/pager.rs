@@ -3803,7 +3803,32 @@ impl Pager {
         // Must run after the upgrade (and any log restart it performed) so
         // the positions belong to the current WAL generation.
         self.materialize_savepoint_wal_positions();
+        if wal.mark_wanted() {
+            if let Err(e) = self.mark_page1() {
+                wal.end_write_tx();
+                return Err(e.into());
+            }
+        }
         Ok(IOResult::Done(()))
+    }
+
+    /// Amphora: page 1 is in this write transaction, its versions those that keep plain SQLite out
+    /// (docs/design/store.md, decision 45). An MVCC database's say more already.
+    fn mark_page1(&self) -> Result<()> {
+        let version = self.io.block(|| self.with_header(|h| h.read_version))?;
+        if !matches!(version.to_version(), Ok(Version::Wal | Version::Wal2)) {
+            return Ok(());
+        }
+        self.set_page1_version(Version::Wal2)
+    }
+
+    fn set_page1_version(&self, version: Version) -> Result<()> {
+        self.io.block(|| {
+            self.with_header_mut(|header| {
+                header.read_version = RawVersion::from(version);
+                header.write_version = RawVersion::from(version);
+            })
+        })
     }
 
     /// Fill in the WAL position of savepoints opened before this write
@@ -6556,10 +6581,68 @@ impl Pager {
                 }
                 attempts += 1;
             }
+            self.leave_to_sqlite(sync_mode)?;
         }
         // TODO: delete the WAL file here after truncate checkpoint, but *only* if we are sure that
         // no other connections have opened since.
         Ok(())
+    }
+
+    /// Amphora: at a clean close, its log folded into the file and both of the log's files empty, the
+    /// database is SQLite's to read again (docs/design/store.md, decision 45): page 1 says version 2,
+    /// in a commit of its own that a checkpoint then folds. Through the log, as any page is changed: a
+    /// page 1 torn in the file would fail its checksum, with no log to restore it from. It stays marked
+    /// where another connection came meanwhile.
+    fn leave_to_sqlite(&self, sync_mode: crate::SyncMode) -> Result<()> {
+        match self.unmark() {
+            Ok(false) | Err(LimboError::Busy | LimboError::BusySnapshot) => Ok(()),
+            Ok(true) => match self.blocking_checkpoint(
+                CheckpointMode::Truncate {
+                    upper_bound_inclusive: None,
+                },
+                sync_mode,
+            ) {
+                Ok(_) | Err(LimboError::Busy) => Ok(()),
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Whether a commit of page 1 without the mark was made ([`Self::leave_to_sqlite`]).
+    fn unmark(&self) -> Result<bool> {
+        let Some(wal) = self.wal.as_ref() else {
+            return Ok(false);
+        };
+        self.begin_read_tx()?;
+        let unmarked = self
+            .io
+            .block(|| self.begin_write_tx(WalAutoActions::empty()))
+            .and_then(|()| {
+                let unmarked = self.unmark_page1(wal.as_ref());
+                if !matches!(unmarked, Ok(true)) {
+                    self.clear_page_cache(true);
+                }
+                wal.end_write_tx();
+                unmarked
+            });
+        wal.end_read_tx();
+        self.commit_wal_end();
+        unmarked
+    }
+
+    fn unmark_page1(&self, wal: &dyn Wal) -> Result<bool> {
+        if !wal.may_unmark()? {
+            return Ok(false);
+        }
+        let version = self.io.block(|| self.with_header(|h| h.read_version))?;
+        if !matches!(version.to_version(), Ok(Version::Wal2)) {
+            return Ok(false);
+        }
+        self.set_page1_version(Version::Wal)?;
+        self.io
+            .block(|| self.commit_wal(WalAutoActions::empty(), 0, crate::SyncMode::Full, true))?;
+        Ok(true)
     }
 
     /// Perform a blocking checkpoint with the specified mode.
@@ -6750,6 +6833,13 @@ impl Pager {
                 });
                 default_header.reserved_space = reserved_space_bytes;
                 self.set_reserved_space(reserved_space_bytes);
+                // Amphora: a new file keeps plain SQLite out from its first page on (decision 45).
+                if self.wal.as_ref().is_some_and(|wal| wal.mark_wanted())
+                    && default_header.read_version == RawVersion::from(Version::Wal)
+                {
+                    default_header.read_version = RawVersion::from(Version::Wal2);
+                    default_header.write_version = RawVersion::from(Version::Wal2);
+                }
 
                 turso_assert_eq!(Some(default_header.page_size), self.get_page_size());
 
@@ -6825,6 +6915,9 @@ impl Pager {
         cache.insert(page_key, page.clone()).map_err(|e| {
             LimboError::InternalError(format!("Failed to insert page 1 into cache: {e:?}"))
         })?;
+        if let Some(wal) = self.wal.as_ref() {
+            wal.page1_in_file(super::wal::page1_version(page.get_contents().as_ptr()));
+        }
         // After we wrote the header page, we may now set this None, to signify we initialized
         self.shared.init_page_1.store(None);
         page.unpin();
