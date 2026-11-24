@@ -2030,12 +2030,12 @@ pure core is `database/slot.rs`, driven by the owner (`Actor::keep_slots`, `star
   detector suspects the holder (`Slots::keep`). A barrier that states no end (a member before lane V14) keeps the
   learned length below. The write's entry carries the request identity alone, so the log doesn't change, and a
   leader before lane V14 takes the context as a write's and echoes it unread. A follower whose write's deadline
-  ends it at its barrier (waiting for the read's answer, or for its own log's tail) is to send its close at its
-  next step that isn't paused, while the barrier's term and leader hold (lane V14). An open defect (lane V15): when
-  that barrier's answer was lost, the member takes the close (`Actor::close` asks its replica for the read, which
-  accepts it) but member 3 sends nothing after it, so the slot holds until its stated end, as before lane V14. The
-  red test is `replicated::v15_a_write_its_deadline_ends_at_its_barrier_closes_its_slot` on branch perf/commits-v15;
-  where inside the member the close stops is not yet traced.
+  ends it at its barrier (waiting for the read's answer, or for its own log's tail) sends its close from its
+  next step that isn't paused, while the barrier's term and leader hold (lane V14). The close is asked of the core
+  after that step's one drive, so it marks the owner driving: the owner drives again at once, and the close leaves
+  with that drive's `Ready` (lane V16). Before lane V16 it waited in the core (`Raft::msgs`) for the owner's next
+  wake: on a real clock its next tick, unless an input came first (read from `run_loop`'s wait, not measured),
+  and never in the driven harness, whose clocks stand still (`replicated::v15_a_write_its_deadline_ends_at_its_barrier_closes_its_slot`).
 - *What bounds a lost forward* (CP-T1.8, lane V15, measured; not yet an event). A holder's forward lost on the way
   is bounded only by its stated end: the holder sends no barrier or forward after it (its write waits, proposed,
   for its entry), and a live holder is not suspected. Lane V15's run on real time (three members in one process,

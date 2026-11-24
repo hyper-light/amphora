@@ -876,7 +876,8 @@ impl Predicate {
     /// The term with its parameter's bound value (an unbound one NULL, as `Variable` reads it),
     /// converted as the serial loop's comparison converts it (`Affinity::convert_for_compare`).
     /// The column's side needs no conversion: the shape takes a parameter only against an INTEGER
-    /// column, whose stored text is text no numeric affinity converts.
+    /// or a REAL column, whose stored text is text no numeric affinity converts, and both
+    /// pipelines read a REAL column's INTEGER as a REAL (`MorselAggregateData::reals`).
     pub(crate) fn bind(
         &self,
         parameters: &[Value],
