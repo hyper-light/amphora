@@ -6,15 +6,15 @@ use crate::turso_debug_assert;
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
     schema::{
-        self, BTreeTable, ColDef, ColDefFlags, Column, Index, IndexColumn, ResolvedFkRef, Table,
+        self, BTreeTable, ColDef, ColDefFlags, Column, Index, IndexColumn, Table,
         EXPR_INDEX_SENTINEL, SQLITE_SEQUENCE_TABLE_NAME,
     },
     sync::Arc,
     translate::{
         emitter::{
-            delete::emit_fk_child_decrement_on_delete, emit_cdc_autocommit_commit,
-            emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, emit_check_constraints,
-            emit_make_record, prepare_cdc_if_necessary, OperationMode, Resolver,
+            emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
+            emit_cdc_patch_record, emit_check_constraints, emit_make_record,
+            prepare_cdc_if_necessary, OperationMode, Resolver,
         },
         expr::{
             bind_and_rewrite_expr, emit_returning_results, emit_returning_scan_back,
@@ -22,11 +22,7 @@ use crate::{
             seed_returning_row_image_in_cache, translate_expr, translate_expr_no_constant_opt,
             walk_expr, BindingBehavior, NoConstantOptReason, ReturningBufferCtx, WalkControl,
         },
-        fkeys::{
-            build_index_affinity_string, emit_fk_restrict_halt, emit_fk_violation,
-            emit_guarded_fk_decrement, emit_skip_if_any_null, index_probe, index_scan_match_any,
-            open_read_index, open_read_table, ForeignKeyActions,
-        },
+        fkeys::{emit_fk_row_added, Coming, FkRow, ForeignKeyActions},
         plan::{
             ColumnUsedMask, EvalAt, JoinedTable, Operation, OuterQueryReference, QueryDestination,
             ResultSetColumn, TableReferences,
@@ -36,7 +32,9 @@ use crate::{
             plan_ctes_as_outer_refs, ROWID_STRS,
         },
         select::translate_select,
-        stmt_journal::{any_index_or_ipk_has_replace, set_insert_stmt_journal_flags},
+        stmt_journal::{
+            any_index_or_ipk_has_replace, insert_writes_one_row, set_insert_stmt_journal_flags,
+        },
         subquery::{
             emit_non_from_clause_subqueries_for_eval_at, emit_non_from_clause_subquery,
             plan_subqueries_from_returning,
@@ -53,9 +51,7 @@ use crate::{
     vdbe::{
         affinity::Affinity,
         builder::{CursorKey, CursorType, DmlColumnContext, ProgramBuilder, ProgramBuilderOpts},
-        insn::{
-            to_u32, CmpInsFlags, HaltAction, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral,
-        },
+        insn::{to_u32, HaltAction, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral},
         BranchOffset,
     },
     CaptureDataChangesExt, Connection, LimboError, Result, VirtualTable,
@@ -1004,19 +1000,32 @@ pub fn translate_insert(
     );
 
     if has_fks {
-        // Child-side FK check must run before any writes (IdxInsert / Insert).
-        // For immediate FKs this emits a direct Halt, so no index entry is written
-        // when the parent is missing — matching SQLite's bytecode order.
-        let fk_layout = btree_table.column_layout()?;
-        emit_fk_child_insert_checks(
-            program,
+        // Before any write: what breaks an immediate key of a row that comes alone halts here, so
+        // no entry of it is written (SQLite's bytecode order).
+        let row = FkRow::image(
             &btree_table,
             insertion.first_col_register(),
             insertion.key_register(),
-            resolver,
-            database_id,
-            &fk_layout,
-        )?;
+            btree_table.column_layout()?,
+        );
+        let alone = !program.flags.is_subprogram()
+            && insert_writes_one_row(
+                resolver,
+                database_id,
+                &btree_table,
+                ctx.statement_on_conflict,
+                inserting_multiple_rows,
+                has_triggers_including_temp(
+                    resolver,
+                    database_id,
+                    TriggerEvent::Insert,
+                    None,
+                    &btree_table,
+                ),
+                has_upsert,
+            );
+        let coming = if alone { Coming::Alone } else { Coming::Among };
+        emit_fk_row_added(program, resolver, &btree_table, &row, coming, database_id)?;
     }
 
     // Emit deferred index inserts for cases where preflight only checked constraints
@@ -1125,20 +1134,6 @@ pub fn translate_insert(
             )?;
         }
         program.preassign_label_to_next_insn(after_trigger_done);
-    }
-
-    if has_fks {
-        // After the row is actually present, repair deferred counters for children referencing this NEW parent key.
-        // For REPLACE: delete increments counters above; the insert path should try to repay
-        // them, even for immediate/self-ref FKs.
-        emit_parent_side_fk_decrement_on_insert(
-            program,
-            &btree_table,
-            &insertion,
-            on_replace,
-            resolver,
-            database_id,
-        )?;
     }
 
     if !is_mvcc {
@@ -3972,27 +3967,14 @@ fn emit_replace_delete_conflicting_row(
     // Phase 1: Before Delete - build parent key registers and handle NoAction/Restrict.
     // CASCADE/SetNull/SetDefault actions are prepared but deferred until after Delete.
     let prepared_fk_actions = if connection.foreign_keys_enabled() {
-        let prepared = ForeignKeyActions::prepare_fk_delete_actions(
+        ForeignKeyActions::remove_row(
             program,
             resolver,
-            ctx.table.name.as_str(),
+            ctx.table,
             ctx.cursor_id,
             ctx.conflict_rowid_reg,
-            None,
             ctx.database_id,
-        )?;
-        if resolver.schema().has_child_fks(ctx.table.name.as_str()) {
-            emit_fk_child_decrement_on_delete(
-                program,
-                ctx.table.as_ref(),
-                ctx.table.name.as_str(),
-                ctx.cursor_id,
-                ctx.conflict_rowid_reg,
-                ctx.database_id,
-                resolver,
-            )?;
-        }
-        prepared
+        )?
     } else {
         ForeignKeyActions::default()
     };
@@ -4091,374 +4073,10 @@ fn emit_replace_delete_conflicting_row(
         program,
         resolver,
         connection,
+        ctx.table,
         ctx.database_id,
     )?;
 
-    Ok(())
-}
-
-/// Child-side FK checks for INSERT of a single row:
-/// For each outgoing FK on `child_tbl`, if the NEW tuple's FK columns are all non-NULL,
-/// verify that the referenced parent key exists.
-pub fn emit_fk_child_insert_checks(
-    program: &mut ProgramBuilder,
-    child_tbl: &BTreeTable,
-    new_start_reg: usize,
-    new_rowid_reg: usize,
-    resolver: &Resolver,
-    database_id: usize,
-    layout: &ColumnLayout,
-) -> crate::Result<()> {
-    for fk_ref in
-        resolver.with_schema(database_id, |s| s.resolved_fks_for_child(&child_tbl.name))?
-    {
-        let is_self_ref = fk_ref.fk.parent_table.eq_ignore_ascii_case(&child_tbl.name);
-
-        // Short-circuit if any NEW component is NULL
-        let fk_ok = program.allocate_label();
-        for cname in &fk_ref.fk.child_columns {
-            let (i, col) = child_tbl.get_column(cname).unwrap();
-            let src = if col.is_rowid_alias() {
-                new_rowid_reg
-            } else {
-                layout.to_register(new_start_reg, i)
-            };
-            program.emit_insn(Insn::IsNull {
-                reg: src,
-                target_pc: fk_ok,
-            });
-        }
-        let parent_tbl = resolver
-            .with_schema(database_id, |s| s.get_btree_table(&fk_ref.fk.parent_table))
-            .expect("parent btree");
-        if fk_ref.parent_uses_rowid {
-            let pcur = open_read_table(program, &parent_tbl, database_id);
-
-            // first child col carries rowid
-            let (i_child, col_child) = child_tbl.get_column(&fk_ref.fk.child_columns[0]).unwrap();
-            let val_reg = if col_child.is_rowid_alias() {
-                new_rowid_reg
-            } else {
-                layout.to_register(new_start_reg, i_child)
-            };
-
-            // Normalize rowid to integer for both the probe and the same-row fast path.
-            let tmp = program.alloc_register();
-            program.emit_insn(Insn::Copy {
-                src_reg: val_reg,
-                dst_reg: tmp,
-                extra_amount: 0,
-            });
-            let violation = program.allocate_label();
-            program.emit_insn(Insn::MustBeInt {
-                reg: tmp,
-                target_pc: Some(violation),
-            });
-
-            // If this is a self-reference *and* the child FK equals NEW rowid,
-            // the constraint will be satisfied once this row is inserted
-            if is_self_ref {
-                program.emit_insn(Insn::Eq {
-                    lhs: tmp,
-                    rhs: new_rowid_reg,
-                    target_pc: fk_ok,
-                    flags: CmpInsFlags::default(),
-                    collation: None,
-                });
-            }
-
-            program.emit_insn(Insn::NotExists {
-                cursor: pcur,
-                rowid_reg: tmp,
-                target_pc: violation,
-            });
-            program.emit_insn(Insn::Close { cursor_id: pcur });
-            program.emit_insn(Insn::Goto { target_pc: fk_ok });
-
-            // Missing parent: immediate → Halt before Insert; deferred → counter
-            program.preassign_label_to_next_insn(violation);
-            program.emit_insn(Insn::Close { cursor_id: pcur });
-            if fk_ref.fk.deferred {
-                emit_fk_violation(program, &fk_ref.fk)?;
-            } else {
-                emit_fk_restrict_halt(program)?;
-            }
-            program.preassign_label_to_next_insn(fk_ok);
-        } else {
-            let idx = fk_ref
-                .parent_unique_index
-                .as_ref()
-                .expect("parent unique index required");
-            let ncols = fk_ref.fk.child_columns.len();
-
-            if is_self_ref {
-                // A self-referential INSERT is checked before the new row has
-                // been written to the parent index. Without a shortcut, even
-                // an exact self-reference would look like a missing parent.
-                // SQLite handles that by comparing the pending INSERT registers
-                // directly before it builds the affinity-coerced index probe.
-                //
-                //   CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER UNIQUE,
-                //                  pk TEXT REFERENCES t(k));
-                //   INSERT INTO t(id, k, pk) VALUES (1, 1, '1');
-                //
-                // In that INSERT image, the child key is pk=TEXT '1' and this
-                // row's parent key is k=INTEGER 1. Those stored values are not
-                // the same, so the same-row shortcut must not fire.
-                //
-                // The normal parent-index probe asks a different question:
-                // "after applying the parent key affinity, does this child key
-                // match some parent row that is already in the index?" That is
-                // why cross-row checks may coerce TEXT '1' to INTEGER 1 before
-                // seeking t(k). For this same-row case there is no parent index
-                // entry yet, so reusing the coerced probe would invent a match
-                // that SQLite rejects.
-                let mismatch = program.allocate_label();
-                for (i, &child_pos) in fk_ref.child_pos.iter().enumerate() {
-                    let child_reg = if child_tbl.columns()[child_pos].is_rowid_alias() {
-                        new_rowid_reg
-                    } else {
-                        layout.to_register(new_start_reg, child_pos)
-                    };
-                    let parent_pos = fk_ref.parent_pos[i];
-                    let parent_reg = if child_tbl.columns()[parent_pos].is_rowid_alias() {
-                        new_rowid_reg
-                    } else {
-                        layout.to_register(new_start_reg, parent_pos)
-                    };
-                    program.emit_insn(Insn::Ne {
-                        lhs: child_reg,
-                        rhs: parent_reg,
-                        target_pc: mismatch,
-                        flags: CmpInsFlags::default().jump_if_null(),
-                        // Keep this as BINARY. Even with
-                        // `k TEXT COLLATE NOCASE UNIQUE, pk TEXT REFERENCES t(k)`,
-                        // SQLite rejects same-row INSERT `(k, pk)=('A', 'a')`;
-                        // NOCASE applies to the later parent-index lookup only.
-                        collation: Some(super::collate::CollationSeq::Binary),
-                    });
-                }
-                // All equal: same-row OK
-                program.emit_insn(Insn::Goto { target_pc: fk_ok });
-                program.preassign_label_to_next_insn(mismatch);
-            }
-
-            let icur = open_read_index(program, idx, database_id);
-
-            // Build NEW child probe from child NEW values, apply parent-index affinities.
-            let probe = {
-                let start = program.alloc_registers(ncols);
-                for (k, cname) in fk_ref.fk.child_columns.iter().enumerate() {
-                    let (i, col) = child_tbl.get_column(cname).unwrap();
-                    program.emit_insn(Insn::Copy {
-                        src_reg: if col.is_rowid_alias() {
-                            new_rowid_reg
-                        } else {
-                            layout.to_register(new_start_reg, i)
-                        },
-                        dst_reg: start + k,
-                        extra_amount: 0,
-                    });
-                }
-                if let Some(cnt) = NonZeroUsize::new(ncols) {
-                    program.emit_insn(Insn::Affinity {
-                        start_reg: start,
-                        count: cnt,
-                        affinities: build_index_affinity_string(idx, &parent_tbl),
-                    });
-                }
-                start
-            };
-            index_probe(
-                program,
-                icur,
-                probe,
-                ncols,
-                // on_found: parent exists, FK satisfied
-                |_p| Ok(()),
-                // on_not_found: immediate → Halt; deferred → counter
-                |p| {
-                    if fk_ref.fk.deferred {
-                        emit_fk_violation(p, &fk_ref.fk)?;
-                    } else {
-                        emit_fk_restrict_halt(p)?;
-                    }
-                    Ok(())
-                },
-            )?;
-            program.emit_insn(Insn::Goto { target_pc: fk_ok });
-            program.preassign_label_to_next_insn(fk_ok);
-        }
-    }
-    Ok(())
-}
-
-/// Build NEW parent key image in FK parent-column order into a contiguous register block.
-/// Handles 3 shapes:
-/// - parent_uses_rowid: single "rowid" component
-/// - explicit fk.parent_columns
-/// - fk.parent_columns empty => use parent's declared PK columns (order-preserving)
-fn build_parent_key_image_for_insert(
-    program: &mut ProgramBuilder,
-    parent_table: &BTreeTable,
-    pref: &ResolvedFkRef,
-    insertion: &Insertion,
-) -> crate::Result<(usize, usize)> {
-    // Decide column list. When the parent is the rowid we force the literal name
-    // "rowid" so the loop below routes through `insertion.key_register()`; otherwise
-    // we reuse the already-resolved columns that `ResolvedFkRef` carries.
-    let rowid_slot: [String; 1];
-    let parent_cols: &[String] = if pref.parent_uses_rowid {
-        rowid_slot = ["rowid".to_string()];
-        &rowid_slot
-    } else {
-        &pref.parent_cols
-    };
-
-    let ncols = parent_cols.len();
-    let start = program.alloc_registers(ncols);
-    // Copy from the would-be parent insertion
-    for (i, pname) in parent_cols.iter().enumerate() {
-        let src = if pname.eq_ignore_ascii_case("rowid") {
-            insertion.key_register()
-        } else {
-            // For rowid-alias parents, get_col_mapping_by_name will return the key mapping,
-            // not the NULL placeholder in col_mappings.
-            insertion
-                .get_col_mapping_by_name(pname)
-                .ok_or_else(|| {
-                    crate::LimboError::PlanningError(format!(
-                        "Column '{}' not present in INSERT image for parent {}",
-                        pname, parent_table.name
-                    ))
-                })?
-                .register
-        };
-        program.emit_insn(Insn::Copy {
-            src_reg: src,
-            dst_reg: start + i,
-            extra_amount: 0,
-        });
-    }
-
-    // Apply affinities of the parent columns (or integer for rowid)
-    let aff: String = if pref.parent_uses_rowid {
-        "i".to_string()
-    } else {
-        parent_cols
-            .iter()
-            .map(|name| {
-                let (_, col) = parent_table.get_column(name).ok_or_else(|| {
-                    crate::LimboError::InternalError(format!("parent col {name} missing"))
-                })?;
-                Ok::<_, crate::LimboError>(col.affinity().aff_mask())
-            })
-            .collect::<Result<String, _>>()?
-    };
-    if let Some(count) = NonZeroUsize::new(ncols) {
-        program.emit_insn(Insn::Affinity {
-            start_reg: start,
-            count,
-            affinities: aff,
-        });
-    }
-
-    Ok((start, ncols))
-}
-
-/// Parent-side: when inserting into the parent, decrement the counter
-/// if any child rows reference the NEW parent key.
-/// We *always* do this for deferred FKs, and we *also* do it for
-/// self-referential FKs (even if immediate) because the insert can
-/// “repair” a prior child-insert count recorded earlier in the same statement.
-pub fn emit_parent_side_fk_decrement_on_insert(
-    program: &mut ProgramBuilder,
-    parent_table: &BTreeTable,
-    insertion: &Insertion,
-    force_immediate: bool,
-    resolver: &Resolver,
-    database_id: usize,
-) -> crate::Result<()> {
-    for pref in resolver.with_schema(database_id, |s| {
-        s.resolved_fks_referencing(&parent_table.name)
-    })? {
-        let is_self_ref = pref
-            .child_table
-            .name
-            .eq_ignore_ascii_case(&parent_table.name);
-        // Skip only when it cannot repair anything: non-deferred and not self-referencing
-        if !force_immediate && !pref.fk.deferred && !is_self_ref {
-            continue;
-        }
-        // Nothing to do if the parent counter is 0
-        let skip_fk = program.allocate_label();
-        program.emit_insn(Insn::FkIfZero {
-            deferred: pref.fk.deferred,
-            target_pc: skip_fk,
-        });
-
-        let (new_pk_start, n_cols) =
-            build_parent_key_image_for_insert(program, parent_table, &pref, insertion)?;
-
-        // Nothing to do if the key contains NULLs, because a NULL parent key
-        // never matches any child row (SQL NULL semantics)
-        emit_skip_if_any_null(program, new_pk_start, n_cols, skip_fk);
-
-        let child_tbl = &pref.child_table;
-        let child_cols = &pref.fk.child_columns;
-        let indices: Vec<_> = resolver.with_schema(database_id, |s| {
-            s.get_indices(&child_tbl.name).cloned().collect()
-        });
-        let idx = indices
-            .iter()
-            .find(|ix| super::fkeys::child_index_matches_fk(ix, &pref, parent_table));
-
-        if let Some(ix) = idx {
-            let icur = open_read_index(program, ix, database_id);
-            // Copy key into probe regs and apply child-index affinities
-            let probe_start = program.alloc_registers(n_cols);
-            for i in 0..n_cols {
-                program.emit_insn(Insn::Copy {
-                    src_reg: new_pk_start + i,
-                    dst_reg: probe_start + i,
-                    extra_amount: 0,
-                });
-            }
-            if let Some(count) = NonZeroUsize::new(n_cols) {
-                program.emit_insn(Insn::Affinity {
-                    start_reg: probe_start,
-                    count,
-                    affinities: build_index_affinity_string(ix, child_tbl),
-                });
-            }
-
-            // Decrement once per matching child row
-            index_scan_match_any(program, icur, probe_start, n_cols, None, |p| {
-                let next = p.allocate_label();
-                emit_guarded_fk_decrement(p, next, pref.fk.deferred);
-                p.preassign_label_to_next_insn(next);
-                Ok(())
-            })?;
-        } else {
-            super::fkeys::table_scan_match_any(
-                program,
-                child_tbl,
-                child_cols,
-                parent_table,
-                &pref.parent_cols,
-                new_pk_start,
-                None,
-                database_id,
-                |program| {
-                    let next = program.allocate_label();
-                    emit_guarded_fk_decrement(program, next, pref.fk.deferred);
-                    program.preassign_label_to_next_insn(next);
-                    Ok(())
-                },
-            )?;
-        }
-        program.preassign_label_to_next_insn(skip_fk);
-    }
     Ok(())
 }
 
