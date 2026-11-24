@@ -1073,6 +1073,7 @@ it was squashed into 536f9730).
 | r607, 06:16Z | macOS, needs cpus=4 | built dde71900 (597 s), the forced runs on the fix |
 | r635, 06:26Z | macOS, needs cpus=6 | clippy at 60b50f0d (the fix's tree): rc 0, 763 s |
 | r638, 06:27Z | macOS, needs cpus=4 | a21_ and session_reads:: |
+| foreground, 06:39Z | macOS, needs cpus=4 | the fix's binary (dde71900), lib tests named `session` or `read_session`: 34 passed, 0 failed (199 s, load 77); the RAM disk of the first probe detached |
 
 **For the next lane (Linux, once the window ends).** Scripts in bench/records/2026-11-23-adacachy2-perf-cross-a24/ (a24build.sh,
 a24suite.sh, a24gates.sh, and a24m2.sh for macOS), run with `on` 00aad8daff2fa3c9daa65d53c425d450, sync false, `git show` them
