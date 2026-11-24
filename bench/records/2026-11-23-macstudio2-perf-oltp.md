@@ -249,6 +249,10 @@ Red runs on main's store.rs (7d6cd7f0), 3 of 3: the first new test fails, left 3
 second passes, as it does on any design that never waits for a told sender to send again (it fails
 only on one that does, which decision 14 refuses on paper).
 
+Main then moved in crates/engine (Q3's log segments), so the merge 1c3b7c84 (main 57fd89cd) got
+r1977: `--test store` 16 passed, `--test crash` 10 passed and 3 ignored, clippy rc 0 (01:37Z).
+Main moved again only in a record; merged and landed on main as 8e6bcca6 (01:40Z).
+
 The design index fails the same 3 tests on W5's tree (r1902) and on this one (r1957). Each fault
 names a decision with no index line, or a quote, from other lanes: local-owner-transport version
 10, planner T13, replication P6, store perf-A9, perf-A18 and 45, and the client protocol's "Answers
