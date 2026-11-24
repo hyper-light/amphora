@@ -61,8 +61,20 @@ weighed (by the hook's shape or a skip), so it is not a routing choice. Not trac
 - r1794: main 0bb4b917, cb4_a and cb4_ab, both fail (copy 510.20 ns/row, rows 5.16 ns/row).
 - r1805: e728b863 (trace only), `AMPHORA_PLAN_TRACE=1`, both fail; the trace above.
 - r1845: cb44211b (the fix), `AMPHORA_PLAN_TRACE=1`: cb4_a ok, cb4_ab fails at the waves check.
+- r1891, the merge gate on 15449390 (the fix merged into main 2f29b288):
+  - `storage::versioned::columns_sql::`, `columns_path::` and `translate::optimizer::column_path::`:
+    23 passed, 1 failed (cb4_ab, as on main).
+  - `cargo clippy -p amphora-engine --all-targets --locked -- -D warnings` exit 0.
+  - `amphora --test columnar_decision`: `cs_1_every_claim_in_the_columnar_decision_is_cited` fails.
+- r1904: that doc test at 15449390 and at main 2f29b288 gives the same nine faults, all in section
+  2's item 4 ("Which way is the default is open": 64, 64, 1, 8, 32, 128, 512, 2048, 4096 in no
+  cited quote). The failure is main's own, and the new part 6 item adds none.
+- Merged to main as 50ab86c6. Main had moved only in `crates/pg-parser`, which neither
+  amphora-engine nor amphora depends on.
 
 ## The A/B, not run
+
+It was refused at 00:35Z and 00:36Z: adacachy2 had 0 of 32 cores idle, at cpus=16 and again at 4.
 
 `~/.cache/amphora-perf/reals-r6-scripts/ab_linux.sh` (lane R6's scripts, adacachy) runs S8's five
 analytics statements (`table_count`, `table_group_by`, `filter_no_index`, `aggregates_range`,
