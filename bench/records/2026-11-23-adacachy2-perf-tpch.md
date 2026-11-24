@@ -1547,3 +1547,105 @@ Times: F's runs 0 to 4, median 864 ms (809 to 1,006). S's warm runs 1 to 4, medi
   (the log checks amphora-engine, 41 s), 69 of 69, 3 of 3 (the log compiling amphora-engine).
 - r50 (4f6725d4, merged again after main moved in `crates/engine` (database.rs, wal.rs) and `crates/amphora`): clippy
   clean (the log checks amphora-engine, 34 s), 69 of 69, 3 of 3 (the log compiling amphora-engine).
+
+# Lane T19 (tpch), 2026-11-24 02:49Z to 03:58Z: the join search prices the star filter the run will use
+
+Losses first:
+- Not done: the other 21 TPC-H queries' plans before and after are not compared. The fix prices a filter for any
+  star-shaped join, so other plans can change; the next lane must list each that does and why (section 5).
+- Not shown yet: the new test failing without the fix. r115 (macOS) runs it on main's engine with only the test added;
+  it had not finished at the hour's end (the MacBook Pro 2 ran at load 64 to 78; its clippy alone took 17 min).
+- The q03 times below are one process at load 42 on 32 cores with both traces on (the seek trace reads the clock twice
+  a seek): not an A/B against S. T18's untraced-for-filters F median was 864 ms and S's 1,871 ms.
+- macOS asks waited 25 min with no room (r71, r95 stopped before they started; r110's tentative place was
+  2768d0d5, which the rules forbid, and it was stopped before it started); r115 ran by `on` on MacBook Pro 2.
+- adacachy2 refused 1 of 4 asks (cpus=8; 6 of 32 idle); asked again at cpus=4.
+
+## 1. The rule T18 left open, and why
+
+`lip::choose` keeps a filter when the work its misses no longer do is more than its lookups, its bits and the
+dimension's second read, and it reads that work off the finished plan: the cost of every loop after the fact table,
+over the fact table's rows (`saved_per_miss`). The join search adds one table at a time and doesn't know the loops
+after the one it adds. The rule this lane chose:
+
+- The search prices a filter at the step that adds its dimension, against the one saving that step can see: the
+  dimension's own read, which each fact row the filter drops no longer reaches. Per dropped row that is the read's
+  cost over the fact rows the filter checks (`read cost / reaching`). It is a lower bound of the whole saving: the
+  loops between the fact table and the dimension save too; the loops after the dimension save nothing (its join drops
+  those rows anyway).
+- Why a lower bound and not an estimate of the rest: an estimate would price a cut the search can't yet see, a guess
+  (rule 0). A lower bound never prices a filter that doesn't pay in the run: if it pays on part of the saving, it pays
+  on the whole of it. It adds no constant (rule 2): the weights, the rows and the sizing are the ones `lip::choose`
+  already used.
+- The filter step keeps the filters the search priced, at the search's rate (`TablePlanEstimate::star_filter`), and
+  doesn't weigh them again against the finished plan: that plan's cost already counts their cut, so `end_cost` would
+  count it twice. The filters the search didn't price are decided as before, so no filter a plan ran before is
+  dropped. One gap, named: a filter the whole-plan rule adds on top is still unpriced in the search, as all were.
+
+## 2. The change (a34ec88b, perf/tpch-t19)
+
+- `join_lhs_and_rhs`: before the read is weighed against a hash join, `lip::price_read` prices the star filter the read
+  would give a fact table the loops before it read whole (`lip::choose`'s conditions: no RIGHT or FULL JOIN, both
+  tables plain inner joins of rowid tables, an equality key between them, terms of the dimension's own, the fact table
+  read whole and not a hash join's build). The read is then priced on the fact rows the filter passes, plus the
+  dimension read once more into the filter, its bits and a lookup a fact row: `read - without + with_filter`, the two
+  totals `bloom_filter_rate_saving` already compares (now returned by `bloom_filter_costs`).
+- The reaching rows are the fact table's prefix rows, cut by the filters priced before for the same fact table.
+- `AMPHORA_PLAN_TRACE` logs each priced read ("T19: a read priced with the star filter it gives": the read's cost, its
+  cost with the filter, the filter's fact table, rate and pass). `AMPHORA_SEEK_TRACE` logs each run's star-filter
+  probes and rejects at its halt ("T19: the star filters' rows this run").
+
+## 3. The test
+
+`optimizer::join::tests::t19_q03_star_filter_priced_in_the_search_seeks_customer`: q03's shape at 1/100 of SF1 (1,500
+customers, 1 in 5 BUILDING; 15,000 orders, 10 a customer, 48% before the date; 60,000 lineitems, 4 an order) with
+ANALYZE's statistics, at T17's S weights pinned. Expect `SCAN orders`, then `SEARCH customer USING INTEGER PRIMARY
+KEY`, then `SEARCH lineitem USING INDEX`; the filter the search priced rejects rows in the run (the statement's
+`star_filter_rejects`); the answer is the nested loops' (an ORDER BY made total with `l_orderkey`).
+
+## 4. The trace (r145, adacachy2, 03:45:17Z to 03:47:09Z, at 36c11cb5)
+
+`SHA=36c11cb5 JOBS=8 bash ~/.cache/tpch-t19/trace.sh` (copy in `~/.cache/amphora-perf/tpch-t19/`): release build
+101 s (the log compiles amphora-engine); q03 at SF1, target `amphora` (one thread), T11's `db-sf1`, pinned at T17's S
+set (every prepare read it, 12 prepares), `AMPHORA_PLAN_TRACE=1 AMPHORA_SEEK_TRACE=1`, one process: the counted run
+then 5 runs on one connection; then SQLite's q03 into the same answers directory. Load 42 on 32 cores, CPU pressure
+avg10 24 to 26%.
+
+- What drops the 4 in 5 orders rows: the star filter built from customer, checked at orders' scan. Every run's halt
+  logs `probes=727305 rejects=580092 passed=147213 filters=["customer"]`: 727,305 orders rows in (orders' own date
+  term passed; the same count T18 saw S's hash build take), 147,213 out (79.8% dropped). The per-operator counts
+  agree: orders' loop gives 147,213 rows, customer's 147,126, lineitem's 30,519; customer is seeked 147,213 times.
+- What the search priced: "T19: a read priced with the star filter it gives": customer after orders, 707,520 rows in,
+  pass 0.1998; the read 251,802.2 page reads without the filter, 52,480.9 with it (the filter's false-positive rate
+  per key 5.95e-9, so it passes 0.1999 of orders' rows). F's whole plan: 433,095.4, against S's 506,982.0 at the same
+  weights (T18's r53): F is chosen. T18 had predicted 433,168 (the run's seeks) and 430,913 (the planner's pass).
+- Every statement chose F: the counted run and runs 0 to 4, `SCAN orders / SEARCH customer USING INTEGER PRIMARY KEY
+  (rowid=?) / SEARCH lineitem USING INDEX sqlite_autoindex_lineitem_1 (l_orderkey=?)`.
+- Answers: answers.py, Amphora's against SQLite's: 1 of 1 compared, 0 differ.
+- Times (traced, one process, not an A/B): counted 1,499 ms; runs 1,370, 1,040, 1,026, 1,002, 1,082 ms (median
+  1,040 ms). Customer's seeks took 1,386 to 1,899 ns each, lineitem's index 863 to 1,541 ns, both with the trace's two
+  clock reads a seek.
+- The search also priced a second filter, from orders to lineitem when lineitem is read whole first (3,170,564 rows in,
+  pass 0.4717, 1,132,387 to 552,005); that order was not chosen.
+
+## 5. Next, in order
+
+1. The 22 queries' plans at S's weights before (main) and after this change, each changed plan listed with the T19
+   lines that changed it; any slower one measured against SQLite and DuckDB.
+2. r115's result: the test on main's engine without the fix (`~/.cache/tpch-t19/base.log` on MacBook Pro 2).
+3. Apart (later lanes, unchanged): the hash join timed on its own; the cold-lookup page reads inside the learned seek
+   weight; the calibration cache's host identity; q03's per-core hotspots.
+
+## 6. Checks
+
+- r115 (MacBook Pro 2, a34ec88b, load 64 to 78): `cargo clippy -p amphora-engine --all-targets --locked -- -D warnings`
+  clean (the log compiles amphora-engine, 17 min); tests then running.
+- r147 (adacachy2, 36c11cb5, this branch merged with main 7de5344d, which moved in crates/amphora and in
+  vdbe/execute.rs by the same fmt this branch made): clippy clean (the log compiles amphora-engine, 47 s);
+  `cargo test -p amphora-engine --lib --locked -- optimizer::join learned_costs optimizer::lip` 70 of 70, the new test
+  among them.
+- r163 (adacachy2, aa04d3b3, merged again with main 9fbfdbaf, which moved in crates/engine: parallel.rs, morsel,
+  execute.rs, storage/versioned): clippy clean (the log checks amphora-engine, 57 s); the same tests 69 of 70: `learned_costs::tests::t_qt_5_5_a_new_database_has_a_page_read_before_its_first_query`
+  failed once (`row_in_pages` None at a new database's open, load 54, CPU pressure avg10 40%; the first run of the new
+  test binary). It passed at 36c11cb5 (r147), and its suite passed 36 of 36 three times on the same tree after (r166,
+  load 58). This lane didn't touch it; one line for the calibration lane.
