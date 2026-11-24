@@ -3886,8 +3886,7 @@ impl BTreeTable {
                 }
             }
 
-            if column.notnull()
-                && (column.explicit_notnull() || !self.key_implies_notnull(column))
+            if column.notnull() && (column.explicit_notnull() || !self.key_implies_notnull(column))
             {
                 sql.push_str(" NOT NULL");
                 push_on_conflict_clause(&mut sql, column.notnull_conflict_clause);

@@ -1024,7 +1024,7 @@ fn first_aggregate_without_over_clause<'a>(
 
 /// Validate that all expressions in the plan return the correct number of values;
 /// generally this only applies to parenthesized lists and subqueries.
-fn validate_expr_correct_column_counts(plan: &SelectPlan) -> Result<()> {
+pub(crate) fn validate_expr_correct_column_counts(plan: &SelectPlan) -> Result<()> {
     for result_column in plan.result_columns.iter() {
         let vec_size = expr_vector_size(&result_column.expr)?;
         if vec_size != 1 {
@@ -1400,9 +1400,7 @@ fn resolve_compound_order_by_expr(
     }
     if let Some(position) = integer_term(expr) {
         return match usize::try_from(position) {
-            Ok(position @ 1..) if position <= num_result_columns => {
-                Ok((position - 1, collation))
-            }
+            Ok(position @ 1..) if position <= num_result_columns => Ok((position - 1, collation)),
             _ => crate::bail_parse_error!(
                 "{} ORDER BY term out of range - should be between 1 and {}",
                 ordinal(term_number),

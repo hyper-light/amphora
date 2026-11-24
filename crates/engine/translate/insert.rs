@@ -42,7 +42,7 @@ use crate::{
             fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
         },
         upsert::{
-            collect_set_clauses_for_upsert, emit_upsert, resolve_upsert_target,
+            collect_set_clauses_for_upsert, emit_upsert, resolve_upsert_target, DoUpdateSubqueries,
             ResolvedUpsertTarget,
         },
     },
@@ -360,6 +360,13 @@ pub fn translate_insert(
     for column in &returning {
         if let ResultColumn::Expr(expr, _) = column {
             collect_subquery_table_refs_in_expr(expr, &mut returning_table_refs);
+        }
+    }
+    for (_, _, upsert) in &upsert_actions {
+        if let UpsertDo::Set { sets, where_clause } = &upsert.do_clause {
+            for expr in sets.iter().map(|set| &set.expr).chain(where_clause) {
+                collect_subquery_table_refs_in_expr(expr, &mut returning_table_refs);
+            }
         }
     }
     plan_ctes_as_outer_refs(
@@ -1696,6 +1703,17 @@ fn resolve_upserts(
             ref mut where_clause,
         } = upsert.do_clause
         {
+            let mut subqueries = DoUpdateSubqueries::plan(
+                program,
+                resolver,
+                connection,
+                ctx,
+                insertion,
+                table_references,
+                table_alias,
+                sets,
+                where_clause,
+            )?;
             // Normalize SET pairs once
             let mut rewritten_sets = collect_set_clauses_for_upsert(table, sets)?;
 
@@ -1711,6 +1729,7 @@ fn resolve_upserts(
                 connection,
                 table_references,
                 table_alias,
+                &mut subqueries,
             )?;
         } else {
             // UpsertDo::Nothing case
@@ -2012,7 +2031,7 @@ struct BoundInsertResult {
 /// Check if an expression contains a subquery (Subquery, InSelect, or Exists).
 /// This is used to detect when single-row VALUES should be routed through the
 /// multi-row path which has proper subquery handling.
-fn expr_contains_subquery(expr: &Expr) -> bool {
+pub(crate) fn expr_contains_subquery(expr: &Expr) -> bool {
     let mut found_subquery = false;
     let _ = walk_expr(expr, &mut |e| {
         if matches!(
