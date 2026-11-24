@@ -3424,6 +3424,16 @@ impl<F: BlockFile + 'static> Actor<F> {
             self.peers(),
             self.replica.core().raft.config().limits.members,
         )?;
+        #[cfg(test)]
+        if self.replica.is_leader() && outgoing.bound != bounds.outgoing {
+            eprintln!(
+                "P19 bound m={} t={} {:?} -> {:?}",
+                self.replica.id(),
+                super::slot::p19(self.at),
+                outgoing.bound,
+                bounds.outgoing
+            );
+        }
         outgoing.bound = bounds.outgoing;
         outgoing.room = bounds.room;
         let held = u64::try_from(outgoing.bytes).unwrap_or(u64::MAX);
