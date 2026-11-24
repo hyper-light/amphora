@@ -2,6 +2,7 @@
 //! a coordinator crash at every step (T-T1.10.1), and seeded simulations under lost and late steps
 //! and crashes, checked Elle-style (AC-T1.10.5).
 
+mod lock_edges;
 mod lock_stamps;
 
 use std::collections::{BTreeMap, BTreeSet};
