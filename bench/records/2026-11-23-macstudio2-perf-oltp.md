@@ -180,3 +180,28 @@ The disturbed runs' JSON stays in `~/.cache/oltp-ab/out-w5` on Mac Studio 2.
    read `ab_w5_stats.py`'s p values for M against D1 and T against D1 at 1, 32 and 128 clients.
 2. Run `w5-checks.sh` (`RED=f363d688`) on perf/oltp's tip.
 3. If D1 holds, fill decision 14's evidence (docs/design/store.md) and merge perf/oltp.
+
+## The rerun (r1888, 00:28Z to 00:39Z) and both runs kept by the disk's quiet flush cost
+
+r1888 (`OUT=out-w5b`, the same arms and binaries) was disturbed in rounds 1, 3, 4 and 5 by the same
+outside work (load to 47, others to 2,900% CPU); unfiltered, its mean flush reached 143 ms against
+the disk's 4.6. Rows a flush, which slow flushes can't push past all clients, held in all 5 runs a
+side: D1 32.0 and 31.4 at 32 clients, 127.2 and 126.1 at 128; main 14.7, 15.0, 60.0 and 60.4.
+
+`ab_w5_quiet.py` keeps, from both runs, the runs whose mean flush is at most W4's largest quiet mean
+on this machine (5.40 ms): a flush is one F_FULLFSYNC whose cost W4 measured the same in both arms.
+The filter was written after the runs, and some cells keep fewer than 5 runs a side, so this is
+evidence for the next lane, not a merge gate. Median (range), writes a second:
+
+| statement | clients | T | M | D1 | D1 against M |
+|---|---|---|---|---|---|
+| insert_one | 1 | 169 (158 to 196), 5 runs | 205 (175 to 218), 5 | 214 (205 to 220), 5 | +4.4%, p 0.302 |
+| insert_one | 32 | 4,712 (3,872 to 4,800), 5 | 3,138 (2,945 to 3,406), 6 | 5,456 (4,896 to 5,856), 6 | +73.9%, p 0.002 |
+| insert_one | 128 | 12,066 (11,361 to 13,184), 4 | 12,027 (10,004 to 12,242), 5 | 14,272 (13,736 to 15,488), 6 | +18.7%, p 0.004 |
+| update_plain | 1 | 159 (157 to 199), 4 | 210 (198 to 226), 5 | 216 (213 to 229), 5 | +2.9%, p 0.278 |
+| update_plain | 32 | 4,858 (3,825 to 5,312), 4 | 3,566 (3,246 to 3,603), 5 | 5,829 (5,667 to 6,641), 7 | +63.5%, p 0.003 |
+| update_plain | 128 | 17,240 (12,160 to 18,688), 4 | 12,923 (11,725 to 13,882), 3 | 18,433 (15,958 to 20,880), 7 | +42.6%, p 0.017 |
+
+Rows a flush in the kept runs: D1 32.0, 127.2, 31.4, 123.5; M 14.6, 60.1, 15.6, 63.5; T 31.9, 98.6,
+30.9, 123.0 (insert_one 32, 128, update_plain 32, 128). p50 at 32 clients: D1 5.28 and 5.12 ms, M
+8.83 and 8.45, T 6.34 and 6.18. Mean flush 4.28 to 5.07 ms in every arm. 0 errors, 0 retries.
