@@ -250,10 +250,19 @@ mod tests {
     use amphora_pg_catalog::Catalog;
 
     fn open(path: &str) -> (Arc<Database>, Arc<Connection>) {
+        open_with(path, Arc::new(PostgresDialect::new()))
+    }
+
+    fn open_with(path: &str, dialect: Arc<PostgresDialect>) -> (Arc<Database>, Arc<Connection>) {
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io, path, Arc::new(PostgresDialect::new())).unwrap();
+        let db = Database::open_file(io, path, dialect).unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
         (db, conn)
+    }
+
+    /// The `pg_class` OID of the table named `name`.
+    fn oid(conn: &Arc<Connection>, name: &str) -> i64 {
+        int(field(&PG_CLASS, &class_row(conn, name), "oid"))
     }
 
     fn query(conn: &Arc<Connection>, sql: &str) -> Vec<Vec<Value>> {
@@ -427,5 +436,78 @@ mod tests {
             third > first.max(second),
             "{third} is past every OID the reopened database holds"
         );
+    }
+
+    /// T-PG.7.6: the OID counter is durable (section 7): a table created after a dropped table
+    /// and a reopen takes the OID after the dropped one's, never the dropped one's, as PostgreSQL
+    /// keeps `nextOid` across restarts (REL_19_0 src/backend/access/transam/xlog.c:7280).
+    #[test]
+    fn t_pg_7_6_a_dropped_tables_oid_is_not_given_again_after_a_reopen() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("dropped.db");
+        let path = path.to_str().unwrap();
+        let dropped = {
+            let (_db, conn) = open(path);
+            conn.execute("CREATE TABLE gone (a int4)").unwrap();
+            let dropped = oid(&conn, "gone");
+            conn.execute("DROP TABLE gone").unwrap();
+            dropped
+        };
+
+        let (_db, conn) = open(path);
+        conn.execute("CREATE TABLE next (b int4)").unwrap();
+        let next = oid(&conn, "next");
+        assert_ne!(next, dropped, "the dropped table's OID is not given again");
+        assert_eq!(
+            next,
+            dropped + 1,
+            "the counter continues from its stored value"
+        );
+    }
+
+    /// T-PG.7.7: two CREATE TABLEs in one transaction take distinct OIDs, and the transaction
+    /// stores the counter past both: after the later table is dropped and the database reopened,
+    /// a new table takes neither.
+    #[test]
+    fn t_pg_7_7_two_creates_in_one_transaction_take_distinct_oids_stored_past_both() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("one-transaction.db");
+        let path = path.to_str().unwrap();
+        let (first, second) = {
+            let (_db, conn) = open(path);
+            conn.execute("BEGIN").unwrap();
+            conn.execute("CREATE TABLE first (a int4)").unwrap();
+            conn.execute("CREATE TABLE second (b int4)").unwrap();
+            conn.execute("COMMIT").unwrap();
+            let first = oid(&conn, "first");
+            let second = oid(&conn, "second");
+            assert_ne!(first, second, "one transaction's tables take distinct OIDs");
+            conn.execute("DROP TABLE second").unwrap();
+            (first, second)
+        };
+
+        let (_db, conn) = open(path);
+        conn.execute("CREATE TABLE third (c int4)").unwrap();
+        let third = oid(&conn, "third");
+        assert!(
+            third != first && third != second,
+            "{third} is neither {first} nor {second}"
+        );
+        assert_eq!(third, first.max(second) + 1);
+    }
+
+    /// T-PG.7.9: a rolled-back CREATE TABLE spends its OID: the counter is outside the transaction,
+    /// as PostgreSQL's `nextOid` is (varsup.c:554-613), so the next table takes the OID after it.
+    #[test]
+    fn t_pg_7_9_a_rolled_back_create_table_spends_its_oid() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("rolled-back.db");
+        let (_db, conn) = open(path.to_str().unwrap());
+        conn.execute("BEGIN").unwrap();
+        conn.execute("CREATE TABLE undone (a int4)").unwrap();
+        let undone = oid(&conn, "undone");
+        conn.execute("ROLLBACK").unwrap();
+        conn.execute("CREATE TABLE kept (a int4)").unwrap();
+        assert_eq!(oid(&conn, "kept"), undone + 1);
     }
 }
