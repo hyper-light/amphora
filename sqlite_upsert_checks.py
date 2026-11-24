@@ -14,9 +14,9 @@ Left out: which of two UNIQUE constraints a row meets first (no document says; a
 expression that raises (SQLite evaluates a constant one before the statement's first row), what Amphora has no table
 function for (pragma_foreign_key_check, pragma_integrity_check('t')) or lists otherwise (pragma_index_list of a WITHOUT
 ROWID table), a STRICT table's CHECK that compares TEXT with a number (Amphora refuses the table), a generated column
-(production doesn't make one), and two foreign key causes: a row with no parent in a statement of several rows (refused at
-once, SQLite at the statement's end) and OR REPLACE of a parent's row on a WITHOUT ROWID table (refused, SQLite takes the
-new row).
+(production doesn't make one), and three foreign key causes: a row with no parent in a statement of several rows (refused at
+once, SQLite at the statement's end), OR REPLACE of a parent's row on a WITHOUT ROWID table (refused, SQLite takes the new
+row), and FAIL, which leaves a row with no parent stored (SQLite ends the statement with the foreign key's refusal).
 
 usage: bench/sqlite_upsert_checks.py COUNT SEED > crates/engine/tests/fixtures/upsert_checks.tsv   (SQLite 3.54.0 in Python)
 """
@@ -56,7 +56,8 @@ class Case:
             defs.append(" ".join(text.split()))
             self.cols.append(name)
 
-        clause = lambda: pick(CLAUSES) if rng.random() < 0.5 else ""
+        clauses = [c for c in CLAUSES if not (self.fk and "FAIL" in c)]
+        clause = lambda: pick(clauses) if rng.random() < 0.5 else ""
         column("n", f"n {ty} NOT NULL{clause()}" + (" DEFAULT 4" if rng.random() < 0.4 else ""))
         column("c", f"c {ty} CHECK (c > 0)")
         if rng.random() < 0.6:
@@ -93,7 +94,7 @@ class Case:
         when = rng.choice([""] * 4 + [f" WHEN {rng.choice(seen)} {rng.choice(['IS NULL', '> 1', 'IS NOT NULL'])}"])
         act = ""
         if rng.random() < 0.55:
-            how = rng.choice(["IGNORE", "IGNORE", "ABORT, 'no'", "ABORT, 'no'", "FAIL, 'no'", "ROLLBACK, 'no'"])
+            how = rng.choice(["IGNORE", "IGNORE", "ABORT, 'no'", "ABORT, 'no'", "ABORT, 'no'" if self.fk else "FAIL, 'no'", "ROLLBACK, 'no'"])
             act = f" SELECT RAISE({how}) WHERE {rng.choice(seen)} {rng.choice(['IS NULL', 'IS NOT NULL', '< 1', '> 1', '= 5'])};"
         elif event.startswith(("BEFORE UPDATE", "AFTER UPDATE")) and rng.random() < 0.4:
             x = rng.choice([x for x in self.cols if x not in ("id", "u", "f")])
@@ -135,7 +136,7 @@ class Case:
         rng = self.rng
         self.many = rng.choice([1, 1, 2, 3])
         rows = ", ".join("(" + ", ".join(self.value(x, 0.08, True) for x in self.cols) + ")" for _ in range(self.many))
-        head = rng.choice(["INSERT"] * 5 + ["INSERT OR ABORT", "INSERT OR FAIL", "INSERT OR IGNORE", "INSERT OR ROLLBACK"] + ["INSERT OR REPLACE"] * (not (self.fk and self.without_rowid)))
+        head = rng.choice(["INSERT"] * 5 + ["INSERT OR ABORT", "INSERT OR IGNORE", "INSERT OR ROLLBACK"] + ["INSERT OR FAIL"] * (not self.fk) + ["INSERT OR REPLACE"] * (not (self.fk and self.without_rowid)))
         where = lambda: rng.choice([""] * 4 + [f" WHERE {rng.choice(['t.', 'excluded.'])}{rng.choice(self.cols)} {rng.choice(['IS NOT NULL', '> 1', '< 5'])}"])
         arms = [f" ON CONFLICT(id) DO UPDATE SET {self.sets()}{where()}", f" ON CONFLICT(u) DO UPDATE SET {self.sets()}{where()}"]
         rng.shuffle(arms)
@@ -154,7 +155,7 @@ class Case:
         where = f" WHERE id = {self.value('id')}" if rng.random() < 0.5 or self.without_rowid else ""
         if drawn < 0.9:
             cols = rng.sample(self.cols[1:], rng.choice([1, 2]))
-            return f"UPDATE{rng.choice([''] * 3 + [' OR IGNORE', ' OR FAIL', ' OR REPLACE'])} t SET " + ", ".join(f"{x} = {self.value(x, 0.4)}" for x in cols) + where
+            return f"UPDATE{rng.choice([''] * 3 + [' OR IGNORE', ' OR REPLACE'] + [' OR FAIL'] * (not self.fk))} t SET " + ", ".join(f"{x} = {self.value(x, 0.4)}" for x in cols) + where
         if drawn < 0.95:
             return f"DELETE FROM t{where}"
         return f"INSERT{rng.choice(['', ' OR IGNORE'] + [' OR REPLACE'] * (not (self.fk and self.without_rowid)))} INTO t VALUES (" + ", ".join(self.value(x, 0.25, True) for x in self.cols) + ")"
