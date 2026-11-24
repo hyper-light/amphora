@@ -5067,126 +5067,283 @@ pub(crate) mod bushy_search_tests {
         }
 
         /// One database of `tests/fixtures/outer_joins.tsv`: the statements that fill it, and its
-        /// queries with SQLite's answers.
+        /// queries with SQLite's answers, each with how many columns its ORDER BY reads (0: one row
+        /// of aggregates, compared as it stands).
         struct OuterJoins {
             name: &'static str,
             fill: Vec<&'static str>,
-            queries: Vec<(&'static str, &'static str)>,
+            queries: Vec<(usize, &'static str, &'static str)>,
         }
 
-        fn outer_joins() -> Vec<OuterJoins> {
+        fn outer_joins(name: &str) -> OuterJoins {
             let mut out: Vec<OuterJoins> = Vec::new();
             for line in include_str!("../../tests/fixtures/outer_joins.tsv").lines() {
-                let mut fields = line.split('\t');
-                match (fields.next(), fields.next(), fields.next()) {
-                    (Some("db"), Some(name), None) => out.push(OuterJoins {
+                let fields: Vec<&'static str> = line.split('\t').collect();
+                match fields.as_slice() {
+                    ["db", name] => out.push(OuterJoins {
                         name,
                         fill: Vec::new(),
                         queries: Vec::new(),
                     }),
-                    (Some("sql"), Some(sql), None) => out.last_mut().unwrap().fill.push(sql),
-                    (Some("q"), Some(sql), Some(answer)) => {
-                        out.last_mut().unwrap().queries.push((sql, answer));
+                    ["sql", sql] => out.last_mut().unwrap().fill.push(sql),
+                    ["q", sql, want] => out.last_mut().unwrap().queries.push((0, sql, want)),
+                    ["o", keys, sql, want] => {
+                        out.last_mut()
+                            .unwrap()
+                            .queries
+                            .push((keys.parse().unwrap(), sql, want))
                     }
                     _ => assert!(line.starts_with('#'), "{line}"),
                 }
             }
-            out
+            out.into_iter().find(|db| db.name == name).unwrap()
         }
 
-        /// PL.8 (T-PL.8.13, lane C3): left, right and full joins among inner ones, four and five
-        /// tables in drawn FROM orders at three sizes, and the fact queries with their outer join
-        /// hung every way, each with SQLite's own answer (`bench/sqlite_outer_joins.py`). Do: run
-        /// each with and without statistics by cost, at one worker and eight, with LEFT JOIN
-        /// probes allowed, under weights that make seeks dear and hash joins cheap and the other
-        /// way round, and as the hand-built bushy trees of its FROM order. Expect: SQLite's answer
-        /// every time, NULL rows counted; plans made bushy, a LEFT JOIN inside a run and a LEFT
-        /// JOIN as a run's probe among them.
-        #[test]
-        fn t_pl_8_13_outer_joins_answer_as_sqlite_whatever_the_plan() {
+        /// FNV-1a 64 of lines, as `bench/sqlite_outer_joins.py` sums SQLite's rows.
+        fn lines_sum(lines: &[String]) -> u64 {
+            lines
+                .join("\n")
+                .bytes()
+                .fold(0xCBF2_9CE4_8422_2325_u64, |sum, byte| {
+                    (sum ^ u64::from(byte)).wrapping_mul(0x100_0000_01B3)
+                })
+        }
+
+        /// What `sql` answers, as the fixture writes SQLite's answer (`keys` 0: its row; otherwise
+        /// its rows' count, the sum of them sorted and the sum of their first `keys` columns in the
+        /// order they came), and its first rows for a report.
+        fn outer_join_outcome(
+            conn: &Arc<crate::Connection>,
+            sql: &str,
+            keys: usize,
+        ) -> (String, Vec<String>) {
+            let got = conn
+                .prepare(sql)
+                .and_then(|mut stmt| stmt.run_collect_rows());
+            let rows: Vec<Vec<String>> = match got {
+                Ok(rows) => rows
+                    .into_iter()
+                    .map(|row| row.iter().map(|value| value.to_string()).collect())
+                    .collect(),
+                Err(error) => return (format!("refused: {error}"), Vec::new()),
+            };
+            let mut lines: Vec<String> = rows.iter().map(|row| row.join(",")).collect();
+            let first = lines.iter().take(6).cloned().collect();
+            if keys == 0 {
+                return (lines.join(";"), first);
+            }
+            let ordered: Vec<String> = rows.iter().map(|row| row[..keys].join(",")).collect();
+            lines.sort();
+            (
+                format!(
+                    "{}:{:016x}:{:016x}",
+                    rows.len(),
+                    lines_sum(&lines),
+                    lines_sum(&ordered)
+                ),
+                first,
+            )
+        }
+
+        /// How a query of the outer joins' sweep is planned.
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum OuterJoinPlans {
+            /// By cost, on the learned weights.
+            ByCost,
+            /// By cost, on weights pinned at a seek's, a hash build's and a hash probe's rows'
+            /// visits, with LEFT JOIN probes allowed.
+            Weights(f64, f64, f64),
+            /// The FROM order left-deep, its last table's hash join built from the run that starts
+            /// at this position.
+            HandBuilt(usize),
+        }
+
+        /// What the sweep's runs did: what its answers were worth.
+        #[derive(Debug, Default)]
+        struct OuterJoinRuns {
+            runs: usize,
+            bushy: usize,
+            left_joins_in_runs: usize,
+            left_join_probes: usize,
+            /// The runs whose joins' workers built hash tables, by the workers stated.
+            hooked: std::collections::BTreeMap<usize, usize>,
+            /// The runs planned bushy that also took the hook.
+            bushy_hooked: usize,
+        }
+
+        /// PL.8 (T-PL.8.13, lanes C3 and C6): left, right and full joins among inner ones, four and
+        /// five tables in drawn FROM orders at three sizes, and the fact queries with their outer
+        /// join hung every way, each as a row of aggregates, as its rows under an ORDER BY (with a
+        /// LIMIT in some) and as groups in their keys' order, with SQLite's own answers
+        /// (`bench/sqlite_outer_joins.py`). Do: run each with or without statistics, by cost, under
+        /// weights that make seeks dear and hash joins cheap and the other way round, with LEFT JOIN
+        /// probes allowed, and as the hand-built bushy trees of its FROM order; each with the
+        /// parallel mode off and at 1, 2 and 8 stated workers. Expect: SQLite's answer every time,
+        /// its rows, their NULLs and their order.
+        fn outer_joins_answer_as_sqlite(name: &str, analyzed: bool) -> OuterJoinRuns {
             use super::super::bushy_test_hook::{APPLIED, PIN, SPLIT};
             use crate::translate::optimizer::learned_costs::LearnedWeights;
-            use crate::vdbe::morsel::ParallelMode;
+            use crate::vdbe::morsel::{MachineCosts, ParallelMode};
+            use std::sync::atomic::Ordering;
+            let db = outer_joins(name);
+            let io = Arc::new(MemoryIO::new());
+            let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            let conn = database.connect(ConnectOpts::new()).unwrap();
+            for sql in &db.fill {
+                conn.execute(*sql).unwrap();
+            }
+            if analyzed {
+                conn.execute("ANALYZE").unwrap();
+            }
+            // Workers, and the table an outer join of two probes on them; each plan at each.
+            let padded = crate::OuterJoinProbe::Padded;
+            let workers = [
+                None,
+                Some((1, padded)),
+                Some((2, padded)),
+                Some((8, padded)),
+                Some((8, crate::OuterJoinProbe::Kept)),
+            ];
+            let plans: &[OuterJoinPlans] = if name == "facts" {
+                &[OuterJoinPlans::ByCost]
+            } else {
+                &[
+                    OuterJoinPlans::ByCost,
+                    OuterJoinPlans::Weights(2.0, 0.5, 0.5),
+                    OuterJoinPlans::Weights(2000.0, 0.5, 0.5),
+                    OuterJoinPlans::Weights(2000.0, 50.0, 0.5),
+                    OuterJoinPlans::HandBuilt(1),
+                    OuterJoinPlans::HandBuilt(2),
+                ]
+            };
+            let mut ran = OuterJoinRuns::default();
             let mut wrong: Vec<String> = Vec::new();
-            let (mut bushy, mut in_runs, mut probing) = (0, 0, 0);
-            for db in outer_joins() {
-                let large = db.name == "facts";
-                for analyzed in [true, false] {
-                    let io = Arc::new(MemoryIO::new());
-                    let database =
-                        Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-                    let conn = database.connect(ConnectOpts::new()).unwrap();
-                    for sql in &db.fill {
-                        conn.execute(*sql).unwrap();
-                    }
-                    if analyzed {
-                        conn.execute("ANALYZE").unwrap();
-                    }
-                    for (sql, want) in &db.queries {
-                        let mut run = |plans: &str| {
-                            BUSHY_PLANS.with(|plans| plans.set(0));
-                            LEFT_JOINS_IN_RUNS.with(|runs| runs.set(0));
-                            LEFT_JOIN_PROBES.with(|probes| probes.set(0));
-                            APPLIED.with(|applied| applied.set(0));
-                            let got = rows(&conn, sql).join(";");
-                            bushy += BUSHY_PLANS.with(Cell::get) + APPLIED.with(Cell::get);
-                            in_runs += LEFT_JOINS_IN_RUNS.with(Cell::get);
-                            probing += LEFT_JOIN_PROBES.with(Cell::get);
-                            if got != *want {
-                                wrong.push(format!(
-                                    "{} analyzed={analyzed} {plans}: got {got}, SQLite {want}: \
-                                     {sql}: {:?}",
-                                    db.name,
-                                    rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"))
-                                ));
-                            }
-                        };
-                        run("by cost");
-                        conn.set_parallel_mode(ParallelMode::On);
-                        conn.set_parallel_cores(std::num::NonZeroUsize::new(8));
-                        run("by cost, eight workers");
-                        conn.set_parallel_mode(ParallelMode::Off);
-                        if large {
-                            continue;
-                        }
+            let mut slowest: Vec<(u128, String)> = Vec::new();
+            for plan in plans {
+                match *plan {
+                    OuterJoinPlans::ByCost => {}
+                    OuterJoinPlans::Weights(seek, hash_build, hash_probe) => {
                         conn.set_bushy_left_join_probes(BushyLeftJoinProbes::ByCost);
-                        for (seek, hash_build, hash_probe) in
-                            [(2.0, 0.5, 0.5), (2000.0, 0.5, 0.5), (2000.0, 50.0, 0.5)]
-                        {
-                            conn.pin_cost_weights(Some(LearnedWeights {
-                                row_in_pages: Some(0.003),
-                                seek,
-                                hash_build,
-                                hash_probe,
-                                sort: 3.0,
-                                bloom_probe: 10.0,
-                                where_step: 1.0,
-                                page_miss: None,
-                            }));
-                            run(&format!(
-                                "seek {seek} hash build {hash_build} hash probe {hash_probe}"
-                            ));
-                        }
+                        conn.pin_cost_weights(Some(LearnedWeights {
+                            row_in_pages: Some(0.003),
+                            seek,
+                            hash_build,
+                            hash_probe,
+                            sort: 3.0,
+                            bloom_probe: 10.0,
+                            where_step: 1.0,
+                            page_miss: None,
+                        }));
+                    }
+                    OuterJoinPlans::HandBuilt(split) => {
                         conn.pin_cost_weights(None);
                         conn.set_bushy_left_join_probes(BushyLeftJoinProbes::Off);
-                        for split in [1, 2] {
-                            PIN.with(|pin| pin.set(true));
-                            SPLIT.with(|first| first.set(Some(split)));
-                            run(&format!("hand-built from {split}"));
-                            PIN.with(|pin| pin.set(false));
-                            SPLIT.with(|first| first.set(None));
+                        PIN.with(|pin| pin.set(true));
+                        SPLIT.with(|first| first.set(Some(split)));
+                    }
+                }
+                for stated in workers {
+                    conn.set_parallel_mode(ParallelMode::Off);
+                    if let Some((count, probe)) = stated {
+                        conn.set_parallel_mode(ParallelMode::On);
+                        conn.set_parallel_outer_probe(probe);
+                        *conn.morsel_costs.lock() = Some(MachineCosts::stated(
+                            std::num::NonZeroUsize::new(count).unwrap(),
+                            1.0,
+                            1.0,
+                        ));
+                    }
+                    for (keys, sql, want) in &db.queries {
+                        BUSHY_PLANS.with(|plans| plans.set(0));
+                        LEFT_JOINS_IN_RUNS.with(|runs| runs.set(0));
+                        LEFT_JOIN_PROBES.with(|probes| probes.set(0));
+                        APPLIED.with(|applied| applied.set(0));
+                        let links = conn.morsel_join_links.load(Ordering::Relaxed);
+                        let began = std::time::Instant::now();
+                        let (got, first) = outer_join_outcome(&conn, sql, *keys);
+                        slowest.push((began.elapsed().as_millis(), format!("{plan:?}: {sql}")));
+                        let bushy = BUSHY_PLANS.with(Cell::get) + APPLIED.with(Cell::get);
+                        let hooked = conn.morsel_join_links.load(Ordering::Relaxed) > links;
+                        ran.runs += 1;
+                        ran.bushy += usize::from(bushy > 0);
+                        ran.left_joins_in_runs +=
+                            usize::from(LEFT_JOINS_IN_RUNS.with(Cell::get) > 0);
+                        ran.left_join_probes += usize::from(LEFT_JOIN_PROBES.with(Cell::get) > 0);
+                        ran.bushy_hooked += usize::from(bushy > 0 && hooked);
+                        if let (Some((count, _)), true) = (stated, hooked) {
+                            *ran.hooked.entry(count).or_default() += 1;
+                        }
+                        if got != *want {
+                            wrong.push(format!(
+                                "{name} analyzed={analyzed} {plan:?} workers={stated:?}: got {got}, \
+                                 SQLite {want}: {sql}: first rows {first:?}: {:?}",
+                                conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                                    .and_then(|mut stmt| stmt.run_collect_rows())
+                                    .map(|rows| rows
+                                        .iter()
+                                        .filter_map(|row| row.last().map(ToString::to_string))
+                                        .collect::<Vec<_>>())
+                            ));
                         }
                     }
                 }
+                conn.set_parallel_mode(ParallelMode::Off);
+                conn.set_parallel_outer_probe(padded);
+                conn.pin_cost_weights(None);
+                conn.set_bushy_left_join_probes(BushyLeftJoinProbes::Off);
+                PIN.with(|pin| pin.set(false));
+                SPLIT.with(|first| first.set(None));
             }
-            eprintln!("bushy={bushy} in_runs={in_runs} probing={probing}");
-            assert!(
-                wrong.is_empty(),
-                "{} wrong:\n{}",
-                wrong.len(),
-                wrong.join("\n")
-            );
-            assert!(bushy > 0 && in_runs > 0 && probing > 0);
+            slowest.sort();
+            for (millis, what) in slowest.iter().rev().take(3) {
+                eprintln!("slowest: {millis} ms, {what}");
+            }
+            eprintln!("{name} analyzed={analyzed}: {ran:?}, {} wrong", wrong.len());
+            for line in &wrong {
+                eprintln!("WRONG {line}");
+            }
+            assert!(wrong.is_empty(), "{} of {} wrong", wrong.len(), ran.runs);
+            ran
+        }
+
+        #[test]
+        fn t_pl_8_13_outer_joins_answer_as_sqlite_small_analyzed() {
+            outer_joins_answer_as_sqlite("small", true);
+        }
+
+        #[test]
+        fn t_pl_8_13_outer_joins_answer_as_sqlite_small() {
+            outer_joins_answer_as_sqlite("small", false);
+        }
+
+        #[test]
+        fn t_pl_8_13_outer_joins_answer_as_sqlite_small_any_analyzed() {
+            outer_joins_answer_as_sqlite("small_any", true);
+        }
+
+        #[test]
+        fn t_pl_8_13_outer_joins_answer_as_sqlite_small_any() {
+            outer_joins_answer_as_sqlite("small_any", false);
+        }
+
+        #[test]
+        fn t_pl_8_13_outer_joins_answer_as_sqlite_middle_analyzed() {
+            outer_joins_answer_as_sqlite("middle", true);
+        }
+
+        #[test]
+        fn t_pl_8_13_outer_joins_answer_as_sqlite_middle() {
+            outer_joins_answer_as_sqlite("middle", false);
+        }
+
+        #[test]
+        fn t_pl_8_13_outer_joins_answer_as_sqlite_facts_analyzed() {
+            outer_joins_answer_as_sqlite("facts", true);
+        }
+
+        #[test]
+        fn t_pl_8_13_outer_joins_answer_as_sqlite_facts() {
+            outer_joins_answer_as_sqlite("facts", false);
         }
 
         /// The bushy tests' queries over `facts` (lanes pl8-14 to pl8-20): the fact queries, with

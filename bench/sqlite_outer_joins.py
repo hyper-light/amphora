@@ -1,11 +1,19 @@
-"""T-PL.8.13 (lane C3): left, right and full joins among inner ones, over every FROM order drawn,
-with the answers SQLite itself gives (the sqlite3 library Python links, printed first). Writes
+"""T-PL.8.13 (lanes C3 and C6): left, right and full joins among inner ones, over every FROM order
+drawn, with the answers SQLite itself gives (the sqlite3 library Python links, printed first). Writes
 crates/engine/tests/fixtures/outer_joins.tsv, which bushy_search_tests' sweep holds every plan to.
 
-Each line is `db <name>`, `sql <statement>` (the database's rows), or `q <query> <answer>`.
-usage: python3 bench/sqlite_outer_joins.py > crates/engine/tests/fixtures/outer_joins.tsv"""
+Each line is `db <name>`, `sql <statement>` (the database's rows), `q <query> <answer>` (one row of
+aggregates, its values joined by commas) or `o <keys> <query> <answer>`: the rows of the q line before
+it, or its groups, under an ORDER BY of their first <keys> columns. An o line's answer is
+`<rows>:<sum of the rows>:<sum of the keys in order>`, each sum the FNV-1a 64 of the lines (a row's
+values joined by commas): the rows' sorted first, so ties in any order agree, and the keys' as they
+came, so an order the ORDER BY doesn't allow differs.
+usage: python3 bench/sqlite_outer_joins.py > crates/engine/tests/fixtures/outer_joins.tsv
+       python3 bench/sqlite_outer_joins.py --rows '<database>' '<query>'   (SQLite's rows of one query)"""
 import random
+import re
 import sqlite3
+import sys
 
 
 def rows_of(name, count, columns):
@@ -117,9 +125,81 @@ def fact_queries():
     return out
 
 
+def tables_of(sql):
+    """The FROM's (table, alias) pairs, in its order."""
+    tail = sql.split(" FROM ", 1)[1].split(" WHERE ", 1)[0]
+    found = re.findall(r"(?:^|JOIN )(d1|d2|f1|f2)(?: (t\d|s)\b)?", tail)
+    return [(table, alias or table) for table, alias in found]
+
+
+def second_column(table, alias):
+    return f"{alias}.{'cat' if KIND[table] == 'd' else 'k'}"
+
+
+def ordered(sql, count):
+    """The query's rows under an ORDER BY: the FROM's ids up or down (an order the loops can give, so
+    the planner may take the ORDER BY out), shuffled with a direction and a NULLs' place each, or one
+    table's id alone, whose ties may come in any order (so with no LIMIT)."""
+    rng = random.Random("ordered " + sql)
+    tail = sql.split(" FROM ", 1)[1]
+    names = tables_of(sql)
+    ids = [alias for _, alias in names]
+    kind = rng.choice(["from", "from desc", "shuffled", "shuffled", "one"])
+    if kind == "one" and count > 5000:
+        kind = "shuffled"
+    if kind == "from":
+        keys = [(alias, "") for alias in ids]
+    elif kind == "from desc":
+        keys = [(alias, " DESC") for alias in ids]
+    elif kind == "one":
+        keys = [(rng.choice(ids), rng.choice(["", " DESC", " DESC NULLS FIRST"]))]
+    else:
+        keys = [(alias, rng.choice(["", " DESC", " NULLS LAST", " DESC NULLS FIRST"]))
+                for alias in rng.sample(ids, len(ids))]
+    keyed = [alias for alias, _ in keys]
+    select = [f"{alias}.id" for alias in keyed + [alias for alias in ids if alias not in keyed]]
+    select += [second_column(table, alias) for table, alias in names]
+    out = (f"SELECT {', '.join(select)} FROM {tail} "
+           f"ORDER BY {', '.join(f'{alias}.id{way}' for alias, way in keys)}")
+    if kind != "one" and (count > 5000 or rng.random() < 0.4):
+        out += f" LIMIT {rng.randrange(1, 40)}"
+        if rng.random() < 0.4:
+            out += f" OFFSET {rng.randrange(1, 9)}"
+    return len(keys), out
+
+
+def grouped(sql):
+    """The query's rows grouped by one table's column, the groups in the key's order."""
+    rng = random.Random("grouped " + sql)
+    tail = sql.split(" FROM ", 1)[1]
+    names = tables_of(sql)
+    table, alias = rng.choice(names)
+    by = rng.choice([second_column(table, alias), f"{alias}.id"])
+    other = rng.choice(names)[1]
+    way = rng.choice(["", " DESC", " NULLS LAST", " DESC NULLS FIRST"])
+    return 1, (f"SELECT {by}, count(*), count({other}.id), sum({other}.id), min({other}.id), max({alias}.id) "
+               f"FROM {tail} GROUP BY {by} ORDER BY {by}{way}")
+
+
+def text(row):
+    return ",".join("" if v is None else str(v) for v in row)
+
+
+def fnv(lines):
+    total = 0xCBF29CE484222325
+    for byte in "\n".join(lines).encode():
+        total = ((total ^ byte) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return f"{total:016x}"
+
+
 def answer(db, sql):
     (row,) = db.execute(sql).fetchall()
-    return ",".join("" if v is None else str(v) for v in row)
+    return text(row)
+
+
+def ordered_answer(db, keys, sql):
+    rows = db.execute(sql).fetchall()
+    return f"{len(rows)}:{fnv(sorted(text(row) for row in rows))}:{fnv([text(row[:keys]) for row in rows])}"
 
 
 DATABASES = [
@@ -129,6 +209,16 @@ DATABASES = [
     ("middle", 50, 1500, 300, 13, 80, ["JOIN", "JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN"]),
     ("facts", 50, 12000, 2, 0, 0, []),
 ]
+
+if sys.argv[1:2] == ["--rows"]:
+    name, dims, facts, keys, every_null, _, _ = next(d for d in DATABASES if d[0] == sys.argv[2])
+    db = sqlite3.connect(":memory:")
+    for sql in database(dims, facts, keys, every_null):
+        db.execute(sql)
+    db.execute("ANALYZE")
+    for row in db.execute(sys.argv[3]):
+        print(text(row))
+    sys.exit(0)
 
 print(f"# SQLite {sqlite3.sqlite_version}: bench/sqlite_outer_joins.py")
 for name, dims, facts, keys, every_null, drawn, joins in DATABASES:
@@ -160,4 +250,7 @@ for name, dims, facts, keys, every_null, drawn, joins in DATABASES:
             continue
         queries.append(sql)
     for sql in queries:
-        print(f"q\t{sql}\t{answer(db, sql)}")
+        got = answer(db, sql)
+        print(f"q\t{sql}\t{got}")
+        for keys_, rows in (ordered(sql, int(got.split(",")[0])), grouped(sql)):
+            print(f"o\t{keys_}\t{rows}\t{ordered_answer(db, keys_, rows)}")
