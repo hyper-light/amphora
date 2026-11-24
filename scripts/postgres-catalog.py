@@ -181,7 +181,7 @@ def main() -> None:
         "//! .dat files (vendor/postgres, REL_19_0), its postgres.bki lifted by scripts/postgres-catalog.py.",
         "//! Generated; do not edit.",
         "",
-        "use crate::Datum::{Bool, Char, Float4, Int2, Int4, Name, Null, Oid, Text, Xid};",
+        "use crate::Datum::{USED};",
         "use crate::{Catalog, Column, Proc};",
         "",
         "/// sha256 over the files genbki.pl read (scripts/postgres-catalog.py `inputs`).",
@@ -214,7 +214,9 @@ def main() -> None:
             f"args: &[{', '.join(str(types.get(a, a)) for a in args)}] }},"
         )
     out.append("];")
-    OUT.write_text("\n".join(out) + "\n")
+    text = "\n".join(out) + "\n"
+    used = sorted(v for v in ("Bool", "Char", "Float4", "Int2", "Int4", "Name", "Null", "Oid", "Text", "Xid") if re.search(rf"\b{v}\b", text.split("{USED}", 1)[1]))
+    OUT.write_text(text.replace("{USED}", ", ".join(used), 1))
     print(f"wrote {OUT.relative_to(ROOT)}")
 
 

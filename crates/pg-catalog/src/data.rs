@@ -3,7 +3,7 @@
 //! .dat files (vendor/postgres, REL_19_0), its postgres.bki lifted by scripts/postgres-catalog.py.
 //! Generated; do not edit.
 
-use crate::Datum::{Bool, Char, Float4, Int2, Int4, Name, Null, Oid, Text, Xid};
+use crate::Datum::Bool, Char, Float4, Int2, Int4, Name, Null, Oid, Xid;
 use crate::{Catalog, Column, Proc};
 
 /// sha256 over the files genbki.pl read (scripts/postgres-catalog.py `inputs`).
