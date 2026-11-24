@@ -1,4 +1,4 @@
-//! Oracle finding CH (lane C10): LEFT, RIGHT and FULL JOINs whose WHERE, ON or select list holds
+//! Oracle findings CH (lane C10) and CN (lane C12): joins whose WHERE, ON or select list holds
 //! subqueries, one inside another, answer as SQLite 3.54.0 does (G2 step 3; AC-T1.1.1: reads as
 //! committed; AC-T1.8.6: the differential suite).
 
@@ -10,17 +10,17 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-/// One database of `fixtures/outer_join_subqueries.tsv`: the statements that fill it, and its queries
-/// with SQLite's answers (`bench/sqlite_outer_join_subqueries.py`).
+/// One database of a fixture: the statements that fill it, and its queries with SQLite's answers
+/// (`bench/sqlite_outer_join_subqueries.py`, `bench/sqlite_join_where_subqueries.py`).
 struct Cases {
     name: &'static str,
     fill: Vec<&'static str>,
     queries: Vec<(&'static str, &'static str)>,
 }
 
-fn cases() -> Vec<Cases> {
+fn cases(fixture: &'static str) -> Vec<Cases> {
     let mut out: Vec<Cases> = Vec::new();
-    for line in include_str!("fixtures/outer_join_subqueries.tsv").lines() {
+    for line in fixture.lines() {
         let fields: Vec<&'static str> = line.split('\t').collect();
         match fields.as_slice() {
             ["db", name] => out.push(Cases {
@@ -63,33 +63,37 @@ struct Settings {
     joins: JoinMethods,
 }
 
-const SETTINGS: [Settings; 5] = {
-    let default = Settings {
-        parallel: false,
-        statistics: false,
-        joins: JoinMethods::ByCost,
-    };
-    [
-        default,
-        Settings {
-            parallel: true,
-            ..default
-        },
-        Settings {
-            statistics: true,
-            ..default
-        },
-        Settings {
-            parallel: true,
-            statistics: true,
-            ..default
-        },
-        Settings {
-            joins: JoinMethods::HashJoinsOnly,
-            ..default
-        },
-    ]
-};
+const fn settings(parallel: bool, statistics: bool, joins: JoinMethods) -> Settings {
+    Settings {
+        parallel,
+        statistics,
+        joins,
+    }
+}
+
+const SETTINGS: [Settings; 5] = [
+    settings(false, false, JoinMethods::ByCost),
+    settings(true, false, JoinMethods::ByCost),
+    settings(false, true, JoinMethods::ByCost),
+    settings(true, true, JoinMethods::ByCost),
+    settings(false, false, JoinMethods::HashJoinsOnly),
+];
+
+/// Each join method wherever a join can take it, over the tables' own statistics too: a hash join of
+/// more than two tables is planned over tables it knows are small.
+const JOIN_SETTINGS: [Settings; 11] = [
+    settings(false, false, JoinMethods::ByCost),
+    settings(true, false, JoinMethods::ByCost),
+    settings(false, true, JoinMethods::ByCost),
+    settings(true, true, JoinMethods::ByCost),
+    settings(false, false, JoinMethods::HashJoinsOnly),
+    settings(false, true, JoinMethods::HashJoinsOnly),
+    settings(true, true, JoinMethods::HashJoinsOnly),
+    settings(false, false, JoinMethods::MergeJoinsOnly),
+    settings(false, true, JoinMethods::MergeJoinsOnly),
+    settings(false, false, JoinMethods::NestedLoopsOnly),
+    settings(true, true, JoinMethods::NestedLoopsOnly),
+];
 
 fn set(conn: &Arc<Connection>, settings: Settings) {
     if settings.parallel {
@@ -143,13 +147,12 @@ fn outcome(io: &MemoryIO, conn: &Arc<Connection>, sql: &str) -> String {
     }
 }
 
-/// Do: run every query of the fixture under each setting. Expect: SQLite's rows, no panic and no
-/// error, and every table holding after the queries the rows it held before them.
-#[test]
-fn outer_joins_with_nested_subqueries_answer_as_sqlite() {
+/// Every query of the fixture under each setting: how many ran, and those that did not answer with
+/// SQLite's rows, or left a table without the rows it held.
+fn differences(fixture: &'static str, all_settings: &[Settings]) -> (usize, Vec<String>) {
     let mut wrong: Vec<String> = Vec::new();
     let mut ran = 0;
-    for db in cases() {
+    for db in cases(fixture) {
         let tables: Vec<String> = db
             .fill
             .iter()
@@ -158,7 +161,7 @@ fn outer_joins_with_nested_subqueries_answer_as_sqlite() {
             .map(|table| format!("SELECT * FROM {table}"))
             .collect();
         assert!(!tables.is_empty());
-        for settings in SETTINGS {
+        for &settings in all_settings {
             let (mut io, mut conn) = open(&db.fill);
             set(&conn, settings);
             let held: Vec<String> = tables.iter().map(|sql| outcome(&io, &conn, sql)).collect();
@@ -184,6 +187,31 @@ fn outer_joins_with_nested_subqueries_answer_as_sqlite() {
             }
         }
     }
+    (ran, wrong)
+}
+
+/// Do: run every query of the fixture under each setting. Expect: SQLite's rows, no panic and no
+/// error, and every table holding after the queries the rows it held before them.
+#[test]
+fn outer_joins_with_nested_subqueries_answer_as_sqlite() {
+    let fixture = include_str!("fixtures/outer_join_subqueries.tsv");
+    let (ran, wrong) = differences(fixture, &SETTINGS);
+    assert!(ran > 0);
+    assert!(
+        wrong.is_empty(),
+        "{} of {ran} answers differ from SQLite's:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+/// Finding CN. Do: run joins whose WHERE terms read subqueries on some of the joined tables beside
+/// columns of the others, by every join method. Expect: SQLite's rows; a term no row can be tested
+/// with before its LEFT, RIGHT or FULL JOIN's NULL row is made is tested on that row too.
+#[test]
+fn joins_filtered_by_subqueries_answer_as_sqlite_by_every_join_method() {
+    let fixture = include_str!("fixtures/join_where_subqueries.tsv");
+    let (ran, wrong) = differences(fixture, &JOIN_SETTINGS);
     assert!(ran > 0);
     assert!(
         wrong.is_empty(),
