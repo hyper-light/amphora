@@ -5183,6 +5183,25 @@ pub(crate) mod bushy_search_tests {
             HandBuilt(usize),
         }
 
+        /// The sweep's plan settings.
+        const OUTER_JOIN_PLANS: [OuterJoinPlans; 6] = [
+            OuterJoinPlans::ByCost,
+            OuterJoinPlans::Weights(2.0, 0.5, 0.5),
+            OuterJoinPlans::Weights(2000.0, 0.5, 0.5),
+            OuterJoinPlans::Weights(2000.0, 50.0, 0.5),
+            OuterJoinPlans::HandBuilt(1),
+            OuterJoinPlans::HandBuilt(2),
+        ];
+
+        /// The worker settings a plan runs at: the ones where the plans differ (`WherePlansDiffer`,
+        /// the small shards in the gate: by cost and with every join a hash join), or all five
+        /// whatever the plan.
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum OuterJoinWorkers {
+            WherePlansDiffer,
+            All,
+        }
+
         /// What the sweep's runs did: what its answers were worth.
         #[derive(Debug, Default)]
         struct OuterJoinRuns {
@@ -5205,7 +5224,20 @@ pub(crate) mod bushy_search_tests {
         /// probes allowed, and as the hand-built bushy trees of its FROM order; each with the
         /// parallel mode off and at 1, 2 and 8 stated workers. Expect: SQLite's answer every time,
         /// its rows, their NULLs and their order.
-        fn outer_joins_answer_as_sqlite(name: &str, analyzed: bool) {
+        ///
+        /// A test takes the plan settings of `plans`, each at the worker settings of `workers`; with
+        /// a shard's tests together every statement meets every setting and every worker count.
+        /// `must_be_bushy` and `must_hook`: whether one of `plans`' settings must make a bushy plan,
+        /// and whether workers must build a hash table in it, in this database (so a setting that
+        /// stops making them shows).
+        fn outer_joins_answer_as_sqlite(
+            name: &str,
+            analyzed: bool,
+            plans: &[OuterJoinPlans],
+            workers: OuterJoinWorkers,
+            must_be_bushy: bool,
+            must_hook: bool,
+        ) {
             use super::super::bushy_test_hook::{APPLIED, PIN, SPLIT};
             use crate::translate::optimizer::learned_costs::LearnedWeights;
             use crate::vdbe::morsel::{MachineCosts, ParallelMode};
@@ -5220,27 +5252,15 @@ pub(crate) mod bushy_search_tests {
             if analyzed {
                 conn.execute("ANALYZE").unwrap();
             }
-            // Workers, and the table an outer join of two probes on them; each plan at each.
+            // The worker settings, and the table an outer join of two probes on them.
             let padded = crate::OuterJoinProbe::Padded;
-            let workers = [
+            let stated_workers = [
                 None,
                 Some((1, padded)),
                 Some((2, padded)),
                 Some((8, padded)),
                 Some((8, crate::OuterJoinProbe::Kept)),
             ];
-            let plans: &[OuterJoinPlans] = if name == "facts" {
-                &[OuterJoinPlans::ByCost]
-            } else {
-                &[
-                    OuterJoinPlans::ByCost,
-                    OuterJoinPlans::Weights(2.0, 0.5, 0.5),
-                    OuterJoinPlans::Weights(2000.0, 0.5, 0.5),
-                    OuterJoinPlans::Weights(2000.0, 50.0, 0.5),
-                    OuterJoinPlans::HandBuilt(1),
-                    OuterJoinPlans::HandBuilt(2),
-                ]
-            };
             let mut ran = OuterJoinRuns::default();
             let mut wrong: Vec<String> = Vec::new();
             let mut slowest: Vec<(u128, String)> = Vec::new();
@@ -5267,18 +5287,13 @@ pub(crate) mod bushy_search_tests {
                         SPLIT.with(|first| first.set(Some(split)));
                     }
                 }
-                // The parallel loops run where the plans differ: by cost, and on the weights that
-                // make every join a hash join. The other plans answer once, serially.
-                let parallel = matches!(
-                    plan,
-                    OuterJoinPlans::ByCost | OuterJoinPlans::Weights(2000.0, 0.5, 0.5)
-                );
-                for stated in workers {
+                let parallel = workers == OuterJoinWorkers::All
+                    || matches!(
+                        plan,
+                        OuterJoinPlans::ByCost | OuterJoinPlans::Weights(2000.0, 0.5, 0.5)
+                    );
+                for stated in stated_workers {
                     if stated.is_some() && !parallel {
-                        continue;
-                    }
-                    // The fact queries join 12,000 rows a side: serial and eight workers.
-                    if name == "facts" && stated.is_some_and(|(count, _)| count < 8) {
                         continue;
                     }
                     conn.set_parallel_mode(ParallelMode::Off);
@@ -5342,53 +5357,109 @@ pub(crate) mod bushy_search_tests {
             }
             assert!(wrong.is_empty(), "{} of {} wrong", wrong.len(), ran.runs);
             // Non-vacuity: bushy plans were run, and workers built the hash tables of some joins.
-            if name != "facts" {
-                assert!(ran.bushy > 0 && !ran.hooked.is_empty(), "{ran:?}");
-            }
+            assert!(ran.bushy > 0 || !must_be_bushy, "{ran:?}");
+            assert!(!ran.hooked.is_empty() || !must_hook, "{ran:?}");
         }
 
         #[test]
         fn t_pl_8_13_outer_joins_answer_as_sqlite_small_analyzed() {
-            outer_joins_answer_as_sqlite("small", true);
+            outer_joins_answer_as_sqlite(
+                "small",
+                true,
+                &OUTER_JOIN_PLANS,
+                OuterJoinWorkers::WherePlansDiffer,
+                true,
+                true,
+            );
         }
 
         #[test]
         fn t_pl_8_13_outer_joins_answer_as_sqlite_small() {
-            outer_joins_answer_as_sqlite("small", false);
+            outer_joins_answer_as_sqlite(
+                "small",
+                false,
+                &OUTER_JOIN_PLANS,
+                OuterJoinWorkers::WherePlansDiffer,
+                true,
+                true,
+            );
         }
 
         #[test]
         fn t_pl_8_13_outer_joins_answer_as_sqlite_small_any_analyzed() {
-            outer_joins_answer_as_sqlite("small_any", true);
+            outer_joins_answer_as_sqlite(
+                "small_any",
+                true,
+                &OUTER_JOIN_PLANS,
+                OuterJoinWorkers::WherePlansDiffer,
+                true,
+                true,
+            );
         }
 
         #[test]
         fn t_pl_8_13_outer_joins_answer_as_sqlite_small_any() {
-            outer_joins_answer_as_sqlite("small_any", false);
+            outer_joins_answer_as_sqlite(
+                "small_any",
+                false,
+                &OUTER_JOIN_PLANS,
+                OuterJoinWorkers::WherePlansDiffer,
+                true,
+                true,
+            );
         }
 
-        #[test]
-        #[ignore = "minutes in a debug build: --ignored runs it"]
-        fn t_pl_8_13_outer_joins_answer_as_sqlite_middle_analyzed() {
-            outer_joins_answer_as_sqlite("middle", true);
+        /// The middle and fact shards: each test one plan setting at all five worker settings, so
+        /// each ends and the tests of a shard together are every run of C6's sweep. The fact
+        /// shard's hand-built trees run with statistics alone: without them one run takes over a
+        /// minute in an optimized build.
+        macro_rules! outer_join_shard {
+            ($reason:literal; $($test:ident: $db:literal, $analyzed:literal, $plan:literal, $bushy:literal, $hooked:literal;)*) => {
+                $(
+                    #[test]
+                    #[ignore = $reason]
+                    fn $test() {
+                        outer_joins_answer_as_sqlite(
+                            $db,
+                            $analyzed,
+                            &OUTER_JOIN_PLANS[$plan..=$plan],
+                            OuterJoinWorkers::All,
+                            $bushy,
+                            $hooked,
+                        );
+                    }
+                )*
+            };
         }
 
-        #[test]
-        #[ignore = "minutes in a debug build: --ignored runs it"]
-        fn t_pl_8_13_outer_joins_answer_as_sqlite_middle() {
-            outer_joins_answer_as_sqlite("middle", false);
+        outer_join_shard! {
+            "minutes each in a debug build: 7 to 26 s at CARGO_PROFILE_DEV_OPT_LEVEL=2, --ignored";
+            t_pl_8_13_outer_joins_answer_as_sqlite_middle_analyzed_by_cost: "middle", true, 0, false, false;
+            t_pl_8_13_outer_joins_answer_as_sqlite_middle_analyzed_seeks_cheap: "middle", true, 1, true, true;
+            t_pl_8_13_outer_joins_answer_as_sqlite_middle_analyzed_hash_joins_cheap: "middle", true, 2, true, true;
+            t_pl_8_13_outer_joins_answer_as_sqlite_middle_analyzed_hash_builds_dear: "middle", true, 3, true, true;
+            t_pl_8_13_outer_joins_answer_as_sqlite_middle_analyzed_hand_built_1: "middle", true, 4, true, true;
+            t_pl_8_13_outer_joins_answer_as_sqlite_middle_analyzed_hand_built_2: "middle", true, 5, false, true;
+            t_pl_8_13_outer_joins_answer_as_sqlite_middle_by_cost: "middle", false, 0, false, false;
+            t_pl_8_13_outer_joins_answer_as_sqlite_middle_seeks_cheap: "middle", false, 1, false, true;
+            t_pl_8_13_outer_joins_answer_as_sqlite_middle_hash_joins_cheap: "middle", false, 2, false, true;
+            t_pl_8_13_outer_joins_answer_as_sqlite_middle_hash_builds_dear: "middle", false, 3, false, true;
+            t_pl_8_13_outer_joins_answer_as_sqlite_middle_hand_built_1: "middle", false, 4, true, true;
+            t_pl_8_13_outer_joins_answer_as_sqlite_middle_hand_built_2: "middle", false, 5, false, true;
         }
 
-        #[test]
-        #[ignore = "minutes in a debug build: --ignored runs it"]
-        fn t_pl_8_13_outer_joins_answer_as_sqlite_facts_analyzed() {
-            outer_joins_answer_as_sqlite("facts", true);
-        }
-
-        #[test]
-        #[ignore = "minutes in a debug build: --ignored runs it"]
-        fn t_pl_8_13_outer_joins_answer_as_sqlite_facts() {
-            outer_joins_answer_as_sqlite("facts", false);
+        outer_join_shard! {
+            "1.5 to 9 minutes each at CARGO_PROFILE_DEV_OPT_LEVEL=2, --ignored; longer in a debug build";
+            t_pl_8_13_outer_joins_answer_as_sqlite_facts_analyzed_by_cost: "facts", true, 0, false, false;
+            t_pl_8_13_outer_joins_answer_as_sqlite_facts_analyzed_seeks_cheap: "facts", true, 1, true, false;
+            t_pl_8_13_outer_joins_answer_as_sqlite_facts_analyzed_hash_joins_cheap: "facts", true, 2, true, false;
+            t_pl_8_13_outer_joins_answer_as_sqlite_facts_analyzed_hash_builds_dear: "facts", true, 3, true, false;
+            t_pl_8_13_outer_joins_answer_as_sqlite_facts_analyzed_hand_built_1: "facts", true, 4, false, false;
+            t_pl_8_13_outer_joins_answer_as_sqlite_facts_analyzed_hand_built_2: "facts", true, 5, false, false;
+            t_pl_8_13_outer_joins_answer_as_sqlite_facts_by_cost: "facts", false, 0, false, false;
+            t_pl_8_13_outer_joins_answer_as_sqlite_facts_seeks_cheap: "facts", false, 1, false, false;
+            t_pl_8_13_outer_joins_answer_as_sqlite_facts_hash_joins_cheap: "facts", false, 2, false, false;
+            t_pl_8_13_outer_joins_answer_as_sqlite_facts_hash_builds_dear: "facts", false, 3, false, false;
         }
 
         /// The bushy tests' queries over `facts` (lanes pl8-14 to pl8-20): the fact queries, with
