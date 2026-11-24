@@ -278,6 +278,24 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         1501 => (0x59de_e058_603f_30b7, begin),
         // TransactionStmtLegacy: END_P opt_transaction opt_transaction_chain
         1502 => (0x88ca_638c_a2a9_d9bb, end),
+        // iso_level: READ UNCOMMITTED
+        244 => (0xc19a_4cd4_72ff_25cf, |_| Ok(word("read uncommitted"))),
+        // iso_level: READ COMMITTED
+        245 => (0x0a87_ab85_7b8e_b9da, |_| Ok(word("read committed"))),
+        // iso_level: REPEATABLE READ
+        246 => (0xebcf_5738_e5ad_bcb9, |_| Ok(word("repeatable read"))),
+        // iso_level: SERIALIZABLE
+        247 => (0x834e_82ee_a2bc_f55b, |_| Ok(word("serializable"))),
+        // TransactionStmt: START TRANSACTION transaction_mode_list_or_empty
+        1490 => (0xc00d_e3fe_f182_1598, start),
+        // transaction_mode_item: ISOLATION LEVEL iso_level
+        1506 => (0x08ac_5dea_e963_9f11, isolation_mode),
+        // transaction_mode_list: transaction_mode_item
+        1511 => (0x28e6_498e_a57f_7c96, list1),
+        // transaction_mode_list: transaction_mode_list ',' transaction_mode_item
+        1512 => (0x33d4_2538_18d1_c793, append),
+        // transaction_mode_list: transaction_mode_list transaction_mode_item
+        1513 => (0xf1ce_0b52_dae7_218a, append_second),
         // transaction_mode_list_or_empty: /* EMPTY */
         1515 => (0x2cdf_e4df_9842_f348, |_| Ok(Value::List(Vec::new()))),
         // opt_transaction_chain: AND CHAIN
@@ -288,6 +306,8 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         141 => (0x86b3_9e15_ebb4_d128, nil),
         // opt_drop_behavior: /* EMPTY */
         148 => (0x784d_d6d1_0e75_e150, |_| Ok(Value::Int(0))),
+        // set_rest: TRANSACTION transaction_mode_list
+        218 => (0xb072_946f_10ae_6e3c, set_transaction),
         // VariableSetStmt: SET set_rest
         215 => (0x7e32_ef61_7adc_84a9, |r| set_stmt(r, 2, false)),
         // VariableSetStmt: SET LOCAL set_rest
@@ -878,6 +898,51 @@ fn transaction(
 fn begin(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
     let options = r.list(3)?;
     transaction(r, TransactionStmtKind::Begin, options, false)
+}
+
+/// `START TRANSACTION transaction_mode_list_or_empty`: BEGIN's statement, kind TRANS_STMT_START.
+fn start(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let options = r.list(3)?;
+    transaction(r, TransactionStmtKind::Start, options, false)
+}
+
+/// `transaction_mode_item: ISOLATION LEVEL iso_level`: makeDefElem("transaction_isolation",
+/// makeStringConst($3, @3), @1).
+fn isolation_mode(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let level = r.string(3)?;
+    let at = r.at(3)?;
+    let arg = r.push(Node::AConst {
+        val: Val::String(level),
+        location: at,
+    })?;
+    let location = r.at(1)?;
+    r.make(Node::DefElem {
+        defnamespace: None,
+        defname: "transaction_isolation".to_owned(),
+        arg: Some(arg),
+        defaction: 0,
+        location,
+    })
+}
+
+/// `lappend($1, $2)`.
+fn append_second(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let mut list = r.list(1)?;
+    list.push(r.node(2)?.ok_or_else(fault)?);
+    Ok(Value::List(list))
+}
+
+/// `set_rest: TRANSACTION transaction_mode_list`: VAR_SET_MULTI, 3, named "TRANSACTION".
+fn set_transaction(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let args = r.list(2)?;
+    r.make(Node::VariableSetStmt {
+        kind: 3,
+        name: Some("TRANSACTION".to_owned()),
+        args,
+        jumble_args: true,
+        is_local: false,
+        location: -1,
+    })
 }
 
 fn end(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
@@ -2328,7 +2393,7 @@ mod tests {
                 n += 1;
             }
         }
-        assert_eq!(n, 272);
+        assert_eq!(n, 282);
     }
 
     /// T-PG.5.1: a syntax error is 42601 at the token 19 names (1-based characters), the end of

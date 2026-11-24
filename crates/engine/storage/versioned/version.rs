@@ -55,6 +55,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::cmp::Ordering as Order;
 use std::collections::{BTreeMap, VecDeque};
 use std::mem::size_of;
+use std::task::Waker;
 
 /// Ids at or above this name a transaction; below it, a commit timestamp.
 const TX: u64 = 1 << 63;
@@ -104,8 +105,21 @@ pub struct Clock {
     /// `AC-NS.2.1`): a summary built beside one would miss its rows once it commits. Bounded by
     /// the trees, each counted once a transaction.
     writing: Mutex<Writing>,
+    /// The transactions that wait for another's end (docs/design/postgres.md section 8), and how many
+    /// wakers they left: none, and an end takes no lock.
+    waits: Mutex<Waits>,
+    waiting: AtomicU64,
     /// What versions, transactions' records and kept commits may hold.
     budget: Budget,
+}
+
+/// Which open transaction each waiting one waits for, and who is woken when one ends
+/// (docs/design/postgres.md section 8): a wait is a `Waker`'s word, never a timer. Bounded by the
+/// transactions that wait, each once; a wait that would close a ring of them is refused.
+#[derive(Default)]
+struct Waits {
+    on: FxHashMap<u64, u64>,
+    told: FxHashMap<u64, Vec<(Option<u64>, Waker)>>,
 }
 
 /// Each tree's open writers, and who waits for a tree to have none (G7 step 2, `AC-NS.2.1`): one
@@ -314,6 +328,20 @@ pub struct Txn {
     /// The bytes of `changed` and `ops` charged to the budget, and of `reads`.
     charged: u64,
     read_bytes: u64,
+    rules: Rules,
+}
+
+/// How a transaction is isolated where it is not the database's default (docs/design/postgres.md
+/// section 8): the validation its commit is checked by, and whether a row another open
+/// transaction has changed refuses it or makes it wait. A session of the PostgreSQL dialect
+/// chooses them by its isolation level ([`super::switch::Level`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Rules {
+    /// The validation of its commit: the database's when none.
+    pub validation: Option<Validation>,
+    /// Whether a row of another's keeps its statement waiting (`RowTaken`) rather than refusing
+    /// its transaction (`WriteWriteConflict`).
+    pub waits: bool,
 }
 
 /// How a database validates a commit (decision 5). Each one is the floor, snapshot isolation with
@@ -321,13 +349,15 @@ pub struct Txn {
 /// serializable against each other on the same commit path, and keeps one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Validation {
-    /// Nothing: snapshot isolation, which allows write skew. The Elle checks' control, set only
-    /// by [`Versioned::with_validation`], which the Elle checks, this file's tests and the
-    /// validations' bench (`amphora-bench --cc`) call on a storage of their own: SQL's storage
-    /// (`durable::Database`, through the switch) is never opened with it. So its gap stays a
-    /// control's (lane g7s2-18, `AC-NS.2.1`): a `CREATE INDEX` that read its table while a writer
-    /// of the table committed beside it is not refused here, and its index lacks that writer's
-    /// rows; every other validation refuses it.
+    /// Nothing: snapshot isolation, which allows write skew. The Elle checks' control, set by
+    /// [`Versioned::with_validation`], which the Elle checks, this file's tests and the validations'
+    /// bench (`amphora-bench --cc`) call on a storage of their own; and a transaction's own, from a
+    /// session's level (`Rules`, docs/design/postgres.md section 8). SQL's storage
+    /// (`durable::Database`, through the switch) is never opened with it. Its gap (lane g7s2-18,
+    /// `AC-NS.2.1`): a `CREATE INDEX` that read its table while a writer of the table committed
+    /// beside it is not refused here, and its index lacks that writer's rows; every other
+    /// validation refuses it, and a session's transaction that changes the catalog takes the
+    /// database's validation ([`Txn::validate_fully`]).
     Snapshot,
     /// Precision locking as HyPer adapts it (Neumann, Mühlbauer, Kemper, SIGMOD 2015): a
     /// transaction that wrote checks the rows and spans it read against the rows written by the
@@ -514,6 +544,28 @@ impl Txn {
         }
     }
 
+    /// Its isolation, chosen before it changes or reads a row.
+    pub fn isolate(&mut self, rules: Rules) {
+        self.rules = rules;
+    }
+
+    /// Its commit is validated by the database's validation from here on, what it reads kept for it:
+    /// a transaction that changes the catalog, so that an index it builds beside a commit that adds
+    /// rows is refused ([`Validation::Snapshot`] alone would let it stand).
+    pub fn validate_fully(&mut self) {
+        self.rules.validation = None;
+    }
+
+    /// Why it can't change a row another's newest version is of: `holder` the open transaction's id,
+    /// none for one that committed since its snapshot.
+    fn taken(&self, holder: Option<u64>) -> LimboError {
+        if self.rules.waits {
+            LimboError::RowTaken(holder)
+        } else {
+            LimboError::WriteWriteConflict
+        }
+    }
+
     /// A savepoint here: [`Versioned::rollback_to`] puts the transaction's rows back as they are
     /// now.
     pub fn savepoint(&self) -> Savepoint {
@@ -576,6 +628,8 @@ impl Clock {
                 .collect(),
             open: Mutex::new(Open::default()),
             writing: Mutex::new(Writing::default()),
+            waits: Mutex::new(Waits::default()),
+            waiting: AtomicU64::new(0),
             budget,
         }
     }
@@ -649,7 +703,70 @@ impl Clock {
             reads: Reads::default(),
             charged: 0,
             read_bytes: 0,
+            rules: Rules::default(),
         })
+    }
+
+    /// `txn`'s snapshot moved to every commit published now: a READ COMMITTED transaction's, at the
+    /// start of each statement (docs/design/postgres.md section 8). Moved under the open
+    /// snapshots' lock, so a collection sees the old one or the new, never neither.
+    pub fn renew(&self, txn: &mut Txn) -> Result<()> {
+        let mut open = self.open.lock();
+        let start = self.visible.load(Ordering::Acquire);
+        if start == txn.start {
+            return Ok(());
+        }
+        count_in(&mut open.all, start)?;
+        if let Err(e) = count_in(&mut open.txns, start) {
+            count_out(&mut open.all, start);
+            return Err(e);
+        }
+        count_out(&mut open.all, txn.start);
+        count_out(&mut open.txns, txn.start);
+        txn.start = start;
+        Ok(())
+    }
+
+    /// Registers `wake` to be called once transaction `holder` ends, for `waiter` (its transaction,
+    /// none when its statement ran in one of its own, already ended): `false` when `holder` has
+    /// ended, and nothing is registered. Registered under the waits' lock while `holder`'s state is
+    /// read, and `holder`'s end removes its state before it takes that lock ([`Clock::forget`]), so
+    /// no end is missed. A wait that would close a ring of waits is refused (`Deadlock`),
+    /// registering nothing.
+    pub fn wait_for(&self, waiter: Option<u64>, holder: u64, wake: &Waker) -> Result<bool> {
+        let states = self.states(holder)?;
+        let mut waits = self.waits.lock();
+        // Counted before the holder's state is read, under the lock its end takes to change it: an end
+        // after that read finds the count, and takes the waits' lock.
+        self.waiting.fetch_add(1, Ordering::SeqCst);
+        let held = || self.waiting.fetch_sub(1, Ordering::SeqCst);
+        if !matches!(states.lock().get(&holder), Some(State::Open)) {
+            held();
+            return Ok(false);
+        }
+        if let Some(waiter) = waiter {
+            // Each transaction waits for one other, so the ring is a path.
+            let mut at = holder;
+            for _ in 0..=waits.on.len() {
+                if at == waiter {
+                    held();
+                    return Err(LimboError::Deadlock);
+                }
+                match waits.on.get(&at) {
+                    Some(&next) => at = next,
+                    None => break,
+                }
+            }
+            waits.on.insert(waiter, holder);
+        }
+        let told = waits.told.entry(holder).or_default();
+        if told.iter().any(|(_, other)| other.will_wake(wake)) {
+            // A task that polls again is told once.
+            held();
+        } else {
+            told.push((waiter, wake.clone()));
+        }
+        Ok(true)
     }
 
     fn resolve(&self, writer: u64) -> Result<Writer> {
@@ -745,6 +862,22 @@ impl Clock {
         // A waiter that went away dropped its end: nothing to tell it.
         for waiter in woken {
             let _ = waiter.try_send(());
+        }
+        if self.waiting.load(Ordering::SeqCst) > 0 {
+            let told = {
+                let mut waits = self.waits.lock();
+                let told = waits.told.remove(&txn.id).unwrap_or_default();
+                for (waiter, _) in &told {
+                    if let Some(waiter) = waiter {
+                        waits.on.remove(waiter);
+                    }
+                }
+                told
+            };
+            for (_, waker) in told {
+                self.waiting.fetch_sub(1, Ordering::SeqCst);
+                waker.wake();
+            }
         }
         self.budget
             .release(txn.charged.saturating_add(txn.read_bytes));
@@ -1043,6 +1176,9 @@ impl VTree {
         key: &[u8],
     ) -> Result<Option<Vec<u8>>> {
         let row = self.get(pool, d, clock, &txn.snapshot(), key)?;
+        if txn.rules.validation == Some(Validation::Snapshot) {
+            return Ok(row);
+        }
         let size = size_of::<(u64, Vec<u8>)>().saturating_add(key.len());
         let tree = self.id;
         txn.reads
@@ -1067,6 +1203,9 @@ impl VTree {
             return Ok(Vec::new());
         }
         let rows = self.scan(pool, d, clock, &txn.snapshot(), from, most)?;
+        if txn.rules.validation == Some(Validation::Snapshot) {
+            return Ok(rows);
+        }
         let to = if rows.len() < most {
             None
         } else {
@@ -1109,10 +1248,8 @@ impl VTree {
         match heads.get_mut(key) {
             Some(head) => match clock.resolve(head.writer)? {
                 Writer::Open(id) if id == txn.id => {}
-                Writer::Open(_) => return Err(LimboError::WriteWriteConflict),
-                Writer::Committed(ts) if ts > txn.start => {
-                    return Err(LimboError::WriteWriteConflict)
-                }
+                Writer::Open(id) => return Err(txn.taken(Some(id))),
+                Writer::Committed(ts) if ts > txn.start => return Err(txn.taken(None)),
                 Writer::Committed(ts) => {
                     clock
                         .budget
@@ -1209,12 +1346,8 @@ impl VTree {
                 // Nothing to remove, unless the cell is another's change, which conflicts.
                 if let Some(head) = heads.get(key) {
                     match clock.resolve(head.writer)? {
-                        Writer::Open(id) if id != txn.id => {
-                            return Err(LimboError::WriteWriteConflict)
-                        }
-                        Writer::Committed(ts) if ts > txn.start => {
-                            return Err(LimboError::WriteWriteConflict)
-                        }
+                        Writer::Open(id) if id != txn.id => return Err(txn.taken(Some(id))),
+                        Writer::Committed(ts) if ts > txn.start => return Err(txn.taken(None)),
                         _ => {}
                     }
                 }
@@ -1788,6 +1921,9 @@ impl Versioned {
         from: Option<&[u8]>,
         to: Option<&[u8]>,
     ) -> Result<()> {
+        if txn.rules.validation == Some(Validation::Snapshot) {
+            return Ok(());
+        }
         let len = |k: Option<&[u8]>| k.map_or(0, <[u8]>::len);
         let joined = txn
             .reads
@@ -1839,7 +1975,7 @@ impl Versioned {
     ) -> Result<Option<Ts>> {
         // Since the snapshot, newest first.
         let since = || recent.iter().rev().take_while(|c| c.ts > txn.start);
-        match self.validation {
+        match txn.rules.validation.unwrap_or(self.validation) {
             Validation::Snapshot => Ok(None),
             // One that only read is serialized at its snapshot, a prefix of the commit order.
             Validation::Precision | Validation::Occ if txn.changed.is_empty() => Ok(None),
@@ -2233,6 +2369,112 @@ mod tests {
         );
         v.clock.close(reader.start);
         v.clock.close(later.start);
+    }
+
+    #[derive(Default)]
+    struct Told(std::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for Told {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl Told {
+        fn times(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    fn told() -> (std::sync::Arc<Told>, Waker) {
+        let told = std::sync::Arc::new(Told::default());
+        (told.clone(), Waker::from(told))
+    }
+
+    /// Do: a waiting transaction changes the row another open transaction changed, for a session that
+    /// waits (`Rules`); the holder commits, and then one rolls back. Expect: `RowTaken` naming the
+    /// holder while it is open, and none once its commit passed the snapshot; the waiter told once,
+    /// by the holder's end, and a wait for an ended holder not registered (T-PG.14.1).
+    #[test]
+    fn t_pg_14_1_a_waiting_writer_is_told_once_by_the_holders_end() {
+        let v = db();
+        let t = v.tree(0).unwrap();
+        let mut d = Descender::new();
+        let waits = Rules {
+            validation: Some(Validation::Snapshot),
+            waits: true,
+        };
+        let mut a = v.clock.begin().unwrap();
+        let mut b = v.clock.begin().unwrap();
+        b.isolate(waits);
+        t.put(&v.pool, &mut d, &v.clock, &mut a, b"k", b"a")
+            .unwrap();
+        let holder = a.id;
+        assert!(matches!(
+            t.put(&v.pool, &mut d, &v.clock, &mut b, b"k", b"b"),
+            Err(LimboError::RowTaken(Some(id))) if id == holder
+        ));
+        let (told_b, waker) = told();
+        assert!(v.clock.wait_for(Some(b.id), holder, &waker).unwrap());
+        assert!(v.clock.wait_for(Some(b.id), holder, &waker).unwrap());
+        assert_eq!(told_b.times(), 0);
+        v.commit(a, &mut d).unwrap();
+        assert_eq!(told_b.times(), 1);
+        assert!(!v.clock.wait_for(Some(b.id), holder, &waker).unwrap());
+        assert!(matches!(
+            t.put(&v.pool, &mut d, &v.clock, &mut b, b"k", b"b"),
+            Err(LimboError::RowTaken(None))
+        ));
+        v.clock.renew(&mut b).unwrap();
+        t.put(&v.pool, &mut d, &v.clock, &mut b, b"k", b"b")
+            .unwrap();
+        let mut c = v.clock.begin().unwrap();
+        c.isolate(waits);
+        assert!(matches!(
+            t.remove(&v.pool, &mut d, &v.clock, &mut c, b"k"),
+            Err(LimboError::RowTaken(Some(id))) if id == b.id
+        ));
+        let (told_c, waker) = told();
+        assert!(v.clock.wait_for(Some(c.id), b.id, &waker).unwrap());
+        v.abort(b, &mut d).unwrap();
+        assert_eq!(told_c.times(), 1);
+        t.remove(&v.pool, &mut d, &v.clock, &mut c, b"k").unwrap();
+        v.commit(c, &mut d).unwrap();
+        assert_eq!(told_b.times(), 1);
+    }
+
+    /// Do: a wait for `b` of `a`, then one for `a` of `b`. Expect: the second refused `Deadlock`, one
+    /// that names no transaction of its own never refused, and each end tells who waits
+    /// (T-PG.14.2).
+    #[test]
+    fn t_pg_14_2_a_wait_that_closes_a_ring_is_refused() {
+        let v = db();
+        let mut d = Descender::new();
+        let a = v.clock.begin().unwrap();
+        let b = v.clock.begin().unwrap();
+        let c = v.clock.begin().unwrap();
+        let (told_a, waker_a) = told();
+        let (told_b, waker_b) = told();
+        let (told_c, waker_c) = told();
+        assert!(v.clock.wait_for(Some(a.id), b.id, &waker_a).unwrap());
+        assert!(matches!(
+            v.clock.wait_for(Some(b.id), a.id, &waker_b),
+            Err(LimboError::Deadlock)
+        ));
+        assert!(v.clock.wait_for(Some(c.id), a.id, &waker_c).unwrap());
+        assert!(v.clock.wait_for(None, a.id, &waker_b).unwrap());
+        assert!(matches!(
+            v.clock.wait_for(Some(b.id), c.id, &waker_b),
+            Err(LimboError::Deadlock)
+        ));
+        v.abort(a, &mut d).unwrap();
+        assert_eq!((told_b.times(), told_c.times()), (1, 1));
+        assert!(v.clock.wait_for(Some(b.id), c.id, &waker_b).unwrap());
+        assert_eq!(told_a.times(), 0);
+        v.abort(c, &mut d).unwrap();
+        assert_eq!((told_a.times(), told_b.times()), (0, 2));
+        v.abort(b, &mut d).unwrap();
+        assert_eq!(told_a.times(), 1);
     }
 
     /// Do: two open transactions change the same row; then one commits and a transaction begun

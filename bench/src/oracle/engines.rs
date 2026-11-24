@@ -109,7 +109,7 @@ fn row_order(a: &[V], b: &[V]) -> std::cmp::Ordering {
 /// A value as a class of equal ones: numbers by value whatever their class, text folded as NOCASE
 /// and RTRIM fold it. Text holding a NUL is NOCASE-equal to another of its length that agrees up
 /// to that NUL (sqlite3StrNICmp stops there), so it folds to that prefix and its length.
-fn folded(v: &V) -> V {
+pub fn folded(v: &V) -> V {
     match v {
         V::Int(i) => V::Real(*i as f64),
         // -0.0 and 0 are one value: a group may show either.
@@ -127,6 +127,11 @@ fn folded(v: &V) -> V {
 /// of several equal values (DISTINCT, GROUP BY, UNION, MIN and MAX under a collation) may keep any
 /// of them ('a' or 'A' under NOCASE, 1 or 1.0), and two engines may keep different ones.
 pub fn same_rows_by(a: &Rows, b: &Rows, loose: bool) -> bool {
+    same_rows_with(a, b, loose, &V::same)
+}
+
+/// [same_rows_by], two values alike where `alike` says so.
+pub fn same_rows_with(a: &Rows, b: &Rows, loose: bool, alike: &dyn Fn(&V, &V) -> bool) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -143,7 +148,7 @@ pub fn same_rows_by(a: &Rows, b: &Rows, loose: bool) -> bool {
     y.sort_by(|p, q| row_order(p, q));
     x.iter()
         .zip(&y)
-        .all(|(p, q)| p.len() == q.len() && p.iter().zip(q.iter()).all(|(u, v)| u.same(v)))
+        .all(|(p, q)| p.len() == q.len() && p.iter().zip(q.iter()).all(|(u, v)| alike(u, v)))
 }
 
 /// A short view of an answer, for a finding: its row count and first rows.
@@ -192,7 +197,9 @@ impl Amphora {
         let db = Database::open(
             io.clone(),
             &format!("oracle-{}-{n}.db", std::process::id()),
-            OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new()),
+            OpenOptions::new(Arc::new(SqliteDialect))
+                // as production opens one (crates/amphora/src/db.rs)
+                .db_opts(DatabaseOpts::new().with_without_rowid(true)),
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?;
         let conn = db
@@ -261,6 +268,13 @@ mod ffi {
     pub type ColF64 = unsafe extern "C" fn(*mut c_void, c_int) -> f64;
     pub type ColPtr = unsafe extern "C" fn(*mut c_void, c_int) -> *const c_void;
     pub type Msg = unsafe extern "C" fn(*mut c_void) -> *const c_char;
+    pub type Progress = unsafe extern "C" fn(
+        *mut c_void,
+        c_int,
+        Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
+        *mut c_void,
+    );
+    pub type Config = unsafe extern "C" fn(*mut c_void, c_int, ...) -> c_int;
 
     pub struct Api {
         pub open: Open,
@@ -276,6 +290,8 @@ mod ffi {
         pub text: ColPtr,
         pub bytes: Col,
         pub errmsg: Msg,
+        pub config: Config,
+        pub progress: Progress,
     }
 
     pub fn load(path: &str) -> Result<(libloading::Library, Api), String> {
@@ -314,6 +330,10 @@ mod ffi {
                     .get(b"sqlite3_column_bytes\0")
                     .map_err(|e| e.to_string())?,
                 errmsg: *lib.get(b"sqlite3_errmsg\0").map_err(|e| e.to_string())?,
+                config: *lib.get(b"sqlite3_db_config\0").map_err(|e| e.to_string())?,
+                progress: *lib
+                    .get(b"sqlite3_progress_handler\0")
+                    .map_err(|e| e.to_string())?,
             };
             Ok((lib, api))
         }
@@ -343,6 +363,18 @@ pub struct Sqlite {
     db: *mut std::ffi::c_void,
 }
 
+/// The instructions a statement may take on SQLite before the oracles leave it: a tenth of a second's
+/// work there, where a check takes about half a millisecond (lane C8's 10,848,439 in 5,900 s), so a
+/// query that would cost hundreds of others.
+const STEPS: std::ffi::c_int = 4_000_000;
+
+/// SQLite's error for a statement past [STEPS].
+pub const INTERRUPTED: &str = "interrupted";
+
+unsafe extern "C" fn interrupt(_: *mut std::ffi::c_void) -> std::ffi::c_int {
+    1
+}
+
 impl Sqlite {
     pub fn new() -> anyhow::Result<Self> {
         let api = api().map_err(|e| anyhow::anyhow!(e))?;
@@ -353,7 +385,23 @@ impl Sqlite {
             rc == 0 && !db.is_null(),
             "opening the system's SQLite: code {rc}"
         );
+        // SAFETY: the handle opened above; the callback reads nothing and lives as long as the program.
+        unsafe { (api.progress)(db, STEPS, Some(interrupt), std::ptr::null_mut()) };
         Ok(Self { db })
+    }
+
+    /// Sets the digits a REAL's text has on this connection (sqlite3.h's SQLITE_DBCONFIG_FP_DIGITS,
+    /// 1023): 17, the default, or 15.
+    pub fn fp_digits(&mut self, digits: std::ffi::c_int) -> Result<(), String> {
+        let api = api()?;
+        let mut now: std::ffi::c_int = 0;
+        // SAFETY: an open handle and the option's own arguments, an int and a place for one.
+        let rc = unsafe { (api.config)(self.db, 1023, digits, &raw mut now) };
+        if rc == 0 && now == digits {
+            Ok(())
+        } else {
+            Err(format!("FP_DIGITS {digits}: code {rc}, now {now}"))
+        }
     }
 
     fn error(&self, api: &ffi::Api) -> String {

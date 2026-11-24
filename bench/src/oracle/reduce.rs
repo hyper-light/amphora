@@ -16,15 +16,51 @@ pub struct Repro {
     pub case: Case,
 }
 
-/// The rows of an INSERT's VALUES, as the generator writes them: `(..), (..)`.
-fn rows(stmt: &str) -> Option<(String, Vec<String>)> {
+/// The rows of an INSERT's VALUES, as the generator writes them: `(..), (..)`, with what comes before
+/// and after them (an UPSERT's clauses).
+fn rows(stmt: &str) -> Option<(String, Vec<String>, String)> {
+    if !stmt.starts_with("INSERT ") {
+        return None;
+    }
     let i = stmt.find(" VALUES (")?;
     let (head, tail) = stmt.split_at(i + " VALUES ".len());
+    let (tail, clauses) = tail.split_at(tail.find(" ON CONFLICT").unwrap_or(tail.len()));
     let inner = tail.strip_prefix('(')?.strip_suffix(')')?;
     Some((
         head.to_owned(),
         inner.split("), (").map(|r| format!("({r})")).collect(),
+        clauses.to_owned(),
     ))
+}
+
+/// What an expression node may be cut to: its children, literals, and a window call without one of its
+/// parts.
+fn smaller(e: &E) -> Vec<E> {
+    let mut v: Vec<E> = e.children().into_iter().cloned().collect();
+    if let E::Win(w) = e {
+        for part in 0..4 {
+            let mut w = w.clone();
+            let had = match part {
+                0 => w.filter.take().is_some(),
+                1 => !std::mem::take(&mut w.partition).is_empty(),
+                2 => w.frame.take().is_some(),
+                _ => {
+                    let had = w.order.len() > 1;
+                    if had {
+                        w.order.remove(0);
+                    }
+                    had
+                }
+            };
+            if had {
+                v.insert(0, E::Win(w));
+            }
+        }
+    }
+    if !matches!(e, E::Lit(_)) {
+        v.extend([E::Lit(V::Null), E::Lit(V::Int(0)), E::Lit(V::Int(1))]);
+    }
+    v
 }
 
 fn count(e: &E) -> usize {
@@ -64,9 +100,15 @@ fn cuts(r: &Repro) -> Vec<Repro> {
         out.push(c);
     }
     for (i, s) in r.stmts.iter().enumerate() {
-        if let Some((head, rs)) = rows(s)
-            && rs.len() > 1
-        {
+        if let Some((head, rs, clauses)) = rows(s) {
+            if !clauses.is_empty() {
+                let mut c = r.clone();
+                c.stmts[i] = format!("{head}{}", rs.join(", "));
+                out.push(c);
+            }
+            if rs.len() < 2 {
+                continue;
+            }
             for j in 0..rs.len() {
                 let mut c = r.clone();
                 let kept: Vec<&String> = rs
@@ -76,7 +118,7 @@ fn cuts(r: &Repro) -> Vec<Repro> {
                     .map(|(_, x)| x)
                     .collect();
                 c.stmts[i] = format!(
-                    "{head}{}",
+                    "{head}{}{clauses}",
                     kept.iter()
                         .map(|x| x.as_str())
                         .collect::<Vec<_>>()
@@ -101,6 +143,46 @@ fn cuts(r: &Repro) -> Vec<Repro> {
                     out.push(c);
                 }
             }
+        }
+    }
+    // a compound's arms, and the CTEs, the same from every query of the case
+    let parts = {
+        let mut c = r.clone();
+        c.case
+            .parts_mut()
+            .0
+            .first()
+            .map(|q| (q.arms.len(), q.with.len()))
+            .unwrap_or_default()
+    };
+    if !matches!(r.case, Case::Cert(..)) {
+        for j in (0..parts.0).rev() {
+            let mut c = r.clone();
+            for q in c.case.parts_mut().0 {
+                if j < q.arms.len() {
+                    q.arms.remove(j);
+                }
+            }
+            out.push(c);
+        }
+        if let Case::Diff(q) = &r.case {
+            for (_, arm) in &q.arms {
+                let mut alone = arm.clone();
+                alone.with = q.with.clone();
+                out.push(Repro {
+                    stmts: r.stmts.clone(),
+                    case: Case::Diff(alone),
+                });
+            }
+        }
+        for j in (0..parts.1).rev() {
+            let mut c = r.clone();
+            for q in c.case.parts_mut().0 {
+                if j < q.with.len() {
+                    q.with.remove(j);
+                }
+            }
+            out.push(c);
         }
     }
     // clauses: the same cut to every query of the case (EET's two forms stay equivalent)
@@ -145,10 +227,16 @@ fn cuts(r: &Repro) -> Vec<Repro> {
         let mut c = r.clone();
         let mut ok = true;
         for q in c.case.parts_mut().0 {
-            if q.cols.len() > 1 && k < q.cols.len() && q.group.is_empty() {
-                q.cols.remove(k);
-            } else {
-                ok = false;
+            let mut cut = |q: &mut Sel| {
+                if q.cols.len() > 1 && k < q.cols.len() && q.group.is_empty() {
+                    q.cols.remove(k);
+                } else {
+                    ok = false;
+                }
+            };
+            cut(q);
+            for (_, arm) in q.arms.iter_mut() {
+                cut(arm);
             }
         }
         if ok {
@@ -178,10 +266,96 @@ fn cuts(r: &Repro) -> Vec<Repro> {
                 && (f.on.is_some() || f.join != Join::Comma)
             {
                 f.on = None;
+                f.using.clear();
+                f.natural = false;
                 f.join = Join::Comma;
             }
         }
         out.push(c);
+    }
+    // the clauses, columns and expressions of the queries it reads from (a derived table's, a CTE's,
+    // an arm's), where the case has one query
+    if n_sels == 1 {
+        let sources = {
+            let mut c = r.clone();
+            c.case.parts_mut().0.first().map_or(0, |q| q.sources())
+        };
+        for n in 0..sources {
+            let cut = |f: &dyn Fn(&mut Sel) -> bool| -> Option<Repro> {
+                let mut c = r.clone();
+                let changed = {
+                    let q = c.case.parts_mut().0.into_iter().next()?;
+                    let mut k = n;
+                    f(q.source_mut(&mut k)?)
+                };
+                if changed { Some(c) } else { None }
+            };
+            for clause in &clause_cuts {
+                out.extend(cut(&|q| clause(q)));
+            }
+            out.extend(cut(&|q| {
+                let had = !q.arms.is_empty();
+                q.arms.clear();
+                had
+            }));
+            let shape = {
+                let mut c = r.clone();
+                let mut k = n;
+                c.case
+                    .parts_mut()
+                    .0
+                    .into_iter()
+                    .next()
+                    .and_then(|q| q.source_mut(&mut k))
+                    .map(|q| {
+                        let from = q.from.len();
+                        let sizes: Vec<usize> = roots(q).into_iter().map(|e| count(e)).collect();
+                        (from, sizes)
+                    })
+                    .unwrap_or_default()
+            };
+            for k in (1..shape.0).rev() {
+                out.extend(cut(&|q| {
+                    q.from.remove(k);
+                    true
+                }));
+            }
+            for (ri, nodes) in shape.1.into_iter().enumerate() {
+                for node in 0..nodes {
+                    let replacements = {
+                        let mut c = r.clone();
+                        let mut k = n;
+                        c.case
+                            .parts_mut()
+                            .0
+                            .into_iter()
+                            .next()
+                            .and_then(|q| q.source_mut(&mut k))
+                            .and_then(|q| {
+                                let mut at = node;
+                                let root = roots(q).into_iter().nth(ri)?;
+                                nth_mut(root, &mut at).map(|e| smaller(e))
+                            })
+                            .unwrap_or_default()
+                    };
+                    for rep in replacements {
+                        out.extend(cut(&|q| {
+                            let mut at = node;
+                            match roots(q).into_iter().nth(ri) {
+                                Some(root) => match nth_mut(root, &mut at) {
+                                    Some(e) => {
+                                        *e = rep.clone();
+                                        true
+                                    }
+                                    None => false,
+                                },
+                                None => false,
+                            }
+                        }));
+                    }
+                }
+            }
+        }
     }
     // expression nodes: not for EET, whose two forms an expression cut to one would part
     if n_sels == 1 || !matches!(r.case, Case::Eet(..)) {
@@ -200,17 +374,9 @@ fn cuts(r: &Repro) -> Vec<Repro> {
             for k in 0..n {
                 let mut c = r.clone();
                 let replacements: Vec<E> = {
-                    let node = target(&mut c, si, ri, k);
-                    match node {
-                        Some(e) => {
-                            let mut v: Vec<E> = e.children().into_iter().cloned().collect();
-                            if !matches!(e, E::Lit(_)) {
-                                v.extend([E::Lit(V::Null), E::Lit(V::Int(0)), E::Lit(V::Int(1))]);
-                            }
-                            v
-                        }
-                        None => vec![],
-                    }
+                    target(&mut c, si, ri, k)
+                        .map(|e| smaller(e))
+                        .unwrap_or_default()
                 };
                 for rep in replacements {
                     let mut c = r.clone();
@@ -259,4 +425,29 @@ pub fn reduce(
         break;
     }
     cur
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Do: take an UPSERT's rows apart. Expect: its rows, and its clauses kept whole after them.
+    #[test]
+    fn an_upserts_rows_are_taken_apart_and_its_clauses_kept() {
+        let (head, rows, clauses) = rows(
+            "INSERT INTO t0 VALUES (1, 'a'), (2, 'b') ON CONFLICT(c0) DO UPDATE SET c1 = (excluded.c1)",
+        )
+        .unwrap();
+        assert_eq!(head, "INSERT INTO t0 VALUES ");
+        assert_eq!(rows, ["(1, 'a')", "(2, 'b')"]);
+        assert_eq!(clauses, " ON CONFLICT(c0) DO UPDATE SET c1 = (excluded.c1)");
+        assert!(
+            rows_of("CREATE TRIGGER g0 AFTER INSERT ON t0 BEGIN INSERT INTO lg VALUES (1); END")
+                .is_none()
+        );
+    }
+
+    fn rows_of(s: &str) -> Option<Vec<String>> {
+        rows(s).map(|(_, rows, _)| rows)
+    }
 }

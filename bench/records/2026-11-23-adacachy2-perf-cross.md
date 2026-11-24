@@ -1328,11 +1328,11 @@ landing). In crates/ this lane moves the line and the queue's room to `replicate
   record bigger than what is left beside the first waits for it to be taken, as before.
 - A call waiting for the memory budget (`Budget::take_until`, A21) does not hear its owner's end: it waits for the budget or its
   deadline. Read from the code, not run; not changed (out of this lane's line).
-- The suites ran on 0d877f36 (before the docs, the hang guards of two joins and main's PG20 and B25 landings), not on the landed tree; the
-  landed tree had clippy, the touched tests and check-production. The suites on main: 6 rounds, the fix: 3.
+- The paired suites ran on 0d877f36 (before the docs, the hang guards of two joins and main's PG20 and B25 landings); the landed tree's
+  three rounds (r1527) have no main beside them at that moment. The suites on main: 6 rounds, the fix: 3 and the landed tree's 3.
 - The rate of wire records refused beside a draining line was not measured; the stress's own record source pushes as fast as it can and
   was refused 60,000 times in 100,000 tries (its bound of 3 to 8 inputs, filled by its own records), which is no one's rate.
-- TSan sees what its instrumented build (std included) reports: no report in 3 rounds of 18 tests, none on main; it can't find a race that no run
+- TSan sees only what its instrumented build (std included) reports: no report in 3 rounds of 18 tests, none on main; it can't find a race that no run
   reaches. It ran on x86_64 Linux. macOS on arm64: see the runs.
 
 **1. The line on every interleaving** (`crates/line-loom`, T-QB.1.19): the owner's own `line.rs`, compiled over loom. loom has no `SeqCst`
@@ -1414,4 +1414,6 @@ runner I must not use was stopped before it started).
 | r1478, 09:14Z | loom with four models unbounded (the owner's end, both budget ones, the two writes) | stopped at 09:19Z, unfinished, after 5 min: the landed tree keeps three and two preemptions for them, as r1398 ran them |
 | r1483, 09:15Z, cpus=1 | M3 (`room_came` read at `Relaxed`) on `bytes_given_back_…` | red, deadlock |
 | r1499, 09:16Z, cpus=3 | 2f5c6d83 (main 77f1e18f merged: B25's backups, engine wal.rs), the landed tree but for the loom bounds above and this record | built 30 s; the touched tests 25 passed twice; clippy -p amphora -p amphora-line-loom --all-targets rc 0 (52 s, amphora-engine compiled, amphora and line-loom checked), the harness's clippy under --cfg loom rc 0; check-production rc 0 (76 s, ratchet 10617); fmt rc 0; requirements test OK |
-| r1438, 09:09Z, MacBook Pro 2, cpus=8 | macOS (arm64), 2b8977af: loom, the touched tests | not ended when this was written (09:20Z) |
+| r1527, 09:21Z, cpus=2 | the landed tree's lib tests (2f5c6d83, `database::replicated:: replication::`), three rounds, load 48 to 53 | 200 passed, 0 failed, each (145, 135 and 139 s) |
+| r1528, 09:20Z, cpus=2 | loom on the landed tree d16ea9d1 | 15 passed (186 s, three threads) |
+| r1438, 09:09Z, MacBook Pro 2, cpus=8 | macOS (arm64), 2b8977af: loom | 15 passed (919 s, all at once); stopped at 09:28Z before the lib tests were built there: the stress is not run on arm64 |

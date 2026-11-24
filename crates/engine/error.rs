@@ -100,6 +100,10 @@ pub enum LimboError {
     Interrupt,
     #[error("Database snapshot is stale. You must rollback and retry the whole transaction.")]
     BusySnapshot,
+    /// Amphora: the read under way was ended, its log segment taken back for writes that needed the
+    /// room (docs/design/store.md, decision 45): the read asked again begins on a newer snapshot.
+    #[error("snapshot too old: the log took back the segment this read began on")]
+    SnapshotTooOld,
     #[error("Conflict: {0}")]
     Conflict(String),
     #[error("Database schema changed")]
@@ -114,6 +118,15 @@ pub enum LimboError {
     TxTerminated,
     #[error("Write-write conflict")]
     WriteWriteConflict,
+    /// A row a session that waits for row locks (the PostgreSQL dialect's: docs/design/postgres.md
+    /// section 8) changes is another transaction's: `Some`, the open one that changed it, to wait
+    /// for; `None`, one that committed a change to it after the snapshot it was read in. The
+    /// statement is undone and its transaction stays open.
+    #[error("row changed by a concurrent transaction")]
+    RowTaken(Option<u64>),
+    /// A wait for a row's holder would close a ring of waits.
+    #[error("deadlock detected")]
+    Deadlock,
     /// Amphora: a serializable transaction's commit refused by its validation (the versioned
     /// storage, docs/design/engine.md decision 5): its caller rolls back and runs it again.
     #[error("Serialization failure: run the transaction again")]
@@ -205,7 +218,10 @@ impl LimboError {
     pub fn sqlite_result_code(&self) -> i32 {
         match self {
             Self::Constraint(_) | Self::ForeignKeyConstraint(_) | Self::Raise(..) => 19,
-            Self::Busy | Self::BusySnapshot | Self::StatementsInProgress(_) => 5,
+            Self::Busy
+            | Self::BusySnapshot
+            | Self::SnapshotTooOld
+            | Self::StatementsInProgress(_) => 5,
             Self::TableLocked => 6,
             Self::ReadOnly => 8,
             Self::Interrupt => 9,
@@ -324,6 +340,10 @@ pub enum CompletionError {
     },
     #[error("tursodb not compiled with checksum feature")]
     ChecksumNotEnabled,
+    /// Amphora: the read this page was read for was ended before its bytes were used
+    /// ([`LimboError::SnapshotTooOld`]).
+    #[error("snapshot too old: the log took back the segment this read began on")]
+    SnapshotTooOld,
     /// Amphora: a packed log record that doesn't decode, or doesn't hold the page asked of it.
     #[error("packed log record at frame {frame_id} doesn't give page {page_idx}")]
     PackedRecordCorrupt { frame_id: u64, page_idx: usize },

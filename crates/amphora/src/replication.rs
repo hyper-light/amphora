@@ -1286,6 +1286,17 @@ impl Machine {
         self.db.switch_log()
     }
 
+    /// The local reads under way that count on the segment the last restart closed
+    /// (`Db::closing_reads`).
+    pub(crate) fn closing_reads(&self) -> u64 {
+        self.db.closing_reads()
+    }
+
+    /// Ends them, and says how many (`Db::end_closing_reads`; store.md, decision 45).
+    pub(crate) fn end_closing_reads(&self) -> usize {
+        self.db.end_closing_reads()
+    }
+
     /// A flush of the database's log, to run on the owner's flushing thread: what was committed
     /// before it began is durable once it ends (`Db::flusher`).
     pub(crate) fn log_flusher(&self) -> crate::store::Flush {

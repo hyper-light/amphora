@@ -2097,17 +2097,15 @@ pub(super) fn partial_index_predicate_terms(
         .as_ref()
         .expect("partial_index_predicate_terms requires a partial index");
     let can_use_query_term = |term: &WhereTerm| -> bool {
-        let Some(join_info) = &table_reference.join_info else {
-            return !term.origin.is_outer_join();
-        };
-        if join_info.is_full_outer() {
-            return false;
+        match &table_reference.join_info {
+            Some(join_info) if join_info.is_full_outer() => false,
+            Some(join_info) if join_info.is_outer() => {
+                term.origin.join_origin() == Some(JoinOrigin::Outer(table_reference.internal_id))
+            }
+            // Another table's outer join keeps the rows of this one its ON refuses, so its ON
+            // proves nothing of them (whereUsablePartialIndex's EP_OuterON test, where.c).
+            _ => !term.origin.is_outer_join(),
         }
-        if join_info.is_outer() {
-            return term.origin.join_origin()
-                == Some(JoinOrigin::Outer(table_reference.internal_id));
-        }
-        true
     };
     // Bind the index WHERE expression's column references to this query's
     // table reference so it can be compared symmetrically against bound query

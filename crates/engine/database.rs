@@ -3442,6 +3442,22 @@ impl Database {
         Ok(switched?.is_some())
     }
 
+    /// Amphora: ends every read under way in this process that counts on the closing segment, and
+    /// says how many (decision 45, [`SharedLog::end_closing_reads`]). None in a multi-process log,
+    /// whose other processes' reads it doesn't see.
+    pub fn end_closing_reads(&self) -> usize {
+        if self.opts.enable_multiprocess_wal {
+            return 0;
+        }
+        self.shared_wal.end_closing_reads()
+    }
+
+    /// Amphora: the reads that count on the closing segment, none when no segment closes
+    /// (decision 45).
+    pub fn closing_reads(&self) -> u64 {
+        self.shared_wal.closing_reads()
+    }
+
     /// The current segment's file flushed, then the switch: every frame of a closing segment is
     /// durable, so a pass copies all of it, unbounded by the current segment's flushes.
     fn flush_and_switch(

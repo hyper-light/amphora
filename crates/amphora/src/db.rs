@@ -117,6 +117,28 @@ fn fail(e: impl std::error::Error + Send + Sync + 'static) -> anyhow::Error {
     anyhow::Error::new(e)
 }
 
+/// Whether `error` says the engine ended this read: its snapshot's log segment was taken back for
+/// writes that needed the room ([`Db::end_closing_reads`]). It read nothing of another snapshot, so
+/// the read asked again is the same read on a newer one.
+pub(crate) fn too_old(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<LimboError>(),
+            Some(
+                LimboError::SnapshotTooOld
+                    | LimboError::CompletionError(CompletionError::SnapshotTooOld)
+            )
+        )
+    })
+}
+
+/// Whether `error` says the engine interrupted the statement it was running.
+pub(crate) fn interrupted(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| matches!(cause.downcast_ref(), Some(LimboError::Interrupt)))
+}
+
 /// Wakes the thread that made it: what a statement stepped on this thread waits on while it is busy
 /// (the release of the lock it found held, [`step`]).
 struct Unpark(std::thread::Thread);
@@ -334,9 +356,19 @@ impl Db {
         clock: impl Fn() -> Instant + Send + Sync + 'static,
     ) -> Deadline {
         // An administrative cancellation quantum, not a throughput tuning claim. A SQL VM can
-        // execute at most 1024 further instructions between deadline checks.
-        self.conn
-            .set_progress_handler(1024, Some(Box::new(move || clock() >= until)));
+        // execute at most 1024 further instructions between deadline checks. A read the log's owner
+        // ended ([`Db::end_closing_reads`]) ends at the same step, whatever it is reading: one that
+        // works in memory alone looks no page up, and would hold nothing back otherwise.
+        let ended = Arc::downgrade(&self.conn);
+        self.conn.set_progress_handler(
+            1024,
+            Some(Box::new(move || {
+                clock() >= until
+                    || ended
+                        .upgrade()
+                        .is_some_and(|conn| conn.get_pager().read_ended())
+            })),
+        );
         Deadline {
             connection: Arc::clone(&self.conn),
         }
@@ -866,6 +898,23 @@ impl Db {
     /// past its room would refuse every submit after the restart that brought it back within.
     pub(crate) fn log_frames_in_use(&self) -> anyhow::Result<u64> {
         Ok(self.db.wal_backfill().0)
+    }
+
+    /// Whether the log's owner ended this connection's last read ([`Db::end_closing_reads`]).
+    pub(crate) fn read_ended(&self) -> bool {
+        self.conn.get_pager().was_read_ended()
+    }
+
+    /// Ends the reads under way that count on the log's closing segment, and says how many: what
+    /// keeps that segment from the writes is then its copy alone (decision 45). Each finds it at
+    /// its next page ([`too_old`]).
+    pub(crate) fn end_closing_reads(&self) -> usize {
+        self.db.end_closing_reads()
+    }
+
+    /// The reads that count on the log's closing segment, none when no segment closes.
+    pub(crate) fn closing_reads(&self) -> u64 {
+        self.db.closing_reads()
     }
 
     /// The frames of log a restart keeps the log's file for: past them, it cuts the file to nothing

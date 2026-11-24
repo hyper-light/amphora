@@ -1087,7 +1087,19 @@ pub(crate) fn refused(error: &anyhow::Error) -> Refusal {
     if let Some(crate::sql::Error::Refusal(refusal)) = error.downcast_ref::<crate::sql::Error>() {
         return refusal.clone();
     }
+    if crate::db::too_old(error) {
+        return snapshot_too_old();
+    }
     unavailable(format!("{error:#}"))
+}
+/// A read ended because its snapshot's segment was taken back for writes that needed the room
+/// (replication.md, "A replica's database log bounded by what it measures", B): asked again, the
+/// same read begins on a newer one.
+pub(crate) fn snapshot_too_old() -> Refusal {
+    Refusal::Serialization {
+        what: "read".into(),
+        why: "snapshot too old: the database's log took back the segment it began on, for a write that needed the room".into(),
+    }
 }
 /// A query's session on `db`, a reader or the writer between its commits: once, before its
 /// deadline, never on a database whose restore is unfinished.
