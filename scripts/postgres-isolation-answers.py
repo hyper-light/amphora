@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""What a real PostgreSQL 19 server answers two sessions' interleaved statements, message by message
-(docs/design/postgres.md, section 8; T-PG.14.1). Reads a list of steps
-(crates/amphora/tests/isolation/steps.txt), each on one line, in order:
+"""What a real PostgreSQL 19 server answers several sessions' interleaved statements, message by message
+(docs/design/postgres.md, section 8; T-PG.14.1, T-PG.15.1). Reads a list of steps
+(crates/amphora/tests/isolation/steps.txt and recheck-steps.txt), each on one line, in order:
 
     # name           an interleaving's name
     s1|sql           session s1 runs sql, and its answer is read
     s2>sql           session s2 sends sql, which must wait for another session's transaction: the
                      next step runs once pg_stat_activity shows it waiting on a lock
     s2<              session s2's outstanding statement's answer is read
+    s2+              session s2's outstanding statement still waits
+    s2!sql           session s2 sends sql, whose wait its deadlock check refuses: its answer is read
+    s2!              session s2's outstanding statement's, which its deadlock check refuses
+    s2~sql           session s2 sends sql, whose wait lock_timeout refuses: its answer is read
 
-and writes `@ session sql` (`@ s2> sql` and `@ s2< -` for the last two), then `<type> <hex body>` a
-message the server answered. It asks for no password. The rules of `s1` and `s2` are held by the
-sessions that the steps open in a database made for the run.
+and writes `@ session sql` (`@ s2> sql`, and `@ s2< -` for one with no sql), then `<type> <hex body>` a
+message the server answered. It asks for no password. The sessions are those the steps open in a
+database made for the run.
 
 usage: postgres-isolation-answers.py <host> <port> <steps> > answers.txt
 """
@@ -80,12 +84,14 @@ host, port, path = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 admin = Client(host, port, "postgres")
 admin.query("drop database if exists %s" % DATABASE)
 admin.query("create database %s" % DATABASE)
-sessions = {"s1": Client(host, port, DATABASE), "s2": Client(host, port, DATABASE)}
+sessions = {}
 for line in open(path, encoding="utf-8").read().splitlines():
     if line.startswith("#") or not line:
         continue
     name = line[:2]
     rest = line[2:]
+    if name not in sessions:
+        sessions[name] = Client(host, port, DATABASE)
     client = sessions[name]
     if rest.startswith("|"):
         sql = rest[1:]
@@ -100,6 +106,18 @@ for line in open(path, encoding="utf-8").read().splitlines():
         messages = []
     elif rest == "<":
         print("@ %s< -" % name)
+        messages = client.answer()
+    elif rest == "+":
+        print("@ %s+ -" % name)
+        time.sleep(0.2)
+        while not waits(admin, client.pid):
+            time.sleep(0.01)
+        messages = []
+    elif rest[:1] in "!~" and rest[1:]:
+        print("@ %s%s %s" % (name, rest[0], rest[1:]))
+        messages = client.query(rest[1:])
+    elif rest == "!":
+        print("@ %s! -" % name)
         messages = client.answer()
     else:
         raise SystemExit("not a step: %s" % line)
