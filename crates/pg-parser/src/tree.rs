@@ -233,6 +233,19 @@ pub enum Node {
     VariableShowStmt {
         name: Option<String>,
     },
+    /// parsenodes.h's PartitionSpec; its PartitionStrategy is a char, printed as its number.
+    PartitionSpec {
+        strategy: char,
+        part_params: Vec<NodeId>,
+        location: i32,
+    },
+    PartitionElem {
+        name: Option<String>,
+        expr: Option<NodeId>,
+        collation: Vec<NodeId>,
+        opclass: Vec<NodeId>,
+        location: i32,
+    },
 }
 
 /// primnodes.h's BoolExprType, printed by name as _outBoolExpr prints it.
@@ -1224,6 +1237,40 @@ impl Tree {
                 Token(name.as_deref()),
                 Text("}"),
             ]),
+            Node::PartitionSpec {
+                strategy,
+                part_params,
+                location: at,
+            } => {
+                p.extend([
+                    Text("{PARTITIONSPEC :strategy "),
+                    Int(i64::from(u32::from(*strategy))),
+                    Text(" :partParams "),
+                    List(part_params),
+                ]);
+                location(p, " :location ", *at);
+                p.push(Text("}"));
+            }
+            Node::PartitionElem {
+                name,
+                expr,
+                collation,
+                opclass,
+                location: at,
+            } => {
+                p.extend([
+                    Text("{PARTITIONELEM :name "),
+                    Token(name.as_deref()),
+                    Text(" :expr "),
+                    N(*expr),
+                    Text(" :collation "),
+                    List(collation),
+                    Text(" :opclass "),
+                    List(opclass),
+                ]);
+                location(p, " :location ", *at);
+                p.push(Text("}"));
+            }
         }
     }
 }
