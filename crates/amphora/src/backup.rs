@@ -341,7 +341,7 @@ impl Marks {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Ended {
     /// The generation that ended with frames in it, its last frame, and whether it was started
-    /// again before all of it was shipped.
+    /// again before all of it was shipped (a send under way then may ship the rest).
     seq: u32,
     frame: u64,
     forced: bool,
@@ -443,9 +443,26 @@ impl Fence {
         }
     }
 
+    /// The generation `seq` ended at `frame`, as the segment it was in says where a log is opened
+    /// (decision 45), the one after it current: what a fence is told where no restart was made
+    /// through it yet.
+    pub(crate) fn opened(&self, seq: u32, frame: u64) -> anyhow::Result<()> {
+        let mut state = self.state()?;
+        if state.ended.is_none() && state.ending.is_none() {
+            state.ended = Some(Ended {
+                seq,
+                frame,
+                forced: false,
+                empties: 0,
+            });
+        }
+        Ok(())
+    }
+
     /// Whether the log ran unbroken from frame `frame` of generation `old`, as it ended, to the start
     /// of generation `new`: every restart between them was through [`crate::db::Db::restart_log`]
-    /// and none of them forced (T-T1.12.D1).
+    /// (or is what the log was opened with, [`Fence::opened`]) and none of them forced, or all the
+    /// forced one left unshipped was shipped since (T-T1.12.D1).
     pub(crate) fn ended_whole(&self, old: u32, frame: u64, new: u32) -> anyhow::Result<bool> {
         let state = *self.state()?;
         // A log at the generation the restart under way begins says it was made; a log at the one
@@ -455,7 +472,10 @@ impl Fence {
             return Ok(false);
         };
         if old == e.seq {
-            return Ok(frame == e.frame && !e.forced);
+            let shipped = state
+                .shipped
+                .is_some_and(|(s, f)| s == e.seq && f >= e.frame);
+            return Ok(frame == e.frame && (!e.forced || shipped));
         }
         // One of the empty generations after it: it ended at frame 0.
         let after = old.wrapping_sub(e.seq);
@@ -662,6 +682,40 @@ mod tests {
             !fence.ended_whole(5, 3, 6).unwrap(),
             "a restart not made ended nothing"
         );
+    }
+
+    /// Decision 45, AC-T1.12.4 (lane B25): a generation ended by force is whole once all of it is
+    /// shipped, and no sooner. Do: start 6 again at frame 5 with 3 shipped; ship it to 4, then 5. Expect:
+    /// 6 reaches 7 whole only at 5, asked from 5.
+    #[test]
+    fn d45_a_generation_ended_by_force_is_whole_once_shipped() {
+        let fence = Fence::default();
+        fence.shipped(6, 3).unwrap();
+        fence.restart(6, 5, true, || Ok(true)).unwrap();
+        for frame in 3..=5 {
+            fence.shipped(6, frame).unwrap();
+            let whole = fence.ended_whole(6, frame, 7).unwrap();
+            assert_eq!(whole, frame == 5, "shipped through {frame} of 5");
+        }
+        assert!(!fence.ended_whole(6, 4, 7).unwrap(), "it ended at 5");
+    }
+
+    /// Decision 45 (lane B25): a fence is told how the generation before the current one ended where a
+    /// log is opened, and what its writer does after is what it answers from then on. Do: tell a new
+    /// fence 4 ended at 9; restart 5, then tell it again of 4. Expect: 4 reaches 5 whole from 9 alone,
+    /// and after the restart 5 reaches 6, 4 nothing.
+    #[test]
+    fn d45_a_fence_told_where_a_log_is_opened() {
+        let fence = Fence::default();
+        fence.opened(4, 9).unwrap();
+        assert!(fence.ended_whole(4, 9, 5).unwrap());
+        assert!(!fence.ended_whole(4, 8, 5).unwrap(), "it ended at 9");
+        assert!(!fence.ended_whole(3, 9, 5).unwrap(), "3 isn't told of");
+        fence.shipped(5, 2).unwrap();
+        fence.restart(5, 2, false, || Ok(true)).unwrap();
+        fence.opened(4, 9).unwrap();
+        assert!(fence.ended_whole(5, 2, 6).unwrap());
+        assert!(!fence.ended_whole(4, 9, 5).unwrap(), "the log is past 5");
     }
 
     /// T-T1.12.P11: a log started again twice with no write between keeps its link whole; a
