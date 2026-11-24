@@ -12,10 +12,18 @@ const RECORD: usize = RECORD_BYTES + ENVELOPE_BYTES;
 
 /// `model` on every interleaving: all of them (none), or those of at most `preemptions` of one
 /// thread by another where all of them are too many to run.
+///
+/// Prints how many it ran (`--nocapture`), so that a model that ran none is seen.
 fn every(preemptions: Option<usize>, model: impl Fn() + Send + Sync + 'static) {
+    let ran = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = std::sync::Arc::clone(&ran);
     let mut builder = loom::model::Builder::new();
     builder.preemption_bound = preemptions;
-    builder.check(model);
+    builder.check(move || {
+        count.fetch_add(1, Ordering::Relaxed);
+        model();
+    });
+    println!("{} interleavings", ran.load(Ordering::Relaxed));
 }
 /// A queue of a hundred bytes, fifty of them the calls', that holds `commands` inputs.
 fn queue(commands: usize) -> Arc<Room> {
@@ -122,6 +130,34 @@ fn t_qb_1_19_the_first_in_line_is_the_first_admitted_and_no_place_is_taken_twice
         in_line(&room, 1);
         let second = call(&room, FAR, admit(2));
         in_line(&room, 2);
+        drop(held);
+        first.join().unwrap();
+        second.join().unwrap();
+        assert_eq!(*order.lock().unwrap(), vec![1, 2]);
+        holds_nothing(&room);
+    });
+}
+
+/// T-QB.1.19: a call that comes while another stands in line goes behind it, the room free or not. Do:
+/// with the one place held and a call in line, another comes as the place is given back. Expect: the
+/// one in line admitted first.
+#[test]
+fn t_qb_1_19_a_call_that_comes_does_not_go_before_one_in_line() {
+    every(Some(3), || {
+        let room = queue(2);
+        let held = Room::place(&room, CALL, true).unwrap();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let admit = |id: usize| {
+            let order = Arc::clone(&order);
+            move |place: Result<Reservation, Refusal>| {
+                let place = place.unwrap();
+                order.lock().unwrap().push(id);
+                drop(place);
+            }
+        };
+        let first = call(&room, FAR, admit(1));
+        in_line(&room, 1);
+        let second = call(&room, FAR, admit(2));
         drop(held);
         first.join().unwrap();
         second.join().unwrap();

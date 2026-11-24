@@ -30,9 +30,9 @@ fn locked<T>(m: &Mutex<T>) -> Result<MutexGuard<'_, T>, Refusal> {
 
 /// What `line` shares between threads. Loom takes a sequentially consistent access for an
 /// acquire-release one and models only `fence(SeqCst)` as C++ states it (its README, "SeqCst
-/// accesses"), so each such access carries the fence beside it: the mapping of C++'s onto a machine
-/// with no such accesses of its own (the leading-fence one), by which a load after a store of
-/// another location can't go before it.
+/// accesses"), so each such access carries the fence before it: the mapping of C++'s onto a machine
+/// with none of its own (Power's, "leading sync"), in which no access of `join`'s stands after its
+/// own `fence` but by that fence.
 mod sync {
     pub(crate) use loom::sync::atomic::fence;
     pub(crate) use loom::sync::{Arc, Mutex};
@@ -55,19 +55,14 @@ mod sync {
         pub(crate) fn store(&self, value: usize, order: Ordering) {
             Self::fenced(order);
             self.0.store(value, order);
-            Self::fenced(order);
         }
         pub(crate) fn fetch_add(&self, by: usize, order: Ordering) -> usize {
             Self::fenced(order);
-            let was = self.0.fetch_add(by, order);
-            Self::fenced(order);
-            was
+            self.0.fetch_add(by, order)
         }
         pub(crate) fn fetch_sub(&self, by: usize, order: Ordering) -> usize {
             Self::fenced(order);
-            let was = self.0.fetch_sub(by, order);
-            Self::fenced(order);
-            was
+            self.0.fetch_sub(by, order)
         }
         pub(crate) fn try_update(
             &self,
@@ -76,9 +71,7 @@ mod sync {
             change: impl FnMut(usize) -> Option<usize>,
         ) -> Result<usize, usize> {
             Self::fenced(set);
-            let was = self.0.fetch_update(set, fetch, change);
-            Self::fenced(set);
-            was
+            self.0.fetch_update(set, fetch, change)
         }
     }
 
