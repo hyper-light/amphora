@@ -8,8 +8,9 @@ What Amphora's PostgreSQL front end is built and checked from (docs/design/postg
   filter and scanner support they need (`parser.c`, `scansup.c`), the keyword list
   (`src/include/parser/kwlist.h`), the parse nodes the grammar's actions build
   (`src/include/nodes/parsenodes.h`, `primnodes.h`), the SQLSTATEs (`src/backend/utils/errcodes.txt`),
-  and the regression suite's SQL (`src/test/regress/sql`), the corpus the parser oracle
-  (crates/pg-oracle) gives verdicts on.
+  the regression suite's SQL (`src/test/regress/sql`), the corpus the parser oracle
+  (crates/pg-oracle) gives verdicts on, and the time zone database (`src/timezone/data/tzdata.zi`,
+  public domain) that amphora-pg-analysis reads a session's `TimeZone` from.
 - **How it's used:** read as data. Nothing here is compiled into Amphora; the oracle that runs
   PostgreSQL's own parser is built apart by scripts/postgres-oracle-extract.sh.
 
