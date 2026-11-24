@@ -105,6 +105,7 @@ enum LogCut {
         segment: SegmentId,
         last: bool,
     },
+    Cut,
     Done,
 }
 
@@ -1087,6 +1088,9 @@ trait WalCoordination: Debug + Send + Sync {
     /// mark of the current segment guards one. The caller holds a checkpoint's locks and the writer's.
     fn switch_unread(&self, io: &dyn IO) -> Result<Option<SegmentId>>;
 
+    /// Both of the log's files are cut: it starts as a new database's does ([`SharedLog::start_first`]).
+    fn start_first(&self, io: &dyn IO) -> Result<()>;
+
     /// Mark the current segment's header unwritten before its file is cut, and return that file.
     fn prepare_truncate(&self) -> Result<Arc<dyn File>>;
 
@@ -1957,6 +1961,10 @@ impl WalCoordination for InProcessWalCoordination {
 
     fn min_pinned_read_frame(&self) -> Option<u64> {
         self.min_pinned_read_frame_inner()
+    }
+
+    fn start_first(&self, io: &dyn IO) -> Result<()> {
+        self.log.start_first(io)
     }
 
     fn move_checkpoint_guard(&self, from: SegmentId, to: SegmentId) -> Result<()> {
@@ -3345,6 +3353,10 @@ impl WalCoordination for ShmWalCoordination {
         }
     }
 
+    fn start_first(&self, _io: &dyn IO) -> Result<()> {
+        Ok(())
+    }
+
     fn move_checkpoint_guard(&self, from: SegmentId, to: SegmentId) -> Result<()> {
         self.fallback.move_checkpoint_guard(from, to)
     }
@@ -4558,6 +4570,31 @@ impl SharedLog {
     /// (lane B19: tests/crash.rs's power cut at seed 45 reopened to sequences 4 and 1). Its log is
     /// at its start already, so there is nothing to switch from.
     pub fn switch(&self, io: &dyn IO, cut_past: Option<u64>) -> Result<Option<SegmentId>> {
+        if self
+            .current()
+            .read()
+            .metadata
+            .max_frame
+            .load(Ordering::Acquire)
+            == 0
+        {
+            return Ok(None);
+        }
+        self.switch_to_free(io, cut_past)
+    }
+
+    /// Both of the log's files are cut to nothing (TRUNCATE's end): no header is on disk, and the log
+    /// is a new database's again, as recovery takes two empty files, its first segment current. Not
+    /// while a read counts on that segment: the second one then stays current. The caller holds
+    /// `write_lock`.
+    fn start_first(&self, io: &dyn IO) -> Result<()> {
+        if self.current_id() == SegmentId::Second {
+            let _ = self.switch_to_free(io, None)?;
+        }
+        Ok(())
+    }
+
+    fn switch_to_free(&self, io: &dyn IO, cut_past: Option<u64>) -> Result<Option<SegmentId>> {
         let segments = self.segments.load();
         if segments.closing().is_some() {
             return Ok(None);
@@ -4567,9 +4604,6 @@ impl SharedLog {
         let (header, epoch, transaction_count, copied) = {
             let closing = self.segment(from).read();
             let frames = closing.metadata.max_frame.load(Ordering::Acquire);
-            if frames == 0 {
-                return Ok(None);
-            }
             let header = *closing.metadata.wal_header.lock();
             (
                 header,
@@ -8589,6 +8623,11 @@ impl WalFile {
                     result.cut = Self::after_cut(segment, last);
                     io_yield_one!(c);
                 }
+                LogCut::Cut => {
+                    self.coordination.start_first(self.io.as_ref())?;
+                    self.read_from_file();
+                    result.cut = LogCut::Done;
+                }
                 LogCut::Done => return Ok(IOResult::Done(())),
             }
         }
@@ -8596,7 +8635,7 @@ impl WalFile {
 
     fn after_cut(segment: SegmentId, last: bool) -> LogCut {
         if last {
-            LogCut::Done
+            LogCut::Cut
         } else {
             LogCut::Truncate {
                 segment: segment.other(),
@@ -12090,9 +12129,8 @@ pub mod test {
             conn.execute("insert into other(value) values ('closing')")
                 .unwrap();
         }
-        // Each TRUNCATE switches the log's segment.
         std::fs::copy(&source, &copy).unwrap();
-        std::fs::copy(format!("{source_path}-wal2"), format!("{copy_path}-wal")).unwrap();
+        std::fs::copy(format!("{source_path}-wal"), format!("{copy_path}-wal")).unwrap();
         conn.execute("pragma wal_checkpoint(TRUNCATE)").unwrap();
         bulk_inserts(&conn, 1, 10);
         std::fs::copy(format!("{source_path}-wal"), format!("{copy_path}-wal2")).unwrap();
