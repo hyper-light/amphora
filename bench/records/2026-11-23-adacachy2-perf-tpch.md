@@ -1652,3 +1652,142 @@ avg10 24 to 26%.
 - r173 (adacachy2, 52906367, merged a third time with main fac69083, which moved in crates/engine: the Postgres
   dialect, pg_catalog_vtab, alter.rs, execute.rs): clippy clean (the log compiles amphora-engine, 55 s); the same tests
   70 of 70, the new test and the learned-cost suite among them. Pushed to main from this tree.
+
+# Lane T21 (tpch), 2026-11-24 04:58Z to 05:40Z: T19's fix across the 22 TPC-H queries; arm C (only the filters the join search priced) kept and merged
+
+Losses first:
+- Times settle nothing between B and C. On queries whose plan, star-filter set and every counted-run operator row count
+  are the same in both arms, times still differ: q07 B against C is 1,499 to 956 ms (p = 0.002), q18 C against B is
+  2,714 to 2,057 ms (p = 0.004, C slower), and q06 to q09 C is faster at p = 0.002. q14 A against B (also the same
+  plan and filters) differs 991 to 681 ms at p = 0.004. The machine ran at load 29 to 62 on 32 cores (CPU pressure
+  avg10 5 to 50%) with the rotation A B C then B C A, so load drift is one cause; the rest (the build that each arm
+  is) was not traced. Times below are listed, not used to choose.
+- 16 cores were refused (9 of 32 idle on adacachy2), so r322 ran at `cpus=8`.
+- Two rounds only, 6 timed runs per arm and query; `q03` has outliers of 17,934 ms (A) and 11,293 ms (B), and `q11`
+  one of 1,838 ms (C), none traced.
+- One change in B's plan that A's faster time doesn't support: q10 (section 4) runs a plan that costs 140,987 against
+  A's 276,204, and the two times are 1,157 ms (A) and 1,467 ms (B), p = 0.093, n = 6 (not settled). The next lane
+  should trace it (the star filter's estimated pass 5.08% against 7.77% seen).
+- q20's main join is inside a list subquery, so the trace's whole-plan lines don't cover it; its change is explained
+  from the read the search priced (section 4), not from weighed whole plans.
+- The checks ran on C's tree and on C merged with main; A and B (main, main without a34ec88b) were not clippied or tested
+  apart from the red test.
+
+## 1. The arms and the run (r322, adacachy2, 05:04:18Z to 05:28:57Z runner time, cpus=8, mem=24g)
+
+- A = b0f09f9a: main a64549cc without a34ec88b's optimizer change (T20's diff c67455f6..b7d5cbe2, applied on main a64549cc: access_method.rs, join.rs, lip.rs, mod.rs, multi_index.rs, plan.rs); the star-filter
+  trace kept. Not for main. The red tree is A plus T19's q03 test alone (d9e75744).
+- B = a64549cc: main at the time. Since c67455f6 it changed crates/engine in parallel.rs, execute.rs, morsel, versioned
+  storage and wal, and in the optimizer only learned_costs.rs (calibration reads, checked: no weight pin changed).
+- C = 7d19a8fa: B merged with e23ab4b6 (lane T20's arm C; `lip::choose` under `StarFilters::ByCost` keeps only the
+  filters the join search priced). The only code difference from B is lip.rs (4 lines added, 6 removed).
+- `A=b0f09f9a B=a64549cc C=7d19a8fa RED=d9e75744 ROUNDS=2 BJOBS=8 CJOBS=6 bash ~/.cache/tpch-t21/sweep.sh` (copies in
+  `~/.cache/amphora-perf/tpch-t21/` and on the branch `perf/tpch-t21-scripts`). Release builds in the lane's one target dir: B 106 s, A 118 s, C 113 s (each
+  compiling amphora-engine). Each arm's `db` is a reflink copy of T11's db-sf1 (3.6 GB), opened by main's engine (rc 0, about 1 s).
+- Calibration measured once with B's open and its body (sha256 b7661c2007aeb06d) copied under every arm's key (rule 5e).
+  Weights pinned for every run with T17's set (`S.json`, sha256 eecf5d727dc3a6ab..., 8 weights; one distinct set in the records
+  of all three arms).
+- Each arm process: every query's counted run, then 3 timed runs, one process per arm-round; order A B C, then B C A.
+  `--timeout-s 120`. Load at each arm start: A r1 56.5, B r1 43.9, C r1 34.4, B r2 30.7, C r2 55.1, A r2 62.3 (cpu
+  pressure avg10 36, 27, 5, 13, 40, 50%).
+- Answers: SQLite's 22 answers taken once, then answers.py on each arm's two rounds (6 arm-rounds): 22 queries
+  compared, 0 differ, every time. 396 timed runs, 0 failed.
+- The whole run traced again with AMPHORA_PLAN_TRACE and AMPHORA_SEEK_TRACE, one process per query, all 22, three
+  arms: the plans, the weighed whole plans, the priced reads and the star filters' probes and rejects.
+
+## 2. Red without the fix
+
+`cargo test -p amphora-engine --lib --locked -- optimizer::join::tests::t19_q03` on d9e75744 (A plus the test): 1 failed,
+`t19_q03_star_filter_priced_in_the_search_seeks_customer` at join.rs:6537: the plan was
+`HASH JOIN customer / SEARCH lineitem USING INDEX sqlite_autoindex_lineitem_1 / SCAN orders`, not `SCAN orders / SEARCH
+customer USING INTEGER PRIMARY KEY`. It passes with the fix (T19's record; the C test run in section 7).
+
+## 3. The 22 queries at SF1 (6 timed runs per arm; medians in ms, range; exact rank-sum p, two-sided)
+
+"plan A = B" and "plan B = C" compare the whole plan detail of every run; "filters" are the star filters the traced
+run checked (A, B and C). Loads are each run's one-minute average. On rows where two arms have the same plan and filters, a
+time difference is the arms' noise (Losses first), not the change's effect.
+
+| query | plan A = B | plan B = C | filters A | filters B | filters C | A ms | B ms | C ms | p B vs A | p C vs B | load range |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| q01 | yes | yes | none | none | none | 3,523 (2,957 to 4,286) | 3,257 (2,398 to 4,056) | 2,571 (2,338 to 3,193) | 0.485 | 0.093 | 31.3 to 62.1 |
+| q02 | yes | yes | none | none | none | 49.4 (36.6 to 70.8) | 53.2 (27.5 to 101) | 36.9 (31.6 to 50.2) | 0.937 | 0.589 | 31.4 to 60.8 |
+| q03 | NO | yes | none | customer | customer | 2,962 (2,572 to 17,934) | 1,016 (787 to 11,293) | 1,076 (908 to 1,388) | 0.041 | 0.485 | 32.7 to 62.3 |
+| q04 | yes | yes | none | none | none | 421 (319 to 585) | 378 (290 to 670) | 357 (337 to 431) | 0.699 | 1.000 | 32.2 to 60.9 |
+| q05 | yes | yes | none | none | none | 1,890 (1,780 to 2,369) | 1,747 (1,490 to 2,389) | 1,652 (1,458 to 2,115) | 0.589 | 0.937 | 32.2 to 60.1 |
+| q06 | yes | yes | none | none | none | 891 (826 to 1,003) | 857 (755 to 1,027) | 614 (550 to 699) | 0.485 | 0.002 | 31.5 to 56.7 |
+| q07 | yes | yes | none | none | none | 1,428 (1,154 to 1,863) | 1,499 (1,200 to 1,901) | 956 (851 to 1,043) | 0.699 | 0.002 | 31.5 to 56.3 |
+| q08 | yes | yes | none | none | none | 407 (357 to 983) | 286 (237 to 460) | 218 (195 to 233) | 0.065 | 0.002 | 31.4 to 54.7 |
+| q09 | yes | yes | none | none | none | 3,073 (2,466 to 5,990) | 2,511 (2,152 to 3,286) | 1,956 (1,715 to 2,062) | 0.132 | 0.002 | 30.7 to 54.7 |
+| q10 | NO | yes | none | orders | orders | 1,157 (1,069 to 1,892) | 1,467 (1,245 to 1,921) | 1,337 (1,018 to 2,131) | 0.093 | 0.699 | 30.4 to 54.4 |
+| q11 | yes | yes | none | none | none | 179 (145 to 221) | 158 (121 to 281) | 170 (104 to 1,838) | 0.699 | 0.818 | 30.4 to 54.4 |
+| q12 | yes | yes | none | none | none | 809 (684 to 1,031) | 952 (724 to 1,248) | 969 (800 to 1,367) | 0.310 | 0.485 | 29.4 to 54.4 |
+| q13 | yes | yes | none | none | none | 3,112 (2,830 to 4,098) | 4,063 (2,383 to 4,881) | 2,948 (2,655 to 3,436) | 0.485 | 0.394 | 29.1 to 56.5 |
+| q14 | yes | yes | none | none | none | 991 (767 to 1,112) | 681 (638 to 832) | 717 (647 to 797) | 0.004 | 0.394 | 29.7 to 56.3 |
+| q15 | yes | yes | none | none | none | 1,535 (1,448 to 1,708) | 1,544 (1,348 to 1,681) | 1,670 (1,348 to 1,699) | 1.000 | 0.394 | 28.6 to 56.3 |
+| q16 | yes | yes | none | none | none | 181 (175 to 193) | 192 (170 to 258) | 211 (202 to 226) | 0.818 | 0.699 | 28.6 to 54.0 |
+| q17 | yes | yes | none | none | none | 98.0 (95.3 to 98.8) | 96.5 (86.4 to 116) | 117 (106 to 130) | 1.000 | 0.015 | 28.6 to 54.0 |
+| q18 | yes | yes | none | none | none | 2,266 (2,012 to 2,519) | 2,057 (1,871 to 2,358) | 2,714 (2,320 to 3,643) | 0.093 | 0.004 | 29.7 to 52.1 |
+| q19 | yes | yes | none | none | none | 54.4 (44.8 to 67.9) | 56.9 (41.1 to 72.3) | 77.3 (56.4 to 106) | 0.937 | 0.180 | 30.1 to 51.0 |
+| q20 | NO | yes | none | nation | nation | 541 (425 to 645) | 505 (334 to 1,300) | 626 (407 to 1,472) | 1.000 | 0.589 | 29.2 to 58.3 |
+| q21 | yes | yes | none | none | none | 1,395 (1,200 to 1,841) | 1,411 (842 to 3,814) | 1,246 (1,076 to 2,275) | 1.000 | 0.818 | 29.2 to 61.3 |
+| q22 | yes | yes | none | none | none | 144 (120 to 205) | 133 (76.6 to 244) | 135 (92.6 to 199) | 0.699 | 1.000 | 30.7 to 61.3 |
+
+failed runs: 0 of 396; counted-run rows per operator identical B vs C: 22 of 22 queries
+Counted-run rows per operator (156 operators): B and C the same on all 22 queries in both rounds; A and B differ only on q03, q10 and q20.
+
+## 4. The plan changes and their causes (A to B; B to C: none)
+
+Every change between A and B is a read the join search now prices with the star filter it gives a fact table it reads
+whole (T19's `lip::price_read` in the join search). Filters B and C run on each are the same, as are their counts (customer: probes 727,305,
+rejects 580,092 on q03; orders: probes 1,478,870, rejects 1,364,008 on q10; nation: probes 4,397, rejects 4,211 on q20).
+C keeps only filters the search priced; B's filter set has no other on these 22 queries (the whole-plan rule added none), so C's
+plans and filters equal B's on every query, as the measured work says.
+
+- q03 (A: 506,982 for the plan weighed, B: 433,095 for `orders > customer > lineitem` in the trace's order): the customer read after orders, 707,520
+  rows in at pass 0.1998: read cost 251,802 without the filter, 52,481 with it. B's filter on customer passes 0.2 of orders' rows
+  (727,305 probes, 580,092 rejected). T19's record says why that read: lane T18 measured F at 864 ms against S's 1,871 ms. Here
+  A's median 2,962 ms against B's 1,016 ms (p = 0.041, with outliers; the plan S of A joins orders by hash, B's seeks). 
+- q10 (A's cheapest 276,204 `orders > lineitem > customer > nation`; B's 140,987 `lineitem > orders > customer > nation`):
+  orders read after lineitem, 1,475,239 rows in, pass 0.0508, priced 533,410 without the filter and 41,033 with it. B's
+  plan: SCAN lineitem, then orders by rowid, then customer by rowid. B's filter rejects 92.2% of lineitem's rows
+  (1,478,870 probes, 1,364,008 rejects). B's cost 140,987 is under A's 276,204, but its time is above A's (1,467 against
+  1,157 ms, p = 0.093, n = 6, not settled).
+- q20 (A: `SCAN nation / SEARCH supplier USING INDEX supplier_nationkey` against B's `SCAN supplier / SEARCH nation USING
+  INTEGER PRIMARY KEY`, the main join's after the two list subqueries): nation read after supplier, 4,641 rows in, pass 0.04,
+  read 1,640 without the filter and 73.9 with it; B's filter on nation checks 4,397 supplier rows and rejects 4,211. The
+  trace's whole plans do not cover the main join. The times: A 541 ms, B 505, C 626 (all p > 0.5).
+- Between B and C there is no plan change and no filter change: C's `lip::choose` drops, under `ByCost`, only the filters the
+  search did not price, and no such filter was chosen on these queries (A, B: filters "none" on 19 of 22, q03 customer,
+  q10 orders, q20 nation).
+
+## 5. The rule, and the evidence it rests on
+
+Kept (arm C, e23ab4b6): the filter step under `StarFilters::ByCost` keeps only the star filters the join search priced; `Always` keeps every safe filter; `Off` none.
+- Its test and its evidence: the 22 queries give identical answers to B and to SQLite (0 differ in 6 arm-rounds) on identical plans and filters
+  (names, probes, rejects) and identical operator row counts (156 operators). So B's `lip::choose` whole-plan decisions on filters not priced by the search
+  add nothing here.
+- The measured times do not enter the decision: identical-work arms differ by p = 0.002 to 0.004 in both directions (the first Loss), so a
+  slower time in C is not evidence against it. Under the rule set before the run (C kept iff answers identical everywhere and
+  no query has C's median above B's in both rounds with a Holm-adjusted exact rank-sum p <= 0.05 over 22 queries) no query
+  qualifies: the smallest p with C above B is q18 at 0.0043 (Holm-adjusted 0.078), C slower in both rounds, plan and filters identical.
+- The join search's filters on the 22 queries are those of B; a query whose whole-plan rule would add an unpriced filter was not found in this set.
+
+## 6. Found on the way, for other lanes (not acted on)
+
+- The whole-plan lines of the join trace don't cover joins inside list subqueries (q20).
+- q10's B plan: the star filter's estimated pass 5.08% against 7.77% seen (orders), and the plan's cost (140,987) does not
+  match its time against A's (1,467 against 1,157 ms, p = 0.093). Next lane: trace both plans pinned, as T18 did for q03.
+- Timing at load 30 to 60 on adacachy2 cannot separate arms whose work is identical (the `Losses` list).
+- q03's outliers in the first run of a process were seen (A 17.9 s, B 11.3 s) and not traced.
+
+## 7. Checks
+
+- r322 (`checks`, on C's tree 7d19a8fa, adacachy2, load 47 to 58): clippy `-p amphora-engine --all-targets --locked -- -D warnings`
+  clean (log says `Compiling amphora-engine`, 46.6 s); `cargo test -p amphora-engine --lib --locked -- optimizer::join learned_costs
+  optimizer::lip` 72 of 72 (T19's q03 test passes on C).
+- r409 (adacachy2, C, 7d19a8fa): `cargo test -p amphora-engine --test star_filters` 5 of 5 (1 ignored, the coordinator's).
+- The branch merged with main 1f4a8e88 (wal.rs, sqlite3_ondisk.rs, schema.rs, vacuum.rs, execute.rs, insn.rs; none of it
+  in the optimizer) is d67c880a: `cargo fmt --all --check` clean, clippy clean (`Checking amphora-engine`, 45.6 s), the
+  lib tests 72 of 72 (T19's q03 test ok), star_filters 5 of 5 (r426). Pushed to main from it with this record.
+- The red test (section 2) was on the arm A plus the test tree; clippy was not run on it (a throwaway).
