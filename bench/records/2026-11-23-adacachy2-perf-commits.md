@@ -2232,3 +2232,121 @@ the engine's rustc had read its sources by then. The merge binary is valid only 
     # owed (Linux, adacachy2): bench/records/2026-11-23-adacachy2-perf-commits-v19/v19.sh <out> 4 5 3 main=fab12d7e merge=<the landed tree>
     #   for T1 and T2 alone and the suites; cargo clippy -p amphora --all-targets --locked -- -D warnings; bash scripts/check-production.sh;
     #   ladder16.sh at 32 and 128 spread writers, both classes
+
+# Lane V20 (commits) on adacachy2: a replica's log restart switches at once and waits for no local read (decision 45; replication.md B and D superseded for the restart); landed on main eaf61d96 (2026-11-24, 06:51:46Z to 07:53Z)
+
+Ada's goal: "we want correct first, *then* we ruthlessly use tracing, profiling, and benchmarking to optimize." One slow reader never
+holds up a write (decision 45), and every replicated write commits or gets a typed refusal. This lane's deliverable: the replica's log
+restart switches at once, as decision 45 says, with the docs and the two tests saying so.
+
+## Losses first
+
+1. **One slow read can still have writes refused, on a nearly full disk.** The restart switches under the read and the writes go on in the
+   other segment. If they fill that segment's whole room too before the read ends, the member refuses new submits, typed, until it does (at most
+   its caller's deadline): `past_its_room_a_replica_refuses_submits_and_restarts_whatever_its_share` shows it with nothing free past one image.
+   replication.md D says so.
+2. **The room counts the pages a closed segment's copy may still add twice.** While a read holds the closed segment uncopied, those pages (up to one a
+   frame) were in its own room and are counted free again in the current one's; they draw on the image kept back. Kept back too, the second
+   segment would have no room while a read held the first, and the read would have a write refused. D states it. No code changed the room. A choice for Ada (the
+   report).
+3. **A restart due again while a read still holds the closed segment keeps asking for empty flushes.** While a restart is due the owner asks a flush and a pass at every step, and a
+   finished one rings the owner to step again (by the code, inferred). In the driven harness each step asked one: 61,353 flushes over T1's 60,000 rounds on main's code (red run
+   r966), where any open read had a due restart wait. Main does it too; on the branch it needs a second restart due. Not measured on a real owner, not changed.
+4. **No test bounds the two segment files' bytes under a slow read.** `a_replicas_database_log_stays_within_its_room` counts the current segment's frames with no read open; the
+   engine's `d45_reads_overlapping_with_no_gap_let_a_copied_segment_go` tests the state machine, and decision 45's named `d45_the_log_stays_bounded_while_reads_overlap` is not in the code.
+   That the peak is two segments, each within the room, is the design's argument (D), not a test of this lane.
+5. **The 128-writer deadline misses (10 s) stay untraced**: 4, 1 and 2 of the replicated 128 cells' writes and 0, 3 and 0 of the persisted ones' missed it in the ladder below.
+6. **No macOS run finished.** r710 (base, `macos/arm64,cpus=8`) and r813 (`cpus=4`) never left the queue; r842 on MacBook Pro 2 failed at its
+   sync ("did not answer the sync in 60s").
+
+## What each test promised, and what this removes
+
+- **T1**, `a_local_read_holds_off_the_logs_restart_and_one_after_waits_for_it`, now
+  `a_local_read_holds_off_no_restart_of_the_log_and_one_after_waits_for_nothing`. Removed by decision 45: no restart is made under an open read
+  (the test's `held_off`, and its `frames > room`), and a read that comes meanwhile waits for it and is refused `Timeout`. Kept: the open read's two views are both [1], a
+  restart once it ended, and a read after sees every value. New: a restart is made while the read is open, and the read that comes meanwhile is answered.
+- **T2**, `a_restart_due_waits_for_a_reads_deadline_and_no_longer`, now
+  `a_restart_due_waits_for_no_read_and_the_next_for_its_deadline_at_most`. Removed by decision 45: no restart while the read runs. Kept: the read is still
+  out until its deadline is passed, is refused at it, and a restart follows. New: the first restart is made while the read runs. The read now begins a
+  transaction that reads a table, so it keeps a segment (the old one's query names no table).
+- Changed for the same cause: `a_read_on_a_wholly_copied_log_holds_passes_off_and_a_busy_pass_holds_reads` (renamed `..._and_no_restart_or_read`: the read is answered and the
+  restart made, the pass still busy), `past_its_room_...` (a restart under the read, then the refusal), `a_local_read_open_across_an_image_install_...` (the
+  learner's owner may have made the restart the second reader asks for), `t_t1_13_a_read_after_a_writes_answer_...` (its `hold_reads` call no longer exists).
+  `the_owner_holds_reads_past_the_room_or_once_a_due_restart_can_go` is deleted with the rule it stated.
+- New: `a_slow_local_read_has_no_write_refused_past_the_logs_room`.
+
+## The change
+
+`Actor::flush` calls `Machine::restart_log`, which is now `Db::switch_log`: the switch alone. It copies nothing on the owner (decision 45: the copy and the file's flush are the
+checkpointer's). It is ready when it is due, no flush is out, and a pass has followed a flush of what the current segment holds (`Pass::ready`, in place of `caught_up` and
+`busy`). A pass is asked as each switch is made, so the segment it closed is copied at once and a read that begins later counts on the current one alone. `Local::hold_reads`,
+`unhold_reads`, `restart_unread`, `Ledger::restarting` and `hold_due` are deleted. The room's formula is unchanged.
+
+Not done: the segment a read holds is reset by its last read's end and the pass that follows (the engine's, unchanged); a switch the closed segment blocks is tried again at each step.
+
+## Red on main's code, green on the change (adacachy2)
+
+The tests at a83c5de2 (main d8afec49's production code with this branch's tests; r966, `--exact`, cpus=1, load 47 to 52), each test alone once:
+
+| test | red | why |
+|---|---|---|
+| `a_slow_local_read_has_no_write_refused_past_the_logs_room` | failed, 1 s | write 22 refused `Unavailable`: 67 frames past the 65 it may hold |
+| T1 | failed, 75 s | "the log's restart waited for a read" |
+| `past_its_room_...` | failed, 0 s | the same |
+| `a_read_on_a_wholly_copied_log_...` | failed, 65 s | the same |
+| T2 | failed, 16 s | the same |
+
+Green: the five and `a_read_after_the_logs_restart_is_not_held_...` (V19's T3), `a_follower_past_its_room_...`, `a_local_read_open_across_an_image_install_...`, `t_t1_13_...`,
+`a_replicas_database_log_stays_within_its_room`, `the_first_restart_is_free_...`, `a_restart_hold_ends_...`: 12 of 12 passed on 32ba72e3 (r858, load 78 to 80),
+10 of 10 on 9efdff4d (r965) and 12 of 12 on 1e4b65b3 (r982, load 62 to 64), the tree that landed save one `#[cfg(test)]` engine file.
+
+## T1 and T2 alone, and the suites, main against the branch (r962, cpus=2, load 36 to 73, 07:26Z to 07:40Z)
+
+Arms: `main` is d8afec49 (origin/main 40b28e2e and V19's test), `branch` is 32ba72e3. Same machine, one target dir, the arm order alternated.
+
+- Alone, 8 rounds a side (main's T1 and T2 by their old names): main T1 failed 0 of 8, main T2 0 of 8; branch T1 0 of 8, T2 0 of 8, the new test 0 of 8.
+  The failures V17 and V18 measured (5 of 16 and 2 of 4) do not appear on either arm with B19's e44b8868 in it.
+- Suites (`--test-threads=2 database::replicated:: replication::`):
+
+| round | main d8afec49 | branch 32ba72e3 |
+|---|---|---|
+| 1 | 187 passed, 1 failed (115 s, load 45): `a_checkpoint_pass_copies_no_frame_past_the_last_finished_flush` | 187 passed, 1 failed (137 s, load 67): `every_falsifier_of_the_floor_holds_under_a_nemesis` |
+| 2 | 187 passed, 1 failed (111 s, load 40): `a_checkpoint_pass_copies_...` | 188 passed, 0 failed (158 s, load 73) |
+| 3 | 186 passed, 2 failed (99 s, load 36): `a_checkpoint_pass_copies_...`, `every_falsifier_...` | 188 passed, 0 failed (131 s, load 51) |
+
+  Order alternated (1 and 3 main first, 2 the branch first); the same 188 tests on both arms (the branch has one more and one fewer), no failure only the branch has.
+  Both failing tests fail on main's own code: in V18's suites too, and alone here (r1023, `--exact`, cpus=1, main and 1e4b65b3 alternated):
+  `every_falsifier_...` failed 1 of 4 on main and 1 of 4 on the branch's tree (8 to 39 s each), `a_checkpoint_pass_...` 1 of 4 on main and 0 of 4 there.
+
+## The ladder (r986, adacachy2, release bench of 1e4b65b3, cpus=4, load 59 to 76, 07:32:39Z to 07:35:08Z)
+
+V16's ladder16.sh (cell13.py): Amphora alone, 32 and 128 spread writers, both classes, 3 rounds, cell order reversed in round 2. **No write was refused by any node in the 12 cells.**
+
+| class | writers | commits/s per round | p50 ms per round | misses per round |
+|---|---|---|---|---|
+| persisted | 32 | 5.8, 14.4, 14.2 | 3,768, 2,392, 2,392 | 0, 0, 0 |
+| replicated | 32 | 5.2, 10.4, 12.4 | 4,391, 3,572, 2,015 | 0, 0, 0 |
+| persisted | 128 | 9.6, 14.6, 15.0 | 8,651, 8,651, 8,126 | 0, 3, 0 |
+| replicated | 128 | 9.4, 6.6, 13.0 | 7,799, 6,685, 7,799 | 4, 1, 2 |
+
+No A/B of the ladder against main was run, and the load was other lanes', so no rate is compared.
+
+## Runs
+
+| run | what | result |
+|---|---|---|
+| r723 | main arm d8afec49: build and clippy warm-up | built 69 s, clippy 0 |
+| r858 | 32ba72e3: fmt, build, the 12 tests; the red build | above |
+| r965 | 9efdff4d: build, 10 tests, clippy | passed, clippy 0 |
+| r966 | the red tests | above |
+| r982 | 1e4b65b3: fmt, build (77 s), 12 tests, clippy, check-production | fmt 0, 12 passed, clippy 0 (54 s), check-production 0 (10,617 left, as the ratchet holds; 86 s) |
+| r986 | release bench build (188 s) and the ladder | above |
+| r962 | alone and suites | above |
+| r710, r813, r842 | macOS | none ran |
+| r963, r969 | stopped by me: a red run begun before the tree moved; the ladder started on a stale release binary (its seven cells are not used) | |
+
+## Landing
+
+Branch perf/commits-v20: a83c5de2 (the tests, red), 32ba72e3 (the change), f09699b9 (docs). Merged with main 60993be4 (9efdff4d), b53a29b1 (1e4b65b3, checked as above) and
+135ed91c (eaf61d96). The last merge moved only crates/engine/vdbe/morsel_scan_tests.rs, which is `#[cfg(test)]` in the engine (so no build of amphora compiles it), and
+records, so no check was run again on it. Pushed to main at 07:33:58Z, fast-forward. check-production and clippy were run on Linux only.
