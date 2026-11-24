@@ -1,7 +1,7 @@
 use crate::alloc::TursoIteratorExt;
 use crate::schema::{Index, IndexColumn, PseudoCursorType};
 use crate::sync::Arc;
-use crate::translate::collate::get_collseq_from_expr;
+use crate::translate::collate::{compound_column_collation, CollationSeq};
 use crate::translate::emitter::{
     select::{emit_materialized_build_inputs, emit_query},
     LimitCtx, Resolver, TranslateCtx,
@@ -143,7 +143,7 @@ pub fn emit_program_for_compound_select(
     // When ORDER BY is present, redirect compound output to a collection index,
     // then sort and emit to the real destination afterwards.
     let (query_destination, collection_cursor, collection_index) = if has_order_by {
-        let (cursor_id, index) = create_collection_index(program, &left[0].0, right_most)?;
+        let (cursor_id, index) = create_collection_index(program, left, right_most)?;
         let dest = QueryDestination::EphemeralIndex {
             cursor_id,
             index: index.clone(),
@@ -221,7 +221,6 @@ pub fn emit_program_for_compound_select(
             limit_ctx,
             offset_reg,
             reg_result_cols_start,
-            &query_destination,
         )
     })?;
     program.pop_current_parent_explain();
@@ -280,7 +279,6 @@ fn emit_compound_select(
     limit_ctx: Option<LimitCtx>,
     offset_reg: Option<usize>,
     reg_result_cols_start: Option<usize>,
-    query_destination: &QueryDestination,
 ) -> crate::Result<()> {
     let compound_select_end = program.allocate_label();
     if let Some(limit_ctx) = &limit_ctx {
@@ -297,6 +295,10 @@ fn emit_compound_select(
         false,
     ));
     right_most_ctx.reg_result_cols_start = reg_result_cols_start;
+    // Where this compound's rows go: the real destination, or the index the operator to its right
+    // (an IN's list among them) set as it took this compound for its left side.
+    let destination = right_most.query_destination.clone();
+    let collations = compound_collations(left, right_most)?;
     match left.split_last_mut() {
         Some(((plan, operator), left)) => match operator {
             CompoundOperator::UnionAll => {
@@ -319,7 +321,6 @@ fn emit_compound_select(
                     limit_ctx,
                     offset_reg,
                     reg_result_cols_start,
-                    query_destination,
                 )?;
 
                 let label_next_select = program.allocate_label();
@@ -353,17 +354,18 @@ fn emit_compound_select(
             }
             CompoundOperator::Union => {
                 let mut new_dedupe_index = false;
-                let affinity_str = match &right_most.query_destination {
-                    QueryDestination::EphemeralIndex { affinity_str, .. } => affinity_str.clone(),
-                    _ => None,
-                };
-                let dedupe_index = match &right_most.query_destination {
+                let (dedupe_index, affinity_str) = match &destination {
                     QueryDestination::EphemeralIndex {
-                        cursor_id, index, ..
-                    } if !index.has_rowid => (*cursor_id, index.clone()),
+                        cursor_id,
+                        index,
+                        affinity_str,
+                        ..
+                    } if tells_rows_apart_by(index, &collations) => {
+                        ((*cursor_id, index.clone()), affinity_str.clone())
+                    }
                     _ => {
                         new_dedupe_index = true;
-                        create_dedupe_index(program, plan, right_most)?
+                        (create_dedupe_index(program, right_most, &collations)?, None)
                     }
                 };
                 plan.query_destination = QueryDestination::EphemeralIndex {
@@ -382,7 +384,6 @@ fn emit_compound_select(
                     None,
                     None,
                     reg_result_cols_start,
-                    query_destination,
                 )?;
 
                 right_most.query_destination = QueryDestination::EphemeralIndex {
@@ -413,17 +414,13 @@ fn emit_compound_select(
                         limit_ctx,
                         offset_reg,
                         reg_result_cols_start,
-                        query_destination,
+                        &destination,
                     )?;
                 }
             }
             CompoundOperator::Intersect => {
-                // For nested compound selects (e.g., A INTERSECT B UNION C), the outer UNION
-                // sets right_most.query_destination to its dedupe_index. We need to capture
-                // this BEFORE we overwrite it with our own indexes for the intersection.
-                let intersect_destination = right_most.query_destination.clone();
-
-                let (left_cursor_id, left_index) = create_dedupe_index(program, plan, right_most)?;
+                let (left_cursor_id, left_index) =
+                    create_dedupe_index(program, right_most, &collations)?;
                 plan.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id: left_cursor_id,
                     index: left_index.clone(),
@@ -432,7 +429,7 @@ fn emit_compound_select(
                 };
 
                 let (right_cursor_id, right_index) =
-                    create_dedupe_index(program, plan, right_most)?;
+                    create_dedupe_index(program, right_most, &collations)?;
                 right_most.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id: right_cursor_id,
                     index: right_index,
@@ -449,7 +446,6 @@ fn emit_compound_select(
                     None,
                     None,
                     reg_result_cols_start,
-                    query_destination,
                 )?;
 
                 emit_explain!(
@@ -472,18 +468,18 @@ fn emit_compound_select(
                     limit_ctx,
                     offset_reg,
                     reg_result_cols_start,
-                    &intersect_destination,
+                    &destination,
                 )?;
             }
             CompoundOperator::Except => {
                 let mut new_index = false;
-                let (cursor_id, index) = match &right_most.query_destination {
+                let (cursor_id, index) = match &destination {
                     QueryDestination::EphemeralIndex {
                         cursor_id, index, ..
-                    } if !index.has_rowid => (*cursor_id, index.clone()),
+                    } if tells_rows_apart_by(index, &collations) => (*cursor_id, index.clone()),
                     _ => {
                         new_index = true;
-                        create_dedupe_index(program, plan, right_most)?
+                        create_dedupe_index(program, right_most, &collations)?
                     }
                 };
                 plan.query_destination = QueryDestination::EphemeralIndex {
@@ -502,7 +498,6 @@ fn emit_compound_select(
                     None,
                     None,
                     reg_result_cols_start,
-                    query_destination,
                 )?;
                 right_most.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id,
@@ -530,7 +525,7 @@ fn emit_compound_select(
                         limit_ctx,
                         offset_reg,
                         reg_result_cols_start,
-                        query_destination,
+                        &destination,
                     )?;
                 }
             }
@@ -564,11 +559,36 @@ fn emit_compound_select(
     Ok(())
 }
 
+/// The collations the rows of the compound `left` and `right_most` make are told apart by, one a
+/// result column: its arms' first that has one, left to right.
+fn compound_collations(
+    left: &[(SelectPlan, CompoundOperator)],
+    right_most: &SelectPlan,
+) -> crate::Result<crate::alloc::Vec<CollationSeq>> {
+    (0..right_most.result_columns.len())
+        .map(|column| {
+            let arms = left.iter().map(|(arm, _)| arm).chain(Some(right_most));
+            compound_column_collation(arms, column)
+        })
+        .try_collect::<crate::Result<_>>()?
+}
+
+/// Whether an operator's rows can be deduplicated in `index`, the one the operator to its right (or
+/// an IN) made: it keeps one of each, by the collations this operator compares by.
+fn tells_rows_apart_by(index: &Index, collations: &[CollationSeq]) -> bool {
+    !index.has_rowid
+        && index.columns.len() == collations.len()
+        && index
+            .columns
+            .iter()
+            .all(|c| collations.get(c.pos_in_table) == Some(&c.collation.unwrap_or_default()))
+}
+
 // Creates an ephemeral index that will be used to deduplicate the results of any sub-selects
 fn create_dedupe_index(
     program: &mut ProgramBuilder,
-    left_select: &SelectPlan,
     right_select: &SelectPlan,
+    collations: &[CollationSeq],
 ) -> crate::Result<(usize, Arc<Index>)> {
     let mut dedupe_columns = right_select
         .result_columns
@@ -583,22 +603,8 @@ fn create_dedupe_index(
             )
         })
         .try_collect::<crate::alloc::Vec<_>>()?;
-    for (i, column) in dedupe_columns.iter_mut().enumerate() {
-        let left_collation = get_collseq_from_expr(
-            &left_select.result_columns[i].expr,
-            &left_select.table_references,
-        )?;
-        let right_collation = get_collseq_from_expr(
-            &right_select.result_columns[i].expr,
-            &right_select.table_references,
-        )?;
-        // Left precedence
-        let collation = match (left_collation, right_collation) {
-            (None, None) => None,
-            (Some(coll), None) | (None, Some(coll)) => Some(coll),
-            (Some(coll), Some(_)) => Some(coll),
-        };
-        column.collation = collation;
+    for (column, collation) in dedupe_columns.iter_mut().zip(collations) {
+        column.collation = Some(*collation);
     }
 
     let dedupe_index = Arc::new(Index {
@@ -792,7 +798,7 @@ pub(crate) fn set_select_plan_destination(plan: &mut Plan, destination: &QueryDe
 /// Uses `has_rowid=true` to allow duplicate entries (needed for UNION ALL).
 fn create_collection_index(
     program: &mut ProgramBuilder,
-    left_select: &SelectPlan,
+    left: &[(SelectPlan, CompoundOperator)],
     right_select: &SelectPlan,
 ) -> crate::Result<(usize, Arc<Index>)> {
     let mut columns = right_select
@@ -812,21 +818,11 @@ fn create_collection_index(
             expr: None,
         })
         .try_collect::<crate::alloc::Vec<_>>()?;
-    for (i, column) in columns.iter_mut().enumerate() {
-        let left_collation = get_collseq_from_expr(
-            &left_select.result_columns[i].expr,
-            &left_select.table_references,
-        )?;
-        let right_collation = get_collseq_from_expr(
-            &right_select.result_columns[i].expr,
-            &right_select.table_references,
-        )?;
-        let collation = match (left_collation, right_collation) {
-            (None, None) => None,
-            (Some(coll), None) | (None, Some(coll)) => Some(coll),
-            (Some(coll), Some(_)) => Some(coll),
-        };
-        column.collation = collation;
+    for (column, collation) in columns
+        .iter_mut()
+        .zip(compound_collations(left, right_select)?)
+    {
+        column.collation = Some(collation);
     }
 
     let index = Arc::new(Index {

@@ -33,6 +33,13 @@ use crate::Result;
 /// The log header's file format for a generation of one page a frame (SQLite's).
 pub(crate) const PAGE_FORMAT: u32 = 3_007_000;
 
+/// The log header's file format for a generation of one page a frame that is a segment beside
+/// another (decision 45, What plain SQLite sees). SQLite knows one log file: beside a generation of
+/// [`PAGE_FORMAT`] it would copy this segment alone into the file and delete it as it closes, even
+/// where it refused the file's version. It refuses a log whose format it doesn't know as it opens it
+/// (`walIndexRecover`, SQLITE_CANTOPEN), and leaves it.
+pub(crate) const PAGES_BESIDE_FORMAT: u32 = 0x414d_5008;
+
 /// The log header's file format for a packed generation whose chains end at [`EIGHT_DELTAS`] in a
 /// row (decision 17, to 2026-11-11): read as ever, and written so while a generation begun so
 /// goes on, so a binary from before reads it.
@@ -100,7 +107,7 @@ impl LogFormat {
     /// The format a log header's file format names: None for one this engine doesn't write.
     pub(crate) fn of(file_format: u32) -> Option<Self> {
         match file_format {
-            PAGE_FORMAT => Some(Self::Pages),
+            PAGE_FORMAT | PAGES_BESIDE_FORMAT => Some(Self::Pages),
             PACKED_FORMAT | PACKED_CHAINS_FORMAT => Some(Self::Packed),
             MIXED_FORMAT | MIXED_CHAINS_FORMAT | MIXED_FRAMES_FORMAT => Some(Self::Mixed),
             _ => None,

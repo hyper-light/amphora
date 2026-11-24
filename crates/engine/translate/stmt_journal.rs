@@ -115,6 +115,32 @@ pub(crate) fn constraint_may_abort(
     pk_aborts || idx_aborts || default_aborts
 }
 
+/// Whether an INSERT writes one row and nothing else: a trigger, REPLACE, an upsert or
+/// `sqlite_sequence` writes more.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn insert_writes_one_row(
+    resolver: &Resolver,
+    database_id: usize,
+    table: &crate::schema::BTreeTable,
+    statement_conflict: Option<ResolveType>,
+    inserting_multiple_rows: bool,
+    has_triggers: bool,
+    has_upsert: bool,
+) -> bool {
+    !inserting_multiple_rows
+        && !has_triggers
+        && !has_upsert
+        && !table.has_autoincrement
+        && !resolver.with_schema(database_id, |s| {
+            any_effective_replace(
+                statement_conflict.is_some(),
+                statement_conflict.unwrap_or(ResolveType::Abort),
+                table.rowid_alias_conflict_clause,
+                s.get_indices(&table.name).map(|index| index.on_conflict),
+            )
+        })
+}
+
 /// Set multi_write / may_abort for INSERT statements.
 ///
 /// Constraint analysis (any_replace, constraint_may_abort) is computed internally
@@ -142,12 +168,6 @@ pub(crate) fn set_insert_stmt_journal_flags(
             .map(|idx| (idx.on_conflict, idx.unique))
             .collect()
     });
-    let any_replace = any_effective_replace(
-        has_statement_conflict,
-        statement_conflict,
-        table.rowid_alias_conflict_clause,
-        index_modes.iter().map(|(oc, _)| *oc),
-    );
     let has_check = !table.check_constraints.is_empty();
     // Multi-row AUTOINCREMENT inserts taint `may_abort` even when no
     // constraint clause is declared on the table: `op_sequence_compute_next`
@@ -180,12 +200,15 @@ pub(crate) fn set_insert_stmt_journal_flags(
 
     // UPSERT is multi-write because DO UPDATE modifies an existing row.
     // AUTOINCREMENT is multi-write because sqlite_sequence is updated before constraint checks.
-    if !inserting_multiple_rows
-        && !has_triggers
-        && !any_replace
-        && !has_upsert
-        && !has_autoincrement
-    {
+    if insert_writes_one_row(
+        resolver,
+        database_id,
+        table,
+        has_statement_conflict.then_some(statement_conflict),
+        inserting_multiple_rows,
+        has_triggers,
+        has_upsert,
+    ) {
         program.set_multi_write(false);
     }
     program.set_may_abort(may_abort);
