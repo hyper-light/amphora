@@ -177,6 +177,17 @@ fn page(db: &mut Db, session: &str, limit: usize) -> anyhow::Result<usize> {
     Ok(n)
 }
 
+/// A session's latest page's event ids, newest first.
+fn page_ids(db: &mut Db, session: &str, limit: usize) -> anyhow::Result<Vec<String>> {
+    let mut ids = Vec::new();
+    let params = [t(session), Value::from_i64(i64::try_from(limit).unwrap_or(i64::MAX))];
+    db.query(schema::EVENTS_LAST, params, |r| {
+        ids.push(r.get_value(1).to_text().unwrap_or_default().to_owned());
+        Ok(true)
+    })?;
+    Ok(ids)
+}
+
 fn search_on(db: &mut Db, word: &str, limit: usize) -> anyhow::Result<usize> {
     let mut n = 0;
     let params = [Value::from_text(format!("%{word}%")), Value::from_i64(i64::try_from(limit).unwrap_or(i64::MAX))];
@@ -262,6 +273,11 @@ impl Driver for Amphora {
         self.groups.read_committed(session, Instant::now() + WAIT, move |db| page(db, &s, limit), move |e| page(&mut e.db, &w, limit))
     }
 
+    fn page(&self, session: &str, limit: usize) -> anyhow::Result<Vec<String>> {
+        let (s, w) = (session.to_owned(), session.to_owned());
+        self.groups.read_committed(session, Instant::now() + WAIT, move |db| page_ids(db, &s, limit), move |e| page_ids(&mut e.db, &w, limit))
+    }
+
     fn search(&self, word: &str, limit: usize) -> anyhow::Result<usize> {
         let (s, w) = (word.to_owned(), word.to_owned());
         let each = self.groups.read_each(Instant::now() + WAIT, true, move |db| search_on(db, &s, limit), move |e| search_on(&mut e.db, &w, limit))?;
@@ -322,6 +338,7 @@ mod tests {
         rx.recv().unwrap().unwrap();
         assert_eq!(amphora.history("s-000001", 50).unwrap(), 3);
         assert_eq!(amphora.history("s-000002", 50).unwrap(), 0);
+        assert_eq!(amphora.page("s-000001", 50).unwrap(), ["e-2", "e-1", "e-0"]);
         drop(amphora);
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -75,6 +75,11 @@ pub trait Driver: Send + Sync {
     fn history(&self, session: &str, limit: usize) -> anyhow::Result<usize>;
     /// Events whose text holds `word`, newest first, at most `limit`: how many came.
     fn search(&self, word: &str, limit: usize) -> anyhow::Result<usize>;
+    /// A session's latest `limit` events' ids, newest first, for `AMPHORA_ANSWERS`.
+    fn page(&self, session: &str, limit: usize) -> anyhow::Result<Vec<String>> {
+        let _ = (session, limit);
+        anyhow::bail!("this target doesn't give its pages (AMPHORA_ANSWERS)")
+    }
     /// What the database says of itself after the run, if it says anything.
     fn stats(&self) -> serde_json::Value {
         serde_json::Value::Null
@@ -755,6 +760,19 @@ fn main() -> anyhow::Result<()> {
         let t = Instant::now();
         driver.search(word, 20)?;
         searches.record(u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX));
+    }
+
+    // AMPHORA_ANSWERS=<path>: every session's latest page as the database answers it after the
+    // mixed phase, one JSON line a session, for a check against SQLite on the same files (lane Q5).
+    if let Ok(path) = std::env::var("AMPHORA_ANSWERS") {
+        use std::io::Write;
+        let mut out = std::io::BufWriter::new(std::fs::File::create(&path)?);
+        for session in 0..o.sessions {
+            let session = format!("s-{session:06}");
+            let ids = driver.page(&session, 50)?;
+            writeln!(out, "{}", serde_json::json!({ "session": session, "ids": ids }))?;
+        }
+        out.flush()?;
     }
 
     let events_written = writes.n as usize * o.batch.max(1);
