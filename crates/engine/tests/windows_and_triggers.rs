@@ -207,3 +207,9 @@ fn windows_over_windows_answer_as_sqlite() {
 fn triggers_fire_as_sqlite_fires_them() {
     answers_as_sqlite(include_str!("fixtures/triggers.tsv"));
 }
+
+/// Finding DC: subqueries of grouped and aggregate outer joins, and row-value ranges across a join.
+#[test]
+fn grouped_outer_joins_and_row_ranges_answer_as_sqlite() {
+    answers_as_sqlite(include_str!("fixtures/unread_cursors.tsv"));
+}
