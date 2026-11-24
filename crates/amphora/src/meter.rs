@@ -1,7 +1,8 @@
 //! What a store is doing, counted as it goes ([`Meter`]): cheap to keep, read at any time without
 //! asking its writer ([`Counters`]).
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// How long reads waited for their answer, counted by power of two of milliseconds: under 1 ms,
@@ -75,8 +76,45 @@ impl Longest {
     }
 }
 
+/// One stripe of read-wait histogram buckets, aligned to 128 bytes (adjacent-line prefetcher pair
+/// on x86_64 and aarch64) so concurrent readers update disjoint cache lines.
+#[repr(align(128))]
+struct WaitStripe([AtomicU64; WAIT_BUCKETS]);
+
+impl Default for WaitStripe {
+    fn default() -> Self {
+        Self(std::array::from_fn(|_| AtomicU64::new(0)))
+    }
+}
+
+/// Hardware-derived stripe count (power of two >= logical CPUs) for contended per-read counters.
+fn wait_stripe_count() -> usize {
+    static COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *COUNT.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .next_power_of_two()
+    })
+}
+
+/// Stable per-thread stripe index, assigned once per thread so `Meter::waited` writes no shared
+/// counter line.
+fn wait_stripe() -> usize {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    thread_local! {
+        static STRIPE: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+    STRIPE.with(|s| match s.get() {
+        Some(v) => v,
+        None => {
+            let v = NEXT.fetch_add(1, Ordering::Relaxed);
+            s.set(Some(v));
+            v
+        }
+    })
+}
+
 /// A store's counters, bumped by its writer, its flusher and its readers as they go.
-#[derive(Default)]
 pub struct Meter {
     commits: AtomicU64,
     rows: AtomicU64,
@@ -107,7 +145,33 @@ pub struct Meter {
     longest: [AtomicU64; LONGEST],
     /// Reads that got no answer in time.
     timeouts: AtomicU64,
-    waits: [AtomicU64; WAIT_BUCKETS],
+    waits: Box<[WaitStripe]>,
+}
+
+impl Default for Meter {
+    fn default() -> Self {
+        let stripes = wait_stripe_count();
+        Self {
+            commits: AtomicU64::new(0),
+            rows: AtomicU64::new(0),
+            jobs: AtomicU64::new(0),
+            busy_us: AtomicU64::new(0),
+            apply_us: AtomicU64::new(0),
+            flushes: AtomicU64::new(0),
+            flush_us: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
+            room_waits: AtomicU64::new(0),
+            failed: AtomicU64::new(0),
+            checkpoints: AtomicU64::new(0),
+            checkpoint_us: AtomicU64::new(0),
+            restarts: AtomicU64::new(0),
+            restart_wait_us: AtomicU64::new(0),
+            restart_us: AtomicU64::new(0),
+            longest: std::array::from_fn(|_| AtomicU64::new(0)),
+            timeouts: AtomicU64::new(0),
+            waits: (0..stripes).map(|_| WaitStripe::default()).collect(),
+        }
+    }
 }
 
 /// What a store's counters say now.
@@ -210,7 +274,9 @@ impl Meter {
     }
 
     pub fn waited(&self, d: Duration) {
-        if let Some(w) = self.waits.get(wait_bucket(d)) {
+        let mask = self.waits.len().saturating_sub(1);
+        let stripe = wait_stripe() & mask;
+        if let Some(w) = self.waits.get(stripe).and_then(|s| s.0.get(wait_bucket(d))) {
             w.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -244,11 +310,15 @@ impl Meter {
                 .map(|l| l.load(Ordering::Relaxed))
                 .collect(),
             timeouts: self.timeouts.load(Ordering::Relaxed),
-            waits: self
-                .waits
-                .iter()
-                .map(|w| w.load(Ordering::Relaxed))
-                .collect(),
+            waits: {
+                let mut totals = vec![0u64; WAIT_BUCKETS];
+                for stripe in &self.waits {
+                    for (total, bucket) in totals.iter_mut().zip(stripe.0.iter()) {
+                        *total = total.saturating_add(bucket.load(Ordering::Relaxed));
+                    }
+                }
+                totals
+            },
         }
     }
 }

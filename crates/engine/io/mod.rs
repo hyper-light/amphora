@@ -835,6 +835,20 @@ impl Buffer {
         })
     }
 
+    /// Allocates a temporary buffer whose bytes are guaranteed to be zeroed: recycled buffers from
+    /// `TEMP_BUFFER_CACHE` are zero-filled in place, while freshly allocated buffers rely on
+    /// `vec![0; size]` (`alloc_zeroed`) without touching every byte a second time.
+    pub fn new_temporary_zeroed(size: usize) -> Self {
+        TEMP_BUFFER_CACHE.with(|cache| {
+            if let Some(mut buffer) = cache.borrow_mut().get_buffer(size) {
+                buffer.fill(0);
+                Self::Heap(buffer)
+            } else {
+                Self::Heap(Pin::new(vec![0; size].into_boxed_slice()))
+            }
+        })
+    }
+
     pub fn len(&self) -> usize {
         match self {
             Self::Heap(buf) => buf.len(),

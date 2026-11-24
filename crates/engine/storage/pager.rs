@@ -6943,7 +6943,7 @@ impl Pager {
                                 cache.contains_key(&page_key)
                             };
                             if !already_present {
-                                let page = allocate_new_page(new_db_size as i64, &self.buffer_pool);
+                                let page = self.allocate_fresh_page(new_db_size as i64);
                                 self.add_dirty(&page)?;
                                 self.page_cache.write().force_insert_page(page_key, page)?;
                             }
@@ -7111,7 +7111,7 @@ impl Pager {
                     // if new_db_size reaches the pending page, we need to allocate a new one
                     if Some(new_db_size) == self.pending_byte_page_id() {
                         let richard_hipp_special_page =
-                            allocate_new_page(new_db_size as i64, &self.buffer_pool);
+                            self.allocate_fresh_page(new_db_size as i64);
                         self.add_dirty(&richard_hipp_special_page)?;
                         let page_key = PageCacheKey::new(richard_hipp_special_page.get().id());
                         self.page_cache
@@ -7128,12 +7128,12 @@ impl Pager {
                     }
 
                     // FIXME: should reserve page cache entry before modifying the database
-                    let page = allocate_new_page(new_db_size as i64, &self.buffer_pool);
+                    let page = self.allocate_fresh_page(new_db_size as i64);
                     {
                         // setup page and add to cache
                         self.add_dirty(&page)?;
 
-                        let page_key = PageCacheKey::new(page.get().id() as usize);
+                        let page_key = PageCacheKey::new(page.get().id());
                         self.page_cache
                             .write()
                             .force_insert_page(page_key, page.clone())?;
@@ -7378,19 +7378,50 @@ impl Pager {
     pub fn enable_encryption(&self, enable: bool) {
         self.enable_encryption.store(enable, Ordering::SeqCst);
     }
+    /// Allocates a zero-filled page for `page_id`, reusing a spare evicted plain page and its
+    /// buffer on `PagePath::Plain` when one is available before allocating from `buffer_pool`.
+    fn allocate_fresh_page(&self, page_id: i64) -> PageRef {
+        if self.page_path() == PagePath::Plain {
+            if let Ok(id) = usize::try_from(page_id) {
+                let page_size = self
+                    .get_page_size()
+                    .and_then(|size| usize::try_from(size.get()).ok());
+                let spare = self.page_cache.write().take_spare();
+                if let Some((page, spare_buf)) = spare.and_then(|p| Page::recycle(p, id)) {
+                    let buffer = match spare_buf.filter(|b| Some(b.len()) == page_size) {
+                        Some(buf) => {
+                            buf.as_mut_slice().fill(0);
+                            buf
+                        }
+                        None => Arc::new(self.buffer_pool.get_page_zeroed()),
+                    };
+                    let inner = page.get();
+                    inner.set_buffer(buffer);
+                    page.set_loaded();
+                    page.clear_wal_tag();
+                    return page;
+                }
+                let page = Arc::new(Page::new_plain(id));
+                let buffer = self.buffer_pool.get_page_zeroed();
+                let inner = page.get();
+                inner.set_buffer(Arc::new(buffer));
+                page.set_loaded();
+                page.clear_wal_tag();
+                return page;
+            }
+        }
+        allocate_new_page(page_id, &self.buffer_pool)
+    }
 }
 
 pub fn allocate_new_page(page_id: i64, buffer_pool: &Arc<BufferPool>) -> PageRef {
     let page = Arc::new(Page::new(page_id));
     {
-        let buffer = buffer_pool.get_page();
         // A new page is all zeros, as SQLite's are (pager.c zero-fills a page past the file's
-        // end). The pool hands out recycled buffers (arena slots, the thread's temporary cache)
-        // still holding an earlier page's bytes, which would otherwise stay in the new page's free
-        // space: written to disk, shipped to replicas and backups, and different from member to
-        // member as allocation differs (CP-T1.8, T-T1.8.A6: members' image digests are equal at
-        // every applied index).
-        buffer.as_mut_slice().fill(0);
+        // end). `get_page_zeroed` zero-fills recycled arena/thread-local buffers and avoids a
+        // redundant pass over freshly `alloc_zeroed` fallback buffers (CP-T1.8, T-T1.8.A6:
+        // members' image digests are equal at every applied index).
+        let buffer = buffer_pool.get_page_zeroed();
         let inner = page.get();
         inner.set_buffer(Arc::new(buffer));
         page.set_loaded();

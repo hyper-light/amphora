@@ -166,6 +166,15 @@ impl BufferPool {
         inner.get_db_page_buffer()
     }
 
+    /// Request a zero-filled `Buffer` of `db_page_size`. Recycled arena or thread-local buffers
+    /// are zeroed in place; freshly allocated fallback buffers come zeroed from `alloc_zeroed`
+    /// without a redundant `.fill(0)` pass.
+    #[inline]
+    pub fn get_page_zeroed(&self) -> Buffer {
+        let inner = self.inner_mut();
+        inner.get_db_page_buffer_zeroed()
+    }
+
     /// Request a `Buffer` for use with a WAL frame,
     /// `[Database::page_size] + `WAL_FRAME_HEADER_SIZE`
     #[inline]
@@ -267,6 +276,19 @@ impl PoolInner {
             .as_ref()
             .and_then(|arena| Arena::try_alloc(arena, db_page_size))
             .unwrap_or_else(|| Buffer::new_temporary(db_page_size))
+    }
+
+    fn get_db_page_buffer_zeroed(&mut self) -> Buffer {
+        let db_page_size = self.get_db_page_size();
+        if let Some(buf) = self
+            .page_arena
+            .as_ref()
+            .and_then(|arena| Arena::try_alloc(arena, db_page_size))
+        {
+            buf.as_mut_slice().fill(0);
+            return buf;
+        }
+        Buffer::new_temporary_zeroed(db_page_size)
     }
 
     fn get_wal_frame_buffer(&mut self) -> Buffer {

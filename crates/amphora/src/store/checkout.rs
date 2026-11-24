@@ -15,8 +15,10 @@
 //! the readers' release take every slot, so no read is under way meanwhile.
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicUsize, Ordering, fence};
-use std::sync::{Condvar, Mutex, MutexGuard, PoisonError, TryLockError};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering, fence};
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::thread::Thread;
 use std::time::Instant;
 
 /// How a read takes its reader (the prototype's switch; `AMPHORA_READ_CHECKOUT` sets it for a
@@ -57,28 +59,54 @@ impl ReadCheckout {
     }
 }
 
+const SLOT_FREE: u8 = 0;
+const SLOT_HELD: u8 = 1;
+
 /// A slot, alone on its cache line pair (the adjacent-line prefetcher pulls lines in pairs, so
-/// 128 bytes, as crossbeam's `CachePadded` aligns on x86_64 and aarch64).
+/// 128 bytes, as crossbeam's `CachePadded` aligns on x86_64 and aarch64). `state` guards ownership
+/// so a finishing reader can hand a slot directly to the next FIFO waiter without releasing it to
+/// barging callers.
 #[repr(align(128))]
-struct Slot<R>(Mutex<Option<R>>);
-
-/// Cache-line-isolated waiter counter so `Slots::wake` loads do not false-share with `slots` or
-/// the fallback `wait`/`freed` mutex/condvar.
-#[repr(align(128))]
-struct PaddedCount(AtomicUsize);
-
-/// The slots and what a reader waiting for one waits on.
-pub(super) struct Slots<R> {
-    slots: Box<[Slot<R>]>,
-    /// Threads waiting for a slot: written by waiters alone, read by each read as it ends.
-    waiting: PaddedCount,
-    wait: Mutex<()>,
-    freed: Condvar,
+struct Slot<R> {
+    state: AtomicU8,
+    reader: Mutex<Option<R>>,
 }
 
-/// A slot taken: its reader (None until one is opened in it) and the slots, to wake a waiter when
-/// it is given back.
+/// Cache-line-isolated waiter and drainer counts so fast-path uncontended reads read a clean
+/// shared line that does not false-share with `slots` or `queue`.
+#[repr(align(128))]
+struct PaddedCount(AtomicUsize, AtomicUsize);
+
+struct WaiterSlot {
+    thread: Option<Thread>,
+    assigned: Option<usize>,
+    cancelled: bool,
+}
+
+#[derive(Default)]
+struct WaitQueue {
+    /// Strict FIFO queue of waiter indices into `entries`.
+    fifo: VecDeque<usize>,
+    /// Reusable waiter slots (grows lazily to peak concurrent waiters, never reallocates after).
+    entries: Vec<WaiterSlot>,
+    /// Free indices in `entries`.
+    free: Vec<usize>,
+    /// Threads currently inside `take_all()` waiting for slots to drain.
+    drain_waiters: Vec<Thread>,
+}
+
+/// The slots and the fair FIFO queue used only when all slots are busy or draining.
+pub(super) struct Slots<R> {
+    slots: Box<[Slot<R>]>,
+    /// `.0`: read threads waiting for a slot; `.1`: active `take_all()` drainers.
+    waiting: PaddedCount,
+    queue: Mutex<WaitQueue>,
+}
+
+/// A slot taken: its index, its reader (None until one is opened in it), and the slots, to hand
+/// it off or release it when dropped.
 pub(super) struct Taken<'a, R> {
+    idx: usize,
     slot: Option<MutexGuard<'a, Option<R>>>,
     slots: &'a Slots<R>,
 }
@@ -92,9 +120,10 @@ impl<R> Taken<'_, R> {
 
 impl<R> Drop for Taken<'_, R> {
     fn drop(&mut self) {
-        // The slot unlocked first, then a waiter woken, so the waiter finds it free.
+        // Unlock the reader mutex first while `state == SLOT_HELD`, then hand off directly to a
+        // queued waiter or mark `SLOT_FREE`.
         drop(self.slot.take());
-        self.slots.wake();
+        self.slots.release_slot(self.idx);
     }
 }
 
@@ -119,115 +148,309 @@ impl<R> Slots<R> {
     /// `most` slots, at least one.
     pub(super) fn new(most: usize) -> Self {
         Self {
-            slots: (0..most.max(1)).map(|_| Slot(Mutex::new(None))).collect(),
-            waiting: PaddedCount(AtomicUsize::new(0)),
-            wait: Mutex::new(()),
-            freed: Condvar::new(),
+            slots: (0..most.max(1))
+                .map(|_| Slot {
+                    state: AtomicU8::new(SLOT_FREE),
+                    reader: Mutex::new(None),
+                })
+                .collect(),
+            waiting: PaddedCount(AtomicUsize::new(0), AtomicUsize::new(0)),
+            queue: Mutex::new(WaitQueue::default()),
         }
     }
 
-    fn lock(slot: &Slot<R>) -> MutexGuard<'_, Option<R>> {
-        slot.0.lock().unwrap_or_else(PoisonError::into_inner)
+    fn lock_reader(slot: &Slot<R>) -> MutexGuard<'_, Option<R>> {
+        slot.reader.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// One free slot, this thread's first, without waiting.
-    fn try_take(&self) -> Option<MutexGuard<'_, Option<R>>> {
+    fn lock_queue(&self) -> MutexGuard<'_, WaitQueue> {
+        self.queue.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    #[inline]
+    fn has_waiters_or_drainers(&self) -> bool {
+        self.waiting.0.load(Ordering::Acquire) > 0 || self.waiting.1.load(Ordering::Acquire) > 0
+    }
+
+    /// Claims one free slot via atomic state transition, probing this thread's home slot first
+    /// without writing cache lines of already-held slots.
+    fn try_claim_free(&self) -> Option<usize> {
         let len = self.slots.len();
         let first = thread_number().checked_rem(len).unwrap_or(0);
-        let (earlier, from_first) = self.slots.split_at(first.min(len));
-        from_first
-            .iter()
-            .chain(earlier)
-            .find_map(|slot| match slot.0.try_lock() {
-                Ok(guard) => Some(guard),
-                Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
-                Err(TryLockError::WouldBlock) => None,
-            })
+        for offset in 0..len {
+            let idx = first.checked_add(offset).map_or(0, |sum| {
+                if sum < len {
+                    sum
+                } else {
+                    sum.saturating_sub(len)
+                }
+            });
+            let Some(slot) = self.slots.get(idx) else {
+                continue;
+            };
+            if slot.state.load(Ordering::Relaxed) == SLOT_FREE
+                && slot
+                    .state
+                    .compare_exchange(SLOT_FREE, SLOT_HELD, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+            {
+                return Some(idx);
+            }
+        }
+        None
     }
 
-    /// A slot: a free one at once, or the first given back before `until` (None past it).
-    pub(super) fn take(&self, until: Instant) -> Option<Taken<'_, R>> {
-        if let Some(reader) = self.try_take() {
-            return Some(Taken {
-                slot: Some(reader),
-                slots: self,
-            });
-        }
-        self.waiting.0.fetch_add(1, Ordering::SeqCst);
-        fence(Ordering::SeqCst);
-        let mut wait = self.wait.lock().unwrap_or_else(PoisonError::into_inner);
-        let taken = loop {
-            if let Some(reader) = self.try_take() {
-                break Some(reader);
-            }
-            let left = until.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                break None;
-            }
-            wait = self
-                .freed
-                .wait_timeout(wait, left)
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
-        };
-        drop(wait);
-        self.waiting.0.fetch_sub(1, Ordering::SeqCst);
-        taken.map(|reader| Taken {
-            slot: Some(reader),
+    fn wrap_claimed(&self, idx: usize) -> Option<Taken<'_, R>> {
+        let slot = self.slots.get(idx)?;
+        Some(Taken {
+            idx,
+            slot: Some(Self::lock_reader(slot)),
             slots: self,
         })
     }
 
-    /// Wakes one waiter, if any. Called as one slot is given back: the waiter counts itself before
-    /// it tries the slots under `wait`, and this reads the count after the slot's unlock (the
-    /// fence), so a waiter whose try failed is either seen here or tries again after.
-    fn wake(&self) {
-        fence(Ordering::SeqCst);
-        if self.waiting.0.load(Ordering::SeqCst) > 0 {
-            drop(self.wait.lock().unwrap_or_else(PoisonError::into_inner));
-            self.freed.notify_one();
+    /// Hands off held slot `idx` to the next live FIFO waiter under `queue`.
+    fn handoff_under_lock(queue: &mut WaitQueue, idx: usize) -> Option<Thread> {
+        while let Some(waiter_id) = queue.fifo.pop_front() {
+            let Some(entry) = queue.entries.get_mut(waiter_id) else {
+                continue;
+            };
+            if entry.cancelled {
+                entry.cancelled = false;
+                entry.thread = None;
+                entry.assigned = None;
+                queue.free.push(waiter_id);
+                continue;
+            }
+            entry.assigned = Some(idx);
+            return entry.thread.take();
+        }
+        None
+    }
+
+    /// A slot: a free one at once when uncontended, or handed off in FIFO order before `until`
+    /// (None past it).
+    pub(super) fn take(&self, until: Instant) -> Option<Taken<'_, R>> {
+        if !self.has_waiters_or_drainers()
+            && let Some(idx) = self.try_claim_free()
+        {
+            return self.wrap_claimed(idx);
+        }
+        if until.saturating_duration_since(Instant::now()).is_zero() {
+            if !self.has_waiters_or_drainers()
+                && let Some(idx) = self.try_claim_free()
+            {
+                return self.wrap_claimed(idx);
+            }
+            return None;
+        }
+
+        self.waiting.0.fetch_add(1, Ordering::SeqCst);
+        let waiter_id = {
+            let mut queue = self.lock_queue();
+            if self.waiting.1.load(Ordering::SeqCst) == 0
+                && queue.fifo.is_empty()
+                && let Some(idx) = self.try_claim_free()
+            {
+                drop(queue);
+                self.waiting.0.fetch_sub(1, Ordering::SeqCst);
+                return self.wrap_claimed(idx);
+            }
+            let current = std::thread::current();
+            let id = match queue.free.pop() {
+                Some(id) => {
+                    if let Some(entry) = queue.entries.get_mut(id) {
+                        entry.thread = Some(current);
+                        entry.assigned = None;
+                        entry.cancelled = false;
+                    }
+                    id
+                }
+                None => {
+                    let id = queue.entries.len();
+                    queue.entries.push(WaiterSlot {
+                        thread: Some(current),
+                        assigned: None,
+                        cancelled: false,
+                    });
+                    id
+                }
+            };
+            queue.fifo.push_back(id);
+            id
+        };
+
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            if !left.is_zero() {
+                std::thread::park_timeout(left);
+            }
+            let mut queue = self.lock_queue();
+            if let Some(entry) = queue.entries.get_mut(waiter_id) {
+                if let Some(idx) = entry.assigned.take() {
+                    entry.thread = None;
+                    entry.cancelled = false;
+                    queue.free.push(waiter_id);
+                    drop(queue);
+                    self.waiting.0.fetch_sub(1, Ordering::SeqCst);
+                    return self.wrap_claimed(idx);
+                }
+                if until.saturating_duration_since(Instant::now()).is_zero() {
+                    entry.cancelled = true;
+                    entry.thread = None;
+                    drop(queue);
+                    self.waiting.0.fetch_sub(1, Ordering::SeqCst);
+                    return None;
+                }
+                if entry.thread.is_none() {
+                    entry.thread = Some(std::thread::current());
+                }
+            } else {
+                drop(queue);
+                self.waiting.0.fetch_sub(1, Ordering::SeqCst);
+                return None;
+            }
         }
     }
 
-    /// Wakes every waiter, if any. Called when every slot is given back at once (`All::drop`).
-    fn wake_all(&self) {
+    /// Hands off held slot `idx` directly to the front FIFO waiter when readers are waiting and no
+    /// `take_all()` is draining; otherwise marks `idx` free and resolves any concurrent waiter or
+    /// drainer under the Dekker `SeqCst` fence.
+    fn release_slot(&self, idx: usize) {
+        let Some(slot) = self.slots.get(idx) else {
+            return;
+        };
+        if self.waiting.0.load(Ordering::Acquire) > 0 && self.waiting.1.load(Ordering::Acquire) == 0
+        {
+            let wake = {
+                let mut queue = self.lock_queue();
+                if self.waiting.1.load(Ordering::Acquire) == 0 {
+                    Self::handoff_under_lock(&mut queue, idx)
+                } else {
+                    None
+                }
+            };
+            if let Some(thread) = wake {
+                thread.unpark();
+                return;
+            }
+        }
+
+        slot.state.store(SLOT_FREE, Ordering::Release);
         fence(Ordering::SeqCst);
-        if self.waiting.0.load(Ordering::SeqCst) > 0 {
-            drop(self.wait.lock().unwrap_or_else(PoisonError::into_inner));
-            self.freed.notify_all();
+
+        if self.has_waiters_or_drainers() {
+            let mut wake_read = None;
+            let mut wake_drainers = Vec::new();
+            {
+                let mut queue = self.lock_queue();
+                if self.waiting.1.load(Ordering::Acquire) > 0 {
+                    wake_drainers = std::mem::take(&mut queue.drain_waiters);
+                } else if !queue.fifo.is_empty()
+                    && slot
+                        .state
+                        .compare_exchange(
+                            SLOT_FREE,
+                            SLOT_HELD,
+                            Ordering::Acquire,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                {
+                    wake_read = Self::handoff_under_lock(&mut queue, idx);
+                    if wake_read.is_none() {
+                        slot.state.store(SLOT_FREE, Ordering::Release);
+                    }
+                }
+            }
+            if let Some(thread) = wake_read {
+                thread.unpark();
+            }
+            for thread in wake_drainers {
+                thread.unpark();
+            }
         }
     }
 
     /// Every slot, each once no read holds it: no read is under way while they are held, and the
-    /// reads that came meanwhile are woken when they are given back.
+    /// reads that came meanwhile are handed slots in FIFO order when they are given back.
     pub(super) fn take_all(&self) -> All<'_, R> {
-        All {
-            held: self.slots.iter().map(Self::lock).collect(),
-            slots: self,
+        self.waiting.1.fetch_add(1, Ordering::SeqCst);
+        let mut held = Vec::with_capacity(self.slots.len());
+        for (idx, slot) in self.slots.iter().enumerate() {
+            loop {
+                if slot
+                    .state
+                    .compare_exchange(SLOT_FREE, SLOT_HELD, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    break;
+                }
+                {
+                    let mut queue = self.lock_queue();
+                    if slot
+                        .state
+                        .compare_exchange(
+                            SLOT_FREE,
+                            SLOT_HELD,
+                            Ordering::Acquire,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
+                        break;
+                    }
+                    queue.drain_waiters.push(std::thread::current());
+                }
+                std::thread::park();
+            }
+            held.push((idx, Self::lock_reader(slot)));
         }
+        All { held, slots: self }
     }
 }
 
 /// Every slot held (`Slots::take_all`, by the log's restart and the readers' release). A read that
-/// found them all held waits on the condition variable, and no read ends to wake it while they
-/// are: giving them back wakes it.
+/// found them all held queues in FIFO order, and giving them back hands slots to waiting reads.
 pub(super) struct All<'a, R> {
-    held: Vec<MutexGuard<'a, Option<R>>>,
+    held: Vec<(usize, MutexGuard<'a, Option<R>>)>,
     slots: &'a Slots<R>,
 }
 
 impl<R> All<'_, R> {
     /// Each slot's reader (None where none was opened).
     pub(super) fn readers(&mut self) -> impl Iterator<Item = &mut Option<R>> {
-        self.held.iter_mut().map(|slot| &mut **slot)
+        self.held.iter_mut().map(|(_, slot)| &mut **slot)
     }
 }
 
 impl<R> Drop for All<'_, R> {
     fn drop(&mut self) {
-        // Every slot unlocked first, then the waiters woken, so they find them free.
-        self.held.clear();
-        self.slots.wake_all();
+        // Unlock every reader mutex first while all slots stay `SLOT_HELD`.
+        let indices: Vec<usize> = self.held.drain(..).map(|(idx, _)| idx).collect();
+        let mut to_wake = Vec::new();
+        {
+            let mut queue = self.slots.lock_queue();
+            let remaining_drainers = self.slots.waiting.1.fetch_sub(1, Ordering::SeqCst);
+            let other_draining = remaining_drainers > 1;
+            for idx in indices {
+                if !other_draining
+                    && let Some(thread) = Slots::<R>::handoff_under_lock(&mut queue, idx)
+                {
+                    to_wake.push(thread);
+                    continue;
+                }
+                if let Some(slot) = self.slots.slots.get(idx) {
+                    slot.state.store(SLOT_FREE, Ordering::Release);
+                }
+            }
+            if other_draining {
+                to_wake.append(&mut queue.drain_waiters);
+            }
+        }
+        for thread in to_wake {
+            thread.unpark();
+        }
     }
 }
 
@@ -387,5 +610,56 @@ mod tests {
             opened.load(Ordering::SeqCst)
         );
         assert!(readers.with(far(), |_| Ok(())).is_none());
+    }
+
+    /// Behavioral fairness: under oversubscription on 1 slot, queued waiters are handed the slot
+    /// in FIFO order rather than starved by a caller looping on the slot.
+    #[test]
+    fn queued_waiters_are_served_in_fifo_order_without_starvation() {
+        let (readers, _, _) = readers(1);
+        let slots = readers.slots.as_ref().unwrap();
+        let (hold_tx, hold_rx) = mpsc::channel::<()>();
+        let (held_tx, held_rx) = mpsc::channel::<()>();
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        std::thread::scope(|s| {
+            let r0 = readers.clone();
+            let holder = s.spawn(move || {
+                r0.with(far(), |_| {
+                    held_tx.send(()).unwrap();
+                    hold_rx.recv().unwrap();
+                    Ok(())
+                })
+                .unwrap()
+                .unwrap();
+                // Immediately try to re-acquire; FIFO handoff must serve already-queued waiters first.
+                r0.with(far(), |_| Ok(())).unwrap().unwrap();
+            });
+            held_rx.recv().unwrap();
+
+            let mut waiters = Vec::new();
+            for id in 1..=4usize {
+                let r = readers.clone();
+                let order = order.clone();
+                waiters.push(s.spawn(move || {
+                    r.with(far(), |_| {
+                        order.lock().unwrap().push(id);
+                        Ok(())
+                    })
+                    .unwrap()
+                    .unwrap();
+                }));
+                while slots.lock_queue().fifo.len() < id {
+                    std::thread::yield_now();
+                }
+            }
+            hold_tx.send(()).unwrap();
+            holder.join().unwrap();
+            for w in waiters {
+                w.join().unwrap();
+            }
+        });
+
+        assert_eq!(*order.lock().unwrap(), vec![1, 2, 3, 4]);
     }
 }
