@@ -6865,6 +6865,7 @@ mod tests {
             handle.admit_receive(2, vec![0xff], until),
             Err(Refusal::Full { limit: 3 })
         ));
+        let fixed = usize::try_from(written(0)).unwrap();
         let (began, mut came) = (Instant::now(), Vec::new());
         while came.len() < 4 {
             assert!(began.elapsed() < crate::transport::HANG, "{came:?}");
@@ -6872,7 +6873,7 @@ mod tests {
             match inputs.try_recv() {
                 Ok(input) => {
                     if matches!(input.command, Input::Submit { .. }) {
-                        came.push(input._reservation.called - written(0) as usize);
+                        came.push(input._reservation.called - fixed);
                     }
                     owner.run_step(Some(input)).unwrap();
                 }
