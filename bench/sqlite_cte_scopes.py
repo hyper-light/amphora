@@ -66,6 +66,9 @@ class Draw:
         self.marks = 0
         # An outer CTE whose body reads a table that isn't there.
         self.bad = False
+        # Whether the statement may hold a fault, which it then holds once: SQLite and Amphora meet several in orders of
+        # their own.
+        self.fault = self.rng.random() < 0.3
 
     def alias(self):
         self.aliases += 1
@@ -98,9 +101,13 @@ class Draw:
     def source(self, ctes):
         rng = self.rng
         drawn = rng.random()
-        if drawn < 0.02:
-            return rng.choice(NAMES)
+        if drawn < 0.04 and self.take_fault():
+            return rng.choice(["c", "d"] if not ctes else [name for name in NAMES if name not in ctes] or ["c"])
         return rng.choice(ctes) if ctes and drawn < 0.8 else rng.choice(SOURCES)
+
+    def take_fault(self):
+        taken, self.fault = self.fault, False
+        return taken
 
     def cte(self, name, ctes, scope, depth):
         """The text of one CTE of a WITH clause, and whether it reads itself."""
@@ -126,10 +133,14 @@ class Draw:
             return f"{name} AS {hint}(SELECT k, v FROM {one} ORDER BY k, v LIMIT {rng.choice([1, 2, 3])})"
         if drawn < 0.68:
             return f"{name} AS {hint}(SELECT x.k, y.v FROM {one} AS x {rng.choice(['JOIN', 'LEFT JOIN'])} {one if rng.random() < 0.6 else two} AS y ON x.k = y.k)"
-        if drawn < 0.7:
-            return f"{name} AS ({rng.choice([f'SELECT k, v FROM {name}', 'SELECT k, v FROM nosuch', 'SELECT nosuch AS k, v FROM t'])})"
-        if drawn < 0.72:
-            return f"{name}(k) AS (SELECT k, v FROM {one})"
+        if drawn < 0.74 and self.take_fault():
+            return rng.choice([
+                f"{name} AS (SELECT k, v FROM {name})",
+                f"{name} AS (SELECT k, v FROM nosuch)",
+                f"{name} AS (SELECT nosuch AS k, v FROM t)",
+                f"{name}(k) AS (SELECT k, v FROM {one})",
+                f"{name}(k, v) AS (SELECT 1, 1 UNION ALL SELECT x.k, y.v FROM {name} AS x JOIN {name} AS y ON x.k = y.k)",
+            ])
         return f"{name} AS {hint}({self.select(ctes, scope, depth - 1, 'pair')})"
 
     def with_clause(self, ctes, scope, depth):
@@ -139,13 +150,14 @@ class Draw:
         around = [name for name in ctes if name not in names]
         parts = []
         for at, name in enumerate(names):
-            reads = around + names[:at] + (names[at + 1:] if rng.random() < 0.1 else [])
+            later = rng.random() < 0.15 and self.take_fault()
+            reads = around + names[:at] + (names[at + 1:] if later else [])
             # A CTE's own name in its body is its own, or the table's: a body reads none of the name around it.
             parts.append(self.cte(name, reads, scope, depth))
         if rng.random() < 0.35:
             # One that nothing reads, most often, whose body would be an error.
             parts.append(f"u AS (SELECT k, v FROM {'bad' if self.bad else rng.choice(['nosuch', 'u', 'c', 'd'])})")
-            if rng.random() < 0.06:
+            if rng.random() < 0.1 and self.take_fault():
                 names = names + ["u"]
         rng.shuffle(parts)
         recursive = "RECURSIVE " if rng.random() < 0.3 else ""

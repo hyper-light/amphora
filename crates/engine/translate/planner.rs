@@ -122,7 +122,7 @@ fn collect_cte_definitions(with: With, program: &mut ProgramBuilder) -> Result<V
 /// Collect the table names that a SELECT and its subqueries read in a FROM clause, but those that
 /// name a CTE of its own WITH clause: of these, the names that the body reads, where something reads
 /// the CTE. Used to find the CTEs that a query reads.
-fn collect_from_clause_table_refs(select: &Select, out: &mut Vec<String>) {
+pub fn collect_from_clause_table_refs(select: &Select, out: &mut Vec<String>) {
     let mut names = Vec::new();
     collect_from_select_body(&select.body, &mut names);
     collect_subquery_table_refs_in_select_exprs(select, &mut names);
@@ -1363,15 +1363,16 @@ fn cte_name_entry(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<OuterQueryReference> {
-    // This plan only makes the name visible. A later FROM lookup performs the
-    // real CTE use and validates its explicit column list.
+    // A use that shares this plan is as much a use as one that has its own, which checks the
+    // explicit column list itself.
+    let validate_explicit_column_count = uses_share_plan;
     let cte_table = plan_cte(
         cte_definition_index,
         with,
         resolver,
         program,
         connection,
-        false,
+        validate_explicit_column_count,
     )?;
     Ok(OuterQueryReference {
         identifier: cte_table.identifier,
@@ -2129,16 +2130,18 @@ fn parse_table(
             return Ok(());
         }
 
+        let outer_ref =
+            table_references.find_cte_outer_query_ref_by_identifier(&normalized_qualified_name);
         // A non-recursive CTE cannot read its own name, even when a table or view
-        // with that name exists.
-        if program.is_cte_being_defined(&normalized_qualified_name) {
+        // with that name exists. A CTE of its name that its body defines hides it.
+        if program.is_cte_being_defined(&normalized_qualified_name)
+            && !outer_ref.is_some_and(OuterQueryReference::defines_cte_name)
+        {
             crate::bail_parse_error!("circular reference: {}", table_name.as_str());
         }
 
         // A CTE can read another CTE defined by the surrounding WITH clause.
-        if let Some(outer_ref) =
-            table_references.find_cte_outer_query_ref_by_identifier(&normalized_qualified_name)
-        {
+        if let Some(outer_ref) = outer_ref {
             if !args.is_empty() {
                 if matches!(outer_ref.table, Table::RecursiveCteInput(_)) {
                     // SQLite resolves the recursive self-reference as a plain

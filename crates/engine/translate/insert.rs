@@ -28,10 +28,13 @@ use crate::{
             open_read_index, open_read_table, ForeignKeyActions,
         },
         plan::{
-            ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
-            TableReferences,
+            ColumnUsedMask, EvalAt, JoinedTable, Operation, OuterQueryReference, QueryDestination,
+            ResultSetColumn, TableReferences,
         },
-        planner::{collect_subquery_table_refs_in_expr, plan_ctes_as_outer_refs, ROWID_STRS},
+        planner::{
+            collect_from_clause_table_refs, collect_subquery_table_refs_in_expr,
+            plan_ctes_as_outer_refs, ROWID_STRS,
+        },
         select::translate_select,
         stmt_journal::{any_index_or_ipk_has_replace, set_insert_stmt_journal_flags},
         subquery::{
@@ -238,21 +241,16 @@ pub fn translate_insert(
     let opts = ProgramBuilderOpts::new(1, 30, 5);
     program.extend(&opts);
 
-    // Merge INSERT's WITH clause into the SELECT source's WITH clause.
+    // INSERT's WITH clause is its SELECT source's where that has none, and around it where it has one.
     // For VALUES/DEFAULT VALUES with subqueries, we route through the multi-row
     // path which goes through translate_select and handles CTEs properly.
     // We also keep a copy for RETURNING clause subqueries.
     let with_for_returning = with.clone();
+    let mut with_around_select = None;
     if let Some(insert_with) = with {
         if let InsertBody::Select(select, _) = &mut body {
-            match &mut select.with {
-                Some(select_with) => {
-                    // Prepend INSERT's CTEs to SELECT's CTEs
-                    let mut merged = insert_with.ctes;
-                    merged.append(&mut select_with.ctes);
-                    select_with.ctes = merged;
-                    select_with.recursive |= insert_with.recursive;
-                }
+            match &select.with {
+                Some(_) => with_around_select = Some(insert_with),
                 None => select.with = Some(insert_with),
             }
         } else {
@@ -371,6 +369,20 @@ pub fn translate_insert(
         connection,
     )?;
 
+    let mut around_select = TableReferences::new_empty();
+    if let InsertBody::Select(select, _) = &body {
+        let mut select_table_refs = Vec::new();
+        collect_from_clause_table_refs(select, &mut select_table_refs);
+        plan_ctes_as_outer_refs(
+            with_around_select,
+            &select_table_refs,
+            resolver,
+            program,
+            &mut around_select,
+            connection,
+        )?;
+    }
+
     // Plan subqueries in RETURNING expressions before processing
     // (so SubqueryResult nodes are cloned into result_columns)
     let mut returning_subqueries = vec![];
@@ -452,6 +464,7 @@ pub fn translate_insert(
         resolver,
         &mut values,
         body,
+        around_select.outer_query_refs(),
         &columns,
         &table_references,
         database_id,
@@ -2235,6 +2248,7 @@ fn init_source_emission<'a>(
     resolver: &Resolver,
     values: &mut Vec<Box<Expr>>,
     body: InsertBody,
+    select_outer_query_refs: &[OuterQueryReference],
     columns: &'a [ast::Name],
     table_references: &TableReferences,
     database_id: usize,
@@ -2301,7 +2315,14 @@ fn init_source_emission<'a>(
                     coroutine_implementation_start: ctx.halt_label,
                 };
                 let num_result_cols = program.nested(|program| {
-                    translate_select(select, resolver, program, query_destination, connection)
+                    translate_select(
+                        select,
+                        select_outer_query_refs,
+                        resolver,
+                        program,
+                        query_destination,
+                        connection,
+                    )
                 })?;
                 if num_result_cols != required_column_count {
                     crate::bail_parse_error!(
