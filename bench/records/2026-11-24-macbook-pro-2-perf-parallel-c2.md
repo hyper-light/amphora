@@ -2,7 +2,7 @@
 
 ## Losses
 
-- **The release runs of the same statements at 1 to 8 workers are not measured.** So whether a user's release build finishes statement 20 in bounded time is not answered. The release build was killed twice, once by the benchmark window (r543) and once by r566's own 1,200 s limit, and the third (r634) got 1:22 of CPU in about 14 minutes on MacBook Pro 2 at load 55 to 77. The harness and its inputs are ready (below).
+- **The release runs of the same statements at 1 to 8 workers are not measured.** So whether a user's release build finishes statement 20 in bounded time is not answered. The release build was stopped twice, once for the benchmark window (r543) and once by r566's own 1,200 s limit; the third (r634) was stopped at the hour's end, with its engine compile at 1:22 of CPU after about 14 minutes on MacBook Pro 2 at load 55 to 81. The harness and its inputs are ready (below).
 - Not merged. Ada's benchmark window on adacachy2 ran from 05:55Z past the lane's hour, and check-production counts only on Linux. The lead chose to hold the merge (c). Branch `perf/parallel-c2` holds the fix.
 - The brief expected a lost event. There is none: no thread waits on another while the test runs on.
 - Not finished on the branch: `cargo clippy -p amphora-engine --all-targets` (r578 hit its 1,800 s limit while it still built dependencies), check-production, `--test join_methods`, `--test adaptive_joins`, and repeated full `morsel` runs. One full `morsel` run finished (below).
@@ -35,7 +35,7 @@ The first wrong place is the generator's term, not a lost event: the engine runs
 
 - Known: the engine's serial run of statement 20 (no workers, `ParallelMode::Off`) is the first run that does not end; the debug build was still in it after 122.6 s. SQLite 3.54.0 takes 11.88 s for the same statement as a count.
 - Not known: the release build's time at 1, 2, 4 and 8 workers, for statements 20, 29 and 32, and whether its answers equal SQLite's (SQLite's count for 20 is above; 29 and 32 were not counted).
-- How to measure it: branch `perf/parallel-c2-diag` (`84efd36b`) has `crates/engine/examples/c2_user.rs`, which loads the fixture through the public API and runs each statement with `ByCost` and `HashJoinsOnly`, serial and on 1, 2, 4 and 8 cores, under a per-statement limit, printing rows, an order-independent hash, prepare and run time. `C2_DIR=<dir> <test binary> --exact vdbe::morsel_scan::tests::c2_dump_fixture` writes `fixture.sql` and `queries.txt` (sha256 8b90ab3a… and 7c3c6f1a… on MacBook Pro 2). Then `c2_user fixture.sql queries.txt <db dir> 60 20`, and 29 and 32, each under an outer limit. Deps of the release build are built on adacachy2 (r543) and MacBook Pro 2.
+- How to measure it: branch `perf/parallel-c2-diag` (`84efd36b`) has `crates/engine/examples/c2_user.rs`, which loads the fixture through the public API and runs each statement with `ByCost` and `HashJoinsOnly`, serial and on 1, 2, 4 and 8 cores, under a per-statement limit, printing rows, an order-independent hash, prepare and run time. `C2_DIR=<dir> <test binary> --exact vdbe::morsel_scan::tests::c2_dump_fixture` writes `fixture.sql` and `queries.txt` (sha256 8b90ab3a… and 7c3c6f1a… on MacBook Pro 2). Then `c2_user fixture.sql queries.txt <db dir> 60 20`, and 29 and 32, each under an outer limit. The release build's dependencies are partly built in the lane's target directory on adacachy2 (r543) and on MacBook Pro 2 (r634).
 
 ## The fix and its checks
 
@@ -46,7 +46,7 @@ The first wrong place is the generator's term, not a lost event: the engine runs
 | `cargo fmt --all --check` | exit 0 (r578) |
 | `t_qt_6_18` (both tests), debug, `--test-threads=1` | 2 passed in 35.38 s at load about 50 (r578) |
 | `morsel` (the whole filter), debug, `--test-threads=4` | 49 passed, 1 failed, 4 ignored in 309 s, no hang (r578). The failure is `t_qt_6_35` ("the hook built no link"), main's own, lane C1's. |
-| `t_qt_6_13 t_qt_6_17 t_qt_6_18 t_qt_6_19 t_qt_6_24`, debug, `--test-threads=1`, 2 and 4, limit 240 s each (r648) | With 1 and 2 threads, stopped by the 240 s limit while only `t_qt_6_24` (one thread) and `t_qt_6_24` beside it (two) still ran; 4 threads stopped by me at the hour with `t_qt_6_18` both tests and `t_qt_6_17` passed. `t_qt_6_18` (both tests) passed in all three; `t_qt_6_13` and `t_qt_6_19` pass at load 55 to 77 in over 60 s. |
+| `t_qt_6_13 t_qt_6_17 t_qt_6_18 t_qt_6_19 t_qt_6_24` (6 tests), debug, one run at each `--test-threads`, limit 240 s (r648) | 4 threads: 6 passed in 108.9 s (load 81). 8 threads: 6 passed in 148.8 s (load 77). 1 and 2 threads: stopped by the 240 s limit with only `t_qt_6_24` still running, every other test passed. Those two are not passes; `t_qt_6_24` passed in the 4-thread `morsel` run above. `t_qt_6_18` (both tests) passed in all four. |
 
 ## For the next lane
 
