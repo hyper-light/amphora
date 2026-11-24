@@ -254,7 +254,9 @@ class Draw:
         text = source if name == source else f"{source} AS {name}"
         scalar = f"({self.select(ctes, [name], depth - 1, 'scalar')})"
         if drawn < 0.68:
-            return f"SELECT {name}.k, count(*) FROM {text} GROUP BY {name}.k HAVING {name}.k IN ({self.select(ctes, [name], depth - 1, 'list')})"
+            # Its subquery reads nothing of the grouped row: that a FROM clause inside it loses that row is a finding of its own,
+            # which holds no CTE (the lane's record).
+            return f"SELECT {name}.k, count(*) FROM {text} GROUP BY {name}.k HAVING {name}.k IN ({self.select(ctes, [], depth - 1, 'list')})"
         if drawn < 0.74:
             return f"SELECT {name}.k, {name}.v FROM {text} ORDER BY {scalar}, {name}.k, {name}.v"
         if drawn < 0.8:
