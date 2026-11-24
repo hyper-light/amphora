@@ -19,6 +19,7 @@ Not drawn, and why:
 - A bare column's value, a text of a group or a tie's value: any of its rows may give it (lower(), rtrim()).
 - new.rowid in a BEFORE INSERT that gives no rowid: undefined (lang_createtrigger.html).
 - A trigger on a WITHOUT ROWID table: Amphora refuses it (lane C11's record).
+- A subquery in a window function's argument: Amphora refuses it (finding CS).
 usage: python3 bench/sqlite_columns_read.py [seed] > crates/engine/tests/fixtures/columns_read.tsv"""
 import random
 import sqlite3
@@ -113,16 +114,16 @@ def argument(rng, left):
         f"(SELECT t.j FROM t WHERE t.k IS {k})",
         f"(SELECT t.j FROM t WHERE t.k = {k} AND {join})",
         f"(SELECT max(t.j) FROM t WHERE {k} IS NULL OR t.k <= {k})",
-        f"(SELECT json_group_array(t.k) FROM t WHERE t.k >= {k})",
-        f"(SELECT json_group_array(t.k) FROM t WHERE {nested} OR t.k IS {k})",
+        f"(SELECT json_array(min(t.k), max(t.k), count(*) + 6) FROM t WHERE t.k >= {k})",
+        f"(SELECT json_array(max(t.k), count(*), 7) FROM t WHERE {nested} OR t.k IS {k})",
         f"coalesce((SELECT t.j FROM t WHERE t.k = {k}), '[7, 1]')",
         f"json_array({k}, (SELECT count(*) FROM t WHERE t.k < {k}), {v})",
         f"CASE WHEN EXISTS (SELECT 1 FROM t WHERE t.k = {v} - 6) THEN '[7, 2]' ELSE '[1]' END",
         f"CASE WHEN {k} IN (SELECT t.k FROM t) THEN '[7]' ELSE '[2, 7]' END",
         f"CASE WHEN {k} NOT IN (SELECT t.k FROM t WHERE t.k <> {v} - 6 AND t.k IS NOT NULL) THEN '[7]' ELSE '[8]' END",
         f"CASE WHEN ({k}, {v}) IN (SELECT t.k, t.k + 6 FROM t) THEN '[7]' ELSE '[1, 8]' END",
-        "(SELECT json_group_array(r.x) FROM r JOIN l ON r.x = l.y)",
-        f"(SELECT json_group_array(t.k) FROM t WHERE {nested})",
+        "(SELECT json_array(min(r.x), max(r.x), 7) FROM r JOIN l ON r.x = l.y)",
+        f"(SELECT json_array(min(t.k), 7) FROM t WHERE {nested})",
         f"json_array({k}, {v}, 7)",
         "'[7, 1, null]'",
     ])
@@ -143,7 +144,7 @@ def argument_query(rng):
     tables += f" {rng.choice(joins)} {function}({argument(rng, reads)}) AS je ON {on}"
     values = [f"{name}.k" for name in names] + ["je.value"]
     if rng.random() < 0.3:
-        second = rng.choice([argument(rng, reads), "json_array(je.value, 7)", "(SELECT json_group_array(t.k) FROM t WHERE t.k < je.value)"])
+        second = rng.choice([argument(rng, reads), "json_array(je.value, 7)", "(SELECT json_array(min(t.k), max(t.k)) FROM t WHERE t.k < je.value)"])
         tables += f" {rng.choice(joins)} json_each({second}) AS jf ON {rng.choice(['jf.value = je.value', 'jf.value = 7', '1', 'jf.key = je.key'])}"
         values.append("jf.value")
     if rng.random() < 0.3:
@@ -188,8 +189,8 @@ def arguments(seed):
 ARGUMENT_FOUND = [
     "SELECT a.k, je.value FROM a FULL JOIN json_each((SELECT t.j FROM t WHERE t.k = a.k AND EXISTS (SELECT 1 FROM r JOIN l ON r.x = l.y))) AS je ON je.value = 7",
     "SELECT a.k, je.value FROM a RIGHT JOIN json_each((SELECT t.j FROM t WHERE t.k = a.k)) AS je ON je.value = 7",
-    "SELECT z.k, je.value FROM z FULL JOIN json_each((SELECT json_group_array(t.k) FROM t WHERE t.k IN (SELECT r.x FROM r JOIN l ON r.x = l.y) OR t.k IS z.k)) AS je",
-    "SELECT z.k, je.value FROM z RIGHT JOIN json_each((SELECT json_group_array(r.x) FROM r JOIN l ON r.x = l.y WHERE z.k IS NULL)) AS je",
+    "SELECT z.k, je.value FROM z FULL JOIN json_each((SELECT json_array(max(t.k), count(*)) FROM t WHERE t.k IN (SELECT r.x FROM r JOIN l ON r.x = l.y) OR t.k IS z.k)) AS je",
+    "SELECT z.k, je.value FROM z RIGHT JOIN json_each((SELECT json_array(min(r.x), max(r.x)) FROM r JOIN l ON r.x = l.y WHERE z.k IS NULL)) AS je",
     "SELECT count(*), sum(je.value) FROM a FULL JOIN json_each((SELECT t.j FROM t WHERE t.k IS a.k)) AS je ON je.value = 7",
     "SELECT a.k, je.value, b.k FROM a JOIN json_each((SELECT t.j FROM t WHERE t.k = a.k)) AS je RIGHT JOIN b ON b.k = je.value",
     "SELECT a.k, b.k, je.value FROM a RIGHT JOIN b ON a.k = b.k LEFT JOIN json_each((SELECT t.j FROM t WHERE t.k IS a.k)) AS je",
@@ -507,16 +508,19 @@ def group_column(rng):
     return f"t.{rng.choice(['nc', 'nc', 'nc', 'rt', 'rt', 'tn', 'b', 'u', 'i'])}"
 
 
-def group_test(rng):
+def group_test(rng, subqueries=True):
     x = group_column(rng)
     y = rng.choice(["'abc'", "'ABC'", "'x'", "'x '", "1", "'1'", group_column(rng), group_column(rng), f"{group_column(rng)} COLLATE {rng.choice(['NOCASE', 'RTRIM', 'BINARY'])}"])
     if rng.random() < 0.15:
         x = rng.choice([f"+{x}", f"CAST({x} AS TEXT)", f"({x} || '')", f"{x} COLLATE {rng.choice(['NOCASE', 'RTRIM', 'BINARY'])}"])
     operator = rng.choice(["=", "=", "<", ">", "<=", ">=", "<>", "IS", "IS NOT"])
-    return rng.choice([
+    plain = [
         f"{x} {operator} {y}", f"{y} {operator} {x}", f"{x} {operator} {y}", f"{x} IN ({y}, 'b')", f"{x} NOT IN ({y}, 'x')",
         f"{x} BETWEEN {y} AND 'b'", f"CASE {x} WHEN {y} THEN 1 ELSE 0 END", f"nullif({x}, {y}) IS NULL",
-        f"({x}, 1) = ({y}, 1)", f"max({x}, {y}) IS {x}", f"{x} IN (SELECT s.nc FROM s)", f"{x} IN (SELECT s.b FROM s WHERE s.b IS NOT NULL)",
+        f"({x}, 1) = ({y}, 1)", f"max({x}, {y}) IS {x}",
+    ]
+    return rng.choice(plain if not subqueries else plain + [
+        f"{x} IN (SELECT s.nc FROM s)", f"{x} IN (SELECT s.b FROM s WHERE s.b IS NOT NULL)",
         f"EXISTS (SELECT 1 FROM s WHERE s.b = {x})", f"EXISTS (SELECT 1 FROM s WHERE {x} = s.b)", f"(SELECT count(*) FROM s WHERE {x} > s.b)",
     ])
 
@@ -550,7 +554,7 @@ def group_query(rng):
     if shape < 0.3:
         window = rng.choice(["ORDER BY t.id", f"PARTITION BY {rng.choice(['t.i', 't.nc', subquery])} ORDER BY t.id", "PARTITION BY t.nc", "ORDER BY t.id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING"])
         test = group_test(rng)
-        calls = [f"{rng.choice(['sum', 'max', 'count', 'min'])}({group_test(rng)}) OVER ({window})" for _ in range(2)]
+        calls = [f"{rng.choice(['sum', 'max', 'count', 'min'])}({group_test(rng, False)}) OVER ({window})" for _ in range(2)]
         return f"SELECT t.id, {', '.join(calls)}, {test} FROM {rng.choice(['t', '(SELECT * FROM t) AS t'])}{where}"
     having = f" HAVING {rng.choice([aggregate(rng), f'{aggregate(rng)} > 0', f'max({group_test(rng)})'])}" if rng.random() < 0.3 else ""
     order = f" ORDER BY {aggregate(rng)}" if rng.random() < 0.2 else ""
