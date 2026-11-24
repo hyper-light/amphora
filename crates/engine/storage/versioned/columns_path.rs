@@ -15,7 +15,8 @@
 //! granules its summaries skip already lower the copy's learned cost per row; on the rows it runs
 //! row by row ([`evaluate_rows`]), with the same answer.
 //!
-//! Behind the planner's switch (`column_path::asked`); SQL's aggregates reach it through
+//! For the tables declared `COLUMNAR` (`docs/design/columnar.md`, decision 1, item 1), the only ones
+//! that keep a copy; SQL's aggregates reach it through
 //! [`super::columns_sql`].
 #![cfg_attr(not(test), allow(dead_code))]
 
@@ -52,8 +53,7 @@ fn count(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
 }
 
-/// Reads `ask` at snapshot `s` as a statement does: by the planner's switch ([`column_path::asked`])
-/// and the database's learned rates. Before both a row's visit and a seek were timed, the rows.
+/// Reads `ask` at snapshot `s` as a statement does: by the database's learned rates. Before both a row's visit and a seek were timed, the rows.
 pub(crate) fn read_learned<B: Block>(
     copy: &Columns<B>,
     rows: &dyn Rows,
@@ -63,8 +63,8 @@ pub(crate) fn read_learned<B: Block>(
     clock: &dyn Fn() -> u128,
 ) -> Result<Read> {
     match RowRates::learned(costs) {
-        Some(rates) => read(copy, rows, s, ask, rates, column_path::asked(), clock),
-        // Unknown rates price nothing: the rows, which the switch being off also gives.
+        Some(rates) => read(copy, rows, s, ask, rates, true, clock),
+        // Unknown rates price nothing: the rows.
         None => read(
             copy,
             rows,
@@ -779,10 +779,6 @@ mod tests {
             let p = read_learned(&copy, &at, snap.start, Ask::Point(&key), &costs, &tick).unwrap();
             assert_eq!(p.rows, want, "{:?}", p.choice);
         }
-        assert_eq!(
-            column_path::asked(),
-            std::env::var(column_path::ENV).is_ok_and(|v| v == "on")
-        );
         db.close_snapshot(snap);
     }
 
