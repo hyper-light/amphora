@@ -401,15 +401,22 @@ impl PageCache {
         let slot_page = Arc::downgrade(&value);
         let entry = PageCacheEntry::new(key, value);
 
-        // Amphora: a new page joins at the head (the queue's back), as SIEVE has it (Zhang et al.,
-        // "SIEVE is Simpler than LRU", NSDI 2024): the hand sweeps from the tail (the front) toward
-        // the head, so it reaches a new page after every older one. Inserted just after the hand,
-        // a page read once was the next the sweep examined: the pages cached before stayed while a
-        // new working set never settled (Amphora's docs/design/store.md, decision 19).
-        self.queue.push_back(entry);
-        let entry_ptr = self.queue.back().get().ok_or_else(|| {
-            CacheError::InternalError("Failed to get inserted entry pointer".into())
-        })? as *const PageCacheEntry as *mut PageCacheEntry;
+        // Amphora (decision 19, lane Q2): a new page joins just behind the hand, where the sweep
+        // looks last, so the hand reaches it after every page already cached. Inserted just after
+        // the hand, a page read once was the next one examined. At the queue's back it came after
+        // only the pages between the hand and the back: with the hand 143 pages from the back after
+        // point lookups, a count's 607 pages evicted one another before each was read again.
+        let entry_ptr = if self.clock_hand.is_null() {
+            self.queue.push_back(entry);
+            self.queue.back().get().map(std::ptr::from_ref)
+        } else {
+            // SAFETY: the hand points into `queue` whenever it is not null.
+            let mut hand = unsafe { self.queue.cursor_mut_from_ptr(self.clock_hand) };
+            hand.insert_before(entry);
+            hand.peek_prev().get().map(std::ptr::from_ref)
+        }
+        .ok_or_else(|| CacheError::InternalError("Failed to get inserted entry pointer".into()))?
+        .cast_mut();
         self.map.insert(
             key,
             Slot {
@@ -1322,6 +1329,75 @@ mod tests {
             "the oldest page went first"
         );
         cache.verify_cache_integrity();
+    }
+
+    /// Lane Q2 (decision 19): do 20,000 point lookups through one index of a table larger than a
+    /// 200-page cache, then count the table's rows four times, through an index the cache holds.
+    /// Expect: every count answers the row count, and the counts after the first read no page from
+    /// the file (S8's `table_count` after `point_secondary` read its index's 607 pages every time).
+    #[test]
+    fn q2_counts_after_point_lookups_read_no_page_from_the_file() {
+        use crate::{ConnectOpts, Database, DatabaseOpts, OpenFlags, SqliteDialect, Value};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q2.db");
+        let io = Arc::new(crate::io::PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            path.to_str().unwrap(),
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let rows: i64 = 20_000;
+        let writer = db.connect(ConnectOpts::new()).unwrap();
+        writer
+            .execute("CREATE TABLE items (id INTEGER PRIMARY KEY, k INTEGER NOT NULL, owner INTEGER NOT NULL, body TEXT NOT NULL)")
+            .unwrap();
+        writer.execute("BEGIN").unwrap();
+        let body = "x".repeat(200);
+        for id in 0..rows {
+            let (k, owner) = ((id * 7919) % rows, id % 97);
+            writer
+                .execute(format!("INSERT INTO items VALUES ({id}, {k}, {owner}, '{body}')"))
+                .unwrap();
+        }
+        writer.execute("COMMIT").unwrap();
+        writer.execute("CREATE INDEX items_k ON items (k)").unwrap();
+        writer.execute("CREATE INDEX items_owner ON items (owner)").unwrap();
+        writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+        let reader = db.connect(ConnectOpts::new()).unwrap();
+        reader.execute("PRAGMA cache_size = 200").unwrap();
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        for _ in 0..20_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let k = i64::try_from(x % u64::try_from(rows).unwrap()).unwrap();
+            let found = reader
+                .prepare(format!("SELECT body FROM items WHERE k = {k}"))
+                .unwrap()
+                .run_collect_rows()
+                .unwrap();
+            assert_eq!(found.len(), 1, "k = {k}");
+        }
+        let pager = reader.get_pager();
+        let mut reads = Vec::new();
+        for _ in 0..4 {
+            let before = pager.page_file_reads();
+            let counted = reader
+                .prepare("SELECT COUNT(*) FROM items")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap();
+            assert_eq!(counted, vec![vec![Value::from_i64(rows)]]);
+            reads.push(pager.page_file_reads().saturating_sub(before));
+        }
+        let (first, later) = reads.split_first().unwrap();
+        assert!(*first > 0, "the first count read its pages: {reads:?}");
+        assert_eq!(later, [0, 0, 0], "file reads per count: {reads:?}");
     }
 
     #[test]
