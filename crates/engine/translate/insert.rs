@@ -243,6 +243,23 @@ pub fn translate_insert(
     let opts = ProgramBuilderOpts::new(1, 30, 5);
     program.extend(&opts);
 
+    let database_id = resolver.resolve_existing_table_database_id_qualified(&tbl_name)?;
+    if let Some(view) = super::view_dml::view_named(resolver, database_id, &tbl_name) {
+        return super::view_dml::translate_insert(
+            &view,
+            database_id,
+            on_conflict,
+            &tbl_name,
+            &columns,
+            body,
+            returning,
+            with,
+            resolver,
+            program,
+            connection,
+        );
+    }
+
     // INSERT's WITH clause is its SELECT source's where that has none, and around it where it has one.
     // For VALUES/DEFAULT VALUES with subqueries, we route through the multi-row
     // path which goes through translate_select and handles CTEs properly.
@@ -265,7 +282,6 @@ pub fn translate_insert(
         // for RETURNING clause subqueries - handled below via with_for_returning.
     }
 
-    let database_id = resolver.resolve_existing_table_database_id_qualified(&tbl_name)?;
     let table_name = &tbl_name.name;
     let table = match resolver.with_schema(database_id, |s| s.get_table(table_name.as_str())) {
         Some(table) => table,

@@ -52,12 +52,18 @@ pub fn translate_select(
         query_destination,
         connection,
     )?;
+    refuse_unsafe_virtual_table(program, &plan)?;
+    emit_select_plan(plan, resolver, program, connection)
+}
+
+/// Refuses a query that reads a virtual table in a trigger.
+pub(crate) fn refuse_unsafe_virtual_table(program: &ProgramBuilder, plan: &Plan) -> Result<()> {
     if program.trigger.is_some() {
-        if let Some(virtual_table) = plan_first_virtual_table_name(&plan) {
+        if let Some(virtual_table) = plan_first_virtual_table_name(plan) {
             crate::bail_parse_error!("unsafe use of virtual table \"{}\"", virtual_table);
         }
     }
-    emit_select_plan(plan, resolver, program, connection)
+    Ok(())
 }
 
 /// Optimize and emit bytecode for an already-prepared select plan.

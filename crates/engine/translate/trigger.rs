@@ -167,18 +167,14 @@ pub fn translate_create_trigger(
         );
     }
 
-    if time
-        .as_ref()
-        .is_some_and(|t| *t == ast::TriggerTime::InsteadOf)
-    {
-        bail_parse_error!("INSTEAD OF triggers are not supported yet");
-    }
-
-    // Verify the table exists (use the table's database, not the trigger's).
-    let table = resolver.with_schema(target_table_database_id, |s| {
-        s.get_table(&normalized_table_name)
+    // Verify the table or view exists (use its database, not the trigger's).
+    let (table, is_view) = resolver.with_schema(target_table_database_id, |s| {
+        (
+            s.get_table(&normalized_table_name),
+            s.get_view(&normalized_table_name).is_some(),
+        )
     });
-    let Some(table) = table else {
+    if table.is_none() && !is_view {
         // SQLite qualifies a non-temp trigger's missing target table with its
         // database ("no such table: main.t1"); temp triggers report the name
         // as the user wrote it.
@@ -192,9 +188,29 @@ pub fn translate_create_trigger(
             .get_database_name_by_index(target_table_database_id)
             .unwrap_or_else(|| "main".to_string());
         bail_parse_error!("no such table: {}.{}", db_name, tbl_name.name.as_str());
-    };
-    if table.virtual_table().is_some() {
+    }
+    if table.is_some_and(|table| table.virtual_table().is_some()) {
         bail_parse_error!("cannot create triggers on virtual tables");
+    }
+    // A view's triggers are INSTEAD OF, and no table's are. SQLite names the target of a trigger in
+    // the temp schema as it was written, and another's by its name alone (`sqlite3FixSrcList`).
+    let target = if database_id == crate::TEMP_DB_ID {
+        crate::util::table_name_for_error(&tbl_name)
+    } else {
+        tbl_name.name.as_str().to_string()
+    };
+    match (is_view, time) {
+        (true, None | Some(ast::TriggerTime::Before)) => {
+            bail_parse_error!("cannot create BEFORE trigger on view: {target}")
+        }
+        (true, Some(ast::TriggerTime::After)) => {
+            bail_parse_error!("cannot create AFTER trigger on view: {target}")
+        }
+        (false, Some(ast::TriggerTime::InsteadOf)) => {
+            bail_parse_error!("cannot create INSTEAD OF trigger on table: {target}")
+        }
+        (true, Some(ast::TriggerTime::InsteadOf))
+        | (false, None | Some(ast::TriggerTime::Before | ast::TriggerTime::After)) => {}
     }
 
     let opts = ProgramBuilderOpts::new(1, 30, 1);

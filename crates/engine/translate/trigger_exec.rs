@@ -836,10 +836,10 @@ pub fn get_triggers_including_temp(
                 .filter(|trigger| match trigger.target_database_id {
                     // Explicit qualifier: include if it matches this database.
                     Some(target_db) => target_db == database_id,
-                    // Unqualified: the trigger targets the temp schema's table if one
+                    // Unqualified: the trigger targets the temp schema's table or view if one
                     // exists, otherwise it targets main/attached. Include it only when
-                    // no temp table with that name shadows it.
-                    None => s.get_table(&trigger.table_name).is_none(),
+                    // none there with that name shadows it.
+                    None => !names_table_or_view(s, &trigger.table_name),
                 })
                 .collect()
         });
@@ -858,6 +858,68 @@ pub fn get_triggers_including_temp(
         triggers = list.into();
     }
     triggers
+}
+
+/// The INSTEAD OF triggers of `event` on a view, in the order they fire: TEMP triggers before the
+/// view's own, as [`get_triggers_including_temp`] orders a table's. `set_columns` are the columns an
+/// UPDATE sets, by name, which an `UPDATE OF` trigger is asked by (trigger.c, `checkColumnOverlap`).
+pub(crate) fn instead_of_triggers(
+    resolver: &Resolver,
+    database_id: usize,
+    view_name: &str,
+    event: TriggerEvent,
+    set_columns: &[String],
+) -> Vec<Arc<Trigger>> {
+    let fires = |trigger: &Trigger| {
+        trigger.time == TriggerTime::InsteadOf
+            && match (&trigger.event, &event) {
+                (TriggerEvent::Delete, TriggerEvent::Delete)
+                | (TriggerEvent::Insert, TriggerEvent::Insert)
+                | (TriggerEvent::Update, TriggerEvent::Update) => true,
+                (TriggerEvent::UpdateOf(columns), TriggerEvent::Update) => {
+                    columns.iter().any(|column| {
+                        set_columns
+                            .iter()
+                            .any(|set| set.eq_ignore_ascii_case(column.as_str()))
+                    })
+                }
+                _ => false,
+            }
+    };
+    let mut triggers: std::collections::VecDeque<Arc<Trigger>> =
+        resolver.with_schema(database_id, |schema| {
+            schema
+                .get_triggers_for_table(view_name)
+                .filter(|trigger| match trigger.target_database_id {
+                    Some(target) => target == database_id,
+                    None => true,
+                })
+                .filter(|trigger| fires(trigger))
+                .cloned()
+                .collect()
+        });
+    if database_id != crate::TEMP_DB_ID && resolver.has_temp_database() {
+        let temp_triggers: Vec<Arc<Trigger>> = resolver.with_schema(crate::TEMP_DB_ID, |schema| {
+            schema
+                .get_triggers_for_table(view_name)
+                .filter(|trigger| match trigger.target_database_id {
+                    Some(target) => target == database_id,
+                    None => !names_table_or_view(schema, view_name),
+                })
+                .filter(|trigger| fires(trigger))
+                .cloned()
+                .collect()
+        });
+        for trigger in temp_triggers {
+            triggers.push_front(trigger);
+        }
+    }
+    triggers.into()
+}
+
+/// Whether `schema` has a table or a view of the name, which an unqualified trigger of its own is on.
+fn names_table_or_view(schema: &crate::schema::Schema, name: &str) -> bool {
+    schema.get_table(name).is_some() || schema.get_view(name).is_some()
 }
 
 /// Like [`has_relevant_triggers_type_only`], but also checks the temp schema.
@@ -880,7 +942,7 @@ pub fn has_triggers_including_temp(
             s.get_triggers_for_table(table.name.as_str())
                 .any(|trigger| match trigger.target_database_id {
                     Some(target_db) => target_db == database_id,
-                    None => s.get_table(&trigger.table_name).is_none(),
+                    None => !names_table_or_view(s, &trigger.table_name),
                 })
         });
         if has_temp {

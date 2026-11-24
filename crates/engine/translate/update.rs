@@ -65,6 +65,17 @@ pub fn translate_update(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> crate::Result<()> {
+    let database_id = resolver.resolve_existing_table_database_id_qualified(&body.tbl_name)?;
+    if let Some(view) = super::view_dml::view_named(resolver, database_id, &body.tbl_name) {
+        return super::view_dml::translate_update(
+            &view,
+            database_id,
+            body,
+            resolver,
+            program,
+            connection,
+        );
+    }
     let plan = prepare_and_optimize_update_plan(program, resolver, body, connection, false, None)?;
     let Plan::Update(ref update_plan) = plan else {
         unreachable!("prepare_and_optimize_update_plan must return Plan::Update");

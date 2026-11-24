@@ -86,6 +86,20 @@ pub fn translate_delete(
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     let database_id = resolver.resolve_existing_table_database_id_qualified(tbl_name)?;
+    if let Some(view) = super::view_dml::view_named(resolver, database_id, tbl_name) {
+        return super::view_dml::translate_delete(
+            &view,
+            database_id,
+            tbl_name,
+            where_clause,
+            returning,
+            &indexed,
+            with,
+            resolver,
+            program,
+            connection,
+        );
+    }
     let normalized_table_name = normalize_ident(tbl_name.name.as_str());
     let table = validate_delete(
         resolver,

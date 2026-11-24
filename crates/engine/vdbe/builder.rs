@@ -358,6 +358,9 @@ pub struct ProgramBuilder {
     /// This is used in UPSERT DO UPDATE context to ensure nested trigger's OR IGNORE/REPLACE
     /// clauses don't suppress errors.
     pub trigger_conflict_override: Option<ResolveType>,
+    /// Amphora: the register of the rows a statement on a view fired its triggers for, which
+    /// `PRAGMA count_changes` answers.
+    pub(crate) view_row_count: Option<usize>,
     /// Counter for CTE identity tracking. Each CTE definition gets a unique ID
     /// so that multiple references to the same CTE can share materialized data.
     next_cte_id: usize,
@@ -805,6 +808,7 @@ impl ProgramBuilder {
             trigger,
             resolve_type: ResolveType::Abort,
             trigger_conflict_override: None,
+            view_row_count: None,
             cursor_overrides: Vec::new(),
             id_register_overrides: HashMap::default(),
             hash_build_signatures: HashMap::default(),

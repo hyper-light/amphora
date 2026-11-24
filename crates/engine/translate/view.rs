@@ -6,7 +6,7 @@ use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
 use crate::translate::{
     emitter::Resolver,
-    schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
+    schema::{emit_delete_trigger_rows, emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
 };
 use crate::util::{
     escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
@@ -533,6 +533,8 @@ pub fn translate_drop_view(
         }
     }
 
+    emit_drop_triggers(program, resolver, &normalized_view_name, database_id)?;
+
     // Open cursor to sqlite_schema table (structure is the same for all databases)
     let schema_table =
         resolver.with_schema(MAIN_DB_ID, |s| s.get_btree_table(SQLITE_TABLEID).unwrap());
@@ -756,5 +758,44 @@ pub fn translate_drop_view(
     });
 
     program.epilogue(resolver.schema());
+    Ok(())
+}
+
+/// Drops the triggers on a view that is dropped, with the TEMP triggers on it
+/// (`sqlite3CodeDropTable`).
+fn emit_drop_triggers(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    view_name: &str,
+    database_id: usize,
+) -> Result<()> {
+    let mut schemas = vec![database_id];
+    if database_id != crate::TEMP_DB_ID && resolver.has_temp_database() {
+        schemas.push(crate::TEMP_DB_ID);
+    }
+    for schema_id in schemas {
+        let names: Vec<String> = resolver.with_schema(schema_id, |schema| {
+            schema
+                .get_triggers_for_table(view_name)
+                .filter(|trigger| match trigger.target_database_id {
+                    Some(target) => target == database_id,
+                    None => schema_id == database_id,
+                })
+                .map(|trigger| trigger.name.clone())
+                .collect()
+        });
+        if names.is_empty() {
+            continue;
+        }
+        let schema_cookie = resolver.with_schema(schema_id, |s| s.schema_version);
+        program.begin_write_on_database(schema_id, schema_cookie)?;
+        emit_delete_trigger_rows(program, resolver, schema_id, &names);
+        for trigger_name in names {
+            program.emit_insn(Insn::DropTrigger {
+                db: schema_id,
+                trigger_name,
+            });
+        }
+    }
     Ok(())
 }

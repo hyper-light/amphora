@@ -48,6 +48,7 @@ pub(crate) mod upsert;
 pub(crate) mod vacuum;
 mod values;
 pub(crate) mod view;
+mod view_dml;
 mod window;
 pub(crate) mod without_rowid;
 
@@ -680,8 +681,14 @@ pub fn translate_inner(
     // a count row (same as SQLite).
     if let Some(column_name) = count_changes_column {
         if program.result_columns.is_empty() {
-            let reg = program.alloc_register();
-            program.emit_insn(crate::vdbe::insn::Insn::ChangeCount { dest: reg });
+            let reg = match program.view_row_count {
+                Some(reg) => reg,
+                None => {
+                    let reg = program.alloc_register();
+                    program.emit_insn(crate::vdbe::insn::Insn::ChangeCount { dest: reg });
+                    reg
+                }
+            };
             program.emit_result_row(reg, 1);
             program.add_pragma_result_column(column_name.to_string());
         }
