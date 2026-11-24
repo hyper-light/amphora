@@ -717,3 +717,114 @@ fn reads_go_on_while_the_engine_replaces_its_file() {
     lab.store.put(vec![row("a", 2)]).unwrap();
     assert_eq!(count(&lab.store, "a"), 2);
 }
+
+/// A flush the test holds while it runs: how many began, and whether the first may end yet.
+struct Held {
+    state: std::sync::Mutex<(u64, bool)>,
+    moved: std::sync::Condvar,
+}
+
+impl Held {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: std::sync::Mutex::new((0, true)),
+            moved: std::sync::Condvar::new(),
+        })
+    }
+
+    /// A flush that counts itself and holds the first until [`Held::end_first`].
+    fn flush(self: &Arc<Self>) -> Flush {
+        let me = self.clone();
+        Box::new(move || {
+            let mut s = me.state.lock().unwrap();
+            s.0 += 1;
+            me.moved.notify_all();
+            while s.0 == 1 && s.1 {
+                s = me.moved.wait(s).unwrap();
+            }
+            Ok(())
+        })
+    }
+
+    fn first_began(&self) {
+        let mut s = self.state.lock().unwrap();
+        while s.0 == 0 {
+            s = self.moved.wait(s).unwrap();
+        }
+    }
+
+    fn end_first(&self) {
+        self.state.lock().unwrap().1 = false;
+        self.moved.notify_all();
+    }
+
+    fn began(&self) -> u64 {
+        self.state.lock().unwrap().0
+    }
+}
+
+/// A flush waits for the batches handed to the writer before it begins: one committed during the
+/// last flush and one the busy writer had not yet taken are made durable by one flush, the next
+/// (docs/design/store.md, decision 14; AC-T1.1.1).
+#[test]
+fn a_batch_handed_before_a_flush_begins_is_made_durable_by_it() {
+    let held = Held::new();
+    let lab = lab(Config::default(), Some(held.flush()));
+    let store = &lab.store;
+    store.put(vec![row("p", 1)]).unwrap();
+    held.first_began();
+    let x = store.put(vec![row("x", 1)]).unwrap();
+    assert_eq!(count(store, "x"), 1, "x is committed during the first flush");
+    let job = Arc::new((std::sync::Mutex::new((false, false)), std::sync::Condvar::new()));
+    std::thread::scope(|s| {
+        let busy = job.clone();
+        s.spawn(move || {
+            store
+                .run(soon(), move |_e| {
+                    let (m, cv) = &*busy;
+                    let mut j = m.lock().unwrap();
+                    j.0 = true;
+                    cv.notify_all();
+                    while !j.1 {
+                        j = cv.wait(j).unwrap();
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        });
+        let (m, cv) = &*job;
+        let mut j = m.lock().unwrap();
+        while !j.0 {
+            j = cv.wait(j).unwrap();
+        }
+        drop(j);
+        let y = store.put(vec![row("y", 1)]).unwrap();
+        held.end_first();
+        m.lock().unwrap().1 = true;
+        cv.notify_all();
+        store.durable(&y, soon()).unwrap();
+    });
+    store.durable(&x, soon()).unwrap();
+    assert_eq!(held.began(), 2, "x and y were made durable by one flush after the first");
+}
+
+/// A sender told its batch is durable that never sends again holds no flush: what was committed
+/// during the flush that told it is made durable by the next (docs/design/store.md, decision 14;
+/// AC-T1.1.1).
+#[test]
+fn a_sender_told_durable_that_sends_nothing_more_holds_no_flush() {
+    let held = Held::new();
+    let lab = lab(Config::default(), Some(held.flush()));
+    let store = &lab.store;
+    let p = store.put(vec![row("p", 1)]).unwrap();
+    held.first_began();
+    std::thread::scope(|s| {
+        let told = s.spawn(|| store.durable(&p, soon()));
+        let x = store.put(vec![row("x", 1)]).unwrap();
+        assert_eq!(count(store, "x"), 1, "x is committed during the first flush");
+        held.end_first();
+        told.join().unwrap().unwrap();
+        store.durable(&x, soon()).unwrap();
+    });
+    assert_eq!(held.began(), 2);
+}
