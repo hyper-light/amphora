@@ -1,16 +1,17 @@
 # Lane C3 (planner), 2026-11-24 05:55:48Z to 06:55:48Z: t_pl_8_13, a left join inside a bushy run
 
-Machine: MacBook Pro 2 (runner e30189ea), the only Mac that took a run this hour: load 50 to 85 on 18 cores, each of my
+Machine: MacBook Pro 2 (runner e30189ea), the only Mac that took a run this hour: load 50 to 86 on 18 cores, each of my
 processes at nice 20 on 10 to 16% of a core (CPU time against elapsed, r660). adacachy2 was closed to lanes (Ada's
-benchmark window). Branch perf/planner-c3 from origin/main 0101aa38. Probes (not for main): perf/planner-c3-ab (main's engine,
-test code and scripts only, and the candidate as c3/candidate.patch).
+benchmark window). perf/planner-c3 is main 0101aa38 with this record and no code. Not green, so on branches of their own:
+perf/planner-c3-candidate d564a2f0 (the candidate price, the sweep's test, its fixture and generator) and
+perf/planner-c3-ab 69dc0668 (main's engine with the probes, and the candidate as c3/candidate.patch).
 
 ## 1. Losses first
 
 - **Not merged, and t_pl_8_13 was not reproduced here.** Its only round to run (r570, main's engine, debug, fresh calibration)
   took 2 min 51 s of CPU in 24 minutes and neither failed nor ended before my limit: no expected-against-got rows.
 - **The candidate fix has never been run.** Its build (r647) did not end either.
-- The sweep was not run. The new test in optimizer/mod.rs has not been compiled.
+- The sweep was not run. Its test has not been compiled.
 - The forced shapes (r636's second half) met my 10 minute limit inside the first shape: no time for either plan.
 - r554, r565, r596 and r609, without `on`, were still queued behind other lanes at 06:44Z; r592's sync timed out (60 s).
 
@@ -29,9 +30,11 @@ Query 0 (`d1 LEFT JOIN d2 s`, no extra ON term), ANALYZEd, main's engine, debug,
 | LEFT JOIN probes allowed | yes | no | SQLite's |
 | adaptive joins | yes | yes | SQLite's |
 | parallel mode, 1 core | yes | yes | SQLite's |
+| parallel mode, 2 cores | yes | yes | SQLite's |
 
 Query 1 (its mirror FROM), by cost (r636): bushy with the LEFT JOIN in the run, `172800,1032825600,1038240000,57600,345600`, SQLite's.
-Not run: the other six queries, without statistics, 2 and 8 workers, the other join methods.
+Whether the parallel hook ran, or the serial loop answered, was not read. Not run: the other six queries, without statistics,
+8 workers, the other join methods.
 
 ## 3. The trace: why the search does not put the LEFT JOIN in the run (r636, `c3_probe_weighed`)
 
@@ -55,7 +58,7 @@ Query 0 at the weights the test starts with: seek 12.79 rows' visits, hash build
   51,705 and the test's plan 19,749, so the second run has the LEFT JOIN in the run. The test passes where that weight moves
   far enough and fails where it does not. Why one run moves it 15 times is not traced.
 
-## 4. The candidate (perf/planner-c3 48ea2a32, unverified)
+## 4. The candidate (perf/planner-c3-candidate d564a2f0, never run)
 
 A row's insert into an ephemeral index costs a seek and a row's visit. `t_qt_5_5_an_ephemeral_index_past_its_cache_reads_and_writes_its_leaves`
 restated the old formula and is changed with it; its page counts are not. The price reaches every automatic index, so TPC-H's 22 plans have to
@@ -66,6 +69,6 @@ be listed before and after.
 - `JOBS=16 bash c3/all.sh` in a checkout of perf/planner-c3-ab (a Mac; r596 is it, queued) builds both arms and prints, for each: six rounds of
   t_pl_8_13 on fresh calibrations, the plans weighed, both shapes forced and timed (15 runs), an automatic index's build timed at 1,500 to
   48,000 rows against a scan and its price, eight queries under 13 settings judged by sqlite3, and the 420-query sweep.
-- bench/sqlite_outer_joins.py writes crates/engine/tests/fixtures/outer_joins.tsv: 400 drawn queries of 4 and 5 tables at three sizes and 20 over the
+- On perf/planner-c3-candidate, bench/sqlite_outer_joins.py writes crates/engine/tests/fixtures/outer_joins.tsv: 400 drawn queries of 4 and 5 tables at three sizes and 20 over the
   test's facts (302 hold a LEFT JOIN, 134 a RIGHT, 137 a FULL, 30 give no row), with SQLite 3.54.0's answers.
 - `t_pl_8_13_outer_joins_answer_as_sqlite_whatever_the_plan` holds every plan to them.
