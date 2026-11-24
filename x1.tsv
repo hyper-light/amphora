@@ -1,0 +1,7 @@
+# x
+db	self
+sql	PRAGMA foreign_keys = ON
+sql	CREATE TABLE t(id INTEGER PRIMARY KEY, pid INT REFERENCES t(id))
+sql	INSERT INTO t VALUES (1, 1), (2, 1), (3, 2)
+x	INSERT INTO t VALUES (4, 5)
+q	INSERT INTO t VALUES (4, 5)	ERROR FOREIGN KEY constraint failed

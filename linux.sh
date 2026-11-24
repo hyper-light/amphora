@@ -62,6 +62,9 @@ for step in "$@"; do
       echo "== check-production rc=$rc $(( $(date +%s) - s ))s"; tail -8 "$O/production.log" ;;
     fmt)
       cargo fmt --all --check > "$O/fmt.log" 2>&1; echo "== fmt rc=$?"; head -60 "$O/fmt.log" ;;
+    raw:*)  # raw:SHA8:FILE
+      IFS=: read -r _ sha file <<< "$step"
+      C26_FIXTURE=$S/$file timeout 120 nice -n 10 "$O/bin/probe-$sha" --nocapture 2>/dev/null | cut -c1-${CUT:-200} | head -${RAW_LINES:-150} ;;
     sh:*) bash -c "${step#sh:}" ;;
   esac
 done
