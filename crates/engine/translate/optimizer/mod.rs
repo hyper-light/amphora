@@ -72,7 +72,7 @@ use join::{
     compute_best_join_order_with_context, count_subquery_calls_for_plan, BestJoinOrderResult,
     CorrelatedSubqueryEstimate, JoinN, JoinPlanningContext,
 };
-use lift_common_subexpressions::{column_read_can_raise, rewrite_or_terms};
+use lift_common_subexpressions::{anti_joined_tables, column_read_can_raise, rewrite_or_terms};
 use order::{
     compute_order_target, plan_satisfies_order_target, simple_aggregate_order_target,
     EliminatesSortBy, OrderTargetPurpose,
@@ -1213,6 +1213,7 @@ fn find_select_plan_form(
     rewrite_or_terms(
         &mut plan.where_clause,
         &available_indexes,
+        &anti_joined_tables(&plan.table_references),
         &|table, column| column_read_can_raise(&plan.table_references, resolver, table, column),
     )?;
     if let ConstantConditionEliminationResult::ImpossibleCondition = eliminate_constant_conditions(
@@ -1504,6 +1505,7 @@ fn optimize_delete_plan(plan: &mut DeletePlan, resolver: &Resolver) -> Result<()
     rewrite_or_terms(
         &mut plan.where_clause,
         &available_indexes,
+        &anti_joined_tables(&plan.table_references),
         &|table, column| column_read_can_raise(&plan.table_references, resolver, table, column),
     )?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
@@ -1558,6 +1560,7 @@ fn optimize_update_plan(
     rewrite_or_terms(
         &mut plan.where_clause,
         &available_indexes,
+        &anti_joined_tables(&target_tables),
         &|table, column| column_read_can_raise(&target_tables, resolver, table, column),
     )?;
     if let ConstantConditionEliminationResult::ImpossibleCondition = eliminate_constant_conditions(
