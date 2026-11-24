@@ -16,10 +16,7 @@ use crate::{
             restore_returning_row_image_in_cache, seed_returning_row_image_in_cache,
             ReturningBufferCtx,
         },
-        fkeys::{
-            build_index_affinity_string, emit_guarded_fk_decrement, open_read_index,
-            open_read_table, ForeignKeyActions,
-        },
+        fkeys::ForeignKeyActions,
         main_loop::{CloseLoop, InitLoop, OpenLoop},
         plan::{
             DeletePlan, EvalAt, JoinOrderMember, JoinedTable, NonFromClauseSubquery, Operation,
@@ -356,148 +353,6 @@ fn emit_clear_btree_delete(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn emit_fk_child_decrement_on_delete(
-    program: &mut ProgramBuilder,
-    child_tbl: &BTreeTable,
-    child_table_name: &str,
-    child_cursor_id: usize,
-    child_rowid_reg: usize,
-    database_id: usize,
-    resolver: &Resolver,
-) -> crate::Result<()> {
-    for fk_ref in
-        resolver.with_schema(database_id, |s| s.resolved_fks_for_child(child_table_name))?
-    {
-        if !fk_ref.fk.deferred {
-            continue;
-        }
-        // Fast path: if any FK column is NULL can't be a violation
-        let null_skip = program.allocate_label();
-        for cname in &fk_ref.fk.child_columns {
-            let (pos, col) = child_tbl.get_column(cname).unwrap();
-            let src = if col.is_rowid_alias() {
-                child_rowid_reg
-            } else {
-                let tmp = program.alloc_register();
-                program.emit_insn(Insn::Column {
-                    cursor_id: child_cursor_id,
-                    column: pos,
-                    dest: tmp,
-                    default: None,
-                });
-                tmp
-            };
-            program.emit_insn(Insn::IsNull {
-                reg: src,
-                target_pc: null_skip,
-            });
-        }
-
-        if fk_ref.parent_uses_rowid {
-            // Probe parent table by rowid
-            let parent_tbl = resolver
-                .with_schema(database_id, |s| s.get_btree_table(&fk_ref.fk.parent_table))
-                .expect("parent btree");
-            let pcur = open_read_table(program, &parent_tbl, database_id);
-
-            let (pos, col) = child_tbl.get_column(&fk_ref.fk.child_columns[0]).unwrap();
-            let val = if col.is_rowid_alias() {
-                child_rowid_reg
-            } else {
-                let tmp = program.alloc_register();
-                program.emit_insn(Insn::Column {
-                    cursor_id: child_cursor_id,
-                    column: pos,
-                    dest: tmp,
-                    default: None,
-                });
-                tmp
-            };
-            let tmpi = program.alloc_register();
-            program.emit_insn(Insn::Copy {
-                src_reg: val,
-                dst_reg: tmpi,
-                extra_amount: 0,
-            });
-            program.emit_insn(Insn::MustBeInt {
-                reg: tmpi,
-                target_pc: None,
-            });
-
-            // NotExists jumps when the parent key is missing, so we decrement there
-            let missing = program.allocate_label();
-            let done = program.allocate_label();
-
-            program.emit_insn(Insn::NotExists {
-                cursor: pcur,
-                rowid_reg: tmpi,
-                target_pc: missing,
-            });
-
-            // Parent FOUND, no decrement
-            program.emit_insn(Insn::Close { cursor_id: pcur });
-            program.emit_insn(Insn::Goto { target_pc: done });
-
-            // Parent MISSING, decrement is guarded by FkIfZero to avoid underflow
-            program.preassign_label_to_next_insn(missing);
-            program.emit_insn(Insn::Close { cursor_id: pcur });
-            emit_guarded_fk_decrement(program, done, true);
-            program.preassign_label_to_next_insn(done);
-        } else {
-            // Probe parent unique index
-            let parent_tbl = resolver
-                .with_schema(database_id, |s| s.get_btree_table(&fk_ref.fk.parent_table))
-                .expect("parent btree");
-            let idx = fk_ref.parent_unique_index.as_ref().expect("unique index");
-            let icur = open_read_index(program, idx, database_id);
-
-            // Build probe from current child row
-            let n = fk_ref.fk.child_columns.len();
-            let probe = program.alloc_registers(n);
-            for (i, cname) in fk_ref.fk.child_columns.iter().enumerate() {
-                let (pos, col) = child_tbl.get_column(cname).unwrap();
-                let src = if col.is_rowid_alias() {
-                    child_rowid_reg
-                } else {
-                    let r = program.alloc_register();
-                    program.emit_insn(Insn::Column {
-                        cursor_id: child_cursor_id,
-                        column: pos,
-                        dest: r,
-                        default: None,
-                    });
-                    r
-                };
-                program.emit_insn(Insn::Copy {
-                    src_reg: src,
-                    dst_reg: probe + i,
-                    extra_amount: 0,
-                });
-            }
-            program.emit_insn(Insn::Affinity {
-                start_reg: probe,
-                count: std::num::NonZeroUsize::new(n).unwrap(),
-                affinities: build_index_affinity_string(idx, &parent_tbl),
-            });
-
-            let ok = program.allocate_label();
-            program.emit_insn(Insn::Found {
-                cursor_id: icur,
-                target_pc: ok,
-                record_reg: probe,
-                num_regs: n,
-            });
-            program.emit_insn(Insn::Close { cursor_id: icur });
-            emit_guarded_fk_decrement(program, ok, true);
-            program.preassign_label_to_next_insn(ok);
-            program.emit_insn(Insn::Close { cursor_id: icur });
-        }
-        program.preassign_label_to_next_insn(null_skip);
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
 fn emit_delete_insns<'a>(
     connection: &Arc<Connection>,
     program: &mut ProgramBuilder,
@@ -690,47 +545,22 @@ fn emit_delete_row_common(
     let internal_id = unsafe { (*table_reference).internal_id };
     let table_name = unsafe { &*table_reference }.table.get_name();
 
-    // Phase 1: Before Delete - build parent key registers and handle NoAction/Restrict.
-    // CASCADE/SetNull/SetDefault actions are prepared but deferred until after Delete.
-    let prepared_fk_actions = if connection.foreign_keys_enabled() {
-        let delete_db_id = unsafe { (*table_reference).database_id };
-        if let Some(table) = unsafe { &*table_reference }.btree() {
-            let prepared = if t_ctx
-                .resolver
-                .with_schema(delete_db_id, |s| s.any_resolved_fks_referencing(table_name))
-            {
-                ForeignKeyActions::prepare_fk_delete_actions(
-                    program,
-                    &mut t_ctx.resolver,
-                    table_name,
-                    main_table_cursor_id,
-                    rowid_reg,
-                    None,
-                    delete_db_id,
-                )?
-            } else {
-                ForeignKeyActions::default()
-            };
-            if t_ctx
-                .resolver
-                .with_schema(delete_db_id, |s| s.has_child_fks(table_name))
-            {
-                emit_fk_child_decrement_on_delete(
-                    program,
-                    &table,
-                    table_name,
-                    main_table_cursor_id,
-                    rowid_reg,
-                    delete_db_id,
-                    &t_ctx.resolver,
-                )?;
-            }
-            prepared
-        } else {
-            ForeignKeyActions::default()
-        }
-    } else {
-        ForeignKeyActions::default()
+    // Phase 1: Before Delete - count what the row's removal breaks and mends.
+    // RESTRICT/CASCADE/SetNull/SetDefault actions are prepared but deferred until after Delete.
+    let fk_table = connection
+        .foreign_keys_enabled()
+        .then(|| unsafe { &*table_reference }.btree())
+        .flatten();
+    let prepared_fk_actions = match &fk_table {
+        Some(table) => ForeignKeyActions::remove_row(
+            program,
+            &mut t_ctx.resolver,
+            table,
+            main_table_cursor_id,
+            rowid_reg,
+            unsafe { (*table_reference).database_id },
+        )?,
+        None => ForeignKeyActions::default(),
     };
 
     if unsafe { &*table_reference }.virtual_table().is_some() {
@@ -904,13 +734,13 @@ fn emit_delete_row_common(
     // Phase 2: After Delete - fire CASCADE/SetNull/SetDefault FK actions.
     // Per SQLite docs, the parent row must be deleted before FK cascade actions fire,
     // so triggers during cascade see the parent row as already deleted.
-    {
-        let delete_db_id = unsafe { (*table_reference).database_id };
+    if let Some(table) = &fk_table {
         prepared_fk_actions.fire_prepared_fk_delete_actions(
             program,
             &mut t_ctx.resolver,
             connection,
-            delete_db_id,
+            table,
+            unsafe { (*table_reference).database_id },
         )?;
     }
 

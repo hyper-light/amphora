@@ -1905,6 +1905,13 @@ impl ProgramState {
             .load(Ordering::Acquire)
     }
 
+    /// A statement counts its immediate violations across the programs it runs: each takes the
+    /// count up where its caller left it and hands it back.
+    pub fn set_fk_immediate_violations_during_stmt(&self, violations: isize) {
+        self.fk_immediate_violations_during_stmt
+            .store(violations, Ordering::Release);
+    }
+
     pub fn increment_fk_immediate_violations_during_stmt(&self, v: isize) {
         self.fk_immediate_violations_during_stmt
             .fetch_add(v, Ordering::AcqRel);

@@ -11,8 +11,8 @@ use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, EXPR_INDEX_SENTINEL, 
 use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{
-    affected_parent_fks_for_update, emit_fk_child_update_counters, emit_fk_update_parent_actions,
-    fire_fk_update_actions, ParentKeyNewProbeMode,
+    affected_parent_fks_for_update, emit_fk_row_added, emit_fk_row_removed, fire_fk_update_actions,
+    FkRow,
 };
 use crate::translate::insert::{
     expr_contains_subquery, format_unique_violation_desc, InsertEmitCtx,
@@ -1094,18 +1094,9 @@ pub fn emit_upsert(
         }
         _ => crate::alloc::vec![],
     };
-    let has_parent_fk_checks = affected_parent_fks.iter().any(|fk| {
-        matches!(
-            fk.fk.on_update,
-            ast::RefAct::NoAction | ast::RefAct::Restrict
-        )
-    });
-    let has_parent_fk_actions = affected_parent_fks.iter().any(|fk| {
-        matches!(
-            fk.fk.on_update,
-            ast::RefAct::Cascade | ast::RefAct::SetNull | ast::RefAct::SetDefault
-        )
-    });
+    let has_parent_fk_actions = affected_parent_fks
+        .iter()
+        .any(|fk| fk.fk.on_update != ast::RefAct::NoAction);
     let preserved_old_registers: Option<Vec<usize>> = if let Some(btree_table) = table_btree {
         let relevant_before_update_triggers = get_triggers_including_temp(
             resolver,
@@ -1248,66 +1239,37 @@ pub fn emit_upsert(
     } else {
         None
     };
-    let rowid_alias_idx = table.columns().iter().position(|c| c.is_rowid_alias());
-    let has_direct_rowid_update = set_pairs
-        .iter()
-        .any(|(idx, _)| *idx == rowid_alias_idx.unwrap_or(ROWID_SENTINEL));
-    let has_user_provided_rowid = if let Some(i) = rowid_alias_idx {
-        set_pairs.iter().any(|(idx, _)| *idx == i) || has_direct_rowid_update
-    } else {
-        has_direct_rowid_update
-    };
-
-    let rowid_set_clause_reg = if has_user_provided_rowid {
-        Some(new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg))
-    } else {
-        None
-    };
     if let Some(bt) = table.btree() {
         if connection.foreign_keys_enabled() {
-            let rowid_new_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
-
-            // Child-side checks
-            if resolver.with_schema(upsert_database_id, |s| s.has_child_fks(bt.name.as_str())) {
-                emit_fk_child_update_counters(
-                    program,
+            if let Some(old_row) = FkRow::read(
+                program,
+                resolver,
+                &bt,
+                ctx.cursor_id,
+                ctx.conflict_rowid_reg,
+                upsert_database_id,
+            )? {
+                let new_row = FkRow::image(
                     &bt,
-                    table.get_name(),
-                    ctx.cursor_id,
-                    new_start,
-                    rowid_new_reg,
-                    &directly_changed_cols,
-                    upsert_database_id,
-                    resolver,
-                    &layout,
-                )?;
-            }
-            let upsert_indices: Vec<_> = resolver.with_schema(upsert_database_id, |s| {
-                s.get_indices(table.get_name()).cloned().collect()
-            });
-            let affected_upsert_indices: Vec<_> = upsert_indices
-                .iter()
-                .filter_map(|idx| {
-                    upsert_index_is_affected(table, idx, &directly_changed_cols, rowid_changed)
-                        .map(|affected| affected.then_some(idx))
-                        .transpose()
-                })
-                .collect::<crate::Result<_>>()?;
-            if has_parent_fk_checks {
-                let _ = emit_fk_update_parent_actions(
-                    program,
-                    &bt,
-                    &affected_parent_fks,
-                    affected_upsert_indices.into_iter(),
-                    ctx.cursor_id,
-                    ctx.conflict_rowid_reg,
                     new_start,
                     new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
-                    rowid_set_clause_reg,
-                    &updated_positions,
-                    ParentKeyNewProbeMode::BeforeWrite,
-                    upsert_database_id,
+                    bt.column_layout()?,
+                );
+                emit_fk_row_removed(
+                    program,
                     resolver,
+                    &bt,
+                    &old_row,
+                    Some(&updated_positions),
+                    upsert_database_id,
+                )?;
+                emit_fk_row_added(
+                    program,
+                    resolver,
+                    &bt,
+                    &new_row,
+                    Some((&updated_positions, &old_row)),
+                    upsert_database_id,
                 )?;
             }
         }

@@ -4067,6 +4067,15 @@ pub fn op_prev(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Whether the statement would leave an immediate foreign key broken if it ended now.
+fn violates_immediate_fk(program: &Program, state: &ProgramState) -> bool {
+    program.connection.foreign_keys_enabled() && state.get_fk_immediate_violations_during_stmt() > 0
+}
+
+fn fk_constraint_failed() -> LimboError {
+    LimboError::ForeignKeyConstraint("FOREIGN KEY constraint failed".to_string())
+}
+
 pub fn halt(
     program: &Program,
     state: &mut ProgramState,
@@ -4116,6 +4125,9 @@ pub fn halt(
             return Err(LimboError::RaiseIgnore.into());
         }
         if err_code > 0 {
+            if resolve_type == ResolveType::Fail && violates_immediate_fk(program, state) {
+                return Err(fk_constraint_failed().into());
+            }
             let error = match resolve_type {
                 ResolveType::Abort | ResolveType::Rollback | ResolveType::Fail => {
                     LimboError::Raise(resolve_type, description.to_string())
@@ -4170,20 +4182,15 @@ pub fn halt(
             Some(HaltAction::Rollback) => ResolveType::Rollback,
             Some(HaltAction::Raise(_)) | None => ResolveType::Abort,
         };
+        // FAIL keeps what the statement wrote only while its foreign keys hold (SQLite's
+        // sqlite3VdbeHalt: the violation is the error then, and it aborts).
+        if state.constraint_action == ResolveType::Fail && violates_immediate_fk(program, state) {
+            state.constraint_action = ResolveType::Abort;
+            return Err(fk_constraint_failed().into());
+        }
         // For FAIL mode with autocommit, commit partial changes before returning error.
         // This matches SQLite behavior where FAIL keeps changes made before the error.
-        // Note: ON CONFLICT FAIL does NOT apply to FK violations, so we check for those first.
         if state.constraint_action == ResolveType::Fail && can_autocommit_now {
-            // Check for immediate FK violations - FK errors don't respect ON CONFLICT
-            if program.connection.foreign_keys_enabled()
-                && state.get_fk_immediate_violations_during_stmt() > 0
-            {
-                return Err(LimboError::ForeignKeyConstraint(
-                    "FOREIGN KEY constraint failed".to_string(),
-                )
-                .into());
-            }
-
             // Stage every custom index before releasing the statement
             // savepoint, then commit the partial FAIL changes. Yielding for
             // I/O here is safe because Halt is re-entrant: the whole opcode
@@ -4222,14 +4229,11 @@ pub fn halt(
         can_autocommit_now
     );
 
-    // Check for immediate foreign key violations.
-    // Any immediate violation causes the statement subtransaction to roll back.
-    if program.connection.foreign_keys_enabled()
-        && state.get_fk_immediate_violations_during_stmt() > 0
-    {
-        return Err(
-            LimboError::ForeignKeyConstraint("FOREIGN KEY constraint failed".to_string()).into(),
-        );
+    // An immediate foreign key is checked where the statement ends, not where a program it runs
+    // does: a later program, or the statement itself, may still make it hold (SQLite's OP_Halt
+    // leaves a frame without sqlite3VdbeCheckFk).
+    if !program.is_trigger_subprogram() && violates_immediate_fk(program, state) {
+        return Err(fk_constraint_failed().into());
     }
 
     if program.is_trigger_subprogram() {
@@ -6364,6 +6368,8 @@ pub fn op_program(
                         .expect("param_idx + 1 should be non-zero");
                     statement.bind_at(param_index, value)?;
                 }
+                statement
+                    .set_fk_immediate_violations(state.get_fk_immediate_violations_during_stmt());
 
                 *state.active_op_state.program() = OpProgramState::Step {
                     is_trigger,
@@ -6425,6 +6431,9 @@ pub fn op_program(
                         Err(err) => {
                             subprogram_aborted = true;
                             state.constraint_action = statement.constraint_action();
+                            state.set_fk_immediate_violations_during_stmt(
+                                statement.fk_immediate_violations(),
+                            );
                             finish_subprogram(
                                 program,
                                 &statement,
@@ -6445,6 +6454,7 @@ pub fn op_program(
                     saved_last_insert_rowid,
                     saved_last_changes_value,
                 );
+                state.set_fk_immediate_violations_during_stmt(statement.fk_immediate_violations());
 
                 // Cache the statement for reuse on subsequent fires of this
                 // same Program instruction (e.g. next row in an INSERT loop).

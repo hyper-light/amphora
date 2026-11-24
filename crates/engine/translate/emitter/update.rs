@@ -15,10 +15,9 @@ use crate::{
     sync::Arc,
     translate::{
         emitter::{
-            check_expr_references_columns, delete::emit_fk_child_decrement_on_delete,
-            emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
-            emit_cdc_patch_record, emit_check_constraints, emit_index_column_value_new_image,
-            emit_index_column_value_old_image, emit_make_record,
+            check_expr_references_columns, emit_cdc_autocommit_commit, emit_cdc_full_record,
+            emit_cdc_insns, emit_cdc_patch_record, emit_check_constraints,
+            emit_index_column_value_new_image, emit_index_column_value_old_image, emit_make_record,
             emit_partial_index_where_old_image, emit_program_for_select, OperationMode, Resolver,
             UpdateRowSource,
         },
@@ -31,10 +30,8 @@ use crate::{
             ReturningBufferCtx,
         },
         fkeys::{
-            affected_parent_fks_for_update, emit_fk_child_update_counters,
-            emit_fk_parent_deferred_new_key_probes, emit_fk_update_parent_actions,
-            fire_fk_update_actions, stabilize_new_row_for_fk, ForeignKeyActions,
-            ParentKeyNewProbeMode,
+            affected_parent_fks_for_update, emit_fk_row_added, emit_fk_row_removed,
+            fire_fk_update_actions, stabilize_new_row_for_fk, FkRow, ForeignKeyActions,
         },
         main_loop::{CloseLoop, InitLoop, OpenLoop},
         plan::{
@@ -758,10 +755,8 @@ pub(crate) fn update_trigger_context(
 /// before the UPDATE can proceed. This function emits that delete:
 /// it removes every index entry belonging to the conflicting row from
 /// `all_index_cursors`, deletes the btree row itself, and — when foreign
-/// keys are enabled — prepares and fires the appropriate FK actions and
-/// child-FK counter decrements. `new_row_registers`, when provided, lets
-/// FK action emission see the incoming NEW image so it can distinguish a
-/// cascading REPLACE from an unrelated delete.
+/// keys are enabled — counts what its removal breaks and mends and fires the
+/// appropriate FK actions.
 #[allow(clippy::too_many_arguments)]
 fn emit_replace_delete<'a>(
     program: &mut ProgramBuilder,
@@ -771,48 +766,25 @@ fn emit_replace_delete<'a>(
     target_table_cursor_id: usize,
     all_index_cursors: &[(Arc<Index>, usize)],
     conflicting_rowid_reg: usize,
-    new_row_registers: Option<(usize, usize)>,
     update_database_id: usize,
     t_ctx: &mut TranslateCtx<'a>,
 ) -> crate::Result<()> {
     let table_name = target_table.table.get_name();
     let internal_id = target_table.internal_id;
-    let prepared_fk_actions = if connection.foreign_keys_enabled() {
-        let prepared = if t_ctx.resolver.with_schema(update_database_id, |s| {
-            s.any_resolved_fks_referencing(table_name)
-        }) {
-            ForeignKeyActions::prepare_fk_delete_actions(
-                program,
-                &mut t_ctx.resolver,
-                table_name,
-                target_table_cursor_id,
-                conflicting_rowid_reg,
-                new_row_registers,
-                update_database_id,
-            )?
-        } else {
-            ForeignKeyActions::default()
-        };
-        if t_ctx
-            .resolver
-            .with_schema(update_database_id, |s| s.has_child_fks(table_name))
-        {
-            emit_fk_child_decrement_on_delete(
-                program,
-                &target_table
-                    .table
-                    .btree()
-                    .expect("UPDATE target must be a BTree table"),
-                table_name,
-                target_table_cursor_id,
-                conflicting_rowid_reg,
-                update_database_id,
-                &t_ctx.resolver,
-            )?;
-        }
-        prepared
-    } else {
-        ForeignKeyActions::default()
+    let fk_table = connection
+        .foreign_keys_enabled()
+        .then(|| target_table.table.btree())
+        .flatten();
+    let prepared_fk_actions = match &fk_table {
+        Some(table) => ForeignKeyActions::remove_row(
+            program,
+            &mut t_ctx.resolver,
+            table,
+            target_table_cursor_id,
+            conflicting_rowid_reg,
+            update_database_id,
+        )?,
+        None => ForeignKeyActions::default(),
     };
 
     for (other_index, other_idx_cursor_id) in all_index_cursors {
@@ -871,12 +843,15 @@ fn emit_replace_delete<'a>(
         is_part_of_update: true,
     });
 
-    prepared_fk_actions.fire_prepared_fk_delete_actions(
-        program,
-        &mut t_ctx.resolver,
-        connection,
-        update_database_id,
-    )?;
+    if let Some(table) = &fk_table {
+        prepared_fk_actions.fire_prepared_fk_delete_actions(
+            program,
+            &mut t_ctx.resolver,
+            connection,
+            table,
+            update_database_id,
+        )?;
+    }
 
     Ok(())
 }
@@ -1415,15 +1390,9 @@ fn emit_update_insns<'a>(
         )?,
         _ => crate::alloc::vec![],
     };
-    let has_parent_fk_checks = affected_parent_fks
+    let has_parent_fk_actions = affected_parent_fks
         .iter()
-        .any(|fk| matches!(fk.fk.on_update, RefAct::NoAction | RefAct::Restrict));
-    let has_parent_fk_actions = affected_parent_fks.iter().any(|fk| {
-        matches!(
-            fk.fk.on_update,
-            RefAct::Cascade | RefAct::SetNull | RefAct::SetDefault
-        )
-    });
+        .any(|fk| fk.fk.on_update != RefAct::NoAction);
     // A row taken may be a later version than the one an index found: its columns are the table
     // cursor's.
     let mut row_tables = recheck.map(|recheck| recheck.tables);
@@ -2157,7 +2126,6 @@ fn emit_update_insns<'a>(
                         target_table_cursor_id,
                         all_index_cursors,
                         idx_rowid_reg,
-                        Some((start, effective_rowid_reg)),
                         update_database_id,
                         t_ctx,
                     )?;
@@ -2251,7 +2219,6 @@ fn emit_update_insns<'a>(
             target_table_cursor_id,
             all_index_cursors,
             target_reg,
-            Some((start, effective_rowid_reg)),
             update_database_id,
             t_ctx,
         )?;
@@ -2278,63 +2245,37 @@ fn emit_update_insns<'a>(
     // pre-rewrite table image. Self-referential rows therefore need explicit
     // handling: table scans see OLD values, while the NEW parent/child keys
     // live in registers until the rewrite.
-    let mut deferred_new_key_plans = Vec::new();
-    if connection.foreign_keys_enabled() {
-        let rowid_new_reg = effective_rowid_reg;
-        if let Some(table_btree) = target_table.table.btree() {
-            // Parent-side checks scan child rows that point at the OLD parent
-            // key. Each match means this update may create a new violation:
-            // RESTRICT halts immediately, while NO ACTION increments the FK
-            // counter so the statement/transaction can fail later if nothing
-            // fixes it.
-            if has_parent_fk_checks {
-                let new_key_probe_mode = if any_effective_replace(
-                    program.flags.has_statement_conflict(),
-                    or_conflict,
-                    table_btree.rowid_alias_conflict_clause,
-                    indexes_to_update.iter().map(|idx| idx.on_conflict),
-                ) {
-                    ParentKeyNewProbeMode::AfterReplace
-                } else {
-                    ParentKeyNewProbeMode::BeforeWrite
-                };
-                deferred_new_key_plans = emit_fk_update_parent_actions(
-                    program,
-                    &table_btree,
-                    &affected_parent_fks,
-                    indexes_to_update.iter(),
-                    target_table_cursor_id,
-                    beg,
-                    start,
-                    rowid_new_reg,
-                    rowid_set_clause_reg,
-                    &updated_column_indices,
-                    new_key_probe_mode,
-                    update_database_id,
-                    &t_ctx.resolver,
-                )?;
-            }
-        }
-    }
-
-    // Child-side checks answer the opposite question: does the row's NEW child
-    // key have a parent? They also have to run after no-op conflict paths and
-    // before the physical rewrite, for the same counter and rollback reasons as
-    // the parent-side checks above.
     if connection.foreign_keys_enabled() {
         if let Some(table_btree) = target_table.table.btree() {
-            if t_ctx.resolver.schema().has_child_fks(table_name) {
-                emit_fk_child_update_counters(
-                    program,
+            if let Some(old_row) = FkRow::read(
+                program,
+                &t_ctx.resolver,
+                &table_btree,
+                target_table_cursor_id,
+                beg,
+                update_database_id,
+            )? {
+                let new_row = FkRow::image(
                     &table_btree,
-                    table_name,
-                    target_table_cursor_id,
                     start,
                     effective_rowid_reg,
-                    &affected_columns,
-                    update_database_id,
+                    table_btree.column_layout()?,
+                );
+                emit_fk_row_removed(
+                    program,
                     &t_ctx.resolver,
-                    &layout,
+                    &table_btree,
+                    &old_row,
+                    Some(&updated_column_indices),
+                    update_database_id,
+                )?;
+                emit_fk_row_added(
+                    program,
+                    &t_ctx.resolver,
+                    &table_btree,
+                    &new_row,
+                    Some((&updated_column_indices, &old_row)),
+                    update_database_id,
                 )?;
             }
         }
@@ -2537,15 +2478,6 @@ fn emit_update_insns<'a>(
                     &seq_name,
                     &seq,
                     effective_rowid_reg,
-                )?;
-            }
-
-            if connection.foreign_keys_enabled() {
-                emit_fk_parent_deferred_new_key_probes(
-                    program,
-                    &deferred_new_key_plans,
-                    update_database_id,
-                    &t_ctx.resolver,
                 )?;
             }
 
