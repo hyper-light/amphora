@@ -7306,9 +7306,10 @@ mod tests {
     #[test]
     fn a28_a_record_with_no_room_beside_a_held_call_enters_once_the_call_ended() {
         let dir = tempfile::tempdir().unwrap();
-        let budget = budget_of(128 << 20);
+        // The owner's bounds come of a small budget; what the calls charge, of one that holds them all.
+        let (small, budget) = (budget_of(128 << 20), budget_of(1 << 50));
         let mut driven = Driven::new();
-        let client = on_budget(&budget, || driven.open(dir.path(), 1, vec![1, 2, 3], None));
+        let client = on_budget(&small, || driven.open(dir.path(), 1, vec![1, 2, 3], None));
         let handle = client.handle().clone();
         let evaluated = Arc::new(AtomicUsize::new(0));
         let whole = usize::try_from(written(0)).unwrap();
@@ -7318,7 +7319,7 @@ mod tests {
             waiting_call(&handle, alone - whole, until, &evaluated)
         });
         let held = held.unwrap();
-        on_budget(&budget, || driven.step());
+        on_budget(&small, || driven.step());
         assert_eq!(driven.owner(0).waiting.len(), 1);
         // Waits past the first, on the first's room, its deadline a second after the first's.
         let later = until + Duration::from_secs(1);
@@ -7343,14 +7344,14 @@ mod tests {
             );
         };
         refused("the first held");
-        on_budget(&budget, || {
+        on_budget(&small, || {
             driven.advance(0, Duration::from_secs(6));
             driven.step();
         });
         assert!(matches!(held.try_recv(), Ok(Err(Refusal::Timeout))));
         let second = finished(second).unwrap();
         refused("the second in its place");
-        on_budget(&budget, || {
+        on_budget(&small, || {
             driven.advance(0, Duration::from_secs(2));
             driven.step();
             driven.step();
