@@ -127,7 +127,7 @@ impl Descriptors {
         self.released.load(Ordering::SeqCst)
     }
 
-    /// The threads waiting for a give-back now (read only by the Linux accept-loop test).
+    /// The threads waiting for a give-back in the Linux accept-loop test.
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn waiting(&self) -> usize {
         self.waiters
@@ -394,12 +394,22 @@ pub(crate) mod tests {
             let budget = Arc::clone(&budget);
             std::thread::spawn(move || budget.wait_release(seen, &AtomicBool::new(false)))
         };
-        while budget.waiting() == 0 {
+        let id = waiter.thread().id();
+        let registrations = || {
+            budget
+                .waiters
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|thread| thread.id() == id)
+                .count()
+        };
+        while registrations() == 0 {
             std::thread::yield_now();
         }
         // Deliver just the notification for a generation the waiter has already seen.
         budget.wake_waiters();
-        let registered_for_next = budget.waiting();
+        let registered_for_next = registrations();
         drop(held);
         // Let the thread exit even if the registration was lost, so the assertion can report it.
         if registered_for_next == 0 {
@@ -407,7 +417,7 @@ pub(crate) mod tests {
         }
         waiter.join().unwrap();
         assert_eq!(registered_for_next, 1);
-        assert_eq!(budget.waiting(), 0);
+        assert!(budget.waiters.lock().unwrap().is_empty());
     }
 
     /// AUDIT 6: a waiter for a give-back ends when its listener stops. Do: hold the only
