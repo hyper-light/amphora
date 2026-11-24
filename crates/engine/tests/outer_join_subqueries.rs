@@ -3,8 +3,8 @@
 //! committed; AC-T1.8.6: the differential suite).
 
 use amphora_engine::{
-    ConnectOpts, Connection, Database, DatabaseOpts, MemoryIO, OpenOptions, SqliteDialect,
-    StepResult, Value, IO,
+    ConnectOpts, Connection, Database, DatabaseOpts, JoinMethods, MemoryIO, OpenOptions,
+    SqliteDialect, StepResult, Value, IO,
 };
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -54,21 +54,51 @@ fn open(fill: &[&str]) -> (Arc<MemoryIO>, Arc<Connection>) {
     (io, conn)
 }
 
-/// The settings a user meets a statement under: the parallel mode, and statistics.
-const SETTINGS: [(&str, bool, bool); 4] = [
-    ("default", false, false),
-    ("parallel", true, false),
-    ("statistics", false, true),
-    ("parallel, statistics", true, true),
-];
+/// The settings a user meets a statement under: the parallel mode, statistics, and hash joins
+/// wherever a join can take one, as by cost over larger tables.
+#[derive(Clone, Copy, Debug)]
+struct Settings {
+    parallel: bool,
+    statistics: bool,
+    joins: JoinMethods,
+}
 
-fn set(conn: &Arc<Connection>, parallel: bool, statistics: bool) {
-    if parallel {
+const SETTINGS: [Settings; 5] = {
+    let default = Settings {
+        parallel: false,
+        statistics: false,
+        joins: JoinMethods::ByCost,
+    };
+    [
+        default,
+        Settings {
+            parallel: true,
+            ..default
+        },
+        Settings {
+            statistics: true,
+            ..default
+        },
+        Settings {
+            parallel: true,
+            statistics: true,
+            ..default
+        },
+        Settings {
+            joins: JoinMethods::HashJoinsOnly,
+            ..default
+        },
+    ]
+};
+
+fn set(conn: &Arc<Connection>, settings: Settings) {
+    if settings.parallel {
         conn.set_parallel_mode(amphora_engine::morsel::ParallelMode::On);
     }
-    if statistics {
+    if settings.statistics {
         conn.execute("ANALYZE").unwrap();
     }
+    conn.set_join_methods(settings.joins);
 }
 
 /// The rows of `sql` as the fixture writes SQLite's, or its error.
@@ -97,37 +127,59 @@ fn answer(io: &MemoryIO, conn: &Arc<Connection>, sql: &str) -> Result<String, St
     Ok(format!("{}:{}", lines.len(), lines.join(";")))
 }
 
-/// Do: run every query of the fixture under each setting. Expect: SQLite's rows, and no panic.
+/// What `sql` answers under `settings` in `db`, or what its panic said.
+fn outcome(io: &MemoryIO, conn: &Arc<Connection>, sql: &str) -> String {
+    match catch_unwind(AssertUnwindSafe(|| answer(io, conn, sql))) {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(error)) => format!("ERROR {error}"),
+        Err(panic) => {
+            let message = panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|text| text.to_string()))
+                .unwrap_or_default();
+            format!("PANIC {message}")
+        }
+    }
+}
+
+/// Do: run every query of the fixture under each setting. Expect: SQLite's rows, no panic and no
+/// error, and every table holding after the queries the rows it held before them.
 #[test]
 fn outer_joins_with_nested_subqueries_answer_as_sqlite() {
     let mut wrong: Vec<String> = Vec::new();
     let mut ran = 0;
     for db in cases() {
-        for (setting, parallel, statistics) in SETTINGS {
+        let tables: Vec<String> = db
+            .fill
+            .iter()
+            .filter_map(|statement| statement.strip_prefix("CREATE TABLE "))
+            .filter_map(|rest| rest.split('(').next())
+            .map(|table| format!("SELECT * FROM {table}"))
+            .collect();
+        assert!(!tables.is_empty());
+        for settings in SETTINGS {
             let (mut io, mut conn) = open(&db.fill);
-            set(&conn, parallel, statistics);
+            set(&conn, settings);
+            let held: Vec<String> = tables.iter().map(|sql| outcome(&io, &conn, sql)).collect();
             for (sql, want) in &db.queries {
                 ran += 1;
-                match catch_unwind(AssertUnwindSafe(|| answer(&io, &conn, sql))) {
-                    Ok(Ok(got)) if got == *want => {}
-                    Ok(got) => wrong.push(format!(
-                        "{} {setting}: {sql}\n    SQLite {want}\n    Amphora {got:?}",
-                        db.name
-                    )),
-                    Err(panic) => {
-                        let message = panic
-                            .downcast_ref::<String>()
-                            .cloned()
-                            .or_else(|| panic.downcast_ref::<&str>().map(|text| text.to_string()))
-                            .unwrap_or_default();
-                        wrong.push(format!(
-                            "{} {setting}: {sql}\n    SQLite {want}\n    PANIC {message}",
-                            db.name
-                        ));
-                        // What the panic left behind is not the next query's to answer for.
-                        (io, conn) = open(&db.fill);
-                        set(&conn, parallel, statistics);
-                    }
+                let got = outcome(&io, &conn, sql);
+                let holds: Vec<String> =
+                    tables.iter().map(|sql| outcome(&io, &conn, sql)).collect();
+                if got != *want || holds != held {
+                    wrong.push(format!(
+                        "{} {settings:?}: {sql}\n    SQLite {want}\n    Amphora {got}{}",
+                        db.name,
+                        if holds == held {
+                            String::new()
+                        } else {
+                            format!("\n    TABLES {holds:?}, held {held:?}")
+                        }
+                    ));
+                    // What a panic left behind is not the next query's to answer for.
+                    (io, conn) = open(&db.fill);
+                    set(&conn, settings);
                 }
             }
         }

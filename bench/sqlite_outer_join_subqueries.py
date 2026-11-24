@@ -40,10 +40,17 @@ class Draw:
     def __init__(self, rng):
         self.rng = rng
         self.made = 0
+        self.ctes = False
 
     def alias(self):
         self.made += 1
         return f"s{self.made}"
+
+    def joined(self, join):
+        """A table on `join`'s right. Amphora refuses a WITHOUT ROWID table with an index there in a
+        RIGHT or FULL JOIN, with a subquery or without (finding CM, open), so none is drawn."""
+        keeps_right = join in ("RIGHT JOIN", "FULL JOIN")
+        return self.rng.choice([table for table in SOURCES if table != "w" or not keeps_right])
 
     def column(self, scope, text=False):
         """A column of one of the aliases in reach, the innermost likeliest."""
@@ -115,9 +122,13 @@ class Draw:
             other = self.alias()
             inner = scope + [name, other]
             join = rng.choice(["JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN"])
-            source += f" {join} {rng.choice(SOURCES)} AS {other} ON {name}.k = {other}.k"
+            source += f" {join} {self.joined(join)} AS {other} ON {name}.k = {other}.k"
         elif rng.random() < 0.06:
             source = f"(SELECT k, v, s FROM {rng.choice(SOURCES)} WHERE {rng.choice(['v > 0', 'k IS NOT NULL', '1'])}) AS {name}"
+        elif rng.random() < 0.04:
+            source = f"(SELECT value AS k, key AS v, type AS s FROM json_each(json_array({self.value(scope)}, {self.value(scope)}, 2))) AS {name}"
+        elif self.ctes and rng.random() < 0.5:
+            source = f"c AS {name}"
         where = [self.condition(inner, depth - 1)]
         if rng.random() < 0.35:
             where.append(self.plain(inner))
@@ -142,6 +153,7 @@ class Draw:
     def query(self):
         rng = self.rng
         self.made = 0
+        self.ctes = rng.random() < 0.08
         count = rng.choice([2, 2, 2, 3, 3])
         aliases = [f"a{n}" for n in range(count)]
         depth = rng.choice([1, 2, 2, 3])
@@ -161,7 +173,7 @@ class Draw:
                 on = f"{aliases[rng.randrange(n)]}.k = {aliases[n]}.{rng.choice('kv')}"
             else:
                 on = self.condition(scope, depth)
-            text += f" {join} {rng.choice(SOURCES)} AS {aliases[n]} ON {on}"
+            text += f" {join} {self.joined(join)} AS {aliases[n]} ON {on}"
         columns = [f"{a}.{c}" for a in aliases for c in ("k", "v")]
         if rng.random() < 0.12:
             columns.append(f"({self.select(aliases, depth, 'scalar')})")
@@ -173,7 +185,11 @@ class Draw:
             where.append(self.condition(aliases, depth))
         if rng.random() < 0.2:
             where.append(self.plain(aliases))
-        return f"SELECT {select} FROM {text} WHERE {' AND '.join(where)}"
+        before = ""
+        if self.ctes:
+            source, hint = rng.choice(SOURCES), rng.choice(["", "", "MATERIALIZED ", "NOT MATERIALIZED "])
+            before = f"WITH c AS {hint}(SELECT k, v, s FROM {source} WHERE {rng.choice(['v > 0', 'k IS NOT NULL', '1'])}) "
+        return f"{before}SELECT {select} FROM {text} WHERE {' AND '.join(where)}"
 
 
 def written(value):
