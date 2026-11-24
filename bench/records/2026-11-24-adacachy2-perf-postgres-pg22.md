@@ -48,11 +48,12 @@ does, so its waiters go on before the ROLLBACK.
 ## Against a PostgreSQL 19.0 server
 
 PostgreSQL 19.0 (Debian 19.0-1.pgdg13+1), the postgres:19 image on adacachy2, a container of the lane's own, removed as each
-run ended, its answers by `scripts/postgres-isolation-answers.sh`; `recheck-answers.txt` is md5 5ecaeb386bc6072fdbb6a8a1660cdeb3
-(answers.txt unchanged, b068e44d4a711a644e23e4de6b9165ed). 29 interleavings, 415 steps, two to eight sessions: 34 waits, 33 ended by
+run ended, its answers by `scripts/postgres-isolation-answers.sh`; `recheck-answers.txt` is md5 8eff6e0911a07e5abe5c431883dc4e54
+(answers.txt unchanged, b068e44d4a711a644e23e4de6b9165ed). 30 interleavings, 425 steps, two to eight sessions: 35 waits, 34 ended by
 their holder's end, one that waits for a second holder, 3 refused by a deadlock check, 5 by lock_timeout. 21 ErrorResponse,
-1 NoticeResponse, 69 DataRow, 72 RowDescription, 359 CommandComplete, 380 ReadyForQuery, all the same (severity, SQLSTATE,
-message, position, detail and hint of a refusal).
+1 NoticeResponse, 71 DataRow, 76 RowDescription, 368 CommandComplete, 389 ReadyForQuery, all the same (severity, SQLSTATE,
+message, position, detail and hint of a refusal). The landing's own list was 29 interleavings and 415 steps (md5
+5ecaeb386bc6072fdbb6a8a1660cdeb3); one interleaving came after it, from the red run M3 below.
 
 | Interleavings | Source |
 |---|---|
@@ -75,10 +76,28 @@ T-PG.15.2: the ring found from each transaction in it. T-PG.15.3: over sockets, 
 other session's help. PG21's T-PG.14.2 is gone: it asserted that a ring is refused at the wait that closes it, which is
 not 19's.
 
+## On main as landed (b5584c1e)
+
+psql and pgbench of the postgres:19 image against Amphora and a 19.0 server (`scripts/postgres-clients.sh`, r1816): every comparison of
+PG20's matrix the same, and section 11's check of unit 15, TPC-B at 32 clients that contend for two branches, 20 tellers and 200 accounts
+(`-M simple -c 32 -j 1 -t 50`; not a timed run): Amphora processed 1600/1600, 0 failed, and the accounts', tellers' and branches'
+balances and the history's deltas each moved by 114930; 19.0 processed 1600/1600, 0 failed, each by -103148 (its own random numbers).
+
 ## Red runs
 
-The two red runs of T-PG.15.1 are r1702 and r1713 below (grammar the steps then left out); the landed code's parts taken out one at
-a time, the clients' script and check-production on main as landed are this record's later commits.
+The two red runs of T-PG.15.1 are r1702 and r1713 below (grammar the steps then left out). Each part taken out of the landed
+code (b5584c1e), one at a time, and `cargo test -p amphora --test postgres_isolation` run on it (r1816, r1832; the engine's `t_pg_15_*` where
+that stayed green). Not run to an end in the hour: the statement's snapshot kept apart from the commits it follows (`Txn::reading`),
+unchanged columns read where the index found the row, a refused statement's changes kept, a rollback that keeps
+what SET set; what T-PG.15.1 is meant to catch of them is unproven here:
+
+| Change | What failed |
+|---|---|
+| M1: the row isn't judged again (no term of the WHERE in `RowRecheck::emit`) | T-PG.15.1, and T-PG.14.1 at `update c set v = v + 1 where v = 10`: 19 says `UPDATE 0` and the value 5, the change `UPDATE 1` and 6 |
+| M2: a row locked and passed by is committed as changed (`put_back_unwritten` does nothing) | T-PG.15.1 at its status comparison: the lock-only interleavings |
+| M3: the index cursors aren't read at the newest commit (`read_newest` left out) | GREEN on b5584c1e: no interleaving had a waiter change a key its holder had changed. The one added after the landing ("the key's index entry is the newest version's", 489a0727, answers captured from 19.0, passing on the landed code) makes T-PG.15.1 red on it (r1832) |
+| M4: a refusal in a block keeps the engine's transaction open | T-PG.15.1 at `s2<`: the waiter isn't woken by the refused session's error |
+| M5: no ring is found (`Clock::deadlock` gives none) | T-PG.15.1 at its first `s2!` step |
 
 ## Runs
 
@@ -100,3 +119,8 @@ CARGO_TARGET_DIR ~/.cache/amphora-perf-target/postgres, CARGO_INCREMENTAL=0, nic
 | r1783, 10:19Z, cpus=4, load 65 | fbdb04d9, main c0ec09f4 merged | the clippy command; isolation, listener, protocol; the engine command; check-production | clippy exit 0; 3, 9, 13 passed; 74 passed; check-production exit 0, 10616 as the ratchet holds |
 | r1800, 10:25Z, cpus=6, load 30 | 76a844ed, main 4b5c78b4 merged (lane C16's engine change) | fmt; `cargo clippy -p amphora -p amphora-engine --all-targets --locked -- -D warnings`; isolation, listener, protocol | fmt 0, clippy exit 0 (both `Checking`); 3, 9 and 13 passed |
 | r1809, 10:27Z, cpus=6, load 34 | 73271948, main 58cd91cd merged (lane C12's engine change) | the same | fmt 0, clippy exit 0 (both `Checking`); 3, 9 and 13 passed. The tree that landed |
+| r1816, 10:29Z, cpus=4, load 50 | b5584c1e, main as landed | `cargo build -p amphora --bin amphora`; `scripts/postgres-clients.sh`; the red runs above; `bash scripts/check-production.sh` | clients exit 0, every comparison the same, and the 32 clients above; stopped by the lane during the red run after M4 to run the interleaving M3 showed missing |
+| a foreground run, 10:36Z, cpus=1 | 37752bd6 | the capture with the added interleaving | exit 0; md5 8eff6e09... |
+| r1832, 10:37Z, cpus=6, load 21 | 489a0727 (b5584c1e and the added interleaving) | isolation; the red run M3; `bash scripts/check-production.sh` | 3 passed; M3 red; check-production exit 0, 10600 as the ratchet holds |
+| r1841, 10:41Z, cpus=6, load 35 | b2ac5c15 (that and main c5f5df92, lanes C14's and C15's engine changes) | fmt; isolation | fmt 0; 3 passed (`Compiling amphora-engine`) |
+| this machine | the branch | `cargo fmt --all --check`, `python3 scripts/test_requirements.py` | pass |
