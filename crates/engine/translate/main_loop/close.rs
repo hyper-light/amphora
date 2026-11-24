@@ -464,6 +464,31 @@ fn emit_unmatched_right_rows(
         }
     }
 
+    // The shared body may look a row up in the list this read steps through, so the read steps
+    // through it by a cursor of its own.
+    for source in in_seek_sources(&mut unmatched_rows_operation) {
+        let InSeekSource::Subquery {
+            internal_id,
+            cursor_id,
+        } = source
+        else {
+            continue;
+        };
+        let Some(CursorType::BTreeIndex(index)) = program.get_cursor_type(*cursor_id).cloned()
+        else {
+            return Err(crate::LimboError::InternalError(
+                "an IN subquery's list is not an index".to_string(),
+            ));
+        };
+        let list_cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(index));
+        program.emit_lazy_subquery_call(*internal_id, *cursor_id);
+        program.emit_insn(Insn::OpenDup {
+            new_cursor_id: list_cursor_id,
+            original_cursor_id: *cursor_id,
+        });
+        *cursor_id = list_cursor_id;
+    }
+
     let cursors = TableReadCursors {
         table_cursor_id: Some(table_cursor_id),
         index_cursor_id,
@@ -554,6 +579,22 @@ fn emit_unmatched_right_rows(
     );
     program.preassign_label_to_next_insn(scan_end);
     Ok(())
+}
+
+/// The IN lists an operation seeks by.
+fn in_seek_sources(operation: &mut Operation) -> Vec<&mut InSeekSource> {
+    match operation {
+        Operation::Search(Search::InSeek { source, .. }) => vec![source],
+        Operation::MultiIndexScan(scan) => scan
+            .branches
+            .iter_mut()
+            .filter_map(|branch| match &mut branch.access {
+                MultiIndexBranchAccess::InSeek { source } => Some(source),
+                MultiIndexBranchAccess::Seek { .. } => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Advance one table read that [emit_table_read_start] started: move to the

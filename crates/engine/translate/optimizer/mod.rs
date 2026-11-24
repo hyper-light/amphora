@@ -732,9 +732,9 @@ fn subquery_resources(plan: &Plan) -> SubqueryResources {
             if let Table::FromClauseSubquery(subquery) = &table.table {
                 add_plan(&subquery.plan, resources);
             }
-            // A RIGHT or FULL JOIN's unmatched-row read runs its own copies of the WHERE clause's
-            // subqueries, taken before they were planned: a copy still holds, and writes, what
-            // unnesting removed from the subquery the loops run.
+            // A RIGHT or FULL JOIN's unmatched-row read runs its own copy of a correlated subquery
+            // in a table function's arguments, taken before it was planned: a copy still holds,
+            // and writes, what unnesting removed from the subquery the loops run.
             if let Some(unmatched) = &table.unmatched_right_rows_plan {
                 add_subqueries(&unmatched.subqueries, resources);
             }
@@ -3480,9 +3480,17 @@ fn plan_unmatched_right_rows(
                 continue;
             }
             let term_tables = table_mask_from_expr(&term.expr, table_references, subqueries)?;
+            // The loops plan and code a correlated subquery once, for themselves: its hash tables,
+            // its cursors and its own subqueries' results are named by its tables. A second coding
+            // of it here would share and spoil them, so its term is left to the shared body, which
+            // decides every WHERE term for each unmatched row.
+            let reads_correlated_subquery = subqueries.iter().any(|subquery| {
+                subquery.correlated && expr_references_subquery_id(&term.expr, subquery.internal_id)
+            });
             if !can_use_where_terms
                 || term.origin.join_origin().is_some()
                 || !available_tables.contains_all_set_bits_of(&term_tables)
+                || reads_correlated_subquery
             {
                 term.expr = Expr::Literal(ast::Literal::Numeric("1".to_string()));
                 term.consumed = true;
@@ -3578,14 +3586,17 @@ fn plan_unmatched_right_rows(
                 "the unmatched-row read found no access method".to_string(),
             ));
         };
-        // SQLite compiles subqueries in its copied WHERE clause again. The new
-        // code must run after the left sources enter their NULL-row state.
+        // A correlated subquery left here is in a table function's arguments, which the read can't
+        // leave out. SQLite compiles it again: the new code must run after the left sources enter
+        // their NULL-row state. An uncorrelated one's result is the one the loops read.
         let unmatched_rows_subqueries = subqueries
             .iter()
             .filter(|subquery| {
-                where_clause_for_unmatched_rows.iter().any(|term| {
-                    !term.consumed && expr_references_subquery_id(&term.expr, subquery.internal_id)
-                })
+                subquery.correlated
+                    && where_clause_for_unmatched_rows.iter().any(|term| {
+                        !term.consumed
+                            && expr_references_subquery_id(&term.expr, subquery.internal_id)
+                    })
             })
             .cloned()
             .collect();
