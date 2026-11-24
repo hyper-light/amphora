@@ -181,14 +181,19 @@ was not measured.
   and Q6's among them; `packed_log` 16, `log_read_index` 1, `spilled_log` 2 passed (1 ignored).
   clippy's log shows `Compiling amphora-engine` (not `Checking`: my script counted 0 of the latter
   and ended 3; RULES 6 counts either).
-- The merged tree 87d37672 (main 1f4a8e88 merged with the fix; main moved in crates/engine, PG14 and
-  PG15, after 3a58a13f and 4b9108d4, the merge the A/B's check-production ran on):
-  - Mac (r424, `STEPS='clippy wal'`): `cargo fmt --all --check` clean (run on the branch before the commit); clippy on amphora-engine exit 0, its log
-    `Checking amphora-engine` (1 line). CHECKS_R424
-  - adacachy2, Linux (r425, `scripts/check-production.sh` on 87d37672 in worktree
-    `~/.cache/analytics-q8/prod-src`): exit 0; `engine-ratchet: 10903 left in the engine's production
-    code across 17 lints, as the ratchet holds`; its log shows `Checking amphora-engine`. (The same
-    command on 4b9108d4 (r391) passed too, with the same ratchet line.)
+- The merged trees, with main's later commits (main moved in crates/engine twice in this hour, PG14/PG15
+  and F6's ratchet; also in crates/amphora, crates/api, CLAUDE.md, vendored hyper-raft and scripts):
+  - 87d37672 (main 1f4a8e88): Mac, r424 (`STEPS='clippy wal'`): clippy on amphora-engine exit 0, its log `Checking
+    amphora-engine`; `storage::wal::test::` 111 passed, 0 failed, 1 ignored. `cargo fmt --all --check` clean
+    before each commit. adacachy2, Linux: r425, `scripts/check-production.sh`, exit 0, `engine-ratchet: 10903
+    left ... as the ratchet holds`, its log `Checking amphora-engine`.
+  - d1718017 (main 15dd57d8, F6's ratchet): Mac, r456 (`STEPS='clippy wal'`): clippy exit 0,
+    `Checking amphora-engine` in its log; `storage::wal::test::` 111 passed, 0 failed, 1 ignored. adacachy2, Linux: r454, check-production
+    exit 0, `engine-ratchet: 10617 left ... as the ratchet holds`, its log `Checking amphora-engine` (line 31).
+  - 4b9108d4 (main 3a58a13f), check-production on adacachy2 (r391): exit 0, 10903 left.
+  Since d1718017, main moved only in crates/amphora (V18, 731240ed), which amphora-engine does not depend on
+  (`cargo tree -p amphora-engine --edges normal,build,dev` names only its own crates and
+  amphora-pg-catalog), so the push of the merge with it re-ran nothing (RULES 6).
 
 ## Commands
 
