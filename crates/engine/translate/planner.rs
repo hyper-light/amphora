@@ -487,6 +487,32 @@ fn collect_subquery_table_refs_in_one_select(one: &ast::OneSelect, out: &mut Vec
     }
 }
 
+/// Collects the table names read by the subqueries in a FROM clause's own expressions: its ON
+/// clauses and its table functions' arguments, those of its parenthesized joins included.
+fn collect_subquery_table_refs_in_from_exprs(from: &FromClause, out: &mut Vec<String>) {
+    let mut groups = vec![from];
+    while let Some(group) = groups.pop() {
+        let sources =
+            std::iter::once(&group.select).chain(group.joins.iter().map(|join| &join.table));
+        for source in sources {
+            match source.as_ref() {
+                ast::SelectTable::TableCall(_, args, _) => {
+                    for arg in args {
+                        collect_subquery_table_refs_in_expr(arg, out);
+                    }
+                }
+                ast::SelectTable::Sub(inner, _) => groups.push(inner),
+                ast::SelectTable::Table(..) | ast::SelectTable::Select { .. } => {}
+            }
+        }
+        for join in &group.joins {
+            if let Some(ast::JoinConstraint::On(expr)) = &join.constraint {
+                collect_subquery_table_refs_in_expr(expr, out);
+            }
+        }
+    }
+}
+
 pub fn collect_subquery_table_refs_in_window_clause(
     window_clause: &[ast::WindowDef],
     out: &mut Vec<String>,
@@ -1267,7 +1293,9 @@ fn plan_cte(
 
     let cte_query_plan = if cte_definition.references_itself {
         prepare_recursive_cte_plan(
-            cte_definition,
+            &cte_definition.name,
+            &cte_definition.select,
+            &cte_definition.explicit_columns,
             resolver,
             program,
             &outer_query_refs,
@@ -1331,17 +1359,16 @@ fn plan_cte(
 }
 
 fn prepare_recursive_cte_plan(
-    cte_definition: &CteDefinition,
+    cte_name: &str,
+    select: &Select,
+    explicit_columns: &[String],
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     outer_query_refs: &[OuterQueryReference],
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
-    let select = &cte_definition.select;
     let mut first_recursive_query_index = None;
-    let ref_counter = RecursiveRefCounter {
-        cte_name: &cte_definition.name,
-    };
+    let ref_counter = RecursiveRefCounter { cte_name };
     // Nested CTEs defined at the body level are visible in every arm; bring
     // them into scope so shadowing and use-through-nested-CTE references are
     // counted the way name resolution will see them.
@@ -1362,26 +1389,22 @@ fn prepare_recursive_cte_plan(
             continue;
         }
         if query_index == 0 {
-            crate::bail_parse_error!("circular reference: {}", cte_definition.name);
+            crate::bail_parse_error!("circular reference: {}", cte_name);
         }
         first_recursive_query_index.get_or_insert(query_index);
         if top_level_from_count == 0 {
-            crate::bail_parse_error!("circular reference: {}", cte_definition.name);
+            crate::bail_parse_error!("circular reference: {}", cte_name);
         }
         if top_level_from_count > 1 {
-            crate::bail_parse_error!(
-                "multiple references to recursive table: {}",
-                cte_definition.name
-            );
+            crate::bail_parse_error!("multiple references to recursive table: {}", cte_name);
         }
         if total_count > top_level_from_count {
-            crate::bail_parse_error!("multiple recursive references: {}", cte_definition.name);
+            crate::bail_parse_error!("multiple recursive references: {}", cte_name);
         }
     }
     let Some(first_recursive_query_index) = first_recursive_query_index else {
         return Err(crate::LimboError::InternalError(format!(
-            "recursive CTE {} has no recursive query",
-            cte_definition.name
+            "recursive CTE {cte_name} has no recursive query"
         )));
     };
 
@@ -1422,14 +1445,13 @@ fn prepare_recursive_cte_plan(
         connection,
     )?;
 
-    let explicit_columns = (!cte_definition.explicit_columns.is_empty())
-        .then_some(cte_definition.explicit_columns.as_slice());
+    let explicit_columns = (!explicit_columns.is_empty()).then_some(explicit_columns);
     if let Some(columns) = explicit_columns {
         let result_column_count = initial_query.select_result_columns().len();
         if columns.len() != result_column_count {
             crate::bail_parse_error!(
                 "table {} has {} values for {} columns",
-                cte_definition.name,
+                cte_name,
                 result_column_count,
                 columns.len()
             );
@@ -1444,7 +1466,9 @@ fn prepare_recursive_cte_plan(
     let input_table_id = program.table_reference_counter.next();
     let initial_columns = subquery_output_columns(&initial_query, explicit_columns)?;
     let recursive_arms = RecursiveArms {
-        cte_definition,
+        cte_name,
+        select,
+        explicit_columns,
         first: first_recursive_query_index,
         input_table_id,
     };
@@ -1498,7 +1522,7 @@ fn prepare_recursive_cte_plan(
 
     Ok(Plan::RecursiveCte(Box::new(
         super::plan::RecursiveCtePlan {
-            name: cte_definition.name.clone(),
+            name: cte_name.to_string(),
             columns,
             initial_query: Box::new(initial_query),
             recursive_query: Box::new(recursive_query),
@@ -1514,7 +1538,9 @@ fn prepare_recursive_cte_plan(
 
 /// A recursive CTE's arms from the first that reads the CTE itself.
 struct RecursiveArms<'a> {
-    cte_definition: &'a CteDefinition,
+    cte_name: &'a str,
+    select: &'a Select,
+    explicit_columns: Option<&'a [String]>,
     first: usize,
     input_table_id: TableInternalId,
 }
@@ -1529,8 +1555,8 @@ impl RecursiveArms<'_> {
         outer_query_refs: &[OuterQueryReference],
         connection: &Arc<crate::Connection>,
     ) -> Result<Plan> {
-        let select = &self.cte_definition.select;
-        let mut arms = select
+        let mut arms = self
+            .select
             .body
             .compounds
             .iter()
@@ -1542,23 +1568,23 @@ impl RecursiveArms<'_> {
         let Some(first_arm) = arms.next() else {
             return Err(crate::LimboError::InternalError(format!(
                 "recursive CTE {} has no recursive query",
-                self.cte_definition.name
+                self.cte_name
             )));
         };
         let input_table = JoinedTable::new_recursive_cte_input(
-            self.cte_definition.name.clone(),
+            self.cte_name.to_string(),
             columns.try_clone()?,
             self.input_table_id,
         );
         let mut recursive_query_outer_refs = outer_query_refs.to_vec();
         recursive_query_outer_refs.push(OuterQueryReference {
-            identifier: self.cte_definition.name.clone(),
+            identifier: self.cte_name.to_string(),
             internal_id: input_table.internal_id,
             table: input_table.table,
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
             cte_select: None,
-            cte_explicit_columns: self.cte_definition.explicit_columns.clone(),
+            cte_explicit_columns: self.explicit_columns.unwrap_or_default().to_vec(),
             cte_id: None,
             cte_definition_only: false,
             rowid_referenced: false,
@@ -1568,7 +1594,7 @@ impl RecursiveArms<'_> {
         prepare_select_plan_from_arms(
             first_arm.select,
             arms,
-            select.with.clone(),
+            self.select.with.clone(),
             vec![],
             None,
             resolver,
@@ -1712,8 +1738,7 @@ fn parse_from_clause_table(
                     table: cte_table.table,
                     join_info: None,
                     col_used_mask: ColumnUsedMask::default(),
-                    cte_select: (!cte_definition.references_itself)
-                        .then(|| cte_definition.select.clone()),
+                    cte_select: Some(cte_definition.select.clone()),
                     cte_explicit_columns: cte_definition.explicit_columns.clone(),
                     cte_id: Some(cte_definition.cte_id),
                     cte_definition_only: name_used_by_table_on_the_left,
@@ -2122,10 +2147,11 @@ fn parse_table(
                 crate::bail_parse_error!("'{}' is not a function", table_name.as_str());
             }
             let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
-            let cte_select_syntax = outer_ref.cte_select.clone();
-            let cte_explicit_columns = outer_ref.cte_explicit_columns.clone();
+            let definition = table_references.cte_definition(outer_ref);
+            let cte_select_syntax = definition.cte_select.clone();
+            let cte_explicit_columns = definition.cte_explicit_columns.clone();
             let cte_id = outer_ref.cte_id;
-            let outer_table = outer_ref.table.clone();
+            let outer_table = definition.table.clone();
             let materialize_hint = match &outer_table {
                 Table::FromClauseSubquery(subquery) => subquery.materialize_hint(),
                 _ => false,
@@ -2136,14 +2162,38 @@ fn parse_table(
                 let identity = crate::subquery_rows::identity(&cte_select);
                 // Plan each use separately so two uses do not receive the same
                 // table or cursor IDs.
-                let cte_query_plan = prepare_select_plan(
-                    cte_select,
-                    resolver,
-                    program,
-                    table_references.outer_query_refs(),
-                    QueryDestination::placeholder_for_subquery(),
-                    connection,
-                )?;
+                let references_itself = matches!(
+                    &outer_table,
+                    Table::FromClauseSubquery(subquery)
+                        if matches!(subquery.plan.as_ref(), Plan::RecursiveCte(_))
+                );
+                let cte_query_plan = if references_itself {
+                    // Its own name in its body is the recursive input's.
+                    let outer_query_refs: Vec<OuterQueryReference> = table_references
+                        .outer_query_refs()
+                        .iter()
+                        .filter(|reference| reference.identifier != normalized_qualified_name)
+                        .cloned()
+                        .collect();
+                    prepare_recursive_cte_plan(
+                        &normalized_qualified_name,
+                        &cte_select,
+                        &cte_explicit_columns,
+                        resolver,
+                        program,
+                        &outer_query_refs,
+                        connection,
+                    )?
+                } else {
+                    prepare_select_plan(
+                        cte_select,
+                        resolver,
+                        program,
+                        table_references.outer_query_refs(),
+                        QueryDestination::placeholder_for_subquery(),
+                        connection,
+                    )?
+                };
                 let explicit_columns = if cte_explicit_columns.is_empty() {
                     None
                 } else {
@@ -2501,9 +2551,14 @@ pub fn parse_from(
             .collect::<Vec<_>>();
         shadowed_outer_ctes = program.mask_shadowed_ctes_being_defined(&shadowing_names);
 
+        // The subqueries in the FROM clause's own expressions read the CTEs too.
+        let mut subquery_table_refs = table_refs_outside_from.to_vec();
+        if let Some(from) = &from {
+            collect_subquery_table_refs_in_from_exprs(from, &mut subquery_table_refs);
+        }
         add_ctes_read_by_subqueries_as_outer_refs(
             &cte_definitions,
-            table_refs_outside_from,
+            &subquery_table_refs,
             resolver,
             program,
             table_references,
@@ -2588,7 +2643,7 @@ fn add_ctes_read_by_subqueries_as_outer_refs(
             table: joined_table.table,
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
-            cte_select: (!cte_definition.references_itself).then(|| cte_definition.select.clone()),
+            cte_select: Some(cte_definition.select.clone()),
             cte_explicit_columns: cte_definition.explicit_columns.clone(),
             cte_id: Some(cte_definition.cte_id),
             // This entry only lets a nested FROM clause find the CTE name.
