@@ -1,0 +1,8 @@
+CREATE TABLE q(k INT, v INT);
+INSERT INTO q VALUES (2, 2), (2, 0), (3, 1);
+CREATE TABLE t(k INT);
+INSERT INTO t VALUES (1), (2);
+WITH c AS (SELECT k FROM q) SELECT c.k FROM c WHERE c.k IN (WITH c AS (SELECT k FROM t) SELECT x.k FROM c AS x WHERE x.k = c.k);
+SELECT c.k FROM q AS c WHERE c.k IN (WITH c AS (SELECT k FROM t) SELECT x.k FROM c AS x WHERE x.k = c.k);
+SELECT c.k, u.k FROM q AS c LEFT JOIN t AS u ON u.k IN (WITH c AS (SELECT k FROM t) SELECT x.k FROM c AS x WHERE x.k = c.k);
+WITH c AS (SELECT k FROM t) SELECT z.k FROM (WITH c AS (SELECT 1 AS k) SELECT x.k FROM c AS x) AS z;
