@@ -3,7 +3,8 @@
 # image (docs/design/postgres.md, section 11's units 9 and 10): pgbench's tables and rows, psql's statements with their
 # SQLSTATEs, its \bind, \parse and pipelines, and pgbench's TPC-B script at `-M simple`, `extended` and `prepared`.
 # psql's output is compared byte for byte, and the tables pgbench leaves row for row; 32 clients that contend for the
-# same rows leave balances that agree (unit 15). Linux, with docker.
+# same rows leave balances that agree (unit 15), and pgbench's own built-in scripts (unit 12) leave the same tables.
+# PARTS=builtin runs those alone. Linux, with docker.
 #
 # usage: scripts/postgres-clients.sh <amphora binary> <work folder>
 set -euo pipefail
@@ -162,6 +163,7 @@ both() { # <what> <command...> with PORT in it
   client "${@/PORT/$OURS}" > "$WORK/$what.ours" 2> "$WORK/$what.err.ours" || true
   client "${@/PORT/$THEIRS}" > "$WORK/$what.theirs" 2> "$WORK/$what.err.theirs" || true
 }
+if [ "${PARTS:-all}" != builtin ]; then
 for script in setup statements extended; do
   both "$script" psql -h 127.0.0.1 -p PORT -U ada -d ada -X -a -f "/sql/$script.sql"
   compare "psql -f $script.sql, stdout" "$WORK/$script.ours" "$WORK/$script.theirs"
@@ -214,6 +216,7 @@ for side in ours theirs; do
   grep -q 'actually processed: 1600/1600' "$WORK/pgbench-32.$side" && grep -q 'failed transactions: 0 ' "$WORK/pgbench-32.$side" || failed=1
   [ "${moves[0]}" = "${moves[1]}" ] && [ "${moves[1]}" = "${moves[2]}" ] && [ "${moves[2]}" = "${moves[3]}" ] || failed=1
 done
+fi
 # pgbench -i of unit 11, its default steps and the server-side ones: the tables it leaves, row for row, its notices and
 # output, its keys (by what they refuse), and TPC-B at -c 8 on them.
 init() { # <steps>
@@ -248,6 +251,7 @@ init() { # <steps>
     compare "after $what: $query" "$WORK/key-all.ours" "$WORK/key-all.theirs"
   done
 }
+if [ "${PARTS:-all}" != builtin ]; then
 init dtgvp
 for mode in simple extended prepared; do
   both tpcb pgbench -h 127.0.0.1 -p PORT -U ada -n -f /sql/tpcb-init.sql -M "$mode" -c 8 -j 1 -t 100 --random-seed=42 ada
@@ -264,4 +268,52 @@ for mode in simple extended prepared; do
   done
 done
 init dtGvp
+fi
+
+# pgbench's built-in scripts (unit 12), which start by asking the count of the branches and the partition query, and by
+# a vacuum and a truncate: what pgbench prints but its times, the tables it leaves, and the balances, which move by what
+# the history's rows add up to.
+sums() { # <port>: the sum of each table's balances, and of the history's
+  for query in "SELECT abalance FROM pgbench_accounts" "SELECT tbalance FROM pgbench_tellers" "SELECT bbalance FROM pgbench_branches" "SELECT delta FROM pgbench_history"; do
+    client psql -h 127.0.0.1 -p "$1" -U ada -d ada -X -At -c "$query" | awk '{ sum += $1 } END { printf "%d ", sum }'
+  done
+}
+builtin() { # <script> <mode> <clients>
+  local what="pgbench -b $1 -M $2 -c $3" side port before after
+  for side in ours theirs; do
+    port=$OURS
+    [ "$side" = ours ] || port=$THEIRS
+    read -r -a before <<< "$(sums "$port")"
+    client pgbench -h 127.0.0.1 -p "$port" -U ada -b "$1" -M "$2" -c "$3" -j 1 -t 100 --random-seed=42 ada > "$WORK/builtin.$side" 2>&1 || true
+    grep -vE '^(latency|initial connection time|tps)' "$WORK/builtin.$side" > "$WORK/builtin-text.$side" || true
+    read -r -a after <<< "$(sums "$port")"
+    echo "$what, $side: $(grep -E 'actually processed|failed' "$WORK/builtin.$side" | tr '\n' ';') the tables moved by $((after[0] - before[0])) $((after[1] - before[1])) $((after[2] - before[2])), the history is ${after[3]}"
+    case $1 in
+      tpcb-like) [ $((after[0] - before[0])) = "${after[3]}" ] && [ $((after[1] - before[1])) = "${after[3]}" ] && [ $((after[2] - before[2])) = "${after[3]}" ] || { echo "the balances don't agree"; failed=1; } ;;
+      simple-update) [ $((after[0] - before[0])) = "${after[3]}" ] && [ "${before[1]} ${before[2]}" = "${after[1]} ${after[2]}" ] || { echo "the balances don't agree"; failed=1; } ;;
+    esac
+  done
+  grep -q "actually processed: $((100 * $3))/$((100 * $3))" "$WORK/builtin.ours" && grep -q 'failed transactions: 0 ' "$WORK/builtin.ours" || failed=1
+  compare "$what's output, times aside" "$WORK/builtin-text.ours" "$WORK/builtin-text.theirs"
+  for query in "SELECT aid, bid, abalance, filler FROM pgbench_accounts" "SELECT tid, bid, tbalance, filler FROM pgbench_tellers" "SELECT bid, bbalance, filler FROM pgbench_branches" "SELECT tid, bid, aid, delta, filler FROM pgbench_history"; do
+    both rows psql -h 127.0.0.1 -p PORT -U ada -d ada -X -At -c "$query"
+    sort "$WORK/rows.ours" > "$WORK/rows.sorted.ours"
+    sort "$WORK/rows.theirs" > "$WORK/rows.sorted.theirs"
+    compare "after $what, sorted: $query" "$WORK/rows.sorted.ours" "$WORK/rows.sorted.theirs"
+  done
+}
+# Without tables, and with them.
+both none psql -h 127.0.0.1 -p PORT -U ada -d ada -X -c 'drop table if exists pgbench_accounts, pgbench_branches, pgbench_history, pgbench_tellers'
+both none pgbench -h 127.0.0.1 -p PORT -U ada -b tpcb-like -t 1 ada
+sed 's/port [0-9]*/port P/' "$WORK/none.err.ours" > "$WORK/none-text.ours"
+sed 's/port [0-9]*/port P/' "$WORK/none.err.theirs" > "$WORK/none-text.theirs"
+compare "pgbench -b tpcb-like without tables, stderr" "$WORK/none-text.ours" "$WORK/none-text.theirs"
+init dtgvp
+for script in tpcb-like simple-update select-only; do
+  for mode in simple extended prepared; do
+    for clients in 1 8; do
+      builtin "$script" "$mode" "$clients"
+    done
+  done
+done
 exit "$failed"

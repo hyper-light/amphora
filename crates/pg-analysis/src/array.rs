@@ -90,7 +90,7 @@ impl Reader<'_> {
         }
         digits.parse().map(Some).map_err(|_| {
             Error::new(
-                sqlstate::ARRAY_SUBSCRIPT_ERROR,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "array bound is out of integer range".to_owned(),
             )
         })
