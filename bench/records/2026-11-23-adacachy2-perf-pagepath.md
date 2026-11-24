@@ -1918,3 +1918,70 @@ The engine lib was not run again on the landed tree: main moved by C26's and C27
 started in eight minutes and was stopped.
 
 **For the next lane.** The notes above, the first two first: what a stopped server's files should be (a decision), and a command that closes one cleanly.
+
+## perf-B30 (2026-11-24, 13:01:46Z-14:01:46Z; a power cut between a switch and TRUNCATE, a stopped server's files)
+
+**Losses first.**
+- Not merged, and the change was built by no run: kiln's runs stopped starting (adacachy2 accepted r2278, r2280 and r2289 from 13:02Z and started none that answered; the Macs' links were down,
+  under strain or full). What ran is the red test, once, on main's engine. Everything green below is still to be run (the commands are at the end).
+- The binary's servers have no orderly end: `amphora serve` and `amphora postgres` handle no signal (read: main.rs, serve.rs `serve`, listener.rs `listen`), so a SIGTERM ends them by its default action
+  and their files stay refused. A replicated member's owner makes no clean close as it ends either (its session worker's and its flushing thread's connections outlive `Actor::run`, and their
+  threads' handles are dropped as they start). What is built is the store's end, so `Database::open`'s owner and any engine a process runs on a `Store`.
+- A backed-up database's files stay refused after an orderly end: its log starts again only once shipped (`Db::back_up` turns both automatic actions off).
+- A clean close costs a fold of the log, two truncations and two syncs, a commit of page 1 and a second fold, at each orderly end; each TRUNCATE of a log with a second file one truncation and one sync
+  more. Not measured.
+- `checkpoint_shutdown` takes any error but Busy for done (`while let Err(Busy)`): `Connection::close` then answers Ok for a close that failed (read, not run). The file stays marked, so nothing is
+  read wrong, but `Database::close` says closed.
+- A database on the versioned storage closed cleanly says read version 2 while its rows are in `<path>-versioned` (read, not run): sqlite3 would read an empty database, not a refused one.
+- `Database::close` answers Ok wherever `Connection::close` does: also where another connection of the process kept the database open, or the fold was Busy three times (read, not run). The file is then as a
+  kill leaves it.
+- Noted, not run: a new `-wal2`'s directory entry is never synced (unix.rs `open_file`), where SQLite syncs the directory of a log it makes; the open's removal of a dead database's `-wal2` isn't
+  either. The drill's disk keeps a file's name whatever is cut.
+
+**1. Shown real: a switch's cut, then TRUNCATE, then a power cut.** The drill (tests/crash.rs, below) on main's engine, 128d4ca2 (fa4117c0 and the test alone), r2301: Mac Studio 2, macOS, 13:17:16Z, 8 cpus
+asked, 26 of 32 cores idle, sqlite3 3.51.0 (Apple's); both tests of the drill failed, B29's clean-close test passed; 5.94 s.
+
+| drill (formats Mixed, Pages, Packed, in that order) | setup, then the steps | cut | what was recovered |
+|---|---|---|---|
+| 6, 7, 8 | Change, Restart, Change; Restart, TRUNCATE | the end | round 1 of 2 acknowledged |
+| 9, 10, 11 | the first segment current again; the same | the end | round 2 of 3 |
+| 12, 13, 14 | second current; Restart, TRUNCATE, Change | change 7, the next commit | round 1 of 2 |
+| 15, 16, 17 | first current again; the same | the end | none: "the log's segments have checkpoint sequences Some(3) and Some(1), neither one past the other" |
+| 18, 19, 20 | second current; Restart, Kill, TRUNCATE, Change | change 10 | round 1 of 2 |
+| 21, 22, 23 | first current again; the same | the end | none, as 15 |
+| seed 56 of the 200 | Change, Restart, Change, Restart; Kill, TRUNCATE, Restart, Restart | change 7 | round 1 of 2 |
+
+Every recovery that opened passed its integrity check: the loss is silent. The run printed the first 20 failures of each test: drills 6 to 24 and 26, and 20 of the 32 seeds that failed, 10 of them read (5, 14, 18, 29, 53, 54, 56,
+57, 66, 68). Drills 24 and 26 and the other nine seeds read are the test's own model (below). Drills 27 to 53 and the seeds past those were not printed.
+- The first place it goes wrong: `LogCut::Truncate`'s filter (wal.rs, `truncate_log`) takes a file that reads empty for one that is durably empty ("nothing to cut in [a segment] cut already"). The
+  switch's unsynced cut is harmless by itself: the next commit writes and syncs a header there, and until then that file's old generation is the one before the closing segment's, a pair recovery takes and
+  copies in order. What loses commits is the sync of the newer file's cut behind it.
+- It is past the window B29 named: the kill and reopen (18 to 23) leave the same state in a process that never switched; and with the first segment current after TRUNCATE the next commits
+  sync the first file alone, so the second's old generation stays a power cut away for as long as the system leaves that cut unwritten (15 to 17).
+- Fixed there: the older file is cut and synced whatever it reads as. Read through for each drill (not run): no other step assumes it (`may_unmark` syncs both, `has_other` is asked where the other
+  file is durable).
+- The model: macOS's sqlite3 reads a cleanly closed file beside a 32-byte `-wal` of Amphora's own format (drills 24, 26; nine seeds). wal.c's walIndexRecover reads a header only of a log longer than one, so there
+  it sees the file alone, whole, at the last acknowledged round, and is refused a write by the write version. `plain_sqlite` (tests/crash.rs) said refused; it goes by the length now.
+
+**2. B29's three inferred ones.**
+- `Database::wal_format` set the current segment's format only: real, by reading, and a user reaches it. `Db::open` asks for records once (db.rs `log_format(Mixed)`), so every generation in a store's second segment
+  was pages (`PAGES_BESIDE_FORMAT`; in r2301's drills the images' second segments are not printed). Fixed: both segments; `share_pages_in` asks the closing generation's format too. Test:
+  `d45_a_logs_format_is_both_its_segments` (plain_sqlite.rs), not run.
+- A multi-process log keeps no mark: its state is `Mark::NotKept` (database.rs, the open, sets one only where `!enable_multiprocess_wal`), which `file_is_marked` takes as marked; it never has a second segment
+  (`ShmWalCoordination::switch` restarts in place, `switch_log` refuses), so `-wal` is all of it. SQLite may read it and write it. No crate of the product turns it on (`grep multiprocess crates/amphora/src`: none).
+- An attached database that was written stays marked: `Connection::close` closes the main pager alone. ATTACH is an experimental feature, off: `translate_attach` refuses it unless `DatabaseOpts::with_attach`,
+  which no crate of the product calls, and `sql::validate` refuses ATTACH besides. Not fixed. A 45-line patch that closes each as the main one is in ~/.cache/amphora-perf/b30-attached.patch, unbuilt.
+
+**3. The clean close at an orderly end.** `Engine::close` (store.rs), asked by the writer once its last handle is gone: what waits committed, readers and checkpointer gone, the last commit's flush ended well; not after a failed
+flush or upkeep. `Store::close` and `Database::close` let a handle go and wait for it. Tests (not run): crates/amphora/tests/shutdown.rs (three lives ended in order, sqlite3 refused while open and reading all after;
+a handle held elsewhere; an owner killed in a process of its own), the drill's clean close at every change, and half the 200 seeds' stores ended in order.
+
+**Where it is.** `perf/pagepath-b30-land`, four commits on main aef6fc8a: 21c21a24 (red test), 8d1a4ae8 (the fix), f0e36f56 (the format), cffeb944 (the orderly end); `perf/pagepath-b30` holds the same tree on fa4117c0 as WIP, `perf/pagepath-b30-wip` (128d4ca2) the red run's.
+fmt 0 at each commit; main's crates/engine and crates/amphora files this changes are the same at fa4117c0 and aef6fc8a.
+
+**Runs.** | r2278, r2280 (adacachy2, cpus=8) | main fa4117c0 | the pass set's baseline: r2278 ended with no exit code and no output; r2280 accepted, nothing back |
+r2282, r2289 (adacachy2, cpus=1, an `ls`) | | nothing back; r2282 stopped |
+r2286 (MacBook Pro 2) | 785d7e5f | "disk low" (20 GB free), by the guard |
+r2292, r2297 (Mac Studio 2) | 785d7e5f | r2292 stopped (its sync may have taken an edit of mine); r2297 didn't compile (a test's borrowed SQL) |
+r2301 (Mac Studio 2, cpus=8) | 128d4ca2 | the red above |
+r2302 (macOS, cpus=8) | 48aac3ab | queued 4th to 7th, stopped unstarted at the coordinator's word |
