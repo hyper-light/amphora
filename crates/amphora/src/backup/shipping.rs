@@ -724,8 +724,7 @@ impl Checker {
 /// Removes a check's scratch database and its log, if there.
 fn remove_scratch(scratch: &Path) -> anyhow::Result<()> {
     let [first, second] = log_paths(scratch);
-    let _ = second;
-    for file in [scratch, &first, &suffixed(scratch, "-shm")] {
+    for file in [scratch, &first, &second, &suffixed(scratch, "-shm")] {
         match std::fs::remove_file(file) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
             _ => {}
