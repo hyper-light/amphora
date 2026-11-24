@@ -568,7 +568,7 @@ struct RecordRead {
     page_len: i32,
     frame_len: usize,
     file: Arc<dyn File>,
-    records: Arc<SpinLock<Records>>,
+    records: Arc<RwLock<Records>>,
     readers: Vec<PageReader>,
     state: SpinLock<ReadState>,
     /// What the read's callers wait on, finished (and taken) once every record is in.
@@ -649,7 +649,7 @@ impl RecordRead {
                 return;
             }
             let found: Vec<(u64, Option<u32>, Option<Arc<Record>>)> = {
-                let records = self.records.lock();
+                let records = self.records.read();
                 wants
                     .into_iter()
                     .map(|frame| {
@@ -775,7 +775,7 @@ impl RecordRead {
         };
         if let Ok(Held::Record(decoded)) = &held {
             self.records
-                .lock()
+                .write()
                 .keep(self.generation, frame, decoded.clone(), self.page_size);
         }
         let last = {
@@ -2069,7 +2069,7 @@ impl WalCoordination for InProcessWalCoordination {
         // slot, as `cache_record`'s guard has it (decision 37).
         let mut cut = None;
         if frame_id <= high_water {
-            let mut records = shared.runtime.records.lock();
+            let mut records = shared.runtime.records.write();
             let from = records.covering(frame_id).unwrap_or(frame_id);
             records.drop_after(from.saturating_sub(1));
             drop(records);
@@ -2110,7 +2110,7 @@ impl WalCoordination for InProcessWalCoordination {
     fn cache_record(&self, head: u64, slots: u32, pages: &mut dyn Iterator<Item = u64>) {
         let shared = self.log.current().read();
         let mut frame_cache = shared.runtime.frame_cache.lock();
-        let mut records = shared.runtime.records.lock();
+        let mut records = shared.runtime.records.write();
         let high_water = shared
             .runtime
             .frame_cache_high_water
@@ -2196,7 +2196,7 @@ impl WalCoordination for InProcessWalCoordination {
             !frames.is_empty()
         });
         // Amphora: and the packed records past it, and its listed changes.
-        shared.runtime.records.lock().drop_after(max_frame);
+        shared.runtime.records.write().drop_after(max_frame);
         shared
             .runtime
             .changes
@@ -4052,7 +4052,7 @@ pub struct WalSharedRuntime {
     pub(crate) format: AtomicU32,
     /// Amphora: the packed records of the log's generation, and those decoded (`packed::Records`).
     /// A leaf lock: nothing else is locked while it is held, and it is never held across IO.
-    pub(crate) records: Arc<SpinLock<Records>>,
+    pub(crate) records: Arc<RwLock<Records>>,
     /// Amphora: the pages the generation's recent frames hold, in frame order, for readers to
     /// forget only those (`changes::ChangeLog`, decision 18). Taken after `frame_cache`'s lock
     /// when both are held; a leaf lock.
@@ -4739,14 +4739,14 @@ impl WalFile {
             LogFormat::Packed => true,
             LogFormat::Mixed => self
                 .segment_records(segment)
-                .lock()
+                .read()
                 .slots_of(frame)
                 .is_some(),
         }
     }
 
     /// `segment`'s record registry, the segment's lock not held past the clone.
-    fn segment_records(&self, segment: SegmentId) -> Arc<SpinLock<Records>> {
+    fn segment_records(&self, segment: SegmentId) -> Arc<RwLock<Records>> {
         let log = self.coordination.shared_wal_state();
         let shared = log.segment(segment).read();
         shared.runtime.records.clone()
@@ -4761,7 +4761,7 @@ impl WalFile {
             LogFormat::Packed => true,
             LogFormat::Mixed => self
                 .with_shared(|shared| shared.runtime.records.clone())
-                .lock()
+                .read()
                 .covering(frame)
                 .is_some(),
         };
@@ -5340,7 +5340,7 @@ impl WalFile {
     /// 39 has a record for every slot of its chains' entries (Decision (lane wal-read)).
     fn publish_records(
         coordination: &dyn WalCoordination,
-        registry: &SpinLock<Records>,
+        registry: &RwLock<Records>,
         generation: u32,
         records: &[(u64, u32)],
         decoded: &[Arc<Record>],
@@ -5363,7 +5363,7 @@ impl WalFile {
                 .map(|&(_, page)| page);
             coordination.cache_record(head, slots, &mut pages);
             registry
-                .lock()
+                .write()
                 .keep(generation, head, record.clone(), page_size);
         }
     }
@@ -8731,7 +8731,7 @@ impl WalFileShared {
                 durable: SpinLock::new(None),
                 legacy_durable_allowed: true,
                 format: AtomicU32::new(packed::PAGE_FORMAT),
-                records: Arc::new(SpinLock::new(Records::default())),
+                records: Arc::new(RwLock::new(Records::default())),
                 changes: SpinLock::new(ChangeLog::default()),
                 #[cfg(test)]
                 frames_compared: AtomicU64::new(0),
@@ -8828,7 +8828,7 @@ impl WalFileShared {
                 durable: SpinLock::new(None),
                 legacy_durable_allowed: true,
                 format: AtomicU32::new(packed::PAGE_FORMAT),
-                records: Arc::new(SpinLock::new(Records::default())),
+                records: Arc::new(RwLock::new(Records::default())),
                 changes: SpinLock::new(ChangeLog::default()),
                 #[cfg(test)]
                 frames_compared: AtomicU64::new(0),
@@ -8875,7 +8875,7 @@ impl WalFileShared {
                 durable: SpinLock::new(None),
                 legacy_durable_allowed: true,
                 format: AtomicU32::new(packed::PAGE_FORMAT),
-                records: Arc::new(SpinLock::new(Records::default())),
+                records: Arc::new(RwLock::new(Records::default())),
                 changes: SpinLock::new(ChangeLog::default()),
                 #[cfg(test)]
                 frames_compared: AtomicU64::new(0),
@@ -8955,7 +8955,7 @@ impl WalFileShared {
         self.runtime
             .frame_cache_high_water
             .store(0, Ordering::Release);
-        self.runtime.records.lock().clear();
+        self.runtime.records.write().clear();
         self.runtime.changes.lock().reset();
         // read-marks
         self.runtime.read_locks[0].set_value_exclusive(0);
@@ -8990,7 +8990,7 @@ impl WalFileShared {
         self.runtime.read_index.invalidate();
         self.runtime.frame_cache = restored.runtime.frame_cache;
         // Amphora: in place, as connections hold the registry's `Arc`.
-        *self.runtime.records.lock() = std::mem::take(&mut *restored.runtime.records.lock());
+        *self.runtime.records.write() = std::mem::take(&mut *restored.runtime.records.write());
         self.runtime.changes.lock().reset();
         self.runtime.file = restored.runtime.file;
         self.runtime.epoch.store(
@@ -10790,6 +10790,34 @@ pub mod test {
         }
     }
 
+    /// Do: one reader holds the shared log's record registry, which a read of a packed or mixed
+    /// generation consults twice a page, while another reader asks it for a published record's
+    /// slots. Expect: the second answers while the first still holds it, so a reader taken off
+    /// its CPU mid-lookup holds up no other read (`docs/design/store.md`, decision of lane
+    /// perf-Q6). The wait on the answer is a hang guard, not a measure.
+    #[test]
+    fn q6_reads_of_the_record_registry_do_not_wait_for_each_other() {
+        let shared = WalFileShared::new_noop();
+        let records = shared.read().runtime.records.clone();
+        records.write().publish(9, 2);
+        let held = records.read();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let other = records.clone();
+        let reader = std::thread::spawn(move || {
+            let answer = other.read().slots_of(9);
+            tx.send(answer).unwrap();
+        });
+        let answer = rx.recv_timeout(std::time::Duration::from_secs(600));
+        assert_eq!(held.slots_of(9), Some(2));
+        drop(held);
+        reader.join().unwrap();
+        assert_eq!(
+            answer,
+            Ok(Some(2)),
+            "a read of the registry waited for another read"
+        );
+    }
+
     /// Do: random appends of frames and of packed records, rewinds into frames and records,
     /// rollbacks and restarts, and after each the latest frames of random ranges. Expect: what a
     /// scan of every page the log holds finds, the frames' own list answering most of the ranges
@@ -10850,7 +10878,7 @@ pub mod test {
                             .runtime
                             .frame_cache_high_water
                             .store(0, Ordering::Release);
-                        shared.current().read().runtime.records.lock().clear();
+                        shared.current().read().runtime.records.write().clear();
                         shared.current().read().runtime.changes.lock().reset();
                         next = 1;
                     }
@@ -10943,7 +10971,7 @@ pub mod test {
                             .runtime
                             .frame_cache_high_water
                             .store(0, Ordering::Release);
-                        guard.runtime.records.lock().clear();
+                        guard.runtime.records.write().clear();
                         guard.runtime.changes.lock().reset();
                         drop(guard);
                         next = 1;
