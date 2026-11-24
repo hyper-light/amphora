@@ -13,8 +13,11 @@ usage: bench/sqlite_dml_rows.py COUNT SEED > crates/engine/tests/fixtures/dml_ro
 Left out, each a difference of another cause (bench/records/2026-11-24-adacachy2-oracle-c11.md): a comparison in a
 trigger of a column with a collation (CX), a generated column on a WITHOUT ROWID table (refused), which of two unique
 constraints an UPSERT with no target meets first (no document says), a subquery in DO UPDATE (refused), the text of a
-REAL past 15 digits (CK), an UPDATE of the rowid where a generated column reads it (NEW holds the old one's), and a
-BEFORE trigger that changes the row it fires for (lang_createtrigger.html: undefined).
+REAL past 15 digits (CK), an UPDATE of the rowid where a generated column reads it (NEW holds the old one's), an index
+on a generated column (an UPSERT beside a BEFORE UPDATE trigger looks for the wrong entry), a type a STRICT table refuses
+in a trigger that an OR IGNORE fires (ignored with the rest), a BEFORE trigger that changes the row it fires for
+(lang_createtrigger.html: undefined), and the order a WITHOUT ROWID table's rows are changed in where another index may
+be read for them (no document says).
 
 At a conflict on the rowid SQLite's `excluded.c` is the value as given, not as c converts it ('7' in an INT column is
 '7'), unless the table has a generated column or an earlier ON CONFLICT names another constraint. By lang_upsert.html it
@@ -124,8 +127,9 @@ class Case:
             options.reverse()
         options = ", ".join(options)
         self.ddl = [f"CREATE TABLE t({', '.join(defs + tail)}) {options}".strip()]
-        if rng.random() < 0.15:
-            self.ddl.append(f"CREATE INDEX i ON t({pick(self.all)})")
+        self.indexed = rng.random() < 0.15
+        if self.indexed:
+            self.ddl.append(f"CREATE INDEX i ON t({pick(self.written)})")
         self.triggers = 0
         if rng.random() < 0.6:
             # before an INSERT without its rowid, new.rowid is -1 (SQLite's documents call it undefined)
@@ -158,8 +162,10 @@ class Case:
                   f" DELETE FROM t WHERE {self.pk} IN (1, 'a');"]
         if others:
             c = rng.choice(others)
-            writes += [f" UPDATE t SET {c} = {self.value(c)} WHERE {self.pk} IS {row}.{self.pk};", f" UPDATE OR IGNORE t SET {c} = {self.value(c)};",
-                       f" INSERT OR IGNORE INTO t({self.pk}, {c}) VALUES ({self.value(self.pk)}, {self.value(c)});"]
+            # of the column's type: a type a STRICT table refuses goes unrefused in a trigger an OR IGNORE fires
+            v = rng.choice(TAKES[self.types[c]] + ["NULL"]) if self.strict else self.value(c)
+            writes += [f" UPDATE t SET {c} = {v} WHERE {self.pk} IS {row}.{self.pk};", f" UPDATE OR IGNORE t SET {c} = {v};",
+                       f" INSERT OR IGNORE INTO t({self.pk}, {c}) VALUES ({self.value(self.pk)}, {v});"]
         return when, rng.choice([raised] + writes * 2)
 
     def value(self, col):
@@ -256,6 +262,9 @@ class Case:
         rng = self.rng
         kind = rng.choice(["insert"] * 2 + ["upsert"] * 6 + ["replace", "or ignore", "or ignore", "or replace", "update", "update", "delete"])
         where = rng.choice(["", f" WHERE {self.written[0]} IS NOT NULL", f" WHERE {rng.choice(self.written)} = {rng.choice(['1', '2', '10'])}"])
+        if self.without_rowid and len(self.unique) + self.indexed > 1:
+            # more rows than one, in the order of whichever index is read: no document says which
+            where = " WHERE " + " AND ".join(f"{c} = {self.value(c)}" for c in self.unique[0])
         if kind == "delete":
             return "DELETE FROM t" + where
         if kind == "update":
