@@ -852,4 +852,6 @@ exit 1: `clippy::disallowed_methods` 42 against 40 (this unit's two `then_some`)
 `cast_possible_truncation` and 1 fewer `disallowed_macros` than the ratchet held, all fixed in 0ca4af89. Run r1899 on
 3c075124 (0ca4af89 with origin/main 2f29b288 merged, which moved only `crates/pg-parser`; load 95-139, at cpus=3):
 check-production exit 0 ("10903 left in the engine's production code across 17 lints, as the ratchet holds"); the
-workspace clippy exit 0 in 62 s; `d45_` passed 18.
+workspace clippy exit 0 in 62 s; `d45_` passed 18. Main then moved in `crates/engine` (lane R6's column copy choice,
+none of this lane's files): run r1919 on 7698a061, the re-merge with origin/main 50ab86c6 (load 70-111): check-production
+exit 0, the ratchet holding; the workspace clippy exit 0 in 42 s; `d45_` passed 18.
