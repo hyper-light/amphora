@@ -3420,6 +3420,195 @@ fn an_outer_tables_columns_stay_in_reach_under_a_cte_of_its_name() {
     );
 }
 
+/// Do: a WITH clause inside another defines a CTE of the same name, and a subquery below it reads
+/// the name; and the body of a CTE outside reads the name it was written under. Expect: SQLite's
+/// rows: each reads the CTE its own place in the statement sees. Amphora read the outermost in both
+/// (finding DH).
+#[test]
+fn a_cte_name_is_the_innermost_with_clauses_that_defines_it() {
+    answer_in_every_setting(
+        &CTE_TABLES,
+        &[
+            (
+                "WITH d AS (SELECT k FROM q) SELECT t.k FROM t WHERE EXISTS (WITH d AS (SELECT k FROM t WHERE k = 1) SELECT 1 FROM d AS s WHERE t.k IN (SELECT e.k FROM d AS e))",
+                &["1"],
+            ),
+            (
+                "WITH d AS (SELECT k FROM q) SELECT d.k FROM d WHERE EXISTS (WITH d AS (SELECT k FROM t) SELECT 1 FROM d AS s WHERE d.k IN (SELECT e.k FROM d AS e))",
+                &["2", "2"],
+            ),
+            (
+                "WITH d AS (SELECT k FROM q) SELECT a.k FROM d AS a WHERE EXISTS (WITH d AS (SELECT k FROM t) SELECT 1 FROM d AS s WHERE a.k IN (SELECT e.k FROM d AS e))",
+                &["2", "2"],
+            ),
+            (
+                "WITH d AS (SELECT k FROM q) SELECT t.k, d.k FROM t LEFT JOIN d ON EXISTS (WITH d AS (SELECT k FROM t WHERE k = 1) SELECT 1 FROM d AS s WHERE t.k IN (SELECT e.k FROM d AS e))",
+                &["1|2", "1|2", "1|3", "2|NULL"],
+            ),
+            (
+                "WITH RECURSIVE d(k) AS (SELECT 5 UNION ALL SELECT k + 1 FROM d WHERE k < 7) SELECT t.k, d.k FROM t LEFT JOIN d ON t.k IN (WITH RECURSIVE d(k) AS (SELECT 0 UNION ALL SELECT k + 1 FROM d WHERE k < 1) SELECT s.k FROM d AS s WHERE s.k IN (SELECT e.k FROM d AS e))",
+                &["1|5", "1|6", "1|7", "2|NULL"],
+            ),
+            (
+                "WITH c AS (SELECT k FROM q), d AS (SELECT k FROM c) SELECT t.k FROM t WHERE t.k IN (WITH c AS (SELECT 1 AS k) SELECT c.k FROM c WHERE c.k IN (SELECT k FROM c) AND EXISTS (SELECT 1 FROM d WHERE d.k = 3))",
+                &["1"],
+            ),
+            (
+                "WITH c AS (SELECT k FROM q), d AS (SELECT k FROM c) SELECT * FROM (WITH c AS (SELECT 1 AS k) SELECT t.k FROM t WHERE t.k IN (SELECT k FROM d) OR t.k IN (SELECT k FROM c))",
+                &["1", "2"],
+            ),
+            (
+                "WITH d AS (SELECT k FROM c), c AS (SELECT k FROM q) SELECT * FROM (WITH c AS (SELECT 1 AS k) SELECT t.k FROM t WHERE t.k IN (SELECT k FROM d) OR t.k IN (SELECT k FROM c))",
+                &["1", "2"],
+            ),
+        ],
+    );
+}
+
+/// Do: nothing reads a CTE whose body is an error, or that closes a circle: an inner CTE that nothing
+/// reads names it, or an inner WITH clause defines its name. Expect: SQLite's rows, as if it were not
+/// there. Amphora planned every CTE that a body anywhere in the statement named (finding DI).
+#[test]
+fn a_cte_that_nothing_reads_is_no_part_of_the_statement() {
+    answer_in_every_setting(
+        &CTE_TABLES,
+        &[
+            (
+                "WITH d AS (SELECT k FROM nosuch), f AS (SELECT k FROM q) SELECT t.k FROM t WHERE t.k IN (WITH x AS (SELECT k FROM d) SELECT k FROM f)",
+                &["2"],
+            ),
+            (
+                "WITH d AS (SELECT k FROM nosuch) SELECT t.k FROM t WHERE EXISTS (WITH x AS (SELECT k FROM d) SELECT 1)",
+                &["1", "2"],
+            ),
+            (
+                "WITH d AS (SELECT k FROM nosuch) SELECT t.k FROM t JOIN q ON t.k = q.k AND EXISTS (WITH x AS (SELECT k FROM d) SELECT 1)",
+                &["2", "2"],
+            ),
+            (
+                "WITH d AS (SELECT k FROM nosuch) SELECT * FROM (WITH x AS (SELECT k FROM d) SELECT 5 AS k)",
+                &["5"],
+            ),
+            (
+                "WITH d AS (SELECT k FROM nosuch), y AS (WITH x AS (SELECT k FROM d) SELECT 7 AS k) SELECT k FROM y",
+                &["7"],
+            ),
+            (
+                "WITH d AS (SELECT k FROM nosuch) SELECT t.k FROM t WHERE t.k IN (WITH d AS (SELECT 1 AS k) SELECT k FROM d)",
+                &["1"],
+            ),
+            (
+                "WITH d AS (SELECT k FROM nosuch) SELECT * FROM (WITH d AS (SELECT 1 AS k) SELECT k FROM d)",
+                &["1"],
+            ),
+            (
+                "WITH d AS (SELECT k FROM nosuch), y AS (WITH d AS (SELECT 1 AS k) SELECT k FROM d) SELECT k FROM y",
+                &["1"],
+            ),
+            (
+                "WITH a AS (WITH b AS (SELECT 1 AS k) SELECT k FROM b), b AS (SELECT k FROM a) SELECT * FROM b",
+                &["1"],
+            ),
+            (
+                "WITH a AS (WITH z AS (SELECT k FROM b) SELECT 1 AS k), b AS (SELECT k FROM a) SELECT * FROM b",
+                &["1"],
+            ),
+            (
+                "WITH d AS (WITH f AS (SELECT k FROM d), d AS (SELECT k FROM t) SELECT k FROM f) SELECT k FROM d",
+                &["1", "2"],
+            ),
+            (
+                "WITH d AS (WITH d AS (SELECT k FROM t) SELECT d.k FROM d WHERE EXISTS (SELECT 1 FROM d AS e WHERE e.k = d.k)) SELECT k FROM d",
+                &["1", "2"],
+            ),
+        ],
+    );
+}
+
+/// [CTE_TABLES], and a view.
+const CTE_TABLES_AND_VIEW: [&str; 5] = [
+    CTE_TABLES[0],
+    CTE_TABLES[1],
+    CTE_TABLES[2],
+    CTE_TABLES[3],
+    "CREATE VIEW w AS SELECT k FROM t WHERE k IN (SELECT k FROM q)",
+];
+
+/// Do: two CTEs of an inner WITH clause read one outer CTE, plain, recursive, or with a row of the
+/// query around it; a body or a view is read where its names mean something else; a FROM clause's
+/// subquery and a LIMIT read the CTE of the innermost WITH clause. Expect: SQLite's rows: each use has
+/// tables and cursors of its own, and reads the names around its definition. Amphora gave two uses one
+/// plan, and lost rows or panicked ("cursor id 0 is None"), and looked names up from where they were
+/// read (findings DH and DI's neighbours, lane C18).
+#[test]
+fn each_use_of_a_cte_has_the_rows_and_the_names_of_its_definition() {
+    answer_in_every_setting(
+        &CTE_TABLES_AND_VIEW,
+        &[
+            (
+                "WITH c AS (SELECT k FROM q) SELECT t.k, (WITH a AS (SELECT k FROM c), b AS (SELECT k FROM c) SELECT count(*) FROM a, b) FROM t",
+                &["1|9", "2|9"],
+            ),
+            (
+                "WITH c AS (SELECT k FROM q) SELECT * FROM (WITH a AS (SELECT k FROM c), b AS (SELECT k FROM c) SELECT a.k AS ak, b.k AS bk FROM a, b)",
+                &["2|2", "2|2", "2|2", "2|2", "2|3", "2|3", "3|2", "3|2", "3|3"],
+            ),
+            (
+                "WITH RECURSIVE c(k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM c WHERE k < 3) SELECT (WITH a AS (SELECT k FROM c), b AS (SELECT k FROM c) SELECT count(*) FROM a, b)",
+                &["9"],
+            ),
+            (
+                "WITH c AS (SELECT k FROM q), x AS (WITH a AS (SELECT k FROM c), b AS (SELECT k FROM c) SELECT a.k AS ak, b.k AS bk FROM a, b) SELECT * FROM x",
+                &["2|2", "2|2", "2|2", "2|2", "2|3", "2|3", "3|2", "3|2", "3|3"],
+            ),
+            (
+                "WITH c AS (SELECT k FROM q), x AS (WITH z AS (SELECT k FROM c) SELECT c.k AS ck, z.k AS zk FROM c, z) SELECT * FROM x",
+                &["2|2", "2|2", "2|2", "2|2", "2|3", "2|3", "3|2", "3|2", "3|3"],
+            ),
+            (
+                "SELECT t.k, (WITH c AS (SELECT q.k FROM q WHERE q.k >= t.k), a AS (SELECT x.k AS xk, y.k AS yk FROM c x, c y) SELECT count(*) FROM a) FROM t",
+                &["1|9", "2|9"],
+            ),
+            (
+                "SELECT t.k, (WITH c AS (SELECT q.k FROM q WHERE q.k >= t.k) SELECT (WITH a AS (SELECT k FROM c), b AS (SELECT k FROM c) SELECT count(*) FROM a, b)) FROM t",
+                &["1|9", "2|9"],
+            ),
+            (
+                "WITH d AS (SELECT k FROM q) SELECT t.k FROM t WHERE EXISTS (WITH d AS (SELECT 1 AS k) SELECT 1 FROM (SELECT k FROM d) AS s WHERE s.k = t.k)",
+                &["1"],
+            ),
+            (
+                "WITH d AS (SELECT k FROM q) SELECT t.k FROM t JOIN q ON t.k IN (WITH d AS (SELECT 1 AS k) SELECT s.k FROM (SELECT k FROM d) AS s)",
+                &["1", "1", "1"],
+            ),
+            (
+                "WITH d AS (SELECT k FROM q), c AS (SELECT k FROM d) SELECT (WITH d AS (SELECT k FROM c) SELECT max(k) FROM d)",
+                &["3"],
+            ),
+            (
+                "SELECT d.k FROM t AS d WHERE EXISTS (WITH d AS (SELECT q.k FROM q WHERE q.k = d.k) SELECT 1 FROM d)",
+                &["2"],
+            ),
+            (
+                "WITH d AS (SELECT k FROM t) SELECT d.k FROM d WHERE EXISTS (WITH d AS (SELECT q.k FROM q WHERE q.k = d.k) SELECT 1 FROM d)",
+                &["2"],
+            ),
+            (
+                "WITH q AS (SELECT 1 AS k) SELECT k FROM t WHERE k IN (SELECT k FROM w) AND k IN (SELECT k + 1 FROM q)",
+                &["2"],
+            ),
+            (
+                "WITH c AS (SELECT 1 AS k) SELECT t.k FROM t WHERE (SELECT max(k) FROM c) IN (SELECT k FROM t)",
+                &["1", "2"],
+            ),
+            (
+                "WITH t AS (SELECT k, v FROM q) SELECT k FROM t ORDER BY k LIMIT (SELECT count(*) FROM t)",
+                &["2", "2", "3"],
+            ),
+        ],
+    );
+}
+
 /// Do: a join whose LEFT JOIN's hash join is built from the tables before it, joined, and whose WHERE
 /// reads a subquery on one of those tables beside a column the LEFT JOIN makes NULL; the same in an
 /// inner join; and a LEFT JOIN in a subquery, whose WHERE reads a subquery on the query around it.
