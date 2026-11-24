@@ -411,6 +411,14 @@ impl Simulated {
         self.state.lock().budget = Some(ops);
     }
 
+    /// A new process can use the disk again. The OS still holds every unflushed write.
+    #[cfg(test)]
+    pub(super) fn restart_process(&self) {
+        let mut state = self.state.lock();
+        state.budget = None;
+        state.crashed = false;
+    }
+
     /// The power cut: each file back to what was flushed, plus, of each write since, all, none or
     /// a prefix of its sectors (cuts since are kept or not); operations work again.
     pub fn power_cut(&self) -> Result<()> {

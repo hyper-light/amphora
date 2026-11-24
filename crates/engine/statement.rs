@@ -13,7 +13,7 @@ use tracing::{instrument, Level};
 use crate::plan_cache::{CustomRun, PlanCacheMode, PlanChoice, PlanKind, PlanValues};
 use crate::{alloc::TursoIteratorExt, connection::PrepareOptions};
 use crate::{
-    busy::{BusyHandler, BusyHandlerState, BusyWake, LockRelease, OwnReleases},
+    busy::{BusyHandler, BusyHandlerState, BusyWake, LockRelease, OwnReleases, ReleaseWait},
     parameters,
     schema::Trigger,
     stats::{refresh_analyze_stats_nonblock, RefreshAnalyzeStatsState},
@@ -356,6 +356,7 @@ pub struct Statement {
     /// its locks.
     lock_release: Option<std::sync::Arc<LockRelease>>,
     release_seen: u64,
+    release_wait: Option<ReleaseWait>,
     /// Per-execution timeout override for this statement.
     /// - `None`: use connection default
     /// - `Some(Some(duration))`: override with a query-specific timeout
@@ -498,6 +499,7 @@ impl Statement {
             busy_handler_state: None,
             lock_release: None,
             release_seen: 0,
+            release_wait: None,
             query_timeout_override: None,
             has_returned_row: false,
             tail_offset,
@@ -888,6 +890,7 @@ impl Statement {
     }
 
     fn step_inner(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+        self.release_wait = None;
         // ANALYZE already ran to Done; only its stats refresh is outstanding.
         // Checked first: the root-statement count was released at Done, so
         // `prepare_step` must not re-register this statement as a root.
@@ -1183,7 +1186,8 @@ impl Statement {
                     // Registered: sleep until the release (or the deadline). A release came
                     // since the step read the count: step again now.
                     let own = own.unwrap_or_else(|| release.own_releases());
-                    let duration = if release.wait(self.release_seen, &own, waker) {
+                    self.release_wait = release.subscribe(self.release_seen, &own, waker);
+                    let duration = if self.release_wait.is_some() {
                         left
                     } else {
                         Duration::ZERO
@@ -2129,6 +2133,7 @@ impl Statement {
             }
         }
 
+        self.release_wait = None;
         let mut reset_error: Option<LimboError> = None;
         // Amphora (PL.7): a run reset before its end is not timed.
         self.cost_sample = None;

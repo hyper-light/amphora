@@ -1,7 +1,8 @@
 use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::sync::Mutex;
 use crate::MonotonicInstant;
-use std::task::Waker;
+use std::sync::Arc;
+use std::task::{Wake, Waker};
 use std::time::Duration;
 
 /// Amphora (lane constants-22, goal "no picked constants"): how a statement that finds the database
@@ -54,12 +55,27 @@ impl LockRelease {
         let mut wakers = self.wakers.lock();
         self.armed.store(true, Ordering::SeqCst);
         if self.generation.load(Ordering::SeqCst) != seen.wrapping_add(own) {
+            self.armed.store(!wakers.is_empty(), Ordering::SeqCst);
             return false;
         }
         if !wakers.iter().any(|held| held.will_wake(waker)) {
             wakers.push(waker.clone());
         }
         true
+    }
+
+    /// Each statement owns its registration even when two statements share a task (T-QB.1.13).
+    pub(crate) fn subscribe(
+        self: &Arc<Self>,
+        seen: u64,
+        step: &OwnReleases,
+        waker: &Waker,
+    ) -> Option<ReleaseWait> {
+        let waker = Waker::from(Arc::new(StatementWake(waker.clone())));
+        self.wait(seen, step, &waker).then(|| ReleaseWait {
+            release: Arc::clone(self),
+            waker,
+        })
     }
 
     /// Starts counting the releases this thread makes of this log's locks, for a step that will
@@ -113,6 +129,32 @@ impl LockRelease {
         for waker in woken {
             waker.wake();
         }
+    }
+}
+
+struct StatementWake(Waker);
+
+impl Wake for StatementWake {
+    fn wake(self: Arc<Self>) {
+        self.0.wake_by_ref();
+    }
+}
+
+/// Dropping a pending step relinquishes its task, even if the lock holder never releases
+/// (T-QB.1.13).
+#[derive(Debug)]
+pub(crate) struct ReleaseWait {
+    release: Arc<LockRelease>,
+    waker: Waker,
+}
+
+impl Drop for ReleaseWait {
+    fn drop(&mut self) {
+        let mut wakers = self.release.wakers.lock();
+        wakers.retain(|held| !held.will_wake(&self.waker));
+        self.release
+            .armed
+            .store(!wakers.is_empty(), Ordering::SeqCst);
     }
 }
 
@@ -398,6 +440,38 @@ mod tests {
             count.0.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "woken wakers are let go"
+        );
+    }
+
+    #[test]
+    fn t_qb_1_13_a_cancelled_busy_wait_relinquishes_its_task() {
+        let release = std::sync::Arc::new(LockRelease::default());
+        let count = std::sync::Arc::new(Count(std::sync::atomic::AtomicUsize::new(0)));
+        let task = std::sync::Arc::downgrade(&count);
+        let waker = Waker::from(count);
+        let step = release.own_releases();
+        let seen = release.generation();
+        let first = release.subscribe(seen, &step, &waker).unwrap();
+        let second = release.subscribe(seen, &step, &waker).unwrap();
+        drop(first);
+        assert_eq!(
+            release.wakers.lock().len(),
+            1,
+            "the other statement still waits"
+        );
+        std::thread::scope(|s| {
+            s.spawn(|| release.notify());
+        });
+        assert_eq!(task.upgrade().unwrap().0.load(Ordering::SeqCst), 1);
+        drop(second);
+        let pending = release
+            .subscribe(release.generation(), &step, &waker)
+            .unwrap();
+        drop(waker);
+        drop(pending);
+        assert!(
+            task.upgrade().is_none(),
+            "the abandoned wait kept its task alive"
         );
     }
 

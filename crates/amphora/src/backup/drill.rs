@@ -809,5 +809,11 @@ mod tests {
         assert_eq!(meter.cost_quantile(3, 1), Some((1 << 20) - 1));
         assert_eq!(meter.cost_quantile(1, 0), None);
         assert_eq!(meter.cost_ns.load(Ordering::Relaxed), 1_000_107);
+
+        let full = DrillMeter::default();
+        full.buckets[0].store(u64::MAX - 1, Ordering::Relaxed);
+        full.buckets[1].store(1, Ordering::Relaxed);
+        assert_eq!(full.cost_quantile(1, 1), Some(1));
+        assert_eq!(full.cost_quantile(0, 1), Some(0));
     }
 }

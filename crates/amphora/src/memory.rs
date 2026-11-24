@@ -44,11 +44,19 @@ pub fn v1_group(proc_self_cgroup: &str) -> Option<&str> {
 /// None for "max" and for v1's no-limit value.
 #[must_use]
 pub fn group_limit(text: &str) -> Option<u64> {
+    read_group_limit(text).ok().flatten()
+}
+
+fn read_group_limit(text: &str) -> Result<Option<u64>, std::num::ParseIntError> {
     let text = text.trim();
     if text == "max" {
-        return None;
+        return Ok(None);
     }
-    text.parse::<u64>().ok().filter(|&n| n < V1_UNLIMITED)
+    let bytes = text.parse::<u64>()?;
+    if bytes >= V1_UNLIMITED {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
 }
 
 /// The machine's memory in bytes, from `/proc/meminfo`'s `MemTotal:` line (in KiB).
@@ -299,29 +307,35 @@ fn whole(file: &std::fs::File) -> Option<Vec<u8>> {
 impl Opened {
     fn open() -> Option<Self> {
         let cgroup = std::fs::File::open("/proc/self/cgroup").ok()?;
+        Self::open_groups(cgroup, std::path::Path::new("/sys/fs/cgroup"))
+    }
+
+    fn open_groups(cgroup: std::fs::File, root: &std::path::Path) -> Option<Self> {
         let seen = whole(&cgroup)?;
         let text = String::from_utf8_lossy(&seen);
         let (mut limits, mut unlimited) = (Vec::new(), Vec::new());
         for (v2, group, root, file) in [
-            (true, v2_group(&text), "/sys/fs/cgroup", "memory.max"),
+            (true, v2_group(&text), root.to_owned(), "memory.max"),
             (
                 false,
                 v1_group(&text),
-                "/sys/fs/cgroup/memory",
+                root.join("memory"),
                 "memory.limit_in_bytes",
             ),
         ] {
             for at in group.map(ancestors).unwrap_or_default() {
-                let dir = format!("{root}{}", if at == "/" { "" } else { at.as_str() });
-                match std::fs::File::open(format!("{dir}/{file}")) {
+                let dir = root.join(at.trim_start_matches('/'));
+                match std::fs::File::open(dir.join(file)) {
                     Ok(open) => limits.push(open),
-                    // v2's root has no limit file, and never grows one.
-                    Err(_) if v2 && at != "/" => {
-                        if let Ok(open) = std::fs::File::open(format!("{dir}/cgroup.controllers")) {
-                            unlimited.push(open);
+                    Err(error) if v2 && error.kind() == std::io::ErrorKind::NotFound => {
+                        // The v2 hierarchy root has no memory.max. A child without the
+                        // controller needs a readable watcher before its files can be cached.
+                        if at != "/" {
+                            unlimited
+                                .push(std::fs::File::open(dir.join("cgroup.controllers")).ok()?);
                         }
                     }
-                    Err(_) => {}
+                    Err(_) => return None,
                 }
             }
         }
@@ -346,24 +360,26 @@ impl Opened {
             Some(n) if n < IN_PLACE => buf.get(..n) == Some(self.seen.as_slice()),
             _ => whole(&self.cgroup).as_deref() == Some(self.seen.as_slice()),
         };
-        same && !self.unlimited.iter().any(|controllers| {
+        same && self.unlimited.iter().all(|controllers| {
             read_at(controllers, &mut buf)
                 .and_then(|n| buf.get(..n))
-                .is_some_and(|text| text.split(u8::is_ascii_whitespace).any(|c| c == b"memory"))
+                .is_some_and(|text| !text.split(u8::is_ascii_whitespace).any(|c| c == b"memory"))
         })
     }
 
     fn limit(&self) -> Option<u64> {
         let mut buf = [0u8; IN_PLACE];
-        let groups = self.limits.iter().filter_map(|file| {
-            let n = read_at(file, &mut buf)?;
-            std::str::from_utf8(buf.get(..n)?)
-                .ok()
-                .and_then(group_limit)
-        });
         let machine = rustix::system::sysinfo();
         let machine = u64::from(machine.mem_unit.max(1)).checked_mul(machine.totalram);
-        groups.chain(machine).chain(process_limits()).min()
+        let mut limit = machine.into_iter().chain(process_limits()).min();
+        for file in &self.limits {
+            let n = read_at(file, &mut buf)?;
+            let text = std::str::from_utf8(buf.get(..n)?).ok()?;
+            if let Some(group) = read_group_limit(text).ok()? {
+                limit = Some(limit.map_or(group, |bound| bound.min(group)));
+            }
+        }
+        limit
     }
 
     /// `/proc/self/statm`'s resident pages (its second field) in bytes, as memory-stats reads it.
@@ -378,32 +394,34 @@ impl Opened {
             .ok()?;
         pages.checked_mul(u64::try_from(rustix::param::page_size()).ok()?)
     }
+
+    fn reading(&self) -> Option<Reading> {
+        if !self.current() {
+            return None;
+        }
+        Some(Reading {
+            limit: Some(self.limit()?),
+            resident: self.resident().or_else(resident),
+        })
+    }
 }
 
 #[cfg(target_os = "linux")]
 impl Readings for System {
     fn read(&self) -> Reading {
         let held = self.opened.read().ok().and_then(|o| o.clone());
-        let opened = match held {
-            Some(opened) if opened.current() => Some(opened),
-            _ => {
-                let fresh = Opened::open().map(Arc::new);
-                if let Ok(mut slot) = self.opened.write() {
-                    slot.clone_from(&fresh);
-                }
-                fresh
-            }
-        };
-        match opened {
-            Some(opened) => Reading {
-                limit: opened.limit(),
-                resident: opened.resident().or_else(resident),
-            },
-            None => Reading {
-                limit: limit(),
-                resident: resident(),
-            },
+        if let Some(reading) = held.as_deref().and_then(Opened::reading) {
+            return reading;
         }
+        let fresh = Opened::open().map(Arc::new);
+        let reading = fresh.as_deref().and_then(Opened::reading);
+        if let Ok(mut slot) = self.opened.write() {
+            *slot = fresh.filter(|_| reading.is_some());
+        }
+        reading.unwrap_or_else(|| Reading {
+            limit: limit(),
+            resident: resident(),
+        })
     }
 }
 
@@ -928,6 +946,61 @@ pub(crate) mod tests {
         assert_eq!(first.limit, limit());
         assert_eq!(again.limit, first.limit);
         assert!(again.resident.is_some());
+    }
+
+    /// AC-MB.1.1. A group whose files could not be opened must be retried even if membership
+    /// stays the same. After the files become available its limit bounds admission again.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn review_retry_incomplete_cgroup_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let membership = dir.path().join("membership");
+        std::fs::write(&membership, "0::/child\n").unwrap();
+        let child = dir.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        let open = || Opened::open_groups(std::fs::File::open(&membership).unwrap(), dir.path());
+        assert!(
+            open().is_none(),
+            "cached a group with neither limit nor watcher"
+        );
+        std::fs::write(child.join("memory.max"), "1024\n").unwrap();
+        assert_eq!(open().unwrap().limit(), Some(1024));
+    }
+
+    /// AC-MB.1.1. A previously opened limit which can no longer be read invalidates the cached
+    /// set, so discovery will retry the same group's current files.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn review_unreadable_cgroup_limit_requires_rediscovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let membership = dir.path().join("membership");
+        std::fs::write(&membership, "0::/child\n").unwrap();
+        let child = dir.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        // A file descriptor whose positional read returns an error.
+        std::fs::create_dir(child.join("memory.max")).unwrap();
+        let opened =
+            Opened::open_groups(std::fs::File::open(membership).unwrap(), dir.path()).unwrap();
+        assert_eq!(opened.limit(), None);
+    }
+
+    /// AC-MB.1.1. Do: cache this process's opened files with a limit file that then fails every
+    /// read, and take the system's reading. Expect: the limit a fresh read gives, from a newly
+    /// opened set that replaces the failing one, not the machine's limit from the rest.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn review_a_cached_limit_that_stops_reading_is_rediscovered() {
+        let mut cached = Opened::open().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        cached.limits = vec![std::fs::File::open(dir.path()).unwrap()];
+        let cached = Arc::new(cached);
+        let system = System::new();
+        *system.opened.write().unwrap() = Some(cached.clone());
+        assert_eq!(system.read().limit, limit());
+        assert!(!Arc::ptr_eq(
+            system.opened.read().unwrap().as_ref().unwrap(),
+            &cached
+        ));
     }
 
     /// Do: parse a cgroup v2 process's `/proc/self/cgroup`, a v1 process's, and a hybrid's. Expect:
