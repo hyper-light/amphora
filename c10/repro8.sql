@@ -1,0 +1,18 @@
+CREATE TABLE a(k INT, j TEXT);
+INSERT INTO a VALUES (1, '[1,2]'), (2, '[3]');
+CREATE TABLE t(k INT, j TEXT);
+INSERT INTO t VALUES (1, '[7,8]'), (2, '[9]');
+CREATE TABLE r(x INT);
+INSERT INTO r VALUES (1), (5);
+CREATE TABLE l(x INT, y INT);
+INSERT INTO l VALUES (2, 5), (3, 7);
+CREATE TABLE e(k INT);
+SELECT a.k, je.value FROM a FULL JOIN json_each((SELECT t.j FROM t WHERE t.k IN (SELECT r.x FROM r WHERE r.x = a.k))) AS je ON je.value = 7;
+SELECT a.k, je.value FROM a FULL JOIN json_each((SELECT t.j FROM t WHERE t.k = a.k AND EXISTS (SELECT 1 FROM r JOIN l ON r.x = l.y))) AS je ON je.value = 7;
+SELECT a.k, je.value FROM a FULL JOIN json_each((SELECT t.j FROM t WHERE t.k = coalesce(a.k, 1) AND (SELECT count(*) FROM r JOIN l ON r.x = l.y) = 1)) AS je ON je.value = 7;
+SELECT e.k, je.value FROM e FULL JOIN json_each((SELECT t.j FROM t WHERE t.k = coalesce(e.k, 1) AND (SELECT count(*) FROM r JOIN l ON r.x = l.y) = 1)) AS je ON je.value = 7;
+SELECT e.k, je.value FROM e FULL JOIN json_each((SELECT t.j FROM t WHERE t.k = coalesce(e.k, 1) AND t.k IN (SELECT r.x FROM r WHERE r.x = coalesce(e.k, 1)))) AS je ON je.value = 7;
+SELECT e.k, je.value FROM e FULL JOIN json_each((SELECT t.j FROM t WHERE t.k = 1 AND (SELECT count(*) FROM r JOIN l ON r.x = l.y) = 1)) AS je ON je.value = 7 WHERE je.value IN (SELECT l.y FROM r JOIN l ON r.x = l.y OR l.x = 3);
+SELECT a.k, je.value FROM a FULL JOIN json_each((SELECT t.j FROM t WHERE t.k = 1)) AS je ON je.value = 7 WHERE je.value IN (SELECT l.y FROM l WHERE l.x > 1) OR a.k IN (SELECT r.x FROM r WHERE r.x = a.k);
+SELECT count(*) FROM a;
+SELECT count(*) FROM t;
