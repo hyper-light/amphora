@@ -17665,11 +17665,17 @@ pub fn op_open_dup(
                 .expect("cursor_id should be valid")
                 .replace(cursor.into_cursor());
         }
-        CursorType::BTreeIndex(_) => {
-            return Err(LimboError::InternalError(
-                "OpenDup is not supported for BTreeIndex".to_string(),
-            )
-            .into());
+        // An ephemeral index alone: a list read by two cursors at once.
+        CursorType::BTreeIndex(index) if is_ephemeral => {
+            let cursor =
+                BTreeCursor::new_index(pager, root_page, index.as_ref(), index.columns.len())?;
+            state
+                .cursors
+                .get_mut(*new_cursor_id)
+                .ok_or_else(|| {
+                    LimboError::InternalError(format!("OpenDup has no cursor {new_cursor_id}"))
+                })?
+                .replace(Cursor::new_btree(Box::new(cursor)));
         }
         _ => {
             return Err(LimboError::InternalError(format!(
