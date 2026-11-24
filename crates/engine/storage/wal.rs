@@ -4129,6 +4129,10 @@ pub struct SharedLog {
     /// the current segment's state reads it without unpacking that word. Written only with
     /// `segments`.
     second_current: AtomicBool,
+    /// The second segment's file (`<db>-wal2`), made by the writer's first switch into it when the
+    /// open found none. None for a log with no path (tests'): its switch into a segment with no
+    /// file fails.
+    second_path: Option<String>,
     /// Lock used by in-place VACUUM to keep new read/write transactions out
     /// while VACUUM is in progress.
     /// Normal WAL transactions hold this shared for the lifetime of their
@@ -4154,6 +4158,7 @@ impl SharedLog {
             first,
             WalFileShared::new_noop(),
             Segments::new(SegmentId::First),
+            None,
         )
     }
 
@@ -4165,6 +4170,7 @@ impl SharedLog {
     pub fn recover(
         first: Arc<RwLock<WalFileShared>>,
         second: Arc<RwLock<WalFileShared>>,
+        second_path: Option<String>,
     ) -> Result<Arc<Self>> {
         let sequence = |segment: &Arc<RwLock<WalFileShared>>| {
             let shared = segment.read();
@@ -4181,13 +4187,14 @@ impl SharedLog {
                  neither one past the other: no switch leaves such a pair"
             ))
         })?;
-        Ok(Self::with_segments(first, second, segments))
+        Ok(Self::with_segments(first, second, segments, second_path))
     }
 
     fn with_segments(
         first: Arc<RwLock<WalFileShared>>,
         second: Arc<RwLock<WalFileShared>>,
         segments: Segments,
+        second_path: Option<String>,
     ) -> Arc<Self> {
         let read_index = |segment: &Arc<RwLock<WalFileShared>>| {
             let guard = segment.read();
@@ -4202,6 +4209,7 @@ impl SharedLog {
             read_indexes,
             second_current: AtomicBool::new(segments.current() == SegmentId::Second),
             segments: SegmentsCell::new(segments),
+            second_path,
             vacuum_lock: PaddedLock::new(TursoRwLock::new()),
             write_lock: PaddedLock::new(TursoRwLock::new()),
             checkpoint_lock: PaddedLock::new(TursoRwLock::new()),
@@ -4253,6 +4261,53 @@ impl SharedLog {
     /// next switch writes its header over it.
     pub(crate) fn end_read(&self, span: ReadSpan) {
         self.segments.end_read(span);
+    }
+
+    /// The writer's switch (decision 45), made where a restart started the log again: the current
+    /// segment closes, uncopied frames and the reads on it kept, and the free one becomes current,
+    /// its header one checkpoint sequence past the closing one's and written and synced by the
+    /// next commit before any frame. It takes no read mark and waits for no read: the segment
+    /// switched to is free, so no read counts on it. The caller holds `write_lock`. The segment
+    /// now current, or None while the other one is still closing (the writer appends on and asks
+    /// again at its next turn).
+    pub fn switch(&self, io: &dyn IO) -> Result<Option<SegmentId>> {
+        let segments = self.segments.load();
+        if segments.closing().is_some() {
+            return Ok(None);
+        }
+        let from = segments.current();
+        let to = from.other();
+        let (header, epoch, transaction_count) = {
+            let closing = self.segment(from).read();
+            let header = *closing.metadata.wal_header.lock();
+            (
+                header,
+                closing.runtime.epoch.load(Ordering::Acquire),
+                closing.metadata.transaction_count.load(Ordering::Acquire),
+            )
+        };
+        {
+            let mut free = self.segment(to).write();
+            if free.runtime.file.is_none() {
+                let path = self.second_path.as_deref().ok_or_else(|| {
+                    LimboError::InternalError(
+                        "the log's free segment has no file and no path to make one".into(),
+                    )
+                })?;
+                free.runtime.file = Some(io.open_file(path, crate::OpenFlags::Create, false)?);
+            }
+            free.metadata.enabled.store(true, Ordering::Release);
+            free.start_after(io, header, epoch, transaction_count);
+        }
+        let switched = self.segments.update(|segments| segments.switch(false));
+        if switched != Some(Some(to)) {
+            return Err(LimboError::InternalError(format!(
+                "the log's switch to {to:?} found {switched:?}: only the writer switches"
+            )));
+        }
+        self.second_current
+            .store(to == SegmentId::Second, Ordering::Release);
+        Ok(Some(to))
     }
 }
 
@@ -7586,11 +7641,15 @@ impl WalFile {
                             return Err(LimboError::Busy.into());
                         }
                     }
+                    // The bound is the current segment's flushes: a closing segment's frames are
+                    // all durable, flushed before its switch (decision 45).
                     if let CheckpointMode::Passive {
                         upper_bound_inclusive: Some(upper_bound),
                     } = mode
                     {
-                        max_frame = max_frame.min(upper_bound);
+                        if closing.is_none() {
+                            max_frame = max_frame.min(upper_bound);
+                        }
                     }
 
                     {
@@ -8747,6 +8806,20 @@ impl WalFileShared {
     /// This function updates the shared-memory structures so that the next
     /// client to write to the database (which may be this one) does so by
     /// writing frames into the start of the log file.
+    /// Make this free segment the one that follows `closing`'s header (decision 45): the same
+    /// format and page size, its sequence one past and its salts new ([`Self::restart_wal_header`]),
+    /// the epoch and transaction count carried on so that neither comes back to a value a
+    /// connection took from the closing segment.
+    fn start_after(&mut self, io: &dyn IO, closing: WalHeader, epoch: u32, transaction_count: u64) {
+        *self.metadata.wal_header.lock() = closing;
+        self.metadata.loaded.store(true, Ordering::Release);
+        self.metadata
+            .transaction_count
+            .store(transaction_count, Ordering::Release);
+        self.runtime.epoch.store(epoch, Ordering::Release);
+        self.restart_wal_header(io);
+    }
+
     fn restart_wal_header(&mut self, io: &dyn IO) {
         {
             let mut hdr = self.metadata.wal_header.lock();

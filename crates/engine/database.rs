@@ -2471,7 +2471,11 @@ impl Database {
                     )?;
                     #[cfg(not(host_shared_wal))]
                     let second_segment = WalFileShared::new_noop();
-                    let shared_log = SharedLog::recover(shared_wal, second_segment)?;
+                    let shared_log = SharedLog::recover(
+                        shared_wal,
+                        second_segment,
+                        Some(storage::wal::second_segment_path(&self.wal_path)),
+                    )?;
 
                     let open_mv_store = *open_mv_store;
                     let HeaderValidationState::OpenWal { mut pager, .. } = std::mem::take(st)
@@ -3382,6 +3386,42 @@ impl Database {
     /// Amphora: where the log ends, as (its generation, the header's `checkpoint_seq`; its last
     /// committed frame). A flush of the log's file begun after this makes every frame up to it
     /// durable ([`Database::wal_durable`]).
+    /// Amphora: the writer's switch to the log's free segment, between its transactions (decision
+    /// 45, [`SharedLog::switch`]): whether it switched. False while another connection writes or
+    /// the other segment is still closing: the caller asks again at its next turn. It waits for
+    /// no read.
+    pub fn switch_log(&self) -> Result<bool> {
+        if !self.shared_wal.write_lock.write() {
+            return Ok(false);
+        }
+        let switched = self.flush_and_switch();
+        self.shared_wal.write_lock.unlock();
+        self.shared_wal.released.notify();
+        Ok(switched?.is_some())
+    }
+
+    /// The current segment's file flushed, then the switch: every frame of a closing segment is
+    /// durable, so a pass copies all of it, unbounded by the current segment's flushes.
+    fn flush_and_switch(&self) -> Result<Option<storage::log_segments::SegmentId>> {
+        if self.shared_wal.segments.load().closing().is_some() {
+            return Ok(None);
+        }
+        let file = self.shared_wal.current().read().runtime.file.clone();
+        if let Some(file) = file {
+            let synced = file.sync(
+                crate::io::Completion::new_sync(|_| {}),
+                crate::io::FileSyncType::DataSync,
+            )?;
+            self.io.wait_for_completion(synced)?;
+        }
+        self.shared_wal.switch(self.io.as_ref())
+    }
+
+    /// Amphora: the segment of the log the writer appends to (decision 45).
+    pub fn wal_segment(&self) -> storage::log_segments::SegmentId {
+        self.shared_wal.current_id()
+    }
+
     pub fn wal_end(&self) -> (u32, u64) {
         let shared = self.shared_wal.current().read();
         let generation = shared.metadata.wal_header.lock().checkpoint_seq;
