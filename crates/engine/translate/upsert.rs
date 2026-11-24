@@ -1772,7 +1772,8 @@ pub(crate) fn rewrite_expr_to_registers(
         match table.get_column_by_name(name) {
             Some((_, c)) if c.is_rowid_alias() => Some(rowid_reg),
             Some((idx, _)) => Some(base_start + layout.to_reg_offset(idx)),
-            None => names_rowid(name).then_some(rowid_reg),
+            None if names_rowid(name) => Some(rowid_reg),
+            None => None,
         }
     };
 

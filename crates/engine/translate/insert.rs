@@ -2389,23 +2389,21 @@ fn init_source_emission<'a>(
                                 // Amphora: a column declared under one of the rowid's names is
                                 // that column, of its own affinity.
                                 let column_name = normalize_ident(col_name.as_str());
-                                table
-                                    .get_column_by_name(&column_name)
-                                    .map(|(_, col)| col.affinity())
-                                    .or_else(|| {
-                                        ROWID_STRS
-                                            .iter()
-                                            .any(|s| s.eq_ignore_ascii_case(&column_name))
-                                            .then_some(Affinity::Integer)
-                                    })
-                                    .map(|affinity| affinity.aff_mask())
-                                    .ok_or_else(|| {
-                                        crate::error::LimboError::ParseError(format!(
-                                            "table {} has no column named {}",
-                                            table.get_name(),
-                                            column_name
-                                        ))
-                                    })
+                                let affinity = match table.get_column_by_name(&column_name) {
+                                    Some((_, col)) => col.affinity(),
+                                    None if ROWID_STRS
+                                        .iter()
+                                        .any(|s| s.eq_ignore_ascii_case(&column_name)) =>
+                                    {
+                                        Affinity::Integer
+                                    }
+                                    None => crate::bail_parse_error!(
+                                        "table {} has no column named {}",
+                                        table.get_name(),
+                                        column_name
+                                    ),
+                                };
+                                Ok(affinity.aff_mask())
                             })
                             .collect::<Result<String>>()?
                     };
