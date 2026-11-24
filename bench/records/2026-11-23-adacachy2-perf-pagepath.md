@@ -1717,3 +1717,58 @@ Refused for room: `cpus=8` at 10:00Z (2 of 32 cores idle), `cpus=6` at 10:07Z (5
 
 **Commands.** `~/.cache/amphora-perf/pagepath-b26/` on this machine holds the scripts and this record's draft; on adacachy2 the same folder holds them, the old base (`old-base`)
 and one folder of logs a run (`wip1`, `wip2`, `merged-9d56159e`, `final-f46a2d7f`, `mutants`, `last-land`) beside the evidence's logs.
+
+## perf-B27 (2026-11-24, 10:19:23Z-11:19:23Z; every restart switches, and the store's slow read)
+
+**Losses first.**
+- Parts 1 and 2 (RESTART, TRUNCATE and the writer's restart switch; the in-place restart deleted), which came first in the brief, are built and NOT landed:
+  branch `perf/pagepath-b27` (WIP history, never for main as it is; the last tested tree is 8681e921, main 837071af merged). Two replicated tests that V22 landed
+  fail there, 3 of 3 runs: `a_slow_local_read_has_no_write_refused_past_the_logs_room` (the slow read is ended) and
+  `a_slow_local_read_past_the_logs_room_ends_typed_and_no_write_is_refused` ("the log started again too seldom"). Both pass on main's engine (r1930).
+- Why, from the code and the three runs (not traced by a log): a replica's writer restarted its log in place at each write that found it copied whole, until the
+  first switch made `-wal2`; its room counts the bytes of its current segment's file (`log_bound::log_room`, `kept`). With the in-place restart gone either the writer
+  switches by itself (r1874), and the read is on a closed segment sooner, or (its own restart turned off, `Db::own_restarts`, r1898 and r1913) the file is longer as the
+  test begins. Both change what the tests' 16 and 32 frames of room mean. The lead's choice: the owner alone restarts (the branch's), and the two tests' logs
+  begin at their start.
+- On the branch a multi-process log still restarts its one segment in place (`ShmWalCoordination::switch_unread`), so "no in-place restart remains" holds for one
+  process only. Its shared memory publishes no switch: what one needs is a switch made when no process reads the log, published with the segments' word, followed by the
+  other processes before a read, a write or a pass, and an open that follows the word rather than its own scan. Not started.
+- On the branch, not as SQLite: a second RESTART or TRUNCATE beside one read of the file alone is busy; a second RESTART counts 0 frames (SQLite's old ones).
+- A clean close (TRUNCATE) leaves an empty `-wal2` beside the database on the branch.
+- Version 3 in bytes 18 and 19 (decision 45, "What plain SQLite sees") is not written by anything I read; with the writer's own switch, a crash leaves commits in `-wal2` that
+  plain SQLite reads without. Not looked into.
+
+**Landed: the store's slow read (part 3).** `Db::restart_log` (the store's restart, asked past the log's bound) ends the reads that count on the closing segment when the
+current segment's file is past the room a restart keeps (`keep_log`, decision 31), before its two passes; `SnapshotTooOld`, as replicas' (V22). Three lines.
+Test: `d45_a_slow_read_gives_way_when_the_logs_room_is_full` (tests/store.rs), a store of 64 frames' bound and 512 a segment's room: 1,500 rows put beside a read held in
+a transaction, each read back, both files within the room and 64 frames, the slow read typed; with room for 1,048,576 the slow read answers its own 2,000 rows.
+Red on main's code (79ced69b's db.rs under the landed test, 11:11:02Z): "the slow read kept the log past its room: 34890" (it was answered); green 5 of 5.
+Landed as fcad33f7 at 11:10:50Z, a fast-forward from 79ced69b, its tree r1930's (6cc53784's) and two records.
+
+**On the branch (parts 1 and 2).**
+- `WalFile::switch_before_write`, `start_log_again`, `truncate_log` (`LogCut`: the file with the older header is cut and synced first), `CheckpointState::ClosingCopied`,
+  `SharedLog::switch_copied` and `start_first`; `Segments` unchanged. The five functions are gone from the crate (grep). The pragma's blocked row is SQLite's
+  (1|frames|copied, "proceeds [...] as SQLITE_CHECKPOINT_PASSIVE"; main answers 1 and two NULLs). FULL copies both segments (main reports the closing one's copy as the log's).
+- Found and fixed on the way there: a switch into a segment whose mark 0 a checkpoint still holds answers None and not an InternalError (a user's write would have failed); VACUUM
+  read none of the closing segment's frames; a TRUNCATE's header read by a connection whose view was older than the copy would have sized the file by an older header.
+- crates/engine/tests/log_restart.rs: 15 cases of steps, on a new log and on one that switched, held to what sqlite3 3.54.0 printed for the same steps (run on
+  adacachy with `sqlite.sh`); three of its four tests fail on main 5fa71186 (r1865): on a switched log RESTART, TRUNCATE answer `1||` and the writer's restart does nothing.
+
+**Runs** (adacachy2, `on` it; clone `pagepath-remote`, target `pagepath`).
+| run | tree | result |
+|---|---|---|
+| r1807 | main 5fa71186 | `storage:: vdbe::vacuum multiprocess_tests mvcc::database::tests` 1,238 passed, 0 failed, 24 ignored (239 s): the pass set |
+| r1844 | f27664fb | tests/backup.rs 50, tests/store.rs 17, tests/files.rs 3, `backup::` 48, the power cut 1 |
+| r1865 | main 5fa71186 + log_restart.rs | 1 passed, 3 failed (red) |
+| r1874 | 027b3620 (main merged) | engine suite 1,239 passed, 0 failed, 24 ignored (222 s); log_restart 4, read_ended 2; backup 50, store 17, files 3, crash 1, `backup::` 48; clippy 0 (Checking amphora-engine, amphora); `database::replicated::` 176 passed, 3 failed (the two above, and `every_falsifier_...`, W4's flake); check-production 1: the ratchet's counts fell by 4 |
+| r1883 | d4b1c144 | tests/store.rs 17 and the new one (its own ROLLBACK failed); red without the rule |
+| r1898, r1913 | b6bf89fe, 8681e921 | store 18; backup 50, files 3, crash 1, `backup::` 48; `d45_ storage::wal ... multiprocess_tests` 212 passed, 0 failed; the two replicated tests fail; clippy and check-production not reached |
+| r1930 | 5d14638e (main 837071af + the landed change; fcad33f7 but for records) | fmt 0; tests/store.rs 18 passed; the two slow-read replicated tests 2 passed; tests/backup.rs 50 passed, 0 failed, 1 ignored (the drill among them); `backup::` 48; the 200-seed power cut 1; clippy `-p amphora -p amphora-engine --all-targets --locked -D warnings` 0 ("Checking amphora-engine"); check-production 0 ("10596 left ... as the ratchet holds") |
+
+The engine's suites were not run on the landed tree: it changes no engine file. `sqlite.sh`, the edits and the drafts are in `~/.cache/amphora-perf/pagepath-b27/` on adacachy; logs on
+adacachy2 in the same folder (`r2` to `r13`, `base`, `red`). Refused for room on the way: 12 cpus at 10:55Z (11 idle), 8 at 11:03Z (3), 6 at 11:06Z (0); the Mac run asked first (r1788) never started.
+r1860, r1864, r1898 and r1913 were stopped by this lane as the tree they ran was superseded.
+
+**For the next lane** (parts 1 and 2): rebase `perf/pagepath-b27`'s diff; keep `Db::own_restarts` and have the two replicated tests' owner start its log before the slow read begins (their 16
+and 32 frames are "past its own file"), or keep the writer's switch off for a log its owner has ever switched, and say which in replication.md; then the engine suite (1,239 on 027b3620), clippy,
+check-production (lower the ratchet by arithmetic 1, cast_possible_wrap 2, disallowed_macros 1, as the branch does) and the multi-process switch.

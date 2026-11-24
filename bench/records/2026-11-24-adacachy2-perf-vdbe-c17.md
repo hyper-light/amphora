@@ -8,14 +8,24 @@ module and the shell, adacachy's and adacachy2's system library). Goal G2 step 3
 - **A conflict clause inside a trigger is still not its statement's own.** A constraint that fails in a trigger's statement is taken by the clause of the statement that fired the trigger. Not
   fixed (not one of the three, no panic): a trigger program holds several statements and one `resolve_type` (`vdbe/mod.rs`), and the parent reads its own (`execute.rs`, `op_program`). The
   sweep's cases, default settings:
-  - `INSERT OR FAIL INTO u ..` in a trigger: SQLite keeps what was written before the failure, Amphora rolls the statement back (`wide1` drawn 465; seed CP of the first draw, drawn 104).
-  - An `INSERT OR IGNORE INTO t .. ON CONFLICT(k) DO UPDATE` whose UPDATE trigger breaks a constraint: SQLite refuses the statement, Amphora skips the trigger's statement (`wide1` drawn 523); under
-    OR FAIL it keeps the rows SQLite rolls back (drawn 107).
-  - `INSERT OR FAIL` as a trigger's last statement makes an earlier one's ABORT a FAIL (`wide1` drawn 489).
-- **The committed sweep draws around that cause and four more** (its generator's head names each): UNIQUE ON CONFLICT beside another constraint, which of two constraints is met first
-  (`wide1` drawn 23, 129, 236, 392, 586); NOCASE columns in a trigger's WHEN (the oracles' CX, drawn 144); text inserted in an INTEGER PRIMARY KEY under OR ROLLBACK, where Amphora ends the transaction
-  and SQLite doesn't (drawn 13); the order a multi-row UPDATE or DELETE visits rows in where the planner chooses an index (with statistics, drawn 332, 343, 399). Of 900 databases of the unrestricted
-  draw (seed wide1) 50 differed, for these causes and the two fixed below.
+  - `INSERT OR FAIL INTO u ..` in a trigger with another statement after it: SQLite keeps what was written before the failure, Amphora rolls the statement back (`wide1` drawn 465; the first draw's 104). Alone or last in
+    its trigger it agrees; last, it makes an earlier statement's ABORT a FAIL (`wide1` drawn 489).
+  - A constraint that fails in a DO UPDATE's trigger under OR IGNORE is ignored (under OR FAIL it keeps the rows, drawn 107); SQLite refuses the statement. Written wrong on a plain rowid table:
+
+    ```sql
+    CREATE TABLE t(k TEXT PRIMARY KEY, a INT); CREATE TABLE u(k TEXT PRIMARY KEY, n INT UNIQUE); INSERT INTO u VALUES ('a', 1), ('b', 2); INSERT INTO t VALUES ('x', 1);
+    CREATE TRIGGER g AFTER UPDATE ON t BEGIN UPDATE u SET n = 2 WHERE k = 'a'; END;
+    INSERT OR IGNORE INTO t VALUES ('x', 5) ON CONFLICT(k) DO UPDATE SET a = excluded.a;   -- SQLite: UNIQUE constraint failed: u.n, a stays 1. Amphora: taken, a is 5
+    ```
+- **The committed sweep draws around that cause and four more** (its generator's head names each; plain forms run on main's build and on SQLite):
+  - `CREATE TABLE t(k TEXT PRIMARY KEY, c INT UNIQUE ON CONFLICT IGNORE) WITHOUT ROWID`, rows ('a', 1), ('b', 2): `INSERT INTO t VALUES ('a', 2)`: SQLite ignores it, Amphora refuses (the primary key is met first;
+    a rowid table agrees).
+  - The same table with a rowid, row ('a', 1): `INSERT INTO t VALUES ('b', 1) ON CONFLICT(k) DO NOTHING`: SQLite ignores it, Amphora refuses.
+  - `BEGIN; INSERT INTO t VALUES (1); INSERT OR ROLLBACK INTO t VALUES ('x'); COMMIT` with t(k INTEGER PRIMARY KEY): SQLite's datatype mismatch leaves the transaction, Amphora ends it and loses the row (drawn 13).
+  - NOCASE columns in a trigger's WHEN (the oracles' CX, drawn 144); and the order a multi-row UPDATE or DELETE visits rows in where the planner chooses an index (with statistics, drawn 332, 343, 399: no document says).
+
+  The unrestricted draw (900 databases, seed wide1, before the generator drew around these) had 50 questions that differ. I read the cases of 16 of their databases in full; the others may hide another cause. The same size of
+  draw as committed (seed wide2) has none.
 - **INSTEAD OF triggers don't exist in Amphora** (refused at CREATE), so none is in the sweep.
 - WITHOUT ROWID tables with generated columns, custom types, UPDATE FROM or CDC still refuse a mutation, triggers or not (docs/design/without-rowid.md).
 - `replace_refuses_unsupported_delete_trigger_and_generated_image_before_writing` (tests/without_rowid_dml.rs) asserted the refusal of a REPLACE on a WITHOUT ROWID table with a DELETE trigger. That refusal was the
@@ -82,20 +92,23 @@ SELECT 1 FROM t AS x JOIN u AS y ON (CASE WHEN x.a <= NULL THEN NULL END) JOIN t
 | sweep (generator) | questions | asked | main's translate (0c0a3b6c) | fixed |
 |---|---:|---:|---|---|
 | windows (`bench/sqlite_windows.py`): every window function and aggregate, 1 to 3 windows, ROWS RANGE GROUPS, EXCLUDE, FILTER, PARTITION BY, named, over joins, groups, DISTINCT, ORDER BY, derived, CTE | 820 | 3,280 | 88 differ, 17 panics | 0 |
-| triggers (`bench/sqlite_triggers.py`): every event and time, WHEN, UPDATE OF, RAISE, bodies writing a log, another table and the table itself; INSERT, REPLACE, UPDATE, DELETE, UPSERT, RETURNING under every clause; what the tables hold after each, PRAGMA integrity_check | 4,384 | 17,536 | 2,628 differ, 184 panics | 0 |
+| triggers (`bench/sqlite_triggers.py`): every event and time, WHEN, UPDATE OF, RAISE, bodies writing a log, another table and the table itself; INSERT, REPLACE, UPDATE, DELETE, UPSERT, RETURNING under every clause; what the tables hold after each, PRAGMA integrity_check | 4,399 | 17,596 | 2,628 of 17,536 differ, 184 panics (before the fourth panic's case was in) | 0 |
 | cursors (`bench/sqlite_unread_cursors.py`): subqueries of grouped and aggregate LEFT, RIGHT and FULL JOINs, row-value ranges across joins | 918 | 3,672 | 148 differ, 5 panics | 0 |
 
 (The panics are counted by distinct question. The fixtures' first questions are each finding's own form.) Wider draws, run once on the fixed tree: windows 2,500 a database (5,020 questions) and cursors 2,000 (6,018), seed wide1:
 none differ. Triggers, seed wide2, 900 databases: none differ.
 
-Each part taken out (mutants, on the merged tree 88eedf4e): CO 84 answers differ (17 panics), the late argument's aggregates 4, DC's output phase 132 (3 panics), DC's prefilter 16 (2 panics).
+Each part taken out (mutants; r1862 on the merged tree 88eedf4e, r1915 on main 837071af): CO 84 answers differ (17 panics), the late argument's aggregates 4, DC's output phase 132 (3 panics), DC's prefilter 16 (2 panics), the row
+not read again after BEFORE triggers 20, OR ABORT 16, the INSERT's seek 12 (1 panic). Not taken out: the key sought again after BEFORE DELETE, `new.rowid`'s refusal and the DO UPDATE's firing, whose cases
+are in the sweep. Sixteen window queries of shapes the sweep lacks (a window in ORDER BY past a unique key, in EXISTS, in IN, unread columns), 64 asked on main 837071af: none differ (r1915).
 
 ## 5. Checks
 
 Linux, adacachy2, the tree landed (20cf0b73, main 0c0a3b6c merged; r1887): `cargo fmt --all --check` 0; `cargo clippy -p amphora-engine --all-targets --locked -- -D warnings` 0; check-production 0 (10,596 left; expect_used
-857 to 856); windows_and_triggers 3 passed (24,500 answers), without_rowid_dml 4, oracle_findings 92, dml_rows 16, upsert_conflict_clauses 1, row_values 4. One commit before the last (88eedf4e, r1858: all but the INSERT's
-seek, its case and the ratchet): without_rowid_seek 6, without_rowid_affinity 2, row_value_seek 5, in_subquery 4, join_methods 4, on_terms 5, outer_join_subqueries 3, the same suites above green, and clippy 0. The
-library's vdbe, window, trigger and upsert tests run after the landing; the next record line says what they gave.
+857 to 856); windows_and_triggers 3 passed (24,548 answers), without_rowid_dml 4, oracle_findings 92, dml_rows 16, upsert_conflict_clauses 1, row_values 4. One commit before the last (88eedf4e, r1858: all but the INSERT's
+seek, its case and the ratchet): without_rowid_seek 6, without_rowid_affinity 2, row_value_seek 5, in_subquery 4, join_methods 4, on_terms 5, outer_join_subqueries 3, the same suites above green, and clippy 0. After
+the landing, on main 837071af: clippy 0 with the log's own `Checking amphora-engine v0.1.0` (r1901); the library's tests `vdbe::` 403 passed, 4 ignored, `translate::` 298 (22 ignored), `window` 6, `trigger` 14,
+`without_rowid` 7, `upsert` 6, none failed; in_subquery 4, on_terms 5 (r1902); the product's own `without_rowid` target (crates/amphora) 17 (r1929). Not run: the suites that need the `simulator` feature (planner, adaptive_joins, unnesting), the corpus, the gate.
 
 Lost time: five runs refused for room (0 to 3 of 32 cores idle). Two copies of the last check, started by a program of mine that ended on an error, ran beside it for two minutes and were ended by their process groups.
 
