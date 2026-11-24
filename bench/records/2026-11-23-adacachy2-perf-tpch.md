@@ -1259,8 +1259,8 @@ Losses first:
 - A new thread's `/proc/thread-self/schedstat` read `0 0 1` (r1778's first line): the run time can be 0, so
   "kept" is read from the third field (times given a CPU), not the first. Found in the A/B, fixed in the final form.
 
-Machine: adacachy2 (runner 00aad8da), named. r1770 asked `cpus=16,mem=24g`, then `cpus=8,mem=24g`; both were
-refused (9, then 5, of 32 cores idle). r1778 ran at `cpus=4,mem=12g`, JOBS=4, from `tpch-remote` (worktree
+Machine: adacachy2 (runner 00aad8da), named. The ask at `cpus=16,mem=24g` was refused at once (9 of 32 cores
+idle), and r1770 at `cpus=8,mem=24g` was refused (5 idle). r1778 ran at `cpus=4,mem=12g`, JOBS=4, from `tpch-remote` (worktree
 `~/.cache/tpch-ab/t15`), the lane's one target dir. Scripts: local copies in `~/.cache/amphora-perf/tpch-t15/`
 (`run.sh`, `summ.py`, `check.sh`).
 
