@@ -9,11 +9,11 @@ documents are 3.54.1's (sqlite-doc-3540100). Goal G2 step 3; AC-T1.1.1, AC-T1.8.
   main's C26, C27 and B29 merged in (foreign keys, recursive triggers), and the fixes of section 4's right column. `cargo fmt` parses and passes it; nothing else of it is checked. Not run at all: clippy, check-production, the four suites
   (windows_and_triggers, oracle_findings, dml_rows, without_rowid_dml), `tests/instead_of.rs`, the sweep at parallel and with statistics, and the red run on main (read, not run: CREATE TRIGGER refuses there, and all but two of the sweep's databases make one).
 - **The last measured sweep is red: 435 of 5,871 questions differ at default settings** (tree a9b78bbe: this lane on main 8d70429d, before the fixes below). Each class is read and explained in section 4; the count after the fixes is not known.
-- **Found and left, each of another cause** (no query of a view does it on main either):
-  - A view's column named with its database, `UPDATE v SET .. WHERE main.v.k = 1`: "no such column: main.v.k"; SQLite takes it. (SET and RETURNING take `main.v.k`.)
-  - A view with a column list over VALUES or over `*` (`CREATE VIEW v(k, a) AS VALUES (1, 2)`, `.. AS SELECT * FROM ..`) keeps its query's own names, so its triggers' `new.k` is "no such column".
-  - `ALTER TABLE t RENAME COLUMN a TO aa` where a view passes `a` through by its own name and its trigger reads `new.a`: SQLite refuses ("error in trigger g after rename: no such column: new.a"), Amphora takes it and the trigger's statement is refused after.
-  - `changes()` after a statement refused as it ran keeps the statement's before it (SQLite: 0), and a WITHOUT ROWID table's INSERT counts twice in `total_changes()` and moves `last_insert_rowid()`; the sweep doesn't ask these.
+- **Found and left, each of another cause** (how each is known is beside it; none was asked as a plain query on main):
+  - A view's column named with its database, `UPDATE v SET .. WHERE main.v.k = 1`: "no such column: main.v.k"; SQLite takes it. Answered so by this lane's DELETE and UPDATE, whose WHERE is a SELECT's over the view; the binder (`resolve_qualified_name`) passes over a subquery's table for a name with a database. SET and RETURNING read it from the row.
+  - A view with a column list over VALUES or over `*` (`CREATE VIEW v(k, a) AS VALUES (1, 2)`, `.. AS SELECT * FROM ..`) keeps its query's own names: `DELETE FROM v WHERE k` and its triggers' `new.k` are "no such column" (a9b78bbe).
+  - `ALTER TABLE t RENAME COLUMN a TO aa` where a view passes `a` through by its own name and its trigger reads `new.a`: SQLite refuses ("error in trigger g after rename: no such column: new.a"), Amphora takes it and the trigger's statement is refused after (read in alter.rs, not run).
+  - `changes()` after a statement refused as it ran keeps the statement's before it (SQLite: 0), and `total_changes()` is 3 more for each WITHOUT ROWID table of 3 rows, `last_insert_rowid()` 3 for SQLite's 0 (read off a9b78bbe's answers); the sweep doesn't ask these.
   - Words: "no such table: q" for a column of a table that isn't there (SQLite: "no such column: q.a"), and a missing table in a trigger's body without its database (SQLite: "no such table: main.v").
 - **Where the documents and sqlite3 3.54.0 differ, the documents are held** (`tests/instead_of.rs`, one test each):
   - An alias in WHERE: SQLite refuses `UPDATE v AS q SET .. WHERE q.k = 1` ("no such column: q.k": `sqlite3MaterializeView` stores the rows under the view's own name); lang_update.html and lang_delete.html give the target an alias.
@@ -74,6 +74,6 @@ cargo test -p amphora-engine --locked --test instead_of
 
 Scratch, never merged: branch diag/vdbe-c28 (`tests/c28_probe.rs`: the sweep at one setting with a trace of every statement; C28_FIXTURE, C28_OUT, C28_SETTING). On adacachy2: ~/.cache/amphora-perf/vdbe-c28-remote, ~/.cache/amphora-perf/vdbe-c28-out, target ~/.cache/amphora-perf-target/vdbe-c28.
 
-Lost time: 4 minutes to the DROP VIEW loop run without a trace; 24 minutes (12:59:35 to 13:24Z) to runs kiln accepted and adacachy2 didn't run (r2269, r2277, r2281, r2284, r2291, r2298) and Mac runs that never started (r2279, r2287, r2293), all stopped by this lane; asking
+Lost time: 4 minutes to the DROP VIEW loop run without a trace; 24 minutes (12:59:35Z to the end) to runs kiln accepted and adacachy2 didn't run (r2269, r2277, r2281, r2284, r2291, r2298) and Mac runs that never started (r2279, r2287, r2293), all stopped by this lane; asking
 again was no use and, the lead said, made it worse. One commit (00b8a2d7 to e488e679) didn't compile (an export missing, found by reading).
 
