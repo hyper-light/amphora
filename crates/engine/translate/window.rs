@@ -3101,12 +3101,12 @@ fn emit_window_arg_from_cursor(
                     dest: value_reg,
                     default: None,
                 });
-                t_ctx.resolver.cache_expr_reg(
+                t_ctx.resolver.cache_scalar_expr_reg(
                     std::borrow::Cow::Owned(node.clone()),
                     value_reg,
                     false,
-                    None,
-                );
+                    &plan.table_references,
+                )?;
                 return Ok(WalkControl::SkipChildren);
             }
             Ok(WalkControl::Continue)
@@ -3120,10 +3120,12 @@ fn emit_window_arg_from_cursor(
             &t_ctx.resolver,
         )?;
     }
-    t_ctx
-        .resolver
-        .cache_expr_reg(std::borrow::Cow::Owned(arg.clone()), dest, false, None);
-    Ok(())
+    t_ctx.resolver.cache_scalar_expr_reg(
+        std::borrow::Cow::Owned(arg.clone()),
+        dest,
+        false,
+        &plan.table_references,
+    )
 }
 
 /// Emit the code that adds one row into each function's running total (an

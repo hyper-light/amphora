@@ -1,4 +1,4 @@
-use crate::schema::{BTreeTable, Trigger};
+use crate::schema::{BTreeTable, Column, Trigger};
 use crate::sync::Arc;
 use crate::translate::expr::WalkControl;
 use crate::translate::plan::ColumnMask;
@@ -12,7 +12,6 @@ use crate::translate::{
     translate_inner, ProgramBuilder, ProgramBuilderOpts,
 };
 use crate::util::normalize_ident;
-use crate::vdbe::affinity::Affinity;
 use crate::vdbe::insn::{Insn, Subprogram};
 use crate::vdbe::BranchOffset;
 use crate::{bail_parse_error, QueryMode, Result};
@@ -196,14 +195,29 @@ struct TriggerSubprogramContext {
     db_name: Option<ast::Name>,
 }
 
-fn variable_from_parameter_index(index: NonZero<usize>, col_type: Option<&str>) -> Expr {
+/// `new.c` or `old.c` in a trigger's body: the parameter it is bound as, which keeps of its column
+/// what SQLite's TK_TRIGGER does.
+fn variable_from_parameter_index(
+    index: NonZero<usize>,
+    col_type: Option<&str>,
+    column: ast::TriggerColumn,
+) -> Expr {
     let nz = u32::try_from(index.get())
         .ok()
         .and_then(std::num::NonZeroU32::new)
         .expect("trigger parameter index must fit into NonZeroU32");
-    match col_type {
-        Some(ty) => Expr::Variable(ast::Variable::indexed_typed(nz, ty)),
-        None => Expr::Variable(ast::Variable::indexed(nz)),
+    Expr::Variable(ast::Variable::of_trigger(nz, col_type, column))
+}
+
+/// What `new.c` or `old.c` keeps of `column`.
+fn trigger_column(column: &Column) -> ast::TriggerColumn {
+    if column.is_rowid_alias() {
+        return ast::TriggerColumn::Rowid;
+    }
+    ast::TriggerColumn::Declared {
+        collation: column
+            .collation_opt()
+            .map(|collation| collation.name().into()),
     }
 }
 
@@ -439,6 +453,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                                 ctx.get_new_rowid_param()
                                     .expect("NEW parameters must be provided"),
                                 ty,
+                                trigger_column(col_def),
                             );
                             return Ok(());
                         }
@@ -447,6 +462,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                                 ctx.get_new_param(idx)
                                     .expect("NEW parameters must be provided"),
                                 ty,
+                                trigger_column(col_def),
                             );
                             return Ok(());
                         } else {
@@ -459,6 +475,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                             ctx.get_new_rowid_param()
                                 .expect("NEW parameters must be provided"),
                             None,
+                            ast::TriggerColumn::Rowid,
                         );
                         return Ok(());
                     }
@@ -481,6 +498,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                                 ctx.get_old_rowid_param()
                                     .expect("OLD parameters must be provided"),
                                 ty,
+                                trigger_column(col_def),
                             );
                             return Ok(());
                         }
@@ -489,6 +507,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                                 ctx.get_old_param(idx)
                                     .expect("OLD parameters must be provided"),
                                 ty,
+                                trigger_column(col_def),
                             );
                             return Ok(());
                         } else {
@@ -501,6 +520,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                             ctx.get_old_rowid_param()
                                 .expect("OLD parameters must be provided"),
                             None,
+                            ast::TriggerColumn::Rowid,
                         );
                         return Ok(());
                     }
@@ -894,7 +914,6 @@ pub fn fire_trigger(
 
     let saved_register_affinities = std::mem::take(&mut resolver.register_affinities);
     let saved_register_collations = std::mem::take(&mut resolver.register_collations);
-    populate_trigger_register_affinities(resolver, ctx);
     let result = (|| -> Result<()> {
         // A trigger body is inlined and re-executed once per affected row. Any
         // run-once block inside it (an uncorrelated subquery, a hash or
@@ -1066,41 +1085,7 @@ fn decode_trigger_registers(
     })
 }
 
-fn populate_trigger_register_affinities(resolver: &mut Resolver, ctx: &TriggerContext) {
-    populate_trigger_row_register_affinities(resolver, &ctx.table, ctx.new_registers.as_deref());
-    populate_trigger_row_register_affinities(resolver, &ctx.table, ctx.old_registers.as_deref());
-}
-
-// NEW/OLD columns don't have affinities, except for rowids and rowid aliases,
-// which have INTEGER affinity. See https://www.sqlite.org/forum/forumpost/819f2d6627
-fn populate_trigger_row_register_affinities(
-    resolver: &mut Resolver,
-    table: &BTreeTable,
-    row_registers: Option<&[usize]>,
-) {
-    let Some(registers) = row_registers else {
-        return;
-    };
-
-    for (idx, column) in table.columns().iter().enumerate() {
-        if !column.is_rowid_alias() {
-            continue;
-        }
-        if let Some(&register) = registers.get(idx) {
-            resolver
-                .register_affinities
-                .insert(register, Affinity::Integer);
-        }
-    }
-
-    if let Some(&rowid_register) = registers.last() {
-        resolver
-            .register_affinities
-            .insert(rowid_register, Affinity::Integer);
-    }
-}
-
-/// Rewrite NEW/OLD references in WHEN clause expressions (uses Register expressions, not Variable)
+/// Rewrite NEW/OLD references in WHEN clause expressions (uses TriggerRegister expressions, not Variable)
 #[amphora_engine_macros::trace_stack]
 fn rewrite_trigger_expr_for_when_clause(
     expr: &mut ast::Expr,
@@ -1351,28 +1336,23 @@ fn rewrite_trigger_expr_single_for_when_clause(
             if ns.eq_ignore_ascii_case("new") {
                 if let Some(new_regs) = &ctx.new_registers {
                     if let Some((idx, col_def)) = table.get_column(&col) {
-                        if col_def.is_rowid_alias() {
-                            // Rowid alias columns map to the rowid register (last element)
-                            *expr = Expr::Register(
-                                *new_regs.last().expect("NEW registers must be provided"),
-                            );
-                            return Ok(());
-                        }
-                        if idx < new_regs.len() {
-                            *expr = Expr::Register(new_regs[idx]);
+                        // A rowid alias is in the rowid's register, the last.
+                        let register = if col_def.is_rowid_alias() {
+                            new_regs.last()
+                        } else {
+                            new_regs.get(idx)
+                        };
+                        if let Some(register) = register {
+                            *expr = Expr::TriggerRegister(*register, trigger_column(col_def));
                             return Ok(());
                         }
                     }
                     // Handle NEW.rowid
                     if names_rowid(table, &col) {
-                        *expr = Expr::Register(
-                            *ctx.new_registers
-                                .as_ref()
-                                .expect("NEW registers must be provided")
-                                .last()
-                                .expect("NEW registers must be provided"),
-                        );
-                        return Ok(());
+                        if let Some(register) = new_regs.last() {
+                            *expr = Expr::TriggerRegister(*register, ast::TriggerColumn::Rowid);
+                            return Ok(());
+                        }
                     }
                     bail_parse_error!("no such column in NEW: {}", col);
                 } else {
@@ -1385,22 +1365,18 @@ fn rewrite_trigger_expr_single_for_when_clause(
             // Handle OLD.column references
             if ns.eq_ignore_ascii_case("old") {
                 if let Some(old_regs) = &ctx.old_registers {
-                    if let Some((idx, _)) = table.get_column(&col) {
-                        if idx < old_regs.len() {
-                            *expr = Expr::Register(old_regs[idx]);
+                    if let Some((idx, col_def)) = table.get_column(&col) {
+                        if let Some(register) = old_regs.get(idx) {
+                            *expr = Expr::TriggerRegister(*register, trigger_column(col_def));
                             return Ok(());
                         }
                     }
                     // Handle OLD.rowid
                     if names_rowid(table, &col) {
-                        *expr = Expr::Register(
-                            *ctx.old_registers
-                                .as_ref()
-                                .expect("OLD registers must be provided")
-                                .last()
-                                .expect("OLD registers must be provided"),
-                        );
-                        return Ok(());
+                        if let Some(register) = old_regs.last() {
+                            *expr = Expr::TriggerRegister(*register, ast::TriggerColumn::Rowid);
+                            return Ok(());
+                        }
                     }
                     bail_parse_error!("no such column in OLD: {}", col);
                 } else {
