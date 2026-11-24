@@ -1263,6 +1263,15 @@ impl Statement {
             .map_err(|err| *err)
     }
 
+    pub(crate) fn fk_immediate_violations(&self) -> isize {
+        self.state.get_fk_immediate_violations_during_stmt()
+    }
+
+    pub(crate) fn set_fk_immediate_violations(&self, violations: isize) {
+        self.state
+            .set_fk_immediate_violations_during_stmt(violations);
+    }
+
     /// What the constraint this subprogram failed on does to the statement that runs it.
     pub(crate) const fn constraint_action(&self) -> amphora_engine_parser::ast::ResolveType {
         self.state.constraint_action

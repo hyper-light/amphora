@@ -15,7 +15,7 @@ use crate::{
     translate::{
         emitter::Resolver,
         expr::{walk_expr, WalkControl},
-        plan::TableReferences,
+        plan::{SelectPlan, TableReferences},
     },
     Result,
 };
@@ -477,6 +477,36 @@ pub fn get_expr_collation_ctx_with_symbols(
     Ok(maybe_explicit_collseq
         .map(|collation| (collation, true))
         .or_else(|| column.map(|collation| (collation, false))))
+}
+
+/// The collation a compound's rows are compared by in result column `column`. lang_select.html 3:
+/// as if the left and the right SELECT's columns "were the left and right-hand operands of the equals
+/// (=) operator, except that greater precedence is not assigned to a collation sequence specified with
+/// the postfix COLLATE operator", and the operators group from the left: the first arm's that has one,
+/// a COLLATE's or a column's (BINARY where it declares none).
+pub(crate) fn compound_column_collation<'a>(
+    arms: impl Iterator<Item = &'a SelectPlan>,
+    column: usize,
+) -> Result<CollationSeq> {
+    for arm in arms {
+        let expr = match arm.values.first().and_then(|row| row.get(column)) {
+            Some(value) => value,
+            None => match arm.result_columns.get(column) {
+                Some(result) => &result.expr,
+                None => continue,
+            },
+        };
+        let (explicit, _) =
+            get_collseq_parts_from_expr_with_symbols(expr, &arm.table_references, None, None)?;
+        let own = match explicit {
+            None => comparison_operand_column_collseq(expr, &arm.table_references)?,
+            explicit => explicit,
+        };
+        if let Some(collation) = own {
+            return Ok(collation);
+        }
+    }
+    Ok(CollationSeq::Binary)
 }
 
 /// Resolve the collation for a binary comparison (=, <, >, etc.) per SQLite rules:

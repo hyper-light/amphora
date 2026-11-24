@@ -50,7 +50,7 @@ impl From<Version> for JournalMode {
     fn from(value: Version) -> Self {
         match value {
             Version::Legacy => Self::Delete,
-            Version::Wal => Self::Wal,
+            Version::Wal | Version::Wal2 => Self::Wal,
             Version::Mvcc => Self::Mvcc,
         }
     }

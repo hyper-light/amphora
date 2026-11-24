@@ -1687,7 +1687,9 @@ fn update_write_set_reason(
             s.resolved_fks_referencing(&btree_table.name)
         })?;
         for fk in &referencing_fks {
-            if matches!(fk.fk.on_update, RefAct::NoAction | RefAct::Restrict) {
+            // RESTRICT judges each row as it changes, so it needs SQLite's order of them, their
+            // rowids'.
+            if matches!(fk.fk.on_update, RefAct::NoAction) {
                 continue;
             }
             if fk.parent_key_may_change(&updated_cols, btree_table)? {
