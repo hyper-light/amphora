@@ -6940,7 +6940,7 @@ mod tests {
                     .map(|(a, _)| {
                         let log = a.replica.core().raft.log();
                         format!(
-                            "[m{} lead{} term{} applied{} commit{} last{:?} xferee{:?} transferring{} pending{:?} held{} waiting{} changing{}] ",
+                            "[m{} lead{} term{} applied{} commit{} last{:?} xferee{:?} transferring{} pending{:?} waiting{} changing{}] ",
                             a.replica.id(),
                             a.replica.leader(),
                             a.replica.term(),
@@ -6950,7 +6950,6 @@ mod tests {
                             a.replica.core().raft.lead_transferee(),
                             a.transferring.is_some(),
                             a.pending.as_ref().map(|p| p19_phase(&p.phase)),
-                            a.replica.apply_held(),
                             a.waiting.len(),
                             a.changing.is_some()
                         )
