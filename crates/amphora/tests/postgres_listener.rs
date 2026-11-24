@@ -651,7 +651,7 @@ fn t_pg_10_2_an_execute_waits_and_what_was_flushed_before_it_is_sent() {
         batch.extend(statement("select b from t where a = 2", &[]));
         batch.extend(frontend(b'S', b""));
         waiter.send(&batch).await;
-        for tag in [b'1', b'2', b'C', b'1', b'2'] {
+        for tag in *b"12C12" {
             assert_eq!(waiter.recv().await.unwrap().0, tag);
         }
         let (tag, body) = waiter.recv().await.unwrap();
@@ -701,7 +701,7 @@ fn t_pg_10_3_prepared_statements_are_charged_to_the_budget() {
         client.send(&frontend(b'C', b"Ss0\0")).await;
         client.send(&parse("s0")).await;
         client.send(&sync).await;
-        for tag in [b'3', b'1', b'Z'] {
+        for tag in *b"31Z" {
             assert_eq!(client.recv().await.unwrap().0, tag);
         }
     });
