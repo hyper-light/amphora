@@ -1390,7 +1390,32 @@ suite, merged to main.
 
 ## Losses first
 
-LOSSES_PLACEHOLDER
+1. **The deliverable is met in the persisted class only.** After the fix, the replicated class still had 0 to 5
+   stale-base refusals a run (r1896's ladder: 1 of 3 runs at 32 spread writers, 3 of 3 at 128). They are not traced
+   here. Their trace (r1942: `diag/commits-v13-residual` 01fd4979, the fix plus the trace, replicated class at 128
+   spread twice and 32 once, 00:53Z, load 16 to 19) names the same first wrong decision: every stale forward (21, 18
+   and 24 a run) followed a slot ended by `expire`, with no detector verdict. The fix's floor is too short in real
+   time: `Bounds::election` follows the owner's measured pace (`slot_bounds(election_tick, pace.period)`, re-bound as
+   the pace moves), so slots were 28 to 49 ms long once the pace settled (p50 44 and 49 ms; only the first slots had
+   200 ms), and expired ones had held 28 to 53 ms. On driven time the pace stays at the 10 ms tick, which is why the
+   new test passes. The election timeout measures a member's silence; a holder that answers heartbeats while its
+   forward is slow is not silent. For the successor (a design, not built): end a slot by time on the detector's
+   verdict alone; make the holder end its slot on every path its write ends without a forward (today its
+   barrier-phase deadline sends no ending barrier); and bound a live holder's lost forward by something it states,
+   such as its write's remaining deadline on its barrier (a wire addition). Logs: adacachy2,
+   `~/.cache/amphora-perf/commits-v13-out/residual/`.
+2. **One suite failure on the fix arm is not explained by its own output.** `every_falsifier_of_the_floor_holds_under_a_nemesis`
+   failed in round 3 on the fix. Main's product fails it too (1 of 4 alone in r1920, "a driven operation was
+   unanswered after 60000 rounds"), and the fix passed it 4 of 4 alone, but the fix arm's own panic was filtered out,
+   so it isn't shown to be the same failure.
+3. **The fix changes a recorded decision** (replication.md, Q3, "the slot's length is learned, not picked"): the
+   core's election timeout, the slot's first value, is now also its shortest. It adds no number, but it is Ada's to
+   keep or reverse (below).
+4. **The ladder is Amphora alone, one run a cell a round, on a loaded host** (load 70 to 131 on 32 cores; other lanes
+   ran beside it). It shows the refusals; it claims no speed.
+5. **The kiln server was unreachable from about 00:24Z to 00:28Z,** so the red and green runs started late.
+6. Main's `replicated.rs` has five rustfmt differences in older tests (test 5, the five-crash test and others), so
+   `cargo fmt --all --check` fails on main itself. Not changed here.
 
 ## The trace (r1814, branch `diag/commits-v13-refusals` 7907920e and 0d2e3e70, never for main)
 
@@ -1510,4 +1535,13 @@ run a cell a round on a loaded host, so no speed is claimed either way.
     # CARGO_INCREMENTAL=0, CARGO_BUILD_JOBS=4 (the release build took 1 min 19 s, warm)
     bash bench/records/2026-11-23-adacachy2-perf-commits-v13/trace13.sh ~/.cache/amphora-perf/commits-v13-out/trace-001149 2
     python3 -I bench/records/2026-11-23-adacachy2-perf-commits-v13/refusals.py ~/.cache/amphora-perf/commits-v13-out/trace-001149/<class>-32-spread-r<n>
-COMMANDS_PLACEHOLDER
+    # r1896: the same runner and folders, needs linux/amd64,cpus=8,mem=24g, CARGO_BUILD_JOBS=8, THREADS=8
+    bash bench/records/2026-11-23-adacachy2-perf-commits-v13/tests13.sh c3ebea5d 2332e2ae 0   # builds, focused, clippy
+    ~/.cache/amphora-perf-bin/commits/v13-tests-<sha> --test-threads=8 database::replicated:: replication::   # 3 rounds, alternated
+    bash bench/records/2026-11-23-adacachy2-perf-commits-v13/ladder13.sh ~/.cache/amphora-perf-bin/commits/v13-2332e2ae \
+      ~/.cache/amphora-perf/commits-v13-out/ladder-003832 3
+    # r1920: the floor test alone, 4 times each arm, alternated, needs cpus=4
+    ~/.cache/amphora-perf-bin/commits/v13-tests-<sha> --exact database::replicated::tests::every_falsifier_of_the_floor_holds_under_a_nemesis --nocapture
+    # r1941: the merged tree a45edff6 (main 90c1ff8d), needs cpus=4: clippy exit 0, focused 15 of 15
+    cargo clippy -p amphora --all-targets --locked -- -D warnings
+    cargo test -p amphora --lib --locked -- --test-threads=4 database::slot:: v13_thirty_two v7_a_hundred_and_twenty_eight
