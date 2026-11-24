@@ -62,11 +62,12 @@ fn log_bytes(path: &std::path::Path) -> u64 {
 
 /// Do: with a log kept to 64 frames across restarts, commit 500 rows of a page each, their bodies
 /// random so that a commit's records (decision 37) don't compress them (more than 500 frames of
-/// log), start the log again (every frame copied into the file, no reader reading), commit
-/// one row, and start it again. Expect: the first restart cuts the log's file, past its bound, to
-/// nothing; the row's commit grows it again to a few frames; the second restart, of a log within its
-/// bound, keeps its file's length (decision 13); and every row reads back after opening the database
-/// again (docs/design/store.md, decision 31; AC-T1.1.1).
+/// log), start the log again (the writer switches to `-wal2`, decision 45), commit a row and start
+/// it again (back to `-wal`), commit one more row, and start it again. Expect: the switch back cuts
+/// `-wal`, past its bound, to nothing; the next row's commit grows it again to a few frames; the
+/// last restart, of a segment within its bound, keeps its file's length (decision 13); and every
+/// row reads back after opening the database again (docs/design/store.md, decision 31;
+/// AC-T1.1.1).
 #[test]
 fn a_restart_cuts_a_log_past_its_bound_to_nothing_and_keeps_one_within_it() {
     let dir = lab();
@@ -90,10 +91,13 @@ fn a_restart_cuts_a_log_past_its_bound_to_nothing_and_keeps_one_within_it() {
         let high = log_bytes(&path);
         assert!(high > 32 + 500 * 4120, "500 rows took {high} bytes of log");
         assert!(db.restart_log().unwrap());
+        db.exec("INSERT INTO t (n, body) VALUES (-2, x'00')")
+            .unwrap();
+        assert!(db.restart_log().unwrap());
         assert_eq!(
             log_bytes(&path),
             0,
-            "the log's file after a restart, past its bound ({high} bytes before)"
+            "the log's first segment once switched to again, past its bound ({high} bytes before)"
         );
         db.exec("INSERT INTO t (n, body) VALUES (-1, x'00')")
             .unwrap();
@@ -116,7 +120,7 @@ fn a_restart_cuts_a_log_past_its_bound_to_nothing_and_keeps_one_within_it() {
         Ok(true)
     })
     .unwrap();
-    assert_eq!(rows, 501);
+    assert_eq!(rows, 502);
 }
 
 /// A restart's hold on the writer, and the commit and flush after it.

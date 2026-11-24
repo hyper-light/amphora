@@ -6,6 +6,7 @@
 //!   ([`Engine::row_bytes`]) to the memory budget's room for queues (MB.1) until its commit ends:
 //!   past that room it is refused ([`Refused::Full`]) rather than queued; [`Store::put_wait`] waits
 //!   for room instead, until its deadline, woken by each charge given back anywhere in the budget.
+//!   A batch past the budget's whole limit is refused at once ([`Refused::TooLarge`]).
 //! - **Durable beside the writer.** A commit doesn't wait for the disk: a flusher thread flushes
 //!   what was committed, over and over, and a write is durable once a flush that began after its
 //!   commit ends ([`Store::durable`] waits for that, by the [`Ticket`] its batch was handed with).
@@ -25,7 +26,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::memory::Charge;
@@ -361,6 +362,9 @@ fn machine_readers() -> usize {
 pub enum Refused {
     /// The memory budget's room for queues has no room for its batch (MB.1).
     Full,
+    /// Its batch's `size` in bytes is past the memory budget's whole `limit`: no room given back
+    /// can fit it (MB.1; lane perf-A19).
+    TooLarge { size: u64, limit: u64 },
     /// Its writer has stopped.
     Stopped,
     /// It didn't answer in time.
@@ -380,8 +384,15 @@ pub enum Refused {
 
 impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Self::TooLarge { size, limit } = self {
+            return write!(
+                f,
+                "the batch's {size} bytes are past the memory budget's whole limit of {limit}"
+            );
+        }
         f.write_str(match self {
             Self::Full => "the store's writer is full",
+            Self::TooLarge { .. } => "the batch is past the memory budget's whole limit",
             Self::Stopped => "the store's writer has stopped",
             Self::Timeout => "the store didn't answer in time",
             Self::Failed => "the batch couldn't be committed; nothing of it was written",
@@ -954,9 +965,6 @@ struct Readers<R> {
     /// The checkpointer: a connection of its own copying the log into the file, never in a
     /// commit's way. It goes and comes back with the readers.
     checkpointer: Mutex<Option<(mpsc::Sender<()>, std::thread::JoinHandle<()>)>>,
-    /// Held by each read and checkpoint as it runs, and by the writer alone while it starts the log
-    /// again.
-    gate: Arc<RwLock<()>>,
     /// The checkpointer found the log past its bound: the writer starts it again.
     restart: Arc<AtomicBool>,
     meter: Arc<Meter>,
@@ -989,7 +997,6 @@ impl<R: Send + 'static> Readers<R> {
             returned: Condvar::new(),
             most: most.max(1),
             checkpointer: Mutex::new(None),
-            gate: Arc::new(RwLock::new(())),
             restart: Arc::new(AtomicBool::new(false)),
             meter,
             slots: match checkout {
@@ -1011,8 +1018,7 @@ impl<R: Send + 'static> Readers<R> {
         let checkpointer = match open() {
             Ok(mut reader) => {
                 let (tx, rx) = mpsc::channel::<()>();
-                let (gate, restart, meter) =
-                    (self.gate.clone(), self.restart.clone(), self.meter.clone());
+                let (restart, meter) = (self.restart.clone(), self.meter.clone());
                 let thread = std::thread::Builder::new()
                     .name("amphora-checkpoint".into())
                     .spawn(move || {
@@ -1051,7 +1057,6 @@ impl<R: Send + 'static> Readers<R> {
                             {
                                 continue;
                             }
-                            let _copying = gate.read().unwrap_or_else(PoisonError::into_inner);
                             let began = Instant::now();
                             let copied = copy(&mut reader);
                             meter.checkpointed(began.elapsed());
@@ -1117,20 +1122,15 @@ impl<R: Send + 'static> Readers<R> {
         }
     }
 
-    /// Starts the log again with `restart`, if the checkpointer asked, holding the readers and the
-    /// checkpointer back meanwhile (each finishes what it is doing first).
+    /// Starts the log again with `restart`, if the checkpointer asked: the writer's switch to the
+    /// log's free segment, which waits for no read and no pass (decision 45).
     fn restart_if_asked(&self, restart: impl FnOnce() -> anyhow::Result<bool>) {
         if !self.restart.swap(false, Ordering::Relaxed) {
             return;
         }
-        let asked = Instant::now();
-        let _alone = self.gate.write().unwrap_or_else(PoisonError::into_inner);
-        // Slot readers hold no gate: holding every slot holds them back.
-        let _slots = self.slots.as_ref().map(checkout::Slots::take_all);
         let began = Instant::now();
         let restarted = restart();
-        self.meter
-            .restarted(began.saturating_duration_since(asked), began.elapsed());
+        self.meter.restarted(Duration::ZERO, began.elapsed());
         match restarted {
             Ok(true) => {}
             Ok(false) => self.restart.store(true, Ordering::Relaxed),
@@ -1181,10 +1181,7 @@ impl<R: Send + 'static> Readers<R> {
                     .0;
             }
         };
-        let answer = {
-            let _reading = self.gate.read().unwrap_or_else(PoisonError::into_inner);
-            f(&mut reader)
-        };
+        let answer = f(&mut reader);
         self.give_back(Some(reader), generation);
         Some(answer)
     }
@@ -1369,9 +1366,9 @@ impl<E: Engine> Store<E> {
     }
 
     /// Charges `rows`' bytes ([`Engine::row_bytes`]) to the memory budget's room for queues
-    /// (MB.1) until their commit ends, waiting until `until` (none: not at all) for room given back
-    /// anywhere in the budget ([`crate::memory::Budget::take_until`]). Refused [`Refused::Full`]
-    /// past `until`.
+    /// (MB.1) until their commit ends ([`Store::charge_queue`]; none: not waiting at all).
+    /// Refused [`Refused::Full`] past `until`, and [`Refused::TooLarge`] at once past the whole
+    /// limit.
     fn charge(&self, rows: &[E::Row], until: Option<Instant>) -> Result<Option<Charge>, Refused> {
         let bytes = rows.iter().fold(0u64, |n, row| {
             n.saturating_add(u64::try_from(E::row_bytes(row)).unwrap_or(u64::MAX))
@@ -1379,14 +1376,29 @@ impl<E: Engine> Store<E> {
         if bytes == 0 {
             return Ok(None);
         }
-        let budget = crate::memory::process();
-        let queues = crate::memory::Use::Queues;
-        match until {
-            None => budget.take(queues, bytes),
-            Some(until) => budget.take_until(queues, bytes, until, || self.meter.waited_for_room()),
-        }
-        .map(Some)
-        .map_err(|_| Refused::Full)
+        self.charge_queue(bytes, until.unwrap_or_else(Instant::now))
+            .map(Some)
+            .map_err(|refusal| match refusal {
+                amphora_api::Refusal::TooLarge { size, limit, .. } => Refused::TooLarge {
+                    size: u64::try_from(size).unwrap_or(u64::MAX),
+                    limit: u64::try_from(limit).unwrap_or(u64::MAX),
+                },
+                _ => Refused::Full,
+            })
+    }
+
+    /// `bytes` charged to the memory budget's room for queues, this writer's queue among them, until
+    /// the charge drops: waiting until `until` for room given back anywhere in the budget
+    /// ([`crate::memory::Budget::take_until`]), each wait counted ([`Counters::room_waits`]). Its
+    /// rows' charge, or a request's admitted to a database on this store (lane perf-A19).
+    pub(crate) fn charge_queue(
+        &self,
+        bytes: u64,
+        until: Instant,
+    ) -> Result<Charge, amphora_api::Refusal> {
+        crate::memory::process().take_until(crate::memory::Use::Queues, bytes, until, || {
+            self.meter.waited_for_room();
+        })
     }
 
     /// Run `f` on a reader, on this thread, once the writes of `key` (of every key: None) handed

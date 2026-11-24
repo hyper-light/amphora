@@ -4138,6 +4138,10 @@ pub struct SharedLog {
     /// the current segment's state reads it without unpacking that word. Written only with
     /// `segments`.
     second_current: AtomicBool,
+    /// The second segment's file (`<db>-wal2`), made by the writer's first switch into it when the
+    /// open found none. None for a log with no path (tests'): its switch into a segment with no
+    /// file fails.
+    second_path: Option<String>,
     /// Lock used by in-place VACUUM to keep new read/write transactions out
     /// while VACUUM is in progress.
     /// Normal WAL transactions hold this shared for the lifetime of their
@@ -4163,6 +4167,7 @@ impl SharedLog {
             first,
             WalFileShared::new_noop(),
             Segments::new(SegmentId::First),
+            None,
         )
     }
 
@@ -4174,6 +4179,7 @@ impl SharedLog {
     pub fn recover(
         first: Arc<RwLock<WalFileShared>>,
         second: Arc<RwLock<WalFileShared>>,
+        second_path: Option<String>,
     ) -> Result<Arc<Self>> {
         let sequence = |segment: &Arc<RwLock<WalFileShared>>| {
             let shared = segment.read();
@@ -4190,13 +4196,14 @@ impl SharedLog {
                  neither one past the other: no switch leaves such a pair"
             ))
         })?;
-        Ok(Self::with_segments(first, second, segments))
+        Ok(Self::with_segments(first, second, segments, second_path))
     }
 
     fn with_segments(
         first: Arc<RwLock<WalFileShared>>,
         second: Arc<RwLock<WalFileShared>>,
         segments: Segments,
+        second_path: Option<String>,
     ) -> Arc<Self> {
         let read_index = |segment: &Arc<RwLock<WalFileShared>>| {
             let guard = segment.read();
@@ -4211,6 +4218,7 @@ impl SharedLog {
             read_indexes,
             second_current: AtomicBool::new(segments.current() == SegmentId::Second),
             segments: SegmentsCell::new(segments),
+            second_path,
             vacuum_lock: PaddedLock::new(TursoRwLock::new()),
             write_lock: PaddedLock::new(TursoRwLock::new()),
             checkpoint_lock: PaddedLock::new(TursoRwLock::new()),
@@ -4262,6 +4270,82 @@ impl SharedLog {
     /// next switch writes its header over it.
     pub(crate) fn end_read(&self, span: ReadSpan) {
         self.segments.end_read(span);
+    }
+
+    /// The writer's switch (decision 45), made where a restart started the log again: the current
+    /// segment closes, uncopied frames and the reads on it kept, and the free one becomes current,
+    /// its header one checkpoint sequence past the closing one's and written and synced by the
+    /// next commit before any frame. It takes no read mark and waits for no read: the segment
+    /// switched to is free, so no read counts on it. The caller holds `write_lock`. The segment
+    /// now current, or None while the other one is still closing (the writer appends on and asks
+    /// again at its next turn). A free segment's file longer than `cut_past` bytes is cut to
+    /// nothing first: nothing in it is needed (decision 31's bound, kept at each segment's reuse).
+    pub fn switch(&self, io: &dyn IO, cut_past: Option<u64>) -> Result<Option<SegmentId>> {
+        let segments = self.segments.load();
+        if segments.closing().is_some() {
+            return Ok(None);
+        }
+        let from = segments.current();
+        let to = from.other();
+        let (header, epoch, transaction_count) = {
+            let closing = self.segment(from).read();
+            let header = *closing.metadata.wal_header.lock();
+            (
+                header,
+                closing.runtime.epoch.load(Ordering::Acquire),
+                closing.metadata.transaction_count.load(Ordering::Acquire),
+            )
+        };
+        {
+            let mut free = self.segment(to).write();
+            if free.runtime.file.is_none() {
+                let path = self.second_path.as_deref().ok_or_else(|| {
+                    LimboError::InternalError(
+                        "the log's free segment has no file and no path to make one".into(),
+                    )
+                })?;
+                free.runtime.file = Some(io.open_file(path, crate::OpenFlags::Create, false)?);
+            }
+            if let (Some(limit), Some(file)) = (cut_past, free.runtime.file.as_ref()) {
+                if file.size()? > limit {
+                    let cut = file.truncate(0, Completion::new_trunc(|_| {}))?;
+                    io.wait_for_completion(cut)?;
+                }
+            }
+            free.metadata.enabled.store(true, Ordering::Release);
+            // Its read marks are set under their exclusive locks: no read holds one of a free
+            // segment's, so each is taken at once.
+            let held = free
+                .runtime
+                .read_locks
+                .iter()
+                .take_while(|lock| lock.write())
+                .count();
+            if held < free.runtime.read_locks.len() {
+                free.runtime
+                    .read_locks
+                    .iter()
+                    .take(held)
+                    .for_each(|lock| lock.unlock());
+                return Err(LimboError::InternalError(
+                    "a read holds a mark of the log's free segment".into(),
+                ));
+            }
+            free.start_after(io, header, epoch, transaction_count);
+            free.runtime
+                .read_locks
+                .iter()
+                .for_each(|lock| lock.unlock());
+        }
+        let switched = self.segments.update(|segments| segments.switch(false));
+        if switched != Some(Some(to)) {
+            return Err(LimboError::InternalError(format!(
+                "the log's switch to {to:?} found {switched:?}: only the writer switches"
+            )));
+        }
+        self.second_current
+            .store(to == SegmentId::Second, Ordering::Release);
+        Ok(Some(to))
     }
 }
 
@@ -5997,9 +6081,15 @@ impl Wal for WalFile {
             frame.set_wal_tag(frame_id, epoch_at_issue);
             None
         });
-        // Amphora: a page a record holds is read from the record.
-        let header = self.coordination.wal_header();
-        if self.holds_record(&header, frame_id) {
+        // Amphora: a page a record holds is read from the record, in the frame's own segment
+        // (decision 45). The current segment's header is read without a lock (decision 40), a
+        // closing one's under its segment's.
+        let header = if at.segment == self.coordination.current_segment() {
+            self.coordination.wal_header()
+        } else {
+            self.coordination.segment_header(at.segment)
+        };
+        if self.holds_segment_record(at.segment, &header, frame_id) {
             let number = u32::try_from(page_idx).map_err(|_| LimboError::IntegerOverflow)?;
             let complete = sqlite3_ondisk::wal_page_reader(
                 complete,
@@ -6008,7 +6098,7 @@ impl Wal for WalFile {
                 &self.io_ctx.read(),
             )?;
             return self.begin_read_record(
-                self.coordination.current_segment(),
+                at.segment,
                 frame_id,
                 vec![(number, complete)],
                 &header,
@@ -7598,11 +7688,15 @@ impl WalFile {
                             return Err(LimboError::Busy.into());
                         }
                     }
+                    // The bound is the current segment's flushes: a closing segment's frames are
+                    // all durable, flushed before its switch (decision 45).
                     if let CheckpointMode::Passive {
                         upper_bound_inclusive: Some(upper_bound),
                     } = mode
                     {
-                        max_frame = max_frame.min(upper_bound);
+                        if closing.is_none() {
+                            max_frame = max_frame.min(upper_bound);
+                        }
                     }
 
                     {
@@ -7985,6 +8079,9 @@ impl WalFile {
     /// 3. nbackfills > 0 - otherwise nothing was backfilled and there is no reason to truncate header
     /// 4. max_frame == nbackfills - otherwise there are some non-checkpointed frames in the WAL and we can't truncate the log
     pub fn try_restart_log_before_write(&self) -> Result<()> {
+        if self.restarts_by_switch() {
+            return Ok(());
+        }
         let max_frame_read_lock_index = self.max_frame_read_lock_index.load(Ordering::Acquire);
         if !matches!(
             ReadGuardKind::from_lock_index(max_frame_read_lock_index),
@@ -8027,8 +8124,22 @@ impl WalFile {
         result
     }
 
+    /// Whether the log's other segment has a file (decision 45): once it has, the log starts again
+    /// only by the writer's switch. A restart in place would take the current segment's sequence
+    /// two past the other's header, a pair recovery refuses, and a truncate would leave the other
+    /// segment's copied frames to be read as the log.
+    fn restarts_by_switch(&self) -> bool {
+        let log = self.coordination.shared_wal_state();
+        let other = log.segment(log.current_id().other());
+        let segment = other.read();
+        segment.runtime.file.is_some()
+    }
+
     fn restart_log(&self) -> Result<()> {
         tracing::debug!("restart_log");
+        if self.restarts_by_switch() {
+            return Err(LimboError::Busy);
+        }
         let snapshot = self.coordination.begin_restart(self.io.as_ref())?;
         self.apply_restart_snapshot(snapshot);
         Ok(())
@@ -8760,6 +8871,20 @@ impl WalFileShared {
     /// This function updates the shared-memory structures so that the next
     /// client to write to the database (which may be this one) does so by
     /// writing frames into the start of the log file.
+    /// Make this free segment the one that follows `closing`'s header (decision 45): the same
+    /// format and page size, its sequence one past and its salts new ([`Self::restart_wal_header`]),
+    /// the epoch and transaction count carried on so that neither comes back to a value a
+    /// connection took from the closing segment.
+    fn start_after(&mut self, io: &dyn IO, closing: WalHeader, epoch: u32, transaction_count: u64) {
+        *self.metadata.wal_header.lock() = closing;
+        self.metadata.loaded.store(true, Ordering::Release);
+        self.metadata
+            .transaction_count
+            .store(transaction_count, Ordering::Release);
+        self.runtime.epoch.store(epoch, Ordering::Release);
+        self.restart_wal_header(io);
+    }
+
     fn restart_wal_header(&mut self, io: &dyn IO) {
         {
             let mut hdr = self.metadata.wal_header.lock();
