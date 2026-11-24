@@ -4,13 +4,16 @@
 # from a worktree at origin/main, with the answers (untimed read rows) stripped from the raw round files.
 set -uo pipefail
 SHA=0101aa386850d1e8e641c6254238567adf9d8aa7
-REV_TABLES=932a6c7a541a43ffbb63b059db6b4f604454ec51
 L=~/.cache/amphora-perf/bench-s7-run; O=$L/out
 S=bench/records/2026-11-24-adacachy2-bench-s7-suite
 SRC=~/.cache/amphora-perf/bench-s
 cd "$SRC" || exit 1
 if [ "${1:-}" = analyze ]; then
-  git fetch -q origin perf/bench-s7b && git show $REV_TABLES:$S/s7_tables.py >"$L/scripts/s7_tables.py" || exit 1
+  git fetch -q origin perf/bench-s7b || exit 1
+  REV=$(git rev-parse FETCH_HEAD)
+  for f in s7_tables.py phases_summary.py finish.sh; do git show $REV:$S/$f >"$L/scripts/$f" || exit 1; done
+  echo "scripts at branch commit $REV"
+  python3 -I "$L/scripts/phases_summary.py" "$O" >"$O/PHASES.md" 2>&1
   python3 -I "$L/scripts/s7_tables.py" "$O" "$SRC/bench/records/2026-11-23-adacachy2-suite-inproc/records.jsonl" >"$O/TABLES.md" 2>"$O/TABLES.err"
   echo "tables rc=$? lines=$(wc -l <"$O/TABLES.md")"; cat "$O/TABLES.err"
   exit 0
@@ -22,7 +25,7 @@ W=$L/commit-wt
 for i in 1 2 3 4 5; do
   git -C "$W" fetch -q origin && git -C "$W" checkout -q -f --detach origin/main || continue
   mkdir -p "$W/$S"
-  for f in rounds.txt phases.log TABLES.md smoke-answers.txt smoke.err sha.txt; do [ -f "$O/$f" ] && cp "$O/$f" "$W/$S/"; done
+  for f in rounds.txt phases.log PHASES.md TABLES.md smoke-answers.txt smoke.err sha.txt; do [ -f "$O/$f" ] && cp "$O/$f" "$W/$S/"; done
   # Process command lines as ps printed them, with anything that looks like a secret cut out.
   sed -E 's/(token|secret|password|passwd|api[_-]?key|bearer)[^ ]*/[redacted]/Ig' "$O/procs.txt" >"$W/$S/procs.txt"
   cp "$O"/round*-answers.txt "$O"/round*.err "$W/$S/" 2>/dev/null
@@ -47,7 +50,7 @@ for p in sorted(glob.glob(os.path.join(src, "round[0-9]*.jsonl"))) + [os.path.jo
 PY
   cp "$L/bench-cargo-lock.diff" "$W/$S/" 2>/dev/null
   tail -5 "$L/build.log" >"$W/$S/build.log.tail"
-  (cd "$L/scripts" && cp rounds.sh smoke_summary.py s7_tables.py finish.sh "$W/$S/")
+  (cd "$L/scripts" && cp rounds.sh smoke_summary.py s7_tables.py phases_summary.py finish.sh "$W/$S/")
   git -C "$W" add -- "$S" && git -C "$W" diff --cached --quiet && { echo "nothing to commit"; exit 0; }
   git -C "$W" commit -q -m "$msg
 
