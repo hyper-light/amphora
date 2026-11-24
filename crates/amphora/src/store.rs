@@ -21,7 +21,7 @@
 //!
 //! What it counts is in [`Meter`].
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
@@ -492,11 +492,6 @@ struct Sends {
     claims: Mutex<Claims>,
     notices: Mutex<Notices>,
     noticed: Condvar,
-    /// The senders waiting in [`Store::durable`] for a flush, counted by the commit each waits for:
-    /// at most one entry a waiting thread. A flusher whose flush made some of them durable waits
-    /// for those to leave before it decides its next flush (decision 14).
-    waiting: Mutex<BTreeMap<u64, u64>>,
-    left: Condvar,
 }
 
 /// The flushes begun ([`flusher`]): a flush's target is made durable only once it and every flush
@@ -567,8 +562,6 @@ impl Default for Sends {
             claims: Mutex::default(),
             notices: Mutex::default(),
             noticed: Condvar::new(),
-            waiting: Mutex::default(),
-            left: Condvar::new(),
         }
     }
 }
@@ -772,25 +765,6 @@ impl Sends {
                     .0;
             }
         };
-        {
-            let mut waiting = locked(&self.waiting);
-            let n = waiting.entry(commit).or_insert(0);
-            *n = n.saturating_add(1);
-        }
-        let answer = self.wait_flushed(commit, until);
-        let mut waiting = locked(&self.waiting);
-        if let Some(n) = waiting.get_mut(&commit) {
-            *n = n.saturating_sub(1);
-            if *n == 0 {
-                waiting.remove(&commit);
-                self.left.notify_all();
-            }
-        }
-        answer
-    }
-
-    /// Waits until a flush begun after commit `commit` has ended, up to `until`.
-    fn wait_flushed(&self, commit: u64, until: Instant) -> Result<(), Refused> {
         let mut durable = locked(&self.durable);
         while durable.commits < commit {
             if self.disk_failed.load(Ordering::SeqCst) {
@@ -807,18 +781,6 @@ impl Sends {
                 .0;
         }
         Ok(())
-    }
-
-    /// Waits until no sender waits in [`Store::durable`] for a commit through `commits`: each was
-    /// woken when a flush made it durable, and leaves on its own thread.
-    fn told(&self, commits: u64) {
-        let mut waiting = locked(&self.waiting);
-        while waiting.first_key_value().is_some_and(|(&c, _)| c <= commits) {
-            waiting = self
-                .left
-                .wait(waiting)
-                .unwrap_or_else(PoisonError::into_inner);
-        }
     }
 
     fn stop(&self) {
@@ -908,10 +870,9 @@ fn notifier(sends: &Sends) {
 /// flush under way and the next; with more, an idle one begins the next at once. A flush that fails
 /// is the last.
 ///
-/// After a flush it waits for the senders that flush told to leave their wait, and before the next
-/// it waits for the batches handed to the writer by the time it found something to flush to be
-/// committed or refused, each a commit of the writer away; what is handed after joins the next
-/// flush (docs/design/store.md, decision 14).
+/// Before it begins, it waits for the batches handed to the writer by the time it found something
+/// to flush to be committed or refused, each a commit of the writer away; what is handed after
+/// joins the next flush (docs/design/store.md, decision 14).
 fn flusher(sends: &Sends, flush: &Flush, meter: &Meter) {
     loop {
         let target = {
@@ -952,7 +913,6 @@ fn flusher(sends: &Sends, flush: &Flush, meter: &Meter) {
                 let durable = locked(&sends.claims).ended_well(target);
                 if let Some(through) = durable {
                     sends.made_durable(through);
-                    sends.told(through.commits);
                 }
             }
             Err(e) => {
