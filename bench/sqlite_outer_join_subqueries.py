@@ -59,8 +59,8 @@ class Draw:
         return f"s{self.made}"
 
     def joined(self, join):
-        """A table on `join`'s right. Amphora refuses a WITHOUT ROWID table with an index there in a
-        RIGHT or FULL JOIN, with a subquery or without (finding CM, open), so none is drawn."""
+        """A table on `join`'s right, but no WITHOUT ROWID table there in a RIGHT or FULL JOIN: Amphora
+        refused one with an index (finding CM), and bench/sqlite_on_ctes.py draws them."""
         keeps_right = join in ("RIGHT JOIN", "FULL JOIN")
         return self.rng.choice([table for table in SOURCES if table != "w" or not keeps_right])
 
@@ -184,7 +184,8 @@ class Draw:
             elif drawn < 0.75:
                 on = f"{aliases[rng.randrange(n)]}.k = {aliases[n]}.{rng.choice('kv')}"
             else:
-                # Amphora finds no CTE from a subquery in an ON clause (finding CO, open).
+                # Amphora found no CTE from a subquery in an ON clause (finding CO), and
+                # bench/sqlite_on_ctes.py draws them.
                 ctes, self.ctes = self.ctes, False
                 on = self.condition(scope, depth)
                 self.ctes = ctes

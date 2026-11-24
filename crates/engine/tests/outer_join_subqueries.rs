@@ -1,6 +1,7 @@
-//! Oracle finding CH (lane C10): LEFT, RIGHT and FULL JOINs whose WHERE, ON or select list holds
-//! subqueries, one inside another, answer as SQLite 3.54.0 does (G2 step 3; AC-T1.1.1: reads as
-//! committed; AC-T1.8.6: the differential suite).
+//! Oracle findings CH (lane C10), CO and CM (lane C13): LEFT, RIGHT and FULL JOINs whose WHERE, ON or
+//! select list holds subqueries, one inside another or over CTEs, and joins of WITHOUT ROWID tables,
+//! answer as SQLite 3.54.0 does (G2 step 3; AC-T1.1.1: reads as committed; AC-T1.8.6: the differential
+//! suite).
 
 use amphora_engine::{
     ConnectOpts, Connection, Database, DatabaseOpts, JoinMethods, MemoryIO, OpenOptions,
@@ -10,17 +11,17 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-/// One database of `fixtures/outer_join_subqueries.tsv`: the statements that fill it, and its queries
-/// with SQLite's answers (`bench/sqlite_outer_join_subqueries.py`).
+/// One database of a fixture: the statements that fill it, and its queries with SQLite's answers
+/// (`bench/sqlite_outer_join_subqueries.py`, `bench/sqlite_on_ctes.py`).
 struct Cases {
     name: &'static str,
     fill: Vec<&'static str>,
     queries: Vec<(&'static str, &'static str)>,
 }
 
-fn cases() -> Vec<Cases> {
+fn cases(fixture: &'static str) -> Vec<Cases> {
     let mut out: Vec<Cases> = Vec::new();
-    for line in include_str!("fixtures/outer_join_subqueries.tsv").lines() {
+    for line in fixture.lines() {
         let fields: Vec<&'static str> = line.split('\t').collect();
         match fields.as_slice() {
             ["db", name] => out.push(Cases {
@@ -145,11 +146,10 @@ fn outcome(io: &MemoryIO, conn: &Arc<Connection>, sql: &str) -> String {
 
 /// Do: run every query of the fixture under each setting. Expect: SQLite's rows, no panic and no
 /// error, and every table holding after the queries the rows it held before them.
-#[test]
-fn outer_joins_with_nested_subqueries_answer_as_sqlite() {
+fn answers_as_sqlite(fixture: &'static str) {
     let mut wrong: Vec<String> = Vec::new();
     let mut ran = 0;
-    for db in cases() {
+    for db in cases(fixture) {
         let tables: Vec<String> = db
             .fill
             .iter()
@@ -191,4 +191,16 @@ fn outer_joins_with_nested_subqueries_answer_as_sqlite() {
         wrong.len(),
         wrong.join("\n")
     );
+}
+
+#[test]
+fn outer_joins_with_nested_subqueries_answer_as_sqlite() {
+    answers_as_sqlite(include_str!("fixtures/outer_join_subqueries.tsv"));
+}
+
+/// Subqueries of ON clauses that read CTEs (finding CO), and WITHOUT ROWID tables, with and without
+/// secondary indexes, on either side of a join (finding CM).
+#[test]
+fn on_clauses_over_ctes_and_joins_of_keyed_tables_answer_as_sqlite() {
+    answers_as_sqlite(include_str!("fixtures/on_ctes.tsv"));
 }
