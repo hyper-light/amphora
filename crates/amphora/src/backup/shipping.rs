@@ -1169,6 +1169,72 @@ mod tests {
         assert_eq!(restored_now(dir.path(), &blobs, &now).unwrap(), ids(&db));
     }
 
+    /// AC-T1.12.4 (lane B26): a check that fails wakes the shipping thread for the base it asks for: no
+    /// commit does. Do: end a first base, commit and ship; zero the last frame of the log's
+    /// generation in the archive, sealed again; start the threads, whose wakes are the test's to make; once
+    /// the check thread holds its snapshot, make one, so the round after it checks the snapshot's second; make no other.
+    /// Expect: the check fails, and a base begun after the short generation ends.
+    #[test]
+    fn a_check_that_fails_wakes_the_round_that_begins_a_base() {
+        use crate::backup::object;
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = Arc::new(SimBlobs::new(64 * 1024, 1_000_000, 1 << 30));
+        let (db, mut prepared, now) = backed_up(
+            &dir.path().join("source.db"),
+            &blobs,
+            None,
+            CheckPolicy::Scratch(None),
+        );
+        write(&db, &now, 0, 10);
+        let mut copy = None;
+        assert!(rounds(&mut prepared, &mut copy), "the first base ends");
+        write(&db, &now, 10, 1);
+        prepared.ship().unwrap();
+        let generation = prepared.shipper.generation();
+        let listed = blobs.list("db/log/", None, 100, until()).unwrap().objects;
+        let (key, _) = listed.last().unwrap();
+        let sealed = blobs.get(key, until()).unwrap();
+        let mut segment: object::Segment =
+            postcard::from_bytes(object::opened(key, &sealed).unwrap()).unwrap();
+        let tail = segment.frames.len() - usize::try_from(FRAME_BYTES).unwrap();
+        segment.frames[tail..].fill(0);
+        blobs.delete(key, until()).unwrap();
+        blobs
+            .create(key, &object::encode(&segment).unwrap(), until())
+            .unwrap();
+        now.fetch_add(2 * SECOND_NS, Ordering::SeqCst);
+
+        let hooks = prepared.hooks();
+        let mut wake = None;
+        let shipping = prepared.start(|watcher| wake = Some(watcher)).unwrap();
+        let deadline = until();
+        while hooks.marks.state().unwrap().watch.is_none() {
+            assert!(Instant::now() < deadline, "no snapshot was taken");
+            std::thread::yield_now();
+        }
+        assert!(wake.as_mut().unwrap()(), "the thread runs");
+        let status = shipping.wait(until(), |s| s.bases > 0).unwrap_or_else(|e| {
+            panic!("no base ended: {e:#}; {:?}", shipping.status());
+        });
+        assert!(
+            matches!(
+                &status.last_check,
+                Some(Check::Failed {
+                    why: CheckFailure::Lacking { lacks, .. },
+                    ..
+                }) if *lacks == Lacks::Frames { generation }
+            ),
+            "{:?}",
+            status.last_check
+        );
+        let bases = blobs.list("db/base/", None, 10, until()).unwrap().objects;
+        let (newest, _) = bases.last().unwrap();
+        let newest = plan::BaseKey::parse("db", newest).unwrap();
+        assert_eq!(newest.start_gen, generation + 1);
+        drop(wake);
+        shipping.wait(until(), |s| s.ended).unwrap();
+    }
+
     /// The most bytes the files in a restore's folder held together, seen at each of its steps.
     struct Peak {
         dir: PathBuf,
