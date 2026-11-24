@@ -48,8 +48,8 @@ use crate::storage::shared_wal_coordination::{
 };
 use crate::storage::sqlite3_ondisk::{
     begin_read_wal_frame, begin_read_wal_frame_raw, finish_read_page, prepare_wal_frame_header,
-    recompute_wal_frame_checksum, write_pages_vectored, PageSize, WAL_FRAME_HEADER_SIZE,
-    WAL_HEADER_SIZE,
+    recompute_wal_frame_checksum, write_pages_vectored, PageSize, RawVersion, Version,
+    WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
 };
 use crate::types::{IOCompletions, IOResult};
 use crate::util::IOExt as _;
@@ -556,6 +556,15 @@ pub struct PreparedFrames {
     pub(crate) depths: Vec<(u8, u32)>,
     pub(crate) decoded: Vec<Arc<Record>>,
     pub(crate) generation: u32,
+}
+
+/// Amphora: page 1's read version, SQLite's guard of its file format (fileformat2.html, 1.3.3). A
+/// page shorter than its header says what an unmarked one does.
+pub(crate) fn page1_version(page: &[u8]) -> RawVersion {
+    const READ_VERSION: usize = 19;
+    page.get(READ_VERSION)
+        .copied()
+        .map_or_else(|| Version::Wal.into(), RawVersion)
 }
 
 /// Amphora: what a page's delta is made against: the log's generation, the last frame the writer
@@ -1091,6 +1100,13 @@ trait WalCoordination: Debug + Send + Sync {
     /// Both of the log's files are cut: it starts as a new database's does ([`SharedLog::start_first`]).
     fn start_first(&self, io: &dyn IO) -> Result<()>;
 
+    /// [`SharedLog::restart_first`], for a TRUNCATE of a log that may have no second segment yet:
+    /// whether it was that log's. Busy while a read is in it. The caller holds a checkpoint's locks,
+    /// read mark 0 among them, and the writer's.
+    fn restart_unmarked(&self, _io: &dyn IO) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Mark the current segment's header unwritten before its file is cut, and return that file.
     fn prepare_truncate(&self) -> Result<Arc<dyn File>>;
 
@@ -1213,6 +1229,22 @@ pub trait Wal: Debug + Send + Sync {
 
     /// End a write transaction.
     fn end_write_tx(&self);
+
+    /// Amphora: whether this write is to carry page 1 with the versions that keep plain SQLite out
+    /// (decision 45, [`Mark::Absent`]).
+    fn mark_wanted(&self) -> bool {
+        false
+    }
+
+    /// Amphora: page 1, written to the file itself, says `version`.
+    fn page1_in_file(&self, _version: RawVersion) {}
+
+    /// Amphora: whether SQLite would see the whole database were its page 1 to say version 2 again:
+    /// the mark is in the file and both of the log's files are empty, the second's emptiness synced
+    /// here. The caller holds the write lock.
+    fn may_unmark(&self) -> Result<bool> {
+        Ok(false)
+    }
 
     /// Returns true if this WAL instance currently holds a read lock.
     fn holds_read_lock(&self) -> bool;
@@ -1995,6 +2027,30 @@ impl WalCoordination for InProcessWalCoordination {
         switched
     }
 
+    fn restart_unmarked(&self, io: &dyn IO) -> Result<bool> {
+        let segments = self.log.segments.load();
+        // Beside a second file its cut would come first, its header the newer one ([`LogCut`]).
+        let one_segment = segments.current() == SegmentId::First
+            && segments.closing().is_none()
+            && !self.log.has_other();
+        if !one_segment || self.log.file_is_marked() {
+            return Ok(false);
+        }
+        let held = (1..READ_MARKS)
+            .take_while(|&slot| self.try_segment_read_mark_exclusive(SegmentId::First, slot))
+            .count();
+        let unread = held == READ_MARKS.saturating_sub(1);
+        if unread {
+            self.log.restart_first(io);
+        }
+        (1..=held).for_each(|slot| self.unlock_segment_read_mark(SegmentId::First, slot));
+        if unread {
+            Ok(true)
+        } else {
+            Err(LimboError::Busy)
+        }
+    }
+
     fn truncates_orphans(&self) -> bool {
         false
     }
@@ -2059,6 +2115,7 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn prepare_wal_header(&self, io: &dyn IO, page_size: PageSize) -> Option<WalHeader> {
+        let beside = self.log.has_other();
         let mut shared: crate::sync::RwLockWriteGuard<'_, WalFileShared> =
             self.log.current().write();
         if shared.metadata.initialized.load(Ordering::Acquire) {
@@ -2080,7 +2137,10 @@ impl WalCoordination for InProcessWalCoordination {
                 hdr.salt_2 = io.generate_random_number() as u32;
             }
             // Amphora: a generation takes its format as its header is written, and keeps it.
-            hdr.file_format = shared.runtime.format.load(Ordering::Acquire);
+            hdr.file_format = match shared.runtime.format.load(Ordering::Acquire) {
+                packed::PAGE_FORMAT if beside => packed::PAGES_BESIDE_FORMAT,
+                format => format,
+            };
 
             let prefix = &hdr.as_bytes()[..WAL_HEADER_SIZE - 8];
             let use_native = (hdr.magic & 1) != 0;
@@ -4268,6 +4328,24 @@ pub struct SharedLog {
     /// The reads of this process's connections, one entry a connection, gone as it is dropped
     /// ([`Self::end_closing_reads`]).
     reads: Mutex<Vec<Weak<ReadHold>>>,
+    /// Where the versions that keep plain SQLite out are. Changed under `write_lock`, or as the
+    /// database is opened or its first page made.
+    mark: Mutex<Mark>,
+}
+
+/// Where a database's mark is, page 1's versions 3 (decision 45, What plain SQLite sees): SQLite
+/// knows no `-wal2`, so the second segment is written only once the file itself refuses it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Mark {
+    /// Not kept: memory's database, or a log that never has a second segment.
+    NotKept,
+    /// The file's page 1 may say versions SQLite reads.
+    Absent,
+    /// A committed frame of the current segment, this one, holds page 1 with the mark: it reaches
+    /// the file with that frame's copy. Every later frame of page 1 carries it too.
+    InLog(u64),
+    /// The file's page 1 has it.
+    InFile,
 }
 
 /// A connection's read under way, as the log's owner can end it (decision 45): its read mark and
@@ -4436,7 +4514,58 @@ impl SharedLog {
             checkpoint_lock: PaddedLock::new(TursoRwLock::new()),
             released: Arc::default(),
             reads: Mutex::default(),
+            mark: Mutex::new(Mark::NotKept),
         })
+    }
+
+    pub(crate) fn mark(&self) -> Mark {
+        *self.mark.lock()
+    }
+
+    /// The database keeps the mark, and this is where it is.
+    pub(crate) fn set_mark(&self, mark: Mark) {
+        *self.mark.lock() = mark;
+    }
+
+    /// A commit's page 1, in `frame` of the current segment, says `version`. A frame without the mark
+    /// may reach the file: the mark is to be set again.
+    fn page1_committed(&self, version: RawVersion, frame: u64) {
+        let mut mark = self.mark.lock();
+        *mark = match (*mark, version.sqlite_reads()) {
+            (Mark::NotKept, _) => Mark::NotKept,
+            (_, true) => Mark::Absent,
+            (Mark::Absent, false) => Mark::InLog(frame),
+            (held, false) => held,
+        };
+    }
+
+    /// Whether the log may have a second segment: the file itself keeps plain SQLite out, its page 1
+    /// copied with the mark and synced. The caller holds `write_lock`.
+    fn file_is_marked(&self) -> bool {
+        let mut mark = self.mark.lock();
+        if let Mark::InLog(frame) = *mark {
+            let copied = self
+                .current()
+                .read()
+                .metadata
+                .nbackfills
+                .load(Ordering::Acquire);
+            if copied >= frame {
+                *mark = Mark::InFile;
+            }
+        }
+        matches!(*mark, Mark::NotKept | Mark::InFile)
+    }
+
+    /// The first segment from its first frame again, in place, in a log that may have no second one
+    /// ([`Self::file_is_marked`]): what SQLite's TRUNCATE does to its one log. The caller holds
+    /// `write_lock` and every read mark of the segment, every frame of it in the synced file.
+    fn restart_first(&self, io: &dyn IO) {
+        let mut first = self.segment(SegmentId::First).write();
+        let header = *first.metadata.wal_header.lock();
+        let epoch = first.runtime.epoch.load(Ordering::Acquire);
+        let transactions = first.metadata.transaction_count.load(Ordering::Acquire);
+        first.start_after(io, header, epoch, transactions);
     }
 
     /// A connection's hold, kept here while the connection is.
@@ -4520,6 +4649,14 @@ impl SharedLog {
         }
     }
 
+    /// Whether the other segment's file holds anything: the log is then two files. A file whose
+    /// length can't be read is taken to.
+    fn has_other(&self) -> bool {
+        let other = self.segment(self.current_id().other()).read();
+        let file = other.runtime.file.as_ref();
+        file.is_some_and(|file| file.size().map_or(true, |bytes| bytes > 0))
+    }
+
     pub(crate) fn read_index(&self, id: SegmentId) -> &Arc<ReadIndex> {
         let [first, second] = &self.read_indexes;
         match id {
@@ -4552,7 +4689,8 @@ impl SharedLog {
     /// next commit before any frame. It takes no read mark and waits for no read: the segment
     /// switched to is free, so no read counts on it. The caller holds `write_lock`. The segment
     /// now current, or None while the other one is still closing (the writer appends on and asks
-    /// again at its next turn) or while the current one holds no frame. A free segment's file
+    /// again at its next turn), while the file's page 1 isn't marked yet ([`Self::file_is_marked`])
+    /// or while the current one holds no frame. A free segment's file
     /// longer than `cut_past` bytes is cut to nothing first: nothing in it is needed (decision
     /// 31's bound, kept at each segment's reuse).
     ///
@@ -4569,6 +4707,7 @@ impl SharedLog {
             .max_frame
             .load(Ordering::Acquire)
             == 0
+            || !self.file_is_marked()
         {
             return Ok(None);
         }
@@ -4587,6 +4726,7 @@ impl SharedLog {
             .max_frame
             .load(Ordering::Acquire)
             == 0
+            || !self.file_is_marked()
         {
             return Ok(None);
         }
@@ -6256,6 +6396,38 @@ impl Wal for WalFile {
         self.coordination.end_write_tx();
     }
 
+    fn mark_wanted(&self) -> bool {
+        self.coordination.shared_wal_state().mark() == Mark::Absent
+    }
+
+    fn page1_in_file(&self, version: RawVersion) {
+        let log = self.coordination.shared_wal_state();
+        if log.mark() != Mark::NotKept {
+            log.set_mark(if version.sqlite_reads() {
+                Mark::Absent
+            } else {
+                Mark::InFile
+            });
+        }
+    }
+
+    fn may_unmark(&self) -> Result<bool> {
+        let log = self.coordination.shared_wal_state();
+        if log.mark() != Mark::InFile || log.current_id() != SegmentId::First {
+            return Ok(false);
+        }
+        for segment in [SegmentId::First, SegmentId::Second] {
+            let file = log.segment(segment).read().runtime.file.clone();
+            let Some(file) = file else { continue };
+            if file.size()? > 0 {
+                return Ok(false);
+            }
+            let synced = file.sync(Completion::new_sync(|_| {}), FileSyncType::Fsync)?;
+            self.io.wait_for_completion(synced)?;
+        }
+        Ok(true)
+    }
+
     /// Returns true if this WAL instance currently holds a read lock.
     fn holds_read_lock(&self) -> bool {
         self.max_frame_read_lock_index.load(Ordering::Acquire) != NO_LOCK_HELD
@@ -6844,6 +7016,11 @@ impl Wal for WalFile {
         let c = file.pwrite(offset, frame_bytes, c)?;
         self.io.wait_for_completion(c)?;
         self.complete_append_frame(page_id, frame_id, checksums);
+        if page_id == DatabaseHeader::PAGE_ID as u64 && page1_version(page).sqlite_reads() {
+            // Committed by a later frame or not at all: the mark is set again either way.
+            let log = self.coordination.shared_wal_state();
+            log.page1_committed(page1_version(page), frame_id);
+        }
         if db_size > 0 {
             self.finish_append_frames_commit()?;
         }
@@ -7415,6 +7592,16 @@ impl Wal for WalFile {
     /// and advance max_frame to make frames visible to readers.
     fn commit_prepared_frames(&self, batches: &[PreparedFrames]) {
         for batch in batches {
+            let page1 = batch
+                .metadata
+                .iter()
+                .find(|(page, _, _)| page.get().id() == DatabaseHeader::PAGE_ID);
+            if let Some((page, _, _)) = page1 {
+                let version = page1_version(page.get_contents().as_ptr());
+                self.coordination
+                    .shared_wal_state()
+                    .page1_committed(version, batch.final_max_frame);
+            }
             if batch.records.is_empty() {
                 for (page, frame_id, checksum) in &batch.metadata {
                     // Update WAL index mapping page -> frame
@@ -8589,7 +8776,17 @@ impl WalFile {
         loop {
             match result.cut {
                 LogCut::Asked => {
-                    self.start_log_again(result)?;
+                    if result.wal_max_frame > 0 {
+                        self.coordination
+                            .publish_backfill(result.wal_total_backfilled);
+                    }
+                    if result.wal_max_frame > 0
+                        && self.coordination.restart_unmarked(self.io.as_ref())?
+                    {
+                        self.read_from_file();
+                    } else {
+                        self.start_log_again(result)?;
+                    }
                     // A segment switched to has its header written by its first commit: until then
                     // its file holds the older one, of its life before.
                     let current = self.coordination.current_segment();

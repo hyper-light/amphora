@@ -202,13 +202,16 @@ impl Default for CacheSize {
 pub enum Version {
     Legacy = 1,
     Wal = 2,
+    /// Amphora: a log of two segments (docs/design/store.md, decision 45). The value SQLite's wal2
+    /// writes: SQLite reads no file whose read version is above 2 (fileformat2.html, 1.3.3).
+    Wal2 = 3,
     Mvcc = 255,
 }
 
 impl Version {
     #[inline]
     pub fn wal(&self) -> bool {
-        matches!(self, Self::Wal)
+        matches!(self, Self::Wal | Self::Wal2)
     }
 
     #[inline]
@@ -229,6 +232,7 @@ impl TryFrom<u8> for Version {
         match value {
             1 => Ok(Version::Legacy),
             2 => Ok(Version::Wal),
+            3 => Ok(Version::Wal2),
             255 => Ok(Version::Mvcc),
             v => Err(v),
         }
@@ -244,6 +248,12 @@ pub struct RawVersion(pub u8);
 impl RawVersion {
     pub fn to_version(self) -> std::result::Result<Version, u8> {
         Version::try_from(self.0)
+    }
+
+    /// Whether SQLite reads a file whose read version this is: up to 2, WAL
+    /// (fileformat2.html, 1.3.3).
+    pub(crate) fn sqlite_reads(self) -> bool {
+        self.0 <= Version::Wal as u8
     }
 }
 

@@ -619,8 +619,9 @@ impl Db {
     /// Copies what the reads under way let it, then starts the log again by switching the writer
     /// to its free segment (docs/design/store.md, decision 45): whether it did. The current
     /// segment is flushed and closes; reads under way keep reading it. It waits for no read:
-    /// false while another connection writes, or while a read still counts on the segment the
-    /// last switch closed, and the caller asks again at its next turn. Past the room a restart
+    /// false while another connection writes, while a read still counts on the segment the last
+    /// switch closed, or before a pass has copied the first page that keeps plain SQLite out (a
+    /// file opened without it), and the caller asks again at its next turn. Past the room a restart
     /// keeps ([`Db::keep_log`]), the reads that count on that segment are ended first, each
     /// answered that its snapshot is too old ([`Db::end_closing_reads`]). A segment switched to is
     /// cut to nothing first if it holds room for more frames than [`Db::keep_log`] keeps
@@ -878,6 +879,13 @@ impl Db {
             })
             .map(|_| ())
             .map_err(fail)
+    }
+
+    /// Closes the database cleanly, this its only connection: its log folded into the file, which
+    /// plain SQLite then reads (docs/design/store.md, decision 45).
+    pub fn close(self) -> anyhow::Result<()> {
+        self.ensure_unfenced()?;
+        self.conn.close().map_err(fail)
     }
 
     /// Folds the log into the file through `frame` (inclusive), leaving the rest in the log and the

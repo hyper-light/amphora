@@ -21291,6 +21291,10 @@ fn op_journal_mode_inner(
 
                 // Clear page cache
                 pager.clear_page_cache(true);
+                // Amphora: page 1 in the file says this mode's version (decision 45).
+                if let (Some(wal), Some(version)) = (pager.wal.as_ref(), new_mode.as_version()) {
+                    wal.page1_in_file(RawVersion::from(version));
+                }
 
                 // Setup new mode
                 if matches!(new_mode, journal_mode::JournalMode::Mvcc) {
@@ -21801,7 +21805,8 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                     source_pager.io.block(|| {
                         source_pager.with_header(VacuumDbHeaderMeta::from_source_header)
                     })?
-                };
+                }
+                .of_a_whole_file();
 
                 let reserved_space: u8 = if !is_attached_db(source_db_id) {
                     // For main or temp db prefer cached value to avoid blocking I/O
