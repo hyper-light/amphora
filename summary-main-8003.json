@@ -1,0 +1,2064 @@
+{
+"duplicates": 1733,
+"features": {
+"derived": {
+"checks": 214198,
+"databases": 0,
+"failed": 315,
+"passed": 155532,
+"refused": {
+"ESCAPE expression must be a single character": 8,
+"FLAGS parameter to json_valid() must be between # and #": 27,
+"Internal error: secondary index lacks primary key locator": 68,
+"JSON cannot hold BLOB values": 39,
+"JSON path error near: \"#\"": 75,
+"JSON path error near: \"#.#\"": 36,
+"JSON path error near: \"#.#e+#\"": 6,
+"JSON path error near: \"-#\"": 13,
+"JSON path error near: \"-#.#\"": 4,
+"JSON path error near: \"-#.#e+#\"": 1,
+"JSON path error near: \"-#.#e-#\"": 5,
+"Parse error: #nd ORDER BY term does not match any column in the result set": 337,
+"Parse error: #rd ORDER BY term does not match any column in the result set": 70,
+"Parse error: #st ORDER BY term does not match any column in the result set": 1178,
+"Parse error: #th ORDER BY term does not match any column in the result set": 6,
+"Parse error: Unexpected character": 65,
+"Parse error: Unexpected end of input": 19,
+"Parse error: bad JSON path: '\u0001\u0002'": 2,
+"Parse error: bad JSON path: ' '": 3,
+"Parse error: bad JSON path: ' a'": 4,
+"Parse error: bad JSON path: '#'": 11,
+"Parse error: bad JSON path: '#.#'": 4,
+"Parse error: bad JSON path: '#.#e+#'": 1,
+"Parse error: bad JSON path: '#e#'": 1,
+"Parse error: bad JSON path: '#x#'": 1,
+"Parse error: bad JSON path: '%'": 4,
+"Parse error: bad JSON path: ''": 13,
+"Parse error: bad JSON path: '-#'": 6,
+"Parse error: bad JSON path: 'A'": 9,
+"Parse error: bad JSON path: 'ABC'": 1,
+"Parse error: bad JSON path: 'NULL'": 1,
+"Parse error: bad JSON path: '_'": 2,
+"Parse error: bad JSON path: 'a '": 2,
+"Parse error: bad JSON path: 'a a '": 1,
+"Parse error: bad JSON path: 'a'": 3,
+"Parse error: bad JSON path: 'g#'": 3,
+"Parse error: bad JSON path: 'true'": 4,
+"Parse error: bad JSON path: 'x'": 2,
+"Parse error: bad JSON path: '{\"a\":null}'": 1,
+"Parse error: bad JSON path: '\u00e9#'": 1,
+"Parse error: bad JSON path: '\u00e9'": 7,
+"Parse error: bad JSON path: '\u00ff'": 4,
+"Parse error: insufficient registers allocated for expression vector write (start=#, count=#, next_free=#)": 229,
+"Parse error: malformed JSON": 219,
+"Parse error: no such table: w#": 8,
+"Parse error: row value misused": 5,
+"integer overflow": 6,
+"json_array_insert() needs an odd number of arguments": 37,
+"json_insert() needs an odd number of arguments": 43,
+"json_object() labels must be TEXT": 29,
+"json_object() requires an even number of arguments": 74,
+"json_replace() needs an odd number of arguments": 44,
+"json_set() needs an odd number of arguments": 33,
+"string or blob too big": 8
+},
+"skipped": 55568
+},
+"except": {
+"checks": 47233,
+"databases": 0,
+"failed": 42,
+"passed": 26351,
+"refused": {
+"ESCAPE expression must be a single character": 6,
+"FLAGS parameter to json_valid() must be between # and #": 15,
+"Internal error: secondary index lacks primary key locator": 25,
+"JSON cannot hold BLOB values": 23,
+"JSON path error near: \"#\"": 41,
+"JSON path error near: \"#.#\"": 18,
+"JSON path error near: \"#.#e+#\"": 1,
+"JSON path error near: \"-#\"": 6,
+"JSON path error near: \"-#.#\"": 1,
+"JSON path error near: \"-#.#e+#\"": 2,
+"Parse error: #nd ORDER BY term does not match any column in the result set": 246,
+"Parse error: #rd ORDER BY term does not match any column in the result set": 39,
+"Parse error: #st ORDER BY term does not match any column in the result set": 862,
+"Parse error: #th ORDER BY term does not match any column in the result set": 6,
+"Parse error: Unexpected character": 33,
+"Parse error: Unexpected end of input": 5,
+"Parse error: bad JSON path: '\u0001\u0002'": 1,
+"Parse error: bad JSON path: ' '": 2,
+"Parse error: bad JSON path: ' a'": 3,
+"Parse error: bad JSON path: '#'": 9,
+"Parse error: bad JSON path: '#.#'": 4,
+"Parse error: bad JSON path: '#e#'": 2,
+"Parse error: bad JSON path: '%'": 1,
+"Parse error: bad JSON path: ''": 8,
+"Parse error: bad JSON path: '-#'": 2,
+"Parse error: bad JSON path: 'A#'": 1,
+"Parse error: bad JSON path: 'A'": 4,
+"Parse error: bad JSON path: 'ABC'": 1,
+"Parse error: bad JSON path: 'NULL'": 1,
+"Parse error: bad JSON path: '_'": 2,
+"Parse error: bad JSON path: 'a '": 1,
+"Parse error: bad JSON path: 'a'": 1,
+"Parse error: bad JSON path: 'g#'": 1,
+"Parse error: bad JSON path: 'true'": 1,
+"Parse error: bad JSON path: 'x'": 4,
+"Parse error: bad JSON path: '\u00e9'": 1,
+"Parse error: bad JSON path: '\u00ff'": 1,
+"Parse error: insufficient registers allocated for expression vector write (start=#, count=#, next_free=#)": 86,
+"Parse error: malformed JSON": 98,
+"Parse error: no such table: w#": 10,
+"Parse error: row value misused": 3,
+"integer overflow": 3,
+"json_array_insert() needs an odd number of arguments": 18,
+"json_insert() needs an odd number of arguments": 28,
+"json_object() labels must be TEXT": 17,
+"json_object() requires an even number of arguments": 35,
+"json_replace() needs an odd number of arguments": 24,
+"json_set() needs an odd number of arguments": 16,
+"string or blob too big": 6
+},
+"skipped": 19116
+},
+"intersect": {
+"checks": 47369,
+"databases": 0,
+"failed": 43,
+"passed": 26476,
+"refused": {
+"ESCAPE expression must be a single character": 3,
+"FLAGS parameter to json_valid() must be between # and #": 12,
+"Internal error: secondary index lacks primary key locator": 31,
+"JSON cannot hold BLOB values": 18,
+"JSON path error near: \"#\"": 43,
+"JSON path error near: \"#.#\"": 16,
+"JSON path error near: \"#.#e+#\"": 3,
+"JSON path error near: \"-#\"": 5,
+"JSON path error near: \"-#.#\"": 3,
+"Parse error: #nd ORDER BY term does not match any column in the result set": 211,
+"Parse error: #rd ORDER BY term does not match any column in the result set": 46,
+"Parse error: #st ORDER BY term does not match any column in the result set": 856,
+"Parse error: #th ORDER BY term does not match any column in the result set": 5,
+"Parse error: Unexpected character": 33,
+"Parse error: Unexpected end of input": 10,
+"Parse error: bad JSON path: '\u0001\u0002'": 2,
+"Parse error: bad JSON path: ' a'": 2,
+"Parse error: bad JSON path: '#'": 7,
+"Parse error: bad JSON path: '#.#'": 4,
+"Parse error: bad JSON path: '#x#'": 1,
+"Parse error: bad JSON path: '%'": 1,
+"Parse error: bad JSON path: ''": 6,
+"Parse error: bad JSON path: '-#'": 2,
+"Parse error: bad JSON path: 'A'": 5,
+"Parse error: bad JSON path: '_'": 2,
+"Parse error: bad JSON path: 'a '": 3,
+"Parse error: bad JSON path: 'a'": 1,
+"Parse error: bad JSON path: 'abc'": 1,
+"Parse error: bad JSON path: 'g#'": 1,
+"Parse error: bad JSON path: 'true'": 2,
+"Parse error: bad JSON path: 'x'": 2,
+"Parse error: bad JSON path: '\u00e9#'": 1,
+"Parse error: bad JSON path: '\u00e9'": 2,
+"Parse error: bad JSON path: '\u00ff'": 1,
+"Parse error: insufficient registers allocated for expression vector write (start=#, count=#, next_free=#)": 72,
+"Parse error: malformed JSON": 106,
+"Parse error: no such table: w#": 8,
+"Parse error: row value misused": 1,
+"integer overflow": 4,
+"json_array_insert() needs an odd number of arguments": 19,
+"json_insert() needs an odd number of arguments": 19,
+"json_object() labels must be TEXT": 19,
+"json_object() requires an even number of arguments": 42,
+"json_replace() needs an odd number of arguments": 30,
+"json_set() needs an odd number of arguments": 19,
+"string or blob too big": 5
+},
+"skipped": 19165
+},
+"natural": {
+"checks": 57098,
+"databases": 0,
+"failed": 78,
+"passed": 41966,
+"refused": {
+"ESCAPE expression must be a single character": 1,
+"FLAGS parameter to json_valid() must be between # and #": 2,
+"Internal error: secondary index lacks primary key locator": 16,
+"JSON cannot hold BLOB values": 11,
+"JSON path error near: \"#\"": 5,
+"JSON path error near: \"#.#\"": 6,
+"JSON path error near: \"-#\"": 2,
+"JSON path error near: \"-#.#\"": 1,
+"Parse error: #nd ORDER BY term does not match any column in the result set": 111,
+"Parse error: #rd ORDER BY term does not match any column in the result set": 18,
+"Parse error: #st ORDER BY term does not match any column in the result set": 377,
+"Parse error: #th ORDER BY term does not match any column in the result set": 2,
+"Parse error: Unexpected character": 14,
+"Parse error: Unexpected end of input": 3,
+"Parse error: bad JSON path: '#'": 2,
+"Parse error: bad JSON path: ''": 3,
+"Parse error: bad JSON path: 'A'": 2,
+"Parse error: bad JSON path: 'ABC'": 1,
+"Parse error: bad JSON path: 'a'": 1,
+"Parse error: bad JSON path: 'x'": 1,
+"Parse error: bad JSON path: '\u00e9'": 2,
+"Parse error: insufficient registers allocated for expression vector write (start=#, count=#, next_free=#)": 40,
+"Parse error: malformed JSON": 42,
+"Parse error: no such table: w#": 2,
+"integer overflow": 1,
+"json_array_insert() needs an odd number of arguments": 8,
+"json_insert() needs an odd number of arguments": 5,
+"json_object() labels must be TEXT": 2,
+"json_object() requires an even number of arguments": 15,
+"json_replace() needs an odd number of arguments": 8,
+"json_set() needs an odd number of arguments": 7,
+"string or blob too big": 3
+},
+"skipped": 14340
+},
+"recursive": {
+"checks": 54725,
+"databases": 0,
+"failed": 41,
+"passed": 39798,
+"refused": {
+"ESCAPE expression must be a single character": 1,
+"FLAGS parameter to json_valid() must be between # and #": 6,
+"Internal error: secondary index lacks primary key locator": 35,
+"JSON cannot hold BLOB values": 10,
+"JSON path error near: \"#\"": 12,
+"JSON path error near: \"#.#\"": 13,
+"JSON path error near: \"#.#e+#\"": 2,
+"JSON path error near: \"-#\"": 2,
+"JSON path error near: \"-#.#e-#\"": 1,
+"Parse error: #nd ORDER BY term does not match any column in the result set": 72,
+"Parse error: #rd ORDER BY term does not match any column in the result set": 15,
+"Parse error: #st ORDER BY term does not match any column in the result set": 297,
+"Parse error: #th ORDER BY term does not match any column in the result set": 3,
+"Parse error: Unexpected character": 2,
+"Parse error: Unexpected end of input": 2,
+"Parse error: bad JSON path: '\u0001\u0002'": 1,
+"Parse error: bad JSON path: '#'": 3,
+"Parse error: bad JSON path: '#.#'": 1,
+"Parse error: bad JSON path: '%'": 1,
+"Parse error: bad JSON path: ''": 2,
+"Parse error: bad JSON path: 'a'": 1,
+"Parse error: bad JSON path: 'x'": 1,
+"Parse error: insufficient registers allocated for expression vector write (start=#, count=#, next_free=#)": 60,
+"Parse error: malformed JSON": 41,
+"Parse error: no such table: w#": 23,
+"integer overflow": 2,
+"json_array_insert() needs an odd number of arguments": 6,
+"json_insert() needs an odd number of arguments": 2,
+"json_object() labels must be TEXT": 5,
+"json_object() requires an even number of arguments": 14,
+"json_replace() needs an odd number of arguments": 9,
+"json_set() needs an odd number of arguments": 7,
+"string or blob too big": 1
+},
+"skipped": 14233
+},
+"row value": {
+"checks": 68006,
+"databases": 0,
+"failed": 1575,
+"passed": 46322,
+"refused": {
+"ESCAPE expression must be a single character": 3,
+"FLAGS parameter to json_valid() must be between # and #": 5,
+"Internal error: secondary index lacks primary key locator": 16,
+"JSON cannot hold BLOB values": 11,
+"JSON path error near: \"#\"": 21,
+"JSON path error near: \"#.#\"": 7,
+"JSON path error near: \"#.#e+#\"": 2,
+"JSON path error near: \"-#\"": 4,
+"JSON path error near: \"-#.#\"": 1,
+"JSON path error near: \"-#.#e+#\"": 1,
+"Parse error: #nd ORDER BY term does not match any column in the result set": 84,
+"Parse error: #rd ORDER BY term does not match any column in the result set": 20,
+"Parse error: #st ORDER BY term does not match any column in the result set": 300,
+"Parse error: #th ORDER BY term does not match any column in the result set": 3,
+"Parse error: Unexpected character": 16,
+"Parse error: Unexpected end of input": 9,
+"Parse error: bad JSON path: '\u0001\u0002'": 1,
+"Parse error: bad JSON path: ' a'": 2,
+"Parse error: bad JSON path: '#'": 3,
+"Parse error: bad JSON path: ''": 4,
+"Parse error: bad JSON path: '-#'": 1,
+"Parse error: bad JSON path: 'A'": 3,
+"Parse error: bad JSON path: '_'": 2,
+"Parse error: bad JSON path: 'a '": 1,
+"Parse error: bad JSON path: 'g#'": 1,
+"Parse error: bad JSON path: 'x'": 1,
+"Parse error: bad JSON path: '\u00ff'": 1,
+"Parse error: insufficient registers allocated for expression vector write (start=#, count=#, next_free=#)": 554,
+"Parse error: malformed JSON": 76,
+"Parse error: no such table: w#": 6,
+"Parse error: parenthesized conditional should have exactly one expression": 1,
+"Parse error: row value misused": 7,
+"integer overflow": 1,
+"json_array_insert() needs an odd number of arguments": 11,
+"json_insert() needs an odd number of arguments": 8,
+"json_object() labels must be TEXT": 14,
+"json_object() requires an even number of arguments": 27,
+"json_replace() needs an odd number of arguments": 11,
+"json_set() needs an odd number of arguments": 17,
+"string or blob too big": 4
+},
+"skipped": 18849
+},
+"star": {
+"checks": 15462,
+"databases": 0,
+"failed": 0,
+"passed": 12035,
+"refused": {
+"FLAGS parameter to json_valid() must be between # and #": 1,
+"Internal error: secondary index lacks primary key locator": 1,
+"JSON cannot hold BLOB values": 1,
+"JSON path error near: \"#\"": 5,
+"JSON path error near: \"#.#e+#\"": 1,
+"Parse error: Unexpected character": 2,
+"Parse error: bad JSON path: '\u0001\u0002'": 1,
+"Parse error: bad JSON path: ''": 1,
+"Parse error: insufficient registers allocated for expression vector write (start=#, count=#, next_free=#)": 15,
+"Parse error: malformed JSON": 15,
+"Parse error: no such table: w#": 3,
+"json_array_insert() needs an odd number of arguments": 2,
+"json_insert() needs an odd number of arguments": 1,
+"json_object() labels must be TEXT": 1,
+"json_object() requires an even number of arguments": 2,
+"json_replace() needs an odd number of arguments": 1,
+"json_set() needs an odd number of arguments": 3
+},
+"skipped": 3371
+},
+"strict": {
+"checks": 197143,
+"databases": 6344,
+"failed": 302,
+"passed": 140418,
+"refused": {
+"ESCAPE expression must be a single character": 5,
+"FLAGS parameter to json_valid() must be between # and #": 9,
+"Internal error: secondary index lacks primary key locator": 16,
+"JSON cannot hold BLOB values": 18,
+"JSON path error near: \"#\"": 26,
+"JSON path error near: \"#.#\"": 12,
+"JSON path error near: \"#.#e+#\"": 1,
+"JSON path error near: \"-#\"": 4,
+"JSON path error near: \"-#.#\"": 1,
+"JSON path error near: \"-#.#e-#\"": 2,
+"Parse error: #nd ORDER BY term does not match any column in the result set": 168,
+"Parse error: #rd ORDER BY term does not match any column in the result set": 37,
+"Parse error: #st ORDER BY term does not match any column in the result set": 576,
+"Parse error: #th ORDER BY term does not match any column in the result set": 2,
+"Parse error: Unexpected character": 28,
+"Parse error: Unexpected end of input": 7,
+"Parse error: bad JSON path: ' '": 2,
+"Parse error: bad JSON path: ' a'": 3,
+"Parse error: bad JSON path: '#'": 6,
+"Parse error: bad JSON path: '#.#e+#'": 1,
+"Parse error: bad JSON path: ''": 5,
+"Parse error: bad JSON path: 'A#'": 1,
+"Parse error: bad JSON path: 'A'": 3,
+"Parse error: bad JSON path: 'ABC'": 1,
+"Parse error: bad JSON path: '_'": 1,
+"Parse error: bad JSON path: 'a '": 3,
+"Parse error: bad JSON path: 'a a '": 1,
+"Parse error: bad JSON path: 'a'": 2,
+"Parse error: bad JSON path: 'x'": 1,
+"Parse error: bad JSON path: '\u00e9'": 2,
+"Parse error: bad JSON path: '\u00ff'": 2,
+"Parse error: insufficient registers allocated for expression vector write (start=#, count=#, next_free=#)": 111,
+"Parse error: malformed JSON": 90,
+"Parse error: no such table: w#": 13,
+"Parse error: row value misused": 2,
+"integer overflow": 6,
+"json_array_insert() needs an odd number of arguments": 11,
+"json_insert() needs an odd number of arguments": 23,
+"json_object() labels must be TEXT": 25,
+"json_object() requires an even number of arguments": 27,
+"json_replace() needs an odd number of arguments": 15,
+"json_set() needs an odd number of arguments": 11,
+"string or blob too big": 6
+},
+"skipped": 55137
+},
+"trigger": {
+"checks": 9201,
+"databases": 9202,
+"failed": 13,
+"passed": 9124,
+"refused": {
+"Internal error: secondary index lacks primary key locator": 3,
+"Parse error: insufficient registers allocated for expression vector write (start=#, count=#, next_free=#)": 17,
+"Parse error: row value misused": 1
+},
+"skipped": 43
+},
+"union": {
+"checks": 94635,
+"databases": 0,
+"failed": 62,
+"passed": 55709,
+"refused": {
+"ESCAPE expression must be a single character": 5,
+"FLAGS parameter to json_valid() must be between # and #": 11,
+"Internal error: secondary index lacks primary key locator": 59,
+"JSON cannot hold BLOB values": 17,
+"JSON path error near: \"#\"": 28,
+"JSON path error near: \"#.#\"": 17,
+"JSON path error near: \"#.#e+#\"": 3,
+"JSON path error near: \"-#\"": 6,
+"JSON path error near: \"-#.#\"": 1,
+"JSON path error near: \"-#.#e+#\"": 1,
+"JSON path error near: \"-#.#e-#\"": 1,
+"Parse error: #nd ORDER BY term does not match any column in the result set": 418,
+"Parse error: #rd ORDER BY term does not match any column in the result set": 78,
+"Parse error: #st ORDER BY term does not match any column in the result set": 1482,
+"Parse error: #th ORDER BY term does not match any column in the result set": 15,
+"Parse error: Unexpected character": 20,
+"Parse error: Unexpected end of input": 10,
+"Parse error: bad JSON path: '\u0001\u0002'": 2,
+"Parse error: bad JSON path: ' '": 1,
+"Parse error: bad JSON path: '#'": 7,
+"Parse error: bad JSON path: '#.#'": 2,
+"Parse error: bad JSON path: '#x#'": 1,
+"Parse error: bad JSON path: '%'": 1,
+"Parse error: bad JSON path: ''": 7,
+"Parse error: bad JSON path: '-#'": 2,
+"Parse error: bad JSON path: 'A'": 3,
+"Parse error: bad JSON path: 'a'": 3,
+"Parse error: bad JSON path: 'true'": 3,
+"Parse error: bad JSON path: '{\"a\":null}'": 1,
+"Parse error: bad JSON path: '\u00e9'": 1,
+"Parse error: bad JSON path: '\u00ff'": 1,
+"Parse error: insufficient registers allocated for expression vector write (start=#, count=#, next_free=#)": 110,
+"Parse error: malformed JSON": 99,
+"Parse error: no such table: w#": 21,
+"Parse error: row value misused": 3,
+"integer overflow": 2,
+"json_array_insert() needs an odd number of arguments": 14,
+"json_insert() needs an odd number of arguments": 16,
+"json_object() labels must be TEXT": 17,
+"json_object() requires an even number of arguments": 35,
+"json_replace() needs an odd number of arguments": 20,
+"json_set() needs an odd number of arguments": 10,
+"string or blob too big": 3
+},
+"skipped": 36307
+},
+"union all": {
+"checks": 90344,
+"databases": 0,
+"failed": 67,
+"passed": 57202,
+"refused": {
+"ESCAPE expression must be a single character": 6,
+"FLAGS parameter to json_valid() must be between # and #": 24,
+"Internal error: secondary index lacks primary key locator": 44,
+"JSON cannot hold BLOB values": 21,
+"JSON path error near: \"#\"": 40,
+"JSON path error near: \"#.#\"": 22,
+"JSON path error near: \"#.#e+#\"": 3,
+"JSON path error near: \"-#\"": 6,
+"JSON path error near: \"-#.#e-#\"": 1,
+"Parse error: #nd ORDER BY term does not match any column in the result set": 282,
+"Parse error: #rd ORDER BY term does not match any column in the result set": 54,
+"Parse error: #st ORDER BY term does not match any column in the result set": 1032,
+"Parse error: #th ORDER BY term does not match any column in the result set": 5,
+"Parse error: Unexpected character": 24,
+"Parse error: Unexpected end of input": 8,
+"Parse error: bad JSON path: ' '": 3,
+"Parse error: bad JSON path: ' a'": 3,
+"Parse error: bad JSON path: '#'": 4,
+"Parse error: bad JSON path: '#.#'": 2,
+"Parse error: bad JSON path: '#e#'": 1,
+"Parse error: bad JSON path: '%'": 3,
+"Parse error: bad JSON path: ''": 5,
+"Parse error: bad JSON path: '-#'": 2,
+"Parse error: bad JSON path: 'A'": 1,
+"Parse error: bad JSON path: '_'": 1,
+"Parse error: bad JSON path: 'a a '": 1,
+"Parse error: bad JSON path: 'a'": 1,
+"Parse error: bad JSON path: 'true'": 1,
+"Parse error: bad JSON path: 'x'": 2,
+"Parse error: bad JSON path: '\u00e9#'": 1,
+"Parse error: bad JSON path: '\u00e9'": 1,
+"Parse error: bad JSON path: '\u00ff'": 2,
+"Parse error: insufficient registers allocated for expression vector write (start=#, count=#, next_free=#)": 131,
+"Parse error: malformed JSON": 113,
+"Parse error: no such table: w#": 23,
+"Parse error: row value misused": 2,
+"integer overflow": 3,
+"json_array_insert() needs an odd number of arguments": 15,
+"json_insert() needs an odd number of arguments": 15,
+"json_object() labels must be TEXT": 11,
+"json_object() requires an even number of arguments": 29,
+"json_replace() needs an odd number of arguments": 17,
+"json_set() needs an odd number of arguments": 14,
+"string or blob too big": 6
+},
+"skipped": 31090
+},
+"upsert": {
+"checks": 15093,
+"databases": 15093,
+"failed": 14,
+"passed": 14992,
+"refused": {
+"Internal error: secondary index lacks primary key locator": 5,
+"Parse error: insufficient registers allocated for expression vector write (start=#, count=#, next_free=#)": 22
+},
+"skipped": 60
+},
+"using": {
+"checks": 56881,
+"databases": 0,
+"failed": 95,
+"passed": 41673,
+"refused": {
+"ESCAPE expression must be a single character": 2,
+"FLAGS parameter to json_valid() must be between # and #": 1,
+"Internal error: secondary index lacks primary key locator": 18,
+"JSON cannot hold BLOB values": 8,
+"JSON path error near: \"#\"": 9,
+"JSON path error near: \"#.#\"": 3,
+"JSON path error near: \"#.#e+#\"": 3,
+"JSON path error near: \"-#\"": 2,
+"JSON path error near: \"-#.#e+#\"": 1,
+"JSON path error near: \"-#.#e-#\"": 1,
+"Parse error: #nd ORDER BY term does not match any column in the result set": 90,
+"Parse error: #rd ORDER BY term does not match any column in the result set": 20,
+"Parse error: #st ORDER BY term does not match any column in the result set": 347,
+"Parse error: #th ORDER BY term does not match any column in the result set": 1,
+"Parse error: Unexpected character": 12,
+"Parse error: Unexpected end of input": 1,
+"Parse error: bad JSON path: ' '": 1,
+"Parse error: bad JSON path: '#'": 1,
+"Parse error: bad JSON path: '#.#'": 1,
+"Parse error: bad JSON path: '%'": 2,
+"Parse error: bad JSON path: ''": 2,
+"Parse error: bad JSON path: '-#'": 1,
+"Parse error: bad JSON path: 'A'": 2,
+"Parse error: bad JSON path: 'NULL'": 1,
+"Parse error: bad JSON path: '_'": 2,
+"Parse error: bad JSON path: 'true'": 1,
+"Parse error: bad JSON path: 'x'": 2,
+"Parse error: bad JSON path: '\u00ff'": 1,
+"Parse error: insufficient registers allocated for expression vector write (start=#, count=#, next_free=#)": 39,
+"Parse error: malformed JSON": 33,
+"Parse error: row value misused": 1,
+"json_array_insert() needs an odd number of arguments": 6,
+"json_insert() needs an odd number of arguments": 10,
+"json_object() labels must be TEXT": 6,
+"json_object() requires an even number of arguments": 10,
+"json_replace() needs an odd number of arguments": 9,
+"json_set() needs an odd number of arguments": 7,
+"string or blob too big": 2
+},
+"skipped": 14454
+},
+"view": {
+"checks": 150611,
+"databases": 9592,
+"failed": 231,
+"passed": 113490,
+"refused": {
+"ESCAPE expression must be a single character": 8,
+"FLAGS parameter to json_valid() must be between # and #": 15,
+"Internal error: secondary index lacks primary key locator": 51,
+"JSON cannot hold BLOB values": 22,
+"JSON path error near: \"#\"": 42,
+"JSON path error near: \"#.#\"": 16,
+"JSON path error near: \"#.#e+#\"": 6,
+"JSON path error near: \"-#\"": 11,
+"JSON path error near: \"-#.#\"": 1,
+"Parse error: #nd ORDER BY term does not match any column in the result set": 186,
+"Parse error: #rd ORDER BY term does not match any column in the result set": 36,
+"Parse error: #st ORDER BY term does not match any column in the result set": 620,
+"Parse error: #th ORDER BY term does not match any column in the result set": 3,
+"Parse error: Unexpected character": 47,
+"Parse error: Unexpected end of input": 16,
+"Parse error: bad JSON path: '\u0001\u0002'": 1,
+"Parse error: bad JSON path: ' '": 2,
+"Parse error: bad JSON path: ' a'": 5,
+"Parse error: bad JSON path: '#'": 1,
+"Parse error: bad JSON path: '#.#'": 6,
+"Parse error: bad JSON path: ''": 10,
+"Parse error: bad JSON path: '-#'": 2,
+"Parse error: bad JSON path: '-#.#e+#'": 1,
+"Parse error: bad JSON path: '-#.#e-#'": 1,
+"Parse error: bad JSON path: 'A'": 4,
+"Parse error: bad JSON path: 'ABC'": 1,
+"Parse error: bad JSON path: 'NULL'": 1,
+"Parse error: bad JSON path: '_'": 3,
+"Parse error: bad JSON path: 'a '": 6,
+"Parse error: bad JSON path: 'a'": 3,
+"Parse error: bad JSON path: 'true'": 2,
+"Parse error: bad JSON path: 'x'": 2,
+"Parse error: bad JSON path: '\u00e9'": 1,
+"Parse error: bad JSON path: '\u00ff'": 4,
+"Parse error: insufficient registers allocated for expression vector write (start=#, count=#, next_free=#)": 175,
+"Parse error: malformed JSON": 132,
+"Parse error: no such table: w#": 2,
+"Parse error: row value misused": 6,
+"json_array_insert() needs an odd number of arguments": 26,
+"json_insert() needs an odd number of arguments": 27,
+"json_object() labels must be TEXT": 18,
+"json_object() requires an even number of arguments": 51,
+"json_replace() needs an odd number of arguments": 31,
+"json_set() needs an odd number of arguments": 24,
+"string or blob too big": 4
+},
+"skipped": 35258
+},
+"window": {
+"checks": 147008,
+"databases": 0,
+"failed": 290,
+"passed": 101833,
+"refused": {
+"ESCAPE expression must be a single character": 3,
+"FLAGS parameter to json_valid() must be between # and #": 15,
+"Internal error: secondary index lacks primary key locator": 45,
+"JSON cannot hold BLOB values": 17,
+"JSON path error near: \"#\"": 37,
+"JSON path error near: \"#.#\"": 17,
+"JSON path error near: \"#.#e+#\"": 5,
+"JSON path error near: \"-#\"": 10,
+"JSON path error near: \"-#.#\"": 2,
+"JSON path error near: \"-#.#e+#\"": 1,
+"JSON path error near: \"-#.#e-#\"": 3,
+"Parse error: #nd ORDER BY term does not match any column in the result set": 353,
+"Parse error: #rd ORDER BY term does not match any column in the result set": 81,
+"Parse error: #st ORDER BY term does not match any column in the result set": 955,
+"Parse error: #th ORDER BY term does not match any column in the result set": 20,
+"Parse error: Unexpected character": 32,
+"Parse error: Unexpected end of input": 11,
+"Parse error: bad JSON path: ' '": 3,
+"Parse error: bad JSON path: ' a'": 2,
+"Parse error: bad JSON path: '#'": 5,
+"Parse error: bad JSON path: '#.#'": 3,
+"Parse error: bad JSON path: '%'": 2,
+"Parse error: bad JSON path: ''": 3,
+"Parse error: bad JSON path: '-#'": 2,
+"Parse error: bad JSON path: 'A'": 4,
+"Parse error: bad JSON path: 'ABC'": 1,
+"Parse error: bad JSON path: '_'": 1,
+"Parse error: bad JSON path: 'a '": 3,
+"Parse error: bad JSON path: 'a'": 2,
+"Parse error: bad JSON path: 'abc'": 1,
+"Parse error: bad JSON path: 'x'": 3,
+"Parse error: bad JSON path: '{\"a\":null}'": 1,
+"Parse error: bad JSON path: '\u00e9#'": 1,
+"Parse error: bad JSON path: '\u00e9'": 2,
+"Parse error: bad JSON path: '\u00ff'": 3,
+"Parse error: insufficient registers allocated for expression vector write (start=#, count=#, next_free=#)": 168,
+"Parse error: malformed JSON": 121,
+"Parse error: no such table: w#": 23,
+"Parse error: parenthesized conditional should have exactly one expression": 1,
+"Parse error: row value misused": 3,
+"integer overflow": 1,
+"json_array_insert() needs an odd number of arguments": 26,
+"json_insert() needs an odd number of arguments": 30,
+"json_object() labels must be TEXT": 16,
+"json_object() requires an even number of arguments": 44,
+"json_replace() needs an odd number of arguments": 30,
+"json_set() needs an odd number of arguments": 16,
+"string or blob too big": 8
+},
+"skipped": 42749
+},
+"with": {
+"checks": 75404,
+"databases": 0,
+"failed": 54,
+"passed": 53477,
+"refused": {
+"ESCAPE expression must be a single character": 3,
+"FLAGS parameter to json_valid() must be between # and #": 16,
+"Internal error: secondary index lacks primary key locator": 45,
+"JSON cannot hold BLOB values": 20,
+"JSON path error near: \"#\"": 28,
+"JSON path error near: \"#.#\"": 16,
+"JSON path error near: \"#.#e+#\"": 1,
+"JSON path error near: \"-#\"": 5,
+"JSON path error near: \"-#.#\"": 2,
+"JSON path error near: \"-#.#e-#\"": 2,
+"Parse error: #nd ORDER BY term does not match any column in the result set": 103,
+"Parse error: #rd ORDER BY term does not match any column in the result set": 19,
+"Parse error: #st ORDER BY term does not match any column in the result set": 419,
+"Parse error: #th ORDER BY term does not match any column in the result set": 5,
+"Parse error: Unexpected character": 19,
+"Parse error: Unexpected end of input": 4,
+"Parse error: bad JSON path: '\u0001\u0002'": 1,
+"Parse error: bad JSON path: ' '": 1,
+"Parse error: bad JSON path: ' a'": 2,
+"Parse error: bad JSON path: '#'": 3,
+"Parse error: bad JSON path: '%'": 2,
+"Parse error: bad JSON path: ''": 7,
+"Parse error: bad JSON path: '-#'": 1,
+"Parse error: bad JSON path: 'A#'": 1,
+"Parse error: bad JSON path: 'A'": 1,
+"Parse error: bad JSON path: 'a '": 3,
+"Parse error: bad JSON path: 'a'": 3,
+"Parse error: bad JSON path: 'true'": 3,
+"Parse error: bad JSON path: 'x'": 2,
+"Parse error: bad JSON path: '{\"a\":null}'": 1,
+"Parse error: bad JSON path: '\u00e9'": 1,
+"Parse error: insufficient registers allocated for expression vector write (start=#, count=#, next_free=#)": 110,
+"Parse error: malformed JSON": 90,
+"Parse error: no such table: w#": 39,
+"integer overflow": 3,
+"json_array_insert() needs an odd number of arguments": 10,
+"json_insert() needs an odd number of arguments": 14,
+"json_object() labels must be TEXT": 14,
+"json_object() requires an even number of arguments": 32,
+"json_replace() needs an odd number of arguments": 16,
+"json_set() needs an odd number of arguments": 13,
+"string or blob too big": 4
+},
+"skipped": 20789
+},
+"without rowid": {
+"checks": 174413,
+"databases": 6182,
+"failed": 290,
+"passed": 118140,
+"refused": {
+"ESCAPE expression must be a single character": 3,
+"FLAGS parameter to json_valid() must be between # and #": 10,
+"Internal error: secondary index lacks primary key locator": 237,
+"JSON cannot hold BLOB values": 8,
+"JSON path error near: \"#\"": 21,
+"JSON path error near: \"#.#\"": 18,
+"JSON path error near: \"#.#e+#\"": 3,
+"JSON path error near: \"-#\"": 3,
+"JSON path error near: \"-#.#\"": 1,
+"JSON path error near: \"-#.#e+#\"": 1,
+"JSON path error near: \"-#.#e-#\"": 1,
+"Parse error: #nd ORDER BY term does not match any column in the result set": 158,
+"Parse error: #rd ORDER BY term does not match any column in the result set": 24,
+"Parse error: #st ORDER BY term does not match any column in the result set": 597,
+"Parse error: #th ORDER BY term does not match any column in the result set": 7,
+"Parse error: Unexpected character": 27,
+"Parse error: Unexpected end of input": 10,
+"Parse error: bad JSON path: '\u0001\u0002'": 1,
+"Parse error: bad JSON path: ' a'": 3,
+"Parse error: bad JSON path: '#'": 3,
+"Parse error: bad JSON path: '#.#'": 2,
+"Parse error: bad JSON path: '%'": 1,
+"Parse error: bad JSON path: ''": 5,
+"Parse error: bad JSON path: 'A#'": 1,
+"Parse error: bad JSON path: 'A'": 2,
+"Parse error: bad JSON path: 'NULL'": 1,
+"Parse error: bad JSON path: 'a'": 2,
+"Parse error: bad JSON path: 'abc'": 1,
+"Parse error: bad JSON path: 'true'": 1,
+"Parse error: bad JSON path: 'x'": 2,
+"Parse error: bad JSON path: '{\"a\":null}'": 2,
+"Parse error: bad JSON path: '\u00e9'": 3,
+"Parse error: bad JSON path: '\u00ff'": 3,
+"Parse error: insufficient registers allocated for expression vector write (start=#, count=#, next_free=#)": 115,
+"Parse error: malformed JSON": 85,
+"Parse error: no such table: w#": 9,
+"Parse error: row value misused": 2,
+"integer overflow": 2,
+"json_array_insert() needs an odd number of arguments": 17,
+"json_insert() needs an odd number of arguments": 14,
+"json_object() labels must be TEXT": 12,
+"json_object() requires an even number of arguments": 29,
+"json_replace() needs an odd number of arguments": 17,
+"json_set() needs an odd number of arguments": 11,
+"string or blob too big": 1
+},
+"skipped": 54507
+}
+},
+"findings": {
+"diff-0302968a031e911a": {
+"features": [
+"recursive",
+"union all",
+"window"
+],
+"kind": "Wrong",
+"oracle": "diff"
+},
+"diff-03d9d1d79817e5cd": {
+"features": [],
+"kind": "Wrong",
+"oracle": "diff"
+},
+"diff-0751adeea1cb5e89": {
+"features": [
+"recursive",
+"union all"
+],
+"kind": "Wrong",
+"oracle": "diff"
+},
+"diff-0936dad1a3fe3a85": {
+"features": [],
+"kind": "Wrong",
+"oracle": "diff"
+},
+"diff-0bb1cd83e88fa3db": {
+"features": [
+"recursive",
+"union all",
+"window"
+],
+"kind": "Wrong",
+"oracle": "diff"
+},
+"diff-18fd3c33042885a5": {
+"features": [
+"recursive",
+"union all",
+"window",
+"without rowid"
+],
+"kind": "Wrong",
+"oracle": "diff"
+},
+"diff-1da5b815022cd770": {
+"features": [
+"window"
+],
+"kind": "Panic",
+"oracle": "diff"
+},
+"diff-21abebf03a489239": {
+"features": [
+"row value"
+],
+"kind": "Wrong",
+"oracle": "diff"
+},
+"diff-28a3c4e6fe370575": {
+"features": [
+"recursive",
+"union"
+],
+"kind": "Wrong",
+"oracle": "diff"
+},
+"diff-36ed305a2f1e106b": {
+"features": [
+"row value",
+"strict",
+"view"
+],
+"kind": "Wrong",
+"oracle": "diff"
+},
+"diff-392f5030bb1df566": {
+"features": [
+"derived"
+],
+"kind": "Wrong",
+"oracle": "diff"
+},
+"diff-3ec322ef63f75c60": {
+"features": [
+"derived",
+"row value"
+],
+"kind": "Wrong",
+"oracle": "diff"
+},
+"diff-4014f8622be0bffb": {
+"features": [
+"except"
+],
+"kind": "Wrong",
+"oracle": "diff"
+},
+"diff-439d4f319c8ebb9a": {
+"features": [
+"strict",
+"window"
+],
+"kind": "Panic",
+"oracle": "diff"
+},
+"diff-527bfec5976dd534": {
+"features": [
+"recursive",
+"strict",
+"union all"
+],
+"kind": "Wrong",
+"oracle": "diff"
+},
+"diff-54a41fedf9fbc9b4": {
+"features": [
+"recursive",
+"row value",
+"union"
+],
+"kind": "Wrong",
+"oracle": "diff"
+},
+"diff-5b2e8403dbeec12f": {
+"features": [
+"window"
+],
+"kind": "Panic",
+"oracle": "diff"
+},
+"diff-620bb340967086bb": {
+"features": [
+"recursive",
+"row value",
+"union"
+],
+"kind": "Wrong",
+"oracle": "diff"
+},
+"diff-7b75c829598ae867": {
+"features": [
+"derived",
+"union",
+"window"
+],
+"kind": "Wrong",
+"oracle": "diff"
+},
+"diff-7f3e21285852b36e": {
+"features": [
+"row value"
+],
+"kind": "Wrong",
+"oracle": "diff"
+},
+"diff-8aacb08e067007e3": {
+"features": [],
+"kind": "Wrong",
+"oracle": "diff"
+},
+"diff-927c89b084c1813d": {
+"features": [
+"with"
+],
+"kind": "Wrong",
+"oracle": "diff"
+},
+"diff-a4f850eb5ac15090": {
+"features": [
+"strict",
+"window"
+],
+"kind": "Panic",
+"oracle": "diff"
+},
+"diff-a5bc44bf8f7c89ed": {
+"features": [],
+"kind": "Wrong",
+"oracle": "diff"
+},
+"diff-b89f3ec307a255f7": {
+"features": [
+"strict",
+"window"
+],
+"kind": "Panic",
+"oracle": "diff"
+},
+"diff-d2c97b33686e7f56": {
+"features": [
+"view"
+],
+"kind": "Wrong",
+"oracle": "diff"
+},
+"diff-df9e4959c7d4b81d": {
+"features": [],
+"kind": "Wrong",
+"oracle": "diff"
+},
+"diff-e21bb7ee45c8683b": {
+"features": [
+"row value",
+"trigger",
+"window"
+],
+"kind": "Wrong",
+"oracle": "diff"
+},
+"diff-e7cf757b227f84a8": {
+"features": [
+"recursive",
+"union all"
+],
+"kind": "Wrong",
+"oracle": "diff"
+},
+"diff-f411ee9a75ca025b": {
+"features": [
+"recursive",
+"union all"
+],
+"kind": "Wrong",
+"oracle": "diff"
+},
+"dqp-40bd70b5c1fb80f0": {
+"features": [
+"window"
+],
+"kind": "Panic",
+"oracle": "dqp"
+},
+"eet-38ce7bb958eea198": {
+"features": [
+"window"
+],
+"kind": "Panic",
+"oracle": "eet"
+},
+"eet-84d26f6cdb25ec5f": {
+"features": [
+"window"
+],
+"kind": "Panic",
+"oracle": "eet"
+},
+"eet-f074f1f69d4ba56a": {
+"features": [
+"window"
+],
+"kind": "Panic",
+"oracle": "eet"
+},
+"eet-fa520b7a5e8a6f8a": {
+"features": [
+"strict",
+"window"
+],
+"kind": "Panic",
+"oracle": "eet"
+},
+"error-002e997e0fe554f3": {
+"features": [
+"row value"
+],
+"kind": "Error",
+"oracle": "norec"
+},
+"error-15c526dd5edf1a96": {
+"features": [
+"view"
+],
+"kind": "Error",
+"oracle": "pqs"
+},
+"error-2b6ca64d483d7683": {
+"features": [
+"row value",
+"view",
+"without rowid"
+],
+"kind": "Error",
+"oracle": "tlp"
+},
+"error-2ca8ffc19f3a6362": {
+"features": [
+"view"
+],
+"kind": "Error",
+"oracle": "pqs"
+},
+"error-327aa6bdaaacbc20": {
+"features": [
+"view"
+],
+"kind": "Error",
+"oracle": "pqs"
+},
+"error-3dae39fe7eb153bb": {
+"features": [
+"view"
+],
+"kind": "Error",
+"oracle": "pqs"
+},
+"error-493c667725cb13ff": {
+"features": [
+"view"
+],
+"kind": "Error",
+"oracle": "pqs"
+},
+"error-768a009cdc44461c": {
+"features": [
+"without rowid"
+],
+"kind": "Error",
+"oracle": "norec"
+},
+"error-b931833187595132": {
+"features": [
+"view",
+"window"
+],
+"kind": "Error",
+"oracle": "eet"
+},
+"error-bb2ea5fa80956af0": {
+"features": [
+"window",
+"without rowid"
+],
+"kind": "Error",
+"oracle": "eet"
+},
+"error-f35ddee3bc1a8dac": {
+"features": [
+"view"
+],
+"kind": "Error",
+"oracle": "pqs"
+},
+"norec-6904b1e3b3a69454": {
+"features": [
+"row value"
+],
+"kind": "Wrong",
+"oracle": "norec"
+},
+"norec-963b735964ed06eb": {
+"features": [
+"row value",
+"without rowid"
+],
+"kind": "Wrong",
+"oracle": "norec"
+},
+"norec-9aaa539567d91ac5": {
+"features": [
+"row value"
+],
+"kind": "Wrong",
+"oracle": "norec"
+},
+"pqs-0af1b80a6bc164a0": {
+"features": [
+"row value"
+],
+"kind": "Wrong",
+"oracle": "pqs"
+},
+"pqs-0d6bf03211da577e": {
+"features": [
+"row value",
+"strict"
+],
+"kind": "Wrong",
+"oracle": "pqs"
+},
+"pqs-175e6543a5fbfe3e": {
+"features": [
+"row value",
+"strict"
+],
+"kind": "Wrong",
+"oracle": "pqs"
+},
+"pqs-224fd659177ffaa8": {
+"features": [
+"row value"
+],
+"kind": "Wrong",
+"oracle": "pqs"
+},
+"pqs-23691736114ae858": {
+"features": [
+"row value"
+],
+"kind": "Wrong",
+"oracle": "pqs"
+},
+"pqs-2fc41d517586a5ff": {
+"features": [
+"row value",
+"strict"
+],
+"kind": "Wrong",
+"oracle": "pqs"
+},
+"pqs-50117de0073a3bc4": {
+"features": [
+"row value",
+"strict"
+],
+"kind": "Wrong",
+"oracle": "pqs"
+},
+"pqs-57156d90f496d168": {
+"features": [
+"row value"
+],
+"kind": "Wrong",
+"oracle": "pqs"
+},
+"pqs-575eeec29532abd5": {
+"features": [
+"row value"
+],
+"kind": "Wrong",
+"oracle": "pqs"
+},
+"pqs-72fa11ba76b2069c": {
+"features": [
+"row value",
+"trigger"
+],
+"kind": "Wrong",
+"oracle": "pqs"
+},
+"pqs-7fe4828c65bddbae": {
+"features": [
+"row value"
+],
+"kind": "Wrong",
+"oracle": "pqs"
+},
+"pqs-80f88cd65ab3ae28": {
+"features": [
+"row value"
+],
+"kind": "Wrong",
+"oracle": "pqs"
+},
+"pqs-8e1b05ca94969772": {
+"features": [],
+"kind": "Wrong",
+"oracle": "pqs"
+},
+"pqs-a75bc974e66c4373": {
+"features": [
+"row value"
+],
+"kind": "Wrong",
+"oracle": "pqs"
+},
+"pqs-bbddd65e13ff561d": {
+"features": [
+"row value"
+],
+"kind": "Wrong",
+"oracle": "pqs"
+},
+"pqs-d61cb9999eee1404": {
+"features": [
+"row value"
+],
+"kind": "Wrong",
+"oracle": "pqs"
+},
+"pqs-f296e0e8f6d246e2": {
+"features": [
+"row value"
+],
+"kind": "Wrong",
+"oracle": "pqs"
+},
+"pqs-f534489785122183": {
+"features": [
+"row value",
+"strict"
+],
+"kind": "Wrong",
+"oracle": "pqs"
+},
+"pqs-fb074345f69de35c": {
+"features": [
+"row value",
+"strict"
+],
+"kind": "Wrong",
+"oracle": "pqs"
+},
+"pqs-fd33ca83fad329de": {
+"features": [
+"row value"
+],
+"kind": "Wrong",
+"oracle": "pqs"
+},
+"pqs-fe703f0fb7fab635": {
+"features": [
+"row value"
+],
+"kind": "Wrong",
+"oracle": "pqs"
+},
+"pqs-ff8500845f8cde59": {
+"features": [
+"row value"
+],
+"kind": "Wrong",
+"oracle": "pqs"
+},
+"same-0e667be14465b015": {
+"features": [
+"upsert",
+"without rowid"
+],
+"kind": "Wrong",
+"oracle": "same"
+},
+"same-4335b4c55e74e0bd": {
+"features": [
+"trigger"
+],
+"kind": "Wrong",
+"oracle": "same"
+},
+"same-52169ec31633e3ab": {
+"features": [
+"strict",
+"trigger"
+],
+"kind": "Wrong",
+"oracle": "same"
+},
+"same-569e139fa912bea6": {
+"features": [
+"strict",
+"upsert"
+],
+"kind": "Wrong",
+"oracle": "same"
+},
+"same-5951da64ea196ee3": {
+"features": [
+"strict",
+"upsert"
+],
+"kind": "Wrong",
+"oracle": "same"
+},
+"same-637ece21f9f0a613": {
+"features": [
+"strict",
+"trigger"
+],
+"kind": "Wrong",
+"oracle": "same"
+},
+"same-65897be3ad0c2c58": {
+"features": [
+"trigger"
+],
+"kind": "Wrong",
+"oracle": "same"
+},
+"same-68c5378b1c7c0e3e": {
+"features": [
+"strict",
+"upsert"
+],
+"kind": "Wrong",
+"oracle": "same"
+},
+"same-6c45dca69b959922": {
+"features": [
+"strict",
+"upsert"
+],
+"kind": "Wrong",
+"oracle": "same"
+},
+"same-72d1756bd917ff34": {
+"features": [
+"strict",
+"trigger"
+],
+"kind": "Wrong",
+"oracle": "same"
+},
+"same-7941701e5bfe825a": {
+"features": [
+"strict",
+"trigger"
+],
+"kind": "Wrong",
+"oracle": "same"
+},
+"same-8b3d06494696fb9e": {
+"features": [
+"strict",
+"trigger"
+],
+"kind": "Wrong",
+"oracle": "same"
+},
+"same-93a2dc0052eb0204": {
+"features": [
+"strict",
+"upsert"
+],
+"kind": "Wrong",
+"oracle": "same"
+},
+"same-a4a8c7f3a8b86870": {
+"features": [
+"trigger"
+],
+"kind": "Wrong",
+"oracle": "same"
+},
+"same-d317539186c847b7": {
+"features": [
+"strict",
+"upsert"
+],
+"kind": "Wrong",
+"oracle": "same"
+},
+"same-e0917a2343977f9e": {
+"features": [
+"strict",
+"trigger"
+],
+"kind": "Wrong",
+"oracle": "same"
+},
+"same-e91fe9326814bd55": {
+"features": [
+"strict",
+"trigger"
+],
+"kind": "Wrong",
+"oracle": "same"
+},
+"same-ec125072ecce8f82": {
+"features": [
+"strict",
+"trigger"
+],
+"kind": "Wrong",
+"oracle": "same"
+},
+"setup-panic-204251f6558500ca": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655850311": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655850354": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655850519": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f6558506bf": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f6558506e4": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655850870": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f6558508dc": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655850bb3": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655850ce1": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655850f1f": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655850f2d": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655851063": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f65585106d": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655851073": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f65585115c": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655851360": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f65585150a": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f6558515c5": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f6558515f8": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f65585163f": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655851988": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655851afa": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655851caa": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655851d2c": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655851d71": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655852021": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f65585203d": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f65585213d": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655852165": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f65585232d": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655852357": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f65585236d": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f6558524a2": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f6558527d5": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f6558529ec": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f6558529ed": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655852c48": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655852dab": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f6558531b1": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655853265": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655853267": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655853326": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f6558535a6": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655853630": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655853830": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655853a50": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655853da3": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655853e2f": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f65585421c": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f65585438e": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655854481": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655854926": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655854a9f": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655854ab6": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655854b5b": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655854f57": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f65585506a": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f6558550da": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f6558552b1": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f6558553f4": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f65585543e": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f65585545c": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f6558556ad": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655855711": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f6558558aa": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f65585596e": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655855b1a": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655855ca8": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655855d40": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655855d69": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655855dfb": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655856065": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f6558560d1": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f65585612f": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f6558561c9": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f65585632d": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f65585642e": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f6558564de": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655856563": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f6558566d1": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f6558566e9": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655856788": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f6558567fa": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655856d3a": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655856d5c": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"setup-panic-204251f655856db6": {
+"kind": "Panic",
+"oracle": "setup"
+},
+"tlp-7cffb5b54ab5a774": {
+"features": [
+"row value",
+"trigger",
+"view"
+],
+"kind": "Wrong",
+"oracle": "tlp"
+},
+"tlp-eac6096a9406ca30": {
+"features": [
+"row value",
+"without rowid"
+],
+"kind": "Wrong",
+"oracle": "tlp"
+}
+},
+"functions": 101,
+"label": "",
+"oracles": {
+"diff": {
+"checks": 180008,
+"digits": 10,
+"failed": 30,
+"passed": 133493,
+"plans_changed": 0,
+"refused": {
+"ESCAPE expression must be a single character": 22,
+"FLAGS parameter to json_valid() must be between # and #": 58,
+"Internal error: secondary index lacks primary key locator": 229,
+"JSON cannot hold BLOB values": 79,
+"JSON path error near: \"#\"": 144,
+"JSON path error near: \"#.#\"": 67,
+"JSON path error near: \"#.#e+#\"": 14,
+"JSON path error near: \"-#\"": 26,
+"JSON path error near: \"-#.#\"": 8,
+"JSON path error near: \"-#.#e+#\"": 2,
+"JSON path error near: \"-#.#e-#\"": 8,
+"Parse error: #nd ORDER BY term does not match any column in the result set": 794,
+"Parse error: #rd ORDER BY term does not match any column in the result set": 148,
+"Parse error: #st ORDER BY term does not match any column in the result set": 2742,
+"Parse error: #th ORDER BY term does not match any column in the result set": 20,
+"Parse error: Unexpected character": 132,
+"Parse error: Unexpected end of input": 44,
+"Parse error: bad JSON path: '\u0001\u0002'": 4,
+"Parse error: bad JSON path: ' '": 5,
+"Parse error: bad JSON path: ' a'": 11,
+"Parse error: bad JSON path: '#'": 19,
+"Parse error: bad JSON path: '#.#'": 8,
+"Parse error: bad JSON path: '#.#e+#'": 1,
+"Parse error: bad JSON path: '#e#'": 2,
+"Parse error: bad JSON path: '#x#'": 2,
+"Parse error: bad JSON path: '%'": 6,
+"Parse error: bad JSON path: ''": 25,
+"Parse error: bad JSON path: '-#'": 9,
+"Parse error: bad JSON path: '-#.#e+#'": 1,
+"Parse error: bad JSON path: '-#.#e-#'": 1,
+"Parse error: bad JSON path: 'A#'": 1,
+"Parse error: bad JSON path: 'A'": 13,
+"Parse error: bad JSON path: 'ABC'": 1,
+"Parse error: bad JSON path: 'NULL'": 1,
+"Parse error: bad JSON path: '_'": 5,
+"Parse error: bad JSON path: 'a '": 11,
+"Parse error: bad JSON path: 'a a '": 1,
+"Parse error: bad JSON path: 'a'": 8,
+"Parse error: bad JSON path: 'abc'": 1,
+"Parse error: bad JSON path: 'g#'": 4,
+"Parse error: bad JSON path: 'true'": 7,
+"Parse error: bad JSON path: 'x'": 9,
+"Parse error: bad JSON path: '{\"a\":null}'": 2,
+"Parse error: bad JSON path: '\u00e9#'": 1,
+"Parse error: bad JSON path: '\u00e9'": 10,
+"Parse error: bad JSON path: '\u00ff'": 7,
+"Parse error: insufficient registers allocated for expression vector write (start=#, count=#, next_free=#)": 610,
+"Parse error: malformed JSON": 461,
+"Parse error: no such table: w#": 49,
+"Parse error: parenthesized conditional should have exactly one expression": 1,
+"Parse error: row value misused": 11,
+"integer overflow": 10,
+"json_array_insert() needs an odd number of arguments": 74,
+"json_insert() needs an odd number of arguments": 82,
+"json_object() labels must be TEXT": 64,
+"json_object() requires an even number of arguments": 155,
+"json_replace() needs an odd number of arguments": 88,
+"json_set() needs an odd number of arguments": 76,
+"string or blob too big": 18
+},
+"skipped": {
+"SQLite's answer holds ill-formed UTF-8 (garbage in, garbage out)": 4,
+"a REAL's text digits, inside a function": 1,
+"a bare column: its row is any of its group's": 20305,
+"over the instructions a query may take on SQLite": 19,
+"sqlite refused": 19744
+}
+},
+"dqp": {
+"checks": 173024,
+"digits": 0,
+"failed": 6,
+"passed": 122880,
+"plans_changed": 36198,
+"refused": {},
+"skipped": {
+"a bare column: its row is any of its group's": 19533,
+"a derived query meets a value's error (evaluation order)": 266,
+"amphora refused the base": 24481,
+"over the instructions a query may take on SQLite": 9,
+"the index can't serve the query": 5849
+}
+},
+"eet": {
+"checks": 180012,
+"digits": 0,
+"failed": 411,
+"passed": 128961,
+"plans_changed": 0,
+"refused": {},
+"skipped": {
+"a bare column: its row is any of its group's": 24304,
+"a derived query errors on SQLite too": 1671,
+"a derived query meets a value's error (evaluation order)": 179,
+"a derived query reads a table no longer in its FROM": 63,
+"amphora refused the base": 24414,
+"over the instructions a query may take on SQLite": 9
+}
+},
+"norec": {
+"checks": 180014,
+"digits": 0,
+"failed": 916,
+"passed": 159253,
+"plans_changed": 0,
+"refused": {},
+"skipped": {
+"a derived query errors on SQLite too": 8,
+"a derived query meets a value's error (evaluation order)": 1658,
+"amphora refused both": 18178,
+"over the instructions a query may take on SQLite": 1
+}
+},
+"pqs": {
+"checks": 135669,
+"digits": 0,
+"failed": 208,
+"passed": 125380,
+"plans_changed": 0,
+"refused": {},
+"skipped": {
+"a derived query meets a value's error (evaluation order)": 133,
+"sqlite can't evaluate it": 8106,
+"sqlite misses its own pivot": 1842
+}
+},
+"same": {
+"checks": 27026,
+"digits": 10,
+"failed": 18,
+"passed": 26859,
+"plans_changed": 0,
+"refused": {
+"Internal error: secondary index lacks primary key locator": 14,
+"Parse error: insufficient registers allocated for expression vector write (start=#, count=#, next_free=#)": 42,
+"Parse error: row value misused": 1
+},
+"skipped": {
+"SQLite's rows hold ill-formed UTF-8 (garbage in, garbage out)": 3,
+"a derived query meets a value's error (evaluation order)": 60,
+"sqlite refused": 29
+}
+},
+"tlp": {
+"checks": 180003,
+"digits": 0,
+"failed": 235,
+"passed": 152746,
+"plans_changed": 0,
+"refused": {},
+"skipped": {
+"a REAL sum's partitions round apart from it": 918,
+"a derived query errors on SQLite too": 7,
+"a derived query meets a value's error (evaluation order)": 3460,
+"a derived query reads a table no longer in its FROM": 91,
+"a partition's sum overflows": 4,
+"amphora refused the base": 22542
+}
+}
+},
+"seconds": 760.00042397,
+"seed": 8003,
+"setup_refused": {
+"NOT NULL constraint failed: t#.c# (#)": 629,
+"Parse error: INSTEAD OF triggers are not supported yet": 1988,
+"Parse error: insufficient registers allocated for expression vector write (start=#, count=#, next_free=#)": 30,
+"Parse error: triggered mutations of WITHOUT ROWID tables are not supported": 402,
+"UNIQUE constraint failed: t#.c#": 1,
+"cannot store BLOB value in INTEGER column t#.c# (#)": 1,
+"cannot store BLOB value in REAL column t#.c# (#)": 2,
+"cannot store INT value in BLOB column t#.c# (#)": 2,
+"cannot store REAL value in BLOB column t#.c# (#)": 2,
+"cannot store REAL value in INT column t#.c# (#)": 1,
+"cannot store REAL value in INTEGER column t#.c# (#)": 1,
+"cannot store TEXT value in BLOB column t#.c# (#)": 4,
+"cannot store TEXT value in INT column t#.c# (#)": 3,
+"cannot store TEXT value in REAL column t#.c# (#)": 3,
+"datatype mismatch": 2,
+"near \"STRICT\": syntax error": 1192
+},
+"sqlite": "3.54.0",
+"sqlite_options": [
+"ATOMIC_INTRINSICS=1",
+"COMPILER=gcc-16.2.1 20260810",
+"DEFAULT_AUTOVACUUM",
+"DEFAULT_CACHE_SIZE=-2000",
+"DEFAULT_FILE_FORMAT=4",
+"DEFAULT_JOURNAL_SIZE_LIMIT=-1",
+"DEFAULT_MMAP_SIZE=0",
+"DEFAULT_PAGE_SIZE=4096",
+"DEFAULT_PCACHE_INITSZ=20",
+"DEFAULT_RECURSIVE_TRIGGERS",
+"DEFAULT_SECTOR_SIZE=4096",
+"DEFAULT_SYNCHRONOUS=2",
+"DEFAULT_WAL_AUTOCHECKPOINT=1000",
+"DEFAULT_WAL_SYNCHRONOUS=2",
+"DEFAULT_WORKER_THREADS=0",
+"DIRECT_OVERFLOW_READ",
+"ENABLE_COLUMN_METADATA",
+"ENABLE_DBSTAT_VTAB",
+"ENABLE_FTS3",
+"ENABLE_FTS3_PARENTHESIS",
+"ENABLE_FTS4",
+"ENABLE_FTS5",
+"ENABLE_MATH_FUNCTIONS",
+"ENABLE_PERCENTILE",
+"ENABLE_PREUPDATE_HOOK",
+"ENABLE_RTREE",
+"ENABLE_SESSION",
+"ENABLE_STAT4",
+"ENABLE_STMTVTAB",
+"ENABLE_UNLOCK_NOTIFY",
+"HAVE_ISNAN",
+"LIKE_DOESNT_MATCH_BLOBS",
+"MALLOC_SOFT_LIMIT=1024",
+"MAX_ATTACHED=10",
+"MAX_COLUMN=2000",
+"MAX_COMPOUND_SELECT=500",
+"MAX_DEFAULT_PAGE_SIZE=8192",
+"MAX_EXPR_DEPTH=10000",
+"MAX_FUNCTION_ARG=1000",
+"MAX_LENGTH=1000000000",
+"MAX_LIKE_PATTERN_LENGTH=50000",
+"MAX_MMAP_SIZE=0x7fff0000",
+"MAX_PAGE_COUNT=0xfffffffe",
+"MAX_PAGE_SIZE=65536",
+"MAX_SCHEMA=10000000",
+"MAX_SQL_LENGTH=1000000000",
+"MAX_TRIGGER_DEPTH=1000",
+"MAX_VARIABLE_NUMBER=250000",
+"MAX_VDBE_OP=250000000",
+"MAX_WORKER_THREADS=8",
+"MUTEX_PTHREADS",
+"SECURE_DELETE",
+"SYSTEM_MALLOC",
+"TEMP_STORE=1",
+"THREADSAFE=1"
+],
+"states": 27114
+}
