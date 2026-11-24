@@ -859,3 +859,83 @@ moved in bench records only). After the merge, run r1928 on main c044b33b (needs
 `--test-threads=2`; load 27-90): `storage:: vdbe::vacuum` passed 731, failed 1 and ignored 14 in 315 s, the one
 `cb4_ab_both_rebuy_policies_at_the_extremes` (main's own; `cb4_a_read_only_transaction_reads_the_copy_at_its_snapshot`
 passes on this main, after lane R6's columns_sql.rs change); `cargo test -p amphora --locked --test store` passed 15.
+
+## perf-B17 (2026-11-24, 00:54-01:54Z)
+
+**Losses first: the hour failed its deliverable. The switch is not built.** Of the brief's seven conditions, two are
+built and checked: reads find their pages in the closing segment (condition 2) and the shared word counts its changes
+(condition 4). Not built: the switch itself and the deletion of both restart paths (condition 1), the reader slots
+recording which segment a read's mark is in (condition 3), and the five tests of decision 45 (condition 5). So a
+reader that never finishes still stops the writer at a restart: the store's `restart_if_asked` still takes the gate
+and every slot. No A/B ran (rule 0: none before the switch works). Lane Q3's segment word (bfa2d3f2) landed on main
+mid-hour and was merged first, as the coordinator asked. Its in-process word has no free bit (30 + 30 read counts and
+four flags) and needs no change count: a read's count and its span are one compare-and-swap there. The change count
+went into the multi-process shared word, where B15's re-check compares whole words.
+
+**Built.**
+1. *A read finds its pages in the closing segment it counts on* (perf/pagepath-d45 554b248e). `WalFile` keeps the
+   closing segment's last frame for the read under way (`closing_max_frame`), set with the span in `try_begin_read_tx`
+   (that segment takes no frame after its switch) and cleared at the read's end. `find_frame` searches the read's own
+   segment, then the closing one (`find_closing_frame`, frames 1 to that last frame), then the file. It searches the
+   closing segment also when the read's own segment is wholly copied, which used to return at once. The
+   shared-memory backend answers a closing segment from its process's scan of the file, as `iter_segment_frames`
+   already did. Test `d45_a_read_finds_a_page_only_the_closing_segment_holds`: on B16's two-segment database, before
+   any checkpoint, a read counts 11 rows of `other` (the file holds 1; the closing segment's page the other 10) and
+   30 of `test`, and nothing of the closing segment was copied. Before this commit that read found `other`'s page in
+   the file alone.
+2. *The shared word counts its changes* (22173583). `Segments::shared_word` keeps the four flags in bits 60-63 and, in
+   bits 0-59, a count raised by each change of them, wrapping at 60 bits. The copy (`copied`), the reset
+   (`reset_if_unread`) and the seed at open (`seed_segments`, now an update of the word it finds) write through it.
+   `Segments::unpack` reads the flags only, so lane Q3's cell and its three tests are untouched. Test
+   `d45_two_switches_never_bring_the_shared_word_back`: from a switch, a reset and a switch twice bring the flags back,
+   and the word differs from the one a read took its span from; a step that changes nothing leaves the word as it is;
+   the count wraps with the flags kept.
+
+**The switch, read but not built: what the successor builds** (wal.rs on 22173583 unless named).
+- *Where.* The writer, holding the log's `write_lock`, between transactions. `SegmentsCell::update(|s| s.switch(backed_up))`
+  answers None while the other segment is still closing: the writer appends on and asks at its next turn. Else, on
+  the free segment: `restart_wal_header`'s body (sequence one past the current one's, salts, frame cache, records,
+  changes, read index and read marks cleared; it is free, so no read holds one of its marks), `initialized` false so
+  the next commit writes and syncs its header before any frame (decision 13), then `second_current` published right
+  after the cell's change. A read whose snapshot came from the old flag fails `try_read_mark`'s re-check (its
+  checkpoint sequence differs) and retries. The writer's connection then takes the new segment's snapshot
+  (`apply_restart_snapshot`) and raises the checkpoint epoch.
+- *The second file.* At open `-wal2` is opened only if it exists (B14, `open_second_segment_if_exists`). The first
+  switch into it must create it and set the segment's `runtime.file`.
+- *The two triggers.* The store's `Readers::restart_if_asked` (store.rs) drops `gate.write()` and
+  `Slots::take_all`, and `Db::restart_log` (db.rs) switches through a new connection call in place of the RESTART or
+  TRUNCATE checkpoint. The engine's `try_restart_log_before_write` switches where it restarted (the segment wholly
+  copied): that segment can be reported copied at once, since `nbackfills` is published only after the file's sync
+  (B16).
+- *Deleted with them.* `begin_restart`, `end_restart` and `try_restart_log_for_write` on both backends,
+  `WalFile::restart_log` and `unlock_after_restart`. A RESTART or TRUNCATE checkpoint then copies and switches, or
+  answers Busy while a segment is closing, as B16's do.
+- *The backup.* `Db::read_log` reads `-wal` by path (db.rs, `wal_path`). After a switch the shipper would find an
+  older generation's header there and ship nothing (ship.rs `ship_durable`: "The log was started again and its header
+  isn't written yet"). It must read the current segment's file. Today's rule (restart only once shipped, or past
+  twice the bound) can stay as the switch's precondition, the closing segment then switched in as shipped.
+- *Condition 3, the slots' segment.* A read live at a switch counts only on its own segment, since a switch needs the
+  other one free. So in a slot, a mark is in segment C exactly when its reads count on C and not on the other
+  segment (`SlotReads`). The closing pass's safe frame (`ShmWalCoordination::determine_max_safe_checkpoint_frame`,
+  through `min_active_reader_frame`) then takes only those slots' frames. That needs the count beside the frame in
+  `live_reader_frames`; the slot is registered before it is counted, but a read in that window fails `span_holds`
+  and reads nothing.
+
+**Checks** (adacachy2, script `~/.cache/amphora-perf/pagepath-b17/check.sh`, B16's with its logs named b17 and a `t:<filter>`
+step; each run held to its needs by `JOBS`). Run r1954 (needs `linux/amd64,cpus=8,mem=24g`, load 24-42) on fe49ddf5
+(this branch with origin/main merged): `cargo check -p amphora-engine --lib --tests` exit 0; `d45_` passed 18. Main then
+took lane Q3's word (bfa2d3f2), merged as c7690cc2. Run r1979 (refused at cpus=8 with 2 of 32 cores idle, run at cpus=2;
+load 21-47) on 554b248e: check exit 0; `d45_` passed 19 (the 18 and the new one); Q3's `q3_` passed 3; `cargo clippy
+--workspace --all-targets --locked -- -D warnings` exit 0 in 40 s; `cargo test -p amphora-engine --lib --locked --
+storage:: vdbe::vacuum --test-threads=2` passed 735, failed 1 and ignored 14 in 287 s, the one
+`cb4_ab_both_rebuy_policies_at_the_extremes` (main's own, as in B16's r1928); `cargo test -p amphora --locked --test
+store` passed 14 (main's store test has 14 since lane A18's change).
+Run r1989 (needs `linux/amd64,cpus=4,mem=12g`, load 45-78) on 22173583: check exit 0; `d45_` passed 20; `q3_` passed 3;
+`storage::shared_wal_coordination` passed 50 and `storage::log_segments` 14; the workspace clippy exit 0 in 45 s;
+`scripts/check-production.sh` exit 0 ("10903 left in the engine's production code across 17 lints, as the ratchet
+holds"). Main then moved in `crates/pg-parser` (lane PG10) and records only; `cargo tree -e all -p amphora-engine` and
+`-p amphora` with `-i amphora-pg-parser` find no such package in their trees, so the merge was pushed without a re-run
+(RULES 6, rev 00:00Z). The engine suite on main after the merge is the successor's first run.
+
+**Notes, one line each.** `Db::read_log` reads `-wal` by path, so the backup will need the current segment's file once
+the switch exists (above). Main's `store` test has 14 tests since lane A18 (15 at B16's merge).
