@@ -575,6 +575,8 @@ impl Db {
             return Ok(false);
         }
         if let Some(hooks) = &self.backup {
+            #[cfg(test)]
+            hooks.fence.at_switch();
             hooks.fence.ended(seq, frame, !shipped)?;
         }
         Ok(true)

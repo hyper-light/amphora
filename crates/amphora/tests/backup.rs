@@ -1052,6 +1052,262 @@ fn d45_a_base_begun_while_a_read_holds_the_closing_segment_restores_every_commit
     assert_eq!(restored, s.model);
 }
 
+/// Decision 45 (lane B24): a restore never takes a log segment left at its path. Do: write 20 rows,
+/// ship them and end a base; start the log again (the writer switches to `-wal2`), and delete every
+/// row in a later second, shipped; end the process, remove the database's file and its `-wal`, the
+/// ones SQLite names, and leave its `-wal2`; restore the second before the delete at its path.
+/// Expect: the restore is refused and writes nothing, as it is where a `-wal` is left, or it holds
+/// that second's 20 rows; with the segment removed it holds them.
+#[test]
+fn d45_a_restore_never_takes_a_log_segment_left_at_its_path() {
+    let mut s = Source::new();
+    s.put(0..20, "a");
+    s.ship().unwrap();
+    let mut base = s.begin_base().unwrap();
+    s.copy_base(&mut base);
+    s.end_base(base).unwrap();
+    let before = s.second();
+    let expected = s.model.clone();
+    assert!(s.db.restart_log().unwrap(), "shipped, so it starts again");
+    s.now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    s.db.exec("DELETE FROM t").unwrap();
+    assert_eq!(rows(&s.db).len(), 0);
+    s.ship().unwrap();
+    s.now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    s.ship().unwrap();
+    let state = log_files(&s.path);
+    let Source {
+        path,
+        db,
+        blobs,
+        dir,
+        ..
+    } = s;
+    drop(db);
+    let beside = |suffix: &str| {
+        let mut file = path.clone().into_os_string();
+        file.push(suffix);
+        std::path::PathBuf::from(file)
+    };
+    std::fs::remove_file(&path).unwrap();
+    std::fs::remove_file(beside("-wal")).unwrap();
+    assert!(
+        std::fs::metadata(beside("-wal2")).unwrap().len() > 32,
+        "non-vacuous: a segment with frames is left; {state}"
+    );
+
+    match backup::restore(&blobs, "db", before, &path, until()) {
+        Ok(_) => assert_eq!(
+            rows(&Db::open(&path).unwrap()),
+            expected,
+            "the rows of the second before the delete, a `-wal2` left at its path; at the end {state}"
+        ),
+        Err(refused) => {
+            assert!(!path.exists(), "refused, nothing written: {refused:#}");
+            std::fs::remove_file(beside("-wal2")).unwrap();
+            backup::restore(&blobs, "db", before, &path, until())
+                .unwrap_or_else(|e| panic!("refused with no segment left: {e:#}"));
+            assert_eq!(rows(&Db::open(&path).unwrap()), expected);
+        }
+    }
+    drop(dir);
+}
+
+/// A store whose writer goes on while a send is under way: once the first part of a segment put
+/// after it is armed is stored, `during` runs, then the send carries on.
+struct MidSend<'a> {
+    inner: &'a dyn Blobs,
+    during: std::sync::Mutex<Option<Box<dyn FnOnce() + Send + 'a>>>,
+}
+
+impl Blobs for MidSend<'_> {
+    fn object_max(&self) -> usize {
+        self.inner.object_max()
+    }
+    fn create(
+        &self,
+        key: &str,
+        bytes: &[u8],
+        until: Instant,
+    ) -> Result<(), amphora_api::blobs::BlobRefusal> {
+        self.inner.create(key, bytes, until)?;
+        let during = if key.contains("/log/") {
+            self.during.lock().unwrap().take()
+        } else {
+            None
+        };
+        if let Some(during) = during {
+            during();
+        }
+        Ok(())
+    }
+    fn get(&self, key: &str, until: Instant) -> Result<Vec<u8>, amphora_api::blobs::BlobRefusal> {
+        self.inner.get(key, until)
+    }
+    fn get_range(
+        &self,
+        key: &str,
+        offset: u64,
+        len: usize,
+        until: Instant,
+    ) -> Result<Vec<u8>, amphora_api::blobs::BlobRefusal> {
+        self.inner.get_range(key, offset, len, until)
+    }
+    fn list(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+        until: Instant,
+    ) -> Result<amphora_api::blobs::Listing, amphora_api::blobs::BlobRefusal> {
+        self.inner.list(prefix, after, limit, until)
+    }
+    fn delete(&self, key: &str, until: Instant) -> Result<(), amphora_api::blobs::BlobRefusal> {
+        self.inner.delete(key, until)
+    }
+}
+
+/// Writes a backlog, then, while a send of it is under way (its first part stored), has the writer
+/// start the log again `restarts` times past what a restart keeps, the send's frames not shipped,
+/// and commit on. Then ships, ends a base after the break, and compares every second from the first
+/// base's on with the rows as of it: whether the send was refused, and the seconds of the backlog
+/// refused.
+fn restarts_forced_mid_send(restarts: i64) -> (Option<String>, Vec<u64>) {
+    let mut s = Source::new();
+    // The frames a restart keeps: far fewer than the backlog's, so it is past them.
+    s.db.keep_log(20);
+    s.put(0..10, "a");
+    s.ship().unwrap();
+    let mut base = s.begin_base().unwrap();
+    s.copy_base(&mut base);
+    s.end_base(base).unwrap();
+    let based = s.second();
+    // The backlog's generation is the third, so both segments' files have held one before it.
+    for (ids, tag) in [(10..20, "b"), (20..30, "c")] {
+        assert!(s.db.restart_log().unwrap(), "shipped, so it starts again");
+        s.put(ids, tag);
+        s.ship().unwrap();
+    }
+    s.put(30..90, "d");
+    let backlog = s.second();
+    let reader = s.db.reader().unwrap();
+    let state = log_files(&s.path);
+    let Source {
+        path,
+        now,
+        db,
+        blobs,
+        mut shipper,
+        model,
+        history,
+        dir,
+        ..
+    } = s;
+    let writer = std::sync::Mutex::new((db, model, history));
+    let store = MidSend {
+        inner: &blobs,
+        during: std::sync::Mutex::new(Some(Box::new(|| {
+            let mut writer = writer.lock().unwrap();
+            let (db, model, history) = &mut *writer;
+            for n in 1..=restarts {
+                assert!(
+                    db.restart_log().unwrap(),
+                    "past what a restart keeps, it starts again unshipped"
+                );
+                let first = 1000 * n;
+                put(db, &now, first..first + 80, "e", model, history);
+            }
+        }))),
+    };
+    let sent = shipper.ship(&reader, &store, until());
+    assert!(
+        store.during.lock().unwrap().is_none(),
+        "the send was under way as the log started again"
+    );
+    let after = log_files(&path);
+    drop(store);
+    let (mut db, mut model, mut history) = writer.into_inner().unwrap();
+    // The generation now is shipped, and a base ends after the break.
+    now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    shipper.ship(&reader, &blobs, until()).unwrap();
+    // The base begins once the file holds the segment the last switch closed.
+    let _copied = db.checkpoint().unwrap();
+    let mut base = shipper
+        .begin_base(&reader, &blobs, &amphora::memory::process(), 32 * 1024)
+        .unwrap();
+    while shipper
+        .copy_base(&reader, &blobs, &mut base, until())
+        .unwrap()
+    {}
+    shipper.end_base(&reader, &blobs, base, until()).unwrap();
+    let mended = now.load(Ordering::SeqCst).div_ceil(SECOND_NS);
+    put(&mut db, &now, 9000..9005, "f", &mut model, &mut history);
+    now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    shipper.ship(&reader, &blobs, until()).unwrap();
+    shipper.ship(&reader, &blobs, until()).unwrap();
+
+    let last = history.last().unwrap().0.div_ceil(SECOND_NS);
+    let mut refused = Vec::new();
+    for second in based..=last {
+        let target = dir.path().join(format!("at-{second}.db"));
+        match backup::restore(&blobs, "db", second, &target, until()) {
+            Ok(_) => {
+                let restored = rows(&Db::open(&target).unwrap());
+                let expected = at(&history, second).cloned().unwrap_or_default();
+                let lost = expected
+                    .iter()
+                    .filter(|(id, v)| restored.get(id) != Some(v))
+                    .count();
+                assert_eq!(
+                    (lost, restored.len()),
+                    (0, expected.len()),
+                    "{restarts} restarts in a send: second {second} (the backlog's last is \
+                     {backlog}) restored with no error, {lost} of its {} rows lost, {} rows in all; \
+                     as the send began {state}; as it ended {after}; the send: {sent:?}",
+                    expected.len(),
+                    restored.len()
+                );
+            }
+            Err(e) => {
+                assert!(
+                    matches!(
+                        e.downcast_ref::<Unrestorable>(),
+                        Some(Unrestorable::NoBase(_) | Unrestorable::Inexact { .. })
+                    ) && second <= mended,
+                    "second {second} refused for another reason than the break: {e:#}"
+                );
+                if second <= backlog {
+                    refused.push(second);
+                }
+            }
+        }
+    }
+    (sent.err().map(|e| format!("{e:#}")), refused)
+}
+
+/// Decision 45 (lane B24): a log started again past what it keeps while a send of its frames is
+/// under way leaves them in the segment that closed, and the send ships them from there. Do: commit
+/// 60 rows with no round, ship them in parts, and as the first is stored have the writer switch,
+/// those commits unshipped, and commit 80 rows more; end a base after the break; restore every
+/// second. Expect: the send ends, every second of its commits restores with its rows, and no second
+/// restores with others.
+#[test]
+fn d45_a_send_ships_its_own_generation_when_the_log_starts_again_under_it() {
+    let (sent, refused) = restarts_forced_mid_send(1);
+    assert_eq!(sent, None, "its frames are in the closing segment");
+    assert_eq!(refused, Vec::<u64>::new(), "its commits are in the archive");
+}
+
+/// Decision 45 (lane B24): a log started again twice in one send writes over the segment the send
+/// reads. Do: as above, the writer switching twice, 80 rows after each. Expect: the send is refused,
+/// never the second generation's frames shipped as the first's, and no second restores with other
+/// rows than its own.
+#[test]
+fn d45_a_send_whose_segment_is_written_over_is_refused() {
+    let (sent, _) = restarts_forced_mid_send(2);
+    assert!(sent.is_some(), "its frames are gone, and it says so");
+}
+
 /// T-T1.12.I1 (AC-T1.12.3, AC-T1.12.4): an incremental base. Do: write 400 rows, start the log
 /// again and copy a base;
 /// change 5 rows over two generations of the log, the shipper opened again between; copy a

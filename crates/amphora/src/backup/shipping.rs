@@ -570,22 +570,27 @@ impl Checker {
         Ok(check)
     }
 
+    /// What a check's restore takes of the scratch disk, and what the disk has ([`admit`]).
+    fn budget(&self) -> anyhow::Result<Budget> {
+        let disk = match self.scratch.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        Ok(Budget {
+            free: fs4::available_space(disk)?,
+            restore: file_len(&self.source)?
+                .saturating_add(file_len(&suffixed(&self.source, "-wal"))?),
+            log_headroom: self.reader.log_kept_frames().saturating_mul(FRAME_BYTES),
+        })
+    }
+
     /// Whether a due check begins now: at once given a scratch path; continuous, once the disk
     /// holds it ([`admit`], T-T1.12.C5), a deferral counted with its reason.
     fn admitted(&self) -> anyhow::Result<bool> {
         if self.pacer.is_none() {
             return Ok(true);
         }
-        let disk = match self.scratch.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent,
-            _ => Path::new("."),
-        };
-        let budget = Budget {
-            free: fs4::available_space(disk)?,
-            restore: file_len(&self.source)?
-                .saturating_add(file_len(&suffixed(&self.source, "-wal"))?),
-            log_headroom: self.reader.log_kept_frames().saturating_mul(FRAME_BYTES),
-        };
+        let budget = self.budget()?;
         match admit(&budget) {
             Ok(()) => Ok(true),
             Err(why) => {
@@ -725,10 +730,50 @@ mod tests {
     use amphora_api::blobs::SimBlobs;
 
     use super::*;
-    use crate::backup::{SECOND_NS, restore};
+    use crate::backup::{SECOND_NS, restore, restore_paced};
 
     fn until() -> Instant {
         Instant::now() + Duration::from_secs(60)
+    }
+
+    /// A database at `path` backed up round by round, its table made, with its clock.
+    fn backed_up(
+        path: &Path,
+        blobs: &Arc<SimBlobs>,
+        kept: Option<u64>,
+        check: CheckPolicy,
+    ) -> (Db, Prepared, Arc<AtomicU64>) {
+        let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS));
+        let read = Arc::clone(&now);
+        let archive = Archive {
+            blobs: Arc::clone(blobs) as Arc<dyn Blobs>,
+            prefix: "db".into(),
+            clock: Arc::new(move || read.load(Ordering::SeqCst)),
+            memory: 32 * 1024,
+            patience: Duration::from_secs(60),
+            chunks: ChunkGrowth::Keep,
+            check,
+        };
+        let mut db = Db::open(path).unwrap();
+        if let Some(kept) = kept {
+            db.keep_log(kept);
+        }
+        let prepared = Prepared::on(&mut db, path, archive, until()).unwrap();
+        db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+            .unwrap();
+        (db, prepared, now)
+    }
+
+    /// Writes `rows` rows from id `from`, one commit a second.
+    fn write(db: &Db, now: &AtomicU64, from: i64, rows: i64) {
+        for id in from..from + rows {
+            now.fetch_add(SECOND_NS, Ordering::SeqCst);
+            db.exec(&format!(
+                "INSERT INTO t (id, v) VALUES ({id}, '{}')",
+                "z".repeat(500)
+            ))
+            .unwrap();
+        }
     }
 
     fn ids(db: &Db) -> Vec<i64> {
@@ -813,5 +858,162 @@ mod tests {
         let target = dir.path().join("restored.db");
         restore(blobs.as_ref(), "db", second, &target, until()).unwrap();
         assert_eq!(ids(&Db::open(&target).unwrap()), ids(&db));
+    }
+
+    /// Decision 45 (lane B24): a round between the writer's switch and the fence's word of it ends
+    /// the base under way. Do: begin a first base; write 5 rows and ship them; start the log again,
+    /// and in the writer's restart, the switch made and the fence not told of it yet, run the round
+    /// that copies the base's last chunk, as the shipping thread may; restore the last commit's
+    /// second. Expect: the base ended, so the second restores with every row.
+    #[test]
+    fn d45_a_round_within_the_writers_switch_ends_the_base_under_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = Arc::new(SimBlobs::new(64 * 1024, 1_000_000, 1 << 30));
+        let (mut db, mut prepared, now) = backed_up(
+            &dir.path().join("source.db"),
+            &blobs,
+            None,
+            CheckPolicy::Off,
+        );
+        write(&db, &now, 0, 10);
+        let mut copy = None;
+        prepared.round(&mut copy).unwrap();
+        assert!(copy.is_some(), "the first base begins");
+        write(&db, &now, 10, 5);
+        prepared.ship().unwrap();
+        let hooks = prepared.hooks();
+        let thread = Arc::new(Mutex::new((prepared, copy, Vec::new())));
+        let within = Arc::clone(&thread);
+        *hooks.fence.during_switch.lock().unwrap() = Some(Box::new(move || {
+            let mut thread = within.lock().unwrap();
+            let (prepared, copy, rounds) = &mut *thread;
+            // As the thread's loop does: a round that fails starts the base over.
+            let round = prepared.round(copy);
+            if round.is_err() {
+                *copy = None;
+            }
+            rounds.push(round.map(|(_, ended)| ended).map_err(|e| format!("{e:#}")));
+        }));
+        assert!(db.restart_log().unwrap(), "shipped, so it starts again");
+        let (_, copy, rounds) = &*thread.lock().unwrap();
+        assert_eq!(rounds.len(), 1, "a round ran within the switch");
+
+        let second = now.load(Ordering::SeqCst) / SECOND_NS;
+        let target = dir.path().join("restored.db");
+        restore(blobs.as_ref(), "db", second, &target, until()).unwrap_or_else(|e| {
+            panic!(
+                "second {second} refused: {e:#}; the round within the switch: {rounds:?}; a base \
+                 under way after it: {}",
+                copy.is_some()
+            )
+        });
+        assert_eq!(ids(&Db::open(&target).unwrap()), ids(&db));
+    }
+
+    /// The most bytes the files in a restore's folder held together, seen at each of its steps.
+    struct Peak {
+        dir: PathBuf,
+        bytes: u64,
+    }
+
+    impl Peak {
+        fn see(&mut self) -> anyhow::Result<()> {
+            let mut held = 0;
+            for entry in std::fs::read_dir(&self.dir)? {
+                held += entry?.metadata()?.len();
+            }
+            self.bytes = self.bytes.max(held);
+            Ok(())
+        }
+    }
+
+    impl Pace for Peak {
+        fn ready(&mut self) -> anyhow::Result<()> {
+            self.see()
+        }
+        fn done(&mut self, _: Option<&std::fs::File>, _: u64) -> anyhow::Result<()> {
+            self.see()
+        }
+    }
+
+    /// Decision 45, T-T1.12.C5 (lane B24): a check begins only where the disk holds its restore and
+    /// the log's growth, both segments counted. Do: end a first base; start the log again (the
+    /// writer switches to `-wal2`) and write 300 rows there, shipped; take the room a check is let
+    /// begin with; run its restore, the room it takes measured at each step; then, no round running
+    /// (the store answers nothing), let the writer commit and start the log again past its bound in
+    /// each segment. Expect: the restore takes no more than the room counted for it, and the log
+    /// grows by no more than the room left it: the disk never fills.
+    #[test]
+    fn d45_a_check_begins_only_where_the_disk_holds_both_of_the_logs_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.db");
+        let blobs = Arc::new(SimBlobs::new(64 * 1024, 1_000_000, 1 << 30));
+        let kept = 400;
+        let (mut db, mut prepared, now) =
+            backed_up(&path, &blobs, Some(kept), CheckPolicy::Continuous);
+        write(&db, &now, 0, 10);
+        let mut copy = None;
+        while !prepared.round(&mut copy).unwrap().1 {}
+        assert!(db.restart_log().unwrap(), "shipped, so it starts again");
+        write(&db, &now, 10, 300);
+        now.fetch_add(SECOND_NS, Ordering::SeqCst);
+        prepared.round(&mut copy).unwrap();
+        let logs = || {
+            let first = file_len(&suffixed(&path, "-wal")).unwrap();
+            let second = file_len(&suffixed(&path, "-wal2")).unwrap();
+            (first, second)
+        };
+        let (first, second) = logs();
+        assert!(
+            second > 300 * FRAME_BYTES && first < 100 * FRAME_BYTES,
+            "non-vacuous: the log is in `-wal2` ({second} bytes; `-wal` {first})"
+        );
+
+        let budget = prepared.checker.as_ref().unwrap().budget().unwrap();
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let mut peak = Peak {
+            dir: scratch.clone(),
+            bytes: 0,
+        };
+        let at = now.load(Ordering::SeqCst) / SECOND_NS - 1;
+        restore_paced(
+            blobs.as_ref(),
+            "db",
+            at,
+            &scratch.join("restored.db"),
+            &mut peak,
+            until(),
+        )
+        .unwrap();
+        assert_eq!(
+            ids(&Db::open(&scratch.join("restored.db")).unwrap()).len(),
+            310
+        );
+        assert!(
+            peak.bytes <= budget.restore,
+            "the restore took {} bytes of the disk, the check begins where {} are free for it: file \
+             {}, `-wal` {first}, `-wal2` {second}",
+            peak.bytes,
+            budget.restore,
+            file_len(&path).unwrap()
+        );
+
+        let mut most = 0;
+        let mut restarts = 0;
+        let mut id = 1000;
+        while restarts < 2 {
+            write(&db, &now, id, 1);
+            id += 1;
+            let (first, second) = logs();
+            most = most.max(first + second);
+            restarts += u64::from(db.restart_log().unwrap());
+        }
+        let grew = most.saturating_sub(first + second);
+        assert!(
+            grew <= budget.log_headroom,
+            "the log grew by {grew} bytes, the check leaves it {}",
+            budget.log_headroom
+        );
     }
 }

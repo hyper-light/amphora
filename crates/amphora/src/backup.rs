@@ -344,6 +344,10 @@ struct FenceState {
 #[derive(Default)]
 pub struct Fence {
     state: Mutex<FenceState>,
+    /// A test's round, run once in the writer's restart between its switch and the fence's word of
+    /// it ([`Fence::at_switch`]).
+    #[cfg(test)]
+    during_switch: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl Fence {
@@ -365,6 +369,15 @@ impl Fence {
                 .state()?
                 .shipped
                 .is_some_and(|(s, f)| s == seq && f >= frame))
+    }
+
+    /// The writer switched and hasn't told the fence yet: runs what a test put there.
+    #[cfg(test)]
+    pub(crate) fn at_switch(&self) {
+        let during = self.during_switch.lock().unwrap().take();
+        if let Some(during) = during {
+            during();
+        }
     }
 
     pub(crate) fn ended(&self, seq: u32, frame: u64, forced: bool) -> anyhow::Result<()> {
