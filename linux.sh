@@ -60,6 +60,14 @@ for step in "$@"; do
       echo "== fixture $f rc=$rc $(( $(date +%s) - s ))s"
       grep -aE "^[0-9]+ runs" "$O/fixture.log" | awk '{r+=$1; w+=$3} END {print r, "runs", w, "wrong"}'
       python3 "$S/classify.py" "$O/fixture.log" ${CLASS_MAX:-14} ;;
+    rq:*)  # rq:COUNT:SEED
+      IFS=: read -r _ count seed <<< "$step"
+      python3 "$S/sqlite_refused_queries.py" "$count" "$seed" > "$O/rq-$seed.tsv" || exit 9
+      C19_RQ=$O/rq-$seed.tsv timeout ${WIDE_TIMEOUT:-420} nice -n 10 "$(bin c19_rq)" --nocapture --test-threads=${JOBS:-8} > "$O/rq-$seed.log" 2>&1; rc=$?
+      echo "== rq $count $seed rc=$rc $(( $(date +%s) - s ))s load $(load)"
+      grep -aE "^[0-9]+ runs" "$O/rq-$seed.log" | awk '{r+=$1; w+=$3; a+=$5} END {print r, "runs", w, "wrong", a, "answered"}'
+      grep -aE "^    Amphora" "$O/rq-$seed.log" | sed -E 's/[0-9]+/#/g' | cut -c1-110 | sort | uniq -c | sort -rn | head -8
+      grep -a -A 9 "^WRONG.*default" "$O/rq-$seed.log" | cut -c1-500 | head -${RQ_LINES:-30} ;;
     clippy)
       timeout 1500 nice -n 10 cargo clippy -p amphora-engine -p amphora-engine-parser --all-targets --locked -- -D warnings > "$O/clippy.log" 2>&1; rc=$?
       echo "== clippy rc=$rc $(( $(date +%s) - s ))s"; grep -E "Checking amphora-engine|^(error|warning)" -A 12 "$O/clippy.log" | head -80 ;;

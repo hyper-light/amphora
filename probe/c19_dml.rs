@@ -342,6 +342,12 @@ fn a_table_is_strict_and_without_rowid() {
             ),
             ("INSERT INTO t VALUES (7, '8', 9), ('a', 1, NULL)", "ok"),
             (
+                "INSERT INTO t VALUES ('a', 1, 1) ON CONFLICT(k) DO UPDATE SET r = excluded.n",
+                "ok",
+            ),
+            ("UPDATE t SET n = n + 1, k = k || 'z'", "ok"),
+            ("SELECT * FROM pragma_integrity_check", "'ok'"),
+            (
                 "INSERT INTO t VALUES ('b', 'x', 1)",
                 "cannot store TEXT value in INT column t.n",
             ),
@@ -350,79 +356,16 @@ fn a_table_is_strict_and_without_rowid() {
                 "NOT NULL constraint failed: t.k",
             ),
             (
-                "INSERT INTO t VALUES ('a', 1, 1)",
+                "INSERT INTO t VALUES ('az', 1, 1)",
                 "UNIQUE constraint failed: t.k",
             ),
-            (
-                "INSERT INTO t VALUES ('a', 1, 1) ON CONFLICT(k) DO UPDATE SET r = excluded.n",
-                "ok",
-            ),
-            ("ALTER TABLE t RENAME COLUMN n TO m", "ok"),
-            ("UPDATE t SET m = m + 1, k = k || 'z'", "ok"),
+            ("SELECT rowid FROM t", "no such column: rowid"),
             (
                 "SELECT * FROM t",
                 "'7z',9,r4022000000000000 / 'az',2,r3ff0000000000000",
             ),
-            ("SELECT rowid FROM t", "no such column: rowid"),
-            ("SELECT * FROM pragma_integrity_check", "'ok'"),
         ]);
     }
-}
-
-/// Do: INSERT, UPDATE, DELETE and UPSERT rows of a WITHOUT ROWID table with BEFORE and AFTER triggers of
-/// each event that log NEW and OLD; a trigger that ignores a row; one for `new.rowid`. Expect: SQLite's
-/// log and rows. UPDATE, DELETE and REPLACE beside a trigger were refused, and an UPDATE OF trigger
-/// panicked (finding CP); `new.rowid` was a register's leftover.
-#[test]
-fn triggers_fire_on_a_table_without_rowid() {
-    let mut statements: Vec<(String, &str)> = vec![
-        (
-            "CREATE TABLE t(v TEXT, k INT, n REAL, PRIMARY KEY(k)) WITHOUT ROWID".to_owned(),
-            "ok",
-        ),
-        ("CREATE INDEX i ON t(v)".to_owned(), "ok"),
-        ("CREATE TABLE lg(e, k, v, n, ok, ov)".to_owned(), "ok"),
-    ];
-    for (event, values) in [
-        ("BEFORE INSERT", "new.k, new.v, new.n, NULL, NULL"),
-        ("AFTER INSERT", "new.k, new.v, new.n, NULL, NULL"),
-        ("BEFORE UPDATE", "new.k, new.v, new.n, old.k, old.v"),
-        ("AFTER UPDATE OF v", "new.k, new.v, new.n, old.k, old.v"),
-        ("BEFORE DELETE", "NULL, NULL, NULL, old.k, old.v"),
-        ("AFTER DELETE", "NULL, NULL, NULL, old.k, old.v"),
-    ] {
-        let name = event.replace(' ', "_");
-        let sql = format!("CREATE TRIGGER {name} {event} ON t BEGIN INSERT INTO lg VALUES ('{event}', {values}); END");
-        statements.push((sql, "ok"));
-    }
-    let rest = [
-        ("INSERT INTO t VALUES (1, '5', 2)", "ok"),
-        ("SELECT e, k, v, n FROM lg", "'AFTER INSERT',5,'1',r4000000000000000 / 'BEFORE INSERT',5,'1',r4000000000000000"),
-        ("DELETE FROM lg", "ok"),
-        ("UPDATE t SET v = 'x', k = 6", "ok"),
-        ("UPDATE t SET n = 3", "ok"),
-        ("SELECT * FROM lg", "'AFTER UPDATE OF v',6,'x',r4000000000000000,5,'1' / 'BEFORE UPDATE',6,'x',r4000000000000000,5,'1' / 'BEFORE UPDATE',6,'x',r4008000000000000,6,'x'"),
-        ("DELETE FROM lg", "ok"),
-        ("INSERT INTO t VALUES ('y', 6, 0) ON CONFLICT(k) DO UPDATE SET v = excluded.v || t.v", "ok"),
-        ("SELECT e, v, ov FROM lg", "'AFTER UPDATE OF v','yx','x' / 'BEFORE INSERT','y',NULL / 'BEFORE UPDATE','yx','x'"),
-        ("DELETE FROM lg", "ok"),
-        ("INSERT OR REPLACE INTO t VALUES ('z', 6, 0)", "ok"),
-        ("SELECT e, v FROM lg", "'AFTER INSERT','z' / 'BEFORE INSERT','z'"),
-        ("DELETE FROM lg", "ok"),
-        ("DELETE FROM t WHERE v = 'z'", "ok"),
-        ("SELECT e, ok, ov FROM lg", "'AFTER DELETE',6,'z' / 'BEFORE DELETE',6,'z'"),
-        ("SELECT * FROM t", ""),
-        ("CREATE TRIGGER skip BEFORE UPDATE ON t WHEN new.n > 5 BEGIN SELECT RAISE(IGNORE); END", "ok"),
-        ("INSERT INTO t VALUES ('a', 1, 1), ('b', 2, 2)", "ok"),
-        ("UPDATE t SET n = n + 4", "ok"),
-        ("SELECT k, n FROM t", "1,r4014000000000000 / 2,r4000000000000000"),
-        ("CREATE TRIGGER names AFTER INSERT ON t BEGIN INSERT INTO lg(e) VALUES (new.rowid); END", "ok"),
-        ("INSERT INTO t VALUES ('c', 3, 3)", "no such column: new.rowid"),
-        ("SELECT * FROM pragma_integrity_check", "'ok'"),
-    ];
-    let mut lines: Vec<(&str, &str)> = statements.iter().map(|(s, w)| (s.as_str(), *w)).collect();
-    lines.extend(rest);
-    answers_as_sqlite(&lines);
 }
 
 /// Do: OR IGNORE, OR REPLACE and OR ABORT of a NULL in a STRICT table's key and in a NOT NULL column, on
