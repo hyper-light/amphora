@@ -3546,14 +3546,9 @@ impl JoinedTable {
                 } else {
                     index
                         .map(|index| {
-                            let physical = if !btree.has_rowid && !index.ephemeral {
-                                Arc::new(index.physical_index(btree)?)
-                            } else {
-                                index.clone()
-                            };
                             program.alloc_cursor_index_if_not_exists(
                                 CursorKey::index(self.internal_id, index.clone()),
-                                &physical,
+                                &self.index_of_cursor(index)?,
                             )
                         })
                         .transpose()?
@@ -3586,6 +3581,17 @@ impl JoinedTable {
                 );
                 Ok((Some(cursor_id), None))
             }
+        }
+    }
+
+    /// `index` as a cursor over it reads its entries: those of a WITHOUT ROWID table's secondary
+    /// index end in the primary key that finds the row, which the declared columns leave out.
+    pub(crate) fn index_of_cursor(&self, index: &Arc<Index>) -> Result<Arc<Index>> {
+        match &self.table {
+            Table::BTree(btree) if !btree.has_rowid && !index.ephemeral => {
+                Ok(Arc::new(index.physical_index(btree)?))
+            }
+            _ => Ok(index.clone()),
         }
     }
 

@@ -485,6 +485,32 @@ fn collect_subquery_table_refs_in_one_select(one: &ast::OneSelect, out: &mut Vec
     }
 }
 
+/// Collects the table names read by the subqueries in a FROM clause's own expressions: its ON
+/// clauses and its table functions' arguments, those of its parenthesized joins included.
+fn collect_subquery_table_refs_in_from_exprs(from: &FromClause, out: &mut Vec<String>) {
+    let mut groups = vec![from];
+    while let Some(group) = groups.pop() {
+        let sources =
+            std::iter::once(&group.select).chain(group.joins.iter().map(|join| &join.table));
+        for source in sources {
+            match source.as_ref() {
+                ast::SelectTable::TableCall(_, args, _) => {
+                    for arg in args {
+                        collect_subquery_table_refs_in_expr(arg, out);
+                    }
+                }
+                ast::SelectTable::Sub(inner, _) => groups.push(inner),
+                ast::SelectTable::Table(..) | ast::SelectTable::Select { .. } => {}
+            }
+        }
+        for join in &group.joins {
+            if let Some(ast::JoinConstraint::On(expr)) = &join.constraint {
+                collect_subquery_table_refs_in_expr(expr, out);
+            }
+        }
+    }
+}
+
 pub fn collect_subquery_table_refs_in_window_clause(
     window_clause: &[ast::WindowDef],
     out: &mut Vec<String>,
@@ -2434,9 +2460,14 @@ pub fn parse_from(
             .collect::<Vec<_>>();
         shadowed_outer_ctes = program.mask_shadowed_ctes_being_defined(&shadowing_names);
 
+        // The subqueries in the FROM clause's own expressions read the CTEs too.
+        let mut subquery_table_refs = table_refs_outside_from.to_vec();
+        if let Some(from) = &from {
+            collect_subquery_table_refs_in_from_exprs(from, &mut subquery_table_refs);
+        }
         add_ctes_read_by_subqueries_as_outer_refs(
             &cte_definitions,
-            table_refs_outside_from,
+            &subquery_table_refs,
             resolver,
             program,
             table_references,
