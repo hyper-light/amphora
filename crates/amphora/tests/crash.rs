@@ -19,7 +19,7 @@
     )
 )]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, Weak, mpsc};
 use std::time::{Duration, Instant};
@@ -281,7 +281,99 @@ impl Disk {
         self.cut();
         self.image.lock().unwrap().clone().unwrap()
     }
+
+    /// Every image a cut here could leave: each change not yet durable kept or lost, in every
+    /// combination while they are few (past [`FEW`], all, none, each alone, each alone missing and each
+    /// prefix), and each write longer than a sector torn, the other changes kept or lost.
+    fn images(&self) -> Vec<BTreeMap<String, Vec<u8>>> {
+        self.cut();
+        let files = self.files.lock().unwrap();
+        let mut left: Vec<(String, Vec<u8>, Vec<Change>)> = files
+            .iter()
+            .map(|(path, file)| {
+                let held = file.held.lock().unwrap();
+                (path.clone(), held.durable.clone(), held.since.clone())
+            })
+            .collect();
+        left.sort_by(|a, b| a.0.cmp(&b.0));
+        let changes: Vec<&Change> = left.iter().flat_map(|(.., since)| since).collect();
+        let n = changes.len();
+        let mut fates: Vec<Vec<Fate>> = Vec::new();
+        let each = |alone: Fate, rest: Fate, i: usize| -> Vec<Fate> {
+            (0..n).map(|j| if i == j { alone } else { rest }).collect()
+        };
+        if n <= FEW {
+            fates.extend((0..1u64 << n).map(|kept| {
+                (0..n)
+                    .map(|i| {
+                        if (kept >> i) & 1 == 1 {
+                            Fate::Kept
+                        } else {
+                            Fate::Lost
+                        }
+                    })
+                    .collect()
+            }));
+        } else {
+            fates.push(vec![Fate::Lost; n]);
+            fates.push(vec![Fate::Kept; n]);
+            for i in 0..n {
+                fates.push(each(Fate::Kept, Fate::Lost, i));
+                fates.push(each(Fate::Lost, Fate::Kept, i));
+                fates.push(
+                    (0..n)
+                        .map(|j| if j < i { Fate::Kept } else { Fate::Lost })
+                        .collect(),
+                );
+            }
+        }
+        for (i, change) in changes.iter().enumerate() {
+            if matches!(change, Change::Write(_, data) if data.len() > 512) {
+                fates.push(each(Fate::Torn, Fate::Kept, i));
+                fates.push(each(Fate::Torn, Fate::Lost, i));
+            }
+        }
+        let mut images: Vec<BTreeMap<String, Vec<u8>>> = fates
+            .into_iter()
+            .map(|fates| {
+                let mut fates = fates.into_iter();
+                left.iter()
+                    .map(|(path, durable, since)| {
+                        let mut bytes = durable.clone();
+                        for change in since {
+                            match (fates.next().unwrap(), change) {
+                                (Fate::Kept, change)
+                                | (Fate::Torn, change @ Change::Truncate(_)) => {
+                                    apply(&mut bytes, change);
+                                }
+                                (Fate::Lost, _) => {}
+                                (Fate::Torn, Change::Write(pos, data)) => {
+                                    let half = data.len() / 2 / 512 * 512;
+                                    apply(&mut bytes, &Change::Write(*pos, data[..half].to_vec()));
+                                }
+                            }
+                        }
+                        (path.clone(), bytes)
+                    })
+                    .collect()
+            })
+            .collect();
+        images.sort();
+        images.dedup();
+        images
+    }
 }
+
+/// What a cut does with a change not yet durable.
+#[derive(Clone, Copy)]
+enum Fate {
+    Kept,
+    Lost,
+    Torn,
+}
+
+/// The changes a cut tries every combination of.
+const FEW: usize = 6;
 
 struct SimFile {
     disk: Weak<Disk>,
@@ -610,10 +702,12 @@ struct Seen {
 }
 
 /// Whether plain SQLite reads the files a cut left, whole. None: it refuses them (docs/design/store.md,
-/// decision 45, What plain SQLite sees). It knows `-wal` alone: of a log whose header holds it refuses
-/// a format that isn't 3007000 (`wal.c`, `walIndexRecover`); the read version it goes by is page 1's, the
-/// log's last committed one where the log has one, and it refuses one above 2 (`btree.c`, `lockBtree`),
-/// but folds the log into the file and deletes it as it closes all the same.
+/// decision 45, What plain SQLite sees). It knows `-wal` alone: of a log longer than its header whose
+/// header holds it refuses a format that isn't 3007000 (`wal.c`, `walIndexRecover`, which reads no
+/// header of a shorter one: run, sqlite3 reads a cleanly closed file beside a log of 32 bytes); the
+/// read version it goes by is page 1's, the log's last committed one where the log has one, and it
+/// refuses one above 2 (`btree.c`, `lockBtree`), but folds the log into the file and deletes it as it
+/// closes all the same.
 fn plain_sqlite(image: &HashMap<String, Vec<u8>>, path: &str) -> Result<Option<()>, String> {
     let empty = Vec::new();
     let file = image.get(path).unwrap_or(&empty);
@@ -627,7 +721,7 @@ fn plain_sqlite(image: &HashMap<String, Vec<u8>>, path: &str) -> Result<Option<(
     };
     let (first, second) = (log("-wal"), log("-wal2"));
     let mut version = file.get(19).copied().unwrap_or(0);
-    if holds(first) {
+    if first.len() > 32 && holds(first) {
         if field(first, 4) != 3_007_000 {
             return Ok(None);
         }
@@ -1062,6 +1156,415 @@ fn d45_a_power_cut_at_any_change_of_a_clean_close_leaves_sqlite_all_of_it_or_non
             }
         }
     }
+}
+
+const DRILL_PATH: &str = "/crash/drill.db";
+
+/// What is done to a database whose log is two files (docs/design/store.md, decision 45).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    /// Every row changed in one commit, and the commit flushed: acknowledged.
+    Change,
+    /// The store's restart: the copies the reads let it make and the switch, the segment switched to
+    /// cut to nothing first (decision 31).
+    Restart,
+    /// `PRAGMA wal_checkpoint(_)`.
+    Checkpoint(&'static str),
+    /// The process is killed, and another opens its files.
+    Kill,
+    /// A clean close, and another open.
+    Close,
+}
+
+/// The rows the drill changes, more than a few pages of them.
+const DRILL_ROWS: i64 = 40;
+
+fn drill_open(disk: &Arc<Disk>, format: LogFormat) -> Result<Db, String> {
+    let path = std::path::Path::new(DRILL_PATH);
+    let mut db = Db::open_with_sharing(path, disk.clone(), &Sharing::Off)
+        .map_err(|e| format!("open: {e:#}"))?;
+    db.log_format(format)
+        .map_err(|e| format!("log format: {e:#}"))?;
+    // Every switch cuts the file it goes to.
+    db.keep_log(0);
+    Ok(db)
+}
+
+/// The row text of a round: no two rounds share a byte position's digits for long.
+fn drill_text(round: usize) -> String {
+    format!("{round:04}").repeat(175)
+}
+
+/// A drill's run so far: the last round begun, and the last acknowledged durable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Rounds {
+    begun: usize,
+    acknowledged: usize,
+}
+
+fn drill_step(
+    disk: &Arc<Disk>,
+    db: &mut Option<Db>,
+    format: LogFormat,
+    step: Step,
+    rounds: &mut Rounds,
+) -> Result<(), String> {
+    let open = db.as_mut().ok_or("no database")?;
+    match step {
+        Step::Change => {
+            rounds.begun += 1;
+            open.exec(&format!("UPDATE t SET a = '{}'", drill_text(rounds.begun)))
+                .map_err(|e| format!("change: {e:#}"))?;
+            open.flusher()().map_err(|e| format!("flush: {e}"))?;
+            rounds.acknowledged = rounds.begun;
+        }
+        Step::Restart => {
+            open.restart_log().map_err(|e| format!("restart: {e:#}"))?;
+        }
+        Step::Checkpoint(mode) => {
+            open.exec(&format!("PRAGMA wal_checkpoint({mode})"))
+                .map_err(|e| format!("{mode}: {e:#}"))?;
+        }
+        Step::Kill => {
+            drop(db.take());
+            *db = Some(drill_open(disk, format)?);
+        }
+        Step::Close => {
+            if let Some(open) = db.take() {
+                open.close().map_err(|e| format!("close: {e:#}"))?;
+            }
+            *db = Some(drill_open(disk, format)?);
+        }
+    }
+    Ok(())
+}
+
+/// The round every row is at, read by a process that opens `image`: one round for all of them, and
+/// Turso's integrity check passed.
+fn drill_round(db: &Db) -> Result<usize, String> {
+    let mut check = String::new();
+    db.query("PRAGMA integrity_check", [], |r| {
+        check = r.get::<String>(0).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(true)
+    })
+    .map_err(|e| format!("integrity_check: {e:#}"))?;
+    if check != "ok" {
+        return Err(format!("integrity_check: {check}"));
+    }
+    let mut found: Vec<(String, i64)> = Vec::new();
+    db.query("SELECT a, count(*) FROM t GROUP BY a", [], |r| {
+        let text = r.get::<String>(0).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let rows = r.get::<i64>(1).map_err(|e| anyhow::anyhow!("{e}"))?;
+        found.push((text, rows));
+        Ok(true)
+    })
+    .map_err(|e| format!("rows: {e:#}"))?;
+    let told: Vec<_> = found.iter().map(|(a, rows)| (&a[..4], *rows)).collect();
+    match found.as_slice() {
+        [(text, DRILL_ROWS)] => {
+            let round = text[..4]
+                .parse::<usize>()
+                .map_err(|e| format!("{e}: {told:?}"))?;
+            if *text == drill_text(round) {
+                Ok(round)
+            } else {
+                Err(format!("torn rows: {told:?}"))
+            }
+        }
+        _ => Err(format!("rows of several rounds: {told:?}")),
+    }
+}
+
+/// What sqlite3's shell reads of `image`, None without a shell: the round, or what it said.
+fn sqlite3_round(image: &BTreeMap<String, Vec<u8>>) -> Option<Result<usize, String>> {
+    let dir = tempfile::tempdir().unwrap();
+    for (path, bytes) in image {
+        let name = path.rsplit('/').next().unwrap();
+        std::fs::write(dir.path().join(name), bytes).unwrap();
+    }
+    let ran = std::process::Command::new("sqlite3")
+        .args(["-batch", dir.path().join("drill.db").to_str().unwrap()])
+        .arg("SELECT DISTINCT substr(a, 1, 4) FROM t; SELECT count(*) FROM t")
+        .output();
+    let ran = match ran {
+        Ok(ran) => ran,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => panic!("sqlite3: {e}"),
+    };
+    let out = String::from_utf8_lossy(&ran.stdout).trim().to_owned();
+    let said = format!("{out} {}", String::from_utf8_lossy(&ran.stderr).trim());
+    let lines: Vec<&str> = out.lines().collect();
+    Some(match lines.as_slice() {
+        [round, "40"] if ran.status.success() => round.parse::<usize>().map_err(|_| said),
+        _ => Err(said),
+    })
+}
+
+/// The state of both segments' files in an image, and where the image's files are written out.
+fn drill_account(image: &BTreeMap<String, Vec<u8>>, name: &str) -> String {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("crash-images")
+        .join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut out = format!("\nthe image: {}", dir.display());
+    for (path, bytes) in image {
+        let file = path.rsplit('/').next().unwrap();
+        std::fs::write(dir.join(file), bytes).unwrap();
+        let header = |at: usize| {
+            bytes
+                .get(at..at + 4)
+                .map(|b| u32::from_be_bytes(b.try_into().unwrap()))
+        };
+        out.push_str(&format!("\n  {file}: {} bytes", bytes.len()));
+        if file.contains("-wal") {
+            out.push_str(&format!(
+                ", format {:?}, sequence {:?}, salts {:?} {:?}",
+                header(4),
+                header(12),
+                header(16),
+                header(20)
+            ));
+        } else {
+            out.push_str(&format!(", versions {:?}", bytes.get(18..20)));
+        }
+    }
+    out
+}
+
+/// What a drill saw, so that its checks aren't vacuous.
+#[derive(Default)]
+struct Drilled {
+    cuts: u64,
+    images: u64,
+    /// Images plain SQLite refuses, and those it reads whole.
+    sqlite_refused: u64,
+    sqlite_read: u64,
+}
+
+/// `steps` on a disk, the power cut at `at` of the changes the steps from `armed` on make (whole, at
+/// their end, past them): every image the cut could leave is recovered whole, at a round no older than
+/// the last one acknowledged, by Amphora, and written on by it; plain SQLite refuses it or reads the
+/// same round.
+fn drill_cut(
+    format: LogFormat,
+    setup: &[Step],
+    steps: &[Step],
+    at: u64,
+    drilled: &mut Drilled,
+) -> Result<u64, String> {
+    let disk = Disk::new(at, HashMap::new());
+    let mut rounds = Rounds::default();
+    let mut db = Some(drill_open(&disk, format)?);
+    let first = db.as_ref().ok_or("no database")?;
+    first
+        .exec("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)")
+        .map_err(|e| format!("table: {e:#}"))?;
+    let values: Vec<String> = (0..DRILL_ROWS)
+        .map(|row| format!("({row}, '{}')", drill_text(0)))
+        .collect();
+    first
+        .exec(&format!("INSERT INTO t VALUES {}", values.join(", ")))
+        .map_err(|e| format!("rows: {e:#}"))?;
+    first.flusher()().map_err(|e| format!("flush: {e}"))?;
+    for step in setup {
+        drill_step(&disk, &mut db, format, *step, &mut rounds)
+            .map_err(|e| format!("setup, {step:?}: {e}"))?;
+    }
+    disk.arm(at);
+    let mut ended = "its end".to_owned();
+    for step in steps {
+        if let Err(e) = drill_step(&disk, &mut db, format, *step, &mut rounds) {
+            if !disk.crashed() {
+                return Err(format!("{step:?}: {e}"));
+            }
+            ended = format!("{step:?}: {e}");
+            break;
+        }
+    }
+    let changes = disk.changes.load(Ordering::SeqCst);
+    let images = disk.images();
+    drop(db);
+    drilled.cuts += 1;
+    for (n, image) in images.iter().enumerate() {
+        drilled.images += 1;
+        let name = format!("{format:?}-{at}-{n}-{}", disk.id);
+        let said = |e: String| {
+            format!(
+                "{format:?}, {setup:?} then {steps:?}, cut at {at} ({ended}), image {n} of {}, \
+                 acknowledged {}, begun {}: {e}{}",
+                images.len(),
+                rounds.acknowledged,
+                rounds.begun,
+                drill_account(image, &name)
+            )
+        };
+        let kept = HashMap::from_iter(image.clone());
+        let round = drill_open(&Disk::new(at, kept.clone()), format)
+            .and_then(|db| drill_round(&db))
+            .map_err(&said)?;
+        if round < rounds.acknowledged || round > rounds.begun {
+            return Err(said(format!("recovered round {round}")));
+        }
+        // Written on, its log started again, and killed: the last change is there.
+        let disk = Disk::new(at, kept.clone());
+        let mut db = Some(drill_open(&disk, format).map_err(&said)?);
+        let mut on = Rounds {
+            begun: 100,
+            acknowledged: 100,
+        };
+        for step in [
+            Step::Change,
+            Step::Restart,
+            Step::Change,
+            Step::Kill,
+            Step::Change,
+        ] {
+            drill_step(&disk, &mut db, format, step, &mut on)
+                .map_err(|e| said(format!("written on, {step:?}: {e}")))?;
+        }
+        drop(db);
+        let after = drill_open(&Disk::new(at, disk.image()), format)
+            .and_then(|db| drill_round(&db))
+            .map_err(|e| said(format!("written on: {e}")))?;
+        if after != on.acknowledged {
+            return Err(said(format!("written on, {on:?}: recovered round {after}")));
+        }
+        // What plain SQLite sees of the image itself.
+        let reads = plain_sqlite(&kept, DRILL_PATH).map_err(&said)?;
+        match (reads, sqlite3_round(image)) {
+            (None, Some(Ok(read))) => {
+                return Err(said(format!(
+                    "sqlite3 reads round {read} of files it is to refuse"
+                )));
+            }
+            (None, _) => drilled.sqlite_refused += 1,
+            (Some(()), Some(Err(e))) => return Err(said(format!("sqlite3 refuses: {e}"))),
+            (Some(()), Some(Ok(read))) if read != round => {
+                return Err(said(format!("sqlite3 reads round {read}, Amphora {round}")));
+            }
+            (Some(()), _) => drilled.sqlite_read += 1,
+        }
+    }
+    Ok(changes)
+}
+
+const TRUNCATE: Step = Step::Checkpoint("TRUNCATE");
+
+/// What comes before a drill's power cut: the second segment current, and the first again.
+const DRILL_SETUPS: [&[Step]; 2] = [
+    &[Step::Change, Step::Restart, Step::Change],
+    &[
+        Step::Change,
+        Step::Restart,
+        Step::Change,
+        Step::Restart,
+        Step::Change,
+    ],
+];
+
+/// The steps whose every change the power is cut at.
+const DRILL_STEPS: [&[Step]; 9] = [
+    &[Step::Restart, Step::Change],
+    &[Step::Restart, TRUNCATE],
+    &[Step::Restart, TRUNCATE, Step::Change],
+    &[Step::Restart, Step::Kill, TRUNCATE, Step::Change],
+    &[Step::Restart, Step::Close, Step::Change],
+    &[Step::Restart, Step::Kill, Step::Close, Step::Change],
+    &[TRUNCATE, Step::Change, Step::Restart, Step::Change],
+    &[Step::Checkpoint("RESTART"), TRUNCATE, Step::Change],
+    &[TRUNCATE, TRUNCATE, Step::Change],
+];
+
+fn drill_one(case: u64) -> Result<Drilled, String> {
+    let case = usize::try_from(case).unwrap();
+    let formats = [LogFormat::Mixed, LogFormat::Pages, LogFormat::Packed];
+    let format = formats[case % formats.len()];
+    let setup = DRILL_SETUPS[case / formats.len() % DRILL_SETUPS.len()];
+    let steps = DRILL_STEPS[case / formats.len() / DRILL_SETUPS.len()];
+    let mut drilled = Drilled::default();
+    let changes = drill_cut(format, setup, steps, u64::MAX, &mut drilled)?;
+    for at in 1..=changes {
+        drill_cut(format, setup, steps, at, &mut drilled)?;
+    }
+    Ok(drilled)
+}
+
+/// Do (decision 45): cut the power at every write, truncation and sync of a switch and of TRUNCATE (by
+/// itself, after a switch, beside a kill, in a clean close), each change not yet durable kept or lost.
+/// Expect: every commit acknowledged before the cut is there, nothing older is read in its place, the
+/// files can be written on, and plain SQLite refuses them or reads the same.
+#[test]
+fn d45_a_power_cut_at_every_change_of_a_switch_and_a_truncate_loses_no_commit() {
+    let cases = 3 * DRILL_SETUPS.len() * DRILL_STEPS.len();
+    let mut all = Drilled::default();
+    for seen in run_seeds(cases as u64, 0, drill_one) {
+        all.cuts += seen.cuts;
+        all.images += seen.images;
+        all.sqlite_refused += seen.sqlite_refused;
+        all.sqlite_read += seen.sqlite_read;
+    }
+    eprintln!(
+        "{cases} drills: {} power cuts, {} images; plain SQLite refuses {} of them and reads {}",
+        all.cuts, all.images, all.sqlite_refused, all.sqlite_read
+    );
+    assert!(
+        all.cuts > 500 && all.images > all.cuts,
+        "{} cuts, {} images",
+        all.cuts,
+        all.images
+    );
+    assert!(all.sqlite_refused > 0 && all.sqlite_read > 0);
+}
+
+/// A seed's steps, drawn, and the power cut at some of their changes.
+fn drill_seed(seed: u64) -> Result<Drilled, String> {
+    let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+    let format = match seed % 4 {
+        1 => LogFormat::Packed,
+        3 => LogFormat::Pages,
+        _ => LogFormat::Mixed,
+    };
+    let mut drawn = |n: u64| -> Vec<Step> {
+        (0..n)
+            .map(|_| match rng.below(12) {
+                0..=3 => Step::Change,
+                4..=6 => Step::Restart,
+                7 | 8 => TRUNCATE,
+                9 => Step::Checkpoint(
+                    ["RESTART", "FULL", "PASSIVE"][usize::try_from(rng.below(3)).unwrap()],
+                ),
+                10 => Step::Kill,
+                _ => Step::Close,
+            })
+            .collect()
+    };
+    let (setup, steps) = (drawn(4), drawn(4));
+    let mut drilled = Drilled::default();
+    let changes = drill_cut(format, &setup, &steps, u64::MAX, &mut drilled)?;
+    for _ in 0..8 {
+        let at = 1 + rng.below(changes);
+        drill_cut(format, &setup, &steps, at, &mut drilled)
+            .map_err(|e| format!("seed {seed}: {e}"))?;
+    }
+    Ok(drilled)
+}
+
+/// Do (decision 45): 200 seeds' steps, each the power cut at eight changes they make. Expect: as at every
+/// change of a switch and a TRUNCATE.
+#[test]
+fn d45_a_power_cut_in_any_steps_of_the_logs_two_files_loses_no_commit() {
+    let mut all = Drilled::default();
+    for seen in run_seeds(200, 0, drill_seed) {
+        all.cuts += seen.cuts;
+        all.images += seen.images;
+        all.sqlite_refused += seen.sqlite_refused;
+        all.sqlite_read += seen.sqlite_read;
+    }
+    eprintln!(
+        "200 seeds: {} power cuts, {} images; plain SQLite refuses {} of them and reads {}",
+        all.cuts, all.images, all.sqlite_refused, all.sqlite_read
+    );
+    assert!(all.images > all.cuts && all.sqlite_refused > 0 && all.sqlite_read > 0);
 }
 
 /// The database the spilling transaction's seeds write.
