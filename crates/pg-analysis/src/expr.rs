@@ -15,6 +15,13 @@ use crate::{Error, Session, format_type, sqlstate};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExprId(u32);
 
+impl ExprId {
+    /// Its place in its [`Exprs`]' list.
+    pub(crate) fn index(self) -> usize {
+        usize::try_from(self.0).unwrap_or(usize::MAX)
+    }
+}
+
 /// `CoercionForm` (src/include/nodes/primnodes.h), for the functions a cast may be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Form {
@@ -135,6 +142,31 @@ impl Exprs {
             location,
         });
         Ok(ExprId(id))
+    }
+
+    /// For each expression, whether it is computed from constants alone: there is no column and no
+    /// parameter in it. Analysis makes an expression after its arguments.
+    pub(crate) fn constant(&self) -> Vec<bool> {
+        let mut constant: Vec<bool> = Vec::with_capacity(self.nodes.len());
+        for expr in &self.nodes {
+            let at = constant.len();
+            let known = |ids: &[ExprId]| {
+                ids.iter()
+                    .all(|id| id.index() < at && constant.get(id.index()) == Some(&true))
+            };
+            let one = match &expr.kind {
+                ExprKind::Const(_) | ExprKind::CurrentTimestamp => true,
+                ExprKind::Param(_) | ExprKind::Var { .. } => false,
+                ExprKind::Op { args, .. }
+                | ExprKind::Func { args, .. }
+                | ExprKind::Bool { args, .. } => known(args),
+                ExprKind::Relabel { arg, .. }
+                | ExprKind::ViaIo { arg, .. }
+                | ExprKind::NullTest { arg, .. } => known(std::slice::from_ref(arg)),
+            };
+            constant.push(one);
+        }
+        constant
     }
 
     /// Every expression, in the order analysis made them.

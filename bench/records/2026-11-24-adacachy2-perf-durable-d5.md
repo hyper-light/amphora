@@ -79,6 +79,10 @@ are on Mac Studio 2 (32 cores, load 3 to 32, the named cores), all Linux ones on
 | `aca5cef3` | `--test serve`, `transport`, `groups`, `replication` (r984) | 11, 9, 12 passed; 2 passed and 1 failed; below |
 | `aca5cef3` | Linux clippy and check-production (r985) | exit 0, exit 0 |
 | `04aee7c9`, main alone | the lib sets with `database::replicated::` (r964) | 305 passed, 1 failed (`v13_...`), 7 ignored |
+| `9529b50c` | Linux, amphora lib `xgroup::`, `database::across::`, `transport::`, `replication::`, `database::replicated::`, `backup::`, `db::` (r1058, jobs 2) | 338 passed, 0 failed, 7 ignored |
+| `9529b50c` | Linux, `--test serve`, `transport` (r1058) | 11 and 9 passed |
+| `1ceb12fd`, main alone | macOS amphora lib `database::replicated::` (r1066) | 162 passed, 2 failed (`a_local_read_open_across_...`, `v13_...`), 5 ignored |
+| `9529b50c` | macOS amphora lib `database::replicated::`, beside it (r1067) | 162 passed, 2 failed (the same two), 5 ignored |
 | each | `cargo fmt --all --check`, `python3 scripts/test_requirements.py` (the duplicate-ID test; already on main) | pass |
 
 Reds, each main's own unless it says otherwise:
@@ -93,12 +97,22 @@ Reds, each main's own unless it says otherwise:
   `04aee7c9` alone too (r1029).
 - `serve` failed two at `ece9982b` under load 31 (`os error 35`, a read's deadline) and passes 11 of 11 since, as on main.
 - `a_group_upgrading_to_the_floor_tracks_joins_...` failed once in r1034 ("owner 1 differs at applied index 3") and passed 3 of 3 alone
-  on `aa99c841` (r1052) and 3 of 3 alone on main `1ceb12fd` (r1051). No lock entry is in it. Whether main's suite shows it is in the
-  post-merge runs below, if they ended in the hour.
+  on `aa99c841` (r1052) and 3 of 3 alone on main `1ceb12fd` (r1051). No lock entry is in it. Main's own suite (r1066) and the landing tree's beside it (r1067) are
+  in the table.
 - `a_local_read_open_across_an_image_install_...` failed in r1034 and 3 of 3 alone on `aa99c841` (r1052): "the state machine failed".
   It passed at `aca5cef3`, before lane V20's `32ba72e3` came in. Main `1ceb12fd` alone fails it 3 of 3, the same line and message
   (r1051): main's own since that landing, on macOS. It passed on Linux in V20's runs. A replica's state machine failed, so its owner
   should see it.
+
+Every red above is macOS's: on Linux the landing tree's sets pass whole (r1058, after the landing).
+
+## Landed
+
+Main `997b36da` (07:46:11Z, fast-forward from `35545f1f`). The tree tested before it is `9529b50c`; what came in after is bench records.
+Scripts on adacachy: `~/.cache/amphora-perf/durable-d5-scripts` (linux.sh, mac2.sh, d5_red.py, d5_red2.py, the red patches).
+
+From `t1/main-review` nothing but `44b95a5f` was taken. `f02b5e67` and `350352d5` are on main already as `8b798818` and `62acdd6d`.
+`2b4c7c82`, `8aaef11d`, `96885fc0`, `abc6680f` and `d10ea05c` are records, left for the next landing.
 
 ## Found on the way, one line each
 

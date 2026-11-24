@@ -745,11 +745,14 @@ pub fn eval(
                     steps.push(Step::Enter(*first));
                 }
                 ExprKind::Var { .. } => return Err(Error::unsupported("a column outside a row")),
-                ExprKind::CurrentTimestamp => {
-                    return Err(Error::unsupported(
-                        "CURRENT_TIMESTAMP outside a transaction",
-                    ));
-                }
+                ExprKind::CurrentTimestamp => match session.now {
+                    Some(t) => values.push(Some(Value::Timestamp(t))),
+                    None => {
+                        return Err(Error::unsupported(
+                            "CURRENT_TIMESTAMP outside a transaction",
+                        ));
+                    }
+                },
             },
             Step::Leave(id) => leave(exprs, id, session, &mut values)?,
             Step::Bool { id, done, null } => {
@@ -826,7 +829,9 @@ fn leave(
     Ok(())
 }
 
-fn call(function: &Proc, args: &[Value], session: &Session<'_>) -> Result<Value, Error> {
+/// A built-in function's value over these arguments, none of them NULL: every body is of a strict one
+/// (src/backend/utils/fmgr/README). `0A000` where its body isn't here.
+pub fn call(function: &Proc, args: &[Value], session: &Session<'_>) -> Result<Value, Error> {
     let body = body(function.src)
         .ok_or_else(|| Error::unsupported(&format!("function {}", function.name)))?;
     body(args, session)

@@ -14,8 +14,13 @@ use crate::pg_catalog_vtab::{PgCatalog, PgCatalogTable};
 use crate::schema::{BTreeTable, Schema};
 use crate::sync::atomic::{AtomicU32, Ordering};
 use crate::sync::Arc;
-use crate::{Connection, LimboError, Value};
+use crate::{Connection, LimboError, Numeric, Value};
 use amphora_engine_parser::ast;
+use amphora_pg_analysis::datetime::TimeZone;
+use amphora_pg_analysis::{lower, Column, Relations, Session, Value as PgValue};
+use amphora_pg_catalog::data::type_oid;
+use amphora_pg_catalog::{Proc, SearchPath};
+use std::sync::OnceLock;
 
 /// What follows the prefix in a stored definition: `/* pg_class.oid <oid> */ `.
 const OID_OPEN: &str = "/* pg_class.oid ";
@@ -299,8 +304,144 @@ impl super::Dialect for PostgresDialect {
     /// The engine's built-in functions, which the statements the engine generates call; which of
     /// them a PostgreSQL statement may name is analysis's (section 11's unit 8).
     fn resolve_function(&self, name: &str, arg_count: usize) -> crate::Result<Option<Func>> {
+        if let Some(function) = pg_proc(name) {
+            return Ok((function.args.len() == arg_count).then(|| Func::Dialect(name.to_string())));
+        }
         super::sqlite::resolve_builtin_function(name, arg_count)
     }
+
+    /// A built-in function over the values its arguments' columns hold, or [`Value::Null`] over
+    /// one that is NULL: every body is of a strict function (section 4).
+    fn exec_scalar_function(
+        &self,
+        _conn: &Connection,
+        name: &str,
+        args: &[Value],
+    ) -> crate::Result<Value> {
+        let function = pg_proc(name)
+            .ok_or_else(|| LimboError::ParseError(format!("no such function: {name}")))?;
+        if args.iter().any(|value| matches!(value, Value::Null)) {
+            return Ok(Value::Null);
+        }
+        let mut values = Vec::with_capacity(args.len());
+        for (value, oid) in args.iter().zip(function.args) {
+            values.push(from_engine(*oid, value)?.ok_or_else(|| {
+                LimboError::InternalError("a NULL reached a strict function".to_string())
+            })?);
+        }
+        let path = SearchPath::new(&[], "", None, |_| None);
+        let session = Session {
+            path: &path,
+            relations: &NoRelations,
+            time_zone: utc()?,
+            now: None,
+        };
+        let value = amphora_pg_analysis::call(function, &values, &session)?;
+        to_engine(function.result, &value)
+    }
+}
+
+/// The built-in function a lowered statement's call names ([`lower::PROC_FUNCTION`]).
+fn pg_proc(name: &str) -> Option<&'static Proc> {
+    let oid = name.strip_prefix(lower::PROC_FUNCTION)?.parse().ok()?;
+    amphora_pg_catalog::proc_by_oid(oid)
+}
+
+/// A `TimeZone` for functions that read none: lowering refuses the ones that do
+/// (amphora_pg_analysis's `session_dependent`).
+fn utc() -> crate::Result<&'static TimeZone> {
+    static UTC: OnceLock<Option<TimeZone>> = OnceLock::new();
+    UTC.get_or_init(|| amphora_pg_analysis::tz::time_zone("UTC").ok())
+        .as_ref()
+        .ok_or_else(|| LimboError::InternalError("the UTC time zone is missing".to_string()))
+}
+
+/// A session's relations for functions that name none.
+struct NoRelations;
+
+impl Relations for NoRelations {
+    fn namespace(&self, _name: &str) -> Option<u32> {
+        None
+    }
+
+    fn relation(&self, _namespace: u32, _name: &str) -> Option<u32> {
+        None
+    }
+
+    fn name(&self, _oid: u32) -> Option<(u32, String)> {
+        None
+    }
+
+    fn namespace_name(&self, _oid: u32) -> Option<String> {
+        None
+    }
+
+    fn columns(&self, _oid: u32) -> Vec<Column> {
+        Vec::new()
+    }
+}
+
+impl From<amphora_pg_analysis::Error> for LimboError {
+    fn from(error: amphora_pg_analysis::Error) -> Self {
+        Self::Postgres {
+            sqlstate: error.sqlstate,
+            message: error.message,
+        }
+    }
+}
+
+/// What the engine stores for a value of a type (section 5): the text types in their own, a
+/// `bpchar` without its trailing spaces, the rest as integers.
+pub fn to_engine(oid: u32, value: &PgValue) -> crate::Result<Value> {
+    Ok(match value {
+        PgValue::Bool(b) => Value::Numeric(Numeric::Integer(i64::from(*b))),
+        PgValue::Int4(i) => Value::Numeric(Numeric::Integer(i64::from(*i))),
+        PgValue::Int8(i) | PgValue::Timestamp(i) => Value::Numeric(Numeric::Integer(*i)),
+        PgValue::Oid(o) => Value::Numeric(Numeric::Integer(i64::from(*o))),
+        PgValue::Text(s) if oid == type_oid::BPCHAR => {
+            Value::build_text(s.trim_end_matches(' ').to_string())
+        }
+        PgValue::Text(s) => Value::build_text(s.clone()),
+        PgValue::Char(_) | PgValue::Numeric(_) | PgValue::Unknown(_) => return Err(unstored(oid)),
+    })
+}
+
+/// The value of a type the engine stores, `None` for NULL: [`to_engine`]'s inverse.
+pub fn from_engine(oid: u32, value: &Value) -> crate::Result<Option<PgValue>> {
+    let integer = match value {
+        Value::Null => return Ok(None),
+        Value::Numeric(Numeric::Integer(i)) => Some(*i),
+        _ => None,
+    };
+    let text = match value {
+        Value::Text(t) => Some(t.as_str()),
+        _ => None,
+    };
+    let corrupt = || LimboError::Corrupt(format!("a stored value isn't one of type {oid}"));
+    Ok(Some(match oid {
+        type_oid::BOOL => PgValue::Bool(integer.ok_or_else(corrupt)? != 0),
+        type_oid::INT4 => {
+            PgValue::Int4(i32::try_from(integer.ok_or_else(corrupt)?).map_err(|_| corrupt())?)
+        }
+        type_oid::INT8 => PgValue::Int8(integer.ok_or_else(corrupt)?),
+        type_oid::OID | type_oid::REGCLASS => {
+            PgValue::Oid(u32::try_from(integer.ok_or_else(corrupt)?).map_err(|_| corrupt())?)
+        }
+        type_oid::TIMESTAMP | type_oid::TIMESTAMPTZ => {
+            PgValue::Timestamp(integer.ok_or_else(corrupt)?)
+        }
+        type_oid::TEXT | type_oid::VARCHAR | type_oid::BPCHAR => {
+            PgValue::Text(text.ok_or_else(corrupt)?.to_string())
+        }
+        _ => return Err(unstored(oid)),
+    }))
+}
+
+fn unstored(oid: u32) -> LimboError {
+    LimboError::from(amphora_pg_analysis::Error::unsupported(&format!(
+        "a stored value of type {}",
+        amphora_pg_analysis::format_type(oid)
+    )))
 }
 
 #[cfg(test)]

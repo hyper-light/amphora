@@ -15,6 +15,11 @@ path = "src/main.rs"
 [dependencies]
 amphora-api = { path = "../api" }
 amphora-engine-parser.workspace = true
+# PostgreSQL 19's parser, analysis and catalog: what a session's statements are lowered by
+# (docs/design/postgres.md, section 11's unit 9).
+amphora-pg-analysis = { path = "../pg-analysis" }
+amphora-pg-catalog.workspace = true
+amphora-pg-parser = { path = "../pg-parser" }
 anyhow = "1"
 thiserror.workspace = true
 tracing = "0.1"
