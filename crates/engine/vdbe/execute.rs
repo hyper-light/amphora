@@ -2913,6 +2913,7 @@ pub fn op_type_check(
             start_reg,
             count,
             check_generated,
+            check_null_keys,
             table_reference,
         },
         insn
@@ -2927,7 +2928,10 @@ pub fn op_type_check(
             assert!(offset < *count);
             let reg = &mut state.registers[*start_reg + offset];
             // INT PRIMARY KEY is not row_id_alias so we throw error if this col is NULL
-            if !col.is_rowid_alias() && col.primary_key() && matches!(reg.get_value(), Value::Null)
+            if *check_null_keys
+                && !col.is_rowid_alias()
+                && col.primary_key()
+                && matches!(reg.get_value(), Value::Null)
             {
                 bail_constraint_error!(
                     "NOT NULL constraint failed: {}.{} ({})",
