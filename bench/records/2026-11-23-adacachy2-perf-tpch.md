@@ -1530,3 +1530,16 @@ Times: F's runs 0 to 4, median 864 ms (809 to 1,006). S's warm runs 1 to 4, medi
    rowid / lineitem by index`.
 3. Five runs of q03 on one connection settle on it in the trace, answers identical; then merge.
 4. Apart: the hash join's price against its time, per operator; the seek weight's samples that hold page reads.
+
+## 6. Checks
+
+- r6 (a3f1c56d), the landing: section 1.
+- r53 (11bd3c7c): release build 149 s. The instruments read true in the real run: customer's seeks (147,665) are
+  orders' rows, and lineitem's (147,126) are customer's, in every statement of F. They have no test of their own.
+- r7 (090dabbd, this branch merged with main 6d76681c, which moved in `crates/engine`): `cargo clippy -p amphora-engine
+  --all-targets --locked -- -D warnings` clean (the log checks amphora-engine, 41 s); `cargo test -p amphora-engine
+  --lib --locked -- optimizer::join learned_costs` 69 of 69; in bench/, `cargo test --release --bin amphora-bench --
+  planner::tests` 3 of 3, the log compiling amphora-engine.
+- r62, the same checks queued on macOS, was lost in kiln's restart at about 02:18Z.
+- r29 (090dabbd), in bench/: `cargo clippy --release --bin amphora-bench -- -D warnings` gives 163 findings, the count
+  T17 recorded on main, none on the lines this lane changed (`planner/mod.rs` 573 to 577); the log checks amphora-engine.
