@@ -1306,14 +1306,14 @@ This holds whether or not anything copies the log back into the file while the r
 nothing doing so. The open reader holds a read mark at its snapshot's last frame. A checkpoint copies no frame past the
 oldest read mark held (`determine_max_safe_checkpoint_frame`, crates/engine/storage/wal.rs: a mark it can't take
 exclusively caps what it copies), so the file never holds a page newer than the reader's snapshot where the reader
-would read it from the file. A restart of the log takes every read mark exclusively first, and returns `Busy` while any
-is held (`begin_restart`, the same file), so it never pulls a reader's frames away. These are SQLite's rules for
-checkpoints under readers (sqlite.org/wal.html, "Checkpoint Starvation": a checkpoint stops at the oldest reader, and
-the log starts over only once no reader uses it). Today nothing checkpoints a replica's database at all
+would read it from the file. A restart of the log switches the writer to the log's free segment and waits for no read
+(store.md, decision 45): the open reader reads on in the segment it began on, which is reset only once no read counts
+on it, so a restart never pulls a reader's frames away. The copy's rule is SQLite's for checkpoints under readers
+(sqlite.org/wal.html, "Checkpoint Starvation": a checkpoint stops at the oldest reader). Today nothing checkpoints a replica's database at all
 (`wal_autocheckpoint = 0`, and no checkpointer runs there). That is a gap of its own, not this decision's (below).
 Falsified by: a local read whose statements see two states, part from before an image and part from it; a read begun
 after the install that sees any of the state before it; a checkpoint during an open read that changes what it sees,
-or a log restart that goes through while it is open. The test:
+or a log restart that takes away frames it reads. The test:
 `a_local_read_open_across_an_image_install_sees_one_side_whole` (T-T1.10.L4). A learner's read transaction is held open
 while the leader's image installs under it, and in a second leg a passive checkpoint and a log restart run on the
 learner's database during it.
