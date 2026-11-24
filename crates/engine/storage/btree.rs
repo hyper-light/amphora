@@ -629,6 +629,23 @@ enum CurrentTableLeafSeek {
     NotFoundAtEnd,
 }
 
+/// Amphora (lane T16): the cell holding `rowid` on a table leaf whose `cell_count` rowids run
+/// from `first` to `last` with none missing. A leaf's rowids are distinct and ascending, so when
+/// they span exactly `cell_count` values cell `i` holds `first + i`: an exact seek reads that one
+/// cell where halving the leaf reads about log2(`cell_count`) of them (q03's lineitem rows, the
+/// split_varint samples under leaf_search in bench/records/2026-11-23-adacachy2-perf-tpch.md).
+/// None when the leaf has a gap or `rowid` is outside `first..=last`.
+fn dense_leaf_cell(first: i64, last: i64, cell_count: usize, rowid: i64) -> Option<isize> {
+    if rowid < first || rowid > last {
+        return None;
+    }
+    let span = u64::try_from(last.checked_sub(first)?).ok()?;
+    if span != u64::try_from(cell_count.checked_sub(1)?).ok()? {
+        return None;
+    }
+    isize::try_from(rowid.checked_sub(first)?).ok()
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct LeafPageBinarySearchState {
     min_cell_idx: isize,
@@ -2917,7 +2934,7 @@ impl BTreeCursor {
             return Ok(CurrentTableLeafSeek::SearchFromRoot);
         }
 
-        let (seek, cell_count) = {
+        let (seek, cell_count, dense_cell) = {
             let page = self.stack.top_ref();
             turso_debug_assert!(page.is_loaded(), "the current table leaf must be loaded");
             let contents = page.get_contents();
@@ -2929,7 +2946,7 @@ impl BTreeCursor {
                 return Ok(CurrentTableLeafSeek::SearchFromRoot);
             }
             let last_rowid = contents.cell_table_leaf_read_rowid(cell_count - 1)?;
-            let seek = if rowid > last_rowid {
+            if rowid > last_rowid {
                 if self.ancestor_pages_have_more_children() {
                     return Ok(CurrentTableLeafSeek::SearchFromRoot);
                 }
@@ -2939,18 +2956,26 @@ impl BTreeCursor {
                         .is_ok_and(|cell_rowid| cell_rowid < rowid)),
                     "a rowid past the last cell must be past every cell"
                 );
-                CurrentTableLeafSeek::NotFoundAtEnd
-            } else if rowid >= contents.cell_table_leaf_read_rowid(0)? {
-                CurrentTableLeafSeek::SearchCurrentLeaf
+                (CurrentTableLeafSeek::NotFoundAtEnd, cell_count, None)
             } else {
-                return Ok(CurrentTableLeafSeek::SearchFromRoot);
-            };
-            (seek, cell_count)
+                let first_rowid = contents.cell_table_leaf_read_rowid(0)?;
+                if rowid < first_rowid {
+                    return Ok(CurrentTableLeafSeek::SearchFromRoot);
+                }
+                let dense_cell = dense_leaf_cell(first_rowid, last_rowid, cell_count, rowid);
+                (CurrentTableLeafSeek::SearchCurrentLeaf, cell_count, dense_cell)
+            }
         };
 
         match seek {
             CurrentTableLeafSeek::SearchCurrentLeaf => {
                 self.start_table_leaf_search(cell_count, seek_op);
+                if let (Some(cell), CursorSeekState::LeafPageBinarySearch { state }) =
+                    (dense_cell, &mut self.seek_state)
+                {
+                    state.min_cell_idx = cell;
+                    state.max_cell_idx = cell;
+                }
                 Ok(CurrentTableLeafSeek::SearchCurrentLeaf)
             }
             CurrentTableLeafSeek::NotFoundAtEnd => {
@@ -12121,6 +12146,86 @@ mod tests {
         assert!(!cursor.has_record);
         assert!(matches!(cursor.seek_state, CursorSeekState::Start));
         assert_eq!(cursor.stack.top_ref().get().id(), rightmost_page);
+    }
+
+    /// Lane T16 (CP-T1.8): seek every rowid in turn, as a deferred seek does row after row. On a
+    /// leaf whose rowids have no gap the search starts on the one cell that holds the rowid; on
+    /// the leaf with a gap it halves the whole leaf; every rowid is found either way, and the
+    /// missing one is not.
+    #[test]
+    fn t16_an_exact_seek_on_a_leaf_without_gaps_starts_on_its_cell() {
+        for gap in [None, Some(150)] {
+            let (pager, root_page, _, _) = empty_btree();
+            let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 1);
+            let registers = &[Register::Value(Value::Text(Text::new("x".repeat(128))))];
+            let record = ImmutableRecord::from_registers(registers, registers.len()).unwrap();
+            let rowids: Vec<i64> = (1..=800).filter(|rowid| Some(*rowid) != gap).collect();
+            for &rowid in &rowids {
+                run_until_done(
+                    || cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }),
+                    &pager,
+                )
+                .unwrap();
+                run_until_done(
+                    || cursor.insert(&BTreeKey::new_table_rowid(rowid, Some(&record))),
+                    &pager,
+                )
+                .unwrap();
+            }
+            let (mut narrowed, mut halved) = (0, 0);
+            for &rowid in &rowids {
+                cursor.seek_state = CursorSeekState::Start;
+                let fast = cursor
+                    .try_start_seek_on_current_table_leaf(rowid, SeekOp::GE { eq_only: true })
+                    .unwrap();
+                if matches!(fast, CurrentTableLeafSeek::SearchCurrentLeaf) {
+                    let contents = cursor.stack.top_ref().get_contents();
+                    let cells = contents.cell_count();
+                    let first = contents.cell_table_leaf_read_rowid(0).unwrap();
+                    let last = contents.cell_table_leaf_read_rowid(cells - 1).unwrap();
+                    let searched = match cursor.seek_state {
+                        CursorSeekState::LeafPageBinarySearch { state } => {
+                            (state.min_cell_idx, state.max_cell_idx)
+                        }
+                        _ => (-1, -1),
+                    };
+                    if last - first + 1 == cells as i64 {
+                        let cell = (rowid - first) as isize;
+                        assert_eq!(searched, (cell, cell));
+                        narrowed += 1;
+                    } else {
+                        assert_eq!(searched, (0, cells as isize - 1));
+                        halved += 1;
+                    }
+                    assert!(matches!(
+                        cursor.tablebtree_seek(rowid, SeekOp::GE { eq_only: true }).unwrap(),
+                        IOResult::Done(SeekResult::Found)
+                    ));
+                } else {
+                    cursor.seek_state = CursorSeekState::Start;
+                    let found = run_until_done(
+                        || cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }),
+                        &pager,
+                    )
+                    .unwrap();
+                    assert_eq!(found, SeekResult::Found);
+                }
+                assert_eq!(run_until_done(|| cursor.rowid(), &pager).unwrap(), Some(rowid));
+            }
+            assert!(narrowed > 0, "some seeks start on their cell");
+            if let Some(missing) = gap {
+                assert!(halved > 0, "the leaf with the gap is halved");
+                cursor.seek_state = CursorSeekState::Start;
+                let found = run_until_done(
+                    || cursor.seek(SeekKey::TableRowId(missing), SeekOp::GE { eq_only: true }),
+                    &pager,
+                )
+                .unwrap();
+                assert_eq!(found, SeekResult::NotFound);
+            } else {
+                assert_eq!(halved, 0, "no leaf has a gap");
+            }
+        }
     }
 
     #[test]
