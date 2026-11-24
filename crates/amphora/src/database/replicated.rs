@@ -1841,7 +1841,7 @@ impl ReplicaHandle {
             });
         }
         let admitted = control.admitted.load(Ordering::Acquire);
-        (admitted.saturating_add(bytes) > queued).then_some(Refusal::Full { limit: queued })
+        (admitted.saturating_add(bytes) > queued).then(|| Refusal::Full { limit: queued })
     }
 
     /// A place in the command queue for an input of `bytes`, a call's (`call`) or another's, or the
