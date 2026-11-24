@@ -502,6 +502,10 @@ impl Database {
                 "no complete checkpoint journal at or after the data file's header",
             ));
         };
+        // A previous process can leave a complete seal in the OS cache before its journal
+        // sync. Older recovery could even have written the matching data header in that state.
+        // Make the selected source durable before adopting it or changing the data file.
+        disk.sync(journal.pages.file)?;
         // A header written after its pages were flushed, naming this journal's checkpoint: the
         // checkpoint finished, its pages in the file. Any other is finished from the journal.
         let finished = header
@@ -1669,6 +1673,17 @@ mod tests {
     /// reopen, and a database that checkpoints and reopens after.
     #[test]
     fn audit_7_5_a_crash_at_each_step_of_a_checkpoint_recovers_every_commit() {
+        checkpoint_crash_sweep(false);
+    }
+
+    /// T-T1.3.1. A replacement process may see a complete checkpoint journal from the OS
+    /// cache. After it recovers the acknowledged rows, cut power and recover them again.
+    #[test]
+    fn a_checkpoint_adopted_after_process_restart_survives_power_loss() {
+        checkpoint_crash_sweep(true);
+    }
+
+    fn checkpoint_crash_sweep(restart_with_cache: bool) {
         fn workload(disk: &Arc<Simulated>) -> (Database, BTreeMap<Vec<u8>, Vec<u8>>) {
             let db = Database::open(disk.clone(), 2_000, 1, cmp).unwrap();
             let mut d = Descender::new();
@@ -1700,10 +1715,16 @@ mod tests {
                 disk.crash_after(crash);
                 let finished = db.checkpoint().is_ok();
                 drop(db);
-                disk.power_cut().unwrap();
-                let at =
-                    format!("crash after {crash} of {steps}, seed {seed}, finished {finished}");
+                if restart_with_cache {
+                    disk.restart_process();
+                } else {
+                    disk.power_cut().unwrap();
+                }
+                let at = format!("crash after {crash} of {steps}, seed {seed}, finished {finished}");
                 for reopen in 0..2 {
+                    if restart_with_cache && reopen == 1 {
+                        disk.power_cut().unwrap();
+                    }
                     let db = Database::open(disk.clone(), 2_000, 1, cmp)
                         .unwrap_or_else(|e| panic!("{at}, reopen {reopen}: {e}"));
                     assert_eq!(rows(&db), want, "{at}, reopen {reopen}");
