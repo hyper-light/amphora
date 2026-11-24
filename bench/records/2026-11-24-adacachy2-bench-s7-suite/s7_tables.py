@@ -213,7 +213,7 @@ def main():
         v = {"ahead": "ahead", "behind": "behind", "overlap": "overlap (no measured difference)"}[sep]
         w(f"| {op} | {c} | {mr(a['ops'])} | {mr(st['turso']['ops']) if st['turso'] and not st['turso'].get('unsupported') else '-'} | "
           f"{mr(st['sqlite']['ops']) if st['sqlite'] and not st['sqlite'].get('unsupported') else '-'} | {best_t} | {ratio_text(ratio)} | {v} | "
-          f"{mr(a['p99'])} | {mr(comp[best_t]['p99'])} | {a['nmin']}/{comp[best_t]['nmin']} |")
+          f"{mr(a['p99'])} | {mr(comp[best_t]['p99'])} | {a['nmin']}/{comp[best_t]['nmin']}{' [<1000]' if min(a['nmin'], comp[best_t]['nmin']) < MIN_SAMPLES else ''} |")
     # ---- counts
     w("")
     ahead = sum(1 for x in ratios if x[4] == "ahead")
@@ -247,7 +247,7 @@ def main():
     w("| rank | op | clients | Amphora/best | best competitor | Amphora ops/s (median, range) | best ops/s (median, range) | Amphora p50 / p99 ms | best p50 / p99 ms | range verdict | min samples |")
     w("|---|---|---|---|---|---|---|---|---|---|---|")
     for i, (ratio, op, c, t, sep, a, b) in enumerate(sorted(ratios, key=lambda x: x[0])[:10], 1):
-        w(f"| {i} | {op} | {c} | {ratio_text(ratio)} ({slower_text(ratio)}) | {t} | {mr(a['ops'])} | {mr(b['ops'])} | {m1(a['p50'])} / {m1(a['p99'])} | {m1(b['p50'])} / {m1(b['p99'])} | {sep} | {min(a['nmin'], b['nmin'])} |")
+        w(f"| {i} | {op} | {c} | {ratio_text(ratio)} ({slower_text(ratio)}) | {t} | {mr(a['ops'])} | {mr(b['ops'])} | {m1(a['p50'])} / {m1(a['p99'])} | {m1(b['p50'])} / {m1(b['p99'])} | {sep} | {min(a['nmin'], b['nmin'])}{' [<1000]' if min(a['nmin'], b['nmin']) < MIN_SAMPLES else ''} |")
     # ---- beside S4's table
     if s4_path and os.path.exists(s4_path):
         s4 = Cells()
