@@ -185,19 +185,20 @@ pub fn restore_within(
     memory: &Arc<Memory>,
     until: Instant,
 ) -> anyhow::Result<Restored> {
-    let restored = make(blobs, prefix, second, path, pace, memory, until);
-    if let Err(e) = &restored
-        && matches!(e.downcast_ref(), Some(Unrestorable::Short { .. }))
-    {
-        let [first, second] = log_paths(path);
-        for file in [path, &first, &second] {
-            match std::fs::remove_file(file) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
-                _ => {}
+    let refused = match make(blobs, prefix, second, path, pace, memory, until) {
+        Err(e) if matches!(e.downcast_ref(), Some(Unrestorable::Short { .. })) => e,
+        restored => return restored,
+    };
+    let [log_path, second_path] = log_paths(path);
+    for file in [path, &log_path, &second_path] {
+        match std::fs::remove_file(file) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(refused.context(format!("{} is left: {e}", file.display())));
             }
+            _ => {}
         }
     }
-    restored
+    Err(refused)
 }
 
 /// [`restore_within`]'s restore, its files left as it ends.
