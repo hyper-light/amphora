@@ -1,0 +1,18 @@
+CREATE TABLE t(k INT, v INT);
+CREATE TABLE q(k INT, v INT);
+CREATE TABLE f(k INT, v INT);
+CREATE TABLE log(k INT, v INT);
+INSERT INTO t VALUES (1, 10), (2, 20), (3, NULL);
+INSERT INTO q VALUES (2, 21), (2, 22), (3, 30), (NULL, 5);
+INSERT INTO f VALUES (1, 41), (4, 42);
+CREATE VIEW g AS SELECT k, v FROM q WHERE k > 1;
+SELECT (WITH d AS MATERIALIZED (SELECT a1.k AS k, a1.v AS v FROM (SELECT k, v FROM g WHERE v IS NOT NULL) AS a1 WHERE a1.k IS NOT NULL AND (SELECT min(a2.v) FROM g AS a2 WHERE a2.k IS NULL) IN (SELECT g.k FROM g)), g(k, v) AS (SELECT k, 101 FROM q WHERE k < 3 UNION SELECT r.k + 1, r.v FROM g AS r JOIN t AS s ON s.k = r.k WHERE r.k < 4) SELECT max(d.v) FROM d LEFT JOIN d AS a3 ON a3.k IN (SELECT a4.k FROM d AS a4 WHERE a4.k >= a4.k) WHERE a3.k = 0 AND 3 NOT IN (SELECT a5.k FROM d AS a5 WHERE (a5.k = a3.k OR d.k = a5.k)));
+SELECT (WITH d AS MATERIALIZED (SELECT a1.k AS k, a1.v AS v FROM g AS a1 WHERE (SELECT min(a2.v) FROM g AS a2) > 0), g(k, v) AS (SELECT k, 101 FROM q WHERE k < 3 UNION SELECT r.k + 1, r.v FROM g AS r WHERE r.k < 4) SELECT max(d.v) FROM d LEFT JOIN d AS a3 ON a3.k IN (SELECT a4.k FROM d AS a4) WHERE 3 NOT IN (SELECT a5.k FROM d AS a5 WHERE d.k = a5.k));
+SELECT (WITH d AS (SELECT a1.k AS k, a1.v AS v FROM g AS a1 WHERE (SELECT min(a2.v) FROM g AS a2) > 0), g(k, v) AS (SELECT k, 101 FROM q WHERE k < 3) SELECT max(d.v) FROM d LEFT JOIN d AS a3 ON a3.k IN (SELECT a4.k FROM d AS a4) WHERE 3 NOT IN (SELECT a5.k FROM d AS a5 WHERE d.k = a5.k));
+WITH d AS MATERIALIZED (SELECT a1.k AS k, a1.v AS v FROM g AS a1 WHERE (SELECT min(a2.v) FROM g AS a2) IN (SELECT g.k FROM g)), g(k, v) AS (SELECT k, 101 FROM q WHERE k < 3) SELECT max(d.v) FROM d LEFT JOIN d AS a3 ON a3.k IN (SELECT a4.k FROM d AS a4) WHERE a3.k = 0 AND 3 NOT IN (SELECT a5.k FROM d AS a5 WHERE (a5.k = a3.k OR d.k = a5.k));
+WITH d AS MATERIALIZED (SELECT a1.k AS k, a1.v AS v FROM g AS a1 WHERE (SELECT min(a2.v) FROM g AS a2) IN (SELECT g.k FROM g)), g(k, v) AS (SELECT k, 101 FROM q WHERE k < 3) SELECT max(d.v) FROM d WHERE d.k = 0 AND 3 NOT IN (SELECT a5.k FROM d AS a5 WHERE (a5.k = d.k));
+WITH d AS MATERIALIZED (SELECT a1.k AS k, a1.v AS v FROM g AS a1 WHERE (SELECT min(a2.v) FROM g AS a2) IN (SELECT g.k FROM g)), g(k, v) AS (SELECT k, 101 FROM q WHERE k < 3) SELECT max(d.v) FROM d LEFT JOIN d AS a3 ON a3.k IN (SELECT a4.k FROM d AS a4);
+WITH d AS (SELECT a1.k AS k, a1.v AS v FROM g AS a1 WHERE (SELECT min(a2.v) FROM g AS a2) IN (SELECT g.k FROM g)), g(k, v) AS (SELECT k, 101 FROM q WHERE k < 3) SELECT count(*) FROM d WHERE 3 NOT IN (SELECT a5.k FROM d AS a5 WHERE a5.k = d.k);
+WITH d AS (SELECT a1.k AS k, a1.v AS v FROM g AS a1 WHERE a1.k IN (SELECT g.k FROM g)), g(k, v) AS (SELECT k, 101 FROM q WHERE k < 3) SELECT count(*) FROM d WHERE 3 NOT IN (SELECT a5.k FROM d AS a5 WHERE a5.k = d.k);
+WITH g(k, v) AS (SELECT k, 101 FROM q WHERE k < 3), d AS (SELECT a1.k AS k, a1.v AS v FROM g AS a1 WHERE a1.k IN (SELECT g.k FROM g)) SELECT count(*) FROM d WHERE 3 NOT IN (SELECT a5.k FROM d AS a5 WHERE a5.k = d.k);
+WITH g(k, v) AS (SELECT k, 101 FROM q WHERE k < 3), d AS (SELECT a1.k AS k, a1.v AS v FROM g AS a1 WHERE a1.k IN (SELECT g.k FROM g)) SELECT count(*) FROM q WHERE q.k IN (SELECT a5.k FROM d AS a5 WHERE a5.k = q.k);
