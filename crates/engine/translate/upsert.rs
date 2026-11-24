@@ -1761,16 +1761,18 @@ pub(crate) fn rewrite_expr_to_registers(
     use ast::Expr;
     let table_name_norm = table_name.map(normalize_ident);
 
+    // Amphora: a column declared under one of the rowid's names is that column, and a table WITHOUT
+    // ROWID has no rowid to name.
+    let has_rowid = table.btree().is_none_or(|bt| bt.has_rowid);
+    let names_rowid =
+        |name: &str| has_rowid && ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(name));
+
     // Map a column name to a register within the row image at `base_start`.
     let col_reg_from_row_image = |name: &str| -> Option<usize> {
-        if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(name)) {
-            return Some(rowid_reg);
-        }
-        let (idx, c) = table.get_column_by_name(name)?;
-        if c.is_rowid_alias() {
-            Some(rowid_reg)
-        } else {
-            Some(base_start + layout.to_reg_offset(idx))
+        match table.get_column_by_name(name) {
+            Some((_, c)) if c.is_rowid_alias() => Some(rowid_reg),
+            Some((idx, _)) => Some(base_start + layout.to_reg_offset(idx)),
+            None => names_rowid(name).then_some(rowid_reg),
         }
     };
 
@@ -1796,9 +1798,7 @@ pub(crate) fn rewrite_expr_to_registers(
                     if allow_excluded && ns.eq_ignore_ascii_case("excluded") && !is_target_namespace
                     {
                         if let Some(ins) = insertion {
-                            if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&c)) {
-                                *expr = Expr::Register(ins.key_register());
-                            } else if let Some(cm) = ins.get_col_mapping_by_name(&c) {
+                            if let Some(cm) = ins.get_col_mapping_by_name(&c) {
                                 if cm.column.is_rowid_alias() {
                                     // Amphora: the alias's value is the key the row would take,
                                     // listed in the INSERT or not. Its own register, and the
@@ -1815,6 +1815,8 @@ pub(crate) fn rewrite_expr_to_registers(
                                 } else {
                                     *expr = Expr::Register(cm.register);
                                 }
+                            } else if names_rowid(&c) {
+                                *expr = Expr::Register(ins.key_register());
                             } else {
                                 bail_parse_error!("no such column in EXCLUDED: {}", c);
                             }

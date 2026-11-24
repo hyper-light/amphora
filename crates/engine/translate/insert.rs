@@ -2386,16 +2386,19 @@ fn init_source_emission<'a>(
                         columns
                             .iter()
                             .map(|col_name| {
+                                // Amphora: a column declared under one of the rowid's names is
+                                // that column, of its own affinity.
                                 let column_name = normalize_ident(col_name.as_str());
-                                if ROWID_STRS
-                                    .iter()
-                                    .any(|s| s.eq_ignore_ascii_case(&column_name))
-                                {
-                                    return Ok(Affinity::Integer.aff_mask());
-                                }
                                 table
                                     .get_column_by_name(&column_name)
-                                    .map(|(_, col)| col.affinity().aff_mask())
+                                    .map(|(_, col)| col.affinity())
+                                    .or_else(|| {
+                                        ROWID_STRS
+                                            .iter()
+                                            .any(|s| s.eq_ignore_ascii_case(&column_name))
+                                            .then_some(Affinity::Integer)
+                                    })
+                                    .map(|affinity| affinity.aff_mask())
                                     .ok_or_else(|| {
                                         crate::error::LimboError::ParseError(format!(
                                             "table {} has no column named {}",
