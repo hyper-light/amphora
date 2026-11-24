@@ -1641,6 +1641,11 @@ pub(crate) fn page_read_anchor(
     most_reads: usize,
     writable: bool,
 ) -> Option<(f64, f64)> {
+    // Calibration's own database times no page read: what it would keep stands for every database in
+    // memory the process opens.
+    if OPENING_SCAN.with(std::cell::Cell::get) {
+        return None;
+    }
     if !writable {
         return None;
     }
