@@ -2553,28 +2553,32 @@ SQLite knows `-wal` alone, and SQLite writes no page's checksum (decision 12): a
     `-wal` into the file and deletes it, though it refused page 1 of that very log: run, with 3 in the file and in the
     log's frames, the query answered 26 and `-wal` was gone. With the second segment closing that loses commits: Amphora
     then recovers `-wal2` alone, older than the file's pages. What stops it is a log header whose format SQLite doesn't
-    know (`wal.c` `walIndexRecover`: SQLITE_CANTOPEN, "unable to open database file (14)"; SQLite's wal2 has one for the
-    same reason): it then touches nothing but a `-shm` of its own. Amphora's logs of records have their own (decisions 16
-    and 37). A generation of pages written beside the other segment's file says `PAGES_BESIDE_FORMAT`; one that is the
-    whole log (a new database's, or the first after a TRUNCATE) keeps 3007000, and folding it loses nothing.
+    know (`wal.c` `walIndexRecover`: SQLITE_CANTOPEN, "unable to open database file (14)"; SQLite's wal2 writes
+    `WAL_VERSION2`, 3021000, for its own): it then touches nothing but a `-shm` of its own. Amphora's logs of records have
+    such a format already (decisions 16 and 37). A generation of pages written beside the other segment's file says
+    `PAGES_BESIDE_FORMAT`; one that is the whole log (a new database's, or the first after a TRUNCATE) keeps 3007000, and
+    folding it loses nothing.
   The first guard holds where `-wal` is empty, torn or not there, the second where it holds frames.
 - *A second segment is written only once the file itself refuses SQLite.* A switch waits for the mark's copy in the synced
   file (`SharedLog::file_is_marked`), so a database carried off without `-wal2`, without `-wal` or without both is
   refused too. A new database has it from its first page on; for one opened with 2 it is the first pass after the first
   commit. Until then the log stays its one segment: the writer appends on, a RESTART is Busy, and a TRUNCATE restarts the
-  segment in place, no read in it, as SQLite's does.
+  segment in place, no read in it, as SQLite's does. An open takes the mark from the file's page 1, and from the log's
+  where the log holds frames: a clean close cut short leaves a page 1 without it there, which the next copy would put in
+  the file beside a second segment.
 - *A cleanly closed Amphora database is SQLite's to read, and never to write.* The last connection's close
   (`Connection::close`, `Pager::checkpoint_shutdown`) folds both segments into the file, syncs it, cuts both to nothing and
   syncs them. Then a commit of page 1 alone says read version 2, and a checkpoint folds it. Its write version stays 3 where
   its pages reserve bytes (checksums, codecs): a file "where the read version is 1 or 2 but the write version is greater
   than 2 [...] must be treated as read-only" (the same section), and sqlite3 says "attempt to write a readonly
-  database". A file with no reserved bytes, as SQLite makes one, gets 2 and 2. Through the log and not in place: page 1 has a checksum, and a page torn in the file would
-  fail it with no log to restore it from; `-wal` can hold that commit because both files are empty and synced before it
-  (`Wal::may_unmark`). A crash before it is durable leaves 3 (refused); after, the log's frame or the file says 2 and every
-  commit is in the file. A commit of page 1 without the mark puts the database back where an opened one is (`Mark::
-  Absent`), so a connection that comes meanwhile marks it again before any switch. A close that can't fold (Busy three
-  times) leaves 3. `Db` has no clean close of its own: its files stay marked as the process ends, and `Db::close` is one.
-  A restore ends in one, so a restored file is SQLite's to read, and VACUUM INTO's file says 2 and 2.
+  database". A file with no reserved bytes, as SQLite makes one, gets 2 and 2. Through the log and not in place: page 1
+  has a checksum, and a page torn in the file would fail it with no log to restore it from; `-wal` can hold that commit
+  because both files are empty and synced before it (`Wal::may_unmark`). A crash before it is durable leaves 3 (refused);
+  after, the log's frame or the file says 2 and every commit is in the file. A commit of page 1 without the mark puts the
+  database back where an opened one is (`Mark::Absent`), so a connection that comes meanwhile marks it again before any
+  switch. A close that can't fold (Busy three times) leaves 3. `Db` makes no clean close as it is dropped: its files stay
+  marked as the process ends. `Db::close` is one, and a restore ends in it, so SQLite reads a restored file too. VACUUM
+  INTO's file says 2 and 2, as before.
 
 **Crash recovery across a switch.** Recovery reads both segments' headers. A segment whose header checksum fails is
 empty. Of two valid segments, the one whose checkpoint sequence is one past the other's is current and the other
