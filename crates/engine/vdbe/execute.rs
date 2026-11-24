@@ -6962,9 +6962,7 @@ fn seek_trace_end(
     };
     let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     if state.seek_times.len() <= cursor_id {
-        state
-            .seek_times
-            .resize(cursor_id.saturating_add(1), (0, 0));
+        state.seek_times.resize(cursor_id.saturating_add(1), (0, 0));
     }
     if let Some((seeks, total)) = state.seek_times.get_mut(cursor_id) {
         if matches!(result, Ok(InsnFunctionStepResult::Step)) {
