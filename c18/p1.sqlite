@@ -1,0 +1,104 @@
+--- WITH d AS (SELECT k FROM nosuch) SELECT t.k FROM t WHERE EXISTS (WITH x AS (SELECT k FROM d) SELECT 1)
+2:1;2
+--- WITH d AS (SELECT k FROM nosuch) SELECT t.k FROM t WHERE t.k IN (WITH x AS (SELECT k FROM d), y AS (SELECT 1 AS k) SELECT k FROM y)
+1:1
+--- WITH d AS (SELECT k FROM nosuch) SELECT * FROM (WITH x AS (SELECT k FROM d) SELECT 5 AS k)
+1:5
+--- WITH d AS (SELECT k FROM nosuch), y AS (WITH x AS (SELECT k FROM d) SELECT 7 AS k) SELECT k FROM y
+1:7
+--- WITH d AS (SELECT k FROM nosuch) SELECT t.k FROM t JOIN q ON t.k = q.k AND EXISTS (WITH x AS (SELECT k FROM d) SELECT 1)
+2:2;2
+--- WITH d AS (SELECT k FROM nosuch) SELECT t.k FROM t WHERE t.k IN (WITH d AS (SELECT 1 AS k) SELECT k FROM d)
+1:1
+--- WITH d AS (SELECT k FROM nosuch) SELECT * FROM (WITH d AS (SELECT 1 AS k) SELECT k FROM d)
+1:1
+--- WITH d AS (SELECT k FROM nosuch), y AS (WITH d AS (SELECT 1 AS k) SELECT k FROM d) SELECT k FROM y
+1:1
+--- WITH a AS (WITH b AS (SELECT 1 AS k) SELECT k FROM b), b AS (SELECT k FROM a) SELECT * FROM b
+1:1
+--- WITH a AS (WITH b AS (SELECT 1 AS k), z AS (SELECT k FROM b) SELECT k FROM z), b AS (SELECT k FROM a) SELECT * FROM b
+1:1
+--- WITH a AS (WITH z AS (SELECT k FROM b) SELECT 1 AS k), b AS (SELECT k FROM a) SELECT * FROM b
+1:1
+--- WITH a AS (WITH z AS (SELECT k FROM b) SELECT k FROM z), b AS (SELECT k FROM a) SELECT * FROM b
+ERROR circular reference: b
+--- WITH c AS (SELECT k FROM q) SELECT t.k, (WITH a AS (SELECT k FROM c), b AS (SELECT k FROM c) SELECT count(*) FROM a, b) FROM t
+2:1,9;2,9
+--- WITH c AS (SELECT k FROM q) SELECT * FROM (WITH a AS (SELECT k FROM c), b AS (SELECT k FROM c) SELECT a.k AS ak, b.k AS bk FROM a, b)
+9:2,2;2,2;2,2;2,2;2,3;2,3;3,2;3,2;3,3
+--- WITH RECURSIVE c(k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM c WHERE k < 3) SELECT (WITH a AS (SELECT k FROM c), b AS (SELECT k FROM c) SELECT count(*) FROM a, b)
+1:9
+--- WITH c AS (SELECT k FROM q), x AS (WITH a AS (SELECT k FROM c), b AS (SELECT k FROM c) SELECT a.k AS ak, b.k AS bk FROM a, b) SELECT * FROM x
+9:2,2;2,2;2,2;2,2;2,3;2,3;3,2;3,2;3,3
+--- WITH c AS (SELECT k FROM q ORDER BY k LIMIT 2), x AS (WITH a AS (SELECT k FROM c WHERE k > 1), b AS (SELECT k FROM c WHERE k < 3) SELECT a.k AS ak, b.k AS bk FROM a LEFT JOIN b ON a.k = b.k) SELECT * FROM x
+4:2,2;2,2;2,2;2,2
+--- WITH c AS (SELECT k FROM q) SELECT t.k FROM t WHERE EXISTS (WITH a AS (SELECT k FROM c), b AS (SELECT k FROM c) SELECT 1 FROM a JOIN b ON a.k = b.k WHERE a.k = t.k)
+1:2
+--- WITH c AS (SELECT k FROM q) SELECT * FROM (WITH a AS (SELECT k FROM c), b AS (SELECT k FROM c) SELECT a.k AS ak, (SELECT count(*) FROM b) AS n FROM a)
+3:2,3;2,3;3,3
+--- WITH c AS (SELECT k FROM q) SELECT * FROM (WITH a AS (SELECT k FROM c), b AS (SELECT k FROM c) SELECT a.k AS ak FROM a WHERE a.k IN (SELECT k FROM b WHERE b.k = a.k))
+3:2;2;3
+--- WITH RECURSIVE c(k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM c WHERE k < 3) SELECT * FROM (WITH a AS (SELECT k FROM c), b AS (SELECT k FROM c) SELECT a.k AS ak, (SELECT count(*) FROM b WHERE b.k <= a.k) AS n FROM a)
+3:1,1;2,2;3,3
+--- WITH t AS (SELECT 99 AS k) SELECT k FROM vt
+2:1;2
+--- WITH t AS (SELECT 99 AS k) SELECT x.k FROM t AS x WHERE EXISTS (SELECT 1 FROM vt WHERE vt.k = 1)
+1:99
+--- WITH t AS (SELECT 99 AS k) SELECT * FROM (SELECT k FROM vt)
+2:1;2
+--- WITH t AS (SELECT 99 AS k) SELECT x.k, vt.k FROM t AS x, vt
+2:99,1;99,2
+--- WITH d AS (SELECT 77 AS k) SELECT vw.k, d.k FROM vw, d
+2:1,77;2,77
+--- WITH d AS (SELECT 77 AS k), t AS (SELECT 78 AS k) SELECT vw.k, d.k, t.k FROM vw, d, t
+2:1,77,78;2,77,78
+--- WITH q AS (SELECT 1 AS k) SELECT vx.k FROM vx, q
+1:2
+--- WITH q AS (SELECT 1 AS k) SELECT k FROM t WHERE k IN (SELECT k FROM vx)
+1:2
+--- WITH q AS (SELECT 1 AS k) SELECT k FROM t WHERE k IN (SELECT k FROM vx) AND k IN (SELECT k + 1 FROM q)
+1:2
+--- WITH c(a, b) AS (SELECT k FROM t) SELECT 1
+1:1
+--- WITH c(a, b) AS (SELECT k FROM t) SELECT * FROM c
+ERROR table c has 1 values for 2 columns
+--- WITH c(a, b) AS (SELECT k FROM t) SELECT 1 WHERE EXISTS (SELECT 1 FROM c)
+ERROR table c has 1 values for 2 columns
+--- WITH c AS (SELECT k FROM c) SELECT * FROM c
+ERROR circular reference: c
+--- WITH t AS (SELECT k FROM t) SELECT * FROM t
+ERROR circular reference: t
+--- WITH c AS (SELECT k FROM d), d AS (SELECT k FROM c) SELECT * FROM c
+ERROR circular reference: c
+--- WITH c AS (SELECT k FROM d), d AS (SELECT k FROM c) SELECT 1
+1:1
+--- WITH c AS (SELECT 1 AS k), c AS (SELECT 2 AS k) SELECT * FROM c
+ERROR duplicate WITH table name: c
+--- SELECT * FROM (WITH c AS (SELECT k FROM nosuch) SELECT * FROM c)
+ERROR no such table: nosuch
+--- WITH c AS (SELECT nosuch FROM t) SELECT * FROM c
+ERROR no such column: nosuch
+--- WITH c AS (SELECT nosuch FROM t) SELECT 1
+1:1
+--- WITH d AS (SELECT k FROM q) SELECT d.k FROM d WHERE EXISTS (WITH d AS (SELECT k FROM t) SELECT 1 FROM d WHERE d.k IN (SELECT e.k FROM d AS e))
+3:2;2;3
+--- WITH d AS (SELECT k FROM q), c AS (SELECT k FROM d) SELECT (WITH d AS (SELECT 8 AS k) SELECT max(c.k) FROM c, d)
+1:3
+--- WITH d AS (SELECT k FROM q), c AS (SELECT k FROM d) SELECT (WITH d AS (SELECT 8 AS k), e AS (SELECT k FROM d UNION ALL SELECT k FROM c) SELECT group_concat(k) FROM e)
+1:8,2,2,3
+--- WITH d AS (SELECT k FROM q), c AS (SELECT k FROM d) SELECT * FROM (WITH d AS (SELECT 8 AS k), e AS (SELECT k FROM d UNION ALL SELECT k FROM c) SELECT * FROM e)
+4:2;2;3;8
+--- WITH d AS (SELECT k FROM q) SELECT t.k FROM t WHERE (WITH d AS (SELECT k + 5 AS k FROM d) SELECT max(k) FROM d) > t.k
+ERROR circular reference: d
+--- WITH d AS (SELECT k FROM q), e AS (WITH d AS (SELECT 1 AS k) SELECT d.k FROM d) SELECT e.k, d.k FROM e, d
+3:1,2;1,2;1,3
+--- WITH d AS (SELECT k FROM q) SELECT * FROM (SELECT * FROM (WITH e AS (SELECT k FROM d) SELECT * FROM e UNION ALL SELECT * FROM d))
+6:2;2;2;2;3;3
+--- WITH d AS (SELECT k FROM q) SELECT t.k FROM t WHERE t.k IN (SELECT x.k FROM (WITH d AS (SELECT 1 AS k) SELECT k FROM d) AS x UNION ALL SELECT k FROM d)
+2:1;2
+--- WITH d AS (SELECT k FROM q) SELECT x.k, (SELECT count(*) FROM d WHERE d.k = x.k) FROM (WITH d AS (SELECT 2 AS k) SELECT k FROM d) AS x
+1:2,2
+--- WITH d AS (SELECT k FROM q) SELECT x.k, y.k FROM (WITH d AS (SELECT 2 AS k) SELECT k FROM d) AS x, (SELECT k FROM d) AS y
+3:2,2;2,2;2,3
+--- WITH d AS (SELECT k FROM q) SELECT x.k, y.k FROM (SELECT k FROM d) AS y, (WITH d AS (SELECT 2 AS k) SELECT k FROM d) AS x
+3:2,2;2,2;2,3
