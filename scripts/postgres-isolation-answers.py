@@ -9,7 +9,7 @@
                      next step runs once pg_stat_activity shows it waiting on a lock
     s2<              session s2's outstanding statement's answer is read
 
-and writes `@ session sql` (`@ s2> sql` and `@ s2<` for the last two), then `<type> <hex body>` a
+and writes `@ session sql` (`@ s2> sql` and `@ s2< -` for the last two), then `<type> <hex body>` a
 message the server answered. It asks for no password. The rules of `s1` and `s2` are held by the
 sessions that the steps open in a database made for the run.
 
@@ -99,7 +99,7 @@ for line in open(path, encoding="utf-8").read().splitlines():
             time.sleep(0.01)
         messages = []
     elif rest == "<":
-        print("@ %s<" % name)
+        print("@ %s< -" % name)
         messages = client.answer()
     else:
         raise SystemExit("not a step: %s" % line)

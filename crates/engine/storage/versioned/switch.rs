@@ -472,6 +472,18 @@ impl Switch {
         }
     }
 
+    /// The connection's open transaction is validated by the database's validation from here on
+    /// ([`super::version::Txn::validate_fully`]).
+    pub(crate) fn validate_fully(&self) {
+        let Some(shared) = self.txn.lock().clone() else {
+            return;
+        };
+        let mut guard = shared.lock();
+        if let Some(txn) = guard.as_mut() {
+            txn.validate_fully();
+        }
+    }
+
     /// Registers `wake` for transaction `holder`'s end; `false` when it has ended
     /// ([`super::version::Clock::wait_for`]).
     pub(crate) fn wait_for(&self, holder: u64, wake: &std::task::Waker) -> Result<bool> {

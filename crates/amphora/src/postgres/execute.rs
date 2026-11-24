@@ -357,7 +357,7 @@ impl Executor {
                 now: Some(now),
             };
             if let Some(utility) = utility(tree, id, &session).map_err(|e| refusal(e, sql))? {
-                self.conn.execute(&utility.sql).map_err(engine)?;
+                self.change_schema(&utility.sql)?;
                 return Ok(complete(out, utility.tag)?);
             }
             let query = analyze(tree, id, &session, &[]).map_err(|e| refusal(e, sql))?;
@@ -371,6 +371,18 @@ impl Executor {
         };
         let (command, lowered) = lowered;
         self.run(command, &lowered, out)
+    }
+
+    /// Runs a statement that changes the catalog, whose transaction is validated in full from here on
+    /// whatever its level (19 takes a lock that keeps the other sessions out of the table): an index it
+    /// builds beside a commit that adds rows to the table would lack them, and is refused `40001`.
+    fn change_schema(&self, sql: &str) -> Result<(), PgError> {
+        // A transaction the statement begins, and one already open.
+        self.conn.set_isolation(Level::Serializable);
+        self.conn.validate_fully();
+        let result = self.conn.execute(sql).map_err(engine);
+        self.conn.set_isolation(self.level);
+        result
     }
 
     /// Runs a lowered statement and writes its answer.

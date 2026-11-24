@@ -349,13 +349,15 @@ pub struct Rules {
 /// serializable against each other on the same commit path, and keeps one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Validation {
-    /// Nothing: snapshot isolation, which allows write skew. The Elle checks' control, set only
-    /// by [`Versioned::with_validation`], which the Elle checks, this file's tests and the
-    /// validations' bench (`amphora-bench --cc`) call on a storage of their own: SQL's storage
-    /// (`durable::Database`, through the switch) is never opened with it. So its gap stays a
-    /// control's (lane g7s2-18, `AC-NS.2.1`): a `CREATE INDEX` that read its table while a writer
-    /// of the table committed beside it is not refused here, and its index lacks that writer's
-    /// rows; every other validation refuses it.
+    /// Nothing: snapshot isolation, which allows write skew. The Elle checks' control, set by
+    /// [`Versioned::with_validation`], which the Elle checks, this file's tests and the validations'
+    /// bench (`amphora-bench --cc`) call on a storage of their own; and a transaction's own, from a
+    /// session's level (`Rules`, docs/design/postgres.md section 8). SQL's storage
+    /// (`durable::Database`, through the switch) is never opened with it. Its gap (lane g7s2-18,
+    /// `AC-NS.2.1`): a `CREATE INDEX` that read its table while a writer of the table committed
+    /// beside it is not refused here, and its index lacks that writer's rows; every other
+    /// validation refuses it, and a session's transaction that changes the catalog takes the
+    /// database's validation ([`Txn::validate_fully`]).
     Snapshot,
     /// Precision locking as HyPer adapts it (Neumann, Mühlbauer, Kemper, SIGMOD 2015): a
     /// transaction that wrote checks the rows and spans it read against the rows written by the
@@ -545,6 +547,13 @@ impl Txn {
     /// Its isolation, chosen before it changes or reads a row.
     pub fn isolate(&mut self, rules: Rules) {
         self.rules = rules;
+    }
+
+    /// Its commit is validated by the database's validation from here on, what it reads kept for it:
+    /// a transaction that changes the catalog, so that an index it builds beside a commit that adds
+    /// rows is refused ([`Validation::Snapshot`] alone would let it stand).
+    pub fn validate_fully(&mut self) {
+        self.rules.validation = None;
     }
 
     /// Why it can't change a row another's newest version is of: `holder` the open transaction's id,

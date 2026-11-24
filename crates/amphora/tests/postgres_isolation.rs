@@ -91,7 +91,7 @@ fn sessions(dir: &tempfile::TempDir) -> BTreeMap<String, Session> {
 fn t_pg_14_1_two_sessions_interleave_as_a_19_server_does() {
     let dir = tempfile::tempdir().unwrap();
     let mut sessions = sessions(&dir);
-    let answers = answers(include_str!("isolation/answers.txt"));
+    let answers = tpcb::answers(include_str!("isolation/answers.txt"));
     let steps: Vec<&str> = include_str!("isolation/steps.txt")
         .lines()
         .filter(|line| !line.starts_with('#') && !line.is_empty())
@@ -99,7 +99,14 @@ fn t_pg_14_1_two_sessions_interleave_as_a_19_server_does() {
     assert_eq!(answers.len(), steps.len());
     let mut waited = 0;
     let mut compared = 0;
-    for ((name, kind, sql, theirs), line) in answers.iter().zip(&steps) {
+    for ((step, sql, theirs), line) in answers.iter().zip(&steps) {
+        let (name, kind) = if let Some(name) = step.strip_suffix('>') {
+            (name, Kind::Waits)
+        } else if let Some(name) = step.strip_suffix('<') {
+            (name, Kind::Ends)
+        } else {
+            (step.as_str(), Kind::Runs)
+        };
         let expected = match kind {
             Kind::Runs => format!("{name}|{sql}"),
             Kind::Waits => format!("{name}>{sql}"),
@@ -164,41 +171,37 @@ enum Kind {
     Ends,
 }
 
-type Step = (String, Kind, String, Vec<(u8, Vec<u8>)>);
-
-/// `@ s1 sql`, `@ s2> sql` or `@ s2<`, then each message's type and hex body
-/// (scripts/postgres-isolation-answers.py).
-fn answers(text: &str) -> Vec<Step> {
-    let mut steps: Vec<Step> = Vec::new();
-    for line in text.lines() {
-        if let Some(step) = line.strip_prefix("@ ") {
-            let (name, rest) = step.split_at(2);
-            let kind = match rest.chars().next() {
-                Some('>') => Kind::Waits,
-                Some('<') => Kind::Ends,
-                _ => Kind::Runs,
-            };
-            let sql = match kind {
-                Kind::Runs => &rest[1..],
-                Kind::Waits => &rest[2..],
-                Kind::Ends => "",
-            };
-            steps.push((name.to_owned(), kind, sql.to_owned(), Vec::new()));
-            continue;
-        }
-        let (kind, hex) = line.split_once(' ').unwrap_or((line, ""));
-        let body = hex
-            .as_bytes()
-            .chunks(2)
-            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
-            .collect();
-        steps
-            .last_mut()
-            .unwrap()
-            .3
-            .push((kind.bytes().next().unwrap(), body));
+/// T-PG.14.1: a transaction that changes the catalog is validated in full at any level: one that
+/// builds an index beside a commit that adds a row to its table is refused `40001` (the index would
+/// lack the row), where a READ COMMITTED transaction that changes rows only is not.
+#[test]
+fn t_pg_14_1_an_index_built_beside_a_commit_is_refused_at_any_level() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut sessions = sessions(&dir);
+    let mut run = |name: &str, sql: &str| {
+        let mut out = Vec::new();
+        let session = sessions.get_mut(name).unwrap();
+        let flow = session.executor.simple_query(sql, &mut out).unwrap();
+        assert_eq!(flow, Flow::Done, "{sql}");
+        out
+    };
+    for (name, sql) in [
+        ("s1", "create table t(id int not null, v int)"),
+        ("s1", "insert into t(id, v) values (1, 10)"),
+        ("s1", "begin"),
+        ("s1", "alter table t add primary key (id)"),
+        ("s2", "insert into t(id, v) values (2, 20)"),
+    ] {
+        let out = run(name, sql);
+        assert_eq!(out[0], b'C', "{name}|{sql}: {out:?}");
     }
-    steps
+    let out = run("s1", "commit");
+    assert!(
+        out.starts_with(b"E") && out.windows(5).any(|w| w == b"40001"),
+        "{out:?}"
+    );
+    let out = run("s2", "select v from t where id = 2");
+    assert!(out.windows(2).any(|w| w == b"20"), "{out:?}");
 }
 
 /// T-PG.14.2: two sessions that wait for each other are not left to wait: the one whose wait would

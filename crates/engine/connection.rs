@@ -6027,6 +6027,15 @@ impl Connection {
         }
     }
 
+    /// Amphora (docs/design/postgres.md section 8): the connection's open transaction is validated by
+    /// the database's validation from here on, and its reads kept for it, as one that changes the
+    /// catalog must be.
+    pub fn validate_fully(&self) {
+        if let Some(switch) = &self.versioned {
+            switch.validate_fully();
+        }
+    }
+
     /// Amphora (docs/design/postgres.md section 8): registers `wake` for the end of the open
     /// transaction `holder` of another session, one this connection's statement was refused for
     /// (`RowTaken`). `false`, registering nothing, when it has ended: the statement can run again. A
