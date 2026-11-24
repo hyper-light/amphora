@@ -2201,12 +2201,13 @@ impl TableReferences {
     /// "CTE definition only". This prevents it from being used for column
     /// resolution while still allowing CTE definition lookup in subquery FROM
     /// clauses. Called when a CTE is consumed by a FROM clause, since column
-    /// resolution is then handled by the joined_table entry instead.
+    /// resolution is then handled by the joined_table entry instead. A table of an outer FROM
+    /// clause that has the CTE's name, which holds no syntax, keeps its columns in reach.
     pub fn mark_outer_query_ref_cte_definition_only(&mut self, identifier: &str) {
         if let Some(outer_ref) = self
             .outer_query_refs
             .iter_mut()
-            .find(|t| t.identifier == identifier)
+            .find(|t| t.identifier == identifier && t.cte_select.is_some())
         {
             outer_ref.cte_definition_only = true;
         }
