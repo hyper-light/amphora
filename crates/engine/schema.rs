@@ -4878,7 +4878,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
     let mut has_autoincrement = false;
     let mut primary_key_columns = vec![];
     let mut foreign_keys = vec![];
+    // A row meets its columns' checks first, then the table's, as they are written.
     let mut check_constraints = vec![];
+    let mut table_check_constraints = vec![];
     let mut cols: Vec<Column> = vec![];
     let is_strict: bool;
     let columnar: bool;
@@ -5051,7 +5053,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     foreign_keys.try_push(Arc::new(fk))?;
                     table_fk_order += 1;
                 } else if let ast::TableConstraint::Check { expr, source } = &c.constraint {
-                    check_constraints.try_push(CheckConstraint::new(
+                    table_check_constraints.try_push(CheckConstraint::new(
                         c.name.as_ref(),
                         expr,
                         source.as_deref(),
@@ -5410,6 +5412,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         }
     }
 
+    check_constraints.try_extend(table_check_constraints)?;
     let mut table = BTreeTable {
         root_page,
         name: table_name,

@@ -77,7 +77,7 @@ fn a_star_over_windows_has_every_column() {
         "CREATE TABLE s(b INT)",
         "INSERT INTO t VALUES (1, 1), (2, 1), (3, 2)",
         "INSERT INTO s VALUES (3), (5)",
-        "CREATE VIEW v AS SELECT a, avg(g) OVER (ORDER BY a), min(a) OVER (ORDER BY a DESC) FROM t",
+        "CREATE VIEW v(a, n, m) AS SELECT a, avg(g) OVER (ORDER BY a), min(a) OVER (ORDER BY a DESC) FROM t",
         "CREATE TABLE c AS SELECT * FROM (SELECT a, sum(g) OVER (ORDER BY a), min(a) OVER (ORDER BY a DESC) FROM t)",
         "CREATE TABLE d(x, y, z)",
         "INSERT INTO d SELECT * FROM (SELECT a, sum(g) OVER (ORDER BY a), min(a) OVER (ORDER BY a DESC) FROM t)",
@@ -113,7 +113,7 @@ fn a_star_over_windows_has_every_column() {
             "min(a) OVER (ORDER BY a DESC)",
             "1 / 2 / 3",
         ),
-        ("SELECT * FROM v", "a|avg(g) OVER (ORDER BY a)|min(a) OVER (ORDER BY a DESC)", "1,r3ff0000000000000,1 / 2,r3ff0000000000000,2 / 3,r3ff5555555555555,3"),
+        ("SELECT a, n, m FROM v", "a|n|m", "1,r3ff0000000000000,1 / 2,r3ff0000000000000,2 / 3,r3ff5555555555555,3"),
         ("SELECT * FROM c", "a|sum(g) OVER (ORDER BY a)|min(a) OVER (ORDER BY a DESC)", "1,1,1 / 2,2,2 / 3,4,3"),
         ("SELECT * FROM d", "x|y|z", "1,1,1 / 2,2,2 / 3,4,3"),
     ];

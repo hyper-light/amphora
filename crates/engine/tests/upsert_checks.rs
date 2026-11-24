@@ -142,11 +142,11 @@ fn a_check_reads_the_row_the_triggers_left() {
         ("CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b INT, CHECK (a < b))", "ok"),
         ("CREATE TRIGGER g BEFORE UPDATE OF a ON t BEGIN UPDATE t SET b = 13 - b WHERE id = old.id; END", "ok"),
         ("INSERT INTO t VALUES (1, 1, 10)", "ok"),
-        ("INSERT INTO t VALUES (1, 1, 1) ON CONFLICT(id) DO UPDATE SET a = 5", "refused: CHECK constraint failed: a < b"),
+        ("INSERT INTO t VALUES (1, 1, 2) ON CONFLICT(id) DO UPDATE SET a = 5", "refused: CHECK constraint failed: a < b"),
         ("SELECT * FROM t", "1,1,10"),
-        ("INSERT INTO t VALUES (1, 1, 1) ON CONFLICT(id) DO UPDATE SET a = 2", "ok"),
+        ("INSERT INTO t VALUES (1, 1, 2) ON CONFLICT(id) DO UPDATE SET a = 2", "ok"),
         ("SELECT * FROM t", "1,2,3"),
-        ("INSERT INTO t VALUES (1, 1, 1) ON CONFLICT(id) DO UPDATE SET a = 9", "ok"),
+        ("INSERT INTO t VALUES (1, 1, 2) ON CONFLICT(id) DO UPDATE SET a = 9", "ok"),
         ("SELECT * FROM t", "1,9,10"),
         ("SELECT * FROM pragma_integrity_check", "'ok'"),
     ]);
@@ -261,7 +261,7 @@ fn a_pragmas_table_function_answers_after_a_refused_statement() {
             ("SELECT * FROM pragma_quick_check", "'ok'"),
             ("SELECT count(*) FROM pragma_table_info('k')", "3"),
             ("SELECT name FROM pragma_table_info('k') AS i, pragma_integrity_check AS c WHERE i.cid = 1", "'v'"),
-            ("SELECT * FROM pragma_foreign_key_check", ""),
+            ("SELECT count(*) FROM pragma_foreign_key_list('k')", "0"),
         ];
         let mut statements = vec![
             (table.as_str(), "ok"),

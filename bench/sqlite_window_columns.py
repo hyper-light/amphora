@@ -121,8 +121,9 @@ def question(rng):
         made.append(f"CREATE TABLE made({', '.join(f'm{i}' for i in range(n))})")
         made.append(f"INSERT INTO made SELECT * FROM {source}")
     if form == "named":
-        name = rng.choice([x for x in inner.names if x != "*"] or ["1"])
-        name = name.split(".")[-1] if name in ("t.a", "t.v", "s.h", "t.rowid") else name
+        # "rowid" reads a subquery's own rowid where it has one, whatever its columns are called
+        name = rng.choice([x for x in inner.names if x not in ("*", "t.rowid")] or ["1"])
+        name = name.split(".")[-1] if name in ("t.a", "t.v", "s.h") else name
         query = 'SELECT "' + name + f'" FROM {source}'
     ordered = False
     if form in ("from", "view", "cte", "qualified", "nested") and rng.random() < 0.4:

@@ -1273,56 +1273,6 @@ pub fn emit_upsert(
     } else {
         None
     };
-    if let Some(bt) = table.btree() {
-        if connection.foreign_keys_enabled() {
-            let rowid_new_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
-
-            // Child-side checks
-            if resolver.with_schema(upsert_database_id, |s| s.has_child_fks(bt.name.as_str())) {
-                emit_fk_child_update_counters(
-                    program,
-                    &bt,
-                    table.get_name(),
-                    ctx.cursor_id,
-                    new_start,
-                    rowid_new_reg,
-                    &directly_changed_cols,
-                    upsert_database_id,
-                    resolver,
-                    &layout,
-                )?;
-            }
-            let upsert_indices: Vec<_> = resolver.with_schema(upsert_database_id, |s| {
-                s.get_indices(table.get_name()).cloned().collect()
-            });
-            let affected_upsert_indices: Vec<_> = upsert_indices
-                .iter()
-                .filter_map(|idx| {
-                    upsert_index_is_affected(table, idx, &directly_changed_cols, rowid_changed)
-                        .map(|affected| affected.then_some(idx))
-                        .transpose()
-                })
-                .collect::<crate::Result<_>>()?;
-            if has_parent_fk_checks {
-                let _ = emit_fk_update_parent_actions(
-                    program,
-                    &bt,
-                    &affected_parent_fks,
-                    affected_upsert_indices.into_iter(),
-                    ctx.cursor_id,
-                    ctx.conflict_rowid_reg,
-                    new_start,
-                    new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
-                    rowid_set_clause_reg,
-                    &updated_positions,
-                    ParentKeyNewProbeMode::BeforeWrite,
-                    upsert_database_id,
-                    resolver,
-                )?;
-            }
-        }
-    }
-
     // Index maintenance (DELETE old key, INSERT new key), honoring
     // partial-index WHEREs. Mirroring SQLite, every UNIQUE constraint (the
     // rowid first, then each unique index) is verified against the NEW row
@@ -1377,9 +1327,8 @@ pub fn emit_upsert(
         record_reg: usize,
     }
 
+    let mut pending_rebuilds: Vec<PendingIndexRebuild> = Vec::new();
     if let Some(before) = before_start {
-        let mut pending_rebuilds: Vec<PendingIndexRebuild> = Vec::new();
-
         // Pass 1: compute the NEW key for every affected index and probe the
         // unique ones for conflicts, without modifying any index yet.
         for (idx_name, _root, idx_cid) in &ctx.idx_cursors {
@@ -1525,7 +1474,69 @@ pub fn emit_upsert(
                 record_reg: rec,
             });
         }
+    }
 
+    // SQLite judges the foreign keys of a row whose other constraints hold (sqlite3FkCheck follows
+    // sqlite3GenerateConstraintChecks).
+    if let Some(bt) = table.btree() {
+        if connection.foreign_keys_enabled() {
+            let rowid_new_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
+            if new_rowid_reg.is_some() {
+                // The probe for the new rowid moved the cursor.
+                program.emit_insn(Insn::SeekRowid {
+                    cursor_id: ctx.cursor_id,
+                    src_reg: ctx.conflict_rowid_reg,
+                    target_pc: ctx.loop_labels.row_done,
+                });
+            }
+
+            // Child-side checks
+            if resolver.with_schema(upsert_database_id, |s| s.has_child_fks(bt.name.as_str())) {
+                emit_fk_child_update_counters(
+                    program,
+                    &bt,
+                    table.get_name(),
+                    ctx.cursor_id,
+                    new_start,
+                    rowid_new_reg,
+                    &directly_changed_cols,
+                    upsert_database_id,
+                    resolver,
+                    &layout,
+                )?;
+            }
+            let upsert_indices: Vec<_> = resolver.with_schema(upsert_database_id, |s| {
+                s.get_indices(table.get_name()).cloned().collect()
+            });
+            let affected_upsert_indices: Vec<_> = upsert_indices
+                .iter()
+                .filter_map(|idx| {
+                    upsert_index_is_affected(table, idx, &directly_changed_cols, rowid_changed)
+                        .map(|affected| affected.then_some(idx))
+                        .transpose()
+                })
+                .collect::<crate::Result<_>>()?;
+            if has_parent_fk_checks {
+                let _ = emit_fk_update_parent_actions(
+                    program,
+                    &bt,
+                    &affected_parent_fks,
+                    affected_upsert_indices.into_iter(),
+                    ctx.cursor_id,
+                    ctx.conflict_rowid_reg,
+                    new_start,
+                    new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
+                    rowid_set_clause_reg,
+                    &updated_positions,
+                    ParentKeyNewProbeMode::BeforeWrite,
+                    upsert_database_id,
+                    resolver,
+                )?;
+            }
+        }
+    }
+
+    if let Some(before) = before_start {
         // Pass 2: every UNIQUE constraint holds, so the index mutations can
         // no longer be interrupted by a constraint failure.
         for pending in pending_rebuilds {
