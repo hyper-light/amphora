@@ -274,7 +274,6 @@ fn emit_row_loop_delete(
             &plan.table_references,
             &join_order,
             OperationMode::DELETE,
-            None,
         )?;
     }
     program.preassign_label_to_next_insn(after_main_loop_label);

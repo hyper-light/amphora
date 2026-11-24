@@ -882,7 +882,8 @@ pub fn fire_trigger(
     //
     // Column affinity for NEW registers is handled by the parent statement:
     // - Non-STRICT tables: INSERT/UPDATE emit Insn::Affinity before any trigger fires
-    // - STRICT tables: no column affinity needed (apply_new_column_affinity was a no-op)
+    // - STRICT tables: INSERT/UPDATE emit Insn::TypeCheck, which converts as the columns do,
+    //   before any trigger fires
     // So we can use the decoded registers directly, skipping N Copy + 1 Affinity per fire.
     let ctx = &decode_trigger_registers(program, resolver, ctx)?;
 

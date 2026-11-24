@@ -26,9 +26,10 @@ use crate::{
         eqp::eqp_detail_for_table_op,
         expr::{
             emit_dml_expr_index_value, emit_returning_results, emit_returning_scan_back,
-            emit_table_column, restore_returning_row_image_in_cache,
-            seed_returning_row_image_in_cache, translate_expr, translate_expr_no_constant_opt,
-            NoConstantOptReason, ReturningBufferCtx,
+            emit_table_column, has_subquery, restore_returning_row_image_in_cache,
+            seed_returning_row_image_in_cache, translate_condition_expr, translate_expr,
+            translate_expr_no_constant_opt, ConditionMetadata, NoConstantOptReason,
+            ReturningBufferCtx,
         },
         fkeys::{
             affected_parent_fks_for_update, emit_fk_child_update_counters,
@@ -67,6 +68,93 @@ use tracing::{instrument, Level};
 struct RowidUpdateInfo {
     rowid_alias_index: Option<usize>,
     updates_rowid: bool,
+}
+
+/// Amphora (docs/design/postgres.md section 8): what judges again, on its newest version, a row that a
+/// commit since the statement's snapshot changed, as 19's EvalPlanQual runs the plan's quals on that
+/// row alone: the statement's WHERE, read from the table's cursor, whatever index found the row.
+struct RowRecheck {
+    tables: TableReferences,
+    terms: Vec<ast::Expr>,
+}
+
+impl RowRecheck {
+    fn of(connection: &Arc<Connection>, plan: &UpdatePlan) -> Result<Option<Self>> {
+        if !connection.locks_rows()
+            || plan
+                .target_table
+                .table
+                .btree()
+                .is_none_or(|table| !table.has_rowid)
+            || plan
+                .set_clauses
+                .iter()
+                .any(|set_clause| set_clause.update_from_result.is_some())
+        {
+            return Ok(None);
+        }
+        let terms = match &plan.write_set_plan {
+            Some(write_set) => &write_set.select.where_clause,
+            None => &plan.where_clause,
+        };
+        let terms: Vec<ast::Expr> = terms.iter().map(|term| term.expr.clone()).collect();
+        if terms.iter().any(has_subquery) {
+            crate::bail_parse_error!(
+                "an UPDATE that waits for rows can't have a subquery in its WHERE"
+            );
+        }
+        let mut target = plan.target_table.clone();
+        target.op = Operation::Scan(Scan::BTreeTable {
+            iter_dir: IterationDirection::Forwards,
+            index: None,
+        });
+        Ok(Some(Self {
+            tables: TableReferences::new(
+                vec![target],
+                plan.from_tables.outer_query_refs().to_vec(),
+            ),
+            terms,
+        }))
+    }
+
+    /// Takes the row under `cursor_id`, and passes it by for `skip` when a later commit removed it, or
+    /// left it a version the WHERE doesn't match.
+    fn emit(
+        &self,
+        program: &mut ProgramBuilder,
+        resolver: &Resolver,
+        cursor_id: usize,
+        indexes: Vec<usize>,
+        skip: BranchOffset,
+    ) -> Result<()> {
+        // An index's scan leaves the table's cursor to be moved by its first read.
+        program.emit_insn(Insn::FinishSeek { cursor_id });
+        let held = program.allocate_label();
+        program.emit_insn(Insn::LockRow {
+            cursor_id,
+            indexes,
+            held,
+            gone: skip,
+        });
+        for term in &self.terms {
+            let matched = program.allocate_label();
+            translate_condition_expr(
+                program,
+                &self.tables,
+                term,
+                ConditionMetadata {
+                    jump_if_condition_is_true: false,
+                    jump_target_when_true: matched,
+                    jump_target_when_false: skip,
+                    jump_target_when_null: skip,
+                },
+                resolver,
+            )?;
+            program.preassign_label_to_next_insn(matched);
+        }
+        program.preassign_label_to_next_insn(held);
+        Ok(())
+    }
 }
 
 fn rowid_update_info(
@@ -128,6 +216,7 @@ pub fn emit_program_for_update(
         None
     };
 
+    let recheck = RowRecheck::of(connection, &plan)?;
     let target_table = Arc::new(plan.target_table.clone());
     let target_tables = TableReferences::new(
         vec![plan.target_table.clone()],
@@ -456,17 +545,11 @@ pub fn emit_program_for_update(
         target_table,
         returning_buffer.as_ref(),
         &mut update_subqueries,
+        recheck,
     )?;
 
     // Close the main loop
-    CloseLoop::emit(
-        program,
-        &mut t_ctx,
-        &write_phase_tables,
-        &join_order,
-        mode,
-        None,
-    )?;
+    CloseLoop::emit(program, &mut t_ctx, &write_phase_tables, &join_order, mode)?;
 
     program.preassign_label_to_next_insn(after_main_loop_label);
     if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
@@ -1108,6 +1191,7 @@ fn emit_update_insns<'a>(
     target_table: Arc<JoinedTable>,
     returning_buffer: Option<&ReturningBufferCtx>,
     non_from_clause_subqueries: &mut [NonFromClauseSubquery],
+    recheck: Option<RowRecheck>,
 ) -> crate::Result<()> {
     let uses_write_set = temp_cursor_id.is_some();
     let iteration_cursor_id = temp_cursor_id.unwrap_or(target_table_cursor_id);
@@ -1250,6 +1334,16 @@ fn emit_update_insns<'a>(
         });
     }
 
+    if let Some(recheck) = &recheck {
+        recheck.emit(
+            program,
+            &t_ctx.resolver,
+            target_table_cursor_id,
+            index_cursors.iter().map(|(cursor, _)| *cursor).collect(),
+            skip_row_label,
+        )?;
+    }
+
     // Emit any remaining SET-clause subqueries inside the loop, after the write cursor
     // is positioned via NotExists. This only applies to the non-FROM ephemeral path:
     // UPDATE ... FROM moves SET expressions into the ephemeral SELECT payload, but
@@ -1328,6 +1422,9 @@ fn emit_update_insns<'a>(
             RefAct::Cascade | RefAct::SetNull | RefAct::SetDefault
         )
     });
+    // A row taken may be a later version than the one an index found: its columns are the table
+    // cursor's.
+    let mut row_tables = recheck.map(|recheck| recheck.tables);
     let column_ctx = UpdateColumnCtx {
         cdc_update_alter_statement,
         target_table: &target_table,
@@ -1337,7 +1434,7 @@ fn emit_update_insns<'a>(
         updates_rowid,
         rowid_set_clause_reg,
         is_virtual_table,
-        index: &index,
+        index: if row_tables.is_some() { &None } else { &index },
         cdc_updates_register,
         layout: &layout,
         affected_columns: &affected_columns,
@@ -1366,7 +1463,7 @@ fn emit_update_insns<'a>(
 
     let table_column_was_read = emit_update_column_values(
         program,
-        table_references,
+        row_tables.as_mut().unwrap_or(table_references),
         set_clauses,
         &column_ctx,
         t_ctx,
@@ -1449,6 +1546,22 @@ fn emit_update_insns<'a>(
                 // Compute virtual columns for NEW values
                 //TODO only emit required virtual columns
                 if let Table::BTree(ref btree) = target_table.table {
+                    // Amphora: NEW holds the values as the columns convert them, which a STRICT
+                    // table's type check does (CV). A non-STRICT table's affinities are applied
+                    // above.
+                    if btree.is_strict {
+                        program.emit_insn(Insn::TypeCheck {
+                            start_reg: start,
+                            count: layout.num_non_virtual_cols(),
+                            check_generated: false,
+                            check_null_keys: false,
+                            table_reference: BTreeTable::input_type_check_table_ref(
+                                btree,
+                                t_ctx.resolver.schema(),
+                                Some(&updated_column_indices),
+                            )?,
+                        });
+                    }
                     let new_ctx =
                         DmlColumnContext::layout(columns, start, new_rowid_reg, layout.clone());
                     compute_virtual_columns(
@@ -1612,6 +1725,7 @@ fn emit_update_insns<'a>(
                 start_reg: start,
                 count: layout.num_non_virtual_cols(),
                 check_generated: false,
+                check_null_keys: true,
                 table_reference: BTreeTable::input_type_check_table_ref(
                     btree,
                     t_ctx.resolver.schema(),
@@ -1765,6 +1879,7 @@ fn emit_update_insns<'a>(
                 count: btree_table.columns().len(),
                 //TODO we should only type-check the generated columns whose dependencies were updated.
                 check_generated: true,
+                check_null_keys: true,
                 table_reference: BTreeTable::type_check_table_ref(
                     &btree_table,
                     t_ctx.resolver.schema(),

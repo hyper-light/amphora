@@ -2,7 +2,8 @@
 # psql and pgbench of the postgres:19 image run the same statements on Amphora's listener and on a 19 server of that
 # image (docs/design/postgres.md, section 11's unit 9): pgbench's tables and rows, psql's statements with their
 # SQLSTATEs, and pgbench's TPC-B script at `-M simple`. psql's output is compared byte for byte, and the tables
-# pgbench leaves row for row. Linux, with docker.
+# pgbench leaves row for row; 32 clients that contend for the same rows leave balances that agree (unit 15). Linux,
+# with docker.
 #
 # usage: scripts/postgres-clients.sh <amphora binary> <work folder>
 set -euo pipefail
@@ -76,6 +77,14 @@ END;
 SQL
 done
 
+cat > "$WORK/sql/tpcb-32.sql" <<SQL
+\\set bid random(1, 2)
+\\set aid random(1, 200)
+\\set tid random(1, 20)
+\\set delta random(-5000, 5000)
+$(sed -n '/^BEGIN;/,$p' "$WORK/sql/tpcb-1.sql")
+SQL
+
 docker run -d --rm --name "$NAME" -e POSTGRES_USER=ada -e POSTGRES_PASSWORD=pencil -p 127.0.0.1:0:5432 postgres:19 > /dev/null
 THEIRS=$(docker port "$NAME" 5432/tcp | head -1 | sed 's/.*://')
 "$AMPHORA" postgres --listen 127.0.0.1:0 --roles "$WORK/roles" --database "$WORK/postgres.db" 2> "$WORK/amphora.err" &
@@ -125,5 +134,26 @@ for clients in 1 2; do
     sort "$WORK/rows.theirs" > "$WORK/rows.sorted.theirs"
     compare "after pgbench -c $clients, sorted: $query" "$WORK/rows.sorted.ours" "$WORK/rows.sorted.theirs"
   done
+done
+
+# 32 clients contend for two branches: none of their transactions fails, and each table's balances move by what the
+# history's rows add up to (section 11's unit 15).
+moved() { # <port>: the sum of each table's balances, and of the history's
+  for query in "SELECT abalance FROM pgbench_accounts" "SELECT tbalance FROM pgbench_tellers" "SELECT bbalance FROM pgbench_branches" "SELECT delta FROM pgbench_history"; do
+    client psql -h 127.0.0.1 -p "$1" -U ada -d ada -X -At -c "$query" | awk '{ sum += $1 } END { printf "%d ", sum }'
+  done
+}
+for side in ours theirs; do
+  port=$OURS
+  [ "$side" = ours ] || port=$THEIRS
+  read -r -a before <<< "$(moved "$port")"
+  client pgbench -h 127.0.0.1 -p "$port" -U ada -n -f /sql/tpcb-32.sql -M simple -c 32 -j 1 -t 50 ada > "$WORK/pgbench-32.$side" 2>&1 || true
+  read -r -a after <<< "$(moved "$port")"
+  counts=$(grep -E 'actually processed|failed|aborted|ERROR|error' "$WORK/pgbench-32.$side" | sort | uniq -c | tr '\n' ';')
+  moves=()
+  for i in 0 1 2 3; do moves+=($((after[i] - before[i]))); done
+  echo "pgbench -c 32 -t 50, $side: $counts the tables moved by ${moves[*]}"
+  grep -q 'actually processed: 1600/1600' "$WORK/pgbench-32.$side" && grep -q 'failed transactions: 0 ' "$WORK/pgbench-32.$side" || failed=1
+  [ "${moves[0]}" = "${moves[1]}" ] && [ "${moves[1]}" = "${moves[2]}" ] && [ "${moves[2]}" = "${moves[3]}" ] || failed=1
 done
 exit "$failed"

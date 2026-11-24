@@ -3608,3 +3608,106 @@ fn each_use_of_a_cte_has_the_rows_and_the_names_of_its_definition() {
         ],
     );
 }
+
+/// Do: a join whose LEFT JOIN's hash join is built from the tables before it, joined, and whose WHERE
+/// reads a subquery on one of those tables beside a column the LEFT JOIN makes NULL; the same in an
+/// inner join; and a LEFT JOIN in a subquery, whose WHERE reads a subquery on the query around it.
+/// Expect: SQLite's rows. Amphora gave the null-extended rows untested, or tested every row with the
+/// columns of a cursor the materialized input had left at its end (finding CN).
+#[test]
+fn a_hash_joins_rows_are_tested_by_where_terms_on_correlated_subqueries() {
+    let fill = [
+        "CREATE TABLE p(id INTEGER PRIMARY KEY, k INT, v INT)",
+        "INSERT INTO p VALUES (1, 1, 2), (2, 2, 3), (3, NULL, 1), (4, 4, NULL), (5, 1, 0)",
+        "CREATE TABLE q(id INTEGER PRIMARY KEY, k INT, v INT)",
+        "INSERT INTO q VALUES (1, 2, 2), (2, 2, 0), (3, 5, 1), (4, NULL, 4), (5, 1, 1)",
+        "CREATE TABLE n(k INT, v INT)",
+        "INSERT INTO n VALUES (1, 2), (NULL, 1), (2, 2), (3, 0), (1, NULL)",
+        "CREATE TABLE e(k INT, v INT)",
+        "CREATE TABLE f(k INT, v INT)",
+        "INSERT INTO f VALUES (1, 2), (2, 1), (2, 5)",
+    ];
+    let join = "SELECT a0.id, a1.id, a2.k FROM p AS a0 JOIN q AS a1 ON a0.k = a1.k LEFT JOIN e AS a2 ON a1.k = a2.v WHERE";
+    let statements: Vec<(String, &[&str])> = vec![
+        (
+            format!("{join} (SELECT min(s1.k) FROM p AS s1 WHERE a0.k < NULL) IS NOT (a2.k - a2.k)"),
+            &[],
+        ),
+        (format!("{join} a2.k IN (SELECT n.k FROM n WHERE n.v = a0.k)"), &[]),
+        (format!("{join} a2.k NOT IN (SELECT n.k FROM n WHERE n.v = a0.k)"), &[]),
+        (
+            format!("{join} a2.k IS NOT NULL OR EXISTS (SELECT 1 FROM n WHERE n.v = a0.k)"),
+            &["1|5|NULL", "2|1|NULL", "2|2|NULL", "5|5|NULL"],
+        ),
+        (
+            format!("{join} a2.k IS NULL AND (SELECT count(*) FROM n WHERE n.k = a0.k AND n.v > a1.v) = 1"),
+            &["1|5|NULL", "2|2|NULL", "5|5|NULL"],
+        ),
+        (
+            "SELECT count(*), sum(a0.id) FROM p AS a0 JOIN q AS a1 ON a0.k = a1.k LEFT JOIN e AS a2 ON a1.k = a2.v WHERE a2.k IS NOT NULL OR EXISTS (SELECT 1 FROM n WHERE n.v = a0.k)".into(),
+            &["4|10"],
+        ),
+        (
+            "SELECT a0.id, a1.id, a2.k FROM p AS a0 JOIN q AS a1 ON a0.k = a1.k JOIN f AS a2 ON a1.k = a2.v WHERE (SELECT a0.k) IS a2.v".into(),
+            &["1|5|2", "2|1|1", "2|2|1", "5|5|2"],
+        ),
+        (
+            "SELECT o.k, (SELECT count(*) FROM q AS a0 LEFT JOIN e AS a1 ON a0.k = a1.v WHERE (SELECT o.k) IS NOT a1.k) FROM p AS o".into(),
+            &["1|5", "1|5", "2|5", "4|5", "NULL|0"],
+        ),
+        (
+            "SELECT o.k, (SELECT count(*) FROM q AS a0 LEFT JOIN f AS a1 ON a0.k = a1.v WHERE (SELECT o.k) IS NOT a1.k) FROM p AS o".into(),
+            &["1|3", "1|3", "2|3", "4|5", "NULL|4"],
+        ),
+        (
+            "SELECT o.k FROM p AS o WHERE EXISTS (SELECT 1 FROM q AS a0 LEFT JOIN e AS a1 ON a0.k = a1.v WHERE (SELECT o.k) = a1.k)".into(),
+            &[],
+        ),
+        // The term was a key of the hash join, its subquery's value read before it was.
+        (
+            "SELECT a1.id, a2.id FROM n AS a0 JOIN p AS a1 ON a0.k = a1.k LEFT JOIN q AS a2 ON a1.k = a2.k WHERE coalesce((SELECT count(n.k) FROM n WHERE n.k IS a2.k), a1.k) = a0.k".into(),
+            &[],
+        ),
+        // The subquery's hash join was built by a copy of it no read ran.
+        (
+            "SELECT a0.id, a1.id, a2.k FROM q AS a0 JOIN p AS a1 ON a0.k = a1.k LEFT JOIN e AS a2 ON a1.k = a2.k WHERE CASE WHEN NOT EXISTS (SELECT 1 FROM p AS s3 JOIN f AS s4 ON s3.k = s4.v WHERE s3.v IS NOT NULL) THEN a2.v IS a2.k ELSE a0.v < a0.v - a0.k END".into(),
+            &[],
+        ),
+    ];
+    for (setting, parallel, statistics, joins) in [
+        ("default", false, false, JoinMethods::ByCost),
+        ("parallel", true, false, JoinMethods::ByCost),
+        ("statistics", false, true, JoinMethods::ByCost),
+        ("parallel, statistics", true, true, JoinMethods::ByCost),
+        (
+            "statistics, hash joins",
+            false,
+            true,
+            JoinMethods::HashJoinsOnly,
+        ),
+        (
+            "statistics, merge joins",
+            false,
+            true,
+            JoinMethods::MergeJoinsOnly,
+        ),
+        ("nested loops", false, false, JoinMethods::NestedLoopsOnly),
+    ] {
+        let (io, conn) = open();
+        for statement in fill {
+            conn.execute(statement).unwrap();
+        }
+        if parallel {
+            conn.set_parallel_mode(amphora_engine::morsel::ParallelMode::On);
+        }
+        if statistics {
+            conn.execute("ANALYZE").unwrap();
+        }
+        conn.set_join_methods(joins);
+        for (sql, expected) in &statements {
+            let mut got = rows(&io, &conn, sql);
+            got.sort();
+            assert_eq!(got, *expected, "{setting}: {sql}");
+        }
+    }
+}

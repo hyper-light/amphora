@@ -1182,6 +1182,9 @@ pub enum Insn {
         count: usize,     // P2
         /// Check generated columns after their values have been computed.
         check_generated: bool, // P3
+        /// Amphora: refuse a NULL in a primary key column that is no rowid alias. False where a
+        /// BEFORE trigger is still to fire: NOT NULL is checked after it, the types before (CV).
+        check_null_keys: bool,
         table_reference: Arc<BTreeTable>, // P4
     },
 
@@ -1472,6 +1475,19 @@ pub enum Insn {
     /// Complete a pending DeferredSeek before a write that can use only index values.
     FinishSeek {
         cursor_id: CursorID,
+    },
+
+    /// Amphora (docs/design/postgres.md section 8): the transaction takes the row under table cursor
+    /// P1 before its statement changes it. Jumps to `held` when the row is as the statement's snapshot
+    /// sees it, and to `gone` when a later commit removed it. Falls through when a later commit changed
+    /// it: the cursor's columns are then its newest version's, and each cursor of `indexes` finds that
+    /// version's entries. A row another open transaction changed stops the statement here, its earlier
+    /// changes kept, until that transaction ends (`Connection::take_row_wait`).
+    LockRow {
+        cursor_id: CursorID,
+        indexes: Vec<CursorID>,
+        held: BranchOffset,
+        gone: BranchOffset,
     },
 
     /// If cursor_id refers to an SQL table (B-Tree that uses integer keys), use the value in start_reg as the key.
@@ -2755,6 +2771,7 @@ impl InsnVariants {
             InsnVariants::SeekRowid => execute::op_seek_rowid,
             InsnVariants::DeferredSeek => execute::op_deferred_seek,
             InsnVariants::FinishSeek => execute::op_finish_seek,
+            InsnVariants::LockRow => execute::op_lock_row,
             InsnVariants::SeekGE
             | InsnVariants::SeekGT
             | InsnVariants::SeekLE

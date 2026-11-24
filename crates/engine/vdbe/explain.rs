@@ -1252,6 +1252,20 @@ pub fn insn_to_row(
                 0,
                 "".to_string(),
             ),
+            Insn::LockRow {
+                cursor_id,
+                indexes: _,
+                held,
+                gone,
+            } => (
+                "LockRow",
+                i64::try_from(*cursor_id).unwrap_or(i64::MAX),
+                i64::from(held.as_debug_int()),
+                i64::from(gone.as_debug_int()),
+                Value::build_text(""),
+                0,
+                "".to_string(),
+            ),
             Insn::FinishSeek { cursor_id } => (
                 "FinishSeek",
                 *cursor_id as i64,

@@ -11,15 +11,17 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
 use hyper_rt::RtError;
+use hyper_rt::futures::sleep;
 use hyper_rt::machine::calibration::{Calibration, Policy};
 use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
 use hyper_rt::tcp::{TcpListener, TcpStream};
 
-use super::execute::{Database, Executor};
+use super::execute::{Database, Executor, SessionRole};
 use super::scram::{self, ScramSecret};
 use super::session::{Config, Next, Role, Roles, Seed, Session};
 use super::wire::{self, PgError, SqlState};
@@ -81,7 +83,7 @@ impl Roles for StoredRoles {
 /// they're charged to, and how many of them may live at once.
 pub struct Listener {
     config: Config,
-    roles: StoredRoles,
+    roles: Rc<StoredRoles>,
     database: Rc<Database>,
     budget: Arc<Budget>,
     max_connections: usize,
@@ -127,7 +129,7 @@ impl Listener {
                 time_zone: std::env::var("TZ").unwrap_or_else(|_| "UTC".to_owned()),
                 mock_nonce,
             },
-            roles,
+            roles: Rc::new(roles),
             database: Rc::new(database),
             budget,
             max_connections,
@@ -183,9 +185,17 @@ impl Listener {
             Err(error) => return Ended::NoRandomness(error),
         };
         let (database, time_zone) = (Rc::clone(&self.database), self.config.time_zone.clone());
+        let process_id = seed.process_id;
+        let superusers = Rc::clone(&self.roles);
         let mut session =
             Session::new(self.config.clone(), seed).with_database(Box::new(move |startup| {
-                Ok(Box::new(database.session(&startup.user, &time_zone)?))
+                let role = SessionRole {
+                    name: &startup.user,
+                    superuser: superusers
+                        .role(&startup.user)
+                        .is_some_and(|role| role.superuser),
+                };
+                Ok(Box::new(database.session(role, &time_zone, process_id)?))
             }));
         let live = self.live.get();
         let admitted = if live < self.max_connections {
@@ -213,7 +223,7 @@ impl Listener {
             let step = if waited {
                 session.resume(&mut out)
             } else {
-                session.step(&input, &self.roles, &mut out)
+                session.step(&input, &*self.roles, &mut out)
             };
             waited = false;
             let step = match step {
@@ -226,7 +236,9 @@ impl Listener {
                 // The end of the transaction it waits for wakes this task (docs/design/postgres.md
                 // section 8); nothing it held is another's, so its other sessions go on meanwhile.
                 Next::Wait => {
-                    std::future::poll_fn(|cx| session.poll_wait(cx)).await;
+                    if let Err(error) = waited_out(&mut session).await {
+                        return Ended::Socket(error);
+                    }
                     waited = true;
                 }
                 Next::Need(total) => {
@@ -276,6 +288,42 @@ impl Listener {
             }
         }
     }
+}
+
+/// Waits until the statement `session` stopped at can go on: its holder's end, or the first of 19's two
+/// deadlines that refuses it. The deadlock check comes before the lock timeout, as in `ProcSleep`.
+async fn waited_out(session: &mut Session) -> Result<(), RtError> {
+    let Some(limits) = session.wait_limits() else {
+        return Ok(());
+    };
+    let mut deadlock = std::pin::pin!(sleep(nanos(limits.deadlock)));
+    let mut checked = false;
+    let mut lock = std::pin::pin!(sleep(limits.lock.map_or(u64::MAX, nanos)));
+    std::future::poll_fn(|cx| {
+        if session.poll_wait(cx).is_ready() {
+            return Poll::Ready(Ok(()));
+        }
+        if !checked && let Poll::Ready(woken) = deadlock.as_mut().poll(cx) {
+            woken?;
+            checked = true;
+            if session.check_deadlock() {
+                return Poll::Ready(Ok(()));
+            }
+        }
+        if limits.lock.is_some()
+            && let Poll::Ready(woken) = lock.as_mut().poll(cx)
+        {
+            woken?;
+            session.lock_timed_out();
+            return Poll::Ready(Ok(()));
+        }
+        Poll::Pending
+    })
+    .await
+}
+
+fn nanos(span: Duration) -> u64 {
+    u64::try_from(span.as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// What a session holds before it reads: its state machine, its executor and its socket.

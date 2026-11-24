@@ -1073,6 +1073,14 @@ impl ProgramBuilder {
             .insert((internal_id, result), (return_reg, start, once));
     }
 
+    /// Whether the subquery `internal_id`, read through `result`, is coded as a subroutine that runs
+    /// once, which every later read calls.
+    pub fn has_once_subquery(&self, internal_id: TableInternalId, result: usize) -> bool {
+        self.lazy_subqueries
+            .get(&(internal_id, result))
+            .is_some_and(|&(_, _, once)| once)
+    }
+
     /// Runs the subquery `internal_id`, read through `result`, here when it runs where read: a
     /// Gosub to its subroutine. One that runs once is skipped once this place has made it (the
     /// subroutine's own Once runs it once in all); a correlated one runs at each read, for the row
@@ -1987,6 +1995,10 @@ impl ProgramBuilder {
                     target_pc,
                 } => {
                     resolve(target_pc, "NotExists")?;
+                }
+                Insn::LockRow { held, gone, .. } => {
+                    resolve(held, "LockRow")?;
+                    resolve(gone, "LockRow")?;
                 }
                 Insn::MustBeInt {
                     target_pc: Some(target_pc),

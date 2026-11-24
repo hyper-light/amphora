@@ -75,6 +75,7 @@ pub struct PgError {
     pub code: SqlState,
     pub message: String,
     pub detail: Option<String>,
+    pub hint: Option<String>,
     pub position: Option<usize>,
 }
 
@@ -85,6 +86,7 @@ impl PgError {
             code,
             message: message.into(),
             detail: None,
+            hint: None,
             position: None,
         }
     }
@@ -95,8 +97,15 @@ impl PgError {
             code,
             message: message.into(),
             detail: None,
+            hint: None,
             position: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
     }
 
     #[must_use]
@@ -325,6 +334,10 @@ pub fn error_response(out: &mut Vec<u8>, error: &PgError) -> Result<(), PgError>
         if let Some(detail) = &error.detail {
             out.push(b'D');
             put_cstr(out, detail.as_bytes());
+        }
+        if let Some(hint) = &error.hint {
+            out.push(b'H');
+            put_cstr(out, hint.as_bytes());
         }
         if let Some(position) = error.position {
             out.push(b'P');
