@@ -38,6 +38,41 @@ for step in "$@"; do
       done
       for p in $pids; do wait "${p%%:*}"; echo "== seed ${p##*:} rc=$? $(tail -1 "$O/main-${p##*:}/run.log" | cut -c1-200)"; done
       echo "== campaign $(( $(date +%s) - s ))s load $(load)" ;;
+    seedfrom:*)  # a private copy of a finished build folder's debug half: its third-party crates, not a fresh build
+      if [ ! -d "$CARGO_TARGET_DIR/debug" ]; then cp -a --reflink=always "$HOME/.cache/amphora-perf-target/${step#seedfrom:}/debug" "$CARGO_TARGET_DIR/"; echo "== seeded rc=$? $(( $(date +%s) - s ))s"; fi ;;
+    tbuild:*)
+      tests=""; IFS=, read -ra names <<< "${step#tbuild:}"; for n in "${names[@]}"; do tests="$tests --test $n"; done
+      timeout 1200 nice -n 10 cargo test -p amphora-engine --locked $tests --no-run > "$O/tbuild.log" 2>&1; rc=$?
+      grep -E "^(error|warning)|Executable|Compiling amphora|Finished" -A 8 "$O/tbuild.log" | head -${BUILD_LINES:-80}
+      echo "== tbuild rc=$rc in $(( $(date +%s) - s ))s"; [ $rc -ne 0 ] && exit 4 ;;
+    test:*)  # test:NAME[:FILTER]
+      IFS=: read -r _ name filter <<< "$step"; b=$(ls -t "$CARGO_TARGET_DIR"/debug/deps/$name-* | grep -v '\.d$' | head -1)
+      timeout 900 nice -n 10 "$b" $filter --test-threads=${THREADS:-8} > "$O/test-$name.log" 2>&1; rc=$?
+      echo "== test $name $filter rc=$rc $(( $(date +%s) - s ))s"; grep -aE "test result|panicked|answers differ|FAILED|failed$" "$O/test-$name.log" | cut -c1-300 | head -${LINES_OUT:-14} ;;
+    cat:*) sed -n 1,${CAT_LINES:-80}p "$O/${step#cat:}" | cut -c1-${CUT:-700} ;;
+    red:*)  # red:REF:FILE[,FILE..]: these files as REF has them
+      IFS=: read -r _ ref files <<< "$step"; git checkout -q -f "$ref" -- ${files//,/ }; echo "== red: $files as $(git rev-parse --short=8 $ref)"; git status --short | head -5 ;;
+    green) git checkout -q -f "$TREE" -- . && git status --short | head -5; echo "== green" ;;
+    fmt) cargo fmt --all --check > "$O/fmt.log" 2>&1; echo "== fmt rc=$?"; head -40 "$O/fmt.log" ;;
+    clippy)
+      timeout 1500 nice -n 10 cargo clippy -p amphora-engine --all-targets --locked -- -D warnings > "$O/clippy.log" 2>&1; rc=$?
+      echo "== clippy rc=$rc $(( $(date +%s) - s ))s"; grep -E "Checking amphora-engine|^(error|warning)" -A 12 "$O/clippy.log" | head -80 ;;
+    prod)
+      timeout 1500 nice -n 10 bash scripts/check-production.sh > "$O/prod.log" 2>&1; rc=$?
+      echo "== check-production rc=$rc $(( $(date +%s) - s ))s"; tail -8 "$O/prod.log" | cut -c1-400 ;;
+    benchclippy)
+      timeout 1500 nice -n 10 cargo clippy --manifest-path bench/Cargo.toml --all-targets -- -D warnings > "$O/benchclippy.log" 2>&1; rc=$?
+      echo "== bench clippy rc=$rc $(( $(date +%s) - s ))s"; grep -E "Checking amphora|^(error|warning)" -A 10 "$O/benchclippy.log" | tail -30 ;;
+    oracletests)
+      mkdir -p bench-lite/src; cp "$S/bench-lite/Cargo.toml" "$S/bench-lite/Cargo.lock" bench-lite/; cp "$S/bench-lite/src/main.rs" bench-lite/src/
+      ( cd bench-lite && timeout 1200 nice -n 10 cargo test --release > "$O/oracletests.log" 2>&1 ); rc=$?
+      echo "== oracle unit tests rc=$rc $(( $(date +%s) - s ))s"; grep -E "test result|^test |FAILED|panicked|^error" -A 3 "$O/oracletests.log" | head -50 ;;
+    lib:*)
+      timeout 1500 nice -n 10 cargo test -p amphora-engine --locked --lib --no-run > "$O/lib.log" 2>&1; rc=$?
+      grep -E "^(error|warning)|Executable|Finished" -A 8 "$O/lib.log" | head -40; echo "== lib build rc=$rc in $(( $(date +%s) - s ))s"
+      b=$(grep -oE "\(.*amphora_engine-[0-9a-f]+\)" "$O/lib.log" | tr -d '()' | tail -1); [ -z "$b" ] && b=$(ls -t "$CARGO_TARGET_DIR"/debug/deps/amphora_engine-* | grep -vE '\.(d|rlib|rmeta)$' | head -1)
+      timeout 900 nice -n 10 "$b" $(echo "${step#lib:}" | tr , ' ') --test-threads=${THREADS:-8} > "$O/libtest.log" 2>&1; rc=$?
+      echo "== libtest ${step#lib:} rc=$rc $(( $(date +%s) - s ))s"; grep -aE "test result|FAILED|failed$|panicked" "$O/libtest.log" | cut -c1-250 | head -20 ;;
     sh:*) bash -c "${step#sh:}" ;;
   esac
 done
