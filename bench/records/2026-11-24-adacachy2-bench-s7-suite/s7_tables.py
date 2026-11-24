@@ -240,6 +240,26 @@ def main():
             gm = math.exp(sum(math.log(v) for v in vals) / len(vals)) if vals else None
             row.append(f"{gm:.2f}x over {len(vals)} ops" + (f", {skip} left out" if skip else "") if gm is not None else "no cell")
         w(f"| {name} | " + " | ".join(row) + " |")
+    # ---- order check
+    w("")
+    w("### Order check: each target's odd rounds (order 1) against its even rounds (reversed order)")
+    w("")
+    w("Each target's cells: the geometric mean of (median of odd rounds) / (median of even rounds) over the cells where both are above 0. "
+      "Near 1.0 means the order of the targets moved nothing systematic; the rounds are alternated so a drift in the machine falls on both orders.")
+    w("")
+    w("| target | geometric mean odd/even | cells |")
+    w("|---|---|---|")
+    import math
+    for t in TARGETS:
+        logs = []
+        for (op, c, tt), runs in cells.d.items():
+            if tt != t:
+                continue
+            odd = [r["ops"] for i, r in enumerate(runs) if i % 2 == 0 and r["ops"]]
+            even = [r["ops"] for i, r in enumerate(runs) if i % 2 == 1 and r["ops"]]
+            if odd and even and med(odd) > 0 and med(even) > 0:
+                logs.append(math.log(med(odd) / med(even)))
+        w(f"| {t} | {math.exp(sum(logs) / len(logs)):.3f} | {len(logs)} |" if logs else f"| {t} | - | 0 |")
     # ---- gaps
     w("")
     w("## 3. The ten largest gaps (Amphora furthest behind the best competitor)")
