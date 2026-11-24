@@ -1976,7 +1976,7 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn switch(&self, io: &dyn IO, _held: ReadGuardKind) -> Result<Option<SegmentId>> {
-        let switched = self.log.switch(io, None);
+        let switched = self.log.switch_copied(io);
         self.log.released.notify();
         switched
     }
@@ -1987,7 +1987,7 @@ impl WalCoordination for InProcessWalCoordination {
             .take_while(|&slot| self.try_segment_read_mark_exclusive(segment, slot))
             .count();
         let switched = if held == READ_MARKS.saturating_sub(1) {
-            self.log.switch(io, None)
+            self.log.switch_copied(io)
         } else {
             Err(LimboError::Busy)
         };
@@ -4572,7 +4572,25 @@ impl SharedLog {
         {
             return Ok(None);
         }
-        self.switch_to_free(io, cut_past)
+        self.switch_to_free(io, cut_past, false)
+    }
+
+    /// [`Self::switch`] from a segment whose every frame is in the synced file: the writer's before a
+    /// write, RESTART's and TRUNCATE's. It is closed copied, so free as the last read on it ends:
+    /// with none, in the switch's own change. An owner's switch leaves that to the next pass, which
+    /// reports what it copied.
+    fn switch_copied(&self, io: &dyn IO) -> Result<Option<SegmentId>> {
+        if self
+            .current()
+            .read()
+            .metadata
+            .max_frame
+            .load(Ordering::Acquire)
+            == 0
+        {
+            return Ok(None);
+        }
+        self.switch_to_free(io, None, true)
     }
 
     /// Both of the log's files are cut to nothing (TRUNCATE's end): no header is on disk, and the log
@@ -4581,19 +4599,24 @@ impl SharedLog {
     /// `write_lock`.
     fn start_first(&self, io: &dyn IO) -> Result<()> {
         if self.current_id() == SegmentId::Second {
-            let _ = self.switch_to_free(io, None)?;
+            let _ = self.switch_to_free(io, None, true)?;
         }
         Ok(())
     }
 
-    fn switch_to_free(&self, io: &dyn IO, cut_past: Option<u64>) -> Result<Option<SegmentId>> {
+    fn switch_to_free(
+        &self,
+        io: &dyn IO,
+        cut_past: Option<u64>,
+        copied: bool,
+    ) -> Result<Option<SegmentId>> {
         let segments = self.segments.load();
         if segments.closing().is_some() {
             return Ok(None);
         }
         let from = segments.current();
         let to = from.other();
-        let (header, epoch, transaction_count, copied) = {
+        let (header, epoch, transaction_count) = {
             let closing = self.segment(from).read();
             let frames = closing.metadata.max_frame.load(Ordering::Acquire);
             let mut header = *closing.metadata.wal_header.lock();
@@ -4606,7 +4629,6 @@ impl SharedLog {
                 header,
                 closing.runtime.epoch.load(Ordering::Acquire),
                 closing.metadata.transaction_count.load(Ordering::Acquire),
-                closing.metadata.nbackfills.load(Ordering::Acquire) == frames,
             )
         };
         {
@@ -4649,8 +4671,6 @@ impl SharedLog {
                 .iter()
                 .for_each(|lock| lock.unlock());
         }
-        // A segment copied whole before the switch is closed so, and is free as the last read on it
-        // ends: with none, in this same change.
         let switched = self.segments.update(|segments| {
             let switched = segments.switch(false);
             if copied {
