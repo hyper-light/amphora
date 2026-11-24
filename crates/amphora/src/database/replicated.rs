@@ -17917,7 +17917,14 @@ mod tests {
             .map(|pair| pair[1].0.saturating_sub(pair[0].0))
             .max()
             .unwrap();
-        for (write, (held, (_, room))) in sizes.iter().zip(&frames).enumerate() {
+        for (write, (held, _)) in sizes.iter().zip(&frames).enumerate() {
+            // The room is learned at each pass, for the segment current then: the most it was so far.
+            let room = frames
+                .iter()
+                .take(write + 1)
+                .map(|seen| seen.1)
+                .max()
+                .unwrap();
             let most = log_bound::FRAME_BYTES * (room + 2 * grew) + 32;
             for ((file, began), bytes) in files.iter().zip(&began).zip(held) {
                 let most = most.max(*began);

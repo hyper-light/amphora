@@ -4196,7 +4196,7 @@ pub struct SharedLog {
 /// the segments it counts on, given back once, by the read's own end or by
 /// [`SharedLog::end_closing_reads`]. One to a connection, empty between its reads.
 #[derive(Debug, Default)]
-pub(crate) struct ReadHold {
+pub struct ReadHold {
     held: Mutex<Option<(ReadGuardKind, ReadSpan)>>,
     /// The read under way was ended here: set with its hold taken, before its marks and counts are
     /// given back, and cleared as it ends.
