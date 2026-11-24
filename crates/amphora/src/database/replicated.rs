@@ -564,13 +564,11 @@ impl Drop for LogShare {
 }
 /// The account's readers: those given back, oldest first, and how many each replica has out.
 /// Its idle readers are at most what the budget charges (each holds `db::READER_PAGES`), and it
-/// names a replica only while that replica's readers are out, or while its owner holds its reads
-/// back to start its database's log again (`restarting`, at most one entry a replica).
+/// names a replica only while that replica's readers are out.
 #[derive(Default)]
 struct Ledger {
     idle: VecDeque<Idle>,
     out: std::collections::BTreeMap<u64, usize>,
-    restarting: std::collections::BTreeSet<u64>,
 }
 struct Idle {
     replica: u64,
@@ -641,17 +639,12 @@ impl Local {
                 return Err(fenced("replica owner ended"));
             };
             let mut ledger = locked(&self.account.ledger)?;
-            let held = ledger.restarting.contains(&self.id);
-            let own = ledger
-                .idle
-                .iter()
-                .position(|idle| idle.replica == self.id)
-                .filter(|_| !held);
+            let own = ledger.idle.iter().position(|idle| idle.replica == self.id);
             if let Some(idle) = own.and_then(|at| ledger.idle.remove(at)) {
                 self.took(&mut ledger)?;
                 break (Some(idle.reader), idle.charge, open);
             }
-            if !held && ledger.out.get(&self.id).copied().unwrap_or(0) < self.descriptors.bound() {
+            if ledger.out.get(&self.id).copied().unwrap_or(0) < self.descriptors.bound() {
                 if let Some(charge) = self.account.pool.charge(pages) {
                     self.took(&mut ledger)?;
                     break (None, charge, open);
@@ -736,37 +729,6 @@ impl Local {
         drop(closed);
         self.account.free();
     }
-    /// The owner is to start the database's log again: no read of this replica begins until it
-    /// has.
-    fn hold_reads(&self) -> Result<(), Refusal> {
-        locked(&self.account.ledger)?.restarting.insert(self.id);
-        Ok(())
-    }
-    /// Reads begin again with no restart run: none runs while a session holds the write lock
-    /// (`Actor::hand_off`), so none is held for one meanwhile.
-    fn unhold_reads(&self) -> Result<(), Refusal> {
-        if locked(&self.account.ledger)?.restarting.remove(&self.id) {
-            self.account.free();
-        }
-        Ok(())
-    }
-    /// `restart`, once no read of this replica is out, its reads held back while it runs: none
-    /// while one is out. Reads begin again once it started the log (`Ok(true)`).
-    fn restart_unread(
-        &self,
-        restart: impl FnOnce() -> anyhow::Result<bool>,
-    ) -> Result<Option<bool>, Refusal> {
-        if locked(&self.account.ledger)?.out.contains_key(&self.id) {
-            return Ok(None);
-        }
-        // No read of this replica begins while it is restarting, so none is out meanwhile.
-        let restarted = restart().map_err(|error| refused(&error))?;
-        if restarted {
-            locked(&self.account.ledger)?.restarting.remove(&self.id);
-            self.account.free();
-        }
-        Ok(Some(restarted))
-    }
     /// The owner ended: no reader opens again, its idle ones close, and reads waiting are refused.
     fn release(&self) {
         if let Ok(mut open) = self.open.lock() {
@@ -779,7 +741,6 @@ impl Local {
                         .into_iter()
                         .partition(|idle| idle.replica == self.id);
                 ledger.idle = others;
-                ledger.restarting.remove(&self.id);
                 mine
             }
             Err(_) => VecDeque::new(),
@@ -1323,12 +1284,14 @@ fn run_session(
     }
 }
 
-/// What the owner asks of its flushing thread: a flush of what was applied through `at`, and
-/// whether a checkpoint pass follows it at once (`copy`: a restart is due, and waits for a pass
-/// that copies every durable frame).
+/// What the owner asks of its flushing thread: a flush of what was applied through `at`, whether
+/// a checkpoint pass follows it at once (`copy`: a restart is due and waits for a pass, or one was
+/// just made and the segment it closed is to be copied), and whether the log's current segment
+/// held frames as it was asked (`held`).
 struct Ask {
     at: Point,
     copy: bool,
+    held: bool,
 }
 /// A flush done, and what its checkpoint pass said, if one ran.
 struct Flushed {
@@ -1338,12 +1301,11 @@ struct Flushed {
 /// What a checkpoint pass said of the database's log.
 #[derive(Debug, Clone)]
 struct Pass {
-    /// It copied every frame a flush had made durable (store.md, decision 15): a restart now
-    /// copies only what was applied since that flush was asked.
-    caught_up: bool,
-    /// It found the log busy and copied nothing: a reader on read-mark 0 holds passes off (wal.c,
-    /// `walCheckpoint` takes `WAL_READ_LOCK(0)`), until reads are held.
-    busy: bool,
+    /// It followed a flush of frames the log's current segment holds (`Ask::held`): a restart now
+    /// flushes on the owner only what was applied since that flush was asked. What it copied is no
+    /// part of it: a read under way holds back a pass's copy, never a restart (store.md, decision
+    /// 45).
+    ready: bool,
     /// The frames the log may hold, from the filesystem's free bytes as read after the pass
     /// (`log_bound::log_room`).
     room: u64,
@@ -1358,15 +1320,6 @@ struct Pass {
 /// How often a checkpoint pass follows a flush while no restart is due: the standalone store's
 /// checkpoint period, measured on fedora 2026-10-20 (docs/design/store.md, decision 4).
 const CHECKPOINT_EVERY: Duration = Duration::from_millis(25);
-
-/// Whether the owner holds local reads back for a restart of the database's log (replication.md,
-/// "A replica's database log bounded by what it measures"): past its room, always; with a restart
-/// due, once a pass copied every durable frame (the restart waits only for the reads out), or
-/// once a pass found the log busy: a read that began on a log wholly copied reads the file alone
-/// and holds every pass off, so only holding reads back lets the passes copy again.
-fn hold_due(pass: &Pass, due: bool, past: bool) -> bool {
-    past || (due && (pass.caught_up || pass.busy))
-}
 
 impl Flushing {
     /// A thread that flushes `machine`'s log for each point it's handed, then copies what the
@@ -1391,7 +1344,7 @@ impl Flushing {
             .name("amphora.replica.flush".into())
             .spawn(move || {
                 let mut copied_at: Option<Instant> = None;
-                for Ask { at, copy } in asked {
+                for Ask { at, copy, held } in asked {
                     // The disk's time, not the owner's: a flush is real I/O however its owner's
                     // clock runs.
                     let began = Instant::now();
@@ -1410,24 +1363,18 @@ impl Flushing {
                         copied_at = Some(began);
                         let said = match copier.checkpoint() {
                             // A busy pass copied nothing and says nothing of the log: not counted.
-                            Ok(copied) if copied == Checkpointed::default() => Ok(None),
-                            Ok(copied) => {
+                            Ok(copied) if copied == Checkpointed::default() => Ok(()),
+                            Ok(_) => {
                                 meter.checkpointed(began.elapsed());
-                                Ok(Some(copied))
+                                Ok(())
                             }
                             // The file's state is unknown after a failed copy: the owner fences.
                             Err(e) => Err(format!("a checkpoint failed: {e:#}")),
                         };
-                        match said.and_then(|copied| {
+                        match said.and_then(|()| {
                             let (room, image, unread) = room(&copier, &mut free, &share, &members)?;
-                            let through = copier.durable_frame();
-                            let caught_up = copied.is_some_and(|c| {
-                                c.left == 0
-                                    || through.is_some_and(|d| c.log.saturating_sub(c.left) >= d)
-                            });
                             Ok(Pass {
-                                caught_up,
-                                busy: copied.is_none(),
+                                ready: held,
                                 room,
                                 image,
                                 unread,
@@ -1450,8 +1397,7 @@ impl Flushing {
             done,
             out: false,
             pass: Pass {
-                caught_up: false,
-                busy: false,
+                ready: false,
                 room,
                 image,
                 unread,
@@ -3494,14 +3440,15 @@ impl<F: BlockFile + 'static> Actor<F> {
         Ok(())
     }
     /// The flushing: takes what a finished flush made durable and what its checkpoint pass said,
-    /// starts the database's log again when it is due and no flush or read is out, and hands the
-    /// flushing thread the point applied when none is out (replication.md, "A replica's database
-    /// log bounded by what it measures"). A restart is due by its share of what it holds
+    /// starts the database's log again when it is due and no flush is out, and hands the flushing
+    /// thread the point applied when none is out (replication.md, "A replica's database log
+    /// bounded by what it measures"). A restart is due by its share of what it holds
     /// (`log_bound::Spacing`), or past the log's room whatever the share says: disk before
-    /// latency. A failed flush or checkpoint leaves the log's state unknown, so the owner fences.
+    /// latency. It waits for no read (store.md, decision 45). A failed flush or checkpoint leaves
+    /// the log's state unknown, so the owner fences.
     fn flush(&mut self) -> Result<(), Refusal> {
-        // While a session holds the database's write lock the log is neither restarted nor are
-        // reads held for a restart: nothing applies meanwhile, so the log does not grow.
+        // While a session holds the database's write lock the log is not restarted: nothing
+        // applies meanwhile, so the log does not grow.
         let lent = self.sessions.out;
         match &mut self.flushing {
             Flushing::Thread {
@@ -3543,10 +3490,8 @@ impl<F: BlockFile + 'static> Actor<F> {
                     .log_limit_bytes(pass.room.saturating_mul(log_bound::FRAME_BYTES));
                 let past = frames > pass.room;
                 let due = past || (frames > 0 && self.spacing.due()?);
-                if hold_due(pass, due, past) && !lent {
-                    self.control.local.hold_reads()?;
-                }
-                if due && pass.caught_up && !*out && !lent {
+                let mut restarted = false;
+                if due && pass.ready && !*out && !lent {
                     // The queue as this step began, on the basis each later step reads it.
                     let queued = self.step_queued;
                     let machine = self.replica.machine_mut();
@@ -3555,14 +3500,11 @@ impl<F: BlockFile + 'static> Actor<F> {
                     // the file (store.md decision 31: files.rs what_cutting_the_log_costs_its_writer,
                     // adacachy 2026-10-29, a check rather than a recorded run).
                     machine.keep_log(pass.room);
-                    if self
-                        .control
-                        .local
-                        .restart_unread(|| machine.restart_log())?
-                        == Some(true)
-                    {
-                        pass.caught_up = false;
-                        pass.busy = false;
+                    // Not made while a read still counts on the segment the last one closed, or
+                    // its copy isn't done: the owner appends on and tries again at its next step.
+                    restarted = machine.restart_log().map_err(|error| refused(&error))?;
+                    if restarted {
+                        pass.ready = false;
                         self.spacing.restarted(queued)?;
                         self.control.meter.restarted();
                     }
@@ -3583,15 +3525,18 @@ impl<F: BlockFile + 'static> Actor<F> {
                     )
                 });
                 // While a restart is due, a pass follows every flush, and one is asked even with
-                // nothing to flush: the restart waits for one that copies every durable frame.
-                let due = past || (frames > 0 && self.spacing.due()?);
+                // nothing to flush: the next restart waits for the segment the last one closed to
+                // be copied. One is asked as a restart is made, so that segment is copied at once:
+                // a read that begins before it is counts on that segment too.
+                let copy = restarted || past || (frames > 0 && self.spacing.due()?);
                 let next = match self.replica.machine().unflushed() {
                     Some(at) => Some(at),
-                    None if due => Some(self.replica.machine().applied()),
+                    None if copy => Some(self.replica.machine().applied()),
                     None => None,
                 };
                 if !*out && let Some(at) = next {
-                    ask.try_send(Ask { at, copy: due })
+                    let held = frames > 0;
+                    ask.try_send(Ask { at, copy, held })
                         .map_err(|_| fenced("the replica's flushing thread took no flush"))?;
                     *out = true;
                 }
@@ -5873,10 +5818,8 @@ impl<F: BlockFile + 'static> Actor<F> {
         claim: Option<Option<crate::database::Application>>,
     ) -> Result<(), Refusal> {
         // A restart due and ready runs before the write lock is lent, as after a session run
-        // inline; none runs while the session is out, so no read is held for one meanwhile
-        // (CP-T1.13, lane P15's trace).
+        // inline; none runs while the session is out (CP-T1.13, lane P15's trace).
         self.flush()?;
-        self.control.local.unhold_reads()?;
         let base = match self.replica.machine().session_base() {
             Ok(base) => base,
             Err(refusal) => {
