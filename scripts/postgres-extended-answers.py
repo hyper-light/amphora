@@ -89,9 +89,11 @@ def answers(client, steps):
         kind, body = client.read()
         kind = kind.decode()
         messages.append((kind, body.hex()))
-        if kind == "E" and ends[0] not in ("q", "Z"):
-            # Every message until Sync is skipped.
+        # Every message from an error to Sync is skipped, the error's own step's or one before it.
+        if (kind == "E" and ends[0] not in ("q", "Z")) or (kind == "Z" and ends[0] not in ("q", "Z")):
             while ends and ends[0] != "Z":
+                ends.pop(0)
+            if kind == "Z":
                 ends.pop(0)
         elif kind in ends[0] or (ends[0] == "q" and kind == "Z"):
             ends.pop(0)
@@ -109,11 +111,16 @@ def main():
     admin.query("drop database if exists %s" % database)
     admin.query("create database %s" % database)
     sessions = {name: wire.Client(host, port, database) for name in ("s1", "s2")}
+    for client in sessions.values():
+        client.sock.settimeout(30)
     for line in open(steps, encoding="utf-8").read().splitlines():
         if not line or line.startswith("#"):
             continue
         name, rest = line.split(": ", 1)
-        sent, messages = answers(sessions[name], rest.split(" ~ "))
+        try:
+            sent, messages = answers(sessions[name], rest.split(" ~ "))
+        except TimeoutError:
+            raise SystemExit("no answer: %s" % line)
         print("@ %s %s" % (name, rest))
         print("> %s" % sent.hex())
         for kind, body in messages:
