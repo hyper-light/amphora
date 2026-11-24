@@ -1,5 +1,5 @@
 use crate::schema::{BTreeTable, Column, Trigger};
-use crate::sync::Arc;
+use crate::sync::{Arc, OnceLock, Weak};
 use crate::translate::expr::WalkControl;
 use crate::translate::plan::ColumnMask;
 use crate::translate::subquery::{
@@ -13,11 +13,12 @@ use crate::translate::{
 };
 use crate::util::normalize_ident;
 use crate::vdbe::insn::{Insn, Subprogram};
-use crate::vdbe::BranchOffset;
+use crate::vdbe::{BranchOffset, PreparedProgram};
 use crate::{bail_parse_error, QueryMode, Result};
 use amphora_engine_parser::ast::{self, Expr, TriggerEvent, TriggerTime};
 use std::cell::RefCell;
 use std::num::NonZero;
+use std::rc::Rc;
 
 /// Context for trigger execution
 #[derive(Debug)]
@@ -176,6 +177,83 @@ impl ParamAllocator {
     /// Total number of parameters allocated so far.
     fn num_params(&self) -> usize {
         self.next_param - 1
+    }
+
+    /// The registers of a firing's row that a call of the program passes, by parameter.
+    fn registers(&self, ctx: &TriggerContext) -> Result<Vec<usize>> {
+        let mut registers = vec![0usize; self.num_params()];
+        let rows = [
+            (&ctx.new_registers, &self.new_entries, self.new_rowid),
+            (&ctx.old_registers, &self.old_entries, self.old_rowid),
+        ];
+        for (row, entries, rowid) in rows {
+            let Some(row) = row else { continue };
+            let columns = entries
+                .iter()
+                .zip(row)
+                .map(|(parameter, register)| (*parameter, *register));
+            let rowid = row.last().map(|register| (rowid, *register));
+            for (parameter, register) in columns.chain(rowid) {
+                let Some(parameter) = parameter else { continue };
+                let place = parameter
+                    .get()
+                    .checked_sub(1)
+                    .and_then(|at| registers.get_mut(at))
+                    .ok_or_else(|| {
+                        crate::LimboError::InternalError("trigger parameter out of range".into())
+                    })?;
+                *place = register;
+            }
+        }
+        Ok(registers)
+    }
+}
+
+/// The trigger programs being compiled, outermost first.
+///
+/// With `PRAGMA recursive_triggers` a trigger's statement may fire the trigger itself. The call it
+/// compiles is of the program being compiled, as a foreign key's action that reaches itself
+/// compiles its own (`FkActionCompileStack`). A program is of one trigger under one conflict clause:
+/// SQLite's `TriggerPrg` is found by both.
+#[derive(Clone, Default)]
+pub(crate) struct TriggerCompileStack(Rc<RefCell<Vec<CompilingTrigger>>>);
+
+#[derive(Clone)]
+struct CompilingTrigger {
+    trigger: Arc<Trigger>,
+    override_conflict: Option<ast::ResolveType>,
+    parameters: Rc<ParamAllocator>,
+    slot: Arc<OnceLock<Weak<PreparedProgram>>>,
+}
+
+impl TriggerCompileStack {
+    fn find(
+        &self,
+        trigger: &Arc<Trigger>,
+        override_conflict: Option<ast::ResolveType>,
+    ) -> Option<CompilingTrigger> {
+        self.0
+            .borrow()
+            .iter()
+            .find(|compiling| {
+                Arc::ptr_eq(&compiling.trigger, trigger)
+                    && compiling.override_conflict == override_conflict
+            })
+            .cloned()
+    }
+
+    fn push(&self, compiling: CompilingTrigger) -> TriggerCompileGuard {
+        self.0.borrow_mut().push(compiling);
+        TriggerCompileGuard(self.clone())
+    }
+}
+
+/// Takes a trigger's program off the stack when its compilation ends, an error's too.
+struct TriggerCompileGuard(TriggerCompileStack);
+
+impl Drop for TriggerCompileGuard {
+    fn drop(&mut self) {
+        self.0 .0.borrow_mut().pop();
     }
 }
 
@@ -566,8 +644,21 @@ fn execute_trigger_commands(
     }
 
     if connection.trigger_is_compiling(trigger) {
-        // Do not recursively compile the same trigger
-        return Ok(false);
+        if !connection.recursive_triggers() {
+            // Do not recursively compile the same trigger
+            return Ok(false);
+        }
+        if let Some(compiling) = resolver
+            .trigger_compile_stack
+            .find(trigger, ctx.override_conflict)
+        {
+            program.emit_insn(Insn::Program {
+                param_registers: compiling.parameters.registers(ctx)?,
+                program: Subprogram::Pending(compiling.slot),
+                ignore_jump_target,
+            });
+            return Ok(true);
+        }
     }
     connection.start_trigger_compilation(trigger.clone());
     let _trigger_compilation_guard = TriggerCompilationGuard {
@@ -619,9 +710,23 @@ fn execute_trigger_commands(
     };
     let prev_trigger_context = resolver.trigger_context.clone();
     resolver.set_trigger_context(trigger_database_id, trigger.name.clone());
+    // Every parameter is known before the first statement is compiled, which may fire this trigger.
+    let statements = trigger
+        .commands
+        .iter()
+        .map(|command| trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx))
+        .collect::<Result<Vec<_>>>()?;
+    let parameters = Rc::new(subprogram_ctx.param_alloc.into_inner());
+    let slot = Arc::new(OnceLock::new());
+    let compile_stack = resolver.trigger_compile_stack.clone();
+    let compiling = compile_stack.push(CompilingTrigger {
+        trigger: trigger.clone(),
+        override_conflict: ctx.override_conflict,
+        parameters: parameters.clone(),
+        slot: slot.clone(),
+    });
     let compile_result = (|| -> Result<()> {
-        for command in trigger.commands.iter() {
-            let stmt = trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx)?;
+        for (command, stmt) in trigger.commands.iter().zip(statements) {
             subprogram_builder.prologue();
             translate_inner(
                 stmt,
@@ -641,6 +746,7 @@ fn execute_trigger_commands(
         }
         Ok(())
     })();
+    drop(compiling);
     // Restore previous trigger context (supports nested triggers).
     resolver.trigger_context = prev_trigger_context;
     compile_result?;
@@ -648,6 +754,9 @@ fn execute_trigger_commands(
     let built_subprogram =
         subprogram_builder.build(connection.clone(), true, "trigger subprogram")?;
     let subprogram_prepared = built_subprogram.prepared();
+    slot.set(Arc::downgrade(subprogram_prepared)).map_err(|_| {
+        crate::LimboError::InternalError("trigger program compiled twice into one slot".into())
+    })?;
 
     // Trigger subprograms do not emit Transaction opcodes, so the parent statement
     // must acquire any attached/temp database transactions the trigger body needs
@@ -672,34 +781,7 @@ fn execute_trigger_commands(
         }
     }
 
-    // Build the param_registers Vec from the sparse allocator: maps each parameter
-    // index to the parent register that holds the value.
-    let alloc = subprogram_ctx.param_alloc.borrow();
-    let total_params = alloc.num_params();
-    let mut param_registers = vec![0usize; total_params];
-
-    if let Some(new_regs) = &ctx.new_registers {
-        for (col_idx, opt_param) in alloc.new_entries.iter().enumerate() {
-            if let Some(param_idx) = opt_param {
-                param_registers[param_idx.get() - 1] = new_regs[col_idx];
-            }
-        }
-        if let Some(param_idx) = alloc.new_rowid {
-            param_registers[param_idx.get() - 1] = *new_regs.last().unwrap();
-        }
-    }
-    if let Some(old_regs) = &ctx.old_registers {
-        for (col_idx, opt_param) in alloc.old_entries.iter().enumerate() {
-            if let Some(param_idx) = opt_param {
-                param_registers[param_idx.get() - 1] = old_regs[col_idx];
-            }
-        }
-        if let Some(param_idx) = alloc.old_rowid {
-            param_registers[param_idx.get() - 1] = *old_regs.last().unwrap();
-        }
-    }
-    drop(alloc);
-
+    let param_registers = parameters.registers(ctx)?;
     program.emit_insn(Insn::Program {
         param_registers,
         program: Subprogram::PreparedProgram(built_subprogram.prepared().clone()),

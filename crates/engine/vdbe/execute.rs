@@ -6244,22 +6244,36 @@ pub fn op_integer(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// A program a statement runs: a trigger's or a foreign key's action.
+pub struct RunningProgram {
+    pub(super) statement: Box<Statement>,
+    is_trigger: bool,
+    /// Saved last_insert_rowid to restore after trigger subprogram completes.
+    /// Per SQLite docs, trigger-body INSERTs must not overwrite the top-level rowid.
+    saved_last_insert_rowid: Option<i64>,
+    /// Saved connection-level `changes()` value to restore after a trigger subprogram.
+    /// Trigger-body statements temporarily replace it via ResetCount, but the caller's
+    /// value becomes visible again once the trigger returns.
+    saved_changes_value: Option<i64>,
+    /// Where its caller goes on when it raises IGNORE.
+    ignore_jump_target: crate::vdbe::BranchOffset,
+    /// Whether its caller keeps the statement for the next time it runs this instruction. A
+    /// program that calls itself doesn't: the statements it would keep are as deep as its calls.
+    kept: bool,
+}
+
+/// The programs a statement runs, however deep, are stepped by the statement's own `op_program`:
+/// a program that runs another hands it over and waits, so their depth takes no stack.
 #[derive(Default)]
 pub enum OpProgramState {
     #[default]
     Start,
-    /// Step state tracks whether we're executing a trigger subprogram (vs FK action subprogram)
-    Step {
-        is_trigger: bool,
-        statement: Box<Statement>,
-        /// Saved last_insert_rowid to restore after trigger subprogram completes.
-        /// Per SQLite docs, trigger-body INSERTs must not overwrite the top-level rowid.
-        saved_last_insert_rowid: Option<i64>,
-        /// Saved connection-level `changes()` value to restore after a trigger subprogram.
-        /// Trigger-body statements temporarily replace it via ResetCount, but the caller's
-        /// value becomes visible again once the trigger returns.
-        saved_changes_value: Option<i64>,
-    },
+    /// This program waits for the one it handed over (`ProgramState::called_program`).
+    Called,
+    /// The program this one handed over failed.
+    Failed(Box<LimboError>),
+    /// The programs running, each called by the one before it and the first by this statement.
+    Running(Vec<RunningProgram>),
 }
 
 fn finish_subprogram(
@@ -6324,6 +6338,10 @@ pub fn op_change_count(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// How deep programs may run programs: SQLITE_MAX_TRIGGER_DEPTH (sqlite.org/limits.html, 10: "The
+/// default maximum trigger depth is 1000"), which bounds foreign keys' actions too.
+const MAX_TRIGGER_DEPTH: usize = 1000;
+
 /// Execute a subprogram (Program opcode).
 /// Used for both triggers and FK actions (CASCADE, SET NULL, etc.)
 pub fn op_program(
@@ -6340,187 +6358,209 @@ pub fn op_program(
         },
         insn
     );
+    match std::mem::take(state.active_op_state.program()) {
+        OpProgramState::Running(running) => return run_programs(program, state, running),
+        OpProgramState::Failed(err) => return Err(err),
+        OpProgramState::Start | OpProgramState::Called => {}
+    }
+    let kept = matches!(
+        subprogram,
+        crate::vdbe::insn::Subprogram::PreparedProgram(_)
+    );
     let subprogram = subprogram.prepared_program()?;
-    loop {
-        match std::mem::take(state.active_op_state.program()) {
-            OpProgramState::Start => {
-                // A trigger doesn't fire from a program it runs, a foreign key's action among them
-                // (SQLite's OP_Program, P5: recursive_triggers is off).
-                let fires_itself = subprogram
-                    .trigger
-                    .as_ref()
-                    .is_some_and(|trigger| program.connection.is_trigger_executing(trigger));
-                if fires_itself {
-                    state.pc += 1;
-                    state.active_op_state.clear();
-                    return Ok(InsnFunctionStepResult::Step);
-                }
-                // Try to reuse a cached statement for this PC, otherwise create a new one.
-                // When we have triggers or fk-actions with multi-row inserts, we can re-use
-                // cached statements by storing them key'd by the state.pc if we are in a loop
-                let pc_key = state.pc as usize;
-                let mut statement =
-                    if let Some(mut cached) = state.subprogram_stmt_cache.remove(&pc_key) {
-                        cached.reset_for_subprogram_reuse();
-                        cached
-                    } else {
-                        Box::new(Statement::new_with_origin(
-                            Program::from_prepared(subprogram.clone(), program.connection.clone()),
-                            pager.clone(),
-                            QueryMode::Normal,
-                            0,
-                            crate::statement::StatementOrigin::Subprogram,
-                            false,
-                        ))
-                    };
+    // A trigger doesn't fire from a program it runs, a foreign key's action among them, unless
+    // PRAGMA recursive_triggers says so (SQLite's OP_Program, P5).
+    let fires_itself = subprogram.trigger.as_ref().is_some_and(|trigger| {
+        !program.connection.recursive_triggers() && program.connection.is_trigger_executing(trigger)
+    });
+    if fires_itself {
+        state.pc += 1;
+        state.active_op_state.clear();
+        return Ok(InsnFunctionStepResult::Step);
+    }
+    let depth = state
+        .program_depth
+        .checked_add(1)
+        .filter(|depth| *depth <= MAX_TRIGGER_DEPTH)
+        .ok_or_else(|| LimboError::SqlError("too many levels of trigger recursion".to_string()))?;
+    // Try to reuse a cached statement for this PC, otherwise create a new one.
+    // When we have triggers or fk-actions with multi-row inserts, we can re-use
+    // cached statements by storing them key'd by the state.pc if we are in a loop
+    let pc_key = state.pc as usize;
+    let mut statement = if let Some(mut cached) = state.subprogram_stmt_cache.remove(&pc_key) {
+        cached.reset_for_subprogram_reuse();
+        cached
+    } else {
+        Box::new(Statement::new_with_origin(
+            Program::from_prepared(subprogram, program.connection.clone()),
+            pager.clone(),
+            QueryMode::Normal,
+            0,
+            crate::statement::StatementOrigin::Subprogram,
+            false,
+        ))
+    };
 
-                // Check if this is a trigger subprogram - if so, track execution
-                // and save last_insert_rowid so it can be restored after the trigger finishes.
-                let (is_trigger, saved_last_insert_rowid, saved_last_changes_value) =
-                    if let Some(ref trigger) = statement.get_trigger() {
-                        program.connection.start_trigger_execution(trigger.clone());
-                        (
-                            true,
-                            Some(program.connection.last_insert_rowid()),
-                            Some(program.connection.changes()),
-                        )
-                    } else {
-                        (false, None, None)
-                    };
+    // Copy parameter values from parent registers into the subprogram's parameters.
+    for (param_idx, &parent_reg) in param_registers.iter().enumerate() {
+        let value = state.registers[parent_reg].get_value().clone();
+        let param_index = param_idx
+            .checked_add(1)
+            .and_then(NonZero::<usize>::new)
+            .ok_or_else(|| LimboError::InternalError("parameter index overflow".to_string()))?;
+        statement.bind_at(param_index, value)?;
+    }
+    statement.set_fk_immediate_violations(state.get_fk_immediate_violations_during_stmt());
+    statement.set_program_depth(depth);
 
-                // Copy parameter values from parent registers into the subprogram's parameters.
-                for (param_idx, &parent_reg) in param_registers.iter().enumerate() {
-                    let value = state.registers[parent_reg].get_value().clone();
-                    let param_index = NonZero::<usize>::new(param_idx + 1)
-                        .expect("param_idx + 1 should be non-zero");
-                    statement.bind_at(param_index, value)?;
-                }
-                statement
-                    .set_fk_immediate_violations(state.get_fk_immediate_violations_during_stmt());
+    // Check if this is a trigger subprogram - if so, track execution
+    // and save last_insert_rowid so it can be restored after the trigger finishes.
+    let trigger = statement.get_trigger();
+    if let Some(trigger) = &trigger {
+        program.connection.start_trigger_execution(trigger.clone());
+    }
+    let called = RunningProgram {
+        is_trigger: trigger.is_some(),
+        saved_last_insert_rowid: trigger
+            .as_ref()
+            .map(|_| program.connection.last_insert_rowid()),
+        saved_changes_value: trigger.as_ref().map(|_| program.connection.changes()),
+        statement,
+        ignore_jump_target: *ignore_jump_target,
+        kept,
+    };
+    if program.is_trigger_subprogram() {
+        // The statement this program runs for runs the one it calls too.
+        state.called_program = Some(Box::new(called));
+        *state.active_op_state.program() = OpProgramState::Called;
+        return Ok(InsnFunctionStepResult::Row);
+    }
+    run_programs(program, state, vec![called])
+}
 
-                *state.active_op_state.program() = OpProgramState::Step {
-                    is_trigger,
-                    statement,
-                    saved_last_insert_rowid,
-                    saved_changes_value: saved_last_changes_value,
-                };
+/// How a program ended, for the one that called it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProgramEnd {
+    Done,
+    /// RAISE(IGNORE): its caller skips the row.
+    Ignored,
+    Failed,
+}
+
+/// Ends the innermost of `running` and takes its caller on: to the next instruction, to where
+/// RAISE(IGNORE) goes, or, if the program failed, to nowhere yet.
+fn end_program<'a>(
+    program: &'a Program,
+    state: &'a mut ProgramState,
+    running: &'a mut Vec<RunningProgram>,
+    end: ProgramEnd,
+) -> Result<&'a mut ProgramState> {
+    let ended = running
+        .pop()
+        .ok_or_else(|| LimboError::InternalError("no program is running".to_string()))?;
+    let caller = match running.last_mut() {
+        Some(caller) => caller.statement.subprogram_state(),
+        None => state,
+    };
+    let aborted = end != ProgramEnd::Done;
+    finish_subprogram(
+        program,
+        &ended.statement,
+        ended.is_trigger,
+        aborted,
+        ended.saved_last_insert_rowid,
+        ended.saved_changes_value,
+    );
+    caller.set_fk_immediate_violations_during_stmt(ended.statement.fk_immediate_violations());
+    match end {
+        ProgramEnd::Done => {
+            // Cache the statement for reuse on subsequent fires of this same Program instruction
+            // (e.g. next row in an INSERT loop). Only cache on clean completion - aborted
+            // statements have dirty internal state and cannot be safely reused.
+            if ended.kept {
+                let pc_key = caller.pc as usize;
+                caller.subprogram_stmt_cache.insert(pc_key, ended.statement);
+            } else {
+                caller.metrics.merge(&ended.statement.metrics());
             }
-            OpProgramState::Step {
-                is_trigger,
-                mut statement,
-                saved_last_insert_rowid,
-                saved_changes_value: saved_last_changes_value,
-            } => {
-                let mut raise_ignore = false;
-                // Track whether the subprogram aborted with an error. When abort()
-                // runs inside the subprogram, it already calls end_trigger_execution(),
-                // so we must not call it again after the loop.
-                let mut subprogram_aborted = false;
-                loop {
-                    let res = statement.step_subprogram();
-                    match res {
-                        Ok(step_result) => match step_result {
-                            StepResult::Done => break,
-                            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
-                                let io = statement
-                                    .take_io_completions()
-                                    .unwrap_or_else(|| IOCompletions(Completion::new_yield()));
-                                *state.active_op_state.program() = OpProgramState::Step {
-                                    is_trigger,
-                                    statement,
-                                    saved_last_insert_rowid,
-                                    saved_changes_value: saved_last_changes_value,
-                                };
-                                return Ok(state.suspend_on_io(io));
-                            }
-                            StepResult::Row => continue,
-                            step @ (StepResult::Interrupt | StepResult::Busy) => {
-                                *state.active_op_state.program() = OpProgramState::Step {
-                                    is_trigger,
-                                    statement,
-                                    saved_last_insert_rowid,
-                                    saved_changes_value: saved_last_changes_value,
-                                };
-                                // An interrupt is the caller's own; busy is another connection's.
-                                let error = if matches!(step, StepResult::Interrupt) {
-                                    LimboError::Interrupt
-                                } else {
-                                    LimboError::Busy
-                                };
-                                return Err(error.into());
-                            }
-                        },
-                        Err(LimboError::RaiseIgnore) => {
-                            raise_ignore = true;
-                            subprogram_aborted = true;
-                            break;
-                        }
-                        Err(err) => {
-                            subprogram_aborted = true;
-                            state.constraint_action = statement.constraint_action();
-                            state.set_fk_immediate_violations_during_stmt(
-                                statement.fk_immediate_violations(),
-                            );
-                            let fails = match &err {
-                                LimboError::Raise(action, _) => *action == ResolveType::Fail,
-                                LimboError::Constraint(_) => {
-                                    state.constraint_action == ResolveType::Fail
-                                }
-                                _ => false,
-                            };
-                            // What FAIL keeps ends the statement's own transaction, where a
-                            // deferred key is checked (SQLite's sqlite3VdbeHalt).
-                            let err = if fails
-                                && !program.is_trigger_subprogram()
-                                && state.can_autocommit_now(&program.connection, true)
-                                && violates_deferred_fk(program)
-                            {
-                                state.constraint_action = ResolveType::Abort;
-                                fk_constraint_failed()
-                            } else {
-                                err
-                            };
-                            finish_subprogram(
-                                program,
-                                &statement,
-                                is_trigger,
-                                subprogram_aborted,
-                                saved_last_insert_rowid,
-                                saved_last_changes_value,
-                            );
-                            return Err(err.into());
-                        }
-                    }
-                }
-                finish_subprogram(
-                    program,
-                    &statement,
-                    is_trigger,
-                    subprogram_aborted,
-                    saved_last_insert_rowid,
-                    saved_last_changes_value,
-                );
-                state.set_fk_immediate_violations_during_stmt(statement.fk_immediate_violations());
+            caller.pc += 1;
+            caller.active_op_state.clear();
+        }
+        ProgramEnd::Ignored => {
+            caller.pc = ended.ignore_jump_target.as_offset_int();
+            caller.active_op_state.clear();
+        }
+        ProgramEnd::Failed => {
+            caller.constraint_action = ended.statement.constraint_action();
+        }
+    }
+    Ok(caller)
+}
 
-                // Cache the statement for reuse on subsequent fires of this
-                // same Program instruction (e.g. next row in an INSERT loop).
-                // Only cache on clean completion - aborted statements have dirty
-                // internal state and cannot be safely reused.
-                if !subprogram_aborted {
-                    let pc_key = state.pc as usize;
-                    state.subprogram_stmt_cache.insert(pc_key, statement);
+/// Steps the programs a statement runs until the first is done.
+fn run_programs(
+    program: &Program,
+    state: &mut ProgramState,
+    mut running: Vec<RunningProgram>,
+) -> InsnResult {
+    while let Some(innermost) = running.last_mut() {
+        match innermost.statement.step_subprogram() {
+            Ok(StepResult::Row) => {
+                if let Some(called) = innermost.statement.subprogram_state().called_program.take() {
+                    running.push(*called);
                 }
-                if raise_ignore {
-                    // RAISE(IGNORE) — skip the current row by jumping to ignore_jump_target
-                    state.pc = ignore_jump_target.as_offset_int();
+            }
+            Ok(StepResult::Done) => {
+                end_program(program, state, &mut running, ProgramEnd::Done)?;
+            }
+            Ok(StepResult::IO | StepResult::Yield | StepResult::Sleep { .. }) => {
+                let io = innermost
+                    .statement
+                    .take_io_completions()
+                    .unwrap_or_else(|| IOCompletions(Completion::new_yield()));
+                *state.active_op_state.program() = OpProgramState::Running(running);
+                return Ok(state.suspend_on_io(io));
+            }
+            Ok(step @ (StepResult::Interrupt | StepResult::Busy)) => {
+                *state.active_op_state.program() = OpProgramState::Running(running);
+                // An interrupt is the caller's own; busy is another connection's.
+                let error = if matches!(step, StepResult::Interrupt) {
+                    LimboError::Interrupt
                 } else {
-                    state.pc += 1;
+                    LimboError::Busy
+                };
+                return Err(error.into());
+            }
+            Err(LimboError::RaiseIgnore) => {
+                end_program(program, state, &mut running, ProgramEnd::Ignored)?;
+            }
+            Err(err) => {
+                let nested = running.len() > 1;
+                let caller = end_program(program, state, &mut running, ProgramEnd::Failed)?;
+                if nested {
+                    // Its caller fails at its own instruction, and is undone as it is there.
+                    *caller.active_op_state.program() = OpProgramState::Failed(Box::new(err));
+                    continue;
                 }
-                state.active_op_state.clear();
-                return Ok(InsnFunctionStepResult::Step);
+                let fails = match &err {
+                    LimboError::Raise(action, _) => *action == ResolveType::Fail,
+                    LimboError::Constraint(_) => state.constraint_action == ResolveType::Fail,
+                    _ => false,
+                };
+                // What FAIL keeps ends the statement's own transaction, where a deferred key is
+                // checked (SQLite's sqlite3VdbeHalt).
+                if fails
+                    && state.can_autocommit_now(&program.connection, true)
+                    && violates_deferred_fk(program)
+                {
+                    state.constraint_action = ResolveType::Abort;
+                    return Err(fk_constraint_failed().into());
+                }
+                return Err(err.into());
             }
         }
     }
+    Ok(InsnFunctionStepResult::Step)
 }
 
 pub(super) fn abort_active_subprogram(
@@ -6533,26 +6573,23 @@ pub(super) fn abort_active_subprogram(
     };
     let subprogram = std::mem::take(subprogram);
     state.active_op_state.clear();
-    if let OpProgramState::Step {
-        is_trigger,
-        mut statement,
-        saved_last_insert_rowid,
-        saved_changes_value,
-    } = subprogram
-    {
-        let result = statement.abort_subprogram(err);
+    let OpProgramState::Running(mut running) = subprogram else {
+        return Ok(());
+    };
+    let mut result = Ok(());
+    while let Some(mut ended) = running.pop() {
+        let aborted = ended.statement.abort_subprogram(err);
         finish_subprogram(
             program,
-            &statement,
-            is_trigger,
+            &ended.statement,
+            ended.is_trigger,
             true,
-            saved_last_insert_rowid,
-            saved_changes_value,
+            ended.saved_last_insert_rowid,
+            ended.saved_changes_value,
         );
-        result
-    } else {
-        Ok(())
+        result = result.and(aborted);
     }
+    result
 }
 
 pub fn op_real(

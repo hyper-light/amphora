@@ -1993,6 +1993,8 @@ pub enum PragmaName {
     PageSize,
     /// make connection query only
     QueryOnly,
+    /// Whether a trigger may fire itself, and REPLACE the DELETE triggers of the rows it removes
+    RecursiveTriggers,
     /// Returns schema version of the database file.
     SchemaVersion,
     /// Deprecated: control whether unaliased column names omit the table name prefix
