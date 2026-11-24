@@ -6029,7 +6029,10 @@ impl Pager {
     }
 
     /// What ends a checkpoint of `mode` once its copy is in the file: its log starts again, or not.
-    const fn start_log_again_phase(mode: CheckpointMode, clear_page_cache: bool) -> CheckpointPhase {
+    const fn start_log_again_phase(
+        mode: CheckpointMode,
+        clear_page_cache: bool,
+    ) -> CheckpointPhase {
         match mode {
             CheckpointMode::Truncate { .. } => {
                 CheckpointPhase::TruncateWalFile { clear_page_cache }

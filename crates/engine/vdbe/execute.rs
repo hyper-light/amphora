@@ -792,7 +792,11 @@ pub fn op_checkpoint(
         };
         match pager.checkpoint(mode, sync_mode, true) {
             Ok(IOResult::Done(result)) if !state.checkpoint_blocked => {
-                break (0, result.wal_max_frame as i64, result.wal_total_backfilled as i64);
+                break (
+                    0,
+                    result.wal_max_frame as i64,
+                    result.wal_total_backfilled as i64,
+                );
             }
             // "the checkpoint operation proceeds from that point in the same way as
             // SQLITE_CHECKPOINT_PASSIVE [...]. SQLITE_BUSY is returned in this case"
@@ -808,7 +812,8 @@ pub fn op_checkpoint(
             Err(err) => {
                 tracing::debug!("PRAGMA wal_checkpoint failed: {err:?}");
                 pager.cleanup_after_checkpoint_failure();
-                if state.checkpoint_blocked || mode == passive || !matches!(*err, LimboError::Busy) {
+                if state.checkpoint_blocked || mode == passive || !matches!(*err, LimboError::Busy)
+                {
                     break (1, -1, -1);
                 }
                 state.checkpoint_blocked = true;

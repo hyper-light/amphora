@@ -4295,11 +4295,7 @@ impl ReadHold {
     }
 
     /// The read under way goes on with `guard` and `span`: what it held until now, to give back.
-    fn move_to(
-        &self,
-        guard: ReadGuardKind,
-        span: ReadSpan,
-    ) -> Option<(ReadGuardKind, ReadSpan)> {
+    fn move_to(&self, guard: ReadGuardKind, span: ReadSpan) -> Option<(ReadGuardKind, ReadSpan)> {
         self.held.lock().replace((guard, span))
     }
 
@@ -8595,7 +8591,8 @@ impl WalFile {
                         .file
                         .clone();
                     // Nothing to cut in a segment never switched to, nor in one cut already.
-                    let file = file.filter(|file| last || file.size().map_or(true, |size| size > 0));
+                    let file =
+                        file.filter(|file| last || file.size().map_or(true, |size| size > 0));
                     let Some(file) = file else {
                         result.cut = Self::after_cut(segment, last);
                         continue;

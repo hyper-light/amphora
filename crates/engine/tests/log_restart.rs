@@ -78,9 +78,8 @@ fn beside(dir: &Path, suffix: &str) -> PathBuf {
 
 /// The bytes of the log's two files.
 fn log_bytes(dir: &Path) -> [u64; 2] {
-    ["-wal", "-wal2"].map(|suffix| {
-        std::fs::metadata(beside(dir, suffix)).map_or(0, |file| file.len())
-    })
+    ["-wal", "-wal2"]
+        .map(|suffix| std::fs::metadata(beside(dir, suffix)).map_or(0, |file| file.len()))
 }
 
 /// A database whose log holds the three frames sqlite3's holds as the steps begin.
