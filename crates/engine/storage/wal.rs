@@ -3185,24 +3185,20 @@ impl WalCoordination for ShmWalCoordination {
                 Ok(CoordinationCheckpointGuardKind::Read0)
             }
             CheckpointMode::Full | CheckpointMode::Restart | CheckpointMode::Truncate { .. } => {
-                if !self.fallback.try_write_lock() {
+                if !self.fallback.try_segment_read_mark_exclusive(segment, 0) {
                     self.fallback.unlock_checkpoint_lock();
                     self.authority.release_writer(self.owner);
                     self.authority.release_checkpoint(self.owner);
                     return Err(LimboError::Busy);
                 }
-                if self.fallback.try_segment_read_mark_exclusive(segment, 0) {
-                    return Ok(CoordinationCheckpointGuardKind::Writer);
+                if !self.fallback.try_write_lock() {
+                    self.fallback.unlock_segment_read_mark(segment, 0);
+                    self.fallback.unlock_checkpoint_lock();
+                    self.authority.release_writer(self.owner);
+                    self.authority.release_checkpoint(self.owner);
+                    return Err(LimboError::Busy);
                 }
-                let held = self.segment_snapshot(segment);
-                if held.max_frame == held.nbackfills {
-                    return Ok(CoordinationCheckpointGuardKind::WriterBesideFileReads);
-                }
-                self.fallback.unlock_write_lock();
-                self.fallback.unlock_checkpoint_lock();
-                self.authority.release_writer(self.owner);
-                self.authority.release_checkpoint(self.owner);
-                Err(LimboError::Busy)
+                Ok(CoordinationCheckpointGuardKind::Writer)
             }
         }
     }
@@ -15168,9 +15164,8 @@ pub mod test {
         // now that we have some frames to checkpoint, try again
         conn2.pager.load().begin_read_tx().unwrap();
         let p = conn1.pager.load();
-        let w = p.wal.as_ref().unwrap();
         loop {
-            match w.checkpoint(&p, CheckpointMode::Restart, SyncMode::Full) {
+            match p.checkpoint(CheckpointMode::Restart, SyncMode::Full, true) {
                 Ok(IOResult::IO(io)) => {
                     io.wait(db.io.as_ref()).unwrap();
                 }

@@ -382,3 +382,46 @@ fn d45_a_read_in_the_log_holds_up_no_write_and_no_restart() {
         assert_eq!(rows(&held.r, "PRAGMA integrity_check"), ["ok"], "{log:?}");
     }
 }
+
+/// Do (decision 45's rule 1): end a process after a switch, the segment it closed not copied (its
+/// files, copied as it left them), and open them: checkpoint (FULL, RESTART, TRUNCATE) or VACUUM, with
+/// no read. Expect: the whole log in the file, the closed segment's frames and the current one's, as
+/// "It then checkpoints all frames in the log file" has it (wal_checkpoint_v2): the file alone holds
+/// every row, and TRUNCATE and VACUUM leave both of the log's files at 0 bytes.
+#[test]
+fn d45_a_checkpoint_of_the_whole_log_copies_both_segments() {
+    for (sql, answer) in [
+        ("PRAGMA wal_checkpoint(FULL)", vec!["0|4|4"]),
+        ("PRAGMA wal_checkpoint(RESTART)", vec!["0|4|4"]),
+        ("PRAGMA wal_checkpoint(TRUNCATE)", vec!["0|0|0"]),
+        ("VACUUM", vec![]),
+    ] {
+        let held = held(Log::New);
+        assert!(held.db.switch_log(None).unwrap());
+        for row in 2..6 {
+            held.w
+                .execute(format!("INSERT INTO t VALUES({row}, 'row')"))
+                .unwrap();
+        }
+        let left = tempfile::tempdir().unwrap();
+        for suffix in ["", "-wal", "-wal2"] {
+            std::fs::copy(beside(held.dir.path(), suffix), beside(left.path(), suffix)).unwrap();
+        }
+        let db = open(&beside(left.path(), ""));
+        let conn = connect(&db);
+        assert!(!db.wal_closing_copied(), "{sql}");
+        assert_eq!(rows(&conn, sql), answer, "{sql}");
+        assert_eq!(rows(&conn, "SELECT count(*) FROM t"), ["5"], "{sql}");
+        if sql.contains("TRUNCATE") || sql == "VACUUM" {
+            assert_eq!(log_bytes(left.path()), [0, 0], "{sql}");
+        }
+        let alone = tempfile::tempdir().unwrap();
+        std::fs::copy(beside(left.path(), ""), beside(alone.path(), "")).unwrap();
+        let file = open(&beside(alone.path(), ""));
+        let file = connect(&file);
+        assert_eq!(rows(&file, "SELECT count(*) FROM t"), ["5"], "{sql}");
+        assert_eq!(rows(&file, "PRAGMA integrity_check"), ["ok"], "{sql}");
+        conn.execute("INSERT INTO t VALUES(6, 'row')").unwrap();
+        assert_eq!(rows(&conn, "SELECT count(*) FROM t"), ["6"], "{sql}");
+    }
+}
