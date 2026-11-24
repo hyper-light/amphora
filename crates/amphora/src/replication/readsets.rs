@@ -77,6 +77,11 @@ struct Head<'a> {
 fn head(data: &[u8]) -> Option<(Head<'_>, usize, &[u8])> {
     // Inside its proposer's stamp (`closed`), which a moved base keeps as it was.
     let (_, inner) = super::closed::open(data).ok()?;
+    // Applying a lock delta also writes its stamp at the entry's final time. Prepared page
+    // images omit those pages, so neither this write nor a later write can rebase across it.
+    if inner.starts_with(super::LOCK_DELTA) {
+        return None;
+    }
     let body = match inner.strip_prefix(super::BASELINE_DELTA) {
         Some(payload) => {
             let (_, rest) =

@@ -1355,3 +1355,60 @@ ba250493, r579; fixed is 38e42411, r621):
 **Commands.** `~/.cache/amphora-perf/pagepath-b22/` on this machine holds the red run's output and the check script (`mac.sh`);
 on MacBook Pro 2 the same folder holds the logs, target `~/.cache/amphora-perf-target/pagepath`, CARGO_INCREMENTAL=0, nice 10.
 
+
+## perf-B23 (2026-11-24, 06:54:32Z-07:54:32Z; lane B22's two backup fixes on main)
+
+**Losses first.**
+- The four side notes lane B22 left are not fixed. They are the next backup lane's, named at this section's end.
+- The fixes are on main, and no run measured what they cost. No benchmark was run (rule 0: the deliverable is correctness).
+- `storage:: vdbe::` is not clean: `t_qt_6_35_joins_over_rowid_ranges_run_on_morsels_as_the_serial_loop` fails on the landed
+  tree (r977, Linux), as it did before it (r719, Linux; r685, macOS), and as lane C1's record has it failing on main ("the hook
+  built no link", the message r977 prints). It is the only failure of 1156 tests. This lane adds twelve lines to the engine
+  (`Database::wal_closing_copied`, database.rs), which no engine code and no engine test calls. Lane C4 changed that test on main
+  after this landing (171e902c); this lane ran nothing on that.
+- `t_qt_6_18_join_workers_run_a_copy_of_the_loop_body_as_the_serial_loop` had not finished when r719 was stopped, at least 4
+  minutes past its start. It did not finish in 24 minutes on main alone either
+  (2026-11-24-macstudio2-perf-durable.md). Lane C5's fix reached main in 60993be4, and it passes in r977.
+- Run time lost to this lane's own script: it touched `crates/engine/lib.rs` (to have clippy re-check the engine) while
+  builds waited on the folder's lock, so "Compiling amphora-engine" is in six of r719's logs where two builds needed it.
+- r685's clippy is red at f12728d2 (lane B22's `chunks_exact`, fixed in 7ceb573a); the clippy of the landed tree is green (r953).
+
+**What landed.** Main b53a29b1 at 07:27:38Z, a fast-forward from 60993be4: lane B22's 4c84dcb0 (a segment with no header yet is one of
+the log's states, `Db::log_header`), 38e42411 (a base begins once the closing segment is in the file), the tests (ba250493, 7ceb573a), and the shipping thread's own test dcd6769b, which 95df7ed2 had taken out unrun and 25e2c075 puts back. No production
+code changed in this lane. Main moved four times while it landed: 75efff54 and 04aee7c9 (records only), 95669341 (lane PG18: crates
+pg-analysis and pg-catalog, the second of which amphora-engine builds on), 60993be4 (lane C5: one `#[cfg(test)]` engine file). Each
+was merged and checked as the table says. The commits: ba250493, 4c84dcb0, 38e42411, dcd6769b, 69c506e4, d4c112d0, 95df7ed2,
+7ceb573a (lane B22's) and 25e2c075 (this lane's).
+
+**Checks** (adacachy2, `on` it, needs as named; the clone is `~/.cache/amphora-perf/pagepath-remote`, target
+`~/.cache/amphora-perf-target/pagepath`, CARGO_INCREMENTAL=0, nice 10):
+
+| run | tree | needs, load | result |
+|---|---|---|---|
+| r719 | 25e2c075 (main b417bb1f merged) | `cpus=12,mem=32g`, 14 to 89, 06:58Z to 07:15Z | `cargo fmt --all --check` 0; clippy `-p amphora -p amphora-engine --all-targets --locked -D warnings` exit 0 in 284 s, waits for the build folder's lock included ("Checking amphora-engine v0.1.0" in its log); amphora lib `backup::` 38 passed, 0 failed (the shipping thread's test among them); tests/backup.rs 24 passed, 0 failed, 1 ignored (the benchmark) in 21.5 s; tests/store.rs 17 passed; engine `d45_` 23 passed; the 200-seed power cut 1 passed; check-production exit 0 ("Compiling amphora-engine" in both passes, "10617 left ... as the ratchet holds"); `storage:: vdbe::` 1155: 1134 ok, 1 failed (`t_qt_6_35`), 18 ignored, 2 unfinished when stopped (`t_qt_6_18`, `g7_5_many_writers_answer_as_a_serial_replay`) |
+| r906 | 861a3642 (main 95669341 merged) | `cpus=4,mem=12g`, 40 to 85, 07:17Z to 07:27Z | fmt 0; `backup::` 38 passed; tests/backup.rs 24 passed, 0 failed, 1 ignored in 48.7 s; tests/store.rs 17 passed; power cut 1 passed; clippy exit 0 in 47 s ("Checking amphora-engine"); check-production exit 0 in 74 s ("Compiling amphora-engine" twice, 10617); `d45_` 23 passed; `g7_5_many_writers_...` alone 1 passed in 219 s |
+| r953 | b53a29b1, landed (main 60993be4 merged) | `cpus=8,mem=24g`, 37 to 50, 07:25Z to 07:27Z | fmt 0; clippy exit 0 in 40 s ("Checking amphora-engine"); `backup::` 38 passed; tests/backup.rs 24 passed, 0 failed, 1 ignored in 13.0 s; tests/store.rs 17 passed; power cut 1 passed; check-production exit 0 in 66 s ("Compiling amphora-engine" twice, 10617) |
+| r977 | b53a29b1, main itself after the push | `cpus=8,mem=24g`, 40 to 70, 07:29Z to 07:37Z | check-production exit 0 in 70 s ("Compiling amphora-engine" twice, "10617 left ... as the ratchet holds"); the red arm (below); `storage:: vdbe::` 1137 passed, 1 failed (`t_qt_6_35`), 18 ignored in 256 s, `t_qt_6_18` among the passed |
+| r1024 | main 980d7c76 (lane V20's `Db::restart_log` change landed on top) | `cpus=6,mem=16g`, 33 to 50, 07:37Z to 07:38Z | `backup::` 38 passed; tests/backup.rs 24 passed, 0 failed, 1 ignored in 20.3 s; tests/store.rs 17 passed; power cut 1 passed |
+| r685 (lane B22's run) | f12728d2, the same production code | MacBook Pro 2, macOS, 41 to 86, 06:41Z to 07:29Z | clippy red on lane B22's test (above); tests/backup.rs 24 passed, 0 failed, 1 ignored in 118.7 s; `d45_` 23 passed; tests/store.rs 17 passed; power cut 1 passed; `storage:: vdbe::` 1155: 1134 ok, 1 failed (`t_qt_6_35`), 18 ignored, 2 unfinished (`t_qt_6_18`, `g7_5`) when this lane stopped it (the lead's word) |
+
+The drill `t_t1_12_d1_restore_drills_at_random_seconds`, lane B22's three scenario tests and
+`d45_a_backup_after_a_switch_holds_the_writes_made_after_it` are in tests/backup.rs's 24. `d45_` is the engine's 23; the one
+`d45_` test of tests/store.rs, the three of tests/backup.rs and the shipping thread's are in their suites above. r719's are this
+branch's first runs on Linux: lane B22's had been on macOS alone.
+
+**The shipping thread's test is red without the fix.** `d45_a_due_base_waits_for_the_closing_segment` (dcd6769b) with 38e42411's start
+condition taken out of ship.rs and shipping.rs (perf/pagepath-b23-red 60fd9336, never for main; r977): "panicked at
+crates/amphora/src/backup/shipping.rs:789:9: the read keeps the closing segment back", 0 passed, 1 failed. It passes as written on
+each tree above (38 of 38 in `backup::`).
+
+**Found on the way, left for the next backup lane (lane B22's four, not touched here).**
+- A leftover `-wal2`: a restore is refused where a `-wal` is left at its path, not where a `-wal2` is (restore.rs 162).
+- The sends' segment: `Shipper::send` reads frames from the current segment's file, not the segment its generation is in.
+- A round between the switch and the fence: `Db::switch_log` before `restart_log` tells the fence makes `end_base` fail ("ship the
+  log's generation before ending a base in it"), and the base under way starts over.
+- The disk estimate: `Checker::admitted` counts `-wal` and not `-wal2`.
+
+**Commands.** `~/.cache/amphora-perf/pagepath-b23/` on this machine holds the first check script (`check.sh`) and this record's draft;
+`~/.cache/amphora-perf/pagepath-b23/{check2.sh,check3.sh}` on adacachy2 hold the landing and post-landing scripts, and one folder of
+logs a run (`linux-25e2c075`, `linux-861a3642`, `linux-b53a29b1`, `main-b53a29b1`, `main-980d7c76`).

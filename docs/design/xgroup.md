@@ -273,7 +273,16 @@ one request, to the endpoint of the group's database, whose owner applies the st
 is applied, one `call_internal` and one atomic commit. The coordinator's newest commit stamp goes
 with the step and the group's newest comes back with the reply, so the hybrid logical clock each
 step carries (T-T1.12.X2) crosses nodes as it crosses threads. A reply lost after the request went
-out is `UnknownOutcome`, which the protocol already treats as a step that may have landed. The node
+out is `UnknownOutcome`, which the protocol already treats as a step that may have landed. A
+transaction starts only where it can finish (the coordinator's decision of 2026-11-24, T-T1.9.R30):
+before its first lock, every participant on a node must speak version 9, which the steps that finish
+it at its one stamp need (`Nodes::finishes`; `ResolveAt`, `DecideAt`, `RecoverAt` and `PreventAt`).
+The version is the one the node's last greeting agreed on, and a node too old then is greeted again,
+so one upgraded since is found. Where one can't, the transaction is refused `Invalid` with nothing
+locked anywhere; a lock step, which version 8 has, is itself sent only at 9, so a node replaced by an
+older one in between is refused its lock before it goes out. What a version-8 coordinator left in
+flight isn't recovered at 9: Amphora is unreleased, and a rule for recovery across versions is owed
+before a release that supports mixed fleets. The node
 makes its group's tables before it serves (`sql::prepare`). Values introduced: none; a step's size
 is held by the frame's bound, as every request's is. Between machines, a group's owner
 also listens at a network address under mutual TLS (`Database::listen`, `Nodes::network`;
