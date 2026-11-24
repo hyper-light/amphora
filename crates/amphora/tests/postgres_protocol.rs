@@ -1246,3 +1246,72 @@ fn t_pg_9_1_tpcb_statements_answer_as_a_19_server_does() {
         "every message of every statement is compared"
     );
 }
+
+/// T-PG.10.1: the extended protocol's messages (pgbench's `-M extended` and `-M prepared` flows, its relkind
+/// query, parameters and columns of each type in text and in binary, portals stopped and gone on with, what
+/// each message refuses, one transaction to each Sync, a failed block's, Flush, and messages malformed
+/// inside), each step's sent at once to the wire core, are answered as a PostgreSQL 19.0 server answered
+/// them (scripts/postgres-extended-answers.sh), message by message.
+#[test]
+fn t_pg_10_1_extended_messages_answer_as_a_19_server_does() {
+    for pace in [Pace::Frames, Pace::Bytes] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("postgres.db");
+        let database = execute::Database::open(
+            path.to_str().unwrap(),
+            amphora_engine::storage::versioned::memory::machine(),
+        )
+        .unwrap();
+        let role = execute::SessionRole {
+            name: "ada",
+            superuser: true,
+        };
+        let mut sessions = std::collections::BTreeMap::new();
+        for (name, process_id) in [("s1", 1001), ("s2", 1002)] {
+            let executor = database.session(role, "UTC", process_id).unwrap();
+            sessions.insert(name.to_owned(), log_in(Box::new(executor)));
+        }
+        let answers = tpcb::answers(include_str!("extended/answers.txt"));
+        let steps: Vec<&str> = include_str!("extended/steps.txt")
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+            .collect();
+        assert_eq!(answers.len(), steps.len());
+        let mut wrong = Vec::new();
+        let mut compared = std::collections::BTreeMap::new();
+        for ((name, step, answer), line) in answers.iter().zip(steps) {
+            assert_eq!(line, format!("{name}: {step}"));
+            let ((b'>', sent), theirs) = answer.split_first().unwrap() else {
+                panic!("{line}: the bytes sent come first");
+            };
+            let session = sessions.get_mut(name).unwrap();
+            let (out, next) = drive(session, roles(), sent, pace);
+            assert_eq!(next, None, "{line}");
+            let told = |messages: &[(u8, Vec<u8>)]| -> Vec<String> {
+                messages
+                    .iter()
+                    .map(|(tag, body)| tpcb::exactly(*tag, body))
+                    .collect()
+            };
+            let (got, want) = (told(&messages(&out)), told(theirs));
+            for (tag, _) in theirs {
+                *compared.entry(char::from(*tag)).or_insert(0) += 1;
+            }
+            if got != want {
+                wrong.push(format!("{line}:\n  here: {got:#?}\n  19:   {want:#?}"));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} steps\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
+        for tag in [
+            '1', '2', '3', 't', 'T', 'n', 'D', 'C', 's', 'I', 'E', 'N', 'Z',
+        ] {
+            assert!(compared.contains_key(&tag), "no {tag} among {compared:?}");
+        }
+        assert!(compared.values().sum::<i32>() > 1000, "{compared:?}");
+    }
+}

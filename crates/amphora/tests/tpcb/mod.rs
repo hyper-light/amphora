@@ -42,6 +42,25 @@ pub fn told(sql: &str, messages: &[(u8, Vec<u8>)]) -> Vec<String> {
         .collect()
 }
 
+/// A message as a client of the extended protocol can tell it: as [`told`] does, but a row's values by
+/// their bytes, whatever their format, and a refusal's context with it.
+pub fn exactly(kind: u8, body: &[u8]) -> String {
+    match kind {
+        b'E' | b'N' => refused(kind, body, b"SVCMWP"),
+        b'D' => format!("D {body:02x?}"),
+        _ => message(kind, body, &[]),
+    }
+}
+
+fn refused(kind: u8, body: &[u8], told: &[u8]) -> String {
+    let fields: Vec<String> = body
+        .split(|b| *b == 0)
+        .filter(|f| f.first().is_some_and(|tag| told.contains(tag)))
+        .map(|f| String::from_utf8_lossy(f).into_owned())
+        .collect();
+    format!("{} {fields:?}", char::from(kind))
+}
+
 fn message(kind: u8, body: &[u8], timestamps: &[usize]) -> String {
     match kind {
         b'T' => {
@@ -82,14 +101,7 @@ fn message(kind: u8, body: &[u8], timestamps: &[usize]) -> String {
             format!("D {values:?}")
         }
         b'C' => format!("C {}", String::from_utf8_lossy(body)),
-        b'E' | b'N' => {
-            let fields: Vec<String> = body
-                .split(|b| *b == 0)
-                .filter(|f| f.first().is_some_and(|tag| b"SVCMP".contains(tag)))
-                .map(|f| String::from_utf8_lossy(f).into_owned())
-                .collect();
-            format!("{} {fields:?}", char::from(kind))
-        }
+        b'E' | b'N' => refused(kind, body, b"SVCMP"),
         b'Z' => format!("Z {}", String::from_utf8_lossy(body)),
         _ => format!("{} {body:02x?}", char::from(kind)),
     }
