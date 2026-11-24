@@ -2156,6 +2156,41 @@ list: `QUEUED_BYTES`, `OUTGOING_BYTES`, `OUTGOING_MESSAGES`).
 `mb1_unread_resident_bytes_fall_to_the_charges_counted` (T-MB.1.3), `mb1_this_process_reads_its_limit_and_resident_bytes`
 (T-MB.1.4, on Linux, macOS and Windows); the engine's `io::system_memory::tests::the_platform_says_its_physical_memory`.
 
+## Decision (lane perf-Q6): the log's record registry is read under a read lock (2026-11-24)
+
+**The decision.** The shared log's registry of packed records (`WalSharedRuntime::records`,
+`packed::Records`) is the engine's `sync::RwLock` (parking_lot's), no longer the spin lock
+(`fast_lock::SpinLock`). Its lookups, which only read (`slots_of`, `decoded`, `covering`), take it
+shared: a read's check that a frame holds a record (`holds_segment_record`), its chain's lookups
+(`RecordRead::drive`) and the refusal of a record's slot as a page frame. What changes it
+(`publish`, `keep`, `drop_after`, `clear`) takes it exclusive. A waiter spins briefly, then parks.
+
+**Why.** K0's mixed phase on main 111f0974 (adacachy2, 32 cores, load 28.6-35.3, AMPHORA_PROFILE at
+997 Hz): every spin sample attributed by its lock and caller. The registry's spin lock was 34.4% of
+all samples at 32 clients and 39.1% at 128 (86% and 93% of all spinning), reached from the readers'
+`holds_segment_record` and `RecordRead::drive`: every page a reader read of a packed or mixed
+generation took that exclusive lock twice for lookups that only read. Running holders were in the
+registry 1.24% and 2.40% of samples, while 6.1 and 4.2 cores spun on it. The bench's threads waited
+runnable 0.72x and 1.40x their CPU time, with 540k and 455k involuntary switches in the phase;
+weighed by the registry's share of their CPU, about a third of its held time was a holder off its
+CPU (an inference from those counters, not a per-acquisition measure), and a spin lock never
+yields, so every waiter spun through it (`bench/records/2026-11-24-adacachy2-perf-reads-q6.md`).
+Decision 29 reads the shared pages the same way.
+
+**Sources.** Ousterhout, "Scheduling Techniques for Concurrent Systems" (ICDCS 1982), and Karlin,
+Li, Manasse and Owicki, "Empirical Studies of Competitive Spinning for a Shared-Memory
+Multiprocessor" (SOSP 1991): a waiter that spins without bound wastes its processor whenever the
+holder is descheduled; spinning about as long as a block costs, then blocking, bounds the waste.
+parking_lot's `RwLock` (its documentation): readers share, a waiter spins a few rounds and then
+parks, and the lock is eventually fair, so a waiting writer is not starved by readers.
+
+**Evidence.** `storage::wal::tests::q6_reads_of_the_record_registry_do_not_wait_for_each_other`:
+with one reader holding the registry, another reads a published record's slots and answers.
+
+**Falsified by.** A profile of the same phase after the change in which the registry's waits are not
+down, or reads a second at 32 and 128 clients no higher; any answer of K0's mixed phase differing
+from SQLite's on the same rows.
+
 ## Decision (lane perf-A18): a wait for room is woken by any charge given back (2026-11-24)
 
 A store's batch is charged its rows' bytes (`Engine::row_bytes`) to the budget's room for queues until its commit
