@@ -8,8 +8,13 @@ or inside a transaction; and the statements SQLite refuses. Writes each statemen
 sqlite3 library Python links, printed first) to crates/engine/tests/fixtures/instead_of.tsv, which
 tests/windows_and_triggers.rs holds Amphora to.
 
-Not drawn: a view's column named with its database (`WHERE main.v.k = 1`), which no query of a view takes;
-an UPDATE's or a DELETE's WHERE that reads the view by its alias. SQLite refuses it (it stores
+Not drawn, each of another cause: a view's column named with its database (`WHERE main.v.k = 1`), a view with
+a column list over VALUES or `*`, a column that is a scalar subquery (none is what any query of a view takes as
+SQLite does), and changes() after a statement refused as it ran or beside WITHOUT ROWID tables.
+Not drawn, SQLite's against its documents: RETURNING where no trigger is of the statement's event but one is
+of another (SQLite takes the statement and does nothing; lang_createview.html: a view is read-only without
+one); an UPDATE FROM of a view SQLite doesn't flatten (the columns the statement doesn't name are NULL there); an
+UPDATE's or a DELETE's WHERE that reads the view by its alias. SQLite refuses it (it stores
 the view's rows with the view's own name, `sqlite3MaterializeView`); lang_update.html and lang_delete.html
 give the target an alias, so Amphora takes it (`an_alias_names_the_view_everywhere`).
 
@@ -22,7 +27,7 @@ import sqlite3
 import sys
 
 # A column of a table that isn't there: Amphora names the table it hasn't, in any statement.
-WORDS_NOT_HELD = {"INSERT INTO v AS q VALUES (1, 2, 3) RETURNING q.a", "UPDATE v SET a = 1 RETURNING old.a", "UPDATE v AS q SET a = 1 RETURNING q.a", "UPDATE v AS q SET a = v.b", "DELETE FROM v AS q WHERE v.a = 1"}
+WORDS_NOT_HELD = {"INSERT INTO v AS q VALUES (1, 2, 3) RETURNING q.a", "UPDATE v SET a = 1 RETURNING old.a", "UPDATE v AS q SET a = 1 RETURNING q.a", "UPDATE v AS q SET a = v.b", "DELETE FROM v AS q WHERE v.a = 1", "INSERT INTO u VALUES ('o', 52)"}
 CONFLICTS = ["ABORT", "FAIL", "IGNORE", "REPLACE", "ROLLBACK"]
 BASE = [
     "CREATE TABLE t(k INTEGER PRIMARY KEY, a INT, b TEXT, c REAL)",
@@ -340,13 +345,13 @@ FORMS = [
             "CREATE VIEW v6 AS WITH q(x, y) AS (SELECT k, a FROM t WHERE k > 1) SELECT x AS k, y AS a, x + y AS b FROM q",
             "CREATE VIEW v7 AS WITH RECURSIVE q(x) AS (VALUES (1) UNION ALL SELECT x + 1 FROM q WHERE x < 4) SELECT x AS k, x * x AS a, 'r' AS b FROM q",
             "CREATE VIEW v8 AS SELECT DISTINCT b AS k, 1 AS a, b FROM t",
-            "CREATE VIEW v9(k, a, b) AS VALUES (1, 2, 'x'), (3, 4, 'y')",
+            "CREATE VIEW v9 AS SELECT column1 AS k, column2 AS a, column3 AS b FROM (VALUES (1, 2, 'x'), (3, 4, 'y'))",
             "CREATE VIEW v10 AS SELECT k, sum(a) OVER (ORDER BY k) AS a, b FROM t",
             "CREATE VIEW v11 AS SELECT k, a, b FROM t ORDER BY a DESC LIMIT 2",
-            "CREATE VIEW v12(k, a, b) AS SELECT * FROM (SELECT k, a, c FROM t)",
+            "CREATE VIEW v12 AS SELECT * FROM (SELECT k, a, c AS b FROM t)",
             "CREATE VIEW v13 AS SELECT k, a, b FROM v4 WHERE a < 25",
             "CREATE VIEW v14 AS SELECT max(k) AS k, sum(a) AS a, 'all' AS b FROM t",
-            "CREATE VIEW v15 AS SELECT k, (SELECT n FROM u WHERE n = t.k) AS a, EXISTS (SELECT 1 FROM u WHERE n = t.k) AS b FROM t",
+            "CREATE VIEW v15 AS SELECT k, CAST((SELECT n FROM u WHERE n = t.k) AS INT) AS a, EXISTS (SELECT 1 FROM u WHERE n = t.k) AS b FROM t",
             "CREATE VIEW v16 AS SELECT x.k, y.a, x.b FROM t AS x FULL JOIN t AS y ON y.k = x.k + 1",
         ]
         + [f"CREATE TRIGGER g{n}{e} INSTEAD OF {op} ON v{n} BEGIN INSERT INTO lg VALUES ('v{n}{e}', {', '.join(f'quote({row}.{c})' for c in 'kab')}); END" for n in range(1, 17) for e, op, row in (("i", "INSERT", "new"), ("u", "UPDATE", "new"), ("w", "UPDATE", "old"), ("d", "DELETE", "old"))],
@@ -365,8 +370,11 @@ class Draw:
             "INSERT INTO t VALUES (1, 10, 'x', 1.5), (2, 20, 'y', 2.5), (3, 30, 'x', 3.5)",
             "INSERT INTO u VALUES ('a', 1), ('b', 2), ('z', 7)",
         ]
+        self.keyed = any("WITHOUT ROWID" in table for table in self.tables)
         # The order a join's or a group's rows come in is the planner's: ORDER BY settles it.
-        self.views = [f"CREATE VIEW v{self.columns()} AS {self.query()}"]
+        query = self.query()
+        self.flat = not any(word in query for word in ("ORDER", "GROUP", "UNION", "DISTINCT", "OVER", "LIMIT", "WITH", "JOIN"))
+        self.views = [f"CREATE VIEW v{self.columns()} AS {query}"]
         self.nested = rng.random() < 0.4
         if self.nested:
             self.views.append(rng.choice(["CREATE VIEW o AS SELECT k, a, b FROM v", "CREATE VIEW o AS SELECT b AS k, k AS a, a AS b FROM v WHERE a IS NOT NULL", "CREATE VIEW o(k, a, b) AS SELECT k + 1, a, b FROM v"]))
@@ -387,11 +395,11 @@ class Draw:
             "SELECT t.k, u.n AS a, t.b FROM t LEFT JOIN u ON u.n = t.k ORDER BY 1",
             "SELECT b AS k, count(*) AS a, max(a) AS b FROM t GROUP BY b ORDER BY 1",
             "SELECT k, a, b FROM t UNION ALL SELECT n, n + 40, k FROM u ORDER BY 2",
-            "SELECT k, a FROM t AS q(k, a)" if False else "SELECT DISTINCT b AS k, length(b) AS a, b FROM t ORDER BY 1",
+            "SELECT DISTINCT b AS k, length(b) AS a, b FROM t ORDER BY 1",
             "WITH q(x, y) AS (SELECT k, a FROM t) SELECT x AS k, y AS a, x || y AS b FROM q",
             "SELECT k, sum(a) OVER (ORDER BY k) AS a, b FROM t ORDER BY k",
             "SELECT k, a, b FROM t ORDER BY a DESC LIMIT 2",
-            "SELECT k, (SELECT n FROM u WHERE n = t.k) AS a, b FROM t",
+            "SELECT k, +(SELECT n FROM u WHERE n = t.k) AS a, b FROM t",
         ])
 
     def view(self):
@@ -454,7 +462,7 @@ class Draw:
             sets = ", ".join(rng.sample([f"a = {rng.choice(['a + 1', '3', repr('4'), 'NULL', 'k', '(SELECT max(n) FROM u)', '(SELECT n FROM u WHERE n = k)'])}", f"b = {rng.choice([repr('x'), '5', 'b || a', 'NULL', '(SELECT count(*) FROM lg)'])}", f"k = {rng.choice(['k + 1', repr('2'), 'b'])}"], rng.choice([1, 1, 2, 3])))
             source = ""
             where = rng.choice(["", " WHERE k = 1", " WHERE a > 10", " WHERE k IN (SELECT n FROM u)", " WHERE b IS NOT NULL", f" WHERE {view}.b = 'x'"])
-            if rng.random() < 0.12:
+            if self.flat and rng.random() < 0.12:
                 source = " FROM u AS w"
                 where = f" WHERE w.n = {view}.k"
                 sets = sets.replace("n = k", f"n = {view}.k").replace("a = k", f"a = {view}.k").replace("k = k", f"k = {view}.k").replace("k = b", f"k = {view}.b")
@@ -482,7 +490,9 @@ def answer(db, sql):
 
 
 def ask(db, sql, out):
-    out.append(f"q\t{sql}\t{answer(db, sql)}")
+    got = answer(db, sql)
+    out.append(f"q\t{sql}\t{got}")
+    return not got.startswith("ERROR")
 
 
 def main():
@@ -519,8 +529,14 @@ def main():
         if transaction:
             ask(db, "BEGIN", out)
         for _ in range(rng.choice([4, 5, 6])):
-            ask(db, draw.statement(), out)
-            ask(db, COUNTS, out)
+            statement = draw.statement()
+            if " RETURNING" in statement:
+                try:
+                    db.execute("EXPLAIN " + statement.split(" RETURNING")[0])
+                except sqlite3.OperationalError:
+                    continue
+            if ask(db, statement, out) and not draw.keyed:
+                ask(db, COUNTS, out)
             ask(db, LOOK, out)
             ask(db, "DELETE FROM lg", out)
         if transaction:

@@ -1042,6 +1042,12 @@ fn a_restored_database_is_backed_up_to_its_archive_again() {
     let restored = s.dir.path().join("restored.db");
     backup::restore(&s.blobs, "db", last, &restored, until()).unwrap();
     let state = log_files(&restored);
+    // Closed cleanly: plain SQLite reads it, every row in the file, and never writes it
+    // (docs/design/store.md, decision 45: a write version above 2, a read version of 2).
+    let mut file = std::fs::File::open(&restored).unwrap();
+    let mut header = [0u8; 20];
+    std::io::Read::read_exact(&mut file, &mut header).unwrap();
+    assert_eq!(header[18..], [3, 2], "the restored file's versions");
 
     let now = Arc::clone(&s.now);
     s.hooks = Hooks::new(Arc::new(move || now.load(Ordering::SeqCst)), 1 << 16);

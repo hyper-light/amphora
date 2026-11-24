@@ -7,7 +7,7 @@ use crate::io::{Buffer, Completion, CompletionGroup, WriteBatch as IOWriteBatch}
 use crate::schema::{BTreeTable, Schema, TypeDef};
 use crate::storage::pager::{AutoVacuumMode, Page, PageRef, Pager};
 use crate::storage::sqlite3_ondisk::{
-    CacheSize, DatabaseHeader, PageSize, RawVersion, TextEncoding, WAL_FRAME_HEADER_SIZE,
+    CacheSize, DatabaseHeader, PageSize, RawVersion, TextEncoding, Version, WAL_FRAME_HEADER_SIZE,
 };
 use crate::types::{IOCompletions, IOResult};
 use crate::util::IOExt;
@@ -228,6 +228,19 @@ impl VacuumDbHeaderMeta {
             user_version: source.user_version.get(),
             application_id: source.application_id.get(),
             pg_next_oid: source.pg_next_oid.get(),
+        }
+    }
+
+    /// VACUUM INTO's file is whole, with no log beside it: SQLite reads it, though its source's
+    /// versions may keep SQLite out (Amphora's docs/design/store.md, decision 45).
+    pub(crate) fn of_a_whole_file(self) -> Self {
+        if self.write_version != RawVersion::from(Version::Wal2) {
+            return self;
+        }
+        Self {
+            read_version: RawVersion::from(Version::Wal),
+            write_version: RawVersion::from(Version::Wal),
+            ..self
         }
     }
 

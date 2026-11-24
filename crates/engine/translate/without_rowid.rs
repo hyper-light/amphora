@@ -9,11 +9,16 @@ use crate::translate::emitter::{
 use crate::translate::expr::{
     emit_returning_results, emit_returning_scan_back, translate_expr, ReturningBufferCtx,
 };
+use crate::translate::fkeys::{
+    affected_parent_fks_for_update, emit_fk_row_added, emit_fk_row_removed, fire_fk_update_actions,
+    Coming, FkRow, ForeignKeyActions,
+};
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{
     ColumnMask, DeletePlan, Distinctness, EphemeralRowidMode, JoinOrderMember, Plan,
     QueryDestination, ResultSetColumn, SelectPlan, TableReferences, UpdatePlan,
 };
+use crate::translate::stmt_journal::any_effective_replace;
 use crate::translate::trigger_exec::{fire_trigger, get_triggers_including_temp, TriggerContext};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{to_u32, HaltAction, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral};
@@ -275,28 +280,9 @@ pub(crate) fn delete_current(
     let image = read_image(program, table, cursor)?;
     let dummy = pk_registers(program, table, image)?;
     let fk = if connection.foreign_keys_enabled() {
-        crate::translate::emitter::delete::emit_fk_child_decrement_on_delete(
-            program,
-            table,
-            &table.name,
-            cursor,
-            dummy,
-            db,
-            resolver,
-        )?;
-        Some(
-            crate::translate::fkeys::ForeignKeyActions::prepare_fk_delete_actions(
-                program,
-                resolver,
-                &table.name,
-                cursor,
-                dummy,
-                None,
-                db,
-            )?,
-        )
+        ForeignKeyActions::remove_row(program, resolver, table, cursor, dummy, db)?
     } else {
-        None
+        ForeignKeyActions::default()
     };
     delete_indexes(program, resolver, table, image, indexes)?;
     program.emit_insn(Insn::Delete {
@@ -304,9 +290,7 @@ pub(crate) fn delete_current(
         table_name: table.name.clone(),
         is_part_of_update: update,
     });
-    if let Some(fk) = fk {
-        fk.fire_prepared_fk_delete_actions(program, resolver, connection, db)?;
-    }
+    fk.fire_prepared_fk_delete_actions(program, resolver, connection, table, db)?;
     Ok(())
 }
 
@@ -579,6 +563,64 @@ fn select_plan(
         phantom_params: vec![],
         loop_order: vec![],
     }
+}
+
+/// Whether an UPDATE changes a primary or foreign key or may replace a row, as SQLite then keeps
+/// the rows it found before it changes any (update.c).
+fn changes_key_or_replaces(
+    connection: &Arc<Connection>,
+    resolver: &Resolver,
+    program: &ProgramBuilder,
+    table: &BTreeTable,
+    updated: &ColumnMask,
+    conflict: ResolveType,
+    db: usize,
+) -> Result<bool> {
+    let key_changes = table.primary_key_columns.iter().any(|(name, _)| {
+        table
+            .get_column(name)
+            .is_some_and(|(position, _)| updated.get(position))
+    });
+    let replaces = resolver.with_schema(db, |s| {
+        any_effective_replace(
+            program.flags.has_statement_conflict(),
+            conflict,
+            Some(primary_key_policy(table)),
+            s.get_indices(&table.name).map(|index| index.on_conflict),
+        )
+    });
+    if key_changes || replaces || !connection.foreign_keys_enabled() {
+        return Ok(key_changes || replaces);
+    }
+    let references = resolver.with_schema(db, |s| s.resolved_fks_for_child(&table.name))?;
+    Ok(references
+        .iter()
+        .any(|fk| fk.child_key_changed(updated, table))
+        || !affected_parent_fks_for_update(resolver, table, updated, db)?.is_empty())
+}
+
+/// The order of the rows a statement of two passes goes in: their key's, whatever index it found
+/// them by (SQLite's DELETE and UPDATE keep the keys of the first pass in an ephemeral index of
+/// the primary key). Triggers that write the table meet the rows in it. `columns` are the key's.
+fn key_order(
+    table: &BTreeTable,
+    columns: &[ResultSetColumn],
+) -> Vec<(Box<Expr>, ast::SortOrder, Option<ast::NullsOrder>)> {
+    table
+        .primary_key_columns
+        .iter()
+        .zip(columns)
+        .map(|((name, order), column)| {
+            let key = match table.primary_key_constraint_collation(name) {
+                Some(collation) => Expr::Collate(
+                    Box::new(column.expr.clone()),
+                    ast::Name::from_string(collation.name()),
+                ),
+                None => column.expr.clone(),
+            };
+            (Box::new(key), *order, None)
+        })
+        .collect()
 }
 
 fn open_table(program: &mut ProgramBuilder, table: &Arc<BTreeTable>, db: usize) -> usize {
@@ -913,7 +955,12 @@ pub(crate) fn emit_update(
             read_subqueries.push(subquery);
         }
     }
-    let mut select = Plan::Select(Box::new(select_plan(
+    let two_passes = !triggers.is_empty()
+        || !read_subqueries.is_empty()
+        || changes_key_or_replaces(
+            connection, &resolver, program, &table, &updated, conflict, db,
+        )?;
+    let mut select = select_plan(
         tables,
         columns,
         std::mem::take(&mut update.where_clause),
@@ -923,7 +970,11 @@ pub(crate) fn emit_update(
             table: scratch,
             rowid_mode: EphemeralRowidMode::Auto,
         },
-    )));
+    );
+    if two_passes {
+        select.order_by = key_order(&table, &select.result_columns);
+    }
+    let mut select = Plan::Select(Box::new(select));
     optimize_plan(program, &mut select, &resolver)?;
     program.nested(|program| emit_program(connection, &resolver, program, select, |_| {}))?;
     let cursor = open_table(program, &table, db);
@@ -1054,37 +1105,22 @@ pub(crate) fn emit_update(
         num_regs: table.primary_key_columns.len(),
     });
     let affected = if connection.foreign_keys_enabled() {
-        let affected = crate::translate::fkeys::affected_parent_fks_for_update(
-            &resolver, &table, &updated, db,
-        )?;
-        crate::translate::fkeys::emit_fk_child_update_counters(
-            program,
-            &table,
-            &table.name,
-            cursor,
-            new,
-            new_pk,
-            &updated,
-            db,
-            &resolver,
-            &layout,
-        )?;
-        crate::translate::fkeys::emit_fk_update_parent_actions(
-            program,
-            &table,
-            &affected,
-            indexes.iter().map(|i| &i.index),
-            cursor,
-            old_pk,
-            new,
-            new_pk,
-            None,
-            &updated,
-            crate::translate::fkeys::ParentKeyNewProbeMode::BeforeWrite,
-            db,
-            &resolver,
-        )?;
-        affected
+        if let Some(old_row) = FkRow::read(program, &resolver, &table, cursor, old_pk, db)? {
+            let new_row = FkRow::image(&table, new, new_pk, table.column_layout()?);
+            emit_fk_row_removed(program, &resolver, &table, &old_row, Some(&updated), db)?;
+            emit_fk_row_added(
+                program,
+                &resolver,
+                &table,
+                &new_row,
+                Coming::Updated {
+                    columns: &updated,
+                    old: &old_row,
+                },
+                db,
+            )?;
+        }
+        affected_parent_fks_for_update(&resolver, &table, &updated, db)?
     } else {
         crate::alloc::Vec::new()
     };
@@ -1105,7 +1141,7 @@ pub(crate) fn emit_update(
                 extra_amount: 0,
             });
         }
-        crate::translate::fkeys::fire_fk_update_actions(
+        fire_fk_update_actions(
             program,
             &mut resolver,
             &table.name,
@@ -1230,19 +1266,33 @@ pub(crate) fn emit_delete(
             read_subqueries.push(subquery);
         }
     }
+    let has_fks = connection.foreign_keys_enabled()
+        && resolver.with_schema(db, |s| {
+            s.has_child_fks(&table.name) || s.any_resolved_fks_referencing(&table.name)
+        });
+    let two_passes = !triggers.is_empty()
+        || has_fks
+        || !delete.result_columns.is_empty()
+        || !read_subqueries.is_empty();
+    let columns = primary_key_columns(&table, target.internal_id, db)?;
     let mut select = if let Some(mut select) = delete.rowset_plan.take() {
-        select.result_columns = primary_key_columns(&table, target.internal_id, db)?;
+        select.result_columns = columns;
         select.query_destination = destination;
-        Plan::Select(Box::new(select))
+        select
     } else {
-        Plan::Select(Box::new(select_plan(
+        select_plan(
             delete.table_references.clone(),
-            primary_key_columns(&table, target.internal_id, db)?,
+            columns,
             std::mem::take(&mut delete.where_clause),
             read_subqueries,
             destination,
-        )))
+        )
     };
+    if two_passes && select.order_by.is_empty() && select.limit.is_none() && select.offset.is_none()
+    {
+        select.order_by = key_order(&table, &select.result_columns);
+    }
+    let mut select = Plan::Select(Box::new(select));
     optimize_plan(program, &mut select, &resolver)?;
     program.nested(|program| emit_program(connection, &resolver, program, select, |_| {}))?;
     let cursor = open_table(program, &table, db);
@@ -1527,40 +1577,36 @@ pub(crate) fn emit_upsert(
         num_regs: bt.primary_key_columns.len(),
     });
     let affected = if connection.foreign_keys_enabled() {
-        let affected = crate::translate::fkeys::affected_parent_fks_for_update(
+        if let Some(old_row) = FkRow::read(
+            program,
             resolver,
             bt,
-            &updated,
-            ctx.database_id,
-        )?;
-        crate::translate::fkeys::emit_fk_child_update_counters(
-            program,
-            bt,
-            &bt.name,
-            ctx.cursor_id,
-            new,
-            new_pk,
-            &updated,
-            ctx.database_id,
-            resolver,
-            &layout,
-        )?;
-        crate::translate::fkeys::emit_fk_update_parent_actions(
-            program,
-            bt,
-            &affected,
-            indexes.iter().map(|i| &i.index),
             ctx.cursor_id,
             old_pk,
-            new,
-            new_pk,
-            None,
-            &updated,
-            crate::translate::fkeys::ParentKeyNewProbeMode::BeforeWrite,
             ctx.database_id,
-            resolver,
-        )?;
-        affected
+        )? {
+            let new_row = FkRow::image(bt, new, new_pk, bt.column_layout()?);
+            emit_fk_row_removed(
+                program,
+                resolver,
+                bt,
+                &old_row,
+                Some(&updated),
+                ctx.database_id,
+            )?;
+            emit_fk_row_added(
+                program,
+                resolver,
+                bt,
+                &new_row,
+                Coming::Updated {
+                    columns: &updated,
+                    old: &old_row,
+                },
+                ctx.database_id,
+            )?;
+        }
+        affected_parent_fks_for_update(resolver, bt, &updated, ctx.database_id)?
     } else {
         crate::alloc::Vec::new()
     };
@@ -1581,7 +1627,7 @@ pub(crate) fn emit_upsert(
                 extra_amount: 0,
             });
         }
-        crate::translate::fkeys::fire_fk_update_actions(
+        fire_fk_update_actions(
             program,
             resolver,
             &bt.name,
