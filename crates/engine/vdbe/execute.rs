@@ -6877,7 +6877,7 @@ pub fn op_finish_seek(
     Ok(InsnFunctionStepResult::Step)
 }
 
-fn versioned_cursor(
+fn locking_cursor(
     state: &mut ProgramState,
     cursor_id: usize,
 ) -> Result<&mut crate::storage::versioned::cursor::VersionedCursor, LimboError> {
@@ -6907,12 +6907,12 @@ pub fn op_lock_row(
         },
         insn
     );
-    state.pc = match versioned_cursor(state, *cursor_id)?.lock_row() {
+    state.pc = match locking_cursor(state, *cursor_id)?.lock_row() {
         Ok(RowLocked::Held) => held.as_offset_int(),
         Ok(RowLocked::Gone) => gone.as_offset_int(),
         Ok(RowLocked::Moved) => {
             for index in indexes {
-                versioned_cursor(state, *index)?.read_newest()?;
+                locking_cursor(state, *index)?.read_newest()?;
             }
             state.pc.saturating_add(1)
         }
