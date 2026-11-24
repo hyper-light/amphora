@@ -964,6 +964,9 @@ pub struct ProgramState {
     /// Amphora: the rows each of the program's counters counted this run, by its slot
     /// (`row_counts.rs`); empty unless the program has counters.
     pub(crate) row_counts: Vec<u64>,
+    /// Lane T18 (PL.13): with `amphora::seek_time` on at DEBUG, each cursor's seeks and their
+    /// nanoseconds this run, by cursor id (`execute::seek_trace_end`); empty otherwise.
+    pub(crate) seek_times: Vec<(u64, u64)>,
     /// Amphora (QT.7): this run's column batches (`leaf_batch.rs`).
     pub(crate) leaf_batches: leaf_batch::LeafBatches,
     /// Amphora (G5 step 4, T-G5.4.3): the scans skipping rows by a summary, a walk a cursor.
@@ -1135,6 +1138,7 @@ impl ProgramState {
             seek_state: OpSeekState::Start,
             metrics: StatementMetrics::new(),
             row_counts: Vec::new(),
+            seek_times: Vec::new(),
             leaf_batches: leaf_batch::LeafBatches::default(),
             skip_walks: crate::skipping::SkipWalks::default(),
             distinct_key_values: Vec::new(),
@@ -1230,6 +1234,7 @@ impl ProgramState {
 
     pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
         self.io_completions = None;
+        self.seek_times.clear();
         self.extension_state = crate::native_ext::ExtensionState::None;
         self.pc = 0;
 
