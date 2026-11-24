@@ -2835,6 +2835,7 @@ impl Database {
             cost_runs: Default::default(),
             versioned,
             versioned_attached: RwLock::new(HashMap::default()),
+            row_wait: Default::default(),
             db: self.clone(),
             context,
             pager: ArcSwap::new(pager),
