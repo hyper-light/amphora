@@ -633,3 +633,62 @@ fn split(line: &[u8]) -> Vec<Option<Vec<u8>>> {
         rest = start.get(at..).unwrap_or_default();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every line of `data`, fed in pieces of `piece` bytes, and what refused the next one.
+    fn lines(data: &[u8], piece: usize) -> (Vec<Vec<u8>>, Option<String>, u64) {
+        let mut reader = Lines::default();
+        let mut found = Vec::new();
+        let mut pieces = data.chunks(piece).collect::<Vec<_>>();
+        pieces.push(&[]);
+        let last = pieces.len() - 1;
+        for (at, piece) in pieces.into_iter().enumerate() {
+            reader.push(piece);
+            loop {
+                match reader.next_line(at == last) {
+                    Ok(Read::Line(line)) => found.push(line),
+                    Ok(Read::More) => break,
+                    Ok(Read::End) if at == last => return (found, None, reader.number()),
+                    Ok(Read::End) => break,
+                    Err(error) => return (found, Some(error.message), reader.number()),
+                }
+            }
+        }
+        (found, None, reader.number())
+    }
+
+    /// T-PG.11.2: data of every kind of byte the reader tells apart gives the same lines, the same refusal at the
+    /// same line, whole or a byte, or seven, at a time.
+    #[test]
+    fn t_pg_11_2_copy_data_reads_the_same_in_pieces_of_any_size() {
+        let alphabet = b"\\.\n\r\tNxa7\xff\0";
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut refused = 0;
+        let mut ended = 0;
+        for length in 0..4_000usize {
+            let data: Vec<u8> = (0..length % 40)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    alphabet[usize::try_from(state % 11).unwrap()]
+                })
+                .collect();
+            let whole = lines(&data, usize::MAX >> 1);
+            assert_eq!(lines(&data, 1), whole, "{data:02x?}");
+            assert_eq!(lines(&data, 7), whole, "{data:02x?}");
+            refused += usize::from(whole.1.is_some());
+            ended += usize::from(whole.1.is_none());
+            for line in &whole.0 {
+                assert!(!split(line).is_empty(), "{data:02x?}");
+            }
+        }
+        assert!(
+            refused > 500 && ended > 500,
+            "{refused} refused, {ended} read"
+        );
+    }
+}
