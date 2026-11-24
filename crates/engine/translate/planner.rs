@@ -1,3 +1,4 @@
+use crate::alloc::TryClone;
 use crate::sync::Arc;
 use crate::{turso_assert, turso_assert_greater_than_or_equal};
 
@@ -5,11 +6,12 @@ use super::plan::NamedWindowBound;
 use super::{
     expr::{walk_expr, walk_expr_mut},
     plan::{
-        left_using_column_sources, merge_columns, query_output_columns, resolve_unqualified_column,
-        Aggregate, ColumnUsedMask, Distinctness, EvalAt, IterationDirection, JoinInfo,
-        JoinOrderMember, JoinOrigin, JoinType as PlanJoinType, JoinedTable, Operation,
-        OuterQueryReference, Plan, QueryDestination, ResolvedColumn, ResultSetColumn, Scan,
-        TableReferences, WhereTerm, WhereTermOrigin,
+        left_using_column_sources, merge_columns, query_output_columns, recursive_cte_columns,
+        resolve_unqualified_column, subquery_output_columns, Aggregate, ColumnUsedMask,
+        Distinctness, EvalAt, IterationDirection, JoinInfo, JoinOrderMember, JoinOrigin,
+        JoinType as PlanJoinType, JoinedTable, Operation, OuterQueryReference, Plan,
+        QueryDestination, ResolvedColumn, ResultSetColumn, Scan, TableReferences, WhereTerm,
+        WhereTermOrigin,
     },
     select::{prepare_select_plan, prepare_select_plan_from_arms},
 };
@@ -27,8 +29,8 @@ use crate::{
     ast::Limit,
     function::Func,
     schema::{
-        ParenthesizedJoinColumn, ParenthesizedJoinColumnSource, ParenthesizedJoinColumnVisibility,
-        Table,
+        Column, ParenthesizedJoinColumn, ParenthesizedJoinColumnSource,
+        ParenthesizedJoinColumnVisibility, Table,
     },
     util::{exprs_are_equivalent, normalize_ident},
     Result,
@@ -1434,50 +1436,27 @@ fn prepare_recursive_cte_plan(
         }
     }
 
-    let input_table = JoinedTable::new_recursive_cte_input(
-        cte_definition.name.clone(),
-        &initial_query,
-        program.table_reference_counter.next(),
-        explicit_columns,
-    )?;
-    let input_table_id = input_table.internal_id;
-
-    let mut recursive_query_outer_refs = outer_query_refs.to_vec();
-    recursive_query_outer_refs.push(OuterQueryReference {
-        identifier: cte_definition.name.clone(),
-        internal_id: input_table.internal_id,
-        table: input_table.table,
-        join_info: None,
-        col_used_mask: ColumnUsedMask::default(),
-        cte_select: None,
-        cte_explicit_columns: cte_definition.explicit_columns.clone(),
-        cte_id: None,
-        cte_definition_only: false,
-        rowid_referenced: false,
-        outer_join_may_null_extend: false,
-        scope_depth: 0,
-    });
-
-    let recursive_query = prepare_select_plan_from_arms(
-        select.body.compounds[first_recursive_query_index - 1]
-            .select
-            .clone(),
-        select.body.compounds[first_recursive_query_index..]
-            .iter()
-            .map(|compound| ast::CompoundSelect {
-                operator: ast::CompoundOperator::UnionAll,
-                select: compound.select.clone(),
-            }),
-        select.with.clone(),
-        vec![],
-        None,
-        resolver,
-        program,
-        &recursive_query_outer_refs,
-        QueryDestination::placeholder_for_subquery(),
-        connection,
-    )?;
-
+    // The recursive arms are planned by the affinities the initial query gives the columns. Where the
+    // arms themselves make them others, they are planned again by those: a comparison with the CTE's
+    // own column is planned by that column's affinity. Inside another CTE's first planning, whose plan
+    // may not be kept, the outer CTE is told instead to plan again, so that the plannings of nested
+    // CTEs add up rather than multiply.
+    let input_table_id = program.table_reference_counter.next();
+    let initial_columns = subquery_output_columns(&initial_query, explicit_columns)?;
+    let recursive_arms = RecursiveArms {
+        cte_definition,
+        first: first_recursive_query_index,
+        input_table_id,
+    };
+    let (recursive_query, nested_mistyped) = program.typing_recursive_arms(|program| {
+        recursive_arms.prepare(
+            &initial_columns,
+            resolver,
+            program,
+            outer_query_refs,
+            connection,
+        )
+    })?;
     if initial_query.select_result_columns().len() != recursive_query.select_result_columns().len()
     {
         crate::bail_parse_error!(
@@ -1485,6 +1464,25 @@ fn prepare_recursive_cte_plan(
             recursive_compound_operator
         );
     }
+    let columns = recursive_cte_columns(
+        &initial_columns,
+        &initial_query,
+        &recursive_query,
+        input_table_id,
+    )?;
+    let mistyped = nested_mistyped
+        || initial_columns
+            .iter()
+            .zip(&columns)
+            .any(|(initial, column)| initial.affinity() != column.affinity());
+    let recursive_query = if !mistyped {
+        recursive_query
+    } else if program.is_typing_recursive_arms() {
+        program.mark_recursive_arms_mistyped();
+        recursive_query
+    } else {
+        recursive_arms.prepare(&columns, resolver, program, outer_query_refs, connection)?
+    };
     reject_aggregates_and_windows_in_recursive_query(&recursive_query)?;
 
     let queue_order = super::select::resolve_recursive_cte_queue_order(
@@ -1501,6 +1499,7 @@ fn prepare_recursive_cte_plan(
     Ok(Plan::RecursiveCte(Box::new(
         super::plan::RecursiveCtePlan {
             name: cte_definition.name.clone(),
+            columns,
             initial_query: Box::new(initial_query),
             recursive_query: Box::new(recursive_query),
             input_table_id,
@@ -1511,6 +1510,74 @@ fn prepare_recursive_cte_plan(
             query_destination: QueryDestination::placeholder_for_subquery(),
         },
     )))
+}
+
+/// A recursive CTE's arms from the first that reads the CTE itself.
+struct RecursiveArms<'a> {
+    cte_definition: &'a CteDefinition,
+    first: usize,
+    input_table_id: TableInternalId,
+}
+
+impl RecursiveArms<'_> {
+    /// Plans the arms, the CTE's own name in them a table of `columns`.
+    fn prepare(
+        &self,
+        columns: &crate::alloc::Vec<Column>,
+        resolver: &Resolver,
+        program: &mut ProgramBuilder,
+        outer_query_refs: &[OuterQueryReference],
+        connection: &Arc<crate::Connection>,
+    ) -> Result<Plan> {
+        let select = &self.cte_definition.select;
+        let mut arms = select
+            .body
+            .compounds
+            .iter()
+            .skip(self.first.saturating_sub(1))
+            .map(|compound| ast::CompoundSelect {
+                operator: ast::CompoundOperator::UnionAll,
+                select: compound.select.clone(),
+            });
+        let Some(first_arm) = arms.next() else {
+            return Err(crate::LimboError::InternalError(format!(
+                "recursive CTE {} has no recursive query",
+                self.cte_definition.name
+            )));
+        };
+        let input_table = JoinedTable::new_recursive_cte_input(
+            self.cte_definition.name.clone(),
+            columns.try_clone()?,
+            self.input_table_id,
+        );
+        let mut recursive_query_outer_refs = outer_query_refs.to_vec();
+        recursive_query_outer_refs.push(OuterQueryReference {
+            identifier: self.cte_definition.name.clone(),
+            internal_id: input_table.internal_id,
+            table: input_table.table,
+            join_info: None,
+            col_used_mask: ColumnUsedMask::default(),
+            cte_select: None,
+            cte_explicit_columns: self.cte_definition.explicit_columns.clone(),
+            cte_id: None,
+            cte_definition_only: false,
+            rowid_referenced: false,
+            outer_join_may_null_extend: false,
+            scope_depth: 0,
+        });
+        prepare_select_plan_from_arms(
+            first_arm.select,
+            arms,
+            select.with.clone(),
+            vec![],
+            None,
+            resolver,
+            program,
+            &recursive_query_outer_refs,
+            QueryDestination::placeholder_for_subquery(),
+            connection,
+        )
+    }
 }
 
 fn reject_aggregates_and_windows_in_recursive_query(query: &Plan) -> Result<()> {

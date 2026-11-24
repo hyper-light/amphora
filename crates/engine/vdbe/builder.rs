@@ -263,6 +263,11 @@ pub struct ProgramBuilder {
     /// references in non-recursive CTEs and to prevent fallthrough to schema
     /// resolution for same-named tables/views.
     ctes_being_defined: Vec<String>,
+    /// How many recursive CTEs' arms are being planned for the first time, a plan that isn't kept
+    /// where the arms' own types turn out other than the initial query's.
+    recursive_arms_being_typed: usize,
+    /// A recursive CTE within those was planned by types its arms turned out not to have.
+    recursive_arms_mistyped: bool,
     /// Stack of views currently being expanded, keyed by `(database_id, name)`
     /// so a view is distinguished from a same-named view in another attached or
     /// temp schema. Used to detect self-referential views.
@@ -808,6 +813,8 @@ impl ProgramBuilder {
             next_cte_id: 0,
             materialized_ctes: HashMap::default(),
             ctes_being_defined: Vec::new(),
+            recursive_arms_being_typed: 0,
+            recursive_arms_mistyped: false,
             views_being_expanded: Vec::new(),
             next_subquery_eqp_id: 1,
             row_counters: None,
@@ -887,6 +894,28 @@ impl ProgramBuilder {
     /// Remove the most recently pushed CTE name after planning completes.
     pub fn pop_cte_being_defined(&mut self) {
         self.ctes_being_defined.pop();
+    }
+
+    /// Plans a recursive CTE's arms for the first time. Also returns whether a recursive CTE within
+    /// them was planned by types its arms turned out not to have.
+    pub fn typing_recursive_arms<T>(
+        &mut self,
+        plan: impl FnOnce(&mut Self) -> crate::Result<T>,
+    ) -> crate::Result<(T, bool)> {
+        let outer_mistyped = std::mem::take(&mut self.recursive_arms_mistyped);
+        self.recursive_arms_being_typed = self.recursive_arms_being_typed.saturating_add(1);
+        let planned = plan(self);
+        self.recursive_arms_being_typed = self.recursive_arms_being_typed.saturating_sub(1);
+        let mistyped = std::mem::replace(&mut self.recursive_arms_mistyped, outer_mistyped);
+        Ok((planned?, mistyped))
+    }
+
+    pub const fn is_typing_recursive_arms(&self) -> bool {
+        self.recursive_arms_being_typed > 0
+    }
+
+    pub const fn mark_recursive_arms_mistyped(&mut self) {
+        self.recursive_arms_mistyped = true;
     }
 
     /// Check whether a name refers to a CTE currently being planned.
