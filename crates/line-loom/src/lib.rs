@@ -6,7 +6,14 @@
 //! loom's types; the stand-ins below are what it takes from around it.
 //!
 //! Run: `RUSTFLAGS="--cfg loom" cargo test -p amphora-line-loom --release --locked`.
-#![cfg(loom)]
+#![cfg(all(loom, test))]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::arithmetic_side_effects,
+    clippy::disallowed_macros
+)]
 
 use amphora_api as api;
 use amphora_api::Refusal;

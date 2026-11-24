@@ -273,7 +273,7 @@ fn t_qb_1_19_a_deadline_beside_a_give_back_leaves_the_next_call_its_room() {
 /// owner's reason or, where the place was free, admitted; none waits on.
 #[test]
 fn t_qb_1_19_the_owners_end_wakes_every_call_in_line() {
-    every(Some(3), || {
+    every(None, || {
         let room = queue(2);
         let held = Room::place(&room, CALL, true).unwrap();
         let waited = [
@@ -346,7 +346,7 @@ fn t_qb_1_19_the_largest_call_never_refuses_the_record_that_finds_a_leader() {
 /// Expect: the write admitted, both its charge and its place held, and nothing after.
 #[test]
 fn t_qb_1_19_a_granted_place_whose_budget_room_went_waits_for_it_again() {
-    every(Some(3), || {
+    every(None, || {
         let budget = memory::Budget::of(5);
         let room = queue(2);
         let held = Room::place(&room, 5, true).unwrap();
@@ -378,7 +378,7 @@ fn t_qb_1_19_a_granted_place_whose_budget_room_went_waits_for_it_again() {
 /// behind it admitted.
 #[test]
 fn t_qb_1_19_a_granted_place_whose_budget_room_never_comes_is_full_at_its_deadline() {
-    every(Some(2), || {
+    every(None, || {
         let budget = memory::Budget::of(5);
         let room = queue(2);
         let held = Room::place(&room, 5, true).unwrap();
@@ -409,7 +409,7 @@ fn t_qb_1_19_a_granted_place_whose_budget_room_never_comes_is_full_at_its_deadli
 /// admitted, one after the other.
 #[test]
 fn t_qb_1_19_two_writes_that_need_all_the_room_are_both_admitted() {
-    every(Some(3), || {
+    every(None, || {
         let budget = memory::Budget::of(5);
         let room = queue(2);
         let write = || {
