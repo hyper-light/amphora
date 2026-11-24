@@ -3055,8 +3055,7 @@ length, and the owner takes none until it has the result back.
    nor runs a `read_db`. Everything else goes on: ticks, heartbeats, votes (a vote is the raft log's hard state, not
    the database's), appends and their flushes, ReadIndex, a member's forward appended. The database's log is not
    restarted while the lock is lent, so a restart due and ready at the hand-off runs first (`Actor::hand_off` steps
-   the flushing), as it ran after a session run inline, and no read is held for one while the session is out; one
-   due as the result comes back runs before the write is decided, while it waits only for a pass (`Actor::decide`).
+   the flushing), as it ran after a session run inline, and no read is held for one while the session is out.
    Lane P15's trace: the step that lent the lock skipped a due and ready restart, the passes then found the log busy
    under the session's reader, and the write was answered with the replica's reads held for a restart still to come
    (CP-T1.13, lane P16).

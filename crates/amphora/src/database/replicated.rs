@@ -710,12 +710,6 @@ impl Local {
         }
         Ok(())
     }
-    /// Whether this replica's reads are held for a restart that waits for a pass alone: no read
-    /// of it is out.
-    fn held_unread(&self) -> Result<bool, Refusal> {
-        let ledger = locked(&self.account.ledger)?;
-        Ok(ledger.restarting.contains(&self.id) && !ledger.out.contains_key(&self.id))
-    }
     /// `restart`, once no read of this replica is out, its reads held back while it runs: none
     /// while one is out. Reads begin again once it started the log (`Ok(true)`).
     fn restart_unread(
@@ -5656,8 +5650,8 @@ impl<F: BlockFile + 'static> Actor<F> {
         claim: Option<Option<crate::database::Application>>,
     ) -> Result<(), Refusal> {
         // A restart due and ready runs before the write lock is lent, as after a session run
-        // inline; none runs while the session is out, so no read is held for one meanwhile, and
-        // one due then runs as it comes back (`decide`; CP-T1.13, lane P15's trace).
+        // inline; none runs while the session is out, so no read is held for one meanwhile
+        // (CP-T1.13, lane P15's trace).
         self.flush()?;
         self.control.local.unhold_reads()?;
         let base = match self.replica.machine().session_base() {
@@ -5692,12 +5686,6 @@ impl<F: BlockFile + 'static> Actor<F> {
     /// write whose lead moved before its preparation does (`requeue`), and a call, its closure
     /// spent, is refused `NotLeader`, a known outcome, never run again (CP-T1.13).
     fn decide(&mut self) -> Result<(), Refusal> {
-        // A restart that came due while the session was out runs before its answer goes out, or
-        // a read the answer lets begin would wait on it (lane P15's trace). It waits only for a
-        // pass while no read is out (`Local::restart_unread`).
-        if self.ran.is_some() && self.control.local.held_unread()? {
-            return Ok(());
-        }
         let Some((ran, operation)) = self.ran.take() else {
             return Ok(());
         };
