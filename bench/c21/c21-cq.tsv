@@ -1,0 +1,22 @@
+db	cq1
+sql	CREATE TABLE a(k INT)
+sql	INSERT INTO a VALUES (1), (2)
+sql	CREATE TABLE t(k INT, j TEXT)
+sql	INSERT INTO t VALUES (1, '[7]'), (2, '[8]')
+sql	CREATE TABLE r(x INT)
+sql	INSERT INTO r VALUES (5)
+sql	CREATE TABLE l(y INT)
+sql	INSERT INTO l VALUES (5)
+sql	CREATE TABLE z(k INT)
+q	SELECT a.k, je.value FROM a FULL JOIN json_each((SELECT t.j FROM t WHERE t.k = a.k AND EXISTS (SELECT 1 FROM r JOIN l ON r.x = l.y))) AS je ON je.value = 7
+q	SELECT a.k, je.value FROM a FULL JOIN json_each((SELECT t.j FROM t WHERE t.k = a.k)) AS je ON je.value = 7
+q	SELECT a.k, je.value FROM a LEFT JOIN json_each((SELECT t.j FROM t WHERE t.k = a.k)) AS je ON je.value = 7
+q	SELECT a.k, je.value FROM a RIGHT JOIN json_each((SELECT t.j FROM t WHERE t.k = a.k)) AS je ON je.value = 7
+q	SELECT a.k, je.value FROM a RIGHT JOIN json_each((SELECT t.j FROM t WHERE t.k IS a.k)) AS je ON je.value = 7
+q	SELECT a.k, je.value FROM a JOIN json_each((SELECT t.j FROM t WHERE t.k = a.k)) AS je
+q	SELECT a.k, je.value FROM a FULL JOIN json_each((SELECT max(t.j) FROM t WHERE a.k IS NULL OR t.k = a.k)) AS je ON je.value = 7
+q	SELECT z.k, je.value FROM z FULL JOIN json_each((SELECT json_group_array(r.x) FROM r JOIN l ON r.x = l.y)) AS je ON je.value = 7
+q	SELECT z.k, je.value FROM z RIGHT JOIN json_each((SELECT json_group_array(r.x) FROM r JOIN l ON r.x = l.y)) AS je ON je.value = 7
+q	SELECT z.k, je.value FROM z FULL JOIN json_each((SELECT json_group_array(t.k) FROM t WHERE t.k IN (SELECT r.x - 4 FROM r JOIN l ON r.x = l.y))) AS je
+q	EXPLAIN QUERY PLAN SELECT a.k, je.value FROM a FULL JOIN json_each((SELECT t.j FROM t WHERE t.k = a.k)) AS je ON je.value = 7
+q	EXPLAIN SELECT a.k, je.value FROM a FULL JOIN json_each((SELECT t.j FROM t WHERE t.k = a.k)) AS je ON je.value = 7
