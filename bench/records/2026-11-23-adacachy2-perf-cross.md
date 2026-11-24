@@ -779,8 +779,8 @@ main a5ae048c's own failures, A19 absent (B18's decision 45 switch; they passed 
 - tests/crash.rs `a_power_cut_at_any_change_loses_nothing_acknowledged_and_tears_no_batch`, crash.rs:821: a power cut at
   seed 45 reopens to a corrupt log (above). A durability defect on main, for lane B18's successor.
 
-A19 landed on 238114df: every module it touches passes wherever main passes, and the tree's failures are main's own,
-the same tests with the same messages (rule 5b).
+On 238114df every module A19 touches passes wherever main passes, and the tree's failures are main's own, the same
+tests with the same messages (rule 5b).
 
 main moved again inside crates/engine (T18's vdbe/execute.rs, 012b6b44), so the landing was checked once more:
 
@@ -791,6 +791,9 @@ main moved again inside crates/engine (T18's vdbe/execute.rs, 012b6b44), so the 
 
 So every failure on the landed tree fails on main without A19. The power cut passed 10/10 on 9ef81742 and failed at
 seed 45 on a5ae048c: whether it is seed- or time-dependent is not known.
+
+Landed on main as d8fcad27 (02:55Z): 9ef81742, these records, and main d22c749c, whose one change in crates/ since
+012b6b44 is lane F1's whitespace-only `cargo fmt` of crates/engine/vdbe/execute.rs (the same text with whitespace removed).
 
 **rustfmt (502375c9).** Of the five call sites A19 fixed in 1a19ead8, two ran past 100 columns (serve.rs's
 `let SqlAnswer::Tables(tables) = answer(..)` at 2542 and 2583); rustfmt's two hunks are applied alone. At 2912576e `cargo
