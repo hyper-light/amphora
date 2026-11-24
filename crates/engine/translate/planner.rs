@@ -408,7 +408,7 @@ impl RecursiveRefCounter<'_> {
         else {
             return 0;
         };
-        let mut first = from.as_ref();
+        let mut first = from;
         let mut tables: Vec<&ast::SelectTable> = Vec::new();
         loop {
             tables.extend(first.joins.iter().map(|join| join.table.as_ref()));
