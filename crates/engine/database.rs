@@ -1764,8 +1764,12 @@ impl Database {
                         .pager
                         .as_ref()
                         .expect("pager must be initialized in Init phase");
-                    let header_schema_cookie =
-                        return_if_io!(pager.with_header(|header| header.schema_cookie.get()));
+                    let (header_schema_cookie, pg_next_oid) = return_if_io!(pager.with_header(
+                        |header| (header.schema_cookie.get(), header.pg_next_oid.get())
+                    ));
+                    if let Some(db) = state.db.as_ref() {
+                        db.dialect().load_next_oid(pg_next_oid);
+                    }
                     let guard = state
                         .schema_guard
                         .as_mut()
