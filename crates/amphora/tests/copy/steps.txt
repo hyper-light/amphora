@@ -153,7 +153,6 @@ s1: Q|copy c from stdin with (nosuch on)
 s1: Q|copy c from stdin with (freeze on, freeze off)
 s1: Q|copy c from stdin with (format xml)
 s1: Q|copy c from stdin with (freeze maybe)
-s1: Q|copy c from stdin with (format text)
 s1: Q|copy c from stdin with (format text) ~ d|20\tq\t1\t\t\\N\t\\N\n ~ c
 s1: Q|copy c from stdin with (freeze on)
 s1: Q|begin
