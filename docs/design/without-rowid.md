@@ -42,9 +42,36 @@ The decision is falsified by a SQLite-oracle discrepancy in locator ordering,
 collation, constraints, conflict actions, foreign-key effects, or rollback; by
 index/table disagreement after reopen; or by a failed call publishing changes.
 The focused suite includes those cases. Unsupported mutation combinations
-(generated columns, user triggers, UPDATE FROM, CDC, and custom-type or array
+(generated columns, UPDATE FROM, CDC, and custom-type or array
 mutations/indexes) retain explicit refusals;
 this change does not claim support for those combinations.
+
+## Triggers
+
+A trigger on a WITHOUT ROWID table fires as one on a rowid table does, by SQLite's
+[CREATE TRIGGER](https://www.sqlite.org/lang_createtrigger.html) and its update.c, delete.c and
+insert.c (3.54.0). Their row is the table's image registers (`without_rowid.rs`, `RowTriggers`);
+it has no rowid to name, so `new.rowid` is \"no such column\".
+
+- **UPDATE, and UPSERT's DO UPDATE.** NEW is converted to its columns' types, then the BEFORE
+  triggers fire. They may have deleted the row or moved it to another key: the old key is sought
+  again and such a row is done with. The row is read again, columns the statement doesn't set keep
+  what the triggers wrote, and that image, not OLD, is the one the index entries are deleted by. The
+  constraints are checked after that. AFTER triggers fire once the row, its foreign-key actions and
+  RETURNING are done.
+- **UPDATE OF** is asked by the columns the statement sets. The refusal this section replaces asked
+  with none, and panicked on the first UPDATE OF trigger it met (the oracles' finding CP).
+- **DELETE.** The BEFORE triggers fire, the key is sought again, the row is deleted, and the AFTER
+  triggers fire with the row as it was read before the BEFORE triggers.
+- **REPLACE** deletes rows without firing DELETE triggers, as recursive triggers are off
+  ([conflict clauses](https://www.sqlite.org/lang_conflict.html)).
+- **Conflict clauses.** A statement's own clause overrides its triggers'; a DO UPDATE's triggers run
+  under ABORT; a DELETE's keep theirs.
+
+Evidence: `triggers_fire_as_sqlite_fires_them` (`crates/engine/tests/windows_and_triggers.rs`), a
+generated sweep of every event, time and clause on rowid and WITHOUT ROWID tables against SQLite
+3.54.0 (`bench/sqlite_triggers.py`). Falsified by any statement of it whose answer, refusal or rows
+left behind differ, or by a failed `PRAGMA integrity_check` after one.
 
 ## Native primary-root query access
 
