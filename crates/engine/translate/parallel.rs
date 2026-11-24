@@ -986,7 +986,10 @@ fn shape(plan: &SelectPlan) -> Option<MorselAggregateData> {
         if term.consumed {
             continue;
         }
-        filter.push(predicate(&term.expr, &column, table)?);
+        filter.push(
+            predicate(&term.expr, &column, table)
+                .or_else(|| parameter(&term.expr, &column, table, &plan.table_references))?,
+        );
     }
     let integer = |at: usize| {
         columns
@@ -1079,6 +1082,51 @@ fn predicate(
         }
         _ => None,
     }
+}
+
+/// `column op ?` (lane R9), or `? op column`, against an INTEGER column: the parameter's value is
+/// read when the statement runs and converted as the serial loop's comparison converts it, by the
+/// comparison's affinity (SQLite's datatype3 section 4.2: NUMERIC applied to the parameter, which
+/// has no affinity), so a row passes exactly where the serial loop's term holds.
+fn parameter(
+    expr: &Expr,
+    column: &impl Fn(&Expr) -> Option<usize>,
+    table: &BTreeTable,
+    refs: &crate::translate::plan::TableReferences,
+) -> Option<Predicate> {
+    let Expr::Binary(left, op, right) = expr else {
+        return None;
+    };
+    let (at, op, variable) = match (column(left), column(right), left.as_ref(), right.as_ref()) {
+        (Some(at), None, _, Expr::Variable(v)) => (at, *op, v),
+        (None, Some(at), Expr::Variable(v), _) => (at, flip(*op)?, v),
+        _ => return None,
+    };
+    let op = match op {
+        Operator::Less => CmpOp::Lt,
+        Operator::LessEquals => CmpOp::Le,
+        Operator::Equals => CmpOp::Eq,
+        Operator::NotEquals => CmpOp::Ne,
+        Operator::Greater => CmpOp::Gt,
+        Operator::GreaterEquals => CmpOp::Ge,
+        _ => return None,
+    };
+    let affinity = crate::translate::expr::comparison_affinity(
+        left.as_ref(),
+        right.as_ref(),
+        Some(refs),
+        None,
+    );
+    if table.columns().get(at)?.affinity() != Affinity::Integer || affinity != Affinity::Numeric {
+        return None;
+    }
+    let index = std::num::NonZeroUsize::new(usize::try_from(variable.index.get()).ok()?)?;
+    Some(Predicate::Parameter {
+        column: at,
+        op,
+        index,
+        affinity,
+    })
 }
 
 fn flip(op: Operator) -> Option<Operator> {

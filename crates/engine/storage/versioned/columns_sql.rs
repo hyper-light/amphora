@@ -837,6 +837,12 @@ fn query(data: &MorselAggregateData, budget: usize) -> Result<Query> {
             },
             Predicate::IsNull { column } => Filter::IsNull(*column),
             Predicate::NotNull { column } => Filter::NotNull(*column),
+            // `op_morsel_aggregate` binds every parameter before the copy reads the filter.
+            Predicate::Parameter { .. } => {
+                return Err(LimboError::InternalError(
+                    "the column copy's filter holds an unbound parameter".into(),
+                ))
+            }
         });
     }
     let mut aggs = Vec::with_capacity(data.aggregates.len());
@@ -1437,6 +1443,82 @@ mod tests {
                 after.kept,
             );
         }
+    }
+
+    /// Lane R9: a term comparing an INTEGER column with a bound parameter. Do: the same table,
+    /// declared `COLUMNAR` and not, with an integer, a real, a text and a NULL among the compared
+    /// column's values; the statement bound to an integer, a real, a numeric text, a text no
+    /// number reads as, a blob and NULL, three runs each. Expect: the same rows on both tables,
+    /// the declared table's statement handed to the copies every run and never skipped as `body`,
+    /// and a numeric text bound answering as its number (NUMERIC affinity applied to the
+    /// parameter, SQLite's datatype3 section 4.2).
+    #[test]
+    fn r9_a_parameter_compared_with_an_integer_column_reaches_the_copies() {
+        trace();
+        let (_a, on) = connect();
+        let (_b, off) = connect();
+        for (c, declared) in [(&on, true), (&off, false)] {
+            create(c, SCHEMA, declared);
+            fill(c, 1, 3000);
+            c.execute("INSERT INTO t VALUES (3001, 1, 2.5, 'r'), (3002, 1, 'abc', 't'), (3003, 1, NULL, 'n'), (3004, 1, x'01', 'b')")
+                .unwrap();
+        }
+        let sql = "SELECT COUNT(*), MIN(g), MAX(g), COUNT(s) FROM t WHERE v >= ?";
+        let bound = |conn: &Arc<crate::Connection>, param: &Value| {
+            let mut stmt = conn.prepare(sql).unwrap();
+            stmt.bind_at(std::num::NonZero::new(1).unwrap(), param.clone())
+                .unwrap();
+            let mut out: Vec<Vec<Value>> = Vec::new();
+            stmt.run_with_row_callback(|row| {
+                out.push(row.get_values().cloned().collect());
+                Ok(())
+            })
+            .unwrap();
+            out
+        };
+        let hooked = rows(&on, &format!("EXPLAIN {sql}")).iter().any(|r| {
+            r.iter()
+                .any(|v| matches!(v, Value::Text(t) if t.as_str() == "MorselAggregate"))
+        });
+        assert!(hooked, "the statement's program holds the copies' hook");
+        let params = [
+            Value::from_i64(500),
+            Value::from_f64(499.5),
+            Value::build_text("500"),
+            Value::build_text("abc"),
+            Value::from_blob(vec![0]),
+            Value::Null,
+        ];
+        let before = copies(&on).counts();
+        for param in &params {
+            for _ in 0..3 {
+                assert_eq!(bound(&on, param), bound(&off, param), "v >= {param:?}");
+            }
+        }
+        let after = copies(&on).counts();
+        let runs = u64::try_from(params.len() * 3).unwrap();
+        assert_eq!(
+            after.handed - before.handed,
+            runs,
+            "every run handed to the copies"
+        );
+        assert_eq!(
+            after.skipped_body, before.skipped_body,
+            "none skipped as body"
+        );
+        assert_eq!(
+            bound(&on, &Value::build_text("500")),
+            bound(&on, &Value::from_i64(500)),
+            "a numeric text bound compares as its number"
+        );
+        eprintln!(
+            "== r9 v >= ?: handed {}, read by the copy {}, sent to the rows {}, no copy yet {}, copies kept {}",
+            after.handed - before.handed,
+            after.copy - before.copy,
+            after.rows - before.rows,
+            after.absent - before.absent,
+            after.kept,
+        );
     }
 
     /// T-CB.4.4 (lane colcopy-9, AC-CB.4.6): an analytic statement in autocommit, then the same

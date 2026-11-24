@@ -220,6 +220,7 @@ fn to_sql(
                 };
                 format!("{} {op} {}", COLUMNS[*column], literal(value))
             }
+            Predicate::Parameter { .. } => panic!("the fuzz shapes bind no parameter"),
         })
         .collect();
     let mut sql = format!("SELECT {} FROM {name}", select.join(", "));
