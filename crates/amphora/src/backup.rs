@@ -684,6 +684,40 @@ mod tests {
         );
     }
 
+    /// Decision 45, AC-T1.12.4 (lane B25): a generation ended by force is whole once all of it is
+    /// shipped, and no sooner. Do: start 6 again at frame 5 with 3 shipped; ship it to 4, then 5. Expect:
+    /// 6 reaches 7 whole only at 5, asked from 5.
+    #[test]
+    fn d45_a_generation_ended_by_force_is_whole_once_shipped() {
+        let fence = Fence::default();
+        fence.shipped(6, 3).unwrap();
+        fence.restart(6, 5, true, || Ok(true)).unwrap();
+        for frame in 3..=5 {
+            fence.shipped(6, frame).unwrap();
+            let whole = fence.ended_whole(6, frame, 7).unwrap();
+            assert_eq!(whole, frame == 5, "shipped through {frame} of 5");
+        }
+        assert!(!fence.ended_whole(6, 4, 7).unwrap(), "it ended at 5");
+    }
+
+    /// Decision 45 (lane B25): a fence is told how the generation before the current one ended where a
+    /// log is opened, and what its writer does after is what it answers from then on. Do: tell a new
+    /// fence 4 ended at 9; restart 5, then tell it again of 4. Expect: 4 reaches 5 whole from 9 alone,
+    /// and after the restart 5 reaches 6, 4 nothing.
+    #[test]
+    fn d45_a_fence_told_where_a_log_is_opened() {
+        let fence = Fence::default();
+        fence.opened(4, 9).unwrap();
+        assert!(fence.ended_whole(4, 9, 5).unwrap());
+        assert!(!fence.ended_whole(4, 8, 5).unwrap(), "it ended at 9");
+        assert!(!fence.ended_whole(3, 9, 5).unwrap(), "3 isn't told of");
+        fence.shipped(5, 2).unwrap();
+        fence.restart(5, 2, false, || Ok(true)).unwrap();
+        fence.opened(4, 9).unwrap();
+        assert!(fence.ended_whole(5, 2, 6).unwrap());
+        assert!(!fence.ended_whole(4, 9, 5).unwrap(), "the log is past 5");
+    }
+
     /// T-T1.12.P11: a log started again twice with no write between keeps its link whole; a
     /// restart forced before its frames were shipped, or one the fence wasn't told of, breaks it.
     #[test]

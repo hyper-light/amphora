@@ -374,7 +374,8 @@ pub(super) fn frame_offset(frame: u64) -> anyhow::Result<u64> {
 
 impl Shipper {
     /// A shipper for `db`'s log under `prefix`, carrying on from what the archive holds: the
-    /// generation it last shipped, if the log is still in it, else a new generation, the log broken.
+    /// generation it last shipped, if the log is still in it, or in the one after it with that one
+    /// shipped to its end (decision 45), else a new generation, the log broken.
     /// Commits the log holds now that weren't stamped are stamped now, their seconds since the
     /// archive's last unknown.
     pub fn open(
