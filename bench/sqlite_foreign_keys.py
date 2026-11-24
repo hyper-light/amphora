@@ -3,8 +3,8 @@ Foreign keys under every action (NO ACTION, RESTRICT, CASCADE, SET NULL, SET DEF
 UPDATE), immediate and deferred, of one column and of two, to a rowid, a primary key and a UNIQUE key, from
 and to WITHOUT ROWID tables, from a table to itself, two tables to each other, and three tables deep; defaults
 that are the key that goes, another and none; NULL keys; triggers of every time and event on all of them, under
-every conflict clause, that write each of them, themselves among them; PRAGMA foreign_keys on
-and off, recursive_triggers off (on: C26_RECURSIVE=1, which Amphora hasn't yet); alone, inside a transaction, and inside savepoints. Writes each statement with
+every conflict clause, that write each of them, themselves among them; PRAGMA foreign_keys and
+recursive_triggers on and off (REPLACE under the second: C26_REPLACED=1); alone, inside a transaction, and inside savepoints. Writes each statement with
 whether SQLite itself takes it (its words, when it doesn't) and what every table and the triggers' log hold after
 it (the sqlite3 library Python links, printed first) to crates/engine/tests/fixtures/foreign_keys.tsv, which
 tests/windows_and_triggers.rs holds Amphora to.
@@ -29,8 +29,9 @@ ORS = [""] + [f" OR {c}" for c in CONFLICTS]
 ACTIONS = ["NO ACTION", "RESTRICT", "CASCADE", "SET NULL", "SET DEFAULT"]
 DEFERRED = " DEFERRABLE INITIALLY DEFERRED"
 LOOK = "SELECT * FROM look"
-# PRAGMA recursive_triggers = ON, which Amphora doesn't have yet (lane C26's record): asked for by its environment.
-RECURSIVE = bool(os.environ.get("C26_RECURSIVE"))
+# The DELETE triggers of the rows REPLACE removes under recursive_triggers, which Amphora doesn't fire yet (lane
+# C26's record): asked for by its environment.
+REPLACED = bool(os.environ.get("C26_REPLACED"))
 
 
 def look(tables):
@@ -90,13 +91,13 @@ def found():
                 asks += [s, "SELECT * FROM p", "SELECT * FROM c"]
             out.append((f"rows that mend each other{late} {action}", on + ["CREATE TABLE p(k INT PRIMARY KEY)", f"CREATE TABLE c(k INT DEFAULT 2 REFERENCES p(k) ON DELETE {action} ON UPDATE {action}{late})", "INSERT INTO p VALUES (1), (2), (3)", "INSERT INTO c VALUES (1), (2), (3), (3)"], asks + ["BEGIN"] + asks + ["COMMIT", "SELECT * FROM p", "SELECT * FROM c", "ROLLBACK"]))
     # C22: recursive_triggers
-    for recursive in ["ON", "OFF"] if RECURSIVE else ["OFF"]:
+    for recursive in ["ON", "OFF"]:
         pragma = [f"PRAGMA recursive_triggers = {recursive}"]
         log = "CREATE TABLE lg(x, y)"
-        out.append((f"recursive_triggers {recursive}: an INSERT that fires itself", [log, "CREATE TABLE t(k INTEGER PRIMARY KEY, n INT)", "CREATE TRIGGER g AFTER INSERT ON t WHEN new.n < 4 BEGIN INSERT INTO lg VALUES ('g', new.n); INSERT INTO t(n) VALUES (new.n + 1); INSERT INTO lg VALUES ('z', new.n); END"] + pragma, ["INSERT INTO t VALUES (100, 1)", "SELECT * FROM t", "SELECT rowid, * FROM lg"] + ([] if not RECURSIVE else ["PRAGMA recursive_triggers", "PRAGMA recursive_triggers = OFF", "INSERT INTO t VALUES (200, 1)", "SELECT * FROM t", "PRAGMA recursive_triggers = ON", "INSERT INTO t VALUES (300, 1)", "SELECT * FROM t", "SELECT rowid, * FROM lg", "PRAGMA recursive_triggers"])))
+        out.append((f"recursive_triggers {recursive}: an INSERT that fires itself", [log, "CREATE TABLE t(k INTEGER PRIMARY KEY, n INT)", "CREATE TRIGGER g AFTER INSERT ON t WHEN new.n < 4 BEGIN INSERT INTO lg VALUES ('g', new.n); INSERT INTO t(n) VALUES (new.n + 1); INSERT INTO lg VALUES ('z', new.n); END"] + pragma, ["INSERT INTO t VALUES (100, 1)", "SELECT * FROM t", "SELECT rowid, * FROM lg", "PRAGMA recursive_triggers", "PRAGMA recursive_triggers = OFF", "INSERT INTO t VALUES (200, 1)", "SELECT * FROM t", "PRAGMA recursive_triggers = ON", "INSERT INTO t VALUES (300, 1)", "SELECT * FROM t", "SELECT rowid, * FROM lg", "PRAGMA recursive_triggers"]))
         for keyed in ["", " WITHOUT ROWID"]:
             out.append((f"recursive_triggers {recursive}: UPDATE and DELETE that fire themselves{keyed}", [log, f"CREATE TABLE t(k INT PRIMARY KEY, n INT){keyed}", "INSERT INTO t VALUES (1, 5), (2, 5), (3, 5), (4, 5)", "CREATE TRIGGER g BEFORE UPDATE ON t WHEN new.n > 2 BEGIN INSERT INTO lg VALUES (old.k || 'b', new.n); UPDATE t SET n = new.n - 1 WHERE k = new.k + 1; END", "CREATE TRIGGER h AFTER UPDATE ON t WHEN new.n > 1 BEGIN INSERT INTO lg VALUES (old.k || 'a', new.n); UPDATE t SET n = new.n - 2 WHERE k = new.k - 1; END", "CREATE TRIGGER i AFTER DELETE ON t BEGIN INSERT INTO lg VALUES (old.k || 'd', old.n); DELETE FROM t WHERE k = old.k + 1; END"] + pragma, ["UPDATE t SET n = 4 WHERE k = 2", "SELECT * FROM t", "SELECT rowid, * FROM lg", "UPDATE t SET n = n + 3", "SELECT * FROM t", "SELECT rowid, * FROM lg", "DELETE FROM t WHERE k = 2", "SELECT * FROM t", "SELECT rowid, * FROM lg"]))
-            for clause in ["", " ON CONFLICT REPLACE"]:
+            for clause in ["", " ON CONFLICT REPLACE"] if REPLACED or recursive == "OFF" else []:
                 out.append((f"recursive_triggers {recursive}: what REPLACE removes{keyed}{clause}", [log, f"CREATE TABLE t(k INT PRIMARY KEY{clause}, n INT UNIQUE{clause}, m INT){keyed}", "INSERT INTO t VALUES (1, 1, 1), (2, 2, 2), (3, 3, 3)", "CREATE TRIGGER g BEFORE DELETE ON t BEGIN INSERT INTO lg VALUES (old.k || 'b', old.n); END", "CREATE TRIGGER h AFTER DELETE ON t BEGIN INSERT INTO lg VALUES (old.k || 'a', (SELECT count(*) FROM t)); END", "CREATE TRIGGER i AFTER INSERT ON t BEGIN INSERT INTO lg VALUES (new.k || 'i', new.n); END", "CREATE TRIGGER j AFTER UPDATE ON t BEGIN INSERT INTO lg VALUES (new.k || 'u', new.n); END"] + pragma, [a for s in ["REPLACE INTO t VALUES (1, 9, 9)", "REPLACE INTO t VALUES (2, 3, 8)", "INSERT INTO t VALUES (1, 4, 4)", "UPDATE OR REPLACE t SET n = 9 WHERE k = 2", "UPDATE t SET k = 7 WHERE k = 1", "REPLACE INTO t VALUES (7, 7, 7), (7, 8, 8), (8, 8, 8)", "INSERT OR REPLACE INTO t VALUES (8, 1, 1) ON CONFLICT(k) DO UPDATE SET m = 5"] for a in [s, "SELECT * FROM t", "SELECT rowid, * FROM lg"]]))
                 out.append((f"recursive_triggers {recursive}: what REPLACE removes writes the row again{keyed}{clause}", [log, f"CREATE TABLE t(k INT PRIMARY KEY{clause}, n INT UNIQUE{clause}){keyed}", "INSERT INTO t VALUES (1, 1), (2, 2), (3, 3)", "CREATE TRIGGER h AFTER DELETE ON t WHEN old.k = 2 BEGIN INSERT INTO lg VALUES (old.k, old.n); INSERT INTO t VALUES (old.k, 77); END", "CREATE TRIGGER i BEFORE DELETE ON t WHEN old.k = 3 BEGIN INSERT INTO lg VALUES (old.k, old.n); DELETE FROM t WHERE k = 3; END"] + pragma, [a for s in ["REPLACE INTO t VALUES (2, 9)", "REPLACE INTO t VALUES (9, 3)", "UPDATE OR REPLACE t SET k = 2 WHERE k = 1"] for a in [s, "SELECT * FROM t", "SELECT rowid, * FROM lg"]]))
         out.append((f"recursive_triggers {recursive}: two triggers that fire each other", [log, "CREATE TABLE t(n INT)", "CREATE TABLE s(n INT)", "CREATE TRIGGER g AFTER INSERT ON t WHEN new.n < 6 BEGIN INSERT INTO lg VALUES ('t', new.n); INSERT INTO s VALUES (new.n + 1); END", "CREATE TRIGGER h AFTER INSERT ON s WHEN new.n < 6 BEGIN INSERT INTO lg VALUES ('s', new.n); INSERT INTO t VALUES (new.n + 1); END"] + pragma, ["INSERT INTO t VALUES (1), (2)", "SELECT * FROM t", "SELECT * FROM s", "SELECT rowid, * FROM lg", "INSERT INTO s VALUES (3)", "SELECT rowid, * FROM lg"]))
@@ -120,13 +121,16 @@ class Draw:
     def __init__(self, rng):
         self.rng = rng
         pick = rng.choice
+        self.recursive = rng.random() < 0.5
+        self.conflicts = [c for c in CONFLICTS if REPLACED or not self.recursive or c != "REPLACE"]
+        self.ors = [""] + [f" OR {c}" for c in self.conflicts]
         self.kind = pick(["INT", "TEXT", "TEXT", "INTEGER"])
         self.domain = ["1", "2", "3", "4"] if self.kind != "TEXT" else ["'a'", "'b'", "'c'", "'d'"]
         action = lambda: pick(ACTIONS)
         clauses = lambda: f" ON DELETE {action()} ON UPDATE {action()}{pick(['', '', DEFERRED])}"
         default = lambda: pick(["", f" DEFAULT {pick(self.domain)}", f" DEFAULT {pick(self.domain)}", " DEFAULT NULL", " DEFAULT 99"])
         keyed = lambda: pick(["", "", " WITHOUT ROWID"])
-        on = lambda: pick(["", "", "", pick([f" ON CONFLICT {c}" for c in CONFLICTS])])
+        on = lambda: pick(["", "", "", pick([f" ON CONFLICT {c}" for c in self.conflicts])])
         kind, loose = self.kind, "INT" if self.kind == "INTEGER" else self.kind
         self.pair = rng.random() < 0.3
         if self.pair:
@@ -147,7 +151,6 @@ class Draw:
         for index in ["CREATE INDEX ck ON c(k)", "CREATE INDEX ckm ON c(k, m)", "CREATE INDEX gk ON g(k)", "CREATE INDEX tk ON t(k)"]:
             if rng.random() < 0.2:
                 self.tables.append(index)
-        self.recursive = RECURSIVE and rng.random() < 0.5
         self.enforced = rng.random() < 0.93
         self.triggers = [self.trigger(f"{table}{i}", table) for table in "pcgt" for i in range(pick([0, 0, 1, 1, 2]))]
 
@@ -175,7 +178,7 @@ class Draw:
             # what becomes of a row a BEFORE trigger changes is undefined (lang_createtrigger.html)
             other = pick("pcgt" if time == "AFTER" or event == "INSERT" else "pcgt".replace(table, ""))
             there = self.columns[other]
-            orc = pick(["", "", "", pick(ORS)])
+            orc = pick(["", "", "", pick(self.ors)])
             drawn = rng.random()
             few = " AND (SELECT count(*) FROM lg) < 24"
             put = lambda: pick([self.key(), read(), read(), "NULL"])
@@ -201,7 +204,7 @@ class Draw:
         pick = rng.choice
         table = pick("ppcct" + "gt")
         columns = self.columns[table]
-        orc = pick(["", "", pick(ORS), pick(ORS)])
+        orc = pick(["", "", pick(self.ors), pick(self.ors)])
         drawn = rng.random()
         where = pick(["", f" WHERE {pick([c for c in columns if c != 'n'])} = {self.key()}", f" WHERE +{pick(columns)} {pick(['>', '<', 'IS NOT'])} {self.key()}", f" WHERE +{pick(columns)} = {self.key()}"])
         if drawn < 0.3:
