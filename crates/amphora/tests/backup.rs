@@ -742,7 +742,10 @@ fn d45_a_backup_after_a_switch_holds_the_writes_made_after_it() {
     let mut shipper = Shipper::open("db", Arc::clone(&hooks), &blobs, &db, until()).unwrap();
     put(&mut db, &now, 0..20, "a", &mut model, &mut history);
     shipper.ship(&db, &blobs, until()).unwrap();
-    assert!(db.restart_log().unwrap(), "the log starts again once shipped");
+    assert!(
+        db.restart_log().unwrap(),
+        "the log starts again once shipped"
+    );
     let mut second = path.clone().into_os_string();
     second.push("-wal2");
     assert!(

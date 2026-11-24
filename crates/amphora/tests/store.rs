@@ -226,7 +226,11 @@ fn d45_a_reader_that_never_finishes_holds_up_no_restart_and_no_commit() {
     for n in 10..60 {
         writer.exec(&format!("INSERT INTO t VALUES ({n})")).unwrap();
     }
-    assert_eq!(rows_in(&writer.reader().unwrap()), 60, "a new read sees every commit");
+    assert_eq!(
+        rows_in(&writer.reader().unwrap()),
+        60,
+        "a new read sees every commit"
+    );
     assert_eq!(rows_in(&slow), 10, "the open read keeps its snapshot");
     slow.exec("COMMIT").unwrap();
     assert_eq!(rows_in(&slow), 60);

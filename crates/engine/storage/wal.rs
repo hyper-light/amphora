@@ -4337,7 +4337,10 @@ impl SharedLog {
                 ));
             }
             free.start_after(io, header, epoch, transaction_count);
-            free.runtime.read_locks.iter().for_each(|lock| lock.unlock());
+            free.runtime
+                .read_locks
+                .iter()
+                .for_each(|lock| lock.unlock());
         }
         let switched = self.segments.update(|segments| segments.switch(false));
         if switched != Some(Some(to)) {

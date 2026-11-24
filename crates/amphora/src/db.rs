@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 pub use amphora_engine::LogFormat;
 use amphora_engine::busy::BusyWake;
 use amphora_engine::io::FileSyncType;
+use amphora_engine::storage::log_segments::SegmentId;
 use amphora_engine::{
     Buffer, CheckpointMode, Completion, CompletionError, ConnectOpts, Connection, Database,
     DatabaseOpts, IO, IOExt, LimboError, OpenFlags, OpenOptions, PlatformIO, Row, SqliteDialect,
@@ -26,7 +27,6 @@ mod cache;
 
 /// The pages a process's databases share (docs/design/store.md, decision 20).
 pub use amphora_engine::storage::shared_pages::{Charge, SharedPages};
-use amphora_engine::storage::log_segments::SegmentId;
 
 /// How long opening waits for another process's hold on the file to go.
 const LOCK_WAIT: Duration = Duration::from_secs(15);
@@ -609,7 +609,11 @@ impl Db {
     /// `len` bytes of the current segment's file of the log from `offset` (decision 45); None
     /// when there is no such file.
     pub(crate) fn read_log(&self, offset: u64, len: usize) -> anyhow::Result<Option<Vec<u8>>> {
-        self.read_at(&segment_path(&self.path, self.db.wal_segment()), offset, len)
+        self.read_at(
+            &segment_path(&self.path, self.db.wal_segment()),
+            offset,
+            len,
+        )
     }
 
     /// `len` bytes of the database's file from `offset`.
