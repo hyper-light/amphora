@@ -1412,3 +1412,111 @@ each tree above (38 of 38 in `backup::`).
 **Commands.** `~/.cache/amphora-perf/pagepath-b23/` on this machine holds the first check script (`check.sh`) and this record's draft;
 `~/.cache/amphora-perf/pagepath-b23/{check2.sh,check3.sh}` on adacachy2 hold the landing and post-landing scripts, and one folder of
 logs a run (`linux-25e2c075`, `linux-861a3642`, `linux-b53a29b1`, `main-b53a29b1`, `main-980d7c76`).
+
+## perf-B24 (2026-11-24, 07:39:40Z-08:39:40Z; lane B22's four backup suspects, each driven by a scenario)
+
+**Losses first.**
+- All four are real. One loses rows with no error (the sends' segment).
+- A log started again under a send still breaks the archive's log there: the send ends whole, but the link after it is a
+  gap (the fence's `forced`, as T-T1.12.P11 asserts), so seconds after it are refused until a base begun after it ends. The
+  commits made between the send's drain and the switch are not shipped though the closing segment holds them.
+- The forced restarts are made by the tests' store (`Db::restart_log` inside a put), not by a store thread under load, and the
+  round within the switch by a hook compiled into the crate's own tests (`Fence::during_switch`). No run had the two threads
+  meet there by chance.
+- What an admitted check's restore may take is still an estimate from the source as it stands. A generation since the base that
+  was longer than either segment's file is now (cut after a forced restart), or an older second with more pages than the
+  database has now, takes more than is counted. Read in the code, not run.
+- No benchmark was run. Each part sent reads 32 bytes more of the log, and each due check asks `PRAGMA page_count`: what that
+  costs is not measured (rule 0: the deliverable is correctness).
+- The engine's `storage:: vdbe::` suites were not run: no engine file changed here.
+- The lane's own branch was force-pushed once, over its own commit b21a45a8 (the fixes before their message); the runs below that
+  name b21a45a8 are of that tree.
+- Looking for its own queued runs, this lane read the pending output of other lanes' runs in the same session (r1200, r1203,
+  r1225 to r1232, r1247, r1248, r1261, r1263, r1266 to r1269): what it read of them is gone from their next read. Its start loop
+  had taken a run still being placed for a refused one, and asked again.
+
+**What each suspect was.** Red is main's code with the tests and the hook (17a18534; its restore test as 46e2480f has it); green is
+the landed tree. Logs on adacachy2 in `~/.cache/amphora-perf/pagepath-b24/` (`red`, `arms1`, `final-8c4f29fa`).
+
+| suspect | the scenario (test) | red: what the user lost | green |
+|---|---|---|---|
+| 1. a `-wal2` left at a restore's path | 20 rows and a base, a switch to `-wal2`, every row deleted a second later, the file and its `-wal` removed, `-wal2` left, the second before the delete restored there (`d45_a_restore_never_takes_a_log_segment_left_at_its_path`, and paced) | the restore ended in "Database is busy", and what stands at its path answers 0 of 20 rows: the delete recovered from `-wal2` | refused before it writes, as where a `-wal` is left; the segment removed, 20 of 20 |
+| 2. a log started again under a send | 60 rows unshipped, shipped in 5 parts; as the first is stored the writer starts the log again past what it keeps and commits 80 (`d45_a_send_ships_its_own_generation_when_the_log_starts_again_under_it`) | the send said it ended; second 1044 restored with no error, 43 of its 44 rows (the first second that restored wrong: the test stops there) | the send ends from its own segment; every second of it restores with its rows |
+| 2, twice | the same, the log started again twice, so the segment is written over (`d45_a_send_whose_segment_is_written_over_is_refused`) | the same 43 of 44, no error | the send is refused; no second restores with other rows than its own |
+| 3. a round between the switch and the fence's word | a base under way, its last chunk copied by a round within the writer's restart (`d45_a_round_within_the_writers_switch_ends_the_base_under_way`) | the base refused its end ("ship the log's generation before ending a base in it") and was thrown away; the last commit's second is refused ("no base precedes second 1015 on an unbroken log") | the base ends there; the second restores, 15 of 15 rows |
+| 4. the disk a check needs | 310 rows, 300 of them in `-wal2`; the check's room counted, its restore run and the room it takes measured at each step (`d45_a_check_begins_only_where_the_disk_holds_both_of_the_logs_segments`) | the restore took 1,861,288 bytes where 74,096 were counted (file 16,384, `-wal` 57,712; `-wal2` 1,693,352 left out) | counted above what it takes; the log's growth in both segments within the room left |
+
+**The causes, and the fixes** (9de10ddd).
+- *The restore* (`restore_within`): it refuses where the file or either segment is there, and names it. The engine recovers both
+  segments at an open (decision 45), so a `-wal2` left is the restored log's next generation to it. Not the engine's fault: a
+  database's files are its three, and the restore knew two. `db::log_paths` names the log's files once, for the restore, the
+  check's scratch and the disk a check needs. A check's scratch files are removed with both segments
+  (`d45_a_check_clears_the_segments_left_at_its_scratch_path`): the refusal would else fail each check after one is left there.
+- *The send* (`Shipper::send`): it read each part from the segment current then (`Db::read_log`). It reads the segment its
+  generation's header was in (`Db::log_header` answers both), and after each part's frames the segment's header again: a
+  generation's header is synced before any frame of it (decision 13; `prepare_wal_finish`), so the generation's own header,
+  still there, says the frames are its own. Else the send is refused before the part is put, and the log is broken there.
+- *The fence* (`Fence::restart`): the switch was seen by a round before the fence was told how the generation ended. The fence is
+  told first, beside what it was told of the restart before (a round that has not seen the switch asks about that one), and
+  takes it back where no switch is made (`d45_the_fence_is_told_before_the_switch`).
+- *The room* (`Checker::budget`): the database's pages, those only its log holds too (`PRAGMA page_count`; the file alone and both
+  segments are still 93,840 bytes short of what the restore took, red arm 2), and both segments' files. The room left for the
+  log's growth is what it keeps in each segment, as its peak on disk is two segment files (store.md, decision 45).
+- backup.md restated: the fence, a send's segment, a restore's path, a check's room.
+
+**What landed.** Main ecaee231 at 08:18:07Z, a fast-forward from b4ad7122: 17a18534 and 46e2480f (the tests and the hook), 9de10ddd (the
+fixes), 8c4f29fa (the fence's own test and comments), and the merges of main 67cc7e69 (eb0c360d) and b4ad7122 (ecaee231).
+
+**Checks** (adacachy2, `on` it, needs as named; the clone is `~/.cache/amphora-perf/pagepath-remote`, target
+`~/.cache/amphora-perf-target/pagepath`, CARGO_INCREMENTAL=0, nice 10; the script is `~/.cache/amphora-perf/pagepath-b24/check.sh` there).
+
+| run | tree | needs, load | result |
+|---|---|---|---|
+| red | 17a18534 (main a3f69b26 plus the tests) | `cpus=4,mem=12g`, 29 to 33, 07:51Z to 07:52Z | 3 of 3 of tests/backup.rs's new tests and 2 of 2 of the crate's fail, as the table above says |
+| arms1 | 46e2480f, then b21a45a8 | `cpus=6,mem=16g`, 28 to 33, 07:55Z | 46e2480f: 4 of 4 fail (the restore test now reads what stands at its path, and runs paced too); b21a45a8: tests/backup.rs `d45_` 7 passed, `backup::` 40 passed |
+| r1101 | eb0c360d (main 67cc7e69 merged) | `cpus=8,mem=24g`, 34 to 75, 07:58Z to 08:04Z | all ten steps exit 0: fmt; `backup::` 40 passed; tests/backup.rs 29 passed, 0 failed, 1 ignored (the benchmark) in 31 s; tests/store.rs 17; power cut 1 (its 200 seeds); engine `d45_` 23; clippy 49 s ("Checking amphora-engine"); check-production 91 s ("Compiling amphora-engine" twice, "10617 left ... as the ratchet holds") |
+| r1145 | 8c4f29fa (eb0c360d plus the fence's test) | `cpus=4,mem=12g`, 49 to 58, 08:05Z to 08:09Z | all exit 0: `backup::` 41 passed; tests/backup.rs 29 passed, 0 failed, 1 ignored in 36 s; store 17; power cut 1; `d45_` 23; clippy 41 s; check-production 62 s, 10617 |
+| r1199 | ecaee231, landed (main b4ad7122 merged) | `cpus=2,mem=8g`, 64 to 79, 08:11Z to 08:18Z | all exit 0: fmt; `backup::` 41 passed; tests/backup.rs 29 passed, 0 failed, 1 ignored in 45 s; store 17; power cut 1; `d45_` 23; clippy `-p amphora -p amphora-engine --all-targets --locked -D warnings` 81 s ("Checking amphora-engine"); check-production 76 s ("Compiling amphora-engine" twice, 10617) |
+
+Refused for room: `cpus=8` at 08:05Z and 08:10Z, then 4, 3 and 2 until 08:11Z (0 to 3 of 32 cores idle).
+
+**Each assertion is red without its part of the fix** (r1265, adacachy2, `cpus=2,mem=8g`, load 52 to 67, 08:21Z to 08:27Z, on the landed
+tree; `perf/pagepath-b24-red2`, never for main).
+
+| arm | what is taken out | red |
+|---|---|---|
+| 86b6bbb2 | the log's growth in the second segment | the log grew by 4,853,360 bytes where the check leaves 3,296,000 |
+| 4b5581b4 | the pages only the log holds (the file and both segments counted) | the restore took 1,861,288 bytes where 1,767,448 were counted |
+| 1af38127 | a check's scratch `-wal2` removed | a check of a whole archive failed: "check.db-wal2 exists: a restore makes a new database" |
+| 1af38127 | the header read after the frames (the generation's segment still read) | second 1044 restored with no error, 43 of 44 rows, the log started again twice in the send |
+
+**Suspect 4 on a real small disk** (`unshare --user --map-root-user --mount`, a tmpfs of 3,571,712 bytes holding the database and its
+check's scratch, 1,798,144 bytes free once the log is in `-wal2`; adacachy2, `cpus=2,mem=8g`, load 49 to 50, 08:26Z; arms adf7c309 and
+aa110114, the landed tree with `small_disk` added, never for main).
+
+| admission | the check | the database |
+|---|---|---|
+| main b4ad7122's (file and `-wal`, one segment's growth) | counted 74,096 and 1,648,000: it begins; its restore ends in "no storage space", 0 bytes left | its next commit fails: "I/O error (pwrite): no storage space" |
+| landed (pages, both segments, both segments' growth) | counted 1,919,000 and 3,296,000: it waits | its next 100 commits hold |
+
+The first try gave the disk 3,653,632 bytes (1,880,064 free): the restore's 1,861,288 fitted and both arms' commits held (r1265).
+
+**What the room costs a user.** A default database keeps 262,144 frames a segment, so a check now begins only with 2,160,066,560 bytes
+free beside its restore (1,080,033,280 before): on a disk between the two, checks that ran are deferred, counted `disk`.
+
+**Found on the way, left (read in the code, no scenario run).**
+- A base begun before a forced restart and ended after it marks the archive mended (`end_base` sets `broken` false), though no
+  restore takes a base begun before a gap (`plan::chain`): no new base is due until the log outweighs it, and the seconds after the
+  break are refused until then.
+- A shipper opened after a switch reads the current segment's header alone (`Shipper::open_within`): a process that ended between
+  the switch and the next round opens on a gap, though the closing segment was shipped whole, and needs a new base.
+- A generation the writer ended while a send of it was under way keeps a gap after it even where that send ships its last frame
+  (`Fence::ended_whole` refuses it by `forced`, which T-T1.12.P11 asserts).
+- A restore doesn't compare the frames its replay recovered with the frames it wrote (`replay`): an archive that already holds
+  another generation's frames (shipped before this fix) restores short with no error.
+- A new database opened at a path with a `-wal2` left and no file: the engine's rule for an orphan log covers `-wal` alone
+  (database.rs, "discarding WAL"), then recovers `-wal2`.
+
+**Commands.** `~/.cache/amphora-perf/pagepath-b24/` on this machine holds the focused script (`run.sh`) and this record's draft; on
+adacachy2 the same folder holds `check.sh`, `arms2.sh` and one folder of logs a run (`red`, `arms1`, `merged-eb0c360d`, `final-8c4f29fa`,
+`landing-ecaee231`, `arms2`, `arms3`).
