@@ -533,7 +533,7 @@ fn declared_trigger_collseq(column: &TriggerColumn) -> Result<Option<CollationSe
 }
 
 /// What `expr` keeps of a trigger row's column, when it is `new.c` or `old.c`.
-fn trigger_column(expr: &Expr) -> Option<&TriggerColumn> {
+pub(crate) fn trigger_column(expr: &Expr) -> Option<&TriggerColumn> {
     match expr {
         Expr::TriggerRegister(_, column)
         | Expr::Variable(Variable {

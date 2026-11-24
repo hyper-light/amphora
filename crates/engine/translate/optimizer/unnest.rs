@@ -254,7 +254,7 @@ pub(crate) fn rewrite_correlated_subqueries(
         let Some(subquery) = plan.non_from_clause_subqueries.get(subquery_index) else {
             continue;
         };
-        if reads_semi_or_anti_joined_table(plan, subquery_index) {
+        if reads_semi_or_anti_joined_table(plan, subquery_index)? {
             // It stays nested: evaluated in its table's loop, before that join's early out.
             continue;
         }
@@ -355,22 +355,40 @@ pub(crate) fn rewrite_correlated_subqueries(
 /// that table. The semi- and anti-join loops stop after a match in their one table (the early out
 /// of `main_loop/close.rs` runs after the whole body), so a join hung off that table would be a
 /// joined inner query those loops don't run: T-PL.10.1 found `EXISTS` in `EXISTS` keeping 24 of
-/// 46 customers that way. Such a subquery stays nested.
-fn reads_semi_or_anti_joined_table(plan: &SelectPlan, subquery_index: usize) -> bool {
-    let Some(inner) = select_subquery_plan(plan, subquery_index) else {
-        return false;
+/// 46 customers that way. Such a subquery stays nested. So does one whose term reads that table
+/// beside it, as `s.k IN (SELECT ...)` reads `s` on its left (the oracles' finding CR): the join it
+/// would become has the term for its condition.
+fn reads_semi_or_anti_joined_table(plan: &SelectPlan, subquery_index: usize) -> Result<bool> {
+    let (Some(subquery), Some(inner)) = (
+        plan.non_from_clause_subqueries.get(subquery_index),
+        select_subquery_plan(plan, subquery_index),
+    ) else {
+        return Ok(false);
     };
-    inner
+    let semi_or_anti_joined = |table: TableInternalId| {
+        plan.table_references
+            .find_joined_table_by_internal_id(table)
+            .and_then(|table| table.join_info.as_ref())
+            .is_some_and(|join_info| join_info.is_semi_or_anti())
+    };
+    if inner
         .table_references
         .outer_query_refs()
         .iter()
-        .filter(|outer| outer.is_used())
-        .any(|outer| {
-            plan.table_references
-                .find_joined_table_by_internal_id(outer.internal_id)
-                .and_then(|table| table.join_info.as_ref())
-                .is_some_and(|join_info| join_info.is_semi_or_anti())
-        })
+        .any(|outer| outer.is_used() && semi_or_anti_joined(outer.internal_id))
+    {
+        return Ok(true);
+    }
+    for term in &plan.where_clause {
+        if expr_references_subquery_id(&term.expr, subquery.internal_id)
+            && collect_table_refs(&term.expr)?
+                .into_iter()
+                .any(semi_or_anti_joined)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Queue each correlated subquery of `plan` the worklist hasn't seen: those a splice brought in.

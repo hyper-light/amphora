@@ -1211,6 +1211,11 @@ fn arguments_collation(
             };
             return Ok(Some(declared.unwrap_or(CollationSeq::Binary)));
         }
+        if let Some(column) = crate::translate::collate::trigger_column(operand) {
+            if let Some(collation) = crate::translate::collate::trigger_column_collseq(column)? {
+                return Ok(Some(collation));
+            }
+        }
     }
     Ok(None)
 }
