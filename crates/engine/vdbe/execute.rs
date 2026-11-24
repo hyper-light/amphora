@@ -12583,7 +12583,7 @@ pub fn op_function(
                                         program
                                             .connection
                                             .dialect()
-                                            .format_rewritten_table_sql(&new_stmt)?,
+                                            .format_rewritten_table_sql(sql.as_str(), &new_stmt)?,
                                     )
                                 } else {
                                     // Other tables: only emit if we actually changed their FK targets.
@@ -12604,7 +12604,7 @@ pub fn op_function(
                                         program
                                             .connection
                                             .dialect()
-                                            .format_rewritten_table_sql(&new_stmt)?,
+                                            .format_rewritten_table_sql(sql.as_str(), &new_stmt)?,
                                     )
                                 }
                             }
@@ -12966,7 +12966,7 @@ pub fn op_function(
                                     program
                                         .connection
                                         .dialect()
-                                        .format_rewritten_table_sql(&new_stmt)?,
+                                        .format_rewritten_table_sql(sql.as_str(), &new_stmt)?,
                                 )
                             }
                             // Trigger SQL is rewritten by separate UPDATE statements

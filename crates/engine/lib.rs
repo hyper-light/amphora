@@ -170,7 +170,7 @@ pub use database::{
     any(not(target_os = "windows"), feature = "experimental_win_iocp")
 ))]
 pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
-pub use dialect::{Dialect, SqliteDialect};
+pub use dialect::{Dialect, PostgresDialect, SqliteDialect};
 pub use error::{io_error, BudgetFull, CompletionError, LimboError};
 pub use function::ContextCollationFunction;
 #[cfg(feature = "io_memory_yield")]
@@ -229,6 +229,7 @@ pub use vtab::{InternalVirtualTable, InternalVirtualTableCursor, VirtualTable};
 /// Database index for the main database (always 0 in SQLite).
 pub const MAIN_DB_ID: usize = 0;
 
+mod pg_catalog_vtab;
 mod turso_types_vtab;
 
 /// Database index for the temp database (always 1 in SQLite).
