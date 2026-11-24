@@ -350,7 +350,7 @@ fn text(oid: u32) -> bool {
 }
 
 /// A quoted identifier of the engine's, whose rule for a `"` is 19's: doubled.
-fn quoted(name: &str) -> String {
+pub(crate) fn quoted(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
@@ -395,6 +395,7 @@ mod tests {
                 name: name.to_owned(),
                 type_oid,
                 typmod,
+                not_null: name == "aid",
             })
             .to_vec()
         }

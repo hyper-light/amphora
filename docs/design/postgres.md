@@ -122,6 +122,16 @@ the A/B's other arm (section 11): both run 1 to 10,000 sessions, with clients th
 clients that pause between statements, reporting throughput and p50, p99 and p99.9; the versioned
 path stays unless the numbers say otherwise.
 
+**What is built** (lane PG20). The listener opens one database of the PostgreSQL dialect on the engine's versioned
+storage (`execute::Database`) and gives each session a connection of its own. A transaction's writes are row
+versions of that connection, so one open across its client's round trips holds no writer (T-PG.9.3's two sessions
+write in two open transactions at once). A transaction that changes the schema holds the pager's header lock until
+it ends, and a second one is refused `40001`. A row another open transaction wrote is refused `40001` at once, where
+19 waits (section 8's units 14 and 15). Rowids: PostgreSQL's rows have none, so the dialect numbers a table's rows
+apart from any snapshot (`Dialect::next_rowid`), or two sessions' inserts would meet on one. Statements run on the
+listener's one thread, each to its end with its answer held whole: the next subsection and an event loop per core
+are not built.
+
 ### Answers stream
 
 PostgreSQL sends a result as DataRow messages with no cap on their number or total size, so
@@ -308,14 +318,19 @@ is the same text), and the engine's planner runs it.
   `TimeZone` or `search_path` over a column is refused `0A000`: the engine's dialect has no session.
 - An expression with no column in it is computed once, at lowering; `CURRENT_TIMESTAMP` is the
   transaction's start.
-- The wire core (`crates/amphora/src/postgres/session.rs`) runs a session's Query through a `Statements` it
-  is given. `postgres/execute.rs` is one over an engine connection of the PostgreSQL dialect: several
-  statements in one Query are one implicit transaction; `BEGIN`, `COMMIT` and `END` only, none of them
-  inside such a Query; a refused statement in a transaction block ends it in `25P02`.
-- Checked by T-PG.9.1 against a 19.0 server: TPC-B's statements on two sessions (selects, updates, inserts,
-  transactions, `22003` on an overflow). The listener (unit 2) still runs none: its sessions have no
-  database yet. `ROLLBACK` and any comparison but `=` are refused `0A000` by the parser's ported rules
-  (section 3's unit 6: of `a_expr`'s operators only `+`, `-`, `/` and `=`).
+- The wire core (`crates/amphora/src/postgres/session.rs`) runs a session's Query through a `Statements`, which
+  it opens once the role is authenticated, where PostgreSQL opens the session's database. `postgres/execute.rs`
+  is one over an engine connection of the PostgreSQL dialect. Its transaction blocks are xact.c's: none, implicit
+  (several statements in one Query), the client's, and failed; `BEGIN`, `COMMIT`, `END`, `ROLLBACK` and `ABORT` do
+  in each what 19 does, inside a Query of several statements too.
+- Utility statements (lane PG20, `crates/pg-analysis/src/utility.rs`): CREATE TABLE of columns of the unit's types
+  with NOT NULL and `fillfactor`, and ALTER TABLE ADD PRIMARY KEY over NOT NULL columns, as a unique index named
+  as 19 names it. Every other clause refuses `0A000`.
+- Checked by T-PG.9.1 (the wire core) and T-PG.9.3 (the listener, over a socket) against a 19.0 server: pgbench's
+  tables and rows, TPC-B's script on two sessions statement by statement, `ROLLBACK`, the comparisons, refusals
+  with their positions, several statements in one Query; and by `scripts/postgres-clients.sh`, where the
+  postgres:19 image's own psql and pgbench run on both. `a_expr`'s `<`, `>`, `<=`, `>=`, `<>`, `=`, `+`, `-` and `/`
+  are the ported operators (section 3's unit 6). An error's DETAIL and HINT aren't made.
 
 **Against the 10x bar.** Arithmetic and comparison on the hot path lower to the engine's own
 instructions (integer add with an overflow check that raises `22003`; comparisons of stored keys,

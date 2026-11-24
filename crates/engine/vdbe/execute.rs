@@ -14391,6 +14391,36 @@ fn new_rowid_inner(
     loop {
         match *state.active_op_state.new_rowid() {
             OpNewRowidState::Start => {
+                // Amphora (docs/design/postgres.md section 2, T-PG.9.3): a dialect may number a
+                // versioned table's rows itself.
+                let cursor_ref = state.get_cursor(*cursor).as_btree_mut() as &mut dyn Any;
+                if let Some(versioned) =
+                    cursor_ref.downcast_mut::<crate::storage::versioned::cursor::VersionedCursor>()
+                {
+                    let root_page = versioned.root_page();
+                    let numbered = program
+                        .connection
+                        .dialect()
+                        .next_rowid(root_page, &mut || versioned.largest_rowid())?;
+                    if let Some(rowid) = numbered {
+                        let missing =
+                            || LimboError::InternalError("NewRowid has no such register".into());
+                        let registers = &mut state.registers;
+                        registers
+                            .get_mut(*rowid_reg)
+                            .ok_or_else(missing)?
+                            .set_int(rowid);
+                        if *prev_largest_reg > 0 {
+                            registers
+                                .get_mut(*prev_largest_reg)
+                                .ok_or_else(missing)?
+                                .set_int(rowid.saturating_sub(1));
+                        }
+                        state.active_op_state.clear();
+                        state.pc = state.pc.checked_add(1).or_overflow()?;
+                        return Ok(InsnFunctionStepResult::Step);
+                    }
+                }
                 if has_mv_store {
                     let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut() as &mut dyn Any;

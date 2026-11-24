@@ -107,6 +107,20 @@ pub trait Dialect: Send + Sync + 'static {
         self.format_table_sql(input, tbl_name, body)
     }
 
+    /// The rowid of the next row inserted into the table at `root_page` of a versioned storage
+    /// (`NewRowid`), for a dialect that numbers its rows itself; `largest` reads the largest there, a
+    /// read no transaction keeps. By default none, so SQLite's rule stands (sqlite.org/autoinc.html):
+    /// the largest rowid the transaction's snapshot shows, read as any row of its is, and one, under
+    /// which two transactions that insert beside each other meet on one rowid and the second is
+    /// refused.
+    fn next_rowid(
+        &self,
+        _root_page: i64,
+        _largest: &mut dyn FnMut() -> crate::Result<Option<i64>>,
+    ) -> crate::Result<Option<i64>> {
+        Ok(None)
+    }
+
     /// Produce stored SQL after the engine rewrites a `CREATE TABLE` AST.
     ///
     /// Schema rewrites cannot reuse the original frontend text because it no

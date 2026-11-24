@@ -11667,6 +11667,34 @@ pub mod test {
         assert_eq!(frames(SegmentId::Second), current_frames);
     }
 
+    /// Decision 45 (lane B25): frames left in a second segment beside a database file with no pages
+    /// are a removed database's, as the first segment's are. Do: put a log's file beside no database
+    /// as `-wal2`; open a database there and checkpoint it. Expect: the log opens empty, in its first
+    /// segment, the file is gone, and the database holds no table.
+    #[test]
+    fn d45_open_discards_a_second_segment_beside_a_database_with_no_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let io = shared_wal_test_io();
+        let source = dir.path().join("source.db");
+        let left = dir.path().join("left.db");
+        let (source_path, left_path) = (source.to_str().unwrap(), left.to_str().unwrap());
+        let db = Database::open_file(io.clone(), source_path, Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("pragma wal_autocheckpoint=0").unwrap();
+        conn.execute("create table t(id integer primary key, v text)")
+            .unwrap();
+        conn.execute("insert into t values(1, 'removed')").unwrap();
+        std::fs::copy(format!("{source_path}-wal"), format!("{left_path}-wal2")).unwrap();
+
+        let opened = Database::open_file(io, left_path, Arc::new(SqliteDialect)).unwrap();
+        assert_eq!(opened.wal_segment(), SegmentId::First);
+        assert_eq!(opened.wal_end().1, 0, "no frame of the removed database");
+        assert!(!std::path::Path::new(&format!("{left_path}-wal2")).exists());
+        let conn = opened.connect(ConnectOpts::new()).unwrap();
+        conn.execute("pragma wal_checkpoint(TRUNCATE)").unwrap();
+        assert_eq!(count_rows(&conn, "sqlite_schema"), 0);
+    }
+
     fn count_rows(conn: &Arc<Connection>, table: &str) -> i64 {
         let mut stmt = conn
             .prepare(format!("select count(*) from {table}"))

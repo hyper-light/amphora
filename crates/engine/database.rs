@@ -2468,11 +2468,7 @@ impl Database {
 
                     // Decision 45: the log's second segment, `-wal2`, recovered beside the first.
                     #[cfg(host_shared_wal)]
-                    let second_segment = WalFileShared::open_second_segment_if_exists(
-                        &self.io,
-                        &storage::wal::second_segment_path(&self.wal_path),
-                        self.open_flags,
-                    )?;
+                    let second_segment = self.open_second_segment()?;
                     #[cfg(not(host_shared_wal))]
                     let second_segment = WalFileShared::new_noop();
                     let shared_log = SharedLog::recover(
@@ -2522,6 +2518,29 @@ impl Database {
                 }
             }
         }
+    }
+
+    /// The log's second segment (decision 45) as its file holds it. Frames left in it beside a
+    /// database file with no pages are a removed database's, as the first segment's are (the open's
+    /// orphan rule), and are thrown away as those are: a read-only open leaves the file.
+    #[cfg(host_shared_wal)]
+    fn open_second_segment(&self) -> Result<Arc<RwLock<WalFileShared>>> {
+        let path = storage::wal::second_segment_path(&self.wal_path);
+        let segment =
+            WalFileShared::open_second_segment_if_exists(&self.io, &path, self.open_flags)?;
+        let (_, frames) = segment.read().last_checksum_and_max_frame();
+        if frames == 0 || self.db_file.size()? > 0 {
+            return Ok(segment);
+        }
+        tracing::warn!(
+            "discarding WAL '{path}': it holds frames but database file '{}' has no pages, so the WAL does not belong to it",
+            self.path
+        );
+        drop(segment);
+        if !self.open_flags.contains(OpenFlags::ReadOnly) {
+            self.io.remove_file(&path)?;
+        }
+        Ok(WalFileShared::new_noop())
     }
 
     pub fn get_database_canonical_path(&self) -> String {
@@ -3444,6 +3463,25 @@ impl Database {
             generation,
             shared.metadata.max_frame.load(Ordering::Acquire),
         )
+    }
+
+    /// Amphora: how the log's generation before the current one ended, where the segment the last
+    /// switch left still holds it (decision 45): that segment, its header's `checkpoint_seq` and its
+    /// last committed frame. None for a log in one segment, and where the other holds another
+    /// generation.
+    pub fn wal_before(&self) -> Option<(storage::log_segments::SegmentId, u32, u64)> {
+        let before = self.shared_wal.current_id().other();
+        let (current, _) = self.wal_end();
+        let shared = self.shared_wal.segment(before).read();
+        if !shared.metadata.initialized.load(Ordering::Acquire) {
+            return None;
+        }
+        let generation = shared.metadata.wal_header.lock().checkpoint_seq;
+        let frame = shared.metadata.max_frame.load(Ordering::Acquire);
+        if frame == 0 || generation.wrapping_add(1) != current {
+            return None;
+        }
+        Some((before, generation, frame))
     }
 
     /// Amphora: the log's last committed frame and how many of its frames are copied into the
