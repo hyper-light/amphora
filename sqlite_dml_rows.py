@@ -305,7 +305,8 @@ def main():
         made_case = Case(rng)
         case = made_case.text()
         out = answer(case)
-        if out is None or not any(x[2] == "ok" for x in out if x[0] == "do"):
+        # integrity_check's one complaint here is SQLite's own: "TEXT value in t.c2" of a row it reads as an integer
+        if out is None or out[-1][2] != "'ok'" or not any(x[2] == "ok" for x in out if x[0] == "do"):
             continue
         if not made_case.without_rowid:
             early = answer(converted_early(case))
