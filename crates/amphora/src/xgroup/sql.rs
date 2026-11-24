@@ -298,7 +298,7 @@ pub(crate) fn held_at(
 
 /// A group's database as a [`Tablet`], inside the step's one transaction.
 pub(crate) struct SqlTablet<'a> {
-    db: &'a Db,
+    db: &'a mut Db,
     /// Each namespace's revision this step writes its Records rows at, and the next row's place.
     revs: BTreeMap<String, (amphora_api::Rev, u64)>,
     /// The Records rows whose locks this step dropped, by key: once it commits, their waiter
@@ -307,7 +307,7 @@ pub(crate) struct SqlTablet<'a> {
 }
 
 impl<'a> SqlTablet<'a> {
-    pub(crate) fn new(db: &'a Db) -> Self {
+    pub(crate) fn new(db: &'a mut Db) -> Self {
         Self {
             db,
             revs: BTreeMap::new(),
@@ -327,23 +327,60 @@ impl<'a> SqlTablet<'a> {
     }
 }
 
+/// Kept in the WAL transaction that publishes the locks, at the clock that publication uses.
+pub(crate) fn keep_lock_stamp(db: &Db, txn: TxnId, at: u64) -> anyhow::Result<()> {
+    let [c, e, s] = txn_params(txn)?;
+    db.query(
+        "INSERT OR IGNORE INTO __amphora_xg_lock_at(coordinator, epoch, seq, stamp) VALUES (?1, ?2, ?3, ?4)",
+        [c, e, s, int(at)?],
+        |_| Ok(true),
+    )
+}
+
+/// What a step answered in its group's writer: its reply, and the transaction whose locks it took,
+/// whose vote is read once the step has applied here (T-T1.9.R30).
+struct AppliedStep {
+    reply: Reply,
+    locked: Option<TxnId>,
+}
+
+impl AnswerBytes for AppliedStep {
+    fn answer_bytes(&self) -> usize {
+        let beside = std::mem::size_of::<Self>().saturating_sub(std::mem::size_of::<Reply>());
+        self.reply.answer_bytes().saturating_add(beside)
+    }
+}
+
+impl AppliedStep {
+    /// Finish the reply after local application. Another entry may already have advanced the
+    /// group clock by the time the caller receives this result.
+    fn answer(self, group: &Database, until: Instant) -> Result<(Reply, Option<u64>), Refusal> {
+        let clock = match self.locked {
+            Some(txn) => group.lock_reply_clock(txn, until)?,
+            None => group.cross_clock(until)?,
+        };
+        Ok((self.reply, clock))
+    }
+}
+
 /// Applies one step on a group's database, and answers the Records rows whose locks it dropped.
 fn apply_step(
-    db: &Db,
+    db: &mut Db,
     here: GroupId,
     envelope: &Envelope,
-) -> anyhow::Result<(Reply, Vec<Vec<u8>>)> {
+) -> anyhow::Result<(AppliedStep, Vec<Vec<u8>>)> {
     let mut tablet = SqlTablet::new(db);
     let mut reply = apply(here, &mut tablet, envelope)?;
     // Grown one push at a time, the lists hold the bytes the step declared once trimmed
     // (`step_answer`).
     reply.trim();
+    let locked = tablet.db.pending_lock();
     let mut dropped = tablet.dropped;
     dropped.shrink_to_fit();
     for key in &mut dropped {
         key.shrink_to_fit();
     }
-    Ok((reply, dropped))
+    Ok((AppliedStep { reply, locked }, dropped))
 }
 
 impl Tablet for SqlTablet<'_> {
@@ -457,19 +494,6 @@ impl Tablet for SqlTablet<'_> {
             Intent::Delete => (DELETE, Value::Null),
         };
         let [coordinator, epoch, seq] = txn_params(lock.txn)?;
-        // The transaction's lock stamp here (lane split-merge-21, T-T1.9.R28): this group's clock
-        // as it takes the first lock, after the coordinator's carried stamp. Its commit stamp is at
-        // or past it, so a read across groups as of a stamp before it never waits on it, and one
-        // at or past it waits for the resolution. A group that stamps nothing keeps none.
-        if let Some(hooks) = self.db.stamps() {
-            let stamp = hooks.marks.next_micros()?;
-            let [c, e, s] = txn_params(lock.txn)?;
-            self.db.query(
-                "INSERT OR IGNORE INTO __amphora_xg_lock_at(coordinator, epoch, seq, stamp) VALUES (?1, ?2, ?3, ?4)",
-                [c, e, s, int(stamp)?],
-                |_| Ok(true),
-            )?;
-        }
         self.db.query(
             "INSERT INTO __amphora_xg_lock(key, coordinator, epoch, seq, anchor, kind, value) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             [
@@ -482,7 +506,8 @@ impl Tablet for SqlTablet<'_> {
                 value,
             ],
             |_| Ok(true),
-        )
+        )?;
+        self.db.locking(lock.txn)
     }
 
     fn drop_locks_of(&mut self, txn: TxnId) -> anyhow::Result<()> {
@@ -723,13 +748,10 @@ pub fn prepare(group: &Database, until: Instant) -> Result<(), Refusal> {
     group.call_internal(until, AnswerMax::fixed(), |db| db.exec(SCHEMA))
 }
 
-/// A step that came over the transport for this owner's group `here` (`Request::Step`): applied as
-/// a local one is, the coordinator's stamp `carried` taken in first; answers the reply, the group's
-/// newest stamp after it (none: the group makes no stamps), and its clock after it, the one
-/// cross-group clock's microseconds ([`Database::cross_clock`]: a replicated group's closed time, a
-/// backed-up group's writer clock; none: it keeps neither; AC-T1.10.1, T-T1.10.W4). Taken after
-/// the step answered, the clock covers the step's own commit: an internal call waits
-/// for its write's index to apply here before answering.
+/// Serve the owner's step using the same clock as a local participant (AC-T1.10.1, T-T1.10.W4).
+/// The reply carries the newest clock observed after the call and the clock of the step. For a
+/// lock the latter is its durable vote, read once its writer transaction has applied (T-T1.9.R30).
+/// Groups that keep neither a writer clock nor a closed time return no stamps.
 pub(crate) fn serve(
     group: &Database,
     here: GroupId,
@@ -738,15 +760,39 @@ pub(crate) fn serve(
     until: Instant,
 ) -> Result<(Reply, Option<u64>, Option<u64>), Refusal> {
     let stamp = AtomicU64::new(carried);
+    let (reply, clock) = local_step(group, here, &stamp, envelope, until)?;
+    Ok((reply, clock.map(|_| stamp.load(Ordering::Acquire)), clock))
+}
+
+/// Read the published lock's own clock after the call. The group may have applied more writes
+/// already. Their clocks still travel in `carried`; recovery can reproduce only the lock's vote.
+fn local_step(
+    group: &Database,
+    here: GroupId,
+    carried: &AtomicU64,
+    envelope: Envelope,
+    until: Instant,
+) -> Result<(Reply, Option<u64>), Refusal> {
+    // Recovery may learn a durable vote from before a restart. It carries the chosen clock
+    // in the decision itself even if the auxiliary clock has not advanced to it.
+    if let super::Step::DecideAt {
+        at,
+        outcome: Outcome::Committed,
+        ..
+    }
+    | super::Step::ResolveAt {
+        at,
+        outcome: Outcome::Committed,
+        ..
+    } = &envelope.step
+    {
+        carried.fetch_max(*at, Ordering::AcqRel);
+    }
     let answer = step_answer(&envelope);
-    let reply = step(group, &stamp, until, answer, move |db| {
+    let applied = step(group, carried, until, answer, move |db| {
         apply_step(db, here, &envelope)
     })?;
-    // The group's clock after the step, the one cross-group clock as it keeps it (lane
-    // split-merge-22, as `step_on` reads a local group's): a backed-up group's writer clock, which
-    // a standalone group's session token never had, so its lock replies carry a stamp too.
-    let clock = group.cross_clock(until)?;
-    Ok((reply, clock.map(|_| stamp.load(Ordering::Acquire)), clock))
+    applied.answer(group, until)
 }
 
 /// Runs one step on `member`, its stamps carried either way. A group on a node answers its closed
@@ -761,18 +807,7 @@ fn step_on(
     envelope: Envelope,
 ) -> Result<(Reply, Option<u64>), Refusal> {
     match member {
-        Member::Local(group) => {
-            let answer = step_answer(&envelope);
-            let reply = step(group, carried, until, answer, move |db| {
-                apply_step(db, here, &envelope)
-            })?;
-            // Read after the step answered, the group's clock is at or past the step's commit:
-            // the one cross-group clock as this group keeps it (lane split-merge-21,
-            // `Database::cross_clock`), so a standalone backed-up group's lock reply carries its
-            // writer's clock, which a session token never had.
-            let clock = group.cross_clock(until)?;
-            Ok((reply, clock))
-        }
+        Member::Local(group) => local_step(group, here, carried, envelope, until),
         Member::Node { nodes, node } => {
             let (reply, latest, micros) = nodes
                 .step(
@@ -1495,7 +1530,7 @@ where
 /// locks it dropped, at most the transaction's own (`coordinator::validate`: `TX_MAX` keys of at
 /// most `KEY_MAX` bytes). A lock step answers each key it reads with a value of at most
 /// `VALUE_MAX`, its real worst case, or the one key a conflict or a condition names.
-fn step_answer(envelope: &Envelope) -> AnswerMax<(Reply, Vec<Vec<u8>>)> {
+fn step_answer(envelope: &Envelope) -> AnswerMax<(AppliedStep, Vec<Vec<u8>>)> {
     let reply = match &envelope.step {
         super::Step::Scan { .. } => {
             amphora_api::SCAN_MAX.saturating_mul(std::mem::size_of::<(TxnId, GroupId)>())
@@ -1508,7 +1543,7 @@ fn step_answer(envelope: &Envelope) -> AnswerMax<(Reply, Vec<Vec<u8>>)> {
     let dropped = amphora_api::TX_MAX
         .saturating_mul(std::mem::size_of::<Vec<u8>>().saturating_add(amphora_api::KEY_MAX));
     AnswerMax::bytes(
-        std::mem::size_of::<(Reply, Vec<Vec<u8>>)>()
+        std::mem::size_of::<(AppliedStep, Vec<Vec<u8>>)>()
             .saturating_add(reply)
             .saturating_add(dropped),
     )
@@ -1996,7 +2031,11 @@ mod answers {
                 stage: None,
             },
         };
-        let held = (reply, Vec::<Vec<u8>>::new()).answer_bytes();
+        let applied = AppliedStep {
+            reply,
+            locked: envelope.step.txn(),
+        };
+        let held = (applied, Vec::<Vec<u8>>::new()).answer_bytes();
         let declared = step_answer(&envelope).get();
         assert!(held <= declared, "{held} > {declared}");
     }
@@ -2842,6 +2881,74 @@ mod sessions {
             // Each relay ends at its member's next record, or once its owner is gone.
             self.stop.store(true, Ordering::Release);
         }
+    }
+
+    /// T-T1.9.R28/R30. The reply is delayed after local application while another clock is
+    /// received and another write applies. Recovery and the delayed lock reply must still agree.
+    #[test]
+    fn t_t1_9_r30_a_delayed_lock_reply_keeps_its_own_apply_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let replicas = Replicas::open(dir.path(), "delayed", 1);
+        let group = &replicas.dbs[replicas.leader()];
+        let txn = TxnId {
+            coordinator: 7,
+            epoch: 1,
+            seq: 1,
+        };
+        let envelope = |step| Envelope {
+            coordinator: 7,
+            epoch: 1,
+            floor: None,
+            step,
+        };
+        let key = record_key("n", "f", b"k").unwrap();
+        let lock = envelope(super::super::Step::Lock {
+            txn,
+            anchor: 0,
+            reads: vec![],
+            writes: vec![(key, Some(vec![1]))],
+            stage: None,
+        });
+        let (applied, _) = group
+            .call_internal(until(), step_answer(&lock), move |db| {
+                apply_step(db, 0, &lock)
+            })
+            .unwrap();
+        let (present, _, _) = serve(
+            group,
+            0,
+            0,
+            envelope(super::super::Step::PreventAt { txn }),
+            until(),
+        )
+        .unwrap();
+        let Reply::PresentAt {
+            present: true,
+            locked: Some(vote),
+            ..
+        } = present
+        else {
+            panic!("the applied lock must have a durable vote: {present:?}");
+        };
+        // Another group's recovered decision supplied a later stamp directly in ResolveAt.
+        // Its auxiliary clock can still be behind it.
+        let later = vote + u64::try_from(Duration::from_secs(3_600).as_micros()).unwrap();
+        let (_, _, after) = serve(
+            group,
+            0,
+            0,
+            envelope(super::super::Step::ResolveAt {
+                txn: TxnId { seq: 2, ..txn },
+                outcome: Outcome::Committed,
+                at: later,
+            }),
+            until(),
+        )
+        .unwrap();
+        assert!(after.unwrap() > later);
+        let (reply, heard) = applied.answer(group, until()).unwrap();
+        assert!(matches!(reply, Reply::Locked { .. }));
+        assert_eq!(heard, Some(vote));
     }
 
     /// A cluster over group 0, `local`, in this process, and group 1, `replicas` reached only

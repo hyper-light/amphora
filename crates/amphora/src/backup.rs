@@ -155,6 +155,26 @@ impl Marks {
             return Ok(());
         }
         let ns = self.stamp(&mut state);
+        self.keep_commit(&mut state, seq, frame, ns);
+        Ok(())
+    }
+
+    /// Publish a lock step and its reply stamp together (T-T1.9.R28/R30). The step has
+    /// finished taking its locks. A reader that sampled the clock before us has a smaller
+    /// stamp. A reader sampling it after us can already see the lock in the committed WAL.
+    pub(crate) fn publish_lock(
+        &self,
+        commit: impl FnOnce(u64) -> anyhow::Result<(u32, u64)>,
+    ) -> anyhow::Result<()> {
+        let mut state = self.state()?;
+        let at = self.next_locked(&mut state);
+        let (seq, frame) = commit(at)?;
+        let ns = state.last;
+        self.keep_commit(&mut state, seq, frame, ns);
+        Ok(())
+    }
+
+    fn keep_commit(&self, state: &mut MarkState, seq: u32, frame: u64, ns: u64) {
         if let Some((second, moved)) = state.watch.as_mut()
             && *second == second_of(ns)
         {
@@ -168,7 +188,7 @@ impl Marks {
             last.ns = ns;
             let stamped = (seq, last.frame, ns);
             state.stamped = Some(stamped);
-            return Ok(());
+            return;
         }
         state.stamped = Some((seq, frame, ns));
         if state.marks.len() >= self.capacity
@@ -187,7 +207,6 @@ impl Marks {
             ns,
             unknown_from: None,
         });
-        Ok(())
     }
 
     /// Takes every mark made so far, and the time through which they are all of them.
@@ -238,13 +257,17 @@ impl Marks {
     /// held-back count stays the clock's own steps back).
     pub fn next_micros(&self) -> anyhow::Result<u64> {
         let mut state = self.state()?;
-        let before = latest_micros(&state);
+        Ok(self.next_locked(&mut state))
+    }
+
+    fn next_locked(&self, state: &mut MarkState) -> u64 {
+        let before = latest_micros(state);
         let micros = self
-            .stamp(&mut state)
+            .stamp(state)
             .div_ceil(MICRO_NS)
             .max(before.saturating_add(1));
         state.micros = micros;
-        Ok(micros)
+        micros
     }
 
     /// The latest stamp in microseconds made or seen here, the backup's nanosecond stamps among

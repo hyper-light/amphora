@@ -899,7 +899,8 @@ transaction by its own clock as it resolved it.
   in one unit, two sources by the group's kind, because a standalone group has no log and so no
   closed time (its session token is none), and every read across groups runs on backed-up
   standalone groups: with the closed time alone, every transaction across them would commit with
-  no stamp. `Database::cross_clock` is the group's reading either way, what a lock reply carries;
+  no stamp. `Database::cross_clock` reads the latest group clock. A lock reply carries the reading
+  recorded with the locks when the writer published them.
   `Database::observe_clock` takes a carried stamp in either way (a replicated owner proposes past
   it), the receive rule each step runs first.
   The stamp
@@ -920,8 +921,8 @@ transaction by its own clock as it resolved it.
   still rise in stamp: while a lock holds the key nothing else writes it, the commit stamp is past
   the lock stamp, which is past every earlier version's, and the clock takes it in as it resolves.
 - **A read past a held lock's stamp waits.** Each group records a transaction's lock stamp
-  (`__amphora_xg_lock_at`: its clock as it takes the first lock, after the coordinator's carried
-  stamp). A get or scan as of a stamp at or past a write lock's stamp in its range can't answer:
+  in `__amphora_xg_lock_at` when it publishes the lock step, after taking in the coordinator's
+  carried stamp. A get or scan as of a stamp at or past a write lock's stamp in its range can't answer:
   the commit stamp may be at or before it. It waits for the lock's resolution and reads again. One
   before the lock's stamp never waits: the commit stamp is past it. The wait is event-driven: at
   first on the group's change event and its count of resolutions; since lane split-merge-22, on the
@@ -965,10 +966,9 @@ coordinator) are now one branch, and three pieces of split-merge-21's "Left" are
   groups give its rows. Its conditions are carried into the lock steps (`commit_records` refused
   them): `Cond::At`'s `rev` names a commit stamp, as reads across groups answer them, and holds
   while the row's newest version is at or before it; `Cond::Absent` while it has none. A failed one
-  is refused `Conflict` on its row and writes nothing. Every reading of a group's clock for a stamp
-  is `Database::cross_clock` (the step a node serves, a commit in one group), so standalone
-  backed-up groups, which have no session token, give stamps too. A commit in one group answers
-  its clock read once it committed: at or past its rows' stamp, not equal to it.
+  is refused `Conflict` on its row and writes nothing. A standalone backed-up group uses its
+  writer clock and a replicated group uses its closed time. A single-group commit reads the group's
+  clock after it commits and answers a stamp at or past its rows.
 - **Recovery resolves at the one stamp.** Recovery sent `Step::Resolve`, so a recovered
   transaction's rows took each group's own stamp, and one that some groups had resolved at the
   coordinator's stamp ended with two. The stamp is now kept where a recovery looks:
@@ -980,8 +980,8 @@ coordinator) are now one branch, and three pieces of split-merge-21's "Left" are
     explicit commit, so a recovery that finds the record still staging asks each participant
     (`Step::PreventAt`, answered `Reply::PresentAt`) for that stamp, or its lock stamp while it
     holds its locks. The stamp is the resolved one if any group resolved it (they all resolved at
-    the same one), else the latest lock stamp, which is at or past every group's lock stamp; the
-    decision then keeps it.
+    the same one). If only locks survive, their largest recorded vote is exactly the stamp the
+    client heard. Recovery stores it in the decision.
   The new steps and replies come after every existing one; the plain ones stay for a coordinator
   whose groups keep no clock.
 - **Held reads wake for their own row.** A read across groups held by a lock (get, scan, the
@@ -991,18 +991,29 @@ coordinator) are now one branch, and three pieces of split-merge-21's "Left" are
   change event. The group's resolution counter is gone, and with it the wake every resolving step
   sent to every held read.
 
-**Evidence.** Not yet run (kiln was down; nothing compiled). T-T1.9.R29, T-T1.9.R30 and T-T1.9.R31
-(`docs/requirements.toml`, lane split-merge-22).
+**Publication and recovery (T-T1.9.R28/R30).** Each participant persists one vote for its
+transaction in `__amphora_xg_lock_at`, in the WAL commit that makes the locks visible. After a
+standalone lock call has taken its last lock, the writer reserves its publication stamp under the
+group clock and holds the clock through COMMIT. A snapshot that sampled the clock while the locks
+were still invisible therefore precedes the vote. On each replicated member the same WAL
+transaction installs the lock pages, records the entry's final closed time and stores that time as
+the vote. This includes a proposal whose time the preceding entry lifts. A refused proposal
+creates no vote. The lock delta has its own Raft entry prefix and carries the transaction ID
+before the existing page encoding. Read-set validation treats this entry as opaque because apply
+also writes the vote. The transport carries the vote in the existing stepped reply.
 
-**Left.** In one recovery case the stamp differs from the one the client heard: under Parallel
-Commits, with every lock in place and nothing decided or resolved, the client heard the latest lock
-reply's clock, which each group reads after its lock step, and the recovery uses the latest lock
-stamp, which is at or before it. Lock replies that carry the lock stamp itself would close it.
-A replicated group's rows are still not in the stamp table. Lane xgroup-sql-12's version
-negotiation (15c2dc14) isn't taken: it conflicts with the network listener's greeting in
-`transport/common.rs`, and belongs on the group branch after this lane's merge.
+After the call the participant reads its durable vote locally. Later writes can advance the clock
+carried to the next step while the vote stays fixed. Parallel Commits answers after one round of
+locks. If the coordinator then crashes before sending any decision or resolution, its successor
+gets the same votes from `PreventAt`, chooses their maximum and writes every Records row at that
+stamp, including rows on a replicated-only group.
+
+**Evidence.** T-T1.9.R30 exercises votes of 30, 50 and 40, a client answer of 50, and recovery
+before any decision or resolution. The storage tests open a snapshot at 25 while a lock is
+unpublished, publish it at 50, and reopen the writer. They also apply a proposal stamped 21 after
+closed time 49 on two replicas and reopen them after closed time reaches 90. Both retain vote 50.
 
 **Falsified by.** A `Records::commit` across groups answering a stamp its rows don't carry; a
 condition naming a stamp at or past its row's newest version failing, or one before it holding; a
-recovered transaction's rows carrying two stamps; a read held by one row's lock woken by another
-row's resolution.
+recovered row whose stamp differs from the client answer, even when all recovered rows agree;
+a read held by one row's lock woken by another row's resolution.
