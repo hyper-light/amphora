@@ -1847,6 +1847,9 @@ pub(crate) fn rewrite_expr_to_registers(
                 Expr::Id(name) => {
                     if let Some(r) = col_reg_from_row_image(&normalize_ident(name.as_str())) {
                         *expr = Expr::Register(r);
+                    } else if allow_excluded && !name.quoted_with('"') {
+                        // Amphora: only a double-quoted name that is no column is a string.
+                        bail_parse_error!("no such column: {}", name.as_str());
                     }
                 }
                 _ => {}
