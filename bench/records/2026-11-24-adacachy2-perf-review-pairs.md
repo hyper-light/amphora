@@ -4,6 +4,8 @@ All 150 primary runs exceeded the one-minute load limit. The historical versione
 
 Kiln r105 used the reserved 03:00–03:45 UTC window. 162 of 162 scheduled arms produced complete, validated measurements. Of 81 scheduled pairs, **0** had two valid arms below load 2 throughout their sampled intervals. Every run has its own load observations, threshold flag, CPU and I/O pressure, and outcome. [Per-run measurements](2026-11-24-adacachy2-perf-review-pairs.jsonl) · [Executed driver](2026-11-24-adacachy2-perf-review-run.py) · [Benchmark rules](../../CLAUDE.md#7-benchmarks-are-recorded)
 
+The coordinator estimates from suite durations that V16’s r73 continued on adacachy2 until about 03:00:20–03:00:45 UTC despite its 300-second timeout. Its exact finish time is unknown. The first timed CPU arm began at 03:02:37.725 UTC, 112.725 seconds after the latest estimated finish. The first versioned point-read arm began at 03:02:47.983 UTC. On that estimate, r73 overlapped none of the timed arms. The coordinator knew of no other swarm run in the window. [Per-arm timestamps](2026-11-24-adacachy2-perf-review-pairs.jsonl)
+
 ## Versioned point reads
 
 The timing gate opened after the reporter started its clock. All 251,616 requested values were checked. The default-storage controls used the same fixture and timing gate. The historical after arm includes CopyId and predates the durability fence in `b6cb6aa8`.
