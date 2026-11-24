@@ -6925,6 +6925,7 @@ pub fn op_seek(
     let traced = seek_trace_start(insn);
     let result = timed_run(
         program,
+        pager,
         crate::translate::optimizer::learned_costs::Work::Seek,
         || seek_run(program, state, insn, pager),
     );
@@ -7034,11 +7035,13 @@ fn star_trace_write(program: &Program, state: &mut ProgramState) {
 }
 
 /// Amphora (QT.5, step 3a): runs `run`, one run of `work`, timing it when the database's
-/// estimator samples this one (`LearnedCosts::sampled`). A run that waits on IO is not timed:
+/// estimator samples this one (`LearnedCosts::sampled`). A run that reads from disk (either
+/// yielding `IO` or completing an inline file read on `PagePath::Plain`) is not timed:
 /// its time is its page reads', which the pager times (`Work::PageRead`), and its resumption's
 /// would be part of the work.
 fn timed_run(
     program: &Program,
+    pager: &Pager,
     work: crate::translate::optimizer::learned_costs::Work,
     run: impl FnOnce() -> InsnResult,
 ) -> InsnResult {
@@ -7046,9 +7049,11 @@ fn timed_run(
     if !costs.sampled(work, &program.connection.cost_runs) {
         return run();
     }
+    let reads_before = pager.page_file_reads();
     let started = std::time::Instant::now();
     let result = run();
-    if matches!(result, Ok(InsnFunctionStepResult::Step)) {
+    if matches!(result, Ok(InsnFunctionStepResult::Step)) && pager.page_file_reads() == reads_before
+    {
         costs.observe_sampled(work, started.elapsed().as_nanos() as f64);
     }
     result
@@ -19096,6 +19101,7 @@ pub fn op_hash_build(
 ) -> InsnResult {
     timed_run(
         program,
+        pager,
         crate::translate::optimizer::learned_costs::Work::HashBuild,
         || hash_build_run(program, state, insn, pager),
     )
@@ -19543,6 +19549,7 @@ pub fn op_hash_probe(
 ) -> InsnResult {
     timed_run(
         program,
+        pager,
         crate::translate::optimizer::learned_costs::Work::HashProbe,
         || hash_probe_run(program, state, insn, pager),
     )

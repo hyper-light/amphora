@@ -1,4 +1,3 @@
-use fastbloom::BloomFilter as BloomFilterInner;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
@@ -12,6 +11,100 @@ const DEFAULT_EXPECTED_ITEMS: u32 = 1024;
 
 /// Default false positive rate (1%).
 const DEFAULT_FALSE_POSITIVE_RATE: f32 = 0.01;
+
+/// Standard double-hashed bit-vector Bloom filter (Broder & Mitzenmacher 2004; Kirsch &
+/// Mitzenmacher 2006) operating directly on pre-computed 64-bit hashes without invoking OS
+/// `getrandom` per query (which `fastbloom::RandomDefaultHasher::default()` called even when only
+/// `insert_hash` / `contains_hash` were used).
+struct BitBloom {
+    words: Box<[u64]>,
+    num_hashes: u32,
+}
+
+impl BitBloom {
+    /// Golden-ratio odd multiplier (Knuth) for deriving an independent second hash from a 64-bit
+    /// `RapidHasher` hash in Kirsch-Mitzenmacher double hashing.
+    const H2_MULT: u64 = 0x9E37_79B9_7F4A_7C15;
+
+    fn optimal_hashes(num_bits: usize, expected_items: usize) -> u32 {
+        let items = expected_items.max(1) as f64;
+        let k = ((num_bits as f64 / items) * std::f64::consts::LN_2).round();
+        if !k.is_finite() || k < 1.0 {
+            1
+        } else if k > 32.0 {
+            32
+        } else {
+            num_traits::ToPrimitive::to_u32(&k).unwrap_or(1)
+        }
+    }
+
+    fn with_words(words: usize, expected_items: usize) -> Self {
+        let words = words.max(1);
+        let num_bits = words.saturating_mul(64);
+        let num_hashes = Self::optimal_hashes(num_bits, expected_items);
+        Self {
+            words: vec![0u64; words].into_boxed_slice(),
+            num_hashes,
+        }
+    }
+
+    fn with_false_pos(fp: f64, expected_items: usize) -> Self {
+        let ln2_sq = std::f64::consts::LN_2 * std::f64::consts::LN_2;
+        let fp = fp.clamp(1e-12, 0.5);
+        let bits = (-(expected_items.max(1) as f64) * fp.ln() / ln2_sq).ceil();
+        let words = num_traits::ToPrimitive::to_usize(&(bits / 64.0).ceil()).unwrap_or(1);
+        Self::with_words(words, expected_items)
+    }
+
+    #[inline(always)]
+    fn bit_index(hash: u64, num_bits: u64) -> usize {
+        // Lemire fast range reduction: maps uniform 64-bit hash into [0, num_bits) without division.
+        let prod = u128::from(hash).wrapping_mul(u128::from(num_bits));
+        usize::try_from(prod >> 64).unwrap_or(0)
+    }
+
+    #[inline(always)]
+    fn insert_hash(&mut self, hash: u64) {
+        let num_bits = self.words.len().saturating_mul(64) as u64;
+        let mut h = hash;
+        let step = hash.wrapping_mul(Self::H2_MULT).rotate_right(32) | 1;
+        for _ in 0..self.num_hashes {
+            let bit = Self::bit_index(h, num_bits);
+            if let Some(word) = self.words.get_mut(bit >> 6) {
+                *word |= 1u64 << (bit & 63);
+            }
+            h = h.wrapping_add(step);
+        }
+    }
+
+    #[inline(always)]
+    fn contains_hash(&self, hash: u64) -> bool {
+        let num_bits = self.words.len().saturating_mul(64) as u64;
+        let mut h = hash;
+        let step = hash.wrapping_mul(Self::H2_MULT).rotate_right(32) | 1;
+        for _ in 0..self.num_hashes {
+            let bit = Self::bit_index(h, num_bits);
+            let Some(&word) = self.words.get(bit >> 6) else {
+                return false;
+            };
+            if (word & (1u64 << (bit & 63))) == 0 {
+                return false;
+            }
+            h = h.wrapping_add(step);
+        }
+        true
+    }
+
+    #[inline]
+    fn num_bits(&self) -> usize {
+        self.words.len().saturating_mul(64)
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        self.words.fill(0);
+    }
+}
 
 /// Amphora (PL.5, `docs/design/planner.md`, "Decision (lane qs5-9)"): how a hash join's filter
 /// is sized once its build has ended, from the keys the build measured rather than an estimate.
@@ -29,11 +122,11 @@ pub struct FilterSizing {
 /// What a filter holds.
 enum Store {
     /// A filter of fixed size, filled and probed as rows come (the automatic index's).
-    Fixed(BloomFilterInner),
+    Fixed(BitBloom),
     /// A sized filter's key hashes while its build runs.
     Collecting(Vec<u64>),
     /// A sized filter built from its build's distinct keys.
-    Sized(BloomFilterInner),
+    Sized(BitBloom),
     /// A sized filter whose build held no key: nothing matches.
     NoKeys,
     /// A sized filter not worth its bits, or past its memory bound: every key passes.
@@ -119,8 +212,7 @@ fn sized_store(hashes: &[u64], sizing: FilterSizing, held: usize) -> Store {
     if words == 0 {
         return Store::PassAll;
     }
-    let mut inner =
-        BloomFilterInner::with_num_bits(words.saturating_mul(64)).expected_items(hashes.len());
+    let mut inner = BitBloom::with_words(words, hashes.len());
     for &hash in hashes {
         inner.insert_hash(hash);
     }
@@ -136,10 +228,10 @@ impl BloomFilter {
     /// Creates a new bloom filter with the specified expected item count and false positive rate.
     pub fn with_capacity(expected_items: u32, false_positive_rate: f32) -> Self {
         Self {
-            store: Store::Fixed(
-                BloomFilterInner::with_false_pos(false_positive_rate as f64)
-                    .expected_items(expected_items as usize),
-            ),
+            store: Store::Fixed(BitBloom::with_false_pos(
+                false_positive_rate as f64,
+                expected_items as usize,
+            )),
             sizing: None,
             count: 0,
             peak: 0,
@@ -161,7 +253,7 @@ impl BloomFilter {
         self.count += 1;
         match &mut self.store {
             Store::Fixed(inner) => {
-                inner.insert(&hash);
+                inner.insert_hash(hash);
             }
             Store::Collecting(hashes) => {
                 let Some(sizing) = self.sizing else {
@@ -198,8 +290,7 @@ impl BloomFilter {
 
     fn contains_hash(&self, hash: u64) -> bool {
         match &self.store {
-            Store::Fixed(inner) => inner.contains(&hash),
-            Store::Sized(inner) => inner.contains_hash(hash),
+            Store::Fixed(inner) | Store::Sized(inner) => inner.contains_hash(hash),
             Store::NoKeys => false,
             Store::Collecting(_) | Store::PassAll => true,
         }

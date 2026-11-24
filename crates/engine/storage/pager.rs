@@ -4182,6 +4182,10 @@ impl Pager {
             Some(buffer) => buffer,
             None => Arc::new(self.buffer_pool.get_page()),
         };
+        let read_timer = self
+            .learned_costs
+            .get()
+            .and_then(|costs| costs.start_page_read());
         let read = {
             let io_ctx = self.io_ctx.read();
             self.db_file
@@ -4190,6 +4194,14 @@ impl Pager {
         let Some(read) = read else {
             return Ok(false);
         };
+        // Inline reads complete synchronously without a Completion; count them as file reads and
+        // feed their latency to LearnedCosts just like completion-driven reads so `page_miss_ratio`
+        // and `Work::PageRead` stay accurate on `PagePath::Plain` (and `timed_run` excludes them
+        // from CPU `Work::Seek`).
+        self.page_file_reads.fetch_add(1, Ordering::Relaxed);
+        if let (Some(costs), Some(timer)) = (self.learned_costs.get(), read_timer) {
+            costs.finish_page_read(timer);
+        }
         let expected = buffer.len();
         if (read == 0 && !allow_empty) || (read != 0 && read != expected) {
             return Err(LimboError::CompletionError(CompletionError::ShortRead {

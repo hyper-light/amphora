@@ -234,6 +234,7 @@ impl Kept {
 
 /// Amphora: whether `record`'s sort key orders strictly before `kept`'s, as the boxed records'
 /// comparison orders them (a row tying with the worst kept row arrived later, so it doesn't).
+/// Uses inline stack storage for up to 4 sort-key columns to avoid heap allocation per rejected row.
 fn orders_before(
     record: &ImmutableRecord,
     key_len: usize,
@@ -244,11 +245,16 @@ fn orders_before(
     if kept.deserialization_error.is_some() {
         return Ok(false);
     }
-    let mut values = Vec::try_with_capacity_ext(key_len)?;
+    let mut values: smallvec::SmallVec<[ValueRef<'_>; 4]> = smallvec::SmallVec::new();
+    if key_len > 4 {
+        values
+            .try_reserve(key_len)
+            .map_err(|_| LimboError::OutOfMemory)?;
+    }
     let mut iter = record.iter()?;
     for _ in 0..key_len {
         match iter.next() {
-            Some(Ok(value)) => values.try_push(value)?,
+            Some(Ok(value)) => values.push(value),
             Some(Err(e)) => return Err(e),
             None => crate::bail_corrupt_error!("Not enough columns in record"),
         }
