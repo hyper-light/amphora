@@ -1981,8 +1981,9 @@ own would, so under steady leader writes it is refused round after round, and ki
 **The rule.** The kind of slot Kung and Robinson prescribe for a transaction that keeps failing validation (f6), as
 the fallback of an optimistic rule, MOCC-style (f7). Once one of a member's writes is refused, that member is queued,
 and its next barrier (its ReadIndex) waits at the leader for its slot. While a member holds the slot, the leader
-appends nothing of its own and holds the other members' forwards, until the holder's next forward arrives or the
-slot's length passes. Today's exact base stays the only admission rule: no entry format, wire or engine change. The
+appends nothing of its own and holds the other members' forwards, until the holder's next forward or its close
+arrives; by time only at the end its write's barrier stated, or when the host's detector suspects the holder ("When
+a slot ends by time", below). Today's exact base stays the only admission rule: no entry format or engine change. The
 pure core is `database/slot.rs`, driven by the owner (`Actor::keep_slots`, `start_slot`, `step_forward`,
 `step_ready`).
 - *When a member is queued.* At the leader's append of its refused entry, not at that entry's commit or apply. The
@@ -2016,6 +2017,30 @@ pure core is `database/slot.rs`, driven by the owner (`Actor::keep_slots`, `star
   the leader's writes for its own round trip. The second barrier a write that forwarded nothing sends is marked
   too. A leader before this echoes the byte unread and takes the barrier as a write's, as it did; a read's
   context is never an entry's, since a read never proposes.
+- *When a slot ends by time* (CP-T1.8, lanes V14 and V15). A write's barrier states the time its write has left:
+  past the request identity, a mark (`WRITE_DEADLINE`) and that time as it was sent, in nanoseconds. The leader
+  keeps the barrier's arrival plus that time as the slot's end on its own clock, later than the holder's own end by
+  the link's one-way time, never earlier (`Slots::read`). A live holder's slot ends by its forward (`forwarded`) or
+  its close (`released`); by time (`expired`) only at that stated end; and at once, `released`, when the host's
+  detector suspects the holder (`Slots::keep`). A barrier that states no end (a member before lane V14) keeps the
+  learned length below. The write's entry carries the request identity alone, so the log doesn't change, and a
+  leader before lane V14 takes the context as a write's and echoes it unread. A follower whose write's deadline
+  ends it at its barrier (waiting for the read's answer, or for its own log's tail) sends its close at its next
+  step that isn't paused, while the barrier's term and leader hold, so the leader's writes wait on no time for it
+  (`replicated::v15_a_write_its_deadline_ends_at_its_barrier_closes_its_slot`).
+- *What bounds a lost forward* (CP-T1.8, lane V15, measured; not yet an event). A holder's forward lost on the way
+  is bounded only by its stated end: the holder sends no barrier or forward after it (its write waits, proposed,
+  for its entry), and a live holder is not suspected. Lane V15's run on real time (three members in one process, relayed by the
+  test pump, which lost member 3's forward; the persisted class; 10 ms ticks; member 3's write with the bench
+  driver's 10 s deadline) timed each stage from member 3's call: its slot began at 0.7 ms, its forward was lost at
+  2.7 ms, and the leader's own write and member 2's were called at 2.8 ms; member 3 was answered `UnknownOutcome`
+  at 10,000.2 ms, the slot ended `expired` at 10,006.7 ms, and the leader's write was answered at 10,030.6 ms and
+  member 2's at 10,064.8 ms: each waited the holder's whole deadline. A bound by an event the leader can see needs a
+  message from the holder that follows its forward on the same ordered link, so that its arrival with no forward
+  before it shows the forward lost: a close sent right behind every forward (one more message per follower write,
+  and a ReadIndex round at the leader unless it consumes the close unstepped), or the holder's forward sent again
+  when its transport reports the link reset or the record refused (with the leader dropping, typed, a copy it
+  already appended). Neither is built; each is a design for the next lane, with its cost to be measured.
 - *What a slot holds* (Q1). Everything the leader would append between the holder's base and its retry: its own
   writes and floor sessions (`prepare` defers them, `slot_deferred`), its class entry (`propose_class`), and other
   members' forwarded proposals, held after the sender and origin checks. A change of members or a hand-off ends the
