@@ -6,7 +6,14 @@
 //! loom's types; the stand-ins below are what it takes from around it.
 //!
 //! Run: `RUSTFLAGS="--cfg loom" cargo test -p amphora-line-loom --release --locked`.
-#![cfg(loom)]
+#![cfg(all(loom, test))]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::arithmetic_side_effects,
+    clippy::disallowed_macros
+)]
 
 use amphora_api as api;
 use amphora_api::Refusal;
@@ -16,10 +23,6 @@ use std::time::Duration;
 #[path = "../../amphora/src/database/replicated/line.rs"]
 #[allow(dead_code)]
 mod line;
-
-/// An input's envelope and a record without entries, in the bytes of the model's small queues.
-const ENVELOPE_BYTES: usize = 1;
-const RECORD_BYTES: usize = 1;
 
 fn unavailable(e: impl std::fmt::Display) -> Refusal {
     Refusal::Unavailable(e.to_string())
