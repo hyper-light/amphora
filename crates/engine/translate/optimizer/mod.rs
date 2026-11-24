@@ -5901,7 +5901,6 @@ fn apply_table_access_plan(
                     );
                     *index = Some(Arc::new(ephemeral_index_build(
                         &table_references.joined_tables()[table_idx],
-                        table_references,
                         &constraints_per_table[table_idx].constraints,
                         constraint_refs,
                         where_clause,
@@ -6927,7 +6926,6 @@ impl Optimizable for ast::Expr {
 
 fn ephemeral_index_build(
     table_reference: &JoinedTable,
-    table_references: &TableReferences,
     constraints: &[Constraint],
     constraint_refs: &[RangeConstraintRef],
     where_clause: &[WhereTerm],
