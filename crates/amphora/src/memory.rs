@@ -623,8 +623,9 @@ impl Budget {
     ) -> Result<Charge, Refusal> {
         let mut given = self.given.0.lock().unwrap_or_else(PoisonError::into_inner);
         self.waiting.fetch_add(1, Ordering::Relaxed);
-        // Pairs with the fence in `give` (Linux's include/linux/wait.h, `waitqueue_active`): either
-        // this look for room sees bytes given back, or their giver sees this holder waiting.
+        // Pairs with `give`'s sequentially consistent give-back and read of `waiting` (C++
+        // [atomics.order], the single total order; Linux's include/linux/wait.h, `waitqueue_active`):
+        // either this look for room sees bytes given back, or their giver sees this holder waiting.
         fence(Ordering::SeqCst);
         let held = 'look: loop {
             let seen = *given;
@@ -664,11 +665,10 @@ impl Budget {
     pub fn give(&self, used: Use, bytes: u64) {
         let _ = self
             .slot(used)
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
                 Some(held.saturating_sub(bytes))
             });
-        fence(Ordering::SeqCst);
-        if self.waiting.load(Ordering::Relaxed) > 0 {
+        if self.waiting.load(Ordering::SeqCst) > 0 {
             let mut given = self.given.0.lock().unwrap_or_else(PoisonError::into_inner);
             *given = given.wrapping_add(1);
             drop(given);

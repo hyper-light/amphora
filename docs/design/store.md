@@ -2094,10 +2094,12 @@ returned at once.
 - No wakeup is lost. A waiter reads the count of gives under the budget's lock in the same hold as its look for room,
   and a giver that sees it waiting bumps that count under the same lock before it wakes it.
 - A give with no holder waiting takes no lock. Holders waiting are counted, and a giver locks and wakes only when the
-  count is above zero. Each side puts a sequentially consistent fence between its write and its read: the waiter
-  counts itself, then looks; the giver gives, then reads the count. So either the look sees the bytes given back or
-  the giver sees the waiter. This is the pattern Linux documents for `waitqueue_active` (include/linux/wait.h); Rust's
-  `fence(SeqCst)` takes part in the single total order of sequentially consistent operations (`std::sync::atomic::fence`).
+  count is above zero. The waiter counts itself, then puts a sequentially consistent fence before its look; the giver's
+  give-back and its read of the count are sequentially consistent operations. The single total order of those
+  operations and fences (C++ [atomics.order], which Rust's atomics follow) then lets either the look see the bytes
+  given back or the giver see the waiter, never neither. This is the pattern Linux documents for `waitqueue_active`
+  (include/linux/wait.h). On x86-64 the giver's sequentially consistent compare-and-swap and load are the same
+  instructions as before (a locked `cmpxchg` and a plain `mov`): a give with no waiter pays no fence.
 
 **What is left.** A batch past the whole limit waits out its deadline: no give can make room for it. Resident bytes
 that fall without a charge given back wake no one. A give wakes every waiter, and each looks again.
