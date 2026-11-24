@@ -156,7 +156,7 @@ pub trait Dialect: Send + Sync + 'static {
     fn load_next_oid(&self, _stored: u32) {}
 
     /// The next OID to store in the header, in the same transaction, with a table whose stored
-    /// definition [`Dialect::format_table_sql`] made: `None` for a dialect without OIDs.
+    /// definition [`Dialect::format_created_table_sql`] made: `None` for a dialect without OIDs.
     fn next_oid_after(&self, _stored_sql: &str) -> crate::Result<Option<u32>> {
         Ok(None)
     }

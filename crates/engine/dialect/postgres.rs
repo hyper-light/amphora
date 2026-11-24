@@ -512,7 +512,11 @@ mod tests {
         conn.execute("CREATE TABLE next (b int4)").unwrap();
         let next = oid(&conn, "next");
         assert_ne!(next, dropped, "the dropped table's OID is not given again");
-        assert_eq!(next, dropped + 1, "the counter continues from its stored value");
+        assert_eq!(
+            next,
+            dropped + 1,
+            "the counter continues from its stored value"
+        );
     }
 
     /// T-PG.7.7: two CREATE TABLEs in one transaction take distinct OIDs, and the transaction
@@ -576,7 +580,11 @@ mod tests {
 
         let (_db, conn) = open(path);
         conn.execute("CREATE TABLE after (a int4)").unwrap();
-        assert_eq!(oid(&conn, "after"), 16386, "a reopen continues after the wrap");
+        assert_eq!(
+            oid(&conn, "after"),
+            16386,
+            "a reopen continues after the wrap"
+        );
     }
 
     /// T-PG.7.9: a rolled-back CREATE TABLE spends its OID: the counter is outside the transaction,

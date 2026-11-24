@@ -2746,7 +2746,10 @@ mod tests {
             application_id,
             pg_next_oid,
         } = VacuumDbHeaderMeta::from_source_header(&source);
-        assert_eq!(pg_next_oid, 16390, "VACUUM keeps the PostgreSQL dialect's next OID");
+        assert_eq!(
+            pg_next_oid, 16390,
+            "VACUUM keeps the PostgreSQL dialect's next OID"
+        );
 
         assert_eq!(read_version, source.read_version);
         assert_eq!(write_version, source.write_version);
