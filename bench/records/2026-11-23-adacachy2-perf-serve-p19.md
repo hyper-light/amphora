@@ -14,9 +14,9 @@ differently, pass 3 of 3 with one clean round and both cp_t1_13 tests, and the b
   harness's moving time charging the worker's real latency, or a loss a real-time run shows too. The real-time
   scenario (lane V13's 32 spread writers on real time, its r1814) was not run.
 - seed_and_delta is traced to the lost order: the leader queues its `MsgTimeoutNow` to member 2, and QB.2's shed
-  drops it from the outgoing queue as its oldest record. Not traced: why the leader's queue is past its bound at that
+  drops it from the outgoing queue as its oldest record, to fit a heartbeat. Not traced: why the leader's queue is past its bound at that
   moment on the branch and not on main.
-- kiln restarted at 02:18Z and lost the first run (r72, macOS). adacachy2 had 1 to 14 idle cores; most runs asked 1
+- kiln restarted at 02:18Z and lost the first run (an earlier r72, macOS). adacachy2 had 1 to 14 idle cores; most runs asked 1
   core (CARGO_BUILD_JOBS=1) after a 4-core ask was refused.
 
 ## Trace 1: V13 on moving time
@@ -58,12 +58,12 @@ for the target before and after the call, the core's hand-off decision, and each
 | member 3's close for its call | arrives at t=20000, after its slot ended by time (`Expired`, held 10000 ms) | arrives at t=0, ends its slot `Released` |
 | before `transfer(2)` | leader's progress for 2: matched 6 of last 6, Replicate | matched 5 of last 5, Replicate |
 | the core's decision | sends `MsgTimeoutNow` (matched == last) | the same |
-| the leader's outgoing queue | queues `MsgTimeoutNow` to 2, heartbeat to 2, heartbeat to 3; then sheds a record for 2 (the run's only shed) and reports 2 unreachable (progress Replicate to Probe) | queues the same three; no shed in the whole run |
+| the leader's outgoing queue | queues `MsgTimeoutNow` to 2, heartbeat to 2, heartbeat to 3; then, to fit the second heartbeat, sheds the queued `MsgTimeoutNow` (the run's only shed: 3 records, 386 bytes) and reports 2 unreachable (progress Replicate to Probe) | queues the same three; no shed in the whole run |
 | member 2 | never receives `MsgTimeoutNow` (r45, r62); its term stays 3 for 60000 rounds | receives it in round 1, campaigns, leads term 4 by round 8 |
 
 The shed (QB.2, the owner's send loop) drops the oldest queued record when a new one would pass the queue's bound,
-"raft sends again what a member still lacks, as over a lossy link". The log names the shed record's member, not its
-kind; that it was the order is inferred from member 2 never receiving one. The core never sends a `MsgTimeoutNow`
+"raft sends again what a member still lacks, as over a lossy link". r72 (02:53Z) names the record shed:
+`oldest=Some(MsgTimeoutNow) new=MsgHeartbeat held=386 count=3`. The core never sends a `MsgTimeoutNow`
 again, and with every clock standing still the transfer never runs out its election timeout, so the lead never
 moves.
 
@@ -76,7 +76,8 @@ closes, or the leader's clock moved 10 s at each, leave the outgoing queue past 
 1. Log the outgoing queue's bound, count and bytes at each push from the first late close on, on both arms, and the
    clock each was learned at. Find why the branch's queue is past its bound at the hand-off.
 2. Trace why each close arrives after its slot ended by time on the branch: log each owner's clock moves and what
-   moves them (`Driven::advance` and its callers) from the call's answer to the close's arrival, on both arms. One
+   moves them from the call's answer to the close's arrival, on both arms. `Driven::advance` moved none before the
+   hand-off (r72 at 02:53Z), so the leader's 5 to 20 s jumps come from another clock setter. One
    candidate, unverified: on the branch `decide` answers the call and queues the close after the step's drive, and
    `end_slot` sets no `driving` where `propose_stamped` does.
 3. For V13, run lane V13's real-time bench (r1814) on the branch and on main. If the branch answers every write with
@@ -100,6 +101,7 @@ probe's SHA, each test alone with `--nocapture`. Logs on adacachy2: ~/.cache/amp
 | r54 | cpus=1,mem=6g | 575ff91d (+ leader's progress) | matched == last before; Probe after |
 | r62 | cpus=1,mem=6g | 8bb5582c (+ core decision, unreachable) | `MsgTimeoutNow` queued, then shed |
 | r66 | cpus=1,mem=6g | 34070c78 (main + the same) | the same three records, no shed; passes |
+| r72 (02:53Z) | cpus=1,mem=6g | aec4c1c6 (+ the shed record's kind, each `Driven::advance`) | shed `MsgTimeoutNow` for a heartbeat; no `advance` before the hand-off |
 
-Probe branches, never to merge: `perf/serve-p19-probe` (8bb5582c, on the branch head) and
+Probe branches, never to merge: `perf/serve-p19-probe` (aec4c1c6, on the branch head) and
 `perf/serve-p19-probe-main` (34070c78, on main d88899f6). Its last commit puts `eprintln!` in vendored hyper-raft.
