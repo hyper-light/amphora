@@ -3,7 +3,9 @@
 use crate::schema::{BTreeCharacteristics, BTreeTable, Index, Trigger};
 use crate::sync::Arc;
 use crate::translate::emitter::update::update_trigger_context;
-use crate::translate::emitter::{emit_check_constraints, emit_program, Resolver};
+use crate::translate::emitter::{
+    check_constraints_of_update, emit_check_constraints, emit_program, Resolver,
+};
 use crate::translate::expr::{
     emit_returning_results, emit_returning_scan_back, translate_expr, ReturningBufferCtx,
 };
@@ -751,6 +753,7 @@ pub(crate) fn validate_image(
     table: &Arc<BTreeTable>,
     image: usize,
     dummy: usize,
+    updated: &ColumnMask,
     conflict: ResolveType,
     skip: BranchOffset,
     refs: &TableReferences,
@@ -808,9 +811,10 @@ pub(crate) fn validate_image(
             table_reference: BTreeTable::type_check_table_ref(table, resolver.schema()),
         });
     }
+    let affected_columns = table.columns_affected_by_update(updated)?;
     emit_check_constraints(
         program,
-        &table.check_constraints,
+        &check_constraints_of_update(table, &affected_columns, false),
         resolver,
         &table.name,
         dummy,
@@ -1021,6 +1025,7 @@ pub(crate) fn emit_update(
         &table,
         new,
         new_pk,
+        &updated,
         conflict,
         next,
         &refs,
@@ -1493,6 +1498,7 @@ pub(crate) fn emit_upsert(
         bt,
         new,
         new_pk,
+        &updated,
         ResolveType::Abort,
         ctx.loop_labels.row_done,
         refs,

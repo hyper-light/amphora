@@ -5,7 +5,7 @@
 # the engine as the shipped binary builds it.
 [left.x86_64-unknown-linux-gnu]
 "clippy::panic" = 195
-"clippy::unwrap_used" = 432
+"clippy::unwrap_used" = 431
 "clippy::expect_used" = 849
 "clippy::unreachable" = 457
 "clippy::todo" = 11
