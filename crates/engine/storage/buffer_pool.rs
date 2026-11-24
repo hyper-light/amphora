@@ -7,7 +7,6 @@ use crate::sync::Arc;
 use crate::turso_assert;
 use crate::{Buffer, LimboError, IO};
 
-use std::cell::UnsafeCell;
 use std::ptr::NonNull;
 use std::sync::OnceLock;
 
@@ -89,33 +88,23 @@ impl std::ops::DerefMut for ArenaBuffer {
 /// Static Buffer pool managing multiple memory arenas
 /// of which `[ArenaBuffer]`s are returned for requested allocations
 pub struct BufferPool {
-    inner: UnsafeCell<PoolInner>,
-}
-
-unsafe impl Sync for BufferPool {}
-unsafe impl Send for BufferPool {}
-crate::assert::assert_send_sync!(BufferPool);
-
-struct PoolInner {
-    /// An instance of the program's IO, used for registering
-    /// Arena's with io_uring.
-    io: Option<Arc<dyn IO>>,
+    /// An instance of the program's IO, used for registering Arenas with io_uring.
+    io: OnceLock<Arc<dyn IO>>,
+    /// Serializes one-time initialization and quiescent external-restore page-size changes.
+    init_lock: crate::sync::Mutex<()>,
     /// An Arena which returns `ArenaBuffer`s of size `db_page_size`.
-    page_arena: Option<Arc<Arena>>,
+    page_arena: arc_swap::ArcSwapOption<Arena>,
     /// An Arena which returns `ArenaBuffer`s of size `db_page_size`
     /// plus 24 byte `WAL_FRAME_HEADER_SIZE`, preventing the fragmentation
     /// or complex book-keeping needed to use the same arena for both sizes.
-    wal_frame_arena: Option<Arc<Arena>>,
+    wal_frame_arena: arc_swap::ArcSwapOption<Arena>,
     /// The size of each `Arena`, in bytes.
     arena_size: usize,
-    /// The `[Database::page_size]`, which the `page_arena` will use to
-    /// return buffers from `Self::get_page`.
-    db_page_size: OnceLock<usize>,
+    /// The `[Database::page_size]` (`0` until finalized), which `page_arena` uses for `get_page`.
+    db_page_size: AtomicUsize,
 }
 
-unsafe impl Sync for PoolInner {}
-unsafe impl Send for PoolInner {}
-crate::assert::assert_send_sync!(PoolInner);
+crate::assert::assert_send_sync!(BufferPool);
 
 impl Default for BufferPool {
     fn default() -> Self {
@@ -143,27 +132,58 @@ impl BufferPool {
             { "arena_size": arena_size, "min": Self::MIN_ARENA_SIZE, "max": Self::MAX_ARENA_SIZE }
         );
         Self {
-            inner: UnsafeCell::new(PoolInner {
-                page_arena: None,
-                wal_frame_arena: None,
-                arena_size,
-                db_page_size: OnceLock::new(),
-                io: None,
-            }),
+            io: OnceLock::new(),
+            init_lock: crate::sync::Mutex::new(()),
+            page_arena: arc_swap::ArcSwapOption::empty(),
+            wal_frame_arena: arc_swap::ArcSwapOption::empty(),
+            arena_size,
+            db_page_size: AtomicUsize::new(0),
+        }
+    }
+
+    #[inline]
+    pub fn get_db_page_size(&self) -> usize {
+        let size = self.db_page_size.load(Ordering::Acquire);
+        if size == 0 {
+            Self::DEFAULT_PAGE_SIZE
+        } else {
+            size
         }
     }
 
     /// Request a `Buffer` of size `len`
     #[inline]
     pub fn allocate(&self, len: usize) -> Buffer {
-        self.inner().allocate(len)
+        turso_assert!(len > 0, "Cannot allocate zero-length buffer");
+
+        let db_page_size = self.get_db_page_size();
+        let wal_frame_size = db_page_size.saturating_add(WAL_FRAME_HEADER_SIZE);
+
+        // Check if this is exactly a WAL frame size allocation
+        if len == wal_frame_size {
+            let guard = self.wal_frame_arena.load();
+            return guard
+                .as_ref()
+                .and_then(|wal_arena| Arena::try_alloc(wal_arena, len))
+                .unwrap_or_else(|| Buffer::new_temporary(len));
+        }
+        // For all other sizes, use regular arena
+        let guard = self.page_arena.load();
+        guard
+            .as_ref()
+            .and_then(|arena| Arena::try_alloc(arena, len))
+            .unwrap_or_else(|| Buffer::new_temporary(len))
     }
 
     /// Request a `Buffer` the size of the `db_page_size` the `BufferPool` was initialized with.
     #[inline]
     pub fn get_page(&self) -> Buffer {
-        let inner = self.inner_mut();
-        inner.get_db_page_buffer()
+        let db_page_size = self.get_db_page_size();
+        let guard = self.page_arena.load();
+        guard
+            .as_ref()
+            .and_then(|arena| Arena::try_alloc(arena, db_page_size))
+            .unwrap_or_else(|| Buffer::new_temporary(db_page_size))
     }
 
     /// Request a zero-filled `Buffer` of `db_page_size`. Recycled arena or thread-local buffers
@@ -171,117 +191,9 @@ impl BufferPool {
     /// without a redundant `.fill(0)` pass.
     #[inline]
     pub fn get_page_zeroed(&self) -> Buffer {
-        let inner = self.inner_mut();
-        inner.get_db_page_buffer_zeroed()
-    }
-
-    /// Request a `Buffer` for use with a WAL frame,
-    /// `[Database::page_size] + `WAL_FRAME_HEADER_SIZE`
-    #[inline]
-    pub fn get_wal_frame(&self) -> Buffer {
-        let inner = self.inner_mut();
-        inner.get_wal_frame_buffer()
-    }
-
-    #[inline]
-    fn inner(&self) -> &PoolInner {
-        unsafe { &*self.inner.get() }
-    }
-
-    #[inline]
-    #[allow(clippy::mut_from_ref)]
-    fn inner_mut(&self) -> &mut PoolInner {
-        unsafe { &mut *self.inner.get() }
-    }
-
-    /// Create a static `BufferPool` initialize the pool to the default page size, **without**
-    /// populating the Arenas. Arenas will not be created until `[BufferPool::finalize_page_size]`,
-    /// and the pool will temporarily return temporary buffers to prevent reallocation of the
-    /// arena if the page size is set to something other than the default value.
-    pub fn begin_init(io: &Arc<dyn IO>, arena_size: usize) -> Arc<Self> {
-        let pool = Arc::new(BufferPool::new(arena_size));
-        let inner = pool.inner_mut();
-        // Just store the IO handle, don't create arena yet
-        if inner.io.is_none() {
-            inner.io = Some(Arc::clone(io));
-        }
-        pool
-    }
-
-    /// Call when `[Database::db_state]` is initialized, providing the `page_size` to allocate
-    /// an arena for the pool. Before this call, the pool will use temporary buffers which are
-    /// cached in thread local storage.
-    pub fn finalize_with_page_size(&self, page_size: usize) -> crate::Result<()> {
-        let inner = self.inner_mut();
-        tracing::trace!("finalize page size called with size {page_size}");
-        if page_size != BufferPool::DEFAULT_PAGE_SIZE {
-            // so far we have handed out some temporary buffers, since the page size is not
-            // default, we need to clear the cache so they aren't reused for other operations.
-            TEMP_BUFFER_CACHE.with(|cache| {
-                cache.borrow_mut().reinit_cache(page_size);
-            });
-        }
-        if inner.page_arena.is_some() {
-            tracing::trace!("Buffer pool already initialized, skipping finalize");
-            return Ok(());
-        }
-
-        // Tries to atomically (guarenteed by the OnceLock) initialize the page size for the inner pool.
-        // If it succeeds, we now have to initialize the arenas.
-        // If the initialization fails, this means the arenas have already been initialized by a previous thread
-        // This avoids a potential TOCTOU race, where 2 threads could try to initalize the arena at the same time
-        // after checking the `db_page_size`
-        if inner.db_page_size.set(page_size).is_ok() {
-            inner.init_arenas()?;
-        };
-        Ok(())
-    }
-}
-
-impl PoolInner {
-    #[inline]
-    pub fn get_db_page_size(&self) -> usize {
-        *(self
-            .db_page_size
-            .get()
-            .unwrap_or(&BufferPool::DEFAULT_PAGE_SIZE))
-    }
-
-    /// Allocate a buffer of the given length from the pool, falling back to
-    /// temporary thread local buffers if the pool is not initialized or is full.
-    pub fn allocate(&self, len: usize) -> Buffer {
-        turso_assert!(len > 0, "Cannot allocate zero-length buffer");
-
         let db_page_size = self.get_db_page_size();
-        let wal_frame_size = db_page_size + WAL_FRAME_HEADER_SIZE;
-
-        // Check if this is exactly a WAL frame size allocation
-        if len == wal_frame_size {
-            return self
-                .wal_frame_arena
-                .as_ref()
-                .and_then(|wal_arena| Arena::try_alloc(wal_arena, len))
-                .unwrap_or_else(|| Buffer::new_temporary(len));
-        }
-        // For all other sizes, use regular arena
-        self.page_arena
-            .as_ref()
-            .and_then(|arena| Arena::try_alloc(arena, len))
-            .unwrap_or_else(|| Buffer::new_temporary(len))
-    }
-
-    fn get_db_page_buffer(&mut self) -> Buffer {
-        let db_page_size = self.get_db_page_size();
-        self.page_arena
-            .as_ref()
-            .and_then(|arena| Arena::try_alloc(arena, db_page_size))
-            .unwrap_or_else(|| Buffer::new_temporary(db_page_size))
-    }
-
-    fn get_db_page_buffer_zeroed(&mut self) -> Buffer {
-        let db_page_size = self.get_db_page_size();
-        if let Some(buf) = self
-            .page_arena
+        let guard = self.page_arena.load();
+        if let Some(buf) = guard
             .as_ref()
             .and_then(|arena| Arena::try_alloc(arena, db_page_size))
         {
@@ -291,60 +203,100 @@ impl PoolInner {
         Buffer::new_temporary_zeroed(db_page_size)
     }
 
-    fn get_wal_frame_buffer(&mut self) -> Buffer {
-        let len = self.get_db_page_size() + WAL_FRAME_HEADER_SIZE;
-        self.wal_frame_arena
+    /// Request a `Buffer` for use with a WAL frame,
+    /// `[Database::page_size] + `WAL_FRAME_HEADER_SIZE`
+    #[inline]
+    pub fn get_wal_frame(&self) -> Buffer {
+        let len = self
+            .get_db_page_size()
+            .saturating_add(WAL_FRAME_HEADER_SIZE);
+        let guard = self.wal_frame_arena.load();
+        guard
             .as_ref()
             .and_then(|wal_arena| Arena::try_alloc(wal_arena, len))
             .unwrap_or_else(|| Buffer::new_temporary(len))
     }
 
-    /// Allocate a new arena for the pool to use
-    fn init_arenas(&mut self) -> crate::Result<()> {
-        let db_page_size = self.get_db_page_size();
-        let arena_size = self.arena_size;
+    /// Create a static `BufferPool` initialize the pool to the default page size, **without**
+    /// populating the Arenas. Arenas will not be created until `[BufferPool::finalize_page_size]`,
+    /// and the pool will temporarily return temporary buffers to prevent reallocation of the
+    /// arena if the page size is set to something other than the default value.
+    pub fn begin_init(io: &Arc<dyn IO>, arena_size: usize) -> Arc<Self> {
+        let pool = Arc::new(BufferPool::new(arena_size));
+        let _ = pool.io.set(Arc::clone(io));
+        pool
+    }
 
-        let io = self.io.as_ref().expect("Pool not initialized").clone();
+    /// Builds fresh page and WAL-frame arenas for `page_size` without touching live arenas until
+    /// both allocations succeed.
+    fn build_arenas(&self, page_size: usize) -> crate::Result<(Arc<Arena>, Arc<Arena>)> {
+        let io = self
+            .io
+            .get()
+            .ok_or_else(|| LimboError::InternalError("BufferPool not initialized".into()))?
+            .clone();
+        let page_arena = Arena::new(page_size, self.arena_size, &io).map_err(|e| {
+            tracing::error!("Failed to create arena: {:?}", e);
+            LimboError::InternalError(format!("Failed to create arena: {e}"))
+        })?;
+        let wal_frame_size = page_size
+            .checked_add(WAL_FRAME_HEADER_SIZE)
+            .ok_or(LimboError::IntegerOverflow)?;
+        let wal_frame_arena = Arena::new(wal_frame_size, self.arena_size, &io).map_err(|e| {
+            tracing::error!("Failed to create WAL frame arena: {:?}", e);
+            LimboError::InternalError(format!("Failed to create WAL frame arena: {e}"))
+        })?;
+        Ok((Arc::new(page_arena), Arc::new(wal_frame_arena)))
+    }
 
-        // Create regular page arena
-        match Arena::new(db_page_size, arena_size, &io) {
-            Ok(arena) => {
-                tracing::trace!(
-                    "added arena {} with size {} MB and slot size {}",
-                    arena.id,
-                    arena_size / (1024 * 1024),
-                    db_page_size
-                );
-                self.page_arena = Some(Arc::new(arena));
-            }
-            Err(e) => {
-                tracing::error!("Failed to create arena: {:?}", e);
-                return Err(LimboError::InternalError(format!(
-                    "Failed to create arena: {e}",
-                )));
-            }
+    /// Call when `[Database::db_state]` is initialized, providing the `page_size` to allocate
+    /// an arena for the pool. Before this call, the pool will use temporary buffers which are
+    /// cached in thread local storage.
+    pub fn finalize_with_page_size(&self, page_size: usize) -> crate::Result<()> {
+        tracing::trace!("finalize page size called with size {page_size}");
+        if page_size != BufferPool::DEFAULT_PAGE_SIZE {
+            // so far we have handed out some temporary buffers, since the page size is not
+            // default, we need to clear the cache so they aren't reused for other operations.
+            TEMP_BUFFER_CACHE.with(|cache| {
+                cache.borrow_mut().reinit_cache(page_size);
+            });
         }
-
-        // Create WAL frame arena
-        let wal_frame_size = db_page_size + WAL_FRAME_HEADER_SIZE;
-        match Arena::new(wal_frame_size, arena_size, &io) {
-            Ok(arena) => {
-                tracing::trace!(
-                    "added WAL frame arena {} with size {} MB and slot size {}",
-                    arena.id,
-                    arena_size / (1024 * 1024),
-                    wal_frame_size
-                );
-                self.wal_frame_arena = Some(Arc::new(arena));
-            }
-            Err(e) => {
-                tracing::error!("Failed to create WAL frame arena: {:?}", e);
-                return Err(LimboError::InternalError(format!(
-                    "Failed to create WAL frame arena: {e}",
-                )));
-            }
+        if self.db_page_size.load(Ordering::Acquire) != 0 {
+            tracing::trace!("Buffer pool already initialized, skipping finalize");
+            return Ok(());
         }
+        let _guard = self.init_lock.lock();
+        if self.db_page_size.load(Ordering::Acquire) != 0 {
+            return Ok(());
+        }
+        let (page_arena, wal_frame_arena) = self.build_arenas(page_size)?;
+        self.page_arena.store(Some(page_arena));
+        self.wal_frame_arena.store(Some(wal_frame_arena));
+        self.db_page_size.store(page_size, Ordering::Release);
+        Ok(())
+    }
 
+    /// Reconfigures the buffer pool's page size and arenas after a quiescent external restore
+    /// replaced the database with an image using a different `page_size` (e.g. 1 KiB or 8 KiB).
+    /// Existing checked-out buffers remain valid through their `Arc<Arena>` handles.
+    #[cfg(feature = "conn_raw_api")]
+    pub fn reconfigure_page_size_after_external_restore(
+        &self,
+        page_size: usize,
+    ) -> crate::Result<()> {
+        let _guard = self.init_lock.lock();
+        if self.db_page_size.load(Ordering::Acquire) == page_size
+            && self.page_arena.load().is_some()
+        {
+            return Ok(());
+        }
+        let (page_arena, wal_frame_arena) = self.build_arenas(page_size)?;
+        TEMP_BUFFER_CACHE.with(|cache| {
+            cache.borrow_mut().reinit_cache(page_size);
+        });
+        self.page_arena.store(Some(page_arena));
+        self.wal_frame_arena.store(Some(wal_frame_arena));
+        self.db_page_size.store(page_size, Ordering::Release);
         Ok(())
     }
 }

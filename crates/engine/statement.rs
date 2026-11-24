@@ -1023,9 +1023,17 @@ impl Statement {
         if matches!(self.state.execution_state, ProgramExecutionState::Init)
             && self.origin != StatementOrigin::InternalHelper
         {
-            if self.state.db_mv_store(&self.program.connection).is_some() {
-                // MVCC checkpoints can publish internal schema roots without changing
-                // SQLite's schema cookie, so refresh before deciding whether to reprepare.
+            if self.state.db_mv_store(&self.program.connection).is_some()
+                || self
+                    .program
+                    .connection
+                    .last_restore_epoch
+                    .load(Ordering::Acquire)
+                    != self.program.connection.db.shared_wal.restore_epoch()
+            {
+                // MVCC checkpoints and quiescent external restores can replace the catalog without
+                // changing SQLite's `schema_cookie`, so refresh before deciding whether to
+                // reprepare.
                 self.program.connection.maybe_update_schema();
             }
             // Amphora (PL.8, lane pl8-17): the exact plan first, so a stale one is planned again.

@@ -170,6 +170,22 @@ pub trait DatabaseStorage: Send + Sync {
     /// database file on disk (including atomic rename to a new inode).
     #[cfg(feature = "conn_raw_api")]
     fn reopen_after_external_restore(&self, _file: Arc<dyn crate::io::File>) {}
+
+    /// Returns a view of the exact same open file handle without any attached `SharedFile` page
+    /// cache, used during quiescent external-restore staging so validation reads disk directly
+    /// without opening or closing a second OS descriptor (preserving Unix advisory locks).
+    #[cfg(feature = "conn_raw_api")]
+    fn unshared_storage_clone(&self) -> Option<Arc<dyn DatabaseStorage>> {
+        None
+    }
+
+    /// Re-acquires the exclusive advisory lock on the existing open file descriptor after an
+    /// in-place external restore (idempotent if already held; restores POSIX `F_SETLK` if the
+    /// caller overwrote the file in-place from the same process via a temporary descriptor).
+    #[cfg(feature = "conn_raw_api")]
+    fn reacquire_lock(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -481,6 +497,16 @@ impl DatabaseStorage for DatabaseFile {
     #[cfg(feature = "conn_raw_api")]
     fn reopen_after_external_restore(&self, file: Arc<dyn crate::io::File>) {
         *self.file.write() = file;
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    fn unshared_storage_clone(&self) -> Option<Arc<dyn DatabaseStorage>> {
+        Some(Arc::new(DatabaseFile::new(self.current_file())))
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    fn reacquire_lock(&self) -> Result<()> {
+        self.current_file().lock_file(true)
     }
 }
 

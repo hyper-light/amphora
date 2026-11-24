@@ -295,171 +295,150 @@ impl Kept {
     }
 }
 
-/// Key-only entry held in [`SpilledTopK`]: stores only the `key_len` sort-key values and the
-/// byte range of the full payload in the sorter's temp file, keeping live row-sized memory `O(1)`
-/// even when wide payloads spill under `LIMIT K`.
-struct SpilledTopKEntry {
-    key_values: Vec<Value>,
-    norm_key: u64,
-    norm_decisive: bool,
-    index_key_info: Rc<Vec<KeyInfo>>,
-    comparators: Rc<Vec<Option<SortComparator>>>,
-    arrived: u64,
-    offset: u64,
-    payload_len: usize,
-    key_bytes: usize,
-}
-
-impl SpilledTopKEntry {
-    fn from_record(
-        record: &ImmutableRecord,
-        key_len: usize,
-        index_key_info: &Rc<Vec<KeyInfo>>,
-        comparators: &Rc<Vec<Option<SortComparator>>>,
-        arrived: u64,
-        offset: u64,
-    ) -> Result<Self> {
-        let mut refs: smallvec::SmallVec<[ValueRef<'_>; 4]> = smallvec::SmallVec::new();
-        if key_len > 4 {
-            refs.try_reserve(key_len)
-                .map_err(|_| LimboError::OutOfMemory)?;
-        }
-        let mut iter = record.iter()?;
-        for _ in 0..key_len {
-            match iter.next() {
-                Some(Ok(v)) => refs.push(v),
-                Some(Err(e)) => return Err(e),
-                None => crate::bail_corrupt_error!("Not enough columns in record"),
-            }
-        }
-        let (norm_key, norm_decisive) = normalized_first_key(&refs, index_key_info, comparators);
-        let mut key_values = Vec::new();
-        key_values
-            .try_reserve_exact(key_len)
-            .map_err(|_| LimboError::OutOfMemory)?;
-        let mut key_bytes = key_len.saturating_mul(std::mem::size_of::<Value>());
-        for r in &refs {
-            let owned = r.to_owned()?;
-            key_bytes = key_bytes.saturating_add(match &owned {
-                Value::Text(t) => t.as_str().len(),
-                Value::Blob(b) => b.capacity(),
-                Value::Null | Value::Numeric(_) => 0,
-            });
-            key_values.push(owned);
-        }
-        Ok(Self {
-            key_values,
-            norm_key,
-            norm_decisive,
-            index_key_info: index_key_info.clone(),
-            comparators: comparators.clone(),
-            arrived,
-            offset,
-            payload_len: record.get_payload().len(),
-            key_bytes,
-        })
-    }
-
-    fn key_refs(&self) -> Result<smallvec::SmallVec<[ValueRef<'_>; 4]>> {
-        let mut out: smallvec::SmallVec<[ValueRef<'_>; 4]> = smallvec::SmallVec::new();
-        if self.key_values.len() > 4 {
-            out.try_reserve(self.key_values.len())
-                .map_err(|_| LimboError::OutOfMemory)?;
-        }
-        for v in &self.key_values {
-            out.push(v.as_ref());
-        }
-        Ok(out)
-    }
-}
-
-impl Ord for SpilledTopKEntry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        let ord = match self.norm_key.cmp(&other.norm_key) {
-            Ordering::Equal if self.norm_decisive && other.norm_decisive => Ordering::Equal,
-            Ordering::Equal => {
-                let mut ord = Ordering::Equal;
-                for (i, (lhs, rhs)) in self
-                    .key_values
-                    .iter()
-                    .zip(other.key_values.iter())
-                    .enumerate()
-                {
-                    let a = lhs.as_ref();
-                    let b = rhs.as_ref();
-                    let c = if let Some(Some(comp)) = self.comparators.get(i) {
-                        comp(&a, &b).unwrap_or(Ordering::Equal)
-                    } else if let Some(ki) = self.index_key_info.get(i) {
-                        cmp_in_column(&a, &b, ki)
-                    } else {
-                        Ordering::Equal
-                    };
-                    if c != Ordering::Equal {
-                        ord = c;
-                        break;
-                    }
-                }
-                ord
-            }
-            ord => ord,
-        };
-        ord.then(self.arrived.cmp(&other.arrived))
-    }
-}
-
-impl PartialOrd for SpilledTopKEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for SpilledTopKEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
-    }
-}
-
-impl Eq for SpilledTopKEntry {}
-
-fn orders_before_spilled(
-    record: &ImmutableRecord,
+/// Extracts the first `key_len` column values from a serialized record payload.
+fn extract_key_refs<'a>(
+    payload: &'a [u8],
     key_len: usize,
-    index_key_info: &[KeyInfo],
-    comparators: &[Option<SortComparator>],
-    kept: &SpilledTopKEntry,
-) -> Result<bool> {
-    let mut values: smallvec::SmallVec<[ValueRef<'_>; 4]> = smallvec::SmallVec::new();
+) -> Result<smallvec::SmallVec<[ValueRef<'a>; 4]>> {
+    let mut refs: smallvec::SmallVec<[ValueRef<'a>; 4]> = smallvec::SmallVec::new();
     if key_len > 4 {
-        values
-            .try_reserve(key_len)
+        refs.try_reserve(key_len)
             .map_err(|_| LimboError::OutOfMemory)?;
     }
-    let mut iter = record.iter()?;
+    let mut iter = ValueIterator::new(payload)?;
     for _ in 0..key_len {
         match iter.next() {
-            Some(Ok(v)) => values.push(v),
+            Some(Ok(v)) => refs.push(v),
             Some(Err(e)) => return Err(e),
             None => crate::bail_corrupt_error!("Not enough columns in record"),
         }
     }
-    let (norm_key, norm_decisive) = normalized_first_key(&values, index_key_info, comparators);
-    let ord = match norm_key.cmp(&kept.norm_key) {
-        Ordering::Equal if norm_decisive && kept.norm_decisive => Ordering::Equal,
-        Ordering::Equal => {
-            let kept_refs = kept.key_refs()?;
-            boxed_full_cmp(&values, &kept_refs, index_key_info, comparators)
+    Ok(refs)
+}
+
+fn entry_key_refs(values: &[Value]) -> Result<smallvec::SmallVec<[ValueRef<'_>; 4]>> {
+    let mut out: smallvec::SmallVec<[ValueRef<'_>; 4]> = smallvec::SmallVec::new();
+    if values.len() > 4 {
+        out.try_reserve(values.len())
+            .map_err(|_| LimboError::OutOfMemory)?;
+    }
+    for v in values {
+        out.push(v.as_ref());
+    }
+    Ok(out)
+}
+
+/// Fallible full key comparison honoring collations, custom comparators, `ASC`/`DESC`, and
+/// `NULLS FIRST`/`NULLS LAST`.
+fn try_full_cmp(
+    self_values: &[ValueRef<'_>],
+    other_values: &[ValueRef<'_>],
+    index_key_info: &[KeyInfo],
+    comparators: &[Option<SortComparator>],
+) -> Result<Ordering> {
+    for (i, ((&self_val, &other_val), key_info)) in self_values
+        .iter()
+        .zip(other_values.iter())
+        .zip(index_key_info.iter())
+        .enumerate()
+    {
+        let cmp = if let Some(Some(comparator)) = comparators.get(i) {
+            comparator(&self_val, &other_val)?
+        } else {
+            match (self_val, other_val) {
+                (ValueRef::Text(left), ValueRef::Text(right)) => {
+                    key_info.collation.compare_strings(&left, &right)
+                }
+                _ => self_val.partial_cmp(&other_val).unwrap_or(Ordering::Equal),
+            }
+        };
+        let cmp = cmp_with_sort(cmp, &self_val, &other_val, key_info);
+        if cmp != Ordering::Equal {
+            return Ok(cmp);
         }
-        ord => ord,
-    };
-    Ok(ord == Ordering::Less)
+    }
+    Ok(Ordering::Equal)
+}
+
+/// Metadata entry held in [`SpilledTopK`]: stores the normalized 64-bit key prefix, optional
+/// inline sort keys (only while total inline key bytes fit within the sorter's byte budget;
+/// wide sort keys leave `inline_keys = None` and resolve rare prefix ties by reading one payload
+/// on demand), and the reclaimed slot range `[offset, offset + slot_cap)` in the temp file.
+struct SpilledTopKEntry {
+    inline_keys: Option<Vec<Value>>,
+    norm_key: u64,
+    norm_decisive: bool,
+    arrived: u64,
+    offset: u64,
+    payload_len: usize,
+    slot_cap: usize,
+    key_bytes: usize,
+}
+
+impl SpilledTopKEntry {
+    #[allow(clippy::too_many_arguments)]
+    fn from_record(
+        record: &ImmutableRecord,
+        key_len: usize,
+        index_key_info: &[KeyInfo],
+        comparators: &[Option<SortComparator>],
+        arrived: u64,
+        offset: u64,
+        slot_cap: usize,
+        max_inline_bytes: usize,
+    ) -> Result<Self> {
+        let payload = record.get_payload();
+        let refs = extract_key_refs(payload, key_len)?;
+        let (norm_key, norm_decisive) = normalized_first_key(&refs, index_key_info, comparators);
+        let mut est_key_bytes = key_len.saturating_mul(std::mem::size_of::<Value>());
+        for r in &refs {
+            est_key_bytes = est_key_bytes.saturating_add(match r {
+                ValueRef::Text(t) => t.as_str().len(),
+                ValueRef::Blob(b) => b.len(),
+                ValueRef::Null | ValueRef::Numeric(_) => 0,
+            });
+        }
+        let (inline_keys, key_bytes) = if est_key_bytes <= max_inline_bytes {
+            let mut owned_vals = Vec::new();
+            owned_vals
+                .try_reserve_exact(key_len)
+                .map_err(|_| LimboError::OutOfMemory)?;
+            let mut actual_bytes = key_len.saturating_mul(std::mem::size_of::<Value>());
+            for r in &refs {
+                let owned = r.to_owned()?;
+                actual_bytes = actual_bytes.saturating_add(match &owned {
+                    Value::Text(t) => t.as_str().len(),
+                    Value::Blob(b) => b.capacity(),
+                    Value::Null | Value::Numeric(_) => 0,
+                });
+                owned_vals.push(owned);
+            }
+            if actual_bytes <= max_inline_bytes {
+                (Some(owned_vals), actual_bytes)
+            } else {
+                (None, 0)
+            }
+        } else {
+            (None, 0)
+        };
+        Ok(Self {
+            inline_keys,
+            norm_key,
+            norm_decisive,
+            arrived,
+            offset,
+            payload_len: payload.len(),
+            slot_cap,
+            key_bytes,
+        })
+    }
 }
 
 struct PendingTopKWrite {
     completion: Completion,
     write_err: Arc<atomic::AtomicBool>,
     entries: Vec<SpilledTopKEntry>,
-    next_offset: u64,
-    /// Rows newly counted in `Sorter::inserted` once this write settles.
+    /// Rows newly counted in `Sorter::inserted` and `SpilledTopK::arrived` once this write settles.
     count_new: u64,
 }
 
@@ -470,23 +449,510 @@ struct PendingTopKRead {
     expected_len: usize,
 }
 
-/// External top-K selector backed by `Sorter::temp_file`: stores only `<= limit` sort keys in RAM
-/// while wide payloads live on disk, keeping live row-sized allocations `O(1)` regardless of input
-/// size and preserving exact FIFO arrival order on tied keys.
+/// External top-K selector backed by `Sorter::temp_file`:
+/// - Holds `<= limit` lightweight entries in an explicit fallible binary max-heap.
+/// - Keeps live row-sized RAM `O(1)` regardless of input count or key width (`inline_keys` is
+///   dropped to `None` when sort keys exceed `max_key_bytes`, reading on-demand only on prefix
+///   ties and dropping the temporary buffer immediately after comparison).
+/// - Reclaims evicted winner slots via a coalesced best-fit `free_slots` list so temp-file growth
+///   remains `O(K)` (`<= K + 1` active+staging slots) even across arbitrarily many better rows.
+/// - Preserves exact SQL sort order (`ASC`/`DESC`, `NULLS FIRST`/`LAST`, collations, custom
+///   comparators) and FIFO arrival order on tied keys.
 struct SpilledTopK {
     limit: usize,
-    heap: BinaryHeap<SpilledTopKEntry>,
+    max_key_bytes: usize,
+    /// Binary max-heap (`heap[0]` is the worst kept winner).
+    heap: Vec<SpilledTopKEntry>,
+    /// Winners sorted in reverse output order (`sorted.last()` is the next row to serve).
     sorted: Vec<SpilledTopKEntry>,
     arrived: u64,
     key_bytes: usize,
     file: Arc<dyn File>,
     next_offset: u64,
+    /// Disjoint, offset-sorted, coalesced free byte ranges `(offset, capacity)` strictly below
+    /// `next_offset`.
+    free_slots: Vec<(u64, usize)>,
     pending_write: Option<PendingTopKWrite>,
     pending_read: Option<PendingTopKRead>,
 }
 
+/// Rounds a temp-file slot length up to cache-line (64 B) or OS-page (4 KiB) granularity so
+/// `pread`/`pwrite` offsets stay block-aligned and small varint-width differences between
+/// equal-shape rows (e.g. `id = 1` vs `id = 2` in SQLite record format) reuse evicted slots
+/// immediately without growing the temp file.
+fn aligned_file_slot_cap(len: usize) -> Result<usize> {
+    if len == 0 {
+        return Ok(0);
+    }
+    let align = if len >= 4096 { 4096usize } else { 64usize };
+    len.checked_next_multiple_of(align)
+        .ok_or(LimboError::IntegerOverflow)
+}
+
 impl SpilledTopK {
-    fn poll_pending_write(&mut self) -> IOResultOr<u64> {
+    /// Reserves a byte slot `[offset, offset + slot_cap)` in `self.file`, reusing the tightest
+    /// fitting free slot (splitting only when capacity exceeds 2x `aligned_len` so adjacent-size
+    /// rows recycle slots without fragmentation) or extending `self.next_offset`.
+    fn reserve_file_slot(&mut self, len: usize) -> Result<(u64, usize)> {
+        let aligned = aligned_file_slot_cap(len)?;
+        if aligned == 0 {
+            return Ok((0, 0));
+        }
+        let mut best_idx: Option<usize> = None;
+        let mut best_cap = usize::MAX;
+        for (i, &(_, cap)) in self.free_slots.iter().enumerate() {
+            if cap >= aligned && cap < best_cap {
+                best_cap = cap;
+                best_idx = Some(i);
+                if cap == aligned {
+                    break;
+                }
+            }
+        }
+        if let Some(idx) = best_idx {
+            let (off, cap) = self.free_slots.remove(idx);
+            if cap > aligned.saturating_mul(2) {
+                let rem_off = off
+                    .checked_add(u64::try_from(aligned).map_err(|_| LimboError::IntegerOverflow)?)
+                    .ok_or(LimboError::IntegerOverflow)?;
+                let rem_cap = cap.saturating_sub(aligned);
+                self.free_slots
+                    .try_reserve(1)
+                    .map_err(|_| LimboError::OutOfMemory)?;
+                self.free_slots.insert(idx, (rem_off, rem_cap));
+                return Ok((off, aligned));
+            }
+            return Ok((off, cap));
+        }
+        let off = self.next_offset;
+        let end = off
+            .checked_add(u64::try_from(aligned).map_err(|_| LimboError::IntegerOverflow)?)
+            .ok_or(LimboError::IntegerOverflow)?;
+        self.next_offset = end;
+        Ok((off, aligned))
+    }
+
+    /// Returns `[offset, offset + slot_cap)` to `self.free_slots`, coalescing with neighbors and
+    /// trimming the file watermark `self.next_offset` whenever the tail becomes free.
+    fn release_file_slot(&mut self, offset: u64, slot_cap: usize) {
+        if slot_cap == 0 {
+            return;
+        }
+        let new_off = offset;
+        let mut new_cap = slot_cap;
+        let pos = self.free_slots.partition_point(|&(off, _)| off < new_off);
+
+        // Merge with successor if contiguous.
+        if let Some(&(next_off, next_cap)) = self.free_slots.get(pos) {
+            if let Some(end) = new_off.checked_add(new_cap as u64) {
+                if end == next_off {
+                    if let Some(merged) = new_cap.checked_add(next_cap) {
+                        new_cap = merged;
+                        self.free_slots.remove(pos);
+                    }
+                }
+            }
+        }
+
+        // Merge with predecessor if contiguous.
+        let mut merged_prev = false;
+        if pos > 0 {
+            let prev_idx = pos.saturating_sub(1);
+            if let Some((prev_off, prev_cap)) = self.free_slots.get_mut(prev_idx) {
+                if let Some(prev_end) = prev_off.checked_add(*prev_cap as u64) {
+                    if prev_end == new_off {
+                        if let Some(merged) = prev_cap.checked_add(new_cap) {
+                            *prev_cap = merged;
+                            merged_prev = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !merged_prev && self.free_slots.try_reserve(1).is_ok() {
+            self.free_slots.insert(pos, (new_off, new_cap));
+        }
+
+        // Trim any free tail range back off `self.next_offset`.
+        while let Some(&(last_off, last_cap)) = self.free_slots.last() {
+            if last_off.checked_add(last_cap as u64) == Some(self.next_offset) {
+                self.free_slots.pop();
+                self.next_offset = last_off;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn read_payload_sync(
+        &self,
+        io: &dyn IO,
+        offset: u64,
+        payload_len: usize,
+    ) -> Result<Arc<Buffer>> {
+        let read_buf = Arc::new(Buffer::new_temporary(payload_len));
+        if payload_len == 0 {
+            return Ok(read_buf);
+        }
+        let expected = i32::try_from(payload_len).map_err(|_| LimboError::IntegerOverflow)?;
+        let read_err = Arc::new(atomic::AtomicBool::new(false));
+        let read_err_cb = read_err.clone();
+        let c = Completion::new_read(
+            read_buf.clone(),
+            Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+                match res {
+                    Ok((_, n)) if n >= expected => {}
+                    _ => read_err_cb.store(true, atomic::Ordering::SeqCst),
+                }
+                None
+            }),
+        );
+        let c = self.file.pread(offset, c)?;
+        IOCompletions(c).wait(io)?;
+        if read_err.load(atomic::Ordering::SeqCst) {
+            return Err(CompletionError::IOError(
+                std::io::ErrorKind::UnexpectedEof,
+                "sorter top-k key read",
+            )
+            .into());
+        }
+        Ok(read_buf)
+    }
+
+    fn compare_entries(
+        &self,
+        a: &SpilledTopKEntry,
+        b: &SpilledTopKEntry,
+        io: &dyn IO,
+        key_len: usize,
+        index_key_info: &[KeyInfo],
+        comparators: &[Option<SortComparator>],
+    ) -> Result<Ordering> {
+        let key_ord =
+            match a.norm_key.cmp(&b.norm_key) {
+                Ordering::Equal if a.norm_decisive && b.norm_decisive => Ordering::Equal,
+                Ordering::Equal => {
+                    let buf_a = if a.inline_keys.is_none() {
+                        Some(self.read_payload_sync(io, a.offset, a.payload_len)?)
+                    } else {
+                        None
+                    };
+                    let buf_b = if b.inline_keys.is_none() {
+                        Some(self.read_payload_sync(io, b.offset, b.payload_len)?)
+                    } else {
+                        None
+                    };
+                    let refs_a = match (&a.inline_keys, &buf_a) {
+                        (Some(vals), _) => entry_key_refs(vals)?,
+                        (None, Some(buf)) => {
+                            let slice = buf.as_slice().get(..a.payload_len).ok_or(
+                                CompletionError::IOError(
+                                    std::io::ErrorKind::UnexpectedEof,
+                                    "sorter top-k key read",
+                                ),
+                            )?;
+                            extract_key_refs(slice, key_len)?
+                        }
+                        (None, None) => {
+                            return Err(LimboError::InternalError(
+                                "spilled top-k entry missing key buffer".into(),
+                            ));
+                        }
+                    };
+                    let refs_b = match (&b.inline_keys, &buf_b) {
+                        (Some(vals), _) => entry_key_refs(vals)?,
+                        (None, Some(buf)) => {
+                            let slice = buf.as_slice().get(..b.payload_len).ok_or(
+                                CompletionError::IOError(
+                                    std::io::ErrorKind::UnexpectedEof,
+                                    "sorter top-k key read",
+                                ),
+                            )?;
+                            extract_key_refs(slice, key_len)?
+                        }
+                        (None, None) => {
+                            return Err(LimboError::InternalError(
+                                "spilled top-k entry missing key buffer".into(),
+                            ));
+                        }
+                    };
+                    try_full_cmp(&refs_a, &refs_b, index_key_info, comparators)?
+                }
+                ord => ord,
+            };
+        Ok(key_ord.then(a.arrived.cmp(&b.arrived)))
+    }
+
+    fn orders_before_entry(
+        &self,
+        record: &ImmutableRecord,
+        worst: &SpilledTopKEntry,
+        io: &dyn IO,
+        key_len: usize,
+        index_key_info: &[KeyInfo],
+        comparators: &[Option<SortComparator>],
+    ) -> Result<bool> {
+        let incoming_refs = extract_key_refs(record.get_payload(), key_len)?;
+        let (norm_key, norm_decisive) =
+            normalized_first_key(&incoming_refs, index_key_info, comparators);
+        let ord = match norm_key.cmp(&worst.norm_key) {
+            Ordering::Equal if norm_decisive && worst.norm_decisive => Ordering::Equal,
+            Ordering::Equal => {
+                let buf = if worst.inline_keys.is_none() {
+                    Some(self.read_payload_sync(io, worst.offset, worst.payload_len)?)
+                } else {
+                    None
+                };
+                let worst_refs = match (&worst.inline_keys, &buf) {
+                    (Some(vals), _) => entry_key_refs(vals)?,
+                    (None, Some(buf)) => {
+                        let slice = buf.as_slice().get(..worst.payload_len).ok_or(
+                            CompletionError::IOError(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "sorter top-k key read",
+                            ),
+                        )?;
+                        extract_key_refs(slice, key_len)?
+                    }
+                    (None, None) => {
+                        return Err(LimboError::InternalError(
+                            "spilled top-k entry missing key buffer".into(),
+                        ));
+                    }
+                };
+                try_full_cmp(&incoming_refs, &worst_refs, index_key_info, comparators)?
+            }
+            ord => ord,
+        };
+        Ok(ord == Ordering::Less)
+    }
+
+    fn heap_sift_up(
+        &mut self,
+        mut idx: usize,
+        io: &dyn IO,
+        key_len: usize,
+        index_key_info: &[KeyInfo],
+        comparators: &[Option<SortComparator>],
+    ) -> Result<()> {
+        while idx > 0 {
+            let parent = idx.saturating_sub(1) / 2;
+            let ord = {
+                let (Some(child_e), Some(parent_e)) = (self.heap.get(idx), self.heap.get(parent))
+                else {
+                    break;
+                };
+                self.compare_entries(child_e, parent_e, io, key_len, index_key_info, comparators)?
+            };
+            if ord == Ordering::Greater {
+                self.heap.swap(idx, parent);
+                idx = parent;
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn heap_sift_down(
+        &mut self,
+        mut idx: usize,
+        io: &dyn IO,
+        key_len: usize,
+        index_key_info: &[KeyInfo],
+        comparators: &[Option<SortComparator>],
+    ) -> Result<()> {
+        let len = self.heap.len();
+        loop {
+            let left = idx.saturating_mul(2).saturating_add(1);
+            if left >= len {
+                break;
+            }
+            let right = left.saturating_add(1);
+            let mut largest = idx;
+            if let (Some(l_e), Some(cur_e)) = (self.heap.get(left), self.heap.get(largest)) {
+                if self.compare_entries(l_e, cur_e, io, key_len, index_key_info, comparators)?
+                    == Ordering::Greater
+                {
+                    largest = left;
+                }
+            }
+            if right < len {
+                if let (Some(r_e), Some(cur_e)) = (self.heap.get(right), self.heap.get(largest)) {
+                    if self.compare_entries(r_e, cur_e, io, key_len, index_key_info, comparators)?
+                        == Ordering::Greater
+                    {
+                        largest = right;
+                    }
+                }
+            }
+            if largest == idx {
+                break;
+            }
+            self.heap.swap(idx, largest);
+            idx = largest;
+        }
+        Ok(())
+    }
+
+    fn heap_push_bounded(
+        &mut self,
+        entry: SpilledTopKEntry,
+        io: &dyn IO,
+        key_len: usize,
+        index_key_info: &[KeyInfo],
+        comparators: &[Option<SortComparator>],
+    ) -> Result<()> {
+        if self.heap.len() < self.limit {
+            let added = entry.key_bytes;
+            self.heap.try_push(entry)?;
+            self.key_bytes = self.key_bytes.saturating_add(added);
+            let last = self.heap.len().saturating_sub(1);
+            self.heap_sift_up(last, io, key_len, index_key_info, comparators)?;
+            return Ok(());
+        }
+        let beats_worst = match self.heap.first() {
+            Some(worst) => {
+                self.compare_entries(&entry, worst, io, key_len, index_key_info, comparators)?
+                    == Ordering::Less
+            }
+            None => false,
+        };
+        if !beats_worst {
+            self.release_file_slot(entry.offset, entry.slot_cap);
+            return Ok(());
+        }
+        let added = entry.key_bytes;
+        let evicted = match self.heap.first_mut() {
+            Some(root) => std::mem::replace(root, entry),
+            None => {
+                self.release_file_slot(entry.offset, entry.slot_cap);
+                return Ok(());
+            }
+        };
+        self.key_bytes = self
+            .key_bytes
+            .saturating_sub(evicted.key_bytes)
+            .saturating_add(added);
+        let sift_res = self.heap_sift_down(0, io, key_len, index_key_info, comparators);
+        self.release_file_slot(evicted.offset, evicted.slot_cap);
+        sift_res
+    }
+
+    /// Orders `self.heap` into `self.sorted` (worst first, best last so `read_next_into` serves
+    /// from the back) without mutating `self.heap` until every fallible comparison succeeds.
+    fn finish_sort(
+        &mut self,
+        io: &dyn IO,
+        key_len: usize,
+        index_key_info: &[KeyInfo],
+        comparators: &[Option<SortComparator>],
+    ) -> Result<()> {
+        let n = self.heap.len();
+        if n == 0 {
+            return Ok(());
+        }
+        let mut order: Vec<usize> = Vec::new();
+        order
+            .try_reserve_exact(n)
+            .map_err(|_| LimboError::OutOfMemory)?;
+        for i in 0..n {
+            order.push(i);
+        }
+        let mut scratch: Vec<usize> = Vec::new();
+        scratch
+            .try_reserve_exact(n)
+            .map_err(|_| LimboError::OutOfMemory)?;
+        scratch.resize(n, 0);
+
+        // Bottom-up merge sort into descending order (worst first, best last).
+        let mut width = 1usize;
+        while width < n {
+            let mut left = 0usize;
+            while left < n {
+                let mid = left.saturating_add(width).min(n);
+                let right = mid.saturating_add(width).min(n);
+                let mut i = left;
+                let mut j = mid;
+                let mut k = left;
+                while i < mid && j < right {
+                    let (Some(&idx_a), Some(&idx_b)) = (order.get(i), order.get(j)) else {
+                        break;
+                    };
+                    let (Some(entry_a), Some(entry_b)) =
+                        (self.heap.get(idx_a), self.heap.get(idx_b))
+                    else {
+                        break;
+                    };
+                    let ord = self.compare_entries(
+                        entry_a,
+                        entry_b,
+                        io,
+                        key_len,
+                        index_key_info,
+                        comparators,
+                    )?;
+                    if let Some(dst) = scratch.get_mut(k) {
+                        if ord != Ordering::Less {
+                            *dst = idx_a;
+                            i = i.saturating_add(1);
+                        } else {
+                            *dst = idx_b;
+                            j = j.saturating_add(1);
+                        }
+                    }
+                    k = k.saturating_add(1);
+                }
+                while i < mid {
+                    if let (Some(&idx_a), Some(dst)) = (order.get(i), scratch.get_mut(k)) {
+                        *dst = idx_a;
+                    }
+                    i = i.saturating_add(1);
+                    k = k.saturating_add(1);
+                }
+                while j < right {
+                    if let (Some(&idx_b), Some(dst)) = (order.get(j), scratch.get_mut(k)) {
+                        *dst = idx_b;
+                    }
+                    j = j.saturating_add(1);
+                    k = k.saturating_add(1);
+                }
+                left = right;
+            }
+            std::mem::swap(&mut order, &mut scratch);
+            width = width.saturating_mul(2);
+        }
+
+        // All comparisons succeeded; pre-reserve output before moving out of `self.heap`.
+        let mut sorted: Vec<SpilledTopKEntry> = Vec::new();
+        sorted
+            .try_reserve_exact(n)
+            .map_err(|_| LimboError::OutOfMemory)?;
+        let mut slots: Vec<Option<SpilledTopKEntry>> = Vec::new();
+        slots
+            .try_reserve_exact(n)
+            .map_err(|_| LimboError::OutOfMemory)?;
+        for entry in std::mem::take(&mut self.heap) {
+            slots.push(Some(entry));
+        }
+        for idx in order {
+            if let Some(slot) = slots.get_mut(idx) {
+                if let Some(entry) = slot.take() {
+                    sorted.push(entry);
+                }
+            }
+        }
+        self.sorted = sorted;
+        Ok(())
+    }
+
+    fn poll_pending_write(
+        &mut self,
+        io: &dyn IO,
+        key_len: usize,
+        index_key_info: &[KeyInfo],
+        comparators: &[Option<SortComparator>],
+    ) -> IOResultOr<u64> {
         let Some(pending) = self.pending_write.take() else {
             return Ok(IOResult::Done(0));
         };
@@ -496,57 +962,60 @@ impl SpilledTopK {
             return Ok(IOResult::IO(IOCompletions(c)));
         }
         if pending.write_err.load(atomic::Ordering::SeqCst) {
+            for entry in pending.entries {
+                self.release_file_slot(entry.offset, entry.slot_cap);
+            }
             return Err(CompletionError::IOError(
                 std::io::ErrorKind::WriteZero,
                 "sorter top-k write",
             )
             .into());
         }
-        self.next_offset = pending.next_offset;
-        for entry in pending.entries {
-            if self.heap.len() >= self.limit {
-                if let Some(evicted) = self.heap.pop() {
-                    self.key_bytes = self.key_bytes.saturating_sub(evicted.key_bytes);
+        let mut entries = pending.entries.into_iter();
+        while let Some(entry) = entries.next() {
+            if let Err(err) =
+                self.heap_push_bounded(entry, io, key_len, index_key_info, comparators)
+            {
+                for remaining in entries {
+                    self.release_file_slot(remaining.offset, remaining.slot_cap);
                 }
+                return Err(err.into());
             }
-            let added = entry.key_bytes;
-            self.heap.try_push(entry)?;
-            self.key_bytes = self.key_bytes.saturating_add(added);
         }
+        self.arrived = self.arrived.saturating_add(pending.count_new);
         Ok(IOResult::Done(pending.count_new))
     }
 
-    fn write_payloads(
+    fn write_slotted_payloads(
         file: &Arc<dyn File>,
         start_offset: u64,
-        payloads: &[&[u8]],
+        total_len: usize,
+        items: &[(u64, &[u8])],
     ) -> Result<(Completion, Arc<atomic::AtomicBool>, u64)> {
-        let mut total = 0usize;
-        for p in payloads {
-            total = total
-                .checked_add(p.len())
-                .ok_or(LimboError::IntegerOverflow)?;
-        }
         let end_offset = start_offset
-            .checked_add(u64::try_from(total).map_err(|_| LimboError::IntegerOverflow)?)
+            .checked_add(u64::try_from(total_len).map_err(|_| LimboError::IntegerOverflow)?)
             .ok_or(LimboError::IntegerOverflow)?;
-        let buffer = Buffer::new_temporary(total);
+        let buffer = Buffer::new_temporary(total_len);
         let dst = buffer.as_mut_slice();
-        let mut pos = 0usize;
-        for p in payloads {
+        for &(item_off, p) in items {
             if !p.is_empty() {
-                let end = pos
+                let rel = usize::try_from(
+                    item_off
+                        .checked_sub(start_offset)
+                        .ok_or(LimboError::IntegerOverflow)?,
+                )
+                .map_err(|_| LimboError::IntegerOverflow)?;
+                let end = rel
                     .checked_add(p.len())
                     .ok_or(LimboError::IntegerOverflow)?;
                 let slot = dst
-                    .get_mut(pos..end)
+                    .get_mut(rel..end)
                     .ok_or_else(|| LimboError::InternalError("sorter top-k write slice".into()))?;
                 slot.copy_from_slice(p);
-                pos = end;
             }
         }
         let buffer_ref = Arc::new(buffer);
-        let expected = i32::try_from(total).map_err(|_| LimboError::IntegerOverflow)?;
+        let expected = i32::try_from(total_len).map_err(|_| LimboError::IntegerOverflow)?;
         let write_err = Arc::new(atomic::AtomicBool::new(false));
         let write_err_cb = write_err.clone();
         let c = Completion::new_write(Box::new(
@@ -562,47 +1031,84 @@ impl SpilledTopK {
     fn offer(
         &mut self,
         record: &ImmutableRecord,
+        io: &dyn IO,
         key_len: usize,
-        index_key_info: &Rc<Vec<KeyInfo>>,
-        comparators: &Rc<Vec<Option<SortComparator>>>,
+        index_key_info: &[KeyInfo],
+        comparators: &[Option<SortComparator>],
     ) -> IOResultOr<u64> {
-        let added = return_if_io!(self.poll_pending_write());
+        let added =
+            return_if_io!(self.poll_pending_write(io, key_len, index_key_info, comparators));
         if added > 0 {
             return Ok(IOResult::Done(added));
         }
-        let arrived = self.arrived;
+        let mut evicted_key_bytes = 0usize;
         if self.heap.len() >= self.limit {
-            if let Some(worst) = self.heap.peek() {
-                if !orders_before_spilled(record, key_len, index_key_info, comparators, worst)? {
+            if let Some(worst) = self.heap.first() {
+                if !self.orders_before_entry(
+                    record,
+                    worst,
+                    io,
+                    key_len,
+                    index_key_info,
+                    comparators,
+                )? {
                     self.arrived = self.arrived.saturating_add(1);
                     return Ok(IOResult::Done(1));
                 }
+                evicted_key_bytes = worst.key_bytes;
             }
+        } else {
+            // Reserve heap capacity before submitting disk I/O so commit cannot OOM.
+            self.heap
+                .try_reserve(1)
+                .map_err(|_| LimboError::OutOfMemory)?;
         }
-        let entry = SpilledTopKEntry::from_record(
+        let payload = record.get_payload();
+        let available_inline = self
+            .max_key_bytes
+            .saturating_sub(self.key_bytes.saturating_sub(evicted_key_bytes));
+        let (slot_offset, slot_cap) = self.reserve_file_slot(payload.len())?;
+        let entry = match SpilledTopKEntry::from_record(
             record,
             key_len,
             index_key_info,
             comparators,
-            arrived,
-            self.next_offset,
-        )?;
-        let (completion, write_err, next_offset) =
-            Self::write_payloads(&self.file, self.next_offset, &[record.get_payload()])?;
-        self.arrived = self.arrived.saturating_add(1);
+            self.arrived,
+            slot_offset,
+            slot_cap,
+            available_inline,
+        ) {
+            Ok(e) => e,
+            Err(err) => {
+                self.release_file_slot(slot_offset, slot_cap);
+                return Err(err.into());
+            }
+        };
         let mut entries = Vec::new();
-        entries
-            .try_reserve_exact(1)
-            .map_err(|_| LimboError::OutOfMemory)?;
+        if entries.try_reserve_exact(1).is_err() {
+            self.release_file_slot(slot_offset, slot_cap);
+            return Err(LimboError::OutOfMemory.into());
+        }
         entries.push(entry);
+        let (completion, write_err, _) = match Self::write_slotted_payloads(
+            &self.file,
+            slot_offset,
+            payload.len(),
+            &[(slot_offset, payload)],
+        ) {
+            Ok(res) => res,
+            Err(err) => {
+                self.release_file_slot(slot_offset, slot_cap);
+                return Err(err.into());
+            }
+        };
         self.pending_write = Some(PendingTopKWrite {
             completion,
             write_err,
             entries,
-            next_offset,
             count_new: 1,
         });
-        self.poll_pending_write()
+        self.poll_pending_write(io, key_len, index_key_info, comparators)
     }
 
     fn read_next_into(&mut self, current: &mut Option<ImmutableRecord>) -> IOResultOr<()> {
@@ -641,18 +1147,25 @@ impl SpilledTopK {
                     *current = Some(rec);
                 }
             }
+            // Pop only after the read succeeded and `*current` has been populated so a read
+            // failure never loses the winner on retry.
+            if let Some(done) = self.sorted.pop() {
+                self.key_bytes = self.key_bytes.saturating_sub(done.key_bytes);
+            }
             return Ok(IOResult::Done(()));
         }
 
-        let Some(entry) = self.sorted.pop() else {
+        let Some(entry) = self.sorted.last() else {
             *current = None;
             return Ok(IOResult::Done(()));
         };
-        self.key_bytes = self.key_bytes.saturating_sub(entry.key_bytes);
         if entry.payload_len == 0 {
             let mut rec = ImmutableRecord::new(0)?;
             rec.start_serialization(&[])?;
             *current = Some(rec);
+            if let Some(done) = self.sorted.pop() {
+                self.key_bytes = self.key_bytes.saturating_sub(done.key_bytes);
+            }
             return Ok(IOResult::Done(()));
         }
         let read_buf = Arc::new(Buffer::new_temporary(entry.payload_len));
@@ -766,13 +1279,13 @@ pub struct Sorter {
     temp_store: crate::TempStore,
     /// Amphora: the rows kept when the reader takes only some (decision 5), else None.
     kept: Option<Kept>,
-    /// File-backed key-only top-K heap used when `kept` overflows `max_buffer_size` while its sort
-    /// keys fit within the budget, keeping live row-sized memory `O(1)` regardless of input size.
+    /// File-backed external top-K heap used when `kept` overflows `max_buffer_size`, keeping live
+    /// row-sized memory `O(1)` and temp-file usage `O(K)` regardless of input size or key width.
     spilled_top_k: Option<SpilledTopK>,
-    /// Row cap active when a top-K sorter demotes to external spilling on byte-budget overflow.
-    output_limit: Option<usize>,
-    /// Rows already returned by [`Self::next`] under [`Self::output_limit`].
-    emitted: usize,
+    /// In-flight conversion from `kept` to `spilled_top_k`. `self.kept` stays completely intact
+    /// until this demotion's disk write and heap insertion finish cleanly, so a short write or
+    /// allocation failure never loses previously accepted winners.
+    pending_demote: Option<SpilledTopK>,
     /// Amphora: whether the first insert has decided `kept`.
     limit_decided: bool,
     /// Amphora (PL.13, lane replan-5): every row put in, kept or not, in memory or spilled.
@@ -828,8 +1341,7 @@ impl Sorter {
             temp_store,
             kept: None,
             spilled_top_k: None,
-            output_limit: None,
-            emitted: 0,
+            pending_demote: None,
             limit_decided: false,
             inserted: 0,
             in_memory_sort: None,
@@ -850,7 +1362,12 @@ impl Sorter {
         let spilled_top_k_bytes = self
             .spilled_top_k
             .as_ref()
-            .map_or(0, |spilled| spilled.key_bytes);
+            .map_or(0, |spilled| spilled.key_bytes)
+            .saturating_add(
+                self.pending_demote
+                    .as_ref()
+                    .map_or(0, |spilled| spilled.key_bytes),
+            );
         self.arena
             .allocated_bytes()
             .saturating_add(
@@ -868,6 +1385,7 @@ impl Sorter {
     pub fn can_reuse(&self) -> bool {
         self.chunks.is_empty()
             && self.spilled_top_k.is_none()
+            && self.pending_demote.is_none()
             && self.temp_file.is_none()
             && self.pending_completion.is_none()
             && self.allocated_bytes() <= crate::vdbe::KEPT_EPHEMERAL_BYTES
@@ -886,8 +1404,7 @@ impl Sorter {
         self.init_chunk_heap_state = InitChunkHeapState::Start;
         self.kept = None;
         self.spilled_top_k = None;
-        self.output_limit = None;
-        self.emitted = 0;
+        self.pending_demote = None;
         self.limit_decided = false;
         self.inserted = 0;
         self.in_memory_sort = None;
@@ -931,6 +1448,7 @@ impl Sorter {
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
             && self.chunks.is_empty()
+            && self.pending_demote.is_none()
             && self
                 .kept
                 .as_ref()
@@ -951,7 +1469,6 @@ impl Sorter {
         self.limit_decided = true;
         if let Some(limit) = limit.filter(|&l| l > 0 && l <= MAX_KEPT) {
             if self.records.is_empty() && self.chunks.is_empty() {
-                self.output_limit = Some(limit);
                 self.kept = Some(Kept {
                     limit,
                     heap: BinaryHeap::new(),
@@ -963,16 +1480,40 @@ impl Sorter {
         }
     }
 
-    /// Attempts to spill `self.kept` and `incoming` into a key-only external [`SpilledTopK`]
-    /// backed by `self.temp_file`, keeping `self.kept` intact if any allocation or I/O setup fails
-    /// (error-safe conversion) and returning `Ok(None)` when the sort keys themselves exceed
-    /// `self.max_buffer_size` (so the caller falls back to full external chunk merge).
-    fn try_demote_kept_to_spilled_top_k(
-        &mut self,
-        incoming: &ImmutableRecord,
-    ) -> Result<Option<IOResult<()>>> {
+    /// Completes any in-flight conversion from `self.kept` to `self.spilled_top_k`, committing
+    /// the transition (and dropping `self.kept`) ONLY once disk write verification and every heap
+    /// insertion succeed. On error, `self.pending_demote` is dropped while `self.kept` remains
+    /// completely intact for retry.
+    fn poll_pending_demote(&mut self) -> IOResultOr<bool> {
+        let Some(mut spilled) = self.pending_demote.take() else {
+            return Ok(IOResult::Done(false));
+        };
+        match spilled.poll_pending_write(
+            self.io.as_ref(),
+            self.key_len,
+            &self.index_key_info,
+            &self.comparators,
+        ) {
+            Ok(IOResult::IO(io)) => {
+                self.pending_demote = Some(spilled);
+                Ok(IOResult::IO(io))
+            }
+            Err(err) => Err(err),
+            Ok(IOResult::Done(added)) => {
+                self.kept = None;
+                self.spilled_top_k = Some(spilled);
+                self.inserted = self.inserted.saturating_add(added);
+                Ok(IOResult::Done(true))
+            }
+        }
+    }
+
+    /// Begins spilling `self.kept` plus `incoming` into an external [`SpilledTopK`] backed by
+    /// `self.temp_file`, keeping `self.kept` intact until [`Self::poll_pending_demote`] confirms
+    /// the write and all heap insertions succeeded.
+    fn demote_kept_to_spilled_top_k(&mut self, incoming: &ImmutableRecord) -> IOResultOr<()> {
         let Some(kept) = self.kept.as_ref() else {
-            return Ok(None);
+            return Ok(IOResult::Done(()));
         };
         let mut refs: Vec<&KeptRecord> = Vec::new();
         refs.try_reserve_exact(kept.heap.len())
@@ -980,18 +1521,21 @@ impl Sorter {
         refs.extend(kept.heap.iter());
         refs.sort_unstable_by_key(|row| row.arrived);
 
+        let total_rows = refs.len().saturating_add(1);
         let mut entries: Vec<SpilledTopKEntry> = Vec::new();
         entries
-            .try_reserve_exact(refs.len().saturating_add(1))
+            .try_reserve_exact(total_rows)
             .map_err(|_| LimboError::OutOfMemory)?;
-        let mut payloads: Vec<&[u8]> = Vec::new();
+        let mut payloads: Vec<(u64, &[u8])> = Vec::new();
         payloads
-            .try_reserve_exact(refs.len().saturating_add(1))
+            .try_reserve_exact(total_rows)
             .map_err(|_| LimboError::OutOfMemory)?;
 
         let mut offset = 0u64;
-        let mut total_key_bytes = 0usize;
+        let mut remaining_inline = self.max_buffer_size;
         for row in &refs {
+            let plen = row.record.record.get_payload().len();
+            let slot_cap = aligned_file_slot_cap(plen)?;
             let entry = SpilledTopKEntry::from_record(
                 &row.record.record,
                 self.key_len,
@@ -999,16 +1543,18 @@ impl Sorter {
                 &self.comparators,
                 row.arrived,
                 offset,
+                slot_cap,
+                remaining_inline,
             )?;
+            remaining_inline = remaining_inline.saturating_sub(entry.key_bytes);
+            payloads.push((offset, row.record.record.get_payload()));
             offset = offset
-                .checked_add(
-                    u64::try_from(entry.payload_len).map_err(|_| LimboError::IntegerOverflow)?,
-                )
+                .checked_add(u64::try_from(slot_cap).map_err(|_| LimboError::IntegerOverflow)?)
                 .ok_or(LimboError::IntegerOverflow)?;
-            total_key_bytes = total_key_bytes.saturating_add(entry.key_bytes);
-            payloads.push(row.record.record.get_payload());
             entries.push(entry);
         }
+        let incoming_len = incoming.get_payload().len();
+        let incoming_cap = aligned_file_slot_cap(incoming_len)?;
         let incoming_entry = SpilledTopKEntry::from_record(
             incoming,
             self.key_len,
@@ -1016,12 +1562,19 @@ impl Sorter {
             &self.comparators,
             kept.arrived,
             offset,
+            incoming_cap,
+            remaining_inline,
         )?;
-        let projected_keys = total_key_bytes.saturating_add(incoming_entry.key_bytes);
-        if projected_keys > self.max_buffer_size {
-            return Ok(None);
-        }
-        payloads.push(incoming.get_payload());
+        let write_len = usize::try_from(
+            offset
+                .checked_add(u64::try_from(incoming_len).map_err(|_| LimboError::IntegerOverflow)?)
+                .ok_or(LimboError::IntegerOverflow)?,
+        )
+        .map_err(|_| LimboError::IntegerOverflow)?;
+        let end_offset = offset
+            .checked_add(u64::try_from(incoming_cap).map_err(|_| LimboError::IntegerOverflow)?)
+            .ok_or(LimboError::IntegerOverflow)?;
+        payloads.push((offset, incoming.get_payload()));
         entries.push(incoming_entry);
 
         let file = match &self.temp_file {
@@ -1033,88 +1586,34 @@ impl Sorter {
                 f
             }
         };
-        let (completion, write_err, next_offset) =
-            SpilledTopK::write_payloads(&file, 0, &payloads)?;
+        let mut heap: Vec<SpilledTopKEntry> = Vec::new();
+        heap.try_reserve_exact(kept.limit.min(total_rows))
+            .map_err(|_| LimboError::OutOfMemory)?;
+        let (completion, write_err, written_end) =
+            SpilledTopK::write_slotted_payloads(&file, 0, write_len, &payloads)?;
+        let next_offset = end_offset.max(written_end);
 
-        let limit = kept.limit;
-        let next_arrived = kept.arrived.saturating_add(1);
-        let mut spilled = SpilledTopK {
-            limit,
-            heap: BinaryHeap::new(),
+        let spilled = SpilledTopK {
+            limit: kept.limit,
+            max_key_bytes: self.max_buffer_size,
+            heap,
             sorted: Vec::new(),
-            arrived: next_arrived,
+            arrived: kept.arrived,
             key_bytes: 0,
             file,
-            next_offset: 0,
+            next_offset,
+            free_slots: Vec::new(),
             pending_write: Some(PendingTopKWrite {
                 completion,
                 write_err,
                 entries,
-                next_offset,
                 count_new: 1,
             }),
             pending_read: None,
         };
-        // All fallible allocations and write submission succeeded; commit transition atomically.
-        self.kept = None;
-        let step = spilled.poll_pending_write()?;
-        self.spilled_top_k = Some(spilled);
-        match step {
-            IOResult::Done(added) => {
-                self.inserted = self.inserted.saturating_add(added);
-                Ok(Some(IOResult::Done(())))
-            }
-            IOResult::IO(io) => Ok(Some(IOResult::IO(io))),
-        }
-    }
-
-    /// Moves all rows currently held in `self.kept` into the arena/records buffer in original
-    /// arrival order and clears `self.kept`, so the regular spilling sorter enforces
-    /// `self.max_buffer_size` when even the top-K sort keys exceed the byte budget. Leaves
-    /// `self.kept` completely intact if any allocation fails partway through.
-    fn demote_kept_to_spilling(&mut self) -> Result<()> {
-        let Some(kept) = self.kept.as_ref() else {
-            return Ok(());
-        };
-        let mut refs: Vec<&KeptRecord> = Vec::new();
-        refs.try_reserve_exact(kept.heap.len())
-            .map_err(|_| LimboError::OutOfMemory)?;
-        refs.extend(kept.heap.iter());
-        refs.sort_unstable_by_key(|row| row.arrived);
-
-        let mut staged: Vec<NonNull<ArenaSortableRecord>> = Vec::new();
-        staged
-            .try_reserve_exact(refs.len())
-            .map_err(|_| LimboError::OutOfMemory)?;
-        self.records
-            .try_reserve(refs.len())
-            .map_err(|_| LimboError::OutOfMemory)?;
-
-        let mut added_bytes = 0usize;
-        let mut max_payload = self.max_payload_size_in_buffer;
-        for row in refs {
-            let payload_size = row.record.record.get_payload().len();
-            let sortable_record = ArenaSortableRecord::new(
-                &self.arena,
-                &row.record.record,
-                self.key_len,
-                &self.index_key_info,
-                &self.comparators,
-            )?;
-            let record_ref = self.arena.try_alloc(sortable_record)?;
-            // SAFETY: try_alloc returns a valid, aligned, non-null pointer.
-            staged.push(NonNull::from(record_ref));
-            added_bytes = added_bytes.saturating_add(payload_size);
-            max_payload = max_payload.max(payload_size);
-        }
-        // Commit only after every row has been staged and `self.records` has reserved capacity.
-        for ptr in staged {
-            self.records.try_push(ptr)?;
-        }
-        self.current_buffer_size = self.current_buffer_size.saturating_add(added_bytes);
-        self.max_payload_size_in_buffer = max_payload;
-        self.kept = None;
-        Ok(())
+        self.pending_demote = Some(spilled);
+        let _ = return_if_io!(self.poll_pending_demote());
+        Ok(IOResult::Done(()))
     }
 
     pub const fn has_more(&self) -> bool {
@@ -1136,13 +1635,21 @@ impl Sorter {
         loop {
             match self.sort_state {
                 SortState::Start => {
+                    let _ = return_if_io!(self.poll_pending_demote());
                     if let Some(spilled) = self.spilled_top_k.as_mut() {
-                        let added = return_if_io!(spilled.poll_pending_write());
+                        let added = return_if_io!(spilled.poll_pending_write(
+                            self.io.as_ref(),
+                            self.key_len,
+                            &self.index_key_info,
+                            &self.comparators,
+                        ));
                         self.inserted = self.inserted.saturating_add(added);
-                        let mut rows = std::mem::take(&mut spilled.heap).into_vec();
-                        rows.sort_unstable();
-                        rows.reverse();
-                        spilled.sorted = rows;
+                        spilled.finish_sort(
+                            self.io.as_ref(),
+                            self.key_len,
+                            &self.index_key_info,
+                            &self.comparators,
+                        )?;
                         self.sort_state = SortState::Next;
                     } else if let Some(kept) = self.kept.as_mut().filter(|k| k.limit > 0) {
                         // The kept rows in output order, last first: served from the end.
@@ -1213,12 +1720,6 @@ impl Sorter {
             self.current = kept.sorted.pop().map(|kept| kept.record.record);
             return Ok(IOResult::Done(()));
         }
-        if let Some(limit) = self.output_limit {
-            if self.emitted >= limit {
-                self.current = None;
-                return Ok(IOResult::Done(()));
-            }
-        }
         if self.chunks.is_empty() {
             match self.records.pop() {
                 Some(ptr) => {
@@ -1235,7 +1736,6 @@ impl Sorter {
                             self.current = Some(arena_record.to_immutable_record()?);
                         }
                     }
-                    self.emitted = self.emitted.saturating_add(1);
 
                     if self.records.is_empty() {
                         self.arena.reset();
@@ -1260,7 +1760,6 @@ impl Sorter {
                             self.current = Some(boxed_record.record);
                         }
                     }
-                    self.emitted = self.emitted.saturating_add(1);
                 }
                 None => self.current = None,
             }
@@ -1284,9 +1783,13 @@ impl Sorter {
     }
 
     pub fn insert(&mut self, record: &ImmutableRecord) -> IOResultOr<()> {
+        if return_if_io!(self.poll_pending_demote()) {
+            return Ok(IOResult::Done(()));
+        }
         if let Some(spilled) = self.spilled_top_k.as_mut() {
             let added = return_if_io!(spilled.offer(
                 record,
+                self.io.as_ref(),
                 self.key_len,
                 &self.index_key_info,
                 &self.comparators,
@@ -1317,10 +1820,7 @@ impl Sorter {
                     return Ok(IOResult::Done(()));
                 }
                 KeptBudget::Exceeds => {
-                    if let Some(res) = self.try_demote_kept_to_spilled_top_k(record)? {
-                        return Ok(res);
-                    }
-                    self.demote_kept_to_spilling()?;
+                    return self.demote_kept_to_spilled_top_k(record);
                 }
             }
         }
@@ -2987,7 +3487,8 @@ mod tests {
         }
         assert_eq!(out, (0..16i64).collect::<Vec<_>>());
 
-        // Case 2: giant sort key itself exceeding the byte budget -> falls back to chunk spilling.
+        // Case 2: giant sort key itself exceeding the byte budget -> stays in SpilledTopK with
+        // out-of-line keys (`inline_keys = None`, `chunks.is_empty()`), keeping RAM `O(1)`.
         let mut big_key = Sorter::new(
             &[SortOrder::Asc],
             std::vec![CollationSeq::Binary],
@@ -3006,14 +3507,14 @@ mod tests {
             let rec = ImmutableRecord::from_values(&[Value::Blob(key_blob)], 1).unwrap();
             io.block(|| big_key.insert(&rec)).unwrap();
             assert!(
-                big_key.current_buffer_size <= budget,
-                "buffered payload {} exceeded budget {budget}",
-                big_key.current_buffer_size
+                big_key.allocated_bytes() <= budget,
+                "allocated bytes {} exceeded budget {budget}",
+                big_key.allocated_bytes()
             );
         }
         assert!(
-            big_key.kept.is_none() && big_key.spilled_top_k.is_none() && !big_key.chunks.is_empty(),
-            "giant-key top-K sorter must fall back to chunk spilling once keys exceed budget"
+            big_key.kept.is_none() && big_key.spilled_top_k.is_some() && big_key.chunks.is_empty(),
+            "giant-key top-K sorter must stay in SpilledTopK with out-of-line keys"
         );
         io.block(|| big_key.sort()).unwrap();
         let mut key_out = Vec::new();
@@ -3195,13 +3696,13 @@ mod tests {
                 .unwrap();
             io.block(|| sorter.insert(&rec)).unwrap();
         }
-        // Trigger `try_demote_kept_to_spilled_top_k` with a malformed 0-column incoming record
+        // Trigger `demote_kept_to_spilled_top_k` with a malformed 0-column incoming record
         // whose payload exceeds the 128-byte budget (forces an error during conversion).
         let mut bad_payload = std::vec![1u8]; // header len 1, 0 columns
         bad_payload.resize(256, 0);
         let mut bad = ImmutableRecord::new(bad_payload.len()).unwrap();
         bad.start_serialization(&bad_payload).unwrap();
-        let err = sorter.try_demote_kept_to_spilled_top_k(&bad);
+        let err = sorter.demote_kept_to_spilled_top_k(&bad);
         assert!(err.is_err());
 
         // Previously accepted winners must still be present and sortable.
@@ -3214,5 +3715,305 @@ mod tests {
             io.block(|| sorter.next()).unwrap();
         }
         assert_eq!(out, std::vec![(10, 1), (20, 2)]);
+    }
+
+    /// Standards P1 regression: a file-backed `LIMIT 2` sort with 520 KiB sort keys (including
+    /// shared prefixes that force full key comparisons) must keep `O(1)` RAM and `O(K)` temp-file
+    /// growth regardless of whether 4 or 12 rows arrive.
+    #[test]
+    fn p1_file_backed_top_k_wide_keys_keep_o1_memory_and_bounded_temp_file() {
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let budget = 64 * 1024;
+        let mut watermarks = Vec::new();
+        for row_count in [4u8, 12] {
+            let mut sorter = Sorter::new(
+                &[SortOrder::Asc],
+                std::vec![CollationSeq::Binary],
+                std::vec![Some(amphora_engine_parser::ast::NullsOrder::Last)],
+                std::vec![None],
+                budget,
+                4096,
+                io.clone(),
+                crate::TempStore::File,
+            )
+            .unwrap();
+            sorter.limit_to(Some(2));
+            let mut rec_len = 0usize;
+            for id in 1..=row_count {
+                // Identical 8-byte prefix forces full-key tie-break reads on disk; the last byte
+                // descends with `id` so every row beats the current heap worst.
+                let mut key_blob = std::vec![b'p'; 520_000];
+                key_blob[519_999] = row_count - id + 1;
+                let rec = ImmutableRecord::from_values(
+                    &[Value::Blob(key_blob), Value::from_i64(i64::from(id))],
+                    2,
+                )
+                .unwrap();
+                rec_len = rec.get_payload().len();
+                io.block(|| sorter.insert(&rec)).unwrap();
+                assert!(
+                    sorter.allocated_bytes() < budget,
+                    "wide-key sorter retained {} bytes on row {id}/{row_count}",
+                    sorter.allocated_bytes()
+                );
+            }
+            let spilled = sorter
+                .spilled_top_k
+                .as_ref()
+                .expect("wide-key LIMIT 2 must use SpilledTopK");
+            assert!(sorter.chunks.is_empty());
+            let slot_cap = aligned_file_slot_cap(rec_len).unwrap() as u64;
+            assert!(
+                spilled.next_offset <= slot_cap * 3,
+                "temp file watermark {} exceeded 3 * slot_cap ({}) for {row_count} rows",
+                spilled.next_offset,
+                slot_cap * 3
+            );
+            watermarks.push(spilled.next_offset);
+
+            io.block(|| sorter.sort()).unwrap();
+            assert!(sorter.allocated_bytes() < budget);
+            let mut ids = Vec::new();
+            while sorter.has_more() {
+                let vals = sorter.record().unwrap().get_values().unwrap();
+                ids.push(vals[1].as_int().unwrap());
+                io.block(|| sorter.next()).unwrap();
+            }
+            assert_eq!(
+                ids,
+                std::vec![i64::from(row_count), i64::from(row_count - 1)]
+            );
+        }
+        // Watermark for 12 rows must match watermark for 4 rows (`O(K)` slot reclamation).
+        assert_eq!(watermarks[0], watermarks[1]);
+    }
+
+    /// Standards P1 regression: a file-backed `LIMIT 2` sort with narrow keys and successively
+    /// better 520 KiB winners must reclaim evicted file slots instead of appending unboundedly.
+    #[test]
+    fn p1_file_backed_top_k_reclaims_evicted_temp_file_slots() {
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let budget = 64 * 1024;
+        let mut sorter = Sorter::new(
+            &[SortOrder::Asc],
+            std::vec![CollationSeq::Binary],
+            std::vec![None],
+            std::vec![None],
+            budget,
+            4096,
+            io.clone(),
+            crate::TempStore::File,
+        )
+        .unwrap();
+        sorter.limit_to(Some(2));
+        let mut rec_len = 0usize;
+        for step in 0..12i64 {
+            let key = 100 - step;
+            let payload = std::vec![u8::try_from(step).unwrap(); 520_000];
+            let rec = ImmutableRecord::from_values(
+                &[
+                    Value::from_i64(key),
+                    Value::from_i64(step),
+                    Value::Blob(payload),
+                ],
+                3,
+            )
+            .unwrap();
+            rec_len = rec.get_payload().len();
+            io.block(|| sorter.insert(&rec)).unwrap();
+        }
+        let spilled = sorter.spilled_top_k.as_ref().unwrap();
+        let slot_cap = aligned_file_slot_cap(rec_len).unwrap() as u64;
+        assert!(
+            spilled.next_offset <= slot_cap * 3,
+            "narrow-key spilled top-K grew temp file to {} bytes (expected <= {} bytes = 3 slots)",
+            spilled.next_offset,
+            slot_cap * 3
+        );
+        io.block(|| sorter.sort()).unwrap();
+        let mut out = Vec::new();
+        while sorter.has_more() {
+            let vals = sorter.record().unwrap().get_values().unwrap();
+            out.push((vals[0].as_int().unwrap(), vals[1].as_int().unwrap()));
+            io.block(|| sorter.next()).unwrap();
+        }
+        assert_eq!(out, std::vec![(89, 11), (90, 10)]);
+    }
+
+    /// Spec P1 regression: `SpilledTopK` must apply `cmp_with_sort` (`DESC` and `NULLS LAST`)
+    /// around custom comparators, matching in-memory SQL ordering.
+    #[test]
+    fn p1_spilled_top_k_respects_desc_nulls_last_custom_comparator() {
+        let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
+        // Custom comparator ordering blobs by their first byte (ascending base order).
+        let custom: SortComparator = Arc::new(|a: &ValueRef, b: &ValueRef| match (a, b) {
+            (ValueRef::Null, ValueRef::Null) => Ok(Ordering::Equal),
+            (ValueRef::Null, _) => Ok(Ordering::Less),
+            (_, ValueRef::Null) => Ok(Ordering::Greater),
+            (ValueRef::Blob(x), ValueRef::Blob(y)) => Ok(x.first().cmp(&y.first())),
+            _ => Ok(Ordering::Equal),
+        });
+        let mut sorter = Sorter::new(
+            &[SortOrder::Desc],
+            std::vec![CollationSeq::Binary],
+            std::vec![Some(amphora_engine_parser::ast::NullsOrder::Last)],
+            std::vec![Some(custom)],
+            1024,
+            256,
+            io.clone(),
+            crate::TempStore::Memory,
+        )
+        .unwrap();
+        sorter.limit_to(Some(2));
+
+        let pad = std::vec![b'x'; 2048];
+        for (id, key) in [
+            (1i64, Value::Blob(std::vec![10u8])),
+            (2, Value::Blob(std::vec![20u8])),
+            (3, Value::Blob(std::vec![30u8])),
+            (4, Value::Null),
+        ] {
+            let rec = ImmutableRecord::from_values(
+                &[key, Value::from_i64(id), Value::Blob(pad.clone())],
+                3,
+            )
+            .unwrap();
+            io.block(|| sorter.insert(&rec)).unwrap();
+        }
+        assert!(sorter.spilled_top_k.is_some());
+        io.block(|| sorter.sort()).unwrap();
+        let mut ids = Vec::new();
+        while sorter.has_more() {
+            let vals = sorter.record().unwrap().get_values().unwrap();
+            ids.push(vals[1].as_int().unwrap());
+            io.block(|| sorter.next()).unwrap();
+        }
+        assert_eq!(ids, std::vec![3, 2]);
+    }
+
+    /// Standards P2 regression: a short write during spill demotion must leave previously accepted
+    /// `Kept` winners intact for retry, and a short read during output must leave the pending
+    /// winner on `SpilledTopK::sorted` so retrying `next()` returns it without data loss.
+    #[test]
+    fn p2_failed_demote_short_write_and_failed_read_preserve_winners_for_retry() {
+        use std::sync::atomic::{AtomicBool, Ordering as AOrd};
+
+        struct FaultFile {
+            inner: Arc<dyn File>,
+            short_write: Arc<AtomicBool>,
+            short_read: Arc<AtomicBool>,
+        }
+        impl File for FaultFile {
+            fn lock_file(&self, exclusive: bool) -> Result<()> {
+                self.inner.lock_file(exclusive)
+            }
+            fn unlock_file(&self) -> Result<()> {
+                self.inner.unlock_file()
+            }
+            fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+                if self.short_read.swap(false, AOrd::SeqCst) {
+                    c.complete(0);
+                    return Ok(c);
+                }
+                self.inner.pread(pos, c)
+            }
+            fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+                if self.short_write.swap(false, AOrd::SeqCst) {
+                    c.complete(0);
+                    return Ok(c);
+                }
+                self.inner.pwrite(pos, buffer, c)
+            }
+            fn sync(
+                &self,
+                c: Completion,
+                sync_type: crate::io::FileSyncType,
+            ) -> Result<Completion> {
+                self.inner.sync(c, sync_type)
+            }
+            fn size(&self) -> Result<u64> {
+                self.inner.size()
+            }
+            fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+                self.inner.truncate(len, c)
+            }
+        }
+
+        let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
+        let short_write = Arc::new(AtomicBool::new(true));
+        let short_read = Arc::new(AtomicBool::new(false));
+        let mut raw_tf = TempFile::with_temp_store(&io, crate::TempStore::Memory).unwrap();
+        let fault_file: Arc<dyn File> = Arc::new(FaultFile {
+            inner: raw_tf.file.clone(),
+            short_write,
+            short_read: short_read.clone(),
+        });
+        raw_tf.file = fault_file;
+
+        let mut sorter = Sorter::new(
+            &[SortOrder::Asc],
+            std::vec![CollationSeq::Binary],
+            std::vec![None],
+            std::vec![None],
+            128,
+            64,
+            io.clone(),
+            crate::TempStore::Memory,
+        )
+        .unwrap();
+        sorter.temp_file = Some(raw_tf);
+        sorter.limit_to(Some(2));
+
+        // Insert two small winners that stay in `Kept`.
+        for (k, id) in [(10i64, 1i64), (20, 2)] {
+            let rec = ImmutableRecord::from_values(&[Value::from_i64(k), Value::from_i64(id)], 2)
+                .unwrap();
+            io.block(|| sorter.insert(&rec)).unwrap();
+        }
+        assert_eq!(sorter.kept.as_ref().unwrap().heap.len(), 2);
+
+        // Third winner triggers demote, which encounters an injected short write.
+        let big = ImmutableRecord::from_values(
+            &[
+                Value::from_i64(5),
+                Value::from_i64(3),
+                Value::Blob(std::vec![b'z'; 256]),
+            ],
+            3,
+        )
+        .unwrap();
+        let err = io.block(|| sorter.insert(&big));
+        assert!(err.is_err(), "injected short write must fail demote");
+        assert!(
+            sorter.kept.as_ref().is_some_and(|k| k.heap.len() == 2),
+            "previously accepted winners must remain intact in Kept after short write"
+        );
+        assert!(sorter.spilled_top_k.is_none());
+        assert!(sorter.pending_demote.is_none());
+
+        // Retrying the same insert now succeeds and retains the top 2 winners [(5, 3), (10, 1)].
+        io.block(|| sorter.insert(&big)).unwrap();
+        assert!(sorter.spilled_top_k.is_some());
+        assert!(sorter.kept.is_none());
+
+        // Inject a short read on the first output record during `sort()` -> `next()`.
+        short_read.store(true, AOrd::SeqCst);
+        let read_err = io.block(|| sorter.sort());
+        assert!(read_err.is_err(), "injected short read must error");
+        assert_eq!(
+            sorter.spilled_top_k.as_ref().unwrap().sorted.len(),
+            2,
+            "failed read must not pop the winner before populating current"
+        );
+
+        // Retrying `sort()` serves BOTH winners intact without losing (5, 3).
+        io.block(|| sorter.sort()).unwrap();
+        let mut out = Vec::new();
+        while sorter.has_more() {
+            let vals = sorter.record().unwrap().get_values().unwrap();
+            out.push((vals[0].as_int().unwrap(), vals[1].as_int().unwrap()));
+            io.block(|| sorter.next()).unwrap();
+        }
+        assert_eq!(out, std::vec![(5, 3), (10, 1)]);
     }
 }

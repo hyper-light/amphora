@@ -1935,6 +1935,9 @@ pub struct SharedPagerState {
     init_lock: Mutex<()>,
     init_page_1: ArcSwapOption<Page>,
     page_size: AtomicU32,
+    /// Reserved bytes published by a quiescent external restore (`RESERVED_SPACE_NOT_SET` until set)
+    /// so warmed pagers refresh their reserved-space and checksum context alongside `page_size`.
+    restored_reserved_space: AtomicU16,
 }
 
 impl SharedPagerState {
@@ -1949,6 +1952,24 @@ impl SharedPagerState {
             init_lock: Mutex::new(()),
             init_page_1: ArcSwapOption::new(init_page_1),
             page_size: AtomicU32::new(page_size),
+            restored_reserved_space: AtomicU16::new(RESERVED_SPACE_NOT_SET),
+        }
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    pub(crate) fn set_restored_page_info(&self, page_size: PageSize, reserved_space: Option<u8>) {
+        self.page_size.store(page_size.get(), Ordering::SeqCst);
+        let encoded = reserved_space.map_or(RESERVED_SPACE_NOT_SET, u16::from);
+        self.restored_reserved_space
+            .store(encoded, Ordering::SeqCst);
+    }
+
+    pub(crate) fn restored_reserved_space(&self) -> Option<u8> {
+        let val = self.restored_reserved_space.load(Ordering::Acquire);
+        if val == RESERVED_SPACE_NOT_SET {
+            None
+        } else {
+            u8::try_from(val).ok()
         }
     }
 
@@ -3783,6 +3804,28 @@ impl Pager {
                 self.clear_page_cache(false);
                 // Invalidate cached schema cookie to force re-read on next access
                 self.set_schema_cookie(None);
+                // After a quiescent external restore, the database may have switched page size or
+                // reserved-space/checksum layout: align this pager's encryption/checksum context
+                // with `SharedPagerState`.
+                if let Some(size) = PageSize::new(self.shared.page_size.load(Ordering::Acquire)) {
+                    self.reset_page_size_in_encryption_ctx(size);
+                }
+                if let Some(reserved) = self.shared.restored_reserved_space() {
+                    self.set_reserved_space(reserved);
+                    if !self.is_encryption_ctx_set() && !self.has_external_page_codec() {
+                        if reserved != crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES {
+                            self.reset_checksum_context();
+                        } else {
+                            {
+                                let mut io_ctx = self.io_ctx.write();
+                                io_ctx.restore_checksum();
+                            }
+                            if let Some(wal) = self.wal.as_ref() {
+                                wal.set_io_context(self.io_ctx.read().clone());
+                            }
+                        }
+                    }
+                }
             }
         }
         Ok(())

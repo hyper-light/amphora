@@ -5510,6 +5510,13 @@ pub fn op_transaction_inner(
             // Can only read header if page 1 has been allocated already
             // begin_write_tx that happens, but not begin_read_tx
             OpTransactionState::CheckSchemaCookie => {
+                if is_main_db
+                    && program.prepare_context.restore_epoch
+                        != program.connection.db.shared_wal.restore_epoch()
+                {
+                    program.connection.maybe_update_schema();
+                    return Err(LimboError::SchemaUpdated.into());
+                }
                 let res = get_schema_cookie(&pager, mv_store.as_ref(), program, *db);
                 match res {
                     Ok(IOResult::Done(header_schema_cookie)) => {

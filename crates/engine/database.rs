@@ -797,8 +797,21 @@ pub struct Database<
     /// Amphora (G7 step 2, `AC-NS.2.1`): the versioned storage its connections' B-trees are on,
     /// once a connection has asked for it (`storage::versioned::switch`).
     versioned: Mutex<Option<Arc<crate::storage::versioned::switch::Storage>>>,
+    /// Last known OS file identity `(dev, ino)` of `self.path` for quiescent external restores:
+    /// lets reload keep the existing locked descriptor on in-place overwrites and reopen + re-key
+    /// `DATABASE_MANAGER` only when atomic rename replaces the inode.
+    #[cfg(feature = "conn_raw_api")]
+    file_id: Mutex<Option<io::FileId>>,
+    /// Key under which this `Database` is currently registered in `DATABASE_MANAGER`, if any.
+    #[cfg_attr(not(feature = "conn_raw_api"), allow(dead_code))]
+    registry_key: Mutex<Option<DatabaseKey>>,
+    /// Encryption key provided at `Database::open` time, retained solely for staging catalog
+    /// validation during `reload_wal_after_external_restore` (never exposed to `connect` or
+    /// registry lookups).
+    #[cfg(feature = "conn_raw_api")]
+    restore_encryption_key: Mutex<Option<EncryptionKey>>,
     // Last: release this Database's I/O fields before its scoped registry entry.
-    registry_registration: std::sync::OnceLock<ScopedRegistration>,
+    registry_registration: Mutex<Option<ScopedRegistration>>,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -893,11 +906,19 @@ impl Database {
             BufferPool::DEFAULT_ARENA_SIZE
         };
 
-        let encryption_cipher_mode = if let Some(encryption_opts) = encryption_opts {
-            Some(CipherMode::try_from(encryption_opts.cipher.as_str())?)
-        } else {
-            None
-        };
+        let (encryption_cipher_mode, restore_encryption_key) =
+            if let Some(encryption_opts) = encryption_opts {
+                let cipher = CipherMode::try_from(encryption_opts.cipher.as_str())?;
+                #[cfg(feature = "conn_raw_api")]
+                let key = Some(EncryptionKey::from_hex_string(&encryption_opts.hexkey)?);
+                #[cfg(not(feature = "conn_raw_api"))]
+                let key: Option<()> = None;
+                (Some(cipher), key)
+            } else {
+                (None, None)
+            };
+        #[cfg(not(feature = "conn_raw_api"))]
+        let _ = restore_encryption_key;
 
         let init_page_1 = if db_size == 0 {
             let default_page_1 = pager::default_page1(encryption_cipher_mode.as_ref());
@@ -928,6 +949,11 @@ impl Database {
             }
             Arc::new(costs)
         };
+
+        #[cfg(feature = "conn_raw_api")]
+        let initial_file_id = (!is_memory_like(&path))
+            .then(|| io.file_id(&path).ok())
+            .flatten();
 
         let db = Database {
             mv_store,
@@ -983,7 +1009,12 @@ impl Database {
 
             durable_storage: None,
             versioned: Mutex::new(None),
-            registry_registration: std::sync::OnceLock::new(),
+            #[cfg(feature = "conn_raw_api")]
+            file_id: Mutex::new(initial_file_id),
+            registry_key: Mutex::new(None),
+            #[cfg(feature = "conn_raw_api")]
+            restore_encryption_key: Mutex::new(restore_encryption_key),
+            registry_registration: Mutex::new(None),
         };
 
         db.register_global_builtin_extensions()
@@ -1526,7 +1557,11 @@ impl Database {
                 // Register the opened database and remove the Opening sentinel.
                 if let Some(registry_key) = state.registry_key.take() {
                     let mut registry = DATABASE_MANAGER.lock();
-                    registry.insert(registry_key, RegistryEntry::Ready(Arc::downgrade(db)));
+                    registry.insert(
+                        registry_key.clone(),
+                        RegistryEntry::Ready(Arc::downgrade(db)),
+                    );
+                    *db.registry_key.lock() = Some(registry_key);
                 }
             }
             Err(_) => {
@@ -1747,12 +1782,14 @@ impl Database {
                             key: key.clone(),
                             owner: Arc::downgrade(&db),
                         };
-                        if db.registry_registration.set(registration).is_err() {
+                        let mut guard = db.registry_registration.lock();
+                        if guard.is_some() {
                             return Err(LimboError::InternalError(
                                 "database registry ownership was already installed".to_string(),
                             )
                             .into());
                         }
+                        *guard = Some(registration);
                     }
 
                     // Check: https://github.com/tursodatabase/turso/pull/1761#discussion_r2154013123
@@ -2566,26 +2603,94 @@ impl Database {
     /// and rebuilding this view. Invalidating old durability proofs does not make concurrent
     /// external file replacement atomic with running operations.
     pub fn reload_wal_after_external_restore(self: &Arc<Self>) -> Result<()> {
+        self.reload_wal_after_external_restore_with_encryption(None, None)
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    /// Like [`Self::reload_wal_after_external_restore`], supplying the caller's cipher/key when
+    /// reloading an encrypted database so the restored image is validated and its catalog parsed
+    /// before mutating any live WAL, file descriptor, buffer pool, or registry state.
+    pub fn reload_wal_after_external_restore_with_encryption(
+        self: &Arc<Self>,
+        cipher_override: Option<CipherMode>,
+        encryption_key: Option<EncryptionKey>,
+    ) -> Result<()> {
         if self.page_codec_id.is_some() {
             return Err(LimboError::InvalidArgument(
                 "reloading a WAL after external restore is not supported with an external page codec"
                     .to_string(),
             ));
         }
-        let flags = self.open_flags;
-        // Drop every cached file page AND WAL frame for this database from any shared page pool
-        // BEFORE reopening or reparsing so neither warmed nor fresh connections can read stale
-        // pre-restore images under reused `(file_id, page, version)` keys.
-        if let Some(shared) = self.db_file.shared_pages() {
-            shared.forget_all();
-        }
-        // Reopen the main database file descriptor so atomic-rename restores to a new inode are
-        // observed immediately rather than reading the unlinked pre-restore file.
-        if !self.is_in_memory_db() {
-            let reopened = self.io.open_file(&self.path, flags, false)?;
-            self.db_file.reopen_after_external_restore(reopened);
+        let cipher = cipher_override.unwrap_or_else(|| self.encryption_cipher_mode.get());
+        let encryption_key = encryption_key.or_else(|| self.restore_encryption_key.lock().clone());
+        let encrypted = encryption_key.is_some() || !matches!(cipher, CipherMode::None);
+        if !matches!(cipher, CipherMode::None) && encryption_key.is_none() {
+            return Err(LimboError::InvalidArgument(
+                "reloading an encrypted database after external restore requires the encryption key"
+                    .to_string(),
+            ));
         }
 
+        let flags = self.open_flags;
+        // Stage 1: inspect inode identity without touching live state.
+        // - In-place overwrite (same inode): reuse the existing `db_file` descriptor so Unix
+        //   advisory locking is never dropped by closing a second fd to the same inode.
+        // - Atomic rename (new inode): verify no other live `Database` owns the new inode, then
+        //   open and lock the replacement file descriptor.
+        type StagedRestoreFile = (
+            Option<Arc<dyn io::File>>,
+            Option<io::FileId>,
+            Arc<dyn DatabaseStorage>,
+        );
+        let (reopened, new_file_id, candidate_storage): StagedRestoreFile = if !self
+            .is_in_memory_db()
+        {
+            let current_fid = self.io.file_id(&self.path)?;
+            let old_fid = *self.file_id.lock();
+            if old_fid != Some(current_fid) {
+                let new_key = DatabaseKey::File(current_fid, self.io.registry_scope());
+                {
+                    let registry = DATABASE_MANAGER.lock();
+                    match registry.get(&new_key) {
+                        Some(RegistryEntry::Opening) => {
+                            return Err(LimboError::LockingError(format!(
+                                "cannot reload '{}': restored file is currently being opened",
+                                self.path
+                            )));
+                        }
+                        Some(RegistryEntry::Ready(weak))
+                            if weak
+                                .upgrade()
+                                .is_some_and(|other| !Arc::ptr_eq(&other, self)) =>
+                        {
+                            return Err(LimboError::LockingError(format!(
+                                "cannot reload '{}': restored inode is already open under another database handle",
+                                self.path
+                            )));
+                        }
+                        _ => {}
+                    }
+                }
+                let file = self.io.open_file(&self.path, flags, true)?;
+                let candidate: Arc<dyn DatabaseStorage> = Arc::new(DatabaseFile::new(file.clone()));
+                (Some(file), Some(current_fid), candidate)
+            } else {
+                if std::env::var("LIMBO_DISABLE_FILE_LOCK").is_err()
+                    && !flags.intersects(OpenFlags::ReadOnly | OpenFlags::NoLock)
+                {
+                    self.db_file.reacquire_lock()?;
+                }
+                let candidate = self
+                    .db_file
+                    .unshared_storage_clone()
+                    .unwrap_or_else(|| self.db_file.clone());
+                (None, Some(current_fid), candidate)
+            }
+        } else {
+            (None, None, self.db_file.clone())
+        };
+
+        // Stage 2: recover candidate `-wal` and `-wal2` segments and validate page geometry.
         #[cfg(host_shared_wal)]
         let shared_authority = self.open_shared_wal_coordination_for_open()?;
         #[cfg(not(host_shared_wal))]
@@ -2601,7 +2706,7 @@ impl Database {
                             &self.wal_path,
                             flags,
                             authority,
-                            &self.db_file,
+                            &candidate_storage,
                         )?
                     } else {
                         WalFileShared::open_shared_if_exists(&self.io, &self.wal_path, flags)?
@@ -2616,11 +2721,9 @@ impl Database {
             }
         };
         // Decision 45: recover `-wal2` alongside `-wal`, matching cold `Database::open`.
-        let new_second_wal = WalFileShared::open_second_segment_if_exists(
-            &self.io,
-            &storage::wal::second_segment_path(&self.wal_path),
-            flags,
-        )?;
+        let second_wal_path = storage::wal::second_segment_path(&self.wal_path);
+        let new_second_wal =
+            WalFileShared::open_second_segment_if_exists(&self.io, &second_wal_path, flags)?;
         let segment_seq = |segment: &Arc<RwLock<WalFileShared>>| {
             let shared = segment.read();
             shared
@@ -2636,6 +2739,115 @@ impl Database {
                     "restored WAL segments have checkpoint sequences {first_seq:?} and {second_seq:?}, neither one past the other"
                 ))
             })?;
+
+        let mut hdr_st = DbHeaderReadState::Start;
+        let header = self
+            .io
+            .block(|| Self::read_db_header_buf_from(&candidate_storage, &mut hdr_st))?;
+        let file_is_empty = matches!(&header, DbHeaderRead::Short { len: 0, .. });
+        let (header_reserved_bytes, header_page_size) = if file_is_empty {
+            (None, None)
+        } else {
+            let (reserved, page_size) = Self::plain_header_page_info(&header, encrypted)?;
+            (Some(reserved), Some(page_size))
+        };
+        let (new_page_size, wal_enabled, last_checksum_and_max_frame, has_wal_frames) = {
+            let current_wal = match segments.current() {
+                storage::log_segments::SegmentId::First => new_first_wal.read(),
+                storage::log_segments::SegmentId::Second => new_second_wal.read(),
+            };
+            let page_size =
+                self.determine_actual_page_size(&current_wal, None, header_page_size)?;
+            let wal_enabled = current_wal.metadata.enabled.load(Ordering::SeqCst);
+            let last_checksum_and_max_frame = current_wal.last_checksum_and_max_frame();
+            let current_frames = current_wal.metadata.max_frame.load(Ordering::Acquire);
+            drop(current_wal);
+            let other_frames = match segments.current() {
+                storage::log_segments::SegmentId::First => new_second_wal
+                    .read()
+                    .metadata
+                    .max_frame
+                    .load(Ordering::Acquire),
+                storage::log_segments::SegmentId::Second => new_first_wal
+                    .read()
+                    .metadata
+                    .max_frame
+                    .load(Ordering::Acquire),
+            };
+            (
+                page_size,
+                wal_enabled,
+                last_checksum_and_max_frame,
+                current_frames > 0 || other_frames > 0,
+            )
+        };
+        let new_reserved_bytes = header_reserved_bytes.or_else(|| {
+            if !matches!(cipher, CipherMode::None) {
+                Some(cipher.metadata_size() as u8)
+            } else {
+                None
+            }
+        });
+        let disable_checksums =
+            new_reserved_bytes.is_some_and(|reserved| reserved != CHECKSUM_REQUIRED_RESERVED_BYTES);
+
+        // Stage 3: validate page 1 (checksum / decryption / page size) and parse the restored
+        // catalog on an isolated staging pool & pager BEFORE mutating any live state on `self`.
+        let restored_schema = if file_is_empty && !has_wal_frames {
+            let mut empty = Schema::with_options(
+                self.experimental_custom_types_enabled(),
+                self.dialect.as_ref(),
+            )?;
+            empty.generated_columns_enabled = self.opts.enable_generated_columns;
+            Arc::new(empty)
+        } else {
+            let staging_pool = BufferPool::begin_init(&self.io, BufferPool::TEST_ARENA_SIZE);
+            staging_pool.finalize_with_page_size(new_page_size.get() as usize)?;
+            let staging_shared_wal = SharedLog::recover(
+                new_first_wal.clone(),
+                new_second_wal.clone(),
+                Some(second_wal_path),
+            )?;
+            let staging_wal: Option<Arc<dyn Wal>> = if wal_enabled {
+                Some(Arc::new(WalFile::new(
+                    self.io.clone(),
+                    staging_shared_wal.clone(),
+                    last_checksum_and_max_frame,
+                    staging_pool.clone(),
+                )))
+            } else {
+                None
+            };
+            let staging_pager = Arc::new(Pager::new(
+                candidate_storage.clone(),
+                staging_wal,
+                self.io.clone(),
+                PageCache::default(),
+                staging_pool,
+                Arc::new(SharedPagerState::new(None)),
+            )?);
+            staging_pager.set_page_size(new_page_size);
+            if let Some(reserved) = new_reserved_bytes {
+                staging_pager.set_reserved_space_bytes(reserved);
+            }
+            if disable_checksums {
+                staging_pager.reset_checksum_context();
+            }
+            if let Some(ref key) = encryption_key {
+                staging_pager.enable_encryption(true);
+                staging_pager.set_encryption_context(cipher, key)?;
+            }
+            let refresh_conn =
+                self.new_connection(true, staging_pager.clone(), encryption_key.clone(), 0, None)?;
+            let parse_res = refresh_conn.force_reparse_schema_without_publish();
+            let parsed = refresh_conn.schema.read().clone();
+            drop(refresh_conn);
+            drop(staging_pager);
+            drop(staging_shared_wal);
+            parse_res?;
+            parsed
+        };
+
         let new_first_wal = Arc::try_unwrap(new_first_wal).map_err(|_| {
             LimboError::InternalError(
                 "new WAL first segment unexpectedly shared during external restore reload"
@@ -2648,18 +2860,55 @@ impl Database {
                     .to_string(),
             )
         })?;
+
+        // Stage 4: prepare owned schema and reconfigure the live buffer pool before mutating
+        // file/WAL/registry state so any allocation failure leaves the live database untouched.
+        let restored_schema_owned = match Arc::try_unwrap(restored_schema) {
+            Ok(schema) => schema,
+            Err(shared) => crate::alloc::TryClone::try_clone(shared.as_ref())?,
+        };
+        self.buffer_pool
+            .reconfigure_page_size_after_external_restore(new_page_size.get() as usize)?;
+
+        // Stage 5: commit the validated restore atomically to live state.
+        if let Some(shared) = self.db_file.shared_pages() {
+            shared.forget_all();
+        }
+        if let (Some(reopened_file), Some(new_fid)) = (reopened, new_file_id) {
+            self.db_file.reopen_after_external_restore(reopened_file);
+            *self.file_id.lock() = Some(new_fid);
+            let new_key = DatabaseKey::File(new_fid, self.io.registry_scope());
+            let mut registry = DATABASE_MANAGER.lock();
+            let mut reg_key = self.registry_key.lock();
+            if let Some(old_key) = reg_key.as_ref() {
+                if *old_key != new_key {
+                    let owned = matches!(
+                        registry.get(old_key),
+                        Some(RegistryEntry::Ready(owner))
+                            if owner.upgrade().is_some_and(|other| Arc::ptr_eq(&other, self))
+                    );
+                    if owned {
+                        registry.remove(old_key);
+                    }
+                    registry.insert(new_key.clone(), RegistryEntry::Ready(Arc::downgrade(self)));
+                    *reg_key = Some(new_key.clone());
+                }
+            }
+            if let Some(scoped) = self.registry_registration.lock().as_mut() {
+                scoped.key = new_key;
+            }
+        }
+        self.pager_state
+            .set_restored_page_info(new_page_size, new_reserved_bytes);
         self.shared_wal.replace_after_external_restore(
             new_first_wal.into_inner(),
             new_second_wal.into_inner(),
             segments,
         );
-        // Reparse and unconditionally publish the restored catalog so both warmed and newly
-        // opened connections immediately observe restored tables/columns even when `schema_cookie`
-        // equals the pre-restore value.
-        let refresh_conn = self._connect(true, None, None, None, None, StatsRefresh::Blocking)?;
-        refresh_conn.force_reparse_schema_without_publish()?;
-        refresh_conn.publish_schema_after_external_restore()?;
-        drop(refresh_conn);
+        self.with_schema_mut(|current| {
+            *current = restored_schema_owned;
+            Ok(())
+        })?;
         if self.mvcc_enabled() || journal_mode::logical_log_exists(std::path::Path::new(&self.path))
         {
             let mv_store = journal_mode::open_mv_store(
@@ -2672,8 +2921,14 @@ impl Database {
                 self.experimental_mvcc_passive_checkpoint_enabled(),
             )?;
             self.mv_store.store(Some(mv_store.clone()));
-            let mvcc_bootstrap_conn =
-                self._connect(true, None, None, None, None, StatsRefresh::Blocking)?;
+            let mvcc_bootstrap_conn = self._connect(
+                true,
+                None,
+                encryption_key,
+                None,
+                None,
+                StatsRefresh::Blocking,
+            )?;
             match mv_store.bootstrap(mvcc_bootstrap_conn.clone()) {
                 Ok(()) => {}
                 Err(LimboError::SchemaUpdated) => {
@@ -3085,6 +3340,13 @@ impl Database {
     /// it finishes. The header may not be complete, in which case a
     /// [`DbHeaderRead::Short`] is returned.
     fn read_db_header_buf(&self, st: &mut DbHeaderReadState) -> IOResultOr<DbHeaderRead> {
+        Self::read_db_header_buf_from(&self.db_file, st)
+    }
+
+    fn read_db_header_buf_from(
+        db_file: &Arc<dyn DatabaseStorage>,
+        st: &mut DbHeaderReadState,
+    ) -> IOResultOr<DbHeaderRead> {
         loop {
             match st {
                 DbHeaderReadState::Start => {
@@ -3094,7 +3356,7 @@ impl Database {
                     );
                     let buf = Arc::new(Buffer::new_temporary(PageSize::MIN as usize));
                     let c = new_header_read_completion(buf.clone());
-                    let c = self.db_file.read_header(c)?;
+                    let c = db_file.read_header(c)?;
                     *st = DbHeaderReadState::Reading { buf, completion: c };
                 }
                 DbHeaderReadState::Reading { completion, .. } => {

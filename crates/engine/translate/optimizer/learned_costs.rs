@@ -789,53 +789,122 @@ impl AtomicWeightsSlot {
         if self.seq.load(Ordering::Relaxed) != s1 {
             return None;
         }
-        let weights = has_weights.then_some(LearnedWeights {
-            row_in_pages: has_row_in_pages.then_some(row_in_pages),
-            seek,
-            hash_build,
-            hash_probe,
-            sort,
-            bloom_probe,
-            where_step,
-            page_miss: None,
-        });
+        let weights = if has_weights {
+            Some(LearnedWeights {
+                row_in_pages: if has_row_in_pages {
+                    Some(row_in_pages)
+                } else {
+                    None
+                },
+                seek,
+                hash_build,
+                hash_probe,
+                sort,
+                bloom_probe,
+                where_step,
+                page_miss: None,
+            })
+        } else {
+            None
+        };
         Some(WeightsSnapshot {
             weights,
             cost_margin,
-            row_nanos: has_row_nanos.then_some(row_nanos_val),
+            row_nanos: if has_row_nanos {
+                Some(row_nanos_val)
+            } else {
+                None
+            },
         })
+    }
+    #[inline]
+    fn try_read_any(&self) -> Option<(u64, WeightsSnapshot)> {
+        let s1 = self.seq.load(Ordering::Acquire);
+        if (s1 & 1) != 0 {
+            return None;
+        }
+        let slot_gen = self.generation.load(Ordering::Relaxed);
+        if slot_gen == 0 {
+            return None;
+        }
+        let has_weights = self.has_weights.load(Ordering::Relaxed);
+        let has_row_in_pages = self.has_row_in_pages.load(Ordering::Relaxed);
+        let has_row_nanos = self.has_row_nanos.load(Ordering::Relaxed);
+        let row_in_pages = f64::from_bits(self.row_in_pages.load(Ordering::Relaxed));
+        let seek = f64::from_bits(self.seek.load(Ordering::Relaxed));
+        let hash_build = f64::from_bits(self.hash_build.load(Ordering::Relaxed));
+        let hash_probe = f64::from_bits(self.hash_probe.load(Ordering::Relaxed));
+        let sort = f64::from_bits(self.sort.load(Ordering::Relaxed));
+        let bloom_probe = f64::from_bits(self.bloom_probe.load(Ordering::Relaxed));
+        let where_step = f64::from_bits(self.where_step.load(Ordering::Relaxed));
+        let cost_margin = f64::from_bits(self.cost_margin.load(Ordering::Relaxed));
+        let row_nanos_val = f64::from_bits(self.row_nanos.load(Ordering::Relaxed));
+        fence(Ordering::Acquire);
+        if self.seq.load(Ordering::Relaxed) != s1 {
+            return None;
+        }
+        let weights = if has_weights {
+            Some(LearnedWeights {
+                row_in_pages: if has_row_in_pages {
+                    Some(row_in_pages)
+                } else {
+                    None
+                },
+                seek,
+                hash_build,
+                hash_probe,
+                sort,
+                bloom_probe,
+                where_step,
+                page_miss: None,
+            })
+        } else {
+            None
+        };
+        Some((
+            slot_gen,
+            WeightsSnapshot {
+                weights,
+                cost_margin,
+                row_nanos: if has_row_nanos {
+                    Some(row_nanos_val)
+                } else {
+                    None
+                },
+            },
+        ))
     }
 }
 
-/// Lock-free, `Arc`-free 4-slot generation-tagged ring buffer holding derived planner weights,
-/// cost margin, and row nanos.
+/// Lock-free, `Arc`-free generation-tagged ring buffer holding derived planner weights, cost
+/// margin, and row nanos, backed by two alternating low-churn calibrated anchor slots.
 ///
 /// Writers (serialized by `LearnedCosts::rates`) write `next_gen = published_gen + 1` into
-/// `slot(next_gen & 3)` and advance `published_gen` ONLY after that slot's sequence is even.
-/// Readers load `g = published_gen` and accept `slot(g & 3)` ONLY if `slot.generation == g` and
-/// `slot.seq` is even and unchanged, guaranteeing:
-/// 1. A descheduled publisher leaves `slot(published_gen)` untouched and even (zero spinning).
-/// 2. Readers never observe an unpublished rewrite or reverse publication order (strict
-///    linearizability).
+/// `slots[next_gen & 7]` and advance `published_gen` ONLY after that slot's sequence is even.
+/// On the first calibrated publication (and periodically thereafter), writers also alternate
+/// writing the calibrated snapshot into `anchors[anchor_gen & 1]`. Because at most one anchor
+/// slot can ever be mid-write at a time, even under sustained writer lapping a reader can always
+/// fall back to a valid calibrated snapshot without blocking, spinning, or degrading to static
+/// defaults.
 #[derive(Debug)]
 struct WeightsRing {
-    slot_0: AtomicWeightsSlot,
-    slot_1: AtomicWeightsSlot,
-    slot_2: AtomicWeightsSlot,
-    slot_3: AtomicWeightsSlot,
-    /// Monotonic generation of the most recently completed publication.
+    slots: [AtomicWeightsSlot; 8],
+    /// Two alternating sticky calibrated anchor slots (never both mid-write at once).
+    anchors: [AtomicWeightsSlot; 2],
+    /// Monotonic generation of the most recently completed ring publication.
     published_gen: AtomicU64,
+    /// Monotonic generation of the most recently completed calibrated anchor publication.
+    anchor_gen: AtomicU64,
 }
 
 impl WeightsRing {
     fn from_rates(rates: &Rates) -> Self {
         let snap = WeightsSnapshot::from_rates(rates);
         let ring = Self {
-            slot_0: AtomicWeightsSlot::new(),
-            slot_1: AtomicWeightsSlot::new(),
-            slot_2: AtomicWeightsSlot::new(),
-            slot_3: AtomicWeightsSlot::new(),
+            slots: std::array::from_fn(|_| AtomicWeightsSlot::new()),
+            anchors: std::array::from_fn(|_| AtomicWeightsSlot::new()),
             published_gen: AtomicU64::new(0),
+            anchor_gen: AtomicU64::new(0),
         };
         ring.store(snap);
         ring
@@ -843,31 +912,82 @@ impl WeightsRing {
 
     #[inline]
     fn slot(&self, generation: u64) -> &AtomicWeightsSlot {
-        match generation & 3 {
-            0 => &self.slot_0,
-            1 => &self.slot_1,
-            2 => &self.slot_2,
-            _ => &self.slot_3,
-        }
+        let [first, ..] = &self.slots;
+        let idx = usize::try_from(generation & 7).unwrap_or(0);
+        self.slots.get(idx).unwrap_or(first)
     }
 
-    /// Publishes `snap` into the next ring slot and advances `published_gen` once complete.
-    /// Caller must hold `LearnedCosts::rates` so writers are strictly serialized.
+    #[inline]
+    fn anchor(&self, anchor_gen: u64) -> &AtomicWeightsSlot {
+        let [first, ..] = &self.anchors;
+        let idx = usize::try_from(anchor_gen & 1).unwrap_or(0);
+        self.anchors.get(idx).unwrap_or(first)
+    }
+
+    /// Publishes `snap` into the next ring slot (and an alternating anchor slot when calibrated)
+    /// and advances `published_gen` once complete. Caller must hold `LearnedCosts::rates`.
     fn store(&self, snap: WeightsSnapshot) {
         let next_gen = self.published_gen.load(Ordering::Relaxed).wrapping_add(1);
         self.slot(next_gen).write(next_gen, snap);
+        if snap.weights.is_some() {
+            let cur_anchor = self.anchor_gen.load(Ordering::Relaxed);
+            // Always capture the first two calibrated publications into both anchor slots so a
+            // complete quiet backup exists immediately, then refresh at most every 64 publishes.
+            if cur_anchor < 2 || (next_gen & 63) == 0 {
+                let next_anchor = cur_anchor.wrapping_add(1);
+                self.anchor(next_anchor).write(next_anchor, snap);
+                self.anchor_gen.store(next_anchor, Ordering::Release);
+            }
+        }
         self.published_gen.store(next_gen, Ordering::Release);
     }
 
     /// Reads the latest published `WeightsSnapshot` with bounded non-spinning attempts (one pass
-    /// per ring slot). Returns `None` only if an actively-progressing publisher lapped all 4 slots
+    /// per ring slot). Returns `None` only if an actively-progressing publisher lapped all 8 slots
     /// across every attempt, never when a publisher is paused mid-write.
     #[inline]
     fn try_load(&self) -> Option<WeightsSnapshot> {
-        for _ in 0..4 {
+        for _ in 0..8 {
             let g = self.published_gen.load(Ordering::Acquire);
             if let Some(snap) = self.slot(g).try_read_generation(g) {
                 return Some(snap);
+            }
+        }
+        None
+    }
+
+    /// Non-blocking fallback when every generation-matched attempt was lapped by an active writer:
+    /// picks the newest coherent ring slot `<= published_gen`, or else one of the two alternating
+    /// calibrated anchor slots (at least one of which is always quiet and even once calibrated).
+    #[cold]
+    fn try_load_fallback(&self) -> Option<WeightsSnapshot> {
+        let max_gen = self.published_gen.load(Ordering::Acquire);
+        let mut best: Option<(u64, WeightsSnapshot)> = None;
+        for slot in &self.slots {
+            if let Some((slot_gen, snap)) = slot.try_read_any() {
+                if slot_gen <= max_gen && best.is_none_or(|(best_gen, _)| slot_gen > best_gen) {
+                    best = Some((slot_gen, snap));
+                }
+            }
+        }
+        if let Some((_, snap)) = best {
+            return Some(snap);
+        }
+        let ag = self.anchor_gen.load(Ordering::Acquire);
+        if ag > 0 {
+            if let Some(snap) = self.anchor(ag).try_read_generation(ag) {
+                return Some(snap);
+            }
+            if ag > 1 {
+                let prev = ag.wrapping_sub(1);
+                if let Some(snap) = self.anchor(prev).try_read_generation(prev) {
+                    return Some(snap);
+                }
+            }
+            for anchor in &self.anchors {
+                if let Some((_, snap)) = anchor.try_read_any() {
+                    return Some(snap);
+                }
             }
         }
         None
@@ -1227,6 +1347,9 @@ impl LearnedCosts {
             if let Some(snap) = self.snapshot.try_load() {
                 return snap;
             }
+        }
+        if let Some(snap) = self.snapshot.try_load_fallback() {
+            return snap;
         }
         WeightsSnapshot {
             weights: None,
@@ -3029,5 +3152,27 @@ mod ab_tests {
             pub_gen
         );
         assert_eq!(costs.weights(), Some(pub_weights));
+
+        // Standards P2 regression: even if every ring slot is marked in-flight (odd) AND the
+        // `rates` mutex is held so all `try_lock()` attempts fail, `load_snapshot_slow()` must
+        // recover calibrated weights from the quiet anchor slot instead of degrading to static
+        // defaults (`weights: None`).
+        let _held_again = costs.rates.lock();
+        for slot in &costs.snapshot.slots {
+            let s = slot.seq.load(Ordering::Relaxed);
+            slot.seq.store(s | 1, Ordering::Release);
+        }
+        // Even with one anchor also in-flight, the alternating second anchor remains calibrated.
+        let active_anchor = costs.snapshot.anchor_gen.load(Ordering::Relaxed);
+        let busy_anchor = costs.snapshot.anchor(active_anchor);
+        let anchor_seq = busy_anchor.seq.load(Ordering::Relaxed);
+        busy_anchor.seq.store(anchor_seq | 1, Ordering::Release);
+
+        let fallback = costs.load_snapshot_slow();
+        assert!(
+            fallback.weights.is_some(),
+            "contended snapshot fallback must preserve valid calibration rather than static defaults"
+        );
+        drop(_held_again);
     }
 }

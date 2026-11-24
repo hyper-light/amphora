@@ -144,7 +144,7 @@ fn only_an_ordering_with_a_limit_tells_its_sorter_how_many_rows() {
 
 /// Spec P1 regression: spilling a wide-payload `ORDER BY k NULLS LAST LIMIT 2` / `LIMIT 1 OFFSET 2`
 /// across low `cache_size = 200` vs high `cache_size = 2048` must preserve the exact same tied
-/// arrival order (`[1, 2]` and `[3]`).
+/// arrival order (`[1, 2]` and `[3]`) when the full 520 KiB payload flows through the sorter.
 #[test]
 fn spilled_top_n_matches_in_memory_arrival_order_on_tied_keys() {
     let dir = tempfile::tempdir().unwrap();
@@ -172,24 +172,90 @@ fn spilled_top_n_matches_in_memory_arrival_order_on_tied_keys() {
             .unwrap();
         let top2 = rows(
             &conn,
-            "SELECT id, length(payload) FROM wide ORDER BY k NULLS LAST LIMIT 2",
+            "SELECT id, payload FROM wide ORDER BY k NULLS LAST LIMIT 2",
         );
+        assert_eq!(top2.len(), 2, "cache_size={cache_pages} LIMIT 2 len");
         assert_eq!(
-            top2,
-            vec![
-                vec![Value::from_i64(1), Value::from_i64(520_000)],
-                vec![Value::from_i64(2), Value::from_i64(520_000)],
-            ],
+            top2.iter().map(|r| r[0].clone()).collect::<Vec<_>>(),
+            vec![Value::from_i64(1), Value::from_i64(2)],
             "cache_size={cache_pages} LIMIT 2"
         );
+        assert_eq!(top2[0][1].to_string().len(), 520_000);
+        assert_eq!(top2[1][1].to_string().len(), 520_000);
+
         let third = rows(
             &conn,
-            "SELECT id, length(payload) FROM wide ORDER BY k NULLS LAST LIMIT 1 OFFSET 2",
+            "SELECT id, payload FROM wide ORDER BY k NULLS LAST LIMIT 1 OFFSET 2",
         );
         assert_eq!(
-            third,
-            vec![vec![Value::from_i64(3), Value::from_i64(520_000)]],
+            third.len(),
+            1,
+            "cache_size={cache_pages} LIMIT 1 OFFSET 2 len"
+        );
+        assert_eq!(
+            third[0][0],
+            Value::from_i64(3),
             "cache_size={cache_pages} LIMIT 1 OFFSET 2"
+        );
+        assert_eq!(third[0][1].to_string().len(), 520_000);
+    }
+}
+
+/// Spec P1-4 regression: a spilled top-K sort with a custom comparator (`INTEGER[]`) must apply
+/// SQL sort direction (`DESC`) and `NULLS LAST` identically to the in-memory sort.
+#[test]
+fn spilled_top_n_respects_desc_nulls_last_with_custom_array_comparator() {
+    let dir = tempfile::tempdir().unwrap();
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let options = OpenOptions::new(Arc::new(SqliteDialect))
+        .db_opts(DatabaseOpts::new().with_custom_types(true));
+    let db = Database::open(io, dir.path().join("arr.db").to_str().unwrap(), options).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE arr (id INTEGER PRIMARY KEY, a INTEGER[], payload TEXT) STRICT")
+        .unwrap();
+    let pad = "z".repeat(520_000);
+    for (id, arr_expr) in [
+        (1i64, "ARRAY[1, 1]"),
+        (2i64, "ARRAY[1, 2]"),
+        (3i64, "ARRAY[2, 0]"),
+        (4i64, "NULL"),
+    ] {
+        let mut ins = conn
+            .prepare(format!(
+                "INSERT INTO arr (id, a, payload) VALUES ({id}, {arr_expr}, ?1)"
+            ))
+            .unwrap();
+        ins.bind_at(NonZero::new(1).unwrap(), Value::build_text(pad.clone()))
+            .unwrap();
+        ins.run_ignore_rows().unwrap();
+    }
+
+    let expected_full = vec![
+        Value::from_i64(3),
+        Value::from_i64(2),
+        Value::from_i64(1),
+        Value::from_i64(4),
+    ];
+    for cache_pages in [2048, 200] {
+        conn.execute(format!("PRAGMA cache_size = {cache_pages}"))
+            .unwrap();
+        let full = rows(
+            &conn,
+            "SELECT id, payload FROM arr ORDER BY a DESC NULLS LAST",
+        );
+        assert_eq!(
+            full.iter().map(|r| r[0].clone()).collect::<Vec<_>>(),
+            expected_full,
+            "full ordering at cache_size={cache_pages}"
+        );
+        let top2 = rows(
+            &conn,
+            "SELECT id, payload FROM arr ORDER BY a DESC NULLS LAST LIMIT 2",
+        );
+        assert_eq!(
+            top2.iter().map(|r| r[0].clone()).collect::<Vec<_>>(),
+            vec![Value::from_i64(3), Value::from_i64(2)],
+            "LIMIT 2 at cache_size={cache_pages}"
         );
     }
 }

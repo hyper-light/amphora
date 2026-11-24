@@ -2262,6 +2262,9 @@ pub struct PrepareContext {
     /// attach/detach, extension registration, etc.) without rebuilding the full
     /// context on every step.
     generation: u64,
+    /// External-restore epoch at prepare time so statements prepared before a quiescent external
+    /// restore always reprepare even when the restored database shares the same `schema_cookie`.
+    pub(crate) restore_epoch: u64,
 }
 
 impl PrepareContext {
@@ -2269,6 +2272,7 @@ impl PrepareContext {
         Self {
             database_ptr: connection.database_ptr(),
             generation: connection.prepare_context_generation(),
+            restore_epoch: connection.db.shared_wal.restore_epoch(),
         }
     }
 
@@ -2276,6 +2280,7 @@ impl PrepareContext {
     pub fn matches_connection(&self, connection: &Connection) -> bool {
         self.database_ptr == connection.database_ptr()
             && self.generation == connection.prepare_context_generation()
+            && self.restore_epoch == connection.db.shared_wal.restore_epoch()
     }
 }
 

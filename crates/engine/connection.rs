@@ -3699,7 +3699,15 @@ impl Connection {
 
     #[cfg(feature = "conn_raw_api")]
     pub fn reload_wal_after_external_restore(&self) -> Result<()> {
-        self.db.reload_wal_after_external_restore()
+        let key = self.encryption_key.read().clone();
+        let cipher = self.encryption_cipher_mode.get();
+        let cipher_override = if !matches!(cipher, CipherMode::None) {
+            Some(cipher)
+        } else {
+            None
+        };
+        self.db
+            .reload_wal_after_external_restore_with_encryption(cipher_override, key)
     }
 
     /// Enable or disable writing portable logical-change metadata into MVCC
