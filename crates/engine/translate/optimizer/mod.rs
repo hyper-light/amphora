@@ -4447,13 +4447,21 @@ pub(crate) mod bushy_test_hook {
             let (first_rows, _, first) = by_cost(&conn, sql);
             let seek = conn.db.learned_costs.nanos_per(Work::Seek).unwrap();
             for _ in 0..128 {
-                conn.db.learned_costs.observe(Work::Seek, 1e9, seek * 1e6 * 1e9);
+                conn.db
+                    .learned_costs
+                    .observe(Work::Seek, 1e9, seek * 1e6 * 1e9);
             }
             let moved = conn.db.learned_costs.weights_at(Some(1.0)).unwrap();
             let (second_rows, _, second) = by_cost(&conn, sql);
             conn.pin_cost_weights(None);
-            assert!(moved.seek > version.seek * 1e3, "the learning did not move: {version:?} {moved:?}");
-            assert_eq!(first, second, "two plannings against one version chose two plans");
+            assert!(
+                moved.seek > version.seek * 1e3,
+                "the learning did not move: {version:?} {moved:?}"
+            );
+            assert_eq!(
+                first, second,
+                "two plannings against one version chose two plans"
+            );
             assert_eq!(first_rows, second_rows);
         }
 

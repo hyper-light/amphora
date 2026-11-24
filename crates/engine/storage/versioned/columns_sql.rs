@@ -38,8 +38,8 @@
 //! its table grows. Counters and trace events (target `amphora::columns`) say what each copy did
 //! and why (AC-CB.3).
 //!
-//! Behind the planner's switch (`AMPHORA_COLUMN_PATH=on`, `column_path::asked`), read once when
-//! the storage opens.
+//! Only a table declared `COLUMNAR` keeps a copy (`docs/design/columnar.md`, decision 1, item 1):
+//! the translator hands the scan hook a statement on such a table alone (`translate::parallel`).
 
 use super::blink::Descender;
 use super::columns::scan::{
@@ -64,7 +64,6 @@ use crate::vdbe::morsel::{
 };
 use crate::Result;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 /// What the copies have counted: the evidence that SQL reads them. Each count saturates at
@@ -301,7 +300,6 @@ pub(crate) struct TableCopy {
 
 /// A storage's SQL tables' copies.
 pub(crate) struct Copies {
-    on: AtomicBool,
     /// How a copy let go is bought again.
     rebuy: Mutex<Rebuy>,
     /// The storage's memory source, counted ([`Metered`]): what each copy's queue, decoded blocks
@@ -385,14 +383,13 @@ fn tick(base: Instant) -> u64 {
 }
 
 impl Copies {
-    pub(crate) fn new(on: bool, room: Arc<dyn Source>) -> Self {
+    pub(crate) fn new(room: Arc<dyn Source>) -> Self {
         let meter = Arc::new(Metered {
             inner: room,
             meter: Mutex::new(Meter::default()),
         });
         let room: Arc<dyn Source> = meter.clone();
         Self {
-            on: AtomicBool::new(on),
             rebuy: Mutex::new(Rebuy::asked()),
             room,
             meter,
@@ -542,16 +539,6 @@ impl Copies {
 
     fn has(&self, tree: u64) -> bool {
         self.tables.lock().contains_key(&tree)
-    }
-
-    /// Whether the planner's switch is on: the translator then hands analytic statements to the
-    /// scan hook.
-    pub(crate) fn on(&self) -> bool {
-        self.on.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn set_on(&self, on: bool) {
-        self.on.store(on, Ordering::Relaxed);
     }
 
     pub(crate) fn counts(&self) -> CopyCounts {
@@ -889,9 +876,6 @@ pub(crate) fn aggregate(
 ) -> Result<Handed> {
     let storage = switch.storage();
     let copies = &storage.copies;
-    if !copies.on() {
-        return Ok(Handed::Rows(None));
-    }
     // A statement no copy can answer reads the rows, counted with its reason (lane colcopy-9,
     // AC-CB.4.6) so an A/B can leave it out: it reads the rows under either rebuy policy.
     let skip = match &data.body {
@@ -1144,7 +1128,9 @@ mod tests {
             use tracing_subscriber::filter::{LevelFilter, Targets};
             use tracing_subscriber::layer::SubscriberExt;
             use tracing_subscriber::util::SubscriberInitExt;
-            let only = Targets::new().with_target("amphora::column_path", LevelFilter::DEBUG);
+            let only = Targets::new()
+                .with_target("amphora::column_path", LevelFilter::DEBUG)
+                .with_target("amphora::columns", LevelFilter::DEBUG);
             let shown = tracing_subscriber::fmt::layer()
                 .with_writer(std::io::stderr)
                 .with_ansi(false)
@@ -1217,6 +1203,17 @@ mod tests {
 
     const SCHEMA: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER, s TEXT)";
 
+    /// Runs `sql`, a CREATE TABLE, declared `COLUMNAR` when `declared`: the table keeps a column
+    /// copy (decision 1, item 1).
+    fn create(conn: &Arc<crate::Connection>, sql: &str, declared: bool) {
+        let sql = if declared {
+            format!("{sql} COLUMNAR")
+        } else {
+            sql.to_string()
+        };
+        conn.execute(sql).unwrap();
+    }
+
     fn fill(conn: &Arc<crate::Connection>, from: i64, to: i64) {
         conn.execute(format!(
             "INSERT INTO t SELECT value, value % 7, (value * 37) % 1000, \
@@ -1258,10 +1255,8 @@ mod tests {
     fn cs5_sql_aggregates_answer_alike_on_copy_and_rows() {
         let (_a, on) = connect();
         let (_b, off) = connect();
-        copies(&on).set_on(true);
-        copies(&off).set_on(false);
-        for c in [&on, &off] {
-            c.execute(SCHEMA).unwrap();
+        for (c, declared) in [(&on, true), (&off, false)] {
+            create(c, SCHEMA, declared);
             fill(c, 1, 3000);
         }
         let writes = [
@@ -1293,8 +1288,7 @@ mod tests {
     #[test]
     fn cs5_a_copy_is_kept_only_for_tables_analytic_statements_read() {
         let (_a, conn) = connect();
-        copies(&conn).set_on(true);
-        conn.execute(SCHEMA).unwrap();
+        create(&conn, SCHEMA, true);
         conn.execute("CREATE TABLE u (a INTEGER, b INTEGER)")
             .unwrap();
         fill(&conn, 1, 200);
@@ -1304,6 +1298,147 @@ mod tests {
         assert_eq!(copies(&conn).counts().kept, 0);
         rows(&conn, "SELECT sum(v) FROM t");
         assert_eq!(copies(&conn).counts().kept, 1);
+    }
+
+    /// AC-CS.5.3, decision 1, item 1 (`docs/design/columnar.md`): two tables alike, one declared
+    /// `COLUMNAR`, each read by the same analytic statements three times (the rent, the buy, a
+    /// read). Expect: the same answers from both; a copy kept for the declared table alone; and
+    /// the declaration kept in its CREATE statement.
+    #[test]
+    fn cs5_only_a_table_declared_columnar_keeps_a_copy() {
+        let (_a, conn) = connect();
+        let table = "(id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)";
+        create(&conn, &format!("CREATE TABLE a {table}"), true);
+        create(&conn, &format!("CREATE TABLE b {table}"), false);
+        for t in ["a", "b"] {
+            conn.execute(format!(
+                "INSERT INTO {t} SELECT value, value % 7, (value * 37) % 1000 \
+                 FROM generate_series(1, 500)"
+            ))
+            .unwrap();
+        }
+        let root = |t: &str| match rows(
+            &conn,
+            &format!("SELECT rootpage FROM sqlite_schema WHERE name = '{t}'"),
+        )
+        .first()
+        .and_then(|r| r.first())
+        {
+            Some(Value::Numeric(Numeric::Integer(n))) => tree_of(*n).unwrap(),
+            other => panic!("no root page for {t}: {other:?}"),
+        };
+        for q in [
+            "SELECT g, count(*), sum(v) FROM {t} GROUP BY g",
+            "SELECT sum(v), max(g) FROM {t}",
+        ] {
+            for _ in 0..3 {
+                assert_eq!(
+                    rows(&conn, &q.replace("{t}", "a")),
+                    rows(&conn, &q.replace("{t}", "b")),
+                    "{q}"
+                );
+            }
+        }
+        let seen = copies(&conn).counts();
+        assert_eq!(seen.kept, 1, "{seen:?}");
+        assert!(
+            copies(&conn).kept(root("a")).is_some(),
+            "the declared table keeps a copy"
+        );
+        assert!(
+            copies(&conn).kept(root("b")).is_none(),
+            "the undeclared table keeps none"
+        );
+        let sql = rows(&conn, "SELECT sql FROM sqlite_schema WHERE name = 'a'");
+        assert!(
+            matches!(sql.first().and_then(|r| r.first()), Some(Value::Text(t)) if t.as_str().ends_with("COLUMNAR")),
+            "{sql:?}"
+        );
+    }
+
+    /// Lane R8 (AC-CS.5.3): S8's five analytics statements (the bench's suite, its tables and
+    /// indexes, `bench/src/suite.rs`) on its tables declared `COLUMNAR`, each run three times with
+    /// its parameters bound as the suite binds them. Expect: the same answers as on the same tables
+    /// undeclared; and, printed with the copies' trace events, each statement's reach: whether the
+    /// translator handed it to the copies (`MorselAggregate` in its program), its plan, and what
+    /// the copies counted for it.
+    #[test]
+    fn r8_s8_statements_on_declared_tables_say_why_they_skip_the_copy() {
+        let (_a, on) = connect();
+        let (_b, off) = connect();
+        let tables = [
+            "CREATE TABLE regions (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+            "CREATE TABLE owners (id INTEGER PRIMARY KEY, name TEXT NOT NULL, region INTEGER NOT NULL, score REAL NOT NULL)",
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, k INTEGER NOT NULL, grp INTEGER NOT NULL, owner INTEGER NOT NULL, price REAL NOT NULL, qty INTEGER NOT NULL, flag INTEGER NOT NULL, created INTEGER NOT NULL, name TEXT NOT NULL, body TEXT NOT NULL, data BLOB NOT NULL, doc TEXT NOT NULL, note TEXT)",
+        ];
+        let load = [
+            "INSERT INTO regions SELECT value, 'region-' || value FROM generate_series(1, 8)",
+            "INSERT INTO owners SELECT value, 'owner-' || value, 1 + value % 8, value * 0.5 FROM generate_series(1, 64)",
+            "INSERT INTO items SELECT value, value * 7, value % 10, 1 + value % 64, (value % 1000) * 1.25, value % 100, value % 2, 1700000000 + value, 'item-' || value, 'body', x'00', '{}', NULL FROM generate_series(1, 3000)",
+            "CREATE INDEX items_k ON items (k)",
+            "CREATE INDEX items_name ON items (name)",
+            "CREATE INDEX items_grp_created ON items (grp, created)",
+            "CREATE INDEX items_owner ON items (owner)",
+            "CREATE INDEX owners_region ON owners (region)",
+        ];
+        for (c, declared) in [(&on, true), (&off, false)] {
+            for t in tables {
+                create(c, t, declared);
+            }
+            for l in load {
+                c.execute(l).unwrap();
+            }
+        }
+        let statements: [(&str, &str, Vec<Value>); 5] = [
+            ("table_count", "SELECT COUNT(*) FROM items", vec![]),
+            ("table_group_by", "SELECT grp, COUNT(*), AVG(price), MAX(qty) FROM items GROUP BY grp", vec![]),
+            ("filter_no_index", "SELECT COUNT(*) FROM items WHERE qty = ? AND price < ?", vec![Value::from_i64(7), Value::from_f64(500.0)]),
+            ("aggregates_range", "SELECT SUM(price), AVG(qty), MIN(created), MAX(created) FROM items WHERE id BETWEEN ? AND ?", vec![Value::from_i64(10), Value::from_i64(1009)]),
+            ("join_three", "SELECT r.name, COUNT(*), AVG(i.price) FROM items i JOIN owners o ON o.id = i.owner JOIN regions r ON r.id = o.region WHERE i.id BETWEEN ? AND ? GROUP BY r.name", vec![Value::from_i64(10), Value::from_i64(1009)]),
+        ];
+        let bound = |conn: &Arc<crate::Connection>, sql: &str, params: &[Value]| {
+            let mut stmt = conn.prepare(sql).unwrap();
+            for (i, v) in params.iter().enumerate() {
+                stmt.bind_at(std::num::NonZero::new(i + 1).unwrap(), v.clone())
+                    .unwrap();
+            }
+            let mut out: Vec<Vec<Value>> = Vec::new();
+            stmt.run_with_row_callback(|row| {
+                out.push(row.get_values().cloned().collect());
+                Ok(())
+            })
+            .unwrap();
+            out
+        };
+        for (name, sql, params) in &statements {
+            let program = rows(&on, &format!("EXPLAIN {sql}"));
+            let hooked = program.iter().any(|r| {
+                r.iter()
+                    .any(|v| matches!(v, Value::Text(t) if t.as_str() == "MorselAggregate"))
+            });
+            let plan: Vec<String> = rows(&on, &format!("EXPLAIN QUERY PLAN {sql}"))
+                .iter()
+                .map(|r| format!("{:?}", r.last()))
+                .collect();
+            eprintln!("== r8 {name}: begins");
+            let before = copies(&on).counts();
+            for _ in 0..3 {
+                assert_eq!(bound(&on, sql, params), bound(&off, sql, params), "{name}");
+            }
+            let after = copies(&on).counts();
+            eprintln!(
+                "== r8 {name}: hook in its program {hooked}; plan {plan:?}; handed {}, skipped rows/body/join/transaction {}/{}/{}/{}, read by the copy {}, sent to the rows {}, no copy yet {}, copies kept {}",
+                after.handed - before.handed,
+                after.skipped_rows - before.skipped_rows,
+                after.skipped_body - before.skipped_body,
+                after.skipped_join - before.skipped_join,
+                after.skipped_transaction - before.skipped_transaction,
+                after.copy - before.copy,
+                after.rows - before.rows,
+                after.absent - before.absent,
+                after.kept,
+            );
+        }
     }
 
     /// T-CB.4.4 (lane colcopy-9, AC-CB.4.6): an analytic statement in autocommit, then the same
@@ -1317,9 +1452,8 @@ mod tests {
     fn cb4_statements_no_copy_can_answer_are_counted_with_their_reason() {
         let (_a, on) = connect();
         let (_b, off) = connect();
-        copies(&on).set_on(true);
-        for c in [&on, &off] {
-            c.execute(SCHEMA).unwrap();
+        for (c, declared) in [(&on, true), (&off, false)] {
+            create(c, SCHEMA, declared);
             fill(c, 1, 500);
         }
         let q = "SELECT count(*), sum(v) FROM t WHERE v < 700";
@@ -1378,8 +1512,7 @@ mod tests {
         let writer = db
             .connect(ConnectOpts::new().with_versioned_storage())
             .unwrap();
-        copies(&reader).set_on(true);
-        reader.execute(SCHEMA).unwrap();
+        create(&reader, SCHEMA, true);
         fill(&reader, 1, 2000);
         // Rent, buy (built after the statement's choice), then read.
         for _ in 0..3 {
@@ -1482,11 +1615,9 @@ mod tests {
     fn cs5_a_copy_behind_its_snapshot_is_never_read() {
         let (_a, on) = connect_in(refusing(super::super::columns::QUEUE));
         let (_b, off) = connect();
-        copies(&on).set_on(true);
-        copies(&off).set_on(false);
         let q = "SELECT g, count(*), sum(v), max(s) FROM t GROUP BY g";
-        for c in [&on, &off] {
-            c.execute(SCHEMA).unwrap();
+        for (c, declared) in [(&on, true), (&off, false)] {
+            create(c, SCHEMA, declared);
             fill(c, 1, 2000);
         }
         // Rent, buy (built after the statement's choice), then read.
@@ -1523,12 +1654,10 @@ mod tests {
     fn cs5_a_copy_its_memory_refuses_is_let_go_and_the_rows_answer() {
         let (_a, on) = connect_in(refusing(BLOCKS));
         let (_b, off) = connect();
-        copies(&on).set_on(true);
         copies(&on).set_rebuy(Rebuy::Rent);
-        copies(&off).set_on(false);
         let q = "SELECT g, count(*), sum(v) FROM t GROUP BY g";
-        for c in [&on, &off] {
-            c.execute(SCHEMA).unwrap();
+        for (c, declared) in [(&on, true), (&off, false)] {
+            create(c, SCHEMA, declared);
             fill(c, 1, 2000);
         }
         for _ in 0..4 {
@@ -1555,10 +1684,8 @@ mod tests {
     fn cs5_sum_over_text_in_an_integer_column_answers_as_sqlite() {
         let (_a, on) = connect();
         let (_b, off) = connect();
-        copies(&on).set_on(true);
-        copies(&off).set_on(false);
-        for c in [&on, &off] {
-            c.execute(SCHEMA).unwrap();
+        for (c, declared) in [(&on, true), (&off, false)] {
+            create(c, SCHEMA, declared);
             fill(c, 1, 3000);
             c.execute("INSERT INTO t VALUES (4001, 1, 'abc', 'x'), (4002, 2, x'01', 'y')")
                 .unwrap();
@@ -1598,12 +1725,13 @@ mod tests {
     fn r5_versioned_exact_sums_stay_exact_past_the_range() {
         let (_a, on) = connect();
         let (_b, off) = connect();
-        copies(&on).set_on(true);
-        copies(&off).set_on(false);
-        for c in [&on, &off] {
+        for (c, declared) in [(&on, true), (&off, false)] {
             c.set_real_sums(crate::RealSums::Exact);
-            c.execute("CREATE TABLE r (id INTEGER PRIMARY KEY, g INTEGER, x REAL)")
-                .unwrap();
+            create(
+                c,
+                "CREATE TABLE r (id INTEGER PRIMARY KEY, g INTEGER, x REAL)",
+                declared,
+            );
             c.execute(
                 "INSERT INTO r VALUES (1, 1, 1e308), (2, 1, 1e308), (3, 1, -1e308), \
                  (4, 1, -1e308), (5, 1, 1e308), (6, 1, 1e308), (7, 2, 1e308), (8, 2, 1e308), \
@@ -1633,8 +1761,7 @@ mod tests {
     /// spare: what the tests size their room by.
     fn need(n: i64) -> u64 {
         let (_a, c) = connect();
-        copies(&c).set_on(true);
-        c.execute(SCHEMA).unwrap();
+        create(&c, SCHEMA, true);
         fill(&c, 1, n);
         for _ in 0..3 {
             rows(&c, QUERIES[2]);
@@ -1648,9 +1775,8 @@ mod tests {
         let room = Arc::new(Capped::new(u64::MAX / 2));
         let shared: Arc<dyn Source> = room.clone();
         let (db, on) = connect_in(Some(shared));
-        copies(&on).set_on(true);
         copies(&on).set_rebuy(rebuy);
-        on.execute(SCHEMA).unwrap();
+        create(&on, SCHEMA, true);
         fill(&on, 1, n);
         (db, on, room)
     }
@@ -1672,9 +1798,7 @@ mod tests {
     }
 
     fn plain() -> (Arc<Database>, Arc<crate::Connection>) {
-        let (db, off) = connect();
-        copies(&off).set_on(false);
-        (db, off)
+        connect()
     }
 
     /// T-CB.1.3: a copy with room for it, then one with half the room it needs, through writes,
@@ -1869,11 +1993,10 @@ mod tests {
             let shared: Arc<dyn Source> = room.clone();
             let (_a, on) = connect_in(Some(shared));
             let (_b, off) = plain();
-            copies(&on).set_on(true);
             copies(&on).set_rebuy(rebuy);
-            for c in [&on, &off] {
+            for (c, declared) in [(&on, true), (&off, false)] {
                 for i in 0..s.tables {
-                    c.execute(schema(i)).unwrap();
+                    create(c, &schema(i), declared);
                     c.execute(fill_sql(i, 1, s.rows)).unwrap();
                 }
             }

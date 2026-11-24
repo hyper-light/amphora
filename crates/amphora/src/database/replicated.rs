@@ -18465,7 +18465,8 @@ mod tests {
                         acknowledged += 1;
                         if crashes < CRASHES {
                             row[id] += WRITERS;
-                            *slot = Some((via, submit(&clients[via], driven.until(), write(row[id]))));
+                            *slot =
+                                Some((via, submit(&clients[via], driven.until(), write(row[id]))));
                         }
                         false
                     }
@@ -18684,7 +18685,10 @@ mod tests {
                             *slot = Some(submit(&clients[id % 3], driven.until(), write(id)));
                         }
                         Ok(Err(refusal)) => {
-                            panic!("{durability:?}: writer {id} at member {}: {refusal:?}", id % 3 + 1)
+                            panic!(
+                                "{durability:?}: writer {id} at member {}: {refusal:?}",
+                                id % 3 + 1
+                            )
                         }
                     }
                 }
@@ -18708,7 +18712,11 @@ mod tests {
                         Ok(ids)
                     })
                     .unwrap();
-                assert_eq!(ids, (0..WRITERS).collect::<Vec<_>>(), "{durability:?}: owner {owner}");
+                assert_eq!(
+                    ids,
+                    (0..WRITERS).collect::<Vec<_>>(),
+                    "{durability:?}: owner {owner}"
+                );
             }
             driven.drain(&mut pump);
             pump.finish();
@@ -18719,7 +18727,10 @@ mod tests {
                 format!("{durability:?}: over {writes} writes, at most {most} for one, in {rounds} rounds"),
             ));
         }
-        assert!(stale.iter().all(|(n, _)| *n == 0), "stale-base refusals: {stale:?}");
+        assert!(
+            stale.iter().all(|(n, _)| *n == 0),
+            "stale-base refusals: {stale:?}"
+        );
     }
 
     /// T-T1.8.W1 (CP-T1.8, lane V13): test 5's writers with time moving, as it does on real time.
@@ -18863,17 +18874,29 @@ mod tests {
                 })
                 .unwrap();
             driven.tick(&mut pump, leader);
-            let ticks = driven.owner(leader).replica.core().raft.config().election_tick;
+            let ticks = driven
+                .owner(leader)
+                .replica
+                .core()
+                .raft
+                .config()
+                .election_tick;
             let election = driven.period(leader) * u32::try_from(ticks).unwrap();
             let clock = driven.clock(leader);
             let slow = submit(&clients[0], driven.until(), move |db| {
-                clock.fetch_add(u64::try_from((2 * election).as_nanos()).unwrap(), Ordering::AcqRel);
+                clock.fetch_add(
+                    u64::try_from((2 * election).as_nanos()).unwrap(),
+                    Ordering::AcqRel,
+                );
                 db.exec("INSERT INTO events VALUES (1)")?;
                 Ok(Vec::new())
             });
             let mut rounds = 0;
             while !driven.owner(leader).slots.holds() {
-                assert!(rounds < ROUNDS, "{durability:?}: member 1's write held no slot");
+                assert!(
+                    rounds < ROUNDS,
+                    "{durability:?}: member 1's write held no slot"
+                );
                 driven.round(&mut pump);
                 rounds += 1;
             }
@@ -19566,7 +19589,10 @@ mod tests {
             driven.round(&mut pump);
         }
         assert!(pump.captures_ready(), "member 3's write never forwarded");
-        assert!(driven.owner(0).slots.holds(), "member 3's write held no slot");
+        assert!(
+            driven.owner(0).slots.holds(),
+            "member 3's write held no slot"
+        );
         let head = enqueue(&clients[1], driven.until(), "ns", Operation::Head);
         let query = enqueue(
             &clients[1],

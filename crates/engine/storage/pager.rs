@@ -7560,14 +7560,34 @@ mod tests {
             now = (now.0 + fetches, now.1 + reads);
             window.read(now, epoch)
         };
-        assert_eq!(read(&mut window, epoch, 500), Some(0.5), "the first epoch stands");
+        assert_eq!(
+            read(&mut window, epoch, 500),
+            Some(0.5),
+            "the first epoch stands"
+        );
         for reads in [520, 480, 510, 490, 505] {
-            assert_eq!(read(&mut window, epoch, reads), Some(0.5), "an epoch {reads} of {epoch} within the noise moved the share");
+            assert_eq!(
+                read(&mut window, epoch, reads),
+                Some(0.5),
+                "an epoch {reads} of {epoch} within the noise moved the share"
+            );
         }
-        assert_eq!(read(&mut window, epoch - 1, epoch - 1), Some(0.5), "fetches inside an epoch moved the share");
-        assert_eq!(read(&mut window, epoch + 1, 1), Some(0.5), "that epoch's share, 0.5, moved the share");
+        assert_eq!(
+            read(&mut window, epoch - 1, epoch - 1),
+            Some(0.5),
+            "fetches inside an epoch moved the share"
+        );
+        assert_eq!(
+            read(&mut window, epoch + 1, 1),
+            Some(0.5),
+            "that epoch's share, 0.5, moved the share"
+        );
         let warm: Vec<_> = (0..4).map(|_| read(&mut window, epoch, 0)).collect();
-        assert_eq!(warm, vec![Some(0.0); 4], "the warm cache's share past the noise did not replace it once");
+        assert_eq!(
+            warm,
+            vec![Some(0.0); 4],
+            "the warm cache's share past the noise did not replace it once"
+        );
     }
 
     /// CP-T1.8, T-T1.8.A6: a new page is all zeros even when the pool hands it a buffer an

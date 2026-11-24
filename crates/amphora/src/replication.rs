@@ -1586,7 +1586,10 @@ mod envelope_tests {
             baseline: Some(widest_declaration()),
             reads: None,
         };
-        assert_eq!(Prepared::decode(&prepared.encode().unwrap()).unwrap().pages, whole);
+        assert_eq!(
+            Prepared::decode(&prepared.encode().unwrap()).unwrap().pages,
+            whole
+        );
     }
 
     /// T-EN.1.2: the widest image of a lowered budget, and of the full one's arithmetic — passes when

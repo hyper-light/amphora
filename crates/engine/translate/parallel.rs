@@ -102,6 +102,13 @@ pub(crate) fn emit_morsel_hook(
             None => return Ok(None),
         },
     };
+    // On the versioned storage the hook is the column copy's, which only a table declared
+    // COLUMNAR keeps (docs/design/columnar.md, decision 1, item 1).
+    if resolver.morsel_hook() == crate::translate::emitter::MorselHookFor::Copies
+        && !declared(plan, data.root_page)
+    {
+        return Ok(None);
+    }
     let body = looped.as_ref().map(|looped| MorselBody {
         on: (!looped.on.is_empty()).then(|| program.allocate_label()),
         links_on: looped
@@ -915,6 +922,14 @@ fn integer(expr: &Expr) -> Option<i64> {
 /// The LIMIT and OFFSET when each is absent or an integer literal, read as SQLite reads them: a
 /// negative LIMIT is none, a negative OFFSET is none. LIMIT 0 and any other expression decline
 /// the hook; the serial loop answers them.
+/// Whether the table the hook reads, at `root`, is declared `COLUMNAR`.
+fn declared(plan: &SelectPlan, root: i64) -> bool {
+    plan.table_references
+        .joined_tables()
+        .iter()
+        .any(|t| matches!(&t.table, Table::BTree(b) if b.root_page == root && b.columnar))
+}
+
 fn window(plan: &SelectPlan) -> Option<Window> {
     let limit = match plan.limit.as_deref() {
         None => None,
