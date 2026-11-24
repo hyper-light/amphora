@@ -1954,9 +1954,9 @@ forward lost on the way, bounded by an event, with the cost of the bound on the 
 1. **Done-when 3 is not met: the replicated suites' three rounds and the ladder did not run.** adacachy2 had 0 or 1 idle
    core (32) from 05:13Z on: cpus=8 at 05:13Z, cpus=4 at 05:13Z (accepted, r363) and at 05:17Z, 05:18Z (refused: 0 to
    1 idle), cpus=2 at 05:17Z and 05:18Z (refused: 1 idle) and 05:25Z (accepted, r403), and at 05:26Z (suites, refused:
-   0 idle) and 05:26Z (release bench and ladder, refused: 0 idle). Nothing after that ran before this record's end.
-   Before merging, the touched tests passed, and the suites' 3 rounds and the ladder at 32 and 128 spread writers on the
-   landed tree are owed (they go first in the next run).
+   0 idle) and 05:26Z (release bench and ladder, refused: 0 idle). The suites and the ladder ran after the landing, from
+   05:31Z (the runs table and "After landing" below state what finished); before it, the touched tests passed on the
+   merged tree and clippy and check-production were clean. Done-when 3 was not met before landing as the brief asked.
 2. **`a_local_read_holds_off_the_logs_restart_and_one_after_waits_for_it` failed once in the one focused run on the
    landed change** (r403, b7c93867, 60.8 s: the Timeout of `read_local`'s unwrap at replicated.rs:17488:14). V17's alone runs
    (r188) had it fail 5 in 16 on main fac69083 and 5 in 16 on the merge alike, so it is main's own; not traced here, and
@@ -2052,6 +2052,58 @@ CARGO_BUILD_JOBS = the needs' cpus.
 | r379 | cpus=1, 05:18:47Z to 05:20:46Z | 3807c7c7 and e27752f9 | the cost arms (the close not consumed, and not sent) |
 | r403 | cpus=2, 05:25:00Z to 05:28:30Z, load 54 to 58 | b7c93867; cost e6ed7152; stages cfdae334 | focused: 23 passed, 1 failed (a_local_read_holds_off, main's own flake); cost (consumed); stages; clippy exit 0 |
 | r404, r406 | 05:26Z | suites (3a58a13f and b7c93867); release bench and ladder | refused: 0 of 32 cores idle |
+| r422 | cpus=2, 05:31:06Z to 05:35:05Z, load 37 to 45 | b9e45555 (origin/main 1f4a8e88 merged) | built 73 s; focused 23 passed; clippy 0; check-production 0 (10,903) |
+| r441 | cpus=2, 05:35:25Z to 05:37:29Z | 731240ed (main 15dd57d8 merged) | built 83 s; focused 23 passed; clippy 0; pushed to main at 05:37:40Z |
+| r427 | cpus=2, 05:31:46Z to 05:47:11Z | main 1f4a8e88 and b9e45555 | the suites' 3 rounds, above |
+| r430 | cpus=2, 05:31:58Z to 05:38:27Z | b9e45555 | the ladder, above |
+| r488 | cpus=2, 05:44:38Z to 05:48:26Z | b9e45555 and 1f4a8e88 | a_restart_due alone in pairs |
+
+## After landing (main 731240ed, pushed 05:37:40Z)
+
+The merged tree's checks, before the push: r422 on b9e45555 (origin/main 1f4a8e88 merged; cpus=2, 05:31:06Z to 05:35:05Z, load 45
+to 37): built 73 s; focused 23 passed, 0 failed (v18's three tests, V15's, slot::, v14, a_slot_holder..., a_read_barrier);
+clippy exit 0; check-production exit 0, the engine's ratchet holds (10,903). Main then moved in crates/engine (lane F6's
+ratchet): r441 on 731240ed (main 15dd57d8 merged; cpus=2, 05:35:25Z to 05:37:29Z): built 83 s; focused 23 passed, 0
+failed; clippy exit 0. check-production was not run again on 731240ed. Pushed at 05:37:40Z, fast-forward.
+
+**The ladder on the landed change's product (r430, b9e45555, 05:31:58Z to 05:38:27Z, cpus=2; release bench built in 253 s;
+load 42 to 57 on 32 cores).** V16's ladder16.sh (cell13.py), V12's flags, Amphora alone, 32 and 128 spread writers, both
+classes, 3 rounds, cell order reversed in round 2. Refusals by node, commits a second and p50 (ms) by round, misses:
+
+| class | writers | refusals by node, r1; r2; r3 | commits/s per round | p50 ms per round | misses per round |
+|---|---|---|---|---|---|
+| persisted | 32 | 0 0 0; 0 0 0; 0 0 0 | 36.2, 9.2, 17.8 | 926, 3,670, 2,097 | 0, 0, 0 |
+| replicated | 32 | 0 0 0; 0 0 0; 0 0 0 | 32.4, 13.6, 18.8 | 705, 1,982, 1,327 | 0, 0, 0 |
+| persisted | 128 | 0 0 0; 0 0 0; 0 0 0 | 27.0, 31.0, 20.8 | 4,653, 5,505, 8,913 | 0, 0, 0 |
+| replicated | 128 | 0 0 0; 0 0 0; 0 0 0 | 30.4, 36.4, 7.2 | 2,851, 2,458, 9,568 | 0, 0, 5 |
+
+No write was refused in 12 runs (no node refused any). Five writes missed their 10 s deadline in round 3's replicated 128 at load
+57. Rates and p50s are in the range of V17's ladder on c39adf56 (r268: 5.2 to 23.0 commits/s and p50 1,229 to 9,699 ms) and below V14's r1987
+(37.2 to 60.8); this machine carried other lanes' runs throughout (load 42 to 57), so no rate comparison is made between
+this and those. An A/B of the ladder against the tree without the close was not run.
+
+**The replicated suites, 3 rounds, after the landing** (r427, 05:31:46Z to 05:47:11Z, cpus=2, `--test-threads=2 database::replicated:: replication::`,
+arms alternated; main's arm is 1f4a8e88, the origin/main the landed tree's first merge held, so its difference from main 731240ed
+is lane F6's crates/engine change; the landed arm is b9e45555, which has three more tests in this filter, the v18_*):
+
+| round | landed b9e45555 | main 1f4a8e88 |
+|---|---|---|
+| 1 | 178 passed, 4 failed (144 s) | 174 passed, 5 failed (120 s) |
+| 2 | 177 passed, 5 failed (152 s) | 177 passed, 2 failed (125 s) |
+| 3 | 176 passed, 6 failed (154 s) | 175 passed, 4 failed (111 s) |
+
+- Failing on both arms over the rounds: `a_local_read_open_across_an_image_install_sees_one_side_whole` (every round, both),
+  `past_its_room_a_replica_refuses_submits_and_restarts_whatever_its_share` (every round, both),
+  `a_checkpoint_pass_copies_no_frame_past_the_last_finished_flush` (landed r1, r3; main r1, r3),
+  `a_replicas_database_log_stays_within_its_room` (landed r2; main r1, r3),
+  `every_falsifier_of_the_floor_holds_under_a_nemesis` (landed r2, r3; main r1).
+- On the landed arm only in these rounds: `a_local_read_holds_off_the_logs_restart_and_one_after_waits_for_it` (r3; V17's
+  alone runs had main fail it 5 in 16) and `a_restart_due_waits_for_a_reads_deadline_and_no_longer` (3 of 3 rounds;
+  main's arm passed it in all 3). Run alone with a 45 s limit, pairs alternated, at load 29 to 43 (r488, 05:44:38Z to
+  05:48:26Z): landed b9e45555 failed 3 of 4 (1, 3, 4), main 1f4a8e88 failed 2 of 4 (2, 3): each failure timed out (its
+  first assertion, `local_readers_in_use` of 1, never reached within the test's hang guard's poll: `left: 0 right: 1` in r1 and
+  r2's logs, at replicated.rs:17676:13). It is main's own by that run, not traced, and the suites' 3 rounds do not show a
+  failure only the change has; the sample is small (4 pairs), and the machine was at load 29 to 62 through it all.
 
 ## Commands
 
