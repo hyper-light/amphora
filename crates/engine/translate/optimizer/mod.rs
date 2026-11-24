@@ -5294,6 +5294,62 @@ pub(crate) mod bushy_search_tests {
             }
         }
 
+        /// Lane C6's probe, not for main: one fixture database and one statement, its plan with ids
+        /// and parents, its program and its answer (`C6_DB`, `C6_SQL`, `C6_WEIGHTS`=seek,build,probe).
+        #[test]
+        fn c6_probe_sql() {
+            use crate::translate::optimizer::learned_costs::LearnedWeights;
+            let Ok(sql) = std::env::var("C6_SQL") else {
+                return;
+            };
+            let db = outer_joins(&std::env::var("C6_DB").unwrap());
+            let io = Arc::new(MemoryIO::new());
+            let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            let conn = database.connect(ConnectOpts::new()).unwrap();
+            for fill in &db.fill {
+                conn.execute(*fill).unwrap();
+            }
+            if std::env::var("C6_ANALYZE").is_ok() {
+                conn.execute("ANALYZE").unwrap();
+            }
+            if let Ok(weights) = std::env::var("C6_WEIGHTS") {
+                let w: Vec<f64> = weights.split(',').map(|x| x.parse().unwrap()).collect();
+                conn.pin_cost_weights(Some(LearnedWeights {
+                    row_in_pages: Some(0.003),
+                    seek: w[0],
+                    hash_build: w[1],
+                    hash_probe: w[2],
+                    sort: 3.0,
+                    bloom_probe: 10.0,
+                    where_step: 1.0,
+                    page_miss: None,
+                }));
+            }
+            BUSHY_PLANS.with(|plans| plans.set(0));
+            LEFT_JOINS_IN_RUNS.with(|runs| runs.set(0));
+            for what in ["", "EXPLAIN QUERY PLAN ", "EXPLAIN "] {
+                if what == "EXPLAIN " && std::env::var("C6_PROGRAM").is_err() {
+                    continue;
+                }
+                eprintln!("== {what}{sql}");
+                let mut stmt = conn.prepare(&format!("{what}{sql}")).unwrap();
+                for row in stmt.run_collect_rows().unwrap() {
+                    eprintln!(
+                        "{}",
+                        row.iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join(" | ")
+                    );
+                }
+                eprintln!(
+                    "bushy={} in_runs={}",
+                    BUSHY_PLANS.with(Cell::get),
+                    LEFT_JOINS_IN_RUNS.with(Cell::get)
+                );
+            }
+        }
+
         /// One database of `tests/fixtures/outer_joins.tsv`: the statements that fill it, and its
         /// queries with SQLite's answers, each with how many columns its ORDER BY reads (0: one row
         /// of aggregates, compared as it stands).
