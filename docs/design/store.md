@@ -2517,8 +2517,8 @@ as the store's does, in a log of one process; nothing restarts a segment in plac
 - *An owner's log.* A replica's owner alone starts its log again, when what it measures says so (replication.md, B): a
   switch before the room is needed would end a local read sooner. So each of the replica's two connections that write
   turns its own restart off (`Db::own_restarts`): the owner's, and its session worker's
-  (`Machine::session_connection`), whose sessions are write transactions too, rolled back. Its local reads' connections
-  write nothing (`Db::query_only`), and the copier's passes start nothing again.
+  (`Machine::session_connection`), whose sessions are write transactions too, rolled back. Its local reads'
+  connections are refused every write (`Db::query_transaction`), and its copier only copies.
 - *A multi-process log* is its one segment, restarted in place as before: its shared memory publishes no switch
   (`ShmWalCoordination::switch_unread`). Not built.
 Tests: crates/engine/tests/log_restart.rs, its steps run in sqlite3 3.54.0 as they are.
