@@ -1089,7 +1089,8 @@ out of `perf/cross-a24` in ~/.cache/amphora-perf/cross-remote:
 
 **Lane times.** First command 06:56:43Z (2026-11-24); the hour ends 07:56:43Z. Branch `perf/cross-a25`: origin/main
 75efff54 with `perf/cross-a24` (a94d1a39: the fix 536f9730 and its record) merged (0af6bdba), then main's later landings.
-Ada's benchmark window on adacachy2 ended at 06:57Z; every run here is on adacachy2 (Linux), after it.
+Ada's benchmark window on adacachy2 ended at 06:57Z; every run here is on adacachy2 (Linux), after it. Landed on main as
+a3f69b26 at 07:39:46Z: its crates/ and Cargo files are d8f0f253's, the last tree gated.
 
 **Losses.**
 - **The count does not show the failure on main.** r5 failed 0 of 17 rounds on main (75efff54) and 0 of 17 on the fix
@@ -1130,7 +1131,8 @@ log: each has a `test result`, and each ran r5 (34 of 34). A round is 50 to 85 s
 The last five aren't this change's and are noted only (rule 0): the change touches `tokens.rs` under `#[cfg(test)]` and
 the session_reads test.
 
-**The gates (Linux, adacachy2).** Clippy, check-production, `a21_` (5) and `session_reads::` (4) are `a24gates.sh` at the SHA;
+**The gates (Linux, adacachy2).** Clippy, check-production, `a21_` (5) and `session_reads::` (4) are `a24gates.sh` at the SHA (r1022 ran the same commands
+inline, with the 43 tests, to save a trip);
 the tests that touch `tokens.rs` are the lib tests named `session`, `closed`, `token` or `t_t1_10` (43). `cargo fmt --all
 --check` passed on this machine at 0af6bdba, 7f663325 and d8f0f253.
 
