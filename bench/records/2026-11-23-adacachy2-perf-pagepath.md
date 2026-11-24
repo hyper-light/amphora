@@ -1177,9 +1177,10 @@ keeps B19's Ok(true) (64e77079).
 
 **What landed.** B19's and B20's commits (94d01e88, e44b8868, ba6ee7d8, 64e77079, 32a1adc5, 73cbafdc, 92fd292e, c50e0709,
 6c28b81c) on main: 286 lines in five files (`crates/engine/storage/wal.rs`, `crates/amphora/src/db.rs`,
-`crates/amphora/src/database/replicated.rs`, docs/design/replication.md and docs/design/store.md), merged with main up to 3a58a13f
-(a1edd3e2; lane P22's replicated, slot and serve changes and hyper-raft 0009 came in clean, the branch's net diff against
-main unchanged). The landing fixes what B18's switch (main a5ae048c) broke: a committed write lost to later readers (a page
+`crates/amphora/src/database/replicated.rs`, docs/design/replication.md and docs/design/store.md), merged with main up to ac2c429a (baa9d51c): each re-merge as main moved came in clean, with
+formatting and the net diff of 286 lines in five files against main unchanged (lane P22's replicated, slot and serve
+changes and hyper-raft 0009 at 3a58a13f; PG15's engine changes at 1f4a8e88; V18's and F6's at 731240ed; T21's at
+ac2c429a). The landing fixes what B18's switch (main a5ae048c) broke: a committed write lost to later readers (a page
 cached from the closing segment passing for the current segment's frame, copied into the file by the next pass), and a
 database a power cut left unopenable (seed 45, a segment with no frame switched from). The fix read in full before landing,
 three facts checked in the code: a switch stores the free segment's epoch, one past the closing one's, before it makes that
@@ -1220,7 +1221,7 @@ On the branch only, once (round 1): `every_falsifier_of_the_floor_holds_under_a_
 (perf-persisted) measured it alone at 1 of 16 on main and 1 of 16 with its change reverted, so it predates this branch).
 `window_slow_flooded_fast_starved`, which failed twice in B20's suites, failed in neither arm here.
 
-**Checks** (tree 999fa608, main a64549cc merged; then a1edd3e2, main 3a58a13f merged):
+**Checks** (trees 999fa608 (main a64549cc merged), a1edd3e2 (3a58a13f), 1dc7e894 (1f4a8e88), baa9d51c (ac2c429a)):
 - r307: `cargo fmt --all --check` exit 0; workspace clippy exit 0, and with the engine re-checked exit 0 in 37 s (r364:
   "Checking amphora-engine v0.1.0" in its log, by touching its lib.rs); check-production on Linux exit 0 ("Checking
   amphora-engine" in its log, "10903 left ... as the ratchet holds"); `d45_` 23 passed (engine) and 1 and 1 (tests/store.rs,
@@ -1236,6 +1237,19 @@ On the branch only, once (round 1): `every_falsifier_of_the_floor_holds_under_a_
   main's own) in 73 s; tests/store.rs 17 of 17; tests/backup.rs 20 passed, 1 failed (`t_t1_12_d1`, main's own); the
   200-seed power cut passed. The engine's `storage:: vdbe::vacuum` was not rerun: P22's merge changes nothing in
   `crates/engine` (r307's 752, 0, 14 at the same engine source).
+- r428 (1dc7e894, main 1f4a8e88 merged: lane PG15's engine changes to vdbe/vacuum, vdbe/insn, storage/sqlite3_ondisk and
+  the dialect; needs `linux/amd64,cpus=8,mem=24g`, load 41 to 65, 05:31Z to 05:41Z): workspace clippy exit 0 in 47 s ("Checking
+  amphora-engine v0.1.0"); check-production exit 0 on Linux ("10903 left ... as the ratchet holds"); `d45_` 23 passed and 1 and 1
+  (tests/store.rs, tests/backup.rs); the 200-seed power cut passed; `storage:: vdbe::vacuum` 752 passed, 0 failed, 14
+  ignored in 263 s; `database::replicated::` 155 passed, 0 failed, 5 ignored in 56 s (`a_checkpoint_pass...`
+  passed in it, as in r307's suite).
+- r481 (baa9d51c, main ac2c429a merged: lane V18's replicated changes, lane F6's ratchet and engine connection.rs and mvcc,
+  lane T21's optimizer/lip.rs; needs `linux/amd64,cpus=4,mem=12g`, load 28 to 45, 05:44Z to 05:48Z): workspace clippy exit 0 in
+  35 s ("Checking amphora-engine v0.1.0"); check-production exit 0 on Linux ("10617 left ... as the ratchet holds", lane F6's
+  counting); `d45_` 23 passed (engine); the replicated tests this branch touches
+  (`a_local_read_open_across_an_image_install_sees_one_side_whole`, `past_its_room_a_replica_refuses_submits_...`,
+  `a_replicas_database_log_stays_within_its_room`) 3 of 3. Main moved three times during the landing, so the whole suites were
+  not rerun at the last merge (rule 6: the touched tests and clippy); r428 ran them whole on 1dc7e894, three merges earlier.
 
 **Commands.** `~/.cache/amphora-perf/pagepath-b21/` on this machine holds `check.sh` and the run commands (`cmd-r1.sh` r307,
 `cmd-r3.sh` r364, `cmd-r4.sh` r401) and runs on adacachy2 in the lane's clone `~/.cache/amphora-perf/pagepath-remote`, target
