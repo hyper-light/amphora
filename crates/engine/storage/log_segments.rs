@@ -191,10 +191,16 @@ impl Segments {
     /// The checkpointer copied the closing segment's last frame and flushed the file: the segment
     /// this resets, if that was the last thing it waited for.
     pub fn copied(&mut self) -> Option<SegmentId> {
+        self.mark_copied();
+        self.reset_if_done()
+    }
+
+    /// [`Self::copied`]'s flag without its reset: the multi-process shared memory publishes the
+    /// flag before it counts every process's reads, then asks [`Self::reset_if_done`].
+    pub fn mark_copied(&mut self) {
         if let Some(closing) = &mut self.other {
             closing.copied = true;
         }
-        self.reset_if_done()
     }
 
     /// The backup shipped the closing segment: the segment this resets, if that was the last thing
@@ -261,7 +267,9 @@ impl Segments {
         }
     }
 
-    fn reset_if_done(&mut self) -> Option<SegmentId> {
+    /// Free the closing segment if no read counts on it, it is copied and it is shipped: the
+    /// segment this resets.
+    pub fn reset_if_done(&mut self) -> Option<SegmentId> {
         match self.other {
             Some(Closing {
                 reads: 0,

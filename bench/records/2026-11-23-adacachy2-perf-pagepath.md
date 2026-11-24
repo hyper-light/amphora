@@ -694,3 +694,90 @@ on 8d4f34c9 (origin/main b234421d merged): `cargo test -p amphora-engine --lib -
 `cb4_ab_both_rebuy_policies_at_the_extremes`, as in B9-B12); `cargo test -p amphora --locked --test store` passed 15;
 the workspace clippy failed on one lazy `then` closure and the ratchet counted one index more, both fixed in 853c72a6.
 Run r1663 on 853c72a6: `cargo clippy --workspace --all-targets --locked -- -D warnings` exit 0; check-production as above.
+
+## perf-B15 (2026-11-23, 22:58-23:58Z)
+
+**Losses first: the hour failed its deliverable. Unit 4 is half built.** Built and checked: the brief's requirements 3 and 4
+(a closing segment is reset only when no read of any process counts it; a read checks, after it is counted, that no reset
+took a segment of its span). Not built: requirements 1 and 2. The checkpointer still copies only the current segment and
+never the closing one, so nothing outside the tests calls the copy event (`MappedSharedWalCoordination::copied`, or
+`Segments::copied` in one process). The brief's test "the current segment isn't copied while the closing one is unreset"
+does not exist. The test of "a read counted during a reset" drives the shared memory (two mappings of one file), not a
+query: a query-level one needs the checkpointer's copy. No A/B ran (the brief: none). The read path's added cost in the
+shared-memory backend is not measured: one SeqCst fence and one load at each read's start, and one fence and one load at
+each read's end.
+
+**Why the checkpointer isn't built.** The checkpoint pass (`checkpoint_inner`, wal.rs) reaches the log through about 16
+coordination calls that name the current segment today, each implemented by both backends. The in-process backend has 24
+uses of `log.current()` or `current_id()`; the shared-memory backend has 90, its authority's calls included. Giving each
+the pass's segment, with two check runs, did not fit the hour.
+
+**Built** (perf/pagepath-d45 d0660c11).
+- `MappedSharedWalCoordination` (shared_wal_coordination.rs):
+  - `begin_span` takes a read's span from the shared word, with the word it was taken from.
+  - `span_holds(word)` is asked once the read is counted: a SeqCst fence, then whether the word is unchanged.
+  - `reset_if_unread` is asked at each reset event. It writes the word (`fetch_or(0)`), fences, sums every live slot's
+    reads (dead slots reclaimed first), and resets by compare-and-swap if the closing segment is copied, shipped and
+    read by nobody. A cheap check of the word comes first, so a read's end that can't reset costs a fence and a load.
+  - `copied` publishes the copied flag, then asks `reset_if_unread`.
+- `ShmWalCoordination` (wal.rs): `try_begin_read_tx` takes the span from `begin_span`. `publish_shared_reader` refuses
+  the read when `span_holds` fails after its count, gives the count back and asks for the reset. `end_read_tx` gives the
+  count back, asks for the reset, and unlocks the read mark of the segment it locked. The shared backend no longer counts
+  reads in its process's `SharedLog::segments`: every process's reads are in the slots, and the local copy of the state
+  could lag another process's reset, which would make a read retry with the same stale span for ever.
+- `Segments::copied` (log_segments.rs) is now `mark_copied` then `reset_if_done` (public), so the shared memory can
+  publish the flag before it counts the reads.
+
+**Why the order holds (lane B14's race).** A read stores its count, fences, then loads the word. A reset stores the word,
+fences, then loads the counts. With SeqCst fences on both sides, one of the two loads sees the other side's store. If the
+reset sees the count, it leaves the segment. If the read sees the reset's store (the copied flag, or the reset itself),
+the word differs from the span's, and the read starts over with a span from the new word. A span taken after the copied
+flag never counts on the closing segment (decision 45, The shape). So a read proceeds on a closing segment only while
+its count holds the reset back. The reset at a read's end does the same store, fence and loads (`fetch_or(0)` is its
+store), so the same holds against a read whose count only that resetter could miss.
+
+**Tests** (shared_wal_coordination.rs, two mappings of one `.tshm`, the switch made by hand as in B12):
+- `d45_a_read_begun_before_the_switch_keeps_the_closing_segment`: the copy leaves the closing segment while a read in the
+  other mapping counts on it; the read's end resets it; a second reset attempt does nothing.
+- `d45_a_read_counted_during_a_reset_never_reads_the_reset_segment`: a span taken before the copy and reset, counted
+  after, is refused, and the retry's span reaches only the current segment. In the other order, a read counted before
+  the copy keeps the segment from its reset until it ends.
+
+**Checks** (adacachy2, needs `linux/amd64,cpus=4,mem=12g`: refused at cpus=8 with 7 of 32 cores idle; script
+`~/.cache/amphora-perf/pagepath-b15/check.sh`, B14's with the job count from `JOBS`). Run r1698 on main f91a9a92 (load
+36-40): `cargo clippy --workspace --all-targets --locked -- -D warnings` exit 0 in 11 s. Run r1723 on d0660c11 (load
+33-48): `cargo check -p amphora-engine --lib --tests` exit 0; `cargo test -p amphora-engine --lib --locked -- d45_` passed
+15 (B14's 13 and the two above); the workspace clippy exit 0 in 35 s; `storage:: vdbe::vacuum --test-threads=4` passed
+724, failed 2 and ignored 14 in 235 s, the two main's own (`cb4_a_read_only_transaction_reads_the_copy_at_its_snapshot`,
+`cb4_ab_both_rebuy_policies_at_the_extremes`) and 724 being main's 722 and the two above; `cargo test -p amphora --locked
+--test store` passed 15; `scripts/check-production.sh` exit 1, `clippy::disallowed_methods: 41, above the 40`, the count
+main had then (T13's site in learned_costs.rs, which lane T14 has since fixed on main, 44515444). Run r1754 on 51cc395e
+(d0660c11 with origin/main c75bb13f merged; load 24-51): `d45_` passed 15; the workspace clippy exit 0 in 61 s;
+check-production exit 0 ("10908 left in the engine's production code across 17 lints, as the ratchet holds");
+`storage:: vdbe::vacuum` passed 724, failed the same 2 and ignored 14 in 229 s. Main then moved again in `crates/`
+(`storage/versioned`, `vdbe`, `amphora`, `pg-parser`, none of this lane's files): run r1767 on 4af592b6, the re-merge
+(load 22-26): `d45_` passed 15; the workspace clippy exit 0 in 33 s; check-production exit 0, the ratchet holding. Main
+moved once more (`amphora`'s store.rs and crash test, `pg-parser`): run r1774 on 940f1c8d (load 18-31): `d45_` passed
+15; the workspace clippy exit 0 in 37 s; `cargo test -p amphora --locked --test store` passed 15. Run r1741 never
+started (the kiln server timed out answering, then had no record of it).
+
+**Rules 1 and 2, the design for the successor** (from `checkpoint_inner`, wal.rs, and the pager's phases, pager.rs).
+- The pass's segment. `OngoingCheckpoint` gains `segment: SegmentId`, chosen once at `CheckpointState::Start`: the
+  closing segment while there is one, else the current one (shared memory: `authority.segments()`; one process:
+  `SharedLog::segments`). The current segment is copied only once no closing segment remains, which is after its reset
+  (rule 1).
+- The calls the pass makes that must take its segment: `load_coordination_snapshot` (max_frame, nbackfills),
+  `determine_max_safe_checkpoint_frame` (only reads begun before the switch hold marks on the closing segment), the
+  guard's `try_read_mark_exclusive(0)`, `ensure_local_frame_cache_covers`, `iter_latest_frames`, `durable_through` and
+  `sync` (the closing segment's file), `wal_header`, `holds_record` and `issue_record_reads`,
+  `issue_wal_read_into_buffer` (a `FrameRef` of the pass's segment), and `cache_get_for_checkpoint`, whose key is a
+  frame and an epoch: skip it for the closing segment, or key it by `frame_generation`.
+- The pager's `PublishBackfill` (after `SyncDbFile`, so the file is flushed first) publishes the closing segment's
+  backfill. When that reaches the segment's last frame, it calls the copy event: `Segments::copied` under
+  `SharedLog::segments` in one process, `MappedSharedWalCoordination::copied` across processes.
+- A Restart or Truncate checkpoint whose pass copied the closing segment must not restart the log: the current segment
+  is not copied yet. It answers Busy, or runs a second pass on the current segment once the reset is in.
+- Shared memory: the authority holds the current segment's frames, not the closing one's. Until unit 5 there is no
+  switch, so a closing segment exists only from recovery, and each process's own scan of that file is complete and the
+  same: a closed segment is never appended to.
+- Test (b), "the current segment isn't copied while the closing one is unreset", belongs with this part.
