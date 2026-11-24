@@ -186,6 +186,10 @@ point ("Continuous Archiving and Point-in-Time Recovery", postgresql.org/docs/cu
 **Evidence.** `crates/amphora/tests/backup.rs` (T-T1.12.D1): three seeds of 600 random steps
 (commits, flushes, checkpoints, log restarts, shipping rounds, base chunks interleaved), then restores
 to 12 random seconds each: every row equal. The planner's cases are unit tests (T-T1.12.P1 to P10).
+What a base's file holds, what a failed restore leaves and what a failed check begins (lane B26): the tests of
+`tests/backup.rs` that name them, a base as a shipper before lane B22 made it and each disagreement of a
+manifest with its log, every step and every read of a restore failing in turn, a restore killed at every
+step of it and cut short by a file that can't grow, and a check of a short archive.
 
 **Falsified by.** A restore to a second whose rows differ from the source's at that second; a second
 refused that the archive holds whole; a restore that succeeds across a break in the log without a base

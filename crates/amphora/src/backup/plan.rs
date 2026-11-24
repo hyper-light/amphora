@@ -106,11 +106,17 @@ pub enum Lacks {
 }
 
 impl Unrestorable {
-    /// What the archive lacks, where a new base mends it.
+    /// What the archive lacks, where a new base mends it: of a generation that isn't the one a base
+    /// began in, which of the two is wrong isn't known, so neither is relied on again.
     #[must_use]
     pub fn lacks(&self) -> Option<Lacks> {
         match self {
-            Self::Short { generation, .. } | Self::Gap(generation) => Some(Lacks::Frames {
+            Self::Short { generation, .. }
+            | Self::Gap(generation)
+            | Self::Unproven {
+                lack: BaseLack::Own { generation, .. },
+                ..
+            } => Some(Lacks::Frames {
                 generation: *generation,
             }),
             Self::Unproven { base, .. } => Some(Lacks::Base { id: *base }),
